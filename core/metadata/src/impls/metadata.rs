@@ -18,7 +18,7 @@ use crate::stm::StateMachine;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
 use consensus::{
     Consensus, Pipeline, PipelineEntry, Plane, PlaneIdentity, Project, Sequencer, VsrConsensus,
-    ack_preflight, ack_quorum_reached, build_reply_message, fence_old_prepare_by_commit,
+    ack_preflight, ack_quorum_reached, build_reply_message, drain_committable_prefix, fence_old_prepare_by_commit,
     panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, replicate_preflight,
     replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
 };
@@ -159,6 +159,7 @@ where
         assert_eq!(header.op, current_op + 1);
 
         consensus.sequencer().set_sequence(header.op);
+        consensus.set_last_prepare_checksum(header.checksum);
 
         // Append to journal.
         journal.handle().append(message.clone()).await;
@@ -197,33 +198,36 @@ where
 
             debug!("on_ack: quorum received for op={}", header.op);
 
-            // Extract the header from the pipeline, fetch the full message from journal
-            // TODO: Commit from the head. ALWAYS
-            let entry = consensus.pipeline().borrow_mut().extract_by_op(header.op);
-            let Some(entry) = entry else {
-                warn!("on_ack: prepare not found in pipeline for op={}", header.op);
-                return;
-            };
+            let drained = drain_committable_prefix(consensus);
+            if let (Some(first), Some(last)) = (drained.first(), drained.last()) {
+                debug!(
+                    "on_ack: draining committed prefix ops=[{}..={}] count={}",
+                    first.header.op,
+                    last.header.op,
+                    drained.len()
+                );
+            }
 
-            let prepare_header = entry.header;
-            // TODO(hubcio): should we replace this with graceful fallback (warn + return)?
-            // When journal compaction is implemented compaction could race
-            // with this lookup if it removes entries below the commit number.
-            let prepare = journal
-                .handle()
-                .entry(&prepare_header)
-                .await
-                .unwrap_or_else(|| {
-                    panic!(
-                        "on_ack: committed prepare op={} checksum={} must be in journal",
-                        prepare_header.op, prepare_header.checksum
-                    )
-                });
+            for entry in drained {
+                let prepare_header = entry.header;
+                // TODO(hubcio): should we replace this with graceful fallback (warn + return)?
+                // When journal compaction is implemented compaction could race
+                // with this lookup if it removes entries below the commit number.
+                let prepare = journal
+                    .handle()
+                    .entry(&prepare_header)
+                    .await
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "on_ack: committed prepare op={} checksum={} must be in journal",
+                            prepare_header.op, prepare_header.checksum
+                        )
+                    });
 
-            // Apply the state (consumes prepare)
-            // TODO: Handle appending result to response
-            let _result = self.mux_stm.update(prepare);
-            debug!("on_ack: state applied for op={}", prepare_header.op);
+                // Apply the state (consumes prepare)
+                // TODO: Handle appending result to response
+                let _result = self.mux_stm.update(prepare);
+                debug!("on_ack: state applied for op={}", prepare_header.op);
 
             // Send reply to client
             let generic_reply = build_reply_message(consensus, &prepare_header).into_generic();
@@ -232,12 +236,13 @@ where
                 prepare_header.client, prepare_header.op
             );
 
-            // TODO: Error handling
-            consensus
-                .message_bus()
-                .send_to_client(prepare_header.client, generic_reply)
-                .await
-                .unwrap()
+                // TODO: Propagate send error instead of panicking; requires bus error design.
+                consensus
+                    .message_bus()
+                    .send_to_client(prepare_header.client, generic_reply)
+                    .await
+                    .unwrap()
+            }
         }
     }
 }

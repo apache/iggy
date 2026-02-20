@@ -136,10 +136,21 @@ pub struct GenericHeader {
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
-    pub namespace: u64,
-    pub reserved_command: [u8; 120],
+    pub reserved_command: [u8; 128],
 }
-const _: () = assert!(core::mem::size_of::<GenericHeader>() == HEADER_SIZE);
+const _: () = {
+    assert!(core::mem::size_of::<GenericHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(GenericHeader, reserved_command)
+            == core::mem::offset_of!(GenericHeader, reserved_frame) + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(GenericHeader, reserved_command) + core::mem::size_of::<[u8; 128]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for GenericHeader {}
 unsafe impl Zeroable for GenericHeader {}
@@ -186,7 +197,19 @@ pub struct RequestHeader {
     pub namespace: u64,
     pub reserved: [u8; 64],
 }
-const _: () = assert!(core::mem::size_of::<RequestHeader>() == HEADER_SIZE);
+const _: () = {
+    assert!(core::mem::size_of::<RequestHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(RequestHeader, client)
+            == core::mem::offset_of!(RequestHeader, reserved_frame) + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(RequestHeader, reserved) + core::mem::size_of::<[u8; 64]>()
+            == HEADER_SIZE
+    );
+};
 
 impl Default for RequestHeader {
     fn default() -> Self {
@@ -266,7 +289,19 @@ pub struct PrepareHeader {
     pub namespace: u64,
     pub reserved: [u8; 32],
 }
-const _: () = assert!(core::mem::size_of::<PrepareHeader>() == HEADER_SIZE);
+const _: () = {
+    assert!(core::mem::size_of::<PrepareHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(PrepareHeader, client)
+            == core::mem::offset_of!(PrepareHeader, reserved_frame) + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(PrepareHeader, reserved) + core::mem::size_of::<[u8; 32]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for PrepareHeader {}
 unsafe impl Zeroable for PrepareHeader {}
@@ -348,7 +383,20 @@ pub struct PrepareOkHeader {
     pub namespace: u64,
     pub reserved: [u8; 48],
 }
-const _: () = assert!(core::mem::size_of::<PrepareOkHeader>() == HEADER_SIZE);
+const _: () = {
+    assert!(core::mem::size_of::<PrepareOkHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(PrepareOkHeader, parent)
+            == core::mem::offset_of!(PrepareOkHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(PrepareOkHeader, reserved) + core::mem::size_of::<[u8; 48]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for PrepareOkHeader {}
 unsafe impl Zeroable for PrepareOkHeader {}
@@ -424,7 +472,19 @@ pub struct CommitHeader {
     pub namespace: u64,
     pub reserved: [u8; 80],
 }
-const _: () = assert!(core::mem::size_of::<CommitHeader>() == HEADER_SIZE);
+const _: () = {
+    assert!(core::mem::size_of::<CommitHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(CommitHeader, commit_checksum)
+            == core::mem::offset_of!(CommitHeader, reserved_frame) + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(CommitHeader, reserved) + core::mem::size_of::<[u8; 80]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for CommitHeader {}
 unsafe impl Zeroable for CommitHeader {}
@@ -476,9 +536,21 @@ pub struct ReplyHeader {
     pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
-    pub reserved: [u8; 41],
+    pub reserved: [u8; 48],
 }
-const _: () = assert!(core::mem::size_of::<ReplyHeader>() == HEADER_SIZE);
+const _: () = {
+    assert!(core::mem::size_of::<ReplyHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(ReplyHeader, request_checksum)
+            == core::mem::offset_of!(ReplyHeader, reserved_frame) + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(ReplyHeader, reserved) + core::mem::size_of::<[u8; 48]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for ReplyHeader {}
 unsafe impl Zeroable for ReplyHeader {}
@@ -526,7 +598,7 @@ impl Default for ReplyHeader {
             operation: Default::default(),
             operation_padding: [0; 7],
             namespace: 0,
-            reserved: [0; 41],
+            reserved: [0; 48],
         }
     }
 }
@@ -546,11 +618,25 @@ pub struct StartViewChangeHeader {
     pub release: u32,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 58],
+    pub reserved_frame: [u8; 66],
 
-    pub reserved: [u8; 128],
+    pub namespace: u64,
+    pub reserved: [u8; 120],
 }
-const _: () = assert!(core::mem::size_of::<StartViewChangeHeader>() == HEADER_SIZE);
+const _: () = {
+    assert!(core::mem::size_of::<StartViewChangeHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(StartViewChangeHeader, namespace)
+            == core::mem::offset_of!(StartViewChangeHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(StartViewChangeHeader, reserved) + core::mem::size_of::<[u8; 120]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for StartViewChangeHeader {}
 unsafe impl Zeroable for StartViewChangeHeader {}
@@ -599,7 +685,7 @@ pub struct DoViewChangeHeader {
     pub release: u32,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 58],
+    pub reserved_frame: [u8; 66],
 
     /// The highest op-number in this replica's log.
     /// Used to select the most complete log when log_view values are equal.
@@ -607,13 +693,27 @@ pub struct DoViewChangeHeader {
     /// The replica's commit number (highest committed op).
     /// The new primary sets its commit to max(commit) across all DVCs.
     pub commit: u64,
+    pub namespace: u64,
     /// The view number when this replica's status was last normal.
     /// This is the key field for log selection: the replica with the
     /// highest log_view has the most authoritative log.
     pub log_view: u32,
-    pub reserved: [u8; 108],
+    pub reserved: [u8; 100],
 }
-const _: () = assert!(core::mem::size_of::<DoViewChangeHeader>() == HEADER_SIZE);
+const _: () = {
+    assert!(core::mem::size_of::<DoViewChangeHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(DoViewChangeHeader, op)
+            == core::mem::offset_of!(DoViewChangeHeader, reserved_frame)
+                + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(DoViewChangeHeader, reserved) + core::mem::size_of::<[u8; 100]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for DoViewChangeHeader {}
 unsafe impl Zeroable for DoViewChangeHeader {}
@@ -678,7 +778,7 @@ pub struct StartViewHeader {
     pub release: u32,
     pub command: Command2,
     pub replica: u8,
-    pub reserved_frame: [u8; 58],
+    pub reserved_frame: [u8; 66],
 
     /// The op-number of the highest entry in the new primary's log.
     /// Backups set their op to this value.
@@ -687,9 +787,22 @@ pub struct StartViewHeader {
     /// This is max(commit) from all DVCs received by the primary.
     /// Backups set their commit to this value.
     pub commit: u64,
-    pub reserved: [u8; 112],
+    pub namespace: u64,
+    pub reserved: [u8; 104],
 }
-const _: () = assert!(core::mem::size_of::<StartViewHeader>() == HEADER_SIZE);
+const _: () = {
+    assert!(core::mem::size_of::<StartViewHeader>() == HEADER_SIZE);
+    // Ensure no implicit padding is inserted between reserved_frame and the body fields.
+    assert!(
+        core::mem::offset_of!(StartViewHeader, op)
+            == core::mem::offset_of!(StartViewHeader, reserved_frame) + core::mem::size_of::<[u8; 66]>()
+    );
+    // Ensure no implicit tail padding is inserted after the explicit trailing bytes.
+    assert!(
+        core::mem::offset_of!(StartViewHeader, reserved) + core::mem::size_of::<[u8; 104]>()
+            == HEADER_SIZE
+    );
+};
 
 unsafe impl Pod for StartViewHeader {}
 unsafe impl Zeroable for StartViewHeader {}

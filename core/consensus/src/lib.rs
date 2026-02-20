@@ -32,9 +32,6 @@ pub trait Pipeline {
 
     fn pop_message(&mut self) -> Option<Self::Entry>;
 
-    /// Extract and remove a message by op number.
-    fn extract_by_op(&mut self, op: u64) -> Option<Self::Entry>;
-
     fn clear(&mut self);
 
     fn message_by_op(&self, op: u64) -> Option<&Self::Entry>;
@@ -42,6 +39,8 @@ pub trait Pipeline {
     fn message_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry>;
 
     fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&Self::Entry>;
+
+    fn head(&self) -> Option<&Self::Entry>;
 
     fn is_full(&self) -> bool;
 
@@ -68,9 +67,6 @@ pub trait Consensus: Sized {
 
     fn pipeline_message(&self, message: Self::Message<Self::ReplicateHeader>);
     fn verify_pipeline(&self);
-
-    // TODO: Figure out how we can achieve that without exposing such methods in the Consensus trait.
-    fn post_replicate_verify(&self, message: &Self::Message<Self::ReplicateHeader>);
 
     fn is_follower(&self) -> bool;
     fn is_normal(&self) -> bool;
@@ -111,6 +107,8 @@ mod impls;
 pub use impls::*;
 mod plane_mux;
 pub use plane_mux::*;
+mod namespaced_pipeline;
+pub use namespaced_pipeline::*;
 mod plane_helpers;
 pub use plane_helpers::*;
 

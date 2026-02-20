@@ -118,11 +118,15 @@ const EXAMPLES: &str = r#"EXAMPLES:
 
 5) Remote Server Benchmarking:
 
-    To benchmark a remote server, specify the server address in the transport subcommand:
+    To benchmark a remote server, specify the server address in the transport subcommand.
+    Both IP addresses and hostnames are supported:
 
     $ cargo r -r --bin iggy-bench -- pinned-producer \
         --streams 5 --producers 5 \
         tcp --server-address 192.168.1.100:8090
+    $ cargo r -r --bin iggy-bench -- pinned-producer \
+        --streams 5 --producers 5 \
+        tcp --server-address localhost:8090
 
     With custom credentials:
 

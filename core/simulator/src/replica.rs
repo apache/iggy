@@ -17,22 +17,24 @@
 
 use crate::bus::{MemBus, SharedMemBus};
 use crate::deps::{
-    MemStorage, ReplicaPartitions, SimJournal, SimMuxStateMachine, SimPlane, SimSnapshot,
+    ReplicaPartitions, SimJournal, SimMetadata, SimMuxStateMachine, SimPlane, SimSnapshot,
 };
-use consensus::{LocalPipeline, MuxPlane, VsrConsensus};
-use iggy_common::IggyByteSize;
-use iggy_common::sharding::ShardId;
-use iggy_common::variadic;
-use metadata::IggyMetadata;
+use iggy_common::sharding::{IggyNamespace, ShardId};
+use iggy_common::{IggyByteSize, variadic};
+use consensus::{LocalPipeline, NamespacedPipeline, VsrConsensus};
 use metadata::stm::consumer_group::{ConsumerGroups, ConsumerGroupsInner};
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
 use partitions::PartitionsConfig;
 use std::sync::Arc;
 
+// TODO: Make configurable
+const CLUSTER_ID: u128 = 1;
+
 pub struct Replica {
     pub id: u8,
     pub name: String,
+    pub replica_count: u8,
     pub plane: SimPlane,
     pub bus: Arc<MemBus>,
 }
@@ -44,67 +46,58 @@ impl Replica {
         let consumer_groups: ConsumerGroups = ConsumerGroupsInner::new().into();
         let mux = SimMuxStateMachine::new(variadic!(users, streams, consumer_groups));
 
-        let cluster_id: u128 = 1; // TODO: Make configurable
+        // Metadata uses namespace=0 (not partition-scoped)
         let metadata_consensus = VsrConsensus::new(
-            cluster_id,
+            CLUSTER_ID,
             id,
             replica_count,
+            0,
             SharedMemBus(Arc::clone(&bus)),
             LocalPipeline::new(),
         );
         metadata_consensus.init();
+        let metadata = SimMetadata {
+            consensus: Some(metadata_consensus),
+            journal: Some(SimJournal::default()),
+            snapshot: Some(SimSnapshot::default()),
+            mux_stm: mux,
+        };
 
-        // Create separate consensus instance for partitions
-        let partitions_consensus = VsrConsensus::new(
-            cluster_id,
-            id,
-            replica_count,
-            SharedMemBus(Arc::clone(&bus)),
-            LocalPipeline::new(),
-        );
-        partitions_consensus.init();
-
-        // Configure partitions
         let partitions_config = PartitionsConfig {
             messages_required_to_save: 1000,
             size_of_messages_required_to_save: IggyByteSize::from(4 * 1024 * 1024),
             enforce_fsync: false, // Disable fsync for simulation
-            segment_size: IggyByteSize::from(1024 * 1024 * 1024), // 1GB segments
+            segment_size: IggyByteSize::from(1024 * 1024 * 1024), // 1GiB segments
         };
 
-        // Only replica 0 gets consensus (primary shard for now)
-        let partitions = if id == 0 {
-            ReplicaPartitions::new(
-                ShardId::new(id as u16),
-                partitions_config,
-                Some(partitions_consensus),
-            )
-        } else {
-            ReplicaPartitions::new(ShardId::new(id as u16), partitions_config, None)
-        };
+        let mut partitions = ReplicaPartitions::new(ShardId::new(id as u16), partitions_config);
 
-        let metadata = IggyMetadata {
-            consensus: Some(metadata_consensus),
-            journal: Some(SimJournal::<MemStorage>::default()),
-            snapshot: Some(SimSnapshot::default()),
-            mux_stm: mux,
-        };
-        let plane = MuxPlane::new(variadic!(metadata, partitions));
+        // TODO: namespace=0 collides with metadata consensus. Safe for now because the simulator
+        // routes by Operation type, but a shared view change bus would produce namespace collisions.
+        let partition_consensus = VsrConsensus::new(
+            CLUSTER_ID,
+            id,
+            replica_count,
+            0,
+            SharedMemBus(Arc::clone(&bus)),
+            NamespacedPipeline::new(),
+        );
+        partition_consensus.init();
+        partitions.set_consensus(partition_consensus);
+        let plane = SimPlane::new(variadic!(metadata, partitions));
 
         Self {
             id,
             name,
             plane,
+            replica_count,
             bus,
         }
     }
 
-    pub fn init_partition_in_memory(&mut self, namespace: iggy_common::sharding::IggyNamespace) {
-        // TODO: create an accessor for the partitions within mux plane, same for metadata.
-        self.plane
-            .inner_mut()
-            .1
-            .0
-            .init_partition_in_memory(namespace);
+    pub fn init_partition(&mut self, namespace: IggyNamespace) {
+        let partitions = &mut self.plane.inner_mut().1.0;
+        partitions.init_partition_in_memory(namespace);
+        partitions.register_namespace_in_pipeline(namespace.inner());
     }
 }

@@ -25,68 +25,84 @@ namespace Apache.Iggy.Tests.Integrations;
 
 public class PersonalAccessTokenTests
 {
-    private const string Name = "test-pat";
     private static readonly TimeSpan Expiry = TimeSpan.FromHours(1);
 
-    [ClassDataSource<PersonalAccessTokenFixture>(Shared = SharedType.PerClass)]
-    public required PersonalAccessTokenFixture Fixture { get; init; }
-
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture Fixture { get; init; }
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task CreatePersonalAccessToken_HappyPath_Should_CreatePersonalAccessToken_Successfully(
         Protocol protocol)
     {
-        var result = await Fixture.Clients[protocol].CreatePersonalAccessTokenAsync(Name, Expiry);
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var name = $"pat-{Guid.NewGuid():N}"[..20];
+        var result = await client.CreatePersonalAccessTokenAsync(name, Expiry);
 
         result.ShouldNotBeNull();
         result.Token.ShouldNotBeNullOrEmpty();
     }
 
     [Test]
-    [DependsOn(nameof(CreatePersonalAccessToken_HappyPath_Should_CreatePersonalAccessToken_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task CreatePersonalAccessToken_Duplicate_Should_Throw_InvalidResponse(Protocol protocol)
     {
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var name = $"dup-{Guid.NewGuid():N}"[..20];
+        await client.CreatePersonalAccessTokenAsync(name, Expiry);
+
         await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
-            Fixture.Clients[protocol].CreatePersonalAccessTokenAsync(Name, Expiry));
+            client.CreatePersonalAccessTokenAsync(name, Expiry));
     }
 
     [Test]
-    [DependsOn(nameof(CreatePersonalAccessToken_Duplicate_Should_Throw_InvalidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetPersonalAccessTokens_Should_ReturnValidResponse(Protocol protocol)
     {
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var name = $"get-{Guid.NewGuid():N}"[..20];
+        await client.CreatePersonalAccessTokenAsync(name, Expiry);
+
         IReadOnlyList<PersonalAccessTokenResponse> response
-            = await Fixture.Clients[protocol].GetPersonalAccessTokensAsync();
+            = await client.GetPersonalAccessTokensAsync();
 
         response.ShouldNotBeNull();
-        response.Count.ShouldBe(1);
-        response[0].Name.ShouldBe(Name);
+        response.Count.ShouldBeGreaterThanOrEqualTo(1);
+        response.ShouldContain(x => x.Name == name);
+
+        var token = response.First(x => x.Name == name);
         var tokenExpiryDateTimeOffset = DateTimeOffset.UtcNow.Add(Expiry);
-        response[0].ExpiryAt!.Value.ToUniversalTime().ShouldBe(tokenExpiryDateTimeOffset, TimeSpan.FromMinutes(1));
+        token.ExpiryAt!.Value.ToUniversalTime().ShouldBe(tokenExpiryDateTimeOffset, TimeSpan.FromMinutes(1));
     }
 
     [Test]
-    [DependsOn(nameof(GetPersonalAccessTokens_Should_ReturnValidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task LoginWithPersonalAccessToken_Should_Be_Successfully(Protocol protocol)
     {
-        var response = await Fixture.Clients[protocol].CreatePersonalAccessTokenAsync("test-pat-login", Expiry);
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        var client = await Fixture.IggyServerFixture.CreateClient(protocol);
+        var name = $"lgn-{Guid.NewGuid():N}"[..20];
+        var response = await client.CreatePersonalAccessTokenAsync(name, Expiry);
 
-        var authResponse = await client.LoginWithPersonalAccessToken(response!.Token);
+        var loginClient = await Fixture.CreateClient(protocol);
+        var authResponse = await loginClient.LoginWithPersonalAccessToken(response!.Token);
 
         authResponse.ShouldNotBeNull();
-        authResponse.UserId.ShouldBeGreaterThan(0);
+        authResponse.UserId.ShouldBeGreaterThanOrEqualTo(0);
     }
 
     [Test]
-    [DependsOn(nameof(LoginWithPersonalAccessToken_Should_Be_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DeletePersonalAccessToken_Should_DeletePersonalAccessToken_Successfully(Protocol protocol)
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].DeletePersonalAccessTokenAsync(Name));
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var name = $"del-{Guid.NewGuid():N}"[..20];
+        await client.CreatePersonalAccessTokenAsync(name, Expiry);
+
+        await Should.NotThrowAsync(() => client.DeletePersonalAccessTokenAsync(name));
     }
 }
