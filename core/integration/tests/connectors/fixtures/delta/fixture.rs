@@ -56,10 +56,6 @@ pub struct DeltaFixture {
 }
 
 impl DeltaFixture {
-    pub fn table_path(&self) -> &PathBuf {
-        &self.table_path
-    }
-
     pub async fn wait_for_delta_log(
         &self,
         min_versions: usize,

@@ -578,9 +578,9 @@ mod tests {
         assert_eq!(value["level1_string"], json!("true"));
 
         // Float
-        let mut value = json!({ "level1_string": 3.14 });
+        let mut value = json!({ "level1_string": 3.15 });
         coerce(&mut value, &tree);
-        assert_eq!(value["level1_string"], json!("3.14"));
+        assert_eq!(value["level1_string"], json!("3.15"));
 
         // Integer
         let mut value = json!({ "level1_string": 42 });
