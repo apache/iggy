@@ -40,7 +40,6 @@ pub async fn pipeline_prepare_common<C, F>(
     consensus.verify_pipeline();
     consensus.pipeline_message(prepare.clone());
     on_replicate(prepare.clone()).await;
-    consensus.post_replicate_verify(&prepare);
 }
 
 /// Shared commit-based old-prepare fence.
@@ -77,6 +76,7 @@ pub async fn replicate_to_next_in_chain<B, P>(
 
     assert_ne!(next, consensus.replica());
 
+    // TODO: Propagate send error instead of panicking; requires bus error design.
     consensus
         .message_bus()
         .send_to_replica(next, message.into_generic())
@@ -135,7 +135,11 @@ where
     Ok(())
 }
 
-/// Shared quorum + extraction flow for ack handling.
+/// Shared quorum tracking flow for ack handling.
+///
+/// After recording the ack, walks forward from `current_commit + 1` advancing
+/// the commit number only while consecutive ops have achieved quorum. This
+/// prevents committing ops that have gaps in quorum acknowledgment.
 pub fn ack_quorum_reached<B, P>(consensus: &VsrConsensus<B, P>, ack: &PrepareOkHeader) -> bool
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
@@ -145,8 +149,49 @@ where
         return false;
     }
 
-    consensus.advance_commit_number(ack.op);
-    true
+    let pipeline = consensus.pipeline().borrow();
+    let mut new_commit = consensus.commit();
+    while let Some(entry) = pipeline.message_by_op(new_commit + 1) {
+        if !entry.ok_quorum_received {
+            break;
+        }
+        new_commit += 1;
+    }
+    drop(pipeline);
+
+    if new_commit > consensus.commit() {
+        consensus.advance_commit_number(new_commit);
+        return true;
+    }
+
+    false
+}
+
+/// Drain and return committable prepares from the pipeline head.
+///
+/// Entries are drained only from the head and only while their op is covered
+/// by the current commit frontier.
+pub fn drain_committable_prefix<B, P>(consensus: &VsrConsensus<B, P>) -> Vec<PipelineEntry>
+where
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+{
+    let commit = consensus.commit();
+    let mut drained = Vec::new();
+    let mut pipeline = consensus.pipeline().borrow_mut();
+
+    while let Some(head_op) = pipeline.head().map(|entry| entry.header.op) {
+        if head_op > commit {
+            break;
+        }
+
+        let entry = pipeline
+            .pop_message()
+            .expect("drain_committable_prefix: head exists");
+        drained.push(entry);
+    }
+
+    drained
 }
 
 /// Shared reply-message construction for committed prepare.
@@ -176,6 +221,7 @@ where
             timestamp: prepare_header.timestamp,
             request: prepare_header.request,
             operation: prepare_header.operation,
+            namespace: prepare_header.namespace,
             ..Default::default()
         };
     })
@@ -253,6 +299,7 @@ pub async fn send_prepare_ok<B, P>(
     let generic_message = message.into_generic();
     let primary = consensus.primary_index(consensus.view());
 
+    // TODO: Propagate send errors instead of panicking; requires bus error design.
     if primary == consensus.replica() {
         // TODO: Queue for self-processing or call handle_prepare_ok directly.
         // TODO: This is temporal, to test simulator, but we should send message to ourselves properly.
@@ -267,5 +314,109 @@ pub async fn send_prepare_ok<B, P>(
             .send_to_replica(primary, generic_message)
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Consensus, LocalPipeline};
+    use iggy_common::IggyError;
+
+    #[derive(Debug, Default)]
+    struct NoopBus;
+
+    impl MessageBus for NoopBus {
+        type Client = u128;
+        type Replica = u8;
+        type Data = Message<GenericHeader>;
+        type Sender = ();
+
+        fn add_client(&mut self, _client: Self::Client, _sender: Self::Sender) -> bool {
+            true
+        }
+
+        fn remove_client(&mut self, _client: Self::Client) -> bool {
+            true
+        }
+
+        fn add_replica(&mut self, _replica: Self::Replica) -> bool {
+            true
+        }
+
+        fn remove_replica(&mut self, _replica: Self::Replica) -> bool {
+            true
+        }
+
+        async fn send_to_client(
+            &self,
+            _client_id: Self::Client,
+            _data: Self::Data,
+        ) -> Result<(), IggyError> {
+            Ok(())
+        }
+
+        async fn send_to_replica(
+            &self,
+            _replica: Self::Replica,
+            _data: Self::Data,
+        ) -> Result<(), IggyError> {
+            Ok(())
+        }
+    }
+
+    fn prepare_message(op: u64, parent: u128, checksum: u128) -> Message<PrepareHeader> {
+        Message::<PrepareHeader>::new(std::mem::size_of::<PrepareHeader>()).transmute_header(
+            |_, new| {
+                *new = PrepareHeader {
+                    command: Command2::Prepare,
+                    op,
+                    parent,
+                    checksum,
+                    ..Default::default()
+                };
+            },
+        )
+    }
+
+    #[test]
+    fn drains_head_prefix_by_commit_frontier() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+
+        consensus.pipeline_message(prepare_message(1, 0, 10));
+        consensus.pipeline_message(prepare_message(2, 10, 20));
+        consensus.pipeline_message(prepare_message(3, 20, 30));
+
+        consensus.advance_commit_number(3);
+
+        let drained = drain_committable_prefix(&consensus);
+        let drained_ops: Vec<_> = drained.into_iter().map(|entry| entry.header.op).collect();
+        assert_eq!(drained_ops, vec![1, 2, 3]);
+        assert!(consensus.pipeline().borrow().is_empty());
+    }
+
+    #[test]
+    fn drains_only_up_to_commit_frontier_even_without_quorum_flags() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+
+        consensus.pipeline_message(prepare_message(5, 0, 50));
+        consensus.pipeline_message(prepare_message(6, 50, 60));
+        consensus.pipeline_message(prepare_message(7, 60, 70));
+
+        consensus.advance_commit_number(6);
+        let drained = drain_committable_prefix(&consensus);
+        let drained_ops: Vec<_> = drained.into_iter().map(|entry| entry.header.op).collect();
+
+        assert_eq!(drained_ops, vec![5, 6]);
+        assert_eq!(
+            consensus
+                .pipeline()
+                .borrow()
+                .head()
+                .map(|entry| entry.header.op),
+            Some(7)
+        );
     }
 }

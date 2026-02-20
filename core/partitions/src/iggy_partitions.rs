@@ -21,9 +21,10 @@ use crate::IggyPartition;
 use crate::Partition;
 use crate::types::PartitionsConfig;
 use consensus::{
-    Consensus, PipelineEntry, Plane, Project, Sequencer, VsrConsensus, ack_preflight,
-    ack_quorum_reached, build_reply_message, fence_old_prepare_by_commit, pipeline_prepare_common,
-    replicate_preflight, replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
+    Consensus, NamespacedPipeline, Pipeline, PipelineEntry, Plane, Project, Sequencer,
+    VsrConsensus, ack_preflight, build_reply_message, fence_old_prepare_by_commit,
+    pipeline_prepare_common, replicate_preflight, replicate_to_next_in_chain,
+    send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_common::{
     INDEX_SIZE, IggyByteSize, IggyIndexesMut, IggyMessagesBatchMut, PartitionStats, PooledBuffer,
@@ -34,7 +35,7 @@ use iggy_common::{
 };
 use message_bus::MessageBus;
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
@@ -58,33 +59,27 @@ pub struct IggyPartitions<C> {
     /// mutate partition state (segments, offsets, journal).
     partitions: UnsafeCell<Vec<IggyPartition>>,
     namespace_to_local: HashMap<IggyNamespace, LocalIdx>,
-    /// Some on shard0, None on other shards
-    pub consensus: Option<C>,
+    consensus: Option<C>,
 }
 
 impl<C> IggyPartitions<C> {
-    pub fn new(shard_id: ShardId, config: PartitionsConfig, consensus: Option<C>) -> Self {
+    pub fn new(shard_id: ShardId, config: PartitionsConfig) -> Self {
         Self {
             shard_id,
             config,
             partitions: UnsafeCell::new(Vec::new()),
             namespace_to_local: HashMap::new(),
-            consensus,
+            consensus: None,
         }
     }
 
-    pub fn with_capacity(
-        shard_id: ShardId,
-        config: PartitionsConfig,
-        consensus: Option<C>,
-        capacity: usize,
-    ) -> Self {
+    pub fn with_capacity(shard_id: ShardId, config: PartitionsConfig, capacity: usize) -> Self {
         Self {
             shard_id,
             config,
             partitions: UnsafeCell::new(Vec::with_capacity(capacity)),
             namespace_to_local: HashMap::with_capacity(capacity),
-            consensus,
+            consensus: None,
         }
     }
 
@@ -231,16 +226,23 @@ impl<C> IggyPartitions<C> {
         &mut self.partitions_mut()[idx]
     }
 
+    pub fn consensus(&self) -> Option<&C> {
+        self.consensus.as_ref()
+    }
+
+    pub fn set_consensus(&mut self, consensus: C) {
+        self.consensus = Some(consensus);
+    }
+
     /// Initialize a new partition with in-memory storage (for testing/simulation).
     ///
-    /// This is a simplified version that doesn't create file-backed storage.
-    /// Use `init_partition()` for production use with real files.
+    /// Idempotent: subsequent calls for the same namespace are no-ops returning
+    /// the existing index. Consensus must be set separately via `set_consensus`.
     ///
     /// TODO: Make the log generic over its storage backend to support both
     /// in-memory (for testing) and file-backed (for production) storage without
     /// needing separate initialization methods.
     pub fn init_partition_in_memory(&mut self, namespace: IggyNamespace) -> LocalIdx {
-        // Check if already initialized
         if let Some(idx) = self.local_idx(&namespace) {
             return idx;
         }
@@ -261,7 +263,6 @@ impl<C> IggyPartitions<C> {
         partition.should_increment_offset = false;
         partition.stats.increment_segments_count(1);
 
-        // Insert and return local index
         self.insert(namespace, partition)
     }
 
@@ -275,9 +276,9 @@ impl<C> IggyPartitions<C> {
     /// 2. Control plane: broadcast to shards (SKIPPED in this method)
     /// 3. Data plane: INITIATE PARTITION (THIS METHOD)
     ///
-    /// Idempotent - returns existing LocalIdx if partition already exists.
+    /// Idempotent: subsequent calls for the same namespace are no-ops.
+    /// Consensus must be set separately via `set_consensus`.
     pub async fn init_partition(&mut self, namespace: IggyNamespace) -> LocalIdx {
-        // Check if already initialized
         if let Some(idx) = self.local_idx(&namespace) {
             return idx;
         }
@@ -324,27 +325,38 @@ impl<C> IggyPartitions<C> {
         partition.should_increment_offset = false;
         partition.stats.increment_segments_count(1);
 
-        // Insert and return local index
         self.insert(namespace, partition)
     }
 }
 
-impl<B> Plane<VsrConsensus<B>> for IggyPartitions<VsrConsensus<B>>
+impl<B> Plane<VsrConsensus<B, NamespacedPipeline>>
+    for IggyPartitions<VsrConsensus<B, NamespacedPipeline>>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
 {
-    async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
-        let consensus = self.consensus.as_ref().unwrap();
+    async fn on_request(
+        &self,
+        message: <VsrConsensus<B, NamespacedPipeline> as Consensus>::Message<RequestHeader>,
+    ) {
+        let namespace = IggyNamespace::from_raw(message.header().namespace);
+        let consensus = self
+            .consensus()
+            .expect("on_request: consensus not initialized");
 
-        debug!("handling partition request");
+        debug!(?namespace, "handling partition request");
         let prepare = message.project(consensus);
         pipeline_prepare_common(consensus, prepare, |prepare| self.on_replicate(prepare)).await;
     }
 
-    async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
-        let consensus = self.consensus.as_ref().unwrap();
-
+    async fn on_replicate(
+        &self,
+        message: <VsrConsensus<B, NamespacedPipeline> as Consensus>::Message<PrepareHeader>,
+    ) {
         let header = message.header();
+        let namespace = IggyNamespace::from_raw(header.namespace);
+        let consensus = self
+            .consensus()
+            .expect("on_replicate: consensus not initialized");
 
         let current_op = match replicate_preflight(consensus, header) {
             Ok(current_op) => current_op,
@@ -367,25 +379,26 @@ where
         // TODO: Make those assertions be toggleable through an feature flag, so they can be used only by simulator/tests.
         debug_assert_eq!(header.op, current_op + 1);
         consensus.sequencer().set_sequence(header.op);
+        consensus.set_last_prepare_checksum(header.checksum);
 
         // TODO: Figure out the flow of the partition operations.
         // In metadata layer we assume that when an `on_request` or `on_replicate` is called, it's called from correct shard.
         // I think we need to do the same here, which means that the code from below is unfallable, the partition should always exist by now!
-        let namespace = IggyNamespace::from_raw(header.namespace);
-        self.apply_replicated_operation(&message, &namespace).await;
+        self.apply_replicated_operation(&namespace, &message).await;
 
-        // After successful journal write, send prepare_ok to primary.
         self.send_prepare_ok(header).await;
 
-        // If follower, commit any newly committable entries.
         if consensus.is_follower() {
-            self.commit_journal();
+            self.commit_journal(&namespace);
         }
     }
 
-    async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareOkHeader>) {
-        let consensus = self.consensus.as_ref().unwrap();
+    async fn on_ack(
+        &self,
+        message: <VsrConsensus<B, NamespacedPipeline> as Consensus>::Message<PrepareOkHeader>,
+    ) {
         let header = message.header();
+        let consensus = self.consensus().expect("on_ack: consensus not initialized");
 
         if let Err(reason) = ack_preflight(consensus) {
             warn!("on_ack: ignoring ({reason})");
@@ -394,42 +407,74 @@ where
 
         {
             let pipeline = consensus.pipeline().borrow();
-            let Some(entry) =
-                pipeline.message_by_op_and_checksum(header.op, header.prepare_checksum)
-            else {
+            if pipeline
+                .message_by_op_and_checksum(header.op, header.prepare_checksum)
+                .is_none()
+            {
                 debug!("on_ack: prepare not in pipeline op={}", header.op);
-                return;
-            };
-
-            if entry.header.checksum != header.prepare_checksum {
-                warn!("on_ack: checksum mismatch");
                 return;
             }
         }
 
-        if ack_quorum_reached(consensus, header) {
-            debug!("on_ack: quorum received for op={}", header.op);
+        consensus.handle_prepare_ok(header);
 
-            // Extract the prepare message from the pipeline by op
-            // TODO: Commit from the head. ALWAYS
-            let entry = consensus.pipeline().borrow_mut().extract_by_op(header.op);
-            let Some(PipelineEntry {
-                header: prepare_header,
-                ..
-            }) = entry
-            else {
-                warn!("on_ack: prepare not found in pipeline for op={}", header.op);
-                return;
-            };
+        // SAFETY(IGGY-66): Per-namespace drain independent of global commit.
+        //
+        // drain_committable_all() drains each namespace queue independently by
+        // quorum flag, so ns_a ops can be drained and replied to clients while
+        // ns_b ops block the global commit (e.g., ns_a ops 1,3 drain while
+        // ns_b op 2 is pending). This is intentional for partition independence.
+        //
+        // View change risk: if a view change occurs before the global commit
+        // covers a drained op, the new primary replays from max_commit+1 and
+        // re-executes it. append_messages is NOT idempotent -- re-execution
+        // produces duplicate partition data.
+        //
+        // Before this path handles real traffic, two guards are required:
+        //   1. Op-based dedup in apply_replicated_operation: skip append if
+        //      the partition journal already contains data for this op.
+        //   2. Client reply dedup by (client_id, request_id): prevent
+        //      duplicate replies after view change re-execution.
+        let drained = {
+            let mut pipeline = consensus.pipeline().borrow_mut();
+            pipeline.drain_committable_all()
+        };
 
-            // Data was already appended to the partition journal during
-            // on_replicate. Now that quorum is reached, update the partition's
-            // current offset and check whether the journal needs flushing.
-            let namespace = IggyNamespace::from_raw(prepare_header.namespace);
+        if drained.is_empty() {
+            return;
+        }
+
+        // Advance global commit for VSR protocol correctness
+        {
+            let pipeline = consensus.pipeline().borrow();
+            let new_commit = pipeline.global_commit_frontier(consensus.commit());
+            drop(pipeline);
+            consensus.advance_commit_number(new_commit);
+        }
+
+        if let (Some(first), Some(last)) = (drained.first(), drained.last()) {
+            debug!(
+                "on_ack: draining committed ops=[{}..={}] count={}",
+                first.header.op,
+                last.header.op,
+                drained.len()
+            );
+        }
+
+        let mut committed_ns: HashSet<IggyNamespace> = HashSet::new();
+
+        for PipelineEntry {
+            header: prepare_header,
+            ..
+        } in drained
+        {
+            let entry_namespace = IggyNamespace::from_raw(prepare_header.namespace);
 
             match prepare_header.operation {
                 Operation::SendMessages => {
-                    self.commit_messages(&namespace).await;
+                    if committed_ns.insert(entry_namespace) {
+                        self.commit_messages(&entry_namespace).await;
+                    }
                     debug!("on_ack: messages committed for op={}", prepare_header.op,);
                 }
                 Operation::StoreConsumerOffset => {
@@ -447,14 +492,13 @@ where
                 }
             }
 
-            // Send reply to client
             let generic_reply = build_reply_message(consensus, &prepare_header).into_generic();
             debug!(
                 "on_ack: sending reply to client={} for op={}",
                 prepare_header.client, prepare_header.op
             );
 
-            // TODO: Error handling
+            // TODO: Propagate send error instead of panicking; requires bus error design.
             consensus
                 .message_bus()
                 .send_to_client(prepare_header.client, generic_reply)
@@ -464,10 +508,18 @@ where
     }
 }
 
-impl<B> IggyPartitions<VsrConsensus<B>>
+impl<B> IggyPartitions<VsrConsensus<B, NamespacedPipeline>>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
 {
+    pub fn register_namespace_in_pipeline(&self, ns: u64) {
+        self.consensus()
+            .expect("register_namespace_in_pipeline: consensus not initialized")
+            .pipeline()
+            .borrow_mut()
+            .register_namespace(ns);
+    }
+
     // TODO: Move this elsewhere, also do not reallocate, we do reallocationg now becauise we use PooledBuffer for the batch body
     // but `Bytes` for `Message` payload.
     fn batch_from_body(body: &[u8]) -> IggyMessagesBatchMut {
@@ -488,10 +540,12 @@ where
 
     async fn apply_replicated_operation(
         &self,
-        message: &Message<PrepareHeader>,
         namespace: &IggyNamespace,
+        message: &Message<PrepareHeader>,
     ) {
-        let consensus = self.consensus.as_ref().unwrap();
+        let consensus = self
+            .consensus()
+            .expect("apply_replicated_operation: consensus not initialized");
         let header = message.header();
 
         match header.operation {
@@ -552,16 +606,16 @@ where
 
     /// Replicate a prepare message to the next replica in the chain.
     ///
-    /// Chain replication pattern:
-    /// - Primary sends to first backup
-    /// - Each backup forwards to the next
-    /// - Stops when we would forward back to primary
+    /// Chain replication: primary -> first backup -> ... -> last backup.
+    /// Stops when the next replica would be the primary.
     async fn replicate(&self, message: Message<PrepareHeader>) {
-        let consensus = self.consensus.as_ref().unwrap();
+        let consensus = self
+            .consensus()
+            .expect("replicate: consensus not initialized");
         replicate_to_next_in_chain(consensus, message).await;
     }
 
-    fn commit_journal(&self) {
+    fn commit_journal(&self, _namespace: &IggyNamespace) {
         // TODO: Implement commit logic for followers.
         // Walk through journal from last committed to current commit number
         // Apply each entry to the partition state
@@ -787,7 +841,9 @@ where
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) {
-        let consensus = self.consensus.as_ref().unwrap();
+        let consensus = self
+            .consensus()
+            .expect("send_prepare_ok: consensus not initialized");
         // TODO: Verify the prepare is persisted in the partition journal.
         // The partition journal uses MessageLookup headers, so we cannot
         // check by PrepareHeader.op directly. For now, skip this check.

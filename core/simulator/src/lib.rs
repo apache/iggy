@@ -22,7 +22,7 @@ pub mod replica;
 
 use bus::MemBus;
 use consensus::Plane;
-use iggy_common::header::{GenericHeader, ReplyHeader};
+use iggy_common::header::{GenericHeader, Operation, ReplyHeader};
 use iggy_common::message::{Message, MessageBag};
 use message_bus::MessageBus;
 use replica::Replica;
@@ -34,10 +34,10 @@ pub struct Simulator {
 }
 
 impl Simulator {
-    /// Initialize a partition on all replicas (in-memory for simulation)
+    /// Initialize a partition with its own consensus group on all replicas.
     pub fn init_partition(&mut self, namespace: iggy_common::sharding::IggyNamespace) {
         for replica in &mut self.replicas {
-            replica.partitions.init_partition_in_memory(namespace);
+            replica.init_partition(namespace);
         }
     }
 
@@ -120,13 +120,16 @@ impl Simulator {
             MessageBag::Request(message) => message.header().operation,
             MessageBag::Prepare(message) => message.header().operation,
             MessageBag::PrepareOk(message) => message.header().operation,
-        } as u8;
+        };
 
-        if operation < 200 {
-            self.dispatch_to_metadata_on_replica(replica, message).await;
-        } else {
-            self.dispatch_to_partition_on_replica(replica, message)
-                .await;
+        match operation {
+            Operation::SendMessages | Operation::StoreConsumerOffset => {
+                self.dispatch_to_partition_on_replica(replica, message)
+                    .await;
+            }
+            _ => {
+                self.dispatch_to_metadata_on_replica(replica, message).await;
+            }
         }
     }
 
@@ -158,3 +161,10 @@ impl Simulator {
         }
     }
 }
+
+// TODO(IGGY-66): Add acceptance test for per-partition consensus independence.
+// Setup: 3-replica simulator, two partitions (ns_a, ns_b).
+// 1. Fill ns_a's pipeline to PIPELINE_PREPARE_QUEUE_MAX without delivering acks.
+// 2. Send a request to ns_b, step until ns_b reply arrives.
+// 3. Assert ns_b committed while ns_a pipeline is still full.
+// Requires namespace-aware stepping (filter bus by namespace) or two-phase delivery.
