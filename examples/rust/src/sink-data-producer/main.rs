@@ -68,8 +68,10 @@ async fn main() -> Result<(), DataProducerError> {
 
     let mut rng = rand::rng();
     let mut batches_count = 0;
+    let mut msg_count = 0;
     while batches_count < 100 {
         let records_count = rng.sample(Uniform::new(100u32, 500).unwrap());
+        msg_count += records_count;
         let messages = (0..records_count)
             .map(|_| random_record())
             .flat_map(|record| serde_json::to_string(&record).ok())
@@ -80,7 +82,7 @@ async fn main() -> Result<(), DataProducerError> {
         batches_count += 1;
     }
 
-    info!("Reached maximum batches count");
+    info!("Reached maximum batches count. Produced {msg_count} total messages.");
     Ok(())
 }
 
