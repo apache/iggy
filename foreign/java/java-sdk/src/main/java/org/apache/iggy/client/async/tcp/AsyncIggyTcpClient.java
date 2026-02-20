@@ -20,8 +20,12 @@
 package org.apache.iggy.client.async.tcp;
 
 import org.apache.iggy.client.async.ConsumerGroupsClient;
+import org.apache.iggy.client.async.ConsumerOffsetsClient;
 import org.apache.iggy.client.async.MessagesClient;
+import org.apache.iggy.client.async.PartitionsClient;
+import org.apache.iggy.client.async.PersonalAccessTokensClient;
 import org.apache.iggy.client.async.StreamsClient;
+import org.apache.iggy.client.async.SystemClient;
 import org.apache.iggy.client.async.TopicsClient;
 import org.apache.iggy.client.async.UsersClient;
 import org.apache.iggy.config.RetryPolicy;
@@ -99,9 +103,13 @@ public class AsyncIggyTcpClient {
     private AsyncTcpConnection connection;
     private MessagesClient messagesClient;
     private ConsumerGroupsClient consumerGroupsClient;
+    private ConsumerOffsetsClient consumerOffsetsClient;
     private StreamsClient streamsClient;
     private TopicsClient topicsClient;
     private UsersClient usersClient;
+    private SystemClient systemClient;
+    private PersonalAccessTokensClient personalAccessTokensClient;
+    private PartitionsClient partitionsClient;
 
     /**
      * Creates a new async TCP client with default settings.
@@ -162,9 +170,13 @@ public class AsyncIggyTcpClient {
         return connection.connect().thenRun(() -> {
             messagesClient = new MessagesTcpClient(connection);
             consumerGroupsClient = new ConsumerGroupsTcpClient(connection);
+            consumerOffsetsClient = new ConsumerOffsetsTcpClient(connection);
             streamsClient = new StreamsTcpClient(connection);
             topicsClient = new TopicsTcpClient(connection);
             usersClient = new UsersTcpClient(connection);
+            systemClient = new SystemTcpClient(connection);
+            personalAccessTokensClient = new PersonalAccessTokensTcpClient(connection);
+            partitionsClient = new PartitionsTcpClient(connection);
         });
     }
 
@@ -254,6 +266,58 @@ public class AsyncIggyTcpClient {
             throw new IggyNotConnectedException();
         }
         return topicsClient;
+    }
+
+    /**
+     * Returns the async system client for server system operations.
+     *
+     * @return the {@link SystemClient} instance
+     * @throws IggyNotConnectedException if the client is not connected
+     */
+    public SystemClient system() {
+        if (systemClient == null) {
+            throw new IggyNotConnectedException();
+        }
+        return systemClient;
+    }
+
+    /**
+     * Returns the async personal access tokens client for token management.
+     *
+     * @return the {@link PersonalAccessTokensClient} instance
+     * @throws IggyNotConnectedException if the client is not connected
+     */
+    public PersonalAccessTokensClient personalAccessTokens() {
+        if (personalAccessTokensClient == null) {
+            throw new IggyNotConnectedException();
+        }
+        return personalAccessTokensClient;
+    }
+
+    /**
+     * Returns the async partitions client for partition management.
+     *
+     * @return the {@link PartitionsClient} instance
+     * @throws IggyNotConnectedException if the client is not connected
+     */
+    public PartitionsClient partitions() {
+        if (partitionsClient == null) {
+            throw new IggyNotConnectedException();
+        }
+        return partitionsClient;
+    }
+
+    /**
+     * Returns the async consumer offsets client for offset management.
+     *
+     * @return the {@link ConsumerOffsetsClient} instance
+     * @throws IggyNotConnectedException if the client is not connected
+     */
+    public ConsumerOffsetsClient consumerOffsets() {
+        if (consumerOffsetsClient == null) {
+            throw new IggyNotConnectedException();
+        }
+        return consumerOffsetsClient;
     }
 
     /**

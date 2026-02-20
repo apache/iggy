@@ -73,6 +73,10 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         assertNotNull(client.streams());
         assertNotNull(client.topics());
         assertNotNull(client.consumerGroups());
+        assertNotNull(client.system());
+        assertNotNull(client.personalAccessTokens());
+        assertNotNull(client.partitions());
+        assertNotNull(client.consumerOffsets());
     }
 
     @Test
@@ -161,6 +165,10 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         assertNotNull(client.streams(), "Streams client should not be null");
         assertNotNull(client.topics(), "Topics client should not be null");
         assertNotNull(client.consumerGroups(), "Consumer groups client should not be null");
+        assertNotNull(client.system(), "System client should not be null");
+        assertNotNull(client.personalAccessTokens(), "Personal access tokens client should not be null");
+        assertNotNull(client.partitions(), "Partitions client should not be null");
+        assertNotNull(client.consumerOffsets(), "Consumer offsets client should not be null");
     }
 
     @Test
@@ -240,6 +248,46 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .build();
 
         assertThrows(IggyNotConnectedException.class, () -> client.consumerGroups());
+    }
+
+    @Test
+    void testThrowExceptionWhenAccessingSystemBeforeConnect() {
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
+
+        assertThrows(IggyNotConnectedException.class, () -> client.system());
+    }
+
+    @Test
+    void testThrowExceptionWhenAccessingPersonalAccessTokensBeforeConnect() {
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
+
+        assertThrows(IggyNotConnectedException.class, () -> client.personalAccessTokens());
+    }
+
+    @Test
+    void testThrowExceptionWhenAccessingPartitionsBeforeConnect() {
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
+
+        assertThrows(IggyNotConnectedException.class, () -> client.partitions());
+    }
+
+    @Test
+    void testThrowExceptionWhenAccessingConsumerOffsetsBeforeConnect() {
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
+
+        assertThrows(IggyNotConnectedException.class, () -> client.consumerOffsets());
     }
 
     @Test
@@ -407,6 +455,10 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         assertNotNull(client.streams());
         assertNotNull(client.topics());
         assertNotNull(client.consumerGroups());
+        assertNotNull(client.system());
+        assertNotNull(client.personalAccessTokens());
+        assertNotNull(client.partitions());
+        assertNotNull(client.consumerOffsets());
     }
 
     @Test
@@ -423,6 +475,10 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         assertNotNull(client.streams());
         assertNotNull(client.topics());
         assertNotNull(client.consumerGroups());
+        assertNotNull(client.system());
+        assertNotNull(client.personalAccessTokens());
+        assertNotNull(client.partitions());
+        assertNotNull(client.consumerOffsets());
     }
 
     @Test
