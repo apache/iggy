@@ -21,8 +21,8 @@ pub mod deps;
 pub mod replica;
 
 use bus::MemBus;
-use consensus::Plane;
-use iggy_common::header::{GenericHeader, Operation, ReplyHeader};
+use consensus::{Plane, PlaneIdentity};
+use iggy_common::header::{GenericHeader, ReplyHeader};
 use iggy_common::message::{Message, MessageBag};
 use message_bus::MessageBus;
 use replica::Replica;
@@ -115,48 +115,28 @@ impl Simulator {
     }
 
     async fn dispatch_to_replica(&self, replica: &Replica, message: Message<GenericHeader>) {
-        let message: MessageBag = message.into();
-        let operation = match &message {
-            MessageBag::Request(message) => message.header().operation,
-            MessageBag::Prepare(message) => message.header().operation,
-            MessageBag::PrepareOk(message) => message.header().operation,
-        };
-
-        match operation {
-            Operation::SendMessages | Operation::StoreConsumerOffset => {
-                self.dispatch_to_partition_on_replica(replica, message)
-                    .await;
-            }
-            _ => {
-                self.dispatch_to_metadata_on_replica(replica, message).await;
-            }
-        }
-    }
-
-    async fn dispatch_to_metadata_on_replica(&self, replica: &Replica, message: MessageBag) {
-        match message {
+        let planes = replica.plane.inner();
+        match MessageBag::from(message) {
             MessageBag::Request(request) => {
-                replica.metadata.on_request(request).await;
+                if planes.0.is_applicable(&request) {
+                    planes.0.on_request(request).await;
+                } else {
+                    planes.1.0.on_request(request).await;
+                }
             }
             MessageBag::Prepare(prepare) => {
-                replica.metadata.on_replicate(prepare).await;
+                if planes.0.is_applicable(&prepare) {
+                    planes.0.on_replicate(prepare).await;
+                } else {
+                    planes.1.0.on_replicate(prepare).await;
+                }
             }
             MessageBag::PrepareOk(prepare_ok) => {
-                replica.metadata.on_ack(prepare_ok).await;
-            }
-        }
-    }
-
-    async fn dispatch_to_partition_on_replica(&self, replica: &Replica, message: MessageBag) {
-        match message {
-            MessageBag::Request(request) => {
-                replica.partitions.on_request(request).await;
-            }
-            MessageBag::Prepare(prepare) => {
-                replica.partitions.on_replicate(prepare).await;
-            }
-            MessageBag::PrepareOk(prepare_ok) => {
-                replica.partitions.on_ack(prepare_ok).await;
+                if planes.0.is_applicable(&prepare_ok) {
+                    planes.0.on_ack(prepare_ok).await;
+                } else {
+                    planes.1.0.on_ack(prepare_ok).await;
+                }
             }
         }
     }

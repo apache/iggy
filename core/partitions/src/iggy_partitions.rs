@@ -20,16 +20,20 @@
 use crate::IggyPartition;
 use crate::Partition;
 use crate::types::PartitionsConfig;
+use consensus::PlaneIdentity;
 use consensus::{
     Consensus, NamespacedPipeline, Pipeline, PipelineEntry, Plane, Project, Sequencer,
     VsrConsensus, ack_preflight, build_reply_message, fence_old_prepare_by_commit,
     pipeline_prepare_common, replicate_preflight, replicate_to_next_in_chain,
     send_prepare_ok as send_prepare_ok_common,
 };
+use iggy_common::header::Command2;
 use iggy_common::{
     INDEX_SIZE, IggyByteSize, IggyIndexesMut, IggyMessagesBatchMut, PartitionStats, PooledBuffer,
     Segment, SegmentStorage,
-    header::{GenericHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader},
+    header::{
+        ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
+    },
     message::Message,
     sharding::{IggyNamespace, LocalIdx, ShardId},
 };
@@ -505,6 +509,27 @@ where
                 .await
                 .unwrap()
         }
+    }
+}
+
+impl<B> PlaneIdentity<VsrConsensus<B>> for IggyPartitions<VsrConsensus<B, NamespacedPipeline>>
+where
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+{
+    fn is_applicable<H>(&self, message: &<VsrConsensus<B> as Consensus>::Message<H>) -> bool
+    where
+        H: ConsensusHeader,
+    {
+        assert!(matches!(
+            message.header().command(),
+            Command2::Request | Command2::Prepare | Command2::PrepareOk
+        ));
+        let operation = message.header().operation();
+        // TODO: Use better selection, smth like greater or equal based on op number.
+        matches!(
+            operation,
+            Operation::DeleteSegments | Operation::SendMessages | Operation::StoreConsumerOffset
+        )
     }
 }
 

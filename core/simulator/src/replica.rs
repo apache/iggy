@@ -17,15 +17,14 @@
 
 use crate::bus::{MemBus, SharedMemBus};
 use crate::deps::{
-    MemStorage, ReplicaPartitions, SimJournal, SimMetadata, SimMuxStateMachine, SimSnapshot,
+    ReplicaPartitions, SimJournal, SimMetadata, SimMuxStateMachine, SimPlane, SimSnapshot,
 };
 use consensus::{LocalPipeline, NamespacedPipeline, VsrConsensus};
-use iggy_common::IggyByteSize;
 use iggy_common::sharding::{IggyNamespace, ShardId};
+use iggy_common::{IggyByteSize, variadic};
 use metadata::stm::consumer_group::{ConsumerGroups, ConsumerGroupsInner};
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
-use metadata::{IggyMetadata, variadic};
 use partitions::PartitionsConfig;
 use std::sync::Arc;
 
@@ -36,8 +35,7 @@ pub struct Replica {
     pub id: u8,
     pub name: String,
     pub replica_count: u8,
-    pub metadata: SimMetadata,
-    pub partitions: ReplicaPartitions,
+    pub plane: SimPlane,
     pub bus: Arc<MemBus>,
 }
 
@@ -58,6 +56,12 @@ impl Replica {
             LocalPipeline::new(),
         );
         metadata_consensus.init();
+        let metadata = SimMetadata {
+            consensus: Some(metadata_consensus),
+            journal: Some(SimJournal::default()),
+            snapshot: Some(SimSnapshot::default()),
+            mux_stm: mux,
+        };
 
         let partitions_config = PartitionsConfig {
             messages_required_to_save: 1000,
@@ -80,25 +84,20 @@ impl Replica {
         );
         partition_consensus.init();
         partitions.set_consensus(partition_consensus);
+        let plane = SimPlane::new(variadic!(metadata, partitions));
 
         Self {
             id,
             name,
+            plane,
             replica_count,
-            metadata: IggyMetadata {
-                consensus: Some(metadata_consensus),
-                journal: Some(SimJournal::<MemStorage>::default()),
-                snapshot: Some(SimSnapshot::default()),
-                mux_stm: mux,
-            },
-            partitions,
             bus,
         }
     }
 
     pub fn init_partition(&mut self, namespace: IggyNamespace) {
-        self.partitions.init_partition_in_memory(namespace);
-        self.partitions
-            .register_namespace_in_pipeline(namespace.inner());
+        let partitions = &mut self.plane.inner_mut().1.0;
+        partitions.init_partition_in_memory(namespace);
+        partitions.register_namespace_in_pipeline(namespace.inner());
     }
 }

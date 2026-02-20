@@ -17,14 +17,17 @@
 
 use crate::bus::SharedMemBus;
 use bytes::Bytes;
-use consensus::{NamespacedPipeline, VsrConsensus};
+use consensus::{
+    MuxPlane, {NamespacedPipeline, VsrConsensus},
+};
 use iggy_common::header::PrepareHeader;
 use iggy_common::message::Message;
+use iggy_common::variadic;
 use journal::{Journal, JournalHandle, Storage};
 use metadata::stm::consumer_group::ConsumerGroups;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
-use metadata::{IggyMetadata, MuxStateMachine, variadic};
+use metadata::{IggyMetadata, MuxStateMachine};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 
@@ -160,3 +163,4 @@ pub type SimMetadata = IggyMetadata<
 /// Type alias for simulator partitions
 pub type ReplicaPartitions =
     partitions::IggyPartitions<VsrConsensus<SharedMemBus, NamespacedPipeline>>;
+pub type SimPlane = MuxPlane<variadic!(SimMetadata, ReplicaPartitions)>;

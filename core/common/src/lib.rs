@@ -22,6 +22,7 @@ mod certificates;
 mod commands;
 mod deduplication;
 mod error;
+mod macros;
 mod sender;
 pub mod sharding;
 mod traits;

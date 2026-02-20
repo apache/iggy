@@ -16,6 +16,7 @@
 // under the License.
 
 use iggy_common::header::ConsensusHeader;
+use iggy_common::message::ConsensusMessage;
 use message_bus::MessageBus;
 
 pub trait Project<T, C: Consensus> {
@@ -48,11 +49,14 @@ pub trait Pipeline {
     fn verify(&self);
 }
 
-// TODO: Create type aliases for the Message types, both here and on the `Plane` trait.
+pub type RequestMessage<C> = <C as Consensus>::Message<<C as Consensus>::RequestHeader>;
+pub type ReplicateMessage<C> = <C as Consensus>::Message<<C as Consensus>::ReplicateHeader>;
+pub type AckMessage<C> = <C as Consensus>::Message<<C as Consensus>::AckHeader>;
+
 pub trait Consensus: Sized {
     type MessageBus: MessageBus;
     #[rustfmt::skip] // Scuffed formatter.
-    type Message<H> where H: ConsensusHeader;
+    type Message<H>: ConsensusMessage<H> where H: ConsensusHeader;
 
     type RequestHeader: ConsensusHeader;
     type ReplicateHeader: ConsensusHeader;
@@ -79,20 +83,30 @@ pub trait Plane<C>
 where
     C: Consensus,
 {
-    fn on_request(&self, message: C::Message<C::RequestHeader>) -> impl Future<Output = ()>
+    fn on_request(&self, message: RequestMessage<C>) -> impl Future<Output = ()>
     where
-        C::Message<C::RequestHeader>:
-            Project<C::Message<C::ReplicateHeader>, C, Consensus = C> + Clone;
+        RequestMessage<C>: Project<ReplicateMessage<C>, C, Consensus = C> + Clone;
 
-    fn on_replicate(&self, message: C::Message<C::ReplicateHeader>) -> impl Future<Output = ()>
+    fn on_replicate(&self, message: ReplicateMessage<C>) -> impl Future<Output = ()>
     where
-        C::Message<C::ReplicateHeader>: Project<C::Message<C::AckHeader>, C, Consensus = C> + Clone;
+        ReplicateMessage<C>: Project<AckMessage<C>, C, Consensus = C> + Clone;
 
-    fn on_ack(&self, message: C::Message<C::AckHeader>) -> impl Future<Output = ()>;
+    fn on_ack(&self, message: AckMessage<C>) -> impl Future<Output = ()>;
+}
+
+pub trait PlaneIdentity<C>
+where
+    C: Consensus,
+{
+    fn is_applicable<H>(&self, message: &C::Message<H>) -> bool
+    where
+        H: ConsensusHeader;
 }
 
 mod impls;
 pub use impls::*;
+mod plane_mux;
+pub use plane_mux::*;
 mod namespaced_pipeline;
 pub use namespaced_pipeline::*;
 mod plane_helpers;
