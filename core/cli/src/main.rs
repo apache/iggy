@@ -22,9 +22,10 @@ mod error;
 mod logging;
 
 use crate::args::{
-    Command, IggyConsoleArgs, client::ClientAction, consumer_group::ConsumerGroupAction,
-    consumer_offset::ConsumerOffsetAction, permissions::PermissionsArgs,
-    personal_access_token::PersonalAccessTokenAction, stream::StreamAction, topic::TopicAction,
+    Command, IggyConsoleArgs, client::ClientAction, cluster::ClusterAction,
+    consumer_group::ConsumerGroupAction, consumer_offset::ConsumerOffsetAction,
+    permissions::PermissionsArgs, personal_access_token::PersonalAccessTokenAction,
+    stream::StreamAction, topic::TopicAction,
 };
 use crate::credentials::IggyCredentials;
 use crate::error::{CmdToolError, IggyCmdError};
@@ -46,6 +47,7 @@ use iggy_binary_protocol::cli::binary_system::snapshot::GetSnapshotCmd;
 use iggy_binary_protocol::cli::cli_command::{CliCommand, PRINT_TARGET};
 use iggy_binary_protocol::cli::{
     binary_client::{get_client::GetClientCmd, get_clients::GetClientsCmd},
+    binary_cluster::get_cluster_metadata::GetClusterMetadataCmd,
     binary_consumer_groups::{
         create_consumer_group::CreateConsumerGroupCmd,
         delete_consumer_group::DeleteConsumerGroupCmd, get_consumer_group::GetConsumerGroupCmd,
@@ -105,6 +107,11 @@ fn get_command(
 ) -> Box<dyn CliCommand> {
     #[warn(clippy::let_and_return)]
     match command {
+        Command::Cluster(command) => match command {
+            ClusterAction::Metadata(args) => {
+                Box::new(GetClusterMetadataCmd::new(args.list_mode.into()))
+            }
+        },
         Command::Stream(command) => match command {
             StreamAction::Create(args) => Box::new(CreateStreamCmd::new(args.name.clone())),
             StreamAction::Delete(args) => Box::new(DeleteStreamCmd::new(args.stream_id.clone())),

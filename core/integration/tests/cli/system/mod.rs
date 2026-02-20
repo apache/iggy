@@ -20,6 +20,7 @@
 // due to missing keyring support while running tests under cross
 #[cfg(not(any(target_os = "macos", target_env = "musl")))]
 mod test_cli_session_scenario;
+mod test_cluster_metadata_command;
 #[cfg(not(any(target_os = "macos", target_env = "musl")))]
 mod test_login_cmd;
 mod test_login_command;

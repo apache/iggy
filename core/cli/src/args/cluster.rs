@@ -16,18 +16,18 @@
  * under the License.
  */
 
-pub mod binary_client;
-pub mod binary_cluster;
-pub mod binary_consumer_groups;
-pub mod binary_consumer_offsets;
-pub mod binary_context;
-pub mod binary_message;
-pub mod binary_partitions;
-pub mod binary_personal_access_tokens;
-pub mod binary_segments;
-pub mod binary_streams;
-pub mod binary_system;
-pub mod binary_topics;
-pub mod binary_users;
-pub mod cli_command;
-pub mod utils;
+use crate::args::common::ListMode;
+use clap::{Args, Subcommand};
+
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum ClusterAction {
+    /// Get cluster metadata
+    #[clap(visible_alias = "m")]
+    Metadata(ClusterMetadataArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ClusterMetadataArgs {
+    #[clap(short, long, value_enum, default_value_t = ListMode::Table)]
+    pub(crate) list_mode: ListMode,
+}
