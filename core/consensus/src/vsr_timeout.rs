@@ -166,6 +166,7 @@ impl TimeoutManager {
         self.start_view_change_message.tick();
         self.do_view_change_message.tick();
         self.request_start_view_message.tick();
+        self.view_change_status.tick();
     }
 
     pub fn fired(&self, kind: TimeoutKind) -> bool {

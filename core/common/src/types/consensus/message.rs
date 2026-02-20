@@ -22,6 +22,25 @@ use crate::{
 use bytes::Bytes;
 use std::marker::PhantomData;
 
+// TODO: Rename this to Message and ConsensusHeader to Header.
+pub trait ConsensusMessage<H>
+where
+    H: ConsensusHeader,
+{
+    // TODO: fn body(&self) -> Something;
+    fn header(&self) -> &H;
+}
+
+impl<H> ConsensusMessage<H> for Message<H>
+where
+    H: ConsensusHeader,
+{
+    fn header(&self) -> &H {
+        let header_bytes = &self.buffer[..size_of::<H>()];
+        bytemuck::from_bytes(header_bytes)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Message<H: ConsensusHeader> {
     buffer: Bytes,
@@ -32,6 +51,13 @@ impl<H> Message<H>
 where
     H: ConsensusHeader,
 {
+    #[inline]
+    #[allow(unused)]
+    pub fn header(&self) -> &H {
+        let header_bytes = &self.buffer[..size_of::<H>()];
+        bytemuck::from_bytes(header_bytes)
+    }
+
     /// Create a new message from a buffer.
     ///
     /// # Safety
@@ -113,17 +139,6 @@ where
             buffer,
             _marker: PhantomData,
         }
-    }
-
-    /// Get a reference to the header using zero-copy access.
-    ///
-    /// This uses `bytemuck::from_bytes` to cast the buffer to the header type
-    /// without any copying or allocation.
-    #[inline]
-    #[allow(unused)]
-    pub fn header(&self) -> &H {
-        let header_bytes = &self.buffer[..size_of::<H>()];
-        bytemuck::from_bytes(header_bytes)
     }
 
     /// Get a reference to the message body (everything after the header).

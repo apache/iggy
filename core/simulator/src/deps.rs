@@ -17,14 +17,17 @@
 
 use crate::bus::SharedMemBus;
 use bytes::Bytes;
-use consensus::VsrConsensus;
+use consensus::{
+    MuxPlane, {NamespacedPipeline, VsrConsensus},
+};
 use iggy_common::header::PrepareHeader;
 use iggy_common::message::Message;
+use iggy_common::variadic;
 use journal::{Journal, JournalHandle, Storage};
 use metadata::stm::consumer_group::ConsumerGroups;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
-use metadata::{IggyMetadata, MuxStateMachine, variadic};
+use metadata::{IggyMetadata, MuxStateMachine};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 
@@ -61,6 +64,7 @@ pub struct SimJournal<S: Storage> {
     storage: S,
     headers: UnsafeCell<HashMap<u64, PrepareHeader>>,
     offsets: UnsafeCell<HashMap<u64, usize>>,
+    write_offset: Cell<usize>,
 }
 
 impl<S: Storage + Default> Default for SimJournal<S> {
@@ -69,6 +73,7 @@ impl<S: Storage + Default> Default for SimJournal<S> {
             storage: S::default(),
             headers: UnsafeCell::new(HashMap::new()),
             offsets: UnsafeCell::new(HashMap::new()),
+            write_offset: Cell::new(0),
         }
     }
 }
@@ -79,6 +84,7 @@ impl<S: Storage> std::fmt::Debug for SimJournal<S> {
             .field("storage", &"<Storage>")
             .field("headers", &"<UnsafeCell>")
             .field("offsets", &"<UnsafeCell>")
+            .field("write_offset", &self.write_offset.get())
             .finish()
     }
 }
@@ -121,14 +127,10 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
 
         let bytes_written = self.storage.write(message_bytes.to_vec()).await;
 
-        let current_offset = unsafe { &mut *self.offsets.get() }
-            .values()
-            .last()
-            .cloned()
-            .unwrap_or_default();
-
+        let offset = self.write_offset.get();
         unsafe { &mut *self.headers.get() }.insert(header.op, header);
-        unsafe { &mut *self.offsets.get() }.insert(header.op, current_offset + bytes_written);
+        unsafe { &mut *self.offsets.get() }.insert(header.op, offset);
+        self.write_offset.set(offset + bytes_written);
     }
 
     fn header(&self, idx: usize) -> Option<Self::HeaderRef<'_>> {
@@ -159,4 +161,6 @@ pub type SimMetadata = IggyMetadata<
 >;
 
 /// Type alias for simulator partitions
-pub type ReplicaPartitions = partitions::IggyPartitions<VsrConsensus<SharedMemBus>>;
+pub type ReplicaPartitions =
+    partitions::IggyPartitions<VsrConsensus<SharedMemBus, NamespacedPipeline>>;
+pub type SimPlane = MuxPlane<variadic!(SimMetadata, ReplicaPartitions)>;

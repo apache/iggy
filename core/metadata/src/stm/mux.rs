@@ -17,6 +17,7 @@
 
 use crate::stm::snapshot::{FillSnapshot, RestoreSnapshot, SnapshotError};
 use iggy_common::Either;
+use iggy_common::variadic;
 use iggy_common::{header::PrepareHeader, message::Message};
 
 use crate::stm::{State, StateMachine};
@@ -50,18 +51,6 @@ where
     fn update(&self, input: Self::Input) -> Result<Self::Output, Self::Error> {
         self.inner.update(input)
     }
-}
-
-//TODO: Move to common
-#[macro_export]
-macro_rules! variadic {
-    () => ( () );
-    (...$a:ident  $(,)? ) => ( $a );
-    (...$a:expr  $(,)? ) => ( $a );
-    ($a:ident  $(,)? ) => ( ($a, ()) );
-    ($a:expr  $(,)? ) => ( ($a, ()) );
-    ($a:ident,  $( $b:tt )+) => ( ($a, variadic!( $( $b )* )) );
-    ($a:expr,  $( $b:tt )+) => ( ($a, variadic!( $( $b )* )) );
 }
 
 // TODO: Figure out how to get around the fact that we need to hardcode the Input/Output type for base case.

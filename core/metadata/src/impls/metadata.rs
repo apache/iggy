@@ -17,13 +17,17 @@
 use crate::stm::StateMachine;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
 use consensus::{
-    Consensus, Pipeline, PipelineEntry, Plane, Project, Sequencer, VsrConsensus, ack_preflight,
-    ack_quorum_reached, build_reply_message, fence_old_prepare_by_commit,
-    panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, replicate_preflight,
-    replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
+    Consensus, Pipeline, PipelineEntry, Plane, PlaneIdentity, Project, Sequencer, VsrConsensus,
+    ack_preflight, ack_quorum_reached, build_reply_message, drain_committable_prefix,
+    fence_old_prepare_by_commit, panic_if_hash_chain_would_break_in_same_view,
+    pipeline_prepare_common, replicate_preflight, replicate_to_next_in_chain,
+    send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_common::{
-    header::{Command2, GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader},
+    header::{
+        Command2, ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
+        RequestHeader,
+    },
     message::Message,
 };
 use journal::{Journal, JournalHandle};
@@ -156,6 +160,7 @@ where
         assert_eq!(header.op, current_op + 1);
 
         consensus.sequencer().set_sequence(header.op);
+        consensus.set_last_prepare_checksum(header.checksum);
 
         // Append to journal.
         journal.handle().append(message.clone()).await;
@@ -194,48 +199,95 @@ where
 
             debug!("on_ack: quorum received for op={}", header.op);
 
-            // Extract the header from the pipeline, fetch the full message from journal
-            // TODO: Commit from the head. ALWAYS
-            let entry = consensus.pipeline().borrow_mut().extract_by_op(header.op);
-            let Some(entry) = entry else {
-                warn!("on_ack: prepare not found in pipeline for op={}", header.op);
-                return;
-            };
+            let drained = drain_committable_prefix(consensus);
+            if let (Some(first), Some(last)) = (drained.first(), drained.last()) {
+                debug!(
+                    "on_ack: draining committed prefix ops=[{}..={}] count={}",
+                    first.header.op,
+                    last.header.op,
+                    drained.len()
+                );
+            }
 
-            let prepare_header = entry.header;
-            // TODO(hubcio): should we replace this with graceful fallback (warn + return)?
-            // When journal compaction is implemented compaction could race
-            // with this lookup if it removes entries below the commit number.
-            let prepare = journal
-                .handle()
-                .entry(&prepare_header)
-                .await
-                .unwrap_or_else(|| {
-                    panic!(
-                        "on_ack: committed prepare op={} checksum={} must be in journal",
-                        prepare_header.op, prepare_header.checksum
-                    )
-                });
+            for entry in drained {
+                let prepare_header = entry.header;
+                // TODO(hubcio): should we replace this with graceful fallback (warn + return)?
+                // When journal compaction is implemented compaction could race
+                // with this lookup if it removes entries below the commit number.
+                let prepare = journal
+                    .handle()
+                    .entry(&prepare_header)
+                    .await
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "on_ack: committed prepare op={} checksum={} must be in journal",
+                            prepare_header.op, prepare_header.checksum
+                        )
+                    });
 
-            // Apply the state (consumes prepare)
-            // TODO: Handle appending result to response
-            let _result = self.mux_stm.update(prepare);
-            debug!("on_ack: state applied for op={}", prepare_header.op);
+                // Apply the state (consumes prepare)
+                // TODO: Handle appending result to response
+                let _result = self.mux_stm.update(prepare);
+                debug!("on_ack: state applied for op={}", prepare_header.op);
 
-            // Send reply to client
-            let generic_reply = build_reply_message(consensus, &prepare_header).into_generic();
-            debug!(
-                "on_ack: sending reply to client={} for op={}",
-                prepare_header.client, prepare_header.op
-            );
+                // Send reply to client
+                let generic_reply = build_reply_message(consensus, &prepare_header).into_generic();
+                debug!(
+                    "on_ack: sending reply to client={} for op={}",
+                    prepare_header.client, prepare_header.op
+                );
 
-            // TODO: Error handling
-            consensus
-                .message_bus()
-                .send_to_client(prepare_header.client, generic_reply)
-                .await
-                .unwrap()
+                // TODO: Propagate send error instead of panicking; requires bus error design.
+                consensus
+                    .message_bus()
+                    .send_to_client(prepare_header.client, generic_reply)
+                    .await
+                    .unwrap()
+            }
         }
+    }
+}
+
+impl<B, P, J, S, M> PlaneIdentity<VsrConsensus<B, P>> for IggyMetadata<VsrConsensus<B, P>, J, S, M>
+where
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    J: JournalHandle,
+    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    M: StateMachine<Input = Message<PrepareHeader>>,
+{
+    fn is_applicable<H>(&self, message: &<VsrConsensus<B, P> as Consensus>::Message<H>) -> bool
+    where
+        H: ConsensusHeader,
+    {
+        assert!(matches!(
+            message.header().command(),
+            Command2::Request | Command2::Prepare | Command2::PrepareOk
+        ));
+        let operation = message.header().operation();
+        // TODO: Use better selection, smth like greater or equal based on op number.
+        matches!(
+            operation,
+            Operation::CreateStream
+                | Operation::UpdateStream
+                | Operation::DeleteStream
+                | Operation::PurgeStream
+                | Operation::CreateTopic
+                | Operation::UpdateTopic
+                | Operation::DeleteTopic
+                | Operation::PurgeTopic
+                | Operation::CreatePartitions
+                | Operation::DeletePartitions
+                | Operation::CreateConsumerGroup
+                | Operation::DeleteConsumerGroup
+                | Operation::CreateUser
+                | Operation::UpdateUser
+                | Operation::DeleteUser
+                | Operation::ChangePassword
+                | Operation::UpdatePermissions
+                | Operation::CreatePersonalAccessToken
+                | Operation::DeletePersonalAccessToken
+        )
     }
 }
 
