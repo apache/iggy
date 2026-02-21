@@ -1,0 +1,39 @@
+type = "sink"
+key = "clickhouse"
+enabled = true
+version = 0
+name = "ClickHouse sink"
+path = "target/release/libiggy_connector_clickhouse_sink"
+verbose = false
+
+[[streams]]
+stream = "qw"
+topics = ["records"]
+schema = "json"
+batch_length = 1000
+poll_interval = "5ms"
+consumer_group = "clickhouse_sink_connector"
+
+[plugin_config]
+url = "http://localhost:8123"
+database = "default"
+username = "default"
+password = ""
+table = "users"
+
+# Insert format: "json_each_row" (default), "row_binary", or "string"
+#   json_each_row  — accepts Payload::Json; ClickHouse handles type coercion
+#   row_binary     — accepts Payload::Json; connector validates + serialises
+#                    to RowBinaryWithDefaults (table must exist, schema is
+#                    fetched at startup; fails if table has unsupported types)
+#   string         — accepts Payload::Text; raw passthrough
+insert_format = "json_each_row"
+
+# Only relevant when insert_format = "string":
+# "json_each_row" (default), "csv", or "tsv"
+# string_format = "csv"
+
+timeout_seconds = 30
+max_retries = 3
+retry_delay = "1s"
+verbose_logging = false

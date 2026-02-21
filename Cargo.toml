@@ -33,6 +33,7 @@ members = [
     "core/configs_derive",
     "core/connectors/runtime",
     "core/connectors/sdk",
+    "core/connectors/sinks/clickhouse_sink",
     "core/connectors/sinks/elasticsearch_sink",
     "core/connectors/sinks/iceberg_sink",
     "core/connectors/sinks/postgres_sink",
