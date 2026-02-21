@@ -523,11 +523,18 @@ fn parse_time(s: &str) -> Result<f64, ()> {
 
 /// Strip a timezone suffix from a time string. Returns (time_without_tz, offset_seconds).
 fn strip_timezone(s: &str) -> (&str, i64) {
+<<<<<<< HEAD
     if let Some(stripped) = s.strip_suffix('Z') {
         return (stripped, 0);
     }
     // Look for ±hh:mm or ±hhmm suffix
     #[allow(clippy::collapsible_if)]
+=======
+    if s.ends_with('Z') {
+        return (&s[..s.len() - 1], 0);
+    }
+    // Look for ±hh:mm or ±hhmm suffix
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
     for (sign, ch) in [(1i64, '+'), (-1i64, '-')] {
         if let Some(pos) = s.rfind(ch) {
             if pos > 0 {
@@ -589,11 +596,15 @@ mod tests {
     }
 
     fn col(name: &str, ch_type: ChType, has_default: bool) -> Column {
+<<<<<<< HEAD
         Column {
             name: name.into(),
             ch_type,
             has_default,
         }
+=======
+        Column { name: name.into(), ch_type, has_default }
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
     }
 
     // ── varint ───────────────────────────────────────────────────────────────
@@ -637,15 +648,25 @@ mod tests {
     #[test]
     fn serialize_float32() {
         let mut buf = vec![];
+<<<<<<< HEAD
         serialize_value(&json_f64(3.15), &ChType::Float32, &mut buf).unwrap();
         assert_eq!(buf, (3.15f64 as f32).to_le_bytes());
+=======
+        serialize_value(&json_f64(3.14), &ChType::Float32, &mut buf).unwrap();
+        assert_eq!(buf, (3.14f64 as f32).to_le_bytes());
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
     }
 
     #[test]
     fn serialize_float64() {
         let mut buf = vec![];
+<<<<<<< HEAD
         serialize_value(&json_f64(2.318281828), &ChType::Float64, &mut buf).unwrap();
         assert_eq!(buf, 2.318281828f64.to_le_bytes());
+=======
+        serialize_value(&json_f64(2.718281828), &ChType::Float64, &mut buf).unwrap();
+        assert_eq!(buf, 2.718281828f64.to_le_bytes());
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
     }
 
     #[test]
@@ -663,6 +684,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn serialize_boolean_from_nonzero_i64_is_true() {
         let mut buf = vec![];
         serialize_value(&json_i64(1), &ChType::Boolean, &mut buf).unwrap();
@@ -677,6 +699,8 @@ mod tests {
     }
 
     #[test]
+=======
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
     fn serialize_string_with_varint_prefix() {
         let mut buf = vec![];
         serialize_value(&json_str("hi"), &ChType::String, &mut buf).unwrap();
@@ -691,6 +715,7 @@ mod tests {
         assert_eq!(buf, [b'a', b'b', 0x00, 0x00]);
     }
 
+<<<<<<< HEAD
     #[test]
     fn serialize_fixed_string_truncates_to_length() {
         let mut buf = vec![];
@@ -698,33 +723,44 @@ mod tests {
         assert_eq!(buf, [b'a', b'b', b'c']);
     }
 
+=======
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
     // ── nullable ─────────────────────────────────────────────────────────────
     #[test]
     fn serialize_nullable_null_writes_marker() {
         let mut buf = vec![];
+<<<<<<< HEAD
         serialize_value(
             &json_null(),
             &ChType::Nullable(Box::new(ChType::Int32)),
             &mut buf,
         )
         .unwrap();
+=======
+        serialize_value(&json_null(), &ChType::Nullable(Box::new(ChType::Int32)), &mut buf).unwrap();
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
         assert_eq!(buf, [0x01]);
     }
 
     #[test]
     fn serialize_nullable_non_null_writes_zero_then_value() {
         let mut buf = vec![];
+<<<<<<< HEAD
         serialize_value(
             &json_i64(42),
             &ChType::Nullable(Box::new(ChType::Int32)),
             &mut buf,
         )
         .unwrap();
+=======
+        serialize_value(&json_i64(42), &ChType::Nullable(Box::new(ChType::Int32)), &mut buf).unwrap();
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
         let mut expected = vec![0x00u8];
         expected.extend_from_slice(&42i32.to_le_bytes());
         assert_eq!(buf, expected);
     }
 
+<<<<<<< HEAD
     // ── uuid ─────────────────────────────────────────────────────────────────
 
     #[test]
@@ -785,6 +821,8 @@ mod tests {
         assert_eq!(buf, 300i16.to_le_bytes());
     }
 
+=======
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
     // ── RowBinary row ────────────────────────────────────────────────────────
     #[test]
     fn serialize_row_with_default_column_absent() {
@@ -803,7 +841,11 @@ mod tests {
         // name: 0x00 prefix + varint(5) + "alice"
         // age:  0x01 (use DEFAULT)
         assert_eq!(buf[0], 0x00); // name: value follows
+<<<<<<< HEAD
         assert_eq!(buf[1], 5); // varint length of "alice"
+=======
+        assert_eq!(buf[1], 5);    // varint length of "alice"
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
         assert_eq!(&buf[2..7], b"alice");
         assert_eq!(buf[7], 0x01); // age: use DEFAULT
     }
@@ -819,6 +861,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+<<<<<<< HEAD
     #[test]
     fn serialize_row_nullable_absent_writes_null_marker() {
         // Absent field + Nullable column + no default → 0x00 prefix + 0x01 null marker.
@@ -850,6 +893,8 @@ mod tests {
         assert!(result.is_err());
     }
 
+=======
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
     // ── date / datetime ──────────────────────────────────────────────────────
     #[test]
     fn serialize_date_from_integer() {
@@ -881,6 +926,7 @@ mod tests {
         assert_eq!(buf, 1_000_000i64.to_le_bytes());
     }
 
+<<<<<<< HEAD
     #[test]
     fn serialize_date32_from_string() {
         let mut buf = vec![];
@@ -928,13 +974,21 @@ mod tests {
         assert_eq!(buf, 1500i64.to_le_bytes());
     }
 
+=======
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
     // ── decimal ──────────────────────────────────────────────────────────────
     #[test]
     fn serialize_decimal32_scale2() {
         let mut buf = vec![];
+<<<<<<< HEAD
         // 3.15 * 10^2 = 314 → Int32
         serialize_value(&json_f64(3.15), &ChType::Decimal(9, 2), &mut buf).unwrap();
         assert_eq!(buf, 315i32.to_le_bytes());
+=======
+        // 3.14 * 10^2 = 314 → Int32
+        serialize_value(&json_f64(3.14), &ChType::Decimal(9, 2), &mut buf).unwrap();
+        assert_eq!(buf, 314i32.to_le_bytes());
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
     }
 
     #[test]
@@ -944,6 +998,7 @@ mod tests {
         assert_eq!(buf, 12345i64.to_le_bytes());
     }
 
+<<<<<<< HEAD
     #[test]
     fn serialize_decimal128_two_word_layout() {
         let mut buf = vec![];
@@ -955,6 +1010,8 @@ mod tests {
         assert_eq!(buf, expected);
     }
 
+=======
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
     // ── array ────────────────────────────────────────────────────────────────
     #[test]
     fn serialize_array_of_int32() {
@@ -968,6 +1025,7 @@ mod tests {
         assert_eq!(&buf[9..13], 3i32.to_le_bytes());
     }
 
+<<<<<<< HEAD
     // ── map ──────────────────────────────────────────────────────────────────
 
     #[test]
@@ -1050,6 +1108,8 @@ mod tests {
         assert!(result.is_err());
     }
 
+=======
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
     // ── ipv4 / ipv6 ──────────────────────────────────────────────────────────
     #[test]
     fn serialize_ipv4() {
@@ -1071,7 +1131,11 @@ mod tests {
 // Hex decoding helper (no extra dep — manual implementation for UUID)
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
+<<<<<<< HEAD
         if !s.len().is_multiple_of(2) {
+=======
+        if s.len() % 2 != 0 {
+>>>>>>> f3f8e9947 (initial clickhouse sink code)
             return Err(());
         }
         s.as_bytes()
