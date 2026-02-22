@@ -25,7 +25,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
+import java.util.List;
 import java.util.Optional;
+
+import org.apache.iggy.message.Message;
+import org.apache.iggy.message.Partitioning;
 
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.apache.iggy.TestConstants.TOPIC_NAME;
@@ -45,6 +49,9 @@ public abstract class ConsumerOffsetsClientBaseTest extends IntegrationTest {
 
     @Test
     void shouldGetConsumerOffset() {
+        // given. Send message to ensure partition is not empty so we can store offset 0
+        client.messages().sendMessages(STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of("test")));
+
         // when
         var consumer = new Consumer(Consumer.Kind.Consumer, ConsumerId.of(1223L));
         consumerOffsetsClient.storeConsumerOffset(STREAM_NAME, TOPIC_NAME, Optional.empty(), consumer, BigInteger.ZERO);

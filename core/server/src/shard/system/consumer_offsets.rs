@@ -62,6 +62,8 @@ impl IggyShard {
             ));
         }
 
+        self.validate_partition_offset(topic.stream_id, topic.topic_id, partition_id, offset)?;
+
         self.store_consumer_offset_base(
             topic.stream_id,
             topic.topic_id,
