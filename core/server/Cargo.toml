@@ -106,7 +106,7 @@ tracing-appender = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 tungstenite = { workspace = true }
-ulid = "1.2.1"
+ulid = { workspace = true }
 ureq = { workspace = true }
 uuid = { workspace = true }
 
