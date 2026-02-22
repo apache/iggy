@@ -85,5 +85,5 @@ def pytest_collection_modifyitems(config, items):
     """Modify test collection to add markers automatically."""
     for item in items:
         # Mark all tests in test_iggy_sdk.py as integration tests
-        if "test_iggy_sdk" in item.nodeid:
+        if "test_iggy_sdk" in item.nodeid or "test_tls" in item.nodeid:
             item.add_marker(pytest.mark.integration)
