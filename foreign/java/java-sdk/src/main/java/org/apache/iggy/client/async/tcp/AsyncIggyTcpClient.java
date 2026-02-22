@@ -24,6 +24,7 @@ import org.apache.iggy.client.async.MessagesClient;
 import org.apache.iggy.client.async.StreamsClient;
 import org.apache.iggy.client.async.TopicsClient;
 import org.apache.iggy.client.async.UsersClient;
+import org.apache.iggy.client.async.tcp.AsyncTcpConnection.TCPConnectionPoolConfig;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
@@ -158,7 +159,15 @@ public class AsyncIggyTcpClient {
      * @return a {@link CompletableFuture} that completes when the connection is established
      */
     public CompletableFuture<Void> connect() {
-        connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate);
+        TCPConnectionPoolConfig.Builder poolConfigBuilder = new TCPConnectionPoolConfig.Builder();
+        if (connectionPoolSize.isPresent()) {
+            poolConfigBuilder.setMaxConnections(connectionPoolSize.get());
+        }
+        if (connectionTimeout.isPresent()) {
+            poolConfigBuilder.setAcquireTimeoutMillis(connectionTimeout.get().toMillis());
+        }
+        TCPConnectionPoolConfig poolConfig = poolConfigBuilder.build();
+        connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate, poolConfig);
         return connection.connect().thenRun(() -> {
             messagesClient = new MessagesTcpClient(connection);
             consumerGroupsClient = new ConsumerGroupsTcpClient(connection);
@@ -202,6 +211,10 @@ public class AsyncIggyTcpClient {
             throw new IggyNotConnectedException();
         }
         return usersClient;
+    }
+
+    public PoolMetrics getTcpConnectionMetrics() {
+        return this.connection.getMetrics();
     }
 
     /**
