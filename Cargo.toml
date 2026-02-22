@@ -297,6 +297,7 @@ trait-variant = "0.1.2"
 tungstenite = "0.28.0"
 twox-hash = { version = "2.1.2", features = ["xxhash32"] }
 ulid = "1.2.1"
+ureq = "2.10"
 uuid = { version = "1.20.0", features = [
     "v4",
     "v7",

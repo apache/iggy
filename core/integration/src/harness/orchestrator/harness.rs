@@ -18,7 +18,7 @@
  */
 
 use super::builder::TestHarnessBuilder;
-use crate::harness::config::ClientConfig;
+use crate::harness::config::{ClientConfig, JwksConfig};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::handle::{
@@ -30,6 +30,8 @@ use iggy::prelude::{ClientWrapper, IggyClient};
 use iggy_common::TransportProtocol;
 use std::path::Path;
 use std::sync::Arc;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Collected logs from all binaries in the harness.
 #[derive(Debug)]
@@ -45,6 +47,8 @@ pub struct TestHarness {
     pub(super) client_configs: Vec<ClientConfig>,
     pub(super) primary_transport: Option<TransportProtocol>,
     pub(super) primary_client_config: Option<ClientConfig>,
+    pub(super) jwks_config: Option<JwksConfig>,
+    pub(super) jwks_server: Option<MockServer>,
     pub(super) started: bool,
 }
 
@@ -103,6 +107,43 @@ impl TestHarness {
     {
         if self.started {
             return Err(TestBinaryError::AlreadyStarted);
+        }
+
+        if let Some(jwks_config) = &self.jwks_config
+            && jwks_config.enabled
+        {
+            let mock_server = MockServer::start().await;
+
+            if let Some(store_path) = &jwks_config.store_path {
+                let content = std::fs::read_to_string(store_path).map_err(|e| {
+                    TestBinaryError::InvalidState {
+                        message: format!("Failed to read JWKS file at {}: {}", store_path, e),
+                    }
+                })?;
+
+                Mock::given(method("GET"))
+                    .and(path("/.well-known/jwks.json"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(content))
+                    .mount(&mock_server)
+                    .await;
+            }
+
+            let jwks_url = format!("{}/.well-known/jwks.json", mock_server.uri());
+            let issuer = jwks_config
+                .issuer_url
+                .as_deref()
+                .unwrap_or("https://test-issuer.com");
+
+            for server in &mut self.servers {
+                server.add_env("IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_ISSUER", issuer);
+                server.add_env(
+                    "IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_JWKS_URL",
+                    jwks_url.as_str(),
+                );
+                server.add_env("IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_AUDIENCE", "iggy");
+            }
+
+            self.jwks_server = Some(mock_server);
         }
 
         for server in &mut self.servers {

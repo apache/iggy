@@ -17,6 +17,7 @@
  */
 
 pub mod json_web_token;
+pub mod jwks;
 pub mod jwt_manager;
 pub mod middleware;
 pub mod storage;

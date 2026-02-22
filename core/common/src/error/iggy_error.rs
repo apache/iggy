@@ -148,6 +148,8 @@ pub enum IggyError {
     AccessTokenMissing = 77,
     #[error("Invalid access token")]
     InvalidAccessToken = 78,
+    #[error("Cannot fetch JWKS from URL: {0}")]
+    CannotFetchJwks(String) = 79,
     #[error("Invalid size bytes")]
     InvalidSizeBytes = 80,
     #[error("Invalid UTF-8")]
