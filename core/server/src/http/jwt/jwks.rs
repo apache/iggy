@@ -20,7 +20,6 @@ use dashmap::DashMap;
 use iggy_common::IggyError;
 use jsonwebtoken::DecodingKey;
 use serde::Deserialize;
-use serde_json;
 use std::hash::Hash;
 use strum::{Display, EnumString};
 
