@@ -32,7 +32,7 @@ pub fn footer() -> Html {
                 <span class="separator">{"|"}</span>
                 {"v"}{env!("CARGO_PKG_VERSION")}
                 <span class="separator">{"|"}</span>
-                {" 2025 Apache Iggy (Incubating). Built with ❤️ for the message streaming community."}
+                {" 2026 Apache Iggy (Incubating). Built with ❤️ for the message streaming community."}
             </div>
         </footer>
     }
