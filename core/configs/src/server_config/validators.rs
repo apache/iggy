@@ -17,18 +17,16 @@
  * under the License.
  */
 
+use super::COMPONENT;
 use super::cluster::ClusterConfig;
 use super::server::{
     DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, TelemetryConfig,
 };
+use super::server::{MemoryPoolConfig, PersonalAccessTokenConfig, ServerConfig};
 use super::sharding::{CpuAllocation, ShardingConfig};
+use super::system::SegmentConfig;
 use super::system::{CompressionConfig, LoggingConfig, PartitionConfig};
-use crate::configs::COMPONENT;
-use crate::configs::server::{MemoryPoolConfig, PersonalAccessTokenConfig, ServerConfig};
-use crate::configs::sharding::NumaTopology;
-use crate::configs::system::SegmentConfig;
-use crate::streaming::segments::*;
-use configs::ConfigurationError;
+use crate::ConfigurationError;
 use err_trail::ErrContext;
 use iggy_common::CompressionAlgorithm;
 use iggy_common::IggyExpiry;
@@ -36,6 +34,9 @@ use iggy_common::MaxTopicSize;
 use iggy_common::Validatable;
 use std::thread::available_parallelism;
 use tracing::warn;
+
+/// 1 GiB max segment size. Canonical definition; re-exported by core/server streaming.
+pub const SEGMENT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 
 impl Validatable<ConfigurationError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
@@ -339,7 +340,10 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
 impl Validatable<ConfigurationError> for ShardingConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
         let available_cpus = available_parallelism()
-            .expect("Failed to get number of CPU cores")
+            .map_err(|_| {
+                eprintln!("Failed to detect available CPU cores");
+                ConfigurationError::InvalidConfigurationValue
+            })?
             .get();
 
         match &self.cpu_allocation {
@@ -372,18 +376,9 @@ impl Validatable<ConfigurationError> for ShardingConfig {
                 }
                 Ok(())
             }
-            CpuAllocation::NumaAware(numa_config) => match NumaTopology::detect() {
-                // TODO: dry the validation, already validate it from the shard allocation
-                Ok(topology) => numa_config.validate(&topology).map_err(|e| {
-                    eprintln!("Invalid NUMA configuration: {}", e);
-                    ConfigurationError::InvalidConfigurationValue
-                }),
-                Err(e) => {
-                    eprintln!("Failed to detect NUMA topology: {}", e);
-                    eprintln!("NUMA allocation requested but system doesn't support it");
-                    Err(ConfigurationError::InvalidConfigurationValue)
-                }
-            },
+            // NUMA topology validation requires hwlocality (runtime dep).
+            // Full NUMA validation happens in server::shard_allocator at startup.
+            CpuAllocation::NumaAware(_) => Ok(()),
         }
     }
 }
@@ -394,19 +389,16 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             return Ok(());
         }
 
-        // Validate cluster name is not empty
         if self.name.trim().is_empty() {
             eprintln!("Invalid cluster configuration: cluster name cannot be empty");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        // Validate current node name is not empty
         if self.node.current.name.trim().is_empty() {
             eprintln!("Invalid cluster configuration: current node name cannot be empty");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        // Check for duplicate node names among other nodes
         let mut node_names = std::collections::HashSet::new();
         node_names.insert(self.node.current.name.clone());
 
@@ -420,16 +412,13 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             }
         }
 
-        // Validate each other node configuration
         let mut used_endpoints = std::collections::HashSet::new();
         for node in &self.node.others {
-            // Validate node name is not empty
             if node.name.trim().is_empty() {
                 eprintln!("Invalid cluster configuration: node name cannot be empty");
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
 
-            // Validate IP is not empty
             if node.ip.trim().is_empty() {
                 eprintln!(
                     "Invalid cluster configuration: IP cannot be empty for node '{}'",
@@ -438,7 +427,6 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
 
-            // Validate transport ports if provided
             let port_list = [
                 ("TCP", node.ports.tcp),
                 ("QUIC", node.ports.quic),
@@ -456,7 +444,6 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                         return Err(ConfigurationError::InvalidConfigurationValue);
                     }
 
-                    // Check for port conflicts across nodes on the same IP
                     let endpoint = format!("{}:{}:{}", node.ip, name, port);
                     if !used_endpoints.insert(endpoint.clone()) {
                         eprintln!(

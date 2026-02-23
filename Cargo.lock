@@ -1936,10 +1936,18 @@ name = "configs"
 version = "0.1.0"
 dependencies = [
  "configs_derive",
+ "derive_more",
+ "err_trail",
  "figment",
+ "iggy_common",
+ "jsonwebtoken",
  "serde",
  "serde_json",
+ "serde_with",
+ "static-toml",
+ "strum",
  "tracing",
+ "tungstenite",
 ]
 
 [[package]]
@@ -3161,7 +3169,6 @@ dependencies = [
  "atomic",
  "pear",
  "serde",
- "serde_json",
  "toml 0.8.23",
  "uncased",
  "version_check",
@@ -5273,9 +5280,9 @@ dependencies = [
 
 [[package]]
 name = "keccak"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecc2af9a1119c51f12a14607e783cb977bde58bc069ff0c3da1095e635d70654"
+checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"
 dependencies = [
  "cpufeatures 0.2.17",
 ]
@@ -8338,13 +8345,11 @@ dependencies = [
  "cyper",
  "cyper-axum",
  "dashmap",
- "derive_more",
  "dotenvy",
  "enum_dispatch",
  "err_trail",
  "error_set",
  "figlet-rs",
- "figment",
  "flume 0.12.0",
  "fs2",
  "futures",
@@ -8375,10 +8380,8 @@ dependencies = [
  "rustls-pemfile",
  "send_wrapper",
  "serde",
- "serde_with",
  "slab",
  "socket2 0.6.2",
- "static-toml",
  "strum",
  "sysinfo 0.38.1",
  "tempfile",

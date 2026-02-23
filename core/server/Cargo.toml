@@ -54,13 +54,11 @@ ctrlc = { workspace = true }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }
 dashmap = { workspace = true }
-derive_more = { workspace = true }
 dotenvy = { workspace = true }
 enum_dispatch = { workspace = true }
 err_trail = { workspace = true }
 error_set = { workspace = true }
 figlet-rs = { workspace = true }
-figment = { workspace = true }
 flume = { workspace = true }
 fs2 = { workspace = true }
 futures = { workspace = true }
@@ -90,10 +88,8 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 send_wrapper = { workspace = true }
 serde = { workspace = true }
-serde_with = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true }
-static-toml = { workspace = true }
 strum = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
@@ -115,5 +111,4 @@ hwlocality = { workspace = true }
 hwlocality = { workspace = true, features = ["vendored"] }
 
 [build-dependencies]
-figment = { workspace = true, features = ["json", "toml", "env"] }
 vergen-git2 = { workspace = true }
