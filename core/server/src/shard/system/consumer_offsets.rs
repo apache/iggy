@@ -143,10 +143,7 @@ impl IggyShard {
         let partition_current_offset = self
             .metadata
             .get_partition_stats(&ns)
-            .map(|s| {
-                let count = s.messages_count_inconsistent();
-                if count > 0 { count - 1 } else { 0 }
-            })
+            .map(|s| s.current_offset())
             .unwrap_or(0);
 
         let offset = match polling_consumer {
