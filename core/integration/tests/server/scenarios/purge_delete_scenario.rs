@@ -130,6 +130,26 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         "Messages 7..25 survive"
     );
 
+    // After deleting segment 0 (7 messages removed): current_offset must still
+    // reflect the true partition max (24), not messages_count - 1 (17).
+    {
+        let max_offset = (TOTAL_MESSAGES - 1) as u64;
+        let offset_info = client
+            .get_consumer_offset(&consumer, &stream_ident, &topic_ident, Some(PARTITION_ID))
+            .await
+            .unwrap()
+            .expect("consumer offset must exist after segment deletion");
+        assert_eq!(offset_info.stored_offset, stored_offset);
+        assert_eq!(
+            offset_info.current_offset,
+            max_offset,
+            "current_offset must be {max_offset} (true partition max), \
+             got {} (messages_count - 1 = {})",
+            offset_info.current_offset,
+            TOTAL_MESSAGES as u64 - MSGS_PER_SEALED_SEGMENT - 1,
+        );
+    }
+
     // --- Barrier prevents deletion ---
     client
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, 1)
@@ -173,6 +193,26 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         (2 * MSGS_PER_SEALED_SEGMENT..TOTAL_MESSAGES as u64).collect::<Vec<_>>(),
         "Messages 14..25 survive"
     );
+
+    // After deleting segments 0 and 1 (14 messages removed): current_offset
+    // must still be 24, not messages_count - 1 (10).
+    {
+        let max_offset = (TOTAL_MESSAGES - 1) as u64;
+        let offset_info = client
+            .get_consumer_offset(&consumer, &stream_ident, &topic_ident, Some(PARTITION_ID))
+            .await
+            .unwrap()
+            .expect("consumer offset must exist after second deletion");
+        assert_eq!(offset_info.stored_offset, seg1_end_offset);
+        assert_eq!(
+            offset_info.current_offset,
+            max_offset,
+            "current_offset must remain {max_offset} after deleting two segments, \
+             got {} (messages_count - 1 = {})",
+            offset_info.current_offset,
+            TOTAL_MESSAGES as u64 - 2 * MSGS_PER_SEALED_SEGMENT - 1,
+        );
+    }
 
     // --- Consumer not stuck ---
     let polled_next = client
