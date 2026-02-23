@@ -23,7 +23,7 @@ namespace Apache.Iggy.Enums;
 public enum ConsumerType
 {
     /// <summary>
-    ///     Regular consumer.
+    ///     Regular consumer, but better
     /// </summary>
     Consumer,
 
