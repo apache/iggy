@@ -20,7 +20,6 @@ use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
-use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -50,14 +49,13 @@ async fn delete_segments(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
     Path((stream_id, topic_id, partition_id)): Path<(String, String, u32)>,
-    Query((segments_count,)): Query<(u32,)>,
     mut query: Query<DeleteSegments>,
 ) -> Result<StatusCode, CustomError> {
     query.stream_id = Identifier::from_str_value(&stream_id)?;
     query.topic_id = Identifier::from_str_value(&topic_id)?;
     query.partition_id = partition_id;
-    query.segments_count = segments_count;
     query.validate()?;
+    let segments_count = query.segments_count;
 
     let (numeric_stream_id, numeric_topic_id) = state
         .shard
@@ -68,12 +66,12 @@ async fn delete_segments(
         numeric_stream_id,
         numeric_topic_id,
     )?;
-    let _deleted_segment_ids = {
+    {
         let delete_future = SendWrapper::new(state.shard.shard().delete_segments_base(
             numeric_stream_id,
             numeric_topic_id,
             partition_id as usize,
-            query.segments_count,
+            segments_count,
         ));
 
         delete_future.await.error(|e: &IggyError| {
@@ -83,29 +81,11 @@ async fn delete_segments(
         })?
     };
 
-    // Send event for deleted segments
-    {
-        let broadcast_future = SendWrapper::new(async {
-            let event = ShardEvent::DeletedSegments {
-                stream_id: query.stream_id.clone(),
-                topic_id: query.topic_id.clone(),
-                segments_count: query.segments_count,
-                partition_id: query.partition_id,
-            };
-            let _responses = state
-                .shard
-                .shard()
-                .broadcast_event_to_all_shards(event)
-                .await;
-        });
-        broadcast_future.await;
-    }
-
     let command = EntryCommand::DeleteSegments(DeleteSegments {
         stream_id: query.stream_id.clone(),
         topic_id: query.topic_id.clone(),
         partition_id: query.partition_id,
-        segments_count: query.segments_count,
+        segments_count,
     });
     let state_future =
         SendWrapper::new(state.shard.shard().state.apply(identity.user_id, &command));

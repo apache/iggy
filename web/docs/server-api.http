@@ -75,6 +75,13 @@ Content-Type: application/json
   "partitions_count": 45
 }
 
+### Delete segments
+DELETE {{url}}/streams/1/topics/1/partitions/1?segments_count=3
+Authorization: Bearer {{access_token}}
+
+# Path params: stream_id, topic_id, partition_id
+# Query param: segments_count
+
 ###
 GET {{url}}/users/13
 Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJqdGkiOiI5NmJlY2QwNy03ZTYyLTRiYTktYTcyZS02NzgwOThmMjE1MmMiLCJpc3MiOiJpZ2d5LnJzIiwiYXVkIjoiaWdneS5ycyIsInN1YiI6MSwiaWF0IjoxNzAwNTk4NTI5LCJleHAiOjE3MDA2MDIxMjksIm5iZiI6MTcwMDU5ODUyOX0.IYaIwFA1VajunF_P2KLQWOnnEzCYHJT31QuIQa__TS0
