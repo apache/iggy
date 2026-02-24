@@ -51,16 +51,7 @@ impl IggyShard {
             return Err(IggyError::NotResolvedConsumer(consumer.id));
         };
 
-        if !self
-            .metadata
-            .partition_exists(topic.stream_id, topic.topic_id, partition_id)
-        {
-            return Err(IggyError::PartitionNotFound(
-                partition_id,
-                Identifier::numeric(topic.topic_id as u32).expect("valid topic id"),
-                Identifier::numeric(topic.stream_id as u32).expect("valid stream id"),
-            ));
-        }
+        self.validate_partition_offset(topic.stream_id, topic.topic_id, partition_id, offset)?;
 
         self.store_consumer_offset_base(
             topic.stream_id,

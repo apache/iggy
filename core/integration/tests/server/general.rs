@@ -17,8 +17,9 @@
 
 use crate::server::scenarios::{
     authentication_scenario, bench_scenario, consumer_timestamp_polling_scenario,
-    create_message_payload, message_headers_scenario, permissions_scenario, snapshot_scenario,
-    stream_size_validation_scenario, system_scenario, user_scenario,
+    create_message_payload, invalid_consumer_offset_scenario, message_headers_scenario,
+    permissions_scenario, snapshot_scenario, stream_size_validation_scenario, system_scenario,
+    user_scenario,
 };
 use integration::iggy_harness;
 
@@ -150,4 +151,17 @@ async fn consumer_timestamp_polling(harness: &TestHarness) {
 )]
 async fn snapshot(harness: &TestHarness) {
     snapshot_scenario::run(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, Http, Quic, WebSocket],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn invalid_consumer_offset(harness: &TestHarness) {
+    invalid_consumer_offset_scenario::run(harness).await;
 }
