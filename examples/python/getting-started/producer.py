@@ -95,7 +95,7 @@ def build_connection_string(args) -> str:
     if args.tls:
         # Extract domain from server address (host:port -> host)
         host = args.tcp_server_address.split(":")[0]
-        query_params = [f"tls=true", f"tls_domain={host}"]
+        query_params = ["tls=true", f"tls_domain={host}"]
         
         # Add CA file if provided
         if args.tls_ca_file:

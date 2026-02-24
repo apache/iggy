@@ -170,6 +170,7 @@ if [ "${exit_code}" -eq 0 ]; then
     done
 
     cd examples/python || exit 1
+    # shellcheck disable=SC1091
     source .venv/bin/activate
 
     # Run getting-started examples with TLS flags
