@@ -156,6 +156,7 @@ jobs:
           retention-days: 7
 
   windows:
+    if: false # TODO(hubcio): temporarily disabled
     runs-on: windows-latest
     steps:
       - name: Download latest copy script from master
