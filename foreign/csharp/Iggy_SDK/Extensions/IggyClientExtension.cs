@@ -25,7 +25,7 @@ namespace Apache.Iggy.Extensions;
 /// <summary>
 ///     Extension methods for <see cref="IIggyClient" />
 /// </summary>
-public static class IggyClientExtenstion
+public static class IggyClientExtension
 {
     /// <summary>
     ///     Creates a new <see cref="IggyConsumerBuilder" /> from <see cref="IIggyClient" /> for the specified stream and

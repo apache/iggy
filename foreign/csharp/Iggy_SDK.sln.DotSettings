@@ -1,4 +1,4 @@
-﻿<wpf:ResourceDictionary xml:space="preserve" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:s="clr-namespace:System;assembly=mscorlib" xmlns:ss="urn:shemas-jetbrains-com:settings-storage-xaml" xmlns:wpf="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
+﻿<wpf:ResourceDictionary xml:space="preserve" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:s="clr-namespace:System;assembly=mscorlib" xmlns:ss="urn:schemas-jetbrains-com:settings-storage-xaml" xmlns:wpf="http://schemas.microsoft.com/winfx/2006/xaml/presentation">
 	<s:String x:Key="/Default/CodeInspection/Highlighting/InspectionSeverities/=EnforceIfStatementBraces/@EntryIndexedValue"></s:String>
 	<s:Boolean x:Key="/Default/CodeInspection/Highlighting/InspectionSeverities/=EnforceIfStatementBraces/@EntryIndexRemoved">True</s:Boolean>
 	<s:String x:Key="/Default/CodeInspection/Highlighting/InspectionSeverities/=EnforceUsingStatementBraces/@EntryIndexedValue"></s:String>
@@ -57,7 +57,7 @@
         &lt;/HasMember&gt;
       &lt;/And&gt;
     &lt;/TypePattern.Match&gt;
-    
+
     &lt;Entry DisplayName="Fields"&gt;
       &lt;Entry.Match&gt;
         &lt;And&gt;
@@ -226,7 +226,7 @@
         &lt;Name /&gt;
       &lt;/Entry.SortBy&gt;
     &lt;/Entry&gt;
-        
+
       &lt;Entry DisplayName="Properties, Indexers"&gt;
           &lt;Entry.Match&gt;
               &lt;Or&gt;
@@ -234,7 +234,7 @@
                   &lt;Kind Is="Indexer" /&gt;
               &lt;/Or&gt;
           &lt;/Entry.Match&gt;
-      &lt;/Entry&gt;        
+      &lt;/Entry&gt;
 
     &lt;Entry DisplayName="Constructors"&gt;
       &lt;Entry.Match&gt;
@@ -245,7 +245,7 @@
         &lt;Static/&gt;
       &lt;/Entry.SortBy&gt;
     &lt;/Entry&gt;
-        
+
       &lt;Entry DisplayName="Interface Implementations" Priority="100"&gt;
       &lt;Entry.Match&gt;
         &lt;And&gt;

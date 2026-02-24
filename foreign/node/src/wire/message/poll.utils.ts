@@ -207,7 +207,7 @@ const ReverseMessageState = reverseRecord(MessageState);
  */
 export const mapMessageState = (k: number): MessageStateId => {
   if (!ReverseMessageState[k as MessageStateValue])
-    throw new Error(`unknow message state: ${k}`);
+    throw new Error(`unknown message state: ${k}`);
   return ReverseMessageState[k as MessageStateValue];
 };
 

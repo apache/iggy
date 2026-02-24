@@ -48,7 +48,7 @@ update = true
 delete = true
 ```
 
-Keep in mind that either of `toml`, `yaml`, or `json` formats are supported for the configuration file. The path to the configuration can be overriden by `IGGY_MCP_CONFIG_PATH` environment variable. Each configuration section can be also additionally updated by using the following convention `IGGY_MCP_SECTION_NAME.KEY_NAME` e.g. `IGGY_MCP_IGGY_USERNAME` and so on.
+Keep in mind that either of `toml`, `yaml`, or `json` formats are supported for the configuration file. The path to the configuration can be overridden by `IGGY_MCP_CONFIG_PATH` environment variable. Each configuration section can be also additionally updated by using the following convention `IGGY_MCP_SECTION_NAME.KEY_NAME` e.g. `IGGY_MCP_IGGY_USERNAME` and so on.
 
 Here's the example configuration to be used with Claude Desktop:
 

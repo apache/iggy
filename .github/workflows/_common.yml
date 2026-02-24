@@ -220,6 +220,20 @@ jobs:
       - name: Check TOML formatting
         run: ./scripts/ci/taplo.sh --check --ci
 
+  typos:
+    name: Check typos
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FORCE_COLOR: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check typos
+        uses: crate-ci/typos@v1.41.0
+
   summary:
     name: Common checks summary
     needs:
@@ -234,6 +248,7 @@ jobs:
         trailing-whitespace,
         trailing-newline,
         toml-format,
+        typos,
       ]
     if: always()
     runs-on: ubuntu-latest
@@ -342,6 +357,15 @@ jobs:
             echo "| ❌ TOML Format | failure | TOML formatting issues found |" >> $GITHUB_STEP_SUMMARY
           else
             echo "| ⏭️ TOML Format | $TOML_FORMAT | Check skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          TYPOS="${{ needs.typos.result }}"
+          if [ "$TYPOS" = "success" ]; then
+            echo "| ✅ Typos Check | success | All files are free of spelling typos |" >> $GITHUB_STEP_SUMMARY
+          elif [ "$TYPOS" = "failure" ]; then
+            echo "| ❌ Typos Check | failure | Spelling typos detected (run 'typos -w' to fix) |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| ⏭️ Typos Check | $TYPOS | Check skipped |" >> $GITHUB_STEP_SUMMARY
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY

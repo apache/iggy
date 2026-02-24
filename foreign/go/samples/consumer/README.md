@@ -12,7 +12,7 @@ To get a local copy up and running follow these simple example steps.
 
 ### Prerequisites
 
-In order to use this SDK you need to install golang on your enviroment. Here's a <a hfref="https://go.dev/doc/install">link to official go documentation</a> explaining how you can do that!
+In order to use this SDK you need to install golang on your environment. Here's a <a hfref="https://go.dev/doc/install">link to official go documentation</a> explaining how you can do that!
 
 ## Usage
 
@@ -38,7 +38,7 @@ In order to successfully launch the consumer app follow these steps:
     go run ./samples/consumer
     ```
 
-    If you have not consumed messages you should see output similiar to this:
+    If you have not consumed messages you should see output similar to this:
 
     ```sh
     $ go run ./samples/consumer
