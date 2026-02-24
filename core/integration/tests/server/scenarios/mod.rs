@@ -29,6 +29,7 @@ pub mod consumer_timestamp_polling_scenario;
 pub mod create_message_payload;
 pub mod cross_protocol_pat_scenario;
 pub mod encryption_scenario;
+pub mod invalid_consumer_offset_scenario;
 pub mod log_rotation_scenario;
 pub mod message_cleanup_scenario;
 pub mod message_headers_scenario;
