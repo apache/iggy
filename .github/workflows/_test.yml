@@ -83,6 +83,18 @@ jobs:
         with:
           task: ${{ inputs.task }}
 
+      - name: Upload Python coverage to Codecov
+        if: inputs.component == 'sdk-python' && inputs.task == 'test'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/python-coverage.xml
+          disable_search: true
+          flags: python
+          fail_ci_if_error: false
+          verbose: true
+          override_pr: ${{ github.event.pull_request.number }}
+
       # Node SDK
       - name: Run Node SDK task
         if: inputs.component == 'sdk-node'
@@ -122,6 +134,18 @@ jobs:
         uses: ./.github/actions/csharp-dotnet/pre-merge
         with:
           task: ${{ inputs.task }}
+
+      - name: Upload C# coverage to Codecov
+        if: inputs.component == 'sdk-csharp' && (inputs.task == 'test' || inputs.task == 'e2e')
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: foreign/csharp/reports/coverage.cobertura.xml
+          disable_search: true
+          flags: csharp
+          fail_ci_if_error: false
+          verbose: true
+          override_pr: ${{ github.event.pull_request.number }}
 
       # Web UI
       - name: Run Web UI task
