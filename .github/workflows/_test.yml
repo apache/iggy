@@ -83,6 +83,18 @@ jobs:
         with:
           task: ${{ inputs.task }}
 
+      - name: Upload Python coverage to Codecov
+        if: inputs.component == 'sdk-python' && inputs.task == 'test'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/python-coverage.xml
+          disable_search: true
+          flags: python
+          fail_ci_if_error: false
+          verbose: true
+          override_pr: ${{ github.event.pull_request.number }}
+
       # Node SDK
       - name: Run Node SDK task
         if: inputs.component == 'sdk-node'
