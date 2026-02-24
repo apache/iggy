@@ -113,7 +113,11 @@ impl Simulator {
         None
     }
 
-    async fn dispatch_to_replica(&self, replica: &Replica, message: Message<iggy_common::header::GenericHeader>) {
+    async fn dispatch_to_replica(
+        &self,
+        replica: &Replica,
+        message: Message<iggy_common::header::GenericHeader>,
+    ) {
         replica.dispatch(message).await;
     }
 }
