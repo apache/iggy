@@ -17,7 +17,8 @@
 
 use crate::permissioner::Permissioner;
 use crate::stm::StateHandler;
-use crate::{collect_handlers, define_state};
+use crate::stm::snapshot::Snapshotable;
+use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
@@ -26,7 +27,11 @@ use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
 use iggy_common::delete_user::DeleteUser;
 use iggy_common::update_permissions::UpdatePermissions;
 use iggy_common::update_user::UpdateUser;
-use iggy_common::{IggyTimestamp, Permissions, PersonalAccessToken, UserId, UserStatus};
+use iggy_common::{
+    GlobalPermissions, IggyTimestamp, Permissions, PersonalAccessToken, StreamPermissions, UserId,
+    UserStatus,
+};
+use serde::{Deserialize, Serialize};
 use slab::Slab;
 use std::sync::Arc;
 
@@ -258,3 +263,219 @@ impl StateHandler for DeletePersonalAccessToken {
         }
     }
 }
+
+/// User snapshot representation for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserSnapshot {
+    pub id: UserId,
+    pub username: String,
+    pub password_hash: String,
+    pub status: UserStatus,
+    pub created_at: IggyTimestamp,
+    pub permissions: Option<Permissions>,
+}
+
+/// Personal access token snapshot representation for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonalAccessTokenSnapshot {
+    pub user_id: UserId,
+    pub name: String,
+    pub token: String,
+    pub expiry_at: Option<IggyTimestamp>,
+}
+
+/// Permissioner snapshot representation for serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionerSnapshot {
+    pub users_permissions: Vec<(UserId, GlobalPermissions)>,
+    pub users_streams_permissions: Vec<((UserId, usize), StreamPermissions)>,
+    pub users_that_can_poll_messages_from_all_streams: Vec<UserId>,
+    pub users_that_can_send_messages_to_all_streams: Vec<UserId>,
+    pub users_that_can_poll_messages_from_specific_streams: Vec<(UserId, usize)>,
+    pub users_that_can_send_messages_to_specific_streams: Vec<(UserId, usize)>,
+}
+
+/// Snapshot representation for the Users state machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsersSnapshot {
+    pub items: Vec<(usize, UserSnapshot)>,
+    pub personal_access_tokens: Vec<(UserId, Vec<(String, PersonalAccessTokenSnapshot)>)>,
+    pub permissioner: PermissionerSnapshot,
+}
+
+impl Snapshotable for Users {
+    type Snapshot = UsersSnapshot;
+
+    fn to_snapshot(&self) -> Self::Snapshot {
+        self.inner.read(|inner| {
+            let items: Vec<(usize, UserSnapshot)> = inner
+                .items
+                .iter()
+                .map(|(user_id, user)| {
+                    (
+                        user_id,
+                        UserSnapshot {
+                            id: user.id,
+                            username: user.username.to_string(),
+                            password_hash: user.password_hash.to_string(),
+                            status: user.status,
+                            created_at: user.created_at,
+                            permissions: user.permissions.as_ref().map(|p| (**p).clone()),
+                        },
+                    )
+                })
+                .collect();
+
+            let personal_access_tokens: Vec<(UserId, Vec<(String, PersonalAccessTokenSnapshot)>)> =
+                inner
+                    .personal_access_tokens
+                    .iter()
+                    .map(|(&user_id, tokens)| {
+                        let token_list: Vec<(String, PersonalAccessTokenSnapshot)> = tokens
+                            .iter()
+                            .map(|(name, pat)| {
+                                (
+                                    name.to_string(),
+                                    PersonalAccessTokenSnapshot {
+                                        user_id: pat.user_id,
+                                        name: pat.name.to_string(),
+                                        token: pat.token.to_string(),
+                                        expiry_at: pat.expiry_at,
+                                    },
+                                )
+                            })
+                            .collect();
+                        (user_id, token_list)
+                    })
+                    .collect();
+
+            let permissioner = PermissionerSnapshot {
+                users_permissions: inner
+                    .permissioner
+                    .users_permissions
+                    .iter()
+                    .map(|(&k, v)| (k, v.clone()))
+                    .collect(),
+                users_streams_permissions: inner
+                    .permissioner
+                    .users_streams_permissions
+                    .iter()
+                    .map(|(&k, v)| (k, v.clone()))
+                    .collect(),
+                users_that_can_poll_messages_from_all_streams: inner
+                    .permissioner
+                    .users_that_can_poll_messages_from_all_streams
+                    .iter()
+                    .copied()
+                    .collect(),
+                users_that_can_send_messages_to_all_streams: inner
+                    .permissioner
+                    .users_that_can_send_messages_to_all_streams
+                    .iter()
+                    .copied()
+                    .collect(),
+                users_that_can_poll_messages_from_specific_streams: inner
+                    .permissioner
+                    .users_that_can_poll_messages_from_specific_streams
+                    .iter()
+                    .copied()
+                    .collect(),
+                users_that_can_send_messages_to_specific_streams: inner
+                    .permissioner
+                    .users_that_can_send_messages_to_specific_streams
+                    .iter()
+                    .copied()
+                    .collect(),
+            };
+
+            UsersSnapshot {
+                items,
+                personal_access_tokens,
+                permissioner,
+            }
+        })
+    }
+
+    fn from_snapshot(
+        snapshot: Self::Snapshot,
+    ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
+        let mut index: AHashMap<Arc<str>, UserId> = AHashMap::new();
+        let mut user_entries: Vec<(usize, User)> = Vec::new();
+
+        for (slab_key, user_snap) in snapshot.items {
+            let username: Arc<str> = Arc::from(user_snap.username.as_str());
+            let user = User {
+                id: user_snap.id,
+                username: username.clone(),
+                password_hash: Arc::from(user_snap.password_hash.as_str()),
+                status: user_snap.status,
+                created_at: user_snap.created_at,
+                permissions: user_snap.permissions.map(Arc::new),
+            };
+
+            index.insert(username, slab_key as UserId);
+            user_entries.push((slab_key, user));
+        }
+
+        let items: Slab<User> = user_entries.into_iter().collect();
+
+        let mut personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>> =
+            AHashMap::new();
+        for (user_id, tokens) in snapshot.personal_access_tokens {
+            let mut token_map: AHashMap<Arc<str>, PersonalAccessToken> = AHashMap::new();
+            for (name, pat_snap) in tokens {
+                let pat = PersonalAccessToken::raw(
+                    pat_snap.user_id,
+                    &pat_snap.name,
+                    &pat_snap.token,
+                    pat_snap.expiry_at,
+                );
+                token_map.insert(Arc::from(name.as_str()), pat);
+            }
+            personal_access_tokens.insert(user_id, token_map);
+        }
+
+        let permissioner = Permissioner {
+            users_permissions: snapshot
+                .permissioner
+                .users_permissions
+                .into_iter()
+                .collect(),
+            users_streams_permissions: snapshot
+                .permissioner
+                .users_streams_permissions
+                .into_iter()
+                .collect(),
+            users_that_can_poll_messages_from_all_streams: snapshot
+                .permissioner
+                .users_that_can_poll_messages_from_all_streams
+                .into_iter()
+                .collect(),
+            users_that_can_send_messages_to_all_streams: snapshot
+                .permissioner
+                .users_that_can_send_messages_to_all_streams
+                .into_iter()
+                .collect(),
+            users_that_can_poll_messages_from_specific_streams: snapshot
+                .permissioner
+                .users_that_can_poll_messages_from_specific_streams
+                .into_iter()
+                .collect(),
+            users_that_can_send_messages_to_specific_streams: snapshot
+                .permissioner
+                .users_that_can_send_messages_to_specific_streams
+                .into_iter()
+                .collect(),
+        };
+
+        let inner = UsersInner {
+            index,
+            items,
+            personal_access_tokens,
+            permissioner,
+        };
+        Ok(inner.into())
+    }
+}
+
+impl_fill_restore!(Users, users);

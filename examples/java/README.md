@@ -132,18 +132,103 @@ Building streams with advanced configuration:
 
 Shows how to use the stream builder API to create and configure streams with custom settings.
 
-## Async Client
+## Async Client Examples
 
-The following example demonstrates how to use the asynchronous client:
+### Async Producer
 
-Async producer example:
+High-throughput async production with pipelining:
 
 ```bash
 ./gradlew runAsyncProducer
 ```
 
-Async consumer example:
+Shows:
+
+- CompletableFuture chaining patterns
+- Pipelining multiple sends without blocking
+- Performance comparison with blocking client
+
+### Async Consumer
+
+Non-blocking async consumption with advanced patterns:
 
 ```bash
-./gradlew runAsyncConsumerExample
+./gradlew runAsyncConsumer
+```
+
+Shows:
+
+- Backpressure management (don't poll faster than you can process)
+- Error recovery with exponential backoff
+- Thread pool separation (Netty I/O threads vs. processing threads)
+- Offset-based polling with CompletableFuture
+
+**CRITICAL ASYNC PATTERN - Thread Pool Management:**
+
+The async client uses Netty's event loop threads for I/O operations. **NEVER** block these threads with:
+
+- `.join()` or `.get()` inside `thenApply/thenAccept`
+- `Thread.sleep()`
+- Blocking database calls
+- Long-running computations
+
+If your message processing involves blocking operations, offload to a separate thread pool using `thenApplyAsync(fn, executor)`.
+
+## Blocking vs. Async - When to Use Each
+
+The Iggy Java SDK provides two client types: **blocking (synchronous)** and **async (non-blocking)**. Choose based on your use case:
+
+### Use Blocking Client When
+
+- Writing scripts, CLI tools, or simple applications
+- Sequential code is easier to reason about
+- Integration tests
+
+### Use Async Client When
+
+- Need high throughput
+- Application is already async/reactive (Spring WebFlux, Vert.x)
+- Want to pipeline multiple requests over a single connection
+- Building services that handle many concurrent streams
+
+## Key Async Patterns
+
+### CompletableFuture Chaining
+
+```java
+client.connect()
+    .thenCompose(v -> client.login())
+    .thenCompose(identity -> client.streams().createStream("my-stream"))
+    .thenAccept(stream -> System.out.println("Created: " + stream.name()))
+    .exceptionally(ex -> {
+        System.err.println("Error: " + ex.getMessage());
+        return null;
+    });
+```
+
+### Pipelining for Throughput
+
+```java
+List<CompletableFuture<Void>> sends = new ArrayList<>();
+for (int i = 0; i < 10; i++) {
+    sends.add(client.messages().sendMessages(...));
+}
+CompletableFuture.allOf(sends.toArray(new CompletableFuture[0])).join();
+```
+
+### Thread Pool Offloading
+
+```java
+// WRONG - blocks Netty event loop
+client.messages().pollMessages(...)
+    .thenAccept(polled -> {
+        saveToDatabase(polled);  // blocking I/O!
+    });
+
+// CORRECT - offloads to processing pool
+var processingPool = Executors.newFixedThreadPool(8);
+client.messages().pollMessages(...)
+    .thenAcceptAsync(polled -> {
+        saveToDatabase(polled);  // runs on processingPool
+    }, processingPool);
 ```

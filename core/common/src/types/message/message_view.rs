@@ -37,17 +37,34 @@ pub struct IggyMessageView<'a> {
 
 impl<'a> IggyMessageView<'a> {
     /// Creates a new immutable message view from a buffer.
-    pub fn new(buffer: &'a [u8]) -> Self {
+    ///
+    /// Validates that the buffer is large enough to contain the full message
+    /// (header + payload + user headers). All subsequent accessors can use
+    /// direct indexing because this constructor guarantees the bounds.
+    pub fn new(buffer: &'a [u8]) -> Result<Self, IggyError> {
+        if buffer.len() < IGGY_MESSAGE_HEADER_SIZE {
+            return Err(IggyError::InvalidMessagePayloadLength);
+        }
         let header_view = IggyMessageHeaderView::new(&buffer[IGGY_MESSAGE_HEADER_RANGE]);
         let payload_len = header_view.payload_length();
+        let user_headers_len = header_view.user_headers_length();
+        let total_size = IGGY_MESSAGE_HEADER_SIZE
+            .checked_add(payload_len)
+            .and_then(|s| s.checked_add(user_headers_len))
+            .ok_or(IggyError::InvalidMessagePayloadLength)?;
+        if buffer.len() < total_size {
+            return Err(IggyError::InvalidMessagePayloadLength);
+        }
         let payload_offset = IGGY_MESSAGE_HEADER_SIZE;
-        let headers_offset = payload_offset + payload_len;
+        let headers_offset = payload_offset
+            .checked_add(payload_len)
+            .ok_or(IggyError::InvalidMessagePayloadLength)?;
 
-        Self {
+        Ok(Self {
             buffer,
             payload_offset,
             user_headers_offset: headers_offset,
-        }
+        })
     }
 
     /// Returns an immutable header view.
@@ -57,23 +74,13 @@ impl<'a> IggyMessageView<'a> {
 
     /// Returns an immutable slice of the user headers.
     pub fn user_headers(&self) -> Option<&[u8]> {
-        if self.header().user_headers_length() > 0 {
-            let header_length = self.header().user_headers_length();
-            let end_offset = self.user_headers_offset + header_length;
-
-            if end_offset <= self.buffer.len() {
-                Some(&self.buffer[self.user_headers_offset..end_offset])
-            } else {
-                tracing::error!(
-                    "Header length in message exceeds buffer bounds: length={}, buffer_remaining={}",
-                    header_length,
-                    self.buffer.len() - self.user_headers_offset
-                );
-                None
-            }
-        } else {
-            None
+        let header_length = self.header().user_headers_length();
+        if header_length == 0 {
+            return None;
         }
+        // Bounds guaranteed by new() which validates total message size
+        let end_offset = self.user_headers_offset + header_length;
+        Some(&self.buffer[self.user_headers_offset..end_offset])
     }
 
     /// Return instantiated user headers map
@@ -108,32 +115,19 @@ impl<'a> IggyMessageView<'a> {
     pub fn payload(&self) -> &[u8] {
         let header_view = self.header();
         let payload_len = header_view.payload_length();
-        &self.buffer[self.payload_offset..self.payload_offset + payload_len]
+        let end = self.payload_offset + payload_len;
+        // Bounds guaranteed by new() which validates total message size
+        &self.buffer[self.payload_offset..end]
     }
 
-    /// Validates that the message view is properly formatted and has valid data.
-    pub fn validate(&self) -> Result<(), IggyError> {
-        if self.buffer.len() < IGGY_MESSAGE_HEADER_SIZE {
-            return Err(IggyError::InvalidMessagePayloadLength);
-        }
-
-        let header = self.header();
-        let payload_len = header.payload_length();
-        let user_headers_len = header.user_headers_length();
-        let total_size = IGGY_MESSAGE_HEADER_SIZE + payload_len + user_headers_len;
-
-        if self.buffer.len() < total_size {
-            return Err(IggyError::InvalidMessagePayloadLength);
-        }
-        Ok(())
-    }
-
-    /// Validates that the message view has a valid checksum.
+    /// Calculates the checksum over the message (excluding the checksum field itself).
     /// This should be called only on server side.
     pub fn calculate_checksum(&self) -> u64 {
-        let checksum_field_size = size_of::<u64>(); // Skip checksum field for checksum calculation
+        let checksum_field_size = size_of::<u64>();
         let size = self.size() - checksum_field_size;
-        let data = &self.buffer[checksum_field_size..checksum_field_size + size];
+        let end = checksum_field_size + size;
+        // Bounds guaranteed by new() which validates total message size
+        let data = &self.buffer[checksum_field_size..end];
         checksum::calculate_checksum(data)
     }
 }
@@ -186,7 +180,7 @@ impl<'a> Iterator for IggyMessageViewIterator<'a> {
         }
 
         let remaining = &self.buffer[self.position..];
-        let view = IggyMessageView::new(remaining);
+        let view = IggyMessageView::new(remaining).ok()?;
         self.position += view.size();
         Some(view)
     }

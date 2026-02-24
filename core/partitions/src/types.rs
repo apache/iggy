@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::PollingStrategy;
+use iggy_common::{IggyByteSize, PollingStrategy};
 
 /// Arguments for polling messages from a partition.
 #[derive(Debug, Clone)]
@@ -154,5 +154,59 @@ impl PartitionOffsets {
 impl Default for PartitionOffsets {
     fn default() -> Self {
         Self::empty()
+    }
+}
+
+/// Configuration for partition operations.
+///
+/// Mirrors the relevant fields from the server's `PartitionConfig` and
+/// `SegmentConfig` (`core/server/src/configs/system.rs`).
+#[derive(Debug, Clone)]
+pub struct PartitionsConfig {
+    /// Flush journal to disk when it accumulates this many messages.
+    pub messages_required_to_save: u32,
+    /// Flush journal to disk when it accumulates this many bytes.
+    pub size_of_messages_required_to_save: IggyByteSize,
+    /// Whether to enforce fsync after writes.
+    pub enforce_fsync: bool,
+    /// Maximum size of a single segment before rotation.
+    pub segment_size: IggyByteSize,
+}
+
+impl PartitionsConfig {
+    /// Constructs the file path for segment messages.
+    ///
+    /// TODO: This is a stub waiting for completion of issue to move server config
+    /// to shared module. Real implementation should use:
+    /// `{base_path}/{streams_path}/{stream_id}/{topics_path}/{topic_id}/{partitions_path}/{partition_id}/{start_offset:0>20}.log`
+    pub fn get_messages_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> String {
+        format!(
+            "/tmp/iggy_stub/streams/{}/topics/{}/partitions/{}/{:0>20}.log",
+            stream_id, topic_id, partition_id, start_offset
+        )
+    }
+
+    /// Constructs the file path for segment indexes.
+    ///
+    /// TODO: This is a stub waiting for completion of issue to move server config
+    /// to shared module. Real implementation should use:
+    /// `{base_path}/{streams_path}/{stream_id}/{topics_path}/{topic_id}/{partitions_path}/{partition_id}/{start_offset:0>20}.index`
+    pub fn get_index_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> String {
+        format!(
+            "/tmp/iggy_stub/streams/{}/topics/{}/partitions/{}/{:0>20}.index",
+            stream_id, topic_id, partition_id, start_offset
+        )
     }
 }

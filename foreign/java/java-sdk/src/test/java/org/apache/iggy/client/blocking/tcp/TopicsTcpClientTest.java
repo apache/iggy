@@ -26,6 +26,6 @@ class TopicsTcpClientTest extends TopicsClientBaseTest {
 
     @Override
     protected IggyBaseClient getClient() {
-        return TcpClientFactory.create(iggyServer);
+        return TcpClientFactory.create(serverHost(), serverTcpPort());
     }
 }

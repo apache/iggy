@@ -217,10 +217,20 @@ impl WebSocketClient {
                     }
                 }
 
-                let server_addr = current_address.parse::<SocketAddr>().map_err(|_| {
-                    error!("Invalid server address: {}", current_address);
-                    IggyError::InvalidConfiguration
-                })?;
+                let server_addr = tokio::net::lookup_host(&*current_address)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "Failed to resolve server address '{}': {}",
+                            current_address, e
+                        );
+                        IggyError::InvalidConfiguration
+                    })?
+                    .next()
+                    .ok_or_else(|| {
+                        error!("No addresses resolved for '{}'", current_address);
+                        IggyError::InvalidConfiguration
+                    })?;
 
                 let connection_stream = if self.config.tls_enabled {
                     match self.connect_tls(server_addr, &mut retry_count).await {
@@ -714,5 +724,15 @@ mod tests {
         let connection_string = "iggy+ws://user:secret@127.0.0.1:8080?invalid_option=invalid";
         let client = WebSocketClient::from_connection_string(connection_string);
         assert!(client.is_err());
+    }
+
+    #[test]
+    fn should_succeed_from_connection_string_with_hostname() {
+        let connection_string = "iggy+ws://user:secret@localhost:8092";
+        let client = WebSocketClient::from_connection_string(connection_string);
+        assert!(client.is_ok());
+
+        let client = client.unwrap();
+        assert_eq!(client.config.server_address, "localhost:8092");
     }
 }

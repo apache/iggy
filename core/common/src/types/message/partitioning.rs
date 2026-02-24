@@ -49,12 +49,13 @@ impl Display for Partitioning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.kind {
             PartitioningKind::Balanced => write!(f, "{}|0", self.kind),
-            PartitioningKind::PartitionId => write!(
-                f,
-                "{}|{}",
-                self.kind,
-                u32::from_le_bytes(self.value[..4].try_into().unwrap())
-            ),
+            PartitioningKind::PartitionId => {
+                if let Some(bytes) = self.value.get(..4).and_then(|s| s.try_into().ok()) {
+                    write!(f, "{}|{}", self.kind, u32::from_le_bytes(bytes))
+                } else {
+                    write!(f, "{}|<invalid>", self.kind)
+                }
+            }
             PartitioningKind::MessagesKey => {
                 write!(f, "{}|{}", self.kind, String::from_utf8_lossy(&self.value))
             }
@@ -137,14 +138,21 @@ impl Partitioning {
         }
     }
 
-    /// Create the partitioning from BytesMut.
+    /// Create the partitioning from a raw byte slice.
     pub fn from_raw_bytes(bytes: &[u8]) -> Result<Self, IggyError> {
-        let kind = PartitioningKind::from_code(bytes[0])?;
-        let length = bytes[1];
-        let value = bytes[2..2 + length as usize].to_vec();
-        if value.len() != length as usize {
+        let kind = PartitioningKind::from_code(*bytes.first().ok_or(IggyError::InvalidCommand)?)?;
+        let length = *bytes.get(1).ok_or(IggyError::InvalidCommand)?;
+        if kind == PartitioningKind::PartitionId && length != 4 {
             return Err(IggyError::InvalidCommand);
         }
+        if kind == PartitioningKind::Balanced && length != 0 {
+            return Err(IggyError::InvalidCommand);
+        }
+
+        let value = bytes
+            .get(2..2 + length as usize)
+            .ok_or(IggyError::InvalidCommand)?
+            .to_vec();
 
         Ok(Partitioning {
             kind,
@@ -192,22 +200,7 @@ impl BytesSerializable for Partitioning {
     where
         Self: Sized,
     {
-        if bytes.len() < 2 {
-            return Err(IggyError::InvalidCommand);
-        }
-
-        let kind = PartitioningKind::from_code(bytes[0])?;
-        let length = bytes[1];
-        let value = bytes[2..2 + length as usize].to_vec();
-        if value.len() != length as usize {
-            return Err(IggyError::InvalidCommand);
-        }
-
-        Ok(Partitioning {
-            kind,
-            length,
-            value,
-        })
+        Self::from_raw_bytes(&bytes)
     }
 
     fn write_to_buffer(&self, bytes: &mut BytesMut) {
@@ -218,5 +211,105 @@ impl BytesSerializable for Partitioning {
 
     fn get_buffer_size(&self) -> usize {
         2 + self.length as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_raw_bytes_should_reject_partition_id_with_wrong_length() {
+        for bad_len in [0u8, 1, 2, 3, 5, 255] {
+            let mut buf = vec![PartitioningKind::PartitionId.as_code(), bad_len];
+            buf.extend(vec![0u8; bad_len as usize]);
+            assert!(
+                Partitioning::from_raw_bytes(&buf).is_err(),
+                "expected error for PartitionId with length={bad_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_raw_bytes_should_accept_valid_partition_id() {
+        let mut buf = vec![PartitioningKind::PartitionId.as_code(), 4];
+        buf.extend(42u32.to_le_bytes());
+        let p = Partitioning::from_raw_bytes(&buf).unwrap();
+        assert_eq!(p.kind, PartitioningKind::PartitionId);
+        assert_eq!(p.length, 4);
+        assert_eq!(p.value, 42u32.to_le_bytes());
+    }
+
+    #[test]
+    fn from_bytes_should_reject_partition_id_with_wrong_length() {
+        for bad_len in [0u8, 1, 2, 3, 5] {
+            let mut buf = BytesMut::new();
+            buf.put_u8(PartitioningKind::PartitionId.as_code());
+            buf.put_u8(bad_len);
+            buf.extend(vec![0u8; bad_len as usize]);
+            assert!(
+                Partitioning::from_bytes(buf.freeze()).is_err(),
+                "expected error for PartitionId with length={bad_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_raw_bytes_should_fail_on_truncated_input() {
+        let p = Partitioning::partition_id(99);
+        let full = p.to_bytes();
+        for i in 0..full.len() {
+            assert!(
+                Partitioning::from_raw_bytes(&full[..i]).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn display_should_not_panic_on_malformed_partition_id() {
+        let malformed = Partitioning {
+            kind: PartitioningKind::PartitionId,
+            length: 0,
+            value: vec![],
+        };
+        let s = format!("{malformed}");
+        assert!(s.contains("<invalid>"));
+    }
+
+    #[test]
+    fn round_trip_partition_id() {
+        let original = Partitioning::partition_id(12345);
+        let bytes = original.to_bytes();
+        let restored = Partitioning::from_bytes(bytes).unwrap();
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn from_raw_bytes_should_reject_balanced_with_nonzero_length() {
+        for bad_len in [1u8, 2, 4, 255] {
+            let mut buf = vec![PartitioningKind::Balanced.as_code(), bad_len];
+            buf.extend(vec![0u8; bad_len as usize]);
+            assert!(
+                Partitioning::from_raw_bytes(&buf).is_err(),
+                "expected error for Balanced with length={bad_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn round_trip_balanced() {
+        let original = Partitioning::balanced();
+        let bytes = original.to_bytes();
+        let restored = Partitioning::from_bytes(bytes).unwrap();
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn round_trip_messages_key() {
+        let original = Partitioning::messages_key(b"my-key").unwrap();
+        let bytes = original.to_bytes();
+        let restored = Partitioning::from_bytes(bytes).unwrap();
+        assert_eq!(original, restored);
     }
 }

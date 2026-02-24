@@ -101,18 +101,25 @@ impl BytesSerializable for ChangePassword {
 
         let user_id = Identifier::from_bytes(bytes.clone())?;
         let mut position = user_id.get_size_bytes().as_bytes_usize();
-        let current_password_length = bytes[position];
+        let current_password_length = *bytes.get(position).ok_or(IggyError::InvalidCommand)?;
         position += 1;
-        let current_password =
-            from_utf8(&bytes[position..position + current_password_length as usize])
-                .map_err(|_| IggyError::InvalidUtf8)?
-                .to_string();
+        let current_password = from_utf8(
+            bytes
+                .get(position..position + current_password_length as usize)
+                .ok_or(IggyError::InvalidCommand)?,
+        )
+        .map_err(|_| IggyError::InvalidUtf8)?
+        .to_string();
         position += current_password_length as usize;
-        let new_password_length = bytes[position];
+        let new_password_length = *bytes.get(position).ok_or(IggyError::InvalidCommand)?;
         position += 1;
-        let new_password = from_utf8(&bytes[position..position + new_password_length as usize])
-            .map_err(|_| IggyError::InvalidUtf8)?
-            .to_string();
+        let new_password = from_utf8(
+            bytes
+                .get(position..position + new_password_length as usize)
+                .ok_or(IggyError::InvalidCommand)?,
+        )
+        .map_err(|_| IggyError::InvalidUtf8)?
+        .to_string();
 
         let command = ChangePassword {
             user_id,
@@ -158,6 +165,24 @@ mod tests {
         assert_eq!(user_id, command.user_id);
         assert_eq!(current_password, command.current_password);
         assert_eq!(new_password, command.new_password);
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_empty_input() {
+        assert!(ChangePassword::from_bytes(Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_truncated_input() {
+        let command = ChangePassword::default();
+        let bytes = command.to_bytes();
+        for i in 0..bytes.len() - 1 {
+            let truncated = bytes.slice(..i);
+            assert!(
+                ChangePassword::from_bytes(truncated).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
     }
 
     #[test]

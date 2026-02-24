@@ -75,19 +75,28 @@ impl BytesSerializable for UpdatePermissions {
 
         let user_id = Identifier::from_bytes(bytes.clone())?;
         let mut position = user_id.get_size_bytes().as_bytes_usize();
-        let has_permissions = bytes[position];
+        let has_permissions = *bytes.get(position).ok_or(IggyError::InvalidCommand)?;
         if has_permissions > 1 {
             return Err(IggyError::InvalidCommand);
         }
 
         position += 1;
         let permissions = if has_permissions == 1 {
-            let permissions_length =
-                u32::from_le_bytes(bytes[position..position + 4].try_into().unwrap());
+            let permissions_length = u32::from_le_bytes(
+                bytes
+                    .get(position..position + 4)
+                    .ok_or(IggyError::InvalidCommand)?
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
+            );
             position += 4;
-            let permissions = Permissions::from_bytes(
-                bytes.slice(position..position + permissions_length as usize),
-            )?;
+            let end = position
+                .checked_add(permissions_length as usize)
+                .ok_or(IggyError::InvalidCommand)?;
+            if end > bytes.len() {
+                return Err(IggyError::InvalidCommand);
+            }
+            let permissions = Permissions::from_bytes(bytes.slice(position..end))?;
             Some(permissions)
         } else {
             None

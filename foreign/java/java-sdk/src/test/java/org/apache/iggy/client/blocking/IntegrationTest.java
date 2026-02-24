@@ -19,19 +19,11 @@
 
 package org.apache.iggy.client.blocking;
 
-import com.github.dockerjava.api.model.Capability;
-import com.github.dockerjava.api.model.Ulimit;
+import org.apache.iggy.client.BaseIntegrationTest;
 import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.topic.CompressionAlgorithm;
-import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.utility.DockerImageName;
 
 import java.math.BigInteger;
 import java.util.ArrayList;
@@ -41,56 +33,12 @@ import static java.util.Optional.empty;
 import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.apache.iggy.TestConstants.TOPIC_NAME;
 
-@Testcontainers
-public abstract class IntegrationTest {
-
-    public static final String LOCALHOST_IP = "127.0.0.1";
-    public static final int HTTP_PORT = 3000;
-    public static final int TCP_PORT = 8090;
-    protected static GenericContainer<?> iggyServer;
-    private static final Logger log = LoggerFactory.getLogger(IntegrationTest.class);
-    private static final boolean USE_EXTERNAL_SERVER = System.getenv("USE_EXTERNAL_SERVER") != null;
+public abstract class IntegrationTest extends BaseIntegrationTest {
 
     // Track created resources for cleanup
     protected List<Long> createdStreamIds = new ArrayList<>();
     protected List<Long> createdUserIds = new ArrayList<>();
     protected IggyBaseClient client;
-
-    public static int tcpPort() {
-        return USE_EXTERNAL_SERVER ? TCP_PORT : iggyServer.getMappedPort(TCP_PORT);
-    }
-
-    @BeforeAll
-    static void setupContainer() {
-        if (!USE_EXTERNAL_SERVER) {
-            log.info("Starting Iggy Server Container...");
-            iggyServer = new GenericContainer<>(DockerImageName.parse("apache/iggy:edge"))
-                    .withExposedPorts(HTTP_PORT, TCP_PORT)
-                    .withEnv("IGGY_ROOT_USERNAME", "iggy")
-                    .withEnv("IGGY_ROOT_PASSWORD", "iggy")
-                    .withEnv("IGGY_TCP_ADDRESS", "0.0.0.0:8090")
-                    .withEnv("IGGY_HTTP_ADDRESS", "0.0.0.0:3000")
-                    .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig()
-                            .withCapAdd(Capability.SYS_NICE)
-                            .withSecurityOpts(List.of("seccomp:unconfined"))
-                            .withUlimits(List.of(new Ulimit("memlock", -1L, -1L))))
-                    .withLogConsumer(frame -> System.out.print(frame.getUtf8String()));
-            iggyServer.start();
-        } else {
-            log.info("Using external Iggy Server");
-        }
-    }
-
-    @AfterAll
-    static void stopContainer() {
-        if (iggyServer != null && iggyServer.isRunning()) {
-            // Print last logs before stopping
-            System.out.println("=== Iggy Server Container Logs ===");
-            System.out.println(iggyServer.getLogs());
-            System.out.println("=================================");
-            iggyServer.stop();
-        }
-    }
 
     @BeforeEach
     void beforeEachIntegrationTest() {

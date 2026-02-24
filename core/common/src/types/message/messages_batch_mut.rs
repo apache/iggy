@@ -199,7 +199,7 @@ impl IggyMessagesBatchMut {
         if self.is_empty() {
             return None;
         }
-        Some(IggyMessageView::new(&self.messages).header().offset())
+        Some(IggyMessageView::new(&self.messages).ok()?.header().offset())
     }
 
     /// Returns the first timestamp in the batch
@@ -207,7 +207,12 @@ impl IggyMessagesBatchMut {
         if self.is_empty() {
             return None;
         }
-        Some(IggyMessageView::new(&self.messages).header().timestamp())
+        Some(
+            IggyMessageView::new(&self.messages)
+                .ok()?
+                .header()
+                .timestamp(),
+        )
     }
 
     /// Returns the last timestamp in the batch
@@ -217,11 +222,13 @@ impl IggyMessagesBatchMut {
         }
 
         let last_index = self.count() as usize - 1;
-        self.get_message_boundaries(last_index).map(|(start, _)| {
-            IggyMessageView::new(&self.messages[start..])
+        let (start, end) = self.get_message_boundaries(last_index)?;
+        Some(
+            IggyMessageView::new(&self.messages[start..end])
+                .ok()?
                 .header()
-                .timestamp()
-        })
+                .timestamp(),
+        )
     }
 
     /// Returns the last offset in the batch
@@ -230,11 +237,13 @@ impl IggyMessagesBatchMut {
             return None;
         }
         let last_index = self.count() as usize - 1;
-        self.get_message_boundaries(last_index).map(|(start, _)| {
-            IggyMessageView::new(&self.messages[start..])
+        let (start, end) = self.get_message_boundaries(last_index)?;
+        Some(
+            IggyMessageView::new(&self.messages[start..end])
+                .ok()?
                 .header()
-                .offset()
-        })
+                .offset(),
+        )
     }
 
     /// Checks if the batch is empty.
@@ -472,8 +481,8 @@ impl IggyMessagesBatchMut {
     /// Get the message at the specified index.
     /// Returns None if the index is out of bounds or the message cannot be found.
     pub fn get(&self, index: usize) -> Option<IggyMessageView<'_>> {
-        self.get_message_boundaries(index)
-            .map(|(start, end)| IggyMessageView::new(&self.messages[start..end]))
+        let (start, end) = self.get_message_boundaries(index)?;
+        IggyMessageView::new(&self.messages[start..end]).ok()
     }
 
     /// This helper function is used to parse newly appended chunks in the `new_buffer`.
@@ -494,7 +503,10 @@ impl IggyMessagesBatchMut {
         let mut current = chunk_start;
 
         while current < chunk_end {
-            let view = IggyMessageView::new(&new_buffer[current..]);
+            let Ok(view) = IggyMessageView::new(&new_buffer[current..]) else {
+                error!("Corrupt message in already-validated chunk at offset {current}");
+                break;
+            };
             let msg_size = view.size();
             *offset_in_new_buffer += msg_size as u32;
             new_indexes.insert(0, *offset_in_new_buffer, 0);

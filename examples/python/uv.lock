@@ -1,0 +1,91 @@
+version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "apache-iggy"
+version = "0.7.0"
+source = { directory = "../../foreign/python" }
+
+[package.metadata]
+requires-dist = [
+    { name = "black", marker = "extra == 'all'", specifier = ">=23.0,<25.0" },
+    { name = "black", marker = "extra == 'dev'", specifier = ">=23.0,<25.0" },
+    { name = "isort", marker = "extra == 'all'", specifier = ">=5.12.0,<6.0" },
+    { name = "isort", marker = "extra == 'dev'", specifier = ">=5.12.0,<6.0" },
+    { name = "loguru", marker = "extra == 'all'", specifier = ">=0.7.0,<1.0" },
+    { name = "maturin", marker = "extra == 'all'", specifier = ">=1.2,<2.0" },
+    { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.2,<2.0" },
+    { name = "mypy", marker = "extra == 'all'", specifier = ">=1.5.0,<2.0" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.5.0,<2.0" },
+    { name = "pytest", marker = "extra == 'all'", specifier = ">=7.0,<9.0" },
+    { name = "pytest", marker = "extra == 'testing'", specifier = ">=7.0,<9.0" },
+    { name = "pytest-asyncio", marker = "extra == 'all'", specifier = ">=0.21.0,<1.0" },
+    { name = "pytest-asyncio", marker = "extra == 'testing'", specifier = ">=0.21.0,<1.0" },
+    { name = "pytest-timeout", marker = "extra == 'all'", specifier = ">=2.0,<3.0" },
+    { name = "pytest-timeout", marker = "extra == 'testing'", specifier = ">=2.0,<3.0" },
+    { name = "pytest-xdist", marker = "extra == 'all'", specifier = ">=3.0,<4.0" },
+    { name = "pytest-xdist", marker = "extra == 'testing'", specifier = ">=3.0,<4.0" },
+    { name = "ruff", marker = "extra == 'all'", specifier = ">=0.1.0,<1.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0,<1.0" },
+    { name = "testcontainers", extras = ["docker"], marker = "extra == 'all'", specifier = ">=3.7.0,<5.0" },
+    { name = "testcontainers", extras = ["docker"], marker = "extra == 'testing-docker'", specifier = ">=3.7.0,<5.0" },
+]
+provides-extras = ["testing", "testing-docker", "dev", "all"]
+
+[[package]]
+name = "argparse"
+version = "1.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/18/dd/e617cfc3f6210ae183374cd9f6a26b20514bbb5a792af97949c5aacddf0f/argparse-1.4.0.tar.gz", hash = "sha256:62b089a55be1d8949cd2bc7e0df0bddb9e028faefc8c32038cc84862aefdd6e4", size = 70508, upload-time = "2015-09-12T20:22:16.217Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f2/94/3af39d34be01a24a6e65433d19e107099374224905f1e0cc6bbe1fd22a2f/argparse-1.4.0-py2.py3-none-any.whl", hash = "sha256:c31647edb69fd3d465a847ea3157d37bed1f95f19760b11a47aa91c04b666314", size = 23000, upload-time = "2015-09-14T16:03:16.137Z" },
+]
+
+[[package]]
+name = "colorama"
+version = "0.4.6"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d8/53/6f443c9a4a8358a93a6792e2acffb9d9d5cb0a5cfd8802644b7b1c9a02e4/colorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44", size = 27697, upload-time = "2022-10-25T02:36:22.414Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335, upload-time = "2022-10-25T02:36:20.889Z" },
+]
+
+[[package]]
+name = "loguru"
+version = "0.7.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "win32-setctime", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3a/05/a1dae3dffd1116099471c643b8924f5aa6524411dc6c63fdae648c4f1aca/loguru-0.7.3.tar.gz", hash = "sha256:19480589e77d47b8d85b2c827ad95d49bf31b0dcde16593892eb51dd18706eb6", size = 63559, upload-time = "2024-12-06T11:20:56.608Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0c/29/0348de65b8cc732daa3e33e67806420b2ae89bdce2b04af740289c5c6c8c/loguru-0.7.3-py3-none-any.whl", hash = "sha256:31a33c10c8e1e10422bfd431aeb5d351c7cf7fa671e3c4df004162264b28220c", size = 61595, upload-time = "2024-12-06T11:20:54.538Z" },
+]
+
+[[package]]
+name = "python-examples"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "apache-iggy" },
+    { name = "argparse" },
+    { name = "loguru" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "apache-iggy", directory = "../../foreign/python" },
+    { name = "argparse", specifier = "==1.4.0" },
+    { name = "loguru", specifier = "==0.7.3" },
+]
+
+[[package]]
+name = "win32-setctime"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b3/8f/705086c9d734d3b663af0e9bb3d4de6578d08f46b1b101c2442fd9aecaa2/win32_setctime-1.2.0.tar.gz", hash = "sha256:ae1fdf948f5640aae05c511ade119313fb6a30d7eabe25fef9764dca5873c4c0", size = 4867, upload-time = "2024-12-07T15:28:28.314Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e1/07/c6fe3ad3e685340704d314d765b7912993bcb8dc198f0e7a89382d37974b/win32_setctime-1.2.0-py3-none-any.whl", hash = "sha256:95d644c4e708aba81dc3704a116d8cbc974d70b3bdb8be1d150e36be6e9d1390", size = 4083, upload-time = "2024-12-07T15:28:26.465Z" },
+]

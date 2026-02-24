@@ -87,6 +87,12 @@ impl QuicClientConfigBuilder {
         self
     }
 
+    /// Sets the cooldown before reconnecting after a previously successful connection.
+    pub fn with_reestablish_after(mut self, reestablish_after: IggyDuration) -> Self {
+        self.config.reconnection.reestablish_after = reestablish_after;
+        self
+    }
+
     /// Sets the response buffer size in bytes. Defaults to 10MB (10,000,000 bytes).
     pub fn with_response_buffer_size(mut self, response_buffer_size: u64) -> Self {
         self.config.response_buffer_size = response_buffer_size;

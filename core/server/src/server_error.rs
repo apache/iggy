@@ -17,7 +17,7 @@
  * under the License.
  */
 
-use compio_quic::{ConnectionError as QuicConnectionError, ReadError, WriteError};
+use compio::quic::{ConnectionError as QuicConnectionError, ReadError, WriteError};
 use error_set::error_set;
 use std::array::TryFromSliceError;
 use std::io;

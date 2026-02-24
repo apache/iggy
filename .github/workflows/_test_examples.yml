@@ -59,14 +59,18 @@ jobs:
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
-      - name: Cache pip
+      - name: Setup uv
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
+        uses: astral-sh/setup-uv@v7
+
+      - name: Cache uv
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('foreign/python/pyproject.toml') }}
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('examples/python/uv.lock', 'foreign/python/uv.lock', 'bdd/python/uv.lock') }}
 
       - name: Setup Java with cache for examples
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-java'

@@ -27,7 +27,6 @@ use super::{
 use crate::streaming::{deduplication::MessageDeduplicator, stats::PartitionStats};
 use iggy_common::IggyTimestamp;
 use std::sync::{Arc, atomic::AtomicU64};
-use tokio::sync::Mutex as TokioMutex;
 
 /// Per-shard partition data - mutable, single-threaded access.
 #[derive(Debug)]
@@ -41,7 +40,6 @@ pub struct LocalPartition {
     pub created_at: IggyTimestamp,
     pub revision_id: u64,
     pub should_increment_offset: bool,
-    pub write_lock: Arc<TokioMutex<()>>,
 }
 
 impl LocalPartition {
@@ -67,7 +65,6 @@ impl LocalPartition {
             created_at,
             revision_id,
             should_increment_offset,
-            write_lock: Arc::new(TokioMutex::new(())),
         }
     }
 
@@ -94,7 +91,6 @@ impl LocalPartition {
             created_at,
             revision_id,
             should_increment_offset,
-            write_lock: Arc::new(TokioMutex::new(())),
         }
     }
 }

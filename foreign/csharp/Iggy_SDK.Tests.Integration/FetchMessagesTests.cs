@@ -15,37 +15,65 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
+using System.Text;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
+using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
-using Apache.Iggy.Tests.Integrations.Attributes;
+using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
+using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations;
 
 public class FetchMessagesTests
 {
-    [ClassDataSource<FetchMessagesFixture>(Shared = SharedType.PerClass)]
-    public required FetchMessagesFixture Fixture { get; init; }
+    private const int MessageCount = 20;
+    private const string TopicName = "topic";
+    private const string HeadersTopicName = "headers-topic";
 
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture Fixture { get; init; }
+
+    private async Task<(IIggyClient client, string streamName)> CreateStreamWithMessages(Protocol protocol)
+    {
+        var client = await Fixture.CreateAuthenticatedClient(protocol);
+
+        var streamName = $"fetch-msg-{Guid.NewGuid():N}";
+
+        await client.CreateStreamAsync(streamName);
+        await client.CreateTopicAsync(Identifier.String(streamName), TopicName, 1);
+        await client.CreateTopicAsync(Identifier.String(streamName), HeadersTopicName, 1);
+
+        await client.SendMessagesAsync(Identifier.String(streamName),
+            Identifier.String(TopicName), Partitioning.None(),
+            CreateMessagesWithoutHeader(MessageCount));
+
+        await client.SendMessagesAsync(Identifier.String(streamName),
+            Identifier.String(HeadersTopicName), Partitioning.None(),
+            CreateMessagesWithHeader(MessageCount));
+
+        return (client, streamName);
+    }
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task PollMessages_WithNoHeaders_Should_PollMessages_Successfully(Protocol protocol)
     {
-        var response = await Fixture.Clients[protocol].PollMessagesAsync(new MessageFetchRequest
+        var (client, streamName) = await CreateStreamWithMessages(protocol);
+
+        var response = await client.PollMessagesAsync(new MessageFetchRequest
         {
             Count = 10,
             AutoCommit = true,
             Consumer = Consumer.New(1),
             PartitionId = 0,
             PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            TopicId = Identifier.String(Fixture.TopicRequest.Name)
+            StreamId = Identifier.String(streamName),
+            TopicId = Identifier.String(TopicName)
         });
 
         response.Messages.Count.ShouldBe(10);
@@ -61,10 +89,11 @@ public class FetchMessagesTests
     }
 
     [Test]
-    [DependsOn(nameof(PollMessages_WithNoHeaders_Should_PollMessages_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task PollMessages_InvalidTopic_Should_Throw_InvalidResponse(Protocol protocol)
     {
+        var (client, streamName) = await CreateStreamWithMessages(protocol);
+
         var invalidFetchRequest = new MessageFetchRequest
         {
             Count = 10,
@@ -72,19 +101,20 @@ public class FetchMessagesTests
             Consumer = Consumer.New(1),
             PartitionId = 0,
             PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            StreamId = Identifier.String(streamName),
             TopicId = Identifier.Numeric(2137)
         };
 
         await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
-            Fixture.Clients[protocol].PollMessagesAsync(invalidFetchRequest));
+            client.PollMessagesAsync(invalidFetchRequest));
     }
 
     [Test]
-    [DependsOn(nameof(PollMessages_InvalidTopic_Should_Throw_InvalidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task PollMessages_WithHeaders_Should_PollMessages_Successfully(Protocol protocol)
     {
+        var (client, streamName) = await CreateStreamWithMessages(protocol);
+
         var headersMessageFetchRequest = new MessageFetchRequest
         {
             Count = 10,
@@ -92,12 +122,11 @@ public class FetchMessagesTests
             Consumer = Consumer.New(1),
             PartitionId = 0,
             PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            TopicId = Identifier.String(Fixture.TopicHeadersRequest.Name)
+            StreamId = Identifier.String(streamName),
+            TopicId = Identifier.String(HeadersTopicName)
         };
 
-
-        var response = await Fixture.Clients[protocol].PollMessagesAsync(headersMessageFetchRequest);
+        var response = await client.PollMessagesAsync(headersMessageFetchRequest);
         response.Messages.Count.ShouldBe(10);
         response.PartitionId.ShouldBe(0);
         response.CurrentOffset.ShouldBe(19u);
@@ -108,5 +137,48 @@ public class FetchMessagesTests
             responseMessage.UserHeaders[HeaderKey.FromString("header1")].ToString().ShouldBe("value1");
             responseMessage.UserHeaders[HeaderKey.FromString("header2")].ToInt32().ShouldBeGreaterThan(0);
         }
+    }
+
+    private static Message[] CreateMessagesWithoutHeader(int count)
+    {
+        var messages = new List<Message>();
+        for (var i = 0; i < count; i++)
+        {
+            var dummyJson = $$"""
+                              {
+                                "userId": {{i + 1}},
+                                "id": {{i + 1}},
+                                "title": "delete",
+                                "completed": false
+                              }
+                              """;
+            messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson)));
+        }
+
+        return messages.ToArray();
+    }
+
+    private static Message[] CreateMessagesWithHeader(int count)
+    {
+        var messages = new List<Message>();
+        for (var i = 0; i < count; i++)
+        {
+            var dummyJson = $$"""
+                              {
+                                "userId": {{i + 1}},
+                                "id": {{i + 1}},
+                                "title": "delete",
+                                "completed": false
+                              }
+                              """;
+            messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson),
+                new Dictionary<HeaderKey, HeaderValue>
+                {
+                    { HeaderKey.FromString("header1"), HeaderValue.FromString("value1") },
+                    { HeaderKey.FromString("header2"), HeaderValue.FromInt32(14 + i) }
+                }));
+        }
+
+        return messages.ToArray();
     }
 }

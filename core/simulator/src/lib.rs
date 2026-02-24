@@ -21,20 +21,26 @@ pub mod deps;
 pub mod replica;
 
 use bus::MemBus;
+use consensus::{Plane, PlaneIdentity};
 use iggy_common::header::{GenericHeader, ReplyHeader};
 use iggy_common::message::{Message, MessageBag};
 use message_bus::MessageBus;
-use metadata::Metadata;
 use replica::Replica;
 use std::sync::Arc;
 
-#[derive(Debug)]
 pub struct Simulator {
     pub replicas: Vec<Replica>,
     pub message_bus: Arc<MemBus>,
 }
 
 impl Simulator {
+    /// Initialize a partition with its own consensus group on all replicas.
+    pub fn init_partition(&mut self, namespace: iggy_common::sharding::IggyNamespace) {
+        for replica in &mut self.replicas {
+            replica.init_partition(namespace);
+        }
+    }
+
     pub fn new(replica_count: usize, clients: impl Iterator<Item = u128>) -> Self {
         let mut message_bus = MemBus::new();
         for client in clients {
@@ -109,57 +115,36 @@ impl Simulator {
     }
 
     async fn dispatch_to_replica(&self, replica: &Replica, message: Message<GenericHeader>) {
-        let message: MessageBag = message.into();
-        let operation = match &message {
-            MessageBag::Request(message) => message.header().operation,
-            MessageBag::Prepare(message) => message.header().operation,
-            MessageBag::PrepareOk(message) => message.header().operation,
-        } as u8;
-
-        if operation < 200 {
-            self.dispatch_to_metadata_on_replica(replica, message).await;
-        } else {
-            self.dispatch_to_partition_on_replica(replica, message);
-        }
-    }
-
-    async fn dispatch_to_metadata_on_replica(&self, replica: &Replica, message: MessageBag) {
-        match message {
+        let planes = replica.plane.inner();
+        match MessageBag::from(message) {
             MessageBag::Request(request) => {
-                replica.metadata.on_request(request).await;
+                if planes.0.is_applicable(&request) {
+                    planes.0.on_request(request).await;
+                } else {
+                    planes.1.0.on_request(request).await;
+                }
             }
             MessageBag::Prepare(prepare) => {
-                replica.metadata.on_replicate(prepare).await;
+                if planes.0.is_applicable(&prepare) {
+                    planes.0.on_replicate(prepare).await;
+                } else {
+                    planes.1.0.on_replicate(prepare).await;
+                }
             }
             MessageBag::PrepareOk(prepare_ok) => {
-                replica.metadata.on_ack(prepare_ok).await;
-            }
-        }
-    }
-
-    fn dispatch_to_partition_on_replica(&self, replica: &Replica, message: MessageBag) {
-        match message {
-            MessageBag::Request(request) => {
-                todo!(
-                    "dispatch request to partition replica {}: operation={:?}",
-                    replica.id,
-                    request.header().operation
-                );
-            }
-            MessageBag::Prepare(prepare) => {
-                todo!(
-                    "dispatch prepare to partition replica {}: operation={:?}",
-                    replica.id,
-                    prepare.header().operation
-                );
-            }
-            MessageBag::PrepareOk(prepare_ok) => {
-                todo!(
-                    "dispatch prepare_ok to partition replica {}: op={}",
-                    replica.id,
-                    prepare_ok.header().op
-                );
+                if planes.0.is_applicable(&prepare_ok) {
+                    planes.0.on_ack(prepare_ok).await;
+                } else {
+                    planes.1.0.on_ack(prepare_ok).await;
+                }
             }
         }
     }
 }
+
+// TODO(IGGY-66): Add acceptance test for per-partition consensus independence.
+// Setup: 3-replica simulator, two partitions (ns_a, ns_b).
+// 1. Fill ns_a's pipeline to PIPELINE_PREPARE_QUEUE_MAX without delivering acks.
+// 2. Send a request to ns_b, step until ns_b reply arrives.
+// 3. Assert ns_b committed while ns_a pipeline is still full.
+// Requires namespace-aware stepping (filter bus by namespace) or two-phase delivery.

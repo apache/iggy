@@ -166,11 +166,8 @@ impl IggyMessagesBatch {
     /// Get the message at the specified index.
     /// Returns None if the index is out of bounds.
     pub fn get(&self, index: usize) -> Option<IggyMessageView<'_>> {
-        if let Some((start, end)) = self.get_message_boundaries(index) {
-            Some(IggyMessageView::new(&self.messages[start..end]))
-        } else {
-            None
-        }
+        let (start, end) = self.get_message_boundaries(index)?;
+        IggyMessageView::new(&self.messages[start..end]).ok()
     }
 }
 

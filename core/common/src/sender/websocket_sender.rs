@@ -22,8 +22,8 @@ use crate::alloc::buffer::PooledBuffer;
 use bytes::{BufMut, BytesMut};
 use compio::buf::IoBufMut;
 use compio::net::TcpStream;
-use compio_ws::WebSocketStream;
-use compio_ws::tungstenite::{Error as TungsteniteError, Message};
+use compio::ws::WebSocketStream;
+use compio::ws::tungstenite::{Error as TungsteniteError, Message};
 use std::ptr;
 use tracing::{debug, warn};
 
@@ -107,8 +107,12 @@ impl Sender for WebSocketSender {
         let data_to_copy = self.read_buffer.split_to(required_len);
 
         unsafe {
-            ptr::copy_nonoverlapping(data_to_copy.as_ptr(), buffer.as_buf_mut_ptr(), required_len);
-            buffer.set_buf_init(required_len);
+            ptr::copy_nonoverlapping(
+                data_to_copy.as_ptr(),
+                buffer.buf_mut_ptr().cast::<u8>(),
+                required_len,
+            );
+            buffer.set_len(required_len);
         }
 
         (Ok(()), buffer)

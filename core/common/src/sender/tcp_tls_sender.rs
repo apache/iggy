@@ -21,7 +21,7 @@ use crate::IggyError;
 use compio::buf::IoBufMut;
 use compio::io::AsyncWrite;
 use compio::net::TcpStream;
-use compio_tls::TlsStream;
+use compio::tls::TlsStream;
 use err_trail::ErrContext;
 
 const COMPONENT: &str = "TCP";

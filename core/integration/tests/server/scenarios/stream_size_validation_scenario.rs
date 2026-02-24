@@ -84,6 +84,23 @@ pub async fn run(harness: &TestHarness) {
     validate_topic(&client, S2_NAME, T1_NAME, MSGS_SIZE * 2, MSGS_COUNT * 2).await;
     validate_topic(&client, S2_NAME, T2_NAME, MSGS_SIZE * 2, MSGS_COUNT * 2).await;
 
+    // 13a. System stats must aggregate all streams: 2 streams × 2 topics × MSGS_COUNT*2.
+    validate_system_stats(&client, MSGS_SIZE * 8, MSGS_COUNT * 8).await;
+
+    // 13b. Purge T1 from S1 while T2 still has messages — S1's system-level stats
+    // must reflect only T2, not be blindly zeroed.
+    //
+    // Regression: zero_out_all() propagated store(0) up to StreamStats, zeroing the
+    // entire stream counter instead of subtracting only the purged topic's contribution.
+    // get_stats() reads StreamStats atomics directly, so it reports 0 for the stream
+    // while the sibling topic still has MSGS_COUNT*2 messages.
+    purge_topic(&client, S1_NAME, T1_NAME).await;
+    validate_topic(&client, S1_NAME, T1_NAME, 0, 0).await;
+    validate_topic(&client, S1_NAME, T2_NAME, MSGS_SIZE * 2, MSGS_COUNT * 2).await;
+    validate_stream(&client, S1_NAME, MSGS_SIZE * 2, MSGS_COUNT * 2).await;
+    // S1 lost MSGS_COUNT*2 from the purge; S2 is unchanged.
+    validate_system_stats(&client, MSGS_SIZE * 6, MSGS_COUNT * 6).await;
+
     // 14. Delete first topic on the first stream
     delete_topic(&client, S1_NAME, T1_NAME).await;
 
@@ -200,6 +217,23 @@ async fn validate_operations_on_topic_twice(
         MSGS_COUNT * 2,
     )
     .await;
+}
+
+async fn validate_system_stats(
+    client: &IggyClient,
+    expected_size: u64,
+    expected_messages_count: u64,
+) {
+    let stats = client.get_stats().await.unwrap();
+    assert_eq!(
+        stats.messages_count, expected_messages_count,
+        "system stats messages_count mismatch"
+    );
+    assert_eq!(
+        stats.messages_size_bytes.as_bytes_u64(),
+        expected_size,
+        "system stats messages_size_bytes mismatch"
+    );
 }
 
 async fn validate_stream(

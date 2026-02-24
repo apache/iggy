@@ -20,62 +20,79 @@ use crate::shard::{
     transmission::{
         connector::ShardConnector,
         event::ShardEvent,
-        frame::ShardFrame,
-        message::{ShardMessage, ShardSendRequestResult},
+        frame::{ShardFrame, ShardResponse},
+        message::{ShardMessage, ShardRequest},
     },
 };
 use futures::future::join_all;
 use hash32::{Hasher, Murmur3Hasher};
-use iggy_common::IggyError;
 use iggy_common::sharding::{IggyNamespace, PartitionLocation};
+use iggy_common::{Identifier, IggyError};
 use std::hash::Hasher as _;
 use tracing::{error, info, warn};
 
 impl IggyShard {
-    pub async fn send_request_to_shard_or_recoil(
+    /// Sends a control-plane request to shard 0's message pump.
+    pub async fn send_to_control_plane(
         &self,
-        namespace: Option<&IggyNamespace>,
-        message: ShardMessage,
-    ) -> Result<ShardSendRequestResult, IggyError> {
-        if let Some(ns) = namespace {
-            if let Some(shard) = self.find_shard(ns) {
-                if shard.id == self.id {
-                    return Ok(ShardSendRequestResult::Recoil(message));
-                }
+        request: ShardRequest,
+    ) -> Result<ShardResponse, IggyError> {
+        let shard0 = &self.shards[0];
+        shard0
+            .send_request(ShardMessage::Request(request))
+            .await
+            .map_err(|err| {
+                error!(
+                    "{COMPONENT} - failed to send control-plane request to shard 0, error: {err}"
+                );
+                err
+            })
+    }
 
-                let response = match shard.send_request(message).await {
-                    Ok(response) => response,
-                    Err(err) => {
-                        error!(
-                            "{COMPONENT} - failed to send request to shard with ID: {}, error: {err}",
-                            shard.id
-                        );
-                        return Err(err);
-                    }
-                };
-                Ok(ShardSendRequestResult::Response(response))
-            } else {
-                Err(IggyError::ShardNotFound(
-                    ns.stream_id(),
-                    ns.topic_id(),
-                    ns.partition_id(),
-                ))
-            }
-        } else {
-            if self.id == 0 {
-                return Ok(ShardSendRequestResult::Recoil(message));
-            }
+    /// Sends a data-plane request to the shard owning the partition.
+    pub async fn send_to_data_plane(
+        &self,
+        request: ShardRequest,
+    ) -> Result<ShardResponse, IggyError> {
+        let ns = request
+            .routing
+            .as_ref()
+            .expect("data-plane request requires namespace");
+        let shard = self
+            .find_shard(ns)
+            .ok_or_else(|| self.namespace_not_found_error(ns))?;
+        shard
+            .send_request(ShardMessage::Request(request))
+            .await
+            .map_err(|err| {
+                error!(
+                    "{COMPONENT} - failed to send data-plane request to shard {}, error: {err}",
+                    shard.id
+                );
+                err
+            })
+    }
 
-            let shard0 = &self.shards[0];
-            let response = match shard0.send_request(message).await {
-                Ok(response) => response,
-                Err(err) => {
-                    error!("{COMPONENT} - failed to send admin request to shard0, error: {err}");
-                    return Err(err);
-                }
-            };
-            Ok(ShardSendRequestResult::Response(response))
+    /// Converts a missing namespace in shards_table to the appropriate entity-not-found error.
+    fn namespace_not_found_error(&self, ns: &IggyNamespace) -> IggyError {
+        let stream_id =
+            Identifier::numeric(ns.stream_id() as u32).expect("numeric identifier is always valid");
+        let topic_id =
+            Identifier::numeric(ns.topic_id() as u32).expect("numeric identifier is always valid");
+
+        if self.metadata.get_stream_id(&stream_id).is_none() {
+            return IggyError::StreamIdNotFound(stream_id);
         }
+
+        if self
+            .metadata
+            .get_topic_id(ns.stream_id(), &topic_id)
+            .is_none()
+        {
+            return IggyError::TopicIdNotFound(stream_id, topic_id);
+        }
+
+        IggyError::PartitionNotFound(ns.partition_id(), topic_id, stream_id)
     }
 
     pub async fn broadcast_event_to_all_shards(&self, event: ShardEvent) -> Result<(), IggyError> {

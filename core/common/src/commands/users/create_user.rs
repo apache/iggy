@@ -110,28 +110,30 @@ impl BytesSerializable for CreateUser {
             return Err(IggyError::InvalidCommand);
         }
 
-        let username_length = bytes[0];
-        let username = from_utf8(&bytes[1..1 + username_length as usize])
-            .map_err(|_| IggyError::InvalidUtf8)?
-            .to_string();
-        if username.len() != username_length as usize {
-            return Err(IggyError::InvalidCommand);
-        }
+        let username_length = *bytes.first().ok_or(IggyError::InvalidCommand)? as usize;
+        let username = from_utf8(
+            bytes
+                .get(1..1 + username_length)
+                .ok_or(IggyError::InvalidCommand)?,
+        )
+        .map_err(|_| IggyError::InvalidUtf8)?
+        .to_string();
 
-        let mut position = 1 + username_length as usize;
-        let password_length = bytes[position];
+        let mut position = 1 + username_length;
+        let password_length = *bytes.get(position).ok_or(IggyError::InvalidCommand)? as usize;
         position += 1;
-        let password = from_utf8(&bytes[position..position + password_length as usize])
-            .map_err(|_| IggyError::InvalidUtf8)?
-            .to_string();
-        if password.len() != password_length as usize {
-            return Err(IggyError::InvalidCommand);
-        }
+        let password = from_utf8(
+            bytes
+                .get(position..position + password_length)
+                .ok_or(IggyError::InvalidCommand)?,
+        )
+        .map_err(|_| IggyError::InvalidUtf8)?
+        .to_string();
 
-        position += password_length as usize;
-        let status = UserStatus::from_code(bytes[position])?;
+        position += password_length;
+        let status = UserStatus::from_code(*bytes.get(position).ok_or(IggyError::InvalidCommand)?)?;
         position += 1;
-        let has_permissions = bytes[position];
+        let has_permissions = *bytes.get(position).ok_or(IggyError::InvalidCommand)?;
         if has_permissions > 1 {
             return Err(IggyError::InvalidCommand);
         }
@@ -139,14 +141,20 @@ impl BytesSerializable for CreateUser {
         position += 1;
         let permissions = if has_permissions == 1 {
             let permissions_length = u32::from_le_bytes(
-                bytes[position..position + 4]
+                bytes
+                    .get(position..position + 4)
+                    .ok_or(IggyError::InvalidCommand)?
                     .try_into()
                     .map_err(|_| IggyError::InvalidNumberEncoding)?,
             );
             position += 4;
-            Some(Permissions::from_bytes(
-                bytes.slice(position..position + permissions_length as usize),
-            )?)
+            let end = position
+                .checked_add(permissions_length as usize)
+                .ok_or(IggyError::InvalidCommand)?;
+            if end > bytes.len() {
+                return Err(IggyError::InvalidCommand);
+            }
+            Some(Permissions::from_bytes(bytes.slice(position..end))?)
         } else {
             None
         };
@@ -230,6 +238,32 @@ mod tests {
         assert_eq!(status, command.status);
         assert_eq!(has_permissions, 1);
         assert_eq!(permissions, command.permissions.unwrap());
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_empty_input() {
+        assert!(CreateUser::from_bytes(Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_truncated_input() {
+        let command = CreateUser::default();
+        let bytes = command.to_bytes();
+        for i in 0..bytes.len() - 1 {
+            let truncated = bytes.slice(..i);
+            assert!(
+                CreateUser::from_bytes(truncated).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_corrupted_username_length() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(255);
+        buf.put_slice(b"short");
+        assert!(CreateUser::from_bytes(buf.freeze()).is_err());
     }
 
     #[test]

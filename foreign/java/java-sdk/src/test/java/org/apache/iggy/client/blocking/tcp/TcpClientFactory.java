@@ -19,25 +19,14 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import org.testcontainers.containers.GenericContainer;
-
-import static org.apache.iggy.client.blocking.IntegrationTest.LOCALHOST_IP;
-import static org.apache.iggy.client.blocking.IntegrationTest.TCP_PORT;
+import org.apache.iggy.Iggy;
 
 final class TcpClientFactory {
 
     private TcpClientFactory() {}
 
-    static IggyTcpClient create(GenericContainer<?> iggyServer) {
-        IggyTcpClient client;
-        if (iggyServer == null) {
-            // Server is running externally
-            client = new IggyTcpClient(LOCALHOST_IP, TCP_PORT);
-        } else {
-            String address = iggyServer.getHost();
-            Integer port = iggyServer.getMappedPort(TCP_PORT);
-            client = new IggyTcpClient(address, port);
-        }
+    static IggyTcpClient create(String host, int port) {
+        var client = Iggy.tcpClientBuilder().blocking().host(host).port(port).build();
         client.connect();
         return client;
     }

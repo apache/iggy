@@ -76,13 +76,14 @@ impl BytesSerializable for DeletePersonalAccessToken {
             return Err(IggyError::InvalidCommand);
         }
 
-        let name_length = bytes[0];
-        let name = from_utf8(&bytes[1..1 + name_length as usize])
-            .map_err(|_| IggyError::InvalidUtf8)?
-            .to_string();
-        if name.len() != name_length as usize {
-            return Err(IggyError::InvalidCommand);
-        }
+        let name_length = *bytes.first().ok_or(IggyError::InvalidCommand)? as usize;
+        let name = from_utf8(
+            bytes
+                .get(1..1 + name_length)
+                .ok_or(IggyError::InvalidCommand)?,
+        )
+        .map_err(|_| IggyError::InvalidUtf8)?
+        .to_string();
 
         let command = DeletePersonalAccessToken { name };
         Ok(command)
@@ -110,6 +111,32 @@ mod tests {
         let name = from_utf8(&bytes[1..1 + name_length as usize]).unwrap();
         assert!(!bytes.is_empty());
         assert_eq!(name, command.name);
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_empty_input() {
+        assert!(DeletePersonalAccessToken::from_bytes(Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_truncated_input() {
+        let command = DeletePersonalAccessToken::default();
+        let bytes = command.to_bytes();
+        for i in 0..bytes.len() - 1 {
+            let truncated = bytes.slice(..i);
+            assert!(
+                DeletePersonalAccessToken::from_bytes(truncated).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_bytes_should_fail_on_corrupted_name_length() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(255);
+        buf.put_slice(b"short");
+        assert!(DeletePersonalAccessToken::from_bytes(buf.freeze()).is_err());
     }
 
     #[test]

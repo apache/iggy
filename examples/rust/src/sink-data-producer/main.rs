@@ -22,7 +22,7 @@ use iggy::prelude::{
     Partitioning,
 };
 use rand::{
-    Rng,
+    RngExt,
     distr::{Alphanumeric, Uniform},
 };
 use serde::{Deserialize, Serialize};

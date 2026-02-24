@@ -20,8 +20,8 @@ use super::{PooledBuffer, Sender};
 use crate::IggyError;
 use compio::BufResult;
 use compio::buf::IoBufMut;
-use compio::io::AsyncReadExt;
-use compio_quic::{ClosedStream, RecvStream, SendStream, WriteError};
+use compio::io::{AsyncReadExt, AsyncWriteExt};
+use compio::quic::{ClosedStream, RecvStream, SendStream};
 use err_trail::ErrContext;
 use tracing::{debug, error};
 
@@ -73,10 +73,9 @@ impl Sender for QuicSender {
         debug!("Sending vectored response with status: {:?}...", STATUS_OK);
 
         let headers = [STATUS_OK, length].concat();
-        self.send
-            .write_all(&headers)
-            .await
-            .error(|e: &WriteError| {
+        let BufResult(result, _) = self.send.write_all(headers).await;
+        result
+            .error(|e: &std::io::Error| {
                 format!("{COMPONENT} (error: {e}) - failed to write headers to stream")
             })
             .map_err(|_| IggyError::QuicError)?;
@@ -84,17 +83,16 @@ impl Sender for QuicSender {
         let mut total_bytes_written = 0;
 
         for slice in slices {
-            let slice_data = &*slice;
-            if !slice_data.is_empty() {
-                self.send
-                    .write_all(slice_data)
-                    .await
-                    .error(|e: &WriteError| {
+            let slice_len = slice.len();
+            if slice_len > 0 {
+                let BufResult(result, _) = self.send.write_all(slice).await;
+                result
+                    .error(|e: &std::io::Error| {
                         format!("{COMPONENT} (error: {e}) - failed to write slice to stream")
                     })
                     .map_err(|_| IggyError::QuicError)?;
 
-                total_bytes_written += slice_data.len();
+                total_bytes_written += slice_len;
             }
         }
 
@@ -123,10 +121,10 @@ impl QuicSender {
             status
         );
         let length = (payload.len() as u32).to_le_bytes();
-        self.send
-            .write_all(&[status, &length, payload].as_slice().concat())
-            .await
-            .error(|e: &WriteError| {
+        let data = [status, &length, payload].concat();
+        let BufResult(result, _) = self.send.write_all(data).await;
+        result
+            .error(|e: &std::io::Error| {
                 format!("{COMPONENT} (error: {e}) - failed to write buffer to the stream")
             })
             .map_err(|_| IggyError::QuicError)?;

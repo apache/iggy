@@ -17,6 +17,7 @@
  */
 
 mod iggy_message;
+mod in_flight;
 mod index;
 mod index_view;
 mod indexes;
@@ -43,6 +44,7 @@ pub use crate::commands::messages::flush_unsaved_buffer::FlushUnsavedBuffer;
 pub use crate::commands::messages::poll_messages::PollMessages;
 pub use crate::commands::messages::send_messages::SendMessages;
 pub use iggy_message::{IggyMessage, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE};
+pub use in_flight::IggyMessagesBatchSetInFlight;
 pub use index::IggyIndex;
 pub use index_view::IggyIndexView;
 pub use indexes::IggyIndexes;

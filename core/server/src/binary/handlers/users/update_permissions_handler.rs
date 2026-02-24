@@ -16,24 +16,17 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
-use crate::binary::handlers::users::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::state::command::EntryCommand;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
 use iggy_common::update_permissions::UpdatePermissions;
-use iggy_common::{Identifier, IggyError, SenderKind};
-use tracing::info;
+use iggy_common::{IggyError, SenderKind};
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for UpdatePermissions {
@@ -55,76 +48,22 @@ impl ServerCommandHandler for UpdatePermissions {
             .metadata
             .perm_update_permissions(session.get_user_id())?;
 
-        // Check if target user is root - cannot change root user permissions
         let target_user = shard.get_user(&self.user_id)?;
         if target_user.is_root() {
             return Err(IggyError::CannotChangePermissions(target_user.id));
         }
 
-        let user_id_for_log = self.user_id.clone();
-        let request = ShardRequest {
-            stream_id: Identifier::default(),
-            topic_id: Identifier::default(),
-            partition_id: 0,
-            payload: ShardRequestPayload::UpdatePermissions {
-                session_user_id: session.get_user_id(),
-                user_id: self.user_id.clone(),
-                permissions: self.permissions.clone(),
-            },
-        };
+        let request = ShardRequest::control_plane(ShardRequestPayload::UpdatePermissionsRequest {
+            user_id: session.get_user_id(),
+            command: self,
+        });
 
-        let message = ShardMessage::Request(request);
-        match shard.send_request_to_shard_or_recoil(None, message).await? {
-            ShardSendRequestResult::Recoil(message) => {
-                if let ShardMessage::Request(ShardRequest { payload, .. }) = message
-                    && let ShardRequestPayload::UpdatePermissions {
-                        user_id,
-                        permissions,
-                        ..
-                    } = payload
-                {
-                    let _user_guard = shard.fs_locks.user_lock.lock().await;
-                    shard
-                        .update_permissions(&user_id, permissions)
-                        .error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to update permissions for user_id: {}, session: {session}",
-                                user_id
-                            )
-                        })?;
-
-                    info!("Updated permissions for user with ID: {}.", user_id_for_log);
-
-                    shard
-                        .state
-                        .apply(session.get_user_id(), &EntryCommand::UpdatePermissions(self))
-                        .await
-                        .error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to apply update permissions for user_id: {}, session: {session}",
-                                user_id_for_log
-                            )
-                        })?;
-
-                    sender.send_empty_ok_response().await?;
-                } else {
-                    unreachable!(
-                        "Expected an UpdatePermissions request inside of UpdatePermissions handler, impossible state"
-                    );
-                }
+        match shard.send_to_control_plane(request).await? {
+            ShardResponse::UpdatePermissionsResponse => {
+                sender.send_empty_ok_response().await?;
             }
-            ShardSendRequestResult::Response(response) => match response {
-                ShardResponse::UpdatePermissionsResponse => {
-                    info!("Updated permissions for user with ID: {}.", user_id_for_log);
-                    sender.send_empty_ok_response().await?;
-                }
-                ShardResponse::ErrorResponse(err) => {
-                    return Err(err);
-                }
-                _ => unreachable!(
-                    "Expected an UpdatePermissionsResponse inside of UpdatePermissions handler, impossible state"
-                ),
-            },
+            ShardResponse::ErrorResponse(err) => return Err(err),
+            _ => unreachable!("Expected UpdatePermissionsResponse"),
         }
 
         Ok(HandlerResult::Finished)

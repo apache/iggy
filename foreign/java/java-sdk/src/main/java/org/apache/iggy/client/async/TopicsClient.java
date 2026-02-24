@@ -31,38 +31,73 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Async client for topic operations.
+ * Async client interface for topic management operations.
+ *
+ * <p>Topics exist within streams and contain one or more partitions that hold the actual
+ * messages. Each topic has configurable properties including compression, message expiry,
+ * maximum size, and replication factor.
+ *
+ * <p>Usage example:
+ * <pre>{@code
+ * TopicsClient topics = client.topics();
+ *
+ * // Create a topic with 3 partitions and no message expiry
+ * topics.createTopic(
+ *         StreamId.of(1L), 3L, CompressionAlgorithm.none(),
+ *         BigInteger.ZERO, BigInteger.ZERO, Optional.empty(), "events")
+ *     .thenAccept(details -> System.out.println("Topic created: " + details.name()));
+ *
+ * // List all topics in a stream
+ * topics.getTopics(StreamId.of(1L))
+ *     .thenAccept(list -> list.forEach(t -> System.out.println(t.name())));
+ * }</pre>
+ *
+ * @see org.apache.iggy.client.async.tcp.AsyncIggyTcpClient#topics()
  */
 public interface TopicsClient {
 
     /**
-     * Gets topic details by stream ID and topic ID.
+     * Gets detailed information about a specific topic.
      *
-     * @param streamId The stream identifier
-     * @param topicId  The topic identifier
-     * @return CompletableFuture with Optional TopicDetails
+     * <p>The returned {@link TopicDetails} includes the topic's metadata, configuration
+     * (compression, expiry, max size), and partition information.
+     *
+     * @param streamId the stream identifier containing the topic
+     * @param topicId  the topic identifier
+     * @return a {@link CompletableFuture} that completes with an {@link Optional} containing
+     *         the {@link TopicDetails} if found, or empty if the topic does not exist
      */
     CompletableFuture<Optional<TopicDetails>> getTopic(StreamId streamId, TopicId topicId);
 
     /**
-     * Gets all topics in a stream.
+     * Gets a list of all topics within a stream.
      *
-     * @param streamId The stream identifier
-     * @return CompletableFuture with list of Topics
+     * @param streamId the stream identifier
+     * @return a {@link CompletableFuture} that completes with a list of {@link Topic} objects
      */
     CompletableFuture<List<Topic>> getTopics(StreamId streamId);
 
     /**
-     * Creates a new topic.
+     * Creates a new topic within a stream.
      *
-     * @param streamId             The stream identifier
-     * @param partitionsCount      Number of partitions
-     * @param compressionAlgorithm Compression algorithm to use
-     * @param messageExpiry        Message expiry time in microseconds
-     * @param maxTopicSize         Maximum topic size in bytes
-     * @param replicationFactor    Optional replication factor
-     * @param name                 Topic name
-     * @return CompletableFuture with created TopicDetails
+     * <p>The topic is created with the specified number of partitions and configuration.
+     * Partition count cannot be changed after creation, but additional partitions can be
+     * added via the partitions API.
+     *
+     * @param streamId             the stream identifier to create the topic in
+     * @param partitionsCount      the initial number of partitions (must be at least 1)
+     * @param compressionAlgorithm the compression algorithm for stored messages
+     *                             (e.g., {@link CompressionAlgorithm#None})
+     * @param messageExpiry        message expiry time in microseconds; {@link BigInteger#ZERO}
+     *                             means messages never expire
+     * @param maxTopicSize         maximum topic size in bytes; {@link BigInteger#ZERO}
+     *                             means unlimited
+     * @param replicationFactor    optional replication factor for the topic; if empty,
+     *                             the server default is used
+     * @param name                 the topic name (must be unique within the stream)
+     * @return a {@link CompletableFuture} that completes with the created {@link TopicDetails}
+     * @throws org.apache.iggy.exception.IggyException if the stream does not exist or a
+     *         topic with the same name already exists
      */
     CompletableFuture<TopicDetails> createTopic(
             StreamId streamId,
@@ -74,16 +109,20 @@ public interface TopicsClient {
             String name);
 
     /**
-     * Updates an existing topic.
+     * Updates the configuration of an existing topic.
      *
-     * @param streamId             The stream identifier
-     * @param topicId              The topic identifier
-     * @param compressionAlgorithm Compression algorithm to use
-     * @param messageExpiry        Message expiry time in microseconds
-     * @param maxTopicSize         Maximum topic size in bytes
-     * @param replicationFactor    Optional replication factor
-     * @param name                 Topic name
-     * @return CompletableFuture that completes when update is done
+     * <p>This allows changing the topic's name, compression, expiry, size limit, and
+     * replication factor. Partition count is not affected by this operation.
+     *
+     * @param streamId             the stream identifier containing the topic
+     * @param topicId              the topic identifier to update
+     * @param compressionAlgorithm the new compression algorithm
+     * @param messageExpiry        the new message expiry in microseconds
+     * @param maxTopicSize         the new maximum topic size in bytes
+     * @param replicationFactor    optional new replication factor
+     * @param name                 the new topic name
+     * @return a {@link CompletableFuture} that completes when the update is done
+     * @throws org.apache.iggy.exception.IggyException if the topic does not exist
      */
     CompletableFuture<Void> updateTopic(
             StreamId streamId,
@@ -95,11 +134,15 @@ public interface TopicsClient {
             String name);
 
     /**
-     * Deletes a topic.
+     * Deletes a topic and all of its partitions and messages.
      *
-     * @param streamId The stream identifier
-     * @param topicId  The topic identifier
-     * @return CompletableFuture that completes when deletion is done
+     * <p><strong>Warning:</strong> This operation is irreversible and will permanently
+     * delete all messages within the topic.
+     *
+     * @param streamId the stream identifier containing the topic
+     * @param topicId  the topic identifier to delete
+     * @return a {@link CompletableFuture} that completes when the deletion is done
+     * @throws org.apache.iggy.exception.IggyException if the topic does not exist
      */
     CompletableFuture<Void> deleteTopic(StreamId streamId, TopicId topicId);
 }

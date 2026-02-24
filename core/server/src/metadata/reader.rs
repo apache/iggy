@@ -19,8 +19,10 @@ use crate::metadata::{
     ConsumerGroupId, ConsumerGroupMeta, InnerMetadata, MetadataReadHandle, PartitionId,
     PartitionMeta, StreamId, StreamMeta, TopicId, TopicMeta, UserId, UserMeta,
 };
+use crate::shard::transmission::message::{ResolvedPartition, ResolvedTopic};
 use crate::streaming::partitions::consumer_group_offsets::ConsumerGroupOffsets;
 use crate::streaming::partitions::consumer_offsets::ConsumerOffsets;
+use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::stats::{PartitionStats, StreamStats, TopicStats};
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::{
@@ -251,43 +253,205 @@ impl Metadata {
         Some(current % partitions_count)
     }
 
-    pub fn get_next_member_partition_id(
+    /// Resolve consumer group partition under a single metadata read guard.
+    pub fn resolve_consumer_group_partition(
+        &self,
+        stream_id: StreamId,
+        topic_id: TopicId,
+        group_identifier: &Identifier,
+        client_id: u32,
+        explicit_partition_id: Option<u32>,
+        calculate_partition_id: bool,
+    ) -> Result<Option<(PollingConsumer, usize)>, IggyError> {
+        let metadata = self.load();
+
+        // Step 1: Resolve group ID
+        let group_id = {
+            let stream = metadata.streams.get(stream_id).ok_or_else(|| {
+                IggyError::ConsumerGroupIdNotFound(
+                    group_identifier.clone(),
+                    Identifier::numeric(topic_id as u32).unwrap(),
+                )
+            })?;
+            let topic = stream.topics.get(topic_id).ok_or_else(|| {
+                IggyError::ConsumerGroupIdNotFound(
+                    group_identifier.clone(),
+                    Identifier::numeric(topic_id as u32).unwrap(),
+                )
+            })?;
+            match group_identifier.kind {
+                IdKind::Numeric => {
+                    let gid = group_identifier.get_u32_value().map_err(|_| {
+                        IggyError::ConsumerGroupIdNotFound(
+                            group_identifier.clone(),
+                            Identifier::numeric(topic_id as u32).unwrap(),
+                        )
+                    })? as ConsumerGroupId;
+                    if topic.consumer_groups.get(gid).is_none() {
+                        return Err(IggyError::ConsumerGroupIdNotFound(
+                            group_identifier.clone(),
+                            Identifier::numeric(topic_id as u32).unwrap(),
+                        ));
+                    }
+                    gid
+                }
+                IdKind::String => {
+                    let name = group_identifier.get_cow_str_value().map_err(|_| {
+                        IggyError::ConsumerGroupIdNotFound(
+                            group_identifier.clone(),
+                            Identifier::numeric(topic_id as u32).unwrap(),
+                        )
+                    })?;
+                    *topic
+                        .consumer_group_index
+                        .get(name.as_ref())
+                        .ok_or_else(|| {
+                            IggyError::ConsumerGroupIdNotFound(
+                                group_identifier.clone(),
+                                Identifier::numeric(topic_id as u32).unwrap(),
+                            )
+                        })?
+                }
+            }
+        };
+
+        // Step 2: Find member by client_id (same read guard, same metadata snapshot)
+        let group = metadata
+            .streams
+            .get(stream_id)
+            .and_then(|s| s.topics.get(topic_id))
+            .and_then(|t| t.consumer_groups.get(group_id))
+            .ok_or_else(|| {
+                IggyError::ConsumerGroupIdNotFound(
+                    group_identifier.clone(),
+                    Identifier::numeric(topic_id as u32).unwrap(),
+                )
+            })?;
+
+        let (member_slab_id, member) = group
+            .members
+            .iter()
+            .find(|(_, m)| m.client_id == client_id)
+            .ok_or_else(|| {
+                IggyError::ConsumerGroupMemberNotFound(
+                    client_id,
+                    group_identifier.clone(),
+                    Identifier::numeric(topic_id as u32).unwrap(),
+                )
+            })?;
+
+        // Step 3a: If explicit partition_id provided, validate member owns it
+        if let Some(pid) = explicit_partition_id {
+            let pid_usize = pid as usize;
+            if !member.partitions.contains(&pid_usize) {
+                // Member doesn't own this partition — check if it's pending revocation
+                let is_pending = member
+                    .pending_revocations
+                    .iter()
+                    .any(|revocation| revocation.partition_id == pid_usize);
+                if !is_pending {
+                    return Ok(None);
+                }
+            }
+            return Ok(Some((
+                PollingConsumer::consumer_group(group_id, member_slab_id),
+                pid_usize,
+            )));
+        }
+
+        // Step 3b: Round-robin partition selection (same snapshot, no race)
+        if member.pending_revocations.is_empty() {
+            // Fast path
+            let partitions = &member.partitions;
+            let count = partitions.len();
+            if count == 0 {
+                return Ok(None);
+            }
+            let counter = &member.partition_index;
+            let partition_id = if calculate_partition_id {
+                let current = counter
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                        Some((c + 1) % count)
+                    })
+                    .unwrap();
+                partitions[current % count]
+            } else {
+                let current = counter.load(Ordering::Relaxed);
+                partitions[current % count]
+            };
+            return Ok(Some((
+                PollingConsumer::consumer_group(group_id, member_slab_id),
+                partition_id,
+            )));
+        }
+
+        // Slow path: skip revoked partitions
+        let effective_count = member.partitions.len() - member.pending_revocations.len();
+        if effective_count == 0 {
+            return Ok(None);
+        }
+
+        let counter = &member.partition_index;
+        let idx = if calculate_partition_id {
+            counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                    Some((c + 1) % effective_count)
+                })
+                .unwrap()
+                % effective_count
+        } else {
+            counter.load(Ordering::Relaxed) % effective_count
+        };
+
+        let mut seen = 0;
+        for &pid in &member.partitions {
+            let is_revoked = member
+                .pending_revocations
+                .iter()
+                .any(|revocation| revocation.partition_id == pid);
+            if is_revoked {
+                continue;
+            }
+            if seen == idx {
+                return Ok(Some((
+                    PollingConsumer::consumer_group(group_id, member_slab_id),
+                    pid,
+                )));
+            }
+            seen += 1;
+        }
+
+        Ok(None)
+    }
+
+    /// Record the last offset returned to a CG member during poll.
+    pub fn record_polled_offset(
         &self,
         stream_id: StreamId,
         topic_id: TopicId,
         group_id: ConsumerGroupId,
-        member_id: usize,
-        calculate: bool,
-    ) -> Option<PartitionId> {
+        partition_id: PartitionId,
+        offset: u64,
+    ) {
+        use crate::streaming::polling_consumer::ConsumerGroupId as CgIdNewtype;
+
         let metadata = self.load();
-        let member = metadata
+        if let Some(partition) = metadata
             .streams
-            .get(stream_id)?
-            .topics
-            .get(topic_id)?
-            .consumer_groups
-            .get(group_id)?
-            .members
-            .get(member_id)?;
-
-        let assigned_partitions = &member.partitions;
-        if assigned_partitions.is_empty() {
-            return None;
-        }
-
-        let partitions_count = assigned_partitions.len();
-        let counter = &member.partition_index;
-
-        if calculate {
-            let current = counter
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    Some((current + 1) % partitions_count)
-                })
-                .unwrap();
-            Some(assigned_partitions[current % partitions_count])
-        } else {
-            let current = counter.load(Ordering::Relaxed);
-            Some(assigned_partitions[current % partitions_count])
+            .get(stream_id)
+            .and_then(|s| s.topics.get(topic_id))
+            .and_then(|t| t.partitions.get(partition_id))
+        {
+            let key = CgIdNewtype(group_id);
+            let guard = partition.last_polled_offsets.pin();
+            match guard.get(&key) {
+                Some(existing) => {
+                    existing.store(offset, Ordering::Release);
+                }
+                None => {
+                    guard.insert(key, Arc::new(std::sync::atomic::AtomicU64::new(offset)));
+                }
+            }
         }
     }
 
@@ -627,10 +791,6 @@ impl Metadata {
                 .unwrap_or_default()
         })
     }
-
-    // ==========================================================================
-    // Permission checking methods (perm_*)
-    // ==========================================================================
 
     /// Inheritance: manage_streams → read_streams → read_topics → poll_messages
     pub fn perm_poll_messages(
@@ -1066,10 +1226,6 @@ impl Metadata {
         self.perm_poll_messages(user_id, stream_id, topic_id)
     }
 
-    // ==========================================================================
-    // User permission methods
-    // ==========================================================================
-
     pub fn perm_get_user(&self, user_id: u32) -> Result<(), IggyError> {
         self.perm_read_users(user_id)
     }
@@ -1122,10 +1278,6 @@ impl Metadata {
         Err(IggyError::Unauthorized)
     }
 
-    // ==========================================================================
-    // System permission methods
-    // ==========================================================================
-
     pub fn perm_get_stats(&self, user_id: u32) -> Result<(), IggyError> {
         self.perm_get_server_info(user_id)
     }
@@ -1149,6 +1301,289 @@ impl Metadata {
 
         Err(IggyError::Unauthorized)
     }
+
+    /// Atomically resolve, authorize, and return stream metadata.
+    pub fn query_stream(
+        &self,
+        user_id: u32,
+        stream_id: &Identifier,
+    ) -> Result<Option<StreamMeta>, IggyError> {
+        self.with_metadata(|m| {
+            let sid = match resolve_stream_id_inner(m, stream_id) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            perm_get_stream_inner(m, user_id, sid)?;
+            Ok(m.streams.get(sid).cloned())
+        })
+    }
+
+    /// Atomically authorize and return all streams.
+    pub fn query_streams(&self, user_id: u32) -> Result<Vec<StreamMeta>, IggyError> {
+        self.with_metadata(|m| {
+            perm_get_streams_inner(m, user_id)?;
+            Ok(m.streams.iter().map(|(_, s)| s.clone()).collect())
+        })
+    }
+
+    /// Atomically resolve, authorize, and return topic metadata.
+    pub fn query_topic(
+        &self,
+        user_id: u32,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<Option<TopicMeta>, IggyError> {
+        self.with_metadata(|m| {
+            let sid = match resolve_stream_id_inner(m, stream_id) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            let tid = match resolve_topic_id_inner(m, sid, topic_id) {
+                Some(id) => id,
+                None => return Ok(None),
+            };
+            perm_get_topic_inner(m, user_id, sid, tid)?;
+            Ok(m.streams.get(sid).and_then(|s| s.topics.get(tid).cloned()))
+        })
+    }
+
+    /// Atomically resolve, authorize, and return all topics for a stream.
+    pub fn query_topics(
+        &self,
+        user_id: u32,
+        stream_id: &Identifier,
+    ) -> Result<Option<Vec<TopicMeta>>, IggyError> {
+        self.with_metadata(|m| {
+            let sid = match resolve_stream_id_inner(m, stream_id) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            perm_get_topics_inner(m, user_id, sid)?;
+            Ok(m.streams
+                .get(sid)
+                .map(|s| s.topics.iter().map(|(_, t)| t.clone()).collect()))
+        })
+    }
+
+    /// Atomically resolve, authorize, and return consumer group metadata.
+    pub fn query_consumer_group(
+        &self,
+        user_id: u32,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+    ) -> Result<Option<ConsumerGroupMeta>, IggyError> {
+        self.with_metadata(|m| {
+            let sid = match resolve_stream_id_inner(m, stream_id) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            let tid = match resolve_topic_id_inner(m, sid, topic_id) {
+                Some(id) => id,
+                None => return Ok(None),
+            };
+            let gid = match resolve_consumer_group_id_inner(m, sid, tid, group_id) {
+                Some(id) => id,
+                None => return Ok(None),
+            };
+            perm_get_consumer_group_inner(m, user_id, sid, tid)?;
+            Ok(m.streams
+                .get(sid)
+                .and_then(|s| s.topics.get(tid))
+                .and_then(|t| t.consumer_groups.get(gid).cloned()))
+        })
+    }
+
+    /// Atomically resolve, authorize, and return all consumer groups for a topic.
+    pub fn query_consumer_groups(
+        &self,
+        user_id: u32,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<Option<Vec<ConsumerGroupMeta>>, IggyError> {
+        self.with_metadata(|m| {
+            let sid = match resolve_stream_id_inner(m, stream_id) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            let tid = match resolve_topic_id_inner(m, sid, topic_id) {
+                Some(id) => id,
+                None => return Ok(None),
+            };
+            perm_get_consumer_group_inner(m, user_id, sid, tid)?;
+            Ok(m.streams
+                .get(sid)
+                .and_then(|s| s.topics.get(tid))
+                .map(|t| t.consumer_groups.iter().map(|(_, cg)| cg.clone()).collect()))
+        })
+    }
+
+    /// Atomically resolve, authorize, and return user metadata.
+    /// Permission check skipped when requesting own data.
+    pub fn query_user(
+        &self,
+        requesting_user_id: u32,
+        target_user_id: &Identifier,
+    ) -> Result<Option<UserMeta>, IggyError> {
+        self.with_metadata(|m| {
+            let uid = match resolve_user_id_inner(m, target_user_id) {
+                Some(id) => id,
+                None => return Ok(None),
+            };
+            if uid != requesting_user_id {
+                perm_get_user_inner(m, requesting_user_id)?;
+            }
+            Ok(m.users.get(uid as usize).cloned())
+        })
+    }
+
+    /// Atomically authorize and return all users.
+    pub fn query_users(&self, user_id: u32) -> Result<Vec<UserMeta>, IggyError> {
+        self.with_metadata(|m| {
+            perm_get_users_inner(m, user_id)?;
+            Ok(m.users.iter().map(|(_, u)| u.clone()).collect())
+        })
+    }
+
+    /// Atomically resolve topic and check permission for consumer offset query.
+    /// Returns resolved topic for use with get_consumer_offset.
+    pub fn resolve_for_consumer_offset(
+        &self,
+        user_id: u32,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<Option<ResolvedTopic>, IggyError> {
+        self.with_metadata(|m| {
+            let sid = match resolve_stream_id_inner(m, stream_id) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            let tid = match resolve_topic_id_inner(m, sid, topic_id) {
+                Some(id) => id,
+                None => return Ok(None),
+            };
+            perm_get_consumer_offset_inner(m, user_id, sid, tid)?;
+            Ok(Some(ResolvedTopic {
+                stream_id: sid,
+                topic_id: tid,
+            }))
+        })
+    }
+
+    /// Atomically resolve topic and check append permission.
+    pub fn resolve_for_append(
+        &self,
+        user_id: u32,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<ResolvedTopic, IggyError> {
+        self.with_metadata(|m| {
+            let sid = resolve_stream_id_inner(m, stream_id)
+                .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+            let tid = resolve_topic_id_inner(m, sid, topic_id)
+                .ok_or_else(|| IggyError::TopicIdNotFound(stream_id.clone(), topic_id.clone()))?;
+            perm_append_messages_inner(m, user_id, sid, tid)?;
+            Ok(ResolvedTopic {
+                stream_id: sid,
+                topic_id: tid,
+            })
+        })
+    }
+
+    /// Atomically resolve topic and check poll permission.
+    pub fn resolve_for_poll(
+        &self,
+        user_id: u32,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<ResolvedTopic, IggyError> {
+        self.with_metadata(|m| {
+            let sid = resolve_stream_id_inner(m, stream_id)
+                .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+            let tid = resolve_topic_id_inner(m, sid, topic_id)
+                .ok_or_else(|| IggyError::TopicIdNotFound(stream_id.clone(), topic_id.clone()))?;
+            perm_poll_messages_inner(m, user_id, sid, tid)?;
+            Ok(ResolvedTopic {
+                stream_id: sid,
+                topic_id: tid,
+            })
+        })
+    }
+
+    /// Atomically resolve topic and check store consumer offset permission.
+    pub fn resolve_for_store_consumer_offset(
+        &self,
+        user_id: u32,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<ResolvedTopic, IggyError> {
+        self.with_metadata(|m| {
+            let sid = resolve_stream_id_inner(m, stream_id)
+                .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+            let tid = resolve_topic_id_inner(m, sid, topic_id)
+                .ok_or_else(|| IggyError::TopicIdNotFound(stream_id.clone(), topic_id.clone()))?;
+            perm_get_consumer_offset_inner(m, user_id, sid, tid)?;
+            Ok(ResolvedTopic {
+                stream_id: sid,
+                topic_id: tid,
+            })
+        })
+    }
+
+    /// Atomically resolve topic and check delete consumer offset permission.
+    pub fn resolve_for_delete_consumer_offset(
+        &self,
+        user_id: u32,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<ResolvedTopic, IggyError> {
+        self.with_metadata(|m| {
+            let sid = resolve_stream_id_inner(m, stream_id)
+                .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+            let tid = resolve_topic_id_inner(m, sid, topic_id)
+                .ok_or_else(|| IggyError::TopicIdNotFound(stream_id.clone(), topic_id.clone()))?;
+            perm_get_consumer_offset_inner(m, user_id, sid, tid)?;
+            Ok(ResolvedTopic {
+                stream_id: sid,
+                topic_id: tid,
+            })
+        })
+    }
+
+    /// Atomically resolve partition and check delete segments permission.
+    pub fn resolve_for_delete_segments(
+        &self,
+        user_id: u32,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: PartitionId,
+    ) -> Result<ResolvedPartition, IggyError> {
+        self.with_metadata(|m| {
+            let sid = resolve_stream_id_inner(m, stream_id)
+                .ok_or_else(|| IggyError::StreamIdNotFound(stream_id.clone()))?;
+            let tid = resolve_topic_id_inner(m, sid, topic_id)
+                .ok_or_else(|| IggyError::TopicIdNotFound(stream_id.clone(), topic_id.clone()))?;
+            let exists = m
+                .streams
+                .get(sid)
+                .and_then(|s| s.topics.get(tid))
+                .and_then(|t| t.partitions.get(partition_id))
+                .is_some();
+            if !exists {
+                return Err(IggyError::PartitionNotFound(
+                    partition_id,
+                    topic_id.clone(),
+                    stream_id.clone(),
+                ));
+            }
+            perm_manage_topic_inner(m, user_id, sid, tid)?;
+            Ok(ResolvedPartition {
+                stream_id: sid,
+                topic_id: tid,
+                partition_id,
+            })
+        })
+    }
 }
 
 /// Information needed to initialize a LocalPartition.
@@ -1159,4 +1594,323 @@ pub struct PartitionInitInfo {
     pub stats: Arc<PartitionStats>,
     pub consumer_offsets: Arc<ConsumerOffsets>,
     pub consumer_group_offsets: Arc<ConsumerGroupOffsets>,
+}
+
+pub(crate) fn resolve_stream_id_inner(
+    m: &InnerMetadata,
+    stream_id: &Identifier,
+) -> Option<StreamId> {
+    match stream_id.kind {
+        IdKind::Numeric => {
+            let sid = stream_id.get_u32_value().ok()? as StreamId;
+            if m.streams.get(sid).is_some() {
+                Some(sid)
+            } else {
+                None
+            }
+        }
+        IdKind::String => {
+            let name = stream_id.get_cow_str_value().ok()?;
+            m.stream_index.get(name.as_ref()).copied()
+        }
+    }
+}
+
+pub(crate) fn resolve_topic_id_inner(
+    m: &InnerMetadata,
+    stream_id: StreamId,
+    topic_id: &Identifier,
+) -> Option<TopicId> {
+    let stream = m.streams.get(stream_id)?;
+    match topic_id.kind {
+        IdKind::Numeric => {
+            let tid = topic_id.get_u32_value().ok()? as TopicId;
+            if stream.topics.get(tid).is_some() {
+                Some(tid)
+            } else {
+                None
+            }
+        }
+        IdKind::String => {
+            let name = topic_id.get_cow_str_value().ok()?;
+            stream.topic_index.get(&Arc::from(name.as_ref())).copied()
+        }
+    }
+}
+
+pub(crate) fn resolve_consumer_group_id_inner(
+    m: &InnerMetadata,
+    stream_id: StreamId,
+    topic_id: TopicId,
+    group_id: &Identifier,
+) -> Option<ConsumerGroupId> {
+    let stream = m.streams.get(stream_id)?;
+    let topic = stream.topics.get(topic_id)?;
+    match group_id.kind {
+        IdKind::Numeric => {
+            let gid = group_id.get_u32_value().ok()? as ConsumerGroupId;
+            if topic.consumer_groups.get(gid).is_some() {
+                Some(gid)
+            } else {
+                None
+            }
+        }
+        IdKind::String => {
+            let name = group_id.get_cow_str_value().ok()?;
+            topic
+                .consumer_group_index
+                .get(&Arc::from(name.as_ref()))
+                .copied()
+        }
+    }
+}
+
+fn resolve_user_id_inner(m: &InnerMetadata, user_id: &Identifier) -> Option<UserId> {
+    match user_id.kind {
+        IdKind::Numeric => Some(user_id.get_u32_value().ok()?),
+        IdKind::String => {
+            let name = user_id.get_cow_str_value().ok()?;
+            m.user_index.get(name.as_ref()).copied()
+        }
+    }
+}
+
+fn perm_get_stream_inner(
+    m: &InnerMetadata,
+    user_id: u32,
+    stream_id: StreamId,
+) -> Result<(), IggyError> {
+    if let Some(global) = m.users_global_permissions.get(&user_id)
+        && (global.manage_streams || global.read_streams)
+    {
+        return Ok(());
+    }
+    if let Some(stream_perm) = m.users_stream_permissions.get(&(user_id, stream_id))
+        && (stream_perm.manage_stream || stream_perm.read_stream)
+    {
+        return Ok(());
+    }
+    Err(IggyError::Unauthorized)
+}
+
+fn perm_get_streams_inner(m: &InnerMetadata, user_id: u32) -> Result<(), IggyError> {
+    if let Some(global) = m.users_global_permissions.get(&user_id)
+        && (global.manage_streams || global.read_streams)
+    {
+        return Ok(());
+    }
+    Err(IggyError::Unauthorized)
+}
+
+/// Inheritance: manage_streams -> manage_topics -> manage_topic
+fn perm_manage_topic_inner(
+    m: &InnerMetadata,
+    user_id: u32,
+    stream_id: StreamId,
+    topic_id: TopicId,
+) -> Result<(), IggyError> {
+    if let Some(global) = m.users_global_permissions.get(&user_id)
+        && (global.manage_streams || global.manage_topics)
+    {
+        return Ok(());
+    }
+
+    if let Some(stream_permissions) = m.users_stream_permissions.get(&(user_id, stream_id)) {
+        if stream_permissions.manage_stream || stream_permissions.manage_topics {
+            return Ok(());
+        }
+
+        if let Some(topics) = &stream_permissions.topics
+            && let Some(topic_permissions) = topics.get(&topic_id)
+            && topic_permissions.manage_topic
+        {
+            return Ok(());
+        }
+    }
+
+    Err(IggyError::Unauthorized)
+}
+
+fn perm_get_topic_inner(
+    m: &InnerMetadata,
+    user_id: u32,
+    stream_id: StreamId,
+    topic_id: TopicId,
+) -> Result<(), IggyError> {
+    if let Some(global) = m.users_global_permissions.get(&user_id)
+        && (global.read_streams
+            || global.manage_streams
+            || global.manage_topics
+            || global.read_topics)
+    {
+        return Ok(());
+    }
+
+    if let Some(stream_permissions) = m.users_stream_permissions.get(&(user_id, stream_id)) {
+        if stream_permissions.manage_stream
+            || stream_permissions.read_stream
+            || stream_permissions.manage_topics
+            || stream_permissions.read_topics
+        {
+            return Ok(());
+        }
+
+        if let Some(topics) = &stream_permissions.topics
+            && let Some(topic_permissions) = topics.get(&topic_id)
+            && (topic_permissions.manage_topic || topic_permissions.read_topic)
+        {
+            return Ok(());
+        }
+    }
+
+    Err(IggyError::Unauthorized)
+}
+
+fn perm_get_topics_inner(
+    m: &InnerMetadata,
+    user_id: u32,
+    stream_id: StreamId,
+) -> Result<(), IggyError> {
+    if let Some(global) = m.users_global_permissions.get(&user_id)
+        && (global.read_streams
+            || global.manage_streams
+            || global.manage_topics
+            || global.read_topics)
+    {
+        return Ok(());
+    }
+
+    if let Some(stream_permissions) = m.users_stream_permissions.get(&(user_id, stream_id))
+        && (stream_permissions.manage_stream
+            || stream_permissions.read_stream
+            || stream_permissions.manage_topics
+            || stream_permissions.read_topics)
+    {
+        return Ok(());
+    }
+
+    Err(IggyError::Unauthorized)
+}
+
+fn perm_get_consumer_group_inner(
+    m: &InnerMetadata,
+    user_id: u32,
+    stream_id: StreamId,
+    topic_id: TopicId,
+) -> Result<(), IggyError> {
+    perm_get_topic_inner(m, user_id, stream_id, topic_id)
+}
+
+fn perm_get_user_inner(m: &InnerMetadata, user_id: u32) -> Result<(), IggyError> {
+    if let Some(global) = m.users_global_permissions.get(&user_id)
+        && (global.manage_users || global.read_users)
+    {
+        return Ok(());
+    }
+    Err(IggyError::Unauthorized)
+}
+
+fn perm_get_users_inner(m: &InnerMetadata, user_id: u32) -> Result<(), IggyError> {
+    perm_get_user_inner(m, user_id)
+}
+
+fn perm_get_consumer_offset_inner(
+    m: &InnerMetadata,
+    user_id: u32,
+    stream_id: StreamId,
+    topic_id: TopicId,
+) -> Result<(), IggyError> {
+    if m.users_can_poll_all_streams.contains(&user_id) {
+        return Ok(());
+    }
+
+    if let Some(global) = m.users_global_permissions.get(&user_id)
+        && (global.read_topics
+            || global.manage_topics
+            || global.read_streams
+            || global.manage_streams)
+    {
+        return Ok(());
+    }
+
+    if m.users_can_poll_stream.contains(&(user_id, stream_id)) {
+        return Ok(());
+    }
+
+    let Some(stream_permissions) = m.users_stream_permissions.get(&(user_id, stream_id)) else {
+        return Err(IggyError::Unauthorized);
+    };
+
+    if stream_permissions.manage_stream || stream_permissions.read_stream {
+        return Ok(());
+    }
+
+    if stream_permissions.manage_topics || stream_permissions.read_topics {
+        return Ok(());
+    }
+
+    if stream_permissions.poll_messages {
+        return Ok(());
+    }
+
+    if let Some(topics) = &stream_permissions.topics
+        && let Some(topic_permissions) = topics.get(&topic_id)
+        && (topic_permissions.manage_topic
+            || topic_permissions.read_topic
+            || topic_permissions.poll_messages)
+    {
+        return Ok(());
+    }
+
+    Err(IggyError::Unauthorized)
+}
+
+fn perm_poll_messages_inner(
+    m: &InnerMetadata,
+    user_id: u32,
+    stream_id: StreamId,
+    topic_id: TopicId,
+) -> Result<(), IggyError> {
+    perm_get_consumer_offset_inner(m, user_id, stream_id, topic_id)
+}
+
+fn perm_append_messages_inner(
+    m: &InnerMetadata,
+    user_id: u32,
+    stream_id: StreamId,
+    topic_id: TopicId,
+) -> Result<(), IggyError> {
+    if m.users_can_send_all_streams.contains(&user_id) {
+        return Ok(());
+    }
+
+    if let Some(global) = m.users_global_permissions.get(&user_id)
+        && (global.manage_streams || global.manage_topics)
+    {
+        return Ok(());
+    }
+
+    if m.users_can_send_stream.contains(&(user_id, stream_id)) {
+        return Ok(());
+    }
+
+    let Some(stream_permissions) = m.users_stream_permissions.get(&(user_id, stream_id)) else {
+        return Err(IggyError::Unauthorized);
+    };
+
+    if stream_permissions.manage_stream
+        || stream_permissions.manage_topics
+        || stream_permissions.send_messages
+    {
+        return Ok(());
+    }
+
+    if let Some(topics) = &stream_permissions.topics
+        && let Some(topic_permissions) = topics.get(&topic_id)
+        && (topic_permissions.manage_topic || topic_permissions.send_messages)
+    {
+        return Ok(());
+    }
+
+    Err(IggyError::Unauthorized)
 }

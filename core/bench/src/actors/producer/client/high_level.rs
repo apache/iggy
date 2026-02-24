@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::utils::{ClientFactory, login_root};
+use crate::utils::{ClientFactory, authenticate};
 use crate::{
     actors::{
         ApiLabel, BatchMetrics, BenchmarkInit,
@@ -84,7 +84,12 @@ impl BenchmarkInit for HighLevelProducerClient {
 
         let client = self.client_factory.create_client().await;
         let client = IggyClient::create(client, None, None);
-        login_root(&client).await;
+        authenticate(
+            &client,
+            self.client_factory.username(),
+            self.client_factory.password(),
+        )
+        .await;
 
         let stream_id_str = self.config.stream_id.clone();
 

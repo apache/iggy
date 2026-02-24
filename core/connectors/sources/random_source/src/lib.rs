@@ -22,7 +22,7 @@ use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
 use rand::{
-    Rng,
+    RngExt,
     distr::{Alphanumeric, Uniform},
 };
 use serde::{Deserialize, Serialize};

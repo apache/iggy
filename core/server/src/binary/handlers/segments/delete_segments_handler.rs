@@ -19,16 +19,11 @@
 use crate::binary::command::{
     BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
 };
-use crate::binary::handlers::partitions::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{
-    ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
-};
-use crate::state::command::EntryCommand;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
-use err_trail::ErrContext;
 use iggy_common::delete_segments::DeleteSegments;
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::{IggyError, SenderKind};
@@ -51,73 +46,37 @@ impl ServerCommandHandler for DeleteSegments {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
 
-        let stream_id = self.stream_id.clone();
-        let topic_id = self.topic_id.clone();
         let partition_id = self.partition_id as usize;
         let segments_count = self.segments_count;
 
-        let (numeric_stream_id, numeric_topic_id, _) =
-            shard.resolve_partition_id(&stream_id, &topic_id, partition_id)?;
-        shard.metadata.perm_delete_segments(
+        let partition = shard.resolve_partition_for_delete_segments(
             session.get_user_id(),
-            numeric_stream_id,
-            numeric_topic_id,
+            &self.stream_id,
+            &self.topic_id,
+            partition_id,
         )?;
 
-        let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+        let namespace = IggyNamespace::new(
+            partition.stream_id,
+            partition.topic_id,
+            partition.partition_id,
+        );
         let payload = ShardRequestPayload::DeleteSegments { segments_count };
-        let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);
-        let message = ShardMessage::Request(request);
+        let request = ShardRequest::data_plane(namespace, payload);
 
-        match shard
-            .send_request_to_shard_or_recoil(Some(&namespace), message)
-            .await?
-        {
-            ShardSendRequestResult::Recoil(message) => {
-                if let ShardMessage::Request(crate::shard::transmission::message::ShardRequest {
-                    stream_id: recoil_stream_id,
-                    topic_id: recoil_topic_id,
-                    partition_id: recoil_partition_id,
-                    payload,
-                }) = message
-                    && let ShardRequestPayload::DeleteSegments { segments_count } = payload
-                {
-                    let (stream, topic) =
-                        shard.resolve_topic_id(&recoil_stream_id, &recoil_topic_id)?;
-                    shard
-                        .delete_segments_base(stream, topic, recoil_partition_id, segments_count)
-                        .await
-                        .error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to delete segments for topic with ID: {recoil_topic_id} in stream with ID: {recoil_stream_id}, session: {session}",
-                            )
-                        })?;
-
-                    shard
-                        .state
-                        .apply(
-                            session.get_user_id(),
-                            &EntryCommand::DeleteSegments(self),
-                        )
-                        .await
-                        .error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to apply 'delete segments' command for partition with ID: {partition_id} in topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
-                            )
-                        })?;
-
-                    sender.send_empty_ok_response().await?;
-                } else {
-                    return Err(IggyError::InvalidCommand);
-                }
-            }
-            ShardSendRequestResult::Response(response) => {
-                if !matches!(response, ShardResponse::DeleteSegments) {
-                    return Err(IggyError::InvalidCommand);
-                }
+        match shard.send_to_data_plane(request).await? {
+            ShardResponse::DeleteSegments {
+                deleted_segments,
+                deleted_messages,
+            } => {
+                shard.metrics.decrement_segments(deleted_segments as u32);
+                shard.metrics.decrement_messages(deleted_messages);
                 sender.send_empty_ok_response().await?;
             }
+            ShardResponse::ErrorResponse(err) => return Err(err),
+            _ => unreachable!("Expected DeleteSegments"),
         }
+
         Ok(HandlerResult::Finished)
     }
 }

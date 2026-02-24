@@ -20,8 +20,8 @@ use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
-use crate::state::command::EntryCommand;
-use crate::state::models::CreateTopicWithId;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
@@ -34,7 +34,6 @@ use iggy_common::delete_topic::DeleteTopic;
 use iggy_common::purge_topic::PurgeTopic;
 use iggy_common::update_topic::UpdateTopic;
 use iggy_common::{IggyError, Topic, TopicDetails};
-use send_wrapper::SendWrapper;
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -140,106 +139,32 @@ async fn create_topic(
     command.stream_id = Identifier::from_str_value(&stream_id)?;
     command.validate()?;
 
-    let numeric_stream_id = state.shard.shard().resolve_stream_id(&command.stream_id)?;
-    state
+    let numeric_stream_id = state
         .shard
         .shard()
         .metadata
-        .perm_create_topic(identity.user_id, numeric_stream_id)?;
+        .get_stream_id(&command.stream_id)
+        .ok_or(CustomError::ResourceNotFound)?;
 
-    let _topic_guard = state.shard.shard().fs_locks.topic_lock.lock().await;
-    let topic_id = {
-        let future = SendWrapper::new(state.shard.shard().create_topic(
-            &command.stream_id,
-            command.name.clone(),
-            command.message_expiry,
-            command.compression_algorithm,
-            command.max_topic_size,
-            command.replication_factor,
-        ));
-        future.await
-    }
-    .error(|e: &IggyError| {
-        format!("{COMPONENT} (error: {e}) - failed to create topic, stream ID: {stream_id}")
-    })?;
-
-    {
-        let shard = state.shard.shard();
-        let numeric_stream_id = shard
-            .metadata
-            .get_stream_id(&command.stream_id)
-            .expect("Stream must exist");
-        let (expiry, max_size) = shard
-            .metadata
-            .get_topic_config(numeric_stream_id, topic_id)
-            .expect("Topic config must exist after creation");
-        command.message_expiry = expiry;
-        command.max_topic_size = max_size;
-    }
-
-    let broadcast_future = SendWrapper::new(async {
-        use crate::shard::transmission::event::ShardEvent;
-
-        let shard = state.shard.shard();
-
-        // Create partitions
-        let partition_infos = shard
-            .create_partitions(
-                &command.stream_id,
-                &Identifier::numeric(topic_id as u32).unwrap(),
-                command.partitions_count,
-            )
-            .await?;
-
-        let event = ShardEvent::CreatedPartitions {
-            stream_id: command.stream_id.clone(),
-            topic_id: Identifier::numeric(topic_id as u32).unwrap(),
-            partitions: partition_infos,
-        };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
-
-        Ok::<(), CustomError>(())
+    let request = ShardRequest::control_plane(ShardRequestPayload::CreateTopicRequest {
+        user_id: identity.user_id,
+        command,
     });
 
-    broadcast_future.await.error(|e: &CustomError| {
-        format!(
-            "{COMPONENT} (error: {e}) - failed to broadcast topic events, stream ID: {stream_id}"
-        )
-    })?;
-
-    let response = {
-        let shard = state.shard.shard();
-        let numeric_stream_id = shard
-            .metadata
-            .get_stream_id(&command.stream_id)
-            .expect("Stream must exist");
-        let topic_meta = shard
-            .metadata
-            .get_topic(numeric_stream_id, topic_id)
-            .expect("Topic must exist after creation");
-        let topic_response = crate::http::mapper::map_topic_details_from_metadata(&topic_meta);
-        Json(topic_response)
-    };
-
-    {
-        let entry_command = EntryCommand::CreateTopic(CreateTopicWithId {
-            topic_id: topic_id as u32,
-            command,
-        });
-        let future = SendWrapper::new(
-            state
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::CreateTopicResponse(data) => {
+            let topic_meta = state
                 .shard
                 .shard()
-                .state
-                .apply(identity.user_id, &entry_command),
-        );
-        future.await
+                .metadata
+                .get_topic(numeric_stream_id, data.id as usize)
+                .expect("Topic must exist after creation");
+            let response = crate::http::mapper::map_topic_details_from_metadata(&topic_meta);
+            Ok(Json(response))
+        }
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected CreateTopicResponse"),
     }
-    .error(|e: &IggyError| {
-        format!("{COMPONENT} (error: {e}) - failed to apply create topic, stream ID: {stream_id}",)
-    })?;
-
-    Ok(response)
 }
 
 #[debug_handler]
@@ -254,67 +179,16 @@ async fn update_topic(
     command.topic_id = Identifier::from_str_value(&topic_id)?;
     command.validate()?;
 
-    let (numeric_stream_id, numeric_topic_id) = state
-        .shard
-        .shard()
-        .resolve_topic_id(&command.stream_id, &command.topic_id)?;
-    state.shard.shard().metadata.perm_update_topic(
-        identity.user_id,
-        numeric_stream_id,
-        numeric_topic_id,
-    )?;
+    let request = ShardRequest::control_plane(ShardRequestPayload::UpdateTopicRequest {
+        user_id: identity.user_id,
+        command,
+    });
 
-    let name_changed = !command.name.is_empty();
-    state.shard.shard().update_topic(
-        &command.stream_id,
-        &command.topic_id,
-        command.name.clone(),
-        command.message_expiry,
-        command.compression_algorithm,
-        command.max_topic_size,
-        command.replication_factor,
-    ).error(|e: &IggyError| {
-        format!(
-            "{COMPONENT} (error: {e}) - failed to update topic, stream ID: {stream_id}, topic ID: {topic_id}"
-        )
-    })?;
-
-    let shard = state.shard.shard();
-    let numeric_stream_id = shard
-        .metadata
-        .get_stream_id(&command.stream_id)
-        .expect("Stream must exist");
-
-    let topic_id_for_lookup = if name_changed {
-        Identifier::named(&command.name.clone()).unwrap()
-    } else {
-        command.topic_id.clone()
-    };
-
-    let numeric_topic_id = shard
-        .metadata
-        .get_topic_id(numeric_stream_id, &topic_id_for_lookup)
-        .expect("Topic must exist after update");
-
-    let (message_expiry, max_topic_size) = shard
-        .metadata
-        .get_topic_config(numeric_stream_id, numeric_topic_id)
-        .expect("Topic metadata must exist");
-    command.message_expiry = message_expiry;
-    command.max_topic_size = max_topic_size;
-
-    {
-        let entry_command = EntryCommand::UpdateTopic(command);
-        let future = SendWrapper::new(state.shard.shard().state
-            .apply(identity.user_id, &entry_command));
-        future.await
-    }.error(|e: &IggyError| {
-        format!(
-            "{COMPONENT} (error: {e}) - failed to apply update topic, stream ID: {stream_id}, topic ID: {topic_id}"
-        )
-    })?;
-
-    Ok(StatusCode::NO_CONTENT)
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::UpdateTopicResponse => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected UpdateTopicResponse"),
+    }
 }
 
 #[debug_handler]
@@ -324,50 +198,22 @@ async fn delete_topic(
     Extension(identity): Extension<Identity>,
     Path((stream_id, topic_id)): Path<(String, String)>,
 ) -> Result<StatusCode, CustomError> {
-    let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
-    let identifier_topic_id = Identifier::from_str_value(&topic_id)?;
+    let stream_id = Identifier::from_str_value(&stream_id)?;
+    let topic_id = Identifier::from_str_value(&topic_id)?;
 
-    let (numeric_stream_id, numeric_topic_id) = state
-        .shard
-        .shard()
-        .resolve_topic_id(&identifier_stream_id, &identifier_topic_id)?;
-    state.shard.shard().metadata.perm_delete_topic(
-        identity.user_id,
-        numeric_stream_id,
-        numeric_topic_id,
-    )?;
-    let _topic_guard = state.shard.shard().fs_locks.topic_lock.lock().await;
+    let request = ShardRequest::control_plane(ShardRequestPayload::DeleteTopicRequest {
+        user_id: identity.user_id,
+        command: DeleteTopic {
+            stream_id,
+            topic_id,
+        },
+    });
 
-    {
-        let future = SendWrapper::new(state.shard.shard().delete_topic(
-            &identifier_stream_id,
-            &identifier_topic_id,
-        ));
-        future.await
-    }.error(|e: &IggyError| {
-        format!(
-            "{COMPONENT} (error: {e}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}",
-        )
-    })?;
-
-    {
-        let entry_command = EntryCommand::DeleteTopic(DeleteTopic {
-            stream_id: identifier_stream_id,
-            topic_id: identifier_topic_id,
-        });
-        let future = SendWrapper::new(state.shard.shard().state
-            .apply(
-                identity.user_id,
-                &entry_command,
-            ));
-        future.await
-    }.error(|e: &IggyError| {
-        format!(
-            "{COMPONENT} (error: {e}) - failed to apply delete topic, stream ID: {stream_id}, topic ID: {topic_id}"
-        )
-    })?;
-
-    Ok(StatusCode::NO_CONTENT)
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::DeleteTopicResponse(_) => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected DeleteTopicResponse"),
+    }
 }
 
 #[debug_handler]
@@ -377,63 +223,20 @@ async fn purge_topic(
     Extension(identity): Extension<Identity>,
     Path((stream_id, topic_id)): Path<(String, String)>,
 ) -> Result<StatusCode, CustomError> {
-    let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
-    let identifier_topic_id = Identifier::from_str_value(&topic_id)?;
+    let stream_id = Identifier::from_str_value(&stream_id)?;
+    let topic_id = Identifier::from_str_value(&topic_id)?;
 
-    let (numeric_stream_id, numeric_topic_id) = state
-        .shard
-        .shard()
-        .resolve_topic_id(&identifier_stream_id, &identifier_topic_id)?;
-    state.shard.shard().metadata.perm_purge_topic(
-        identity.user_id,
-        numeric_stream_id,
-        numeric_topic_id,
-    )?;
+    let request = ShardRequest::control_plane(ShardRequestPayload::PurgeTopicRequest {
+        user_id: identity.user_id,
+        command: PurgeTopic {
+            stream_id,
+            topic_id,
+        },
+    });
 
-    {
-        let future = SendWrapper::new(state.shard.shard().purge_topic(
-            &identifier_stream_id,
-            &identifier_topic_id,
-        ));
-        future.await
-    }.error(|e: &IggyError| {
-        format!(
-            "{COMPONENT} (error: {e}) - failed to purge topic, stream ID: {stream_id}, topic ID: {topic_id}"
-        )
-    })?;
-
-    {
-        let broadcast_future = SendWrapper::new(async {
-            use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::PurgedTopic {
-                stream_id: identifier_stream_id.clone(),
-                topic_id: identifier_topic_id.clone(),
-            };
-            let _responses = state
-                .shard
-                .shard()
-                .broadcast_event_to_all_shards(event)
-                .await;
-        });
-        broadcast_future.await;
+    match state.shard.send_to_control_plane(request).await? {
+        ShardResponse::PurgeTopicResponse => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::ErrorResponse(err) => Err(err.into()),
+        _ => unreachable!("Expected PurgeTopicResponse"),
     }
-
-    {
-        let entry_command = EntryCommand::PurgeTopic(PurgeTopic {
-            stream_id: identifier_stream_id,
-            topic_id: identifier_topic_id,
-        });
-        let future = SendWrapper::new(state.shard.shard().state
-            .apply(
-                identity.user_id,
-                &entry_command,
-            ));
-        future.await
-    }.error(|e: &IggyError| {
-        format!(
-            "{COMPONENT} (error: {e}) - failed to apply purge topic, stream ID: {stream_id}, topic ID: {topic_id}"
-        )
-    })?;
-
-    Ok(StatusCode::NO_CONTENT)
 }

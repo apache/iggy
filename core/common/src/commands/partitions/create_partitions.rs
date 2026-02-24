@@ -92,7 +92,9 @@ impl BytesSerializable for CreatePartitions {
         let topic_id = Identifier::from_bytes(bytes.slice(position..))?;
         position += topic_id.get_size_bytes().as_bytes_usize();
         let partitions_count = u32::from_le_bytes(
-            bytes[position..position + 4]
+            bytes
+                .get(position..position + 4)
+                .ok_or(IggyError::InvalidCommand)?
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );

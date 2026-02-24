@@ -97,13 +97,17 @@ impl BytesSerializable for DeleteSegments {
         let topic_id = Identifier::from_bytes(bytes.slice(position..))?;
         position += topic_id.get_size_bytes().as_bytes_usize();
         let partition_id = u32::from_le_bytes(
-            bytes[position..position + std::mem::size_of::<u32>()]
+            bytes
+                .get(position..position + std::mem::size_of::<u32>())
+                .ok_or(IggyError::InvalidCommand)?
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
         position += std::mem::size_of::<u32>();
         let segments_count = u32::from_le_bytes(
-            bytes[position..position + std::mem::size_of::<u32>()]
+            bytes
+                .get(position..position + std::mem::size_of::<u32>())
+                .ok_or(IggyError::InvalidCommand)?
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );

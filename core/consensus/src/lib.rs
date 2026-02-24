@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_common::header::ConsensusHeader;
+use iggy_common::message::ConsensusMessage;
 use message_bus::MessageBus;
 
 pub trait Project<T, C: Consensus> {
-    fn project(self, consensus: &C) -> T;
+    type Consensus: Consensus;
+    fn project(self, consensus: &Self::Consensus) -> T;
 }
 
 pub trait Pipeline {
@@ -29,9 +32,6 @@ pub trait Pipeline {
 
     fn pop_message(&mut self) -> Option<Self::Entry>;
 
-    /// Extract and remove a message by op number.
-    fn extract_by_op(&mut self, op: u64) -> Option<Self::Entry>;
-
     fn clear(&mut self);
 
     fn message_by_op(&self, op: u64) -> Option<&Self::Entry>;
@@ -40,6 +40,8 @@ pub trait Pipeline {
 
     fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&Self::Entry>;
 
+    fn head(&self) -> Option<&Self::Entry>;
+
     fn is_full(&self) -> bool;
 
     fn is_empty(&self) -> bool;
@@ -47,27 +49,68 @@ pub trait Pipeline {
     fn verify(&self);
 }
 
+pub type RequestMessage<C> = <C as Consensus>::Message<<C as Consensus>::RequestHeader>;
+pub type ReplicateMessage<C> = <C as Consensus>::Message<<C as Consensus>::ReplicateHeader>;
+pub type AckMessage<C> = <C as Consensus>::Message<<C as Consensus>::AckHeader>;
+
 pub trait Consensus: Sized {
     type MessageBus: MessageBus;
-    // I am wondering, whether we should create a dedicated trait for cloning, so it's explicit that we do ref counting.
-    type RequestMessage: Project<Self::ReplicateMessage, Self> + Clone;
-    type ReplicateMessage: Project<Self::AckMessage, Self> + Clone;
-    type AckMessage;
-    type Sequencer: Sequencer;
-    type Pipeline: Pipeline<Message = Self::ReplicateMessage>;
+    #[rustfmt::skip] // Scuffed formatter.
+    type Message<H>: ConsensusMessage<H> where H: ConsensusHeader;
 
-    fn pipeline_message(&self, message: Self::ReplicateMessage);
+    type RequestHeader: ConsensusHeader;
+    type ReplicateHeader: ConsensusHeader;
+    type AckHeader: ConsensusHeader;
+
+    type Sequencer: Sequencer;
+    type Pipeline: Pipeline<Message = Self::Message<Self::ReplicateHeader>>;
+
+    fn pipeline_message(&self, message: Self::Message<Self::ReplicateHeader>);
     fn verify_pipeline(&self);
 
-    // TODO: Figure out how we can achieve that without exposing such methods in the Consensus trait.
-    fn post_replicate_verify(&self, message: &Self::ReplicateMessage);
-
     fn is_follower(&self) -> bool;
+    fn is_normal(&self) -> bool;
     fn is_syncing(&self) -> bool;
+}
+
+/// Shared consensus lifecycle interface for control/data planes.
+///
+/// This abstracts the VSR message flow:
+/// - request -> prepare
+/// - replicate (prepare)
+/// - ack (prepare_ok)
+pub trait Plane<C>
+where
+    C: Consensus,
+{
+    fn on_request(&self, message: RequestMessage<C>) -> impl Future<Output = ()>
+    where
+        RequestMessage<C>: Project<ReplicateMessage<C>, C, Consensus = C> + Clone;
+
+    fn on_replicate(&self, message: ReplicateMessage<C>) -> impl Future<Output = ()>
+    where
+        ReplicateMessage<C>: Project<AckMessage<C>, C, Consensus = C> + Clone;
+
+    fn on_ack(&self, message: AckMessage<C>) -> impl Future<Output = ()>;
+}
+
+pub trait PlaneIdentity<C>
+where
+    C: Consensus,
+{
+    fn is_applicable<H>(&self, message: &C::Message<H>) -> bool
+    where
+        H: ConsensusHeader;
 }
 
 mod impls;
 pub use impls::*;
+mod plane_mux;
+pub use plane_mux::*;
+mod namespaced_pipeline;
+pub use namespaced_pipeline::*;
+mod plane_helpers;
+pub use plane_helpers::*;
 
 mod view_change_quorum;
 pub use view_change_quorum::*;

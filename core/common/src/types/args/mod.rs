@@ -362,18 +362,10 @@ const WEBSOCKET_TRANSPORT: &str = "websocket";
 impl Args {
     pub fn get_server_address(&self) -> Option<String> {
         match self.transport.as_str() {
-            QUIC_TRANSPORT => Some(self.quic_server_address.replace("localhost", "127.0.0.1")),
-            HTTP_TRANSPORT => Some(
-                self.http_api_url
-                    .clone()
-                    .replace("http://", "")
-                    .replace("localhost", "127.0.0.1"),
-            ),
-            TCP_TRANSPORT => Some(self.tcp_server_address.replace("localhost", "127.0.0.1")),
-            WEBSOCKET_TRANSPORT => Some(
-                self.websocket_server_address
-                    .replace("localhost", "127.0.0.1"),
-            ),
+            QUIC_TRANSPORT => Some(self.quic_server_address.clone()),
+            HTTP_TRANSPORT => Some(self.http_api_url.clone().replace("http://", "")),
+            TCP_TRANSPORT => Some(self.tcp_server_address.clone()),
+            WEBSOCKET_TRANSPORT => Some(self.websocket_server_address.clone()),
             _ => None,
         }
     }

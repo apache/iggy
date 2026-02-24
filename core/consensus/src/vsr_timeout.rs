@@ -31,7 +31,7 @@
 ///
 /// Timeouts count down from an initial duration (`after`) and fire when
 /// reaching zero. They support exponential backoff with jitter for retries.
-use rand::Rng;
+use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::SeedableRng;
 
@@ -166,6 +166,7 @@ impl TimeoutManager {
         self.start_view_change_message.tick();
         self.do_view_change_message.tick();
         self.request_start_view_message.tick();
+        self.view_change_status.tick();
     }
 
     pub fn fired(&self, kind: TimeoutKind) -> bool {

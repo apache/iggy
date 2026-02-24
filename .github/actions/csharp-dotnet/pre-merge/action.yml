@@ -65,7 +65,13 @@ runs:
       working-directory: foreign/csharp
       run: |
         # Run unit tests
-        dotnet test --project Iggy_SDK_Tests --no-build --verbosity normal
+        dotnet test --project Iggy_SDK_Tests \
+          --no-build \
+          --verbosity normal \
+          --coverage \
+          --coverage-output-format cobertura \
+          --coverage-output coverage.cobertura.xml \
+          --results-directory ./reports
 
       shell: bash
 
@@ -85,7 +91,14 @@ runs:
         IGGY_SERVER_DOCKER_IMAGE: ${{ steps.docker_build.outputs.docker_image }}
         IGGY_TEST_LOGS_DIR: ./reports/container-logs
       run: |
-        dotnet test --project Iggy_SDK.Tests.Integration --no-build --verbosity normal --results-directory ./reports -- --report-trx
+        dotnet test --project Iggy_SDK.Tests.Integration \
+          --no-build \
+          --verbosity normal \
+          --coverage \
+          --coverage-output-format cobertura \
+          --coverage-output coverage.cobertura.xml \
+          --results-directory ./reports \
+          -- --report-trx
       shell: bash
 
     - name: Collect container logs

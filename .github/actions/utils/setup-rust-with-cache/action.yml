@@ -49,7 +49,12 @@ runs:
     - name: Install system dependencies (macOS)
       if: runner.os == 'macOS'
       run: |
-        brew install hwloc
+        # Pin version of hwloc to 2.12.2_1
+        # brew extract doesn't have this version, so we fetch the formula directly
+        brew tap-new iggy/local-hwloc
+        curl -fsSL https://raw.githubusercontent.com/Homebrew/homebrew-core/bb1e23f8e5eacf4d31acd489f6079c8a53ebd690/Formula/h/hwloc.rb \
+          -o "$(brew --repository iggy/local-hwloc)/Formula/hwloc.rb"
+        brew install iggy/local-hwloc/hwloc
       shell: bash
 
     - name: Setup Rust toolchain

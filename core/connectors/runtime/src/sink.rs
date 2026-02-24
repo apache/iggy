@@ -349,7 +349,7 @@ async fn consume_messages(
 
 fn get_plugin_version(container: &Container<SinkApi>) -> String {
     unsafe {
-        let version_ptr = (container.version)();
+        let version_ptr = (container.iggy_sink_version)();
         std::ffi::CStr::from_ptr(version_ptr)
             .to_string_lossy()
             .into_owned()
@@ -362,7 +362,7 @@ fn init_sink(
     id: u32,
 ) -> Result<(), RuntimeError> {
     let plugin_config = serde_json::to_string(plugin_config).expect("Invalid sink plugin config.");
-    let result = (container.open)(
+    let result = (container.iggy_sink_open)(
         id,
         plugin_config.as_ptr(),
         plugin_config.len(),

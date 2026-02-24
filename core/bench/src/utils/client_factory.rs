@@ -21,9 +21,8 @@ use crate::args::transport::BenchmarkTransportCommand;
 use async_trait::async_trait;
 use iggy::http::http_client::HttpClient;
 use iggy::prelude::{
-    Client, ClientWrapper, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, HttpClientConfig,
-    IdentityInfo, IggyClient, QuicClientConfig, TcpClient, TcpClientConfig, TransportProtocol,
-    UserClient, WebSocketClientConfig,
+    Client, ClientWrapper, HttpClientConfig, IdentityInfo, IggyClient, QuicClientConfig, TcpClient,
+    TcpClientConfig, TransportProtocol, UserClient, WebSocketClientConfig,
 };
 use iggy::quic::quic_client::QuicClient;
 use iggy::websocket::websocket_client::WebSocketClient;
@@ -34,18 +33,19 @@ pub trait ClientFactory: Sync + Send {
     async fn create_client(&self) -> ClientWrapper;
     fn transport(&self) -> TransportProtocol;
     fn server_addr(&self) -> String;
+    fn username(&self) -> &str;
+    fn password(&self) -> &str;
 }
 
-pub async fn login_root(client: &IggyClient) -> IdentityInfo {
-    client
-        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
-        .await
-        .unwrap()
+pub async fn authenticate(client: &IggyClient, username: &str, password: &str) -> IdentityInfo {
+    client.login_user(username, password).await.unwrap()
 }
 
 #[derive(Debug, Clone)]
 pub struct HttpClientFactory {
     pub server_addr: String,
+    pub username: String,
+    pub password: String,
 }
 
 #[async_trait]
@@ -66,6 +66,14 @@ impl ClientFactory for HttpClientFactory {
     fn server_addr(&self) -> String {
         self.server_addr.clone()
     }
+
+    fn username(&self) -> &str {
+        &self.username
+    }
+
+    fn password(&self) -> &str {
+        &self.password
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,6 +84,8 @@ pub struct TcpClientFactory {
     pub tls_domain: String,
     pub tls_ca_file: Option<String>,
     pub tls_validate_certificate: bool,
+    pub username: String,
+    pub password: String,
 }
 
 #[async_trait]
@@ -122,11 +132,21 @@ impl ClientFactory for TcpClientFactory {
     fn server_addr(&self) -> String {
         self.server_addr.clone()
     }
+
+    fn username(&self) -> &str {
+        &self.username
+    }
+
+    fn password(&self) -> &str {
+        &self.password
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct QuicClientFactory {
     pub server_addr: String,
+    pub username: String,
+    pub password: String,
 }
 
 #[async_trait]
@@ -149,11 +169,21 @@ impl ClientFactory for QuicClientFactory {
     fn server_addr(&self) -> String {
         self.server_addr.clone()
     }
+
+    fn username(&self) -> &str {
+        &self.username
+    }
+
+    fn password(&self) -> &str {
+        &self.password
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct WebSocketClientFactory {
     pub server_addr: String,
+    pub username: String,
+    pub password: String,
 }
 
 #[async_trait]
@@ -175,12 +205,25 @@ impl ClientFactory for WebSocketClientFactory {
     fn server_addr(&self) -> String {
         self.server_addr.clone()
     }
+
+    fn username(&self) -> &str {
+        &self.username
+    }
+
+    fn password(&self) -> &str {
+        &self.password
+    }
 }
 
 pub fn create_client_factory(args: &IggyBenchArgs) -> Arc<dyn ClientFactory> {
+    let username = args.username().to_owned();
+    let password = args.password().to_owned();
+
     match &args.transport() {
         TransportProtocol::Http => Arc::new(HttpClientFactory {
             server_addr: args.server_address().to_owned(),
+            username,
+            password,
         }),
         TransportProtocol::Tcp => {
             let transport_command = args.transport_command();
@@ -192,6 +235,8 @@ pub fn create_client_factory(args: &IggyBenchArgs) -> Arc<dyn ClientFactory> {
                     tls_domain: tcp_args.tls_domain.clone(),
                     tls_ca_file: tcp_args.tls_ca_file.clone(),
                     tls_validate_certificate: tcp_args.tls_validate_certificate,
+                    username,
+                    password,
                 })
             } else {
                 unreachable!("Transport is TCP but transport command is not TcpArgs")
@@ -199,9 +244,13 @@ pub fn create_client_factory(args: &IggyBenchArgs) -> Arc<dyn ClientFactory> {
         }
         TransportProtocol::Quic => Arc::new(QuicClientFactory {
             server_addr: args.server_address().to_owned(),
+            username,
+            password,
         }),
         TransportProtocol::WebSocket => Arc::new(WebSocketClientFactory {
             server_addr: args.server_address().to_owned(),
+            username,
+            password,
         }),
     }
 }

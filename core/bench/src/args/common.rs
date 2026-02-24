@@ -30,7 +30,10 @@ use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
-use iggy::prelude::{IggyByteSize, IggyDuration, IggyExpiry, TransportProtocol};
+use iggy::prelude::{
+    DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyByteSize, IggyDuration, IggyExpiry,
+    TransportProtocol,
+};
 use std::num::NonZeroU32;
 use std::str::FromStr;
 
@@ -47,7 +50,7 @@ pub struct IggyBenchArgs {
     pub message_size: BenchmarkNumericParameter,
 
     /// Number of messages per batch
-    #[arg(long, short = 'p', value_parser = BenchmarkNumericParameter::from_str, default_value_t = BenchmarkNumericParameter::Value(DEFAULT_MESSAGES_PER_BATCH.get()))]
+    #[arg(long, short = 'P', value_parser = BenchmarkNumericParameter::from_str, default_value_t = BenchmarkNumericParameter::Value(DEFAULT_MESSAGES_PER_BATCH.get()))]
     pub messages_per_batch: BenchmarkNumericParameter,
 
     /// Number of message batches per actor (producer / consumer / producing consumer).
@@ -80,6 +83,14 @@ pub struct IggyBenchArgs {
     /// Use high-level API for actors
     #[arg(long, short = 'H', default_value_t = false)]
     pub high_level_api: bool,
+
+    /// Username for server authentication
+    #[arg(long, short = 'u', default_value_t = DEFAULT_ROOT_USERNAME.to_string())]
+    pub username: String,
+
+    /// Password for server authentication
+    #[arg(long, short = 'p', default_value_t = DEFAULT_ROOT_PASSWORD.to_string())]
+    pub password: String,
 }
 
 impl IggyBenchArgs {
@@ -301,6 +312,14 @@ impl IggyBenchArgs {
 
     pub const fn high_level_api(&self) -> bool {
         self.high_level_api
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn password(&self) -> &str {
+        &self.password
     }
 
     /// Generates the output directory name based on benchmark parameters.

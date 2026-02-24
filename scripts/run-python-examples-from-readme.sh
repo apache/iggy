@@ -33,7 +33,7 @@ set -euo pipefail
 #       It will wait until the server is started before running the commands.
 #       It will also terminate the server after running all the commands.
 #       Script executes every command in README files which is enclosed in backticks (`) and starts
-#       with `python `. Other commands are ignored.
+#       with `uv run `. Other commands are ignored.
 #       Order of commands in README files is important as script will execute them from top to bottom.
 
 readonly LOG_FILE="iggy-server.log"
@@ -95,20 +95,9 @@ done
 
 cd examples/python || exit 1
 
-# Set up Python virtual environment and install dependencies
-echo "Setting up Python virtual environment..."
-python3 -m venv .venv
-# shellcheck disable=SC1091
-source .venv/bin/activate
-
-# Build and install Python SDK from repository
-echo "Building Python SDK from repository..."
-pip install -q maturin patchelf
-(cd ../../foreign/python && maturin develop -q)
-
-# Install other example dependencies (excluding apache-iggy which we built locally)
-echo "Installing example dependencies..."
-pip install -q loguru argparse
+# Install example dependencies with uv (including local apache-iggy source mapping)
+echo "Syncing Python dependencies with uv..."
+uv sync --frozen
 
 # Execute all example commands from examples/python/README.md and check if they pass or fail
 exit_code=0
@@ -141,11 +130,10 @@ if [ -f "README.md" ]; then
         # Add a small delay between examples to avoid potential race conditions
         sleep 2
 
-    done < <(grep -E "^python " "README.md")
+    done < <(grep -E "^uv run " "README.md")
 fi
 
-# Deactivate and clean up virtual environment
-deactivate 2>/dev/null || true
+# Clean up virtual environment
 rm -rf .venv
 
 cd ../..

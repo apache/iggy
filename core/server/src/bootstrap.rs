@@ -579,6 +579,7 @@ pub fn build_inner_metadata(
                     stats: partition_stats,
                     consumer_offsets: Arc::new(ConsumerOffsets::with_capacity(0)),
                     consumer_group_offsets: Arc::new(ConsumerGroupOffsets::with_capacity(0)),
+                    last_polled_offsets: Arc::new(papaya::HashMap::new()),
                 };
                 partition_entries.push((partition_id, partition_meta));
                 partitions_count += 1;

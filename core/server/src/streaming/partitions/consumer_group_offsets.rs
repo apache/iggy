@@ -15,37 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::streaming::partitions::consumer_offset;
-use crate::streaming::polling_consumer::ConsumerGroupId;
-
-#[derive(Debug, Clone)]
-pub struct ConsumerGroupOffsets(papaya::HashMap<ConsumerGroupId, consumer_offset::ConsumerOffset>);
-
-impl ConsumerGroupOffsets {
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self(papaya::HashMap::with_capacity(capacity))
-    }
-}
-
-impl<I> From<I> for ConsumerGroupOffsets
-where
-    I: IntoIterator<Item = (ConsumerGroupId, consumer_offset::ConsumerOffset)>,
-{
-    fn from(iter: I) -> Self {
-        Self(papaya::HashMap::from_iter(iter))
-    }
-}
-
-impl std::ops::Deref for ConsumerGroupOffsets {
-    type Target = papaya::HashMap<ConsumerGroupId, consumer_offset::ConsumerOffset>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for ConsumerGroupOffsets {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
+pub use iggy_common::ConsumerGroupOffsets;
