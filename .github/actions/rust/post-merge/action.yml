@@ -117,8 +117,12 @@ runs:
           echo "🔍 Dry run - would publish crate: $PACKAGE"
           echo ""
 
-          # Run cargo publish in dry-run mode
-          cargo publish --dry-run -p "$PACKAGE"
+          # Use cargo package instead of cargo publish --dry-run to avoid
+          # dependency resolution from crates.io — earlier crates in the
+          # chain (e.g. iggy_common) haven't been published yet during dry run.
+          # Build correctness is already verified by the "Build package" step
+          # which uses workspace-local dependencies.
+          cargo package -p "$PACKAGE" --no-verify
 
           echo ""
           echo "Would publish:"
