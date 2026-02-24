@@ -8428,6 +8428,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "shard"
+version = "0.1.0"
+dependencies = [
+ "consensus",
+ "iggy_common",
+ "journal",
+ "message_bus",
+ "metadata",
+ "partitions",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8513,6 +8525,7 @@ dependencies = [
  "message_bus",
  "metadata",
  "partitions",
+ "shard",
 ]
 
 [[package]]
