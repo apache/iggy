@@ -343,6 +343,67 @@ jobs:
           flags: csharp
           fail_ci_if_error: false
 
+  python-coverage:
+    name: Python coverage baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "false"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        run: |
+          cd foreign/python
+          uv sync --frozen --extra dev --extra testing --extra testing-docker
+
+      - name: Build Python wheel
+        run: |
+          cd foreign/python
+          uv run maturin build -o dist
+          uv pip install dist/*.whl --force-reinstall
+
+      - name: Start Iggy server
+        id: iggy
+        uses: ./.github/actions/utils/server-start
+
+      - name: Run tests with coverage
+        run: |
+          cd foreign/python
+          IGGY_SERVER_HOST=127.0.0.1 \
+          IGGY_SERVER_TCP_PORT=8090 \
+            uv run pytest tests/ -v \
+              --cov --cov-report=xml:../../reports/python-coverage.xml \
+              --tb=short \
+              --capture=no
+
+      - name: Stop Iggy server
+        if: always()
+        uses: ./.github/actions/utils/server-stop
+        with:
+          pid-file: ${{ steps.iggy.outputs.pid_file }}
+          log-file: ${{ steps.iggy.outputs.log_file }}
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/python-coverage.xml
+          disable_search: true
+          flags: python
+          fail_ci_if_error: false
+
   create-prerelease:
     name: Create edge pre-release
     runs-on: ubuntu-latest

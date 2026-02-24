@@ -127,6 +127,33 @@ impl IggyShard {
         Ok(())
     }
 
+    /// Validates that consumer_offset does not exceed actual partition offset.
+    pub fn validate_partition_offset(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        consumer_offset: u64,
+    ) -> Result<(), IggyError> {
+        let partition_stats = self
+            .metadata
+            .get_partition_stats_by_ids(stream_id, topic_id, partition_id)
+            .ok_or(IggyError::PartitionNotFound(
+                partition_id,
+                Identifier::numeric(topic_id as u32).expect("numeric identifier is always valid"),
+                Identifier::numeric(stream_id as u32).expect("numeric identifier is always valid"),
+            ))?;
+
+        // Also rejects storing any offset if the partition is completely empty (i.e., has never contained any messages).
+        if (partition_stats.messages_count_inconsistent() == 0
+            && partition_stats.current_offset() == 0)
+            || consumer_offset > partition_stats.current_offset()
+        {
+            return Err(IggyError::InvalidOffset(consumer_offset));
+        }
+        Ok(())
+    }
+
     /// Resolves consumer with partition ID for polling/offset operations.
     /// For consumer groups, all lookups happen under a single metadata read guard.
     pub fn resolve_consumer_with_partition_id(
