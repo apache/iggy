@@ -20,16 +20,17 @@ use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
-use crate::state::command::EntryCommand;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::delete;
 use axum::{Extension, Router, debug_handler};
 use err_trail::ErrContext;
 use iggy_common::Identifier;
-use iggy_common::IggyError;
 use iggy_common::Validatable;
 use iggy_common::delete_segments::DeleteSegments;
+use iggy_common::sharding::IggyNamespace;
 use send_wrapper::SendWrapper;
 use std::sync::Arc;
 use tracing::instrument;
@@ -57,44 +58,62 @@ async fn delete_segments(
     query.validate()?;
     let segments_count = query.segments_count;
 
-    let (numeric_stream_id, numeric_topic_id) = state
-        .shard
-        .shard()
-        .resolve_topic_id(&query.stream_id, &query.topic_id)?;
-    state.shard.shard().metadata.perm_delete_segments(
+    let partition = state.shard.shard().resolve_partition_for_delete_segments(
         identity.user_id,
-        numeric_stream_id,
-        numeric_topic_id,
+        &query.stream_id,
+        &query.topic_id,
+        partition_id as usize,
     )?;
-    {
-        let delete_future = SendWrapper::new(state.shard.shard().delete_segments_base(
-            numeric_stream_id,
-            numeric_topic_id,
-            partition_id as usize,
-            segments_count,
-        ));
 
-        delete_future.await.error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to delete segments for topic with ID: {topic_id} in stream with ID: {stream_id}"
-            )
-        })?
-    };
+    let namespace = IggyNamespace::new(
+        partition.stream_id,
+        partition.topic_id,
+        partition.partition_id,
+    );
+    let request = ShardRequest::data_plane(
+        namespace,
+        ShardRequestPayload::DeleteSegments { segments_count },
+    );
 
-    let command = EntryCommand::DeleteSegments(DeleteSegments {
+    let delete_future = SendWrapper::new(state.shard.shard().send_to_data_plane(request));
+    match delete_future.await? {
+        ShardResponse::DeleteSegments {
+            deleted_segments,
+            deleted_messages,
+        } => {
+            state
+                .shard
+                .shard()
+                .metrics
+                .decrement_segments(deleted_segments as u32);
+            state
+                .shard
+                .shard()
+                .metrics
+                .decrement_messages(deleted_messages);
+        }
+        ShardResponse::ErrorResponse(err) => return Err(err.into()),
+        _ => unreachable!("Expected DeleteSegments"),
+    }
+
+    let command = DeleteSegments {
         stream_id: query.stream_id.clone(),
         topic_id: query.topic_id.clone(),
         partition_id: query.partition_id,
         segments_count,
-    });
-    let state_future =
-        SendWrapper::new(state.shard.shard().state.apply(identity.user_id, &command));
-
-    state_future.await
-        .error(|e: &IggyError| {
-            format!(
-                "{COMPONENT} (error: {e}) - failed to apply delete segments, stream ID: {stream_id}, topic ID: {topic_id}"
-            )
-        })?;
+    };
+    let entry_command = crate::state::command::EntryCommand::DeleteSegments(command);
+    let state_future = SendWrapper::new(
+        state
+            .shard
+            .shard()
+            .state
+            .apply(identity.user_id, &entry_command),
+    );
+    state_future.await.error(|e: &iggy_common::IggyError| {
+        format!(
+            "{COMPONENT} (error: {e}) - failed to apply delete segments, stream ID: {stream_id}, topic ID: {topic_id}"
+        )
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }

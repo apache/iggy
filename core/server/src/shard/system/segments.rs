@@ -352,8 +352,7 @@ impl IggyShard {
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_id);
 
         // Drain segments from local_partitions
-        let (segments, storages, stats, deleted_segments_count) = {
-
+        let (segments, storages, stats) = {
             let mut partitions = self.local_partitions.borrow_mut();
             let partition = partitions
                 .get_mut(&namespace)
@@ -375,16 +374,8 @@ impl IggyShard {
                 .indexes_mut()
                 .drain(..upperbound)
                 .collect::<Vec<_>>();
-            (
-                segments,
-                storages,
-                partition.stats.clone(),
-                (upperbound - begin) as u32,
-            )
+            (segments, storages, partition.stats.clone())
         };
-        if deleted_segments_count == 0 {
-            return Ok(());
-        }
 
         for (mut storage, segment) in storages.into_iter().zip(segments.into_iter()) {
             let (msg_writer, index_writer) = storage.shutdown();
@@ -424,7 +415,6 @@ impl IggyShard {
         }
 
         self.init_log_in_local_partitions(&namespace).await?;
-        stats.decrement_segments_count(deleted_segments_count);
         stats.increment_segments_count(1);
         Ok(())
     }

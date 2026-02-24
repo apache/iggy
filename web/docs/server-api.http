@@ -66,7 +66,7 @@ Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJqdGkiOiJmODM0NTI5M
   "max_topic_size": "1000000000"
 }
 
- 
+
 ### Create partitions
 POST {{url}}/streams/3/topics/3/partitions
 Content-Type: application/json
