@@ -73,5 +73,5 @@ export const COMMAND_CODE = {
 const reverseCommandCodeMap = reverseRecord(COMMAND_CODE);
 
 export const translateCommandCode = (code: number): string => {
-  return reverseCommandCodeMap[code] || `unknow_command_code_${code}`
+  return reverseCommandCodeMap[code] || `unknown_command_code_${code}`
 };

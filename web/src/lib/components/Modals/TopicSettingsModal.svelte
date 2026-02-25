@@ -158,7 +158,7 @@
     on:result={onConfirmationResult}
   >
     {#snippet message()}
-      Deleting the topic "<span class="font-semibold">{topic.name}</span>" will permenently remove
+      Deleting the topic "<span class="font-semibold">{topic.name}</span>" will permanently remove
       all associated <span class="font-semibold">partitions ({topic.partitionsCount})</span> and
       <span class="font-semibold">messages ({topic.messagesCount})</span>.
     {/snippet}

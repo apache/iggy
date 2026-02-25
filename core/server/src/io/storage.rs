@@ -48,7 +48,7 @@ impl OpenOpts {
         }
     }
 
-    pub fn permament(path: String) -> Self {
+    pub fn permanent(path: String) -> Self {
         Self {
             keep_fd: true,
             path,
@@ -144,5 +144,28 @@ impl Storage for BlockStorage {
         };
         result?;
         Ok(buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_opts_ephemeral_creates_correct_config() {
+        let path = "path/to/file".to_string();
+        let opts = OpenOpts::ephemeral(path.clone());
+
+        assert!(!opts.keep_fd);
+        assert_eq!(opts.path, path);
+    }
+
+    #[test]
+    fn open_opts_permanent_creates_correct_config() {
+        let path = "path/to/file".to_string();
+        let opts = OpenOpts::permanent(path.clone());
+
+        assert!(opts.keep_fd);
+        assert_eq!(opts.path, path);
     }
 }

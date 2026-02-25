@@ -143,7 +143,7 @@ pub struct BackgroundConfig {
 #[derive(Clone, Builder)]
 pub struct DirectConfig {
     /// Maximum number of messages to pack into **one** synchronous request.
-    /// `0` ⇒ MAX_BATCH_LENTH().
+    /// `0` ⇒ MAX_BATCH_LENGTH().
     #[builder(default = 1000)]
     pub batch_length: u32,
     /// How long to wait for more messages before flushing the current set.

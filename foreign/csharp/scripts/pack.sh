@@ -47,7 +47,7 @@ echo "Uploading Iggy package to Nuget using branch $GITHUB_REF_NAME"
 case "$GITHUB_REF_NAME" in
   "master")
     dotnet nuget push ./*.nupkg -k "$NUGET_API_KEY" -s https://api.nuget.org/v3/index.json
-    echo "Published package succesfully!"
+    echo "Published package successfully!"
     ;;
   *)
     echo "Skipping NuGet package push as the branch is not master."
