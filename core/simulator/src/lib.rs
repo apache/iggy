@@ -118,7 +118,7 @@ impl Simulator {
         replica: &Replica,
         message: Message<iggy_common::header::GenericHeader>,
     ) {
-        replica.dispatch(message).await;
+        replica.on_message(message).await;
     }
 }
 

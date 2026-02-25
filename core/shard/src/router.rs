@@ -15,56 +15,50 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod router;
-
-use consensus::{MuxPlane, NamespacedPipeline, Plane, PlaneIdentity, VsrConsensus};
-use iggy_common::header::{GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader};
+use crate::IggyShard;
+use iggy_common::header::{
+    ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
+};
 use iggy_common::message::{Message, MessageBag};
-use iggy_common::sharding::IggyNamespace;
-use iggy_common::variadic;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use metadata::IggyMetadata;
 use metadata::stm::StateMachine;
-use partitions::IggyPartitions;
 
-// variadic!(Metadata, Partitions) = (Metadata, (Partitions, ()))
-type PlaneInner<B, J, S, M> = (
-    IggyMetadata<VsrConsensus<B>, J, S, M>,
-    (IggyPartitions<VsrConsensus<B, NamespacedPipeline>>, ()),
-);
-
-pub type ShardPlane<B, J, S, M> = MuxPlane<PlaneInner<B, J, S, M>>;
-
-pub struct IggyShard<B, J, S, M>
+/// Routes incoming network messages to the appropriate [`IggyShard`].
+///
+/// Current routing strategy (single-shard):
+///   - All messages are dispatched to shard 0.
+///
+/// Future routing strategy (multi-shard):
+///   - Metadata operations -> the designated metadata shard.
+///   - Partition operations -> the shard owning the namespace extracted from the
+///     message header.
+pub struct ShardRouter<B, J, S, M>
 where
     B: MessageBus,
 {
-    pub id: u8,
-    pub name: String,
-    pub plane: ShardPlane<B, J, S, M>,
+    shards: Vec<IggyShard<B, J, S, M>>,
 }
 
-impl<B, J, S, M> IggyShard<B, J, S, M>
+impl<B, J, S, M> ShardRouter<B, J, S, M>
 where
     B: MessageBus,
 {
-    /// Create a new shard from pre-built metadata and partition planes.
-    pub fn new(
-        id: u8,
-        name: String,
-        metadata: IggyMetadata<VsrConsensus<B>, J, S, M>,
-        partitions: IggyPartitions<VsrConsensus<B, NamespacedPipeline>>,
-    ) -> Self {
-        let plane = MuxPlane::new(variadic!(metadata, partitions));
-        Self { id, name, plane }
+    pub fn new(shards: Vec<IggyShard<B, J, S, M>>) -> Self {
+        Self { shards }
     }
 
-    /// Dispatch an incoming network message to the appropriate consensus plane.
-    ///
-    /// Routes requests, replication messages, and acks to either the metadata
-    /// plane or the partitions plane based on `PlaneIdentity::is_applicable`.
-    pub async fn on_message(&self, message: Message<GenericHeader>)
+    pub fn shards(&self) -> &[IggyShard<B, J, S, M>] {
+        &self.shards
+    }
+
+    pub fn shards_mut(&mut self) -> &mut [IggyShard<B, J, S, M>] {
+        &mut self.shards
+    }
+
+    /// Dispatch a raw network message: determine the target shard, then
+    /// forward to its consensus planes.
+    pub async fn dispatch(&self, message: Message<GenericHeader>)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
         J: JournalHandle,
@@ -93,12 +87,9 @@ where
             >,
         M: StateMachine<Input = Message<PrepareHeader>>,
     {
-        let planes = self.plane.inner();
-        if planes.0.is_applicable(&request) {
-            planes.0.on_request(request).await;
-        } else {
-            planes.1.0.on_request(request).await;
-        }
+        let header = request.header();
+        let shard = self.resolve(header.operation(), header.namespace);
+        shard.on_request(request).await;
     }
 
     pub async fn on_replicate(&self, prepare: Message<PrepareHeader>)
@@ -112,12 +103,9 @@ where
             >,
         M: StateMachine<Input = Message<PrepareHeader>>,
     {
-        let planes = self.plane.inner();
-        if planes.0.is_applicable(&prepare) {
-            planes.0.on_replicate(prepare).await;
-        } else {
-            planes.1.0.on_replicate(prepare).await;
-        }
+        let header = prepare.header();
+        let shard = self.resolve(header.operation(), header.namespace);
+        shard.on_replicate(prepare).await;
     }
 
     pub async fn on_ack(&self, prepare_ok: Message<PrepareOkHeader>)
@@ -131,24 +119,25 @@ where
             >,
         M: StateMachine<Input = Message<PrepareHeader>>,
     {
-        let planes = self.plane.inner();
-        if planes.0.is_applicable(&prepare_ok) {
-            planes.0.on_ack(prepare_ok).await;
-        } else {
-            planes.1.0.on_ack(prepare_ok).await;
-        }
+        let header = prepare_ok.header();
+        let shard = self.resolve(header.operation(), header.namespace);
+        shard.on_ack(prepare_ok).await;
     }
 
-    pub fn init_partition(&mut self, namespace: IggyNamespace)
-    where
-        B: MessageBus<
-                Replica = u8,
-                Data = iggy_common::message::Message<iggy_common::header::GenericHeader>,
-                Client = u128,
-            >,
-    {
-        let partitions = &mut self.plane.inner_mut().1.0;
-        partitions.init_partition_in_memory(namespace);
-        partitions.register_namespace_in_pipeline(namespace.inner());
+    /// Resolve which shard should handle a message given its operation and namespace.
+    ///
+    /// Assumes at least one shard exists. Panics otherwise.
+    fn resolve(&self, _operation: Operation, _namespace: u64) -> &IggyShard<B, J, S, M> {
+        // TODO: Multi-shard routing.
+        //
+        // Metadata operations (CreateStream, CreateUser, …) should be routed to
+        // the designated metadata shard.
+        //
+        // Partition operations (SendMessages, StoreConsumerOffset, DeleteSegments)
+        // should use the namespace (packed stream_id + topic_id + partition_id) to
+        // determine which shard owns that partition.
+        //
+        // For now, everything routes to shard 0.
+        &self.shards[0]
     }
 }
