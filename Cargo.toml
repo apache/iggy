@@ -35,6 +35,7 @@ members = [
     "core/connectors/sdk",
     "core/connectors/sinks/elasticsearch_sink",
     "core/connectors/sinks/iceberg_sink",
+    "core/connectors/sinks/mongodb_sink",
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
     "core/connectors/sinks/stdout_sink",

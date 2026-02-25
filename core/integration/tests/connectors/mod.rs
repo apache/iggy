@@ -22,6 +22,7 @@ mod elasticsearch;
 mod fixtures;
 mod http_config_provider;
 mod iceberg;
+mod mongodb;
 mod postgres;
 mod quickwit;
 mod random;
