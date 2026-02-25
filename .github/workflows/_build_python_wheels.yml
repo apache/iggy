@@ -237,7 +237,8 @@ jobs:
 
   collect:
     name: Collect all wheels
-    needs: [linux, macos, windows, sdist]
+    needs: [linux, macos, sdist] # TODO(hubcio): add windows back when re-enabled
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     outputs:
       artifact_name: ${{ steps.output.outputs.artifact_name }}
