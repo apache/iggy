@@ -508,8 +508,17 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
     public void testStoreAndGetConsumerOffset() throws Exception {
         log.info("Testing consumer offset store and get");
 
+        // Send message to ensure partition is not empty so we can store offset 0
+        client.messages()
+                .sendMessages(
+                        StreamId.of(TEST_STREAM),
+                        TopicId.of(TEST_TOPIC),
+                        Partitioning.partitionId(PARTITION_ID),
+                        List.of(Message.of("test")))
+                .get(5, TimeUnit.SECONDS);
+
         var consumer = new Consumer(Consumer.Kind.Consumer, ConsumerId.of(5000L));
-        var offset = BigInteger.valueOf(42);
+        var offset = BigInteger.valueOf(0);
 
         client.consumerOffsets()
                 .storeConsumerOffset(
