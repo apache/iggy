@@ -632,8 +632,8 @@ mod tests {
     #[test]
     fn serialize_float32() {
         let mut buf = vec![];
-        serialize_value(&json_f64(3.14), &ChType::Float32, &mut buf).unwrap();
-        assert_eq!(buf, (3.14f64 as f32).to_le_bytes());
+        serialize_value(&json_f64(3.15), &ChType::Float32, &mut buf).unwrap();
+        assert_eq!(buf, (3.15f64 as f32).to_le_bytes());
     }
 
     #[test]
@@ -658,6 +658,20 @@ mod tests {
     }
 
     #[test]
+    fn serialize_boolean_from_nonzero_i64_is_true() {
+        let mut buf = vec![];
+        serialize_value(&json_i64(1), &ChType::Boolean, &mut buf).unwrap();
+        assert_eq!(buf, [0x01]);
+    }
+
+    #[test]
+    fn serialize_boolean_from_zero_u64_is_false() {
+        let mut buf = vec![];
+        serialize_value(&json_u64(0), &ChType::Boolean, &mut buf).unwrap();
+        assert_eq!(buf, [0x00]);
+    }
+
+    #[test]
     fn serialize_string_with_varint_prefix() {
         let mut buf = vec![];
         serialize_value(&json_str("hi"), &ChType::String, &mut buf).unwrap();
@@ -670,6 +684,13 @@ mod tests {
         let mut buf = vec![];
         serialize_value(&json_str("ab"), &ChType::FixedString(4), &mut buf).unwrap();
         assert_eq!(buf, [b'a', b'b', 0x00, 0x00]);
+    }
+
+    #[test]
+    fn serialize_fixed_string_truncates_to_length() {
+        let mut buf = vec![];
+        serialize_value(&json_str("abcdef"), &ChType::FixedString(3), &mut buf).unwrap();
+        assert_eq!(buf, [b'a', b'b', b'c']);
     }
 
     // ── nullable ─────────────────────────────────────────────────────────────
@@ -687,6 +708,62 @@ mod tests {
         let mut expected = vec![0x00u8];
         expected.extend_from_slice(&42i32.to_le_bytes());
         assert_eq!(buf, expected);
+    }
+
+    // ── uuid ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn serialize_uuid_writes_split_reversed_halves() {
+        let mut buf = vec![];
+        // Raw bytes: [55 0e 84 00 e2 9b 41 d4] [a7 16 44 66 55 44 00 00]
+        // First half reversed:  [d4 41 9b e2 00 84 0e 55]
+        // Second half reversed: [00 00 44 55 66 44 16 a7]
+        serialize_value(
+            &json_str("550e8400-e29b-41d4-a716-446655440000"),
+            &ChType::Uuid,
+            &mut buf,
+        ).unwrap();
+        assert_eq!(buf, [
+            0xd4, 0x41, 0x9b, 0xe2, 0x00, 0x84, 0x0e, 0x55,
+            0x00, 0x00, 0x44, 0x55, 0x66, 0x44, 0x16, 0xa7,
+        ]);
+    }
+
+    #[test]
+    fn serialize_uuid_invalid_string_is_error() {
+        let mut buf = vec![];
+        let result = serialize_value(&json_str("not-a-uuid"), &ChType::Uuid, &mut buf);
+        assert!(result.is_err());
+    }
+
+    // ── enum ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn serialize_enum8_known_value() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("active".to_string(), 1i8);
+        map.insert("inactive".to_string(), 2i8);
+        let mut buf = vec![];
+        serialize_value(&json_str("active"), &ChType::Enum8(map), &mut buf).unwrap();
+        assert_eq!(buf, [0x01]);
+    }
+
+    #[test]
+    fn serialize_enum8_unknown_value_is_error() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("active".to_string(), 1i8);
+        let mut buf = vec![];
+        let result = serialize_value(&json_str("deleted"), &ChType::Enum8(map), &mut buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serialize_enum16_known_value_little_endian() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("low".to_string(), 300i16);
+        let mut buf = vec![];
+        serialize_value(&json_str("low"), &ChType::Enum16(map), &mut buf).unwrap();
+        assert_eq!(buf, 300i16.to_le_bytes());
     }
 
     // ── RowBinary row ────────────────────────────────────────────────────────
@@ -723,6 +800,37 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn serialize_row_nullable_absent_writes_null_marker() {
+        // Absent field + Nullable column + no default → 0x00 prefix + 0x01 null marker.
+        let value = OwnedValue::Object(Box::new(simd_json::owned::Object::new()));
+        let columns = vec![col("x", ChType::Nullable(Box::new(ChType::Int32)), false)];
+        let mut buf = vec![];
+        serialize_row(&value, &columns, &mut buf).unwrap();
+        assert_eq!(buf, [0x00, 0x01]);
+    }
+
+    #[test]
+    fn serialize_row_non_nullable_explicit_null_is_error() {
+        // Field present in JSON but set to null, column is non-nullable → error.
+        let mut obj = simd_json::owned::Object::new();
+        obj.insert("id".into(), json_null());
+        let value = OwnedValue::Object(Box::new(obj));
+        let columns = vec![col("id", ChType::Int32, false)];
+        let mut buf = vec![];
+        let result = serialize_row(&value, &columns, &mut buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serialize_row_non_object_payload_is_error() {
+        let value = OwnedValue::Array(Box::new(vec![]));
+        let columns = vec![col("x", ChType::Int32, false)];
+        let mut buf = vec![];
+        let result = serialize_row(&value, &columns, &mut buf);
+        assert!(result.is_err());
+    }
+
     // ── date / datetime ──────────────────────────────────────────────────────
     #[test]
     fn serialize_date_from_integer() {
@@ -754,13 +862,45 @@ mod tests {
         assert_eq!(buf, 1_000_000i64.to_le_bytes());
     }
 
+    #[test]
+    fn serialize_date32_from_string() {
+        let mut buf = vec![];
+        // 1970-01-02 = day 1 as i32 (Date32 uses signed Int32, not UInt16)
+        serialize_value(&json_str("1970-01-02"), &ChType::Date32, &mut buf).unwrap();
+        assert_eq!(buf, 1i32.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_datetime_from_iso8601_utc_string() {
+        let mut buf = vec![];
+        // "1970-01-02T00:00:00Z" = 86400 seconds
+        serialize_value(&json_str("1970-01-02T00:00:00Z"), &ChType::DateTime, &mut buf).unwrap();
+        assert_eq!(buf, 86400u32.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_datetime_from_iso8601_positive_offset() {
+        let mut buf = vec![];
+        // "1970-01-01T01:00:00+01:00" = midnight UTC = 0 seconds
+        serialize_value(&json_str("1970-01-01T01:00:00+01:00"), &ChType::DateTime, &mut buf).unwrap();
+        assert_eq!(buf, 0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_datetime64_from_string_with_fractional_seconds() {
+        let mut buf = vec![];
+        // 1.5 seconds at precision=3 → 1500 milliseconds
+        serialize_value(&json_str("1970-01-01T00:00:01.500Z"), &ChType::DateTime64(3), &mut buf).unwrap();
+        assert_eq!(buf, 1500i64.to_le_bytes());
+    }
+
     // ── decimal ──────────────────────────────────────────────────────────────
     #[test]
     fn serialize_decimal32_scale2() {
         let mut buf = vec![];
-        // 3.14 * 10^2 = 314 → Int32
-        serialize_value(&json_f64(3.14), &ChType::Decimal(9, 2), &mut buf).unwrap();
-        assert_eq!(buf, 314i32.to_le_bytes());
+        // 3.15 * 10^2 = 314 → Int32
+        serialize_value(&json_f64(3.15), &ChType::Decimal(9, 2), &mut buf).unwrap();
+        assert_eq!(buf, 315i32.to_le_bytes());
     }
 
     #[test]
@@ -768,6 +908,17 @@ mod tests {
         let mut buf = vec![];
         serialize_value(&json_f64(1.2345), &ChType::Decimal(18, 4), &mut buf).unwrap();
         assert_eq!(buf, 12345i64.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_decimal128_two_word_layout() {
+        let mut buf = vec![];
+        // Decimal(38, 2): 1.0 → int_val = 100 → fits in i128
+        // Written as two little-endian i64 words: lo=100, hi=0
+        serialize_value(&json_f64(1.0), &ChType::Decimal(38, 2), &mut buf).unwrap();
+        let mut expected = 100i64.to_le_bytes().to_vec();
+        expected.extend_from_slice(&0i64.to_le_bytes());
+        assert_eq!(buf, expected);
     }
 
     // ── array ────────────────────────────────────────────────────────────────
@@ -781,6 +932,85 @@ mod tests {
         assert_eq!(&buf[1..5], 1i32.to_le_bytes());
         assert_eq!(&buf[5..9], 2i32.to_le_bytes());
         assert_eq!(&buf[9..13], 3i32.to_le_bytes());
+    }
+
+    // ── map ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn serialize_map_string_to_int32() {
+        // Map(String, Int32): {"k": 1}
+        // → varint(1) + string("k") + Int32(1)
+        let mut obj = simd_json::owned::Object::new();
+        obj.insert("k".into(), json_i64(1));
+        let value = OwnedValue::Object(Box::new(obj));
+        let mut buf = vec![];
+        serialize_value(
+            &value,
+            &ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
+            &mut buf,
+        ).unwrap();
+        assert_eq!(buf[0], 1); // varint: 1 entry
+        assert_eq!(buf[1], 1); // varint: key length 1
+        assert_eq!(buf[2], b'k');
+        assert_eq!(&buf[3..7], 1i32.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_map_non_object_is_error() {
+        let value = OwnedValue::Array(Box::new(vec![]));
+        let mut buf = vec![];
+        let result = serialize_value(
+            &value,
+            &ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
+            &mut buf,
+        );
+        assert!(result.is_err());
+    }
+
+    // ── tuple ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn serialize_tuple_from_json_array() {
+        // Tuple(String, Int32): ["hi", 7]
+        let arr = OwnedValue::Array(Box::new(vec![json_str("hi"), json_i64(7)]));
+        let mut buf = vec![];
+        serialize_value(
+            &arr,
+            &ChType::Tuple(vec![ChType::String, ChType::Int32]),
+            &mut buf,
+        ).unwrap();
+        assert_eq!(&buf[..3], &[0x02, b'h', b'i']); // string "hi"
+        assert_eq!(&buf[3..], 7i32.to_le_bytes());   // Int32 7
+    }
+
+    #[test]
+    fn serialize_tuple_from_json_object() {
+        // Tuple(String, Int32) as named object: {"a": "hi", "b": 7}
+        let mut obj = simd_json::owned::Object::new();
+        obj.insert("a".into(), json_str("hi"));
+        obj.insert("b".into(), json_i64(7));
+        let value = OwnedValue::Object(Box::new(obj));
+        let mut buf = vec![];
+        serialize_value(
+            &value,
+            &ChType::Tuple(vec![ChType::String, ChType::Int32]),
+            &mut buf,
+        ).unwrap();
+        assert_eq!(&buf[..3], &[0x02, b'h', b'i']);
+        assert_eq!(&buf[3..], 7i32.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_tuple_length_mismatch_is_error() {
+        // Schema expects 2 fields, array has 1 → error
+        let arr = OwnedValue::Array(Box::new(vec![json_i64(1)]));
+        let mut buf = vec![];
+        let result = serialize_value(
+            &arr,
+            &ChType::Tuple(vec![ChType::Int32, ChType::String]),
+            &mut buf,
+        );
+        assert!(result.is_err());
     }
 
     // ── ipv4 / ipv6 ──────────────────────────────────────────────────────────

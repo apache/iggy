@@ -16,9 +16,10 @@
  * under the License.
  */
 
-use crate::{ClickHouseSink, InsertFormat, StringFormat, client::ClickHouseClient};
+use crate::body::{build_json_body, build_row_binary_body, build_string_body};
+use crate::{ClickHouseSink, InsertFormat, client::ClickHouseClient};
 use async_trait::async_trait;
-use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata};
+use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
 use tracing::{debug, error, info, warn};
 
 #[async_trait]
@@ -155,89 +156,3 @@ impl Sink for ClickHouseSink {
     }
 }
 
-// ─── Body builders ────────────────────────────────────────────────────────────
-
-/// Build a newline-delimited JSON body for `FORMAT JSONEachRow`.
-/// Each `Payload::Json` message becomes one line. Other payload types are skipped.
-fn build_json_body(messages: &[ConsumedMessage]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(messages.len() * 64);
-    for msg in messages {
-        match &msg.payload {
-            Payload::Json(value) => {
-                if let Ok(s) = simd_json::to_string(value) {
-                    buf.extend_from_slice(s.as_bytes());
-                    buf.push(b'\n');
-                } else {
-                    warn!("Failed to serialise JSON payload at offset {}", msg.offset);
-                }
-            }
-            other => {
-                warn!(
-                    "JSONEachRow mode: skipping unsupported payload type {:?} at offset {}",
-                    payload_type_name(other),
-                    msg.offset
-                );
-            }
-        }
-    }
-    buf
-}
-
-/// Build a RowBinaryWithDefaults body.
-/// Each `Payload::Json` message is serialised to binary using the table schema.
-fn build_row_binary_body(
-    messages: &[ConsumedMessage],
-    schema: &[crate::schema::Column],
-) -> Result<Vec<u8>, Error> {
-    let mut buf = Vec::with_capacity(messages.len() * 128);
-    for msg in messages {
-        match &msg.payload {
-            Payload::Json(value) => {
-                crate::binary::serialize_row(value, schema, &mut buf)?;
-            }
-            other => {
-                warn!(
-                    "RowBinary mode: skipping unsupported payload type {:?} at offset {}",
-                    payload_type_name(other),
-                    msg.offset
-                );
-            }
-        }
-    }
-    Ok(buf)
-}
-
-/// Build a raw string body for CSV / TSV / JSONEachRow string passthrough.
-/// Each `Payload::Text` message is written as-is with a trailing newline
-/// appended for CSV/TSV if not already present.
-fn build_string_body(messages: &[ConsumedMessage], string_format: StringFormat) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(messages.len() * 64);
-    for msg in messages {
-        match &msg.payload {
-            Payload::Text(s) => {
-                buf.extend_from_slice(s.as_bytes());
-                if string_format.requires_newline() && !s.ends_with('\n') {
-                    buf.push(b'\n');
-                }
-            }
-            other => {
-                warn!(
-                    "String passthrough mode: skipping unsupported payload type {:?} at offset {}",
-                    payload_type_name(other),
-                    msg.offset
-                );
-            }
-        }
-    }
-    buf
-}
-
-fn payload_type_name(p: &Payload) -> &'static str {
-    match p {
-        Payload::Json(_) => "Json",
-        Payload::Raw(_) => "Raw",
-        Payload::Text(_) => "Text",
-        Payload::Proto(_) => "Proto",
-        Payload::FlatBuffer(_) => "FlatBuffer",
-    }
-}

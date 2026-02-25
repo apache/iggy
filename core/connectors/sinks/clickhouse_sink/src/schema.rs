@@ -17,6 +17,60 @@
  */
 
 //! ClickHouse column schema model and type string parser used by RowBinary mode.
+//!
+//! 
+//! # Type string grammar
+//!
+//! Grammer followed by ClickHouse type strings (as returned by `SELECT type FROM system.columns`):
+//! ```text
+//! type  ::= composite | parameterised | primitive
+//!
+//! composite      ::= "Nullable(" type ")"
+//!                  | "Array(" type ")"
+//!                  | "Map(" type ", " type ")"
+//!                  | "Tuple(" tuple_fields ")"
+//!
+//! tuple_fields   ::= type ("," type)*            -- unnamed fields
+//!                  | ident type ("," ident type)* -- named fields
+//!
+//! parameterised  ::= "FixedString(" n ")"
+//!                  | "DateTime64(" precision ["," tz] ")"
+//!                  | "DateTime(" tz ")"
+//!                  | "Decimal(" precision "," scale ")"
+//!                  | "Decimal32(" scale ")"
+//!                  | "Decimal64(" scale ")"
+//!                  | "Decimal128(" scale ")"
+//!                  | "Enum8(" enum_pairs ")"
+//!                  | "Enum16(" enum_pairs ")"
+//!
+//! enum_pairs     ::= "'" name "' = " int ("," "'" name "' = " int)*
+//!
+//! primitive      ::= "String" | "Int8" | "Int16" | "Int32" | "Int64"
+//!                  | "UInt8" | "UInt16" | "UInt32" | "UInt64"
+//!                  | "Float32" | "Float64" | "Bool" | "Boolean"
+//!                  | "UUID" | "Date" | "Date32" | "DateTime"
+//!                  | "IPv4" | "IPv6"
+//! ```
+//!
+//! 
+//! ## Example
+//!
+//! ```text
+//! Nullable(Map(String, Array(Tuple(id Int32, ts DateTime64(3, 'UTC')))))
+//! ```
+//!
+//! Parses into the AST:
+//!
+//! ```text
+//! Nullable
+//! └── Map
+//!     ├── key:   String
+//!     └── value: Array
+//!                └── Tuple
+//!                    ├── [0] Int32
+//!                    └── [1] DateTime64(3)
+//! ```
+
 
 use iggy_connector_sdk::Error;
 use std::collections::HashMap;
@@ -100,13 +154,15 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
     // This shouldn't be needed for well-formed ClickHouse type strings, but is
     // a defensive measure.
     let s = s.trim();
-
+    // e.g. "Nullable(Int32)"
     if let Some(inner) = strip_wrapper(s, "Nullable") {
         return Ok(ChType::Nullable(Box::new(parse_type_inner(inner)?)));
     }
+    // e.g. "Array(String)"
     if let Some(inner) = strip_wrapper(s, "Array") {
         return Ok(ChType::Array(Box::new(parse_type_inner(inner)?)));
     }
+    // e.g. "Map(String, Int64)"
     if let Some(inner) = strip_wrapper(s, "Map") {
         let (k, v) = split_two_args(inner)?;
         return Ok(ChType::Map(
@@ -114,6 +170,7 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
             Box::new(parse_type_inner(v)?),
         ));
     }
+    // e.g. "Tuple(Int32, String)" or "Tuple(id Int32, name String)"
     if let Some(inner) = strip_wrapper(s, "Tuple") {
         let parts = split_args(inner)?;
         // Named tuples look like `field_name Type, …`. Strip names if present.
@@ -132,20 +189,24 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
             .collect();
         return Ok(ChType::Tuple(types?));
     }
+    // e.g. "Enum8('a' = 1, 'b' = 2)"
     if let Some(inner) = strip_wrapper(s, "Enum8") {
         let map = parse_enum_values_i8(inner)?;
         return Ok(ChType::Enum8(map));
     }
+    // e.g. "Enum16('a' = 1, 'b' = 2)"
     if let Some(inner) = strip_wrapper(s, "Enum16") {
         let map = parse_enum_values_i16(inner)?;
         return Ok(ChType::Enum16(map));
     }
+    // e.g. "FixedString(16)"
     if let Some(inner) = strip_wrapper(s, "FixedString") {
         let n: usize = inner.trim().parse().map_err(|_| {
             init_err(format!("Invalid FixedString length: {inner}"))
         })?;
         return Ok(ChType::FixedString(n));
     }
+    // e.g. "DateTime64(3)" or "DateTime64(3, 'UTC')"
     if let Some(inner) = strip_wrapper(s, "DateTime64") {
         // DateTime64(precision) or DateTime64(precision, 'timezone')
         let precision_str = inner.split(',').next().unwrap_or(inner).trim();
@@ -154,11 +215,13 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
         })?;
         return Ok(ChType::DateTime64(precision));
     }
+    // e.g. "DateTime('UTC')"
     if let Some(inner) = strip_wrapper(s, "DateTime") {
         // DateTime('timezone') — timezone is ignored for serialisation.
         let _ = inner;
         return Ok(ChType::DateTime);
     }
+    // e.g. "Decimal(18, 4)"
     if let Some(inner) = strip_wrapper(s, "Decimal") {
         let (p_str, s_str) = split_two_args(inner)?;
         let precision: u8 = p_str.trim().parse().map_err(|_| {
@@ -169,18 +232,21 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
         })?;
         return Ok(ChType::Decimal(precision, scale));
     }
+    // e.g. "Decimal32(4)"
     if let Some(inner) = strip_wrapper(s, "Decimal32") {
         let scale: u8 = inner.trim().parse().map_err(|_| {
             init_err(format!("Invalid Decimal32 scale: {inner}"))
         })?;
         return Ok(ChType::Decimal(9, scale));
     }
+    // e.g. "Decimal64(4)"
     if let Some(inner) = strip_wrapper(s, "Decimal64") {
         let scale: u8 = inner.trim().parse().map_err(|_| {
             init_err(format!("Invalid Decimal64 scale: {inner}"))
         })?;
         return Ok(ChType::Decimal(18, scale));
     }
+    // e.g. "Decimal128(4)"
     if let Some(inner) = strip_wrapper(s, "Decimal128") {
         let scale: u8 = inner.trim().parse().map_err(|_| {
             init_err(format!("Invalid Decimal128 scale: {inner}"))
@@ -450,7 +516,7 @@ mod tests {
 
     #[test]
     fn parses_array_of_nullable_int32() {
-        let t = parse_type("Array(Nullable(Int32))").unwrap();
+        let t = parse_type("(Array(Nullable(Int32)))").unwrap();
         assert!(matches!(
             t,
             ChType::Array(inner)
@@ -530,5 +596,60 @@ mod tests {
     #[test]
     fn rejects_unknown_type() {
         assert!(parse_type("WeirdType").is_err());
+    }
+
+    // Parse deeply-nested expressions ──────────────────────────────────
+
+    /// Validates the exact example shown in the module-level grammar comment.
+    #[test]
+    fn parses_doc_comment_example() {
+        // Nullable(Map(String, Array(Tuple(id Int32, ts DateTime64(3, 'UTC')))))
+        let t = parse_type("Nullable(Map(String, Array(Tuple(id Int32, ts DateTime64(3, 'UTC')))))").unwrap();
+        let ChType::Nullable(inner) = t else { panic!("expected Nullable") };
+        let ChType::Map(k, v) = *inner else { panic!("expected Map") };
+        assert!(matches!(*k, ChType::String));
+        let ChType::Array(inner) = *v else { panic!("expected Array") };
+        let ChType::Tuple(fields) = *inner else { panic!("expected Tuple") };
+        assert_eq!(fields.len(), 2);
+        assert!(matches!(fields[0], ChType::Int32));
+        assert!(matches!(fields[1], ChType::DateTime64(3)));
+    }
+
+    /// Nullable wrapping a composite type (not just a primitive).
+    #[test]
+    fn parses_nullable_wrapping_composite() {
+        let t = parse_type("Nullable(Array(Int32))").unwrap();
+        let ChType::Nullable(inner) = t else { panic!("expected Nullable") };
+        assert!(matches!(*inner, ChType::Array(_)));
+    }
+
+    /// Named tuple whose fields are themselves composite types.
+    #[test]
+    fn parses_named_tuple_with_composite_fields() {
+        // strip_named_tuple_field must correctly skip names whose type contains parens
+        let t = parse_type("Tuple(tags Array(String), meta Map(String, Int32))").unwrap();
+        let ChType::Tuple(fields) = t else { panic!("expected Tuple") };
+        assert_eq!(fields.len(), 2);
+        assert!(matches!(fields[0], ChType::Array(_)));
+        assert!(matches!(fields[1], ChType::Map(_, _)));
+    }
+
+    /// Map whose value type is itself a Map — exercises that split_two_args
+    /// does not split on the comma inside the nested Map's argument list.
+    #[test]
+    fn parses_map_of_maps() {
+        let t = parse_type("Map(String, Map(String, Int32))").unwrap();
+        assert!(matches!(t, ChType::Map(k, v)
+            if matches!(*k, ChType::String) && matches!(*v, ChType::Map(_, _))));
+    }
+
+    /// Array wrapping an unnamed tuple with more than two elements.
+    #[test]
+    fn parses_array_of_three_element_tuple() {
+        let t = parse_type("Array(Tuple(Float32, Float32, Float32))").unwrap();
+        let ChType::Array(inner) = t else { panic!("expected Array") };
+        let ChType::Tuple(fields) = *inner else { panic!("expected Tuple") };
+        assert_eq!(fields.len(), 3);
+        assert!(fields.iter().all(|f| matches!(f, ChType::Float32)));
     }
 }

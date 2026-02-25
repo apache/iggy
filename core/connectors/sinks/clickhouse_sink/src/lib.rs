@@ -23,9 +23,10 @@ use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-pub mod binary;
-pub mod client;
-pub mod schema;
+mod binary;
+mod body;
+mod client;
+mod schema;
 mod sink;
 
 sink_connector!(ClickHouseSink);
