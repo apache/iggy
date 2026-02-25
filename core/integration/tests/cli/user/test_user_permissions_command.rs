@@ -293,7 +293,7 @@ Options:
 {CLAP_INDENT}
           Stream permissions are defined by each stream separately. Setting permission for stream
           allows to set each permission individually, by default, if no permission is provided
-          (only stream ID is provided) all are set fo false. Stream permission format consists
+          (only stream ID is provided) all are set to false. Stream permission format consists
           of stream ID followed by colon (:) and list of permissions separated by comma (,).
           For each stream permission there's long variant (same as in SDK in
           iggy::models::permissions::StreamPermissions) and short variant.
@@ -304,7 +304,7 @@ Options:
           For each stream one can set permissions for each topic separately. Topic permissions
           are defined for each topic separately. Setting permission for topic allows to set each
           permission individually, by default, if no permission is provided (only topic ID is provided)
-          all are set fo false. Topic permission format consists of topic ID followed by colon (:)
+          all are set to false. Topic permission format consists of topic ID followed by colon (:)
           and list of permissions separated by comma (,). For each topic permission there's long
           variant (same as in SDK in iggy::models::permissions::TopicPermissions) and short variant.
           Topic permissions are separated by hash (#) after stream permissions.

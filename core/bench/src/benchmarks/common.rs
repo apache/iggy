@@ -22,7 +22,7 @@ use crate::{
     actors::{
         consumer::typed_benchmark_consumer::TypedBenchmarkConsumer,
         producer::typed_benchmark_producer::TypedBenchmarkProducer,
-        producing_consumer::typed_banchmark_producing_consumer::TypedBenchmarkProducingConsumer,
+        producing_consumer::typed_benchmark_producing_consumer::TypedBenchmarkProducingConsumer,
     },
     args::common::IggyBenchArgs,
     utils::finish_condition::{BenchmarkFinishCondition, BenchmarkFinishConditionMode},

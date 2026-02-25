@@ -137,7 +137,7 @@ impl Codec {
     }
 ```
 
-The other two methods implement the compression and decompression logic, which is specifc to the actual Codec instance, dependent on the enum's variant.
+The other two methods implement the compression and decompression logic, which is specific to the actual Codec instance, dependent on the enum's variant.
 The example Codec implements two. *None*, where data is not compressed and *Lz4* (using the lz4_flex crate).
 Note, that this can be easily extended to more algorithms.
 It might be reasonable to limit the number of bytes that can be decompressed to avoid large memory footprints, or even crashing the consumer.

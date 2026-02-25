@@ -165,7 +165,7 @@
     on:result={onConfirmationResult}
   >
     {#snippet message()}
-      Deleting the stream "<span class="font-semibold">{stream.name}</span>" will permenently remove
+      Deleting the stream "<span class="font-semibold">{stream.name}</span>" will permanently remove
       all associated
       <span class="font-semibold">topics ({stream.topicsCount})</span>,
       <span class="font-semibold"

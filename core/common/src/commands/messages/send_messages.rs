@@ -298,8 +298,8 @@ impl<'de> Deserialize<'de> for SendMessages {
                             let mut iggy_messages = Vec::new();
 
                             for msg in message_data {
-                                let id = parse_message_id(msg.get("id")).map_err(|errror| {
-                                    de::Error::custom(format!("Invalid message ID: {errror}"))
+                                let id = parse_message_id(msg.get("id")).map_err(|error| {
+                                    de::Error::custom(format!("Invalid message ID: {error}"))
                                 })?;
 
                                 let payload = msg
@@ -420,6 +420,26 @@ fn parse_message_id(value: Option<&serde_json::Value>) -> Result<u128, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deserialize_send_messages_with_invalid_uuid_fails() {
+        let json_data = serde_json::json!({
+            "partitioning": {
+                "kind": "balanced",
+                "value": ""
+            },
+            "messages": [{
+                "id": "114514-invalid-uuid-1919810",
+                "payload": "SGVsbG8gSWdneSE=",
+                "user_headers": [{
+                    "key": "content-type",
+                    "value": "text/plain"
+                }]
+            }]
+        });
+
+        assert!(serde_json::from_value::<SendMessages>(json_data).is_err());
+    }
 
     #[test]
     fn key_of_type_balanced_should_have_empty_value() {
