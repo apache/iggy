@@ -33,7 +33,9 @@ TOPIC_ID = 0
 PARTITION_ID = 0
 BATCHES_LIMIT = 5
 
-ArgNamespace = namedtuple("ArgNamespace", ["tcp_server_address", "tls", "tls_ca_file", "username", "password"])
+ArgNamespace = namedtuple(
+    "ArgNamespace", ["tcp_server_address", "tls", "tls_ca_file", "username", "password"]
+)
 
 
 class ValidateUrl(argparse.Action):
@@ -80,29 +82,31 @@ def parse_args():
         help="Password for authentication",
     )
     args = parser.parse_args()
-    
+
     # Validate TLS requirements
     if args.tls and not args.tls_ca_file:
         parser.error("--tls requires --tls-ca-file")
-    
+
     return ArgNamespace(**vars(args))
+
 
 def build_connection_string(args) -> str:
     """Build a connection string with TLS support."""
 
     conn_str = f"iggy://{args.username}:{args.password}@{args.tcp_server_address}"
-    
+
     if args.tls:
         # Extract domain from server address (host:port -> host)
         host = args.tcp_server_address.split(":")[0]
         query_params = ["tls=true", f"tls_domain={host}"]
-        
+
         # Add CA file if provided
         if args.tls_ca_file:
             query_params.append(f"tls_ca_file={args.tls_ca_file}")
         conn_str += "?" + "&".join(query_params)
-    
+
     return conn_str
+
 
 async def main():
     args: ArgNamespace = parse_args()
@@ -111,7 +115,6 @@ async def main():
     logger.info(f"Connection string: {connection_string}")
     logger.info(f"Connecting to {args.tcp_server_address} (TLS: {args.tls})")
 
-    
     client = IggyClient.from_connection_string(connection_string)
     logger.info("Connecting to IggyClient")
     await client.connect()
