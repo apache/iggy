@@ -102,6 +102,18 @@ jobs:
         with:
           task: ${{ inputs.task }}
 
+      - name: Upload Node coverage to Codecov
+        if: inputs.component == 'sdk-node' && (inputs.task == 'test' || inputs.task == 'e2e')
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/node-coverage/${{ inputs.task == 'test' && 'unit' || 'e2e' }}/lcov.info
+          disable_search: true
+          flags: node
+          fail_ci_if_error: false
+          verbose: true
+          override_pr: ${{ github.event.pull_request.number }}
+
       # Go SDK
       - name: Run Go SDK task
         if: inputs.component == 'sdk-go'
