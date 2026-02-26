@@ -120,9 +120,7 @@ class TestTlsConnectivity:
 
         # Create stream and topic
         await tls_client.create_stream(stream_name)
-        await tls_client.create_topic(
-            stream_name, topic_name, partitions_count=1
-        )
+        await tls_client.create_topic(stream_name, topic_name, partitions_count=1)
 
         # Produce messages
         test_messages = [f"tls-message-{i}" for i in range(3)]
