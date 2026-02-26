@@ -45,8 +45,8 @@ export const deserializeClient = (r: Buffer, pos = 0): ClientDeserialized => {
    *  0 - 4   u32 - client_id
    *  4 - 8   u32 - user_id
    *  8 - 9   u8  - transport
-   *  9 - 13  u32 - adress length x
-   * 13 - x   string - adress
+   *  9 - 13  u32 - address length x
+   * 13 - x   string - address
    *  x - x+4 u32 - consumerGroupCount
    */
   if(r.length < 17)

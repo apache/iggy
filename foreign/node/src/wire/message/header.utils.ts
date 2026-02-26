@@ -250,7 +250,7 @@ type ParsedHeaderDeserialized = {
  */
 export const mapHeaderKind = (k: number): HeaderKindId => {
   if (!ReverseHeaderKind[k as HeaderKindValue])
-    throw new Error(`unknow header kind: ${k}`);
+    throw new Error(`unknown header kind: ${k}`);
   return ReverseHeaderKind[k as HeaderKindValue];
 };
 

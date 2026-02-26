@@ -21,11 +21,10 @@ pub mod deps;
 pub mod replica;
 
 use bus::MemBus;
-use consensus::{Plane, PlaneIdentity};
-use iggy_common::header::{GenericHeader, ReplyHeader};
-use iggy_common::message::{Message, MessageBag};
+use iggy_common::header::ReplyHeader;
+use iggy_common::message::Message;
 use message_bus::MessageBus;
-use replica::Replica;
+use replica::{Replica, new_replica};
 use std::sync::Arc;
 
 pub struct Simulator {
@@ -54,7 +53,7 @@ impl Simulator {
         let message_bus = Arc::new(message_bus);
         let replicas = (0..replica_count)
             .map(|i| {
-                Replica::new(
+                new_replica(
                     i as u8,
                     format!("replica-{}", i),
                     Arc::clone(&message_bus),
@@ -77,7 +76,7 @@ impl Simulator {
         let message_bus = Arc::new(message_bus);
         let replicas = (0..replica_count)
             .map(|i| {
-                Replica::new(
+                new_replica(
                     i as u8,
                     format!("replica-{}", i),
                     Arc::clone(&message_bus),
@@ -114,31 +113,12 @@ impl Simulator {
         None
     }
 
-    async fn dispatch_to_replica(&self, replica: &Replica, message: Message<GenericHeader>) {
-        let planes = replica.plane.inner();
-        match MessageBag::from(message) {
-            MessageBag::Request(request) => {
-                if planes.0.is_applicable(&request) {
-                    planes.0.on_request(request).await;
-                } else {
-                    planes.1.0.on_request(request).await;
-                }
-            }
-            MessageBag::Prepare(prepare) => {
-                if planes.0.is_applicable(&prepare) {
-                    planes.0.on_replicate(prepare).await;
-                } else {
-                    planes.1.0.on_replicate(prepare).await;
-                }
-            }
-            MessageBag::PrepareOk(prepare_ok) => {
-                if planes.0.is_applicable(&prepare_ok) {
-                    planes.0.on_ack(prepare_ok).await;
-                } else {
-                    planes.1.0.on_ack(prepare_ok).await;
-                }
-            }
-        }
+    async fn dispatch_to_replica(
+        &self,
+        replica: &Replica,
+        message: Message<iggy_common::header::GenericHeader>,
+    ) {
+        replica.on_message(message).await;
     }
 }
 

@@ -51,6 +51,18 @@ cargo sort --workspace
 
 For other languages, check the README in `foreign/{language}/` (e.g., `foreign/go/`, `foreign/java/`).
 
+### Typos Checks
+
+We use [typos](https://github.com/crate-ci/typos):
+
+```bash
+cargo install typos-cli --locked
+typos
+typos --write-changes
+```
+
+If it's indeed not a typo, you can set an exception in `.typos.toml`.
+
 ### Pre-commit Hooks
 
 We use [prek](https://github.com/j178/prek):

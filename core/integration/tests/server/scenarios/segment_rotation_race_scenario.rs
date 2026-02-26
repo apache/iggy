@@ -16,7 +16,7 @@
  * under the License.
  */
 
-//! This scenario fixes the bug that occured when concurrent message sends race with segment rotation:
+//! This scenario fixes the bug that occurred when concurrent message sends race with segment rotation:
 //! 1. Task A commits journal, ensures indexes for segment N, starts async save
 //! 2. Task B's send triggers segment rotation (handle_full_segment)
 //! 3. Task B clears segment N's indexes or creates segment N+1 with None indexes
