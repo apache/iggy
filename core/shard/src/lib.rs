@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod router;
-
 use consensus::{MuxPlane, NamespacedPipeline, Plane, PlaneIdentity, VsrConsensus};
 use iggy_common::header::{GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader};
 use iggy_common::message::{Message, MessageBag};
