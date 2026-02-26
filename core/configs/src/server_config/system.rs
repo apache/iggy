@@ -17,8 +17,8 @@
  */
 
 use super::cache_indexes::CacheIndexesConfig;
+use super::server::MemoryPoolConfig;
 use super::sharding::ShardingConfig;
-use crate::configs::server::MemoryPoolConfig;
 use configs::ConfigEnv;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyError;

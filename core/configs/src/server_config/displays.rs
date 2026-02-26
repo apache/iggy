@@ -17,13 +17,13 @@
  * under the License.
  */
 
-use crate::configs::quic::{QuicCertificateConfig, QuicConfig};
-use crate::configs::server::{
+use super::quic::{QuicCertificateConfig, QuicConfig};
+use super::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MessagesMaintenanceConfig,
     TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
 };
-use crate::configs::system::MessageDeduplicationConfig;
-use crate::configs::{
+use super::system::MessageDeduplicationConfig;
+use super::{
     http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig},
     server::{MessageSaverConfig, ServerConfig},
     system::{

@@ -32,4 +32,4 @@ pub use types::IggyMessageViewMut;
 pub use types::IggyMessagesBatchMut;
 pub use types::IggyMessagesBatchSet;
 
-pub const SEGMENT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+pub use crate::configs::validators::SEGMENT_MAX_SIZE_BYTES;

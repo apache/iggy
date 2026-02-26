@@ -17,16 +17,7 @@
  * under the License.
  */
 
-extern crate self as configs;
-
-mod configs_impl;
-mod server_config;
-pub use configs_derive::ConfigEnv;
-pub use configs_impl::{
-    ConfigEnvMappings, ConfigProvider, ConfigurationError, ConfigurationType, EnvVarMapping,
-    FileConfigProvider, TypedEnvProvider, parse_env_value_to_json,
-};
-pub use server_config::{
+pub use configs::{
     COMPONENT, cache_indexes, cluster, defaults, displays, http, quic, server, sharding, system,
     tcp, validators, websocket,
 };

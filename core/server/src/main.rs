@@ -32,7 +32,6 @@ use server::bootstrap::{
     create_directories, create_shard_connections, create_shard_executor, load_config,
     load_metadata, resolve_persister, update_system_info,
 };
-use server::configs::sharding::ShardAllocator;
 use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info};
 use server::io::fs_utils;
 use server::log::logger::Logging;
@@ -40,6 +39,7 @@ use server::metadata::{Metadata, create_metadata_handles};
 use server::server_error::ServerError;
 use server::shard::system::info::SystemInfo;
 use server::shard::{IggyShard, calculate_shard_assignment};
+use server::shard_allocator::ShardAllocator;
 use server::state::file::FileState;
 use server::state::system::SystemState;
 use server::streaming::clients::client_manager::{Client, ClientManager};
