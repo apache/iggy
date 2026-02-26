@@ -404,6 +404,70 @@ jobs:
           flags: python
           fail_ci_if_error: false
 
+  node-coverage:
+    name: Node coverage baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "23"
+          cache: "npm"
+          cache-dependency-path: foreign/node/package-lock.json
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "false"
+
+      - name: Install netcat
+        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd
+
+      - name: Install dependencies
+        run: |
+          cd foreign/node
+          npm ci --ignore-scripts
+
+      - name: Start Iggy server
+        id: iggy
+        uses: ./.github/actions/utils/server-start
+        env:
+          IGGY_CLUSTER_ENABLED: true
+
+      - name: Run unit tests with coverage
+        run: |
+          cd foreign/node
+          mkdir -p ../../reports/node-coverage/unit
+          npx c8 --reporter=lcov --reports-dir=../../reports/node-coverage/unit npm run test:unit
+
+      - name: Run e2e tests with coverage
+        run: |
+          cd foreign/node
+          mkdir -p ../../reports/node-coverage/e2e
+          npx c8 --reporter=lcov --reports-dir=../../reports/node-coverage/e2e npm run test:e2e
+        env:
+          IGGY_SERVER_HOST: 127.0.0.1
+          IGGY_SERVER_TCP_PORT: 8090
+
+      - name: Stop Iggy server
+        if: always()
+        uses: ./.github/actions/utils/server-stop
+        with:
+          pid-file: ${{ steps.iggy.outputs.pid_file }}
+          log-file: ${{ steps.iggy.outputs.log_file }}
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/node-coverage/unit/lcov.info,reports/node-coverage/e2e/lcov.info
+          disable_search: true
+          flags: node
+          fail_ci_if_error: false
+
   create-prerelease:
     name: Create edge pre-release
     runs-on: ubuntu-latest
