@@ -19,17 +19,20 @@
 
 // TLS integration tests for the Node.js SDK.
 //
-// Prerequisites:
-//   Start the Iggy server with TLS enabled:
-//     IGGY_TCP_TLS_ENABLED=true \
-//     IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
-//     IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
-//     cargo r --bin iggy-server
+// These tests require a TLS-enabled Iggy server and are skipped by default.
+// To run them locally:
 //
-// Run tests:
-//   cd foreign/node
-//   IGGY_TCP_ADDRESS=127.0.0.1:8090 node --import @swc-node/register/esm-register \
-//     --test src/e2e/tls.system.e2e.ts
+//   1. Start the server with TLS:
+//        IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+//        IGGY_TCP_TLS_ENABLED=true \
+//        IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
+//        IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
+//        cargo r --bin iggy-server
+//
+//   2. Run the tests:
+//        cd foreign/node
+//        IGGY_TCP_TLS_ENABLED=true IGGY_TCP_ADDRESS=127.0.0.1:8090 \
+//        node --import @swc-node/register/esm-register --test src/e2e/tls.system.e2e.ts
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -39,8 +42,7 @@ import { Client } from '../client/client.js';
 import { Partitioning, Consumer, PollingStrategy } from '../wire/index.js';
 import { getIggyAddress } from '../tcp.sm.utils.js';
 
-const [host, port] = getIggyAddress();
-const credentials = { username: 'iggy', password: 'iggy' };
+const tlsEnabled = process.env.IGGY_TCP_TLS_ENABLED === 'true';
 
 // Walk up from cwd to find core/certs/
 function findCertsDir(): string {
@@ -57,27 +59,31 @@ function findCertsDir(): string {
   throw new Error('Could not find core/certs/ directory with TLS certificates');
 }
 
-const certsDir = findCertsDir();
-const caCert = readFileSync(resolve(certsDir, 'iggy_ca_cert.pem'));
+const getTlsClient = () => {
+  const [host, port] = getIggyAddress();
+  const certsDir = findCertsDir();
+  const caCert = readFileSync(resolve(certsDir, 'iggy_ca_cert.pem'));
 
-// The server certificate is issued for 'localhost'. When IGGY_TCP_ADDRESS uses
-// an IP (e.g. 127.0.0.1), the default TLS hostname check would fail because
-// the cert CN/SAN does not match an IP literal. Providing a custom
-// checkServerIdentity that always succeeds works around this for local testing.
-const getTlsClient = () => new Client({
-  transport: 'TLS',
-  options: {
-    port,
-    host,
-    ca: caCert,
-    checkServerIdentity: () => undefined,
-  },
-  credentials,
-});
+  // The server certificate is issued for 'localhost'. When IGGY_TCP_ADDRESS uses
+  // an IP (e.g. 127.0.0.1), the default TLS hostname check would fail because
+  // the cert CN/SAN does not match an IP literal. Providing a custom
+  // checkServerIdentity that always succeeds works around this for local testing.
+  return new Client({
+    transport: 'TLS',
+    options: {
+      port,
+      host,
+      ca: caCert,
+      checkServerIdentity: () => undefined,
+    },
+    credentials: { username: 'iggy', password: 'iggy' },
+  });
+};
 
-describe('e2e -> tls', async () => {
+describe('e2e -> tls', { skip: !tlsEnabled && 'IGGY_TCP_TLS_ENABLED is not set' }, async () => {
 
   const c = getTlsClient();
+  const credentials = { username: 'iggy', password: 'iggy' };
 
   it('e2e -> tls::ping', async () => {
     assert.ok(await c.system.ping());
