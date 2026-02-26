@@ -79,11 +79,13 @@ runs:
         fi
       shell: bash
 
+
     - name: Test
       if: inputs.task == 'test'
       run: |
         cd foreign/node
-        npm run test:unit
+        mkdir -p ../../reports/node-coverage/unit
+        npx c8 --reporter=lcov --reports-dir=../../reports/node-coverage/unit npm run test:unit
       shell: bash
 
     - name: Start Iggy server
@@ -97,7 +99,8 @@ runs:
       if: inputs.task == 'e2e'
       run: |
         cd foreign/node
-        npm run test:e2e
+        mkdir -p ../../reports/node-coverage/e2e
+        npx c8 --reporter=lcov --reports-dir=../../reports/node-coverage/e2e npm run test:e2e
       env:
         IGGY_SERVER_HOST: 127.0.0.1
         IGGY_SERVER_TCP_PORT: 8090

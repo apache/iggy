@@ -16,35 +16,33 @@
  * under the License.
  */
 
-use super::sharding::ShardingConfig;
-use super::tcp::TcpSocketConfig;
-use crate::configs::cluster::CurrentNodeConfig;
-use crate::configs::cluster::{ClusterConfig, NodeConfig, OtherNodeConfig, TransportPorts};
-use crate::configs::http::{
-    HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig,
-};
-use crate::configs::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
-use crate::configs::server::{
+use super::cluster::CurrentNodeConfig;
+use super::cluster::{ClusterConfig, NodeConfig, OtherNodeConfig, TransportPorts};
+use super::http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig};
+use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
+use super::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig,
     MessageSaverConfig, MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig,
     PersonalAccessTokenConfig, ServerConfig, TelemetryConfig, TelemetryLogsConfig,
     TelemetryTracesConfig,
 };
-use crate::configs::system::{
+use super::sharding::ShardingConfig;
+use super::system::{
     BackupConfig, CompatibilityConfig, CompressionConfig, EncryptionConfig, LoggingConfig,
     MessageDeduplicationConfig, PartitionConfig, RecoveryConfig, RuntimeConfig, SegmentConfig,
     StateConfig, StreamConfig, SystemConfig, TopicConfig,
 };
-use crate::configs::tcp::{TcpConfig, TcpTlsConfig};
-use crate::configs::websocket::{WebSocketConfig, WebSocketTlsConfig};
+use super::tcp::TcpSocketConfig;
+use super::tcp::{TcpConfig, TcpTlsConfig};
+use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
 use std::sync::Arc;
 use std::time::Duration;
 
 static_toml::static_toml! {
-    // static_toml crate always starts from CARGO_MANIFEST_DIR (core/server)
-    pub static SERVER_CONFIG = include_toml!("config.toml");
+    // static_toml resolves relative to CARGO_MANIFEST_DIR (core/configs/).
+    pub static SERVER_CONFIG = include_toml!("../server/config.toml");
 }
 
 impl Default for ServerConfig {
