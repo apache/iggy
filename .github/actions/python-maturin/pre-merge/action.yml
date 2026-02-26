@@ -90,14 +90,13 @@ runs:
     - name: Build Python wheel with coverage instrumentation
       if: inputs.task == 'test'
       run: |
+        cd foreign/python
         source <(cargo llvm-cov show-env --export-prefix)
         cargo llvm-cov clean --workspace --profraw-only
 
-        # Export for subsequent steps
+        # Export for subsequent steps (LLVM_PROFILE_FILE needed when tests run)
         echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> $GITHUB_ENV
-        echo "CARGO_LLVM_COV_TARGET_DIR=${CARGO_LLVM_COV_TARGET_DIR}" >> $GITHUB_ENV
 
-        cd foreign/python
         echo "Building Python wheel with coverage instrumentation..."
         echo "RUSTFLAGS: ${RUSTFLAGS}"
         echo "LLVM_PROFILE_FILE: ${LLVM_PROFILE_FILE}"
@@ -174,11 +173,12 @@ runs:
       if: inputs.task == 'test'
       run: |
         mkdir -p reports
+        cd foreign/python
         source <(cargo llvm-cov show-env --export-prefix)
         cargo llvm-cov report \
-          --manifest-path foreign/python/Cargo.toml \
+          --release \
           --codecov \
-          --output-path reports/python-coverage.json
+          --output-path ../../reports/python-coverage.json
       shell: bash
 
     - name: Upload test artifacts
