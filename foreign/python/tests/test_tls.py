@@ -34,8 +34,8 @@ import uuid
 import pytest
 from apache_iggy import IggyClient, PollingStrategy
 from apache_iggy import SendMessage as Message
-from testcontainers.core.container import DockerContainer
-from testcontainers.core.waiting_utils import wait_for_logs
+from testcontainers.core.container import DockerContainer  # type: ignore[import-not-found]
+from testcontainers.core.waiting_utils import wait_for_logs  # type: ignore[import-not-found]
 
 from .utils import wait_for_ping, wait_for_server
 

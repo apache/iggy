@@ -125,3 +125,6 @@ filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::pytest.PytestUnraisableExceptionWarning",
 ]
+
+[tool.mypy]
+ignore_missing_imports = true
