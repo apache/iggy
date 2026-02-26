@@ -16,18 +16,14 @@
 # under the License.
 
 [package]
-name = "simulator"
+name = "shard"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bytemuck = { workspace = true }
-bytes = { workspace = true }
 consensus = { path = "../consensus" }
-futures = { workspace = true }
 iggy_common = { path = "../common" }
 journal = { path = "../journal" }
 message_bus = { path = "../message_bus" }
 metadata = { path = "../metadata" }
 partitions = { path = "../partitions" }
-shard = { path = "../shard" }
