@@ -1,0 +1,136 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Whitelist valid technical terms to avoid typos false positives
+[default.extend-words]
+# Valid bi-directional map data structure term
+bimap = "bimap"
+# Valid compression algorithm abbreviation
+flate = "flate"
+# Valid Rust compression crate name
+flate2 = "flate2"
+# Valid project-specific technical acronym
+bais = "bais"
+# Legitimate abbreviation for "Strategy" (e.g. pollingStrat)
+Strat = "Strat"
+# Same as above
+strin = "strin"
+
+# Exclude auto-generated/non-editable files from typos check
+[files]
+extend-exclude = [
+    # Auto-generated npm lockfile (pnpm)
+    "**/pnpm-lock.yaml",
+    # Auto-generated npm lockfile (npm)
+    "**/package-lock.json",
+    # Auto-generated Rust dependency lockfile
+    "**/Cargo.lock",
+    # Changelog (may contain intentional version/typo references)
+    "**/CHANGELOG.md",
+    # Auto-generated test snapshot files
+    "**/*.snap",
+    # Static test fixture files (no manual spelling review needed)
+    "**/fixtures/**",
+    # Deliberate spelling mistake, used to test Levenshtein Distance.
+    "core/configs/src/configs_impl/typed_env_provider.rs",
+    # JetBrains IDE solution settings
+    "*.DotSettings",
+    # Rust build output directory
+    "target*",
+    # JetBrains IDE configuration directory
+    ".idea/",
+    # VS Code configuration directory
+    ".vscode/",
+    # Visual Studio configuration directory
+    ".vs/",
+    # Zed IDE configuration directory
+    ".zed/",
+    # macOS system file (stores custom folder attributes)
+    ".DS_Store",
+    # Gradle build cache directory
+    ".gradle",
+    # Local data directory (project-specific)
+    "local_data*",
+    # Local state directory (project-specific)
+    "local_state*",
+    # Test logs output directory
+    "test_logs/",
+    # Benchmark results directory (root level)
+    "/bench_*",
+    # SDK errors table output directory
+    "/sdk/errors_table/",
+    # Rust Clippy analysis results file
+    "/rust-clippy-results.sarif",
+    # Performance test results file/directory
+    "/performance_results*",
+    # Environment variables file (may contain secrets)
+    ".env",
+    # Direnv environment configuration file
+    ".envrc",
+    # Iggy release output directory
+    "/iggy_release",
+    # Iggy temporary release directory
+    "/iggy_release_tmp",
+    # Compiled object files directory (any depth)
+    "/**/obj",
+    # Compiled binary files directory (any depth)
+    "/**/bin",
+    # Exception: Keep Python SDK bin directory
+    "!/foreign/python/src/bin",
+    # IntelliJ IDEA module file
+    "*.iml",
+    # C++ SDK build directory
+    "foreign/cpp/build",
+    # Java SDK build directory
+    "foreign/java/**/build",
+    # Java SDK output directory
+    "foreign/java/**/out",
+    # Node.js SDK distribution directory
+    "foreign/node/**/dist",
+    # Node.js npm debug log file
+    "foreign/node/npm-debug.log*",
+    # Node.js npm cache directory
+    "foreign/node/.npm",
+    # Node.js dependencies directory (any depth)
+    "**/node_modules",
+    # JetBrains user-specific IDE settings (any depth)
+    "/**/*.DotSettings.user",
+    # Windows executable file
+    "*.exe",
+    # Windows executable backup file
+    "*.exe~",
+    # Windows dynamic link library
+    "*.dll",
+    # Unix/Linux shared object library
+    "*.so",
+    # macOS dynamic library
+    "*.dylib",
+    # GNU Libtool library file
+    "*.lai",
+    # GNU Libtool library file
+    "*.la",
+    # Unix/Linux static library
+    "*.a",
+    # Windows static library
+    "*.lib",
+    # General compiled output file
+    "*.out",
+    # Go workspace file
+    "go.work",
+    # Benchmark dashboard frontend build output
+    "core/bench/dashboard/frontend/dist",
+]

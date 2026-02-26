@@ -259,7 +259,7 @@ export class CommandResponseStream extends EventEmitter {
 
     this.heartbeatIntervalHandler = setInterval(async () => {
       if (this.connection.connected) {
-        debug(`sending hearbeat ping (interval: ${interval} ms)`);
+        debug(`sending heartbeat ping (interval: ${interval} ms)`);
         await this.ping()
       }
     }, interval);
