@@ -34,9 +34,10 @@ runs:
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
 
-    - name: Install cargo-llvm-cov
+    - name: Install llvm-tools for coverage
       if: inputs.task == 'test'
-      uses: taiki-e/install-action@cargo-llvm-cov
+      run: rustup component add llvm-tools-preview
+      shell: bash
 
     - name: Install uv
       uses: astral-sh/setup-uv@v7
@@ -91,18 +92,15 @@ runs:
       if: inputs.task == 'test'
       run: |
         cd foreign/python
-        source <(cargo llvm-cov show-env --export-prefix)
-        cargo llvm-cov clean --workspace --profraw-only
+        mkdir -p target/coverage
 
-        # Export for subsequent steps (LLVM_PROFILE_FILE needed when tests run)
+        # Instrument Rust code with coverage and set profraw output path
+        export RUSTFLAGS="-C instrument-coverage"
+        export LLVM_PROFILE_FILE="$(pwd)/target/coverage/%p-%4m.profraw"
         echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> $GITHUB_ENV
 
         echo "Building Python wheel with coverage instrumentation..."
-        echo "RUSTFLAGS: ${RUSTFLAGS}"
-        echo "LLVM_PROFILE_FILE: ${LLVM_PROFILE_FILE}"
-        echo "CARGO_LLVM_COV_TARGET_DIR: ${CARGO_LLVM_COV_TARGET_DIR}"
-
-        CARGO_TARGET_DIR="${CARGO_LLVM_COV_TARGET_DIR}" uv run maturin develop --release
+        uv run maturin develop --release
       shell: bash
 
     - name: Build Python wheel
@@ -174,11 +172,29 @@ runs:
       run: |
         mkdir -p reports
         cd foreign/python
-        source <(cargo llvm-cov show-env --export-prefix)
-        cargo llvm-cov report \
-          --release \
-          --codecov \
-          --output-path ../../reports/python-coverage.json
+
+        PROFRAW_COUNT=$(find target/coverage -name '*.profraw' 2>/dev/null | wc -l)
+        echo "Found ${PROFRAW_COUNT} profraw file(s)"
+
+        if [ "${PROFRAW_COUNT}" -eq 0 ]; then
+          echo "No profraw files found, skipping coverage report"
+          exit 0
+        fi
+
+        LLVM_PROFDATA=$(find "$(rustc --print sysroot)" -name 'llvm-profdata' -type f | head -1)
+        LLVM_COV=$(find "$(rustc --print sysroot)" -name 'llvm-cov' -type f | head -1)
+        SHARED_LIB=$(find target/release -name 'libapache_iggy*.so' 2>/dev/null | head -1)
+
+        "${LLVM_PROFDATA}" merge -sparse target/coverage/*.profraw -o target/coverage/merged.profdata
+
+        "${LLVM_COV}" export \
+          --format=lcov \
+          --instr-profile=target/coverage/merged.profdata \
+          --ignore-filename-regex='(/.cargo/registry|/rustc/)' \
+          "${SHARED_LIB}" \
+          > ../../reports/python-coverage.lcov
+
+        echo "Coverage report generated: $(wc -l < ../../reports/python-coverage.lcov) lines"
       shell: bash
 
     - name: Upload test artifacts
@@ -188,7 +204,7 @@ runs:
         name: python-test-results-${{ github.run_id }}-${{ github.run_attempt }}
         path: |
           reports/python-junit.xml
-          reports/python-coverage.json
+          reports/python-coverage.lcov
           foreign/python/dist/*.whl
         retention-days: 7
         if-no-files-found: ignore
