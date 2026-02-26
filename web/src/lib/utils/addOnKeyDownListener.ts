@@ -60,7 +60,7 @@ type Key =
   | 'Ampersand'
   | 'Eight'
   | 'Star'
-  | 'Asterik'
+  | 'Asterisk'
   | 'Nine'
   | 'OpenParen'
   | 'A'

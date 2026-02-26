@@ -56,6 +56,9 @@ flag_management:
     - name: csharp
       paths:
         - foreign/csharp/
+    - name: python
+      paths:
+        - foreign/python/
 
 comment:
   layout: "header, diff, flags, files"
@@ -73,7 +76,6 @@ ignore:
   - "examples/**"
   - "foreign/go/**"
   - "foreign/node/**"
-  - "foreign/python/**"
   - "web/**"
   - "**/tests/**"
   - "**/*Test.java"

@@ -123,6 +123,7 @@ runs:
         IGGY_SERVER_HOST=127.0.0.1 \
         IGGY_SERVER_TCP_PORT=8090 \
           uv run pytest tests/ -v \
+            --cov --cov-report=xml:../../reports/python-coverage.xml \
             --junitxml=../../reports/python-junit.xml \
             --tb=short \
             --capture=no || TEST_EXIT_CODE=$?
@@ -141,6 +142,7 @@ runs:
         # Run unit tests only (exclude integration tests)
         uv run pytest tests/ -v \
           -m "not integration" \
+          --cov --cov-report=xml:../../reports/python-coverage.xml \
           --junitxml=../../reports/python-junit.xml \
           --tb=short || TEST_EXIT_CODE=$?
 
@@ -162,6 +164,7 @@ runs:
         name: python-test-results-${{ github.run_id }}-${{ github.run_attempt }}
         path: |
           reports/python-junit.xml
+          reports/python-coverage.xml
           foreign/python/dist/*.whl
         retention-days: 7
         if-no-files-found: ignore

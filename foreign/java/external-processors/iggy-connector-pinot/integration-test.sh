@@ -144,7 +144,7 @@ TABLE_RESPONSE=$(curl -s -X POST "http://localhost:9000/tables" \
   -H "Content-Type: application/json" \
   -d @deployment/table.json)
 
-if echo "$TABLE_RESPONSE" | grep -q '"status":"Table test_events_REALTIME succesfully added"'; then
+if echo "$TABLE_RESPONSE" | grep -q '"status":"Table test_events_REALTIME successfully added"'; then
   echo -e "${GREEN}✓ Table created${NC}"
 elif echo "$TABLE_RESPONSE" | grep -q '"code":500'; then
   echo -e "${RED}✗ Table creation failed${NC}"
