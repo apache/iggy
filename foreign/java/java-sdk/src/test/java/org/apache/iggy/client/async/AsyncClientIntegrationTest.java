@@ -508,12 +508,13 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
     public void testStoreAndGetConsumerOffset() throws Exception {
         log.info("Testing consumer offset store and get");
 
-        // Send message to ensure partition is not empty so we can store offset 0
+        // Send message to partition 0 to ensure it is not empty so we can store offset 0
+        // Note: storeConsumerOffset with empty partitionId defaults to partition 0 on server
         client.messages()
                 .sendMessages(
                         StreamId.of(TEST_STREAM),
                         TopicId.of(TEST_TOPIC),
-                        Partitioning.partitionId(PARTITION_ID),
+                        Partitioning.partitionId(0L),
                         List.of(Message.of("test")))
                 .get(5, TimeUnit.SECONDS);
 
