@@ -92,17 +92,17 @@ runs:
       run: |
         source <(cargo llvm-cov show-env --export-prefix)
         cargo llvm-cov clean --workspace --profraw-only
-        
+
         # Export for subsequent steps
         echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> $GITHUB_ENV
         echo "CARGO_LLVM_COV_TARGET_DIR=${CARGO_LLVM_COV_TARGET_DIR}" >> $GITHUB_ENV
-        
+
         cd foreign/python
         echo "Building Python wheel with coverage instrumentation..."
         echo "RUSTFLAGS: ${RUSTFLAGS}"
         echo "LLVM_PROFILE_FILE: ${LLVM_PROFILE_FILE}"
         echo "CARGO_LLVM_COV_TARGET_DIR: ${CARGO_LLVM_COV_TARGET_DIR}"
-        
+
         CARGO_TARGET_DIR="${CARGO_LLVM_COV_TARGET_DIR}" uv run maturin develop --release
       shell: bash
 
