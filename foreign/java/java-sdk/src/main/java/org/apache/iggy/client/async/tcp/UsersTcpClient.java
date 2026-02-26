@@ -25,7 +25,6 @@ import org.apache.iggy.client.async.UsersClient;
 import org.apache.iggy.exception.IggyEmptyResponseException;
 import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.serde.BytesDeserializer;
-import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
@@ -39,6 +38,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+
+import static org.apache.iggy.serde.BytesSerializer.toBytes;
 
 /**
  * Async TCP implementation of users client.
@@ -54,38 +55,115 @@ public class UsersTcpClient implements UsersClient {
 
     @Override
     public CompletableFuture<Optional<UserInfoDetails>> getUser(UserId userId) {
-        throw new IllegalStateException("not yet implemented");
+        var payload = toBytes(userId);
+        return connection.send(CommandCode.User.GET.getValue(), payload).thenApply(response -> {
+            try {
+                if (response.isReadable()) {
+                    return Optional.of(BytesDeserializer.readUserInfoDetails(response));
+                }
+                return Optional.empty();
+            } finally {
+                response.release();
+            }
+        });
     }
 
     @Override
     public CompletableFuture<List<UserInfo>> getUsers() {
-        throw new IllegalStateException("not yet implemented");
+        var payload = Unpooled.EMPTY_BUFFER;
+        return connection.send(CommandCode.User.GET_ALL.getValue(), payload).thenApply(response -> {
+            try {
+                var result = new ArrayList<UserInfo>();
+                while (response.isReadable()) {
+                    result.add(BytesDeserializer.readUserInfo(response));
+                }
+                return result;
+            } finally {
+                response.release();
+            }
+        });
     }
 
     @Override
     public CompletableFuture<UserInfoDetails> createUser(
             String username, String password, UserStatus status, Optional<Permissions> permissions) {
-        throw new IllegalStateException("not yet implemented");
+        var payload = Unpooled.buffer();
+        payload.writeBytes(toBytes(username));
+        payload.writeBytes(toBytes(password));
+        payload.writeByte(status.asCode());
+        permissions.ifPresentOrElse(
+                perms -> {
+                    payload.writeByte(1);
+                    var permissionBytes = toBytes(perms);
+                    payload.writeIntLE(permissionBytes.readableBytes());
+                    payload.writeBytes(permissionBytes);
+                },
+                () -> payload.writeByte(0));
+
+        return connection.send(CommandCode.User.CREATE.getValue(), payload).thenApply(response -> {
+            try {
+                if (!response.isReadable()) {
+                    throw new IggyEmptyResponseException(CommandCode.User.CREATE.toString());
+                }
+                return BytesDeserializer.readUserInfoDetails(response);
+            } finally {
+                response.release();
+            }
+        });
     }
 
     @Override
     public CompletableFuture<Void> deleteUser(UserId userId) {
-        throw new IllegalStateException("not yet implemented");
+        var payload = toBytes(userId);
+        return connection.send(CommandCode.User.DELETE.getValue(), payload).thenAccept(response -> response.release());
     }
 
     @Override
     public CompletableFuture<Void> updateUser(UserId userId, Optional<String> username, Optional<UserStatus> status) {
-        throw new IllegalStateException("not yet implemented");
+        var payload = toBytes(userId);
+        username.ifPresentOrElse(
+                un -> {
+                    payload.writeByte(1);
+                    payload.writeBytes(toBytes(un));
+                },
+                () -> payload.writeByte(0));
+        status.ifPresentOrElse(
+                s -> {
+                    payload.writeByte(1);
+                    payload.writeByte(s.asCode());
+                },
+                () -> payload.writeByte(0));
+
+        return connection.send(CommandCode.User.UPDATE.getValue(), payload).thenAccept(response -> response.release());
     }
 
     @Override
     public CompletableFuture<Void> updatePermissions(UserId userId, Optional<Permissions> permissions) {
-        throw new IllegalStateException("not yet implemented");
+        var payload = toBytes(userId);
+
+        permissions.ifPresentOrElse(
+                perms -> {
+                    payload.writeByte(1);
+                    var permissionBytes = toBytes(perms);
+                    payload.writeIntLE(permissionBytes.readableBytes());
+                    payload.writeBytes(permissionBytes);
+                },
+                () -> payload.writeByte(0));
+
+        return connection
+                .send(CommandCode.User.UPDATE_PERMISSIONS.getValue(), payload)
+                .thenAccept(response -> response.release());
     }
 
     @Override
     public CompletableFuture<Void> changePassword(UserId userId, String currentPassword, String newPassword) {
-        throw new IllegalStateException("not yet implemented");
+        var payload = toBytes(userId);
+        payload.writeBytes(toBytes(currentPassword));
+        payload.writeBytes(toBytes(newPassword));
+
+        return connection
+                .send(CommandCode.User.CHANGE_PASSWORD.getValue(), payload)
+                .thenAccept(response -> response.release());
     }
 
     @Override
@@ -94,8 +172,8 @@ public class UsersTcpClient implements UsersClient {
         String context = IggyVersion.getInstance().toString();
 
         var payload = Unpooled.buffer();
-        var usernameBytes = BytesSerializer.toBytes(username);
-        var passwordBytes = BytesSerializer.toBytes(password);
+        var usernameBytes = toBytes(username);
+        var passwordBytes = toBytes(password);
 
         payload.writeBytes(usernameBytes);
         payload.writeBytes(passwordBytes);
