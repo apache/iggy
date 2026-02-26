@@ -24,7 +24,15 @@ publish = false
 
 [dependencies]
 configs_derive = { workspace = true }
+derive_more = { workspace = true }
+err_trail = { workspace = true }
 figment = { workspace = true }
+iggy_common = { workspace = true }
+jsonwebtoken = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_with = { workspace = true }
+static-toml = { workspace = true }
+strum = { workspace = true }
 tracing = { workspace = true }
+tungstenite = { workspace = true }
