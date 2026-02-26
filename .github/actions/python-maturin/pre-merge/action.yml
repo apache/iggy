@@ -34,6 +34,10 @@ runs:
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
 
+    - name: Install cargo-llvm-cov
+      if: inputs.task == 'test'
+      uses: taiki-e/install-action@cargo-llvm-cov
+
     - name: Install uv
       uses: astral-sh/setup-uv@v7
 
@@ -83,8 +87,28 @@ runs:
         echo "mypy version: $(uv run mypy --version)"
       shell: bash
 
-    - name: Build Python wheel for testing
-      if: inputs.task == 'test' || inputs.task == 'build'
+    - name: Prepare coverage environment
+      if: inputs.task == 'test'
+      run: |
+        source <(cargo llvm-cov show-env --export-prefix)
+        cargo llvm-cov clean --workspace --profraw-only
+        echo "RUSTFLAGS=${RUSTFLAGS}" >> $GITHUB_ENV
+        echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> $GITHUB_ENV
+        echo "CARGO_LLVM_COV_TARGET_DIR=${CARGO_LLVM_COV_TARGET_DIR}" >> $GITHUB_ENV
+      shell: bash
+
+    - name: Build Python wheel for testing (with coverage)
+      if: inputs.task == 'test'
+      run: |
+        cd foreign/python
+        echo "Building Python wheel with coverage instrumentation..."
+        uv run maturin develop --release
+      shell: bash
+      env:
+        CARGO_TARGET_DIR: ${{ env.CARGO_LLVM_COV_TARGET_DIR }}
+
+    - name: Build Python wheel
+      if: inputs.task == 'build'
       run: |
         cd foreign/python
 
@@ -92,18 +116,10 @@ runs:
         echo "Building Python wheel..."
         uv run maturin build -o dist
 
-        if [ "${{ inputs.task }}" = "test" ]; then
-          # Install the built wheel for testing
-          echo "Installing built wheel..."
-          uv pip install dist/*.whl --force-reinstall
-        fi
-
-        if [ "${{ inputs.task }}" = "build" ]; then
-          # List built artifacts
-          echo ""
-          echo "Build artifacts:"
-          ls -la dist/
-        fi
+        # List built artifacts
+        echo ""
+        echo "Build artifacts:"
+        ls -la dist/
       shell: bash
 
     - name: Start Iggy server
@@ -123,7 +139,6 @@ runs:
         IGGY_SERVER_HOST=127.0.0.1 \
         IGGY_SERVER_TCP_PORT=8090 \
           uv run pytest tests/ -v \
-            --cov --cov-report=xml:../../reports/python-coverage.xml \
             --junitxml=../../reports/python-junit.xml \
             --tb=short \
             --capture=no || TEST_EXIT_CODE=$?
@@ -142,7 +157,6 @@ runs:
         # Run unit tests only (exclude integration tests)
         uv run pytest tests/ -v \
           -m "not integration" \
-          --cov --cov-report=xml:../../reports/python-coverage.xml \
           --junitxml=../../reports/python-junit.xml \
           --tb=short || TEST_EXIT_CODE=$?
 
@@ -157,6 +171,16 @@ runs:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
         log-file: ${{ steps.iggy.outputs.log_file }}
 
+    - name: Generate coverage report
+      if: inputs.task == 'test'
+      run: |
+        mkdir -p reports
+        cargo llvm-cov report \
+          --manifest-path foreign/python/Cargo.toml \
+          --codecov \
+          --output-path reports/python-coverage.json
+      shell: bash
+
     - name: Upload test artifacts
       if: always() && inputs.task == 'test'
       uses: actions/upload-artifact@v4
@@ -164,7 +188,7 @@ runs:
         name: python-test-results-${{ github.run_id }}-${{ github.run_attempt }}
         path: |
           reports/python-junit.xml
-          reports/python-coverage.xml
+          reports/python-coverage.json
           foreign/python/dist/*.whl
         retention-days: 7
         if-no-files-found: ignore
