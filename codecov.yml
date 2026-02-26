@@ -62,6 +62,9 @@ flag_management:
     - name: node
       paths:
         - foreign/node/
+    - name: go
+      paths:
+        - foreign/go/
 
 comment:
   layout: "header, diff, flags, files"
@@ -77,7 +80,6 @@ ignore:
   - "core/harness_derive/**"
   - "bdd/**"
   - "examples/**"
-  - "foreign/go/**"
   - "web/**"
   - "**/tests/**"
   - "**/*Test.java"

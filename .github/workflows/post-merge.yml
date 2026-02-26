@@ -468,6 +468,47 @@ jobs:
           flags: node
           fail_ci_if_error: false
 
+  go-coverage:
+    name: Go coverage baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go with cache
+        uses: ./.github/actions/utils/setup-go-with-cache
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "false"
+
+      - name: Start Iggy server
+        id: iggy
+        uses: ./.github/actions/utils/server-start
+
+      - name: Run tests with coverage
+        run: |
+          cd foreign/go
+          mkdir -p ../../reports
+          go test -v -race -coverprofile=../../reports/go-coverage.out ./...
+
+      - name: Stop Iggy server
+        if: always()
+        uses: ./.github/actions/utils/server-stop
+        with:
+          pid-file: ${{ steps.iggy.outputs.pid_file }}
+          log-file: ${{ steps.iggy.outputs.log_file }}
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/go-coverage.out
+          disable_search: true
+          flags: go
+          fail_ci_if_error: false
+
   create-prerelease:
     name: Create edge pre-release
     runs-on: ubuntu-latest
