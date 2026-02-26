@@ -34,6 +34,7 @@ import org.apache.iggy.topic.CompressionAlgorithm;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledIfEnvironmentVariable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.GenericContainer;
@@ -54,8 +55,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /**
  * Integration tests for TCP/TLS connections.
  * Starts an Iggy server container with TLS enabled and custom certificates.
+ *
+ * Skipped when USE_EXTERNAL_SERVER is set (CI) because the external server
+ * does not have TLS enabled. Run locally with Docker to exercise these tests.
  */
 @Testcontainers
+@DisabledIfEnvironmentVariable(named = "USE_EXTERNAL_SERVER", matches = ".+")
 class TlsConnectionTest {
 
     private static final int TCP_PORT = 8090;
@@ -104,7 +109,7 @@ class TlsConnectionTest {
     }
 
     @Test
-    void connectWithTls_withCaCert_shouldSucceed() {
+    void connectWithTlsWithCaCertShouldSucceed() {
         var client = IggyTcpClient.builder()
                 .host(iggyServer.getHost())
                 .port(iggyServer.getMappedPort(TCP_PORT))
@@ -118,7 +123,7 @@ class TlsConnectionTest {
     }
 
     @Test
-    void connectWithTls_withServerCert_shouldSucceed() {
+    void connectWithTlsWithServerCertShouldSucceed() {
         var client = IggyTcpClient.builder()
                 .host(iggyServer.getHost())
                 .port(iggyServer.getMappedPort(TCP_PORT))
@@ -132,7 +137,7 @@ class TlsConnectionTest {
     }
 
     @Test
-    void connectWithoutTls_shouldFail_whenTlsRequired() {
+    void connectWithoutTlsShouldFailWhenTlsRequired() {
         assertThatThrownBy(() -> {
                     var client = IggyTcpClient.builder()
                             .host(iggyServer.getHost())
@@ -145,7 +150,7 @@ class TlsConnectionTest {
     }
 
     @Test
-    void sendAndReceiveOverTls_shouldWork() {
+    void sendAndReceiveOverTlsShouldWork() {
         var client = IggyTcpClient.builder()
                 .host(iggyServer.getHost())
                 .port(iggyServer.getMappedPort(TCP_PORT))
