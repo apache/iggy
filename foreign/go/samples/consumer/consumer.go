@@ -105,7 +105,7 @@ func ConsumeMessages(cli iggcon.Client) error {
 		streamIdentifier, _ := iggcon.NewIdentifier(DefaultStreamId)
 		topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
 		consumerIdentifier, _ := iggcon.NewIdentifier(ConsumerId)
-		partionId := uint32(Partition)
+		partitionId := uint32(Partition)
 		messagesWrapper, err := cli.PollMessages(
 			streamIdentifier,
 			topicIdentifier,
@@ -113,7 +113,7 @@ func ConsumeMessages(cli iggcon.Client) error {
 			iggcon.NextPollingStrategy(),
 			1,
 			true,
-			&partionId)
+			&partitionId)
 		if err != nil {
 			return err
 		}

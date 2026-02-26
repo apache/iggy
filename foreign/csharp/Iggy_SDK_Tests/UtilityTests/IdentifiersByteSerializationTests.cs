@@ -22,7 +22,7 @@ namespace Apache.Iggy.Tests.UtilityTests;
 public sealed class IdentifiersByteSerializationTests
 {
     [Fact]
-    public void StringIdentifer_WithInvalidLength_ShouldThrowArgumentException()
+    public void StringIdentifier_WithInvalidLength_ShouldThrowArgumentException()
     {
         const char character = 'a';
         var val = string.Concat(Enumerable.Range(0, 500).Select(_ => character));

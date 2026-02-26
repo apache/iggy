@@ -73,6 +73,9 @@ pub fn memory_pool() -> &'static MemoryPool {
         .expect("Memory pool not initialized - MemoryPool::init_pool should be called first")
 }
 
+// TODO: Extract shared domain types (IggyByteSize, IggyDuration, etc.) into an `iggy_types`
+// leaf crate so `iggy_common` can depend on `configs` directly. That lets us delete this
+// duplicate and use `configs::server::MemoryPoolConfig` here instead.
 /// Configuration for the memory pool.
 #[derive(Debug)]
 pub struct MemoryPoolConfigOther {

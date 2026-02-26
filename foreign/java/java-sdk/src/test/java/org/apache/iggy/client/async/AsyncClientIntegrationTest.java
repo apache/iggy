@@ -22,6 +22,7 @@ package org.apache.iggy.client.async;
 import org.apache.iggy.client.BaseIntegrationTest;
 import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.consumergroup.Consumer;
+import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
@@ -386,5 +387,256 @@ public class AsyncClientIntegrationTest extends BaseIntegrationTest {
         CompletableFuture.allOf(operations.toArray(new CompletableFuture[0])).get(15, TimeUnit.SECONDS);
 
         log.info("Successfully completed {} concurrent operations", operations.size());
+    }
+
+    // ===== System client tests =====
+
+    @Test
+    @Order(11)
+    public void testGetStats() throws Exception {
+        log.info("Testing system getStats");
+
+        var stats = client.system().getStats().get(5, TimeUnit.SECONDS);
+
+        assertThat(stats).isNotNull();
+        log.info("Successfully retrieved server stats");
+    }
+
+    @Test
+    @Order(12)
+    public void testGetMe() throws Exception {
+        log.info("Testing system getMe");
+
+        var me = client.system().getMe().get(5, TimeUnit.SECONDS);
+
+        assertThat(me).isNotNull();
+        assertThat(me.clientId()).isGreaterThan(0);
+        log.info("Successfully retrieved current client info, clientId: {}", me.clientId());
+    }
+
+    @Test
+    @Order(13)
+    public void testGetClients() throws Exception {
+        log.info("Testing system getClients");
+
+        var clients = client.system().getClients().get(5, TimeUnit.SECONDS);
+
+        assertThat(clients).isNotNull();
+        assertThat(clients).isNotEmpty();
+        log.info("Successfully retrieved {} connected clients", clients.size());
+    }
+
+    @Test
+    @Order(14)
+    public void testGetClient() throws Exception {
+        log.info("Testing system getClient");
+
+        var me = client.system().getMe().get(5, TimeUnit.SECONDS);
+        var clientInfo = client.system().getClient(me.clientId()).get(5, TimeUnit.SECONDS);
+
+        assertThat(clientInfo).isNotNull();
+        assertThat(clientInfo.clientId()).isEqualTo(me.clientId());
+        log.info("Successfully retrieved client info for clientId: {}", clientInfo.clientId());
+    }
+
+    // ===== Consumer groups client tests =====
+
+    @Test
+    @Order(20)
+    public void testCreateAndGetConsumerGroup() throws Exception {
+        log.info("Testing consumer group create and get");
+
+        String groupName = "async-test-group";
+        var group = client.consumerGroups()
+                .createConsumerGroup(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC), groupName)
+                .get(5, TimeUnit.SECONDS);
+
+        assertThat(group).isNotNull();
+        assertThat(group.name()).isEqualTo(groupName);
+        log.info("Successfully created consumer group: {}", group.name());
+
+        // Get by ID
+        var retrieved = client.consumerGroups()
+                .getConsumerGroup(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC), ConsumerId.of(group.id()))
+                .get(5, TimeUnit.SECONDS);
+
+        assertThat(retrieved).isPresent();
+        assertThat(retrieved.get().id()).isEqualTo(group.id());
+        log.info("Successfully retrieved consumer group by ID: {}", group.id());
+    }
+
+    @Test
+    @Order(21)
+    public void testGetConsumerGroups() throws Exception {
+        log.info("Testing consumer groups list");
+
+        var groups = client.consumerGroups()
+                .getConsumerGroups(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC))
+                .get(5, TimeUnit.SECONDS);
+
+        assertThat(groups).isNotNull();
+        assertThat(groups).isNotEmpty();
+        log.info("Successfully retrieved {} consumer groups", groups.size());
+    }
+
+    @Test
+    @Order(22)
+    public void testDeleteConsumerGroup() throws Exception {
+        log.info("Testing consumer group deletion");
+
+        String groupName = "async-delete-group";
+        var group = client.consumerGroups()
+                .createConsumerGroup(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC), groupName)
+                .get(5, TimeUnit.SECONDS);
+
+        client.consumerGroups()
+                .deleteConsumerGroup(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC), ConsumerId.of(group.id()))
+                .get(5, TimeUnit.SECONDS);
+
+        var deleted = client.consumerGroups()
+                .getConsumerGroup(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC), ConsumerId.of(group.id()))
+                .get(5, TimeUnit.SECONDS);
+
+        assertThat(deleted).isEmpty();
+        log.info("Successfully deleted consumer group: {}", groupName);
+    }
+
+    // ===== Consumer offsets client tests =====
+
+    @Test
+    @Order(30)
+    public void testStoreAndGetConsumerOffset() throws Exception {
+        log.info("Testing consumer offset store and get");
+
+        // Send message to partition 0 to ensure it is not empty so we can store offset 0
+        // Note: storeConsumerOffset with empty partitionId defaults to partition 0 on server
+        client.messages()
+                .sendMessages(
+                        StreamId.of(TEST_STREAM),
+                        TopicId.of(TEST_TOPIC),
+                        Partitioning.partitionId(0L),
+                        List.of(Message.of("test")))
+                .get(5, TimeUnit.SECONDS);
+
+        var consumer = new Consumer(Consumer.Kind.Consumer, ConsumerId.of(5000L));
+        var offset = BigInteger.valueOf(0);
+
+        client.consumerOffsets()
+                .storeConsumerOffset(
+                        StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC), Optional.empty(), consumer, offset)
+                .get(5, TimeUnit.SECONDS);
+
+        log.info("Successfully stored consumer offset: {}", offset);
+
+        var retrieved = client.consumerOffsets()
+                .getConsumerOffset(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC), Optional.of(0L), consumer)
+                .get(5, TimeUnit.SECONDS);
+
+        assertThat(retrieved).isPresent();
+        log.info("Successfully retrieved consumer offset");
+    }
+
+    // ===== Partitions client tests =====
+
+    @Test
+    @Order(40)
+    public void testCreateAndDeletePartitions() throws Exception {
+        log.info("Testing partition create and delete");
+
+        // Get initial partition count
+        var topicBefore = client.topics()
+                .getTopic(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC))
+                .get(5, TimeUnit.SECONDS);
+        assertThat(topicBefore).isPresent();
+        long initialCount = topicBefore.get().partitionsCount();
+        log.info("Initial partition count: {}", initialCount);
+
+        // Create additional partitions
+        client.partitions()
+                .createPartitions(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC), 3L)
+                .get(5, TimeUnit.SECONDS);
+
+        var topicAfterCreate = client.topics()
+                .getTopic(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC))
+                .get(5, TimeUnit.SECONDS);
+        assertThat(topicAfterCreate).isPresent();
+        assertThat(topicAfterCreate.get().partitionsCount()).isEqualTo(initialCount + 3);
+        log.info("Partition count after create: {}", topicAfterCreate.get().partitionsCount());
+
+        // Delete the added partitions
+        client.partitions()
+                .deletePartitions(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC), 3L)
+                .get(5, TimeUnit.SECONDS);
+
+        var topicAfterDelete = client.topics()
+                .getTopic(StreamId.of(TEST_STREAM), TopicId.of(TEST_TOPIC))
+                .get(5, TimeUnit.SECONDS);
+        assertThat(topicAfterDelete).isPresent();
+        assertThat(topicAfterDelete.get().partitionsCount()).isEqualTo(initialCount);
+        log.info("Partition count after delete: {}", topicAfterDelete.get().partitionsCount());
+    }
+
+    // ===== Personal access tokens client tests =====
+
+    @Test
+    @Order(50)
+    public void testCreateAndDeletePersonalAccessToken() throws Exception {
+        log.info("Testing personal access token create and delete");
+
+        String tokenName = "async-test-token";
+        var token = client.personalAccessTokens()
+                .createPersonalAccessToken(tokenName, BigInteger.valueOf(50_000))
+                .get(5, TimeUnit.SECONDS);
+
+        assertThat(token).isNotNull();
+        log.info("Successfully created personal access token: {}", tokenName);
+
+        // List tokens
+        var tokens = client.personalAccessTokens().getPersonalAccessTokens().get(5, TimeUnit.SECONDS);
+
+        assertThat(tokens).isNotNull();
+        assertThat(tokens).anyMatch(t -> t.name().equals(tokenName));
+        log.info("Found {} personal access tokens", tokens.size());
+
+        // Delete token
+        client.personalAccessTokens().deletePersonalAccessToken(tokenName).get(5, TimeUnit.SECONDS);
+
+        var tokensAfterDelete =
+                client.personalAccessTokens().getPersonalAccessTokens().get(5, TimeUnit.SECONDS);
+
+        assertThat(tokensAfterDelete).noneMatch(t -> t.name().equals(tokenName));
+        log.info("Successfully deleted personal access token: {}", tokenName);
+    }
+
+    @Test
+    @Order(51)
+    public void testLoginWithPersonalAccessToken() throws Exception {
+        log.info("Testing login with personal access token");
+
+        String tokenName = "async-login-token";
+        var token = client.personalAccessTokens()
+                .createPersonalAccessToken(tokenName, BigInteger.valueOf(50_000))
+                .get(5, TimeUnit.SECONDS);
+
+        assertThat(token).isNotNull();
+        assertThat(token.token()).isNotEmpty();
+        log.info("Created token for login test");
+
+        // Login with PAT using a separate client
+        var patClient = new AsyncIggyTcpClient(serverHost(), serverTcpPort());
+        try {
+            patClient.connect().get(5, TimeUnit.SECONDS);
+            var identity = patClient
+                    .personalAccessTokens()
+                    .loginWithPersonalAccessToken(token.token())
+                    .get(5, TimeUnit.SECONDS);
+
+            assertThat(identity).isNotNull();
+            log.info("Successfully logged in with personal access token");
+        } finally {
+            patClient.close().get(5, TimeUnit.SECONDS);
+            // Clean up token
+            client.personalAccessTokens().deletePersonalAccessToken(tokenName).get(5, TimeUnit.SECONDS);
+        }
     }
 }

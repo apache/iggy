@@ -21,7 +21,7 @@ use iggy_common::message::Message;
 use message_bus::MessageBus;
 use std::ops::AsyncFnOnce;
 
-// TODO: Rework all of those helpers, once the boundries are more clear and we have a better picture of the commonalities between all of the planes.
+// TODO: Rework all of those helpers, once the boundaries are more clear and we have a better picture of the commonalities between all of the planes.
 
 /// Shared pipeline-first request flow used by metadata and partitions.
 pub async fn pipeline_prepare_common<C, F>(
