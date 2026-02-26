@@ -100,6 +100,7 @@ jobs:
             sdk
             security
             server
+            shard
             test
             web
             consensus
