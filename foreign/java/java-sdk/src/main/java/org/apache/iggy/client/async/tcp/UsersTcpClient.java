@@ -22,12 +22,21 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.async.UsersClient;
+import org.apache.iggy.exception.IggyEmptyResponseException;
+import org.apache.iggy.identifier.UserId;
+import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
+import org.apache.iggy.user.Permissions;
+import org.apache.iggy.user.UserInfo;
+import org.apache.iggy.user.UserInfoDetails;
+import org.apache.iggy.user.UserStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
@@ -41,6 +50,42 @@ public class UsersTcpClient implements UsersClient {
 
     public UsersTcpClient(AsyncTcpConnection connection) {
         this.connection = connection;
+    }
+
+    @Override
+    public CompletableFuture<Optional<UserInfoDetails>> getUser(UserId userId) {
+        throw new IllegalStateException("not yet implemented");
+    }
+
+    @Override
+    public CompletableFuture<List<UserInfo>> getUsers() {
+        throw new IllegalStateException("not yet implemented");
+    }
+
+    @Override
+    public CompletableFuture<UserInfoDetails> createUser(
+            String username, String password, UserStatus status, Optional<Permissions> permissions) {
+        throw new IllegalStateException("not yet implemented");
+    }
+
+    @Override
+    public CompletableFuture<Void> deleteUser(UserId userId) {
+        throw new IllegalStateException("not yet implemented");
+    }
+
+    @Override
+    public CompletableFuture<Void> updateUser(UserId userId, Optional<String> username, Optional<UserStatus> status) {
+        throw new IllegalStateException("not yet implemented");
+    }
+
+    @Override
+    public CompletableFuture<Void> updatePermissions(UserId userId, Optional<Permissions> permissions) {
+        throw new IllegalStateException("not yet implemented");
+    }
+
+    @Override
+    public CompletableFuture<Void> changePassword(UserId userId, String currentPassword, String newPassword) {
+        throw new IllegalStateException("not yet implemented");
     }
 
     @Override

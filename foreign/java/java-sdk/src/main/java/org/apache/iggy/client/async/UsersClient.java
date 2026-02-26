@@ -19,8 +19,15 @@
 
 package org.apache.iggy.client.async;
 
+import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.user.IdentityInfo;
+import org.apache.iggy.user.Permissions;
+import org.apache.iggy.user.UserInfo;
+import org.apache.iggy.user.UserInfoDetails;
+import org.apache.iggy.user.UserStatus;
 
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -52,6 +59,41 @@ import java.util.concurrent.CompletableFuture;
  * @see org.apache.iggy.client.async.tcp.AsyncIggyTcpClientBuilder#buildAndLogin()
  */
 public interface UsersClient {
+
+    default CompletableFuture<Optional<UserInfoDetails>> getUser(Long userId) {
+        return getUser(UserId.of(userId));
+    }
+
+    CompletableFuture<Optional<UserInfoDetails>> getUser(UserId userId);
+
+    CompletableFuture<List<UserInfo>> getUsers();
+
+    CompletableFuture<UserInfoDetails> createUser(
+            String username, String password, UserStatus status, Optional<Permissions> permissions);
+
+    default CompletableFuture<Void> deleteUser(Long userId) {
+        return deleteUser(UserId.of(userId));
+    }
+
+    CompletableFuture<Void> deleteUser(UserId userId);
+
+    default CompletableFuture<Void> updateUser(Long userId, Optional<String> username, Optional<UserStatus> status) {
+        return updateUser(UserId.of(userId), username, status);
+    }
+
+    CompletableFuture<Void> updateUser(UserId userId, Optional<String> username, Optional<UserStatus> status);
+
+    default CompletableFuture<Void> updatePermissions(Long userId, Optional<Permissions> permissions) {
+        return updatePermissions(UserId.of(userId), permissions);
+    }
+
+    CompletableFuture<Void> updatePermissions(UserId userId, Optional<Permissions> permissions);
+
+    default CompletableFuture<Void> changePassword(Long userId, String currentPassword, String newPassword) {
+        return changePassword(UserId.of(userId), currentPassword, newPassword);
+    }
+
+    CompletableFuture<Void> changePassword(UserId userId, String currentPassword, String newPassword);
 
     /**
      * Logs in to the Iggy server with the specified credentials.
