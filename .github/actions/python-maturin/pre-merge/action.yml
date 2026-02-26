@@ -87,25 +87,24 @@ runs:
         echo "mypy version: $(uv run mypy --version)"
       shell: bash
 
-    - name: Prepare coverage environment
+    - name: Build Python wheel with coverage instrumentation
       if: inputs.task == 'test'
       run: |
         source <(cargo llvm-cov show-env --export-prefix)
         cargo llvm-cov clean --workspace --profraw-only
-        echo "RUSTFLAGS=${RUSTFLAGS}" >> $GITHUB_ENV
+        
+        # Export for subsequent steps
         echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> $GITHUB_ENV
         echo "CARGO_LLVM_COV_TARGET_DIR=${CARGO_LLVM_COV_TARGET_DIR}" >> $GITHUB_ENV
-      shell: bash
-
-    - name: Build Python wheel for testing (with coverage)
-      if: inputs.task == 'test'
-      run: |
+        
         cd foreign/python
         echo "Building Python wheel with coverage instrumentation..."
-        uv run maturin develop --release
+        echo "RUSTFLAGS: ${RUSTFLAGS}"
+        echo "LLVM_PROFILE_FILE: ${LLVM_PROFILE_FILE}"
+        echo "CARGO_LLVM_COV_TARGET_DIR: ${CARGO_LLVM_COV_TARGET_DIR}"
+        
+        CARGO_TARGET_DIR="${CARGO_LLVM_COV_TARGET_DIR}" uv run maturin develop --release
       shell: bash
-      env:
-        CARGO_TARGET_DIR: ${{ env.CARGO_LLVM_COV_TARGET_DIR }}
 
     - name: Build Python wheel
       if: inputs.task == 'build'
@@ -175,6 +174,7 @@ runs:
       if: inputs.task == 'test'
       run: |
         mkdir -p reports
+        source <(cargo llvm-cov show-env --export-prefix)
         cargo llvm-cov report \
           --manifest-path foreign/python/Cargo.toml \
           --codecov \
