@@ -1052,7 +1052,7 @@ checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 
 [[package]]
 name = "bench-dashboard-frontend"
-version = "0.5.0"
+version = "0.5.1-edge.1"
 dependencies = [
  "bench-dashboard-shared",
  "bench-report",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "bench-report"
-version = "0.2.2"
+version = "0.2.3-edge.1"
 dependencies = [
  "charming",
  "colored",
@@ -4553,7 +4553,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench-dashboard-server"
-version = "0.6.0"
+version = "0.6.1-edge.1"
 dependencies = [
  "actix-cors",
  "actix-files",
