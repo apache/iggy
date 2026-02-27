@@ -143,6 +143,7 @@ dlopen2 = "0.8.2"
 dotenvy = "0.15.7"
 elasticsearch = { version = "9.1.0-alpha.1", features = ["rustls-tls"], default-features = false }
 enum_dispatch = "0.3.13"
+enumset = "1.1"
 env_logger = "0.11.9"
 err_trail = { version = "0.11.0", features = ["tracing"] }
 error_set = "0.9.1"

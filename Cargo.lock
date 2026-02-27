@@ -2980,6 +2980,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "enumset"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25b07a8dfbbbfc0064c0a6bdf9edcf966de6b1c33ce344bdeca3b41615452634"
+dependencies = [
+ "enumset_derive",
+]
+
+[[package]]
+name = "enumset_derive"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f43e744e4ea338060faee68ed933e46e722fb7f3617e722a5772d7e856d8b3ce"
+dependencies = [
+ "darling 0.21.3",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.115",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4700,6 +4721,7 @@ dependencies = [
  "compio",
  "crossbeam",
  "derive_more",
+ "enumset",
  "err_trail",
  "human-repr",
  "humantime",
@@ -8522,13 +8544,17 @@ dependencies = [
  "bytemuck",
  "bytes",
  "consensus",
+ "enumset",
  "futures",
  "iggy_common",
  "journal",
  "message_bus",
  "metadata",
  "partitions",
+ "rand 0.10.0",
+ "rand_xoshiro",
  "shard",
+ "tracing",
 ]
 
 [[package]]

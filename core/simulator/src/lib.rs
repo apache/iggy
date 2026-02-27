@@ -18,6 +18,9 @@
 pub mod bus;
 pub mod client;
 pub mod deps;
+pub mod network;
+pub mod packet;
+pub mod ready_queue;
 pub mod replica;
 
 use bus::MemBus;

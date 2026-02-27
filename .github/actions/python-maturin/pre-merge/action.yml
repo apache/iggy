@@ -34,6 +34,11 @@ runs:
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
 
+    - name: Install llvm-tools for coverage
+      if: inputs.task == 'test'
+      run: rustup component add llvm-tools-preview
+      shell: bash
+
     - name: Install uv
       uses: astral-sh/setup-uv@v7
 
@@ -83,8 +88,23 @@ runs:
         echo "mypy version: $(uv run mypy --version)"
       shell: bash
 
-    - name: Build Python wheel for testing
-      if: inputs.task == 'test' || inputs.task == 'build'
+    - name: Build Python wheel with coverage instrumentation
+      if: inputs.task == 'test'
+      run: |
+        cd foreign/python
+        mkdir -p target/coverage
+
+        # Instrument Rust code with coverage and set profraw output path
+        export RUSTFLAGS="-C instrument-coverage"
+        export LLVM_PROFILE_FILE="$(pwd)/target/coverage/%p-%4m.profraw"
+        echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> $GITHUB_ENV
+
+        echo "Building Python wheel with coverage instrumentation..."
+        uv run maturin develop --release
+      shell: bash
+
+    - name: Build Python wheel
+      if: inputs.task == 'build'
       run: |
         cd foreign/python
 
@@ -92,18 +112,10 @@ runs:
         echo "Building Python wheel..."
         uv run maturin build -o dist
 
-        if [ "${{ inputs.task }}" = "test" ]; then
-          # Install the built wheel for testing
-          echo "Installing built wheel..."
-          uv pip install dist/*.whl --force-reinstall
-        fi
-
-        if [ "${{ inputs.task }}" = "build" ]; then
-          # List built artifacts
-          echo ""
-          echo "Build artifacts:"
-          ls -la dist/
-        fi
+        # List built artifacts
+        echo ""
+        echo "Build artifacts:"
+        ls -la dist/
       shell: bash
 
     - name: Start Iggy server
@@ -123,7 +135,6 @@ runs:
         IGGY_SERVER_HOST=127.0.0.1 \
         IGGY_SERVER_TCP_PORT=8090 \
           uv run pytest tests/ -v \
-            --cov --cov-report=xml:../../reports/python-coverage.xml \
             --junitxml=../../reports/python-junit.xml \
             --tb=short \
             --capture=no || TEST_EXIT_CODE=$?
@@ -142,7 +153,6 @@ runs:
         # Run unit tests only (exclude integration tests)
         uv run pytest tests/ -v \
           -m "not integration" \
-          --cov --cov-report=xml:../../reports/python-coverage.xml \
           --junitxml=../../reports/python-junit.xml \
           --tb=short || TEST_EXIT_CODE=$?
 
@@ -157,6 +167,36 @@ runs:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
         log-file: ${{ steps.iggy.outputs.log_file }}
 
+    - name: Generate coverage report
+      if: inputs.task == 'test'
+      run: |
+        mkdir -p reports
+        cd foreign/python
+
+        PROFRAW_COUNT=$(find target/coverage -name '*.profraw' 2>/dev/null | wc -l)
+        echo "Found ${PROFRAW_COUNT} profraw file(s)"
+
+        if [ "${PROFRAW_COUNT}" -eq 0 ]; then
+          echo "No profraw files found, skipping coverage report"
+          exit 0
+        fi
+
+        LLVM_PROFDATA=$(find "$(rustc --print sysroot)" -name 'llvm-profdata' -type f | head -1)
+        LLVM_COV=$(find "$(rustc --print sysroot)" -name 'llvm-cov' -type f | head -1)
+        SHARED_LIB=$(find target/release -name 'libapache_iggy*.so' 2>/dev/null | head -1)
+
+        "${LLVM_PROFDATA}" merge -sparse target/coverage/*.profraw -o target/coverage/merged.profdata
+
+        "${LLVM_COV}" export \
+          --format=lcov \
+          --instr-profile=target/coverage/merged.profdata \
+          --ignore-filename-regex='(/.cargo/registry|/rustc/)' \
+          "${SHARED_LIB}" \
+          > ../../reports/python-coverage.lcov
+
+        echo "Coverage report generated: $(wc -l < ../../reports/python-coverage.lcov) lines"
+      shell: bash
+
     - name: Upload test artifacts
       if: always() && inputs.task == 'test'
       uses: actions/upload-artifact@v4
@@ -164,7 +204,7 @@ runs:
         name: python-test-results-${{ github.run_id }}-${{ github.run_attempt }}
         path: |
           reports/python-junit.xml
-          reports/python-coverage.xml
+          reports/python-coverage.lcov
           foreign/python/dist/*.whl
         retention-days: 7
         if-no-files-found: ignore
