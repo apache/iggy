@@ -22,7 +22,6 @@ package org.apache.iggy.client.async.tcp;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.async.UsersClient;
-import org.apache.iggy.exception.IggyEmptyResponseException;
 import org.apache.iggy.identifier.UserId;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
@@ -34,7 +33,6 @@ import org.apache.iggy.user.UserStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -56,32 +54,13 @@ public class UsersTcpClient implements UsersClient {
     @Override
     public CompletableFuture<Optional<UserInfoDetails>> getUser(UserId userId) {
         var payload = toBytes(userId);
-        return connection.send(CommandCode.User.GET.getValue(), payload).thenApply(response -> {
-            try {
-                if (response.isReadable()) {
-                    return Optional.of(BytesDeserializer.readUserInfoDetails(response));
-                }
-                return Optional.empty();
-            } finally {
-                response.release();
-            }
-        });
+        return connection.exchangeForOptional(CommandCode.User.GET, payload, BytesDeserializer::readUserInfoDetails);
     }
 
     @Override
     public CompletableFuture<List<UserInfo>> getUsers() {
         var payload = Unpooled.EMPTY_BUFFER;
-        return connection.send(CommandCode.User.GET_ALL.getValue(), payload).thenApply(response -> {
-            try {
-                var result = new ArrayList<UserInfo>();
-                while (response.isReadable()) {
-                    result.add(BytesDeserializer.readUserInfo(response));
-                }
-                return result;
-            } finally {
-                response.release();
-            }
-        });
+        return connection.exchangeForList(CommandCode.User.GET_ALL, payload, BytesDeserializer::readUserInfo);
     }
 
     @Override
@@ -100,22 +79,13 @@ public class UsersTcpClient implements UsersClient {
                 },
                 () -> payload.writeByte(0));
 
-        return connection.send(CommandCode.User.CREATE.getValue(), payload).thenApply(response -> {
-            try {
-                if (!response.isReadable()) {
-                    throw new IggyEmptyResponseException(CommandCode.User.CREATE.toString());
-                }
-                return BytesDeserializer.readUserInfoDetails(response);
-            } finally {
-                response.release();
-            }
-        });
+        return connection.exchangeForEntity(CommandCode.User.CREATE, payload, BytesDeserializer::readUserInfoDetails);
     }
 
     @Override
     public CompletableFuture<Void> deleteUser(UserId userId) {
         var payload = toBytes(userId);
-        return connection.send(CommandCode.User.DELETE.getValue(), payload).thenAccept(response -> response.release());
+        return connection.sendAndRelease(CommandCode.User.DELETE, payload);
     }
 
     @Override
@@ -134,7 +104,7 @@ public class UsersTcpClient implements UsersClient {
                 },
                 () -> payload.writeByte(0));
 
-        return connection.send(CommandCode.User.UPDATE.getValue(), payload).thenAccept(response -> response.release());
+        return connection.sendAndRelease(CommandCode.User.UPDATE, payload);
     }
 
     @Override
@@ -150,9 +120,7 @@ public class UsersTcpClient implements UsersClient {
                 },
                 () -> payload.writeByte(0));
 
-        return connection
-                .send(CommandCode.User.UPDATE_PERMISSIONS.getValue(), payload)
-                .thenAccept(response -> response.release());
+        return connection.sendAndRelease(CommandCode.User.UPDATE_PERMISSIONS, payload);
     }
 
     @Override
@@ -161,9 +129,7 @@ public class UsersTcpClient implements UsersClient {
         payload.writeBytes(toBytes(currentPassword));
         payload.writeBytes(toBytes(newPassword));
 
-        return connection
-                .send(CommandCode.User.CHANGE_PASSWORD.getValue(), payload)
-                .thenAccept(response -> response.release());
+        return connection.sendAndRelease(CommandCode.User.CHANGE_PASSWORD, payload);
     }
 
     @Override
