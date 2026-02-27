@@ -33,5 +33,5 @@ metadata = { path = "../metadata" }
 partitions = { path = "../partitions" }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
-tracing = { workspace = true }
 shard = { path = "../shard" }
+tracing = { workspace = true }
