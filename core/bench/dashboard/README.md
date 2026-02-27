@@ -169,10 +169,10 @@ All endpoints return JSON responses (except artifacts which returns a ZIP file) 
 
 ### Development Mode
 
-Run the development script to start both the frontend and backend servers:
+Run the development script from root of `apache/iggy` repository to start both the frontend and backend servers:
 
 ```bash
-./scripts/run_dev.sh
+./scripts/dashboard/run_dev.sh
 ```
 
 This will start:

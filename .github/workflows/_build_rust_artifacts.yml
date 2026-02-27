@@ -144,7 +144,16 @@ jobs:
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
           fi
 
-          cargo build --locked --release --target ${{ matrix.target }} "${bin_flags[@]}"
+          # iggy-bench-dashboard-server enables charming's "ssr" feature (deno_core -> v8).
+          # v8 has no prebuilt binary for aarch64-unknown-linux-musl, so exclude dashboard
+          # crates to prevent cargo feature unification from pulling V8 into unrelated binaries.
+          # TODO: build V8 from source (V8_FROM_SOURCE=1, ~30min + clang) or wait for upstream support.
+          exclude_flags=()
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+            exclude_flags+=(--workspace --exclude iggy-bench-dashboard-server --exclude bench-dashboard-frontend)
+          fi
+
+          cargo build --locked --release --target ${{ matrix.target }} "${bin_flags[@]}" "${exclude_flags[@]}"
 
       - name: Package binaries
         id: pkg
