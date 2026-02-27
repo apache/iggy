@@ -19,6 +19,7 @@
 #![allow(clippy::cast_precision_loss)]
 #![allow(clippy::struct_field_names)]
 
+use super::latency_distribution::compute_latency_distribution;
 use crate::analytics::time_series::{
     calculator::TimeSeriesCalculator,
     processors::{TimeSeriesProcessor, moving_average::MovingAverageProcessor},
@@ -62,6 +63,18 @@ pub fn from_individual_metrics(
     let (min_latency_ms_value, max_latency_ms_value) =
         calculate_min_max_latencies(stats, &time_series.2);
 
+    let mut all_latencies: Vec<f64> = stats
+        .iter()
+        .flat_map(|s| s.raw_latencies_ms.iter().copied())
+        .collect();
+    all_latencies.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let latency_distribution = if all_latencies.is_empty() {
+        None
+    } else {
+        Some(compute_latency_distribution(&all_latencies))
+    };
+
     let summary = BenchmarkGroupMetricsSummary {
         kind,
         total_throughput_megabytes_per_second: throughput_metrics.total_megabytes_per_sec,
@@ -86,6 +99,7 @@ pub fn from_individual_metrics(
         avg_throughput_mb_ts: time_series.0,
         avg_throughput_msg_ts: time_series.1,
         avg_latency_ts: time_series.2,
+        latency_distribution,
     })
 }
 

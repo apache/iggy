@@ -23,6 +23,7 @@ use yew::prelude::*;
 pub enum MeasurementType {
     Latency,
     Throughput,
+    Distribution,
 }
 
 impl Display for MeasurementType {
@@ -30,6 +31,7 @@ impl Display for MeasurementType {
         match self {
             MeasurementType::Latency => write!(f, "Latency"),
             MeasurementType::Throughput => write!(f, "Throughput"),
+            MeasurementType::Distribution => write!(f, "Distribution"),
         }
     }
 }
@@ -41,6 +43,7 @@ impl FromStr for MeasurementType {
         match s {
             "Latency" => Ok(MeasurementType::Latency),
             "Throughput" => Ok(MeasurementType::Throughput),
+            "Distribution" => Ok(MeasurementType::Distribution),
             _ => Err(()),
         }
     }
@@ -55,23 +58,29 @@ pub struct MeasurementTypeSelectorProps {
 
 #[function_component(MeasurementTypeSelector)]
 pub fn measurement_type_selector(props: &MeasurementTypeSelectorProps) -> Html {
-    let is_latency = matches!(props.selected_measurement, MeasurementType::Latency);
+    let selected = &props.selected_measurement;
 
     html! {
         <div class="view-mode-container">
             <h3>{"Measurements"}</h3>
             <div class="segmented-control">
                 <button
-                    class={if is_latency { "segment active" } else { "segment" }}
+                    class={if *selected == MeasurementType::Latency { "segment active" } else { "segment" }}
                     onclick={props.on_measurement_select.reform(|_| MeasurementType::Latency)}
                 >
                     {"Latency"}
                 </button>
                 <button
-                    class={if !is_latency { "segment active" } else { "segment" }}
+                    class={if *selected == MeasurementType::Throughput { "segment active" } else { "segment" }}
                     onclick={props.on_measurement_select.reform(|_| MeasurementType::Throughput)}
                 >
                     {"Throughput"}
+                </button>
+                <button
+                    class={if *selected == MeasurementType::Distribution { "segment active" } else { "segment" }}
+                    onclick={props.on_measurement_select.reform(|_| MeasurementType::Distribution)}
+                >
+                    {"Distribution"}
                 </button>
             </div>
         </div>

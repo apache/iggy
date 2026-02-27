@@ -111,6 +111,13 @@ pub fn single_chart(props: &SingleChartProps) -> Html {
                         MeasurementType::Throughput => {
                             bench_report::create_throughput_chart(data, config.is_dark, true)
                         }
+                        MeasurementType::Distribution => {
+                            bench_report::create_latency_distribution_chart(
+                                data,
+                                config.is_dark,
+                                true,
+                            )
+                        }
                     };
 
                     let renderer = if config.is_dark {

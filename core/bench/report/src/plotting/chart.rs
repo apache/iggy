@@ -22,11 +22,13 @@ use charming::{
         Axis, DataView, DataZoom, DataZoomType, Feature, Grid, Legend, LegendSelectedMode,
         LegendType, Restore, SaveAsImage, Title, Toolbox, ToolboxDataZoom,
     },
+    datatype::DataPoint,
     element::{
-        AxisLabel, AxisPointer, AxisPointerType, AxisType, Emphasis, ItemStyle, LineStyle,
-        NameLocation, Orient, SplitLine, Symbol, TextAlign, TextStyle, Tooltip,
+        AxisLabel, AxisPointer, AxisPointerType, AxisType, Emphasis, ItemStyle, Label,
+        LabelPosition, LineStyle, NameLocation, Orient, SplitLine, Symbol, TextAlign, TextStyle,
+        Tooltip,
     },
-    series::Line,
+    series::{Bar, Line, Scatter},
 };
 
 pub struct IggyChart {
@@ -240,6 +242,64 @@ impl IggyChart {
         }
 
         self.inner = self.inner.series(line);
+        self
+    }
+
+    /// Add a bar series (for histograms).
+    pub fn add_bar_series(mut self, name: &str, data: Vec<f64>, color: &str, opacity: f64) -> Self {
+        let bar = Bar::new()
+            .name(name)
+            .data(data)
+            .bar_width("100%")
+            .bar_gap("-100%")
+            .item_style(ItemStyle::new().color(color).opacity(opacity));
+
+        self.inner = self.inner.series(bar);
+        self
+    }
+
+    /// Add a smooth line series (for PDF curves).
+    pub fn add_smooth_line_series(
+        mut self,
+        name: &str,
+        data: Vec<Vec<f64>>,
+        color: &str,
+        width: f64,
+    ) -> Self {
+        let line = Line::new()
+            .name(name)
+            .data(data)
+            .show_symbol(false)
+            .smooth(true)
+            .line_style(LineStyle::new().width(width))
+            .item_style(ItemStyle::new().color(color));
+
+        self.inner = self.inner.series(line);
+        self
+    }
+
+    /// Add a scatter series with labels (for percentile markers).
+    pub fn add_scatter_series(
+        mut self,
+        name: &str,
+        data: Vec<DataPoint>,
+        symbol_size: f64,
+        color: &str,
+    ) -> Self {
+        let scatter = Scatter::new()
+            .name(name)
+            .data(data)
+            .symbol_size(symbol_size)
+            .item_style(ItemStyle::new().color(color))
+            .label(
+                Label::new()
+                    .show(true)
+                    .position(LabelPosition::Top)
+                    .font_size(11)
+                    .formatter("{b}"),
+            );
+
+        self.inner = self.inner.series(scatter);
         self
     }
 

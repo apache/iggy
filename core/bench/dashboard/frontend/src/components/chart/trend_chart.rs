@@ -80,7 +80,9 @@ pub fn trend_chart(props: &TrendChartProps) -> Html {
             move |(data, measurement_type, is_dark, size)| {
                 if !data.is_empty() {
                     let plot_type = match measurement_type {
-                        MeasurementType::Latency => PlotType::Latency,
+                        MeasurementType::Latency | MeasurementType::Distribution => {
+                            PlotType::Latency
+                        }
                         MeasurementType::Throughput => PlotType::Throughput,
                     };
 
