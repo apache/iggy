@@ -40,6 +40,24 @@ pub fn topbar(props: &TopBarProps) -> Html {
     let selected_measurement = ui_state.selected_measurement.clone();
     let is_benchmark_tooltip_visible = ui_state.is_benchmark_tooltip_visible;
     let is_server_stats_tooltip_visible = ui_state.is_server_stats_tooltip_visible;
+    let has_distribution = benchmark_ctx
+        .state
+        .selected_benchmark
+        .as_ref()
+        .is_some_and(|b| b.has_latency_distribution());
+
+    {
+        let ui_state = ui_state.clone();
+        let selected_measurement = selected_measurement.clone();
+        use_effect_with(
+            (has_distribution, selected_measurement),
+            move |(has_dist, measurement)| {
+                if !has_dist && *measurement == MeasurementType::Distribution {
+                    ui_state.dispatch(UiAction::SetMeasurementType(MeasurementType::Latency));
+                }
+            },
+        );
+    }
 
     let on_download_artifacts = {
         let benchmark_ctx = benchmark_ctx.clone();
@@ -142,6 +160,23 @@ pub fn topbar(props: &TopBarProps) -> Html {
                                     >
                                         { "Latency" }
                                     </button>
+                                    {
+                                        if has_distribution {
+                                            html! {
+                                                <button
+                                                    class={classes!(
+                                                        "measurement-button",
+                                                        (selected_measurement == MeasurementType::Distribution).then_some("active")
+                                                    )}
+                                                    onclick={on_measurement_select.reform(|_| MeasurementType::Distribution)}
+                                                >
+                                                    { "Distribution" }
+                                                </button>
+                                            }
+                                        } else {
+                                            html! {}
+                                        }
+                                    }
                                     <button
                                         class={classes!(
                                             "measurement-button",
