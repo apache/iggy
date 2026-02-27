@@ -18,7 +18,7 @@
 ---
 BasedOnStyle: Chromium
 IndentWidth: 4
-ColumnLimit: 100
+ColumnLimit: 120
 BreakBeforeBraces: Custom
 IndentCaseLabels: true
 PointerAlignment: Right

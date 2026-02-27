@@ -30,4 +30,4 @@ crate-type = ["staticlib"]
 cxx = "1.0.194"
 
 [build-dependencies]
-cxx-build = "1.0"
+cxx-build = "1.0.194"

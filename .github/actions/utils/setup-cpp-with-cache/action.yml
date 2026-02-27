@@ -15,9 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# NOTE: this action sets up Bazel/Bazelisk with caching for faster CI runs,
-#       it is a convenience wrapper, so that we can use it in all workflows.
-
 name: setup-cpp-with-cache
 description: Setup Bazel toolchain and caching (bazelisk + repository + disk cache)
 

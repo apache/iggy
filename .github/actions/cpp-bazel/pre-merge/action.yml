@@ -29,6 +29,9 @@ runs:
     - name: Setup Bazel with cache
       uses: ./.github/actions/utils/setup-cpp-with-cache
 
+    - name: Setup Rust with cache
+      uses: ./.github/actions/utils/setup-rust-with-cache
+
     - name: Install clang-format
       if: inputs.task == 'lint'
       shell: bash
@@ -38,7 +41,7 @@ runs:
           exit 0
         fi
         sudo apt-get update --yes
-        sudo apt-get install --yes clang-format
+        sudo apt-get install --yes clang-format-18
         clang-format --version
 
     - name: Lint (clang-format)

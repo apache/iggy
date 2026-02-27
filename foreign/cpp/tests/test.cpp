@@ -26,9 +26,16 @@ TEST(CompressionAlgorithmTest, ReturnsExpectedValues) {
     EXPECT_EQ(iggy::CompressionAlgorithm::gzip().compression_algorithm_value(), "gzip");
 }
 
+TEST(IdKindTest, ReturnsExpectedValues) {
+    EXPECT_EQ(iggy::IdKind::numeric().id_kind_value(), "numeric");
+    EXPECT_EQ(iggy::IdKind::string().id_kind_value(), "string");
+}
+
 TEST(MaxTopicSizeTest, ReturnsExpectedValues) {
     EXPECT_EQ(iggy::MaxTopicSize::server_default().max_topic_size(), "server_default");
     EXPECT_EQ(iggy::MaxTopicSize::unlimited().max_topic_size(), "unlimited");
+    EXPECT_EQ(iggy::MaxTopicSize::from_bytes(0).max_topic_size(), "server_default");
+    EXPECT_EQ(iggy::MaxTopicSize::from_bytes(std::numeric_limits<std::uint64_t>::max()).max_topic_size(), "unlimited");
     EXPECT_EQ(iggy::MaxTopicSize::from_bytes(1024).max_topic_size(), "1024");
 }
 
@@ -54,14 +61,14 @@ TEST(PollingStrategyTest, ReturnsExpectedKindAndValue) {
     EXPECT_EQ(next.polling_strategy_value(), 0u);
 }
 
-TEST(ExpiryTest, CanCreateAllVariants) {
+TEST(ExpiryTest, ReturnsExpectedKindAndValue) {
     const auto server_default = iggy::Expiry::server_default();
     EXPECT_EQ(server_default.expiry_kind(), "server_default");
     EXPECT_EQ(server_default.expiry_value(), 0);
 
     const auto never_expire = iggy::Expiry::never_expire();
     EXPECT_EQ(never_expire.expiry_kind(), "never_expire");
-    EXPECT_EQ(never_expire.expiry_value(), 0);
+    EXPECT_EQ(never_expire.expiry_value(), std::numeric_limits<std::uint64_t>::max());
 
     const auto duration = iggy::Expiry::duration(15);
     EXPECT_EQ(duration.expiry_kind(), "duration");

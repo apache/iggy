@@ -24,6 +24,7 @@ common --enable_bzlmod
 build --copt=-Wall
 build --copt=-Wpedantic
 build --copt=-Werror
+build --copt=-Wextra
 
 # Debug configuration
 build:debug --compilation_mode=dbg

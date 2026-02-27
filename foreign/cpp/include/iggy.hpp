@@ -18,8 +18,10 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace iggy {
@@ -35,7 +37,7 @@ class CompressionAlgorithm final {
     static CompressionAlgorithm none() { return CompressionAlgorithm("none"); }
     static CompressionAlgorithm gzip() { return CompressionAlgorithm("gzip"); }
 
-    std::string compression_algorithm_value() const { return algorithm_; }
+    std::string_view compression_algorithm_value() const { return algorithm_; }
 
   private:
     explicit CompressionAlgorithm(std::string algorithm) : algorithm_(std::move(algorithm)) {}
@@ -46,18 +48,18 @@ class CompressionAlgorithm final {
 class Expiry final {
   public:
     static Expiry server_default() { return Expiry("server_default", 0); }
-    static Expiry never_expire() { return Expiry("never_expire", 0); }
-    static Expiry duration(std::uint32_t micros) { return Expiry("duration", micros); }
+    static Expiry never_expire() { return Expiry("never_expire", std::numeric_limits<std::uint64_t>::max()); }
+    static Expiry duration(std::uint64_t micros) { return Expiry("duration", micros); }
 
-    std::string expiry_kind() const { return expiry_kind_; }
-    std::uint32_t expiry_value() const { return expiry_value_; }
+    std::string_view expiry_kind() const { return expiry_kind_; }
+    std::uint64_t expiry_value() const { return expiry_value_; }
 
   private:
-    Expiry(std::string expiry_kind, std::uint32_t expiry_value)
+    explicit Expiry(std::string expiry_kind, std::uint64_t expiry_value)
         : expiry_kind_(std::move(expiry_kind)), expiry_value_(expiry_value) {}
 
     std::string expiry_kind_;
-    std::uint32_t expiry_value_;
+    std::uint64_t expiry_value_;
 };
 
 class MaxTopicSize final {
@@ -65,14 +67,19 @@ class MaxTopicSize final {
     static MaxTopicSize server_default() { return MaxTopicSize("server_default"); }
     static MaxTopicSize unlimited() { return MaxTopicSize("unlimited"); }
     static MaxTopicSize from_bytes(std::uint64_t bytes) {
+        if (bytes == 0) {
+            return server_default();
+        }
+        if (bytes == std::numeric_limits<std::uint64_t>::max()) {
+            return unlimited();
+        }
         return MaxTopicSize(std::to_string(bytes));
     }
 
-    std::string max_topic_size() const { return max_topic_size_; }
+    std::string_view max_topic_size() const { return max_topic_size_; }
 
   private:
-    explicit MaxTopicSize(std::string max_topic_size)
-        : max_topic_size_(std::move(max_topic_size)) {}
+    explicit MaxTopicSize(std::string max_topic_size) : max_topic_size_(std::move(max_topic_size)) {}
 
     std::string max_topic_size_;
 };
@@ -80,22 +87,34 @@ class MaxTopicSize final {
 class PollingStrategy final {
   public:
     static PollingStrategy offset(std::uint64_t value) { return PollingStrategy("offset", value); }
-    static PollingStrategy timestamp(std::uint64_t value) {
-        return PollingStrategy("timestamp", value);
-    }
+    static PollingStrategy timestamp(std::uint64_t value) { return PollingStrategy("timestamp", value); }
     static PollingStrategy first() { return PollingStrategy("first", 0); }
     static PollingStrategy last() { return PollingStrategy("last", 0); }
     static PollingStrategy next() { return PollingStrategy("next", 0); }
 
-    std::string polling_strategy_kind() const { return polling_strategy_kind_; }
+    std::string_view polling_strategy_kind() const { return polling_strategy_kind_; }
     std::uint64_t polling_strategy_value() const { return polling_strategy_value_; }
 
   private:
-    PollingStrategy(std::string kind, std::uint64_t value)
+    explicit PollingStrategy(std::string kind, std::uint64_t value)
         : polling_strategy_kind_(std::move(kind)), polling_strategy_value_(value) {}
 
     std::string polling_strategy_kind_;
     std::uint64_t polling_strategy_value_;
+};
+
+// TODO(slbotbm): Add rust bindings for Identifier that will use IdKind
+class IdKind final {
+  public:
+    static IdKind numeric() { return IdKind("numeric"); }
+    static IdKind string() { return IdKind("string"); }
+
+    std::string_view id_kind_value() const { return id_kind_; }
+
+  private:
+    explicit IdKind(std::string id_kind) : id_kind_(std::move(id_kind)) {}
+
+    std::string id_kind_;
 };
 
 }  // namespace iggy
