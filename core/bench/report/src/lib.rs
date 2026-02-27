@@ -52,7 +52,7 @@ pub fn create_throughput_chart(
 
         chart = chart.add_dual_time_line_series(
             &format!("{} {} [MB/s]", actor_type, metrics.summary.actor_id),
-            metrics.throughput_mb_ts.as_charming_points(),
+            metrics.throughput_mb_ts.as_downsampled_charming_points(),
             None,
             0.4,
             0,
@@ -60,7 +60,7 @@ pub fn create_throughput_chart(
         );
         chart = chart.add_dual_time_line_series(
             &format!("{} {} [msg/s]", actor_type, metrics.summary.actor_id),
-            metrics.throughput_msg_ts.as_charming_points(),
+            metrics.throughput_msg_ts.as_downsampled_charming_points(),
             None,
             0.4,
             1,
@@ -77,7 +77,9 @@ pub fn create_throughput_chart(
 
         chart = chart.add_dual_time_line_series(
             &format!("All {}s [MB/s]", metrics.summary.kind.actor()),
-            metrics.avg_throughput_mb_ts.as_charming_points(),
+            metrics
+                .avg_throughput_mb_ts
+                .as_downsampled_charming_points(),
             None,
             1.0,
             0,
@@ -85,7 +87,9 @@ pub fn create_throughput_chart(
         );
         chart = chart.add_dual_time_line_series(
             &format!("All {}s [msg/s]", metrics.summary.kind.actor()),
-            metrics.avg_throughput_msg_ts.as_charming_points(),
+            metrics
+                .avg_throughput_msg_ts
+                .as_downsampled_charming_points(),
             None,
             1.0,
             1,
@@ -117,7 +121,7 @@ pub fn create_latency_chart(
 
         chart = chart.add_time_series(
             &format!("{} {} [ms]", actor_type, metrics.summary.actor_id),
-            metrics.latency_ts.as_charming_points(),
+            metrics.latency_ts.as_downsampled_charming_points(),
             None,
             0.3,
         );
@@ -131,7 +135,7 @@ pub fn create_latency_chart(
 
         chart = chart.add_dual_time_line_series(
             &format!("Avg {}s [ms]", metrics.summary.kind.actor()),
-            metrics.avg_latency_ts.as_charming_points(),
+            metrics.avg_latency_ts.as_downsampled_charming_points(),
             None,
             1.0,
             0,
