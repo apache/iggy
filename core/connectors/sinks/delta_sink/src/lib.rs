@@ -16,9 +16,6 @@
  * under the License.
  */
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 use deltalake::DeltaTable;
 use deltalake::writer::JsonWriter;
 use iggy_connector_sdk::sink_connector;

@@ -27,8 +27,8 @@ verbose = false
 stream = "test_stream"
 topics = ["test_topic"]
 schema = "json"
-batch_length = 100
-poll_interval = "5ms"
+batch_length = 10000
+poll_interval = "20ms"
 consumer_group = "elasticsearch_sink_cg"
 
 [plugin_config]

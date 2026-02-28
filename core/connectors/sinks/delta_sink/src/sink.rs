@@ -54,7 +54,7 @@ impl Sink for DeltaSink {
                 .await
             {
                 Ok(table) => table,
-                Err(_) if !self.config.schema.is_empty() => {
+                Err(deltalake::DeltaTableError::NotATable(_)) if !self.config.schema.is_empty() => {
                     info!("Table does not exist, creating from configured schema...");
                     create_table(&self.config.table_uri, storage_options, &self.config.schema)
                         .await?
@@ -111,16 +111,7 @@ impl Sink for DeltaSink {
         for msg in &messages {
             match &msg.payload {
                 Payload::Json(simd_value) => {
-                    let json_bytes = simd_json::to_vec(simd_value).map_err(|e| {
-                        error!("Failed to serialize JSON payload: {e}");
-                        Error::InvalidJsonPayload
-                    })?;
-                    let value: serde_json::Value =
-                        serde_json::from_slice(&json_bytes).map_err(|e| {
-                            error!("Failed to parse JSON payload: {e}");
-                            Error::InvalidJsonPayload
-                        })?;
-                    json_values.push(value);
+                    json_values.push(owned_value_to_serde_json(simd_value));
                 }
                 other => {
                     error!(
@@ -154,14 +145,14 @@ impl Sink for DeltaSink {
         })?;
 
         // Flush buffers to object store and commit to Delta log
-        let version = state
-            .writer
-            .flush_and_commit(&mut state.table)
-            .await
-            .map_err(|e| {
+        let version = match state.writer.flush_and_commit(&mut state.table).await {
+            Ok(v) => v,
+            Err(e) => {
+                state.writer.reset();
                 error!("Failed to flush and commit to Delta table: {e}");
-                Error::Storage(format!("Failed to flush and commit: {e}"))
-            })?;
+                return Err(Error::Storage(format!("Failed to flush and commit: {e}")));
+            }
+        };
 
         debug!(
             "Delta sink with ID: {} committed version {}",
@@ -172,8 +163,42 @@ impl Sink for DeltaSink {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
+        if let Some(mut state) = self.state.lock().await.take() {
+            if let Err(e) = state.writer.flush_and_commit(&mut state.table).await {
+                error!(
+                    "Delta sink with ID: {} failed to flush on close: {e}",
+                    self.id
+                );
+                return Err(Error::Storage(format!("Failed to flush on close: {e}")));
+            }
+        }
         info!("Delta Lake sink connector with ID: {} is closed.", self.id);
         Ok(())
+    }
+}
+
+fn owned_value_to_serde_json(value: &simd_json::OwnedValue) -> serde_json::Value {
+    match value {
+        simd_json::OwnedValue::Static(s) => match s {
+            simd_json::StaticNode::Null => serde_json::Value::Null,
+            simd_json::StaticNode::Bool(b) => serde_json::Value::Bool(*b),
+            simd_json::StaticNode::I64(n) => serde_json::Value::Number((*n).into()),
+            simd_json::StaticNode::U64(n) => serde_json::Value::Number((*n).into()),
+            simd_json::StaticNode::F64(n) => serde_json::Number::from_f64(*n)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+        },
+        simd_json::OwnedValue::String(s) => serde_json::Value::String(s.to_string()),
+        simd_json::OwnedValue::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(owned_value_to_serde_json).collect())
+        }
+        simd_json::OwnedValue::Object(obj) => {
+            let map: serde_json::Map<String, serde_json::Value> = obj
+                .iter()
+                .map(|(k, v)| (k.to_string(), owned_value_to_serde_json(v)))
+                .collect();
+            serde_json::Value::Object(map)
+        }
     }
 }
 
@@ -194,4 +219,118 @@ async fn create_table(
         })?;
     info!("Created new Delta table at {table_uri}");
     Ok(table)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use simd_json::{OwnedValue, StaticNode};
+
+    #[test]
+    fn test_null() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::Null)),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn test_bool() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::Bool(true))),
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::Bool(false))),
+            serde_json::Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_i64() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::I64(-42))),
+            serde_json::json!(-42)
+        );
+    }
+
+    #[test]
+    fn test_u64() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::U64(100))),
+            serde_json::json!(100)
+        );
+    }
+
+    #[test]
+    fn test_f64_finite() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(1.5))),
+            serde_json::json!(1.5)
+        );
+    }
+
+    #[test]
+    fn test_f64_nan_becomes_null() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(f64::NAN))),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn test_f64_infinity_becomes_null() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(f64::INFINITY))),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(f64::NEG_INFINITY))),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn test_string() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::String("hello".into())),
+            serde_json::Value::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_array() {
+        let input = OwnedValue::Array(Box::new(vec![
+            OwnedValue::Static(StaticNode::Null),
+            OwnedValue::Static(StaticNode::Bool(true)),
+        ]));
+        assert_eq!(
+            owned_value_to_serde_json(&input),
+            serde_json::json!([null, true])
+        );
+    }
+
+    #[test]
+    fn test_object() {
+        let mut obj = simd_json::owned::Object::new();
+        obj.insert("k".into(), OwnedValue::Static(StaticNode::I64(1)));
+        let input = OwnedValue::Object(Box::new(obj));
+        assert_eq!(
+            owned_value_to_serde_json(&input),
+            serde_json::json!({"k": 1})
+        );
+    }
+
+    #[test]
+    fn test_nested_object() {
+        let mut inner = simd_json::owned::Object::new();
+        inner.insert("b".into(), OwnedValue::String("v".into()));
+        let mut outer = simd_json::owned::Object::new();
+        outer.insert("a".into(), OwnedValue::Object(Box::new(inner)));
+        let input = OwnedValue::Object(Box::new(outer));
+        assert_eq!(
+            owned_value_to_serde_json(&input),
+            serde_json::json!({"a": {"b": "v"}})
+        );
+    }
 }

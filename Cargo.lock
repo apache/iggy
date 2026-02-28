@@ -5402,7 +5402,6 @@ dependencies = [
  "dashmap",
  "deltalake",
  "iggy_connector_sdk",
- "mimalloc",
  "once_cell",
  "serde",
  "serde_json",

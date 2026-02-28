@@ -26,6 +26,10 @@ pub(crate) fn parse_schema(schema: &[String]) -> Result<Vec<StructField>, Error>
         .map(|entry| {
             let parts: Vec<&str> = entry.split_whitespace().collect();
             if parts.len() != 2 {
+                error!(
+                    "Invalid schema entry '{}': expected '<name> <type>', e.g. 'id integer'",
+                    entry
+                );
                 return Err(Error::InvalidConfig);
             }
             let name = parts[0];
