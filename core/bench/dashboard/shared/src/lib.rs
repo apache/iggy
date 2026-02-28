@@ -20,7 +20,8 @@ pub mod title;
 
 use bench_report::{
     group_metrics_summary::BenchmarkGroupMetricsSummary, hardware::BenchmarkHardware,
-    individual_metrics_summary::BenchmarkIndividualMetricsSummary, params::BenchmarkParams,
+    individual_metrics_summary::BenchmarkIndividualMetricsSummary,
+    latency_distribution::LatencyDistribution, params::BenchmarkParams,
     server_stats::BenchmarkServerStats,
 };
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,16 @@ pub struct BenchmarkReportLight {
 #[derive(Debug, Serialize, Clone, PartialEq, Deserialize)]
 pub struct BenchmarkGroupMetricsLight {
     pub summary: BenchmarkGroupMetricsSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_distribution: Option<LatencyDistribution>,
+}
+
+impl BenchmarkReportLight {
+    pub fn has_latency_distribution(&self) -> bool {
+        self.group_metrics
+            .iter()
+            .any(|gm| gm.latency_distribution.is_some())
+    }
 }
 
 /// Same as BenchmarkIndividualMetrics, but without the time series

@@ -88,7 +88,7 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: reports/python-coverage.xml
+          files: reports/python-coverage.lcov
           disable_search: true
           flags: python
           fail_ci_if_error: false
