@@ -218,7 +218,6 @@ async fn main() -> Result<(), RuntimeError> {
     }
 
     let context = Arc::new(context);
-    api::init(&config.http, context.clone()).await;
 
     let source_handles = source::handle(source_wrappers, context.clone());
     for (key, handler_tasks) in source_handles {
@@ -242,6 +241,7 @@ async fn main() -> Result<(), RuntimeError> {
     }
 
     info!("All sources and sinks spawned.");
+    api::init(&config.http, context.clone()).await;
 
     #[cfg(unix)]
     let (mut ctrl_c, mut sigterm) = {

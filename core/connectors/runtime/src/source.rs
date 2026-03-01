@@ -435,8 +435,6 @@ pub(crate) fn spawn_source_handler(
     });
 
     let plugin_key = plugin_key.to_string();
-    let context_for_error = context.clone();
-    let plugin_key_for_error = plugin_key.clone();
     let handler_task = tokio::spawn(async move {
         source_forwarding_loop(
             plugin_id,
@@ -450,13 +448,6 @@ pub(crate) fn spawn_source_handler(
             context,
         )
         .await;
-        context_for_error
-            .sources
-            .set_error(
-                &plugin_key_for_error,
-                "Source forwarding loop terminated unexpectedly",
-            )
-            .await;
     });
 
     vec![blocking_handle, handler_task]
