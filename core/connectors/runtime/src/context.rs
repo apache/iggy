@@ -32,6 +32,7 @@ use iggy_connector_sdk::api::ConnectorError;
 use iggy_connector_sdk::api::ConnectorStatus;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::error;
 
 pub struct RuntimeContext {
@@ -114,6 +115,7 @@ fn map_sinks(
                 shutdown_tx: None,
                 task_handles: vec![],
                 container: None,
+                restart_guard: Arc::new(Mutex::new(())),
             });
         }
     }
@@ -158,6 +160,7 @@ fn map_sources(
                 config: source_config.clone(),
                 handler_tasks: vec![],
                 container: None,
+                restart_guard: Arc::new(Mutex::new(())),
             });
         }
     }

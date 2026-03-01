@@ -243,6 +243,17 @@ impl SourceManager {
         state_path: &str,
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
+        let guard = {
+            let details_arc = self
+                .sources
+                .get(key)
+                .map(|e| e.value().clone())
+                .ok_or_else(|| RuntimeError::SourceNotFound(key.to_string()))?;
+            let details = details_arc.lock().await;
+            details.restart_guard.clone()
+        };
+        let _lock = guard.lock().await;
+
         info!("Restarting source connector: {key}");
         self.stop_connector(key, metrics).await?;
 
@@ -277,6 +288,7 @@ pub struct SourceDetails {
     pub config: SourceConfig,
     pub handler_tasks: Vec<JoinHandle<()>>,
     pub container: Option<Arc<Container<SourceApi>>>,
+    pub restart_guard: Arc<Mutex<()>>,
 }
 
 impl fmt::Debug for SourceDetails {
@@ -321,6 +333,7 @@ mod tests {
             },
             handler_tasks: vec![],
             container: None,
+            restart_guard: Arc::new(Mutex::new(())),
         }
     }
 

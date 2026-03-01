@@ -241,6 +241,17 @@ impl SinkManager {
         iggy_client: &IggyClient,
         metrics: &Arc<Metrics>,
     ) -> Result<(), RuntimeError> {
+        let guard = {
+            let details_arc = self
+                .sinks
+                .get(key)
+                .map(|e| e.value().clone())
+                .ok_or_else(|| RuntimeError::SinkNotFound(key.to_string()))?;
+            let details = details_arc.lock().await;
+            details.restart_guard.clone()
+        };
+        let _lock = guard.lock().await;
+
         info!("Restarting sink connector: {key}");
         self.stop_connector(key, metrics).await?;
 
@@ -276,6 +287,7 @@ pub struct SinkDetails {
     pub shutdown_tx: Option<watch::Sender<()>>,
     pub task_handles: Vec<JoinHandle<()>>,
     pub container: Option<Arc<Container<SinkApi>>>,
+    pub restart_guard: Arc<Mutex<()>>,
 }
 
 impl fmt::Debug for SinkDetails {
@@ -321,6 +333,7 @@ mod tests {
             shutdown_tx: None,
             task_handles: vec![],
             container: None,
+            restart_guard: Arc::new(Mutex::new(())),
         }
     }
 
