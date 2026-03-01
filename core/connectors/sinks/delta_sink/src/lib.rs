@@ -25,7 +25,6 @@ use tokio::sync::Mutex;
 mod coercions;
 mod sink;
 mod storage;
-mod utils;
 
 use crate::coercions::CoercionTree;
 
@@ -48,8 +47,6 @@ struct SinkState {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeltaSinkConfig {
     pub table_uri: String,
-    #[serde(default)]
-    pub schema: Vec<String>,
     #[serde(default)]
     pub storage_backend_type: Option<String>,
 

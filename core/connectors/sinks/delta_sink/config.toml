@@ -39,14 +39,6 @@ consumer_group = "delta_sink_connector"
 
 [plugin_config]
 table_uri = "file:///tmp/iggy_delta_table"
-schema = [
-    "id long",
-    "name string",
-    "count integer",
-    "amount double",
-    "active boolean",
-    "timestamp long",
-]
 
 # storage_backend_type: "s3", "azure", or "gcs". Omit for local filesystem.
 

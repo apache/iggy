@@ -102,7 +102,6 @@ mod tests {
     fn default_config() -> DeltaSinkConfig {
         DeltaSinkConfig {
             table_uri: "file:///tmp/test".into(),
-            schema: vec![],
             storage_backend_type: None,
             aws_s3_access_key: None,
             aws_s3_secret_key: None,

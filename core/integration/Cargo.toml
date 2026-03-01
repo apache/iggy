@@ -36,6 +36,7 @@ compio = { workspace = true }
 configs = { workspace = true }
 configs_derive = { workspace = true }
 ctor = { workspace = true }
+deltalake = { workspace = true }
 figment = { workspace = true }
 futures = { workspace = true }
 harness_derive = { workspace = true }

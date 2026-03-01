@@ -122,6 +122,8 @@ async fn delta_sink_consumes_json_messages(harness: &TestHarness, fixture: Delta
     assert_eq!(sinks.len(), 1);
     assert_eq!(sinks[0].key, DELTA_SINK_KEY);
     assert!(sinks[0].last_error.is_none());
+
+    drop(fixture);
 }
 
 #[iggy_harness(
@@ -183,6 +185,8 @@ async fn delta_sink_handles_bulk_messages(harness: &TestHarness, fixture: DeltaF
 
     assert_eq!(sinks.len(), 1);
     assert!(sinks[0].last_error.is_none());
+
+    drop(fixture);
 }
 
 #[iggy_harness(

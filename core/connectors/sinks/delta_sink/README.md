@@ -5,7 +5,6 @@ The Delta Lake Sink Connector allows you to consume messages from Iggy topics an
 ## Features
 
 - **Support for local filesystem, AWS S3, Azure Blob Storage, and Google Cloud Storage**
-- **Automatic table creation from a configured schema**
 - **Intelligent type coercion** to match Delta table schemas (e.g. ISO 8601 strings to timestamps)
 - **Transactional writes** with atomic flush-and-commit operations
 
@@ -16,14 +15,6 @@ The Delta Lake Sink Connector allows you to consume messages from Iggy topics an
 ```toml
 [plugin_config]
 table_uri = "file:///tmp/iggy_delta_table"
-schema = [
-    "id long",
-    "name string",
-    "count integer",
-    "amount double",
-    "active boolean",
-    "created_at timestamp",
-]
 ```
 
 ### AWS S3
@@ -66,7 +57,6 @@ gcs_bucket = "my-bucket"
 ### Core
 
 - **table_uri** (required): Path or URI to the Delta table. Supported schemes: `file://`, `s3://`, `az://`, `gs://`.
-- **schema** (optional): Schema definition for automatic table creation when the table does not already exist. Each entry is a string in the format `"<field_name> <field_type>"`. If the table already exists, the schema is inferred from the table and this field is ignored.
 - **storage_backend_type** (optional): The cloud storage backend to use. One of `"s3"`, `"azure"`, or `"gcs"`. Omit for local filesystem tables.
 
 ### AWS S3
@@ -94,12 +84,6 @@ Required when `storage_backend_type = "gcs"`.
 
 - **gcs_service_account_key**: GCS service account JSON key (as a string).
 - **gcs_bucket**: GCS bucket name.
-
-## Supported Schema Types
-
-The following types can be used in the `schema` configuration:
-
-`string`, `byte`, `short`, `integer`, `long`, `float`, `double`, `boolean`, `binary`, `date`, `timestamp`, `timestampNtz`
 
 ## Type Coercion
 

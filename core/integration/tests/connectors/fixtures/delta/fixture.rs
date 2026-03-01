@@ -18,6 +18,8 @@
  */
 
 use async_trait::async_trait;
+use deltalake::kernel::{DataType, PrimitiveType, StructField};
+use deltalake::operations::create::CreateBuilder;
 use integration::harness::{TestBinaryError, TestFixture};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -81,6 +83,26 @@ impl DeltaFixture {
         })
     }
 
+    async fn create_table(table_uri: &str) -> Result<(), TestBinaryError> {
+        let columns = vec![
+            StructField::new("id", DataType::Primitive(PrimitiveType::Long), true),
+            StructField::new("name", DataType::Primitive(PrimitiveType::String), true),
+            StructField::new("count", DataType::Primitive(PrimitiveType::Integer), true),
+            StructField::new("amount", DataType::Primitive(PrimitiveType::Double), true),
+            StructField::new("active", DataType::Primitive(PrimitiveType::Boolean), true),
+            StructField::new("timestamp", DataType::Primitive(PrimitiveType::Long), true),
+        ];
+        CreateBuilder::new()
+            .with_location(table_uri)
+            .with_columns(columns)
+            .await
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "DeltaFixture".to_string(),
+                message: format!("Failed to create Delta table: {error}"),
+            })?;
+        Ok(())
+    }
+
     fn count_delta_versions(delta_log_dir: &std::path::Path) -> usize {
         std::fs::read_dir(delta_log_dir)
             .map(|entries| {
@@ -102,6 +124,8 @@ impl TestFixture for DeltaFixture {
         })?;
 
         let table_path = temp_dir.path().join("delta_table");
+        let table_uri = format!("file://{}", table_path.display());
+        Self::create_table(&table_uri).await?;
         info!(
             "Delta fixture created with table path: {}",
             table_path.display()
@@ -212,6 +236,36 @@ impl DeltaS3Fixture {
         info!("Created MinIO bucket: {MINIO_BUCKET}");
         Ok(())
     }
+
+    async fn create_table(minio_endpoint: &str) -> Result<(), TestBinaryError> {
+        let table_uri = format!("s3://{MINIO_BUCKET}/delta_table");
+        let columns = vec![
+            StructField::new("id", DataType::Primitive(PrimitiveType::Long), true),
+            StructField::new("name", DataType::Primitive(PrimitiveType::String), true),
+            StructField::new("count", DataType::Primitive(PrimitiveType::Integer), true),
+            StructField::new("amount", DataType::Primitive(PrimitiveType::Double), true),
+            StructField::new("active", DataType::Primitive(PrimitiveType::Boolean), true),
+            StructField::new("timestamp", DataType::Primitive(PrimitiveType::Long), true),
+        ];
+        let storage_options = HashMap::from([
+            ("AWS_ACCESS_KEY_ID".into(), MINIO_ACCESS_KEY.into()),
+            ("AWS_SECRET_ACCESS_KEY".into(), MINIO_SECRET_KEY.into()),
+            ("AWS_REGION".into(), "us-east-1".into()),
+            ("AWS_ENDPOINT_URL".into(), minio_endpoint.into()),
+            ("AWS_ALLOW_HTTP".into(), "true".into()),
+            ("AWS_S3_ALLOW_HTTP".into(), "true".into()),
+        ]);
+        CreateBuilder::new()
+            .with_location(table_uri)
+            .with_storage_options(storage_options)
+            .with_columns(columns)
+            .await
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "DeltaS3Fixture".to_string(),
+                message: format!("Failed to create Delta table in MinIO: {error}"),
+            })?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -223,6 +277,7 @@ impl TestFixture for DeltaS3Fixture {
 
         let (minio, minio_endpoint) = Self::start_minio(&network, &minio_name).await?;
         Self::create_bucket(&minio_endpoint).await?;
+        Self::create_table(&minio_endpoint).await?;
 
         info!("Delta S3 fixture ready with MinIO at {minio_endpoint}");
 

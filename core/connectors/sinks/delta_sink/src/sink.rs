@@ -20,13 +20,9 @@ use crate::DeltaSink;
 use crate::SinkState;
 use crate::coercions::{coerce, create_coercion_tree};
 use crate::storage::build_storage_options;
-use crate::utils::parse_schema;
 use async_trait::async_trait;
-use deltalake::DeltaTable;
-use deltalake::operations::create::CreateBuilder;
 use deltalake::writer::{DeltaWriter, JsonWriter};
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata};
-use std::collections::HashMap;
 use tracing::{debug, error, info};
 
 #[async_trait]
@@ -54,11 +50,6 @@ impl Sink for DeltaSink {
                 .await
             {
                 Ok(table) => table,
-                Err(deltalake::DeltaTableError::NotATable(_)) if !self.config.schema.is_empty() => {
-                    info!("Table does not exist, creating from configured schema...");
-                    create_table(&self.config.table_uri, storage_options, &self.config.schema)
-                        .await?
-                }
                 Err(e) => {
                     error!("Failed to load Delta table: {e}");
                     return Err(Error::InitError(format!("Failed to load Delta table: {e}")));
@@ -163,14 +154,14 @@ impl Sink for DeltaSink {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        if let Some(mut state) = self.state.lock().await.take() {
-            if let Err(e) = state.writer.flush_and_commit(&mut state.table).await {
-                error!(
-                    "Delta sink with ID: {} failed to flush on close: {e}",
-                    self.id
-                );
-                return Err(Error::Storage(format!("Failed to flush on close: {e}")));
-            }
+        if let Some(mut state) = self.state.lock().await.take()
+            && let Err(e) = state.writer.flush_and_commit(&mut state.table).await
+        {
+            error!(
+                "Delta sink with ID: {} failed to flush on close: {e}",
+                self.id
+            );
+            return Err(Error::Storage(format!("Failed to flush on close: {e}")));
         }
         info!("Delta Lake sink connector with ID: {} is closed.", self.id);
         Ok(())
@@ -200,25 +191,6 @@ fn owned_value_to_serde_json(value: &simd_json::OwnedValue) -> serde_json::Value
             serde_json::Value::Object(map)
         }
     }
-}
-
-async fn create_table(
-    table_uri: &str,
-    storage_options: HashMap<String, String>,
-    schema: &[String],
-) -> Result<DeltaTable, Error> {
-    let columns = parse_schema(schema)?;
-    let table = CreateBuilder::new()
-        .with_location(table_uri)
-        .with_storage_options(storage_options)
-        .with_columns(columns)
-        .await
-        .map_err(|e| {
-            error!("Failed to create Delta table: {e}");
-            Error::InitError(format!("Failed to create Delta table: {e}"))
-        })?;
-    info!("Created new Delta table at {table_uri}");
-    Ok(table)
 }
 
 #[cfg(test)]
