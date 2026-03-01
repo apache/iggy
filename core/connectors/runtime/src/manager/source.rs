@@ -195,31 +195,18 @@ impl SourceManager {
         let (producer, encoder, transforms) =
             source::setup_source_producer(config, iggy_client).await?;
 
-        let (sender, receiver) = flume::unbounded();
-        source::SOURCE_SENDERS.insert(plugin_id, sender);
-
         let callback = container.iggy_source_handle;
-        tokio::task::spawn_blocking(move || {
-            callback(plugin_id, source::handle_produced_messages);
-        });
-
-        let plugin_key = key.to_string();
-        let verbose = config.verbose;
-        let context_clone = context.clone();
-        let handler_task = tokio::spawn(async move {
-            source::source_forwarding_loop(
-                plugin_id,
-                plugin_key,
-                verbose,
-                producer,
-                encoder,
-                transforms,
-                state_storage,
-                receiver,
-                context_clone,
-            )
-            .await;
-        });
+        let handler_tasks = source::spawn_source_handler(
+            plugin_id,
+            key,
+            config.verbose,
+            producer,
+            encoder,
+            transforms,
+            state_storage,
+            callback,
+            context.clone(),
+        );
 
         {
             let mut details = details_arc.lock().await;
@@ -227,7 +214,7 @@ impl SourceManager {
             details.info.status = ConnectorStatus::Running;
             details.info.last_error = None;
             details.config = config.clone();
-            details.handler_tasks = vec![handler_task];
+            details.handler_tasks = handler_tasks;
             metrics.increment_sources_running();
         }
 

@@ -26,7 +26,7 @@ use iggy::prelude::{
 };
 use iggy_connector_sdk::{
     ConnectorState, DecodedMessage, Error, ProducedMessages, StreamEncoder, TopicMetadata,
-    transforms::Transform,
+    source::HandleCallback, transforms::Transform,
 };
 use once_cell::sync::Lazy;
 use std::{
@@ -62,7 +62,7 @@ pub async fn init(
 ) -> Result<HashMap<String, SourceConnector>, RuntimeError> {
     let mut source_connectors: HashMap<String, SourceConnector> = HashMap::new();
     for (key, config) in source_configs {
-        let name = config.name;
+        let name = config.name.clone();
         if !config.enabled {
             warn!("Source: {name} is disabled ({key})");
             continue;
@@ -84,7 +84,7 @@ pub async fn init(
             let version = get_plugin_version(&container.container);
             init_error = init_source(
                 &container.container,
-                &config.plugin_config.unwrap_or_default(),
+                &config.plugin_config.clone().unwrap_or_default(),
                 plugin_id,
                 state,
             )
@@ -115,7 +115,7 @@ pub async fn init(
             let version = get_plugin_version(&container);
             init_error = init_source(
                 &container,
-                &config.plugin_config.unwrap_or_default(),
+                &config.plugin_config.clone().unwrap_or_default(),
                 plugin_id,
                 state,
             )
@@ -151,20 +151,7 @@ pub async fn init(
             );
         }
 
-        let transforms = if let Some(transforms_config) = config.transforms {
-            let transforms = transform::load(&transforms_config).map_err(|error| {
-                RuntimeError::InvalidConfiguration(format!("Failed to load transforms: {error}"))
-            })?;
-            let types = transforms
-                .iter()
-                .map(|t| t.r#type().into())
-                .collect::<Vec<&'static str>>()
-                .join(", ");
-            info!("Enabled transforms for source: {name} ({key}): {types}",);
-            transforms
-        } else {
-            vec![]
-        };
+        let (producer, encoder, transforms) = setup_source_producer(&config, iggy_client).await?;
 
         let connector = source_connectors.get_mut(&path).ok_or_else(|| {
             RuntimeError::InvalidConfiguration(format!(
@@ -180,32 +167,8 @@ pub async fn init(
                     "Source plugin not found for ID: {plugin_id}"
                 ))
             })?;
-
-        for stream in config.streams.iter() {
-            let linger_time = IggyDuration::from_str(
-                stream.linger_time.as_deref().unwrap_or("5ms"),
-            )
-            .map_err(|error| {
-                RuntimeError::InvalidConfiguration(format!("Invalid linger time: {error}"))
-            })?;
-            let batch_length = stream.batch_length.unwrap_or(1000);
-            let producer = iggy_client
-                .producer(&stream.stream, &stream.topic)?
-                .direct(
-                    DirectConfig::builder()
-                        .batch_length(batch_length)
-                        .linger_time(linger_time)
-                        .build(),
-                )
-                .build();
-
-            producer.init().await?;
-            plugin.producer = Some(SourceConnectorProducer {
-                producer,
-                encoder: stream.schema.encoder(),
-            });
-            plugin.transforms = transforms.clone();
-        }
+        plugin.producer = Some(SourceConnectorProducer { producer, encoder });
+        plugin.transforms = transforms;
     }
 
     Ok(source_connectors)
@@ -446,6 +409,44 @@ pub(crate) async fn source_forwarding_loop(
         .await;
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_source_handler(
+    plugin_id: u32,
+    plugin_key: &str,
+    verbose: bool,
+    producer: IggyProducer,
+    encoder: Arc<dyn StreamEncoder>,
+    transforms: Vec<Arc<dyn Transform>>,
+    state_storage: StateStorage,
+    callback: HandleCallback,
+    context: Arc<RuntimeContext>,
+) -> Vec<JoinHandle<()>> {
+    let (sender, receiver) = flume::unbounded();
+    SOURCE_SENDERS.insert(plugin_id, sender);
+
+    tokio::task::spawn_blocking(move || {
+        callback(plugin_id, handle_produced_messages);
+    });
+
+    let plugin_key = plugin_key.to_string();
+    let handler_task = tokio::spawn(async move {
+        source_forwarding_loop(
+            plugin_id,
+            plugin_key,
+            verbose,
+            producer,
+            encoder,
+            transforms,
+            state_storage,
+            receiver,
+            context,
+        )
+        .await;
+    });
+
+    vec![handler_task]
+}
+
 pub fn handle(
     sources: Vec<SourceConnectorWrapper>,
     context: Arc<RuntimeContext>,
@@ -455,7 +456,6 @@ pub fn handle(
         for plugin in source.plugins {
             let plugin_id = plugin.id;
             let plugin_key = plugin.key.clone();
-            let context = context.clone();
 
             if let Some(error) = &plugin.error {
                 error!(
@@ -470,32 +470,19 @@ pub fn handle(
                 continue;
             };
 
-            let (sender, receiver) = flume::unbounded();
-            SOURCE_SENDERS.insert(plugin_id, sender);
+            let handler_tasks = spawn_source_handler(
+                plugin_id,
+                &plugin_key,
+                plugin.verbose,
+                producer_wrapper.producer,
+                producer_wrapper.encoder,
+                plugin.transforms,
+                plugin.state_storage,
+                source.callback,
+                context.clone(),
+            );
 
-            let callback = source.callback;
-            tokio::task::spawn_blocking(move || {
-                callback(plugin_id, handle_produced_messages);
-            });
-            info!("Handler for source connector with ID: {plugin_id} started successfully.");
-
-            let plugin_key_clone = plugin_key.clone();
-            let handler_task = tokio::spawn(async move {
-                source_forwarding_loop(
-                    plugin_id,
-                    plugin_key_clone,
-                    plugin.verbose,
-                    producer_wrapper.producer,
-                    producer_wrapper.encoder,
-                    plugin.transforms,
-                    plugin.state_storage,
-                    receiver,
-                    context,
-                )
-                .await;
-            });
-
-            handles.push((plugin_key, vec![handler_task]));
+            handles.push((plugin_key, handler_tasks));
         }
     }
     handles
