@@ -271,6 +271,7 @@ impl IggyChart {
             .data(data)
             .show_symbol(false)
             .smooth(true)
+            .z(1)
             .line_style(LineStyle::new().width(width))
             .item_style(ItemStyle::new().color(color));
 
