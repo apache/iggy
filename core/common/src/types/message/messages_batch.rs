@@ -112,7 +112,14 @@ impl IggyMessagesBatch {
 
     /// Get offset of last message
     pub fn last_offset(&self) -> Option<u64> {
-        self.iter().last().map(|msg| msg.header().offset())
+        if self.is_empty() {
+            return None;
+        }
+
+        let last_index = self.count().saturating_sub(1) as usize;
+        self.get(last_index)
+            .map(|msg| msg.header().offset())
+            .or_else(|| self.iter().last().map(|msg| msg.header().offset()))
     }
 
     /// Get timestamp of last message
