@@ -29,6 +29,7 @@ use figlet_rs::FIGfont;
 use iggy::prelude::{Client, IggyConsumer, IggyProducer};
 use iggy_connector_sdk::{
     StreamDecoder, StreamEncoder,
+    api::ConnectorStatus,
     sink::ConsumeCallback,
     source::{HandleCallback, SendCallback},
     transforms::Transform,
@@ -234,6 +235,10 @@ async fn main() -> Result<(), RuntimeError> {
             details.shutdown_tx = Some(shutdown_tx);
             details.task_handles = task_handles;
         }
+        context
+            .sinks
+            .update_status(&key, ConnectorStatus::Running, Some(&context.metrics))
+            .await;
     }
 
     info!("All sources and sinks spawned.");

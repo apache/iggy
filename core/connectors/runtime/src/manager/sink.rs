@@ -33,7 +33,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::info;
 
 #[derive(Debug)]
 pub struct SinkManager {
@@ -100,6 +100,7 @@ impl SinkManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn set_error(&self, key: &str, error_message: &str) {
         if let Some(sink) = self.sinks.get(key) {
             let mut sink = sink.lock().await;
@@ -187,38 +188,9 @@ impl SinkManager {
 
         let consumers = sink::setup_sink_consumers(key, config, iggy_client).await?;
 
-        let (shutdown_tx, shutdown_rx) = watch::channel(());
         let callback = container.iggy_sink_consume;
-        let verbose = config.verbose;
-        let mut task_handles = Vec::new();
-
-        for (consumer, decoder, batch_size, transforms) in consumers {
-            let plugin_key = key.to_string();
-            let metrics_clone = metrics.clone();
-            let shutdown_rx = shutdown_rx.clone();
-
-            let handle = tokio::spawn(async move {
-                if let Err(error) = sink::consume_messages(
-                    plugin_id,
-                    decoder,
-                    batch_size,
-                    callback,
-                    transforms,
-                    consumer,
-                    verbose,
-                    &plugin_key,
-                    &metrics_clone,
-                    shutdown_rx,
-                )
-                .await
-                {
-                    error!(
-                        "Failed to consume messages for sink connector with ID: {plugin_id}: {error}"
-                    );
-                }
-            });
-            task_handles.push(handle);
-        }
+        let (shutdown_tx, task_handles) =
+            sink::spawn_consume_tasks(plugin_id, key, consumers, callback, config.verbose, metrics);
 
         {
             let mut details = details_arc.lock().await;

@@ -31,7 +31,6 @@ use iggy::prelude::{
     AutoCommit, AutoCommitWhen, IggyClient, IggyConsumer, IggyDuration, IggyMessage,
     PollingStrategy,
 };
-use iggy_connector_sdk::api::ConnectorStatus;
 use iggy_connector_sdk::{
     DecodedMessage, MessagesMetadata, RawMessage, RawMessages, ReceivedMessage, StreamDecoder,
     TopicMetadata, sink::ConsumeCallback, transforms::Transform,
@@ -52,7 +51,7 @@ pub async fn init(
 ) -> Result<HashMap<String, SinkConnector>, RuntimeError> {
     let mut sink_connectors: HashMap<String, SinkConnector> = HashMap::new();
     for (key, config) in sink_configs {
-        let name = config.name;
+        let name = config.name.clone();
         if !config.enabled {
             warn!("Sink: {name} is disabled ({key})");
             continue;
@@ -70,7 +69,7 @@ pub async fn init(
             let version = get_plugin_version(&container.container);
             init_error = init_sink(
                 &container.container,
-                &config.plugin_config.unwrap_or_default(),
+                &config.plugin_config.clone().unwrap_or_default(),
                 plugin_id,
             )
             .err()
@@ -98,7 +97,7 @@ pub async fn init(
             let version = get_plugin_version(&container);
             init_error = init_sink(
                 &container,
-                &config.plugin_config.unwrap_or_default(),
+                &config.plugin_config.clone().unwrap_or_default(),
                 plugin_id,
             )
             .err()
@@ -131,21 +130,7 @@ pub async fn init(
             );
         }
 
-        let transforms = if let Some(transforms_config) = config.transforms {
-            let transforms = transform::load(&transforms_config).map_err(|error| {
-                RuntimeError::InvalidConfiguration(format!("Failed to load transforms: {error}"))
-            })?;
-            let types = transforms
-                .iter()
-                .map(|t| t.r#type().into())
-                .collect::<Vec<&'static str>>()
-                .join(", ");
-            info!("Enabled transforms for sink: {name} ({key}): {types}",);
-            transforms
-        } else {
-            vec![]
-        };
-
+        let consumers = setup_sink_consumers(&key, &config, iggy_client).await?;
         let connector = sink_connectors.get_mut(&path).ok_or_else(|| {
             RuntimeError::InvalidConfiguration(format!("Sink connector not found for path: {path}"))
         })?;
@@ -158,39 +143,13 @@ pub async fn init(
                     "Sink plugin not found for ID: {plugin_id}"
                 ))
             })?;
-
-        for stream in config.streams.iter() {
-            let poll_interval = IggyDuration::from_str(
-                stream.poll_interval.as_deref().unwrap_or("5ms"),
-            )
-            .map_err(|error| {
-                RuntimeError::InvalidConfiguration(format!("Invalid poll interval: {error}"))
-            })?;
-            let default_consumer_group = format!("iggy-connect-sink-{key}");
-            let consumer_group = stream
-                .consumer_group
-                .as_deref()
-                .unwrap_or(&default_consumer_group);
-            let batch_length = stream.batch_length.unwrap_or(1000);
-            for topic in stream.topics.iter() {
-                let mut consumer = iggy_client
-                    .consumer_group(consumer_group, &stream.stream, topic)?
-                    .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
-                    .create_consumer_group_if_not_exists()
-                    .auto_join_consumer_group()
-                    .polling_strategy(PollingStrategy::next())
-                    .poll_interval(poll_interval)
-                    .batch_length(batch_length)
-                    .build();
-
-                consumer.init().await?;
-                plugin.consumers.push(SinkConnectorConsumer {
-                    consumer,
-                    decoder: stream.schema.decoder(),
-                    batch_size: batch_length,
-                    transforms: transforms.clone(),
-                });
-            }
+        for (consumer, decoder, batch_size, transforms) in consumers {
+            plugin.consumers.push(SinkConnectorConsumer {
+                consumer,
+                decoder,
+                batch_size,
+                transforms,
+            });
         }
     }
 
@@ -212,61 +171,68 @@ pub fn consume(
                 continue;
             }
             info!("Starting consume for sink with ID: {}...", plugin.id);
-            let (shutdown_tx, shutdown_rx) = watch::channel(());
-            let mut task_handles = Vec::new();
-
-            for consumer in plugin.consumers {
-                let plugin_key = plugin.key.clone();
-                let context = context.clone();
-                let shutdown_rx = shutdown_rx.clone();
-
-                let handle = tokio::spawn(async move {
-                    context
-                        .sinks
-                        .update_status(
-                            &plugin_key,
-                            ConnectorStatus::Running,
-                            Some(&context.metrics),
-                        )
-                        .await;
-
-                    if let Err(error) = consume_messages(
-                        plugin.id,
-                        consumer.decoder,
-                        consumer.batch_size,
-                        sink.callback,
-                        consumer.transforms,
-                        consumer.consumer,
-                        plugin.verbose,
-                        &plugin_key,
-                        &context.metrics,
-                        shutdown_rx,
-                    )
-                    .await
-                    {
-                        let error_msg = format!(
-                            "Failed to consume messages for sink connector with ID: {}. {error}",
-                            plugin.id
-                        );
-                        error!("{error_msg}");
-                        context
-                            .metrics
-                            .increment_errors(&plugin_key, ConnectorType::Sink);
-                        context.sinks.set_error(&plugin_key, &error_msg).await;
-                        return;
-                    }
-                    info!(
-                        "Consume messages for sink connector with ID: {} completed.",
-                        plugin.id
-                    );
-                });
-                task_handles.push(handle);
-            }
-
-            handles.push((plugin.key.clone(), shutdown_tx, task_handles));
+            let consumers = plugin
+                .consumers
+                .into_iter()
+                .map(|c| (c.consumer, c.decoder, c.batch_size, c.transforms))
+                .collect();
+            let (shutdown_tx, task_handles) = spawn_consume_tasks(
+                plugin.id,
+                &plugin.key,
+                consumers,
+                sink.callback,
+                plugin.verbose,
+                &context.metrics,
+            );
+            handles.push((plugin.key, shutdown_tx, task_handles));
         }
     }
     handles
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn spawn_consume_tasks(
+    plugin_id: u32,
+    plugin_key: &str,
+    consumers: Vec<(
+        IggyConsumer,
+        Arc<dyn StreamDecoder>,
+        u32,
+        Vec<Arc<dyn Transform>>,
+    )>,
+    callback: ConsumeCallback,
+    verbose: bool,
+    metrics: &Arc<Metrics>,
+) -> (watch::Sender<()>, Vec<JoinHandle<()>>) {
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let mut task_handles = Vec::new();
+    for (consumer, decoder, batch_size, transforms) in consumers {
+        let plugin_key = plugin_key.to_string();
+        let metrics = metrics.clone();
+        let shutdown_rx = shutdown_rx.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(error) = consume_messages(
+                plugin_id,
+                decoder,
+                batch_size,
+                callback,
+                transforms,
+                consumer,
+                verbose,
+                &plugin_key,
+                &metrics,
+                shutdown_rx,
+            )
+            .await
+            {
+                error!(
+                    "Failed to consume messages for sink connector with ID: {plugin_id}: {error}"
+                );
+            }
+        });
+        task_handles.push(handle);
+    }
+    (shutdown_tx, task_handles)
 }
 
 #[allow(clippy::too_many_arguments)]
