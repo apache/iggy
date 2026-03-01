@@ -101,13 +101,30 @@ impl SinkManager {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn set_error(&self, key: &str, error_message: &str) {
         if let Some(sink) = self.sinks.get(key) {
             let mut sink = sink.lock().await;
             sink.info.status = ConnectorStatus::Error;
             sink.info.last_error = Some(ConnectorError::new(error_message));
         }
+    }
+
+    pub async fn stop_connector_with_guard(
+        &self,
+        key: &str,
+        metrics: &Arc<Metrics>,
+    ) -> Result<(), RuntimeError> {
+        let guard = {
+            let details_arc = self
+                .sinks
+                .get(key)
+                .map(|e| e.value().clone())
+                .ok_or_else(|| RuntimeError::SinkNotFound(key.to_string()))?;
+            let details = details_arc.lock().await;
+            details.restart_guard.clone()
+        };
+        let _lock = guard.lock().await;
+        self.stop_connector(key, metrics).await
     }
 
     pub async fn stop_connector(

@@ -110,6 +110,24 @@ impl SourceManager {
         }
     }
 
+    pub async fn stop_connector_with_guard(
+        &self,
+        key: &str,
+        metrics: &Arc<Metrics>,
+    ) -> Result<(), RuntimeError> {
+        let guard = {
+            let details_arc = self
+                .sources
+                .get(key)
+                .map(|e| e.value().clone())
+                .ok_or_else(|| RuntimeError::SourceNotFound(key.to_string()))?;
+            let details = details_arc.lock().await;
+            details.restart_guard.clone()
+        };
+        let _lock = guard.lock().await;
+        self.stop_connector(key, metrics).await
+    }
+
     pub async fn stop_connector(
         &self,
         key: &str,
@@ -193,7 +211,7 @@ impl SourceManager {
         info!("Source connector with ID: {plugin_id} for plugin: {key} initialized successfully.");
 
         let (producer, encoder, transforms) =
-            source::setup_source_producer(config, iggy_client).await?;
+            source::setup_source_producer(key, config, iggy_client).await?;
 
         let callback = container.iggy_source_handle;
         let handler_tasks = source::spawn_source_handler(

@@ -151,7 +151,8 @@ pub async fn init(
             );
         }
 
-        let (producer, encoder, transforms) = setup_source_producer(&config, iggy_client).await?;
+        let (producer, encoder, transforms) =
+            setup_source_producer(&key, &config, iggy_client).await?;
 
         let connector = source_connectors.get_mut(&path).ok_or_else(|| {
             RuntimeError::InvalidConfiguration(format!(
@@ -217,6 +218,7 @@ pub(crate) fn get_state_storage(state_path: &str, key: &str) -> StateStorage {
 }
 
 pub(crate) async fn setup_source_producer(
+    key: &str,
     config: &SourceConfig,
     iggy_client: &IggyClient,
 ) -> Result<
@@ -232,7 +234,7 @@ pub(crate) async fn setup_source_producer(
             RuntimeError::InvalidConfiguration(format!("Failed to load transforms: {error}"))
         })?;
         for t in &loaded {
-            info!("Loaded transform: {:?} for source", t.r#type());
+            info!("Loaded transform: {:?} for source: {key}", t.r#type());
         }
         loaded
     } else {
@@ -433,6 +435,8 @@ pub(crate) fn spawn_source_handler(
     });
 
     let plugin_key = plugin_key.to_string();
+    let context_for_error = context.clone();
+    let plugin_key_for_error = plugin_key.clone();
     let handler_task = tokio::spawn(async move {
         source_forwarding_loop(
             plugin_id,
@@ -446,6 +450,13 @@ pub(crate) fn spawn_source_handler(
             context,
         )
         .await;
+        context_for_error
+            .sources
+            .set_error(
+                &plugin_key_for_error,
+                "Source forwarding loop terminated unexpectedly",
+            )
+            .await;
     });
 
     vec![blocking_handle, handler_task]

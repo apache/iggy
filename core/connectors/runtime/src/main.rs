@@ -270,17 +270,11 @@ async fn main() -> Result<(), RuntimeError> {
         .map(|s| s.key)
         .collect();
     for key in &source_keys {
-        let guard = if let Some(details) = context.sources.get(key).await {
-            let details = details.lock().await;
-            Some(details.restart_guard.clone())
-        } else {
-            None
-        };
-        let _lock = match &guard {
-            Some(g) => Some(g.lock().await),
-            None => None,
-        };
-        if let Err(err) = context.sources.stop_connector(key, &context.metrics).await {
+        if let Err(err) = context
+            .sources
+            .stop_connector_with_guard(key, &context.metrics)
+            .await
+        {
             error!("Failed to stop source connector: {key}. {err}");
         }
     }
@@ -293,17 +287,11 @@ async fn main() -> Result<(), RuntimeError> {
         .map(|s| s.key)
         .collect();
     for key in &sink_keys {
-        let guard = if let Some(details) = context.sinks.get(key).await {
-            let details = details.lock().await;
-            Some(details.restart_guard.clone())
-        } else {
-            None
-        };
-        let _lock = match &guard {
-            Some(g) => Some(g.lock().await),
-            None => None,
-        };
-        if let Err(err) = context.sinks.stop_connector(key, &context.metrics).await {
+        if let Err(err) = context
+            .sinks
+            .stop_connector_with_guard(key, &context.metrics)
+            .await
+        {
             error!("Failed to stop sink connector: {key}. {err}");
         }
     }
