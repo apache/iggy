@@ -183,6 +183,7 @@ pub fn consume(
                 sink.callback,
                 plugin.verbose,
                 &context.metrics,
+                context.clone(),
             );
             handles.push((plugin.key, shutdown_tx, task_handles));
         }
@@ -203,6 +204,7 @@ pub(crate) fn spawn_consume_tasks(
     callback: ConsumeCallback,
     verbose: bool,
     metrics: &Arc<Metrics>,
+    context: Arc<RuntimeContext>,
 ) -> (watch::Sender<()>, Vec<JoinHandle<()>>) {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let mut task_handles = Vec::new();
@@ -210,6 +212,7 @@ pub(crate) fn spawn_consume_tasks(
         let plugin_key = plugin_key.to_string();
         let metrics = metrics.clone();
         let shutdown_rx = shutdown_rx.clone();
+        let context = context.clone();
         let handle = tokio::spawn(async move {
             if let Err(error) = consume_messages(
                 plugin_id,
@@ -228,6 +231,10 @@ pub(crate) fn spawn_consume_tasks(
                 error!(
                     "Failed to consume messages for sink connector with ID: {plugin_id}: {error}"
                 );
+                context
+                    .sinks
+                    .set_error(&plugin_key, &error.to_string())
+                    .await;
             }
         });
         task_handles.push(handle);
@@ -384,9 +391,13 @@ pub(crate) async fn setup_sink_consumers(
     RuntimeError,
 > {
     let transforms = if let Some(transforms_config) = &config.transforms {
-        transform::load(transforms_config).map_err(|error| {
+        let loaded = transform::load(transforms_config).map_err(|error| {
             RuntimeError::InvalidConfiguration(format!("Failed to load transforms: {error}"))
-        })?
+        })?;
+        for t in &loaded {
+            info!("Loaded transform: {:?} for sink: {key}", t.r#type());
+        }
+        loaded
     } else {
         vec![]
     };

@@ -228,9 +228,13 @@ pub(crate) async fn setup_source_producer(
     RuntimeError,
 > {
     let transforms = if let Some(transforms_config) = &config.transforms {
-        transform::load(transforms_config).map_err(|error| {
+        let loaded = transform::load(transforms_config).map_err(|error| {
             RuntimeError::InvalidConfiguration(format!("Failed to load transforms: {error}"))
-        })?
+        })?;
+        for t in &loaded {
+            info!("Loaded transform: {:?} for source", t.r#type());
+        }
+        loaded
     } else {
         vec![]
     };
@@ -424,7 +428,7 @@ pub(crate) fn spawn_source_handler(
     let (sender, receiver) = flume::unbounded();
     SOURCE_SENDERS.insert(plugin_id, sender);
 
-    tokio::task::spawn_blocking(move || {
+    let blocking_handle = tokio::task::spawn_blocking(move || {
         callback(plugin_id, handle_produced_messages);
     });
 
@@ -444,7 +448,7 @@ pub(crate) fn spawn_source_handler(
         .await;
     });
 
-    vec![handler_task]
+    vec![blocking_handle, handler_task]
 }
 
 pub fn handle(

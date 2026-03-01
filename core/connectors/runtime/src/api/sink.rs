@@ -259,6 +259,7 @@ async fn restart_sink(
             context.config_provider.as_ref(),
             &context.iggy_clients.consumer,
             &context.metrics,
+            &context,
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)

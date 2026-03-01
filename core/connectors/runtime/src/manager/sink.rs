@@ -19,6 +19,7 @@
 use crate::PLUGIN_ID;
 use crate::SinkApi;
 use crate::configs::connectors::{ConfigFormat, ConnectorsConfigProvider, SinkConfig};
+use crate::context::RuntimeContext;
 use crate::error::RuntimeError;
 use crate::metrics::Metrics;
 use crate::sink;
@@ -163,6 +164,7 @@ impl SinkManager {
         config: &SinkConfig,
         iggy_client: &IggyClient,
         metrics: &Arc<Metrics>,
+        context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
         let details_arc = self
             .sinks
@@ -189,8 +191,15 @@ impl SinkManager {
         let consumers = sink::setup_sink_consumers(key, config, iggy_client).await?;
 
         let callback = container.iggy_sink_consume;
-        let (shutdown_tx, task_handles) =
-            sink::spawn_consume_tasks(plugin_id, key, consumers, callback, config.verbose, metrics);
+        let (shutdown_tx, task_handles) = sink::spawn_consume_tasks(
+            plugin_id,
+            key,
+            consumers,
+            callback,
+            config.verbose,
+            metrics,
+            context.clone(),
+        );
 
         {
             let mut details = details_arc.lock().await;
@@ -212,6 +221,7 @@ impl SinkManager {
         config_provider: &dyn ConnectorsConfigProvider,
         iggy_client: &IggyClient,
         metrics: &Arc<Metrics>,
+        context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
         let guard = {
             let details_arc = self
@@ -233,7 +243,7 @@ impl SinkManager {
             .map_err(|e| RuntimeError::InvalidConfiguration(e.to_string()))?
             .ok_or_else(|| RuntimeError::SinkNotFound(key.to_string()))?;
 
-        self.start_connector(key, &config, iggy_client, metrics)
+        self.start_connector(key, &config, iggy_client, metrics, context)
             .await?;
         info!("Sink connector: {key} restarted successfully.");
         Ok(())
