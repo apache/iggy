@@ -22,7 +22,7 @@ runs:
   using: "composite"
   steps:
     - name: Setup Bazel with cache
-      uses: bazel-contrib/setup-bazel@0.18.0
+      uses: bazel-contrib/setup-bazel@8d2cb86a3680a820c3e219597279ce3f80d17a47
       with:
         bazelisk-cache: true
         disk-cache: true
