@@ -33,10 +33,11 @@ genrule(
         set -euo pipefail
 
         CARGO="$$(command -v cargo)"
-        CARGO_TARGET_DIR="$(@D)/cargo_target"
-        OUT_LIB="$$(pwd)/$(location libiggy_cpp.a)"
-        OUT_RS="$$(pwd)/$(location include/lib.rs.h)"
-        OUT_CXX="$$(pwd)/$(location cxxbridge/rust/cxx.h)"
+        EXECROOT="$$(pwd)"
+        CARGO_TARGET_DIR="$$EXECROOT/$(@D)/cargo_target"
+        OUT_LIB="$$EXECROOT/$(location libiggy_cpp.a)"
+        OUT_RS="$$EXECROOT/$(location include/lib.rs.h)"
+        OUT_CXX="$$EXECROOT/$(location cxxbridge/rust/cxx.h)"
 
         PROJECT_ROOT="$$(dirname $$(readlink -f $(location Cargo.toml)))"
         cd "$$PROJECT_ROOT"
