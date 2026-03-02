@@ -22,6 +22,10 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
+[features]
+default = ["websocket"]
+websocket = ["dep:tungstenite"]
+
 [dependencies]
 configs_derive = { workspace = true }
 derive_more = { workspace = true }
@@ -35,4 +39,4 @@ serde_with = { workspace = true }
 static-toml = { workspace = true }
 strum = { workspace = true }
 tracing = { workspace = true }
-tungstenite = { workspace = true }
+tungstenite = { workspace = true, optional = true }

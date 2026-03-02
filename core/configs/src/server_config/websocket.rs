@@ -20,6 +20,7 @@ use configs::ConfigEnv;
 use iggy_common::IggyByteSize;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
+#[cfg(feature = "websocket")]
 use tungstenite::protocol::WebSocketConfig as TungsteniteConfig;
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
@@ -51,6 +52,7 @@ pub struct WebSocketTlsConfig {
 }
 
 impl WebSocketConfig {
+    #[cfg(feature = "websocket")]
     pub fn to_tungstenite_config(&self) -> TungsteniteConfig {
         let mut config = TungsteniteConfig::default();
 
