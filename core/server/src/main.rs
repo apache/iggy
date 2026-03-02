@@ -304,6 +304,7 @@ fn main() -> Result<(), ServerError> {
         let metrics = Metrics::init();
 
         // TWELFTH DISCRETE LOADING STEP.
+        #[cfg(feature = "tcp")]
         info!(
             "Enable TCP socket migration across shards: {}.",
             config.tcp.socket_migration

@@ -176,9 +176,13 @@ impl IggyShardBuilder {
             metrics,
             is_follower: self.is_follower,
             is_shutting_down: AtomicBool::new(false),
+            #[cfg(feature = "tcp")]
             tcp_bound_address: Cell::new(None),
+            #[cfg(feature = "quic")]
             quic_bound_address: Cell::new(None),
+            #[cfg(feature = "websocket")]
             websocket_bound_address: Cell::new(None),
+            #[cfg(feature = "http")]
             http_bound_address: Cell::new(None),
             config_writer_notify,
             config_writer_receiver,

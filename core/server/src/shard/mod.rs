@@ -88,9 +88,13 @@ pub struct IggyShard {
     pub messages_receiver: Cell<Option<Receiver<ShardFrame>>>,
     pub(crate) stop_receiver: StopReceiver,
     pub(crate) is_shutting_down: AtomicBool,
+    #[cfg(feature = "tcp")]
     pub(crate) tcp_bound_address: Cell<Option<SocketAddr>>,
+    #[cfg(feature = "quic")]
     pub(crate) quic_bound_address: Cell<Option<SocketAddr>>,
+    #[cfg(feature = "websocket")]
     pub(crate) websocket_bound_address: Cell<Option<SocketAddr>>,
+    #[cfg(feature = "http")]
     pub(crate) http_bound_address: Cell<Option<SocketAddr>>,
     pub(crate) config_writer_notify: async_channel::Sender<()>,
     config_writer_receiver: async_channel::Receiver<()>,
@@ -119,19 +123,16 @@ impl IggyShard {
         continuous::spawn_message_pump(self.clone());
 
         // Spawn config writer task on shard 0 if we need to wait for bound addresses
-        if self.id == 0
-            && (self.config.tcp.enabled
-                || self.config.quic.enabled
-                || self.config.http.enabled
-                || self.config.websocket.enabled)
-        {
+        if self.id == 0 && self.any_transport_enabled() {
             tasks::oneshot::spawn_config_writer_task(self);
         }
 
+        #[cfg(feature = "tcp")]
         if self.config.tcp.enabled {
             continuous::spawn_tcp_server(self.clone());
         }
 
+        #[cfg(feature = "http")]
         if self.config.http.enabled && self.id == 0 {
             continuous::spawn_http_server(self.clone());
         }
@@ -141,9 +142,11 @@ impl IggyShard {
         // TODO(hubcio): QUIC doesn't properly work on all shards, especially tests `concurrent` and `system_scenario`.
         // it's probably related to Endpoint not Cloned between shards, but all shards are creating its own instance.
         // This way packet CID is invalid. (crypto-related stuff)
+        #[cfg(feature = "quic")]
         if self.config.quic.enabled && self.id == 0 {
             continuous::spawn_quic_server(self.clone());
         }
+        #[cfg(feature = "websocket")]
         if self.config.websocket.enabled {
             continuous::spawn_websocket_server(self.clone());
         }
@@ -371,6 +374,27 @@ impl IggyShard {
         self.is_shutting_down.store(true, Ordering::SeqCst);
         debug!("Shard {} shutdown state set", self.id);
         self.task_registry.graceful_shutdown(SHUTDOWN_TIMEOUT).await
+    }
+
+    fn any_transport_enabled(&self) -> bool {
+        let mut enabled = false;
+        #[cfg(feature = "tcp")]
+        {
+            enabled |= self.config.tcp.enabled;
+        }
+        #[cfg(feature = "quic")]
+        {
+            enabled |= self.config.quic.enabled;
+        }
+        #[cfg(feature = "http")]
+        {
+            enabled |= self.config.http.enabled;
+        }
+        #[cfg(feature = "websocket")]
+        {
+            enabled |= self.config.websocket.enabled;
+        }
+        enabled
     }
 
     pub fn get_available_shards_count(&self) -> u32 {

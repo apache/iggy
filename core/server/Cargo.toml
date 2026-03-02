@@ -32,10 +32,14 @@ name = "iggy-server"
 path = "src/main.rs"
 
 [features]
-default = ["mimalloc", "iggy-web"]
+default = ["mimalloc", "iggy-web", "tcp", "quic", "http", "websocket"]
 disable-mimalloc = []
 mimalloc = ["dep:mimalloc"]
-iggy-web = ["dep:rust-embed", "dep:mime_guess"]
+iggy-web = ["http", "dep:rust-embed", "dep:mime_guess"]
+tcp = ["iggy_common/tcp"]
+quic = ["iggy_common/quic"]
+http = ["dep:axum", "dep:axum-server", "dep:cyper-axum", "dep:tower-http", "dep:jsonwebtoken"]
+websocket = ["iggy_common/websocket", "configs/websocket", "dep:tungstenite"]
 
 [dependencies]
 ahash = { workspace = true }
@@ -43,8 +47,8 @@ anyhow = { workspace = true }
 argon2 = { workspace = true }
 async-channel = { workspace = true }
 async_zip = { workspace = true }
-axum = { workspace = true }
-axum-server = { workspace = true }
+axum = { workspace = true, optional = true }
+axum-server = { workspace = true, optional = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
@@ -52,7 +56,7 @@ compio = { workspace = true }
 configs = { workspace = true }
 ctrlc = { workspace = true }
 cyper = { workspace = true }
-cyper-axum = { workspace = true }
+cyper-axum = { workspace = true, optional = true }
 dashmap = { workspace = true }
 dotenvy = { workspace = true }
 enum_dispatch = { workspace = true }
@@ -65,7 +69,7 @@ futures = { workspace = true }
 hash32 = { workspace = true }
 human-repr = { workspace = true }
 iggy_common = { workspace = true }
-jsonwebtoken = { workspace = true }
+jsonwebtoken = { workspace = true, optional = true }
 left-right = { workspace = true }
 metadata = { workspace = true }
 mimalloc = { workspace = true, optional = true }
@@ -95,12 +99,12 @@ sysinfo = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
-tower-http = { workspace = true }
+tower-http = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
-tungstenite = { workspace = true }
+tungstenite = { workspace = true, optional = true }
 ulid = { workspace = true }
 uuid = { workspace = true }
 

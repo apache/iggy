@@ -29,23 +29,35 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[cfg(windows)]
 compile_error!("iggy-server doesn't support windows.");
 
+#[cfg(not(any(
+    feature = "tcp",
+    feature = "quic",
+    feature = "http",
+    feature = "websocket"
+)))]
+compile_error!("At least one transport feature must be enabled (tcp, quic, http, websocket).");
+
 pub mod args;
 pub mod binary;
 pub mod bootstrap;
 pub(crate) mod compat;
 pub mod configs;
 pub mod diagnostics;
+#[cfg(feature = "http")]
 pub mod http;
 pub mod io;
 pub mod log;
 pub mod metadata;
+#[cfg(feature = "quic")]
 pub mod quic;
 pub mod server_error;
 pub mod shard;
 pub mod shard_allocator;
 pub mod state;
 pub mod streaming;
+#[cfg(feature = "tcp")]
 pub mod tcp;
+#[cfg(feature = "websocket")]
 pub mod websocket;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -31,7 +31,10 @@ use iggy_common::{
     update_topic::UpdateTopic, update_user::UpdateUser,
 };
 
-use std::{net::SocketAddr, os::fd::OwnedFd};
+#[cfg(feature = "tcp")]
+use std::net::SocketAddr;
+#[cfg(feature = "tcp")]
+use std::os::fd::OwnedFd;
 
 /// Resolved stream ID. Contains only the numeric ID - `Identifier` stays at handler boundary.
 #[derive(Debug, Clone, Copy)]
@@ -120,6 +123,7 @@ pub enum ShardRequestPayload {
         topic_id: usize,
         partition_ids: Vec<usize>,
     },
+    #[cfg(feature = "tcp")]
     SocketTransfer {
         fd: OwnedFd,
         from_shard: u16,

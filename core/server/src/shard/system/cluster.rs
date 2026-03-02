@@ -111,29 +111,41 @@ impl IggyShard {
     /// Get actual bound ports from the shard's bound addresses
     /// This is needed when server binds to port 0 (OS-assigned port)
     fn get_actual_bound_ports(&self) -> Option<TransportEndpoints> {
+        #[cfg(feature = "tcp")]
         let tcp_port = self
             .tcp_bound_address
             .get()
             .map(|addr| addr.port())
             .unwrap_or_else(|| extract_port(&self.config.tcp.address));
+        #[cfg(not(feature = "tcp"))]
+        let tcp_port = extract_port(&self.config.tcp.address);
 
+        #[cfg(feature = "quic")]
         let quic_port = self
             .quic_bound_address
             .get()
             .map(|addr| addr.port())
             .unwrap_or_else(|| extract_port(&self.config.quic.address));
+        #[cfg(not(feature = "quic"))]
+        let quic_port = extract_port(&self.config.quic.address);
 
+        #[cfg(feature = "http")]
         let http_port = self
             .http_bound_address
             .get()
             .map(|addr| addr.port())
             .unwrap_or_else(|| extract_port(&self.config.http.address));
+        #[cfg(not(feature = "http"))]
+        let http_port = extract_port(&self.config.http.address);
 
+        #[cfg(feature = "websocket")]
         let websocket_port = self
             .websocket_bound_address
             .get()
             .map(|addr| addr.port())
             .unwrap_or_else(|| extract_port(&self.config.websocket.address));
+        #[cfg(not(feature = "websocket"))]
+        let websocket_port = extract_port(&self.config.websocket.address);
 
         trace!(
             "Using actual bound ports - TCP: {}, QUIC: {}, HTTP: {}, WebSocket: {}",

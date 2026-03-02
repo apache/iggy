@@ -83,6 +83,7 @@ pub enum ShardResponse {
     CreatePartitionsResponse(Vec<usize>),
     DeletePartitionsResponse(Vec<usize>),
     UpdateStreamResponse,
+    #[cfg(feature = "tcp")]
     SocketTransferResponse,
     UpdatePermissionsResponse,
     ChangePasswordResponse,

@@ -16,23 +16,27 @@
 // under the License.
 
 use super::*;
-use crate::{
-    shard::{
-        IggyShard, execution,
-        transmission::{
-            event::ShardEvent,
-            frame::ShardResponse,
-            message::{ShardMessage, ShardRequest, ShardRequestPayload},
-        },
-    },
-    tcp::{
-        connection_handler::{ConnectionAction, handle_connection, handle_error},
-        tcp_listener::cleanup_connection,
+use crate::shard::{
+    IggyShard, execution,
+    transmission::{
+        event::ShardEvent,
+        frame::ShardResponse,
+        message::{ShardMessage, ShardRequest, ShardRequestPayload},
     },
 };
+#[cfg(feature = "tcp")]
+use crate::tcp::{
+    connection_handler::{ConnectionAction, handle_connection, handle_error},
+    tcp_listener::cleanup_connection,
+};
+#[cfg(feature = "tcp")]
 use compio::net::TcpStream;
-use iggy_common::{IggyError, SenderKind, TransportProtocol, sharding::IggyNamespace};
+#[cfg(feature = "tcp")]
+use iggy_common::SenderKind;
+use iggy_common::{IggyError, TransportProtocol, sharding::IggyNamespace};
+#[cfg(feature = "tcp")]
 use nix::sys::stat::SFlag;
+#[cfg(feature = "tcp")]
 use std::os::fd::{FromRawFd, IntoRawFd};
 use tracing::info;
 
@@ -378,6 +382,7 @@ async fn handle_request(
 
             Ok(ShardResponse::CompletePartitionRevocationResponse)
         }
+        #[cfg(feature = "tcp")]
         ShardRequestPayload::SocketTransfer {
             fd,
             from_shard,
@@ -532,22 +537,28 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
                 protocol, address
             );
             match protocol {
+                #[cfg(feature = "tcp")]
                 TransportProtocol::Tcp => {
                     shard.tcp_bound_address.set(Some(address));
                     let _ = shard.config_writer_notify.try_send(());
                 }
+                #[cfg(feature = "quic")]
                 TransportProtocol::Quic => {
                     shard.quic_bound_address.set(Some(address));
                     let _ = shard.config_writer_notify.try_send(());
                 }
+                #[cfg(feature = "http")]
                 TransportProtocol::Http => {
                     shard.http_bound_address.set(Some(address));
                     let _ = shard.config_writer_notify.try_send(());
                 }
+                #[cfg(feature = "websocket")]
                 TransportProtocol::WebSocket => {
                     shard.websocket_bound_address.set(Some(address));
                     let _ = shard.config_writer_notify.try_send(());
                 }
+                #[allow(unreachable_patterns)]
+                _ => {}
             }
             Ok(())
         }

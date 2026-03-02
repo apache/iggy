@@ -17,6 +17,7 @@
  */
 
 mod heartbeat_verifier;
+#[cfg(feature = "http")]
 mod jwt_token_cleaner;
 mod message_cleaner;
 mod message_saver;
@@ -25,6 +26,7 @@ mod revocation_timeout;
 mod sysinfo_printer;
 
 pub use heartbeat_verifier::spawn_heartbeat_verifier;
+#[cfg(feature = "http")]
 pub use jwt_token_cleaner::spawn_jwt_token_cleaner;
 pub use message_cleaner::spawn_message_cleaner;
 pub use message_saver::spawn_message_saver;

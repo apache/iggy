@@ -39,9 +39,13 @@ async fn write_config(
     shutdown_token: ShutdownToken,
 ) -> Result<(), IggyError> {
     let shard_clone = shard.clone();
+    #[cfg(feature = "tcp")]
     let tcp_enabled = shard.config.tcp.enabled;
+    #[cfg(feature = "quic")]
     let quic_enabled = shard.config.quic.enabled;
+    #[cfg(feature = "http")]
     let http_enabled = shard.config.http.enabled;
+    #[cfg(feature = "websocket")]
     let websocket_enabled = shard.config.websocket.enabled;
 
     let notify_receiver = shard_clone.config_writer_receiver.clone();
@@ -62,11 +66,23 @@ async fn write_config(
             }
         }
 
+        #[cfg(feature = "tcp")]
         let tcp_ready = !tcp_enabled || shard_clone.tcp_bound_address.get().is_some();
+        #[cfg(not(feature = "tcp"))]
+        let tcp_ready = true;
+        #[cfg(feature = "quic")]
         let quic_ready = !quic_enabled || shard_clone.quic_bound_address.get().is_some();
+        #[cfg(not(feature = "quic"))]
+        let quic_ready = true;
+        #[cfg(feature = "http")]
         let http_ready = !http_enabled || shard_clone.http_bound_address.get().is_some();
+        #[cfg(not(feature = "http"))]
+        let http_ready = true;
+        #[cfg(feature = "websocket")]
         let websocket_ready =
             !websocket_enabled || shard_clone.websocket_bound_address.get().is_some();
+        #[cfg(not(feature = "websocket"))]
+        let websocket_ready = true;
 
         if tcp_ready && quic_ready && http_ready && websocket_ready {
             break;
@@ -75,10 +91,22 @@ async fn write_config(
 
     let mut current_config = shard_clone.config.clone();
 
+    #[cfg(feature = "tcp")]
     let tcp_addr = shard_clone.tcp_bound_address.get();
+    #[cfg(not(feature = "tcp"))]
+    let tcp_addr: Option<std::net::SocketAddr> = None;
+    #[cfg(feature = "quic")]
     let quic_addr = shard_clone.quic_bound_address.get();
+    #[cfg(not(feature = "quic"))]
+    let quic_addr: Option<std::net::SocketAddr> = None;
+    #[cfg(feature = "http")]
     let http_addr = shard_clone.http_bound_address.get();
+    #[cfg(not(feature = "http"))]
+    let http_addr: Option<std::net::SocketAddr> = None;
+    #[cfg(feature = "websocket")]
     let websocket_addr = shard_clone.websocket_bound_address.get();
+    #[cfg(not(feature = "websocket"))]
+    let websocket_addr: Option<std::net::SocketAddr> = None;
 
     info!(
         "Config writer: TCP addr = {:?}, QUIC addr = {:?}, HTTP addr = {:?}, WebSocket addr = {:?}",

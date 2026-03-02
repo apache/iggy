@@ -18,7 +18,9 @@
 
 use crate::binary::command::{BinaryServerCommand, HandlerResult, ServerCommandHandler};
 use crate::shard::IggyShard;
-use crate::shard::transmission::message::{ResolvedPartition, ShardRequest, ShardRequestPayload};
+use crate::shard::transmission::message::ResolvedPartition;
+#[cfg(feature = "tcp")]
+use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
 use crate::streaming::topics;
@@ -27,11 +29,14 @@ use iggy_common::Identifier;
 use iggy_common::PooledBuffer;
 use iggy_common::SenderKind;
 use iggy_common::Sizeable;
+#[cfg(feature = "tcp")]
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::{INDEX_SIZE, PartitioningKind};
 use iggy_common::{IggyError, Partitioning, SendMessages, Validatable};
 use std::rc::Rc;
-use tracing::{debug, error, info, instrument};
+use tracing::instrument;
+#[cfg(feature = "tcp")]
+use tracing::{debug, error, info};
 
 impl ServerCommandHandler for SendMessages {
     fn code(&self) -> u32 {
@@ -164,45 +169,48 @@ impl ServerCommandHandler for SendMessages {
             }
         };
 
-        let namespace = IggyNamespace::new(topic.stream_id, topic.topic_id, partition_id);
-        let user_id = session.get_user_id();
-        let unsupported_socket_transfer = matches!(
-            self.partitioning.kind,
-            PartitioningKind::Balanced | PartitioningKind::MessagesKey
-        );
-        let enabled_socket_migration = shard.config.tcp.socket_migration;
-
-        if enabled_socket_migration
-            && !(session.is_migrated() || unsupported_socket_transfer)
-            && let Some(target_shard) = shard.find_shard(&namespace)
-            && target_shard.id != shard.id
+        #[cfg(feature = "tcp")]
         {
-            debug!(
-                "TCP wrong shared detected: migrating from_shard {}, to_shard {}",
-                shard.id, target_shard.id
+            let namespace = IggyNamespace::new(topic.stream_id, topic.topic_id, partition_id);
+            let user_id = session.get_user_id();
+            let unsupported_socket_transfer = matches!(
+                self.partitioning.kind,
+                PartitioningKind::Balanced | PartitioningKind::MessagesKey
             );
+            let enabled_socket_migration = shard.config.tcp.socket_migration;
 
-            if let Some(fd) = sender.take_and_migrate_tcp() {
-                let payload = ShardRequestPayload::SocketTransfer {
-                    fd,
-                    from_shard: shard.id,
-                    client_id: session.client_id,
-                    user_id,
-                    address: session.ip_address,
-                    initial_data: batch,
-                };
+            if enabled_socket_migration
+                && !(session.is_migrated() || unsupported_socket_transfer)
+                && let Some(target_shard) = shard.find_shard(&namespace)
+                && target_shard.id != shard.id
+            {
+                debug!(
+                    "TCP wrong shared detected: migrating from_shard {}, to_shard {}",
+                    shard.id, target_shard.id
+                );
 
-                let request = ShardRequest::data_plane(namespace, payload);
+                if let Some(fd) = sender.take_and_migrate_tcp() {
+                    let payload = ShardRequestPayload::SocketTransfer {
+                        fd,
+                        from_shard: shard.id,
+                        client_id: session.client_id,
+                        user_id,
+                        address: session.ip_address,
+                        initial_data: batch,
+                    };
 
-                if let Err(e) = shard.send_to_data_plane(request).await {
-                    error!("transfer socket to another shard failed, drop connection. {e:?}");
-                    return Ok(HandlerResult::Finished);
+                    let request = ShardRequest::data_plane(namespace, payload);
+
+                    if let Err(e) = shard.send_to_data_plane(request).await {
+                        error!("transfer socket to another shard failed, drop connection. {e:?}");
+                        return Ok(HandlerResult::Finished);
+                    }
+
+                    info!("Sending socket transfer to shard {}", target_shard.id);
+                    return Ok(HandlerResult::Migrated {
+                        to_shard: target_shard.id,
+                    });
                 }
-
-                info!("Sending socket transfer to shard {}", target_shard.id);
-                return Ok(HandlerResult::Migrated {
-                    to_shard: target_shard.id,
-                });
             }
         }
 
