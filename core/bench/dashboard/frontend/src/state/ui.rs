@@ -33,6 +33,7 @@ pub struct UiState {
     pub selected_measurement: MeasurementType,
     pub is_benchmark_tooltip_visible: bool,
     pub is_server_stats_tooltip_visible: bool,
+    pub is_embed_modal_visible: bool,
 }
 
 impl Default for UiState {
@@ -42,6 +43,7 @@ impl Default for UiState {
             selected_measurement: MeasurementType::Latency,
             is_benchmark_tooltip_visible: false,
             is_server_stats_tooltip_visible: false,
+            is_embed_modal_visible: false,
         }
     }
 }
@@ -50,6 +52,7 @@ pub enum UiAction {
     SetMeasurementType(MeasurementType),
     ToggleBenchmarkTooltip,
     ToggleServerStatsTooltip,
+    ToggleEmbedModal,
     SetViewMode(ViewMode),
 }
 
@@ -68,6 +71,10 @@ impl Reducible for UiState {
             },
             UiAction::ToggleServerStatsTooltip => UiState {
                 is_server_stats_tooltip_visible: !self.is_server_stats_tooltip_visible,
+                ..(*self).clone()
+            },
+            UiAction::ToggleEmbedModal => UiState {
+                is_embed_modal_visible: !self.is_embed_modal_visible,
                 ..(*self).clone()
             },
             UiAction::SetViewMode(vm) => UiState {

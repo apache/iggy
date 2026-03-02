@@ -103,6 +103,14 @@ repos:
         types: [text]
         pass_filenames: false
 
+      - id: typos
+        name: typos (spelling check)
+        entry: typos
+        args: [ "-w" ]
+        language: system
+        types: [ text ]
+        pass_filenames: false
+
       - id: taplo
         name: taplo (TOML format)
         entry: ./scripts/ci/taplo.sh

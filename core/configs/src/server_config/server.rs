@@ -16,14 +16,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::configs::COMPONENT;
-use crate::configs::cluster::ClusterConfig;
-use crate::configs::http::HttpConfig;
-use crate::configs::quic::QuicConfig;
-use crate::configs::system::SystemConfig;
-use crate::configs::tcp::TcpConfig;
-use crate::configs::websocket::WebSocketConfig;
-use crate::server_error::ConfigurationError;
+use super::COMPONENT;
+use super::cluster::ClusterConfig;
+use super::http::HttpConfig;
+use super::quic::QuicConfig;
+use super::system::SystemConfig;
+use super::tcp::TcpConfig;
+use super::websocket::WebSocketConfig;
+use crate::ConfigurationError;
 use configs::{ConfigEnv, ConfigEnvMappings, ConfigProvider, FileConfigProvider, TypedEnvProvider};
 use derive_more::Display;
 use err_trail::ErrContext;
@@ -66,7 +66,6 @@ pub struct MemoryPoolConfig {
     pub bucket_capacity: u32,
 }
 
-// Hack around the fact that we define our config inside of the `server`  crate, but `memory_pool` is in `common`.
 impl MemoryPoolConfig {
     pub fn into_other(&self) -> MemoryPoolConfigOther {
         MemoryPoolConfigOther {
@@ -204,7 +203,7 @@ impl ServerConfig {
 
     /// Create a config provider using compile-time generated env var mappings.
     pub fn config_provider(config_path: &str) -> FileConfigProvider<ServerConfigEnvProvider> {
-        let default_config = Toml::string(include_str!("../../config.toml"));
+        let default_config = Toml::string(include_str!("../../../server/config.toml"));
         FileConfigProvider::new(
             config_path.to_string(),
             ServerConfigEnvProvider::default(),

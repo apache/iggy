@@ -173,7 +173,13 @@ runs:
 
     - name: Build aarch64-musl
       if: inputs.task == 'build-aarch64-musl'
-      run: cargo build --locked --target aarch64-unknown-linux-musl
+      # Exclude dashboard crates: charming's "ssr" feature pulls deno_core -> v8,
+      # which has no prebuilt binary for aarch64-unknown-linux-musl.
+      # TODO: support when upstream rusty_v8 publishes aarch64-musl binaries.
+      run: >-
+        cargo build --locked --workspace --target aarch64-unknown-linux-musl
+        --exclude iggy-bench-dashboard-server
+        --exclude bench-dashboard-frontend
       shell: bash
       env:
         # Disable GCC outline atomics to avoid undefined __aarch64_ldadd4_sync

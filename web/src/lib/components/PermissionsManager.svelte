@@ -265,11 +265,11 @@
 
             Object.keys(perm).forEach((topicId) => {
               const topicPerm = perm[topicId];
-              const isTopicTained = Object.keys(topicPerm)
+              const isTopicTainted = Object.keys(topicPerm)
                 .map((k) => topicPerm[k])
                 .some((p) => p.checked);
 
-              if (isTopicTained) tainted.add(streamId);
+              if (isTopicTainted) tainted.add(streamId);
             });
           } else {
             const perm = streamsPerms[streamId][permissionKey];
