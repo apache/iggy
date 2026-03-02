@@ -145,11 +145,10 @@ jobs:
           fi
 
           # iggy-bench-dashboard-server enables charming's "ssr" feature (deno_core -> v8).
-          # v8 has no prebuilt binary for aarch64-unknown-linux-musl, so exclude dashboard
-          # crates to prevent cargo feature unification from pulling V8 into unrelated binaries.
-          # TODO: build V8 from source (V8_FROM_SOURCE=1, ~30min + clang) or wait for upstream support.
+          # rusty_v8 has no prebuilt static libraries for any musl target, so exclude
+          # dashboard crates to prevent cargo feature unification from pulling V8.
           exclude_flags=()
-          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
             exclude_flags+=(--workspace --exclude iggy-bench-dashboard-server --exclude bench-dashboard-frontend)
           fi
 
