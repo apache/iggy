@@ -27,9 +27,13 @@ impl Client for ClientWrapper {
     async fn connect(&self) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.connect().await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.connect().await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.connect().await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.connect().await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.connect().await,
         }
     }
@@ -37,9 +41,13 @@ impl Client for ClientWrapper {
     async fn disconnect(&self) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.disconnect().await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.disconnect().await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.disconnect().await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.disconnect().await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.disconnect().await,
         }
     }
@@ -47,9 +55,13 @@ impl Client for ClientWrapper {
     async fn shutdown(&self) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.shutdown().await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.shutdown().await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.shutdown().await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.shutdown().await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.shutdown().await,
         }
     }
@@ -57,9 +69,13 @@ impl Client for ClientWrapper {
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
         match self {
             ClientWrapper::Iggy(client) => client.subscribe_events().await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.subscribe_events().await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.subscribe_events().await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.subscribe_events().await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.subscribe_events().await,
         }
     }

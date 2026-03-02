@@ -36,21 +36,25 @@ impl ConsumerGroupClient for ClientWrapper {
                     .get_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .get_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .get_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .get_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .get_consumer_group(stream_id, topic_id, group_id)
@@ -66,9 +70,13 @@ impl ConsumerGroupClient for ClientWrapper {
     ) -> Result<Vec<ConsumerGroup>, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.get_consumer_groups(stream_id, topic_id).await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.get_consumer_groups(stream_id, topic_id).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.get_consumer_groups(stream_id, topic_id).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.get_consumer_groups(stream_id, topic_id).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client.get_consumer_groups(stream_id, topic_id).await
             }
@@ -87,21 +95,25 @@ impl ConsumerGroupClient for ClientWrapper {
                     .create_consumer_group(stream_id, topic_id, name)
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .create_consumer_group(stream_id, topic_id, name)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .create_consumer_group(stream_id, topic_id, name)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .create_consumer_group(stream_id, topic_id, name)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .create_consumer_group(stream_id, topic_id, name)
@@ -122,21 +134,25 @@ impl ConsumerGroupClient for ClientWrapper {
                     .delete_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .delete_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .delete_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .delete_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .delete_consumer_group(stream_id, topic_id, group_id)
@@ -157,21 +173,25 @@ impl ConsumerGroupClient for ClientWrapper {
                     .join_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .join_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .join_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .join_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .join_consumer_group(stream_id, topic_id, group_id)
@@ -192,21 +212,25 @@ impl ConsumerGroupClient for ClientWrapper {
                     .leave_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .leave_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .leave_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .leave_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .leave_consumer_group(stream_id, topic_id, group_id)
@@ -223,15 +247,19 @@ impl AsyncDrop for ClientWrapper {
             ClientWrapper::Iggy(client) => {
                 let _ = client.logout_user().await;
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 let _ = client.logout_user().await;
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 let _ = client.logout_user().await;
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 let _ = client.logout_user().await;
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 let _ = client.logout_user().await;
             }

@@ -29,9 +29,13 @@ impl SystemClient for ClientWrapper {
     async fn get_stats(&self) -> Result<Stats, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.get_stats().await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.get_stats().await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.get_stats().await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.get_stats().await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.get_stats().await,
         }
     }
@@ -39,9 +43,13 @@ impl SystemClient for ClientWrapper {
     async fn get_me(&self) -> Result<ClientInfoDetails, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.get_me().await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.get_me().await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.get_me().await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.get_me().await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.get_me().await,
         }
     }
@@ -49,9 +57,13 @@ impl SystemClient for ClientWrapper {
     async fn get_client(&self, client_id: u32) -> Result<Option<ClientInfoDetails>, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.get_client(client_id).await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.get_client(client_id).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.get_client(client_id).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.get_client(client_id).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.get_client(client_id).await,
         }
     }
@@ -59,9 +71,13 @@ impl SystemClient for ClientWrapper {
     async fn get_clients(&self) -> Result<Vec<ClientInfo>, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.get_clients().await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.get_clients().await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.get_clients().await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.get_clients().await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.get_clients().await,
         }
     }
@@ -69,9 +85,13 @@ impl SystemClient for ClientWrapper {
     async fn ping(&self) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.ping().await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.ping().await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.ping().await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.ping().await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.ping().await,
         }
     }
@@ -79,9 +99,13 @@ impl SystemClient for ClientWrapper {
     async fn heartbeat_interval(&self) -> IggyDuration {
         match self {
             ClientWrapper::Iggy(client) => client.heartbeat_interval().await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.heartbeat_interval().await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.heartbeat_interval().await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.heartbeat_interval().await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.heartbeat_interval().await,
         }
     }
@@ -93,9 +117,13 @@ impl SystemClient for ClientWrapper {
     ) -> Result<Snapshot, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.snapshot(compression, snapshot_types).await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.snapshot(compression, snapshot_types).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.snapshot(compression, snapshot_types).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.snapshot(compression, snapshot_types).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.snapshot(compression, snapshot_types).await,
         }
     }

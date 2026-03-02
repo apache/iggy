@@ -391,7 +391,7 @@ impl WebSocketClient {
                 .with_no_client_auth()
         } else {
             // skip certificate validation (development/self-signed certs)
-            use crate::tcp::tcp_tls_verifier::NoServerVerification;
+            use crate::tls::no_server_verification::NoServerVerification;
             rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoServerVerification))

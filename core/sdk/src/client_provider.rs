@@ -18,18 +18,32 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::client::IggyClient;
+#[cfg(feature = "http")]
 use crate::http::http_client::HttpClient;
-use crate::prelude::{
-    ClientError, HttpClientConfig, IggyDuration, QuicClientConfig, QuicClientReconnectionConfig,
-    TcpClientConfig, TcpClientReconnectionConfig, WebSocketClient,
-};
+use crate::prelude::ClientError;
+#[cfg(feature = "http")]
+use crate::prelude::HttpClientConfig;
+#[cfg(any(feature = "quic", feature = "tcp", feature = "websocket"))]
+use crate::prelude::IggyDuration;
+#[cfg(feature = "websocket")]
+use crate::prelude::WebSocketClient;
+#[cfg(feature = "quic")]
+use crate::prelude::{QuicClientConfig, QuicClientReconnectionConfig};
+#[cfg(feature = "tcp")]
+use crate::prelude::{TcpClientConfig, TcpClientReconnectionConfig};
+#[cfg(feature = "quic")]
 use crate::quic::quic_client::QuicClient;
+#[cfg(feature = "tcp")]
 use crate::tcp::tcp_client::TcpClient;
+#[cfg(any(feature = "tcp", feature = "quic", feature = "websocket"))]
 use iggy_binary_protocol::Client;
-use iggy_common::{
-    AutoLogin, Credentials, TransportProtocol, WebSocketClientConfig,
-    WebSocketClientReconnectionConfig, WebSocketConfig,
-};
+#[cfg(any(feature = "quic", feature = "tcp", feature = "websocket"))]
+use iggy_common::AutoLogin;
+#[cfg(any(feature = "quic", feature = "tcp", feature = "websocket"))]
+use iggy_common::Credentials;
+use iggy_common::TransportProtocol;
+#[cfg(feature = "websocket")]
+use iggy_common::{WebSocketClientConfig, WebSocketClientReconnectionConfig, WebSocketConfig};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -44,22 +58,42 @@ pub struct ClientProviderConfig {
     /// The transport protocol to use.
     pub transport: TransportProtocol,
     /// The optional configuration for the HTTP transport.
+    #[cfg(feature = "http")]
     pub http: Option<Arc<HttpClientConfig>>,
     /// The optional configuration for the QUIC transport.
+    #[cfg(feature = "quic")]
     pub quic: Option<Arc<QuicClientConfig>>,
     /// The optional configuration for the TCP transport.
+    #[cfg(feature = "tcp")]
     pub tcp: Option<Arc<TcpClientConfig>>,
     /// The optional configuration for the WebSocket transport.
+    #[cfg(feature = "websocket")]
     pub websocket: Option<Arc<WebSocketClientConfig>>,
 }
 
 impl Default for ClientProviderConfig {
     fn default() -> ClientProviderConfig {
         ClientProviderConfig {
+            #[cfg(feature = "tcp")]
             transport: TransportProtocol::Tcp,
+            #[cfg(all(not(feature = "tcp"), feature = "quic"))]
+            transport: TransportProtocol::Quic,
+            #[cfg(all(not(feature = "tcp"), not(feature = "quic"), feature = "http"))]
+            transport: TransportProtocol::Http,
+            #[cfg(all(
+                not(feature = "tcp"),
+                not(feature = "quic"),
+                not(feature = "http"),
+                feature = "websocket"
+            ))]
+            transport: TransportProtocol::WebSocket,
+            #[cfg(feature = "http")]
             http: Some(Arc::new(HttpClientConfig::default())),
+            #[cfg(feature = "quic")]
             quic: Some(Arc::new(QuicClientConfig::default())),
+            #[cfg(feature = "tcp")]
             tcp: Some(Arc::new(TcpClientConfig::default())),
+            #[cfg(feature = "websocket")]
             websocket: Some(Arc::new(WebSocketClientConfig::default())),
         }
     }
@@ -77,16 +111,22 @@ impl ClientProviderConfig {
         args: crate::prelude::Args,
         auto_login: bool,
     ) -> Result<Self, ClientError> {
+        let _ = &auto_login;
         let transport = TransportProtocol::from_str(&args.transport)
             .map_err(|_| ClientError::InvalidTransport(args.transport.clone()))?;
         let mut config = Self {
             transport,
+            #[cfg(feature = "http")]
             http: None,
+            #[cfg(feature = "quic")]
             quic: None,
+            #[cfg(feature = "tcp")]
             tcp: None,
+            #[cfg(feature = "websocket")]
             websocket: None,
         };
         match config.transport {
+            #[cfg(feature = "quic")]
             TransportProtocol::Quic => {
                 config.quic = Some(Arc::new(QuicClientConfig {
                     client_address: args.quic_client_address,
@@ -122,12 +162,14 @@ impl ClientProviderConfig {
                     validate_certificate: args.quic_validate_certificate,
                 }));
             }
+            #[cfg(feature = "http")]
             TransportProtocol::Http => {
                 config.http = Some(Arc::new(HttpClientConfig {
                     api_url: args.http_api_url,
                     retries: args.http_retries,
                 }));
             }
+            #[cfg(feature = "tcp")]
             TransportProtocol::Tcp => {
                 config.tcp = Some(Arc::new(TcpClientConfig {
                     server_address: args.tcp_server_address,
@@ -157,6 +199,7 @@ impl ClientProviderConfig {
                     },
                 }));
             }
+            #[cfg(feature = "websocket")]
             TransportProtocol::WebSocket => {
                 config.websocket = Some(Arc::new(WebSocketClientConfig {
                     server_address: args.websocket_server_address,
@@ -187,6 +230,8 @@ impl ClientProviderConfig {
                     tls_validate_certificate: args.websocket_tls_validate_certificate,
                 }));
             }
+            #[allow(unreachable_patterns)]
+            _ => return Err(ClientError::InvalidTransport(args.transport)),
         }
 
         Ok(config)
@@ -216,7 +261,9 @@ pub async fn get_raw_client(
     config: Arc<ClientProviderConfig>,
     establish_connection: bool,
 ) -> Result<ClientWrapper, ClientError> {
+    let _ = &establish_connection;
     match config.transport {
+        #[cfg(feature = "quic")]
         TransportProtocol::Quic => {
             let quic_config = config.quic.as_ref().unwrap();
             let client = QuicClient::create(quic_config.clone())?;
@@ -225,11 +272,13 @@ pub async fn get_raw_client(
             };
             Ok(ClientWrapper::Quic(client))
         }
+        #[cfg(feature = "http")]
         TransportProtocol::Http => {
             let http_config = config.http.as_ref().unwrap();
             let client = HttpClient::create(http_config.clone())?;
             Ok(ClientWrapper::Http(client))
         }
+        #[cfg(feature = "tcp")]
         TransportProtocol::Tcp => {
             let tcp_config = config.tcp.as_ref().unwrap();
             let client = TcpClient::create(tcp_config.clone())?;
@@ -238,6 +287,7 @@ pub async fn get_raw_client(
             };
             Ok(ClientWrapper::Tcp(client))
         }
+        #[cfg(feature = "websocket")]
         TransportProtocol::WebSocket => {
             let websocket_config = config.websocket.as_ref().unwrap();
             let client = WebSocketClient::create(websocket_config.clone())?;
@@ -246,5 +296,7 @@ pub async fn get_raw_client(
             };
             Ok(ClientWrapper::WebSocket(client))
         }
+        #[allow(unreachable_patterns)]
+        _ => Err(ClientError::InvalidTransport(config.transport.to_string())),
     }
 }

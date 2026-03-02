@@ -26,9 +26,13 @@ impl ClusterClient for ClientWrapper {
     async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.get_cluster_metadata().await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.get_cluster_metadata().await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.get_cluster_metadata().await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.get_cluster_metadata().await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.get_cluster_metadata().await,
         }
     }

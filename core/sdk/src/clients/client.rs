@@ -19,13 +19,17 @@
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::client_wrappers::connection_info::ConnectionInfo;
 use crate::clients::client_builder::IggyClientBuilder;
+#[cfg(feature = "http")]
 use crate::http::http_client::HttpClient;
 use crate::prelude::EncryptorKind;
 use crate::prelude::IggyConsumerBuilder;
 use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
+#[cfg(feature = "quic")]
 use crate::quic::quic_client::QuicClient;
+#[cfg(feature = "tcp")]
 use crate::tcp::tcp_client::TcpClient;
+#[cfg(feature = "websocket")]
 use crate::websocket::websocket_client::WebSocketClient;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
@@ -37,7 +41,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::spawn;
 use tokio::time::sleep;
-use tracing::log::warn;
+use tracing::warn;
 use tracing::{debug, error, info};
 
 /// The main client struct which implements all the `Client` traits and wraps the underlying low-level client for the specific transport.
@@ -51,6 +55,7 @@ pub struct IggyClient {
     pub(crate) encryptor: Option<Arc<EncryptorKind>>,
 }
 
+#[cfg(feature = "tcp")]
 impl Default for IggyClient {
     fn default() -> Self {
         IggyClient::new(ClientWrapper::Tcp(TcpClient::default()))
@@ -83,18 +88,24 @@ impl IggyClient {
     /// Creates a new `IggyClient` from the provided connection string.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         match ConnectionStringUtils::parse_protocol(connection_string)? {
+            #[cfg(feature = "tcp")]
             TransportProtocol::Tcp => Ok(IggyClient::new(ClientWrapper::Tcp(
                 TcpClient::from_connection_string(connection_string)?,
             ))),
+            #[cfg(feature = "quic")]
             TransportProtocol::Quic => Ok(IggyClient::new(ClientWrapper::Quic(
                 QuicClient::from_connection_string(connection_string)?,
             ))),
+            #[cfg(feature = "http")]
             TransportProtocol::Http => Ok(IggyClient::new(ClientWrapper::Http(
                 HttpClient::from_connection_string(connection_string)?,
             ))),
+            #[cfg(feature = "websocket")]
             TransportProtocol::WebSocket => Ok(IggyClient::new(ClientWrapper::WebSocket(
                 WebSocketClient::from_connection_string(connection_string)?,
             ))),
+            #[allow(unreachable_patterns)]
+            _ => Err(IggyError::InvalidCommand),
         }
     }
 
@@ -312,6 +323,7 @@ mod tests {
         assert!(client.is_err());
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn should_succeed_with_default_prefix() {
         let default_connection_string_prefix = "iggy://";
@@ -326,6 +338,7 @@ mod tests {
         assert!(client.is_ok());
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn should_succeed_with_tcp_protocol() {
         let connection_string_prefix = "iggy+";
@@ -341,6 +354,7 @@ mod tests {
         assert!(client.is_ok());
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn should_succeed_with_tcp_protocol_using_pat() {
         let connection_string_prefix = "iggy+";
@@ -353,6 +367,7 @@ mod tests {
         assert!(client.is_ok());
     }
 
+    #[cfg(feature = "quic")]
     #[tokio::test]
     async fn should_succeed_with_quic_protocol() {
         let connection_string_prefix = "iggy+";
@@ -368,6 +383,7 @@ mod tests {
         assert!(client.is_ok());
     }
 
+    #[cfg(feature = "quic")]
     #[tokio::test]
     async fn should_succeed_with_quic_protocol_using_pat() {
         let connection_string_prefix = "iggy+";
@@ -380,6 +396,7 @@ mod tests {
         assert!(client.is_ok());
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn should_succeed_with_http_protocol() {
         let connection_string_prefix = "iggy+";
@@ -395,6 +412,7 @@ mod tests {
         assert!(client.is_ok());
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn should_succeed_with_http_protocol_with_pat() {
         let connection_string_prefix = "iggy+";

@@ -17,17 +17,25 @@
  */
 
 use crate::clients::client::IggyClient;
+#[cfg(feature = "http")]
 use crate::http::http_client::HttpClient;
+#[cfg(feature = "quic")]
 use crate::quic::quic_client::QuicClient;
+#[cfg(feature = "tcp")]
 use crate::tcp::tcp_client::TcpClient;
+#[cfg(feature = "websocket")]
 use crate::websocket::websocket_client::WebSocketClient;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ClientWrapper {
     Iggy(IggyClient),
+    #[cfg(feature = "http")]
     Http(HttpClient),
+    #[cfg(feature = "tcp")]
     Tcp(TcpClient),
+    #[cfg(feature = "quic")]
     Quic(QuicClient),
+    #[cfg(feature = "websocket")]
     WebSocket(WebSocketClient),
 }

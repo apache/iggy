@@ -32,9 +32,13 @@ impl TopicClient for ClientWrapper {
     ) -> Result<Option<TopicDetails>, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.get_topic(stream_id, topic_id).await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.get_topic(stream_id, topic_id).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.get_topic(stream_id, topic_id).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.get_topic(stream_id, topic_id).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.get_topic(stream_id, topic_id).await,
         }
     }
@@ -42,9 +46,13 @@ impl TopicClient for ClientWrapper {
     async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.get_topics(stream_id).await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.get_topics(stream_id).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.get_topics(stream_id).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.get_topics(stream_id).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.get_topics(stream_id).await,
         }
     }
@@ -73,6 +81,7 @@ impl TopicClient for ClientWrapper {
                     )
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .create_topic(
@@ -86,6 +95,7 @@ impl TopicClient for ClientWrapper {
                     )
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .create_topic(
@@ -99,6 +109,7 @@ impl TopicClient for ClientWrapper {
                     )
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .create_topic(
@@ -112,6 +123,7 @@ impl TopicClient for ClientWrapper {
                     )
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .create_topic(
@@ -152,6 +164,7 @@ impl TopicClient for ClientWrapper {
                     )
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .update_topic(
@@ -165,6 +178,7 @@ impl TopicClient for ClientWrapper {
                     )
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .update_topic(
@@ -178,6 +192,7 @@ impl TopicClient for ClientWrapper {
                     )
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .update_topic(
@@ -191,6 +206,7 @@ impl TopicClient for ClientWrapper {
                     )
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .update_topic(
@@ -214,9 +230,13 @@ impl TopicClient for ClientWrapper {
     ) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.delete_topic(stream_id, topic_id).await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.delete_topic(stream_id, topic_id).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.delete_topic(stream_id, topic_id).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.delete_topic(stream_id, topic_id).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.delete_topic(stream_id, topic_id).await,
         }
     }
@@ -228,9 +248,13 @@ impl TopicClient for ClientWrapper {
     ) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.purge_topic(stream_id, topic_id).await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.purge_topic(stream_id, topic_id).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.purge_topic(stream_id, topic_id).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.purge_topic(stream_id, topic_id).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.purge_topic(stream_id, topic_id).await,
         }
     }

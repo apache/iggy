@@ -35,21 +35,25 @@ impl PartitionClient for ClientWrapper {
                     .create_partitions(stream_id, topic_id, partitions_count)
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .create_partitions(stream_id, topic_id, partitions_count)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .create_partitions(stream_id, topic_id, partitions_count)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .create_partitions(stream_id, topic_id, partitions_count)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .create_partitions(stream_id, topic_id, partitions_count)
@@ -70,21 +74,25 @@ impl PartitionClient for ClientWrapper {
                     .delete_partitions(stream_id, topic_id, partitions_count)
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .delete_partitions(stream_id, topic_id, partitions_count)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .delete_partitions(stream_id, topic_id, partitions_count)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .delete_partitions(stream_id, topic_id, partitions_count)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .delete_partitions(stream_id, topic_id, partitions_count)

@@ -16,21 +16,4 @@
  * under the License.
  */
 
-pub mod client_provider;
-pub mod client_wrappers;
-pub mod clients;
-pub mod consumer_ext;
-#[cfg(feature = "http")]
-pub mod http;
-#[cfg(any(feature = "tcp", feature = "quic", feature = "websocket"))]
-mod leader_aware;
-pub mod prelude;
-#[cfg(feature = "quic")]
-pub mod quic;
-pub mod stream_builder;
-#[cfg(feature = "tcp")]
-pub mod tcp;
-#[cfg(any(feature = "tcp", feature = "websocket"))]
-pub(crate) mod tls;
-#[cfg(feature = "websocket")]
-pub mod websocket;
+pub(crate) mod no_server_verification;

@@ -16,6 +16,7 @@
  * under the License.
  */
 
+#[cfg(any(feature = "tcp", feature = "quic", feature = "websocket"))]
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::prelude::IggyClient;
 use async_trait::async_trait;
@@ -103,8 +104,11 @@ impl UserClient for IggyClient {
         let should_redirect = {
             let client = self.client.read().await;
             match &*client {
+                #[cfg(feature = "tcp")]
                 ClientWrapper::Tcp(tcp_client) => tcp_client.handle_leader_redirection().await?,
+                #[cfg(feature = "quic")]
                 ClientWrapper::Quic(quic_client) => quic_client.handle_leader_redirection().await?,
+                #[cfg(feature = "websocket")]
                 ClientWrapper::WebSocket(ws_client) => {
                     ws_client.handle_leader_redirection().await?
                 }

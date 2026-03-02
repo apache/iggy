@@ -18,13 +18,24 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::client::IggyClient;
+#[cfg(feature = "http")]
 use crate::http::http_client::HttpClient;
-use crate::prelude::{
-    AutoLogin, EncryptorKind, HttpClientConfigBuilder, IggyDuration, IggyError, Partitioner,
-    QuicClientConfigBuilder, TcpClientConfigBuilder, WebSocketClientConfigBuilder,
-};
+#[cfg(feature = "http")]
+use crate::prelude::HttpClientConfigBuilder;
+#[cfg(feature = "quic")]
+use crate::prelude::QuicClientConfigBuilder;
+#[cfg(feature = "tcp")]
+use crate::prelude::TcpClientConfigBuilder;
+#[cfg(feature = "websocket")]
+use crate::prelude::WebSocketClientConfigBuilder;
+#[cfg(any(feature = "tcp", feature = "quic", feature = "websocket"))]
+use crate::prelude::{AutoLogin, IggyDuration};
+use crate::prelude::{EncryptorKind, IggyError, Partitioner};
+#[cfg(feature = "quic")]
 use crate::quic::quic_client::QuicClient;
+#[cfg(feature = "tcp")]
 use crate::tcp::tcp_client::TcpClient;
+#[cfg(feature = "websocket")]
 use crate::websocket::websocket_client::WebSocketClient;
 use iggy_common::{ConnectionStringUtils, TransportProtocol};
 use std::sync::Arc;
@@ -50,26 +61,32 @@ impl IggyClientBuilder {
         let mut builder = Self::new();
 
         match ConnectionStringUtils::parse_protocol(connection_string)? {
+            #[cfg(feature = "tcp")]
             TransportProtocol::Tcp => {
                 builder.client = Some(ClientWrapper::Tcp(TcpClient::from_connection_string(
                     connection_string,
                 )?));
             }
+            #[cfg(feature = "quic")]
             TransportProtocol::Quic => {
                 builder.client = Some(ClientWrapper::Quic(QuicClient::from_connection_string(
                     connection_string,
                 )?));
             }
+            #[cfg(feature = "http")]
             TransportProtocol::Http => {
                 builder.client = Some(ClientWrapper::Http(HttpClient::from_connection_string(
                     connection_string,
                 )?));
             }
+            #[cfg(feature = "websocket")]
             TransportProtocol::WebSocket => {
                 builder.client = Some(ClientWrapper::WebSocket(
                     WebSocketClient::from_connection_string(connection_string)?,
                 ));
             }
+            #[allow(unreachable_patterns)]
+            _ => return Err(IggyError::InvalidCommand),
         }
 
         Ok(builder)
@@ -96,6 +113,7 @@ impl IggyClientBuilder {
     /// This method provides fluent API for the TCP client configuration.
     /// It returns the `TcpClientBuilder` instance, which allows to configure the TCP client with custom settings or using defaults.
     /// This should be called after the non-protocol specific methods, such as `with_partitioner`, `with_encryptor` or `with_message_handler`.
+    #[cfg(feature = "tcp")]
     pub fn with_tcp(self) -> TcpClientBuilder {
         TcpClientBuilder {
             config: TcpClientConfigBuilder::default(),
@@ -106,6 +124,7 @@ impl IggyClientBuilder {
     /// This method provides fluent API for the QUIC client configuration.
     /// It returns the `QuicClientBuilder` instance, which allows to configure the QUIC client with custom settings or using defaults.
     /// This should be called after the non-protocol specific methods, such as `with_partitioner`, `with_encryptor` or `with_message_handler`.
+    #[cfg(feature = "quic")]
     pub fn with_quic(self) -> QuicClientBuilder {
         QuicClientBuilder {
             config: QuicClientConfigBuilder::default(),
@@ -116,6 +135,7 @@ impl IggyClientBuilder {
     /// This method provides fluent API for the HTTP client configuration.
     /// It returns the `HttpClientBuilder` instance, which allows to configure the HTTP client with custom settings or using defaults.
     /// This should be called after the non-protocol specific methods, such as `with_partitioner`, `with_encryptor` or `with_message_handler`.
+    #[cfg(feature = "http")]
     pub fn with_http(self) -> HttpClientBuilder {
         HttpClientBuilder {
             config: HttpClientConfigBuilder::default(),
@@ -126,6 +146,7 @@ impl IggyClientBuilder {
     /// This method provides fluent API for the WebSocket client configuration.
     /// It returns the `WebSocketClientBuilder` instance, which allows to configure the WebSocket client with custom settings or using defaults.
     /// This should be called after the non-protocol specific methods, such as `with_partitioner`, `with_encryptor` or `with_message_handler`.
+    #[cfg(feature = "websocket")]
     pub fn with_websocket(self) -> WebSocketClientBuilder {
         WebSocketClientBuilder {
             config: WebSocketClientConfigBuilder::default(),
@@ -147,12 +168,14 @@ impl IggyClientBuilder {
     }
 }
 
+#[cfg(feature = "tcp")]
 #[derive(Debug, Default)]
 pub struct TcpClientBuilder {
     config: TcpClientConfigBuilder,
     parent_builder: IggyClientBuilder,
 }
 
+#[cfg(feature = "tcp")]
 impl TcpClientBuilder {
     /// Sets the server address for the TCP client.
     pub fn with_server_address(mut self, server_address: String) -> Self {
@@ -231,12 +254,14 @@ impl TcpClientBuilder {
     }
 }
 
+#[cfg(feature = "quic")]
 #[derive(Debug, Default)]
 pub struct QuicClientBuilder {
     config: QuicClientConfigBuilder,
     parent_builder: IggyClientBuilder,
 }
 
+#[cfg(feature = "quic")]
 impl QuicClientBuilder {
     /// Sets the server address for the QUIC client.
     pub fn with_server_address(mut self, server_address: String) -> Self {
@@ -289,12 +314,14 @@ impl QuicClientBuilder {
     }
 }
 
+#[cfg(feature = "http")]
 #[derive(Debug, Default)]
 pub struct HttpClientBuilder {
     config: HttpClientConfigBuilder,
     parent_builder: IggyClientBuilder,
 }
 
+#[cfg(feature = "http")]
 impl HttpClientBuilder {
     /// Sets the server address for the HTTP client.
     pub fn with_api_url(mut self, api_url: String) -> Self {
@@ -319,11 +346,13 @@ impl HttpClientBuilder {
     }
 }
 
+#[cfg(feature = "websocket")]
 pub struct WebSocketClientBuilder {
     config: WebSocketClientConfigBuilder,
     parent_builder: IggyClientBuilder,
 }
 
+#[cfg(feature = "websocket")]
 impl WebSocketClientBuilder {
     /// Sets the server address for the WebSocket client.
     pub fn with_server_address(mut self, server_address: String) -> Self {
@@ -482,6 +511,7 @@ mod tests {
         assert!(client_builder.is_err());
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn should_succeed_with_default_prefix() {
         let default_connection_string_prefix = "iggy://";
@@ -496,6 +526,7 @@ mod tests {
         assert!(client_builder.is_ok());
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn should_succeed_with_tcp_protocol() {
         let connection_string_prefix = "iggy+";
@@ -511,6 +542,7 @@ mod tests {
         assert!(client_builder.is_ok());
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn should_succeed_with_tcp_protocol_using_pat() {
         let connection_string_prefix = "iggy+";
@@ -523,6 +555,7 @@ mod tests {
         assert!(client_builder.is_ok());
     }
 
+    #[cfg(feature = "quic")]
     #[tokio::test]
     async fn should_succeed_with_quic_protocol() {
         let connection_string_prefix = "iggy+";
@@ -538,6 +571,7 @@ mod tests {
         assert!(client_builder.is_ok());
     }
 
+    #[cfg(feature = "quic")]
     #[tokio::test]
     async fn should_succeed_with_quic_protocol_using_pat() {
         let connection_string_prefix = "iggy+";
@@ -550,6 +584,7 @@ mod tests {
         assert!(client_builder.is_ok());
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn should_succeed_with_http_protocol() {
         let connection_string_prefix = "iggy+";
@@ -565,6 +600,7 @@ mod tests {
         assert!(client_builder.is_ok());
     }
 
+    #[cfg(feature = "http")]
     #[test]
     fn should_succeed_with_http_protocol_with_pat() {
         let connection_string_prefix = "iggy+";

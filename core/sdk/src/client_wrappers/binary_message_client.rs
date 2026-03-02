@@ -49,6 +49,7 @@ impl MessageClient for ClientWrapper {
                     )
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .poll_messages(
@@ -62,6 +63,7 @@ impl MessageClient for ClientWrapper {
                     )
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .poll_messages(
@@ -75,6 +77,7 @@ impl MessageClient for ClientWrapper {
                     )
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .poll_messages(
@@ -88,6 +91,7 @@ impl MessageClient for ClientWrapper {
                     )
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .poll_messages(
@@ -117,21 +121,25 @@ impl MessageClient for ClientWrapper {
                     .send_messages(stream_id, topic_id, partitioning, messages)
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .send_messages(stream_id, topic_id, partitioning, messages)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .send_messages(stream_id, topic_id, partitioning, messages)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .send_messages(stream_id, topic_id, partitioning, messages)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .send_messages(stream_id, topic_id, partitioning, messages)
@@ -153,21 +161,25 @@ impl MessageClient for ClientWrapper {
                     .flush_unsaved_buffer(stream_id, topic_id, partitioning_id, fsync)
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .flush_unsaved_buffer(stream_id, topic_id, partitioning_id, fsync)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .flush_unsaved_buffer(stream_id, topic_id, partitioning_id, fsync)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .flush_unsaved_buffer(stream_id, topic_id, partitioning_id, fsync)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .flush_unsaved_buffer(stream_id, topic_id, partitioning_id, fsync)

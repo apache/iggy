@@ -40,18 +40,22 @@ impl ClientWrapper {
                     server_address: String::from("unknown"),
                 }
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => ConnectionInfo {
                 protocol: TransportProtocol::Tcp,
                 server_address: client.current_server_address.lock().await.clone(),
             },
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => ConnectionInfo {
                 protocol: TransportProtocol::Quic,
                 server_address: client.current_server_address.lock().await.clone(),
             },
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => ConnectionInfo {
                 protocol: TransportProtocol::Http,
                 server_address: client.api_url.to_string(),
             },
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => ConnectionInfo {
                 protocol: TransportProtocol::WebSocket,
                 server_address: client.current_server_address.lock().await.clone(),

@@ -28,6 +28,14 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
+[features]
+default = ["tokio_lock", "tcp", "quic", "http", "websocket"]
+tokio_lock = []
+tcp = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
+quic = ["dep:quinn", "dep:rustls"]
+http = ["dep:reqwest", "dep:reqwest-middleware", "dep:reqwest-retry", "dep:reqwest-tracing"]
+websocket = ["dep:tokio-tungstenite", "dep:tungstenite", "dep:rustls", "dep:webpki-roots"]
+
 [dependencies]
 async-broadcast = { workspace = true }
 async-dropper = { workspace = true }
@@ -40,20 +48,20 @@ futures = { workspace = true }
 futures-util = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
-quinn = { workspace = true }
-reqwest = { workspace = true }
-reqwest-middleware = { workspace = true }
-reqwest-retry = { workspace = true }
-reqwest-tracing = { workspace = true }
-rustls = { workspace = true }
+quinn = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+reqwest-middleware = { workspace = true, optional = true }
+reqwest-retry = { workspace = true, optional = true }
+reqwest-tracing = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 serde = { workspace = true }
 tokio = { workspace = true }
-tokio-rustls = { workspace = true }
-tokio-tungstenite = { workspace = true }
+tokio-rustls = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
 tracing = { workspace = true }
 trait-variant = { workspace = true }
-tungstenite = { workspace = true }
-webpki-roots = { workspace = true }
+tungstenite = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
 
 [dev-dependencies]
 mockall = { workspace = true }

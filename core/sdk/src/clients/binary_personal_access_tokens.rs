@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::prelude::{ClientWrapper, IggyClient};
+#[cfg(any(feature = "tcp", feature = "quic", feature = "websocket"))]
+use crate::prelude::ClientWrapper;
+use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_binary_protocol::{Client, PersonalAccessTokenClient};
 use iggy_common::locking::IggyRwLockFn;
@@ -66,8 +68,11 @@ impl PersonalAccessTokenClient for IggyClient {
         let should_redirect = {
             let client = self.client.read().await;
             match &*client {
+                #[cfg(feature = "tcp")]
                 ClientWrapper::Tcp(tcp_client) => tcp_client.handle_leader_redirection().await?,
+                #[cfg(feature = "quic")]
                 ClientWrapper::Quic(quic_client) => quic_client.handle_leader_redirection().await?,
+                #[cfg(feature = "websocket")]
                 ClientWrapper::WebSocket(ws_client) => {
                     ws_client.handle_leader_redirection().await?
                 }

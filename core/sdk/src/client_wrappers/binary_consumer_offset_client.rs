@@ -37,21 +37,25 @@ impl ConsumerOffsetClient for ClientWrapper {
                     .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
@@ -73,21 +77,25 @@ impl ConsumerOffsetClient for ClientWrapper {
                     .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
@@ -109,21 +117,25 @@ impl ConsumerOffsetClient for ClientWrapper {
                     .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)

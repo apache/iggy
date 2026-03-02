@@ -29,9 +29,13 @@ impl PersonalAccessTokenClient for ClientWrapper {
     async fn get_personal_access_tokens(&self) -> Result<Vec<PersonalAccessTokenInfo>, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.get_personal_access_tokens().await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.get_personal_access_tokens().await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.get_personal_access_tokens().await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.get_personal_access_tokens().await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.get_personal_access_tokens().await,
         }
     }
@@ -43,9 +47,13 @@ impl PersonalAccessTokenClient for ClientWrapper {
     ) -> Result<RawPersonalAccessToken, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.create_personal_access_token(name, expiry).await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.create_personal_access_token(name, expiry).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.create_personal_access_token(name, expiry).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.create_personal_access_token(name, expiry).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client.create_personal_access_token(name, expiry).await
             }
@@ -55,9 +63,13 @@ impl PersonalAccessTokenClient for ClientWrapper {
     async fn delete_personal_access_token(&self, name: &str) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.delete_personal_access_token(name).await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.delete_personal_access_token(name).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.delete_personal_access_token(name).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.delete_personal_access_token(name).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.delete_personal_access_token(name).await,
         }
     }
@@ -68,9 +80,13 @@ impl PersonalAccessTokenClient for ClientWrapper {
     ) -> Result<IdentityInfo, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.login_with_personal_access_token(token).await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.login_with_personal_access_token(token).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.login_with_personal_access_token(token).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.login_with_personal_access_token(token).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client.login_with_personal_access_token(token).await
             }

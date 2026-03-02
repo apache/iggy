@@ -36,21 +36,25 @@ impl SegmentClient for ClientWrapper {
                     .delete_segments(stream_id, topic_id, partition_id, segments_count)
                     .await
             }
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .delete_segments(stream_id, topic_id, partition_id, segments_count)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .delete_segments(stream_id, topic_id, partition_id, segments_count)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .delete_segments(stream_id, topic_id, partition_id, segments_count)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .delete_segments(stream_id, topic_id, partition_id, segments_count)

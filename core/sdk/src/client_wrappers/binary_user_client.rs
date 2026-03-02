@@ -28,9 +28,13 @@ impl UserClient for ClientWrapper {
     async fn get_user(&self, user_id: &Identifier) -> Result<Option<UserInfoDetails>, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.get_user(user_id).await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.get_user(user_id).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.get_user(user_id).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.get_user(user_id).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.get_user(user_id).await,
         }
     }
@@ -38,9 +42,13 @@ impl UserClient for ClientWrapper {
     async fn get_users(&self) -> Result<Vec<UserInfo>, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.get_users().await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.get_users().await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.get_users().await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.get_users().await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.get_users().await,
         }
     }
@@ -53,16 +61,19 @@ impl UserClient for ClientWrapper {
         permissions: Option<Permissions>,
     ) -> Result<UserInfoDetails, IggyError> {
         match self {
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .create_user(username, password, status, permissions)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .create_user(username, password, status, permissions)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .create_user(username, password, status, permissions)
@@ -73,6 +84,7 @@ impl UserClient for ClientWrapper {
                     .create_user(username, password, status, permissions)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .create_user(username, password, status, permissions)
@@ -83,10 +95,14 @@ impl UserClient for ClientWrapper {
 
     async fn delete_user(&self, user_id: &Identifier) -> Result<(), IggyError> {
         match self {
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.delete_user(user_id).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.delete_user(user_id).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.delete_user(user_id).await,
             ClientWrapper::Iggy(client) => client.delete_user(user_id).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.delete_user(user_id).await,
         }
     }
@@ -98,10 +114,14 @@ impl UserClient for ClientWrapper {
         status: Option<UserStatus>,
     ) -> Result<(), IggyError> {
         match self {
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.update_user(user_id, username, status).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.update_user(user_id, username, status).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.update_user(user_id, username, status).await,
             ClientWrapper::Iggy(client) => client.update_user(user_id, username, status).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.update_user(user_id, username, status).await,
         }
     }
@@ -113,9 +133,13 @@ impl UserClient for ClientWrapper {
     ) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.update_permissions(user_id, permissions).await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.update_permissions(user_id, permissions).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.update_permissions(user_id, permissions).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.update_permissions(user_id, permissions).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client.update_permissions(user_id, permissions).await
             }
@@ -129,16 +153,19 @@ impl UserClient for ClientWrapper {
         new_password: &str,
     ) -> Result<(), IggyError> {
         match self {
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => {
                 client
                     .change_password(user_id, current_password, new_password)
                     .await
             }
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => {
                 client
                     .change_password(user_id, current_password, new_password)
                     .await
             }
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => {
                 client
                     .change_password(user_id, current_password, new_password)
@@ -149,6 +176,7 @@ impl UserClient for ClientWrapper {
                     .change_password(user_id, current_password, new_password)
                     .await
             }
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => {
                 client
                     .change_password(user_id, current_password, new_password)
@@ -160,9 +188,13 @@ impl UserClient for ClientWrapper {
     async fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.login_user(username, password).await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.login_user(username, password).await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.login_user(username, password).await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.login_user(username, password).await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.login_user(username, password).await,
         }
     }
@@ -170,9 +202,13 @@ impl UserClient for ClientWrapper {
     async fn logout_user(&self) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.logout_user().await,
+            #[cfg(feature = "http")]
             ClientWrapper::Http(client) => client.logout_user().await,
+            #[cfg(feature = "tcp")]
             ClientWrapper::Tcp(client) => client.logout_user().await,
+            #[cfg(feature = "quic")]
             ClientWrapper::Quic(client) => client.logout_user().await,
+            #[cfg(feature = "websocket")]
             ClientWrapper::WebSocket(client) => client.logout_user().await,
         }
     }
