@@ -17,6 +17,7 @@
  */
 
 use super::indexes_mut::IggyIndexesMut;
+use super::message_boundaries::IggyMessageBoundaries;
 use super::message_view_mut::IggyMessageViewMutIterator;
 use crate::{
     BytesSerializable, IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, IggyByteSize, IggyError,
@@ -100,7 +101,12 @@ impl IggyMessagesBatchMut {
 
     /// Creates an iterator that yields immutable views of messages.
     pub fn iter(&self) -> IggyMessageViewIterator<'_> {
-        IggyMessageViewIterator::new(&self.messages)
+        IggyMessageViewIterator::new_with_boundaries(
+            &self.messages,
+            &self.indexes,
+            self.indexes.base_position(),
+            self.count(),
+        )
     }
 
     /// Returns the number of messages in the batch.
@@ -289,32 +295,23 @@ impl IggyMessagesBatchMut {
         self.indexes.get(index).map(|index| index.position())
     }
 
+    fn boundaries(&self) -> Option<IggyMessageBoundaries<'_>> {
+        IggyMessageBoundaries::new(
+            &self.indexes,
+            self.messages.len(),
+            self.indexes.base_position(),
+            self.count(),
+        )
+    }
+
     /// Calculates the start position of a message at the given index in the buffer
     fn message_start_position(&self, index: usize) -> Option<usize> {
-        if index >= self.count() as usize {
-            return None;
-        }
-
-        if index == 0 {
-            Some(0)
-        } else {
-            self.position_at(index as u32 - 1)
-                .map(|pos| (pos - self.indexes.base_position()) as usize)
-        }
+        self.get_message_boundaries(index).map(|(start, _)| start)
     }
 
     /// Calculates the end position of a message at the given index in the buffer
     fn message_end_position(&self, index: usize) -> Option<usize> {
-        if index >= self.count() as usize {
-            return None;
-        }
-
-        if index == self.count() as usize - 1 {
-            Some(self.messages.len())
-        } else {
-            self.position_at(index as u32)
-                .map(|pos| (pos - self.indexes.base_position()) as usize)
-        }
+        self.get_message_boundaries(index).map(|(_, end)| end)
     }
 
     /// Returns a contiguous slice (as a new `IggyMessagesBatch`) of up to `count` messages
@@ -464,8 +461,7 @@ impl IggyMessagesBatchMut {
 
     /// Gets the byte range for a message at the given index
     fn get_message_boundaries(&self, index: usize) -> Option<(usize, usize)> {
-        let start = self.message_start_position(index)?;
-        let end = self.message_end_position(index)?;
+        let (start, end) = self.boundaries()?.boundaries(index)?;
 
         if start > self.messages.len()
             || end > self.messages.len()
