@@ -15,30 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package binaryserialization
+package iggcon
 
 import (
 	"encoding/binary"
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
-type TcpCreateTopicRequest struct {
-	StreamId             iggcon.Identifier           `json:"streamId"`
-	PartitionsCount      uint32                      `json:"partitionsCount"`
-	CompressionAlgorithm iggcon.CompressionAlgorithm `json:"compressionAlgorithm"`
-	MessageExpiry        iggcon.Duration             `json:"messageExpiry"`
-	MaxTopicSize         uint64                      `json:"maxTopicSize"`
-	Name                 string                      `json:"name"`
-	ReplicationFactor    *uint8                      `json:"replicationFactor"`
+type CreateTopic struct {
+	StreamId             Identifier           `json:"streamId"`
+	PartitionsCount      uint32               `json:"partitionsCount"`
+	CompressionAlgorithm CompressionAlgorithm `json:"compressionAlgorithm"`
+	MessageExpiry        Duration             `json:"messageExpiry"`
+	MaxTopicSize         uint64               `json:"maxTopicSize"`
+	Name                 string               `json:"name"`
+	ReplicationFactor    *uint8               `json:"replicationFactor"`
 }
 
-func (request *TcpCreateTopicRequest) Serialize() []byte {
-	if request.ReplicationFactor == nil {
-		request.ReplicationFactor = new(uint8)
+func (t *CreateTopic) Code() CommandCode {
+	return CreateTopicCode
+}
+
+func (t *CreateTopic) MarshalBinary() ([]byte, error) {
+	if t.ReplicationFactor == nil {
+		t.ReplicationFactor = new(uint8)
 	}
 
-	streamIdBytes := SerializeIdentifier(request.StreamId)
-	nameBytes := []byte(request.Name)
+	streamIdBytes, err := t.StreamId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	nameBytes := []byte(t.Name)
 
 	totalLength := len(streamIdBytes) + // StreamId
 		4 + // PartitionsCount
@@ -57,23 +63,23 @@ func (request *TcpCreateTopicRequest) Serialize() []byte {
 	position += len(streamIdBytes)
 
 	// PartitionsCount
-	binary.LittleEndian.PutUint32(bytes[position:], request.PartitionsCount)
+	binary.LittleEndian.PutUint32(bytes[position:], t.PartitionsCount)
 	position += 4
 
 	// CompressionAlgorithm
-	bytes[position] = byte(request.CompressionAlgorithm)
+	bytes[position] = byte(t.CompressionAlgorithm)
 	position++
 
 	// MessageExpiry
-	binary.LittleEndian.PutUint64(bytes[position:], uint64(request.MessageExpiry))
+	binary.LittleEndian.PutUint64(bytes[position:], uint64(t.MessageExpiry))
 	position += 8
 
 	// MaxTopicSize
-	binary.LittleEndian.PutUint64(bytes[position:], request.MaxTopicSize)
+	binary.LittleEndian.PutUint64(bytes[position:], t.MaxTopicSize)
 	position += 8
 
 	// ReplicationFactor
-	bytes[position] = *request.ReplicationFactor
+	bytes[position] = *t.ReplicationFactor
 	position++
 
 	// Name
@@ -81,5 +87,5 @@ func (request *TcpCreateTopicRequest) Serialize() []byte {
 	position++
 	copy(bytes[position:], nameBytes)
 
-	return bytes
+	return bytes, nil
 }

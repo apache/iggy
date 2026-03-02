@@ -15,20 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package binaryserialization
+package iggcon
 
-import (
-	"encoding/binary"
-)
+import "encoding/binary"
 
-type TcpLogInRequest struct {
+type LoginUser struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 }
 
-func (request *TcpLogInRequest) Serialize() []byte {
-	usernameBytes := []byte(request.Username)
-	passwordBytes := []byte(request.Password)
+func (lu *LoginUser) Code() CommandCode {
+	return LoginUserCode
+}
+
+func (lu *LoginUser) MarshalBinary() ([]byte, error) {
+	usernameBytes := []byte(lu.Username)
+	passwordBytes := []byte(lu.Password)
 	versionBytes := []byte("")
 	contextBytes := []byte("")
 
@@ -62,5 +64,38 @@ func (request *TcpLogInRequest) Serialize() []byte {
 	position += 4
 	copy(result[position:], contextBytes)
 
-	return result
+	return result, nil
+}
+
+type LoginWithPersonalAccessToken struct {
+	Token string `json:"token"`
+}
+
+func (lw *LoginWithPersonalAccessToken) Code() CommandCode {
+	return LoginWithAccessTokenCode
+}
+
+func (lw *LoginWithPersonalAccessToken) MarshalBinary() ([]byte, error) {
+	length := 1 + len(lw.Token)
+	bytes := make([]byte, length)
+	bytes[0] = byte(len(lw.Token))
+	copy(bytes[1:], lw.Token)
+	return bytes, nil
+}
+
+type IdentityInfo struct {
+	// Unique identifier (numeric) of the user.
+	UserId uint32 `json:"userId"`
+	// The optional tokens, used only by HTTP transport.
+	AccessToken *string `json:"accessToken"`
+}
+
+type LogoutUser struct{}
+
+func (lu *LogoutUser) Code() CommandCode {
+	return LogoutUserCode
+}
+
+func (lu *LogoutUser) MarshalBinary() ([]byte, error) {
+	return []byte{}, nil
 }

@@ -17,38 +17,24 @@
 
 package iggcon
 
-import (
-	"encoding"
-	"encoding/binary"
-)
-
-type Command interface {
-	// Code returns the command code associated with this command.
-	Code() CommandCode
-
-	encoding.BinaryMarshaler
+type UpdateStream struct {
+	StreamId Identifier `json:"streamId"`
+	Name     string     `json:"name"`
 }
 
-type GetClients struct{}
-
-func (c *GetClients) Code() CommandCode {
-	return GetClientsCode
+func (u *UpdateStream) Code() CommandCode {
+	return UpdateStreamCode
 }
-
-func (c *GetClients) MarshalBinary() ([]byte, error) {
-	return []byte{}, nil
-}
-
-type GetClient struct {
-	ClientID uint32
-}
-
-func (c *GetClient) Code() CommandCode {
-	return GetClientCode
-}
-
-func (c *GetClient) MarshalBinary() ([]byte, error) {
-	bytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(bytes, c.ClientID)
+func (u *UpdateStream) MarshalBinary() ([]byte, error) {
+	streamIdBytes, err := u.StreamId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	nameLength := len(u.Name)
+	bytes := make([]byte, len(streamIdBytes)+1+nameLength)
+	copy(bytes[0:len(streamIdBytes)], streamIdBytes)
+	position := len(streamIdBytes)
+	bytes[position] = byte(nameLength)
+	copy(bytes[position+1:], u.Name)
 	return bytes, nil
 }

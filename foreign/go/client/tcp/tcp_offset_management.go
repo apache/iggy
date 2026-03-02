@@ -23,13 +23,12 @@ import (
 )
 
 func (c *IggyTcpClient) GetConsumerOffset(consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionId *uint32) (*iggcon.ConsumerOffsetInfo, error) {
-	message := binaryserialization.GetOffset(iggcon.GetConsumerOffsetRequest{
+	buffer, err := c.do(&iggcon.GetConsumerOffset{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Consumer:    consumer,
 		PartitionId: partitionId,
 	})
-	buffer, err := c.sendAndFetchResponse(message, iggcon.GetOffsetCode)
 	if err != nil {
 		return nil, err
 	}
@@ -38,24 +37,22 @@ func (c *IggyTcpClient) GetConsumerOffset(consumer iggcon.Consumer, streamId igg
 }
 
 func (c *IggyTcpClient) StoreConsumerOffset(consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, offset uint64, partitionId *uint32) error {
-	message := binaryserialization.UpdateOffset(iggcon.StoreConsumerOffsetRequest{
+	_, err := c.do(&iggcon.StoreConsumerOffsetRequest{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Offset:      offset,
 		Consumer:    consumer,
 		PartitionId: partitionId,
 	})
-	_, err := c.sendAndFetchResponse(message, iggcon.StoreOffsetCode)
 	return err
 }
 
 func (c *IggyTcpClient) DeleteConsumerOffset(consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionId *uint32) error {
-	message := binaryserialization.DeleteOffset(iggcon.DeleteConsumerOffsetRequest{
+	_, err := c.do(&iggcon.DeleteConsumerOffset{
 		Consumer:    consumer,
 		StreamId:    streamId,
 		TopicId:     topicId,
 		PartitionId: partitionId,
 	})
-	_, err := c.sendAndFetchResponse(message, iggcon.DeleteConsumerOffsetCode)
 	return err
 }
