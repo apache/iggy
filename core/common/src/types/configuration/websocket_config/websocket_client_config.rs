@@ -21,6 +21,7 @@ use crate::types::configuration::websocket_config::websocket_connection_string_o
 use crate::{AutoLogin, IggyDuration, WebSocketClientReconnectionConfig};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
+#[cfg(feature = "websocket")]
 use tungstenite::protocol::WebSocketConfig as TungsteniteConfig;
 
 /// Configuration for the WebSocket client.
@@ -82,20 +83,34 @@ impl Default for WebSocketClientConfig {
 
 impl Default for WebSocketConfig {
     fn default() -> Self {
-        // Use tungstenite defaults
-        let tungstenite_config = TungsteniteConfig::default();
-        WebSocketConfig {
-            read_buffer_size: Some(tungstenite_config.read_buffer_size),
-            write_buffer_size: Some(tungstenite_config.write_buffer_size),
-            max_write_buffer_size: Some(tungstenite_config.max_write_buffer_size),
-            max_message_size: tungstenite_config.max_message_size,
-            max_frame_size: tungstenite_config.max_frame_size,
-            accept_unmasked_frames: false,
+        #[cfg(feature = "websocket")]
+        {
+            let tungstenite_config = TungsteniteConfig::default();
+            WebSocketConfig {
+                read_buffer_size: Some(tungstenite_config.read_buffer_size),
+                write_buffer_size: Some(tungstenite_config.write_buffer_size),
+                max_write_buffer_size: Some(tungstenite_config.max_write_buffer_size),
+                max_message_size: tungstenite_config.max_message_size,
+                max_frame_size: tungstenite_config.max_frame_size,
+                accept_unmasked_frames: false,
+            }
+        }
+        #[cfg(not(feature = "websocket"))]
+        {
+            WebSocketConfig {
+                read_buffer_size: Some(128 * 1024),
+                write_buffer_size: Some(128 * 1024),
+                max_write_buffer_size: Some(usize::MAX),
+                max_message_size: Some(64 << 20),
+                max_frame_size: Some(16 << 20),
+                accept_unmasked_frames: false,
+            }
         }
     }
 }
 
 impl WebSocketConfig {
+    #[cfg(feature = "websocket")]
     /// Convert to tungstenite WebSocketConfig so we can use tungstenite defaults
     pub fn to_tungstenite_config(&self) -> TungsteniteConfig {
         let mut config = TungsteniteConfig::default();

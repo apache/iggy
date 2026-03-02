@@ -49,9 +49,13 @@ pub use commands::system::*;
 pub use commands::topics::*;
 pub use commands::users::*;
 pub use deduplication::MessageDeduplicator;
-pub use sender::{
-    QuicSender, Sender, SenderKind, TcpSender, TcpTlsSender, WebSocketSender, WebSocketTlsSender,
-};
+#[cfg(feature = "quic")]
+pub use sender::QuicSender;
+pub use sender::{Sender, SenderKind};
+#[cfg(feature = "tcp")]
+pub use sender::{TcpSender, TcpTlsSender};
+#[cfg(feature = "websocket")]
+pub use sender::{WebSocketSender, WebSocketTlsSender};
 pub use traits::bytes_serializable::BytesSerializable;
 pub use traits::partitioner::Partitioner;
 pub use traits::sizeable::Sizeable;

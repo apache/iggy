@@ -16,16 +16,31 @@
  * under the License.
  */
 
+#[cfg(not(any(feature = "tcp", feature = "quic", feature = "websocket")))]
+compile_error!(
+    "At least one protocol feature (tcp, quic, websocket) must be enabled for iggy_common"
+);
+
+#[cfg(feature = "quic")]
 mod quic_sender;
+#[cfg(feature = "tcp")]
 mod tcp_sender;
+#[cfg(feature = "tcp")]
 mod tcp_tls_sender;
+#[cfg(feature = "websocket")]
 mod websocket_sender;
+#[cfg(feature = "websocket")]
 mod websocket_tls_sender;
 
+#[cfg(feature = "quic")]
 pub use quic_sender::QuicSender;
+#[cfg(feature = "tcp")]
 pub use tcp_sender::TcpSender;
+#[cfg(feature = "tcp")]
 pub use tcp_tls_sender::TcpTlsSender;
+#[cfg(feature = "websocket")]
 pub use websocket_sender::WebSocketSender;
+#[cfg(feature = "websocket")]
 pub use websocket_tls_sender::WebSocketTlsSender;
 
 use crate::IggyError;
@@ -33,8 +48,11 @@ use crate::alloc::buffer::PooledBuffer;
 use compio::BufResult;
 use compio::buf::IoBufMut;
 use compio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(any(feature = "tcp", feature = "websocket"))]
 use compio::net::TcpStream;
+#[cfg(feature = "quic")]
 use compio::quic::{RecvStream, SendStream};
+#[cfg(feature = "tcp")]
 use compio::tls::TlsStream;
 use std::future::Future;
 #[cfg(unix)]
@@ -58,10 +76,15 @@ macro_rules! forward_async_methods {
             $(<$($generic $(: $bound)?),+>)?
             (&mut self, $( $arg: $arg_ty ),* ) -> $ret {
                 match self {
+                    #[cfg(feature = "tcp")]
                     Self::Tcp(d) => d.$method_name$(::<$($generic),+>)?($( $arg ),*).await,
+                    #[cfg(feature = "tcp")]
                     Self::TcpTls(s) => s.$method_name$(::<$($generic),+>)?($( $arg ),*).await,
+                    #[cfg(feature = "quic")]
                     Self::Quic(s) => s.$method_name$(::<$($generic),+>)?($( $arg ),*).await,
+                    #[cfg(feature = "websocket")]
                     Self::WebSocket(s) => s.$method_name$(::<$($generic),+>)?($( $arg ),*).await,
+                    #[cfg(feature = "websocket")]
                     Self::WebSocketTls(s) => s.$method_name$(::<$($generic),+>)?($( $arg ),*).await,
                 }
             }
@@ -88,24 +111,32 @@ pub trait Sender {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum SenderKind {
+    #[cfg(feature = "tcp")]
     Tcp(TcpSender),
+    #[cfg(feature = "tcp")]
     TcpTls(TcpTlsSender),
+    #[cfg(feature = "quic")]
     Quic(QuicSender),
+    #[cfg(feature = "websocket")]
     WebSocket(WebSocketSender),
+    #[cfg(feature = "websocket")]
     WebSocketTls(WebSocketTlsSender),
 }
 
 impl SenderKind {
+    #[cfg(feature = "tcp")]
     pub fn get_tcp_sender(stream: TcpStream) -> Self {
         Self::Tcp(TcpSender {
             stream: Some(stream),
         })
     }
 
+    #[cfg(feature = "tcp")]
     pub fn get_tcp_tls_sender(stream: TlsStream<TcpStream>) -> Self {
         Self::TcpTls(TcpTlsSender { stream })
     }
 
+    #[cfg(feature = "quic")]
     pub fn get_quic_sender(send_stream: SendStream, recv_stream: RecvStream) -> Self {
         Self::Quic(QuicSender {
             send: send_stream,
@@ -113,15 +144,17 @@ impl SenderKind {
         })
     }
 
+    #[cfg(feature = "websocket")]
     pub fn get_websocket_sender(stream: WebSocketSender) -> Self {
         Self::WebSocket(stream)
     }
 
+    #[cfg(feature = "websocket")]
     pub fn get_websocket_tls_sender(stream: WebSocketTlsSender) -> Self {
         Self::WebSocketTls(stream)
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "tcp"))]
     pub fn take_and_migrate_tcp(&mut self) -> Option<OwnedFd> {
         match self {
             SenderKind::Tcp(tcp_sender) => {

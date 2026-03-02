@@ -27,6 +27,12 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
+[features]
+default = ["tcp", "quic", "websocket"]
+tcp = []
+quic = []
+websocket = ["dep:tungstenite"]
+
 [dependencies]
 aes-gcm = { workspace = true }
 ahash = { workspace = true }
@@ -60,7 +66,7 @@ strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tungstenite = { workspace = true }
+tungstenite = { workspace = true, optional = true }
 twox-hash = { workspace = true }
 ulid = { workspace = true }
 uuid = { workspace = true }
