@@ -38,7 +38,13 @@ mimalloc = ["dep:mimalloc"]
 iggy-web = ["http", "dep:rust-embed", "dep:mime_guess"]
 tcp = ["iggy_common/tcp"]
 quic = ["iggy_common/quic"]
-http = ["dep:axum", "dep:axum-server", "dep:cyper-axum", "dep:tower-http", "dep:jsonwebtoken"]
+http = [
+    "dep:axum",
+    "dep:axum-server",
+    "dep:cyper-axum",
+    "dep:tower-http",
+    "dep:jsonwebtoken",
+]
 websocket = ["iggy_common/websocket", "configs/websocket", "dep:tungstenite"]
 
 [dependencies]

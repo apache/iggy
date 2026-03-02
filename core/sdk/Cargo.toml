@@ -33,7 +33,12 @@ default = ["tokio_lock", "tcp", "quic", "http", "websocket"]
 tokio_lock = []
 tcp = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
 quic = ["dep:quinn", "dep:rustls"]
-http = ["dep:reqwest", "dep:reqwest-middleware", "dep:reqwest-retry", "dep:reqwest-tracing"]
+http = [
+    "dep:reqwest",
+    "dep:reqwest-middleware",
+    "dep:reqwest-retry",
+    "dep:reqwest-tracing",
+]
 websocket = ["dep:tokio-tungstenite", "dep:tungstenite", "dep:rustls", "dep:webpki-roots"]
 
 [dependencies]
