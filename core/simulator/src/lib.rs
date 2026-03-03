@@ -122,6 +122,14 @@ impl Simulator {
         message: Message<iggy_common::header::GenericHeader>,
     ) {
         replica.on_message(message).await;
+
+        let mut buf = Vec::new();
+        replica.process_loopback(&mut buf).await;
+        debug_assert_eq!(
+            replica.process_loopback(&mut buf).await,
+            0,
+            "on_ack must not re-enqueue loopback messages"
+        );
     }
 }
 
