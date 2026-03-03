@@ -78,7 +78,7 @@ pub trait Consensus: Sized {
 /// This abstracts the VSR message flow:
 /// - request -> prepare
 /// - replicate (prepare)
-/// - ack (prepare_ok)
+/// - ack (`prepare_ok`)
 pub trait Plane<C>
 where
     C: Consensus,
