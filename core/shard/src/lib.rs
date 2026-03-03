@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod router;
+pub mod shards_table;
+
 use consensus::{
     MetadataHandle, MuxPlane, NamespacedPipeline, PartitionsHandle, Plane, PlaneIdentity,
     VsrConsensus,
@@ -28,6 +31,7 @@ use message_bus::MessageBus;
 use metadata::IggyMetadata;
 use metadata::stm::StateMachine;
 use partitions::IggyPartitions;
+use shards_table::ShardsTable;
 
 pub type ShardPlane<B, J, S, M> = MuxPlane<
     variadic!(
@@ -36,30 +40,105 @@ pub type ShardPlane<B, J, S, M> = MuxPlane<
     ),
 >;
 
-pub struct IggyShard<B, J, S, M>
-where
-    B: MessageBus,
-{
-    pub id: u8,
-    pub name: String,
-    pub plane: ShardPlane<B, J, S, M>,
+/// Envelope for inter-shard channel messages.
+///
+/// Wraps a consensus [`Message`] together with an optional one-shot response
+/// channel.  Fire-and-forget dispatches leave `response_sender` as `None`;
+/// request-response dispatches provide a sender that the message pump will
+/// notify once the message has been processed.
+///
+/// The response type `R` is generic so that higher layers (e.g. HTTP handlers)
+/// can carry a response enum while the consensus layer can default to `()`.
+pub struct ShardFrame<R = ()> {
+    pub message: Message<GenericHeader>,
+    pub response_sender: Option<flume::Sender<R>>,
 }
 
-impl<B, J, S, M> IggyShard<B, J, S, M>
+impl<R> ShardFrame<R> {
+    /// Create a fire-and-forget frame (no caller waiting for completion).
+    pub fn fire_and_forget(message: Message<GenericHeader>) -> Self {
+        Self {
+            message,
+            response_sender: None,
+        }
+    }
+
+    /// Create a request-response frame.  Returns the frame and a receiver
+    /// that the caller can await for completion notification.
+    pub fn with_response(message: Message<GenericHeader>) -> (Self, flume::Receiver<R>) {
+        let (tx, rx) = flume::bounded(1);
+        (
+            Self {
+                message,
+                response_sender: Some(tx),
+            },
+            rx,
+        )
+    }
+}
+
+pub struct IggyShard<B, J, S, M, T = (), R = ()>
 where
     B: MessageBus,
 {
-    /// Create a new shard from pre-built metadata and partition planes.
+    pub id: u16,
+    pub name: String,
+    pub plane: ShardPlane<B, J, S, M>,
+
+    /// Channel senders to every shard, indexed by shard id.
+    /// Includes a sender to self so that local routing goes through the
+    /// same channel path as remote routing.
+    senders: Vec<flume::Sender<ShardFrame<R>>>,
+
+    /// Receiver end of this shard's inbox.  Peer shards (and self) send
+    /// messages here via the corresponding sender.
+    inbox: flume::Receiver<ShardFrame<R>>,
+
+    /// Partition namespace -> owning shard lookup.
+    shards_table: T,
+}
+
+impl<B, J, S, M, T, R> IggyShard<B, J, S, M, T, R>
+where
+    B: MessageBus,
+    T: ShardsTable,
+{
+    /// Create a new shard with channel links and a shards table.
+    ///
+    /// * `senders` - one sender per shard in the cluster (indexed by shard id).
+    /// * `inbox` - the receiver that this shard drains in its message pump.
+    /// * `shards_table` - namespace -> shard routing table.
     pub fn new(
-        id: u8,
+        id: u16,
         name: String,
         metadata: IggyMetadata<VsrConsensus<B>, J, S, M>,
         partitions: IggyPartitions<VsrConsensus<B, NamespacedPipeline>>,
+        senders: Vec<flume::Sender<ShardFrame<R>>>,
+        inbox: flume::Receiver<ShardFrame<R>>,
+        shards_table: T,
     ) -> Self {
         let plane = MuxPlane::new(variadic!(metadata, partitions));
-        Self { id, name, plane }
+        Self {
+            id,
+            name,
+            plane,
+            senders,
+            inbox,
+            shards_table,
+        }
     }
 
+    pub fn shards_table(&self) -> &T {
+        &self.shards_table
+    }
+}
+
+/// Local message processing — these methods handle messages that have been
+/// routed to this shard via the message pump.
+impl<B, J, S, M, T, R> IggyShard<B, J, S, M, T, R>
+where
+    B: MessageBus,
+{
     /// Dispatch an incoming network message to the appropriate consensus plane.
     ///
     /// Routes requests, replication messages, and acks to either the metadata

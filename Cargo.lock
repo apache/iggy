@@ -9362,11 +9362,16 @@ name = "shard"
 version = "0.1.0"
 dependencies = [
  "consensus",
+ "flume 0.12.0",
+ "futures",
+ "hash32 1.0.0",
  "iggy_common",
  "journal",
  "message_bus",
  "metadata",
+ "papaya",
  "partitions",
+ "tracing",
 ]
 
 [[package]]
@@ -9468,6 +9473,7 @@ dependencies = [
  "bytes",
  "consensus",
  "enumset",
+ "flume 0.12.0",
  "futures",
  "iggy_common",
  "journal",

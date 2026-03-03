@@ -24,6 +24,7 @@ edition = "2024"
 bytemuck = { workspace = true }
 bytes = { workspace = true }
 consensus = { path = "../consensus" }
+flume = { workspace = true }
 enumset = { workspace = true }
 futures = { workspace = true }
 iggy_common = { path = "../common" }

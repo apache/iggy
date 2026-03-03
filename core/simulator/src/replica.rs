@@ -82,5 +82,6 @@ pub fn new_replica(id: u8, name: String, bus: Arc<MemBus>, replica_count: u8) ->
     partition_consensus.init();
     partitions.set_consensus(partition_consensus);
 
-    shard::IggyShard::new(id, name, metadata, partitions)
+    let (_tx, inbox) = flume::unbounded();
+    shard::IggyShard::new(id as u16, name, metadata, partitions, Vec::new(), inbox, ())
 }
