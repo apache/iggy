@@ -15,14 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-fn main() {
-    cxx_build::bridge("src/lib.rs")
-        .std("c++17")
-        .compile("iggy-cpp-bridge");
+use crate::ffi;
+use iggy::prelude::StreamDetails as RustStreamDetails;
 
-    println!("cargo:rerun-if-changed=src/client.rs");
-    println!("cargo:rerun-if-changed=src/identifier.rs");
-    println!("cargo:rerun-if-changed=src/lib.rs");
-    println!("cargo:rerun-if-changed=src/stream_details.rs");
-    println!("cargo:rerun-if-changed=src/topic.rs");
+impl From<RustStreamDetails> for ffi::StreamDetails {
+    fn from(stream: RustStreamDetails) -> Self {
+        ffi::StreamDetails {
+            id: stream.id,
+            created_at: stream.created_at.as_micros(),
+            name: stream.name,
+            size_bytes: stream.size.as_bytes_u64(),
+            messages_count: stream.messages_count,
+            topics_count: stream.topics_count,
+            topics: stream.topics.into_iter().map(Into::into).collect(),
+        }
+    }
 }
