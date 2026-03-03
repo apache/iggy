@@ -107,11 +107,14 @@ impl Client {
             self.inner
                 .delete_stream(&rust_stream_id)
                 .await
-                .map_err(|error| format!("Could not delete stream '{}': {error}", rust_stream_id))?;
+                .map_err(|error| {
+                    format!("Could not delete stream '{}': {error}", rust_stream_id)
+                })?;
             Ok(())
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
         stream_id: ffi::Identifier,
@@ -180,7 +183,6 @@ impl Client {
             Ok(())
         })
     }
-
 }
 
 pub unsafe fn delete_connection(client: *mut Client) -> Result<(), String> {
