@@ -160,7 +160,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StateMachine<Input = Message<PrepareHeader>>,
+        M: StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = bytes::Bytes,
+                Error = iggy_common::IggyError,
+            >,
     {
         match MessageBag::from(message) {
             MessageBag::Request(request) => self.on_request(request).await,
@@ -178,7 +182,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StateMachine<Input = Message<PrepareHeader>>,
+        M: StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = bytes::Bytes,
+                Error = iggy_common::IggyError,
+            >,
     {
         self.plane.on_request(request).await;
     }
@@ -192,7 +200,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StateMachine<Input = Message<PrepareHeader>>,
+        M: StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = bytes::Bytes,
+                Error = iggy_common::IggyError,
+            >,
     {
         self.plane.on_replicate(prepare).await;
     }
@@ -206,7 +218,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StateMachine<Input = Message<PrepareHeader>>,
+        M: StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = bytes::Bytes,
+                Error = iggy_common::IggyError,
+            >,
     {
         self.plane.on_ack(prepare_ok).await;
     }
@@ -228,7 +244,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StateMachine<Input = Message<PrepareHeader>>,
+        M: StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = bytes::Bytes,
+                Error = iggy_common::IggyError,
+            >,
     {
         debug_assert!(buf.is_empty(), "buf must be empty on entry");
 
