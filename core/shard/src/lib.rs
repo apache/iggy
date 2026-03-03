@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use consensus::{MuxPlane, NamespacedPipeline, Plane, PlaneIdentity, VsrConsensus};
+use consensus::{
+    MetadataHandle, MuxPlane, NamespacedPipeline, PartitionsHandle, Plane, PlaneIdentity,
+    VsrConsensus,
+};
 use iggy_common::header::{GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader};
 use iggy_common::message::{Message, MessageBag};
 use iggy_common::sharding::IggyNamespace;
@@ -91,11 +94,10 @@ where
             >,
         M: StateMachine<Input = Message<PrepareHeader>>,
     {
-        let planes = self.plane.inner();
-        if planes.0.is_applicable(&request) {
-            planes.0.on_request(request).await;
+        if self.plane.metadata().is_applicable(&request) {
+            self.plane.metadata().on_request(request).await;
         } else {
-            planes.1.0.on_request(request).await;
+            self.plane.partitions().on_request(request).await;
         }
     }
 
@@ -110,11 +112,10 @@ where
             >,
         M: StateMachine<Input = Message<PrepareHeader>>,
     {
-        let planes = self.plane.inner();
-        if planes.0.is_applicable(&prepare) {
-            planes.0.on_replicate(prepare).await;
+        if self.plane.metadata().is_applicable(&prepare) {
+            self.plane.metadata().on_replicate(prepare).await;
         } else {
-            planes.1.0.on_replicate(prepare).await;
+            self.plane.partitions().on_replicate(prepare).await;
         }
     }
 
@@ -129,11 +130,10 @@ where
             >,
         M: StateMachine<Input = Message<PrepareHeader>>,
     {
-        let planes = self.plane.inner();
-        if planes.0.is_applicable(&prepare_ok) {
-            planes.0.on_ack(prepare_ok).await;
+        if self.plane.metadata().is_applicable(&prepare_ok) {
+            self.plane.metadata().on_ack(prepare_ok).await;
         } else {
-            planes.1.0.on_ack(prepare_ok).await;
+            self.plane.partitions().on_ack(prepare_ok).await;
         }
     }
 
@@ -145,7 +145,7 @@ where
                 Client = u128,
             >,
     {
-        let partitions = &mut self.plane.inner_mut().1.0;
+        let partitions = self.plane.partitions_mut();
         partitions.init_partition_in_memory(namespace);
         partitions.register_namespace_in_pipeline(namespace.inner());
     }
