@@ -19,9 +19,9 @@
 macro_rules! variadic {
     () => (());
     (...$a:ident $(,)?) => ($a);
-    (...$a:expr $(,)?) => ($a);
-    ($a:ident $(,)?) => (($a, ()));
-    ($a:expr $(,)?) => (($a, ()));
+    (...$a:ty $(,)?) => ($a);
     ($a:ident, $($b:tt)+) => (($a, $crate::variadic!($($b)+)));
-    ($a:expr, $($b:tt)+) => (($a, $crate::variadic!($($b)+)));
+    ($a:ty, $($b:tt)+) => (($a, $crate::variadic!($($b)+)));
+    ($a:ident $(,)?) => (($a, ()));
+    ($a:ty $(,)?) => (($a, ()));
 }
