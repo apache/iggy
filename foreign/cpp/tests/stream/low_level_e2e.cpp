@@ -25,7 +25,7 @@
 
 TEST(LowLevelE2E_Stream, CreateStreamAfterLogin) {
     const std::string stream_name = "cpp-create-stream-after-login";
-    iggy::ffi::Client *client = login_to_server();
+    iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
     ASSERT_NO_THROW(client->create_stream(stream_name));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
@@ -34,7 +34,7 @@ TEST(LowLevelE2E_Stream, CreateStreamAfterLogin) {
 
 TEST(LowLevelE2E_Stream, CreateDuplicateStreamThrows) {
     const std::string stream_name = "cpp-create-stream-duplicate";
-    iggy::ffi::Client *client = login_to_server();
+    iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
     ASSERT_NO_THROW(client->create_stream(stream_name));
     ASSERT_THROW(client->create_stream(stream_name), std::exception);
@@ -78,7 +78,7 @@ TEST(LowLevelE2E_Stream, CreateStreamValidatesNameConstraintsAndUniqueness) {
 
 TEST(LowLevelE2E_Stream, StreamCreatedAndDeletedSuccessfully) {
     const std::string stream_name = "cpp-delete-stream-created-and-deleted";
-    iggy::ffi::Client *client = login_to_server();
+    iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
     ASSERT_NO_THROW(client->create_stream(stream_name));
 
@@ -90,7 +90,7 @@ TEST(LowLevelE2E_Stream, StreamCreatedAndDeletedSuccessfully) {
 
 TEST(LowLevelE2E_Stream, DeleteNotCreatedStreamThrows) {
     const std::string stream_name = "cpp-delete-stream-not-created";
-    iggy::ffi::Client *client = login_to_server();
+    iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
 
     ASSERT_THROW(client->delete_stream(make_string_identifier(stream_name)), std::exception);
@@ -118,7 +118,7 @@ TEST(LowLevelE2E_Stream, DeleteStreamBeforeLoginThrows) {
 
 TEST(LowLevelE2E_Stream, DeleteStreamTwiceThrows) {
     const std::string stream_name = "cpp-delete-stream-twice";
-    iggy::ffi::Client *client = login_to_server();
+    iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
     ASSERT_NO_THROW(client->create_stream(stream_name));
 
@@ -171,7 +171,7 @@ TEST(LowLevelE2E_Stream, GetStreamDetailsWithInvalidIdentifierThrows) {
 
 TEST(LowLevelE2E_Stream, GetStreamByStringIdentifierReturnsStreamDetails) {
     const std::string stream_name = "cpp-get-stream-by-string";
-    iggy::ffi::Client *client = login_to_server();
+    iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
     ASSERT_NO_THROW(client->create_stream(stream_name));
 
@@ -192,7 +192,7 @@ TEST(LowLevelE2E_Stream, GetStreamByStringIdentifierReturnsStreamDetails) {
 
 TEST(LowLevelE2E_Stream, GetNonExistentStreamDetailsThrows) {
     const std::string stream_name = "cpp-get-nonexistent-stream-details";
-    iggy::ffi::Client *client = login_to_server();
+    iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
     ASSERT_THROW(client->get_stream(make_string_identifier(stream_name)), std::exception);
 
@@ -216,7 +216,7 @@ TEST(LowLevelE2E_Stream, GetStreamDetailsBeforeLoginThrows) {
 
 TEST(LowLevelE2E_Stream, GetDeletedStreamDetailsThrows) {
     const std::string stream_name = "cpp-get-deleted-stream-details";
-    iggy::ffi::Client *client = login_to_server();
+    iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
     ASSERT_NO_THROW(client->create_stream(stream_name));
     ASSERT_NO_THROW(client->get_stream(make_string_identifier(stream_name)));
@@ -229,7 +229,7 @@ TEST(LowLevelE2E_Stream, GetDeletedStreamDetailsThrows) {
 
 TEST(LowLevelE2E_Stream, GetStreamByNumericIdentifierReturnsStreamDetails) {
     const std::string stream_name = "cpp-get-stream-by-numeric";
-    iggy::ffi::Client *client = login_to_server();
+    iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
     ASSERT_NO_THROW(client->create_stream(stream_name));
 
