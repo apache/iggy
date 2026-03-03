@@ -43,4 +43,10 @@ public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyCon
     /// </remarks>
     /// <param name="callback">The method previously registered for connection event notifications to be removed.</param>
     void UnsubscribeConnectionEvents(Func<ConnectionStateChangedEventArgs, Task> callback);
+
+    /// <summary>
+    ///     Gets the current address of the client.
+    /// </summary>
+    /// <returns>The current address of the client.</returns>
+    string GetCurrentAddress();
 }
