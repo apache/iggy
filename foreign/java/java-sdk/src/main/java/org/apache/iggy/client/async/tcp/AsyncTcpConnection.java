@@ -34,18 +34,23 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
+import org.apache.iggy.exception.IggyEmptyResponseException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
 import org.apache.iggy.exception.IggyTlsException;
+import org.apache.iggy.serde.CommandCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.net.ssl.SSLException;
 import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 
 /**
  * Async TCP connection using Netty for non-blocking I/O.
@@ -134,6 +139,57 @@ public class AsyncTcpConnection {
         });
 
         return future;
+    }
+
+    public <T> CompletableFuture<T> exchangeForEntity(
+            CommandCode commandCode, ByteBuf payload, Function<ByteBuf, T> func) {
+        return send(commandCode, payload).thenApply(response -> {
+            try {
+                if (!response.isReadable()) {
+                    throw new IggyEmptyResponseException(commandCode.toString());
+                }
+                return func.apply(response);
+            } finally {
+                response.release();
+            }
+        });
+    }
+
+    public <T> CompletableFuture<List<T>> exchangeForList(
+            CommandCode commandCode, ByteBuf payload, Function<ByteBuf, T> func) {
+        return send(commandCode, payload).thenApply(response -> {
+            try {
+                var result = new ArrayList<T>();
+                while (response.isReadable()) {
+                    result.add(func.apply(response));
+                }
+                return result;
+            } finally {
+                response.release();
+            }
+        });
+    }
+
+    public <T> CompletableFuture<Optional<T>> exchangeForOptional(
+            CommandCode commandCode, ByteBuf payload, Function<ByteBuf, T> func) {
+        return send(commandCode, payload).thenApply(response -> {
+            try {
+                if (response.isReadable()) {
+                    return Optional.of(func.apply(response));
+                }
+                return Optional.empty();
+            } finally {
+                response.release();
+            }
+        });
+    }
+
+    public CompletableFuture<Void> sendAndRelease(CommandCode commandCode, ByteBuf payload) {
+        return send(commandCode, payload).thenAccept(response -> response.release());
+    }
+
+    public CompletableFuture<ByteBuf> send(CommandCode commandCode, ByteBuf payload) {
+        return send(commandCode.getValue(), payload);
     }
 
     /**

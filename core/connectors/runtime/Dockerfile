@@ -60,9 +60,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
     *) echo "Unsupported platform/libc combination: $TARGETPLATFORM/$LIBC" && exit 1 ;; \
     esac && \
     if [ "$PROFILE" = "debug" ]; then \
-    cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild; \
+    cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild \
+      -p iggy-connectors; \
     else \
-    cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild --release; \
+    cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild --release \
+      -p iggy-connectors; \
     fi
 
 COPY . .

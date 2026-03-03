@@ -43,6 +43,13 @@ impl CacheWatcher {
                     event.kind,
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                 ) {
+                    let in_embed_cache = event
+                        .paths
+                        .iter()
+                        .all(|p| p.components().any(|c| c.as_os_str() == "embed_cache"));
+                    if in_embed_cache {
+                        return;
+                    }
                     let cache = Arc::clone(&cache_clone);
                     runtime_handle.spawn(async move {
                         cache.schedule_reload().await;

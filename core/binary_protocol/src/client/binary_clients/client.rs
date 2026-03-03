@@ -17,7 +17,7 @@
  */
 
 use crate::{
-    ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PartitionClient,
+    ClusterClient, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PartitionClient,
     PersonalAccessTokenClient, SegmentClient, StreamClient, SystemClient, TopicClient, UserClient,
 };
 use async_broadcast::Receiver;
@@ -30,7 +30,8 @@ use std::fmt::Debug;
 /// Except the ping, login and get me, all the other methods require authentication.
 #[async_trait]
 pub trait Client:
-    SystemClient
+    ClusterClient
+    + SystemClient
     + UserClient
     + PersonalAccessTokenClient
     + StreamClient

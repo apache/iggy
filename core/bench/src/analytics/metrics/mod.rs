@@ -18,3 +18,4 @@
 
 pub mod group;
 pub mod individual;
+pub mod latency_distribution;
