@@ -535,10 +535,12 @@ jobs:
         run: |
           cd bdd/go
           mkdir -p ../../reports
+          # Run only tcp_test suite (ginkgo); godog leader_redirection
+          # tests require a multi-node cluster not available in CI.
           go test -v -race \
             -coverpkg=github.com/apache/iggy/foreign/go/... \
             -coverprofile=../../reports/go-coverage-bdd.out \
-            ./...
+            ./tests/tcp_test/...
 
       - name: Merge coverage profiles
         run: |

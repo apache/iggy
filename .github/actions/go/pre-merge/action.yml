@@ -148,12 +148,14 @@ runs:
           ./...
 
         # Run BDD tests with coverage of foreign/go packages
+        # Only tcp_test suite (ginkgo); godog leader_redirection tests
+        # require a multi-node cluster not available in CI.
         echo "Running BDD tests..."
         cd ../../bdd/go
         go test -v -race \
           -coverpkg=github.com/apache/iggy/foreign/go/... \
           -coverprofile=../../reports/go-coverage-e2e-bdd.out \
-          ./...
+          ./tests/tcp_test/...
 
         # Merge e2e coverage profiles
         cd ../..
