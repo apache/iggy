@@ -69,6 +69,7 @@ mod ffi {
         fn create_stream(&self, stream_name: String) -> Result<()>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(&self, stream_id: Identifier) -> Result<()>;
+        #[allow(clippy::too_many_arguments)]
         fn create_topic(
             &self,
             stream_id: Identifier,

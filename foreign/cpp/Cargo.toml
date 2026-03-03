@@ -27,7 +27,6 @@ ignored = ["cxx-build"]
 crate-type = ["staticlib"]
 
 [dependencies]
-bytes = "1"
 cxx = "1.0.194"
 iggy = { path = "../../core/sdk" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
