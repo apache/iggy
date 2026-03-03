@@ -36,13 +36,13 @@ runs:
       if: inputs.task == 'lint'
       shell: bash
       run: |
-        if command -v clang-format >/dev/null 2>&1; then
-          clang-format --version
+        if command -v clang-format-18 >/dev/null 2>&1; then
+          clang-format-18 --version
           exit 0
         fi
         sudo apt-get update --yes
         sudo apt-get install --yes clang-format-18
-        clang-format --version
+        clang-format-18 --version
 
     - name: Lint (clang-format)
       if: inputs.task == 'lint'
@@ -56,7 +56,7 @@ runs:
           exit 0
         fi
 
-        printf '%s\n' "${files[@]}" | xargs clang-format --style=file --dry-run --Werror
+        printf '%s\n' "${files[@]}" | xargs clang-format-18 --style=file --dry-run --Werror
 
     - name: Build
       if: inputs.task == 'build'
