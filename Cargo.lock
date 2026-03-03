@@ -2165,6 +2165,7 @@ name = "consensus"
 version = "0.1.0"
 dependencies = [
  "bit-set",
+ "futures",
  "iggy_common",
  "message_bus",
  "rand 0.10.0",

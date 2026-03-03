@@ -137,6 +137,57 @@ where
         }
     }
 
+    /// Drain and dispatch loopback messages for each consensus plane.
+    ///
+    /// Each plane's loopback is dispatched directly to that plane's `on_ack`,
+    /// avoiding a flat merge that would require re-routing through `on_message`.
+    ///
+    /// Invariant: planes do not produce loopback messages for each other.
+    /// `on_ack` commits and applies but never calls `push_loopback`, so
+    /// draining metadata before partitions is order-independent.
+    pub async fn process_loopback(&self, buf: &mut Vec<Message<GenericHeader>>) -> usize
+    where
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        J: JournalHandle,
+        <J as JournalHandle>::Target: Journal<
+                <J as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        M: StateMachine<Input = Message<PrepareHeader>>,
+    {
+        debug_assert!(buf.is_empty(), "buf must be empty on entry");
+
+        let mut total = 0;
+        let planes = self.plane.inner();
+
+        if let Some(ref consensus) = planes.0.consensus {
+            consensus.drain_loopback_into(buf);
+            let count = buf.len();
+            total += count;
+            for msg in buf.drain(..) {
+                let typed: Message<PrepareOkHeader> = msg
+                    .try_into_typed()
+                    .expect("loopback queue must only contain PrepareOk messages");
+                planes.0.on_ack(typed).await;
+            }
+        }
+
+        if let Some(consensus) = planes.1.0.consensus() {
+            consensus.drain_loopback_into(buf);
+            let count = buf.len();
+            total += count;
+            for msg in buf.drain(..) {
+                let typed: Message<PrepareOkHeader> = msg
+                    .try_into_typed()
+                    .expect("loopback queue must only contain PrepareOk messages");
+                planes.1.0.on_ack(typed).await;
+            }
+        }
+
+        total
+    }
+
     pub fn init_partition(&mut self, namespace: IggyNamespace)
     where
         B: MessageBus<
