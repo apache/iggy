@@ -31,11 +31,6 @@ TEST(IdKindTest, ReturnsExpectedValues) {
     EXPECT_EQ(iggy::IdKind::string().id_kind_value(), "string");
 }
 
-TEST(IdKindTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::IdKind::numeric().id_kind_value(), "numeric");
-    EXPECT_EQ(iggy::IdKind::string().id_kind_value(), "string");
-}
-
 TEST(MaxTopicSizeTest, ReturnsExpectedValues) {
     EXPECT_EQ(iggy::MaxTopicSize::server_default().max_topic_size(), "server_default");
     EXPECT_EQ(iggy::MaxTopicSize::unlimited().max_topic_size(), "unlimited");
