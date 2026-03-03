@@ -9484,7 +9484,6 @@ dependencies = [
  "bytemuck",
  "bytes",
  "consensus",
- "crossfire",
  "enumset",
  "futures",
  "iggy_common",

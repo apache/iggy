@@ -37,7 +37,7 @@ pub type ShardPlane<B, J, S, M> = MuxPlane<
     ),
 >;
 
-/// Bounded mpsc channel sender (blocking send, cloneable).
+/// Bounded mpsc channel sender (blocking send).
 pub type Sender<T> = crossfire::MTx<crossfire::mpsc::Array<T>>;
 
 /// Bounded mpsc channel receiver (async recv).
