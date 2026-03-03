@@ -144,7 +144,7 @@
     {#snippet message()}
       Deleting the <span class="font-semibold">{$form.partitions_count}</span>
       {$form.partitions_count > 1 ? 'partitions' : 'partition'} from topic
-      <span class="font-semibold">"{topic.name}"</span> will permenently remove all associated
+      <span class="font-semibold">"{topic.name}"</span> will permanently remove all associated
       messages <span class="font-semibold">({messagesToDelete})</span>.
     {/snippet}
   </ModalConfirmation>

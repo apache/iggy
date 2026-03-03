@@ -59,6 +59,12 @@ flag_management:
     - name: python
       paths:
         - foreign/python/
+    - name: node
+      paths:
+        - foreign/node/
+    - name: go
+      paths:
+        - foreign/go/
 
 comment:
   layout: "header, diff, flags, files"
@@ -74,8 +80,6 @@ ignore:
   - "core/harness_derive/**"
   - "bdd/**"
   - "examples/**"
-  - "foreign/go/**"
-  - "foreign/node/**"
   - "web/**"
   - "**/tests/**"
   - "**/*Test.java"

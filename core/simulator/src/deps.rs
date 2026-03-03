@@ -15,19 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::bus::SharedMemBus;
 use bytes::Bytes;
-use consensus::{
-    MuxPlane, {NamespacedPipeline, VsrConsensus},
-};
 use iggy_common::header::PrepareHeader;
 use iggy_common::message::Message;
 use iggy_common::variadic;
 use journal::{Journal, JournalHandle, Storage};
+use metadata::MuxStateMachine;
 use metadata::stm::consumer_group::ConsumerGroups;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
-use metadata::{IggyMetadata, MuxStateMachine};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 
@@ -151,16 +147,5 @@ impl JournalHandle for SimJournal<MemStorage> {
 #[derive(Debug, Default)]
 pub struct SimSnapshot {}
 
-/// Type aliases for simulator metadata
+/// Type alias for simulator state machine
 pub type SimMuxStateMachine = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
-pub type SimMetadata = IggyMetadata<
-    VsrConsensus<SharedMemBus>,
-    SimJournal<MemStorage>,
-    SimSnapshot,
-    SimMuxStateMachine,
->;
-
-/// Type alias for simulator partitions
-pub type ReplicaPartitions =
-    partitions::IggyPartitions<VsrConsensus<SharedMemBus, NamespacedPipeline>>;
-pub type SimPlane = MuxPlane<variadic!(SimMetadata, ReplicaPartitions)>;

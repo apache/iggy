@@ -21,4 +21,4 @@ base_url = "http://localhost:8080"
 
 [connectors.response]
 data_path = "data"
-errot_path = "error"
+error_path = "error"

@@ -28,6 +28,7 @@ use tracing::info;
 pub enum ChartType {
     Throughput,
     Latency,
+    LatencyDistribution,
 }
 
 impl ChartType {
@@ -35,6 +36,7 @@ impl ChartType {
         match self {
             Self::Throughput => "throughput",
             Self::Latency => "latency",
+            Self::LatencyDistribution => "latency_distribution",
         }
     }
 
@@ -42,6 +44,7 @@ impl ChartType {
         match self {
             Self::Throughput => bench_report::create_throughput_chart,
             Self::Latency => bench_report::create_latency_chart,
+            Self::LatencyDistribution => bench_report::create_latency_distribution_chart,
         }
     }
 
@@ -57,6 +60,12 @@ impl ChartType {
                 .iter()
                 .filter(|m| !m.latency_ts.points.is_empty())
                 .map(|m| m.latency_ts.points.len())
+                .sum(),
+            Self::LatencyDistribution => report
+                .group_metrics
+                .iter()
+                .filter_map(|m| m.latency_distribution.as_ref())
+                .map(|d| d.bins.len())
                 .sum(),
         }
     }
