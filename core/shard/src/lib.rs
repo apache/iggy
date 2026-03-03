@@ -18,10 +18,7 @@
 mod router;
 pub mod shards_table;
 
-use consensus::{
-    MetadataHandle, MuxPlane, NamespacedPipeline, PartitionsHandle, Plane, PlaneIdentity,
-    VsrConsensus,
-};
+use consensus::{MuxPlane, NamespacedPipeline, PartitionsHandle, Plane, VsrConsensus};
 use iggy_common::header::{GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader};
 use iggy_common::message::{Message, MessageBag};
 use iggy_common::sharding::IggyNamespace;
@@ -183,11 +180,7 @@ where
             >,
         M: StateMachine<Input = Message<PrepareHeader>>,
     {
-        if self.plane.metadata().is_applicable(&request) {
-            self.plane.metadata().on_request(request).await;
-        } else {
-            self.plane.partitions().on_request(request).await;
-        }
+        self.plane.on_request(request).await;
     }
 
     pub async fn on_replicate(&self, prepare: Message<PrepareHeader>)
@@ -201,11 +194,7 @@ where
             >,
         M: StateMachine<Input = Message<PrepareHeader>>,
     {
-        if self.plane.metadata().is_applicable(&prepare) {
-            self.plane.metadata().on_replicate(prepare).await;
-        } else {
-            self.plane.partitions().on_replicate(prepare).await;
-        }
+        self.plane.on_replicate(prepare).await;
     }
 
     pub async fn on_ack(&self, prepare_ok: Message<PrepareOkHeader>)
@@ -219,11 +208,7 @@ where
             >,
         M: StateMachine<Input = Message<PrepareHeader>>,
     {
-        if self.plane.metadata().is_applicable(&prepare_ok) {
-            self.plane.metadata().on_ack(prepare_ok).await;
-        } else {
-            self.plane.partitions().on_ack(prepare_ok).await;
-        }
+        self.plane.on_ack(prepare_ok).await;
     }
 
     /// Drain and dispatch loopback messages for each consensus plane.
