@@ -17,20 +17,14 @@
 
 package iggcon
 
-type LoginUserRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Version  string `json:"version,omitempty"`
-	Context  string `json:"context,omitempty"`
+type DeleteUser struct {
+	Id Identifier
 }
 
-type LoginWithPersonalAccessTokenRequest struct {
-	Token string `json:"token"`
+func (d *DeleteUser) Code() CommandCode {
+	return DeleteUserCode
 }
 
-type IdentityInfo struct {
-	// Unique identifier (numeric) of the user.
-	UserId uint32 `json:"userId"`
-	// The optional tokens, used only by HTTP transport.
-	AccessToken *string `json:"accessToken"`
+func (d *DeleteUser) MarshalBinary() ([]byte, error) {
+	return d.Id.MarshalBinary()
 }

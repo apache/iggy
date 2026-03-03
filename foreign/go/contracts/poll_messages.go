@@ -15,12 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package binaryserialization
+package iggcon
 
 import (
 	"encoding/binary"
-
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 const (
@@ -31,24 +29,37 @@ const (
 	commitFlagSize        = 1
 )
 
-type TcpFetchMessagesRequest struct {
-	StreamId    iggcon.Identifier      `json:"streamId"`
-	TopicId     iggcon.Identifier      `json:"topicId"`
-	Consumer    iggcon.Consumer        `json:"consumer"`
-	PartitionId *uint32                `json:"partitionId"`
-	Strategy    iggcon.PollingStrategy `json:"pollingStrategy"`
-	Count       uint32                 `json:"count"`
-	AutoCommit  bool                   `json:"autoCommit"`
+type PollMessages struct {
+	StreamId    Identifier      `json:"streamId"`
+	TopicId     Identifier      `json:"topicId"`
+	Consumer    Consumer        `json:"consumer"`
+	PartitionId *uint32         `json:"partitionId"`
+	Strategy    PollingStrategy `json:"pollingStrategy"`
+	Count       uint32          `json:"count"`
+	AutoCommit  bool            `json:"autoCommit"`
 }
 
-func (request *TcpFetchMessagesRequest) Serialize() []byte {
-	consumerIdBytes := SerializeIdentifier(request.Consumer.Id)
-	streamIdBytes := SerializeIdentifier(request.StreamId)
-	topicIdBytes := SerializeIdentifier(request.TopicId)
+func (m *PollMessages) Code() CommandCode {
+	return PollMessagesCode
+}
+
+func (m *PollMessages) MarshalBinary() ([]byte, error) {
+	consumerIdBytes, err := m.Consumer.Id.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	streamIdBytes, err := m.StreamId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	topicIdBytes, err := m.TopicId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
 	messageSize := 1 + len(consumerIdBytes) + len(streamIdBytes) + len(topicIdBytes) + partitionStrategySize + offsetSize + commitFlagSize
 	bytes := make([]byte, messageSize)
 
-	bytes[0] = byte(request.Consumer.Kind)
+	bytes[0] = byte(m.Consumer.Kind)
 	position := 1
 	copy(bytes[position:position+len(consumerIdBytes)], consumerIdBytes)
 	position += len(consumerIdBytes)
@@ -57,26 +68,26 @@ func (request *TcpFetchMessagesRequest) Serialize() []byte {
 	position += len(streamIdBytes)
 	copy(bytes[position:position+len(topicIdBytes)], topicIdBytes)
 	position += len(topicIdBytes)
-	if request.PartitionId != nil {
+	if m.PartitionId != nil {
 		bytes[position] = 1
-		binary.LittleEndian.PutUint32(bytes[position+1:position+1+4], *request.PartitionId)
+		binary.LittleEndian.PutUint32(bytes[position+1:position+1+4], *m.PartitionId)
 	} else {
 		bytes[position] = 0
 		binary.LittleEndian.PutUint32(bytes[position+1:position+1+4], 0)
 	}
-	bytes[position+1+4] = byte(request.Strategy.Kind)
+	bytes[position+1+4] = byte(m.Strategy.Kind)
 
 	position += partitionStrategySize
-	binary.LittleEndian.PutUint64(bytes[position:position+8], request.Strategy.Value)
-	binary.LittleEndian.PutUint32(bytes[position+8:position+12], request.Count)
+	binary.LittleEndian.PutUint64(bytes[position:position+8], m.Strategy.Value)
+	binary.LittleEndian.PutUint32(bytes[position+8:position+12], m.Count)
 
 	position += offsetSize
 
-	if request.AutoCommit {
+	if m.AutoCommit {
 		bytes[position] = 1
 	} else {
 		bytes[position] = 0
 	}
 
-	return bytes
+	return bytes, nil
 }

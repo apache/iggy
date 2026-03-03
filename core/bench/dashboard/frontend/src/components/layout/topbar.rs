@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::api;
+use crate::components::embed_modal::EmbedModal;
 use crate::components::selectors::measurement_type_selector::MeasurementType;
 use crate::components::theme::theme_toggle::ThemeToggle;
 use crate::components::tooltips::benchmark_info_toggle::BenchmarkInfoToggle;
@@ -89,6 +90,13 @@ pub fn topbar(props: &TopBarProps) -> Html {
         })
     };
 
+    let on_embed_toggle = {
+        let ui_state = ui_state.clone();
+        Callback::from(move |_| {
+            ui_state.dispatch(UiAction::ToggleEmbedModal);
+        })
+    };
+
     html! {
         <div class="top-buttons">
             <div class="controls">
@@ -112,6 +120,39 @@ pub fn topbar(props: &TopBarProps) -> Html {
                                         <line x1="12" y1="15" x2="12" y2="3"/>
                                     </svg>
                                 </button>
+                                <div class="info-container">
+                                    <button
+                                        class={classes!(
+                                            "icon-button",
+                                            ui_state.is_embed_modal_visible.then_some("active")
+                                        )}
+                                        onclick={on_embed_toggle.clone()}
+                                        title="Embed Chart"
+                                        disabled={benchmark_ctx.state.selected_benchmark.is_none()}
+                                    >
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <polyline points="16 18 22 12 16 6"/>
+                                            <polyline points="8 6 2 12 8 18"/>
+                                        </svg>
+                                    </button>
+                                    {
+                                        if ui_state.is_embed_modal_visible {
+                                            if let Some(benchmark) = &benchmark_ctx.state.selected_benchmark {
+                                                html! {
+                                                    <EmbedModal
+                                                        uuid={benchmark.uuid.to_string()}
+                                                        measurement_type={selected_measurement.clone()}
+                                                        is_dark={props.is_dark}
+                                                    />
+                                                }
+                                            } else {
+                                                html! {}
+                                            }
+                                        } else {
+                                            html! {}
+                                        }
+                                    }
+                                </div>
                                 <div class="info-container">
                                     <ServerStatsToggle
                                         is_visible={is_server_stats_tooltip_visible}
