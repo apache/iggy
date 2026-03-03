@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::shards_table::ShardsTable;
-use crate::{IggyShard, ShardFrame};
+use crate::{IggyShard, Receiver, ShardFrame};
 use futures::FutureExt;
 use iggy_common::header::{GenericHeader, PrepareHeader};
 use iggy_common::message::{Message, MessageBag};
@@ -35,7 +35,7 @@ impl<B, J, S, M, T, R> IggyShard<B, J, S, M, T, R>
 where
     B: MessageBus,
     T: ShardsTable,
-    R: Send,
+    R: Send + 'static,
 {
     /// Classify a raw network message and route it to
     /// the correct shard's message pump.
@@ -80,7 +80,7 @@ where
 
     /// Dispatch a message and return a receiver that resolves when the target
     /// shard has finished processing it.
-    pub fn dispatch_request(&self, message: Message<GenericHeader>) -> flume::Receiver<R> {
+    pub fn dispatch_request(&self, message: Message<GenericHeader>) -> Receiver<R> {
         let (operation, namespace, generic) = match MessageBag::from(message) {
             MessageBag::Request(ref r) => {
                 let h = r.header();
@@ -127,7 +127,7 @@ where
     }
 
     /// Drain this shard's inbox and process each frame locally.
-    pub async fn run_message_pump(&self, stop: flume::Receiver<()>)
+    pub async fn run_message_pump(&self, stop: Receiver<()>)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
         J: JournalHandle,
@@ -140,8 +140,8 @@ where
     {
         loop {
             futures::select! {
-                _ = stop.recv_async().fuse() => break,
-                frame = self.inbox.recv_async().fuse() => {
+                _ = stop.recv().fuse() => break,
+                frame = self.inbox.recv().fuse() => {
                     match frame {
                         Ok(frame) => self.process_frame(frame).await,
                         Err(_) => break,

@@ -22,7 +22,7 @@ edition = "2024"
 
 [dependencies]
 consensus = { path = "../consensus" }
-flume = { workspace = true }
+crossfire = { workspace = true }
 futures = { workspace = true }
 hash32 = { workspace = true }
 iggy_common = { path = "../common" }

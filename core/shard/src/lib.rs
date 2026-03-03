@@ -40,6 +40,17 @@ pub type ShardPlane<B, J, S, M> = MuxPlane<
     ),
 >;
 
+/// Bounded mpsc channel sender (blocking send, cloneable).
+pub type Sender<T> = crossfire::MTx<crossfire::mpsc::Array<T>>;
+
+/// Bounded mpsc channel receiver (async recv).
+pub type Receiver<T> = crossfire::AsyncRx<crossfire::mpsc::Array<T>>;
+
+/// Create a bounded mpsc channel with a blocking sender and async receiver.
+pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+    crossfire::mpsc::bounded_blocking_async(capacity)
+}
+
 /// Envelope for inter-shard channel messages.
 ///
 /// Wraps a consensus [`Message`] together with an optional one-shot response
@@ -49,12 +60,12 @@ pub type ShardPlane<B, J, S, M> = MuxPlane<
 ///
 /// The response type `R` is generic so that higher layers (e.g. HTTP handlers)
 /// can carry a response enum while the consensus layer can default to `()`.
-pub struct ShardFrame<R = ()> {
+pub struct ShardFrame<R: Send + 'static = ()> {
     pub message: Message<GenericHeader>,
-    pub response_sender: Option<flume::Sender<R>>,
+    pub response_sender: Option<Sender<R>>,
 }
 
-impl<R> ShardFrame<R> {
+impl<R: Send + 'static> ShardFrame<R> {
     /// Create a fire-and-forget frame (no caller waiting for completion).
     pub fn fire_and_forget(message: Message<GenericHeader>) -> Self {
         Self {
@@ -65,8 +76,8 @@ impl<R> ShardFrame<R> {
 
     /// Create a request-response frame.  Returns the frame and a receiver
     /// that the caller can await for completion notification.
-    pub fn with_response(message: Message<GenericHeader>) -> (Self, flume::Receiver<R>) {
-        let (tx, rx) = flume::bounded(1);
+    pub fn with_response(message: Message<GenericHeader>) -> (Self, Receiver<R>) {
+        let (tx, rx) = channel(1);
         (
             Self {
                 message,
@@ -77,7 +88,7 @@ impl<R> ShardFrame<R> {
     }
 }
 
-pub struct IggyShard<B, J, S, M, T = (), R = ()>
+pub struct IggyShard<B, J, S, M, T = (), R: Send + 'static = ()>
 where
     B: MessageBus,
 {
@@ -88,17 +99,17 @@ where
     /// Channel senders to every shard, indexed by shard id.
     /// Includes a sender to self so that local routing goes through the
     /// same channel path as remote routing.
-    senders: Vec<flume::Sender<ShardFrame<R>>>,
+    senders: Vec<Sender<ShardFrame<R>>>,
 
     /// Receiver end of this shard's inbox.  Peer shards (and self) send
     /// messages here via the corresponding sender.
-    inbox: flume::Receiver<ShardFrame<R>>,
+    inbox: Receiver<ShardFrame<R>>,
 
     /// Partition namespace -> owning shard lookup.
     shards_table: T,
 }
 
-impl<B, J, S, M, T, R> IggyShard<B, J, S, M, T, R>
+impl<B, J, S, M, T, R: Send + 'static> IggyShard<B, J, S, M, T, R>
 where
     B: MessageBus,
     T: ShardsTable,
@@ -113,8 +124,8 @@ where
         name: String,
         metadata: IggyMetadata<VsrConsensus<B>, J, S, M>,
         partitions: IggyPartitions<VsrConsensus<B, NamespacedPipeline>>,
-        senders: Vec<flume::Sender<ShardFrame<R>>>,
-        inbox: flume::Receiver<ShardFrame<R>>,
+        senders: Vec<Sender<ShardFrame<R>>>,
+        inbox: Receiver<ShardFrame<R>>,
         shards_table: T,
     ) -> Self {
         let plane = MuxPlane::new(variadic!(metadata, partitions));
@@ -135,7 +146,7 @@ where
 
 /// Local message processing — these methods handle messages that have been
 /// routed to this shard via the message pump.
-impl<B, J, S, M, T, R> IggyShard<B, J, S, M, T, R>
+impl<B, J, S, M, T, R: Send + 'static> IggyShard<B, J, S, M, T, R>
 where
     B: MessageBus,
 {

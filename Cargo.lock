@@ -2421,6 +2421,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
+name = "crossfire"
+version = "3.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fb12e9c05ae4854f743f0acec2f817148ba59a902484f6aa298d4fc7df2fac4"
+dependencies = [
+ "crossbeam-utils",
+ "futures-core",
+ "parking_lot",
+ "smallvec",
+]
+
+[[package]]
 name = "crossterm"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8727,7 +8739,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9362,7 +9374,7 @@ name = "shard"
 version = "0.1.0"
 dependencies = [
  "consensus",
- "flume 0.12.0",
+ "crossfire",
  "futures",
  "hash32 1.0.0",
  "iggy_common",
@@ -9472,8 +9484,8 @@ dependencies = [
  "bytemuck",
  "bytes",
  "consensus",
+ "crossfire",
  "enumset",
- "flume 0.12.0",
  "futures",
  "iggy_common",
  "journal",
