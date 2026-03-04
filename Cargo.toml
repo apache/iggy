@@ -116,6 +116,7 @@ configs_derive = { path = "core/configs_derive", version = "0.1.0" }
 consensus = { path = "core/consensus" }
 console-subscriber = "0.5.0"
 crossbeam = "0.8.4"
+crossfire = "3.1.4"
 ctor = "0.6.3"
 ctrlc = { version = "3.5", features = ["termination"] }
 cucumber = "0.22"

@@ -514,12 +514,7 @@ where
             message.header().command(),
             Command2::Request | Command2::Prepare | Command2::PrepareOk
         ));
-        let operation = message.header().operation();
-        // TODO: Use better selection, smth like greater or equal based on op number.
-        matches!(
-            operation,
-            Operation::DeleteSegments | Operation::SendMessages | Operation::StoreConsumerOffset
-        )
+        message.header().operation().is_partition()
     }
 }
 
