@@ -42,7 +42,11 @@ opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
 reqwest = { workspace = true }
-rmcp = { workspace = true, features = ["server", "transport-io", "transport-streamable-http-server"] }
+rmcp = { workspace = true, features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 socket2 = "0.6"
