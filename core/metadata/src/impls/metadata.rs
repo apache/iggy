@@ -25,8 +25,7 @@ use consensus::{
 };
 use iggy_common::{
     header::{
-        Command2, ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
-        RequestHeader,
+        Command2, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader,
     },
     message::Message,
 };
@@ -260,30 +259,7 @@ where
             message.header().command(),
             Command2::Request | Command2::Prepare | Command2::PrepareOk
         ));
-        let operation = message.header().operation();
-        // TODO: Use better selection, smth like greater or equal based on op number.
-        matches!(
-            operation,
-            Operation::CreateStream
-                | Operation::UpdateStream
-                | Operation::DeleteStream
-                | Operation::PurgeStream
-                | Operation::CreateTopic
-                | Operation::UpdateTopic
-                | Operation::DeleteTopic
-                | Operation::PurgeTopic
-                | Operation::CreatePartitions
-                | Operation::DeletePartitions
-                | Operation::CreateConsumerGroup
-                | Operation::DeleteConsumerGroup
-                | Operation::CreateUser
-                | Operation::UpdateUser
-                | Operation::DeleteUser
-                | Operation::ChangePassword
-                | Operation::UpdatePermissions
-                | Operation::CreatePersonalAccessToken
-                | Operation::DeletePersonalAccessToken
-        )
+        message.header().operation().is_metadata()
     }
 }
 
