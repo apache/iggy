@@ -16,7 +16,10 @@
  * under the License.
  */
 
-use super::{group_metrics_summary::BenchmarkGroupMetricsSummary, time_series::TimeSeries};
+use super::{
+    group_metrics_summary::BenchmarkGroupMetricsSummary, latency_distribution::LatencyDistribution,
+    time_series::TimeSeries,
+};
 use crate::utils::{max, min, std_dev};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -28,6 +31,8 @@ pub struct BenchmarkGroupMetrics {
     pub avg_throughput_mb_ts: TimeSeries,
     pub avg_throughput_msg_ts: TimeSeries,
     pub avg_latency_ts: TimeSeries,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_distribution: Option<LatencyDistribution>,
 }
 
 // Custom deserializer implementation
@@ -53,6 +58,7 @@ impl<'de> Deserialize<'de> for BenchmarkGroupMetrics {
                 let mut avg_throughput_mb_ts: Option<TimeSeries> = None;
                 let mut avg_throughput_msg_ts: Option<TimeSeries> = None;
                 let mut avg_latency_ts: Option<TimeSeries> = None;
+                let mut latency_distribution: Option<LatencyDistribution> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -67,6 +73,9 @@ impl<'de> Deserialize<'de> for BenchmarkGroupMetrics {
                         }
                         "avg_latency_ts" => {
                             avg_latency_ts = Some(map.next_value()?);
+                        }
+                        "latency_distribution" => {
+                            latency_distribution = map.next_value()?;
                         }
                         _ => {
                             let _ = map.next_value::<serde::de::IgnoredAny>()?;
@@ -108,6 +117,7 @@ impl<'de> Deserialize<'de> for BenchmarkGroupMetrics {
                     avg_throughput_mb_ts,
                     avg_throughput_msg_ts,
                     avg_latency_ts,
+                    latency_distribution,
                 })
             }
         }

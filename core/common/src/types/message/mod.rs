@@ -22,6 +22,7 @@ mod index;
 mod index_view;
 mod indexes;
 mod indexes_mut;
+mod message_boundaries;
 mod message_header;
 mod message_header_view;
 mod message_header_view_mut;

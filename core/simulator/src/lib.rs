@@ -18,6 +18,9 @@
 pub mod bus;
 pub mod client;
 pub mod deps;
+pub mod network;
+pub mod packet;
+pub mod ready_queue;
 pub mod replica;
 
 use bus::MemBus;
@@ -119,6 +122,14 @@ impl Simulator {
         message: Message<iggy_common::header::GenericHeader>,
     ) {
         replica.on_message(message).await;
+
+        let mut buf = Vec::new();
+        replica.process_loopback(&mut buf).await;
+        debug_assert_eq!(
+            replica.process_loopback(&mut buf).await,
+            0,
+            "on_ack must not re-enqueue loopback messages"
+        );
     }
 }
 

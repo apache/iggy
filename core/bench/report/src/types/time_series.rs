@@ -48,9 +48,20 @@ pub enum TimeSeriesKind {
     Latency,
 }
 
+const MAX_CHART_POINTS: usize = 3000;
+
 impl TimeSeries {
     pub fn as_charming_points(&self) -> Vec<Vec<f64>> {
         self.points
+            .iter()
+            .map(|p| vec![p.time_s, p.value])
+            .collect()
+    }
+
+    /// LTTB-downsampled points for chart rendering.
+    /// Caps output at `MAX_CHART_POINTS` to keep ECharts responsive.
+    pub fn as_downsampled_charming_points(&self) -> Vec<Vec<f64>> {
+        crate::utils::lttb_downsample(&self.points, MAX_CHART_POINTS)
             .iter()
             .map(|p| vec![p.time_s, p.value])
             .collect()

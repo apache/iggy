@@ -360,6 +360,9 @@ jobs:
         with:
           save-cache: "false"
 
+      - name: Install llvm-tools for coverage
+        run: rustup component add llvm-tools-preview
+
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
@@ -368,23 +371,30 @@ jobs:
           cd foreign/python
           uv sync --frozen --extra dev --extra testing --extra testing-docker
 
-      - name: Build Python wheel
+      - name: Build Python wheel with coverage instrumentation
         run: |
           cd foreign/python
-          uv run maturin build -o dist
-          uv pip install dist/*.whl --force-reinstall
+          mkdir -p target/coverage
+
+          # Instrument Rust code with coverage and set profraw output path
+          export RUSTFLAGS="-C instrument-coverage"
+          export LLVM_PROFILE_FILE="$(pwd)/target/coverage/%p-%4m.profraw"
+          echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> $GITHUB_ENV
+
+          echo "Building Python wheel with coverage instrumentation..."
+          uv run maturin develop --release
 
       - name: Start Iggy server
         id: iggy
         uses: ./.github/actions/utils/server-start
 
-      - name: Run tests with coverage
+      - name: Run tests
         run: |
           cd foreign/python
           IGGY_SERVER_HOST=127.0.0.1 \
           IGGY_SERVER_TCP_PORT=8090 \
             uv run pytest tests/ -v \
-              --cov --cov-report=xml:../../reports/python-coverage.xml \
+              --junitxml=../../reports/python-junit.xml \
               --tb=short \
               --capture=no
 
@@ -395,11 +405,39 @@ jobs:
           pid-file: ${{ steps.iggy.outputs.pid_file }}
           log-file: ${{ steps.iggy.outputs.log_file }}
 
+      - name: Generate coverage report
+        run: |
+          mkdir -p reports
+          cd foreign/python
+
+          PROFRAW_COUNT=$(find target/coverage -name '*.profraw' 2>/dev/null | wc -l)
+          echo "Found ${PROFRAW_COUNT} profraw file(s)"
+
+          if [ "${PROFRAW_COUNT}" -eq 0 ]; then
+            echo "No profraw files found, skipping coverage report"
+            exit 0
+          fi
+
+          LLVM_PROFDATA=$(find "$(rustc --print sysroot)" -name 'llvm-profdata' -type f | head -1)
+          LLVM_COV=$(find "$(rustc --print sysroot)" -name 'llvm-cov' -type f | head -1)
+          SHARED_LIB=$(find target/release -name 'libapache_iggy*.so' 2>/dev/null | head -1)
+
+          "${LLVM_PROFDATA}" merge -sparse target/coverage/*.profraw -o target/coverage/merged.profdata
+
+          "${LLVM_COV}" export \
+            --format=lcov \
+            --instr-profile=target/coverage/merged.profdata \
+            --ignore-filename-regex='(/.cargo/registry|/rustc/)' \
+            "${SHARED_LIB}" \
+            > ../../reports/python-coverage.lcov
+
+          echo "Coverage report generated: $(wc -l < ../../reports/python-coverage.lcov) lines"
+
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: reports/python-coverage.xml
+          files: reports/python-coverage.lcov
           disable_search: true
           flags: python
           fail_ci_if_error: false

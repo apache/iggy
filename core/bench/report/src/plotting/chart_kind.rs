@@ -24,4 +24,6 @@ pub enum ChartKind {
     Throughput,
     #[display("Latency")]
     Latency,
+    #[display("Latency Distribution")]
+    LatencyDistribution,
 }

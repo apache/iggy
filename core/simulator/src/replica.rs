@@ -82,5 +82,9 @@ pub fn new_replica(id: u8, name: String, bus: Arc<MemBus>, replica_count: u8) ->
     partition_consensus.init();
     partitions.set_consensus(partition_consensus);
 
-    shard::IggyShard::new(id, name, metadata, partitions)
+    // TODO: previously we used used unbounded channel with flume,
+    // but this is not possible with crossfire without mangling types due to Flavor trait in crossfire.
+    // This needs to be revisited in the future.
+    let (_tx, inbox) = shard::channel(1024);
+    shard::IggyShard::new(id as u16, name, metadata, partitions, Vec::new(), inbox, ())
 }

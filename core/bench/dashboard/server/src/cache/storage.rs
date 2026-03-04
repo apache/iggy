@@ -51,6 +51,10 @@ impl BenchmarkCache {
             .map(|entry| entry.value().0.clone())
     }
 
+    pub fn results_dir(&self) -> &std::path::Path {
+        &self.results_dir
+    }
+
     pub(crate) fn clear(&self) {
         self.benchmarks.clear();
         self.hardware_to_gitref.clear();

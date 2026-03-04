@@ -131,7 +131,7 @@ repos:
 
       - id: cargo-sort
         name: cargo sort
-        entry: cargo sort --workspace
+        entry: cargo sort --no-format --workspace
         language: system
         files: (^|/)Cargo\.toml$
         pass_filenames: false
