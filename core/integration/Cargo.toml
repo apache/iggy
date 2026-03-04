@@ -54,12 +54,7 @@ rcgen = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
-rmcp = { workspace = true, features = [
-    "client",
-    "reqwest",
-    "transport-streamable-http-client",
-    "transport-streamable-http-client-reqwest",
-] }
+rmcp = { workspace = true, features = ["client", "reqwest", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }

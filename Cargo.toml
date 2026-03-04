@@ -74,14 +74,7 @@ async-broadcast = "0.7.2"
 async-channel = "2.5.0"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
 async-trait = "0.1.89"
-async_zip = { version = "0.0.18", features = [
-    "tokio",
-    "lzma",
-    "bzip2",
-    "xz",
-    "deflate",
-    "zstd",
-] }
+async_zip = { version = "0.0.18", features = ["tokio", "lzma", "bzip2", "xz", "deflate", "zstd"] }
 axum = { version = "0.8.8", features = ["macros"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 base64 = "0.22.1"
@@ -93,11 +86,7 @@ bench-runner = { path = "core/bench/runner" }
 bit-set = "0.8.0"
 blake3 = "1.8.3"
 bon = "3.8.2"
-byte-unit = { version = "5.2.0", default-features = false, features = [
-    "serde",
-    "byte",
-    "std",
-] }
+byte-unit = { version = "5.2.0", default-features = false, features = ["serde", "byte", "std"] }
 bytemuck = { version = "1.25" }
 bytes = "1.11.1"
 charming = "0.6.0"
@@ -107,19 +96,7 @@ clap_complete = "4.5.66"
 clock = { path = "core/clock" }
 colored = "3.1.1"
 comfy-table = "7.2.2"
-compio = { version = "0.18.0", features = [
-    "runtime",
-    "macros",
-    "io-uring",
-    "time",
-    "rustls",
-    "ring",
-    "net",
-    "quic",
-    "tls",
-    "ws",
-    "fs",
-] }
+compio = { version = "0.18.0", features = ["runtime", "macros", "io-uring", "time", "rustls", "ring", "net", "quic", "tls", "ws", "fs"] }
 # Pin compio-driver >= 0.11.2 to fix musl compilation (compio-rs/compio#668)
 compio-driver = "0.11.2"
 configs = { path = "core/configs", version = "0.1.0" }
@@ -195,22 +172,9 @@ octocrab = "0.49.5"
 once_cell = "1.21.3"
 opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["log"] }
-opentelemetry-otlp = { version = "0.31.0", features = [
-    "logs",
-    "trace",
-    "grpc-tonic",
-    "http",
-    "http-proto",
-    "reqwest-client",
-] }
+opentelemetry-otlp = { version = "0.31.0", features = ["logs", "trace", "grpc-tonic", "http", "http-proto", "reqwest-client"] }
 opentelemetry-semantic-conventions = "0.31.0"
-opentelemetry_sdk = { version = "0.31.0", features = [
-    "logs",
-    "trace",
-    "experimental_async_runtime",
-    "experimental_logs_batch_log_processor_with_async_runtime",
-    "experimental_trace_batch_span_processor_with_async_runtime",
-] }
+opentelemetry_sdk = { version = "0.31.0", features = ["logs", "trace", "experimental_async_runtime", "experimental_logs_batch_log_processor_with_async_runtime", "experimental_trace_batch_span_processor_with_async_runtime"] }
 papaya = "0.2.3"
 parquet = "57.3.0"
 partitions = { path = "core/partitions" }
@@ -232,10 +196,7 @@ rand_xoshiro = "0.8.0"
 rayon = "1.11.0"
 rcgen = "0.14.7"
 regex = "1.12.3"
-reqwest = { version = "0.12.28", default-features = false, features = [
-    "json",
-    "rustls-tls",
-] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 reqwest-middleware = { version = "0.4.2", features = ["json"] }
 reqwest-retry = "0.8.0"
 reqwest-tracing = "0.5.8"
@@ -245,10 +206,7 @@ rmcp = "0.15.0"
 rmp-serde = "1.3.1"
 rolling-file = "0.2.0"
 rust-embed = "8.11.0"
-rust-s3 = { version = "0.37.1", default-features = false, features = [
-    "tokio-rustls-tls",
-    "tags",
-] }
+rust-s3 = { version = "0.37.1", default-features = false, features = ["tokio-rustls-tls", "tags"] }
 rustls = { version = "0.23.36", features = ["ring"] }
 rustls-pemfile = "2.2.0"
 send_wrapper = "0.6.0"
@@ -261,13 +219,7 @@ server = { path = "core/server" }
 simd-json = { version = "0.17.0", features = ["serde_impl"] }
 slab = "0.4.12"
 socket2 = "0.6.2"
-sqlx = { version = "0.8.6", features = [
-    "runtime-tokio-rustls",
-    "postgres",
-    "chrono",
-    "uuid",
-    "json",
-] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
 static-toml = "1.3.0"
 strum = { version = "0.27.2", features = ["derive"] }
 strum_macros = "0.27.2"
@@ -282,42 +234,20 @@ tokio-rustls = "0.26.4"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7.18", features = ["compat"] }
 toml = "1.0.0"
-tower-http = { version = "0.6.8", features = [
-    "add-extension",
-    "cors",
-    "trace",
-] }
+tower-http = { version = "0.6.8", features = ["add-extension", "cors", "trace"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.4"
 tracing-opentelemetry = "0.32.1"
-tracing-subscriber = { version = "0.3.22", default-features = false, features = [
-    "fmt",
-    "env-filter",
-    "ansi",
-] }
+tracing-subscriber = { version = "0.3.22", default-features = false, features = ["fmt", "env-filter", "ansi"] }
 trait-variant = "0.1.2"
 tungstenite = "0.28.0"
 twox-hash = { version = "2.1.2", features = ["xxhash32"] }
 ulid = "1.2.1"
-uuid = { version = "1.20.0", features = [
-    "v4",
-    "v7",
-    "fast-rng",
-    "serde",
-    "zerocopy",
-] }
+uuid = { version = "1.20.0", features = ["v4", "v7", "fast-rng", "serde", "zerocopy"] }
 vergen-git2 = { version = "9.1.0", features = ["build", "cargo", "rustc", "si"] }
 walkdir = "2.5.0"
 wasm-bindgen = "0.2"
-web-sys = { version = "0.3", features = [
-    "Window",
-    "Location",
-    "HtmlSelectElement",
-    "Clipboard",
-    "Navigator",
-    "ResizeObserver",
-    "ResizeObserverEntry",
-] }
+web-sys = { version = "0.3", features = ["Window", "Location", "HtmlSelectElement", "Clipboard", "Navigator", "ResizeObserver", "ResizeObserverEntry"] }
 webpki-roots = "1.0.6"
 yew = { version = "0.22", features = ["csr"] }
 yew-router = "0.19"
