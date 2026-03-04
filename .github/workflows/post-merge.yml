@@ -188,9 +188,11 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update --yes
-          sudo apt-get install --yes gnome-keyring keyutils
+          sudo apt-get install --yes gnome-keyring keyutils dbus-x11
           rm -f $HOME/.local/share/keyrings/*
-          echo -n "test" | gnome-keyring-daemon --unlock
+          eval $(dbus-launch --sh-syntax)
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> $GITHUB_ENV
+          echo -n "test" | gnome-keyring-daemon --unlock --components=secrets
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
