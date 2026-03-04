@@ -179,9 +179,6 @@ impl IggyShard {
         info!("Starting...");
         self.init().await?;
 
-        // TODO: Fixme
-        //self.assert_init();
-
         self.init_tasks();
         let (shutdown_complete_tx, shutdown_complete_rx) = async_channel::bounded(1);
         let stop_receiver = self.get_stop_receiver();
