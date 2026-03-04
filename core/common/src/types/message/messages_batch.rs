@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use super::message_boundaries::IggyMessageBoundaries;
 use crate::{
     BytesSerializable, INDEX_SIZE, IggyByteSize, IggyIndexes, IggyMessage, IggyMessageView,
     IggyMessageViewIterator, MAX_PAYLOAD_SIZE, Sizeable, Validatable, error::IggyError,
@@ -52,7 +53,12 @@ impl IggyMessagesBatch {
 
     /// Create iterator over messages
     pub fn iter(&self) -> IggyMessageViewIterator<'_> {
-        IggyMessageViewIterator::new(&self.messages)
+        IggyMessageViewIterator::new_with_boundaries(
+            &self.messages,
+            &self.indexes,
+            self.indexes.base_position(),
+            self.count,
+        )
     }
 
     /// Get the number of messages
@@ -120,47 +126,18 @@ impl IggyMessagesBatch {
         self.iter().last().map(|msg| msg.header().timestamp())
     }
 
-    /// Calculates the start position of a message at the given index in the buffer
-    fn message_start_position(&self, index: usize) -> usize {
-        if index == 0 {
-            0
-        } else {
-            self.position_at(index as u32 - 1) as usize - self.indexes.base_position() as usize
-        }
-    }
-
-    /// Calculates the end position of a message at the given index in the buffer
-    fn message_end_position(&self, index: usize) -> usize {
-        if index >= self.count as usize - 1 {
-            self.messages.len()
-        } else {
-            self.position_at(index as u32) as usize - self.indexes.base_position() as usize
-        }
+    fn boundaries(&self) -> Option<IggyMessageBoundaries<'_>> {
+        IggyMessageBoundaries::new(
+            &self.indexes,
+            self.messages.len(),
+            self.indexes.base_position(),
+            self.count,
+        )
     }
 
     /// Gets the byte range for a message at the given index
     fn get_message_boundaries(&self, index: usize) -> Option<(usize, usize)> {
-        if index >= self.count as usize {
-            return None;
-        }
-
-        let start = self.message_start_position(index);
-        let end = self.message_end_position(index);
-
-        if start > self.messages.len() || end > self.messages.len() || start > end {
-            return None;
-        }
-
-        Some((start, end))
-    }
-
-    /// Helper method to read a position (u32) from the byte array at the given index
-    fn position_at(&self, position_index: u32) -> u32 {
-        if let Some(index) = self.indexes.get(position_index) {
-            index.position()
-        } else {
-            0
-        }
+        self.boundaries()?.boundaries(index)
     }
 
     /// Get the message at the specified index.
