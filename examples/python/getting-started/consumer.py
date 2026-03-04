@@ -118,9 +118,7 @@ async def main():
     try:
         logger.info("Connecting to IggyClient...")
         await client.connect()
-        logger.info("Connected. Logging in user...")
-        await client.login_user(args.username, args.password)
-        logger.info("Logged in.")
+        logger.info("Connected.")
         await consume_messages(client)
     except Exception as error:
         logger.exception("Exception occurred in main function: {}", error)

@@ -118,9 +118,7 @@ async def main():
     client = IggyClient.from_connection_string(connection_string)
     logger.info("Connecting to IggyClient")
     await client.connect()
-    logger.info("Connected. Logging in user...")
-    await client.login_user(args.username, args.password)
-    logger.info("Logged in.")
+    logger.info("Connected.")
     await init_system(client)
     await produce_messages(client)
 

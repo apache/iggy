@@ -28,14 +28,15 @@ Requirements:
     - CA certificate available at core/certs/iggy_ca_cert.pem
 """
 
+import asyncio
 import os
 import uuid
 
 import pytest
 from apache_iggy import IggyClient, PollingStrategy
 from apache_iggy import SendMessage as Message
-from testcontainers.core.container import DockerContainer  # type: ignore[import-not-found]
-from testcontainers.core.waiting_utils import wait_for_logs  # type: ignore[import-not-found]
+from testcontainers.core.container import DockerContainer  # type: ignore[import-untyped]
+from testcontainers.core.waiting_utils import wait_for_logs  # type: ignore[import-untyped]
 
 from .utils import wait_for_ping, wait_for_server
 
@@ -85,7 +86,6 @@ async def tls_client(tls_container) -> IggyClient:
     client = IggyClient.from_connection_string(conn_str)
     await client.connect()
     await wait_for_ping(client)
-    await client.login_user("iggy", "iggy")
     return client
 
 
@@ -171,6 +171,7 @@ class TestTlsConnectionString:
         await client.ping()
 
     @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
     async def test_connect_without_tls_should_fail(self, tls_container):
         """Test that connecting without TLS to a TLS-enabled server fails."""
         host = "localhost"
@@ -178,10 +179,10 @@ class TestTlsConnectionString:
 
         wait_for_server(host, int(port))
 
-        # Connect without TLS to a TLS-enabled server
-        # IggyClient constructor requires IP address, not hostname
-        client = IggyClient(f"127.0.0.1:{port}")
-        await client.connect()
+        # Use connection string without TLS params to a TLS-enabled server
+        # The SDK retries internally, so we use a timeout to detect failure
+        conn_str = f"iggy+tcp://iggy:iggy@{host}:{port}"
+        client = IggyClient.from_connection_string(conn_str)
 
-        with pytest.raises(RuntimeError):
-            await client.login_user("iggy", "iggy")
+        with pytest.raises(Exception):
+            await asyncio.wait_for(client.connect(), timeout=5)
