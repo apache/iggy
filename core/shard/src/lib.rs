@@ -29,13 +29,12 @@ use metadata::IggyMetadata;
 use metadata::stm::StateMachine;
 use partitions::IggyPartitions;
 
-// variadic!(Metadata, Partitions) = (Metadata, (Partitions, ()))
-type PlaneInner<B, J, S, M> = (
-    IggyMetadata<VsrConsensus<B>, J, S, M>,
-    (IggyPartitions<VsrConsensus<B, NamespacedPipeline>>, ()),
-);
-
-pub type ShardPlane<B, J, S, M> = MuxPlane<PlaneInner<B, J, S, M>>;
+pub type ShardPlane<B, J, S, M> = MuxPlane<
+    variadic!(
+        IggyMetadata<VsrConsensus<B>, J, S, M>,
+        IggyPartitions<VsrConsensus<B, NamespacedPipeline>>
+    ),
+>;
 
 pub struct IggyShard<B, J, S, M>
 where
