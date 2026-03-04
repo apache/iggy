@@ -24,8 +24,7 @@ import (
 )
 
 func (c *IggyTcpClient) GetUser(identifier iggcon.Identifier) (*iggcon.UserInfoDetails, error) {
-	message := binaryserialization.SerializeIdentifier(identifier)
-	buffer, err := c.sendAndFetchResponse(message, iggcon.GetUserCode)
+	buffer, err := c.do(&iggcon.GetUser{Id: identifier})
 	if err != nil {
 		return nil, err
 	}
@@ -37,7 +36,7 @@ func (c *IggyTcpClient) GetUser(identifier iggcon.Identifier) (*iggcon.UserInfoD
 }
 
 func (c *IggyTcpClient) GetUsers() ([]iggcon.UserInfo, error) {
-	buffer, err := c.sendAndFetchResponse([]byte{}, iggcon.GetUsersCode)
+	buffer, err := c.do(&iggcon.GetUsers{})
 	if err != nil {
 		return nil, err
 	}
@@ -46,13 +45,12 @@ func (c *IggyTcpClient) GetUsers() ([]iggcon.UserInfo, error) {
 }
 
 func (c *IggyTcpClient) CreateUser(username string, password string, status iggcon.UserStatus, permissions *iggcon.Permissions) (*iggcon.UserInfoDetails, error) {
-	message := binaryserialization.SerializeCreateUserRequest(iggcon.CreateUserRequest{
+	buffer, err := c.do(&iggcon.CreateUser{
 		Username:    username,
 		Password:    password,
 		Status:      status,
 		Permissions: permissions,
 	})
-	buffer, err := c.sendAndFetchResponse(message, iggcon.CreateUserCode)
 	if err != nil {
 		return nil, err
 	}
@@ -64,36 +62,34 @@ func (c *IggyTcpClient) CreateUser(username string, password string, status iggc
 }
 
 func (c *IggyTcpClient) UpdateUser(userID iggcon.Identifier, username *string, status *iggcon.UserStatus) error {
-	message := binaryserialization.SerializeUpdateUser(iggcon.UpdateUserRequest{
+	_, err := c.do(&iggcon.UpdateUser{
 		UserID:   userID,
 		Username: username,
 		Status:   status,
 	})
-	_, err := c.sendAndFetchResponse(message, iggcon.UpdateUserCode)
 	return err
 }
 
 func (c *IggyTcpClient) DeleteUser(identifier iggcon.Identifier) error {
-	message := binaryserialization.SerializeIdentifier(identifier)
-	_, err := c.sendAndFetchResponse(message, iggcon.DeleteUserCode)
+	_, err := c.do(&iggcon.DeleteUser{
+		Id: identifier,
+	})
 	return err
 }
 
 func (c *IggyTcpClient) UpdatePermissions(userID iggcon.Identifier, permissions *iggcon.Permissions) error {
-	message := binaryserialization.SerializeUpdateUserPermissionsRequest(iggcon.UpdatePermissionsRequest{
+	_, err := c.do(&iggcon.UpdatePermissions{
 		UserID:      userID,
 		Permissions: permissions,
 	})
-	_, err := c.sendAndFetchResponse(message, iggcon.UpdatePermissionsCode)
 	return err
 }
 
 func (c *IggyTcpClient) ChangePassword(userID iggcon.Identifier, currentPassword string, newPassword string) error {
-	message := binaryserialization.SerializeChangePasswordRequest(iggcon.ChangePasswordRequest{
+	_, err := c.do(&iggcon.ChangePassword{
 		UserID:          userID,
 		CurrentPassword: currentPassword,
 		NewPassword:     newPassword,
 	})
-	_, err := c.sendAndFetchResponse(message, iggcon.ChangePasswordCode)
 	return err
 }

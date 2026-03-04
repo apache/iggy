@@ -1,10 +1,4 @@
-# C# SDK for [Iggy](https://github.com/apache/iggy)
-
-<div align="center">
-
-[![Nuget (with prereleases)](https://img.shields.io/nuget/v/Apache.Iggy)](https://www.nuget.org/packages/Apache.Iggy)
-
-</div>
+# C# SDK for [Iggy](https://github.com/apache/iggy) [![Nuget (with prereleases)](https://img.shields.io/nuget/v/Apache.Iggy)](https://www.nuget.org/packages/Apache.Iggy)
 
 ## Overview
 
@@ -34,6 +28,18 @@ The SDK supports two transport protocols:
 The SDK is built around the `IIggyClient` interface. To create a client instance:
 
 ```c#
+var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
+{
+    BaseAddress = "127.0.0.1:8090",
+    Protocol = Protocol.Tcp
+});
+
+await client.ConnectAsync();
+```
+
+Optionally, you can provide an `ILoggerFactory` for diagnostics and debugging (defaults to `NullLoggerFactory.Instance`):
+
+```c#
 var loggerFactory = LoggerFactory.Create(builder =>
 {
     builder
@@ -44,13 +50,12 @@ var loggerFactory = LoggerFactory.Create(builder =>
 var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
 {
     BaseAddress = "127.0.0.1:8090",
-    Protocol = Protocol.Tcp
-}, loggerFactory);
+    Protocol = Protocol.Tcp,
+    LoggerFactory = loggerFactory
+});
 
 await client.ConnectAsync();
 ```
-
-The `ILoggerFactory` is required and used throughout the SDK for diagnostics and debugging.
 
 ### Configuration
 
@@ -67,7 +72,7 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
     SendBufferSize = 4096,
 
     // TLS/SSL configuration
-    TlsSettings = new TlsConfiguration
+    TlsSettings = new TlsSettings
     {
         Enabled = true,
         Hostname = "iggy",
@@ -92,8 +97,11 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         Enabled = true,
         Username = "your_username",
         Password = "your_password"
-    }
-}, loggerFactory);
+    },
+
+    // Optional: logging
+    LoggerFactory = loggerFactory
+});
 
 await client.ConnectAsync();
 ```
@@ -256,6 +264,19 @@ await client.SendMessagesAsync(
 );
 ```
 
+### Flushing Unsaved Buffer
+
+Force a flush of the in-memory buffer to disk for a specific partition:
+
+```c#
+await client.FlushUnsavedBufferAsync(
+    Identifier.String("my-stream"),
+    Identifier.String("my-topic"),
+    partitionId: 1,
+    fsync: true
+);
+```
+
 ## Consumer Groups
 
 ### Creating Consumer Groups
@@ -412,6 +433,45 @@ Get information about connected clients:
 ```c#
 var clients = await client.GetClientsAsync();
 var currentClient = await client.GetMeAsync();
+```
+
+### Snapshots
+
+Capture a system snapshot as a compressed ZIP archive:
+
+```c#
+var snapshotBytes = await client.GetSnapshotAsync(
+    SnapshotCompression.Zstd,
+    new List<SystemSnapshotType>
+    {
+        SystemSnapshotType.ServerLogs,
+        SystemSnapshotType.ServerConfig,
+        SystemSnapshotType.ResourceUsage
+    }
+);
+
+// Or capture everything
+var fullSnapshot = await client.GetSnapshotAsync(
+    SnapshotCompression.Deflated,
+    new List<SystemSnapshotType> { SystemSnapshotType.All }
+);
+```
+
+Available compression methods: `Stored`, `Deflated`, `Bzip2`, `Zstd`, `Lzma`, `Xz`.
+
+Available snapshot types: `FilesystemOverview`, `ProcessList`, `ResourceUsage`, `Test`, `ServerLogs`, `ServerConfig`, `All`.
+
+### Segment Management
+
+Delete the last N segments from a partition:
+
+```c#
+await client.DeleteSegmentsAsync(
+    Identifier.String("my-stream"),
+    Identifier.String("my-topic"),
+    partitionId: 1,
+    segmentsCount: 2
+);
 ```
 
 ## Event Subscription
@@ -571,6 +631,7 @@ The SDK provides the following main interfaces:
 - **IIggyOffset** - Offset management
 - **IIggyConsumerGroup** - Consumer group operations
 - **IIggyPartition** - Partition operations
+- **IIggySegment** - Segment management
 - **IIggyUsers** - User and authentication management
 - **IIggySystem** - System and cluster operations
 - **IIggyPersonalAccessToken** - Personal access token management
@@ -582,24 +643,25 @@ Additionally, builder-based APIs are available:
 
 ## Running Examples
 
-Examples are located in `examples/csharp/` in root iggy directory.
+Examples are located in `examples/csharp/src/` in root iggy directory. Available examples:
 
-- Start the Iggy server:
+- **GettingStarted** - Basic producer/consumer setup
+- **Basic** - Simple message publishing and consuming
+- **MessageHeaders** - Using custom message headers
+- **MessageEnvelope** - Envelope pattern for message serialization
+- **NewSdk** - High-level IggyPublisher/IggyConsumer API
+
+Start the Iggy server:
 
 ```bash
 cargo run --bin iggy-server
 ```
 
-- Run the producer example:
+Run an example (from the `examples/csharp/` directory):
 
 ```bash
-dotnet run -c Release --project Iggy_SDK.Examples.GettingStarted.Producer
-```
-
-- Run the consumer example:
-
-```bash
-dotnet run -c Release --project Iggy_SDK.Examples.GettingStarted.Consumer
+dotnet run -c Release --project src/GettingStarted/Iggy_SDK.Examples.GettingStarted.Producer
+dotnet run -c Release --project src/GettingStarted/Iggy_SDK.Examples.GettingStarted.Consumer
 ```
 
 ## Integration Tests
@@ -611,7 +673,7 @@ Integration tests are located in `Iggy_SDK.Tests.Integration/`. Tests can run ag
 
 ### Requirements
 
-- .NET 8 SDK
+- .NET 10 SDK
 - Docker (for TestContainers tests)
 
 ### Running Integration Tests Locally
@@ -633,8 +695,9 @@ dotnet build foreign/csharp/Iggy_SDK.Tests.Integration
 #### 3. Run test
 
 ```bash
+cd foreign/csharp
 export IGGY_SERVER_DOCKER_IMAGE=local-iggy-server
-dotnet test foreign/csharp/Iggy_SDK.Tests.Integration --no-build --verbosity diagnostic
+dotnet test -f net10.0 --project Iggy_SDK.Tests.Integration --no-build --verbosity diagnostic
 ```
 
 ## Useful Resources

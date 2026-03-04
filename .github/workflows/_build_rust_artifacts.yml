@@ -144,7 +144,15 @@ jobs:
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
           fi
 
-          cargo build --locked --release --target ${{ matrix.target }} "${bin_flags[@]}"
+          # iggy-bench-dashboard-server enables charming's "ssr" feature (deno_core -> v8).
+          # rusty_v8 has no prebuilt static libraries for any musl target, so exclude
+          # dashboard crates to prevent cargo feature unification from pulling V8.
+          exclude_flags=()
+          if [[ "${{ matrix.libc }}" == "musl" ]]; then
+            exclude_flags+=(--workspace --exclude iggy-bench-dashboard-server --exclude bench-dashboard-frontend)
+          fi
+
+          cargo build --locked --release --target ${{ matrix.target }} "${bin_flags[@]}" "${exclude_flags[@]}"
 
       - name: Package binaries
         id: pkg
