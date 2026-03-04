@@ -27,6 +27,7 @@ use crate::utils::checksum;
 use crate::{HeaderKey, IggyMessageHeaderView};
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
 /// A immutable view of a message.
 #[derive(Debug)]
@@ -161,12 +162,7 @@ impl Sizeable for IggyMessageView<'_> {
 pub struct IggyMessageViewIterator<'a> {
     buffer: &'a [u8],
     position: usize,
-    indexed: Option<IggyMessageViewIteratorIndexed<'a>>,
-}
-
-struct IggyMessageViewIteratorIndexed<'a> {
-    boundaries: IggyMessageBoundaries<'a>,
-    next_index: usize,
+    indexed_last: Option<(usize, NonZeroUsize)>,
 }
 
 impl<'a> IggyMessageViewIterator<'a> {
@@ -174,7 +170,7 @@ impl<'a> IggyMessageViewIterator<'a> {
         Self {
             buffer,
             position: 0,
-            indexed: None,
+            indexed_last: None,
         }
     }
 
@@ -187,11 +183,11 @@ impl<'a> IggyMessageViewIterator<'a> {
         let mut iter = Self::new(messages);
         if let Some(boundaries) =
             IggyMessageBoundaries::new(indexes, messages.len(), base_position, count)
+            && boundaries.count() > 0
         {
-            iter.indexed = Some(IggyMessageViewIteratorIndexed {
-                boundaries,
-                next_index: 0,
-            });
+            iter.indexed_last = boundaries
+                .boundaries(boundaries.count() - 1)
+                .and_then(|(start, end)| Some((start, NonZeroUsize::new(end)?)));
         }
         iter
     }
@@ -201,17 +197,6 @@ impl<'a> Iterator for IggyMessageViewIterator<'a> {
     type Item = IggyMessageView<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(indexed) = &mut self.indexed {
-            if indexed.next_index >= indexed.boundaries.count() {
-                return None;
-            }
-
-            let (start, end) = indexed.boundaries.boundaries(indexed.next_index)?;
-            indexed.next_index += 1;
-            self.position = end;
-            return IggyMessageView::new(&self.buffer[start..end]).ok();
-        }
-
         if self.position >= self.buffer.len() {
             return None;
         }
@@ -223,12 +208,11 @@ impl<'a> Iterator for IggyMessageViewIterator<'a> {
     }
 
     fn last(self) -> Option<Self::Item> {
-        if let Some(indexed) = &self.indexed
-            && indexed.next_index < indexed.boundaries.count()
+        if self.position == 0
+            && let Some((start, end)) = self.indexed_last
+            && let Ok(view) = IggyMessageView::new(&self.buffer[start..end.get()])
         {
-            let last_index = indexed.boundaries.count() - 1;
-            let (start, end) = indexed.boundaries.boundaries(last_index)?;
-            return IggyMessageView::new(&self.buffer[start..end]).ok();
+            return Some(view);
         }
 
         let mut last = None;
