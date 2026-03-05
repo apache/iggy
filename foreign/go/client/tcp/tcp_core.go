@@ -18,10 +18,12 @@
 package tcp
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -296,7 +298,6 @@ func (c *IggyTcpClient) connect() error {
 		}
 	}
 
-	// TODO handle tls logic
 	var conn net.Conn
 	if err := retry.Do(
 		func() error {
@@ -325,8 +326,42 @@ func (c *IggyTcpClient) connect() error {
 				return nil
 			}
 
-			// TODO TLS logic
-			return errors.New("TLS connection is not implemented yet")
+			// Build TLS configuration.
+			tlsServerName := c.config.tlsDomain
+			if tlsServerName == "" {
+				// Extract hostname/IP from serverAddress when tlsDomain is not set.
+				host, _, splitErr := net.SplitHostPort(c.currentServerAddress)
+				if splitErr == nil {
+					tlsServerName = host
+				} else {
+					tlsServerName = c.currentServerAddress
+				}
+			}
+
+			tlsCfg := &tls.Config{
+				ServerName:         tlsServerName,
+				InsecureSkipVerify: !c.config.tlsValidateCertificate, //nolint:gosec
+			}
+
+			if c.config.tlsCAFile != "" {
+				caCert, err := os.ReadFile(c.config.tlsCAFile)
+				if err != nil {
+					return fmt.Errorf("failed to read TLS CA file %q: %w", c.config.tlsCAFile, err)
+				}
+				caCertPool := x509.NewCertPool()
+				if !caCertPool.AppendCertsFromPEM(caCert) {
+					return fmt.Errorf("failed to parse TLS CA certificate from %q", c.config.tlsCAFile)
+				}
+				tlsCfg.RootCAs = caCertPool
+			}
+
+			tlsConn := tls.Client(connection, tlsCfg)
+			if err := tlsConn.Handshake(); err != nil {
+				_ = tlsConn.Close()
+				return fmt.Errorf("TLS handshake failed: %w", err)
+			}
+			conn = tlsConn
+			return nil
 		},
 		retry.Attempts(uint(c.config.reconnection.maxRetries)),
 		retry.Delay(c.config.reconnection.interval),
