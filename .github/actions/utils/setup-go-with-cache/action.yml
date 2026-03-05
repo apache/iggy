@@ -15,35 +15,29 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# NOTE: this action sets up the Go toolchain + caching for dependencies,
-#       it is a convenience wrapper, so that we can use it in all workflows.
+# NOTE: Go builds are fast, so caching is disabled by default.
+# The read-cache/save-cache inputs exist for parity with setup-rust-with-cache
+# but both default to "false". Enable only if Go build times become a bottleneck.
 
 name: setup-go-with-cache
-description: Setup Go toolchain and comprehensive caching (go mod cache + golangci-lint cache)
+description: Setup Go toolchain and optional caching (go mod cache + golangci-lint cache)
 inputs:
   go-version:
     description: "Go version to use"
     required: false
     default: "1.23.0"
-  enabled:
-    description: "Whether to enable caching"
+  read-cache:
+    description: "Whether to read from cache"
     required: false
-    default: "true"
-  cache-dependency-path:
-    description: "Paths to go.sum files for caching (newline separated)"
+    default: "false"
+  save-cache:
+    description: "Whether to save cache"
     required: false
-    default: |
-      foreign/go/go.sum
-      bdd/go/go.sum
-      examples/go/go.sum
+    default: "false"
   download-deps:
     description: "Whether to download module dependencies"
     required: false
     default: "true"
-  golangci-lint-version:
-    description: "golangci-lint version for cache key"
-    required: false
-    default: "v1.61"
 
 runs:
   using: "composite"
@@ -52,11 +46,10 @@ runs:
       uses: actions/setup-go@v5
       with:
         go-version: ${{ inputs.go-version }}
-        cache: ${{ inputs.enabled == 'true' }}
-        cache-dependency-path: ${{ inputs.cache-dependency-path }}
+        cache: ${{ inputs.read-cache == 'true' }}
 
     - name: Setup additional Go module cache
-      if: inputs.enabled == 'true'
+      if: inputs.read-cache == 'true'
       uses: actions/cache@v4
       with:
         path: |
@@ -67,13 +60,13 @@ runs:
           go-mod-${{ runner.os }}-${{ runner.arch }}-
 
     - name: Setup golangci-lint cache
-      if: inputs.enabled == 'true'
+      if: inputs.read-cache == 'true'
       uses: actions/cache@v4
       with:
         path: ~/.cache/golangci-lint
-        key: golangci-lint-${{ runner.os }}-${{ inputs.golangci-lint-version }}-${{ hashFiles('**/go.sum') }}
+        key: golangci-lint-${{ runner.os }}-${{ hashFiles('**/go.sum') }}
         restore-keys: |
-          golangci-lint-${{ runner.os }}-${{ inputs.golangci-lint-version }}-
+          golangci-lint-${{ runner.os }}-
 
     - name: Download Go module dependencies
       if: inputs.download-deps == 'true'
