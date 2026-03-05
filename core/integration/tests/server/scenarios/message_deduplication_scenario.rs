@@ -30,7 +30,7 @@ pub async fn run(harness: &TestHarness) {
     init_system(&client).await;
 
     // Step 1: Duplicate rejection
-    // Send messages with IDs 1..10, then resend the same IDs.
+    // Send messages with IDs 1..`MESSAGES_PER_BATCH`, then resend the same IDs.
     // Only the first batch should be persisted.
     let mut original_messages = build_messages(1, MESSAGES_PER_BATCH, "original");
     client
@@ -69,7 +69,7 @@ pub async fn run(harness: &TestHarness) {
     }
 
     // Step 2: Unique messages pass through
-    // Send messages with new IDs 11..20 — these should all be accepted.
+    // Send messages with new IDs (`MESSAGES_PER_BATCH`+1)..(`MESSAGES_PER_BATCH`*2) — these should all be accepted.
     let mut new_messages = build_messages(MESSAGES_PER_BATCH + 1, MESSAGES_PER_BATCH, "new-unique");
     client
         .send_messages(
@@ -88,11 +88,37 @@ pub async fn run(harness: &TestHarness) {
         "Unique messages should have been accepted"
     );
 
-    // Step 3: TTL expiry re-accepts previously seen IDs
+    // Step 3: Partial deduplication
+    // Send a batch where half the IDs are duplicates and half are new.
+    // IDs `overlap_id_start`..(`overlap_id_start`+`MESSAGES_PER_BATCH`):
+    // IDs `overlap_id_start`..(`MESSAGES_PER_BATCH`*2) already exist (from Step 2),
+    // IDs (`MESSAGES_PER_BATCH`*2+1)..(`overlap_id_start`+`MESSAGES_PER_BATCH`) are new.
+    let overlap_id_start = 16;
+    let total_after_step3 = MESSAGES_PER_BATCH + overlap_id_start - 1;
+    // Ensure the `overlap_id_start` is between two batches.
+    assert!(overlap_id_start > MESSAGES_PER_BATCH && overlap_id_start < 2 * MESSAGES_PER_BATCH);
+    let mut mixed_messages = build_messages(overlap_id_start, MESSAGES_PER_BATCH, "mixed");
+    client
+        .send_messages(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            &Partitioning::partition_id(PARTITION_ID),
+            &mut mixed_messages,
+        )
+        .await
+        .unwrap();
+
+    let polled = poll_all(&client, MESSAGES_PER_BATCH * 4).await;
+    assert_eq!(
+        polled.messages.len() as u32,
+        total_after_step3,
+        "Only new IDs from the mixed batch should have been accepted"
+    );
+
+    // Step 4: TTL expiry re-accepts previously seen IDs
     // The server is configured with a 2s dedup expiry. Wait for it to elapse,
     // then resend the original IDs — they should be accepted again.
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-
     let mut reused_messages = build_messages(1, MESSAGES_PER_BATCH, "after-ttl");
     client
         .send_messages(
@@ -104,10 +130,10 @@ pub async fn run(harness: &TestHarness) {
         .await
         .unwrap();
 
-    let polled = poll_all(&client, MESSAGES_PER_BATCH * 4).await;
+    let polled = poll_all(&client, total_after_step3 + MESSAGES_PER_BATCH).await;
     assert_eq!(
         polled.messages.len() as u32,
-        MESSAGES_PER_BATCH * 3,
+        total_after_step3 + MESSAGES_PER_BATCH,
         "Previously seen IDs should be accepted again after TTL expiry"
     );
 

@@ -23,10 +23,10 @@ use crate::shard::transmission::event::PartitionInfo;
 use crate::shard::transmission::message::ResolvedTopic;
 use crate::streaming::partitions::consumer_group_offsets::ConsumerGroupOffsets;
 use crate::streaming::partitions::consumer_offsets::ConsumerOffsets;
+use crate::streaming::partitions::helpers::create_message_deduplicator;
 use crate::streaming::partitions::local_partition::LocalPartition;
 use crate::streaming::partitions::storage::create_partition_file_hierarchy;
 use crate::streaming::partitions::storage::delete_partitions_from_disk;
-use crate::streaming::partitions::helpers::create_message_deduplicator;
 use crate::streaming::segments::Segment;
 use crate::streaming::segments::storage::create_segment_storage;
 use crate::streaming::stats::PartitionStats;
@@ -281,8 +281,7 @@ impl IggyShard {
                 )
             });
 
-        let message_deduplicator =
-            create_message_deduplicator(&self.config.system).map(Arc::new);
+        let message_deduplicator = create_message_deduplicator(&self.config.system).map(Arc::new);
 
         let partition = LocalPartition::with_log(
             loaded_log,
