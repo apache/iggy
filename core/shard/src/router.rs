@@ -136,7 +136,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StateMachine<Input = Message<PrepareHeader>>,
+        M: StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = bytes::Bytes,
+                Error = iggy_common::IggyError,
+            >,
     {
         loop {
             futures::select! {
@@ -165,7 +169,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StateMachine<Input = Message<PrepareHeader>>,
+        M: StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = bytes::Bytes,
+                Error = iggy_common::IggyError,
+            >,
     {
         self.on_message(frame.message).await;
         // TODO: once on_message returns an R (e.g. ShardResponse), send it

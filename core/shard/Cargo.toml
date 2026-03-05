@@ -21,6 +21,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytes = { workspace = true }
 consensus = { path = "../consensus" }
 crossfire = { workspace = true }
 futures = { workspace = true }

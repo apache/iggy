@@ -2165,6 +2165,8 @@ name = "consensus"
 version = "0.1.0"
 dependencies = [
  "bit-set",
+ "bytemuck",
+ "bytes",
  "futures",
  "iggy_common",
  "message_bus",
@@ -6398,6 +6400,7 @@ name = "metadata"
 version = "0.1.0"
 dependencies = [
  "ahash 0.8.12",
+ "bytes",
  "consensus",
  "iggy_common",
  "journal",
@@ -7293,6 +7296,7 @@ dependencies = [
 name = "partitions"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "consensus",
  "iggy_common",
  "journal",
@@ -9390,6 +9394,7 @@ dependencies = [
 name = "shard"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "consensus",
  "crossfire",
  "futures",
