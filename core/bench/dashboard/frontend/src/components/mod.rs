@@ -17,7 +17,7 @@
 
 pub mod app_content;
 pub mod chart;
-// pub mod common; // Removed unused module
+pub mod embed_modal;
 pub mod footer;
 pub mod layout;
 pub mod selectors;

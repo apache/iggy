@@ -35,6 +35,7 @@ impl BenchmarkCache {
             .map_err(IggyBenchDashboardServerError::Io)?
             .filter_map(|r: std::result::Result<std::fs::DirEntry, std::io::Error>| r.ok())
             .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter(|entry| entry.file_name() != "embed_cache")
             .collect();
 
         let mut total_removed_size = 0;

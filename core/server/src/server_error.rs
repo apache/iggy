@@ -37,34 +37,8 @@ error_set!(
     }
 
     NumaError := {
-        #[display("Failed to detect topology: {}", msg)]
-        TopologyDetection {
-            msg: String
-        },
-
-        #[display("There is no NUMA node on this server")]
-        NoNumaNodes,
-
-        #[display("No Topology")]
-        NoTopology,
-
-        #[display("Binding Failed")]
-        BindingFailed,
-
-        #[display("Insufficient cores on node {}: requested {}, only {} available", node, requested, available)]
-        InsufficientCores {
-            requested: usize,
-            available: usize,
-            node: usize,
-        },
-
-        #[display("Invalid NUMA node: requested {}, only available {} node", requested, available)]
-        InvalidNode { requested: usize, available: usize },
-
-        #[display("Other error: {}", msg)]
-        Other {
-            msg: String
-        },
+        #[display("{0}")]
+        Sharding(crate::shard_allocator::ShardingError),
     }
 
     ConfigurationError := {

@@ -47,7 +47,7 @@ public sealed class TcpMessageStream : IIggyClient
     private readonly SemaphoreSlim _connectionSemaphore;
     private readonly ILogger<TcpMessageStream> _logger;
     private readonly SemaphoreSlim _sendingSemaphore;
-    private ClusterNode? _currentLeaderNode;
+    private string _currentAddress = string.Empty;
     private X509Certificate2Collection _customCaStore = [];
     private bool _isConnecting;
     private DateTimeOffset _lastConnectionTime;
@@ -87,6 +87,12 @@ public sealed class TcpMessageStream : IIggyClient
     public void UnsubscribeConnectionEvents(Func<ConnectionStateChangedEventArgs, Task> callback)
     {
         _connectionEvents.Unsubscribe(callback);
+    }
+
+    /// <inheritdoc />
+    public string GetCurrentAddress()
+    {
+        return _currentAddress;
     }
 
     /// <inheritdoc />
@@ -736,6 +742,13 @@ public sealed class TcpMessageStream : IIggyClient
 
         var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..responseBuffer.Length]);
         SetConnectionStateAsync(ConnectionState.Authenticated);
+
+        if (await RedirectAsync(token))
+        {
+            await ConnectAsync(token);
+            return await LoginUser(userName, password, token);
+        }
+
         var authResponse = new AuthResponse(userId, null);
         return authResponse;
     }
@@ -803,6 +816,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE);
 
+        SetConnectionStateAsync(ConnectionState.Authenticating);
         var responseBuffer = await SendWithResponseAsync(payload, ct);
 
         if (responseBuffer.Length <= 1)
@@ -812,8 +826,15 @@ public sealed class TcpMessageStream : IIggyClient
 
         var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..4]);
 
-        //TODO: Figure out how to solve this workaround about default of TokenInfo
-        return new AuthResponse(userId, default);
+        SetConnectionStateAsync(ConnectionState.Authenticated);
+
+        if (await RedirectAsync(ct))
+        {
+            await ConnectAsync(ct);
+            return await LoginWithPersonalAccessToken(token, ct);
+        }
+
+        return new AuthResponse(userId, null);
     }
 
     private async Task TryEstablishConnectionAsync(CancellationToken token)
@@ -826,10 +847,12 @@ public sealed class TcpMessageStream : IIggyClient
             _stream?.Close();
             _stream?.Dispose();
 
-            var connectionAddress = _currentLeaderNode != null
-                ? $"{_currentLeaderNode.Ip}:{_currentLeaderNode.Endpoints.Tcp}"
-                : _configuration.BaseAddress;
-            var urlPortSplitter = connectionAddress.Split(":");
+            if (string.IsNullOrEmpty(_currentAddress))
+            {
+                _currentAddress = _configuration.BaseAddress;
+            }
+
+            var urlPortSplitter = _currentAddress.Split(":");
             if (urlPortSplitter.Length > 2)
             {
                 throw new InvalidBaseAddressException();
@@ -861,22 +884,6 @@ public sealed class TcpMessageStream : IIggyClient
                         _configuration.AutoLoginSettings.Username);
                     await LoginUser(_configuration.AutoLoginSettings.Username,
                         _configuration.AutoLoginSettings.Password, token);
-
-                    _currentLeaderNode = await GetCurrentLeaderNodeAsync(token);
-                    if (_currentLeaderNode == null)
-                    {
-                        break;
-                    }
-
-                    var currentAddress = $"{_currentLeaderNode.Ip}:{_currentLeaderNode.Endpoints.Tcp}";
-                    if (currentAddress == _configuration.BaseAddress)
-                    {
-                        break;
-                    }
-
-                    _logger.LogInformation("Leader address changed. Trying to reconnect to {Address}",
-                        currentAddress);
-                    continue;
                 }
 
                 break;
@@ -1203,5 +1210,29 @@ public sealed class TcpMessageStream : IIggyClient
         }
 
         return false;
+    }
+
+    private async Task<bool> RedirectAsync(CancellationToken token)
+    {
+        var currentLeaderNode = await GetCurrentLeaderNodeAsync(token);
+        if (currentLeaderNode == null)
+        {
+            return false;
+        }
+
+        var leaderAddress = $"{currentLeaderNode.Ip}:{currentLeaderNode.Endpoints.Tcp}";
+        if (leaderAddress == _currentAddress)
+        {
+            return false;
+        }
+
+        _currentAddress = leaderAddress;
+
+        _logger.LogInformation("Leader address changed. Trying to reconnect to {Address}",
+            leaderAddress);
+
+        _stream.Close();
+        SetConnectionStateAsync(ConnectionState.Disconnected);
+        return true;
     }
 }

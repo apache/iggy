@@ -16,6 +16,7 @@
 // under the License.
 
 use bytemuck::{Pod, Zeroable};
+use enumset::EnumSetType;
 use thiserror::Error;
 
 const HEADER_SIZE: usize = 256;
@@ -28,7 +29,7 @@ pub trait ConsensusHeader: Sized + Pod + Zeroable {
     fn size(&self) -> u32;
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, EnumSetType)]
 #[repr(u8)]
 pub enum Command2 {
     #[default]
@@ -121,6 +122,46 @@ pub enum Operation {
     StoreConsumerOffset = 161,
 
     Reserved = 200,
+}
+
+impl Operation {
+    /// Returns `true` for metadata / control-plane operations (streams, topics,
+    /// users, consumer groups, etc.) that are always handled by shard 0.
+    #[inline]
+    pub fn is_metadata(&self) -> bool {
+        matches!(
+            self,
+            Operation::CreateStream
+                | Operation::UpdateStream
+                | Operation::DeleteStream
+                | Operation::PurgeStream
+                | Operation::CreateTopic
+                | Operation::UpdateTopic
+                | Operation::DeleteTopic
+                | Operation::PurgeTopic
+                | Operation::CreatePartitions
+                | Operation::DeletePartitions
+                | Operation::CreateConsumerGroup
+                | Operation::DeleteConsumerGroup
+                | Operation::CreateUser
+                | Operation::UpdateUser
+                | Operation::DeleteUser
+                | Operation::ChangePassword
+                | Operation::UpdatePermissions
+                | Operation::CreatePersonalAccessToken
+                | Operation::DeletePersonalAccessToken
+        )
+    }
+
+    /// Returns `true` for data-plane operations that are routed to the shard
+    /// owning the partition identified by the message's namespace.
+    #[inline]
+    pub fn is_partition(&self) -> bool {
+        matches!(
+            self,
+            Operation::SendMessages | Operation::StoreConsumerOffset | Operation::DeleteSegments
+        )
+    }
 }
 
 #[repr(C)]
