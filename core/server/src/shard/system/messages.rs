@@ -356,6 +356,10 @@ impl IggyShard {
             )
             .await;
 
+        if batch.count() == 0 {
+            return Ok(());
+        }
+
         let (journal_messages_count, journal_size, is_full) = {
             let mut partitions = self.local_partitions.borrow_mut();
             let partition = partitions

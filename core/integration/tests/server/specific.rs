@@ -18,8 +18,8 @@
  */
 
 use crate::server::scenarios::{
-    message_size_scenario, segment_rotation_race_scenario, single_message_per_batch_scenario,
-    tcp_tls_scenario, websocket_tls_scenario,
+    message_deduplication_scenario, message_size_scenario, segment_rotation_race_scenario,
+    single_message_per_batch_scenario, tcp_tls_scenario, websocket_tls_scenario,
 };
 use integration::iggy_harness;
 
@@ -85,4 +85,12 @@ async fn should_handle_single_message_per_batch_with_delayed_persistence(harness
 ))]
 async fn segment_rotation_scenario(harness: &TestHarness) {
     segment_rotation_race_scenario::run(harness).await;
+}
+
+#[iggy_harness(server(
+    system.message_deduplication.enabled = true,
+    system.message_deduplication.expiry = "2s"
+))]
+async fn message_deduplication(harness: &TestHarness) {
+    message_deduplication_scenario::run(harness).await;
 }
