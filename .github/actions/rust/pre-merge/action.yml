@@ -76,7 +76,7 @@ runs:
 
     - name: Cargo sort
       if: inputs.task == 'sort'
-      run: cargo sort --check --workspace
+      run: cargo sort --check --no-format --workspace
       shell: bash
 
     - name: Cargo machete
@@ -94,9 +94,11 @@ runs:
     - name: Install dependencies for Rust tests
       if: inputs.task == 'test' && runner.os == 'Linux'
       run: |
-        sudo apt-get update --yes && sudo apt-get install --yes musl-tools gnome-keyring keyutils
+        sudo apt-get update --yes && sudo apt-get install --yes musl-tools gnome-keyring keyutils dbus-x11
         rm -f $HOME/.local/share/keyrings/*
-        echo -n "test" | gnome-keyring-daemon --unlock
+        eval $(dbus-launch --sh-syntax)
+        echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> $GITHUB_ENV
+        echo -n "test" | gnome-keyring-daemon --unlock --components=secrets
       shell: bash
 
     - name: Install cargo-llvm-cov

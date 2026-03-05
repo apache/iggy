@@ -198,33 +198,44 @@ where
 pub fn build_reply_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     prepare_header: &PrepareHeader,
+    body: bytes::Bytes,
 ) -> Message<ReplyHeader>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
     P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
 {
-    Message::<ReplyHeader>::new(std::mem::size_of::<ReplyHeader>()).transmute_header(|_, new| {
-        *new = ReplyHeader {
-            checksum: 0,
-            checksum_body: 0,
-            cluster: consensus.cluster(),
-            size: std::mem::size_of::<ReplyHeader>() as u32,
-            view: consensus.view(),
-            release: 0,
-            command: Command2::Reply,
-            replica: consensus.replica(),
-            reserved_frame: [0; 66],
-            request_checksum: prepare_header.request_checksum,
-            context: 0,
-            op: prepare_header.op,
-            commit: consensus.commit(),
-            timestamp: prepare_header.timestamp,
-            request: prepare_header.request,
-            operation: prepare_header.operation,
-            namespace: prepare_header.namespace,
-            ..Default::default()
-        };
-    })
+    let header_size = std::mem::size_of::<ReplyHeader>();
+    let total_size = header_size + body.len();
+    let mut buffer = bytes::BytesMut::zeroed(total_size);
+
+    let header = bytemuck::from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size]);
+    *header = ReplyHeader {
+        checksum: 0,
+        checksum_body: 0,
+        cluster: consensus.cluster(),
+        size: total_size as u32,
+        view: consensus.view(),
+        release: 0,
+        command: Command2::Reply,
+        replica: consensus.replica(),
+        reserved_frame: [0; 66],
+        request_checksum: prepare_header.request_checksum,
+        context: 0,
+        op: prepare_header.op,
+        commit: consensus.commit(),
+        timestamp: prepare_header.timestamp,
+        request: prepare_header.request,
+        operation: prepare_header.operation,
+        namespace: prepare_header.namespace,
+        ..Default::default()
+    };
+
+    if !body.is_empty() {
+        buffer[header_size..].copy_from_slice(&body);
+    }
+
+    Message::<ReplyHeader>::from_bytes(buffer.freeze())
+        .expect("build_reply_message: constructed header must be valid")
 }
 
 /// Verify hash chain would not break if we add this header.
@@ -296,25 +307,11 @@ pub async fn send_prepare_ok<B, P>(
     let message: Message<PrepareOkHeader> =
         Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>())
             .transmute_header(|_, new| *new = prepare_ok_header);
-    let generic_message = message.into_generic();
     let primary = consensus.primary_index(consensus.view());
 
-    // TODO: Propagate send errors instead of panicking; requires bus error design.
-    if primary == consensus.replica() {
-        // TODO: Queue for self-processing or call handle_prepare_ok directly.
-        // TODO: This is temporal, to test simulator, but we should send message to ourselves properly.
-        consensus
-            .message_bus()
-            .send_to_replica(primary, generic_message)
-            .await
-            .unwrap();
-    } else {
-        consensus
-            .message_bus()
-            .send_to_replica(primary, generic_message)
-            .await
-            .unwrap();
-    }
+    consensus
+        .send_or_loopback(primary, message.into_generic())
+        .await;
 }
 
 #[cfg(test)]
@@ -377,6 +374,230 @@ mod tests {
                 };
             },
         )
+    }
+
+    #[test]
+    fn loopback_push_and_drain() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+
+        let mut buf = Vec::new();
+        consensus.drain_loopback_into(&mut buf);
+        assert!(buf.is_empty());
+
+        let msg = Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>());
+        consensus.push_loopback(msg.into_generic());
+        consensus.drain_loopback_into(&mut buf);
+        assert_eq!(buf.len(), 1);
+        buf.clear();
+        consensus.drain_loopback_into(&mut buf);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn loopback_cleared_on_view_change_reset() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+
+        let msg = Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>());
+        consensus.push_loopback(msg.into_generic());
+        consensus.reset_view_change_state();
+        let mut buf = Vec::new();
+        consensus.drain_loopback_into(&mut buf);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn send_prepare_ok_pushes_to_loopback_when_primary() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+
+        let prepare_header = PrepareHeader {
+            command: Command2::Prepare,
+            cluster: 1,
+            view: 0,
+            op: 0,
+            checksum: 42,
+            ..Default::default()
+        };
+
+        futures::executor::block_on(send_prepare_ok(&consensus, &prepare_header, Some(true)));
+
+        let mut buf = Vec::new();
+        consensus.drain_loopback_into(&mut buf);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0].header().command, Command2::PrepareOk);
+
+        let typed: Message<PrepareOkHeader> = buf
+            .remove(0)
+            .try_into_typed()
+            .expect("loopback message must be PrepareOk");
+        assert_eq!(typed.header().command, Command2::PrepareOk);
+    }
+
+    #[test]
+    fn loopback_cleared_on_complete_view_change_as_primary() {
+        use iggy_common::header::{DoViewChangeHeader, StartViewChangeHeader};
+
+        // 3 replicas, replica 0 is primary for view 0 (and view 3: 3 % 3 = 0).
+        let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+
+        // SVC from replica 1 for view 3.
+        // Replica 0 advances to view 3 (reset_view_change_state clears loopback),
+        // records own SVC + DVC, and records replica 1's SVC. DVC quorum needs 2, have 1.
+        let svc = StartViewChangeHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 3,
+            release: 0,
+            command: Command2::StartViewChange,
+            replica: 1,
+            reserved_frame: [0; 66],
+            namespace: 0,
+            reserved: [0; 120],
+        };
+        let _ = consensus.handle_start_view_change(&svc);
+
+        // Simulate an in-flight loopback message queued between SVC and DVC quorum.
+        let stale_msg = Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>());
+        consensus.push_loopback(stale_msg.into_generic());
+
+        // DVC from replica 2 for view 3 -- quorum reached, complete_view_change_as_primary fires.
+        let dvc = DoViewChangeHeader {
+            checksum: 0,
+            checksum_body: 0,
+            cluster: 0,
+            size: 0,
+            view: 3,
+            release: 0,
+            command: Command2::DoViewChange,
+            replica: 2,
+            reserved_frame: [0; 66],
+            op: 0,
+            commit: 0,
+            namespace: 0,
+            log_view: 0,
+            reserved: [0; 100],
+        };
+        let actions = consensus.handle_do_view_change(&dvc);
+
+        // View change completed: should have SendStartView action.
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, crate::VsrAction::SendStartView { .. })),
+            "expected SendStartView action after DVC quorum"
+        );
+
+        // The stale loopback message must have been cleared.
+        let mut buf = Vec::new();
+        consensus.drain_loopback_into(&mut buf);
+        assert!(
+            buf.is_empty(),
+            "loopback queue must be empty after view change completion"
+        );
+    }
+
+    #[test]
+    fn send_prepare_ok_sends_to_bus_when_not_primary() {
+        let consensus = VsrConsensus::new(1, 1, 3, 0, NoopBus, LocalPipeline::new());
+        consensus.init();
+
+        let prepare_header = PrepareHeader {
+            command: Command2::Prepare,
+            cluster: 1,
+            view: 0,
+            op: 0,
+            checksum: 42,
+            ..Default::default()
+        };
+
+        futures::executor::block_on(send_prepare_ok(&consensus, &prepare_header, Some(true)));
+
+        let mut buf = Vec::new();
+        consensus.drain_loopback_into(&mut buf);
+        assert!(buf.is_empty());
+    }
+
+    struct SpyBus {
+        sent: std::cell::RefCell<Vec<(u8, Message<GenericHeader>)>>,
+    }
+
+    impl SpyBus {
+        fn new() -> Self {
+            Self {
+                sent: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl MessageBus for SpyBus {
+        type Client = u128;
+        type Replica = u8;
+        type Data = Message<GenericHeader>;
+        type Sender = ();
+
+        fn add_client(&mut self, _client: Self::Client, _sender: Self::Sender) -> bool {
+            true
+        }
+        fn remove_client(&mut self, _client: Self::Client) -> bool {
+            true
+        }
+        fn add_replica(&mut self, _replica: Self::Replica) -> bool {
+            true
+        }
+        fn remove_replica(&mut self, _replica: Self::Replica) -> bool {
+            true
+        }
+        async fn send_to_client(
+            &self,
+            _client_id: Self::Client,
+            _data: Self::Data,
+        ) -> Result<(), IggyError> {
+            Ok(())
+        }
+        async fn send_to_replica(
+            &self,
+            replica: Self::Replica,
+            data: Self::Data,
+        ) -> Result<(), IggyError> {
+            self.sent.borrow_mut().push((replica, data));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn send_or_loopback_routes_self_to_queue() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, SpyBus::new(), LocalPipeline::new());
+        consensus.init();
+
+        let msg = Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>());
+        futures::executor::block_on(consensus.send_or_loopback(0, msg.into_generic()));
+
+        let mut buf = Vec::new();
+        consensus.drain_loopback_into(&mut buf);
+        assert_eq!(buf.len(), 1);
+        assert!(consensus.message_bus().sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn send_or_loopback_routes_other_to_bus() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, SpyBus::new(), LocalPipeline::new());
+        consensus.init();
+
+        let msg = Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>());
+        futures::executor::block_on(consensus.send_or_loopback(1, msg.into_generic()));
+
+        let mut buf = Vec::new();
+        consensus.drain_loopback_into(&mut buf);
+        assert!(buf.is_empty());
+
+        let sent = consensus.message_bus().sent.borrow();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, 1);
     }
 
     #[test]

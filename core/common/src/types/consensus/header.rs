@@ -124,6 +124,46 @@ pub enum Operation {
     Reserved = 200,
 }
 
+impl Operation {
+    /// Returns `true` for metadata / control-plane operations (streams, topics,
+    /// users, consumer groups, etc.) that are always handled by shard 0.
+    #[inline]
+    pub fn is_metadata(&self) -> bool {
+        matches!(
+            self,
+            Operation::CreateStream
+                | Operation::UpdateStream
+                | Operation::DeleteStream
+                | Operation::PurgeStream
+                | Operation::CreateTopic
+                | Operation::UpdateTopic
+                | Operation::DeleteTopic
+                | Operation::PurgeTopic
+                | Operation::CreatePartitions
+                | Operation::DeletePartitions
+                | Operation::CreateConsumerGroup
+                | Operation::DeleteConsumerGroup
+                | Operation::CreateUser
+                | Operation::UpdateUser
+                | Operation::DeleteUser
+                | Operation::ChangePassword
+                | Operation::UpdatePermissions
+                | Operation::CreatePersonalAccessToken
+                | Operation::DeletePersonalAccessToken
+        )
+    }
+
+    /// Returns `true` for data-plane operations that are routed to the shard
+    /// owning the partition identified by the message's namespace.
+    #[inline]
+    pub fn is_partition(&self) -> bool {
+        matches!(
+            self,
+            Operation::SendMessages | Operation::StoreConsumerOffset | Operation::DeleteSegments
+        )
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct GenericHeader {

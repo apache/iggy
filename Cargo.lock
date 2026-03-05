@@ -2165,6 +2165,9 @@ name = "consensus"
 version = "0.1.0"
 dependencies = [
  "bit-set",
+ "bytemuck",
+ "bytes",
+ "futures",
  "iggy_common",
  "message_bus",
  "rand 0.10.0",
@@ -2418,6 +2421,18 @@ name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+
+[[package]]
+name = "crossfire"
+version = "3.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fb12e9c05ae4854f743f0acec2f817148ba59a902484f6aa298d4fc7df2fac4"
+dependencies = [
+ "crossbeam-utils",
+ "futures-core",
+ "parking_lot",
+ "smallvec",
+]
 
 [[package]]
 name = "crossterm"
@@ -6368,6 +6383,7 @@ name = "metadata"
 version = "0.1.0"
 dependencies = [
  "ahash 0.8.12",
+ "bytes",
  "consensus",
  "iggy_common",
  "journal",
@@ -7263,6 +7279,7 @@ dependencies = [
 name = "partitions"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "consensus",
  "iggy_common",
  "journal",
@@ -8726,7 +8743,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9360,12 +9377,18 @@ dependencies = [
 name = "shard"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "consensus",
+ "crossfire",
+ "futures",
+ "hash32 1.0.0",
  "iggy_common",
  "journal",
  "message_bus",
  "metadata",
+ "papaya",
  "partitions",
+ "tracing",
 ]
 
 [[package]]

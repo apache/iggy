@@ -29,7 +29,12 @@ readme = "../../../README.md"
 
 [dependencies]
 bit-set = { workspace = true }
+bytemuck = { workspace = true }
+bytes = { workspace = true }
 iggy_common = { workspace = true }
 message_bus = { workspace = true }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
