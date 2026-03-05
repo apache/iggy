@@ -198,33 +198,44 @@ where
 pub fn build_reply_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     prepare_header: &PrepareHeader,
+    body: bytes::Bytes,
 ) -> Message<ReplyHeader>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
     P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
 {
-    Message::<ReplyHeader>::new(std::mem::size_of::<ReplyHeader>()).transmute_header(|_, new| {
-        *new = ReplyHeader {
-            checksum: 0,
-            checksum_body: 0,
-            cluster: consensus.cluster(),
-            size: std::mem::size_of::<ReplyHeader>() as u32,
-            view: consensus.view(),
-            release: 0,
-            command: Command2::Reply,
-            replica: consensus.replica(),
-            reserved_frame: [0; 66],
-            request_checksum: prepare_header.request_checksum,
-            context: 0,
-            op: prepare_header.op,
-            commit: consensus.commit(),
-            timestamp: prepare_header.timestamp,
-            request: prepare_header.request,
-            operation: prepare_header.operation,
-            namespace: prepare_header.namespace,
-            ..Default::default()
-        };
-    })
+    let header_size = std::mem::size_of::<ReplyHeader>();
+    let total_size = header_size + body.len();
+    let mut buffer = bytes::BytesMut::zeroed(total_size);
+
+    let header = bytemuck::from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size]);
+    *header = ReplyHeader {
+        checksum: 0,
+        checksum_body: 0,
+        cluster: consensus.cluster(),
+        size: total_size as u32,
+        view: consensus.view(),
+        release: 0,
+        command: Command2::Reply,
+        replica: consensus.replica(),
+        reserved_frame: [0; 66],
+        request_checksum: prepare_header.request_checksum,
+        context: 0,
+        op: prepare_header.op,
+        commit: consensus.commit(),
+        timestamp: prepare_header.timestamp,
+        request: prepare_header.request,
+        operation: prepare_header.operation,
+        namespace: prepare_header.namespace,
+        ..Default::default()
+    };
+
+    if !body.is_empty() {
+        buffer[header_size..].copy_from_slice(&body);
+    }
+
+    Message::<ReplyHeader>::from_bytes(buffer.freeze())
+        .expect("build_reply_message: constructed header must be valid")
 }
 
 /// Verify hash chain would not break if we add this header.
