@@ -63,7 +63,13 @@ pub fn from_records(
         total_messages,
     );
 
-    let latency_metrics = calculate_latency_metrics(records, &latency_ts);
+    let mut raw_latencies_ms: Vec<f64> = records
+        .iter()
+        .map(|r| r.latency_us as f64 / 1_000.0)
+        .collect();
+    raw_latencies_ms.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let latency_metrics = calculate_latency_metrics(&raw_latencies_ms, &latency_ts);
 
     BenchmarkIndividualMetrics {
         summary: BenchmarkIndividualMetricsSummary {
@@ -92,6 +98,7 @@ pub fn from_records(
         throughput_mb_ts,
         throughput_msg_ts,
         latency_ts,
+        raw_latencies_ms,
     }
 }
 
@@ -127,6 +134,7 @@ fn create_empty_metrics(
         throughput_mb_ts: TimeSeries::default(),
         throughput_msg_ts: TimeSeries::default(),
         latency_ts: TimeSeries::default(),
+        raw_latencies_ms: Vec::new(),
     }
 }
 
@@ -213,28 +221,22 @@ struct LatencyMetrics {
 }
 
 fn calculate_latency_metrics(
-    records: &[BenchmarkRecord],
+    sorted_latencies_ms: &[f64],
     latency_ts: &TimeSeries,
 ) -> LatencyMetrics {
-    let mut latencies_ms: Vec<f64> = records
-        .iter()
-        .map(|r| r.latency_us as f64 / 1_000.0)
-        .collect();
-    latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = calculate_percentile(sorted_latencies_ms, 50.0);
+    let p90 = calculate_percentile(sorted_latencies_ms, 90.0);
+    let p95 = calculate_percentile(sorted_latencies_ms, 95.0);
+    let p99 = calculate_percentile(sorted_latencies_ms, 99.0);
+    let p999 = calculate_percentile(sorted_latencies_ms, 99.9);
+    let p9999 = calculate_percentile(sorted_latencies_ms, 99.99);
 
-    let p50 = calculate_percentile(&latencies_ms, 50.0);
-    let p90 = calculate_percentile(&latencies_ms, 90.0);
-    let p95 = calculate_percentile(&latencies_ms, 95.0);
-    let p99 = calculate_percentile(&latencies_ms, 99.0);
-    let p999 = calculate_percentile(&latencies_ms, 99.9);
-    let p9999 = calculate_percentile(&latencies_ms, 99.99);
-
-    let avg = latencies_ms.iter().sum::<f64>() / latencies_ms.len() as f64;
-    let len = latencies_ms.len() / 2;
-    let median = if latencies_ms.len().is_multiple_of(2) {
-        f64::midpoint(latencies_ms[len - 1], latencies_ms[len])
+    let avg = sorted_latencies_ms.iter().sum::<f64>() / sorted_latencies_ms.len() as f64;
+    let len = sorted_latencies_ms.len() / 2;
+    let median = if sorted_latencies_ms.len().is_multiple_of(2) {
+        f64::midpoint(sorted_latencies_ms[len - 1], sorted_latencies_ms[len])
     } else {
-        latencies_ms[len]
+        sorted_latencies_ms[len]
     };
 
     let min = min(latency_ts).unwrap_or(0.0);
@@ -256,7 +258,7 @@ fn calculate_latency_metrics(
     }
 }
 
-fn calculate_percentile(sorted_data: &[f64], percentile: f64) -> f64 {
+pub fn calculate_percentile(sorted_data: &[f64], percentile: f64) -> f64 {
     if sorted_data.is_empty() {
         return 0.0;
     }

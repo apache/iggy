@@ -17,6 +17,7 @@
  */
 
 use super::HeaderValue;
+use super::message_boundaries::IggyMessageBoundaries;
 use super::message_header::*;
 use crate::BytesSerializable;
 use crate::IggyByteSize;
@@ -25,7 +26,8 @@ use crate::error::IggyError;
 use crate::utils::checksum;
 use crate::{HeaderKey, IggyMessageHeaderView};
 use bytes::{Bytes, BytesMut};
-use std::{collections::HashMap, iter::Iterator};
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
 /// A immutable view of a message.
 #[derive(Debug)]
@@ -160,6 +162,7 @@ impl Sizeable for IggyMessageView<'_> {
 pub struct IggyMessageViewIterator<'a> {
     buffer: &'a [u8],
     position: usize,
+    indexed_last: Option<(usize, NonZeroUsize)>,
 }
 
 impl<'a> IggyMessageViewIterator<'a> {
@@ -167,7 +170,26 @@ impl<'a> IggyMessageViewIterator<'a> {
         Self {
             buffer,
             position: 0,
+            indexed_last: None,
         }
+    }
+
+    pub(crate) fn new_with_boundaries(
+        messages: &'a [u8],
+        indexes: &'a [u8],
+        base_position: u32,
+        count: u32,
+    ) -> Self {
+        let mut iter = Self::new(messages);
+        if let Some(boundaries) =
+            IggyMessageBoundaries::new(indexes, messages.len(), base_position, count)
+            && boundaries.count() > 0
+        {
+            iter.indexed_last = boundaries
+                .boundaries(boundaries.count() - 1)
+                .and_then(|(start, end)| Some((start, NonZeroUsize::new(end)?)));
+        }
+        iter
     }
 }
 
@@ -183,5 +205,69 @@ impl<'a> Iterator for IggyMessageViewIterator<'a> {
         let view = IggyMessageView::new(remaining).ok()?;
         self.position += view.size();
         Some(view)
+    }
+
+    fn last(self) -> Option<Self::Item> {
+        if self.position == 0
+            && let Some((start, end)) = self.indexed_last
+            && let Ok(view) = IggyMessageView::new(&self.buffer[start..end.get()])
+        {
+            return Some(view);
+        }
+
+        let mut last = None;
+        for item in self {
+            last = Some(item);
+        }
+        last
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::IggyMessage;
+    use bytes::Bytes;
+
+    fn build_batch() -> crate::IggyMessagesBatch {
+        let messages = vec![
+            IggyMessage::builder()
+                .payload(Bytes::from_static(b"one"))
+                .build()
+                .unwrap(),
+            IggyMessage::builder()
+                .payload(Bytes::from_static(b"two"))
+                .build()
+                .unwrap(),
+            IggyMessage::builder()
+                .payload(Bytes::from_static(b"three"))
+                .build()
+                .unwrap(),
+        ];
+        crate::IggyMessagesBatch::from(messages)
+    }
+
+    #[test]
+    fn should_return_tail_for_indexed_last_after_next() {
+        let batch = build_batch();
+        let mut iter = IggyMessageViewIterator::new_with_boundaries(
+            batch.buffer(),
+            batch.indexes_slice(),
+            batch.indexes().base_position(),
+            batch.count(),
+        );
+
+        let first = iter.next().unwrap();
+        assert_eq!(first.payload(), b"one");
+
+        let last = iter.last().unwrap();
+        assert_eq!(last.payload(), b"three");
+    }
+
+    #[test]
+    fn should_return_last_message_for_raw_last() {
+        let batch = build_batch();
+        let last = IggyMessageViewIterator::new(batch.buffer()).last().unwrap();
+        assert_eq!(last.payload(), b"three");
     }
 }

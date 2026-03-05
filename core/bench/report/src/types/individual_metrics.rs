@@ -30,6 +30,10 @@ pub struct BenchmarkIndividualMetrics {
     pub throughput_mb_ts: TimeSeries,
     pub throughput_msg_ts: TimeSeries,
     pub latency_ts: TimeSeries,
+    /// Per-batch latencies in ms, sorted ascending. Only populated in-memory
+    /// during report building for distribution computation; never serialized.
+    #[serde(skip)]
+    pub raw_latencies_ms: Vec<f64>,
 }
 
 // Custom deserializer implementation
@@ -109,6 +113,7 @@ impl<'de> Deserialize<'de> for BenchmarkIndividualMetrics {
                     throughput_mb_ts,
                     throughput_msg_ts,
                     latency_ts,
+                    raw_latencies_ms: Vec::new(),
                 })
             }
         }

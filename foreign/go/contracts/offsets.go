@@ -17,6 +17,8 @@
 
 package iggcon
 
+import "encoding/binary"
+
 type StoreConsumerOffsetRequest struct {
 	StreamId    Identifier `json:"streamId"`
 	TopicId     Identifier `json:"topicId"`
@@ -25,11 +27,86 @@ type StoreConsumerOffsetRequest struct {
 	Offset      uint64     `json:"offset"`
 }
 
-type GetConsumerOffsetRequest struct {
+func (s *StoreConsumerOffsetRequest) Code() CommandCode {
+	return StoreOffsetCode
+}
+
+func (s *StoreConsumerOffsetRequest) MarshalBinary() ([]byte, error) {
+	hasPartition := byte(0)
+	var partition uint32 = 0
+	if s.PartitionId != nil {
+		hasPartition = 1
+		partition = *s.PartitionId
+	}
+	consumerBytes, err := s.Consumer.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	streamIdBytes, err := s.StreamId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	topicIdBytes, err := s.TopicId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	// consumer + stream_id + topic_id + hasPartition(1) + partition(4) + offset(8)
+	bytes := make([]byte, len(consumerBytes)+len(streamIdBytes)+len(topicIdBytes)+13)
+	position := 0
+	copy(bytes[position:], consumerBytes)
+	position += len(consumerBytes)
+	copy(bytes[position:], streamIdBytes)
+	position += len(streamIdBytes)
+	copy(bytes[position:], topicIdBytes)
+	position += len(topicIdBytes)
+	bytes[position] = hasPartition
+	binary.LittleEndian.PutUint32(bytes[position+1:position+5], partition)
+	binary.LittleEndian.PutUint64(bytes[position+5:position+13], s.Offset)
+	return bytes, nil
+}
+
+type GetConsumerOffset struct {
 	StreamId    Identifier `json:"streamId"`
 	TopicId     Identifier `json:"topicId"`
 	Consumer    Consumer   `json:"consumer"`
 	PartitionId *uint32    `json:"partitionId"`
+}
+
+func (g *GetConsumerOffset) Code() CommandCode {
+	return GetOffsetCode
+}
+
+func (g *GetConsumerOffset) MarshalBinary() ([]byte, error) {
+	hasPartition := byte(0)
+	var partition uint32 = 0
+	if g.PartitionId != nil {
+		hasPartition = 1
+		partition = *g.PartitionId
+	}
+	consumerBytes, err := g.Consumer.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	streamIdBytes, err := g.StreamId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	topicIdBytes, err := g.TopicId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	// consumer + stream_id + topic_id + hasPartition(1) + partition(4)
+	bytes := make([]byte, len(consumerBytes)+len(streamIdBytes)+len(topicIdBytes)+5)
+	position := 0
+	copy(bytes[position:], consumerBytes)
+	position += len(consumerBytes)
+	copy(bytes[position:], streamIdBytes)
+	position += len(streamIdBytes)
+	copy(bytes[position:], topicIdBytes)
+	position += len(topicIdBytes)
+	bytes[position] = hasPartition
+	binary.LittleEndian.PutUint32(bytes[position+1:position+5], partition)
+	return bytes, nil
 }
 
 type ConsumerOffsetInfo struct {
@@ -38,9 +115,46 @@ type ConsumerOffsetInfo struct {
 	StoredOffset  uint64 `json:"storedOffset"`
 }
 
-type DeleteConsumerOffsetRequest struct {
+type DeleteConsumerOffset struct {
 	Consumer    Consumer
 	StreamId    Identifier
 	TopicId     Identifier
 	PartitionId *uint32
+}
+
+func (d *DeleteConsumerOffset) Code() CommandCode {
+	return DeleteConsumerOffsetCode
+}
+
+func (d *DeleteConsumerOffset) MarshalBinary() ([]byte, error) {
+	hasPartition := byte(0)
+	var partition uint32 = 0
+	if d.PartitionId != nil {
+		hasPartition = 1
+		partition = *d.PartitionId
+	}
+	consumerBytes, err := d.Consumer.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	streamIdBytes, err := d.StreamId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	topicIdBytes, err := d.TopicId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	// consumer + stream_id + topic_id + hasPartition(1) + partition(4)
+	bytes := make([]byte, len(consumerBytes)+len(streamIdBytes)+len(topicIdBytes)+5)
+	position := 0
+	copy(bytes[position:], consumerBytes)
+	position += len(consumerBytes)
+	copy(bytes[position:], streamIdBytes)
+	position += len(streamIdBytes)
+	copy(bytes[position:], topicIdBytes)
+	position += len(topicIdBytes)
+	bytes[position] = hasPartition
+	binary.LittleEndian.PutUint32(bytes[position+1:position+5], partition)
+	return bytes, nil
 }

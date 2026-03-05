@@ -129,6 +129,16 @@ impl BenchmarkRunner {
                 error!("Failed to generate plots: {e}");
                 IggyError::CannotWriteToFile
             })?;
+            plot_chart(
+                &report,
+                &full_output_path,
+                &ChartType::LatencyDistribution,
+                should_open_charts,
+            )
+            .map_err(|e| {
+                error!("Failed to generate plots: {e}");
+                IggyError::CannotWriteToFile
+            })?;
         }
 
         Ok(())
