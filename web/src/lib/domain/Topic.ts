@@ -17,7 +17,6 @@
  * under the License.
  */
 
-import { numberSizes } from '$lib/utils/constants/numberSizes';
 import { bytesFormatter } from '$lib/utils/formatters/bytesFormatter';
 import { formatDate } from '$lib/utils/formatters/dateFormatter';
 import { durationFormatter } from '$lib/utils/formatters/durationFormatter';
@@ -37,17 +36,16 @@ export type Topic = {
 };
 
 export function topicMapper(item: any): Topic {
-  const messageExpirySeconds =
-    item.message_expiry == null || item.message_expiry >= numberSizes.max.u32
-      ? 0
-      : item.message_expiry;
+  const micros: number = item.message_expiry ?? 0;
+
+  const messageExpiry = micros === 0 || micros >= Number.MAX_SAFE_INTEGER ? 0 : micros;
   return {
     id: item.id,
     name: item.name,
     sizeBytes: item.size,
     sizeFormatted: bytesFormatter(item.size),
-    messageExpiry: messageExpirySeconds,
-    messageExpiryFormatted: formatExpiry(messageExpirySeconds),
+    messageExpiry,
+    messageExpiryFormatted: formatExpiry(messageExpiry),
     messagesCount: item.messages_count,
     partitionsCount: item.partitions_count,
     createdAt: formatDate(item.created_at),
@@ -56,10 +54,7 @@ export function topicMapper(item: any): Topic {
   };
 }
 
-function formatExpiry(expiry: number): string {
-  if (expiry === 0 || expiry >= numberSizes.max.u32) {
-    return 'never';
-  }
-
-  return durationFormatter(expiry);
+function formatExpiry(micros: number): string {
+  if (micros === 0) return 'never';
+  return durationFormatter(micros);
 }

@@ -28,7 +28,7 @@
   import type { CloseModalFn } from '$lib/types/utilTypes';
   import type { StreamDetails } from '$lib/domain/StreamDetails';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
-  import { durationFormatter } from '$lib/utils/formatters/durationFormatter';
+  import DurationInput from '../DurationInput.svelte';
   import { numberSizes } from '$lib/utils/constants/numberSizes';
   import { showToast } from '../AppToasts.svelte';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
@@ -46,7 +46,7 @@
       .min(1, 'Name must contain at least 1 character')
       .max(255, 'Name must not exceed 255 characters'),
     partitions_count: z.number().min(0).max(numberSizes.max.u32).default(1),
-    message_expiry: z.number().min(0).max(numberSizes.max.u32).default(0),
+    message_expiry: z.number().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
     compression_algorithm: z.enum(['none', 'gzip']).default('none'),
     max_topic_size: z.number().min(0).max(numberSizes.max.u32).default(2_000_000_000)
   });
@@ -136,24 +136,7 @@
       errorMessage={$errors.partitions_count?.[0]}
     />
 
-    <Input
-      label="Message expiry"
-      type="number"
-      name="messageExpiry"
-      bind:value={$form.message_expiry}
-      {...$constraints.message_expiry}
-      errorMessage={$errors.message_expiry?.[0]}
-    />
-
-    <span class="-mt-1 text-xs text-shade-d200 dark:text-shade-l700">
-      {#if !$form.message_expiry || $form.message_expiry > numberSizes.max.u32}
-        {#if $form.message_expiry === 0}
-          never
-        {/if}
-      {:else}
-        {durationFormatter(+$form.message_expiry)}
-      {/if}
-    </span>
+    <DurationInput label="Message expiry" bind:value={$form.message_expiry} />
 
     <Select
       label="Compression Algorithm"
