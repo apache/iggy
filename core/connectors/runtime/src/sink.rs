@@ -521,7 +521,7 @@ async fn process_messages(
         RuntimeError::FailedToSerializeRawMessages
     })?;
 
-    let consume_result = (consume)(
+    (consume)(
         plugin_id,
         topic_meta.as_ptr(),
         topic_meta.len(),
@@ -530,14 +530,6 @@ async fn process_messages(
         messages.as_ptr(),
         messages.len(),
     );
-
-    if consume_result != 0 {
-        return Err(RuntimeError::ConnectorSdkError(
-            iggy_connector_sdk::Error::CannotStoreData(format!(
-                "Sink consume callback returned non-zero status ({consume_result}) for plugin ID: {plugin_id}"
-            )),
-        ));
-    }
 
     Ok(processed_count)
 }

@@ -304,10 +304,10 @@ impl MongoDbSink {
             if self.include_metadata {
                 let (offset_key, offset_value) = build_offset_metadata_value(message.offset);
                 doc.insert(offset_key, offset_value);
-                // Convert microseconds to milliseconds for BSON DateTime
-                let timestamp_ms = (message.timestamp / 1000) as i64;
-                let bson_timestamp = bson::DateTime::from_millis(timestamp_ms);
-                doc.insert("iggy_timestamp", bson_timestamp);
+                doc.insert(
+                    "iggy_timestamp",
+                    build_bson_datetime_value(message.timestamp),
+                );
                 doc.insert("iggy_stream", &topic_metadata.stream);
                 doc.insert("iggy_topic", &topic_metadata.topic);
                 doc.insert(
@@ -317,13 +317,17 @@ impl MongoDbSink {
             }
 
             if self.include_checksum {
-                doc.insert("iggy_checksum", message.checksum as i64);
+                doc.insert(
+                    "iggy_checksum",
+                    build_checksum_metadata_value(message.checksum),
+                );
             }
 
             if self.include_origin_timestamp {
-                let origin_timestamp_ms = (message.origin_timestamp / 1000) as i64;
-                let bson_timestamp = bson::DateTime::from_millis(origin_timestamp_ms);
-                doc.insert("iggy_origin_timestamp", bson_timestamp);
+                doc.insert(
+                    "iggy_origin_timestamp",
+                    build_bson_datetime_value(message.origin_timestamp),
+                );
             }
 
             // Handle payload based on format
@@ -484,6 +488,20 @@ fn build_offset_metadata_value(offset: u64) -> (&'static str, bson::Bson) {
         ("iggy_offset", bson::Bson::Int64(offset))
     } else {
         ("iggy_offset_str", bson::Bson::String(offset.to_string()))
+    }
+}
+
+fn build_bson_datetime_value(timestamp_micros: u64) -> bson::DateTime {
+    let timestamp_ms = timestamp_micros / 1000;
+    let timestamp_ms = i64::try_from(timestamp_ms).unwrap_or(i64::MAX);
+    bson::DateTime::from_millis(timestamp_ms)
+}
+
+fn build_checksum_metadata_value(checksum: u64) -> bson::Bson {
+    if let Ok(checksum) = i64::try_from(checksum) {
+        bson::Bson::Int64(checksum)
+    } else {
+        bson::Bson::String(checksum.to_string())
     }
 }
 
@@ -720,6 +738,33 @@ mod tests {
         assert_eq!(
             build_partition_metadata_value(oversized_partition),
             bson::Bson::Int64(i64::from(oversized_partition))
+        );
+    }
+
+    #[test]
+    fn given_timestamp_values_should_use_bounded_bson_datetime() {
+        assert_eq!(
+            build_bson_datetime_value(1_234_000),
+            bson::DateTime::from_millis(1_234)
+        );
+
+        assert_eq!(
+            build_bson_datetime_value(u64::MAX),
+            bson::DateTime::from_millis((u64::MAX / 1_000) as i64)
+        );
+    }
+
+    #[test]
+    fn given_checksum_values_should_use_lossless_bson_value() {
+        assert_eq!(
+            build_checksum_metadata_value(i64::MAX as u64),
+            bson::Bson::Int64(i64::MAX)
+        );
+
+        let oversized_checksum = (i64::MAX as u64) + 1;
+        assert_eq!(
+            build_checksum_metadata_value(oversized_checksum),
+            bson::Bson::String(oversized_checksum.to_string())
         );
     }
 
