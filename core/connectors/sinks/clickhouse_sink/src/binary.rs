@@ -523,11 +523,12 @@ fn parse_time(s: &str) -> Result<f64, ()> {
 
 /// Strip a timezone suffix from a time string. Returns (time_without_tz, offset_seconds).
 fn strip_timezone(s: &str) -> (&str, i64) {
-    if s.ends_with('Z') {
-        return (&s[..s.len() - 1], 0);
+    if let Some(stripped) = s.strip_suffix('Z') {
+        return (stripped, 0);
     }
     // Look for ±hh:mm or ±hhmm suffix
     for (sign, ch) in [(1i64, '+'), (-1i64, '-')] {
+        #[allow(clippy::collapsible_if)]
         if let Some(pos) = s.rfind(ch) {
             if pos > 0 {
                 let tz = &s[pos + 1..];
@@ -643,8 +644,8 @@ mod tests {
     #[test]
     fn serialize_float64() {
         let mut buf = vec![];
-        serialize_value(&json_f64(2.718281828), &ChType::Float64, &mut buf).unwrap();
-        assert_eq!(buf, 2.718281828f64.to_le_bytes());
+        serialize_value(&json_f64(2.318281828), &ChType::Float64, &mut buf).unwrap();
+        assert_eq!(buf, 2.318281828f64.to_le_bytes());
     }
 
     #[test]
@@ -842,7 +843,7 @@ mod tests {
 
     #[test]
     fn serialize_row_non_object_payload_is_error() {
-        let value = OwnedValue::Array(Box::new(vec![]));
+        let value = OwnedValue::Array(Box::default());
         let columns = vec![col("x", ChType::Int32, false)];
         let mut buf = vec![];
         let result = serialize_row(&value, &columns, &mut buf);
@@ -991,7 +992,7 @@ mod tests {
 
     #[test]
     fn serialize_map_non_object_is_error() {
-        let value = OwnedValue::Array(Box::new(vec![]));
+        let value = OwnedValue::Array(Box::default());
         let mut buf = vec![];
         let result = serialize_value(
             &value,
@@ -1070,7 +1071,7 @@ mod tests {
 // Hex decoding helper (no extra dep — manual implementation for UUID)
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
-        if s.len() % 2 != 0 {
+        if !s.len().is_multiple_of(2) {
             return Err(());
         }
         s.as_bytes()
