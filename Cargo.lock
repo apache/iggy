@@ -5267,6 +5267,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_clickhouse_sink"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "humantime",
+ "iggy_connector_sdk",
+ "once_cell",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "simd-json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "iggy_connector_elasticsearch_sink"
 version = "0.3.1-edge.1"
 dependencies = [
