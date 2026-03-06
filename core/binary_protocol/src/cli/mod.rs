@@ -17,6 +17,7 @@
  */
 
 pub mod binary_client;
+pub mod binary_cluster;
 pub mod binary_consumer_groups;
 pub mod binary_consumer_offsets;
 pub mod binary_context;

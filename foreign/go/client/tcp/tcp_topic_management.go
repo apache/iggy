@@ -24,8 +24,7 @@ import (
 )
 
 func (c *IggyTcpClient) GetTopics(streamId iggcon.Identifier) ([]iggcon.Topic, error) {
-	message := binaryserialization.SerializeIdentifier(streamId)
-	buffer, err := c.sendAndFetchResponse(message, iggcon.GetTopicsCode)
+	buffer, err := c.do(&iggcon.GetTopics{StreamId: streamId})
 	if err != nil {
 		return nil, err
 	}
@@ -34,8 +33,7 @@ func (c *IggyTcpClient) GetTopics(streamId iggcon.Identifier) ([]iggcon.Topic, e
 }
 
 func (c *IggyTcpClient) GetTopic(streamId iggcon.Identifier, topicId iggcon.Identifier) (*iggcon.TopicDetails, error) {
-	message := binaryserialization.SerializeIdentifiers(streamId, topicId)
-	buffer, err := c.sendAndFetchResponse(message, iggcon.GetTopicCode)
+	buffer, err := c.do(&iggcon.GetTopic{StreamId: streamId, TopicId: topicId})
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +68,7 @@ func (c *IggyTcpClient) CreateTopic(
 		return nil, ierror.ErrInvalidReplicationFactor
 	}
 
-	serializedRequest := binaryserialization.TcpCreateTopicRequest{
+	buffer, err := c.do(&iggcon.CreateTopic{
 		StreamId:             streamId,
 		Name:                 name,
 		PartitionsCount:      partitionsCount,
@@ -78,8 +76,7 @@ func (c *IggyTcpClient) CreateTopic(
 		MessageExpiry:        messageExpiry,
 		MaxTopicSize:         maxTopicSize,
 		ReplicationFactor:    replicationFactor,
-	}
-	buffer, err := c.sendAndFetchResponse(serializedRequest.Serialize(), iggcon.CreateTopicCode)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -102,20 +99,19 @@ func (c *IggyTcpClient) UpdateTopic(
 	if replicationFactor != nil && *replicationFactor == 0 {
 		return ierror.ErrInvalidReplicationFactor
 	}
-	serializedRequest := binaryserialization.TcpUpdateTopicRequest{
+	_, err := c.do(&iggcon.UpdateTopic{
 		StreamId:             streamId,
 		TopicId:              topicId,
 		CompressionAlgorithm: compressionAlgorithm,
 		MessageExpiry:        messageExpiry,
 		MaxTopicSize:         maxTopicSize,
 		ReplicationFactor:    replicationFactor,
-		Name:                 name}
-	_, err := c.sendAndFetchResponse(serializedRequest.Serialize(), iggcon.UpdateTopicCode)
+		Name:                 name,
+	})
 	return err
 }
 
 func (c *IggyTcpClient) DeleteTopic(streamId, topicId iggcon.Identifier) error {
-	message := binaryserialization.SerializeIdentifiers(streamId, topicId)
-	_, err := c.sendAndFetchResponse(message, iggcon.DeleteTopicCode)
+	_, err := c.do(&iggcon.DeleteTopic{StreamId: streamId, TopicId: topicId})
 	return err
 }

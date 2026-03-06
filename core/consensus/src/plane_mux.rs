@@ -82,6 +82,58 @@ where
     async fn on_ack(&self, _message: AckMessage<C>) {}
 }
 
+pub trait MetadataHandle {
+    type Metadata;
+    fn metadata(&self) -> &Self::Metadata;
+    fn metadata_mut(&mut self) -> &mut Self::Metadata;
+}
+
+pub trait PartitionsHandle {
+    type Partitions;
+    fn partitions(&self) -> &Self::Partitions;
+    fn partitions_mut(&mut self) -> &mut Self::Partitions;
+}
+
+impl<M, Tail> MetadataHandle for (M, Tail) {
+    type Metadata = M;
+    fn metadata(&self) -> &Self::Metadata {
+        &self.0
+    }
+    fn metadata_mut(&mut self) -> &mut Self::Metadata {
+        &mut self.0
+    }
+}
+
+impl<M, P> PartitionsHandle for (M, (P, ())) {
+    type Partitions = P;
+    fn partitions(&self) -> &Self::Partitions {
+        &self.1.0
+    }
+    fn partitions_mut(&mut self) -> &mut Self::Partitions {
+        &mut self.1.0
+    }
+}
+
+impl<T: MetadataHandle> MetadataHandle for MuxPlane<T> {
+    type Metadata = T::Metadata;
+    fn metadata(&self) -> &Self::Metadata {
+        self.inner.metadata()
+    }
+    fn metadata_mut(&mut self) -> &mut Self::Metadata {
+        self.inner.metadata_mut()
+    }
+}
+
+impl<T: PartitionsHandle> PartitionsHandle for MuxPlane<T> {
+    type Partitions = T::Partitions;
+    fn partitions(&self) -> &Self::Partitions {
+        self.inner.partitions()
+    }
+    fn partitions_mut(&mut self) -> &mut Self::Partitions {
+        self.inner.partitions_mut()
+    }
+}
+
 impl<C, Head, Tail> Plane<C> for variadic!(Head, ...Tail)
 where
     C: Consensus,

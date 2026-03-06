@@ -103,6 +103,13 @@ repos:
         types: [text]
         pass_filenames: false
 
+      - id: binary-artifacts
+        name: binary artifacts
+        entry: ./scripts/ci/binary-artifacts.sh
+        args: ["--check", "--staged"]
+        language: system
+        pass_filenames: false
+
       - id: typos
         name: typos (spelling check)
         entry: typos
@@ -131,7 +138,7 @@ repos:
 
       - id: cargo-sort
         name: cargo sort
-        entry: cargo sort --workspace
+        entry: cargo sort --no-format --workspace
         language: system
         files: (^|/)Cargo\.toml$
         pass_filenames: false

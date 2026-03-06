@@ -25,8 +25,7 @@ use consensus::{
 };
 use iggy_common::{
     header::{
-        Command2, ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
-        RequestHeader,
+        Command2, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader,
     },
     message::Message,
 };
@@ -100,15 +99,18 @@ pub struct IggyMetadata<C, J, S, M> {
     pub mux_stm: M,
 }
 
-impl<B, P, J, S, M> Plane<VsrConsensus<B, P>> for IggyMetadata<VsrConsensus<B, P>, J, S, M>
+impl<B, J, S, M> Plane<VsrConsensus<B>> for IggyMetadata<VsrConsensus<B>, J, S, M>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    M: StateMachine<Input = Message<PrepareHeader>>,
+    M: StateMachine<
+            Input = Message<PrepareHeader>,
+            Output = bytes::Bytes,
+            Error = iggy_common::IggyError,
+        >,
 {
-    async fn on_request(&self, message: <VsrConsensus<B, P> as Consensus>::Message<RequestHeader>) {
+    async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
 
         // TODO: Bunch of asserts.
@@ -117,10 +119,7 @@ where
         pipeline_prepare_common(consensus, prepare, |prepare| self.on_replicate(prepare)).await;
     }
 
-    async fn on_replicate(
-        &self,
-        message: <VsrConsensus<B, P> as Consensus>::Message<PrepareHeader>,
-    ) {
+    async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
@@ -174,7 +173,7 @@ where
         }
     }
 
-    async fn on_ack(&self, message: <VsrConsensus<B, P> as Consensus>::Message<PrepareOkHeader>) {
+    async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareOkHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
         let header = message.header();
 
@@ -225,13 +224,17 @@ where
                         )
                     });
 
-                // Apply the state (consumes prepare)
-                // TODO: Handle appending result to response
-                let _result = self.mux_stm.update(prepare);
+                let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                    warn!(
+                        "on_ack: state machine error for op={}: {err}",
+                        prepare_header.op
+                    );
+                    bytes::Bytes::new()
+                });
                 debug!("on_ack: state applied for op={}", prepare_header.op);
 
-                // Send reply to client
-                let generic_reply = build_reply_message(consensus, &prepare_header).into_generic();
+                let generic_reply =
+                    build_reply_message(consensus, &prepare_header, response).into_generic();
                 debug!(
                     "on_ack: sending reply to client={} for op={}",
                     prepare_header.client, prepare_header.op
@@ -264,30 +267,7 @@ where
             message.header().command(),
             Command2::Request | Command2::Prepare | Command2::PrepareOk
         ));
-        let operation = message.header().operation();
-        // TODO: Use better selection, smth like greater or equal based on op number.
-        matches!(
-            operation,
-            Operation::CreateStream
-                | Operation::UpdateStream
-                | Operation::DeleteStream
-                | Operation::PurgeStream
-                | Operation::CreateTopic
-                | Operation::UpdateTopic
-                | Operation::DeleteTopic
-                | Operation::PurgeTopic
-                | Operation::CreatePartitions
-                | Operation::DeletePartitions
-                | Operation::CreateConsumerGroup
-                | Operation::DeleteConsumerGroup
-                | Operation::CreateUser
-                | Operation::UpdateUser
-                | Operation::DeleteUser
-                | Operation::ChangePassword
-                | Operation::UpdatePermissions
-                | Operation::CreatePersonalAccessToken
-                | Operation::DeletePersonalAccessToken
-        )
+        message.header().operation().is_metadata()
     }
 }
 

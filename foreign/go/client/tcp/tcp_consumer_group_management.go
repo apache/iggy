@@ -24,8 +24,10 @@ import (
 )
 
 func (c *IggyTcpClient) GetConsumerGroups(streamId, topicId iggcon.Identifier) ([]iggcon.ConsumerGroup, error) {
-	message := binaryserialization.SerializeIdentifiers(streamId, topicId)
-	buffer, err := c.sendAndFetchResponse(message, iggcon.GetGroupsCode)
+	buffer, err := c.do(&iggcon.GetConsumerGroups{
+		StreamId: streamId,
+		TopicId:  topicId,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -34,8 +36,13 @@ func (c *IggyTcpClient) GetConsumerGroups(streamId, topicId iggcon.Identifier) (
 }
 
 func (c *IggyTcpClient) GetConsumerGroup(streamId, topicId, groupId iggcon.Identifier) (*iggcon.ConsumerGroupDetails, error) {
-	message := binaryserialization.SerializeIdentifiers(streamId, topicId, groupId)
-	buffer, err := c.sendAndFetchResponse(message, iggcon.GetGroupCode)
+	buffer, err := c.do(&iggcon.GetConsumerGroup{
+		TopicPath: iggcon.TopicPath{
+			StreamId: streamId,
+			TopicId:  topicId,
+		},
+		GroupId: groupId,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -51,12 +58,13 @@ func (c *IggyTcpClient) CreateConsumerGroup(streamId iggcon.Identifier, topicId 
 	if MaxStringLength < len(name) || len(name) == 0 {
 		return nil, ierror.ErrInvalidConsumerGroupName
 	}
-	message := binaryserialization.CreateGroup(iggcon.CreateConsumerGroupRequest{
-		StreamId: streamId,
-		TopicId:  topicId,
-		Name:     name,
+	buffer, err := c.do(&iggcon.CreateConsumerGroup{
+		TopicPath: iggcon.TopicPath{
+			StreamId: streamId,
+			TopicId:  topicId,
+		},
+		Name: name,
 	})
-	buffer, err := c.sendAndFetchResponse(message, iggcon.CreateGroupCode)
 	if err != nil {
 		return nil, err
 	}
@@ -65,19 +73,34 @@ func (c *IggyTcpClient) CreateConsumerGroup(streamId iggcon.Identifier, topicId 
 }
 
 func (c *IggyTcpClient) DeleteConsumerGroup(streamId iggcon.Identifier, topicId iggcon.Identifier, groupId iggcon.Identifier) error {
-	message := binaryserialization.SerializeIdentifiers(streamId, topicId, groupId)
-	_, err := c.sendAndFetchResponse(message, iggcon.DeleteGroupCode)
+	_, err := c.do(&iggcon.DeleteConsumerGroup{
+		TopicPath: iggcon.TopicPath{
+			StreamId: streamId,
+			TopicId:  topicId,
+		},
+		GroupId: groupId,
+	})
 	return err
 }
 
 func (c *IggyTcpClient) JoinConsumerGroup(streamId iggcon.Identifier, topicId iggcon.Identifier, groupId iggcon.Identifier) error {
-	message := binaryserialization.SerializeIdentifiers(streamId, topicId, groupId)
-	_, err := c.sendAndFetchResponse(message, iggcon.JoinGroupCode)
+	_, err := c.do(&iggcon.JoinConsumerGroup{
+		TopicPath: iggcon.TopicPath{
+			StreamId: streamId,
+			TopicId:  topicId,
+		},
+		GroupId: groupId,
+	})
 	return err
 }
 
 func (c *IggyTcpClient) LeaveConsumerGroup(streamId iggcon.Identifier, topicId iggcon.Identifier, groupId iggcon.Identifier) error {
-	message := binaryserialization.SerializeIdentifiers(streamId, topicId, groupId)
-	_, err := c.sendAndFetchResponse(message, iggcon.LeaveGroupCode)
+	_, err := c.do(&iggcon.LeaveConsumerGroup{
+		TopicPath: iggcon.TopicPath{
+			StreamId: streamId,
+			TopicId:  topicId,
+		},
+		GroupId: groupId,
+	})
 	return err
 }

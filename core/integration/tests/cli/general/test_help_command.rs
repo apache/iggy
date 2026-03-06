@@ -44,6 +44,7 @@ Commands:
   pat              personal access token operations
   user             user operations [aliases: u]
   client           client operations [aliases: c]
+  cluster          cluster operations [aliases: cl]
   consumer-group   consumer group operations [aliases: g]
   consumer-offset  consumer offset operations [aliases: o]
   message          message operations [aliases: m]

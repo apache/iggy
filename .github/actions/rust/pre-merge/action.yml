@@ -76,7 +76,7 @@ runs:
 
     - name: Cargo sort
       if: inputs.task == 'sort'
-      run: cargo sort --check --workspace
+      run: cargo sort --check --no-format --workspace
       shell: bash
 
     - name: Cargo machete
@@ -94,9 +94,11 @@ runs:
     - name: Install dependencies for Rust tests
       if: inputs.task == 'test' && runner.os == 'Linux'
       run: |
-        sudo apt-get update --yes && sudo apt-get install --yes musl-tools gnome-keyring keyutils
+        sudo apt-get update --yes && sudo apt-get install --yes musl-tools gnome-keyring keyutils dbus-x11
         rm -f $HOME/.local/share/keyrings/*
-        echo -n "test" | gnome-keyring-daemon --unlock
+        eval $(dbus-launch --sh-syntax)
+        echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> $GITHUB_ENV
+        echo -n "test" | gnome-keyring-daemon --unlock --components=secrets
       shell: bash
 
     - name: Install cargo-llvm-cov
@@ -173,7 +175,13 @@ runs:
 
     - name: Build aarch64-musl
       if: inputs.task == 'build-aarch64-musl'
-      run: cargo build --locked --target aarch64-unknown-linux-musl
+      # Exclude dashboard crates: charming's "ssr" feature pulls deno_core -> v8,
+      # which has no prebuilt binary for aarch64-unknown-linux-musl.
+      # TODO: support when upstream rusty_v8 publishes aarch64-musl binaries.
+      run: >-
+        cargo build --locked --workspace --target aarch64-unknown-linux-musl
+        --exclude iggy-bench-dashboard-server
+        --exclude bench-dashboard-frontend
       shell: bash
       env:
         # Disable GCC outline atomics to avoid undefined __aarch64_ldadd4_sync

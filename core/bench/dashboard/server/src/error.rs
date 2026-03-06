@@ -31,6 +31,8 @@ pub enum IggyBenchDashboardServerError {
     InvalidJson(String),
     #[error("Invalid UUID format: {0}")]
     InvalidUuid(String),
+    #[error("Bad request: {0}")]
+    BadRequest(String),
     #[error("Internal error: {0}")]
     InternalError(String),
 }
@@ -40,6 +42,10 @@ impl ResponseError for IggyBenchDashboardServerError {
         match self {
             IggyBenchDashboardServerError::NotFound(msg) => {
                 HttpResponse::NotFound().json(json!({ "error": msg }))
+            }
+            IggyBenchDashboardServerError::InvalidUuid(msg)
+            | IggyBenchDashboardServerError::BadRequest(msg) => {
+                HttpResponse::BadRequest().json(json!({ "error": msg }))
             }
             _ => HttpResponse::InternalServerError().json(json!({ "error": self.to_string() })),
         }

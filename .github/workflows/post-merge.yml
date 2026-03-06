@@ -188,9 +188,11 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update --yes
-          sudo apt-get install --yes gnome-keyring keyutils
+          sudo apt-get install --yes gnome-keyring keyutils dbus-x11
           rm -f $HOME/.local/share/keyrings/*
-          echo -n "test" | gnome-keyring-daemon --unlock
+          eval $(dbus-launch --sh-syntax)
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> $GITHUB_ENV
+          echo -n "test" | gnome-keyring-daemon --unlock --components=secrets
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -360,8 +362,10 @@ jobs:
         with:
           save-cache: "false"
 
-      - name: Install llvm-tools for coverage
-        run: rustup component add llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -374,15 +378,16 @@ jobs:
       - name: Build Python wheel with coverage instrumentation
         run: |
           cd foreign/python
-          mkdir -p target/coverage
+          source <(cargo llvm-cov show-env --sh)
+          export CARGO_TARGET_DIR=$CARGO_LLVM_COV_TARGET_DIR
 
-          # Instrument Rust code with coverage and set profraw output path
-          export RUSTFLAGS="-C instrument-coverage"
-          export LLVM_PROFILE_FILE="$(pwd)/target/coverage/%p-%4m.profraw"
+          # Propagate LLVM_PROFILE_FILE so the test step can write profraw data
           echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> $GITHUB_ENV
 
+          cargo llvm-cov clean --workspace
           echo "Building Python wheel with coverage instrumentation..."
-          uv run maturin develop --release
+          uv run --no-sync maturin develop
+        shell: bash
 
       - name: Start Iggy server
         id: iggy
@@ -393,7 +398,7 @@ jobs:
           cd foreign/python
           IGGY_SERVER_HOST=127.0.0.1 \
           IGGY_SERVER_TCP_PORT=8090 \
-            uv run pytest tests/ -v \
+            uv run --no-sync pytest tests/ -v \
               --junitxml=../../reports/python-junit.xml \
               --tb=short \
               --capture=no
@@ -409,29 +414,19 @@ jobs:
         run: |
           mkdir -p reports
           cd foreign/python
+          source <(cargo llvm-cov show-env --sh)
+          export CARGO_TARGET_DIR=$CARGO_LLVM_COV_TARGET_DIR
 
-          PROFRAW_COUNT=$(find target/coverage -name '*.profraw' 2>/dev/null | wc -l)
-          echo "Found ${PROFRAW_COUNT} profraw file(s)"
+          cargo llvm-cov report --lcov \
+            --ignore-filename-regex='(\.cargo/|/rustc/|/core/)' \
+            --output-path ../../reports/python-coverage.lcov
 
-          if [ "${PROFRAW_COUNT}" -eq 0 ]; then
-            echo "No profraw files found, skipping coverage report"
-            exit 0
-          fi
-
-          LLVM_PROFDATA=$(find "$(rustc --print sysroot)" -name 'llvm-profdata' -type f | head -1)
-          LLVM_COV=$(find "$(rustc --print sysroot)" -name 'llvm-cov' -type f | head -1)
-          SHARED_LIB=$(find target/release -name 'libapache_iggy*.so' 2>/dev/null | head -1)
-
-          "${LLVM_PROFDATA}" merge -sparse target/coverage/*.profraw -o target/coverage/merged.profdata
-
-          "${LLVM_COV}" export \
-            --format=lcov \
-            --instr-profile=target/coverage/merged.profdata \
-            --ignore-filename-regex='(/.cargo/registry|/rustc/)' \
-            "${SHARED_LIB}" \
-            > ../../reports/python-coverage.lcov
+          # Fix paths: cargo-llvm-cov outputs paths relative to the crate root (src/...)
+          # but Codecov expects paths relative to the repo root (foreign/python/src/...)
+          sed -i 's|^SF:src/|SF:foreign/python/src/|' ../../reports/python-coverage.lcov
 
           echo "Coverage report generated: $(wc -l < ../../reports/python-coverage.lcov) lines"
+        shell: bash
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
