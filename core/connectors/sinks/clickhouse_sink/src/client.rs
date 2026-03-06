@@ -28,13 +28,8 @@
 
 use crate::schema::{Column, parse_type};
 use iggy_connector_sdk::Error;
-<<<<<<< HEAD
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
-=======
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
-use reqwest::StatusCode;
->>>>>>> f3f8e9947 (initial clickhouse sink code)
 use serde::Deserialize;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};

@@ -21,7 +21,7 @@
 //!
 //! # Type string grammar
 //!
-//! Grammer followed by ClickHouse type strings (as returned by `SELECT type FROM system.columns`):
+//! Grammar followed by ClickHouse type strings (as returned by `SELECT type FROM system.columns`):
 //! ```text
 //! type  ::= composite | parameterised | primitive
 //!
