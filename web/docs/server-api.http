@@ -66,7 +66,7 @@ Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJqdGkiOiJmODM0NTI5M
   "max_topic_size": "1000000000"
 }
 
- 
+
 ### Create partitions
 POST {{url}}/streams/3/topics/3/partitions
 Content-Type: application/json
@@ -74,6 +74,13 @@ Content-Type: application/json
 {
   "partitions_count": 45
 }
+
+### Delete segments
+DELETE {{url}}/streams/1/topics/1/partitions/1?segments_count=3
+Authorization: Bearer {{access_token}}
+
+# Path params: stream_id, topic_id, partition_id
+# Query param: segments_count
 
 ###
 GET {{url}}/users/13
