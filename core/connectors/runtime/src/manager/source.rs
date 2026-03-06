@@ -116,12 +116,12 @@ impl SourceManager {
         metrics: &Arc<Metrics>,
     ) -> Result<(), RuntimeError> {
         let guard = {
-            let details_arc = self
+            let details = self
                 .sources
                 .get(key)
                 .map(|e| e.value().clone())
                 .ok_or_else(|| RuntimeError::SourceNotFound(key.to_string()))?;
-            let details = details_arc.lock().await;
+            let details = details.lock().await;
             details.restart_guard.clone()
         };
         let _lock = guard.lock().await;
@@ -133,14 +133,14 @@ impl SourceManager {
         key: &str,
         metrics: &Arc<Metrics>,
     ) -> Result<(), RuntimeError> {
-        let details_arc = self
+        let details = self
             .sources
             .get(key)
             .map(|e| e.value().clone())
             .ok_or_else(|| RuntimeError::SourceNotFound(key.to_string()))?;
 
         let (task_handles, plugin_id, container) = {
-            let mut details = details_arc.lock().await;
+            let mut details = details.lock().await;
             (
                 std::mem::take(&mut details.handler_tasks),
                 details.info.id,
@@ -161,7 +161,7 @@ impl SourceManager {
         }
 
         {
-            let mut details = details_arc.lock().await;
+            let mut details = details.lock().await;
             let old_status = details.info.status;
             details.info.status = ConnectorStatus::Stopped;
             details.info.last_error = None;
@@ -182,14 +182,14 @@ impl SourceManager {
         state_path: &str,
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
-        let details_arc = self
+        let details = self
             .sources
             .get(key)
             .map(|e| e.value().clone())
             .ok_or_else(|| RuntimeError::SourceNotFound(key.to_string()))?;
 
         let container = {
-            let details = details_arc.lock().await;
+            let details = details.lock().await;
             details.container.clone().ok_or_else(|| {
                 RuntimeError::InvalidConfiguration(format!("No container loaded for source: {key}"))
             })?
@@ -227,7 +227,7 @@ impl SourceManager {
         );
 
         {
-            let mut details = details_arc.lock().await;
+            let mut details = details.lock().await;
             details.info.id = plugin_id;
             details.info.status = ConnectorStatus::Running;
             details.info.last_error = None;
@@ -249,12 +249,12 @@ impl SourceManager {
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
         let guard = {
-            let details_arc = self
+            let details = self
                 .sources
                 .get(key)
                 .map(|e| e.value().clone())
                 .ok_or_else(|| RuntimeError::SourceNotFound(key.to_string()))?;
-            let details = details_arc.lock().await;
+            let details = details.lock().await;
             details.restart_guard.clone()
         };
         let _lock = guard.lock().await;

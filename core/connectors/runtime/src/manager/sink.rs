@@ -115,12 +115,12 @@ impl SinkManager {
         metrics: &Arc<Metrics>,
     ) -> Result<(), RuntimeError> {
         let guard = {
-            let details_arc = self
+            let details = self
                 .sinks
                 .get(key)
                 .map(|e| e.value().clone())
                 .ok_or_else(|| RuntimeError::SinkNotFound(key.to_string()))?;
-            let details = details_arc.lock().await;
+            let details = details.lock().await;
             details.restart_guard.clone()
         };
         let _lock = guard.lock().await;
@@ -132,14 +132,14 @@ impl SinkManager {
         key: &str,
         metrics: &Arc<Metrics>,
     ) -> Result<(), RuntimeError> {
-        let details_arc = self
+        let details = self
             .sinks
             .get(key)
             .map(|e| e.value().clone())
             .ok_or_else(|| RuntimeError::SinkNotFound(key.to_string()))?;
 
         let (shutdown_tx, task_handles, plugin_id, container) = {
-            let mut details = details_arc.lock().await;
+            let mut details = details.lock().await;
             (
                 details.shutdown_tx.take(),
                 std::mem::take(&mut details.task_handles),
@@ -163,7 +163,7 @@ impl SinkManager {
         }
 
         {
-            let mut details = details_arc.lock().await;
+            let mut details = details.lock().await;
             let old_status = details.info.status;
             details.info.status = ConnectorStatus::Stopped;
             details.info.last_error = None;
@@ -183,14 +183,14 @@ impl SinkManager {
         metrics: &Arc<Metrics>,
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
-        let details_arc = self
+        let details = self
             .sinks
             .get(key)
             .map(|e| e.value().clone())
             .ok_or_else(|| RuntimeError::SinkNotFound(key.to_string()))?;
 
         let container = {
-            let details = details_arc.lock().await;
+            let details = details.lock().await;
             details.container.clone().ok_or_else(|| {
                 RuntimeError::InvalidConfiguration(format!("No container loaded for sink: {key}"))
             })?
@@ -219,7 +219,7 @@ impl SinkManager {
         );
 
         {
-            let mut details = details_arc.lock().await;
+            let mut details = details.lock().await;
             details.info.id = plugin_id;
             details.info.status = ConnectorStatus::Running;
             details.info.last_error = None;
@@ -241,12 +241,12 @@ impl SinkManager {
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
         let guard = {
-            let details_arc = self
+            let details = self
                 .sinks
                 .get(key)
                 .map(|e| e.value().clone())
                 .ok_or_else(|| RuntimeError::SinkNotFound(key.to_string()))?;
-            let details = details_arc.lock().await;
+            let details = details.lock().await;
             details.restart_guard.clone()
         };
         let _lock = guard.lock().await;
