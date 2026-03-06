@@ -527,9 +527,9 @@ fn strip_timezone(s: &str) -> (&str, i64) {
         return (stripped, 0);
     }
     // Look for ±hh:mm or ±hhmm suffix
+    #[allow(clippy::collapsible_if)]
     for (sign, ch) in [(1i64, '+'), (-1i64, '-')] {
         if let Some(pos) = s.rfind(ch) {
-            #[allow(clippy::collapsible_if)]
             if pos > 0 {
                 let tz = &s[pos + 1..];
                 let secs = if tz.contains(':') {
