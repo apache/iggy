@@ -29,10 +29,7 @@ impl Sink for ClickHouseSink {
     async fn open(&mut self) -> Result<(), Error> {
         info!(
             "Opening ClickHouse sink connector ID: {} → {}/{} (format: {:?})",
-            self.id,
-            self.config.url,
-            self.config.table,
-            self.insert_format,
+            self.id, self.config.url, self.config.table, self.insert_format,
         );
 
         let client = ClickHouseClient::new(
@@ -100,9 +97,7 @@ impl Sink for ClickHouseSink {
                 })?;
                 build_row_binary_body(&messages, schema)?
             }
-            InsertFormat::StringPassthrough => {
-                build_string_body(&messages, self.string_format)
-            }
+            InsertFormat::StringPassthrough => build_string_body(&messages, self.string_format),
         };
 
         if body.is_empty() {
@@ -152,7 +147,7 @@ impl Sink for ClickHouseSink {
             self.id, state.messages_processed, state.errors_count,
         );
         self.client = None;
+        self.table_schema = None;
         Ok(())
     }
 }
-

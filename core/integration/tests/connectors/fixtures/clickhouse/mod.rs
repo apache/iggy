@@ -20,4 +20,6 @@
 mod container;
 mod sink;
 
-pub use sink::{ClickHouseSinkFixture, ClickHouseSinkRowBinaryFixture, ClickHouseSinkStringFixture};
+pub use sink::{
+    ClickHouseSinkFixture, ClickHouseSinkRowBinaryFixture, ClickHouseSinkStringFixture,
+};

@@ -155,24 +155,15 @@ impl ClickHouseSink {
     }
 
     pub fn database(&self) -> &str {
-        self.config
-            .database
-            .as_deref()
-            .unwrap_or(DEFAULT_DATABASE)
+        self.config.database.as_deref().unwrap_or(DEFAULT_DATABASE)
     }
 
     pub fn username(&self) -> &str {
-        self.config
-            .username
-            .as_deref()
-            .unwrap_or(DEFAULT_USERNAME)
+        self.config.username.as_deref().unwrap_or(DEFAULT_USERNAME)
     }
 
     pub fn password(&self) -> &str {
-        self.config
-            .password
-            .as_deref()
-            .unwrap_or(DEFAULT_PASSWORD)
+        self.config.password.as_deref().unwrap_or(DEFAULT_PASSWORD)
     }
 
     pub fn timeout(&self) -> Duration {

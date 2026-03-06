@@ -588,7 +588,11 @@ mod tests {
     }
 
     fn col(name: &str, ch_type: ChType, has_default: bool) -> Column {
-        Column { name: name.into(), ch_type, has_default }
+        Column {
+            name: name.into(),
+            ch_type,
+            has_default,
+        }
     }
 
     // ── varint ───────────────────────────────────────────────────────────────
@@ -697,14 +701,24 @@ mod tests {
     #[test]
     fn serialize_nullable_null_writes_marker() {
         let mut buf = vec![];
-        serialize_value(&json_null(), &ChType::Nullable(Box::new(ChType::Int32)), &mut buf).unwrap();
+        serialize_value(
+            &json_null(),
+            &ChType::Nullable(Box::new(ChType::Int32)),
+            &mut buf,
+        )
+        .unwrap();
         assert_eq!(buf, [0x01]);
     }
 
     #[test]
     fn serialize_nullable_non_null_writes_zero_then_value() {
         let mut buf = vec![];
-        serialize_value(&json_i64(42), &ChType::Nullable(Box::new(ChType::Int32)), &mut buf).unwrap();
+        serialize_value(
+            &json_i64(42),
+            &ChType::Nullable(Box::new(ChType::Int32)),
+            &mut buf,
+        )
+        .unwrap();
         let mut expected = vec![0x00u8];
         expected.extend_from_slice(&42i32.to_le_bytes());
         assert_eq!(buf, expected);
@@ -722,11 +736,15 @@ mod tests {
             &json_str("550e8400-e29b-41d4-a716-446655440000"),
             &ChType::Uuid,
             &mut buf,
-        ).unwrap();
-        assert_eq!(buf, [
-            0xd4, 0x41, 0x9b, 0xe2, 0x00, 0x84, 0x0e, 0x55,
-            0x00, 0x00, 0x44, 0x55, 0x66, 0x44, 0x16, 0xa7,
-        ]);
+        )
+        .unwrap();
+        assert_eq!(
+            buf,
+            [
+                0xd4, 0x41, 0x9b, 0xe2, 0x00, 0x84, 0x0e, 0x55, 0x00, 0x00, 0x44, 0x55, 0x66, 0x44,
+                0x16, 0xa7,
+            ]
+        );
     }
 
     #[test]
@@ -784,7 +802,7 @@ mod tests {
         // name: 0x00 prefix + varint(5) + "alice"
         // age:  0x01 (use DEFAULT)
         assert_eq!(buf[0], 0x00); // name: value follows
-        assert_eq!(buf[1], 5);    // varint length of "alice"
+        assert_eq!(buf[1], 5); // varint length of "alice"
         assert_eq!(&buf[2..7], b"alice");
         assert_eq!(buf[7], 0x01); // age: use DEFAULT
     }
@@ -874,7 +892,12 @@ mod tests {
     fn serialize_datetime_from_iso8601_utc_string() {
         let mut buf = vec![];
         // "1970-01-02T00:00:00Z" = 86400 seconds
-        serialize_value(&json_str("1970-01-02T00:00:00Z"), &ChType::DateTime, &mut buf).unwrap();
+        serialize_value(
+            &json_str("1970-01-02T00:00:00Z"),
+            &ChType::DateTime,
+            &mut buf,
+        )
+        .unwrap();
         assert_eq!(buf, 86400u32.to_le_bytes());
     }
 
@@ -882,7 +905,12 @@ mod tests {
     fn serialize_datetime_from_iso8601_positive_offset() {
         let mut buf = vec![];
         // "1970-01-01T01:00:00+01:00" = midnight UTC = 0 seconds
-        serialize_value(&json_str("1970-01-01T01:00:00+01:00"), &ChType::DateTime, &mut buf).unwrap();
+        serialize_value(
+            &json_str("1970-01-01T01:00:00+01:00"),
+            &ChType::DateTime,
+            &mut buf,
+        )
+        .unwrap();
         assert_eq!(buf, 0u32.to_le_bytes());
     }
 
@@ -890,7 +918,12 @@ mod tests {
     fn serialize_datetime64_from_string_with_fractional_seconds() {
         let mut buf = vec![];
         // 1.5 seconds at precision=3 → 1500 milliseconds
-        serialize_value(&json_str("1970-01-01T00:00:01.500Z"), &ChType::DateTime64(3), &mut buf).unwrap();
+        serialize_value(
+            &json_str("1970-01-01T00:00:01.500Z"),
+            &ChType::DateTime64(3),
+            &mut buf,
+        )
+        .unwrap();
         assert_eq!(buf, 1500i64.to_le_bytes());
     }
 
@@ -948,7 +981,8 @@ mod tests {
             &value,
             &ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
             &mut buf,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(buf[0], 1); // varint: 1 entry
         assert_eq!(buf[1], 1); // varint: key length 1
         assert_eq!(buf[2], b'k');
@@ -978,9 +1012,10 @@ mod tests {
             &arr,
             &ChType::Tuple(vec![ChType::String, ChType::Int32]),
             &mut buf,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(&buf[..3], &[0x02, b'h', b'i']); // string "hi"
-        assert_eq!(&buf[3..], 7i32.to_le_bytes());   // Int32 7
+        assert_eq!(&buf[3..], 7i32.to_le_bytes()); // Int32 7
     }
 
     #[test]
@@ -995,7 +1030,8 @@ mod tests {
             &value,
             &ChType::Tuple(vec![ChType::String, ChType::Int32]),
             &mut buf,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(&buf[..3], &[0x02, b'h', b'i']);
         assert_eq!(&buf[3..], 7i32.to_le_bytes());
     }

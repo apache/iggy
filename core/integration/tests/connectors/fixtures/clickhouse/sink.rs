@@ -18,11 +18,11 @@
  */
 
 use super::container::{
-    CLICKHOUSE_TEST_PASSWORD, CLICKHOUSE_TEST_USER, ClickHouseContainer, ClickHouseOps,
-    CREATE_TABLE_SQL, DEFAULT_DATABASE, DEFAULT_SINK_TABLE, DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC,
+    CLICKHOUSE_TEST_PASSWORD, CLICKHOUSE_TEST_USER, CREATE_TABLE_SQL, ClickHouseContainer,
+    ClickHouseOps, DEFAULT_DATABASE, DEFAULT_SINK_TABLE, DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC,
     ENV_SINK_DATABASE, ENV_SINK_INSERT_FORMAT, ENV_SINK_PASSWORD, ENV_SINK_PATH,
-    ENV_SINK_STRING_FORMAT, ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA,
-    ENV_SINK_STREAMS_0_STREAM, ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_TABLE, ENV_SINK_URL,
+    ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM,
+    ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_STRING_FORMAT, ENV_SINK_TABLE, ENV_SINK_URL,
     ENV_SINK_USERNAME, HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, create_http_client,
 };
 use async_trait::async_trait;
@@ -94,8 +94,14 @@ fn base_envs(container: &ClickHouseContainer, schema: &str) -> HashMap<String, S
     envs.insert(ENV_SINK_URL.to_string(), container.base_url.clone());
     envs.insert(ENV_SINK_DATABASE.to_string(), DEFAULT_DATABASE.to_string());
     envs.insert(ENV_SINK_TABLE.to_string(), DEFAULT_SINK_TABLE.to_string());
-    envs.insert(ENV_SINK_USERNAME.to_string(), CLICKHOUSE_TEST_USER.to_string());
-    envs.insert(ENV_SINK_PASSWORD.to_string(), CLICKHOUSE_TEST_PASSWORD.to_string());
+    envs.insert(
+        ENV_SINK_USERNAME.to_string(),
+        CLICKHOUSE_TEST_USER.to_string(),
+    );
+    envs.insert(
+        ENV_SINK_PASSWORD.to_string(),
+        CLICKHOUSE_TEST_PASSWORD.to_string(),
+    );
     envs.insert(
         ENV_SINK_STREAMS_0_STREAM.to_string(),
         DEFAULT_TEST_STREAM.to_string(),

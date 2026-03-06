@@ -18,10 +18,10 @@
  */
 
 use super::TEST_MESSAGE_COUNT;
+use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
     ClickHouseSinkFixture, ClickHouseSinkRowBinaryFixture, ClickHouseSinkStringFixture,
 };
-use crate::connectors::create_test_messages;
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_binary_protocol::MessageClient;
@@ -87,15 +87,21 @@ async fn clickhouse_sink_stores_json_messages(
     for (i, row) in rows.iter().enumerate() {
         let expected = &messages_data[i];
 
-        let id = row["id"].as_str().and_then(|s| s.parse::<u64>().ok())
+        let id = row["id"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
             .or_else(|| row["id"].as_u64())
             .unwrap_or_else(|| panic!("Missing 'id' at row {i}"));
         assert_eq!(id, expected.id, "id mismatch at row {i}");
 
-        let name = row["name"].as_str().unwrap_or_else(|| panic!("Missing 'name' at row {i}"));
+        let name = row["name"]
+            .as_str()
+            .unwrap_or_else(|| panic!("Missing 'name' at row {i}"));
         assert_eq!(name, expected.name, "name mismatch at row {i}");
 
-        let amount = row["amount"].as_str().and_then(|s| s.parse::<f64>().ok())
+        let amount = row["amount"]
+            .as_str()
+            .and_then(|s| s.parse::<f64>().ok())
             .or_else(|| row["amount"].as_f64())
             .unwrap_or_else(|| panic!("Missing 'amount' at row {i}"));
         assert!(
@@ -105,7 +111,8 @@ async fn clickhouse_sink_stores_json_messages(
         );
 
         // ClickHouse returns Bool columns as JSON true/false
-        let active = row["active"].as_bool()
+        let active = row["active"]
+            .as_bool()
             .or_else(|| row["active"].as_u64().map(|v| v != 0))
             .unwrap_or_else(|| panic!("Missing 'active' at row {i}"));
         assert_eq!(active, expected.active, "active mismatch at row {i}");
@@ -226,15 +233,21 @@ async fn clickhouse_sink_stores_messages_with_row_binary(
     for (i, row) in rows.iter().enumerate() {
         let expected = &messages_data[i];
 
-        let id = row["id"].as_str().and_then(|s| s.parse::<u64>().ok())
+        let id = row["id"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
             .or_else(|| row["id"].as_u64())
             .unwrap_or_else(|| panic!("Missing 'id' at row {i}"));
         assert_eq!(id, expected.id, "id mismatch at row {i}");
 
-        let name = row["name"].as_str().unwrap_or_else(|| panic!("Missing 'name' at row {i}"));
+        let name = row["name"]
+            .as_str()
+            .unwrap_or_else(|| panic!("Missing 'name' at row {i}"));
         assert_eq!(name, expected.name, "name mismatch at row {i}");
 
-        let count = row["count"].as_str().and_then(|s| s.parse::<u32>().ok())
+        let count = row["count"]
+            .as_str()
+            .and_then(|s| s.parse::<u32>().ok())
             .or_else(|| row["count"].as_u64().map(|v| v as u32))
             .unwrap_or_else(|| panic!("Missing 'count' at row {i}"));
         assert_eq!(count, expected.count, "count mismatch at row {i}");
@@ -265,12 +278,7 @@ async fn clickhouse_sink_stores_string_passthrough_csv(
         .map(|(i, msg)| {
             let csv = format!(
                 "{},{},{},{},{},{}\n",
-                msg.id,
-                msg.name,
-                msg.count,
-                msg.amount,
-                msg.active as u8,
-                msg.timestamp,
+                msg.id, msg.name, msg.count, msg.amount, msg.active as u8, msg.timestamp,
             );
             IggyMessage::builder()
                 .id((i + 1) as u128)
@@ -301,8 +309,7 @@ async fn clickhouse_sink_stores_string_passthrough_csv(
         .expect("Failed to count rows from ClickHouse");
 
     assert_eq!(
-        row_count,
-        TEST_MESSAGE_COUNT,
+        row_count, TEST_MESSAGE_COUNT,
         "Expected {TEST_MESSAGE_COUNT} rows in ClickHouse (string/CSV)"
     );
 }

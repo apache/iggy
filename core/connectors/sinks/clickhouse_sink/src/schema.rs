@@ -18,7 +18,7 @@
 
 //! ClickHouse column schema model and type string parser used by RowBinary mode.
 //!
-//! 
+//!
 //! # Type string grammar
 //!
 //! Grammer followed by ClickHouse type strings (as returned by `SELECT type FROM system.columns`):
@@ -52,7 +52,7 @@
 //!                  | "IPv4" | "IPv6"
 //! ```
 //!
-//! 
+//!
 //! ## Example
 //!
 //! ```text
@@ -70,7 +70,6 @@
 //!                    ├── [0] Int32
 //!                    └── [1] DateTime64(3)
 //! ```
-
 
 use iggy_connector_sdk::Error;
 use std::collections::HashMap;
@@ -201,18 +200,19 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
     }
     // e.g. "FixedString(16)"
     if let Some(inner) = strip_wrapper(s, "FixedString") {
-        let n: usize = inner.trim().parse().map_err(|_| {
-            init_err(format!("Invalid FixedString length: {inner}"))
-        })?;
+        let n: usize = inner
+            .trim()
+            .parse()
+            .map_err(|_| init_err(format!("Invalid FixedString length: {inner}")))?;
         return Ok(ChType::FixedString(n));
     }
     // e.g. "DateTime64(3)" or "DateTime64(3, 'UTC')"
     if let Some(inner) = strip_wrapper(s, "DateTime64") {
         // DateTime64(precision) or DateTime64(precision, 'timezone')
         let precision_str = inner.split(',').next().unwrap_or(inner).trim();
-        let precision: u8 = precision_str.parse().map_err(|_| {
-            init_err(format!("Invalid DateTime64 precision: {precision_str}"))
-        })?;
+        let precision: u8 = precision_str
+            .parse()
+            .map_err(|_| init_err(format!("Invalid DateTime64 precision: {precision_str}")))?;
         return Ok(ChType::DateTime64(precision));
     }
     // e.g. "DateTime('UTC')"
@@ -224,33 +224,38 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
     // e.g. "Decimal(18, 4)"
     if let Some(inner) = strip_wrapper(s, "Decimal") {
         let (p_str, s_str) = split_two_args(inner)?;
-        let precision: u8 = p_str.trim().parse().map_err(|_| {
-            init_err(format!("Invalid Decimal precision: {p_str}"))
-        })?;
-        let scale: u8 = s_str.trim().parse().map_err(|_| {
-            init_err(format!("Invalid Decimal scale: {s_str}"))
-        })?;
+        let precision: u8 = p_str
+            .trim()
+            .parse()
+            .map_err(|_| init_err(format!("Invalid Decimal precision: {p_str}")))?;
+        let scale: u8 = s_str
+            .trim()
+            .parse()
+            .map_err(|_| init_err(format!("Invalid Decimal scale: {s_str}")))?;
         return Ok(ChType::Decimal(precision, scale));
     }
     // e.g. "Decimal32(4)"
     if let Some(inner) = strip_wrapper(s, "Decimal32") {
-        let scale: u8 = inner.trim().parse().map_err(|_| {
-            init_err(format!("Invalid Decimal32 scale: {inner}"))
-        })?;
+        let scale: u8 = inner
+            .trim()
+            .parse()
+            .map_err(|_| init_err(format!("Invalid Decimal32 scale: {inner}")))?;
         return Ok(ChType::Decimal(9, scale));
     }
     // e.g. "Decimal64(4)"
     if let Some(inner) = strip_wrapper(s, "Decimal64") {
-        let scale: u8 = inner.trim().parse().map_err(|_| {
-            init_err(format!("Invalid Decimal64 scale: {inner}"))
-        })?;
+        let scale: u8 = inner
+            .trim()
+            .parse()
+            .map_err(|_| init_err(format!("Invalid Decimal64 scale: {inner}")))?;
         return Ok(ChType::Decimal(18, scale));
     }
     // e.g. "Decimal128(4)"
     if let Some(inner) = strip_wrapper(s, "Decimal128") {
-        let scale: u8 = inner.trim().parse().map_err(|_| {
-            init_err(format!("Invalid Decimal128 scale: {inner}"))
-        })?;
+        let scale: u8 = inner
+            .trim()
+            .parse()
+            .map_err(|_| init_err(format!("Invalid Decimal128 scale: {inner}")))?;
         return Ok(ChType::Decimal(38, scale));
     }
 
@@ -277,7 +282,9 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
 
         // ── Explicitly unsupported ─────────────────────────────────────────
         s if s.starts_with("LowCardinality") => {
-            error!("Unsupported ClickHouse type: {s}. LowCardinality uses dictionary encoding that is not supported in RowBinary mode.");
+            error!(
+                "Unsupported ClickHouse type: {s}. LowCardinality uses dictionary encoding that is not supported in RowBinary mode."
+            );
             Err(init_err(format!("Unsupported type: {s}")))
         }
         s if s.starts_with("Variant") => {
@@ -285,11 +292,19 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
             Err(init_err(format!("Unsupported type: {s}")))
         }
         "JSON" => {
-            error!("Unsupported ClickHouse type: JSON. The native JSON column type is not supported in RowBinary mode.");
+            error!(
+                "Unsupported ClickHouse type: JSON. The native JSON column type is not supported in RowBinary mode."
+            );
             Err(init_err("Unsupported type: JSON".into()))
         }
-        s if matches!(s, "Point" | "Ring" | "Polygon" | "MultiPolygon" | "LineString" | "MultiLineString") => {
-            error!("Unsupported ClickHouse type: {s}. Geo types are not supported in RowBinary mode.");
+        s if matches!(
+            s,
+            "Point" | "Ring" | "Polygon" | "MultiPolygon" | "LineString" | "MultiLineString"
+        ) =>
+        {
+            error!(
+                "Unsupported ClickHouse type: {s}. Geo types are not supported in RowBinary mode."
+            );
             Err(init_err(format!("Unsupported type: {s}")))
         }
         other => {
@@ -386,9 +401,9 @@ fn parse_enum_values_i8(s: &str) -> Result<HashMap<String, i8>, Error> {
     let mut map = HashMap::new();
     for pair in split_args(s)? {
         let (name, val) = parse_enum_pair(pair)?;
-        let v: i8 = val.parse().map_err(|_| {
-            init_err(format!("Invalid Enum8 value: {val}"))
-        })?;
+        let v: i8 = val
+            .parse()
+            .map_err(|_| init_err(format!("Invalid Enum8 value: {val}")))?;
         map.insert(name, v);
     }
     Ok(map)
@@ -399,9 +414,9 @@ fn parse_enum_values_i16(s: &str) -> Result<HashMap<String, i16>, Error> {
     let mut map = HashMap::new();
     for pair in split_args(s)? {
         let (name, val) = parse_enum_pair(pair)?;
-        let v: i16 = val.parse().map_err(|_| {
-            init_err(format!("Invalid Enum16 value: {val}"))
-        })?;
+        let v: i16 = val
+            .parse()
+            .map_err(|_| init_err(format!("Invalid Enum16 value: {val}")))?;
         map.insert(name, v);
     }
     Ok(map)
@@ -411,9 +426,9 @@ fn parse_enum_values_i16(s: &str) -> Result<HashMap<String, i16>, Error> {
 fn parse_enum_pair(pair: &str) -> Result<(String, &str), Error> {
     let pair = pair.trim();
     // Format: 'name' = value
-    let eq_pos = pair.rfind('=').ok_or_else(|| {
-        init_err(format!("Invalid enum pair (no '='): {pair}"))
-    })?;
+    let eq_pos = pair
+        .rfind('=')
+        .ok_or_else(|| init_err(format!("Invalid enum pair (no '='): {pair}")))?;
     let name_part = pair[..eq_pos].trim();
     let val_part = pair[eq_pos + 1..].trim();
     // Strip surrounding single quotes from name
@@ -604,12 +619,22 @@ mod tests {
     #[test]
     fn parses_doc_comment_example() {
         // Nullable(Map(String, Array(Tuple(id Int32, ts DateTime64(3, 'UTC')))))
-        let t = parse_type("Nullable(Map(String, Array(Tuple(id Int32, ts DateTime64(3, 'UTC')))))").unwrap();
-        let ChType::Nullable(inner) = t else { panic!("expected Nullable") };
-        let ChType::Map(k, v) = *inner else { panic!("expected Map") };
+        let t =
+            parse_type("Nullable(Map(String, Array(Tuple(id Int32, ts DateTime64(3, 'UTC')))))")
+                .unwrap();
+        let ChType::Nullable(inner) = t else {
+            panic!("expected Nullable")
+        };
+        let ChType::Map(k, v) = *inner else {
+            panic!("expected Map")
+        };
         assert!(matches!(*k, ChType::String));
-        let ChType::Array(inner) = *v else { panic!("expected Array") };
-        let ChType::Tuple(fields) = *inner else { panic!("expected Tuple") };
+        let ChType::Array(inner) = *v else {
+            panic!("expected Array")
+        };
+        let ChType::Tuple(fields) = *inner else {
+            panic!("expected Tuple")
+        };
         assert_eq!(fields.len(), 2);
         assert!(matches!(fields[0], ChType::Int32));
         assert!(matches!(fields[1], ChType::DateTime64(3)));
@@ -619,7 +644,9 @@ mod tests {
     #[test]
     fn parses_nullable_wrapping_composite() {
         let t = parse_type("Nullable(Array(Int32))").unwrap();
-        let ChType::Nullable(inner) = t else { panic!("expected Nullable") };
+        let ChType::Nullable(inner) = t else {
+            panic!("expected Nullable")
+        };
         assert!(matches!(*inner, ChType::Array(_)));
     }
 
@@ -628,7 +655,9 @@ mod tests {
     fn parses_named_tuple_with_composite_fields() {
         // strip_named_tuple_field must correctly skip names whose type contains parens
         let t = parse_type("Tuple(tags Array(String), meta Map(String, Int32))").unwrap();
-        let ChType::Tuple(fields) = t else { panic!("expected Tuple") };
+        let ChType::Tuple(fields) = t else {
+            panic!("expected Tuple")
+        };
         assert_eq!(fields.len(), 2);
         assert!(matches!(fields[0], ChType::Array(_)));
         assert!(matches!(fields[1], ChType::Map(_, _)));
@@ -647,8 +676,12 @@ mod tests {
     #[test]
     fn parses_array_of_three_element_tuple() {
         let t = parse_type("Array(Tuple(Float32, Float32, Float32))").unwrap();
-        let ChType::Array(inner) = t else { panic!("expected Array") };
-        let ChType::Tuple(fields) = *inner else { panic!("expected Tuple") };
+        let ChType::Array(inner) = t else {
+            panic!("expected Array")
+        };
+        let ChType::Tuple(fields) = *inner else {
+            panic!("expected Tuple")
+        };
         assert_eq!(fields.len(), 3);
         assert!(fields.iter().all(|f| matches!(f, ChType::Float32)));
     }

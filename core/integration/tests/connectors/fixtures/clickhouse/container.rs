@@ -18,8 +18,8 @@
  */
 
 use integration::harness::TestBinaryError;
-use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::Client as HttpClient;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 use std::time::Duration;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
@@ -208,9 +208,12 @@ pub trait ClickHouseOps: Sync {
             }
 
             let parsed: ClickHouseJsonResponse =
-                response.json().await.map_err(|e| TestBinaryError::InvalidState {
-                    message: format!("Failed to parse count response: {e}"),
-                })?;
+                response
+                    .json()
+                    .await
+                    .map_err(|e| TestBinaryError::InvalidState {
+                        message: format!("Failed to parse count response: {e}"),
+                    })?;
 
             let count = parsed
                 .data
@@ -281,9 +284,12 @@ pub trait ClickHouseOps: Sync {
             }
 
             let parsed: ClickHouseJsonResponse =
-                response.json().await.map_err(|e| TestBinaryError::InvalidState {
-                    message: format!("Failed to parse SELECT response: {e}"),
-                })?;
+                response
+                    .json()
+                    .await
+                    .map_err(|e| TestBinaryError::InvalidState {
+                        message: format!("Failed to parse SELECT response: {e}"),
+                    })?;
 
             Ok(parsed.data)
         }

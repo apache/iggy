@@ -37,8 +37,7 @@ pub(crate) fn build_json_body(messages: &[ConsumedMessage]) -> Vec<u8> {
     for msg in messages {
         match &msg.payload {
             Payload::Json(value) => {
-                if let Ok(s) = simd_json::to_string(value) {
-                    buf.extend_from_slice(s.as_bytes());
+                if simd_json::to_writer(&mut buf, value).is_ok() {
                     buf.push(b'\n');
                 } else {
                     warn!("Failed to serialise JSON payload at offset {}", msg.offset);
@@ -83,7 +82,10 @@ pub(crate) fn build_row_binary_body(
 /// Build a raw string body for CSV / TSV / JSONEachRow string passthrough.
 /// Each `Payload::Text` message is written as-is with a trailing newline
 /// appended for CSV/TSV if not already present.
-pub(crate) fn build_string_body(messages: &[ConsumedMessage], string_format: StringFormat) -> Vec<u8> {
+pub(crate) fn build_string_body(
+    messages: &[ConsumedMessage],
+    string_format: StringFormat,
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(messages.len() * 64);
     for msg in messages {
         match &msg.payload {
@@ -138,7 +140,11 @@ mod tests {
     }
 
     fn col(name: &str, ch_type: ChType) -> Column {
-        Column { name: name.into(), ch_type, has_default: false }
+        Column {
+            name: name.into(),
+            ch_type,
+            has_default: false,
+        }
     }
 
     fn json_null() -> OwnedValue {
@@ -207,7 +213,10 @@ mod tests {
     #[test]
     fn string_body_tsv_appends_newline_when_missing() {
         let messages = vec![msg(Payload::Text("a\tb\tc".into()))];
-        assert_eq!(build_string_body(&messages, StringFormat::Tsv), b"a\tb\tc\n");
+        assert_eq!(
+            build_string_body(&messages, StringFormat::Tsv),
+            b"a\tb\tc\n"
+        );
     }
 
     #[test]
