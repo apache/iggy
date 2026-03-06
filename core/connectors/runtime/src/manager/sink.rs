@@ -249,7 +249,10 @@ impl SinkManager {
             let details = details.lock().await;
             details.restart_guard.clone()
         };
-        let _lock = guard.lock().await;
+        let Ok(_lock) = guard.try_lock() else {
+            info!("Restart already in progress for sink connector: {key}, skipping.");
+            return Ok(());
+        };
 
         info!("Restarting sink connector: {key}");
         self.stop_connector(key, metrics).await?;
