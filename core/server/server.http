@@ -289,6 +289,11 @@ DELETE {{url}}/streams/{{stream_id}}/topics/{{topic_id}}/partitions?partitions_c
 Authorization: Bearer {{access_token}}
 
 ###
+### Delete segments
+DELETE {{url}}/streams/1/topics/1/partitions/1?segments_count=3
+Authorization: Bearer {{access_token}}
+
+###
 POST {{url}}/streams/{{stream_id}}/topics/{{topic_id}}/messages
 Authorization: Bearer {{access_token}}
 Content-Type: application/json
