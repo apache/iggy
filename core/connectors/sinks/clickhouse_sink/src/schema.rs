@@ -531,7 +531,7 @@ mod tests {
 
     #[test]
     fn parses_array_of_nullable_int32() {
-        let t = parse_type("(Array(Nullable(Int32)))").unwrap();
+        let t = parse_type("Array(Nullable(Int32))").unwrap();
         assert!(matches!(
             t,
             ChType::Array(inner)

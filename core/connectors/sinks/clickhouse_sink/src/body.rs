@@ -264,8 +264,8 @@ mod tests {
         let messages = vec![msg(Payload::Json(OwnedValue::Object(Box::new(obj))))];
         let schema = vec![col("name", ChType::String)];
         let body = build_row_binary_body(&messages, &schema).unwrap();
-        // "alice" as a RowBinary String: LEB128 length (5) + UTF-8 bytes
-        assert_eq!(body, b"\x05alice");
+        // RowBinaryWithDefaults: 0x00 (value follows) + LEB128 length (5) + UTF-8 bytes
+        assert_eq!(body, b"\x00\x05alice");
     }
 
     #[test]
@@ -280,7 +280,7 @@ mod tests {
         ];
         let schema = vec![col("n", ChType::String)];
         let body = build_row_binary_body(&messages, &schema).unwrap();
-        // Two rows: \x01x and \x01y
-        assert_eq!(body, b"\x01x\x01y");
+        // Two rows: 0x00 (value follows) + \x01x and 0x00 + \x01y
+        assert_eq!(body, b"\x00\x01x\x00\x01y");
     }
 }

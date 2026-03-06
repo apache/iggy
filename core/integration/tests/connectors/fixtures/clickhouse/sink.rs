@@ -45,8 +45,9 @@ async fn start_and_init_container(
     let ping_url = format!("{}/ping", container.base_url);
     let mut ready = false;
     for _ in 0..HEALTH_CHECK_ATTEMPTS {
-        if let Ok(resp) = client.get(&ping_url).send().await 
-            && resp.status().is_success() {
+        if let Ok(resp) = client.get(&ping_url).send().await
+            && resp.status().is_success()
+        {
             info!("ClickHouse HTTP interface is ready");
             ready = true;
             break;
