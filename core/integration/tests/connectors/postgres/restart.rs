@@ -37,42 +37,6 @@ const SINK_KEY: &str = "postgres";
 
 type SinkRow = (i64, String, String, Vec<u8>);
 
-async fn wait_for_sink_status(
-    http: &Client,
-    api_url: &str,
-    expected: ConnectorStatus,
-) -> SinkInfoResponse {
-    for _ in 0..POLL_ATTEMPTS {
-        if let Ok(resp) = http
-            .get(format!("{api_url}/sinks/{SINK_KEY}"))
-            .header("api-key", API_KEY)
-            .send()
-            .await
-            && let Ok(info) = resp.json::<SinkInfoResponse>().await
-            && info.status == expected
-        {
-            return info;
-        }
-        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-    }
-    panic!("Sink connector did not reach {expected:?} status in time");
-}
-
-fn build_messages(messages_data: &[TestMessage], id_offset: usize) -> Vec<IggyMessage> {
-    messages_data
-        .iter()
-        .enumerate()
-        .map(|(i, msg)| {
-            let payload = serde_json::to_vec(msg).expect("Failed to serialize message");
-            IggyMessage::builder()
-                .id((id_offset + i + 1) as u128)
-                .payload(Bytes::from(payload))
-                .build()
-                .expect("Failed to build message")
-        })
-        .collect()
-}
-
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/postgres/sink.toml")),
     seed = seeds::connector_stream
@@ -160,4 +124,115 @@ async fn restart_sink_connector_continues_processing(
         "Expected at least {total_expected} rows after restart, got {}",
         rows.len()
     );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/postgres/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn parallel_restart_requests_should_not_break_connector(
+    harness: &TestHarness,
+    fixture: PostgresSinkFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connector runtime should be available")
+        .http_url();
+    let http = Client::new();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+
+    fixture.wait_for_table(&pool, SINK_TABLE).await;
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+
+    wait_for_sink_status(&http, &api_url, ConnectorStatus::Running).await;
+
+    let mut tasks = Vec::new();
+    for _ in 0..5 {
+        let http = http.clone();
+        let url = format!("{api_url}/sinks/{SINK_KEY}/restart");
+        tasks.push(tokio::spawn(async move {
+            http.post(&url)
+                .header("api-key", API_KEY)
+                .send()
+                .await
+                .expect("Failed to call restart endpoint")
+        }));
+    }
+
+    let responses = futures::future::join_all(tasks).await;
+    for resp in responses {
+        let resp = resp.expect("Task panicked");
+        assert_eq!(
+            resp.status().as_u16(),
+            204,
+            "All restart requests should return 204"
+        );
+    }
+
+    wait_for_sink_status(&http, &api_url, ConnectorStatus::Running).await;
+
+    let batch = create_test_messages(TEST_MESSAGE_COUNT);
+    let mut messages = build_messages(&batch, 0);
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("Failed to send messages after parallel restarts");
+
+    let query = format!(
+        "SELECT iggy_offset, iggy_stream, iggy_topic, payload FROM {SINK_TABLE} ORDER BY iggy_offset"
+    );
+    let rows: Vec<SinkRow> = fixture
+        .fetch_rows_as(&pool, &query, TEST_MESSAGE_COUNT)
+        .await
+        .expect("Failed to fetch rows after parallel restarts");
+
+    assert!(
+        rows.len() >= TEST_MESSAGE_COUNT,
+        "Expected at least {TEST_MESSAGE_COUNT} rows after parallel restarts, got {}",
+        rows.len()
+    );
+}
+
+async fn wait_for_sink_status(
+    http: &Client,
+    api_url: &str,
+    expected: ConnectorStatus,
+) -> SinkInfoResponse {
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(resp) = http
+            .get(format!("{api_url}/sinks/{SINK_KEY}"))
+            .header("api-key", API_KEY)
+            .send()
+            .await
+            && let Ok(info) = resp.json::<SinkInfoResponse>().await
+            && info.status == expected
+        {
+            return info;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    panic!("Sink connector did not reach {expected:?} status in time");
+}
+
+fn build_messages(messages_data: &[TestMessage], id_offset: usize) -> Vec<IggyMessage> {
+    messages_data
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| {
+            let payload = serde_json::to_vec(msg).expect("Failed to serialize message");
+            IggyMessage::builder()
+                .id((id_offset + i + 1) as u128)
+                .payload(Bytes::from(payload))
+                .build()
+                .expect("Failed to build message")
+        })
+        .collect()
 }
