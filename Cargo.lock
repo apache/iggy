@@ -4882,14 +4882,12 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "dashmap",
- "futures",
  "humantime",
  "iggy_connector_sdk",
  "mongodb",
  "once_cell",
  "serde",
  "serde_json",
- "simd-json",
  "tokio",
  "tracing",
 ]

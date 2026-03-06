@@ -39,6 +39,14 @@ const DEFAULT_SINK_COLLECTION: &str = "iggy_messages";
 const LARGE_BATCH_COUNT: usize = 50;
 const MONGODB_SINK_KEY: &str = "mongodb";
 
+fn build_expected_document_id(message_id: u128) -> String {
+    build_expected_document_id_for_topic(seeds::names::TOPIC, message_id)
+}
+
+fn build_expected_document_id_for_topic(topic_name: &str, message_id: u128) -> String {
+    format!("{}:{}:{}:{message_id}", seeds::names::STREAM, topic_name, 0)
+}
+
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/mongodb/sink.toml")),
     seed = seeds::connector_stream
@@ -276,7 +284,7 @@ async fn duplicate_key_is_explicit_failure_and_not_silent_success(
         .collection::<Document>(DEFAULT_SINK_COLLECTION);
 
     let preseeded_document = doc! {
-        "_id": "2",
+        "_id": build_expected_document_id(2),
         "seed_marker": "preseed-unchanged",
         "payload": "preseeded"
     };
@@ -286,10 +294,10 @@ async fn duplicate_key_is_explicit_failure_and_not_silent_success(
         .await
         .expect("Failed to pre-seed duplicate _id document");
 
-    // Create deterministic ordering:
+    // Create deterministic insert set:
     // - "1" should be inserted
     // - "2" collides with pre-seeded _id
-    // - "3" should not be inserted because ordered insert_many stops at first duplicate.
+    // - "3" should be inserted because unordered insert_many continues past duplicates.
     let mut messages: Vec<IggyMessage> = vec![
         IggyMessage::builder()
             .id(1)
@@ -322,7 +330,7 @@ async fn duplicate_key_is_explicit_failure_and_not_silent_success(
     let mut first_message_inserted = false;
     for _ in 0..POLL_ATTEMPTS {
         if collection
-            .find_one(doc! { "_id": "1" })
+            .find_one(doc! { "_id": build_expected_document_id(1) })
             .await
             .expect("Failed to query _id=1")
             .is_some()
@@ -339,7 +347,7 @@ async fn duplicate_key_is_explicit_failure_and_not_silent_success(
     );
 
     let preseeded_after = collection
-        .find_one(doc! { "_id": "2" })
+        .find_one(doc! { "_id": build_expected_document_id(2) })
         .await
         .expect("Failed to query pre-seeded document")
         .expect("Pre-seeded _id=2 document should still exist");
@@ -353,7 +361,7 @@ async fn duplicate_key_is_explicit_failure_and_not_silent_success(
     );
 
     let duplicate_count = collection
-        .count_documents(doc! { "_id": "2" })
+        .count_documents(doc! { "_id": build_expected_document_id(2) })
         .await
         .expect("Failed to count _id=2 documents");
     assert_eq!(
@@ -361,20 +369,18 @@ async fn duplicate_key_is_explicit_failure_and_not_silent_success(
         "Duplicate _id must not create extra documents"
     );
 
-    assert!(
-        collection
-            .find_one(doc! { "_id": "3" })
-            .await
-            .expect("Failed to query _id=3")
-            .is_none(),
-        "Message after duplicate conflict should not be inserted with ordered insert_many"
-    );
-
     let mut sink_error_reported = false;
     let mut processed_messages = u64::MAX;
     let mut sink_errors = 0_u64;
+    let mut third_message_inserted = false;
 
     for _ in 0..POLL_ATTEMPTS {
+        third_message_inserted = collection
+            .find_one(doc! { "_id": build_expected_document_id(3) })
+            .await
+            .expect("Failed to query _id=3")
+            .is_some();
+
         let sinks_response = http_client
             .get(format!("{}/sinks", api_address))
             .send()
@@ -405,7 +411,11 @@ async fn duplicate_key_is_explicit_failure_and_not_silent_success(
             .expect("messages_processed should be present for sink stats");
         sink_errors = sink_stats.errors;
 
-        if sink_error_reported {
+        if third_message_inserted
+            && !sink_error_reported
+            && sink_errors == 0
+            && processed_messages == 3
+        {
             break;
         }
 
@@ -413,16 +423,20 @@ async fn duplicate_key_is_explicit_failure_and_not_silent_success(
     }
 
     assert!(
-        sink_error_reported,
-        "Duplicate key collision must be surfaced as explicit sink failure (last_error)"
+        third_message_inserted,
+        "Message after duplicate conflict should still be inserted with unordered insert_many"
     );
     assert!(
-        sink_errors > 0,
-        "Duplicate key collision must increment sink error metrics"
+        !sink_error_reported,
+        "Duplicate key collision should be idempotent"
     );
-    assert!(
-        processed_messages < TEST_MESSAGE_COUNT as u64,
-        "messages_processed must not report full success on duplicate-key batch failure"
+    assert_eq!(
+        sink_errors, 0,
+        "Idempotent duplicate handling should not count as sink error"
+    );
+    assert_eq!(
+        processed_messages, 3,
+        "messages_processed should reflect the successful runtime batch processing count"
     );
 }
 
@@ -453,7 +467,7 @@ async fn ordered_duplicate_partial_insert_has_exact_accounting(
 
     collection
         .insert_one(doc! {
-            "_id": "2",
+            "_id": build_expected_document_id(2),
             "seed_marker": "preseeded-stable",
             "payload": "preseeded"
         })
@@ -489,7 +503,7 @@ async fn ordered_duplicate_partial_insert_has_exact_accounting(
         .expect("Failed to send ordered duplicate batch");
 
     let mut id1_inserted = false;
-    let mut id3_inserted = true;
+    let mut id3_inserted = false;
     let mut sink_last_error = false;
     let mut sink_status = ConnectorStatus::Stopped;
     let mut processed_messages = u64::MAX;
@@ -497,12 +511,12 @@ async fn ordered_duplicate_partial_insert_has_exact_accounting(
 
     for _ in 0..POLL_ATTEMPTS {
         id1_inserted = collection
-            .find_one(doc! { "_id": "1" })
+            .find_one(doc! { "_id": build_expected_document_id(1) })
             .await
             .expect("Failed to query _id=1")
             .is_some();
         id3_inserted = collection
-            .find_one(doc! { "_id": "3" })
+            .find_one(doc! { "_id": build_expected_document_id(3) })
             .await
             .expect("Failed to query _id=3")
             .is_some();
@@ -538,7 +552,10 @@ async fn ordered_duplicate_partial_insert_has_exact_accounting(
             .expect("messages_processed must be present for sink stats");
         sink_errors = sink_stats.errors;
 
-        if id1_inserted && !id3_inserted && sink_last_error && sink_status == ConnectorStatus::Error
+        if id1_inserted
+            && id3_inserted
+            && !sink_last_error
+            && sink_status == ConnectorStatus::Running
         {
             break;
         }
@@ -548,12 +565,12 @@ async fn ordered_duplicate_partial_insert_has_exact_accounting(
 
     assert!(id1_inserted, "Prefix write (_id=1) must be inserted");
     assert!(
-        !id3_inserted,
-        "Suffix write (_id=3) must not be inserted after ordered duplicate failure"
+        id3_inserted,
+        "Suffix write (_id=3) should be inserted with unordered duplicate handling"
     );
 
     let preseeded_after = collection
-        .find_one(doc! { "_id": "2" })
+        .find_one(doc! { "_id": build_expected_document_id(2) })
         .await
         .expect("Failed to query pre-seeded _id=2")
         .expect("Pre-seeded _id=2 document must remain");
@@ -570,32 +587,32 @@ async fn ordered_duplicate_partial_insert_has_exact_accounting(
         .await
         .expect("Failed to count total collection documents");
     assert_eq!(
-        total_docs, 2,
-        "Expected exact prefix accounting in Mongo collection (preseed + first insert)"
+        total_docs, 3,
+        "Expected exact collection accounting (preseed + two successful inserts)"
     );
 
     let duplicate_docs = collection
-        .count_documents(doc! { "_id": "2" })
+        .count_documents(doc! { "_id": build_expected_document_id(2) })
         .await
         .expect("Failed to count duplicate _id entries");
     assert_eq!(duplicate_docs, 1, "Duplicate _id must remain single");
 
     assert!(
-        sink_last_error,
-        "Sink must expose explicit last_error on ordered duplicate failure"
+        !sink_last_error,
+        "Duplicate collision should not produce sink last_error"
     );
     assert_eq!(
         sink_status,
-        ConnectorStatus::Error,
-        "Sink status must transition to Error on hard write failure"
+        ConnectorStatus::Running,
+        "Sink should remain Running on idempotent duplicate handling"
     );
     assert_eq!(
-        sink_errors, 1,
-        "Expected exact runtime error accounting for one failed ordered batch"
+        sink_errors, 0,
+        "Duplicate handling should not increment runtime errors"
     );
     assert_eq!(
-        processed_messages, 0,
-        "Failed ordered batch must not increment runtime messages_processed"
+        processed_messages, 3,
+        "Idempotent duplicate handling should keep runtime batch processed count"
     );
 }
 
@@ -623,8 +640,8 @@ async fn schema_validation_mid_batch_surfaces_hard_error_and_partial_prefix(
     let database = mongo_client.database(DEFAULT_TEST_DATABASE);
     let collection = database.collection::<Document>(DEFAULT_SINK_COLLECTION);
 
-    // Enforce that only the first message in this ordered batch is valid.
-    // iggy_offset=0 passes; iggy_offset>=1 fails validation and stops ordered insert_many.
+    // Enforce that only the first message in this batch is valid.
+    // iggy_offset=0 passes; iggy_offset>=1 fails validation.
     database
         .run_command(doc! {
             "create": DEFAULT_SINK_COLLECTION,
@@ -676,17 +693,17 @@ async fn schema_validation_mid_batch_surfaces_hard_error_and_partial_prefix(
 
     for _ in 0..POLL_ATTEMPTS {
         id11_inserted = collection
-            .find_one(doc! { "_id": "11" })
+            .find_one(doc! { "_id": build_expected_document_id(11) })
             .await
             .expect("Failed to query _id=11")
             .is_some();
         id12_inserted = collection
-            .find_one(doc! { "_id": "12" })
+            .find_one(doc! { "_id": build_expected_document_id(12) })
             .await
             .expect("Failed to query _id=12")
             .is_some();
         id13_inserted = collection
-            .find_one(doc! { "_id": "13" })
+            .find_one(doc! { "_id": build_expected_document_id(13) })
             .await
             .expect("Failed to query _id=13")
             .is_some();
@@ -782,7 +799,7 @@ async fn schema_validation_mid_batch_surfaces_hard_error_and_partial_prefix(
     );
     assert_eq!(
         processed_messages, 0,
-        "Failed ordered schema-validation batch must not increment runtime messages_processed"
+        "Failed sink callback should not increment runtime processed count for the batch"
     );
 }
 
@@ -1050,9 +1067,9 @@ async fn retryable_write_failover_keeps_single_doc_per_id(
         "successful retryable failover recovery must count full batch as processed"
     );
 
-    for id in ["201", "202", "203"] {
+    for id in [201_u128, 202, 203] {
         let count = collection
-            .count_documents(doc! { "_id": id })
+            .count_documents(doc! { "_id": build_expected_document_id(id) })
             .await
             .expect("Failed to count per-id documents after retryable failover");
         assert_eq!(count, 1, "Expected exactly one document for _id={id}");
@@ -1198,9 +1215,9 @@ async fn no_writes_performed_label_path_preserves_state_accuracy(
         "NoWritesPerformed retry recovery must count full batch as processed"
     );
 
-    for id in ["301", "302", "303"] {
+    for id in [301_u128, 302, 303] {
         let count = collection
-            .count_documents(doc! { "_id": id })
+            .count_documents(doc! { "_id": build_expected_document_id(id) })
             .await
             .expect("Failed to count per-id documents for NoWritesPerformed path");
         assert_eq!(count, 1, "Expected exactly one document for _id={id}");

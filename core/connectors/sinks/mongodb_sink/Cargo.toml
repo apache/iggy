@@ -28,22 +28,17 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
-[package.metadata.cargo-machete]
-ignored = ["dashmap", "once_cell", "futures", "simd-json"]
-
 [lib]
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
 async-trait = { workspace = true }
 dashmap = { workspace = true }
-futures = { workspace = true }
 humantime = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 mongodb = { version = "3.0", features = ["rustls-tls"] }
 once_cell = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-simd-json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

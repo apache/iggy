@@ -24,8 +24,8 @@ use iggy_connector_sdk::{
 use mongodb::{Client, Collection, bson, options::ClientOptions};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 sink_connector!(MongoDbSink);
@@ -38,9 +38,16 @@ pub struct MongoDbSink {
     pub id: u32,
     client: Option<Client>,
     config: MongoDbSinkConfig,
-    state: Mutex<State>,
     verbose: bool,
+    batch_size: usize,
+    include_metadata: bool,
+    include_checksum: bool,
+    include_origin_timestamp: bool,
+    payload_format: PayloadFormat,
+    max_retries: u32,
     retry_delay: Duration,
+    messages_processed: AtomicU64,
+    insertion_errors: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,23 +77,29 @@ pub enum PayloadFormat {
 
 impl PayloadFormat {
     fn from_config(s: Option<&str>) -> Self {
-        match s.map(|s| s.to_lowercase()).as_deref() {
-            Some("json") => PayloadFormat::Json,
-            Some("string") | Some("text") => PayloadFormat::String,
-            _ => PayloadFormat::Binary,
+        let (payload_format, unknown_value) = classify_payload_format_value(s);
+        if let Some(value) = unknown_value {
+            warn!("Unknown MongoDB sink payload format '{value}', defaulting to binary");
         }
+        payload_format
     }
 }
 
 #[derive(Debug)]
-struct State {
-    messages_processed: u64,
-    insertion_errors: u64,
+struct BatchInsertOutcome {
+    inserted_count: u64,
+    error: Option<Error>,
 }
 
 impl MongoDbSink {
     pub fn new(id: u32, config: MongoDbSinkConfig) -> Self {
         let verbose = config.verbose_logging.unwrap_or(false);
+        let payload_format = PayloadFormat::from_config(config.payload_format.as_deref());
+        let batch_size = config.batch_size.unwrap_or(100).max(1) as usize;
+        let include_metadata = config.include_metadata.unwrap_or(true);
+        let include_checksum = config.include_checksum.unwrap_or(true);
+        let include_origin_timestamp = config.include_origin_timestamp.unwrap_or(true);
+        let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
         let delay_str = config.retry_delay.as_deref().unwrap_or(DEFAULT_RETRY_DELAY);
         let retry_delay = HumanDuration::from_str(delay_str)
             .map(|duration| duration.into())
@@ -95,12 +108,16 @@ impl MongoDbSink {
             id,
             client: None,
             config,
-            state: Mutex::new(State {
-                messages_processed: 0,
-                insertion_errors: 0,
-            }),
             verbose,
+            batch_size,
+            include_metadata,
+            include_checksum,
+            include_origin_timestamp,
+            payload_format,
+            max_retries,
             retry_delay,
+            messages_processed: AtomicU64::new(0),
+            insertion_errors: AtomicU64::new(0),
         }
     }
 }
@@ -139,10 +156,11 @@ impl Sink for MongoDbSink {
         // Just take the client to drop it
         self.client.take();
 
-        let state = self.state.lock().await;
+        let messages_processed = self.messages_processed.load(Ordering::Relaxed);
+        let insertion_errors = self.insertion_errors.load(Ordering::Relaxed);
         info!(
             "MongoDB sink ID: {} processed {} messages with {} errors",
-            self.id, state.messages_processed, state.insertion_errors
+            self.id, messages_processed, insertion_errors
         );
         Ok(())
     }
@@ -217,35 +235,28 @@ impl MongoDbSink {
         let client = self.get_client()?;
         let db = client.database(&self.config.database);
         let collection = db.collection(&self.config.collection);
-        let batch_size = self.config.batch_size.unwrap_or(100) as usize;
 
-        // Track successfully inserted messages for accurate metrics
         let mut successful_inserts = 0u64;
         let mut last_error: Option<Error> = None;
 
-        for batch in messages.chunks(batch_size) {
-            match self
+        for batch in messages.chunks(self.batch_size) {
+            let outcome = self
                 .insert_batch(batch, topic_metadata, messages_metadata, &collection)
-                .await
-            {
-                Ok(()) => {
-                    successful_inserts += batch.len() as u64;
-                }
-                Err(e) => {
-                    let mut state = self.state.lock().await;
-                    state.insertion_errors += batch.len() as u64;
-                    error!("Failed to insert batch of {} messages: {e}", batch.len());
-                    last_error = Some(e);
-                    // Continue to try remaining batches, but we'll return error at the end
-                }
+                .await;
+
+            successful_inserts += outcome.inserted_count;
+            if let Some(batch_error) = outcome.error {
+                self.insertion_errors.fetch_add(1, Ordering::Relaxed);
+                error!(
+                    "Failed to insert batch of {} messages: {batch_error}",
+                    batch.len()
+                );
+                last_error = Some(batch_error);
             }
         }
 
-        // Update state with only successful inserts
-        {
-            let mut state = self.state.lock().await;
-            state.messages_processed += successful_inserts;
-        }
+        self.messages_processed
+            .fetch_add(successful_inserts, Ordering::Relaxed);
 
         let coll = &self.config.collection;
         if self.verbose {
@@ -260,8 +271,6 @@ impl MongoDbSink {
             );
         }
 
-        // CRITICAL: Return error if any batch failed to prevent silent data loss.
-        // Upstream must know that some messages were NOT persisted.
         if let Some(e) = last_error {
             Err(e)
         } else {
@@ -275,51 +284,62 @@ impl MongoDbSink {
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
         collection: &Collection<mongodb::bson::Document>,
-    ) -> Result<(), Error> {
+    ) -> BatchInsertOutcome {
         if messages.is_empty() {
-            return Ok(());
+            return BatchInsertOutcome {
+                inserted_count: 0,
+                error: None,
+            };
         }
-
-        let include_metadata = self.config.include_metadata.unwrap_or(true);
-        let include_checksum = self.config.include_checksum.unwrap_or(true);
-        let include_origin_timestamp = self.config.include_origin_timestamp.unwrap_or(true);
-        let payload_format = self.payload_format();
 
         let mut docs = Vec::with_capacity(messages.len());
 
         for message in messages {
             let mut doc = mongodb::bson::Document::new();
 
-            // Add message ID as string (MongoDB doesn't support u128)
-            doc.insert("_id", message.id.to_string());
+            let document_id =
+                build_composite_document_id(topic_metadata, messages_metadata, message.id);
+            doc.insert("_id", document_id);
 
-            if include_metadata {
-                doc.insert("iggy_offset", message.offset as i64);
+            if self.include_metadata {
+                let (offset_key, offset_value) = build_offset_metadata_value(message.offset);
+                doc.insert(offset_key, offset_value);
                 // Convert microseconds to milliseconds for BSON DateTime
                 let timestamp_ms = (message.timestamp / 1000) as i64;
                 let bson_timestamp = bson::DateTime::from_millis(timestamp_ms);
                 doc.insert("iggy_timestamp", bson_timestamp);
                 doc.insert("iggy_stream", &topic_metadata.stream);
                 doc.insert("iggy_topic", &topic_metadata.topic);
-                doc.insert("iggy_partition_id", messages_metadata.partition_id as i32);
+                doc.insert(
+                    "iggy_partition_id",
+                    build_partition_metadata_value(messages_metadata.partition_id),
+                );
             }
 
-            if include_checksum {
+            if self.include_checksum {
                 doc.insert("iggy_checksum", message.checksum as i64);
             }
 
-            if include_origin_timestamp {
+            if self.include_origin_timestamp {
                 let origin_timestamp_ms = (message.origin_timestamp / 1000) as i64;
                 let bson_timestamp = bson::DateTime::from_millis(origin_timestamp_ms);
                 doc.insert("iggy_origin_timestamp", bson_timestamp);
             }
 
             // Handle payload based on format
-            let payload_bytes = message.payload.clone().try_into_vec().map_err(|e| {
-                Error::CannotStoreData(format!("Failed to convert payload to bytes: {e}"))
-            })?;
+            let payload_bytes = match message.payload.clone().try_into_vec() {
+                Ok(payload_bytes) => payload_bytes,
+                Err(error) => {
+                    return BatchInsertOutcome {
+                        inserted_count: 0,
+                        error: Some(Error::CannotStoreData(format!(
+                            "Failed to convert payload to bytes: {error}"
+                        ))),
+                    };
+                }
+            };
 
-            match payload_format {
+            match self.payload_format {
                 PayloadFormat::Binary => {
                     doc.insert(
                         "payload",
@@ -330,24 +350,46 @@ impl MongoDbSink {
                     );
                 }
                 PayloadFormat::Json => {
-                    let json_value: serde_json::Value = serde_json::from_slice(&payload_bytes)
-                        .map_err(|e| {
-                            error!("Failed to parse payload as JSON: {e}");
-                            Error::CannotStoreData(format!("Failed to parse payload as JSON: {e}"))
-                        })?;
-                    let bson_value = bson::to_bson(&json_value).map_err(|e| {
-                        error!("Failed to convert JSON to BSON: {e}");
-                        Error::CannotStoreData(format!("Failed to convert JSON to BSON: {e}"))
-                    })?;
+                    let json_value: serde_json::Value = match serde_json::from_slice(&payload_bytes)
+                    {
+                        Ok(json_value) => json_value,
+                        Err(error) => {
+                            error!("Failed to parse payload as JSON: {error}");
+                            return BatchInsertOutcome {
+                                inserted_count: 0,
+                                error: Some(Error::CannotStoreData(format!(
+                                    "Failed to parse payload as JSON: {error}"
+                                ))),
+                            };
+                        }
+                    };
+                    let bson_value = match bson::to_bson(&json_value) {
+                        Ok(bson_value) => bson_value,
+                        Err(error) => {
+                            error!("Failed to convert JSON to BSON: {error}");
+                            return BatchInsertOutcome {
+                                inserted_count: 0,
+                                error: Some(Error::CannotStoreData(format!(
+                                    "Failed to convert JSON to BSON: {error}"
+                                ))),
+                            };
+                        }
+                    };
                     doc.insert("payload", bson_value);
                 }
                 PayloadFormat::String => {
-                    let text_value = String::from_utf8(payload_bytes).map_err(|e| {
-                        error!("Failed to parse payload as UTF-8 text: {e}");
-                        Error::CannotStoreData(format!(
-                            "Failed to parse payload as UTF-8 text: {e}"
-                        ))
-                    })?;
+                    let text_value = match String::from_utf8(payload_bytes) {
+                        Ok(text_value) => text_value,
+                        Err(error) => {
+                            error!("Failed to parse payload as UTF-8 text: {error}");
+                            return BatchInsertOutcome {
+                                inserted_count: 0,
+                                error: Some(Error::CannotStoreData(format!(
+                                    "Failed to parse payload as UTF-8 text: {error}"
+                                ))),
+                            };
+                        }
+                    };
                     doc.insert("payload", text_value);
                 }
             }
@@ -355,7 +397,6 @@ impl MongoDbSink {
             docs.push(doc);
         }
 
-        // Insert batch with retry logic
         self.insert_batch_with_retry(collection, &docs).await
     }
 
@@ -363,28 +404,50 @@ impl MongoDbSink {
         &self,
         collection: &Collection<mongodb::bson::Document>,
         docs: &[mongodb::bson::Document],
-    ) -> Result<(), Error> {
-        let max_retries = self.get_max_retries();
-        let retry_delay = self.retry_delay;
+    ) -> BatchInsertOutcome {
         let mut attempts = 0u32;
 
         loop {
-            let result = collection.insert_many(docs.to_vec()).await;
+            let result = collection.insert_many(docs.to_vec()).ordered(false).await;
 
             match result {
-                Ok(_) => return Ok(()),
-                Err(e) => {
+                Ok(result) => {
+                    return BatchInsertOutcome {
+                        inserted_count: result.inserted_ids.len() as u64,
+                        error: None,
+                    };
+                }
+                Err(error) => {
+                    if let Some(duplicate_count) = count_duplicate_write_errors(&error) {
+                        let inserted_count = docs.len().saturating_sub(duplicate_count) as u64;
+                        if duplicate_count > 0 {
+                            warn!(
+                                "MongoDB sink ID: {} ignored {duplicate_count} duplicate writes in batch",
+                                self.id
+                            );
+                        }
+                        return BatchInsertOutcome {
+                            inserted_count,
+                            error: None,
+                        };
+                    }
+
                     attempts += 1;
-                    if !is_transient_error(&e) || attempts >= max_retries {
-                        error!("Batch insert failed after {attempts} attempts: {e}");
-                        return Err(Error::CannotStoreData(format!(
-                            "Batch insert failed after {attempts} attempts: {e}"
-                        )));
+                    if !is_transient_error(&error) || attempts >= self.max_retries {
+                        let inserted_count = estimate_inserted_count_value(&error, docs.len());
+                        error!("Batch insert failed after {attempts} attempts: {error}");
+                        return BatchInsertOutcome {
+                            inserted_count,
+                            error: Some(Error::CannotStoreData(format!(
+                                "Batch insert failed after {attempts} attempts: {error}"
+                            ))),
+                        };
                     }
                     warn!(
-                        "Transient database error (attempt {attempts}/{max_retries}): {e}. Retrying..."
+                        "Transient database error (attempt {attempts}/{}): {error}. Retrying...",
+                        self.max_retries
                     );
-                    tokio::time::sleep(retry_delay * attempts).await;
+                    tokio::time::sleep(self.retry_delay * attempts).await;
                 }
             }
         }
@@ -395,14 +458,77 @@ impl MongoDbSink {
             .as_ref()
             .ok_or_else(|| Error::InitError("Database not connected".to_string()))
     }
+}
 
-    fn payload_format(&self) -> PayloadFormat {
-        PayloadFormat::from_config(self.config.payload_format.as_deref())
+fn build_composite_document_id(
+    topic_metadata: &TopicMetadata,
+    messages_metadata: &MessagesMetadata,
+    message_id: u128,
+) -> String {
+    format!(
+        "{}:{}:{}:{message_id}",
+        topic_metadata.stream, topic_metadata.topic, messages_metadata.partition_id
+    )
+}
+
+fn build_partition_metadata_value(partition_id: u32) -> bson::Bson {
+    if let Ok(value) = i32::try_from(partition_id) {
+        bson::Bson::Int32(value)
+    } else {
+        bson::Bson::Int64(i64::from(partition_id))
+    }
+}
+
+fn build_offset_metadata_value(offset: u64) -> (&'static str, bson::Bson) {
+    if let Ok(offset) = i64::try_from(offset) {
+        ("iggy_offset", bson::Bson::Int64(offset))
+    } else {
+        ("iggy_offset_str", bson::Bson::String(offset.to_string()))
+    }
+}
+
+fn classify_payload_format_value(input: Option<&str>) -> (PayloadFormat, Option<&str>) {
+    match input {
+        Some(value) if value.eq_ignore_ascii_case("json") => (PayloadFormat::Json, None),
+        Some(value)
+            if value.eq_ignore_ascii_case("string") || value.eq_ignore_ascii_case("text") =>
+        {
+            (PayloadFormat::String, None)
+        }
+        Some(value) if value.eq_ignore_ascii_case("binary") => (PayloadFormat::Binary, None),
+        Some(value) => (PayloadFormat::Binary, Some(value)),
+        None => (PayloadFormat::Binary, None),
+    }
+}
+
+fn count_duplicate_write_errors(error: &mongodb::error::Error) -> Option<usize> {
+    use mongodb::error::ErrorKind;
+
+    let ErrorKind::InsertMany(insert_many_error) = error.kind.as_ref() else {
+        return None;
+    };
+    if insert_many_error.write_concern_error.is_some() {
+        return None;
     }
 
-    fn get_max_retries(&self) -> u32 {
-        self.config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES)
+    let write_errors = insert_many_error.write_errors.as_ref()?;
+    if write_errors.is_empty() || write_errors.iter().any(|error| error.code != 11000) {
+        return None;
     }
+
+    Some(write_errors.len())
+}
+
+fn estimate_inserted_count_value(error: &mongodb::error::Error, total_docs: usize) -> u64 {
+    use mongodb::error::ErrorKind;
+
+    if let ErrorKind::InsertMany(insert_many_error) = error.kind.as_ref()
+        && let Some(write_errors) = &insert_many_error.write_errors
+    {
+        return total_docs.saturating_sub(write_errors.len()) as u64;
+    }
+
+    0
 }
 
 fn is_transient_error(e: &mongodb::error::Error) -> bool {
@@ -489,6 +615,26 @@ mod tests {
     }
 
     #[test]
+    fn given_unknown_payload_format_should_mark_warning_contract() {
+        let (payload_format, unknown_value) = classify_payload_format_value(Some("surprise"));
+        assert_eq!(payload_format, PayloadFormat::Binary);
+        assert_eq!(unknown_value, Some("surprise"));
+    }
+
+    #[test]
+    fn given_macro_runtime_dependencies_should_link_explicitly() {
+        let cache = dashmap::DashMap::new();
+        cache.insert("connector", 1_u8);
+        let entry = cache
+            .get("connector")
+            .expect("DashMap should contain inserted key");
+        assert_eq!(*entry, 1);
+
+        let lazy_value = once_cell::sync::Lazy::new(|| 7_u8);
+        assert_eq!(*lazy_value, 7);
+    }
+
+    #[test]
     fn given_retry_configurations_should_use_expected_values() {
         let cases = [
             (None, None, DEFAULT_MAX_RETRIES, Duration::from_secs(1)),
@@ -507,7 +653,7 @@ mod tests {
             config.retry_delay = retry_delay.map(std::string::ToString::to_string);
 
             let sink = MongoDbSink::new(1, config);
-            assert_eq!(sink.get_max_retries(), expected_retries);
+            assert_eq!(sink.max_retries, expected_retries);
             assert_eq!(sink.retry_delay, expected_delay);
         }
     }
@@ -544,8 +690,61 @@ mod tests {
             config.payload_format = payload_format.map(std::string::ToString::to_string);
 
             let sink = MongoDbSink::new(1, config);
-            assert_eq!(sink.payload_format(), expected);
+            assert_eq!(sink.payload_format, expected);
         }
+    }
+
+    #[test]
+    fn given_offset_values_should_use_expected_metadata_field() {
+        let (normal_key, normal_value) = build_offset_metadata_value(i64::MAX as u64);
+        assert_eq!(normal_key, "iggy_offset");
+        assert_eq!(normal_value, bson::Bson::Int64(i64::MAX));
+
+        let oversized_offset = (i64::MAX as u64) + 1;
+        let (oversized_key, oversized_value) = build_offset_metadata_value(oversized_offset);
+        assert_eq!(oversized_key, "iggy_offset_str");
+        assert_eq!(
+            oversized_value,
+            bson::Bson::String(oversized_offset.to_string())
+        );
+    }
+
+    #[test]
+    fn given_partition_values_should_use_expected_bson_type() {
+        assert_eq!(
+            build_partition_metadata_value(i32::MAX as u32),
+            bson::Bson::Int32(i32::MAX)
+        );
+
+        let oversized_partition = (i32::MAX as u32) + 1;
+        assert_eq!(
+            build_partition_metadata_value(oversized_partition),
+            bson::Bson::Int64(i64::from(oversized_partition))
+        );
+    }
+
+    #[test]
+    fn given_cross_topic_messages_should_build_unique_document_ids() {
+        let first_topic = TopicMetadata {
+            stream: "test_stream".to_string(),
+            topic: "topic_primary".to_string(),
+        };
+        let second_topic = TopicMetadata {
+            stream: "test_stream".to_string(),
+            topic: "topic_secondary".to_string(),
+        };
+        let messages_metadata = MessagesMetadata {
+            partition_id: 0,
+            current_offset: 0,
+            schema: iggy_connector_sdk::Schema::Raw,
+        };
+
+        let first_id = build_composite_document_id(&first_topic, &messages_metadata, 42);
+        let second_id = build_composite_document_id(&second_topic, &messages_metadata, 42);
+        assert_ne!(
+            first_id, second_id,
+            "Composite document ID must differ for different topics"
+        );
     }
 
     #[test]
@@ -652,10 +851,9 @@ mod tests {
             "process_messages MUST return Err when client is unavailable - silent data loss bug!"
         );
 
-        // Verify state: messages_processed should be 0 since nothing succeeded
-        let state = sink.state.lock().await;
         assert_eq!(
-            state.messages_processed, 0,
+            sink.messages_processed.load(Ordering::Relaxed),
+            0,
             "messages_processed must only count SUCCESSFUL inserts"
         );
     }
@@ -668,13 +866,14 @@ mod tests {
     #[test]
     fn given_new_sink_should_have_zero_messages_processed() {
         let sink = MongoDbSink::new(1, given_default_config());
-        let state = sink.state.blocking_lock();
         assert_eq!(
-            state.messages_processed, 0,
+            sink.messages_processed.load(Ordering::Relaxed),
+            0,
             "New sink must start with zero processed count"
         );
         assert_eq!(
-            state.insertion_errors, 0,
+            sink.insertion_errors.load(Ordering::Relaxed),
+            0,
             "New sink must start with zero error count"
         );
     }
