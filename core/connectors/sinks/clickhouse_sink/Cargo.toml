@@ -35,14 +35,14 @@ ignored = ["dashmap", "once_cell"]
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-async-trait        = { workspace = true }
-dashmap            = { workspace = true }
-humantime          = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+humantime = { workspace = true }
 iggy_connector_sdk = { workspace = true }
-once_cell          = { workspace = true }
-reqwest            = { workspace = true }
-serde              = { workspace = true }
-serde_json         = { workspace = true }
-simd-json          = { workspace = true }
-tokio              = { workspace = true }
-tracing            = { workspace = true }
+once_cell = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+simd-json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
