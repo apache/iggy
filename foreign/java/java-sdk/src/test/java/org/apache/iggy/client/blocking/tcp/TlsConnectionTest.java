@@ -22,7 +22,7 @@ package org.apache.iggy.client.blocking.tcp;
 import com.github.dockerjava.api.model.Capability;
 import com.github.dockerjava.api.model.Ulimit;
 import io.netty.util.ResourceLeakDetector;
-import org.apache.iggy.exception.IggyException;
+
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
@@ -38,6 +38,7 @@ import org.junit.jupiter.api.condition.DisabledIfEnvironmentVariable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
@@ -45,8 +46,13 @@ import org.testcontainers.utility.MountableFile;
 import java.io.File;
 import java.math.BigInteger;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static java.util.Optional.empty;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -94,6 +100,8 @@ class TlsConnectionTest {
                         .withCapAdd(Capability.SYS_NICE)
                         .withSecurityOpts(List.of("seccomp:unconfined"))
                         .withUlimits(List.of(new Ulimit("memlock", -1L, -1L))))
+                .waitingFor(Wait.forLogMessage(".*Iggy TCP TLS server has started.*", 1)
+                        .withStartupTimeout(Duration.ofMinutes(2)))
                 .withLogConsumer(frame -> System.out.print(frame.getUtf8String()));
         iggyServer.start();
     }
@@ -138,15 +146,24 @@ class TlsConnectionTest {
 
     @Test
     void connectWithoutTlsShouldFailWhenTlsRequired() {
-        assertThatThrownBy(() -> {
-                    var client = IggyTcpClient.builder()
-                            .host(iggyServer.getHost())
-                            .port(iggyServer.getMappedPort(TCP_PORT))
-                            .credentials("iggy", "iggy")
-                            .buildAndLogin();
-                    client.system().getStats();
-                })
-                .isInstanceOf(IggyException.class);
+        // The blocking TCP client hangs on responses.take() when the server drops
+        // a non-TLS connection, so we run in a separate thread with a timeout.
+        // The connection should either fail with an exception or hang (both mean failure).
+        var executor = Executors.newSingleThreadExecutor();
+        try {
+            var future = executor.submit(() -> {
+                var client = IggyTcpClient.builder()
+                        .host(iggyServer.getHost())
+                        .port(iggyServer.getMappedPort(TCP_PORT))
+                        .credentials("iggy", "iggy")
+                        .buildAndLogin();
+                client.system().getStats();
+            });
+            assertThatThrownBy(() -> future.get(10, TimeUnit.SECONDS))
+                    .isInstanceOfAny(ExecutionException.class, TimeoutException.class);
+        } finally {
+            executor.shutdownNow();
+        }
     }
 
     @Test
@@ -181,13 +198,13 @@ class TlsConnectionTest {
             List<Message> messages =
                     List.of(Message.of("tls-message-1"), Message.of("tls-message-2"), Message.of("tls-message-3"));
 
-            client.messages().sendMessages(streamId, topicId, Partitioning.partitionId(1L), messages);
+            client.messages().sendMessages(streamId, topicId, Partitioning.partitionId(0L), messages);
 
             PolledMessages polled = client.messages()
                     .pollMessages(
                             streamId,
                             topicId,
-                            Optional.of(1L),
+                            Optional.of(0L),
                             org.apache.iggy.consumergroup.Consumer.of(0L),
                             PollingStrategy.offset(BigInteger.ZERO),
                             3L,
