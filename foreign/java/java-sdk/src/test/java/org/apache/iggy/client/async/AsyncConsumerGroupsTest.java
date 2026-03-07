@@ -262,7 +262,7 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
 
         assertThat(group.membersCount()).isEqualTo(1);
         assertThat(group.members()).hasSize(1);
-        assertThat(group.members().getFirst().partitionsCount()).isGreaterThan(0);
+        assertThat(group.members().get(0).partitionsCount()).isGreaterThan(0);
 
         client.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
