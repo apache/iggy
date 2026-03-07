@@ -508,7 +508,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Go with cache
+      - name: Setup Go
         uses: ./.github/actions/utils/setup-go-with-cache
 
       - name: Setup Rust with cache
