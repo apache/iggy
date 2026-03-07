@@ -146,6 +146,12 @@ runs:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
         log-file: ${{ steps.iggy.outputs.log_file }}
 
+    - name: TLS integration tests (Testcontainers)
+      if: inputs.task == 'test'
+      shell: bash
+      working-directory: foreign/java
+      run: ./gradlew :java-sdk:test --tests "*TlsConnectionTest*"
+
     - name: Test Summary
       uses: test-summary/action@v2
       with:
