@@ -38,14 +38,14 @@ import { BATCHES_LIMIT, cleanup, initSystem, log, MESSAGES_PER_BATCH, sleep } fr
 
 async function produceMessages(
   client: Client,
-  stream: Awaited<ReturnType<typeof initSystem>>['stream'],
-  topic: Awaited<ReturnType<typeof initSystem>>['topic'],
+  streamId: number | string,
+  topicId: number | string,
 ) {
   const interval = 500;
   log(
-    'Messages will be sent to stream: %d, topic: %d with interval %d ms.',
-    stream.id,
-    topic.id,
+    'Messages will be sent to stream: %s, topic: %s with interval %d ms.',
+    streamId,
+    topicId,
     interval,
   );
 
@@ -64,12 +64,10 @@ async function produceMessages(
 
     try {
       await client.message.send({
-        streamId: stream.id,
-        topicId: topic.id,
+        streamId,
+        topicId,
         messages,
-        partition: Partitioning.PartitionId(
-          topic.partitions[Math.floor(Math.random() * topic.partitions.length)].id,
-        ),
+        partition: Partitioning.Balanced,
       });
     } catch (error) {
       log('Error sending messages: %o', error);
@@ -98,7 +96,7 @@ async function main() {
     credentials: { username: 'iggy', password: 'iggy' },
   });
 
-  let streamId = null;
+  let streamId: number | null = null;
   let topicId = 0;
   try {
     log('TLS producer has started, selected transport: TLS');
@@ -112,7 +110,7 @@ async function main() {
     log('Ping successful.', pong);
 
     log('Stream ID: %s, Topic ID: %s', streamId, topicId);
-    await produceMessages(client, stream, topic);
+    await produceMessages(client, streamId, topicId);
   } catch (error) {
     log('Error in main: %o', error);
     process.exitCode = 1;

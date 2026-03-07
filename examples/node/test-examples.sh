@@ -133,4 +133,13 @@ test_example "Stream Builder" "npm run test:stream-builder" 8
 echo -e "\n${YELLOW}Testing Sink Data Producer${NC}"
 test_example "Sink Data Producer" "npm run test:sink-data-producer" 8
 
+# TCP/TLS examples (require a TLS-enabled server)
+if [ "$IGGY_TCP_TLS_ENABLED" = "true" ]; then
+    echo -e "\n${YELLOW}Testing TCP/TLS Examples${NC}"
+    test_example "TCP/TLS Producer" "npm run test:tcp-tls:producer" 10
+    test_example "TCP/TLS Consumer" "npm run test:tcp-tls:consumer" 8
+else
+    echo -e "\n${YELLOW}Skipping TCP/TLS examples (set IGGY_TCP_TLS_ENABLED=true to run)${NC}"
+fi
+
 echo -e "\n${GREEN}🎉 All tests completed!${NC}"

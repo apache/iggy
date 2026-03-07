@@ -34,15 +34,23 @@
 
 import { readFileSync } from 'node:fs';
 import { Client, PollingStrategy, Consumer } from 'apache-iggy';
-import { BATCHES_LIMIT, log, MESSAGES_PER_BATCH, PARTITION_ID, STREAM_ID, TOPIC_ID } from '../utils';
+import { log, PARTITION_ID, STREAM_ID, TOPIC_ID } from '../utils';
 
-async function consumeMessages(client: Client): Promise<void> {
+const BATCHES_LIMIT = 5;
+const MESSAGES_PER_BATCH = 10;
+
+async function consumeMessages(
+  client: Client,
+  streamId: number | string,
+  topicId: number | string,
+  partitionId: number,
+) {
   const interval = 500;
   log(
-    'Messages will be consumed from stream: %d, topic: %d, partition: %d with interval %d ms.',
-    STREAM_ID,
-    TOPIC_ID,
-    PARTITION_ID,
+    'Messages will be consumed from stream: %s, topic: %s, partition: %d with interval %d ms.',
+    streamId,
+    topicId,
+    partitionId,
     interval,
   );
 
@@ -53,10 +61,10 @@ async function consumeMessages(client: Client): Promise<void> {
     try {
       log('Polling for messages...');
       const polledMessages = await client.message.poll({
-        streamId: STREAM_ID,
-        topicId: TOPIC_ID,
+        streamId,
+        topicId,
         consumer: Consumer.Single,
-        partitionId: PARTITION_ID,
+        partitionId,
         pollingStrategy: PollingStrategy.Offset(BigInt(offset)),
         count: MESSAGES_PER_BATCH,
         autocommit: false,
@@ -72,7 +80,9 @@ async function consumeMessages(client: Client): Promise<void> {
       offset += polledMessages.messages.length;
 
       for (const message of polledMessages.messages) {
-        handleMessage(message);
+        const payload = message.payload.toString('utf8');
+        const { offset: msgOffset, timestamp } = message.headers;
+        log('Received message: %s (offset: %d, timestamp: %d)', payload, msgOffset, timestamp);
       }
 
       consumedBatches++;
@@ -88,15 +98,7 @@ async function consumeMessages(client: Client): Promise<void> {
   log('Consumed %d batches of messages, exiting.', consumedBatches);
 }
 
-function handleMessage(message: any): void {
-  const payload = message.payload.toString('utf8');
-  log(
-    `Handling message at offset: ${message.headers.offset}, payload: %s...`,
-    payload,
-  );
-}
-
-async function main(): Promise<void> {
+async function main() {
   // Configure the client with TLS transport.
   // transport: 'TLS'  activates TLS on the TCP connection
   // ca: readFileSync(...)  provides the CA certificate to verify the server cert
@@ -115,11 +117,7 @@ async function main(): Promise<void> {
     log('TLS consumer has started, selected transport: TLS');
     log('Connecting to Iggy server over TLS...');
 
-    log('Logging in user...');
-    await client.session.login({ username: 'iggy', password: 'iggy' });
-    log('Logged in successfully.');
-
-    await consumeMessages(client);
+    await consumeMessages(client, STREAM_ID, TOPIC_ID, PARTITION_ID);
   } catch (error) {
     log('Error in main: %o', error);
     process.exitCode = 1;
@@ -131,16 +129,7 @@ async function main(): Promise<void> {
 
 process.on('unhandledRejection', (reason, promise) => {
   log('Unhandled Rejection at: %o, reason: %o', promise, reason);
-  process.exit(1);
+  process.exitCode = 1;
 });
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  void (async () => {
-    try {
-      await main();
-    } catch (error) {
-      log('Main function error: %o', error);
-      process.exit(1);
-    }
-  })();
-}
+main();

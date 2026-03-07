@@ -44,25 +44,14 @@ import { getIggyAddress } from '../tcp.sm.utils.js';
 
 const tlsEnabled = process.env.IGGY_TCP_TLS_ENABLED === 'true';
 
-// Walk up from cwd to find core/certs/
-function findCertsDir(): string {
-  let dir = process.cwd();
-  while (dir !== '/') {
-    const certsPath = resolve(dir, 'core/certs');
-    try {
-      readFileSync(resolve(certsPath, 'iggy_ca_cert.pem'));
-      return certsPath;
-    } catch {
-      dir = resolve(dir, '..');
-    }
-  }
-  throw new Error('Could not find core/certs/ directory with TLS certificates');
-}
+// Path to the CA certificate. Override with E2E_ROOT_CA_CERT env var,
+// otherwise fall back to the default relative path from the repo root.
+const caCertPath = process.env.E2E_ROOT_CA_CERT
+  || resolve(process.cwd(), '../../core/certs/iggy_ca_cert.pem');
 
 const getTlsClient = () => {
   const [host, port] = getIggyAddress();
-  const certsDir = findCertsDir();
-  const caCert = readFileSync(resolve(certsDir, 'iggy_ca_cert.pem'));
+  const caCert = readFileSync(caCertPath);
 
   // The server certificate is issued for 'localhost'. When IGGY_TCP_ADDRESS uses
   // an IP (e.g. 127.0.0.1), the default TLS hostname check would fail because
