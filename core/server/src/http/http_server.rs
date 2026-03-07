@@ -101,6 +101,7 @@ pub async fn start_http_server(
         .merge(consumer_groups::router(app_state.clone()))
         .merge(consumer_offsets::router(app_state.clone()))
         .merge(partitions::router(app_state.clone()))
+        .merge(segments::router(app_state.clone()))
         .merge(messages::router(app_state.clone()))
         .layer(DefaultBodyLimit::max(
             config.max_request_size.as_bytes_u64() as usize,
