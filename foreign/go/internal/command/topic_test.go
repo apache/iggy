@@ -15,21 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package iggcon
+package command
 
 import (
 	"bytes"
 	"testing"
+
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 func TestSerialize_UpdateTopic(t *testing.T) {
-	streamId, _ := NewIdentifier("stream")
-	topicId, _ := NewIdentifier(uint32(1))
+	streamId, _ := iggcon.NewIdentifier("stream")
+	topicId, _ := iggcon.NewIdentifier(uint32(1))
 	request := UpdateTopic{
 		StreamId:      streamId,
 		TopicId:       topicId,
 		Name:          "update_topic",
-		MessageExpiry: 100 * Microsecond,
+		MessageExpiry: 100 * iggcon.Microsecond,
 		MaxTopicSize:  100,
 	}
 

@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package iggcon
+package command
 
 import (
+	"bytes"
 	"reflect"
 	"testing"
+
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 func TestSerialize_TcpCreateStreamRequest(t *testing.T) {
@@ -50,5 +53,30 @@ func TestSerialize_TcpCreateStreamRequest(t *testing.T) {
 	// Check the Payload field
 	if !reflect.DeepEqual(serialized[payloadOffset:], expectedPayload) {
 		t.Errorf("Payload is incorrect. Expected: %v, Got: %v", expectedPayload, serialized[payloadOffset:])
+	}
+}
+
+func TestSerialize_UpdateStream(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier("stream")
+	request := UpdateStream{
+		StreamId: streamId,
+		Name:     "update_stream",
+	}
+
+	serialized1, err := request.MarshalBinary()
+	if err != nil {
+		t.Errorf("Failed to serialize UpdateStream: %v", err)
+	}
+
+	expected := []byte{
+		0x02,                               // StreamId Kind (StringId)
+		0x06,                               // StreamId Length (2)
+		0x73, 0x74, 0x72, 0x65, 0x61, 0x6D, // StreamId Value ("stream")
+		0x0D,                                                                         // Name Length (13)
+		0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x5F, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6D, // Name ("update_stream")
+	}
+
+	if !bytes.Equal(serialized1, expected) {
+		t.Errorf("Test case 1 failed. \nExpected:\t%v\nGot:\t\t%v", expected, serialized1)
 	}
 }

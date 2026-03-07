@@ -15,19 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package iggcon
+package command
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+)
 
 type StoreConsumerOffsetRequest struct {
-	StreamId    Identifier `json:"streamId"`
-	TopicId     Identifier `json:"topicId"`
-	Consumer    Consumer   `json:"consumer"`
-	PartitionId *uint32    `json:"partitionId"`
-	Offset      uint64     `json:"offset"`
+	StreamId    iggcon.Identifier `json:"streamId"`
+	TopicId     iggcon.Identifier `json:"topicId"`
+	Consumer    iggcon.Consumer   `json:"consumer"`
+	PartitionId *uint32           `json:"partitionId"`
+	Offset      uint64            `json:"offset"`
 }
 
-func (s *StoreConsumerOffsetRequest) Code() CommandCode {
+func (s *StoreConsumerOffsetRequest) Code() Code {
 	return StoreOffsetCode
 }
 
@@ -66,13 +70,13 @@ func (s *StoreConsumerOffsetRequest) MarshalBinary() ([]byte, error) {
 }
 
 type GetConsumerOffset struct {
-	StreamId    Identifier `json:"streamId"`
-	TopicId     Identifier `json:"topicId"`
-	Consumer    Consumer   `json:"consumer"`
-	PartitionId *uint32    `json:"partitionId"`
+	StreamId    iggcon.Identifier `json:"streamId"`
+	TopicId     iggcon.Identifier `json:"topicId"`
+	Consumer    iggcon.Consumer   `json:"consumer"`
+	PartitionId *uint32           `json:"partitionId"`
 }
 
-func (g *GetConsumerOffset) Code() CommandCode {
+func (g *GetConsumerOffset) Code() Code {
 	return GetOffsetCode
 }
 
@@ -109,20 +113,14 @@ func (g *GetConsumerOffset) MarshalBinary() ([]byte, error) {
 	return bytes, nil
 }
 
-type ConsumerOffsetInfo struct {
-	PartitionId   uint32 `json:"partitionId"`
-	CurrentOffset uint64 `json:"currentOffset"`
-	StoredOffset  uint64 `json:"storedOffset"`
-}
-
 type DeleteConsumerOffset struct {
-	Consumer    Consumer
-	StreamId    Identifier
-	TopicId     Identifier
+	Consumer    iggcon.Consumer
+	StreamId    iggcon.Identifier
+	TopicId     iggcon.Identifier
 	PartitionId *uint32
 }
 
-func (d *DeleteConsumerOffset) Code() CommandCode {
+func (d *DeleteConsumerOffset) Code() Code {
 	return DeleteConsumerOffsetCode
 }
 

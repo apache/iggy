@@ -30,6 +30,7 @@ import (
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/avast/retry-go"
 )
 
@@ -237,7 +238,7 @@ func (c *IggyTcpClient) write(payload []byte) (int, error) {
 }
 
 // do sends the command to the Iggy server and returns the response.
-func (c *IggyTcpClient) do(cmd iggcon.Command) ([]byte, error) {
+func (c *IggyTcpClient) do(cmd command.Command) ([]byte, error) {
 	data, err := cmd.MarshalBinary()
 	if err != nil {
 		return nil, err
@@ -245,7 +246,7 @@ func (c *IggyTcpClient) do(cmd iggcon.Command) ([]byte, error) {
 	return c.sendAndFetchResponse(data, cmd.Code())
 }
 
-func (c *IggyTcpClient) sendAndFetchResponse(message []byte, command iggcon.CommandCode) ([]byte, error) {
+func (c *IggyTcpClient) sendAndFetchResponse(message []byte, command command.Code) ([]byte, error) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
@@ -280,7 +281,7 @@ func (c *IggyTcpClient) sendAndFetchResponse(message []byte, command iggcon.Comm
 	return buffer, nil
 }
 
-func createPayload(message []byte, command iggcon.CommandCode) []byte {
+func createPayload(message []byte, command command.Code) []byte {
 	messageLength := len(message) + 4
 	messageBytes := make([]byte, RequestInitialBytesLength+messageLength)
 	binary.LittleEndian.PutUint32(messageBytes[:4], uint32(messageLength))
