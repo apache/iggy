@@ -17,20 +17,6 @@
  * under the License.
  */
 
-mod delta;
-mod elasticsearch;
-mod iceberg;
-mod postgres;
-mod quickwit;
-mod wiremock;
+mod fixture;
 
-pub use delta::{DeltaFixture, DeltaS3Fixture};
-pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
-pub use iceberg::{DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergOps, IcebergPreCreatedFixture};
-pub use postgres::{
-    PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
-    PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceJsonFixture,
-    PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceOps,
-};
-pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
-pub use wiremock::{WireMockDirectFixture, WireMockWrappedFixture};
+pub use fixture::{DeltaFixture, DeltaS3Fixture};
