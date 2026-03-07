@@ -24,8 +24,8 @@ path = "target/release/libiggy_connector_delta_sink"
 verbose = true
 
 [[streams]]
-stream = "test_stream"
-topics = ["test_topic"]
+stream = "qw"
+topics = ["records"]
 schema = "json"
 batch_length = 100
 poll_interval = "5ms"
