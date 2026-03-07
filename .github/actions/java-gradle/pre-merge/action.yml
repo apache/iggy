@@ -150,7 +150,7 @@ runs:
       if: inputs.task == 'test'
       shell: bash
       working-directory: foreign/java
-      run: ./gradlew :java-sdk:test --tests "*TlsConnectionTest*"
+      run: ./gradlew :iggy:test --tests "*TlsConnectionTest*"
 
     - name: Test Summary
       uses: test-summary/action@v2
