@@ -35,32 +35,105 @@ type ConsumerGroupMember struct {
 	Partitions      []uint32
 }
 
-type CreateConsumerGroupRequest struct {
-	StreamId Identifier `json:"streamId"`
-	TopicId  Identifier `json:"topicId"`
-	Name     string     `json:"name"`
+type TopicPath struct {
+	StreamId Identifier
+	TopicId  Identifier
 }
 
-type DeleteConsumerGroupRequest struct {
-	StreamId        Identifier `json:"streamId"`
-	TopicId         Identifier `json:"topicId"`
-	ConsumerGroupId Identifier `json:"consumerGroupId"`
+type CreateConsumerGroup struct {
+	TopicPath
+	Name string
 }
 
-type JoinConsumerGroupRequest struct {
-	StreamId        Identifier `json:"streamId"`
-	TopicId         Identifier `json:"topicId"`
-	ConsumerGroupId Identifier `json:"consumerGroupId"`
+func (c *CreateConsumerGroup) Code() CommandCode {
+	return CreateGroupCode
 }
 
-type LeaveConsumerGroupRequest struct {
-	StreamId        Identifier `json:"streamId"`
-	TopicId         Identifier `json:"topicId"`
-	ConsumerGroupId Identifier `json:"consumerGroupId"`
+func (c *CreateConsumerGroup) MarshalBinary() ([]byte, error) {
+	streamIdBytes, err := c.StreamId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	topicIdBytes, err := c.TopicId.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	offset := len(streamIdBytes) + len(topicIdBytes)
+	bytes := make([]byte, offset+1+len(c.Name))
+	copy(bytes[0:len(streamIdBytes)], streamIdBytes)
+	copy(bytes[len(streamIdBytes):offset], topicIdBytes)
+	bytes[offset] = byte(len(c.Name))
+	copy(bytes[offset+1:], c.Name)
+	return bytes, nil
+}
+
+type DeleteConsumerGroup struct {
+	TopicPath
+	GroupId Identifier
+}
+
+func (d *DeleteConsumerGroup) Code() CommandCode {
+	return DeleteGroupCode
+}
+
+func (d *DeleteConsumerGroup) MarshalBinary() ([]byte, error) {
+	return marshalIdentifiers(d.StreamId, d.TopicId, d.GroupId)
+}
+
+type JoinConsumerGroup struct {
+	TopicPath
+	GroupId Identifier
+}
+
+func (j *JoinConsumerGroup) Code() CommandCode {
+	return JoinGroupCode
+}
+
+func (j *JoinConsumerGroup) MarshalBinary() ([]byte, error) {
+	return marshalIdentifiers(j.StreamId, j.TopicId, j.GroupId)
+}
+
+type LeaveConsumerGroup struct {
+	TopicPath
+	GroupId Identifier
+}
+
+func (l *LeaveConsumerGroup) Code() CommandCode {
+	return LeaveGroupCode
+}
+
+func (l *LeaveConsumerGroup) MarshalBinary() ([]byte, error) {
+	return marshalIdentifiers(l.StreamId, l.TopicId, l.GroupId)
+}
+
+type GetConsumerGroup struct {
+	TopicPath
+	GroupId Identifier
+}
+
+func (g *GetConsumerGroup) Code() CommandCode {
+	return GetGroupCode
+}
+
+func (g *GetConsumerGroup) MarshalBinary() ([]byte, error) {
+	return marshalIdentifiers(g.StreamId, g.TopicId, g.GroupId)
+}
+
+type GetConsumerGroups struct {
+	StreamId Identifier
+	TopicId  Identifier
+}
+
+func (g *GetConsumerGroups) Code() CommandCode {
+	return GetGroupsCode
+}
+
+func (g *GetConsumerGroups) MarshalBinary() ([]byte, error) {
+	return marshalIdentifiers(g.StreamId, g.TopicId)
 }
 
 type ConsumerGroupInfo struct {
-	StreamId        uint32 `json:"streamId"`
-	TopicId         uint32 `json:"topicId"`
-	ConsumerGroupId uint32 `json:"consumerGroupId"`
+	StreamId uint32 `json:"streamId"`
+	TopicId  uint32 `json:"topicId"`
+	GroupId  uint32 `json:"groupId"`
 }

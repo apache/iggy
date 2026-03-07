@@ -23,7 +23,6 @@ use crate::{
     configs::{
         cache_indexes::CacheIndexesConfig,
         server::ServerConfig,
-        sharding::ShardInfo,
         system::{INDEX_EXTENSION, LOG_EXTENSION, SystemConfig},
     },
     io::fs_utils::{self, DirEntry},
@@ -36,6 +35,7 @@ use crate::{
             frame::ShardFrame,
         },
     },
+    shard_allocator::ShardInfo,
     state::system::{StreamState, TopicState, UserState},
     streaming::{
         partitions::{

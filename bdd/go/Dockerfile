@@ -18,10 +18,23 @@
 FROM golang:1.23.10-alpine
 
 WORKDIR /app
-COPY . .
 
-# Install Ginkgo
-RUN go install github.com/onsi/ginkgo/v2/ginkgo@v2.23.4
+# Copy only go.mod and go.sum first to leverage Docker layer caching
+COPY bdd/go/go.mod bdd/go/go.sum ./bdd/go/
+
+# Copy the go sdk code
+COPY foreign/go ./foreign/go
+
+# Install dependencies
+WORKDIR /app/bdd/go
+RUN go mod download
+
+# Return to project root
+WORKDIR /app
+
+# Copy the BDD test code and scenarios
+COPY bdd/go ./bdd/go
+COPY bdd/scenarios ./bdd/scenarios
 
 # Change workdir to bdd/go
 WORKDIR /app/bdd/go

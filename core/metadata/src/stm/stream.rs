@@ -20,6 +20,7 @@ use crate::stm::StateHandler;
 use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
+use bytes::Bytes;
 use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
@@ -272,12 +273,13 @@ impl StreamsInner {
     }
 }
 
+// TODO(hubcio): Serialize proper reply (e.g. assigned stream ID) instead of empty Bytes.
 impl StateHandler for CreateStream {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let name_arc: Arc<str> = Arc::from(self.name.as_str());
         if state.index.contains_key(&name_arc) {
-            return;
+            return Bytes::new();
         }
 
         let stream = Stream {
@@ -294,37 +296,39 @@ impl StateHandler for CreateStream {
             stream.id = id;
         }
         state.index.insert(name_arc, id);
+        Bytes::new()
     }
 }
 
 impl StateHandler for UpdateStream {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-            return;
+            return Bytes::new();
         };
         let Some(stream) = state.items.get_mut(stream_id) else {
-            return;
+            return Bytes::new();
         };
 
         let new_name_arc: Arc<str> = Arc::from(self.name.as_str());
         if let Some(&existing_id) = state.index.get(&new_name_arc)
             && existing_id != stream_id
         {
-            return;
+            return Bytes::new();
         }
 
         state.index.remove(&stream.name);
         stream.name = new_name_arc.clone();
         state.index.insert(new_name_arc, stream_id);
+        Bytes::new()
     }
 }
 
 impl StateHandler for DeleteStream {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-            return;
+            return Bytes::new();
         };
 
         if let Some(stream) = state.items.get(stream_id) {
@@ -333,30 +337,32 @@ impl StateHandler for DeleteStream {
             state.items.remove(stream_id);
             state.index.remove(&name);
         }
+        Bytes::new()
     }
 }
 
 impl StateHandler for PurgeStream {
     type State = StreamsInner;
-    fn apply(&self, _state: &mut StreamsInner) {
+    fn apply(&self, _state: &mut StreamsInner) -> Bytes {
         // TODO
         todo!();
     }
 }
 
+// TODO(hubcio): Serialize proper reply (e.g. assigned topic ID) instead of empty Bytes.
 impl StateHandler for CreateTopic {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-            return;
+            return Bytes::new();
         };
         let Some(stream) = state.items.get_mut(stream_id) else {
-            return;
+            return Bytes::new();
         };
 
         let name_arc: Arc<str> = Arc::from(self.name.as_str());
         if stream.topic_index.contains_key(&name_arc) {
-            return;
+            return Bytes::new();
         }
 
         let topic = Topic {
@@ -386,31 +392,32 @@ impl StateHandler for CreateTopic {
         }
 
         stream.topic_index.insert(name_arc, topic_id);
+        Bytes::new()
     }
 }
 
 impl StateHandler for UpdateTopic {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-            return;
+            return Bytes::new();
         };
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
-            return;
+            return Bytes::new();
         };
 
         let Some(stream) = state.items.get_mut(stream_id) else {
-            return;
+            return Bytes::new();
         };
         let Some(topic) = stream.topics.get_mut(topic_id) else {
-            return;
+            return Bytes::new();
         };
 
         let new_name_arc: Arc<str> = Arc::from(self.name.as_str());
         if let Some(&existing_id) = stream.topic_index.get(&new_name_arc)
             && existing_id != topic_id
         {
-            return;
+            return Bytes::new();
         }
 
         stream.topic_index.remove(&topic.name);
@@ -422,20 +429,21 @@ impl StateHandler for UpdateTopic {
             topic.replication_factor = rf;
         }
         stream.topic_index.insert(new_name_arc, topic_id);
+        Bytes::new()
     }
 }
 
 impl StateHandler for DeleteTopic {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-            return;
+            return Bytes::new();
         };
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
-            return;
+            return Bytes::new();
         };
         let Some(stream) = state.items.get_mut(stream_id) else {
-            return;
+            return Bytes::new();
         };
 
         if let Some(topic) = stream.topics.get(topic_id) {
@@ -443,32 +451,34 @@ impl StateHandler for DeleteTopic {
             stream.topics.remove(topic_id);
             stream.topic_index.remove(&name);
         }
+        Bytes::new()
     }
 }
 
 impl StateHandler for PurgeTopic {
     type State = StreamsInner;
-    fn apply(&self, _state: &mut StreamsInner) {
+    fn apply(&self, _state: &mut StreamsInner) -> Bytes {
         // TODO
         todo!();
     }
 }
 
+// TODO(hubcio): Serialize proper reply (e.g. assigned partition IDs) instead of empty Bytes.
 impl StateHandler for CreatePartitions {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-            return;
+            return Bytes::new();
         };
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
-            return;
+            return Bytes::new();
         };
 
         let Some(stream) = state.items.get_mut(stream_id) else {
-            return;
+            return Bytes::new();
         };
         let Some(topic) = stream.topics.get_mut(topic_id) else {
-            return;
+            return Bytes::new();
         };
 
         let current_partition_count = topic.partitions.len();
@@ -480,24 +490,25 @@ impl StateHandler for CreatePartitions {
             };
             topic.partitions.push(partition);
         }
+        Bytes::new()
     }
 }
 
 impl StateHandler for DeletePartitions {
     type State = StreamsInner;
-    fn apply(&self, state: &mut StreamsInner) {
+    fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
-            return;
+            return Bytes::new();
         };
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
-            return;
+            return Bytes::new();
         };
 
         let Some(stream) = state.items.get_mut(stream_id) else {
-            return;
+            return Bytes::new();
         };
         let Some(topic) = stream.topics.get_mut(topic_id) else {
-            return;
+            return Bytes::new();
         };
 
         let count_to_delete = self.partitions_count as usize;
@@ -506,6 +517,7 @@ impl StateHandler for DeletePartitions {
                 .partitions
                 .truncate(topic.partitions.len() - count_to_delete);
         }
+        Bytes::new()
     }
 }
 
@@ -646,7 +658,11 @@ impl Snapshotable for Streams {
         }
 
         let items: Slab<Stream> = stream_entries.into_iter().collect();
-        let inner = StreamsInner { index, items };
+        let inner = StreamsInner {
+            index,
+            items,
+            last_result: None,
+        };
         Ok(inner.into())
     }
 }

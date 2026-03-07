@@ -333,15 +333,11 @@ impl<C> IggyPartitions<C> {
     }
 }
 
-impl<B> Plane<VsrConsensus<B, NamespacedPipeline>>
-    for IggyPartitions<VsrConsensus<B, NamespacedPipeline>>
+impl<B> Plane<VsrConsensus<B>> for IggyPartitions<VsrConsensus<B, NamespacedPipeline>>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
 {
-    async fn on_request(
-        &self,
-        message: <VsrConsensus<B, NamespacedPipeline> as Consensus>::Message<RequestHeader>,
-    ) {
+    async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let namespace = IggyNamespace::from_raw(message.header().namespace);
         let consensus = self
             .consensus()
@@ -352,10 +348,7 @@ where
         pipeline_prepare_common(consensus, prepare, |prepare| self.on_replicate(prepare)).await;
     }
 
-    async fn on_replicate(
-        &self,
-        message: <VsrConsensus<B, NamespacedPipeline> as Consensus>::Message<PrepareHeader>,
-    ) {
+    async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
         let header = message.header();
         let namespace = IggyNamespace::from_raw(header.namespace);
         let consensus = self
@@ -397,10 +390,7 @@ where
         }
     }
 
-    async fn on_ack(
-        &self,
-        message: <VsrConsensus<B, NamespacedPipeline> as Consensus>::Message<PrepareOkHeader>,
-    ) {
+    async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareOkHeader>) {
         let header = message.header();
         let consensus = self.consensus().expect("on_ack: consensus not initialized");
 
@@ -496,7 +486,8 @@ where
                 }
             }
 
-            let generic_reply = build_reply_message(consensus, &prepare_header).into_generic();
+            let generic_reply =
+                build_reply_message(consensus, &prepare_header, bytes::Bytes::new()).into_generic();
             debug!(
                 "on_ack: sending reply to client={} for op={}",
                 prepare_header.client, prepare_header.op
@@ -524,12 +515,7 @@ where
             message.header().command(),
             Command2::Request | Command2::Prepare | Command2::PrepareOk
         ));
-        let operation = message.header().operation();
-        // TODO: Use better selection, smth like greater or equal based on op number.
-        matches!(
-            operation,
-            Operation::DeleteSegments | Operation::SendMessages | Operation::StoreConsumerOffset
-        )
+        message.header().operation().is_partition()
     }
 }
 

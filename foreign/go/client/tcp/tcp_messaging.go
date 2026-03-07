@@ -36,13 +36,13 @@ func (c *IggyTcpClient) SendMessages(
 	if len(messages) == 0 {
 		return ierror.ErrInvalidMessagesCount
 	}
-	serializedRequest := binaryserialization.TcpSendMessagesRequest{
+	_, err := c.do(&iggcon.SendMessages{
+		Compression:  c.MessageCompression,
 		StreamId:     streamId,
 		TopicId:      topicId,
 		Partitioning: partitioning,
 		Messages:     messages,
-	}
-	_, err := c.sendAndFetchResponse(serializedRequest.Serialize(c.MessageCompression), iggcon.SendMessagesCode)
+	})
 	return err
 }
 
@@ -55,7 +55,7 @@ func (c *IggyTcpClient) PollMessages(
 	autoCommit bool,
 	partitionId *uint32,
 ) (*iggcon.PolledMessage, error) {
-	serializedRequest := binaryserialization.TcpFetchMessagesRequest{
+	buffer, err := c.do(&iggcon.PollMessages{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Consumer:    consumer,
@@ -63,8 +63,7 @@ func (c *IggyTcpClient) PollMessages(
 		Strategy:    strategy,
 		Count:       count,
 		PartitionId: partitionId,
-	}
-	buffer, err := c.sendAndFetchResponse(serializedRequest.Serialize(), iggcon.PollMessagesCode)
+	})
 	if err != nil {
 		return nil, err
 	}

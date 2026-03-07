@@ -20,6 +20,7 @@ mod cache;
 mod error;
 mod github;
 mod handlers;
+mod render;
 
 use crate::cache::CacheWatcher;
 use actix_cors::Cors;
@@ -47,6 +48,7 @@ use tracing_subscriber::{
 struct ServerState {
     cache: Arc<BenchmarkCache>,
     _watcher: Arc<CacheWatcher>,
+    render_pool: Arc<render::PngRenderPool>,
 }
 
 async fn index() -> actix_web::Result<NamedFile> {
@@ -106,9 +108,12 @@ async fn main() -> Result<(), std::io::Error> {
         None
     };
 
+    let render_pool = Arc::new(render::PngRenderPool::default_pool());
+
     let state = ServerState {
         cache: Arc::clone(&cache),
         _watcher: Arc::clone(&watcher),
+        render_pool,
     };
 
     info!("Starting server on {}", addr);
@@ -148,6 +153,7 @@ async fn main() -> Result<(), std::io::Error> {
             .wrap(Compress::default())
             .app_data(web::Data::new(AppState {
                 cache: Arc::clone(&state.cache),
+                render_pool: Arc::clone(&state.render_pool),
             }))
             .service(handlers::health_check)
             .service(handlers::list_hardware)
@@ -159,6 +165,8 @@ async fn main() -> Result<(), std::io::Error> {
             .service(handlers::get_benchmark_report_light)
             .service(handlers::get_benchmark_trend)
             .service(handlers::get_test_artifacts_zip)
+            .service(handlers::embed_chart_png)
+            .service(handlers::embed_chart)
             .service(
                 fs::Files::new("/", "frontend/dist")
                     .index_file("index.html")

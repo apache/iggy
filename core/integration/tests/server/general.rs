@@ -26,6 +26,7 @@ use integration::iggy_harness;
 #[iggy_harness(
     test_client_transport = [Tcp, Http, Quic, WebSocket],
     server(
+        segment.size = "1MiB",
         tcp.socket.override_defaults = true,
         tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",

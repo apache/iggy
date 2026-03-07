@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::api;
+use crate::components::embed_modal::EmbedModal;
 use crate::components::selectors::measurement_type_selector::MeasurementType;
 use crate::components::theme::theme_toggle::ThemeToggle;
 use crate::components::tooltips::benchmark_info_toggle::BenchmarkInfoToggle;
@@ -40,6 +41,24 @@ pub fn topbar(props: &TopBarProps) -> Html {
     let selected_measurement = ui_state.selected_measurement.clone();
     let is_benchmark_tooltip_visible = ui_state.is_benchmark_tooltip_visible;
     let is_server_stats_tooltip_visible = ui_state.is_server_stats_tooltip_visible;
+    let has_distribution = benchmark_ctx
+        .state
+        .selected_benchmark
+        .as_ref()
+        .is_some_and(|b| b.has_latency_distribution());
+
+    {
+        let ui_state = ui_state.clone();
+        let selected_measurement = selected_measurement.clone();
+        use_effect_with(
+            (has_distribution, selected_measurement),
+            move |(has_dist, measurement)| {
+                if !has_dist && *measurement == MeasurementType::Distribution {
+                    ui_state.dispatch(UiAction::SetMeasurementType(MeasurementType::Latency));
+                }
+            },
+        );
+    }
 
     let on_download_artifacts = {
         let benchmark_ctx = benchmark_ctx.clone();
@@ -71,6 +90,13 @@ pub fn topbar(props: &TopBarProps) -> Html {
         })
     };
 
+    let on_embed_toggle = {
+        let ui_state = ui_state.clone();
+        Callback::from(move |_| {
+            ui_state.dispatch(UiAction::ToggleEmbedModal);
+        })
+    };
+
     html! {
         <div class="top-buttons">
             <div class="controls">
@@ -94,6 +120,39 @@ pub fn topbar(props: &TopBarProps) -> Html {
                                         <line x1="12" y1="15" x2="12" y2="3"/>
                                     </svg>
                                 </button>
+                                <div class="info-container">
+                                    <button
+                                        class={classes!(
+                                            "icon-button",
+                                            ui_state.is_embed_modal_visible.then_some("active")
+                                        )}
+                                        onclick={on_embed_toggle.clone()}
+                                        title="Embed Chart"
+                                        disabled={benchmark_ctx.state.selected_benchmark.is_none()}
+                                    >
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                            <polyline points="16 18 22 12 16 6"/>
+                                            <polyline points="8 6 2 12 8 18"/>
+                                        </svg>
+                                    </button>
+                                    {
+                                        if ui_state.is_embed_modal_visible {
+                                            if let Some(benchmark) = &benchmark_ctx.state.selected_benchmark {
+                                                html! {
+                                                    <EmbedModal
+                                                        uuid={benchmark.uuid.to_string()}
+                                                        measurement_type={selected_measurement.clone()}
+                                                        is_dark={props.is_dark}
+                                                    />
+                                                }
+                                            } else {
+                                                html! {}
+                                            }
+                                        } else {
+                                            html! {}
+                                        }
+                                    }
+                                </div>
                                 <div class="info-container">
                                     <ServerStatsToggle
                                         is_visible={is_server_stats_tooltip_visible}
@@ -142,6 +201,23 @@ pub fn topbar(props: &TopBarProps) -> Html {
                                     >
                                         { "Latency" }
                                     </button>
+                                    {
+                                        if has_distribution {
+                                            html! {
+                                                <button
+                                                    class={classes!(
+                                                        "measurement-button",
+                                                        (selected_measurement == MeasurementType::Distribution).then_some("active")
+                                                    )}
+                                                    onclick={on_measurement_select.reform(|_| MeasurementType::Distribution)}
+                                                >
+                                                    { "Distribution" }
+                                                </button>
+                                            }
+                                        } else {
+                                            html! {}
+                                        }
+                                    }
                                     <button
                                         class={classes!(
                                             "measurement-button",

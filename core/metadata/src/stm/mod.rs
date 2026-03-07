@@ -21,6 +21,7 @@ pub mod snapshot;
 pub mod stream;
 pub mod user;
 
+use bytes::Bytes;
 use iggy_common::Either;
 use left_right::*;
 use std::cell::UnsafeCell;
@@ -78,9 +79,10 @@ pub trait Command {
 
 /// Per-command handler for a given state type.
 /// Each command struct implements this for the state it mutates.
+/// Returns a `Bytes` response that will be threaded into the Reply message.
 pub trait StateHandler {
     type State;
-    fn apply(&self, state: &mut Self::State);
+    fn apply(&self, state: &mut Self::State) -> Bytes;
 }
 
 #[derive(Debug)]
@@ -171,6 +173,7 @@ macro_rules! define_state {
                 $(
                     pub $field_name: $field_type,
                 )*
+                pub last_result: Option<bytes::Bytes>,
             }
 
             impl [<$state Inner>] {
@@ -251,19 +254,19 @@ macro_rules! collect_handlers {
 
             impl [<$state Inner>] {
                 fn dispatch(&mut self, cmd: &[<$state Command>]) {
-                    match cmd {
+                    self.last_result = Some(match cmd {
                         $(
                             [<$state Command>]::$operation(payload) => {
-                                $crate::stm::StateHandler::apply(payload, self);
+                                $crate::stm::StateHandler::apply(payload, self)
                             },
                         )*
-                    }
+                    });
                 }
             }
 
             impl $crate::stm::State for $state {
                 type Input = <[<$state Inner>] as $crate::stm::Command>::Input;
-                type Output = ();
+                type Output = bytes::Bytes;
                 type Error = <[<$state Inner>] as $crate::stm::Command>::Error;
 
                 fn apply(&self, input: Self::Input) -> Result<::iggy_common::Either<Self::Output, Self::Input>, Self::Error> {
@@ -272,7 +275,10 @@ macro_rules! collect_handlers {
                     match <[<$state Inner>] as $crate::stm::Command>::parse(input)? {
                         Either::Left(cmd) => {
                             self.inner.do_apply(cmd);
-                            Ok(Either::Left(()))
+                            let result = self.inner.read(|state| {
+                                state.last_result.clone().unwrap_or_default()
+                            });
+                            Ok(Either::Left(result))
                         }
                         Either::Right(input) => {
                             Ok(Either::Right(input))

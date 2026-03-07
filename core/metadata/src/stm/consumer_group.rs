@@ -18,6 +18,7 @@
 use crate::stm::StateHandler;
 use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
+use bytes::Bytes;
 
 use ahash::AHashMap;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
@@ -166,12 +167,13 @@ impl ConsumerGroupsInner {
 // TODO: This is all a hack, we need to figure out how to do this in a way where `Identifier`
 // does not reach this stage of execution.
 
+// TODO(hubcio): Serialize proper reply (e.g. assigned group ID) instead of empty Bytes.
 impl StateHandler for CreateConsumerGroup {
     type State = ConsumerGroupsInner;
-    fn apply(&self, state: &mut ConsumerGroupsInner) {
+    fn apply(&self, state: &mut ConsumerGroupsInner) -> Bytes {
         let name: Arc<str> = Arc::from(self.name.as_str());
         if state.name_index.contains_key(&name) {
-            return;
+            return Bytes::new();
         }
 
         let group = ConsumerGroup::new(name.clone());
@@ -198,18 +200,19 @@ impl StateHandler for CreateConsumerGroup {
             let key = (Arc::from(s.as_str()), Arc::from(t.as_str()));
             state.topic_name_index.entry(key).or_default().push(id);
         }
+        Bytes::new()
     }
 }
 
 impl StateHandler for DeleteConsumerGroup {
     type State = ConsumerGroupsInner;
-    fn apply(&self, state: &mut ConsumerGroupsInner) {
+    fn apply(&self, state: &mut ConsumerGroupsInner) -> Bytes {
         let Some(id) = state.resolve_consumer_group_id_by_identifiers(
             &self.stream_id,
             &self.topic_id,
             &self.group_id,
         ) else {
-            return;
+            return Bytes::new();
         };
 
         let group = state.items.remove(id);
@@ -232,6 +235,7 @@ impl StateHandler for DeleteConsumerGroup {
                 vec.retain(|&x| x != id);
             }
         }
+        Bytes::new()
     }
 }
 
@@ -367,6 +371,7 @@ impl Snapshotable for ConsumerGroups {
             topic_index,
             topic_name_index,
             items,
+            last_result: None,
         };
         Ok(inner.into())
     }
