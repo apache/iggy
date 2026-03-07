@@ -2165,6 +2165,8 @@ name = "consensus"
 version = "0.1.0"
 dependencies = [
  "bit-set",
+ "bytemuck",
+ "bytes",
  "futures",
  "iggy_common",
  "message_bus",
@@ -5009,7 +5011,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.9.0"
+version = "0.9.1-edge.1"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -5041,7 +5043,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench"
-version = "0.4.0"
+version = "0.4.1-edge.1"
 dependencies = [
  "async-trait",
  "bench-report",
@@ -5097,7 +5099,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.11.0"
+version = "0.11.1-edge.1"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -5117,7 +5119,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.3.0"
+version = "0.3.1-edge.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -5168,7 +5170,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-mcp"
-version = "0.3.0"
+version = "0.3.1-edge.1"
 dependencies = [
  "axum",
  "axum-server",
@@ -5201,7 +5203,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.9.0"
+version = "0.9.1-edge.1"
 dependencies = [
  "anyhow",
  "async-broadcast",
@@ -5222,7 +5224,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.9.0"
+version = "0.9.1-edge.1"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
@@ -5266,7 +5268,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_elasticsearch_sink"
-version = "0.3.0"
+version = "0.3.1-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5284,7 +5286,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_elasticsearch_source"
-version = "0.3.0"
+version = "0.3.1-edge.1"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -5302,7 +5304,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_iceberg_sink"
-version = "0.3.0"
+version = "0.3.1-edge.1"
 dependencies = [
  "arrow-json",
  "async-trait",
@@ -5321,7 +5323,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_postgres_sink"
-version = "0.3.0"
+version = "0.3.1-edge.1"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -5340,7 +5342,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_postgres_source"
-version = "0.3.0"
+version = "0.3.1-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5361,7 +5363,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_quickwit_sink"
-version = "0.3.0"
+version = "0.3.1-edge.1"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -5376,7 +5378,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_random_source"
-version = "0.3.0"
+version = "0.3.1-edge.1"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -5394,7 +5396,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_sdk"
-version = "0.2.0"
+version = "0.2.1-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5424,7 +5426,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_stdout_sink"
-version = "0.3.0"
+version = "0.3.1-edge.1"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -6381,6 +6383,7 @@ name = "metadata"
 version = "0.1.0"
 dependencies = [
  "ahash 0.8.12",
+ "bytes",
  "consensus",
  "iggy_common",
  "journal",
@@ -7276,6 +7279,7 @@ dependencies = [
 name = "partitions"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "consensus",
  "iggy_common",
  "journal",
@@ -9266,7 +9270,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.7.0"
+version = "0.7.1-edge.1"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
@@ -9373,6 +9377,7 @@ dependencies = [
 name = "shard"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "consensus",
  "crossfire",
  "futures",

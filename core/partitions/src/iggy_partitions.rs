@@ -486,7 +486,8 @@ where
                 }
             }
 
-            let generic_reply = build_reply_message(consensus, &prepare_header).into_generic();
+            let generic_reply =
+                build_reply_message(consensus, &prepare_header, bytes::Bytes::new()).into_generic();
             debug!(
                 "on_ack: sending reply to client={} for op={}",
                 prepare_header.client, prepare_header.op

@@ -53,18 +53,14 @@ where
     }
 }
 
-// TODO: Figure out how to get around the fact that we need to hardcode the Input/Output type for base case.
-// TODO: I think we could move the base case to the impl site of `State`, so this way we know the `Input` and `Output` types.
 // Base case of the recursive resolution.
 impl StateMachine for () {
     type Input = Message<PrepareHeader>;
-    // TODO: Make sure that the `Output` matches to the output type of the rest of list.
-    // TODO: Add a trait bound to the output that will allow us to get the response in bytes.
-    type Output = ();
+    type Output = bytes::Bytes;
     type Error = iggy_common::IggyError;
 
     fn update(&self, _input: Self::Input) -> Result<Self::Output, Self::Error> {
-        Ok(())
+        Ok(bytes::Bytes::new())
     }
 }
 

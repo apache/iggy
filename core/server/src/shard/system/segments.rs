@@ -351,6 +351,7 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_id);
 
+        // Drain segments from local_partitions
         let (segments, storages, stats) = {
             let mut partitions = self.local_partitions.borrow_mut();
             let partition = partitions

@@ -20,6 +20,7 @@ use crate::stm::StateHandler;
 use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
+use bytes::Bytes;
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use iggy_common::create_user::CreateUser;
@@ -122,12 +123,13 @@ impl UsersInner {
     }
 }
 
+// TODO(hubcio): Serialize proper reply (e.g. assigned user ID) instead of empty Bytes.
 impl StateHandler for CreateUser {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) {
+    fn apply(&self, state: &mut UsersInner) -> Bytes {
         let username_arc: Arc<str> = Arc::from(self.username.as_str());
         if state.index.contains_key(&username_arc) {
-            return;
+            return Bytes::new();
         }
 
         let user = User {
@@ -148,18 +150,19 @@ impl StateHandler for CreateUser {
         state
             .personal_access_tokens
             .insert(id as UserId, AHashMap::default());
+        Bytes::new()
     }
 }
 
 impl StateHandler for UpdateUser {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) {
+    fn apply(&self, state: &mut UsersInner) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
-            return;
+            return Bytes::new();
         };
 
         let Some(user) = state.items.get_mut(user_id) else {
-            return;
+            return Bytes::new();
         };
 
         if let Some(new_username) = &self.username {
@@ -167,7 +170,7 @@ impl StateHandler for UpdateUser {
             if let Some(&existing_id) = state.index.get(&new_username_arc)
                 && existing_id != user_id as UserId
             {
-                return;
+                return Bytes::new();
             }
 
             state.index.remove(&user.username);
@@ -178,14 +181,15 @@ impl StateHandler for UpdateUser {
         if let Some(new_status) = self.status {
             user.status = new_status;
         }
+        Bytes::new()
     }
 }
 
 impl StateHandler for DeleteUser {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) {
+    fn apply(&self, state: &mut UsersInner) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
-            return;
+            return Bytes::new();
         };
 
         if let Some(user) = state.items.get(user_id) {
@@ -194,51 +198,55 @@ impl StateHandler for DeleteUser {
             state.index.remove(&username);
             state.personal_access_tokens.remove(&(user_id as UserId));
         }
+        Bytes::new()
     }
 }
 
 impl StateHandler for ChangePassword {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) {
+    fn apply(&self, state: &mut UsersInner) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
-            return;
+            return Bytes::new();
         };
 
         if let Some(user) = state.items.get_mut(user_id) {
             user.password_hash = Arc::from(self.new_password.as_str());
         }
+        Bytes::new()
     }
 }
 
 impl StateHandler for UpdatePermissions {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) {
+    fn apply(&self, state: &mut UsersInner) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
-            return;
+            return Bytes::new();
         };
 
         if let Some(user) = state.items.get_mut(user_id) {
             user.permissions = self.permissions.as_ref().map(|p| Arc::new(p.clone()));
         }
+        Bytes::new()
     }
 }
 
+// TODO(hubcio): Serialize proper reply (e.g. generated token) instead of empty Bytes.
 impl StateHandler for CreatePersonalAccessToken {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) {
+    fn apply(&self, state: &mut UsersInner) -> Bytes {
         // TODO: Stub until protocol gets adjusted.
         let user_id = 0;
         let user_tokens = state.personal_access_tokens.entry(user_id).or_default();
         let name_arc: Arc<str> = Arc::from(self.name.as_str());
         if user_tokens.contains_key(&name_arc) {
-            return;
+            return Bytes::new();
         }
 
         let expiry_at = PersonalAccessToken::calculate_expiry_at(IggyTimestamp::now(), self.expiry);
         if let Some(expiry_at) = expiry_at
             && expiry_at.as_micros() <= IggyTimestamp::now().as_micros()
         {
-            return;
+            return Bytes::new();
         }
 
         let (pat, _) = PersonalAccessToken::new(
@@ -248,12 +256,13 @@ impl StateHandler for CreatePersonalAccessToken {
             self.expiry,
         );
         user_tokens.insert(name_arc, pat);
+        Bytes::new()
     }
 }
 
 impl StateHandler for DeletePersonalAccessToken {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) {
+    fn apply(&self, state: &mut UsersInner) -> Bytes {
         // TODO: Stub until protocol gets adjusted.
         let user_id = 0;
 
@@ -261,6 +270,7 @@ impl StateHandler for DeletePersonalAccessToken {
             let name_arc: Arc<str> = Arc::from(self.name.as_str());
             user_tokens.remove(&name_arc);
         }
+        Bytes::new()
     }
 }
 
@@ -473,6 +483,7 @@ impl Snapshotable for Users {
             items,
             personal_access_tokens,
             permissioner,
+            last_result: None,
         };
         Ok(inner.into())
     }
