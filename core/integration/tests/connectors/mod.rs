@@ -49,7 +49,7 @@ pub fn create_test_messages(count: usize) -> Vec<TestMessage> {
             id: i as u64,
             name: format!("user_{}", i - 1),
             count: ((i - 1) * 10) as u32,
-            amount: (i - 1) as f64 * 99.99,
+            amount: (i - 1) as f64 * 100.0,
             active: (i - 1) % 2 == 0,
             timestamp: (base_timestamp + (i - 1) as u64 * ONE_DAY_MICROS) as i64,
         })

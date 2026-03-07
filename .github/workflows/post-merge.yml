@@ -188,9 +188,11 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update --yes
-          sudo apt-get install --yes gnome-keyring keyutils
+          sudo apt-get install --yes gnome-keyring keyutils dbus-x11
           rm -f $HOME/.local/share/keyrings/*
-          echo -n "test" | gnome-keyring-daemon --unlock
+          eval $(dbus-launch --sh-syntax)
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> $GITHUB_ENV
+          echo -n "test" | gnome-keyring-daemon --unlock --components=secrets
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -360,6 +362,11 @@ jobs:
         with:
           save-cache: "false"
 
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
@@ -368,23 +375,31 @@ jobs:
           cd foreign/python
           uv sync --frozen --extra dev --extra testing --extra testing-docker
 
-      - name: Build Python wheel
+      - name: Build Python wheel with coverage instrumentation
         run: |
           cd foreign/python
-          uv run maturin build -o dist
-          uv pip install dist/*.whl --force-reinstall
+          source <(cargo llvm-cov show-env --sh)
+          export CARGO_TARGET_DIR=$CARGO_LLVM_COV_TARGET_DIR
+
+          # Propagate LLVM_PROFILE_FILE so the test step can write profraw data
+          echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> $GITHUB_ENV
+
+          cargo llvm-cov clean --workspace
+          echo "Building Python wheel with coverage instrumentation..."
+          uv run --no-sync maturin develop
+        shell: bash
 
       - name: Start Iggy server
         id: iggy
         uses: ./.github/actions/utils/server-start
 
-      - name: Run tests with coverage
+      - name: Run tests
         run: |
           cd foreign/python
           IGGY_SERVER_HOST=127.0.0.1 \
           IGGY_SERVER_TCP_PORT=8090 \
-            uv run pytest tests/ -v \
-              --cov --cov-report=xml:../../reports/python-coverage.xml \
+            uv run --no-sync pytest tests/ -v \
+              --junitxml=../../reports/python-junit.xml \
               --tb=short \
               --capture=no
 
@@ -395,11 +410,29 @@ jobs:
           pid-file: ${{ steps.iggy.outputs.pid_file }}
           log-file: ${{ steps.iggy.outputs.log_file }}
 
+      - name: Generate coverage report
+        run: |
+          mkdir -p reports
+          cd foreign/python
+          source <(cargo llvm-cov show-env --sh)
+          export CARGO_TARGET_DIR=$CARGO_LLVM_COV_TARGET_DIR
+
+          cargo llvm-cov report --lcov \
+            --ignore-filename-regex='(\.cargo/|/rustc/|/core/)' \
+            --output-path ../../reports/python-coverage.lcov
+
+          # Fix paths: cargo-llvm-cov outputs paths relative to the crate root (src/...)
+          # but Codecov expects paths relative to the repo root (foreign/python/src/...)
+          sed -i 's|^SF:src/|SF:foreign/python/src/|' ../../reports/python-coverage.lcov
+
+          echo "Coverage report generated: $(wc -l < ../../reports/python-coverage.lcov) lines"
+        shell: bash
+
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: reports/python-coverage.xml
+          files: reports/python-coverage.lcov
           disable_search: true
           flags: python
           fail_ci_if_error: false
@@ -466,6 +499,47 @@ jobs:
           files: reports/node-coverage/unit/lcov.info,reports/node-coverage/e2e/lcov.info
           disable_search: true
           flags: node
+          fail_ci_if_error: false
+
+  go-coverage:
+    name: Go coverage baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go with cache
+        uses: ./.github/actions/utils/setup-go-with-cache
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "false"
+
+      - name: Start Iggy server
+        id: iggy
+        uses: ./.github/actions/utils/server-start
+
+      - name: Run tests with coverage
+        run: |
+          cd foreign/go
+          mkdir -p ../../reports
+          go test -v -race -coverprofile=../../reports/go-coverage.out ./...
+
+      - name: Stop Iggy server
+        if: always()
+        uses: ./.github/actions/utils/server-stop
+        with:
+          pid-file: ${{ steps.iggy.outputs.pid_file }}
+          log-file: ${{ steps.iggy.outputs.log_file }}
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/go-coverage.out
+          disable_search: true
+          flags: go
           fail_ci_if_error: false
 
   create-prerelease:

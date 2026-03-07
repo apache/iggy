@@ -177,7 +177,8 @@ public class HttpMessageStream : IIggyClient
         CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(
-            new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize, DurationHelpers.ToDuration(messageExpiry), replicationFactor),
+            new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize, DurationHelpers.ToDuration(messageExpiry),
+                replicationFactor),
             _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/streams/{streamId}/topics/{topicId}", data, token);
@@ -816,6 +817,12 @@ public class HttpMessageStream : IIggyClient
     /// <inheritdoc />
     public void UnsubscribeConnectionEvents(Func<ConnectionStateChangedEventArgs, Task> callback)
     {
+    }
+
+    /// <inheritdoc />
+    public string GetCurrentAddress()
+    {
+        return _httpClient.BaseAddress?.ToString() ?? string.Empty;
     }
 
     private static async Task HandleResponseAsync(HttpResponseMessage response, bool shouldThrowOnGetNotFound = false)

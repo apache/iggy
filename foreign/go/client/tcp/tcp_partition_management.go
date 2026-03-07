@@ -18,26 +18,23 @@
 package tcp
 
 import (
-	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 func (c *IggyTcpClient) CreatePartitions(streamId iggcon.Identifier, topicId iggcon.Identifier, partitionsCount uint32) error {
-	message := binaryserialization.CreatePartitions(iggcon.CreatePartitionsRequest{
+	_, err := c.do(&iggcon.CreatePartitions{
 		StreamId:        streamId,
 		TopicId:         topicId,
 		PartitionsCount: partitionsCount,
 	})
-	_, err := c.sendAndFetchResponse(message, iggcon.CreatePartitionsCode)
 	return err
 }
 
 func (c *IggyTcpClient) DeletePartitions(streamId iggcon.Identifier, topicId iggcon.Identifier, partitionsCount uint32) error {
-	message := binaryserialization.DeletePartitions(iggcon.DeletePartitionsRequest{
+	_, err := c.do(&iggcon.DeletePartitions{
 		StreamId:        streamId,
 		TopicId:         topicId,
 		PartitionsCount: partitionsCount,
 	})
-	_, err := c.sendAndFetchResponse(message, iggcon.DeletePartitionsCode)
 	return err
 }
