@@ -1,0 +1,161 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#include <string>
+
+#include <gtest/gtest.h>
+
+#include "lib.rs.h"
+
+TEST(LowLevelE2E_Client, ConnectAndLogin) {
+    const std::string username             = "iggy";
+    const std::string password             = "iggy";
+    const std::string connection_strings[] = {"iggy://iggy:iggy@127.0.0.1:8090", "iggy+tcp://iggy:iggy@127.0.0.1:8090",
+                                              ""};
+
+    for (const std::string &connection_string : connection_strings) {
+        SCOPED_TRACE(connection_string);
+        iggy::ffi::Client *client = nullptr;
+        ASSERT_NO_THROW({ client = iggy::ffi::new_connection(connection_string); });
+        ASSERT_NE(client, nullptr);
+
+        ASSERT_NO_THROW(client->connect());
+        ASSERT_NO_THROW(client->login_user(username, password));
+        ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+        client = nullptr;
+    }
+}
+
+TEST(LowLevelE2E_Client, NewConnectionWithMalformedConnectionStringsThrow) {
+    const std::string malformed_connection_strings[] = {
+        "iggy+invalid://iggy:iggy@127.0.0.1:8090", "iggy+tcp://iggy:iggy@:8090",      "iggy+tcp://iggy:iggy@127.0.0.1",
+        "iggy+tcp://iggy:iggy@127.0.0.1:abc",      "iggy+tcp://:iggy@127.0.0.1:8090", "iggy+tcp://iggy:@127.0.0.1:8090",
+        "iggy+tcp://iggy:iggy127.0.0.1:8090",      "not-a-connection-string",         "iggy://iggy:iggy@",
+    };
+
+    for (const std::string &connection_string : malformed_connection_strings) {
+        SCOPED_TRACE(connection_string);
+        ASSERT_THROW({ iggy::ffi::new_connection(connection_string); }, std::exception);
+    }
+}
+
+TEST(LowLevelE2E_Client, LoginWithInvalidCredentialsThrows) {
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->login_user("biggy", "biggy"), std::exception);
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    client = nullptr;
+}
+
+TEST(LowLevelE2E_Client, LoginTwiceWithSameCredentials) {
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    client = nullptr;
+}
+
+TEST(LowLevelE2E_Client, LoginTwiceWithDifferentCredentials) {
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_THROW(client->login_user("biggy", "biggy"), std::exception);
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    client = nullptr;
+}
+
+TEST(LowLevelE2E_Client, LogoutWithoutLogin) {
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    client = nullptr;
+}
+
+TEST(LowLevelE2E_Client, DeleteWhileUnauthenticatedAfterFailedLogin) {
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_THROW(client->login_user("biggy", "biggy"), std::exception);
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    client = nullptr;
+}
+
+TEST(LowLevelE2E_Client, LoginWithoutConnect) {
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    client = nullptr;
+}
+
+TEST(LowLevelE2E_Client, ConnectWithoutLoginThenDelete) {
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    client = nullptr;
+}
+
+TEST(LowLevelE2E_Client, ConnectTwiceIsDoesNotThrow) {
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->connect());
+
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    client = nullptr;
+}
+
+TEST(LowLevelE2E_Client, RepeatedClientMethodCallsHaveStableBehavior) {
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+    ASSERT_NE(client, nullptr);
+
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->connect());
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    client = nullptr;
+
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+}
+
+TEST(LowLevelE2E_Client, DeleteNullConnectionIsNoop) {
+    iggy::ffi::Client *client = nullptr;
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+}
