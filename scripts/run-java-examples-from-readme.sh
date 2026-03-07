@@ -120,16 +120,93 @@ if [ -f "${README_FILE}" ]; then
 
         # Small delay between runs to avoid thrashing the server
         sleep 2
-    done < <(grep -E '^\./gradlew' "${README_FILE}")
+    done < <(grep -E '^\./gradlew' "${README_FILE}" | grep -v "TcpTls")
 else
     echo "README file ${README_FILE} not found in examples/java."
 fi
 
 cd "${ROOT_WORKDIR}"
 
-# Terminate server
+# Terminate non-TLS server
 kill -TERM "$(cat ${PID_FILE})"
 test -e ${PID_FILE} && rm ${PID_FILE}
+
+# Run TLS examples if non-TLS examples passed
+if [ "${exit_code}" -eq 0 ]; then
+    TLS_README="examples/java/README.md"
+    if [ -f "${TLS_README}" ] && grep -qE '^\./gradlew.*TcpTls' "${TLS_README}"; then
+        echo ""
+        echo "=== Running TLS examples ==="
+        echo ""
+
+        # Clean up for fresh TLS start
+        test -d local_data && rm -fr local_data
+        test -e ${LOG_FILE} && rm ${LOG_FILE}
+
+        # Start TLS server
+        echo "Starting TLS server from ${SERVER_BIN}..."
+        IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+            IGGY_TCP_TLS_ENABLED=true \
+            IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
+            IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
+            ${SERVER_BIN} &>${LOG_FILE} &
+        echo $! >${PID_FILE}
+
+        # Wait for TLS server to start
+        SERVER_START_TIME=0
+        while ! grep -q "has started" ${LOG_FILE}; do
+            if [ ${SERVER_START_TIME} -gt ${TIMEOUT} ]; then
+                echo "TLS server did not start within ${TIMEOUT} seconds."
+                ps fx
+                cat ${LOG_FILE}
+                exit_code=1
+                break
+            fi
+            echo "Waiting for TLS Iggy server to start... ${SERVER_START_TIME}"
+            sleep 1
+            ((SERVER_START_TIME += 1))
+        done
+
+        if [ "${exit_code}" -eq 0 ]; then
+            cd examples/java
+
+            while IFS= read -r command; do
+                # Remove backticks and comments from command
+                command=$(echo "${command}" | tr -d '`' | sed 's/^#.*//')
+                # Skip empty lines
+                if [ -z "${command}" ]; then
+                    continue
+                fi
+
+                echo -e "\e[33mChecking TLS example command:\e[0m ${command}"
+                echo ""
+
+                set +e
+                eval "${command}"
+                exit_code=$?
+                set -e
+
+                if [ ${exit_code} -ne 0 ]; then
+                    echo ""
+                    echo -e "\e[31mTLS example command failed:\e[0m ${command}"
+                    echo ""
+                    break
+                fi
+
+                # Small delay between runs to avoid thrashing the server
+                sleep 2
+            done < <(grep -E '^\./gradlew.*TcpTls' "${ROOT_WORKDIR}/${TLS_README}")
+
+            cd "${ROOT_WORKDIR}"
+        fi
+
+        # Terminate TLS server
+        if [ -e ${PID_FILE} ]; then
+            kill -TERM "$(cat ${PID_FILE})" 2>/dev/null || true
+            rm -f ${PID_FILE}
+        fi
+    fi
+fi
 
 if [ "${exit_code}" -eq 0 ]; then
     echo "Test passed"
