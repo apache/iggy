@@ -131,7 +131,7 @@ done < <(grep -E "^\`cargo r --bin iggy -- " README.md)
 
 cd examples/node
 
-# Execute all example commands from README.md and examples/node/README.md and check if they pass or fail
+# Execute all non-TLS example commands from README.md and examples/node/README.md
 for readme_file in README.md examples/node/README.md; do
     if [ ! -f "${readme_file}" ]; then
         continue
@@ -163,13 +163,93 @@ for readme_file in README.md examples/node/README.md; do
         # Add a small delay between examples to avoid potential race conditions
         sleep 2
 
-    done < <(grep -E "^(npm run|tsx)" "${readme_file}")
+    done < <(grep -E "^(npm run|tsx)" "${readme_file}" | grep -v "tcp-tls")
 done
 
 cd "${ROOT_WORKDIR}"
 
-# Terminate server
-kill -TERM "$(cat ${PID_FILE})"
+# Stop the plain server before starting TLS server
+kill -TERM "$(cat ${PID_FILE})" 2>/dev/null || true
+sleep 2
+test -e ${PID_FILE} && rm ${PID_FILE}
+test -e ${LOG_FILE} && rm ${LOG_FILE}
+
+# Check if there are any TLS examples to run
+TLS_COMMANDS=""
+for readme_file in examples/node/README.md; do
+    if [ -f "${readme_file}" ]; then
+        TLS_COMMANDS=$(grep -E "^(npm run|tsx)" "${readme_file}" | grep "tcp-tls" || true)
+    fi
+done
+
+if [ -n "${TLS_COMMANDS}" ] && [ "${exit_code}" -eq 0 ]; then
+    echo ""
+    echo "=== Starting TLS server for TLS examples ==="
+
+    # Remove old server data for clean TLS test
+    test -d local_data && rm -fr local_data
+
+    # Start TLS-enabled server
+    IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+    IGGY_TCP_TLS_ENABLED=true \
+    IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
+    IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
+    ${SERVER_BIN} &>${LOG_FILE} &
+    echo $! >${PID_FILE}
+
+    # Wait for TLS server to start
+    SERVER_START_TIME=0
+    while ! grep -q "has started" ${LOG_FILE}; do
+        if [ ${SERVER_START_TIME} -gt ${TIMEOUT} ]; then
+            echo "TLS server did not start within ${TIMEOUT} seconds."
+            cat ${LOG_FILE}
+            exit 1
+        fi
+        echo "Waiting for TLS Iggy server to start... ${SERVER_START_TIME}"
+        sleep 1
+        ((SERVER_START_TIME += 1))
+    done
+
+    cd examples/node
+
+    # Run only TLS examples
+    for readme_file in README.md examples/node/README.md; do
+        if [ ! -f "${readme_file}" ]; then
+            continue
+        fi
+
+        while IFS= read -r command; do
+            command=$(echo "${command}" | tr -d '`' | sed 's/^#.*//')
+            if [ -z "${command}" ]; then
+                continue
+            fi
+
+            echo -e "\e[33mChecking TLS example command from ${readme_file}:\e[0m ${command}"
+            echo ""
+
+            set +e
+            eval "${command}"
+            exit_code=$?
+            set -e
+
+            if [ ${exit_code} -ne 0 ]; then
+                echo ""
+                echo -e "\e[31mTLS example command failed:\e[0m ${command}"
+                echo ""
+                break 2
+            fi
+            sleep 2
+
+        done < <(grep -E "^(npm run|tsx)" "${readme_file}" | grep "tcp-tls")
+    done
+
+    cd "${ROOT_WORKDIR}"
+
+    # Terminate TLS server
+    kill -TERM "$(cat ${PID_FILE})" 2>/dev/null || true
+fi
+
+# Cleanup
 test -e ${PID_FILE} && rm ${PID_FILE}
 
 # If everything is ok remove log and pid files otherwise cat server log
