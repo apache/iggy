@@ -33,11 +33,9 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 async-trait = { workspace = true }
-dashmap = { workspace = true }
 humantime = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 mongodb = { version = "3.0", features = ["rustls-tls"] }
-once_cell = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

@@ -5429,11 +5429,9 @@ name = "iggy_connector_mongodb_sink"
 version = "0.3.0"
 dependencies = [
  "async-trait",
- "dashmap",
  "humantime",
  "iggy_connector_sdk",
  "mongodb",
- "once_cell",
  "serde",
  "serde_json",
  "tokio",

@@ -640,19 +640,6 @@ mod tests {
     }
 
     #[test]
-    fn given_macro_runtime_dependencies_should_link_explicitly() {
-        let cache = dashmap::DashMap::new();
-        cache.insert("connector", 1_u8);
-        let entry = cache
-            .get("connector")
-            .expect("DashMap should contain inserted key");
-        assert_eq!(*entry, 1);
-
-        let lazy_value = once_cell::sync::Lazy::new(|| 7_u8);
-        assert_eq!(*lazy_value, 7);
-    }
-
-    #[test]
     fn given_retry_configurations_should_use_expected_values() {
         let cases = [
             (None, None, DEFAULT_MAX_RETRIES, Duration::from_secs(1)),
