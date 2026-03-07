@@ -22,7 +22,6 @@ package org.apache.iggy.client.blocking.tcp;
 import com.github.dockerjava.api.model.Capability;
 import com.github.dockerjava.api.model.Ulimit;
 import io.netty.util.ResourceLeakDetector;
-
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
