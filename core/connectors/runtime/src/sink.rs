@@ -324,7 +324,6 @@ async fn consume_messages(
                 error!(
                     "Failed to process {messages_count} messages for sink connector with ID: {plugin_id}. {error}",
                 );
-                metrics.increment_errors(plugin_key, ConnectorType::Sink);
                 return Err(error);
             }
         };

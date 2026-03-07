@@ -222,8 +222,7 @@ macro_rules! sink_connector {
             assert_trait::<$type>();
         };
 
-        use dashmap::DashMap;
-        use once_cell::sync::Lazy;
+        use $crate::connector_macro_support::{DashMap, Lazy};
         use $crate::LogCallback;
         use $crate::sink::SinkContainer;
 
