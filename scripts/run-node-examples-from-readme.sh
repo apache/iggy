@@ -176,11 +176,9 @@ test -e ${LOG_FILE} && rm ${LOG_FILE}
 
 # Check if there are any TLS examples to run
 TLS_COMMANDS=""
-for readme_file in examples/node/README.md; do
-    if [ -f "${readme_file}" ]; then
-        TLS_COMMANDS=$(grep -E "^(npm run|tsx)" "${readme_file}" | grep "tcp-tls" || true)
-    fi
-done
+if [ -f "examples/node/README.md" ]; then
+    TLS_COMMANDS=$(grep -E "^(npm run|tsx)" "examples/node/README.md" | grep "tcp-tls" || true)
+fi
 
 if [ -n "${TLS_COMMANDS}" ] && [ "${exit_code}" -eq 0 ]; then
     echo ""
