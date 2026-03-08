@@ -492,7 +492,9 @@ impl PacketSimulator {
                     };
 
                     // Per-command link filter check: drop if command not in filter
-                    let command = packet.message.header().command;
+                    let Ok(command) = Command2::try_from(packet.message.header().command) else {
+                        continue;
+                    };
                     if !link.filter.contains(command) {
                         tracing::trace!(?command, "packet dropped (command filtered)");
                         continue;
@@ -724,7 +726,7 @@ mod tests {
         let size = std::mem::size_of::<GenericHeader>();
         let mut buf = vec![0u8; size];
         let header: &mut GenericHeader = bytemuck::from_bytes_mut(&mut buf);
-        header.command = command;
+        header.command = command as u8;
         Message::<GenericHeader>::from_bytes(bytes::Bytes::from(buf)).unwrap()
     }
 
@@ -974,7 +976,7 @@ mod tests {
 
         // Only the Ping should be delivered
         assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].message.header().command, Command2::Ping);
+        assert_eq!(delivered[0].message.header().command, Command2::Ping as u8);
 
         // Nothing left in flight
         assert_eq!(sim.packets_in_flight(), 0);

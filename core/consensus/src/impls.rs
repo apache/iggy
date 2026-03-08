@@ -1096,7 +1096,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Returns `true` if quorum was just reached for this op.
     /// Caller (`on_ack`) should validate `is_primary` and status before calling.
     pub fn handle_prepare_ok(&self, header: &PrepareOkHeader) -> bool {
-        assert_eq!(header.command, Command2::PrepareOk);
+        assert_eq!(header.command, Command2::PrepareOk as u8);
         assert!(
             header.replica < self.replica_count,
             "handle_prepare_ok: invalid replica {}",
@@ -1206,7 +1206,7 @@ where
                 size: old.size,
                 view: consensus.view.get(),
                 release: old.release,
-                command: Command2::Prepare,
+                command: Command2::Prepare as u8,
                 replica: consensus.replica,
                 client: old.client,
                 parent: consensus.last_prepare_checksum(),
@@ -1233,7 +1233,7 @@ where
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareOkHeader> {
         self.transmute_header(|old, new| {
             *new = PrepareOkHeader {
-                command: Command2::PrepareOk,
+                command: Command2::PrepareOk as u8,
                 parent: old.parent,
                 prepare_checksum: old.checksum,
                 request: old.request,

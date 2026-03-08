@@ -18,7 +18,7 @@
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, Receiver, ShardFrame};
 use futures::FutureExt;
-use iggy_common::header::{GenericHeader, PrepareHeader};
+use iggy_common::header::{ConsensusError, GenericHeader, Operation, PrepareHeader};
 use iggy_common::message::{Message, MessageBag};
 use iggy_common::sharding::IggyNamespace;
 use journal::{Journal, JournalHandle};
@@ -44,7 +44,7 @@ where
     /// or PrepareOk) to access the operation and namespace, then resolves
     /// the target shard and enqueues the message via its channel sender.
     pub fn dispatch(&self, message: Message<GenericHeader>) {
-        let (operation, namespace, generic) = match MessageBag::from(message) {
+        let (operation_byte, namespace, generic) = match MessageBag::from(message) {
             MessageBag::Request(ref r) => {
                 let h = r.header();
                 (h.operation, h.namespace, r.as_generic().clone())
@@ -56,6 +56,17 @@ where
             MessageBag::PrepareOk(ref p) => {
                 let h = p.header();
                 (h.operation, h.namespace, p.as_generic().clone())
+            }
+        };
+        let operation = match Operation::try_from(operation_byte) {
+            Ok(op) => op,
+            Err(byte) => {
+                tracing::warn!(
+                    shard = self.id,
+                    byte,
+                    "dispatch: unknown operation byte, dropping message"
+                );
+                return;
             }
         };
         let namespace = IggyNamespace::from_raw(namespace);
@@ -80,8 +91,11 @@ where
 
     /// Dispatch a message and return a receiver that resolves when the target
     /// shard has finished processing it.
-    pub fn dispatch_request(&self, message: Message<GenericHeader>) -> Receiver<R> {
-        let (operation, namespace, generic) = match MessageBag::from(message) {
+    pub fn dispatch_request(
+        &self,
+        message: Message<GenericHeader>,
+    ) -> Result<Receiver<R>, ConsensusError> {
+        let (operation_byte, namespace, generic) = match MessageBag::from(message) {
             MessageBag::Request(ref r) => {
                 let h = r.header();
                 (h.operation, h.namespace, r.as_generic().clone())
@@ -95,6 +109,8 @@ where
                 (h.operation, h.namespace, p.as_generic().clone())
             }
         };
+        let operation =
+            Operation::try_from(operation_byte).map_err(ConsensusError::InvalidOperationByte)?;
         let namespace = IggyNamespace::from_raw(namespace);
 
         // Determine which shard should handle a message given its operation and
@@ -123,7 +139,7 @@ where
         // Create a frame and send it to the target shard.
         let (frame, rx) = ShardFrame::<R>::with_response(generic);
         let _ = self.senders[target as usize].send(frame);
-        rx
+        Ok(rx)
     }
 
     /// Drain this shard's inbox and process each frame locally.

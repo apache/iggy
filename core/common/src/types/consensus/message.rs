@@ -243,10 +243,11 @@ where
         }
 
         let generic = self.as_generic();
-        if generic.header().command != T::COMMAND {
+        if generic.header().command != T::COMMAND as u8 {
             return Err(header::ConsensusError::InvalidCommand {
                 expected: T::COMMAND,
-                found: generic.header().command,
+                found: header::Command2::try_from(generic.header().command)
+                    .unwrap_or(header::Command2::Reserved),
             });
         }
 
@@ -275,10 +276,11 @@ where
 
         // check the command matches
         let generic = self.as_generic();
-        if generic.header().command != T::COMMAND {
+        if generic.header().command != T::COMMAND as u8 {
             return Err(header::ConsensusError::InvalidCommand {
                 expected: T::COMMAND,
-                found: generic.header().command,
+                found: header::Command2::try_from(generic.header().command)
+                    .unwrap_or(header::Command2::Reserved),
             });
         }
 
@@ -303,9 +305,15 @@ impl MessageBag {
     #[allow(unused)]
     pub fn command(&self) -> header::Command2 {
         match self {
-            MessageBag::Request(message) => message.header().command,
-            MessageBag::Prepare(message) => message.header().command,
-            MessageBag::PrepareOk(message) => message.header().command,
+            MessageBag::Request(message) => {
+                header::Command2::try_from(message.header().command).expect("validated")
+            }
+            MessageBag::Prepare(message) => {
+                header::Command2::try_from(message.header().command).expect("validated")
+            }
+            MessageBag::PrepareOk(message) => {
+                header::Command2::try_from(message.header().command).expect("validated")
+            }
         }
     }
 
@@ -321,9 +329,15 @@ impl MessageBag {
     #[allow(unused)]
     pub fn operation(&self) -> header::Operation {
         match self {
-            MessageBag::Request(message) => message.header().operation,
-            MessageBag::Prepare(message) => message.header().operation,
-            MessageBag::PrepareOk(message) => message.header().operation,
+            MessageBag::Request(message) => {
+                header::Operation::try_from(message.header().operation).expect("validated")
+            }
+            MessageBag::Prepare(message) => {
+                header::Operation::try_from(message.header().operation).expect("validated")
+            }
+            MessageBag::PrepareOk(message) => {
+                header::Operation::try_from(message.header().operation).expect("validated")
+            }
         }
     }
 }
@@ -340,17 +354,17 @@ where
         // SAFETY: All Message<H> types have identical memory layout (only PhantomData differs).
         // We've validated the command when the original message was created.
         match command {
-            header::Command2::Prepare => {
+            c if c == header::Command2::Prepare as u8 => {
                 let msg =
                     unsafe { Message::<header::PrepareHeader>::from_buffer_unchecked(buffer) };
                 MessageBag::Prepare(msg)
             }
-            header::Command2::Request => {
+            c if c == header::Command2::Request as u8 => {
                 let msg =
                     unsafe { Message::<header::RequestHeader>::from_buffer_unchecked(buffer) };
                 MessageBag::Request(msg)
             }
-            header::Command2::PrepareOk => {
+            c if c == header::Command2::PrepareOk as u8 => {
                 let msg =
                     unsafe { Message::<header::PrepareOkHeader>::from_buffer_unchecked(buffer) };
                 MessageBag::PrepareOk(msg)
@@ -383,7 +397,7 @@ mod tests {
             header.checksum = 123456;
             header.cluster = 12345;
             header.size = total_size as u32;
-            header.command = header::Command2::Reserved;
+            header.command = header::Command2::Reserved as u8;
 
             for (i, item) in buffer
                 .iter_mut()
@@ -413,12 +427,12 @@ mod tests {
             header.cluster = 12345;
             header.size = total_size as u32;
             header.view = 1;
-            header.command = header::Command2::Prepare;
+            header.command = header::Command2::Prepare as u8;
             header.replica = 1;
             header.op = 100;
             header.commit = 99;
             header.timestamp = 1234567890;
-            header.operation = header::Operation::CreateStream;
+            header.operation = header::Operation::CreateStream as u8;
 
             Message::<Self>::from_bytes(buffer.freeze()).unwrap()
         }
@@ -437,7 +451,7 @@ mod tests {
             header.cluster = 12345;
             header.size = 256;
             header.view = 1;
-            header.command = header::Command2::Commit;
+            header.command = header::Command2::Commit as u8;
             header.replica = 2;
             header.commit = 50;
 
@@ -459,11 +473,11 @@ mod tests {
             header.cluster = 12345;
             header.size = total_size as u32;
             header.view = 1;
-            header.command = header::Command2::Reply;
+            header.command = header::Command2::Reply as u8;
             header.replica = 3;
             header.op = 100;
             header.commit = 99;
-            header.operation = header::Operation::CreateStream;
+            header.operation = header::Operation::CreateStream as u8;
 
             Message::<Self>::from_bytes(buffer.freeze()).unwrap()
         }
@@ -474,7 +488,7 @@ mod tests {
         let message = header::GenericHeader::create_test();
 
         assert_eq!(message.header().cluster, 12345);
-        assert_eq!(message.header().command, header::Command2::Reserved);
+        assert_eq!(message.header().command, header::Command2::Reserved as u8);
         assert_eq!(
             message.body().len(),
             message.header().size() as usize - size_of::<header::GenericHeader>()
@@ -495,7 +509,10 @@ mod tests {
         let original_bytes = prepare_message.as_bytes().to_vec();
 
         let generic_message = prepare_message.into_generic();
-        assert_eq!(generic_message.header().command, header::Command2::Prepare);
+        assert_eq!(
+            generic_message.header().command,
+            header::Command2::Prepare as u8
+        );
 
         let prepare_again: Message<header::PrepareHeader> =
             generic_message.try_into_typed().unwrap();

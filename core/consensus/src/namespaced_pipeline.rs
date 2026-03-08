@@ -313,7 +313,7 @@ mod tests {
         Message::<PrepareHeader>::new(std::mem::size_of::<PrepareHeader>()).transmute_header(
             |_, new| {
                 *new = PrepareHeader {
-                    command: Command2::Prepare,
+                    command: Command2::Prepare as u8,
                     op,
                     parent,
                     checksum,
