@@ -32,6 +32,7 @@ assert_cmd = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
 bytes = { workspace = true }
+clickhouse = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
 configs_derive = { workspace = true }

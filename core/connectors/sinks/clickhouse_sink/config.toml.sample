@@ -1,0 +1,63 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "clickhouse"
+enabled = true
+version = 0
+name = "ClickHouse sink"
+path = "../../../target/debug/libiggy_connector_clickhouse_sink"
+verbose = false
+
+[[streams]]
+stream = "user_events"
+topics = ["users", "orders"]
+consumer_group = "clickhouse_sink"
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+
+[plugin_config]
+url = "https://clickhouse.example.com:8443"
+compression_enabled = true # by default uses lz4 when enabled
+auth_type = none # options - none(username/pwd=None), credential, jwt
+tls_enabled = true # if true certs are configured in client init 
+tls_root_ca_cert = "/path/to/ca.pem"
+tls_client_cert = "/path/to/client-cert.pem"
+tls_client_key = "/path/to/client-key.pem"
+username = "user"
+password = "pwd"
+jwt_token = "token"
+roles = ["user_role1",'user_role2"]
+database = "test" # database name if other than default
+table = "iggy_data"
+max_batch_size = 10 # max no of messages/records flushed to clickhouse server
+chunk_size = 1024 # defaults to 1 MB for explicit flush control. currently applicable only for json insert_type. Make sure this to be > size of max_batch_size else the connector flush rows in batch size equalling the chunk_size which results in delayed error detection (if any) and in case of retryable error could result in duplicate rows as the whole batch is retried not based on chunk_size. 
+retry = true #defaults to true
+max_retry = 3
+base_delay = 100 # in millis
+insert_type = "json"  # rowbinary or json. json lets you choose fields using field_mappings, rowbinary supports json as data type or string(json) through payload_format 
+payload_data_type = "json" # json is for  json data type, or string(json)
+include_metadata = true  # When true, includes all metadata fields (offset, timestamp, checksum, etc.) in the insert. Used by typed Inserter.
+
+# Extract nested fields. Only these fields are included in the insert.
+[plugin_config.field_mappings]
+"event.id" = "event_id"
+"event.type" = "event_type"
+"user.id" = "user_id"
+"user.profile.name" = "user_name"
+"metadata.timestamp" = "event_time"

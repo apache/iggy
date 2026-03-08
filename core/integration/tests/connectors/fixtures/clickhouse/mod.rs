@@ -17,24 +17,12 @@
  * under the License.
  */
 
-mod clickhouse;
-mod elasticsearch;
-mod iceberg;
-mod postgres;
-mod quickwit;
-mod wiremock;
+mod container;
+mod sink;
 
-pub use clickhouse::{
-    ClickHouseOps, ClickHouseSinkJsonFieldMappingsFixture, ClickHouseSinkJsonFixture,
+pub use container::ClickHouseOps;
+pub use sink::{
+    ClickHouseSinkJsonFieldMappingsFixture, ClickHouseSinkJsonFixture,
     ClickHouseSinkJsonWithMetadataFixture, ClickHouseSinkRowBinaryFixture,
     ClickHouseSinkRowBinaryWithMetadataFixture,
 };
-pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
-pub use iceberg::{DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergOps, IcebergPreCreatedFixture};
-pub use postgres::{
-    PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
-    PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceJsonFixture,
-    PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceOps,
-};
-pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
-pub use wiremock::{WireMockDirectFixture, WireMockWrappedFixture};
