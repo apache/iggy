@@ -49,7 +49,7 @@ fn main() {
     let test_namespace = IggyNamespace::new(1, 1, 0);
 
     // Initialize partition on all replicas
-    println!("[sim] Initializing test partition: {:?}", test_namespace);
+    println!("[sim] Initializing test partition: {test_namespace:?}");
     sim.init_partition(test_namespace);
 
     // Responses queue
@@ -70,13 +70,14 @@ fn main() {
                 b"Message 3".as_slice(),
             ];
 
-            let send_msg = client.send_messages(test_namespace, test_messages);
+            let send_msg = client.send_messages(test_namespace, &test_messages);
             bus.send_to_replica(leader, send_msg.into_generic())
                 .await
                 .expect("failed to send messages");
 
             loop {
-                if let Some(reply) = responses_clone.lock().unwrap().pop() {
+                let reply = responses_clone.lock().unwrap().pop();
+                if let Some(reply) = reply {
                     println!("[client] Got send_messages reply: {:?}", reply.header());
                     break;
                 }
@@ -90,7 +91,8 @@ fn main() {
                 .expect("failed to send create_stream");
 
             loop {
-                if let Some(reply) = responses_clone.lock().unwrap().pop() {
+                let reply = responses_clone.lock().unwrap().pop();
+                if let Some(reply) = reply {
                     println!("[client] Got create_stream reply: {:?}", reply.header());
                     break;
                 }
@@ -103,7 +105,8 @@ fn main() {
                 .expect("failed to send delete_stream");
 
             loop {
-                if let Some(reply) = responses_clone.lock().unwrap().pop() {
+                let reply = responses_clone.lock().unwrap().pop();
+                if let Some(reply) = reply {
                     println!("[client] Got delete_stream reply: {:?}", reply.header());
                     break;
                 }
