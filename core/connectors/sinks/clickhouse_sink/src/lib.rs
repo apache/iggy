@@ -43,7 +43,9 @@ impl ClickHouseSinkDefaults {
     pub const CHUNK_SIZE: usize = 1024 * 1024; //1MB
     pub const RETRY: bool = true;
     pub const MAX_RETRY: u32 = 3;
+    pub const MAX_RETRY_LIMIT: u32 = 10;
     pub const RETRY_BASE_DELAY: u64 = 500; //500 milliseconds
+    pub const MAX_RETRY_DELAY_MS: u64 = 900_000; // 15 minutes in milliseconds
     pub const INCLUDE_METADATA: bool = false;
     pub const VERBOSE_LOGGING: bool = false;
 }

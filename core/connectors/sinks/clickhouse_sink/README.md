@@ -372,11 +372,11 @@ include_metadata = true
 
 ### Automatic Retries
 
-The connector automatically retries transient errors with exponential backoff. The retry delay is calculated as `base_delay * attempt_number` milliseconds. Configure with:
+The connector automatically retries transient errors with exponential backoff. The retry delay is calculated as `base_delay * 2^attempt` milliseconds. Configure with:
 
 - `retry` (default: `true`) - Enable/disable retries
-- `max_retry` (default: `3`) - Maximum retry attempts
-- `base_delay` (default: `500ms`) - Base delay between retries
+- `max_retry` (default: `3`) - Maximum retry attempts; the connector will fail to open at startup if this exceeds `10`
+- `base_delay` (default: `500ms`) - Base delay between retries; the computed delay is capped at 15 minutes to prevent unbounded waits
 
 Non-transient errors fail immediately without retrying.
 

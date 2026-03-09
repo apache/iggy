@@ -21,8 +21,8 @@ use std::time::Duration;
 use crate::clickhouse_client::ClickHouseClient;
 use crate::generic_inserter;
 use crate::{
-    ClickHouseSink, ClickHouseSinkConfig, InsertType, MessageRowWithMetadata,
-    MessageRowWithoutMetadata,
+    ClickHouseSink, ClickHouseSinkConfig, ClickHouseSinkDefaults, InsertType,
+    MessageRowWithMetadata, MessageRowWithoutMetadata,
 };
 use async_trait::async_trait;
 use clickhouse::error::Error as ChError;
@@ -33,6 +33,9 @@ use tracing::{debug, error, info, warn};
 #[async_trait]
 impl Sink for ClickHouseSink {
     async fn open(&mut self) -> Result<(), Error> {
+        if self.config.max_retry() > ClickHouseSinkDefaults::MAX_RETRY_LIMIT {
+            return Err(Error::InvalidConfig);
+        }
         let clickhouse_client = ClickHouseClient::init(self.config.clone())
             .map_err(|e| Error::InitError(e.to_string()))?;
         self.client = Some(clickhouse_client);
@@ -55,7 +58,10 @@ impl Sink for ClickHouseSink {
         let state = self.state.lock().await;
         info!(
             "ClickHouse sink ID: {} processed {} messages with {} batch attempt failures and with {} batch failures",
-            self.id, state.messages_processed, state.insert_batch_failed, state.insert_batch_failed
+            self.id,
+            state.messages_processed,
+            state.insert_attempt_failed,
+            state.insert_batch_failed
         );
         Ok(())
     }
@@ -195,7 +201,9 @@ impl ClickHouseSink {
                 }
                 //TODO: is_retryable check -- done
                 Err(ch_err) if retry && retry_count < max_retries && is_retryable(&ch_err) => {
-                    let delay = base_delay * 2u32.pow(retry_count);
+                    let max_delay =
+                        Duration::from_millis(ClickHouseSinkDefaults::MAX_RETRY_DELAY_MS);
+                    let delay = (base_delay * 2u32.pow(retry_count)).min(max_delay);
                     warn!(
                         "Failed to write messages (attempt {}): {}. Retrying in {:?}...",
                         retry_count + 1,
