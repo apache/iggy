@@ -16,7 +16,7 @@
 // under the License.
 
 use iggy_common::{IggyError, header::GenericHeader, message::Message};
-use message_bus::MessageBus;
+use message_bus::{MessageBus, Outbound, Recipient};
 use std::collections::{HashSet, VecDeque};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
@@ -51,7 +51,7 @@ impl MemBus {
         }
     }
 
-    /// Get the next pending message from the bus
+    /// Get the next pending message from the bus.
     ///
     /// # Panics
     /// Panics if the internal mutex is poisoned.
@@ -67,11 +67,7 @@ impl MessageBus for MemBus {
     type Sender = ();
 
     fn add_client(&mut self, client: Self::Client, _sender: Self::Sender) -> bool {
-        if self.clients.lock().unwrap().contains(&client) {
-            return false;
-        }
-        self.clients.lock().unwrap().insert(client);
-        true
+        self.clients.lock().unwrap().insert(client)
     }
 
     fn remove_client(&mut self, client: Self::Client) -> bool {
@@ -79,11 +75,7 @@ impl MessageBus for MemBus {
     }
 
     fn add_replica(&mut self, replica: Self::Replica) -> bool {
-        if self.replicas.lock().unwrap().contains(&replica) {
-            return false;
-        }
-        self.replicas.lock().unwrap().insert(replica);
-        true
+        self.replicas.lock().unwrap().insert(replica)
     }
 
     fn remove_replica(&mut self, replica: Self::Replica) -> bool {
@@ -127,6 +119,25 @@ impl MessageBus for MemBus {
         });
 
         Ok(())
+    }
+
+    fn drain(&self, buf: &mut Vec<Outbound<Self::Client, Self::Replica, Self::Data>>) {
+        buf.extend(
+            self.pending_messages
+                .lock()
+                .unwrap()
+                .drain(..)
+                .map(|envelope| {
+                    let recipient = if let Some(client) = envelope.to_client {
+                        Recipient::Client(client)
+                    } else if let Some(replica) = envelope.to_replica {
+                        Recipient::Replica(replica)
+                    } else {
+                        unreachable!("envelope must have either to_client or to_replica set")
+                    };
+                    (recipient, envelope.message)
+                }),
+        );
     }
 }
 
@@ -177,5 +188,112 @@ impl MessageBus for SharedMemBus {
         message: Self::Data,
     ) -> Result<(), IggyError> {
         self.0.send_to_replica(replica, message).await
+    }
+
+    fn drain(&self, buf: &mut Vec<Outbound<Self::Client, Self::Replica, Self::Data>>) {
+        self.0.drain(buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_common::header::GenericHeader;
+
+    fn make_message() -> Message<GenericHeader> {
+        Message::<GenericHeader>::new(std::mem::size_of::<GenericHeader>())
+    }
+
+    #[test]
+    fn drain_empty_yields_nothing() {
+        let bus = MemBus::new();
+        let mut buf = Vec::new();
+        bus.drain(&mut buf);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn send_to_replica_then_drain() {
+        let mut bus = MemBus::new();
+        bus.add_replica(0);
+
+        futures::executor::block_on(bus.send_to_replica(0, make_message())).unwrap();
+        futures::executor::block_on(bus.send_to_replica(0, make_message())).unwrap();
+
+        let mut buf = Vec::new();
+        bus.drain(&mut buf);
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0].0, Recipient::Replica(0));
+        assert_eq!(buf[1].0, Recipient::Replica(0));
+    }
+
+    #[test]
+    fn send_to_client_then_drain() {
+        let mut bus = MemBus::new();
+        bus.add_client(42, ());
+
+        futures::executor::block_on(bus.send_to_client(42, make_message())).unwrap();
+
+        let mut buf = Vec::new();
+        bus.drain(&mut buf);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0].0, Recipient::Client(42));
+    }
+
+    #[test]
+    fn double_drain_second_empty() {
+        let mut bus = MemBus::new();
+        bus.add_replica(0);
+
+        futures::executor::block_on(bus.send_to_replica(0, make_message())).unwrap();
+
+        let mut buf = Vec::new();
+        bus.drain(&mut buf);
+        assert_eq!(buf.len(), 1);
+
+        buf.clear();
+        bus.drain(&mut buf);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn send_to_unknown_replica_errors_and_drain_empty() {
+        let bus = MemBus::new();
+        let result = futures::executor::block_on(bus.send_to_replica(99, make_message()));
+        assert!(result.is_err());
+
+        let mut buf = Vec::new();
+        bus.drain(&mut buf);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_preserves_routing() {
+        let mut bus = MemBus::new();
+        bus.add_replica(1);
+        bus.add_client(42, ());
+
+        futures::executor::block_on(bus.send_to_replica(1, make_message())).unwrap();
+        futures::executor::block_on(bus.send_to_client(42, make_message())).unwrap();
+
+        let mut buf = Vec::new();
+        bus.drain(&mut buf);
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0].0, Recipient::Replica(1));
+        assert_eq!(buf[1].0, Recipient::Client(42));
+    }
+
+    #[test]
+    fn shared_mem_bus_drain_delegates() {
+        let bus = Arc::new(MemBus::new());
+        let mut shared = SharedMemBus(bus);
+        shared.add_replica(0);
+
+        futures::executor::block_on(shared.send_to_replica(0, make_message())).unwrap();
+
+        let mut buf = Vec::new();
+        shared.drain(&mut buf);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0].0, Recipient::Replica(0));
     }
 }
