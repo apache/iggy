@@ -24,6 +24,7 @@
 #include "tests/common/test_helpers.hpp"
 
 TEST(LowLevelE2E_Stream, CreateStreamAfterLogin) {
+    RecordProperty("description", "Creates a stream successfully after authenticating.");
     const std::string stream_name = "cpp-create-stream-after-login";
     iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -33,6 +34,7 @@ TEST(LowLevelE2E_Stream, CreateStreamAfterLogin) {
 }
 
 TEST(LowLevelE2E_Stream, CreateDuplicateStreamThrows) {
+    RecordProperty("description", "Rejects creating the same stream twice.");
     const std::string stream_name = "cpp-create-stream-duplicate";
     iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -43,6 +45,7 @@ TEST(LowLevelE2E_Stream, CreateDuplicateStreamThrows) {
 }
 
 TEST(LowLevelE2E_Stream, CreateStreamBeforeLoginThrows) {
+    RecordProperty("description", "Throws when stream creation is attempted before authentication.");
     const std::string stream_name = "cpp-create-stream-immediate-new-connection";
     iggy::ffi::Client *client     = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
@@ -57,6 +60,8 @@ TEST(LowLevelE2E_Stream, CreateStreamBeforeLoginThrows) {
 }
 
 TEST(LowLevelE2E_Stream, CreateStreamValidatesNameConstraintsAndUniqueness) {
+    RecordProperty("description",
+                   "Validates stream name length constraints and accepts the maximum allowed name length.");
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
 
@@ -77,6 +82,7 @@ TEST(LowLevelE2E_Stream, CreateStreamValidatesNameConstraintsAndUniqueness) {
 }
 
 TEST(LowLevelE2E_Stream, StreamCreatedAndDeletedSuccessfully) {
+    RecordProperty("description", "Creates a stream and deletes it successfully by string identifier.");
     const std::string stream_name = "cpp-delete-stream-created-and-deleted";
     iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -89,6 +95,7 @@ TEST(LowLevelE2E_Stream, StreamCreatedAndDeletedSuccessfully) {
 }
 
 TEST(LowLevelE2E_Stream, DeleteNotCreatedStreamThrows) {
+    RecordProperty("description", "Throws when deleting a stream that does not exist.");
     const std::string stream_name = "cpp-delete-stream-not-created";
     iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -100,6 +107,7 @@ TEST(LowLevelE2E_Stream, DeleteNotCreatedStreamThrows) {
 }
 
 TEST(LowLevelE2E_Stream, DeleteStreamBeforeLoginThrows) {
+    RecordProperty("description", "Throws when stream deletion is attempted before authentication.");
     const std::string stream_name = "cpp-delete-stream-without-login";
 
     iggy::ffi::Client *client = nullptr;
@@ -117,6 +125,7 @@ TEST(LowLevelE2E_Stream, DeleteStreamBeforeLoginThrows) {
 }
 
 TEST(LowLevelE2E_Stream, DeleteStreamTwiceThrows) {
+    RecordProperty("description", "Throws when deleting the same stream a second time.");
     const std::string stream_name = "cpp-delete-stream-twice";
     iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -130,6 +139,7 @@ TEST(LowLevelE2E_Stream, DeleteStreamTwiceThrows) {
 }
 
 TEST(LowLevelE2E_Stream, DeleteStreamWithInvalidIdentifierThrows) {
+    RecordProperty("description", "Rejects stream deletion requests that use invalid identifier formats.");
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
 
@@ -150,6 +160,7 @@ TEST(LowLevelE2E_Stream, DeleteStreamWithInvalidIdentifierThrows) {
 }
 
 TEST(LowLevelE2E_Stream, GetStreamDetailsWithInvalidIdentifierThrows) {
+    RecordProperty("description", "Rejects stream detail lookups that use invalid identifier formats.");
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
 
@@ -170,6 +181,7 @@ TEST(LowLevelE2E_Stream, GetStreamDetailsWithInvalidIdentifierThrows) {
 }
 
 TEST(LowLevelE2E_Stream, GetStreamByStringIdentifierReturnsStreamDetails) {
+    RecordProperty("description", "Returns expected stream details when looked up by string identifier.");
     const std::string stream_name = "cpp-get-stream-by-string";
     iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -191,6 +203,7 @@ TEST(LowLevelE2E_Stream, GetStreamByStringIdentifierReturnsStreamDetails) {
 }
 
 TEST(LowLevelE2E_Stream, GetNonExistentStreamDetailsThrows) {
+    RecordProperty("description", "Throws when requesting details for a stream that does not exist.");
     const std::string stream_name = "cpp-get-nonexistent-stream-details";
     iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -201,6 +214,7 @@ TEST(LowLevelE2E_Stream, GetNonExistentStreamDetailsThrows) {
 }
 
 TEST(LowLevelE2E_Stream, GetStreamDetailsBeforeLoginThrows) {
+    RecordProperty("description", "Throws when stream details are requested before authentication.");
     const std::string stream_name = "cpp-get-stream-details-without-login";
     iggy::ffi::Client *client     = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
@@ -215,6 +229,7 @@ TEST(LowLevelE2E_Stream, GetStreamDetailsBeforeLoginThrows) {
 }
 
 TEST(LowLevelE2E_Stream, GetDeletedStreamDetailsThrows) {
+    RecordProperty("description", "Throws when requesting details for a stream after it has been deleted.");
     const std::string stream_name = "cpp-get-deleted-stream-details";
     iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -228,6 +243,7 @@ TEST(LowLevelE2E_Stream, GetDeletedStreamDetailsThrows) {
 }
 
 TEST(LowLevelE2E_Stream, GetStreamByNumericIdentifierReturnsStreamDetails) {
+    RecordProperty("description", "Returns expected stream details when looked up by numeric identifier.");
     const std::string stream_name = "cpp-get-stream-by-numeric";
     iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);

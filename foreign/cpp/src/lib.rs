@@ -16,7 +16,7 @@
 // under the License.
 mod client;
 mod identifier;
-mod stream_details;
+mod stream;
 mod topic;
 
 use client::{Client, delete_connection, new_connection};
