@@ -19,8 +19,9 @@
 use crate::permissioner::Permissioner;
 use iggy_common::IggyError;
 
+#[allow(clippy::missing_errors_doc)]
 impl Permissioner {
-    /// Inheritance: manage_streams → read_streams → read_topics → poll_messages
+    /// Inheritance: `manage_streams` -> `read_streams` -> `read_topics` -> `poll_messages`
     pub fn poll_messages(
         &self,
         user_id: u32,
@@ -79,7 +80,7 @@ impl Permissioner {
         Err(IggyError::Unauthorized)
     }
 
-    /// Inheritance: manage_streams → manage_topics → send_messages
+    /// Inheritance: `manage_streams` -> `manage_topics` -> `send_messages`
     pub fn append_messages(
         &self,
         user_id: u32,

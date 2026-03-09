@@ -119,6 +119,12 @@ impl BinaryTransport for WebSocketClient {
                 | IggyError::EmptyResponse
                 | IggyError::Unauthenticated
                 | IggyError::StaleClient
+                | IggyError::NotConnected
+                | IggyError::CannotEstablishConnection
+                | IggyError::TcpError
+                | IggyError::ConnectionClosed
+                | IggyError::WebSocketSendError
+                | IggyError::WebSocketReceiveError
         ) {
             return Err(error);
         }

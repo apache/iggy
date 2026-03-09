@@ -46,7 +46,8 @@ pub struct Timeout {
 }
 
 impl Timeout {
-    pub fn new(id: u128, after: u64) -> Self {
+    #[must_use]
+    pub const fn new(id: u128, after: u64) -> Self {
         Self {
             id,
             after,
@@ -56,30 +57,31 @@ impl Timeout {
         }
     }
 
-    pub fn start(&mut self) {
+    pub const fn start(&mut self) {
         self.ticks_remaining = self.after;
         self.ticking = true;
         self.attempts = 0;
     }
 
-    pub fn stop(&mut self) {
+    pub const fn stop(&mut self) {
         self.ticking = false;
         self.ticks_remaining = 0;
         self.attempts = 0;
     }
 
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.ticks_remaining = self.after;
         self.attempts = 0;
     }
 
-    pub fn tick(&mut self) {
+    pub const fn tick(&mut self) {
         if self.ticking {
             self.ticks_remaining = self.ticks_remaining.saturating_sub(1);
         }
     }
 
-    pub fn fired(&self) -> bool {
+    #[must_use]
+    pub const fn fired(&self) -> bool {
         self.ticking && self.ticks_remaining == 0
     }
 
@@ -135,6 +137,7 @@ impl TimeoutManager {
     const DO_VIEW_CHANGE_MESSAGE_TICKS: u64 = 50;
     const REQUEST_START_VIEW_MESSAGE_TICKS: u64 = 100;
 
+    // TODO: add #[must_use] -- constructor, discarding is always a bug.
     pub fn new(replica_id: u128) -> Self {
         Self {
             ping: Timeout::new(replica_id, Self::PING_TICKS),
@@ -151,6 +154,8 @@ impl TimeoutManager {
                 replica_id,
                 Self::REQUEST_START_VIEW_MESSAGE_TICKS,
             ),
+            // Upper bits of replica_id are not critical for PRNG seed diversity.
+            #[allow(clippy::cast_possible_truncation)]
             prng: Xoshiro256Plus::seed_from_u64(replica_id as u64),
         }
     }
@@ -158,7 +163,7 @@ impl TimeoutManager {
     /// Tick all timeouts
     /// This is the first phase of the two-phase tick-based timeout mechanism.
     /// 2nd phase is checking which timeouts have fired and calling the appropriate handlers.
-    pub fn tick(&mut self) {
+    pub const fn tick(&mut self) {
         self.ping.tick();
         self.prepare.tick();
         self.commit_message.tick();
@@ -169,11 +174,12 @@ impl TimeoutManager {
         self.view_change_status.tick();
     }
 
-    pub fn fired(&self, kind: TimeoutKind) -> bool {
+    #[must_use]
+    pub const fn fired(&self, kind: TimeoutKind) -> bool {
         self.get(kind).fired()
     }
 
-    pub fn get(&self, kind: TimeoutKind) -> &Timeout {
+    pub const fn get(&self, kind: TimeoutKind) -> &Timeout {
         match kind {
             TimeoutKind::Ping => &self.ping,
             TimeoutKind::Prepare => &self.prepare,
@@ -186,7 +192,7 @@ impl TimeoutManager {
         }
     }
 
-    pub fn get_mut(&mut self, kind: TimeoutKind) -> &mut Timeout {
+    pub const fn get_mut(&mut self, kind: TimeoutKind) -> &mut Timeout {
         match kind {
             TimeoutKind::Ping => &mut self.ping,
             TimeoutKind::Prepare => &mut self.prepare,
@@ -199,15 +205,15 @@ impl TimeoutManager {
         }
     }
 
-    pub fn start(&mut self, kind: TimeoutKind) {
+    pub const fn start(&mut self, kind: TimeoutKind) {
         self.get_mut(kind).start();
     }
 
-    pub fn stop(&mut self, kind: TimeoutKind) {
+    pub const fn stop(&mut self, kind: TimeoutKind) {
         self.get_mut(kind).stop();
     }
 
-    pub fn reset(&mut self, kind: TimeoutKind) {
+    pub const fn reset(&mut self, kind: TimeoutKind) {
         self.get_mut(kind).reset();
     }
 
@@ -225,7 +231,8 @@ impl TimeoutManager {
         timeout.backoff(&mut self.prng);
     }
 
-    pub fn is_ticking(&self, kind: TimeoutKind) -> bool {
+    #[must_use]
+    pub const fn is_ticking(&self, kind: TimeoutKind) -> bool {
         self.get(kind).ticking
     }
 }

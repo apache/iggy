@@ -43,6 +43,7 @@ impl Simulator {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     pub fn new(replica_count: usize, clients: impl Iterator<Item = u128>) -> Self {
         let mut message_bus = MemBus::new();
         for client in clients {
@@ -58,8 +59,8 @@ impl Simulator {
             .map(|i| {
                 new_replica(
                     i as u8,
-                    format!("replica-{}", i),
-                    Arc::clone(&message_bus),
+                    format!("replica-{i}"),
+                    &message_bus,
                     replica_count as u8,
                 )
             })
@@ -71,6 +72,7 @@ impl Simulator {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     pub fn with_message_bus(replica_count: usize, mut message_bus: MemBus) -> Self {
         for i in 0..replica_count as u8 {
             message_bus.add_replica(i);
@@ -81,8 +83,8 @@ impl Simulator {
             .map(|i| {
                 new_replica(
                     i as u8,
-                    format!("replica-{}", i),
-                    Arc::clone(&message_bus),
+                    format!("replica-{i}"),
+                    &message_bus,
                     replica_count as u8,
                 )
             })
@@ -96,6 +98,9 @@ impl Simulator {
 }
 
 impl Simulator {
+    /// # Panics
+    /// Panics if a client response message has an invalid command type.
+    #[allow(clippy::future_not_send)]
     pub async fn step(&self) -> Option<Message<ReplyHeader>> {
         if let Some(envelope) = self.message_bus.receive() {
             if let Some(_client_id) = envelope.to_client {
@@ -116,6 +121,7 @@ impl Simulator {
         None
     }
 
+    #[allow(clippy::future_not_send)]
     async fn dispatch_to_replica(
         &self,
         replica: &Replica,

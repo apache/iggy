@@ -35,3 +35,8 @@ rand = { workspace = true }
 rand_xoshiro = { workspace = true }
 shard = { path = "../shard" }
 tracing = { workspace = true }
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "warn"
