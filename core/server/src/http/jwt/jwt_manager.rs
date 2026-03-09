@@ -16,9 +16,10 @@
  * under the License.
  */
 
-use crate::configs::http::HttpJwtConfig;
+use crate::configs::http::{HttpJwtConfig, TrustedIssuerConfig};
 use crate::http::jwt::COMPONENT;
 use crate::http::jwt::json_web_token::{GeneratedToken, JwtClaims, RevokedAccessToken};
+use crate::http::jwt::jwks::JwksClient;
 use crate::http::jwt::storage::TokenStorage;
 use crate::streaming::persistence::persister::PersisterKind;
 use ahash::AHashMap;
@@ -31,6 +32,7 @@ use iggy_common::UserId;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::locking::IggyRwLockFn;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation, encode};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
@@ -56,6 +58,8 @@ pub struct JwtManager {
     tokens_storage: TokenStorage,
     revoked_tokens: IggyRwLock<AHashMap<String, u64>>,
     validations: AHashMap<Algorithm, Validation>,
+    jwks_client: JwksClient,
+    trusted_issuer: HashMap<String, TrustedIssuerConfig>,
 }
 
 impl JwtManager {
@@ -78,6 +82,8 @@ impl JwtManager {
             validator,
             tokens_storage: TokenStorage::new(persister, path),
             revoked_tokens: IggyRwLock::new(AHashMap::new()),
+            jwks_client: JwksClient::default(),
+            trusted_issuer: HashMap::new(),
         })
     }
 
@@ -105,7 +111,17 @@ impl JwtManager {
                 format!("{COMPONENT} (error: {e}) - failed to get decoding key")
             })?,
         };
-        JwtManager::new(persister, path, issuer, validator)
+        let mut manager = JwtManager::new(persister, path, issuer, validator)?;
+
+        if let Some(trusted_issuers) = config.trusted_issuers.as_ref() {
+            for issuer_config in trusted_issuers {
+                manager
+                    .trusted_issuer
+                    .insert(issuer_config.issuer.clone(), issuer_config.clone());
+            }
+        }
+
+        Ok(manager)
     }
 
     fn create_validation(
@@ -181,7 +197,7 @@ impl JwtManager {
         let nbf = iat + self.issuer.not_before.as_secs() as u64;
         let claims = JwtClaims {
             jti: uuid::Uuid::now_v7().to_string(),
-            sub: user_id,
+            sub: user_id.to_string(),
             aud: self.issuer.audience.to_string(),
             iss: self.issuer.issuer.to_string(),
             iat,
@@ -210,7 +226,7 @@ impl JwtManager {
 
         let token_header =
             jsonwebtoken::decode_header(token).map_err(|_| IggyError::InvalidAccessToken)?;
-        let jwt_claims = self.decode(token, token_header.alg)?;
+        let jwt_claims = self.decode(token, token_header.alg).await?;
         let id = jwt_claims.claims.jti;
         let expiry = jwt_claims.claims.exp;
         if self
@@ -232,26 +248,92 @@ impl JwtManager {
             .error(|e: &IggyError| {
                 format!("{COMPONENT} (error: {e}) - failed to save revoked access token: {id}")
             })?;
-        self.generate(jwt_claims.claims.sub)
+        let user_id = jwt_claims
+            .claims
+            .sub
+            .parse::<u32>()
+            .map_err(|_| IggyError::InvalidAccessToken)?;
+        self.generate(user_id)
     }
 
-    pub fn decode(
+    pub async fn decode(
         &self,
         token: &str,
         algorithm: Algorithm,
     ) -> Result<TokenData<JwtClaims>, IggyError> {
         let validation = self.validations.get(&algorithm);
-        if validation.is_none() {
-            return Err(IggyError::InvalidJwtAlgorithm(
-                Self::map_algorithm_to_string(algorithm),
-            ));
-        }
+        let kid = jsonwebtoken::decode_header(token).ok().and_then(|h| h.kid);
 
-        let validation = validation.unwrap();
-        match jsonwebtoken::decode::<JwtClaims>(token, &self.validator.key, validation) {
-            Ok(claims) => Ok(claims),
-            _ => Err(IggyError::Unauthenticated),
-        }
+        // try to decode using JWKS if it's a trusted issuer
+        let insecure = match jsonwebtoken::dangerous::insecure_decode::<JwtClaims>(token) {
+            Ok(claims) => claims,
+            Err(_) => {
+                error!("Failed to decode JWT insecurely");
+                return self.decode_with_fallback(token, validation, algorithm);
+            }
+        };
+
+        /* debug!(
+            "JWT decoded insecurely, issuer: {}, kid: {:?}",
+            insecure.claims.iss, kid
+        ); */
+
+        let config = match self.trusted_issuer.get(&insecure.claims.iss) {
+            Some(config) => config,
+            None => {
+                debug!("No trusted issuer found for: {}", insecure.claims.iss);
+                return self.decode_with_fallback(token, validation, algorithm);
+            }
+        };
+
+        // debug!("Found trusted issuer config: {}", config.issuer);
+
+        let kid_str = match kid.as_deref() {
+            Some(kid) => kid,
+            None => {
+                error!("No kid found in JWT header");
+                return self.decode_with_fallback(token, validation, algorithm);
+            }
+        };
+
+        let decoding_key = match self
+            .jwks_client
+            .get_key(&config.issuer, &config.jwks_url, kid_str)
+            .await
+        {
+            Some(key) => key,
+            None => {
+                error!("Failed to get decoding key from JWKS for kid: {}", kid_str);
+                return self.decode_with_fallback(token, validation, algorithm);
+            }
+        };
+
+        // debug!("Got decoding key from JWKS for kid: {}", kid_str);
+
+        let mut validation = Validation::new(algorithm);
+        validation.set_issuer(std::slice::from_ref(&config.issuer));
+        validation.set_audience(std::slice::from_ref(&config.audience));
+        debug!("Validation configured, attempting to decode JWT");
+
+        jsonwebtoken::decode::<JwtClaims>(token, &decoding_key, &validation).map_err(|e| {
+            error!("Failed to decode JWT: {}", e);
+            IggyError::Unauthenticated
+        })
+    }
+
+    /// fallback to standard JWT validation if JWKS validation fails
+    fn decode_with_fallback(
+        &self,
+        token: &str,
+        validation: Option<&Validation>,
+        algorithm: Algorithm,
+    ) -> Result<TokenData<JwtClaims>, IggyError> {
+        let validation = validation.ok_or_else(|| {
+            IggyError::InvalidJwtAlgorithm(Self::map_algorithm_to_string(algorithm))
+        })?;
+
+        jsonwebtoken::decode::<JwtClaims>(token, &self.validator.key, validation)
+            .map_err(|_| IggyError::Unauthenticated)
     }
 
     fn map_algorithm_to_string(algorithm: Algorithm) -> String {
