@@ -34,4 +34,4 @@ rand = { workspace = true }
 [lints.clippy]
 enum_glob_use = "deny"
 pedantic = "deny"
-nursery = "deny"
+nursery = "warn"

@@ -32,7 +32,8 @@ pub struct SimClient {
 }
 
 impl SimClient {
-    pub fn new(client_id: u128) -> Self {
+    #[must_use]
+    pub const fn new(client_id: u128) -> Self {
         Self {
             client_id,
             request_counter: Cell::new(0),
@@ -51,22 +52,25 @@ impl SimClient {
         };
         let payload = create_stream.to_bytes();
 
-        self.build_request(Operation::CreateStream, payload)
+        self.build_request(Operation::CreateStream, &payload)
     }
 
+    /// # Panics
+    /// Panics if the stream name cannot be converted to an `Identifier`.
     pub fn delete_stream(&self, name: &str) -> Message<RequestHeader> {
         let delete_stream = DeleteStream {
             stream_id: Identifier::named(name).unwrap(),
         };
         let payload = delete_stream.to_bytes();
 
-        self.build_request(Operation::DeleteStream, payload)
+        self.build_request(Operation::DeleteStream, &payload)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     pub fn send_messages(
         &self,
         namespace: IggyNamespace,
-        messages: Vec<&[u8]>,
+        messages: &[&[u8]],
     ) -> Message<RequestHeader> {
         // Build batch: count | indexes | messages
         let count = messages.len() as u32;
@@ -74,7 +78,7 @@ impl SimClient {
         let mut messages_buf = Vec::new();
 
         let mut current_position = 0u32;
-        for msg in &messages {
+        for msg in messages {
             // Write index: position (u32) + length (u32)
             indexes.extend_from_slice(&current_position.to_le_bytes());
             indexes.extend_from_slice(&(msg.len() as u32).to_le_bytes());
@@ -90,17 +94,14 @@ impl SimClient {
         payload.extend_from_slice(&indexes);
         payload.extend_from_slice(&messages_buf);
 
-        self.build_request_with_namespace(
-            Operation::SendMessages,
-            bytes::Bytes::from(payload),
-            namespace,
-        )
+        self.build_request_with_namespace(Operation::SendMessages, &payload, namespace)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn build_request_with_namespace(
         &self,
         operation: Operation,
-        payload: bytes::Bytes,
+        payload: &[u8],
         namespace: IggyNamespace,
     ) -> Message<RequestHeader> {
         use bytes::Bytes;
@@ -130,13 +131,14 @@ impl SimClient {
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
         buffer.extend_from_slice(header_bytes);
-        buffer.extend_from_slice(&payload);
+        buffer.extend_from_slice(payload);
 
         Message::<RequestHeader>::from_bytes(Bytes::from(buffer))
             .expect("failed to build request message")
     }
 
-    fn build_request(&self, operation: Operation, payload: bytes::Bytes) -> Message<RequestHeader> {
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_request(&self, operation: Operation, payload: &[u8]) -> Message<RequestHeader> {
         use bytes::Bytes;
 
         let header_size = std::mem::size_of::<RequestHeader>();
@@ -163,7 +165,7 @@ impl SimClient {
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
         buffer.extend_from_slice(header_bytes);
-        buffer.extend_from_slice(&payload);
+        buffer.extend_from_slice(payload);
 
         Message::<RequestHeader>::from_bytes(Bytes::from(buffer))
             .expect("failed to build request message")
