@@ -20,7 +20,7 @@
 use crate::configs::connectors::SinkConfig;
 use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
-use crate::metrics::{ConnectorType, Metrics};
+use crate::metrics::Metrics;
 use crate::{
     PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer, SinkConnectorPlugin,
     SinkConnectorWrapper, resolve_plugin_path, transform,
