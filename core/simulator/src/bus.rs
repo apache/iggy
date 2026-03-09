@@ -17,7 +17,7 @@
 
 use iggy_common::{IggyError, header::GenericHeader, message::Message};
 use message_bus::MessageBus;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
@@ -36,21 +36,25 @@ pub struct Envelope {
 // I think the way we could handle that is by having an dedicated collection for client responses (clients_table).
 #[derive(Debug, Default)]
 pub struct MemBus {
-    clients: Mutex<HashMap<u128, ()>>,
-    replicas: Mutex<HashMap<u8, ()>>,
+    clients: Mutex<HashSet<u128>>,
+    replicas: Mutex<HashSet<u8>>,
     pending_messages: Mutex<VecDeque<Envelope>>,
 }
 
 impl MemBus {
+    #[must_use]
     pub fn new() -> Self {
         Self {
-            clients: Mutex::new(HashMap::new()),
-            replicas: Mutex::new(HashMap::new()),
+            clients: Mutex::new(HashSet::new()),
+            replicas: Mutex::new(HashSet::new()),
             pending_messages: Mutex::new(VecDeque::new()),
         }
     }
 
     /// Get the next pending message from the bus
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
     pub fn receive(&self) -> Option<Envelope> {
         self.pending_messages.lock().unwrap().pop_front()
     }
@@ -63,27 +67,27 @@ impl MessageBus for MemBus {
     type Sender = ();
 
     fn add_client(&mut self, client: Self::Client, _sender: Self::Sender) -> bool {
-        if self.clients.lock().unwrap().contains_key(&client) {
+        if self.clients.lock().unwrap().contains(&client) {
             return false;
         }
-        self.clients.lock().unwrap().insert(client, ());
+        self.clients.lock().unwrap().insert(client);
         true
     }
 
     fn remove_client(&mut self, client: Self::Client) -> bool {
-        self.clients.lock().unwrap().remove(&client).is_some()
+        self.clients.lock().unwrap().remove(&client)
     }
 
     fn add_replica(&mut self, replica: Self::Replica) -> bool {
-        if self.replicas.lock().unwrap().contains_key(&replica) {
+        if self.replicas.lock().unwrap().contains(&replica) {
             return false;
         }
-        self.replicas.lock().unwrap().insert(replica, ());
+        self.replicas.lock().unwrap().insert(replica);
         true
     }
 
     fn remove_replica(&mut self, replica: Self::Replica) -> bool {
-        self.replicas.lock().unwrap().remove(&replica).is_some()
+        self.replicas.lock().unwrap().remove(&replica)
     }
 
     async fn send_to_client(
@@ -91,7 +95,8 @@ impl MessageBus for MemBus {
         client_id: Self::Client,
         message: Self::Data,
     ) -> Result<(), IggyError> {
-        if !self.clients.lock().unwrap().contains_key(&client_id) {
+        if !self.clients.lock().unwrap().contains(&client_id) {
+            #[allow(clippy::cast_possible_truncation)]
             return Err(IggyError::ClientNotFound(client_id as u32));
         }
 
@@ -110,8 +115,8 @@ impl MessageBus for MemBus {
         replica: Self::Replica,
         message: Self::Data,
     ) -> Result<(), IggyError> {
-        if !self.replicas.lock().unwrap().contains_key(&replica) {
-            return Err(IggyError::ResourceNotFound(format!("Replica {}", replica)));
+        if !self.replicas.lock().unwrap().contains(&replica) {
+            return Err(IggyError::ResourceNotFound(format!("Replica {replica}")));
         }
 
         self.pending_messages.lock().unwrap().push_back(Envelope {
@@ -125,7 +130,7 @@ impl MessageBus for MemBus {
     }
 }
 
-/// Newtype wrapper for shared MemBus that implements MessageBus
+/// Newtype wrapper for shared [`MemBus`] that implements [`MessageBus`]
 #[derive(Debug, Clone)]
 pub struct SharedMemBus(pub Arc<MemBus>);
 
@@ -142,30 +147,20 @@ impl MessageBus for SharedMemBus {
     type Data = Message<GenericHeader>;
     type Sender = ();
 
-    fn add_client(&mut self, client: Self::Client, sender: Self::Sender) -> bool {
-        self.0
-            .clients
-            .lock()
-            .unwrap()
-            .insert(client, sender)
-            .is_none()
+    fn add_client(&mut self, client: Self::Client, _sender: Self::Sender) -> bool {
+        self.0.clients.lock().unwrap().insert(client)
     }
 
     fn remove_client(&mut self, client: Self::Client) -> bool {
-        self.0.clients.lock().unwrap().remove(&client).is_some()
+        self.0.clients.lock().unwrap().remove(&client)
     }
 
     fn add_replica(&mut self, replica: Self::Replica) -> bool {
-        self.0
-            .replicas
-            .lock()
-            .unwrap()
-            .insert(replica, ())
-            .is_none()
+        self.0.replicas.lock().unwrap().insert(replica)
     }
 
     fn remove_replica(&mut self, replica: Self::Replica) -> bool {
-        self.0.replicas.lock().unwrap().remove(&replica).is_some()
+        self.0.replicas.lock().unwrap().remove(&replica)
     }
 
     async fn send_to_client(
