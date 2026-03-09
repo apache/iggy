@@ -17,6 +17,7 @@
  * under the License.
  */
 
+mod clickhouse;
 mod elasticsearch;
 mod iceberg;
 mod mongodb;
@@ -24,6 +25,9 @@ mod postgres;
 mod quickwit;
 mod wiremock;
 
+pub use clickhouse::{
+    ClickHouseSinkFixture, ClickHouseSinkRowBinaryFixture, ClickHouseSinkStringFixture,
+};
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use iceberg::{DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergOps, IcebergPreCreatedFixture};
 pub use mongodb::{
