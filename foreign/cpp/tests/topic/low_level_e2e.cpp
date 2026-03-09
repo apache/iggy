@@ -28,6 +28,8 @@
 #include "tests/common/test_helpers.hpp"
 
 TEST(LowLevelE2E_Topic, CreateTopicWithAllOptionCombinations) {
+    RecordProperty("description",
+                   "Creates topics across supported option combinations and verifies they are all returned.");
     const std::string stream_name = "cpp-create-topic-after-login";
 
     iggy::ffi::Client *client = login_to_server();
@@ -89,6 +91,7 @@ TEST(LowLevelE2E_Topic, CreateTopicWithAllOptionCombinations) {
 }
 
 TEST(LowLevelE2E_Topic, CreateTopicWithBoundaryPartitionsCountValues) {
+    RecordProperty("description", "Accepts boundary partition counts and rejects values above the supported maximum.");
     const std::string stream_name = "cpp-create-topic-boundary-partitions";
 
     iggy::ffi::Client *client = login_to_server();
@@ -123,6 +126,7 @@ TEST(LowLevelE2E_Topic, CreateTopicWithBoundaryPartitionsCountValues) {
 }
 
 TEST(LowLevelE2E_Topic, CreateTopicWithInvalidNamesThrows) {
+    RecordProperty("description", "Rejects invalid topic names and accepts the maximum allowed name length.");
     const std::string stream_name = "cpp-create-topic-invalid-names";
 
     iggy::ffi::Client *client = login_to_server();
@@ -151,6 +155,7 @@ TEST(LowLevelE2E_Topic, CreateTopicWithInvalidNamesThrows) {
 }
 
 TEST(LowLevelE2E_Topic, CreateDuplicateTopicThrows) {
+    RecordProperty("description", "Rejects creating a duplicate topic within the same stream.");
     const std::string stream_name = "cpp-create-duplicate-topic";
     const std::string topic_name  = "topic-duplicate";
 
@@ -170,6 +175,7 @@ TEST(LowLevelE2E_Topic, CreateDuplicateTopicThrows) {
 }
 
 TEST(LowLevelE2E_Topic, CreateSameTopicNameInDifferentStreamsSucceeds) {
+    RecordProperty("description", "Allows the same topic name to be created in different streams.");
     const std::string first_stream_name  = "cpp-create-topic-same-name-stream-a";
     const std::string second_stream_name = "cpp-create-topic-same-name-stream-b";
     const std::string topic_name         = "shared-topic-name";
@@ -192,6 +198,7 @@ TEST(LowLevelE2E_Topic, CreateSameTopicNameInDifferentStreamsSucceeds) {
 }
 
 TEST(LowLevelE2E_Topic, CreateTopicWithInvalidOptionsThrows) {
+    RecordProperty("description", "Rejects topic creation requests that use invalid option values.");
     const std::string stream_name = "cpp-create-topic-invalid-options";
 
     iggy::ffi::Client *client = login_to_server();
@@ -215,6 +222,8 @@ TEST(LowLevelE2E_Topic, CreateTopicWithInvalidOptionsThrows) {
 }
 
 TEST(LowLevelE2E_Topic, CreateTopicWithMaxTopicSizeBelowSegmentSizeThrows) {
+    RecordProperty("description",
+                   "Rejects topic creation when the maximum topic size is smaller than the segment size.");
     const std::string stream_name = "cpp-create-topic-below-segment-size";
 
     iggy::ffi::Client *client = login_to_server();
@@ -231,6 +240,7 @@ TEST(LowLevelE2E_Topic, CreateTopicWithMaxTopicSizeBelowSegmentSizeThrows) {
 }
 
 TEST(LowLevelE2E_Topic, CreateTopicOnNonExistentStreamThrows) {
+    RecordProperty("description", "Throws when creating a topic on a stream that does not exist.");
     const std::string stream_name = "cpp-create-topic-non-existent-stream";
 
     iggy::ffi::Client *client = login_to_server();
@@ -245,6 +255,7 @@ TEST(LowLevelE2E_Topic, CreateTopicOnNonExistentStreamThrows) {
 }
 
 TEST(LowLevelE2E_Topic, CreateTopicAfterStreamDeletionThrows) {
+    RecordProperty("description", "Throws when creating a topic after its stream has been deleted.");
     const std::string stream_name = "cpp-create-topic-after-stream-deletion";
 
     iggy::ffi::Client *client = login_to_server();
@@ -262,6 +273,7 @@ TEST(LowLevelE2E_Topic, CreateTopicAfterStreamDeletionThrows) {
 }
 
 TEST(LowLevelE2E_Topic, CreateTopicWithInvalidStreamIdentifierThrows) {
+    RecordProperty("description", "Rejects topic creation requests that use invalid stream identifier formats.");
     const std::string stream_name = "cpp-create-topic-invalid-stream-identifier";
 
     iggy::ffi::Client *client = login_to_server();
@@ -291,6 +303,7 @@ TEST(LowLevelE2E_Topic, CreateTopicWithInvalidStreamIdentifierThrows) {
 }
 
 TEST(LowLevelE2E_Topic, CreateTopicBeforeLoginThrows) {
+    RecordProperty("description", "Throws when topic creation is attempted from an unauthenticated client.");
     const std::string stream_name = "cpp-create-topic-before-login";
     const std::string topic_name  = "topic-before-login";
 

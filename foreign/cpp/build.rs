@@ -23,6 +23,6 @@ fn main() {
     println!("cargo:rerun-if-changed=src/client.rs");
     println!("cargo:rerun-if-changed=src/identifier.rs");
     println!("cargo:rerun-if-changed=src/lib.rs");
-    println!("cargo:rerun-if-changed=src/stream_details.rs");
+    println!("cargo:rerun-if-changed=src/stream.rs");
     println!("cargo:rerun-if-changed=src/topic.rs");
 }
