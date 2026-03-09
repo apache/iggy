@@ -88,7 +88,7 @@ runs:
         version: v1.64.8
         working-directory: foreign/go
         args: --timeout=5m
-        cache: false
+        skip-cache: true
 
     - name: Lint BDD
       if: inputs.task == 'lint' && hashFiles('bdd/go/go.mod') != ''
@@ -97,7 +97,7 @@ runs:
         version: v1.64.8
         working-directory: bdd/go
         args: --timeout=5m
-        cache: false
+        skip-cache: true
 
     - name: Lint Examples
       if: inputs.task == 'lint' && hashFiles('examples/go/go.mod') != ''
@@ -106,7 +106,7 @@ runs:
         version: v1.64.8
         working-directory: examples/go
         args: --timeout=5m
-        cache: false
+        skip-cache: true
 
     - name: Build
       shell: bash

@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM golang:1.23.10-alpine
+FROM golang:1.25.0-alpine
 
 WORKDIR /app
 
