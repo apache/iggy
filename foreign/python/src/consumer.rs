@@ -292,7 +292,7 @@ impl From<&AutoCommit> for RustAutoCommit {
 /// The auto-commit mode for storing the offset on the server.
 #[derive(Debug, PartialEq, Copy, Clone)]
 #[gen_stub_pyclass_complex_enum]
-#[pyclass]
+#[pyclass(from_py_object)]
 pub enum AutoCommitWhen {
     /// The offset is stored on the server when the messages are received.
     PollingMessages(),
@@ -320,7 +320,7 @@ impl From<&AutoCommitWhen> for RustAutoCommitWhen {
 /// The auto-commit mode for storing the offset on the server **after** receiving the messages.
 #[derive(Debug, PartialEq, Copy, Clone)]
 #[gen_stub_pyclass_complex_enum]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[allow(clippy::enum_variant_names)]
 pub enum AutoCommitAfter {
     /// The offset is stored on the server after all the messages are consumed.

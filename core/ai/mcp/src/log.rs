@@ -21,7 +21,7 @@ use crate::configs::{McpTransport, TelemetryConfig, TelemetryTransport};
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
+use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use tracing::info;
@@ -135,7 +135,6 @@ fn init_logs_exporter(
         TelemetryTransport::Http => {
             let log_exporter = opentelemetry_otlp::LogExporter::builder()
                 .with_http()
-                .with_http_client(reqwest::Client::new())
                 .with_endpoint(telemetry_config.logs.endpoint.clone())
                 .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
                 .build()
@@ -166,7 +165,6 @@ fn init_traces_exporter(
         TelemetryTransport::Http => {
             let trace_exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_http()
-                .with_http_client(reqwest::Client::new())
                 .with_endpoint(telemetry_config.traces.endpoint.clone())
                 .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
                 .build()

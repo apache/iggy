@@ -37,13 +37,13 @@ async fn invoke<T: DeserializeOwned>(
     method: &str,
     data: Option<serde_json::Value>,
 ) -> T {
+    let params = CallToolRequestParams::new(method.to_owned());
+    let params = match data.and_then(|v| v.as_object().cloned()) {
+        Some(args) => params.with_arguments(args),
+        None => params,
+    };
     let mut result = client
-        .call_tool(CallToolRequestParams {
-            name: method.to_owned().into(),
-            arguments: data.and_then(|v| v.as_object().cloned()),
-            task: None,
-            meta: None,
-        })
+        .call_tool(params)
         .await
         .unwrap_or_else(|e| panic!("Failed to invoke {method}: {e}"));
 
@@ -56,13 +56,13 @@ async fn invoke<T: DeserializeOwned>(
 }
 
 async fn invoke_empty(client: &McpClient, method: &str, data: Option<serde_json::Value>) {
+    let params = CallToolRequestParams::new(method.to_owned());
+    let params = match data.and_then(|v| v.as_object().cloned()) {
+        Some(args) => params.with_arguments(args),
+        None => params,
+    };
     let result = client
-        .call_tool(CallToolRequestParams {
-            name: method.to_owned().into(),
-            arguments: data.and_then(|v| v.as_object().cloned()),
-            task: None,
-            meta: None,
-        })
+        .call_tool(params)
         .await
         .unwrap_or_else(|e| panic!("Failed to invoke {method}: {e}"));
 
