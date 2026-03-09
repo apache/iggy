@@ -27,4 +27,4 @@ where
     fn deallocate(&self, entry: SS::Entry) -> Option<SS::Delta>;
 }
 
-pub(crate) mod connection;
+pub mod connection;
