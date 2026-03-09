@@ -28,3 +28,8 @@ repository = "https://github.com/apache/iggy"
 readme = "../../../README.md"
 
 [dependencies]
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "warn"

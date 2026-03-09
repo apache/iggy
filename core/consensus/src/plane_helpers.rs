@@ -24,6 +24,12 @@ use std::ops::AsyncFnOnce;
 // TODO: Rework all of those helpers, once the boundaries are more clear and we have a better picture of the commonalities between all of the planes.
 
 /// Shared pipeline-first request flow used by metadata and partitions.
+///
+/// # Panics
+/// - If the caller is not the primary.
+/// - If the consensus status is not normal.
+/// - If the consensus is syncing.
+#[allow(clippy::future_not_send)]
 pub async fn pipeline_prepare_common<C, F>(
     consensus: &C,
     prepare: C::Message<C::ReplicateHeader>,
@@ -43,7 +49,8 @@ pub async fn pipeline_prepare_common<C, F>(
 }
 
 /// Shared commit-based old-prepare fence.
-pub fn fence_old_prepare_by_commit<B, P>(
+#[must_use]
+pub const fn fence_old_prepare_by_commit<B, P>(
     consensus: &VsrConsensus<B, P>,
     header: &PrepareHeader,
 ) -> bool
@@ -55,6 +62,13 @@ where
 }
 
 /// Shared chain-replication forwarding to the next replica.
+///
+/// # Panics
+/// - If `header.command` is not `Command2::Prepare`.
+/// - If `header.op <= consensus.commit()`.
+/// - If the computed next replica equals self.
+/// - If the message bus send fails.
+#[allow(clippy::future_not_send)]
 pub async fn replicate_to_next_in_chain<B, P>(
     consensus: &VsrConsensus<B, P>,
     message: Message<PrepareHeader>,
@@ -87,6 +101,13 @@ pub async fn replicate_to_next_in_chain<B, P>(
 /// Shared preflight checks for `on_replicate`.
 ///
 /// Returns current op on success.
+///
+/// # Errors
+/// Returns a static error string if the replica is syncing, not in normal
+/// status, or the message has a newer view.
+///
+/// # Panics
+/// If `header.command` is not `Command2::Prepare`.
 pub fn replicate_preflight<B, P>(
     consensus: &VsrConsensus<B, P>,
     header: &PrepareHeader,
@@ -119,6 +140,10 @@ where
 }
 
 /// Shared preflight checks for `on_ack`.
+///
+/// # Errors
+/// Returns a static error string if the replica is not primary or not in
+/// normal status.
 pub fn ack_preflight<B, P>(consensus: &VsrConsensus<B, P>) -> Result<(), &'static str>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
@@ -171,6 +196,9 @@ where
 ///
 /// Entries are drained only from the head and only while their op is covered
 /// by the current commit frontier.
+///
+/// # Panics
+/// If `head()` returns `Some` but `pop_message()` returns `None` (unreachable).
 pub fn drain_committable_prefix<B, P>(consensus: &VsrConsensus<B, P>) -> Vec<PipelineEntry>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
@@ -195,39 +223,57 @@ where
 }
 
 /// Shared reply-message construction for committed prepare.
+///
+/// # Panics
+/// If the constructed message buffer is not valid.
+#[allow(clippy::needless_pass_by_value, clippy::cast_possible_truncation)]
 pub fn build_reply_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     prepare_header: &PrepareHeader,
+    body: bytes::Bytes,
 ) -> Message<ReplyHeader>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
     P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
 {
-    Message::<ReplyHeader>::new(std::mem::size_of::<ReplyHeader>()).transmute_header(|_, new| {
-        *new = ReplyHeader {
-            checksum: 0,
-            checksum_body: 0,
-            cluster: consensus.cluster(),
-            size: std::mem::size_of::<ReplyHeader>() as u32,
-            view: consensus.view(),
-            release: 0,
-            command: Command2::Reply,
-            replica: consensus.replica(),
-            reserved_frame: [0; 66],
-            request_checksum: prepare_header.request_checksum,
-            context: 0,
-            op: prepare_header.op,
-            commit: consensus.commit(),
-            timestamp: prepare_header.timestamp,
-            request: prepare_header.request,
-            operation: prepare_header.operation,
-            namespace: prepare_header.namespace,
-            ..Default::default()
-        };
-    })
+    let header_size = std::mem::size_of::<ReplyHeader>();
+    let total_size = header_size + body.len();
+    let mut buffer = bytes::BytesMut::zeroed(total_size);
+
+    let header = bytemuck::from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size]);
+    *header = ReplyHeader {
+        checksum: 0,
+        checksum_body: 0,
+        cluster: consensus.cluster(),
+        size: total_size as u32,
+        view: consensus.view(),
+        release: 0,
+        command: Command2::Reply,
+        replica: consensus.replica(),
+        reserved_frame: [0; 66],
+        request_checksum: prepare_header.request_checksum,
+        context: 0,
+        op: prepare_header.op,
+        commit: consensus.commit(),
+        timestamp: prepare_header.timestamp,
+        request: prepare_header.request,
+        operation: prepare_header.operation,
+        namespace: prepare_header.namespace,
+        ..Default::default()
+    };
+
+    if !body.is_empty() {
+        buffer[header_size..].copy_from_slice(&body);
+    }
+
+    Message::<ReplyHeader>::from_bytes(buffer.freeze())
+        .expect("build_reply_message: constructed header must be valid")
 }
 
 /// Verify hash chain would not break if we add this header.
+///
+/// # Panics
+/// If both headers share the same view and `current.parent != previous.checksum`.
 pub fn panic_if_hash_chain_would_break_in_same_view(
     previous: &PrepareHeader,
     current: &PrepareHeader,
@@ -243,6 +289,10 @@ pub fn panic_if_hash_chain_would_break_in_same_view(
 }
 
 // TODO: Figure out how to make this check the journal if it contains the prepare.
+/// # Panics
+/// - If `header.command` is not `Command2::Prepare`.
+/// - If `header.view > consensus.view()`.
+#[allow(clippy::cast_possible_truncation, clippy::future_not_send)]
 pub async fn send_prepare_ok<B, P>(
     consensus: &VsrConsensus<B, P>,
     header: &PrepareHeader,
@@ -261,7 +311,7 @@ pub async fn send_prepare_ok<B, P>(
         return;
     }
 
-    if let Some(false) = is_persisted {
+    if is_persisted == Some(false) {
         return;
     }
 
@@ -523,6 +573,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::future_not_send)]
     impl MessageBus for SpyBus {
         type Client = u128;
         type Replica = u8;

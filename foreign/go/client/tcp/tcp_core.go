@@ -18,10 +18,13 @@
 package tcp
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -138,6 +141,35 @@ func NewPersonalAccessTokenCredentials(token string) Credentials {
 func WithServerAddress(address string) Option {
 	return func(opts *Options) {
 		opts.config.serverAddress = address
+	}
+}
+
+// WithTLS enables or disables TLS for the TCP client.
+func WithTLS(enabled bool) Option {
+	return func(opts *Options) {
+		opts.config.tlsEnabled = enabled
+	}
+}
+
+// WithTLSDomain sets the TLS domain for server name indication (SNI).
+// If empty, the domain will be automatically extracted from the server address.
+func WithTLSDomain(domain string) Option {
+	return func(opts *Options) {
+		opts.config.tlsDomain = domain
+	}
+}
+
+// WithTLSCAFile sets the path to the CA certificate file for TLS verification.
+func WithTLSCAFile(path string) Option {
+	return func(opts *Options) {
+		opts.config.tlsCAFile = path
+	}
+}
+
+// WithTLSValidateCertificate enables or disables TLS certificate validation.
+func WithTLSValidateCertificate(validate bool) Option {
+	return func(opts *Options) {
+		opts.config.tlsValidateCertificate = validate
 	}
 }
 
@@ -295,21 +327,18 @@ func (c *IggyTcpClient) connect() error {
 			time.Sleep(remaining)
 		}
 	}
-
+	attempts := uint(1)
+	interval := time.Duration(0)
+	if c.config.reconnection.enabled {
+		attempts = uint(c.config.reconnection.maxRetries)
+		interval = c.config.reconnection.interval
+	}
 	// TODO handle tls logic
 	var conn net.Conn
 	if err := retry.Do(
 		func() error {
 			connection, err := net.Dial("tcp", c.currentServerAddress)
 			if err != nil {
-				if !c.config.reconnection.enabled {
-					return retry.Unrecoverable(ierror.ErrCannotEstablishConnection)
-				}
-
-				c.mtx.Lock()
-				c.state = iggcon.StateDisconnected
-				c.mtx.Unlock()
-				// TODO publish event disconnected
 				return ierror.ErrCannotEstablishConnection
 			}
 
@@ -325,12 +354,28 @@ func (c *IggyTcpClient) connect() error {
 				return nil
 			}
 
-			// TODO TLS logic
-			return errors.New("TLS connection is not implemented yet")
+			// TLS logic
+			tlsConfig, err := c.createTLSConfig()
+			if err != nil {
+				return err
+			}
+
+			tlsConn := tls.Client(connection, tlsConfig)
+			if err := tlsConn.Handshake(); err != nil {
+				connection.Close()
+				return fmt.Errorf("TLS handshake failed: %w", err)
+			}
+
+			conn = tlsConn
+			return nil
 		},
-		retry.Attempts(uint(c.config.reconnection.maxRetries)),
-		retry.Delay(c.config.reconnection.interval),
+		retry.Attempts(attempts),
+		retry.Delay(interval),
 	); err != nil {
+		c.mtx.Lock()
+		c.state = iggcon.StateDisconnected
+		c.mtx.Unlock()
+		// TODO publish event disconnected
 		return err
 	}
 
@@ -340,6 +385,45 @@ func (c *IggyTcpClient) connect() error {
 	c.connectedAt = time.Now()
 	c.mtx.Unlock()
 	return nil
+}
+
+func (c *IggyTcpClient) createTLSConfig() (*tls.Config, error) {
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: !c.config.tlsValidateCertificate,
+	}
+
+	// Set server name for SNI
+	serverName := c.config.tlsDomain
+	if serverName == "" {
+		// Extract hostname from server address (format: "host:port")
+		host := c.currentServerAddress
+		if colonIdx := strings.LastIndex(host, ":"); colonIdx != -1 {
+			host = host[:colonIdx]
+		}
+		serverName = host
+	}
+
+	if serverName == "" {
+		return nil, ierror.ErrInvalidTlsDomain
+	}
+	tlsConfig.ServerName = serverName
+
+	// Load CA certificate if provided
+	if c.config.tlsCAFile != "" {
+		caCert, err := os.ReadFile(c.config.tlsCAFile)
+		if err != nil {
+			return nil, ierror.ErrInvalidTlsCertificatePath
+		}
+
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, ierror.ErrInvalidTlsCertificate
+		}
+
+		tlsConfig.RootCAs = caCertPool
+	}
+
+	return tlsConfig, nil
 }
 
 func (c *IggyTcpClient) disconnect() error {

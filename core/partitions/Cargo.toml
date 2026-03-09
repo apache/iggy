@@ -28,6 +28,7 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
 [dependencies]
+bytes = { workspace = true }
 consensus = { workspace = true }
 iggy_common = { workspace = true }
 journal = { workspace = true }
@@ -35,3 +36,8 @@ message_bus = { workspace = true }
 ringbuffer = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "deny"
