@@ -31,7 +31,7 @@ import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
-	"github.com/avast/retry-go"
+	"github.com/avast/retry-go/v5"
 )
 
 type Option func(config *Options)
@@ -101,7 +101,7 @@ type tcpClientReconnectionConfig struct {
 func defaultTcpClientReconnectionConfig() tcpClientReconnectionConfig {
 	return tcpClientReconnectionConfig{
 		enabled:          true,
-		maxRetries:       10,
+		maxRetries:       0, //infinity retry
 		interval:         2 * time.Second,
 		reestablishAfter: 0,
 	}
@@ -336,7 +336,11 @@ func (c *IggyTcpClient) connect() error {
 	}
 	// TODO handle tls logic
 	var conn net.Conn
-	if err := retry.Do(
+	if err := retry.New(
+		retry.Attempts(attempts),
+		retry.Delay(interval),
+		retry.DelayType(retry.FixedDelay),
+	).Do(
 		func() error {
 			connection, err := net.Dial("tcp", c.currentServerAddress)
 			if err != nil {
@@ -369,10 +373,7 @@ func (c *IggyTcpClient) connect() error {
 
 			conn = tlsConn
 			return nil
-		},
-		retry.Attempts(attempts),
-		retry.Delay(interval),
-	); err != nil {
+		}); err != nil {
 		c.mtx.Lock()
 		c.state = iggcon.StateDisconnected
 		c.mtx.Unlock()
