@@ -15,9 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::{IggyMessagesBatchMut, IggyMessagesBatchSet};
+use bytes::BytesMut;
+use iggy_common::{
+    INDEX_SIZE, IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, PooledBuffer,
+    header::{Operation, PrepareHeader},
+    message::Message,
+};
 use journal::{Journal, Storage};
-use std::cell::UnsafeCell;
+use std::{cell::UnsafeCell, collections::HashMap};
 
 // TODO: Fix that, we need to figure out how to store the `IggyMessagesBatchSet`.
 /// No-op storage backend for the in-memory partition journal.
@@ -31,7 +36,7 @@ impl Storage for Noop {
         0
     }
 
-    async fn read(&self, _offset: usize, _buffer: ()) {}
+    async fn read(&self, _offset: usize, _buffer: ()) -> () { ()}
 }
 
 /// Lookup key for querying messages from the journal.
@@ -49,14 +54,7 @@ impl std::ops::Deref for MessageLookup {
     }
 }
 
-/// In-memory journal that accumulates message batches as an `IggyMessagesBatchSet`.
-///
-/// This is a pure storage layer — it holds batches and supports lookups via
-/// `MessageLookup`. All tracking metadata (offsets, timestamps, counts) lives
-/// outside the journal in the `SegmentedLog`'s `JournalInfo`.
-///
-/// Uses `UnsafeCell` for interior mutability, matching the single-threaded
-/// per-shard execution model.
+// [LEGACY]
 pub struct PartitionJournal {
     batch_set: UnsafeCell<IggyMessagesBatchSet>,
 }
@@ -89,6 +87,168 @@ impl Default for PartitionJournal {
 impl std::fmt::Debug for PartitionJournal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PartitionJournal").finish()
+    }
+}
+
+pub trait PartitionJournal2<S>: Journal<S>
+where
+    S: Storage,
+{
+    type Query;
+
+    fn get(&self, query: &Self::Query) -> impl Future<Output = Option<IggyMessagesBatchSet>>;
+}
+
+pub struct PartitionJournal2Impl {
+    message_offset_to_op: UnsafeCell<HashMap<u64, usize>>,
+    timestamp_to_op: UnsafeCell<HashMap<u64, usize>>,
+    inner: UnsafeCell<JournalInner>,
+}
+
+struct JournalInner {
+    set: Vec<Message<PrepareHeader>>,
+}
+
+impl Default for PartitionJournal2Impl {
+    fn default() -> Self {
+        Self {
+            message_offset_to_op: UnsafeCell::new(HashMap::new()),
+            timestamp_to_op: UnsafeCell::new(HashMap::new()),
+            inner: UnsafeCell::new(JournalInner { set: Vec::new() }),
+        }
+    }
+}
+
+impl PartitionJournal2Impl {
+    fn decode_send_messages_batch(body: bytes::Bytes) -> Option<IggyMessagesBatchMut> {
+        // TODO: This is bad, 
+        let mut body = body
+            .try_into_mut()
+            .unwrap_or_else(|body| BytesMut::from(body.as_ref()));
+
+        if body.len() < 4 {
+            return None;
+        }
+
+        let count_bytes = body.split_to(4);
+        let count = u32::from_le_bytes(count_bytes.as_ref().try_into().ok()?);
+        let indexes_len = (count as usize).checked_mul(INDEX_SIZE)?;
+
+        if body.len() < indexes_len {
+            return None;
+        }
+
+        let indexes_bytes = body.split_to(indexes_len);
+        let indexes = IggyIndexesMut::from_bytes(PooledBuffer::from(indexes_bytes), 0);
+        let messages = PooledBuffer::from(body);
+
+        Some(IggyMessagesBatchMut::from_indexes_and_messages(
+            indexes, messages,
+        ))
+    }
+
+    fn message_to_batch(message: &Message<PrepareHeader>) -> Option<IggyMessagesBatchMut> {
+        if message.header().operation != Operation::SendMessages {
+            return None;
+        }
+
+        Self::decode_send_messages_batch(message.body_bytes())
+    }
+
+    fn messages_to_batch_set<'a>(messages: impl Iterator<Item = &'a Message<PrepareHeader>>) -> IggyMessagesBatchSet {
+        let mut batch_set = IggyMessagesBatchSet::empty();
+
+        for message in messages {
+            if let Some(batch) = Self::message_to_batch(message) {
+                batch_set.add_batch(batch);
+            }
+        }
+
+        batch_set
+    }
+
+    fn candidate_start_op(&self, query: &MessageLookup) -> usize {
+        match query {
+            MessageLookup::Offset { offset, .. } => {
+                let offsets = unsafe { &*self.message_offset_to_op.get() };
+                offsets.get(offset).copied().unwrap_or_default()
+            }
+            MessageLookup::Timestamp { timestamp, .. } => {
+                let timestamps = unsafe { &*self.timestamp_to_op.get() };
+                timestamps.get(timestamp).copied().unwrap_or_default()
+            }
+        }
+    }
+
+    fn messages_from_op(&self, start_op: usize) -> impl Iterator<Item = &Message<PrepareHeader>> {
+        let inner = unsafe { &*self.inner.get() };
+        inner.set.iter().skip(start_op)
+    }
+}
+
+impl Journal<Noop> for PartitionJournal2Impl {
+    type Header = PrepareHeader;
+    type Entry = Message<Self::Header>;
+    type HeaderRef<'a> = &'a Self::Header;
+
+    fn header(&self, idx: usize) -> Option<Self::HeaderRef<'_>> {
+        // TODO: Fixes
+        let inner = unsafe { &*self.inner.get() };
+        inner.set.get(idx).map(|msg| msg.header())
+    }
+
+    fn previous_header(&self, header: &Self::Header) -> Option<Self::HeaderRef<'_>> {
+        // TODO: Fixes
+        let prev_idx = header.op.saturating_sub(1) as usize;
+        let inner = unsafe { &*self.inner.get() };
+        inner.set.get(prev_idx).map(|msg| msg.header())
+    }
+
+    async fn append(&self, entry: Self::Entry) {
+        let first_offset_and_timestamp = Self::message_to_batch(&entry)
+            .and_then(|batch| Some((batch.first_offset()?, batch.first_timestamp()?)));
+
+        let inner = unsafe { &mut *self.inner.get() };
+        let op = inner.set.len();
+        inner.set.push(entry);
+
+        if let Some((offset, timestamp)) = first_offset_and_timestamp {
+            let offsets = unsafe { &mut *self.message_offset_to_op.get() };
+            offsets.insert(offset, op);
+
+            let timestamps = unsafe { &mut *self.timestamp_to_op.get() };
+            timestamps.insert(timestamp, op);
+        }
+    }
+
+    async fn entry(&self, header: &Self::Header) -> Option<Self::Entry> {
+        let op = header.op as usize;
+        let inner = unsafe { &*self.inner.get() };
+        inner.set.get(op).cloned()
+    }
+}
+
+impl PartitionJournal2<Noop> for PartitionJournal2Impl {
+    type Query = MessageLookup;
+
+    async fn get(&self, query: &Self::Query) -> Option<IggyMessagesBatchSet> {
+        let query = *query;
+            let start_op = self.candidate_start_op(&query);
+            let messages = self.messages_from_op(start_op);
+            let batch_set = Self::messages_to_batch_set(messages);
+
+            let result = match query {
+                MessageLookup::Offset { offset, count } => batch_set.get_by_offset(offset, count),
+                MessageLookup::Timestamp { timestamp, count } => {
+                    batch_set.get_by_timestamp(timestamp, count)
+                }
+            };
+
+            if result.is_empty() {
+                None
+            } else {
+                Some(result)
+            }
     }
 }
 
