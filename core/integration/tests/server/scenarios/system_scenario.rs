@@ -726,7 +726,52 @@ pub async fn run(harness: &TestHarness) {
 
     assert_eq!(topic.name, topic_name);
 
-    // 45. Delete the existing streams and ensure there's no streams left
+    // 45. Delete segments and validate partition segments count before and after
+    let topic_before_delete = client
+        .get_topic(
+            &Identifier::named(&stream_name).unwrap(),
+            &Identifier::named(&topic_name).unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("Failed to get topic");
+    let segments_count_before_delete =
+        topic_before_delete.partitions[PARTITION_ID as usize].segments_count;
+    assert!(
+        segments_count_before_delete > 0,
+        "Expected at least one segment before delete_segments."
+    );
+
+    client
+        .delete_segments(
+            &Identifier::named(&stream_name).unwrap(),
+            &Identifier::named(&topic_name).unwrap(),
+            PARTITION_ID,
+            3,
+        )
+        .await
+        .unwrap();
+
+    let topic_after_delete = client
+        .get_topic(
+            &Identifier::named(&stream_name).unwrap(),
+            &Identifier::named(&topic_name).unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("Failed to get topic");
+    let segments_count_after_delete =
+        topic_after_delete.partitions[PARTITION_ID as usize].segments_count;
+    assert!(
+        segments_count_after_delete > 0,
+        "Expected at least one segment after delete_segments."
+    );
+    assert!(
+        segments_count_after_delete <= segments_count_before_delete,
+        "Expected segment count not to increase after delete_segments. Before: {segments_count_before_delete}, after: {segments_count_after_delete}"
+    );
+
+    // 46. Delete the existing streams and ensure there's no streams left
     let streams = client.get_streams().await.unwrap();
     assert_eq!(streams.len(), 2);
 
@@ -740,7 +785,7 @@ pub async fn run(harness: &TestHarness) {
     let streams = client.get_streams().await.unwrap();
     assert!(streams.is_empty());
 
-    // 46. Get clients and ensure that there's 0 (HTTP) or 1 (TCP, QUIC) client
+    // 47. Get clients and ensure that there's 0 (HTTP) or 1 (TCP, QUIC) client
     let clients = client.get_clients().await.unwrap();
 
     assert!(clients.len() <= 1);
