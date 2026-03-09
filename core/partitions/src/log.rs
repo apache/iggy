@@ -133,23 +133,23 @@ where
     S: Storage,
     J: Debug + Journal<S>,
 {
-    pub fn has_segments(&self) -> bool {
+    pub const fn has_segments(&self) -> bool {
         !self.segments.is_empty()
     }
 
-    pub fn segments(&self) -> &Vec<Segment> {
+    pub const fn segments(&self) -> &Vec<Segment> {
         &self.segments
     }
 
-    pub fn segments_mut(&mut self) -> &mut Vec<Segment> {
+    pub const fn segments_mut(&mut self) -> &mut Vec<Segment> {
         &mut self.segments
     }
 
-    pub fn storages_mut(&mut self) -> &mut Vec<SegmentStorage> {
+    pub const fn storages_mut(&mut self) -> &mut Vec<SegmentStorage> {
         &mut self.storage
     }
 
-    pub fn storages(&self) -> &Vec<SegmentStorage> {
+    pub const fn storages(&self) -> &Vec<SegmentStorage> {
         &self.storage
     }
 
@@ -177,11 +177,11 @@ where
             .expect("active storage called on empty log")
     }
 
-    pub fn indexes(&self) -> &Vec<Option<IggyIndexesMut>> {
+    pub const fn indexes(&self) -> &Vec<Option<IggyIndexesMut>> {
         &self.indexes
     }
 
-    pub fn indexes_mut(&mut self) -> &mut Vec<Option<IggyIndexesMut>> {
+    pub const fn indexes_mut(&mut self) -> &mut Vec<Option<IggyIndexesMut>> {
         &mut self.indexes
     }
 
@@ -230,11 +230,11 @@ where
         }
     }
 
-    pub fn in_flight(&self) -> &IggyMessagesBatchSetInFlight {
+    pub const fn in_flight(&self) -> &IggyMessagesBatchSetInFlight {
         &self.in_flight
     }
 
-    pub fn in_flight_mut(&mut self) -> &mut IggyMessagesBatchSetInFlight {
+    pub const fn in_flight_mut(&mut self) -> &mut IggyMessagesBatchSetInFlight {
         &mut self.in_flight
     }
 
@@ -252,11 +252,11 @@ where
     S: Storage,
     J: Debug + Journal<S>,
 {
-    pub fn journal_mut(&mut self) -> &mut JournalState<J> {
+    pub const fn journal_mut(&mut self) -> &mut JournalState<J> {
         &mut self.journal
     }
 
-    pub fn journal(&self) -> &JournalState<J> {
+    pub const fn journal(&self) -> &JournalState<J> {
         &self.journal
     }
 }

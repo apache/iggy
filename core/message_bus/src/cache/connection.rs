@@ -36,17 +36,17 @@ pub trait ShardedState {
 /// Least-loaded allocation strategy for connections
 #[derive(Debug)]
 pub struct LeastLoadedStrategy {
-    total_shards: usize,
+    total_shards: u16,
     connections_per_shard: RefCell<Vec<(u16, usize)>>,
     replica_to_shards: RefCell<HashMap<u8, HashSet<u16>>>,
     rng_seed: u64,
 }
 
 impl LeastLoadedStrategy {
-    pub fn new(total_shards: usize, seed: u64) -> Self {
+    pub fn new(total_shards: u16, seed: u64) -> Self {
         Self {
             total_shards,
-            connections_per_shard: RefCell::new((0..total_shards).map(|s| (s as u16, 0)).collect()),
+            connections_per_shard: RefCell::new((0..total_shards).map(|s| (s, 0)).collect()),
             replica_to_shards: RefCell::new(HashMap::new()),
             rng_seed: seed,
         }
@@ -58,11 +58,11 @@ impl LeastLoadedStrategy {
         replica: u8,
         mut conn_shards: Vec<u16>,
     ) {
-        for shard in &conn_shards {
+        for &shard in &conn_shards {
             mappings.push(ShardAssignment {
                 replica,
-                shard: *shard,
-                conn_shard: *shard,
+                shard,
+                conn_shard: shard,
             });
         }
 
@@ -71,7 +71,6 @@ impl LeastLoadedStrategy {
 
         let mut j = 0;
         for shard in 0..self.total_shards {
-            let shard = shard as u16;
             if conn_shards.contains(&shard) {
                 continue;
             }
@@ -123,7 +122,7 @@ impl AllocationStrategy<ConnectionCache> for LeastLoadedStrategy {
 
         let mut connections = Vec::new();
         let mut mappings = Vec::new();
-        let connections_needed = self.total_shards.min(MAX_CONNECTIONS_PER_REPLICA);
+        let connections_needed = usize::from(self.total_shards).min(MAX_CONNECTIONS_PER_REPLICA);
 
         let mut rng = StdRng::seed_from_u64(self.rng_seed);
         self.connections_per_shard.borrow_mut().shuffle(&mut rng);
@@ -182,7 +181,6 @@ impl AllocationStrategy<ConnectionCache> for LeastLoadedStrategy {
         }
 
         for shard in 0..self.total_shards {
-            let shard = shard as u16;
             mappings.push(ConnectionAssignment { replica, shard });
         }
 
@@ -209,7 +207,7 @@ where
     SS: ShardedState,
     A: AllocationStrategy<SS>,
 {
-    pub fn new(strategy: A) -> Self {
+    pub const fn new(strategy: A) -> Self {
         Self {
             strategy,
             _ss: std::marker::PhantomData,
@@ -271,7 +269,7 @@ pub struct ConnectionCache {
 
 impl ConnectionCache {
     pub fn get_connection(&self, replica: u8) -> Option<Rc<TcpSender>> {
-        self.connections.get(&replica).and_then(|opt| opt.clone())
+        self.connections.get(&replica).and_then(Clone::clone)
     }
 
     pub fn get_mapped_shard(&self, replica: u8) -> Option<u16> {
