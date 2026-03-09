@@ -34,6 +34,7 @@ pub struct MemStorage {
     offset: Cell<u64>,
 }
 
+#[allow(clippy::future_not_send)]
 impl Storage for MemStorage {
     type Buffer = Vec<u8>;
 
@@ -74,6 +75,7 @@ impl<S: Storage + Default> Default for SimJournal<S> {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl<S: Storage> std::fmt::Debug for SimJournal<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SimJournal")
@@ -85,6 +87,7 @@ impl<S: Storage> std::fmt::Debug for SimJournal<S> {
     }
 }
 
+#[allow(clippy::future_not_send)]
 impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
     type Header = PrepareHeader;
     type Entry = Message<PrepareHeader>;
@@ -137,7 +140,7 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
 
 impl JournalHandle for SimJournal<MemStorage> {
     type Storage = MemStorage;
-    type Target = SimJournal<MemStorage>;
+    type Target = Self;
 
     fn handle(&self) -> &Self::Target {
         self

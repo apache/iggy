@@ -19,6 +19,7 @@
 
 mod postgres_sink;
 mod postgres_source;
+mod restart;
 
 use crate::connectors::TestMessage;
 use serde::Deserialize;

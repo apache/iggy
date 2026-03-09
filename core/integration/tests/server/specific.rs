@@ -18,8 +18,8 @@
  */
 
 use crate::server::scenarios::{
-    message_size_scenario, segment_rotation_race_scenario, single_message_per_batch_scenario,
-    tcp_tls_scenario, websocket_tls_scenario,
+    message_size_scenario, reconnect_after_restart_scenario, segment_rotation_race_scenario,
+    single_message_per_batch_scenario, tcp_tls_scenario, websocket_tls_scenario,
 };
 use integration::iggy_harness;
 
@@ -58,6 +58,32 @@ async fn message_size_scenario(harness: &TestHarness) {
 #[iggy_harness(server(partition.messages_required_to_save = "10000"))]
 async fn should_handle_single_message_per_batch_with_delayed_persistence(harness: &TestHarness) {
     single_message_per_batch_scenario::run(harness, 5).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn producer_reconnect_after_server_restart(harness: &mut TestHarness) {
+    reconnect_after_restart_scenario::run_producer(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn consumer_reconnect_after_server_restart(harness: &mut TestHarness) {
+    reconnect_after_restart_scenario::run_consumer(harness).await;
 }
 
 /// This test configures the server to trigger frequent segment rotations and runs

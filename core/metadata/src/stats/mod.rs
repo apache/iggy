@@ -114,7 +114,7 @@ pub struct TopicStats {
 }
 
 impl TopicStats {
-    pub fn new(parent: Arc<StreamStats>) -> Self {
+    pub const fn new(parent: Arc<StreamStats>) -> Self {
         Self {
             parent,
             size_bytes: AtomicU64::new(0),
@@ -258,7 +258,7 @@ pub struct PartitionStats {
 }
 
 impl PartitionStats {
-    pub fn new(parent_stats: Arc<TopicStats>) -> Self {
+    pub const fn new(parent_stats: Arc<TopicStats>) -> Self {
         Self {
             parent: parent_stats,
             messages_count: AtomicU64::new(0),

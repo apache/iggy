@@ -15,16 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package iggcon
+package command
 
-type GetUser struct {
-	Id Identifier
-}
+import (
+	"encoding"
+)
 
-func (c *GetUser) Code() CommandCode {
-	return GetUserCode
-}
+type Command interface {
+	// Code returns the command code associated with this command.
+	Code() Code
 
-func (c *GetUser) MarshalBinary() ([]byte, error) {
-	return c.Id.MarshalBinary()
+	encoding.BinaryMarshaler
 }

@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![allow(clippy::future_not_send)]
+
 mod iggy_partition;
 mod iggy_partitions;
 mod journal;
@@ -48,6 +50,8 @@ pub trait Partition {
         async { Err(IggyError::FeatureUnavailable) }
     }
 
+    /// # Errors
+    /// Returns `IggyError::FeatureUnavailable` by default.
     fn store_consumer_offset(
         &self,
         consumer: PollingConsumer,

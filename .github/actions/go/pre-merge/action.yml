@@ -26,10 +26,8 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Setup Go with cache
+    - name: Setup Go
       uses: ./.github/actions/utils/setup-go-with-cache
-      with:
-        enabled: "false"
 
     - name: Format Check
       shell: bash
@@ -90,6 +88,7 @@ runs:
         version: v1.64.8
         working-directory: foreign/go
         args: --timeout=5m
+        cache: false
 
     - name: Lint BDD
       if: inputs.task == 'lint' && hashFiles('bdd/go/go.mod') != ''
@@ -98,6 +97,7 @@ runs:
         version: v1.64.8
         working-directory: bdd/go
         args: --timeout=5m
+        cache: false
 
     - name: Lint Examples
       if: inputs.task == 'lint' && hashFiles('examples/go/go.mod') != ''
@@ -106,6 +106,7 @@ runs:
         version: v1.64.8
         working-directory: examples/go
         args: --timeout=5m
+        cache: false
 
     - name: Build
       shell: bash

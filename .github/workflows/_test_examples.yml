@@ -78,12 +78,10 @@ jobs:
         with:
           gradle-cache-disabled: "true"
 
-      - name: Setup Go with cache for examples
+      - name: Setup Go for examples
         if: inputs.component == 'examples-suite' && inputs.task == 'examples-go'
         uses: ./.github/actions/utils/setup-go-with-cache
         with:
-          enabled: "false"
-          cache-dependency-path: examples/go/go.sum
           download-deps: "false"
 
       - name: Build common binaries for all examples
