@@ -15,15 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package iggcon
+package command
+
+import "github.com/apache/iggy/foreign/go/contracts"
 
 type UpdateUser struct {
-	UserID   Identifier  `json:"-"`
-	Username *string     `json:"username"`
-	Status   *UserStatus `json:"userStatus"`
+	UserID   iggcon.Identifier  `json:"-"`
+	Username *string            `json:"username"`
+	Status   *iggcon.UserStatus `json:"userStatus"`
 }
 
-func (u *UpdateUser) Code() CommandCode {
+func (u *UpdateUser) Code() Code {
 	return UpdateUserCode
 }
 
@@ -71,9 +73,9 @@ func (u *UpdateUser) MarshalBinary() ([]byte, error) {
 		position++
 		statusByte := byte(0)
 		switch *u.Status {
-		case Active:
+		case iggcon.Active:
 			statusByte = 1
-		case Inactive:
+		case iggcon.Inactive:
 			statusByte = 2
 		}
 		bytes[position] = statusByte

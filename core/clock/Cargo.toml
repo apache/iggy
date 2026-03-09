@@ -22,3 +22,8 @@ edition = "2024"
 
 [dependencies]
 iggy_common = { workspace = true }
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "warn"

@@ -64,7 +64,8 @@ impl Default for User {
 }
 
 impl User {
-    pub fn new(
+    #[must_use]
+    pub const fn new(
         username: Arc<str>,
         password_hash: Arc<str>,
         status: UserStatus,
@@ -126,6 +127,7 @@ impl UsersInner {
 // TODO(hubcio): Serialize proper reply (e.g. assigned user ID) instead of empty Bytes.
 impl StateHandler for CreateUser {
     type State = UsersInner;
+    #[allow(clippy::cast_possible_truncation)]
     fn apply(&self, state: &mut UsersInner) -> Bytes {
         let username_arc: Arc<str> = Arc::from(self.username.as_str());
         if state.index.contains_key(&username_arc) {
@@ -156,6 +158,7 @@ impl StateHandler for CreateUser {
 
 impl StateHandler for UpdateUser {
     type State = UsersInner;
+    #[allow(clippy::cast_possible_truncation)]
     fn apply(&self, state: &mut UsersInner) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return Bytes::new();
@@ -187,6 +190,7 @@ impl StateHandler for UpdateUser {
 
 impl StateHandler for DeleteUser {
     type State = UsersInner;
+    #[allow(clippy::cast_possible_truncation)]
     fn apply(&self, state: &mut UsersInner) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return Bytes::new();
@@ -406,6 +410,7 @@ impl Snapshotable for Users {
         })
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn from_snapshot(
         snapshot: Self::Snapshot,
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {

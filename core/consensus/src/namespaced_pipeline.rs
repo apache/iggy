@@ -24,7 +24,7 @@ use std::collections::{HashMap, VecDeque};
 /// Pipeline that partitions entries by namespace for independent commit draining.
 ///
 /// A single global op sequence and hash chain spans all namespaces, but entries
-/// are stored in per-namespace VecDeques. Each namespace tracks its own commit
+/// are stored in per-namespace `VecDeques`. Each namespace tracks its own commit
 /// frontier so `drain_committable_all` drains quorum'd entries per-namespace
 /// without waiting for the global commit to advance past unrelated namespaces.
 ///
@@ -58,6 +58,7 @@ impl Default for NamespacedPipeline {
 }
 
 impl NamespacedPipeline {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             queues: HashMap::new(),
@@ -75,6 +76,7 @@ impl NamespacedPipeline {
     }
 
     /// Per-namespace commit frontier for the given namespace.
+    #[must_use]
     pub fn ns_commit(&self, ns: u64) -> Option<u64> {
         self.ns_commits.get(&ns).copied()
     }
@@ -84,6 +86,9 @@ impl NamespacedPipeline {
     /// For each namespace queue, drains from the front while entries have
     /// `ok_quorum_received == true`. Returns entries sorted by global op
     /// for deterministic processing.
+    ///
+    /// # Panics
+    /// If the front entry exists but `pop_front` returns `None` (unreachable).
     pub fn drain_committable_all(&mut self) -> Vec<PipelineEntry> {
         let mut drained = Vec::new();
 
@@ -117,6 +122,7 @@ impl NamespacedPipeline {
     /// Walks forward from `current_commit + 1`, treating any op not found
     /// in the pipeline (already drained) as committed. Stops at the first
     /// op still present in a queue or past `last_push_op`.
+    #[must_use]
     pub fn global_commit_frontier(&self, current_commit: u64) -> u64 {
         let mut commit = current_commit;
         loop {
@@ -143,6 +149,11 @@ impl Pipeline for NamespacedPipeline {
     type Message = Message<PrepareHeader>;
     type Entry = PipelineEntry;
 
+    /// # Panics
+    /// - If the pipeline is full.
+    /// - If ops are not globally sequential.
+    /// - If the hash chain is broken.
+    /// - If the namespace is not registered.
     fn push_message(&mut self, message: Self::Message) {
         assert!(
             self.total_count < PIPELINE_PREPARE_QUEUE_MAX,
@@ -258,7 +269,7 @@ impl Pipeline for NamespacedPipeline {
     fn verify(&self) {
         assert!(self.total_count <= PIPELINE_PREPARE_QUEUE_MAX);
 
-        let actual_count: usize = self.queues.values().map(|q| q.len()).sum();
+        let actual_count: usize = self.queues.values().map(VecDeque::len).sum();
         assert_eq!(actual_count, self.total_count, "total_count mismatch");
 
         // Per-namespace: ops must be monotonically increasing
@@ -492,6 +503,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn is_full() {
         let mut pipeline = NamespacedPipeline::new();
         pipeline.register_namespace(0);
@@ -506,6 +518,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "namespaced pipeline full")]
+    #[allow(clippy::cast_possible_truncation)]
     fn push_when_full_panics() {
         let mut pipeline = NamespacedPipeline::new();
         pipeline.register_namespace(0);

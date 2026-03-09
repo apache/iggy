@@ -77,6 +77,7 @@ jobs:
             bench
             ci
             cli
+            clock
             connector
             connectors
             cpp
@@ -89,6 +90,7 @@ jobs:
             integration
             io_uring
             java
+            journal
             js
             mcp
             partitions
@@ -117,11 +119,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Go with cache
+      - name: Setup Go
         uses: ./.github/actions/utils/setup-go-with-cache
         with:
           go-version: "1.23"
-          enabled: "false"
           download-deps: "false"
 
       - name: Install addlicense

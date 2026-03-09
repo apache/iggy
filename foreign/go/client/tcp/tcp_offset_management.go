@@ -20,10 +20,11 @@ package tcp
 import (
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
 func (c *IggyTcpClient) GetConsumerOffset(consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionId *uint32) (*iggcon.ConsumerOffsetInfo, error) {
-	buffer, err := c.do(&iggcon.GetConsumerOffset{
+	buffer, err := c.do(&command.GetConsumerOffset{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Consumer:    consumer,
@@ -37,7 +38,7 @@ func (c *IggyTcpClient) GetConsumerOffset(consumer iggcon.Consumer, streamId igg
 }
 
 func (c *IggyTcpClient) StoreConsumerOffset(consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, offset uint64, partitionId *uint32) error {
-	_, err := c.do(&iggcon.StoreConsumerOffsetRequest{
+	_, err := c.do(&command.StoreConsumerOffsetRequest{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Offset:      offset,
@@ -48,7 +49,7 @@ func (c *IggyTcpClient) StoreConsumerOffset(consumer iggcon.Consumer, streamId i
 }
 
 func (c *IggyTcpClient) DeleteConsumerOffset(consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionId *uint32) error {
-	_, err := c.do(&iggcon.DeleteConsumerOffset{
+	_, err := c.do(&command.DeleteConsumerOffset{
 		Consumer:    consumer,
 		StreamId:    streamId,
 		TopicId:     topicId,

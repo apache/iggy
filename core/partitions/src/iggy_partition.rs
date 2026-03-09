@@ -91,24 +91,21 @@ impl Partition for IggyPartition {
         let last_dirty_offset = if batch_messages_count == 0 {
             dirty_offset
         } else {
-            dirty_offset + batch_messages_count as u64 - 1
+            dirty_offset + u64::from(batch_messages_count) - 1
         };
 
-        if self.should_increment_offset {
-            self.dirty_offset
-                .store(last_dirty_offset, Ordering::Relaxed);
-        } else {
+        if !self.should_increment_offset {
             self.should_increment_offset = true;
-            self.dirty_offset
-                .store(last_dirty_offset, Ordering::Relaxed);
         }
+        self.dirty_offset
+            .store(last_dirty_offset, Ordering::Relaxed);
 
         let segment_index = self.log.segments().len() - 1;
         self.log.segments_mut()[segment_index].current_position += batch_messages_size;
 
         let journal = self.log.journal_mut();
         journal.info.messages_count += batch_messages_count;
-        journal.info.size += IggyByteSize::from(batch_messages_size as u64);
+        journal.info.size += IggyByteSize::from(u64::from(batch_messages_size));
         journal.info.current_offset = last_dirty_offset;
         if let Some(ts) = batch.first_timestamp()
             && journal.info.first_timestamp == 0

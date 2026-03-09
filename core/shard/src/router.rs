@@ -41,7 +41,7 @@ where
     /// the correct shard's message pump.
     ///
     /// Decomposes the generic message into its typed form (Request, Prepare,
-    /// or PrepareOk) to access the operation and namespace, then resolves
+    /// or `PrepareOk`) to access the operation and namespace, then resolves
     /// the target shard and enqueues the message via its channel sender.
     pub fn dispatch(&self, message: Message<GenericHeader>) {
         let (operation, namespace, generic) = match MessageBag::from(message) {
@@ -127,6 +127,7 @@ where
     }
 
     /// Drain this shard's inbox and process each frame locally.
+    #[allow(clippy::future_not_send)]
     pub async fn run_message_pump(&self, stop: Receiver<()>)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
@@ -160,6 +161,7 @@ where
         }
     }
 
+    #[allow(clippy::future_not_send)]
     async fn process_frame(&self, frame: ShardFrame<R>)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
