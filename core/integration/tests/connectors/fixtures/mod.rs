@@ -17,6 +17,7 @@
  * under the License.
  */
 
+mod delta;
 mod elasticsearch;
 mod iceberg;
 mod mongodb;
@@ -24,6 +25,7 @@ mod postgres;
 mod quickwit;
 mod wiremock;
 
+pub use delta::{DeltaFixture, DeltaS3Fixture};
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use iceberg::{DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergOps, IcebergPreCreatedFixture};
 pub use mongodb::{
