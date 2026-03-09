@@ -33,3 +33,8 @@ metadata = { path = "../metadata" }
 papaya = { workspace = true }
 partitions = { path = "../partitions" }
 tracing = { workspace = true }
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "warn"

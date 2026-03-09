@@ -33,8 +33,8 @@ pub enum SnapshotError {
 impl fmt::Display for SnapshotError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SnapshotError::Serialize(e) => write!(f, "snapshot serialization failed: {}", e),
-            SnapshotError::Deserialize(e) => write!(f, "snapshot deserialization failed: {}", e),
+            Self::Serialize(e) => write!(f, "snapshot serialization failed: {e}"),
+            Self::Deserialize(e) => write!(f, "snapshot deserialization failed: {e}"),
         }
     }
 }
@@ -42,8 +42,8 @@ impl fmt::Display for SnapshotError {
 impl std::error::Error for SnapshotError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            SnapshotError::Serialize(e) => Some(e),
-            SnapshotError::Deserialize(e) => Some(e),
+            Self::Serialize(e) => Some(e),
+            Self::Deserialize(e) => Some(e),
         }
     }
 }
@@ -75,6 +75,7 @@ impl Default for MetadataSnapshot {
 
 impl MetadataSnapshot {
     /// Create a new snapshot with the given sequence number.
+    #[must_use]
     pub fn new(sequence_number: u64) -> Self {
         Self {
             version: 1,
@@ -87,11 +88,17 @@ impl MetadataSnapshot {
     }
 
     /// Encode the snapshot to msgpack bytes.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError::Serialize` if msgpack serialization fails.
     pub fn encode(&self) -> Result<Vec<u8>, SnapshotError> {
         rmp_serde::to_vec(self).map_err(SnapshotError::Serialize)
     }
 
     /// Decode a snapshot from msgpack bytes.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError::Deserialize` if msgpack deserialization fails.
     pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
         rmp_serde::from_slice(bytes).map_err(SnapshotError::Deserialize)
     }
@@ -101,6 +108,7 @@ impl MetadataSnapshot {
 ///
 /// This is the high-level interface that concrete snapshot types (e.g. `IggySnapshot`)
 /// must satisfy. It provides methods for creating, encoding, and decoding snapshots.
+#[allow(clippy::missing_errors_doc)]
 pub trait Snapshot: Sized {
     /// The error type for snapshot operations.
     type Error: std::error::Error;
@@ -139,6 +147,7 @@ pub trait Snapshot: Sized {
 /// Trait implemented by each `{Name}Inner` state machine to support snapshotting.
 /// Each state machine defines its own snapshot
 /// type for serialization and provides conversion methods.
+#[allow(clippy::missing_errors_doc)]
 pub trait Snapshotable {
     /// The serde-serializable snapshot representation of this state.
     /// This should be a plain struct with only serializable types and no wrappers
@@ -156,7 +165,8 @@ pub trait Snapshotable {
 
 /// Trait for filling a typed snapshot with state machine data.
 ///
-/// Each state machine implements this to write its serialized state
+/// Each state machine implements this to write its serialized state.
+#[allow(clippy::missing_errors_doc)]
 pub trait FillSnapshot<S> {
     /// Fill the snapshot with this state machine's data.
     fn fill_snapshot(&self, snapshot: &mut S) -> Result<(), SnapshotError>;
@@ -165,6 +175,7 @@ pub trait FillSnapshot<S> {
 /// Trait for restoring state machine data from a typed snapshot.
 ///
 /// Each state machine implements this to read its state.
+#[allow(clippy::missing_errors_doc)]
 pub trait RestoreSnapshot<S>: Sized {
     /// Restore this state machine from the snapshot.
     fn restore_snapshot(snapshot: &S) -> Result<Self, SnapshotError>;
@@ -249,7 +260,7 @@ mod tests {
 
     #[test]
     fn roundtrip_with_data() {
-        let ts = IggyTimestamp::from(1694968446131680u64);
+        let ts = IggyTimestamp::from(1_694_968_446_131_680_u64);
 
         let mut snapshot = MetadataSnapshot::new(100);
         snapshot.streams = Some(StreamsSnapshot {
@@ -295,7 +306,7 @@ mod tests {
         use crate::stm::user::{PermissionerSnapshot, UserSnapshot, UsersSnapshot};
         use iggy_common::UserStatus;
 
-        let ts = IggyTimestamp::from(1694968446131680u64);
+        let ts = IggyTimestamp::from(1_694_968_446_131_680_u64);
 
         let users_snap = UsersSnapshot {
             items: vec![
@@ -373,8 +384,8 @@ mod tests {
         let encoded = snapshot.encode().unwrap();
         let decoded = MetadataSnapshot::decode(&encoded).unwrap();
 
-        use crate::stm::user::Users;
-        let restored_users: Users = RestoreSnapshot::restore_snapshot(&decoded).unwrap();
+        let restored_users: crate::stm::user::Users =
+            RestoreSnapshot::restore_snapshot(&decoded).unwrap();
 
         let mut verify = MetadataSnapshot::new(0);
         restored_users.fill_snapshot(&mut verify).unwrap();
@@ -387,8 +398,8 @@ mod tests {
         assert_eq!(users_snap.items[1].1.username, "charlie");
         assert_eq!(users_snap.items[1].1.id, 2);
 
-        use crate::stm::stream::Streams;
-        let restored_streams: Streams = RestoreSnapshot::restore_snapshot(&decoded).unwrap();
+        let restored_streams: crate::stm::stream::Streams =
+            RestoreSnapshot::restore_snapshot(&decoded).unwrap();
 
         let mut verify = MetadataSnapshot::new(0);
         restored_streams.fill_snapshot(&mut verify).unwrap();
