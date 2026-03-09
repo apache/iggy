@@ -28,6 +28,7 @@ import org.apache.iggy.client.async.StreamsClient;
 import org.apache.iggy.client.async.SystemClient;
 import org.apache.iggy.client.async.TopicsClient;
 import org.apache.iggy.client.async.UsersClient;
+import org.apache.iggy.client.async.tcp.AsyncTcpConnection.TCPConnectionPoolConfig;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
@@ -94,7 +95,7 @@ public class AsyncIggyTcpClient {
     private final int port;
     private final Optional<String> username;
     private final Optional<String> password;
-    private final Optional<Duration> connectionTimeout;
+    private final Optional<Duration> acquireTimeout;
     private final Optional<Duration> requestTimeout;
     private final Optional<Integer> connectionPoolSize;
     private final Optional<RetryPolicy> retryPolicy;
@@ -129,7 +130,7 @@ public class AsyncIggyTcpClient {
             int port,
             String username,
             String password,
-            Duration connectionTimeout,
+            Duration acquireTimeout,
             Duration requestTimeout,
             Integer connectionPoolSize,
             RetryPolicy retryPolicy,
@@ -139,7 +140,7 @@ public class AsyncIggyTcpClient {
         this.port = port;
         this.username = Optional.ofNullable(username);
         this.password = Optional.ofNullable(password);
-        this.connectionTimeout = Optional.ofNullable(connectionTimeout);
+        this.acquireTimeout = Optional.ofNullable(acquireTimeout);
         this.requestTimeout = Optional.ofNullable(requestTimeout);
         this.connectionPoolSize = Optional.ofNullable(connectionPoolSize);
         this.retryPolicy = Optional.ofNullable(retryPolicy);
@@ -166,7 +167,12 @@ public class AsyncIggyTcpClient {
      * @return a {@link CompletableFuture} that completes when the connection is established
      */
     public CompletableFuture<Void> connect() {
-        connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate);
+        TCPConnectionPoolConfig.Builder poolConfigBuilder = new TCPConnectionPoolConfig.Builder();
+        connectionPoolSize.ifPresent(poolConfigBuilder::setMaxConnections);
+        acquireTimeout.ifPresent(timeout -> poolConfigBuilder.setAcquireTimeoutMillis(timeout.toMillis()));
+        TCPConnectionPoolConfig poolConfig = poolConfigBuilder.build();
+        // TCPConnectionPoolConfig poolConfig = new TCPConnectionPoolConfig();
+        connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate, poolConfig);
         return connection.connect().thenRun(() -> {
             messagesClient = new MessagesTcpClient(connection);
             consumerGroupsClient = new ConsumerGroupsTcpClient(connection);
@@ -215,7 +221,6 @@ public class AsyncIggyTcpClient {
         }
         return usersClient;
     }
-
     /**
      * Returns the async messages client for producing and consuming messages.
      *

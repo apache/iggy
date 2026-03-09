@@ -1,0 +1,46 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "mongodb"
+enabled = true
+version = 0
+name = "MongoDB sink"
+path = "../../target/release/libiggy_connector_mongodb_sink"
+verbose = false
+
+[[streams]]
+stream = "user_events"
+topics = ["users", "orders"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "mongodb_sink"
+
+[plugin_config]
+connection_uri = "mongodb://localhost:27017"
+database = "iggy_messages"
+collection = "messages"
+batch_size = 100
+include_metadata = true
+include_checksum = true
+include_origin_timestamp = true
+payload_format = "binary"
+auto_create_collection = false
+verbose_logging = false
+max_retries = 3
+retry_delay = "1s"

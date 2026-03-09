@@ -35,7 +35,8 @@ impl<T> MuxStateMachine<T>
 where
     T: StateMachine,
 {
-    pub fn new(inner: T) -> Self {
+    #[must_use]
+    pub const fn new(inner: T) -> Self {
         Self { inner }
     }
 }
@@ -124,7 +125,7 @@ where
 {
     fn restore_snapshot(snapshot: &SnapshotData) -> Result<Self, SnapshotError> {
         let inner = T::restore_snapshot(snapshot)?;
-        Ok(MuxStateMachine::new(inner))
+        Ok(Self::new(inner))
     }
 }
 
@@ -156,6 +157,8 @@ mod tests {
 
     #[test]
     fn mux_state_machine_snapshot_roundtrip() {
+        type MuxTuple = (Users, (Streams, (ConsumerGroups, ())));
+
         let users: Users = UsersInner::new().into();
         let streams: Streams = StreamsInner::new().into();
         let consumer_groups: ConsumerGroups = ConsumerGroupsInner::new().into();
@@ -171,8 +174,6 @@ mod tests {
         assert!(snapshot.streams.is_some());
         assert!(snapshot.consumer_groups.is_some());
 
-        // Restore and verify
-        type MuxTuple = (Users, (Streams, (ConsumerGroups, ())));
         let restored: MuxStateMachine<MuxTuple> =
             MuxStateMachine::restore_snapshot(&snapshot).unwrap();
 
@@ -189,11 +190,12 @@ mod tests {
         use crate::impls::metadata::IggySnapshot;
         use crate::stm::snapshot::Snapshot;
 
+        type MuxTuple = (Users, (Streams, (ConsumerGroups, ())));
+
         let users: Users = UsersInner::new().into();
         let streams: Streams = StreamsInner::new().into();
         let consumer_groups: ConsumerGroups = ConsumerGroupsInner::new().into();
 
-        type MuxTuple = (Users, (Streams, (ConsumerGroups, ())));
         let mux: MuxStateMachine<MuxTuple> =
             MuxStateMachine::new(variadic!(users, streams, consumer_groups));
 

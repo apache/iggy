@@ -22,8 +22,8 @@ use std::hash::Hasher as _;
 /// Lookup table that maps partition namespaces to their owning shard.
 ///
 /// Implementations can be:
-/// - A shared concurrent map (DashMap, papaya, etc.) referenced by all shards.
-/// - A per-shard local `HashMap` replica, updated via
+/// - A shared concurrent map (`DashMap`, papaya, etc.) referenced by all shards.
+/// - A per-shard local `HashMap` replica, updated via a
 ///   broadcast when partitions are created, deleted, or moved.
 pub trait ShardsTable {
     /// Returns the shard id that owns `namespace`, or `None` if the
@@ -51,12 +51,14 @@ impl Default for PapayaShardsTable {
 }
 
 impl PapayaShardsTable {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             inner: papaya::HashMap::new(),
         }
     }
 
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             inner: papaya::HashMap::with_capacity(capacity),
@@ -85,6 +87,7 @@ impl ShardsTable for PapayaShardsTable {
 /// Given a packed `IggyNamespace` and the total number of shards, returns the
 /// shard id that should own the partition.  The upper bits of the Murmur3 hash
 /// are used to avoid the weak lower bits for small integer inputs.
+#[must_use]
 pub fn calculate_shard_assignment(ns: &IggyNamespace, shard_count: u32) -> u16 {
     let mut hasher = Murmur3Hasher::default();
     hasher.write_u64(ns.inner());
