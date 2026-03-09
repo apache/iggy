@@ -19,6 +19,7 @@
 use crate::permissioner::Permissioner;
 use iggy_common::IggyError;
 
+#[allow(clippy::missing_errors_doc)]
 impl Permissioner {
     pub fn get_consumer_offset(
         &self,

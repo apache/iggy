@@ -19,6 +19,7 @@
 use crate::configs::connectors::{ConnectorsConfigProvider, SinkConfig, SourceConfig};
 use crate::configs::runtime::ConnectorsRuntimeConfig;
 use crate::metrics::Metrics;
+use crate::stream::IggyClients;
 use crate::{
     SinkConnectorWrapper, SourceConnectorWrapper,
     manager::{
@@ -31,6 +32,7 @@ use iggy_connector_sdk::api::ConnectorError;
 use iggy_connector_sdk::api::ConnectorStatus;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::error;
 
 pub struct RuntimeContext {
@@ -40,8 +42,11 @@ pub struct RuntimeContext {
     pub config_provider: Arc<dyn ConnectorsConfigProvider>,
     pub metrics: Arc<Metrics>,
     pub start_time: IggyTimestamp,
+    pub iggy_clients: Arc<IggyClients>,
+    pub state_path: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn init(
     config: &ConnectorsRuntimeConfig,
     sinks_config: &HashMap<String, SinkConfig>,
@@ -49,6 +54,8 @@ pub fn init(
     sink_wrappers: &[SinkConnectorWrapper],
     source_wrappers: &[SourceConnectorWrapper],
     config_provider: Box<dyn ConnectorsConfigProvider>,
+    iggy_clients: Arc<IggyClients>,
+    state_path: String,
 ) -> RuntimeContext {
     let metrics = Arc::new(Metrics::init());
     let sinks = SinkManager::new(map_sinks(sinks_config, sink_wrappers));
@@ -64,6 +71,8 @@ pub fn init(
         config_provider: Arc::from(config_provider),
         metrics,
         start_time: IggyTimestamp::now(),
+        iggy_clients,
+        state_path,
     }
 }
 
@@ -103,6 +112,10 @@ fn map_sinks(
                     plugin_config_format: sink_plugin.config_format,
                 },
                 config: sink_config.clone(),
+                shutdown_tx: None,
+                task_handles: vec![],
+                container: None,
+                restart_guard: Arc::new(Mutex::new(())),
             });
         }
     }
@@ -145,6 +158,9 @@ fn map_sources(
                     plugin_config_format: source_plugin.config_format,
                 },
                 config: source_config.clone(),
+                handler_tasks: vec![],
+                container: None,
+                restart_guard: Arc::new(Mutex::new(())),
             });
         }
     }

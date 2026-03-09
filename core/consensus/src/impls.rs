@@ -50,7 +50,8 @@ pub struct LocalSequencer {
 }
 
 impl LocalSequencer {
-    pub fn new(initial_op: u64) -> Self {
+    #[must_use]
+    pub const fn new(initial_op: u64) -> Self {
         Self {
             op: Cell::new(initial_op),
         }
@@ -89,11 +90,12 @@ pub struct PipelineEntry {
     pub header: PrepareHeader,
     /// Bitmap of replicas that have acknowledged this prepare.
     pub ok_from_replicas: BitSet<u32>,
-    /// Whether we've received a quorum of prepare_ok messages.
+    /// Whether we've received a quorum of `prepare_ok` messages.
     pub ok_quorum_received: bool,
 }
 
 impl PipelineEntry {
+    #[must_use]
     pub fn new(header: PrepareHeader) -> Self {
         Self {
             header,
@@ -102,7 +104,7 @@ impl PipelineEntry {
         }
     }
 
-    /// Record a prepare_ok from the given replica.
+    /// Record a `prepare_ok` from the given replica.
     /// Returns the new count of acknowledgments.
     pub fn add_ack(&mut self, replica: u8) -> usize {
         self.ok_from_replicas.insert(replica as usize);
@@ -110,11 +112,13 @@ impl PipelineEntry {
     }
 
     /// Check if we have an ack from the given replica.
+    #[must_use]
     pub fn has_ack(&self, replica: u8) -> bool {
         self.ok_from_replicas.contains(replica as usize)
     }
 
     /// Get the number of acks received.
+    #[must_use]
     pub fn ack_count(&self) -> usize {
         self.ok_from_replicas.len()
     }
@@ -128,7 +132,7 @@ pub struct RequestEntry {
 }
 
 impl RequestEntry {
-    pub fn new(message: Message<RequestHeader>) -> Self {
+    pub const fn new(message: Message<RequestHeader>) -> Self {
         Self {
             message,
             received_at: 0, //TODO figure the correct way to do this
@@ -149,25 +153,30 @@ impl Default for LocalPipeline {
 }
 
 impl LocalPipeline {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             prepare_queue: VecDeque::with_capacity(PIPELINE_PREPARE_QUEUE_MAX),
         }
     }
 
+    #[must_use]
     pub fn prepare_count(&self) -> usize {
         self.prepare_queue.len()
     }
 
+    #[must_use]
     pub fn prepare_queue_full(&self) -> bool {
         self.prepare_queue.len() >= PIPELINE_PREPARE_QUEUE_MAX
     }
 
     /// Returns true if prepare queue is full.
+    #[must_use]
     pub fn is_full(&self) -> bool {
         self.prepare_queue_full()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.prepare_queue.is_empty()
     }
@@ -177,6 +186,8 @@ impl LocalPipeline {
     /// # Panics
     /// - If message queue is full.
     /// - If the message doesn't chain correctly to the previous entry.
+    // Signature must match `Pipeline::push_message` trait definition.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn push_message(&mut self, message: Message<PrepareHeader>) {
         assert!(!self.prepare_queue_full(), "prepare queue is full");
 
@@ -208,6 +219,7 @@ impl LocalPipeline {
     }
 
     /// Get the head (oldest) prepare.
+    #[must_use]
     pub fn prepare_head(&self) -> Option<&PipelineEntry> {
         self.prepare_queue.front()
     }
@@ -217,11 +229,15 @@ impl LocalPipeline {
     }
 
     /// Get the tail (newest) prepare.
+    #[must_use]
     pub fn prepare_tail(&self) -> Option<&PipelineEntry> {
         self.prepare_queue.back()
     }
 
     /// Find a message by op number and checksum (immutable).
+    // Pipeline bounded at PIPELINE_PREPARE_QUEUE_MAX (8) entries; index always fits in usize.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&PipelineEntry> {
         let head_op = self.prepare_queue.front()?.header.op;
         let tail_op = self.prepare_queue.back()?.header.op;
@@ -250,6 +266,9 @@ impl LocalPipeline {
     }
 
     /// Find a message by op number only.
+    // Pipeline bounded at PIPELINE_PREPARE_QUEUE_MAX (8) entries; index always fits in usize.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn message_by_op(&self, op: u64) -> Option<&PipelineEntry> {
         let head_op = self.prepare_queue.front()?.header.op;
 
@@ -263,6 +282,8 @@ impl LocalPipeline {
 
     /// Get mutable reference to a message entry by op number.
     /// Returns None if op is not in the pipeline.
+    // Pipeline bounded at PIPELINE_PREPARE_QUEUE_MAX (8) entries; index always fits in usize.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn message_by_op_mut(&mut self, op: u64) -> Option<&mut PipelineEntry> {
         let head_op = self.prepare_queue.front()?.header.op;
         if op < head_op {
@@ -276,14 +297,16 @@ impl LocalPipeline {
     }
 
     /// Get the entry at the head of the prepare queue (oldest uncommitted).
+    #[must_use]
     pub fn head(&self) -> Option<&PipelineEntry> {
         self.prepare_queue.front()
     }
 
-    /// Search prepare queue for a message from the given client.
+    /// Search `prepare_queue` for a message from the given client.
     ///
-    /// If there are multiple messages (possible in prepare_queue after view change),
+    /// If there are multiple messages (possible in `prepare_queue` after view change),
     /// returns the latest one.
+    #[must_use]
     pub fn has_message_from_client(&self, client: u128) -> bool {
         self.prepare_queue.iter().any(|p| p.header.client == client)
     }
@@ -324,43 +347,43 @@ impl Pipeline for LocalPipeline {
     type Entry = PipelineEntry;
 
     fn push_message(&mut self, message: Self::Message) {
-        LocalPipeline::push_message(self, message)
+        Self::push_message(self, message);
     }
 
     fn pop_message(&mut self) -> Option<Self::Entry> {
-        LocalPipeline::pop_message(self)
+        Self::pop_message(self)
     }
 
     fn clear(&mut self) {
-        LocalPipeline::clear(self)
+        Self::clear(self);
     }
 
     fn message_by_op(&self, op: u64) -> Option<&Self::Entry> {
-        LocalPipeline::message_by_op(self, op)
+        Self::message_by_op(self, op)
     }
 
     fn message_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry> {
-        LocalPipeline::message_by_op_mut(self, op)
+        Self::message_by_op_mut(self, op)
     }
 
     fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&Self::Entry> {
-        LocalPipeline::message_by_op_and_checksum(self, op, checksum)
+        Self::message_by_op_and_checksum(self, op, checksum)
     }
 
     fn head(&self) -> Option<&Self::Entry> {
-        LocalPipeline::head(self)
+        Self::head(self)
     }
 
     fn is_full(&self) -> bool {
-        LocalPipeline::is_full(self)
+        Self::is_full(self)
     }
 
     fn is_empty(&self) -> bool {
-        LocalPipeline::is_empty(self)
+        Self::is_empty(self)
     }
 
     fn verify(&self) {
-        LocalPipeline::verify(self)
+        Self::verify(self);
     }
 }
 
@@ -374,9 +397,9 @@ pub enum Status {
 /// Actions to be taken by the caller after processing a VSR event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VsrAction {
-    /// Send StartViewChange to all replicas.
+    /// Send `StartViewChange` to all replicas.
     SendStartViewChange { view: u32, namespace: u64 },
-    /// Send DoViewChange to primary.
+    /// Send `DoViewChange` to primary.
     SendDoViewChange {
         view: u32,
         target: u8,
@@ -385,14 +408,14 @@ pub enum VsrAction {
         commit: u64,
         namespace: u64,
     },
-    /// Send StartView to all backups (as new primary).
+    /// Send `StartView` to all backups (as new primary).
     SendStartView {
         view: u32,
         op: u64,
         commit: u64,
         namespace: u64,
     },
-    /// Send PrepareOK to primary.
+    /// Send `PrepareOK` to primary.
     SendPrepareOk {
         view: u32,
         op: u64,
@@ -453,6 +476,9 @@ where
 }
 
 impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
+    /// # Panics
+    /// - If `replica >= replica_count`.
+    /// - If `replica_count < 1`.
     pub fn new(
         cluster: u128,
         replica: u8,
@@ -469,7 +495,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // TODO: Verify that XOR-based seeding provides sufficient jitter diversity
         // across groups. Consider using a proper hash (e.g., Murmur3) of
         // (replica_id, namespace) for production.
-        let timeout_seed = replica as u128 ^ namespace as u128;
+        let timeout_seed = u128::from(replica) ^ u128::from(namespace);
         Self {
             cluster,
             replica,
@@ -499,14 +525,21 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.status.set(Status::Normal);
     }
 
-    pub fn primary_index(&self, view: u32) -> u8 {
+    #[must_use]
+    // cast_lossless: `u32::from()` unavailable in const fn.
+    // cast_possible_truncation: modulo by replica_count (u8) guarantees result fits in u8.
+    #[allow(clippy::cast_lossless, clippy::cast_possible_truncation)]
+    pub const fn primary_index(&self, view: u32) -> u8 {
         (view % self.replica_count as u32) as u8
     }
 
-    pub fn is_primary(&self) -> bool {
+    #[must_use]
+    pub const fn is_primary(&self) -> bool {
         self.primary_index(self.view.get()) == self.replica
     }
 
+    /// # Panics
+    /// If the stored commit number somehow exceeds the given `commit` after update.
     pub fn advance_commit_number(&self, commit: u64) {
         if commit > self.commit.get() {
             self.commit.set(commit);
@@ -517,33 +550,40 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// Maximum number of faulty replicas that can be tolerated.
     /// For a cluster of 2f+1 replicas, this returns f.
-    pub fn max_faulty(&self) -> usize {
+    #[must_use]
+    pub const fn max_faulty(&self) -> usize {
         (self.replica_count as usize - 1) / 2
     }
 
-    /// Quorum size = f + 1 = max_faulty + 1
-    pub fn quorum(&self) -> usize {
+    /// Quorum size = f + 1 = `max_faulty` + 1
+    #[must_use]
+    pub const fn quorum(&self) -> usize {
         self.max_faulty() + 1
     }
 
-    pub fn commit(&self) -> u64 {
+    #[must_use]
+    pub const fn commit(&self) -> u64 {
         self.commit.get()
     }
 
-    pub fn is_syncing(&self) -> bool {
-        // for now return false. we have to add syncing related setup to VsrConsensus to make this work.
+    #[must_use]
+    pub const fn is_syncing(&self) -> bool {
+        // TODO: for now return false. we have to add syncing related setup to VsrConsensus to make this work.
         false
     }
 
-    pub fn replica(&self) -> u8 {
+    #[must_use]
+    pub const fn replica(&self) -> u8 {
         self.replica
     }
 
-    pub fn sequencer(&self) -> &LocalSequencer {
+    #[must_use]
+    pub const fn sequencer(&self) -> &LocalSequencer {
         &self.sequencer
     }
 
-    pub fn view(&self) -> u32 {
+    #[must_use]
+    pub const fn view(&self) -> u32 {
         self.view.get()
     }
 
@@ -551,34 +591,41 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.view.set(view);
     }
 
-    pub fn status(&self) -> Status {
+    #[must_use]
+    pub const fn status(&self) -> Status {
         self.status.get()
     }
 
     // TODO(hubcio): returning &RefCell<P> leaks interior mutability - callers
     // could hold a Ref/RefMut across an .await and cause a runtime panic.
     // We had this problem with slab + ECS.
-    pub fn pipeline(&self) -> &RefCell<P> {
+    #[must_use]
+    pub const fn pipeline(&self) -> &RefCell<P> {
         &self.pipeline
     }
 
-    pub fn pipeline_mut(&mut self) -> &mut RefCell<P> {
+    #[must_use]
+    pub const fn pipeline_mut(&mut self) -> &mut RefCell<P> {
         &mut self.pipeline
     }
 
-    pub fn cluster(&self) -> u128 {
+    #[must_use]
+    pub const fn cluster(&self) -> u128 {
         self.cluster
     }
 
-    pub fn replica_count(&self) -> u8 {
+    #[must_use]
+    pub const fn replica_count(&self) -> u8 {
         self.replica_count
     }
 
-    pub fn namespace(&self) -> u64 {
+    #[must_use]
+    pub const fn namespace(&self) -> u64 {
         self.namespace
     }
 
-    pub fn last_prepare_checksum(&self) -> u128 {
+    #[must_use]
+    pub const fn last_prepare_checksum(&self) -> u128 {
         self.last_prepare_checksum.get()
     }
 
@@ -586,7 +633,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.last_prepare_checksum.set(checksum);
     }
 
-    pub fn log_view(&self) -> u32 {
+    #[must_use]
+    pub const fn log_view(&self) -> u32 {
         self.log_view.get()
     }
 
@@ -594,7 +642,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.log_view.set(log_view);
     }
 
-    pub fn is_primary_for_view(&self, view: u32) -> bool {
+    #[must_use]
+    pub const fn is_primary_for_view(&self, view: u32) -> bool {
         self.primary_index(view) == self.replica
     }
 
@@ -624,9 +673,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// Reset all view change state when transitioning to a new view.
     ///
-    /// Clears the loopback queue: stale PrepareOks from the old view
+    /// Clears the loopback queue: stale `PrepareOks` from the old view
     /// reference pipeline entries that no longer exist, so processing
-    /// them would be a no-op (handle_prepare_ok ignores unknown ops).
+    /// them would be a no-op (`handle_prepare_ok` ignores unknown ops).
     /// The primary does not require its own self-ack for quorum.
     pub(crate) fn reset_view_change_state(&self) {
         self.reset_svc_quorum();
@@ -675,7 +724,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         actions
     }
 
-    /// Called when normal_heartbeat timeout fires.
+    /// Called when `normal_heartbeat` timeout fires.
     /// Backup hasn't heard from primary - start view change.
     fn handle_normal_heartbeat_timeout(&self) -> Vec<VsrAction> {
         // Only backups trigger view change on heartbeat timeout
@@ -788,11 +837,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }]
     }
 
-    /// Handle a received StartViewChange message.
+    /// Handle a received `StartViewChange` message.
     ///
     /// "When replica i receives STARTVIEWCHANGE messages for its view-number
     /// from f OTHER replicas, it sends a DOVIEWCHANGE message to the node
     /// that will be the primary in the new view."
+    ///
+    /// # Panics
+    /// If `header.namespace` does not match this replica's namespace.
     pub fn handle_start_view_change(&self, header: &StartViewChangeHeader) -> Vec<VsrAction> {
         assert_eq!(
             header.namespace, self.namespace,
@@ -887,11 +939,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         actions
     }
 
-    /// Handle a received DoViewChange message (only relevant for primary candidate).
+    /// Handle a received `DoViewChange` message (only relevant for primary candidate).
     ///
     /// "When the new primary receives f + 1 DOVIEWCHANGE messages from different
     /// replicas (including itself), it sets its view-number to that in the messages
     /// and selects as the new log the one contained in the message with the largest v'..."
+    ///
+    /// # Panics
+    /// If `header.namespace` does not match this replica's namespace.
     pub fn handle_do_view_change(&self, header: &DoViewChangeHeader) -> Vec<VsrAction> {
         assert_eq!(
             header.namespace, self.namespace,
@@ -984,12 +1039,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         actions
     }
 
-    /// Handle a received StartView message (backups only).
+    /// Handle a received `StartView` message (backups only).
     ///
     /// "When other replicas receive the STARTVIEW message, they replace their log
     /// with the one in the message, set their op-number to that of the latest entry
     /// in the log, set their view-number to the view number in the message, change
-    /// their status to normal, and send PrepareOK for any uncommitted ops."
+    /// their status to normal, and send `PrepareOK` for any uncommitted ops."
+    ///
+    /// # Panics
+    /// If `header.namespace` does not match this replica's namespace.
     pub fn handle_start_view(&self, header: &StartViewHeader) -> Vec<VsrAction> {
         assert_eq!(header.namespace, self.namespace, "SV routed to wrong group");
         let from_replica = header.replica;
@@ -1091,10 +1149,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }]
     }
 
-    /// Handle a PrepareOk message from a replica.
+    /// Handle a `PrepareOk` message from a replica.
     ///
     /// Returns `true` if quorum was just reached for this op.
     /// Caller (`on_ack`) should validate `is_primary` and status before calling.
+    ///
+    /// # Panics
+    /// - If `header.command` is not `Command2::PrepareOk`.
+    /// - If `header.replica >= self.replica_count`.
     pub fn handle_prepare_ok(&self, header: &PrepareOkHeader) -> bool {
         assert_eq!(header.command, Command2::PrepareOk);
         assert!(
@@ -1151,7 +1213,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// Enqueue a self-addressed message for processing in the next loopback drain.
     ///
-    /// Currently only PrepareOk messages are routed here (via `send_or_loopback`).
+    /// Currently only `PrepareOk` messages are routed here (via `send_or_loopback`).
     // TODO: Route SVC/DVC self-messages through loopback once VsrAction dispatch is implemented.
     pub(crate) fn push_loopback(&self, message: Message<GenericHeader>) {
         assert!(
@@ -1170,6 +1232,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 
     /// Send a message to `target`, routing self-addressed messages through the loopback queue.
+    // VsrConsensus uses Cell/RefCell for single-threaded compio shards; futures are intentionally !Send.
+    #[allow(clippy::future_not_send)]
     pub(crate) async fn send_or_loopback(&self, target: u8, message: Message<GenericHeader>)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
@@ -1185,7 +1249,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
     }
 
-    pub fn message_bus(&self) -> &B {
+    #[must_use]
+    pub const fn message_bus(&self) -> &B {
         &self.message_bus
     }
 }
@@ -1226,7 +1291,7 @@ where
 impl<B, P> Project<Message<PrepareOkHeader>, VsrConsensus<B, P>> for Message<PrepareHeader>
 where
     B: MessageBus,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Message = Self, Entry = PipelineEntry>,
 {
     type Consensus = VsrConsensus<B, P>;
 

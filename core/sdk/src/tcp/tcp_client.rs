@@ -122,6 +122,7 @@ impl BinaryTransport for TcpClient {
                 | IggyError::StaleClient
                 | IggyError::NotConnected
                 | IggyError::CannotEstablishConnection
+                | IggyError::TcpError
         ) {
             return Err(error);
         }

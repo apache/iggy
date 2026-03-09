@@ -122,11 +122,11 @@ jobs:
           task: ${{ inputs.task }}
 
       - name: Upload Go coverage to Codecov
-        if: inputs.component == 'sdk-go' && inputs.task == 'test'
+        if: inputs.component == 'sdk-go' && (inputs.task == 'test' || inputs.task == 'e2e')
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: reports/go-coverage.out
+          files: reports/${{ inputs.task == 'test' && 'go-coverage.out' || 'go-coverage-e2e.out' }}
           disable_search: true
           flags: go
           fail_ci_if_error: false

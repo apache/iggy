@@ -17,7 +17,7 @@
 
 use crate::REPLICAS_MAX;
 
-/// Stored information from a DoViewChange message.
+/// Stored information from a `DoViewChange` message.
 #[derive(Debug, Clone, Copy)]
 pub struct StoredDvc {
     pub replica: u8,
@@ -28,12 +28,13 @@ pub struct StoredDvc {
 }
 
 impl StoredDvc {
-    /// Compare for log selection: highest log_view, then highest op.
-    pub fn is_better_than(&self, other: &StoredDvc) -> bool {
-        if self.log_view != other.log_view {
-            self.log_view > other.log_view
-        } else {
+    /// Compare for log selection: highest `log_view`, then highest op.
+    #[must_use]
+    pub const fn is_better_than(&self, other: &Self) -> bool {
+        if self.log_view == other.log_view {
             self.op > other.op
+        } else {
+            self.log_view > other.log_view
         }
     }
 }
@@ -42,12 +43,13 @@ impl StoredDvc {
 pub type DvcQuorumArray = [Option<StoredDvc>; REPLICAS_MAX];
 
 /// Create an empty DVC quorum array.
+#[must_use]
 pub const fn dvc_quorum_array_empty() -> DvcQuorumArray {
     [None; REPLICAS_MAX]
 }
 
 /// Record a DVC in the array. Returns true if this is a new entry (not duplicate).
-pub fn dvc_record(array: &mut DvcQuorumArray, dvc: StoredDvc) -> bool {
+pub const fn dvc_record(array: &mut DvcQuorumArray, dvc: StoredDvc) -> bool {
     let slot = &mut array[dvc.replica as usize];
     if slot.is_some() {
         return false; // Duplicate
@@ -57,20 +59,20 @@ pub fn dvc_record(array: &mut DvcQuorumArray, dvc: StoredDvc) -> bool {
 }
 
 /// Count how many DVCs have been received.
+#[must_use]
 pub fn dvc_count(array: &DvcQuorumArray) -> usize {
     array.iter().filter(|m| m.is_some()).count()
 }
 
 /// Check if a specific replica has sent a DVC.
+#[must_use]
 pub fn dvc_has_from(array: &DvcQuorumArray, replica: u8) -> bool {
-    array
-        .get(replica as usize)
-        .map(|m| m.is_some())
-        .unwrap_or(false)
+    array.get(replica as usize).is_some_and(Option::is_some)
 }
 
 /// Select the winning DVC (best log) from the quorum.
-/// Returns the DVC with: highest log_view, then highest op.
+/// Returns the DVC with: highest `log_view`, then highest op.
+#[must_use]
 pub fn dvc_select_winner(array: &DvcQuorumArray) -> Option<&StoredDvc> {
     array
         .iter()
@@ -82,6 +84,7 @@ pub fn dvc_select_winner(array: &DvcQuorumArray) -> Option<&StoredDvc> {
 }
 
 /// Get the maximum commit number across all DVCs.
+#[must_use]
 pub fn dvc_max_commit(array: &DvcQuorumArray) -> u64 {
     array
         .iter()
@@ -92,11 +95,12 @@ pub fn dvc_max_commit(array: &DvcQuorumArray) -> u64 {
 }
 
 /// Reset the DVC quorum array.
-pub fn dvc_reset(array: &mut DvcQuorumArray) {
+pub const fn dvc_reset(array: &mut DvcQuorumArray) {
     *array = dvc_quorum_array_empty();
 }
 
 /// Iterator over all stored DVCs.
+// TODO: add #[must_use] -- pure iterator query, callers should not ignore.
 pub fn dvc_iter(array: &DvcQuorumArray) -> impl Iterator<Item = &StoredDvc> {
     array.iter().filter_map(|m| m.as_ref())
 }

@@ -19,6 +19,7 @@
 
 use crate::IggyPartition;
 use crate::Partition;
+use crate::log::JournalInfo;
 use crate::types::PartitionsConfig;
 use consensus::PlaneIdentity;
 use consensus::{
@@ -49,14 +50,14 @@ use tracing::{debug, warn};
 /// This struct manages ALL partitions assigned to a single shard, regardless
 /// of which stream/topic they belong to.
 ///
-/// Note: The partition_id within IggyNamespace may NOT equal the Vec index.
-/// For example, shard 0 might have partition_ids [0, 2, 4] while shard 1
-/// has partition_ids [1, 3, 5]. The `LocalIdx` provides the actual index
+/// Note: The `partition_id` within `IggyNamespace` may NOT equal the Vec index.
+/// For example, shard 0 might have `partition_ids` [0, 2, 4] while shard 1
+/// has `partition_ids` [1, 3, 5]. The `LocalIdx` provides the actual index
 /// into the `partitions` Vec.
 pub struct IggyPartitions<C> {
     shard_id: ShardId,
     config: PartitionsConfig,
-    /// Collection of partitions, the index of each partition isn't it's ID, but rather an local index (LocalIdx) which is used for lookups.
+    /// Collection of partitions, the index of each partition isn't it's ID, but rather an local index (`LocalIdx`) which is used for lookups.
     ///
     /// Wrapped in `UnsafeCell` for interior mutability — matches the single-threaded
     /// per-shard execution model. Consensus trait methods take `&self` but need to
@@ -67,6 +68,7 @@ pub struct IggyPartitions<C> {
 }
 
 impl<C> IggyPartitions<C> {
+    #[must_use]
     pub fn new(shard_id: ShardId, config: PartitionsConfig) -> Self {
         Self {
             shard_id,
@@ -77,6 +79,7 @@ impl<C> IggyPartitions<C> {
         }
     }
 
+    #[must_use]
     pub fn with_capacity(shard_id: ShardId, config: PartitionsConfig, capacity: usize) -> Self {
         Self {
             shard_id,
@@ -87,7 +90,7 @@ impl<C> IggyPartitions<C> {
         }
     }
 
-    pub fn config(&self) -> &PartitionsConfig {
+    pub const fn config(&self) -> &PartitionsConfig {
         &self.config
     }
 
@@ -103,7 +106,7 @@ impl<C> IggyPartitions<C> {
         unsafe { &mut *self.partitions.get() }
     }
 
-    pub fn shard_id(&self) -> ShardId {
+    pub const fn shard_id(&self) -> ShardId {
         self.shard_id
     }
 
@@ -172,7 +175,7 @@ impl<C> IggyPartitions<C> {
         // If we swapped an element, update its index in the map
         if idx < partitions.len() {
             // Find the namespace that was at the last position (now at idx)
-            for (_ns, lidx) in self.namespace_to_local.iter_mut() {
+            for lidx in self.namespace_to_local.values_mut() {
                 if **lidx == partitions.len() {
                     *lidx = LocalIdx::new(idx);
                     break;
@@ -230,7 +233,7 @@ impl<C> IggyPartitions<C> {
         &mut self.partitions_mut()[idx]
     }
 
-    pub fn consensus(&self) -> Option<&C> {
+    pub const fn consensus(&self) -> Option<&C> {
         self.consensus.as_ref()
     }
 
@@ -258,7 +261,7 @@ impl<C> IggyPartitions<C> {
 
         // Create partition with initialized log
         let stats = Arc::new(PartitionStats::default());
-        let mut partition = IggyPartition::new(stats.clone());
+        let mut partition = IggyPartition::new(stats);
         partition.log.add_persisted_segment(segment, storage);
         partition.offset.store(start_offset, Ordering::Relaxed);
         partition
@@ -276,12 +279,15 @@ impl<C> IggyPartitions<C> {
     /// initial segment, and storage. Skips the control plane metadata broadcasting.
     ///
     /// Corresponds to the "INITIATE PARTITION" phase in the server's flow:
-    /// 1. Control plane: create PartitionMeta (SKIPPED in this method)
+    /// 1. Control plane: create `PartitionMeta` (SKIPPED in this method)
     /// 2. Control plane: broadcast to shards (SKIPPED in this method)
     /// 3. Data plane: INITIATE PARTITION (THIS METHOD)
     ///
     /// Idempotent: subsequent calls for the same namespace are no-ops.
     /// Consensus must be set separately via `set_consensus`.
+    ///
+    /// # Panics
+    /// Panics if segment storage creation fails.
     pub async fn init_partition(&mut self, namespace: IggyNamespace) -> LocalIdx {
         if let Some(idx) = self.local_idx(&namespace) {
             return idx;
@@ -320,7 +326,7 @@ impl<C> IggyPartitions<C> {
 
         // Create partition with initialized log
         let stats = Arc::new(PartitionStats::default());
-        let mut partition = IggyPartition::new(stats.clone());
+        let mut partition = IggyPartition::new(stats);
         partition.log.add_persisted_segment(segment, storage);
         partition.offset.store(start_offset, Ordering::Relaxed);
         partition
@@ -367,10 +373,10 @@ where
         };
 
         let is_old_prepare = fence_old_prepare_by_commit(consensus, header);
-        if !is_old_prepare {
-            self.replicate(message.clone()).await;
-        } else {
+        if is_old_prepare {
             warn!("received old prepare, not replicating");
+        } else {
+            self.replicate(message.clone()).await;
         }
 
         // TODO: Make those assertions be toggleable through an feature flag, so they can be used only by simulator/tests.
@@ -386,7 +392,7 @@ where
         self.send_prepare_ok(header).await;
 
         if consensus.is_follower() {
-            self.commit_journal(&namespace);
+            self.commit_journal(namespace);
         }
     }
 
@@ -498,7 +504,7 @@ where
                 .message_bus()
                 .send_to_client(prepare_header.client, generic_reply)
                 .await
-                .unwrap()
+                .unwrap();
         }
     }
 }
@@ -523,6 +529,8 @@ impl<B> IggyPartitions<VsrConsensus<B, NamespacedPipeline>>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
 {
+    /// # Panics
+    /// Panics if consensus is not initialized.
     pub fn register_namespace_in_pipeline(&self, ns: u64) {
         self.consensus()
             .expect("register_namespace_in_pipeline: consensus not initialized")
@@ -540,8 +548,7 @@ where
         let indexes_end = 4 + indexes_len;
         assert!(
             body.len() >= indexes_end,
-            "prepare body too small for {} indexes",
-            count
+            "prepare body too small for {count} indexes",
         );
 
         let indexes = IggyIndexesMut::from_bytes(PooledBuffer::from(&body[4..indexes_end]), 0);
@@ -626,7 +633,8 @@ where
         replicate_to_next_in_chain(consensus, message).await;
     }
 
-    fn commit_journal(&self, _namespace: &IggyNamespace) {
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
+    fn commit_journal(&self, _namespace: IggyNamespace) {
         // TODO: Implement commit logic for followers.
         // Walk through journal from last committed to current commit number
         // Apply each entry to the partition state
@@ -665,7 +673,7 @@ where
             .increment_size_bytes(journal_info.size.as_bytes_u64());
         partition
             .stats
-            .increment_messages_count(journal_info.messages_count as u64);
+            .increment_messages_count(u64::from(journal_info.messages_count));
 
         // 3. Check flush thresholds.
         let is_full = segment.is_full();
@@ -703,7 +711,7 @@ where
             let partition = self
                 .get_mut_by_ns(namespace)
                 .expect("commit_messages: partition not found");
-            partition.log.journal_mut().info = Default::default();
+            partition.log.journal_mut().info = JournalInfo::default();
         }
 
         // 4. Advance committed offset (last, so consumers only see offset after data is durable).
@@ -721,7 +729,10 @@ where
         namespace: &IggyNamespace,
         frozen_batches: Vec<iggy_common::IggyMessagesBatch>,
     ) {
-        let batch_count: u32 = frozen_batches.iter().map(|b| b.count()).sum();
+        let batch_count: u32 = frozen_batches
+            .iter()
+            .map(iggy_common::IggyMessagesBatch::count)
+            .sum();
 
         if batch_count == 0 {
             return;

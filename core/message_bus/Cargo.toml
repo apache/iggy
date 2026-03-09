@@ -30,3 +30,8 @@ readme = "../../../README.md"
 [dependencies]
 iggy_common = { workspace = true }
 rand = { workspace = true }
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "warn"

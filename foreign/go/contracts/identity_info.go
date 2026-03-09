@@ -17,14 +17,9 @@
 
 package iggcon
 
-type DeleteUser struct {
-	Id Identifier
-}
-
-func (d *DeleteUser) Code() CommandCode {
-	return DeleteUserCode
-}
-
-func (d *DeleteUser) MarshalBinary() ([]byte, error) {
-	return d.Id.MarshalBinary()
+type IdentityInfo struct {
+	// Unique identifier (numeric) of the user.
+	UserId uint32 `json:"userId"`
+	// The optional tokens, used only by HTTP transport.
+	AccessToken *string `json:"accessToken"`
 }

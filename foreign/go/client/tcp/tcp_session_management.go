@@ -21,13 +21,14 @@ import (
 	"time"
 
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
+	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/util"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 func (c *IggyTcpClient) LoginUser(username string, password string) (*iggcon.IdentityInfo, error) {
-	buffer, err := c.do(&iggcon.LoginUser{
+	buffer, err := c.do(&command.LoginUser{
 		Username: username,
 		Password: password,
 	})
@@ -50,7 +51,7 @@ func (c *IggyTcpClient) LoginUser(username string, password string) (*iggcon.Ide
 }
 
 func (c *IggyTcpClient) LoginWithPersonalAccessToken(token string) (*iggcon.IdentityInfo, error) {
-	buffer, err := c.do(&iggcon.LoginWithPersonalAccessToken{
+	buffer, err := c.do(&command.LoginWithPersonalAccessToken{
 		Token: token,
 	})
 	if err != nil {
@@ -72,7 +73,7 @@ func (c *IggyTcpClient) LoginWithPersonalAccessToken(token string) (*iggcon.Iden
 }
 
 func (c *IggyTcpClient) LogoutUser() error {
-	_, err := c.do(&iggcon.LogoutUser{})
+	_, err := c.do(&command.LogoutUser{})
 	return err
 }
 
