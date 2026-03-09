@@ -31,16 +31,15 @@ pub struct Permissioner {
 }
 
 impl Permissioner {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn init_permissions_for_user(&mut self, user_id: UserId, permissions: Option<Permissions>) {
-        if permissions.is_none() {
+        let Some(permissions) = permissions else {
             return;
-        }
-
-        let permissions = permissions.unwrap();
+        };
         if permissions.global.poll_messages {
             self.users_that_can_poll_messages_from_all_streams
                 .insert(user_id);
@@ -52,11 +51,9 @@ impl Permissioner {
         }
 
         self.users_permissions.insert(user_id, permissions.global);
-        if permissions.streams.is_none() {
+        let Some(streams) = permissions.streams else {
             return;
-        }
-
-        let streams = permissions.streams.unwrap();
+        };
         for (stream_id, stream) in streams {
             if stream.poll_messages {
                 self.users_that_can_poll_messages_from_specific_streams

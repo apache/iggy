@@ -53,11 +53,7 @@ runs:
       shell: bash
       run: |
         cd foreign/python
-        if [ "${{ inputs.task }}" = "test" ]; then
-          uv sync --frozen --extra dev --extra testing --extra testing-docker
-        else
-          uv sync --frozen --extra dev --extra testing
-        fi
+        uv sync --frozen --extra dev --extra testing --extra testing-docker
 
     - name: Lint and format check
       if: inputs.task == 'lint'

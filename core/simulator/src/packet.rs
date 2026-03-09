@@ -142,11 +142,11 @@ impl Default for PacketSimulatorOptions {
     }
 }
 
-/// Per-path link: holds packets in a ReadyQueue sorted by ready_at.
+/// Per-path link: holds packets in a [`ReadyQueue`] sorted by `ready_at`.
 struct Link {
-    /// Packets waiting to be delivered, ordered by ready_at (min-heap).
+    /// Packets waiting to be delivered, ordered by `ready_at` (min-heap).
     packets: ReadyQueue<Packet>,
-    /// Tick until which this link is clogged. Clogged when clogged_till > current_tick.
+    /// Tick until which this link is clogged. Clogged when `clogged_till` > `current_tick`.
     clogged_till: u64,
     /// Per-command filter controlling which commands pass through this link.
     /// [`ALLOW_ALL`] = fully enabled (default), [`BLOCK_ALL`] = fully disabled.
@@ -156,6 +156,7 @@ struct Link {
     drop_packet_fn: Option<fn(&Packet) -> bool>,
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for Link {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Link")
@@ -206,11 +207,11 @@ pub enum PartitionSymmetry {
 /// The packet simulator manages a matrix of links between processes.
 pub struct PacketSimulator {
     options: PacketSimulatorOptions,
-    /// Flat array of links. Index = from_idx * max_processes + to_idx.
+    /// Flat array of links. Index = `from_idx` * `max_processes` + `to_idx`.
     links: Vec<Link>,
     /// Maximum number of processes (determines link array size).
     max_processes: usize,
-    /// Mapping from ProcessId to flat index.
+    /// Mapping from [`ProcessId`] to flat index.
     process_indices: HashMap<ProcessId, usize>,
     /// Next flat index to assign to a newly registered client.
     /// Initialized to `replica_count` and incremented on each new registration.
@@ -225,7 +226,7 @@ pub struct PacketSimulator {
     auto_partition: Vec<bool>,
     /// Countdown timer for partition/unpartition stability.
     auto_partition_stability: u32,
-    /// Scratch buffer for Fisher-Yates shuffle in UniformSize partition mode.
+    /// Scratch buffer for Fisher-Yates shuffle in [`UniformSize`] partition mode.
     auto_partition_nodes: Vec<usize>,
     /// Reusable buffer for delivered packets.
     delivered: Vec<Packet>,
@@ -233,11 +234,16 @@ pub struct PacketSimulator {
 
 impl PacketSimulator {
     /// Create a new packet simulator.
+    ///
+    /// # Panics
+    /// Panics if `node_count` is 0, or if delay/probability parameters are invalid.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn new(options: PacketSimulatorOptions) -> Self {
         let node_count = options.node_count as usize;
         let client_count = options.client_count as usize;
 
-        assert!(node_count > 0, "node_count must be > 0, got {}", node_count);
+        assert!(node_count > 0, "node_count must be > 0, got {node_count}");
         assert!(
             options.one_way_delay_min >= 1,
             "one_way_delay_min must be >= 1 (got {}), zero causes unbounded replay loops",
@@ -310,6 +316,9 @@ impl PacketSimulator {
 
     /// Register a client process. Returns its flat index.
     /// Re-registering a client with the same ID returns the same index.
+    ///
+    /// # Panics
+    /// Panics if the maximum number of processes has been reached.
     pub fn register_client(&mut self, client_id: u128) -> usize {
         if let Some(&idx) = self.process_indices.get(&ProcessId::Client(client_id)) {
             return idx;
@@ -327,7 +336,7 @@ impl PacketSimulator {
     }
 
     /// Resolve a `ProcessId` to its flat index.
-    /// Fast path for replicas (direct arithmetic), HashMap fallback for clients.
+    /// Fast path for replicas (direct arithmetic), `HashMap` fallback for clients.
     fn process_index(&self, id: ProcessId) -> Option<usize> {
         match id {
             ProcessId::Replica(i) => {
@@ -391,6 +400,11 @@ impl PacketSimulator {
 
     /// Generate an exponentially distributed random value with the given mean.
     /// Uses inverse CDF: -mean * ln(U) where U ~ Uniform(0,1).
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
     fn random_exponential(prng: &mut Xoshiro256Plus, mean: u64) -> u64 {
         let u: f64 = prng.random::<f64>();
         if u > 0.0 {
@@ -402,7 +416,7 @@ impl PacketSimulator {
     }
 
     /// Number of registered processes.
-    fn process_count(&self) -> usize {
+    const fn process_count(&self) -> usize {
         self.next_index
     }
 
@@ -417,6 +431,7 @@ impl PacketSimulator {
     }
 
     /// Check whether a link is currently enabled (filter is not empty).
+    #[must_use]
     pub fn is_link_enabled(&self, from: ProcessId, to: ProcessId) -> bool {
         let idx = self.link_index(from, to);
         !self.links[idx].filter.is_empty()
@@ -656,7 +671,8 @@ impl PacketSimulator {
     }
 
     /// Get the current tick.
-    pub fn current_tick(&self) -> u64 {
+    #[must_use]
+    pub const fn current_tick(&self) -> u64 {
         self.current_tick
     }
 
@@ -695,11 +711,13 @@ impl PacketSimulator {
     }
 
     /// Get the number of packets in flight across all links.
+    #[must_use]
     pub fn packets_in_flight(&self) -> usize {
         self.links.iter().map(|l| l.packets.len()).sum()
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for PacketSimulator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PacketSimulator")
@@ -830,7 +848,7 @@ mod tests {
         sim.clog(ProcessId::Replica(0), ProcessId::Replica(1));
 
         // Submit a packet
-        sim.submit(ProcessId::Replica(0), ProcessId::Replica(1), msg.clone());
+        sim.submit(ProcessId::Replica(0), ProcessId::Replica(1), msg);
         for _ in 0..20 {
             sim.tick();
         }
