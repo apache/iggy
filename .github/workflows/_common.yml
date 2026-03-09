@@ -117,11 +117,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Go with cache
+      - name: Setup Go
         uses: ./.github/actions/utils/setup-go-with-cache
         with:
           go-version: "1.23"
-          enabled: "false"
           download-deps: "false"
 
       - name: Install addlicense
@@ -221,6 +220,18 @@ jobs:
       - name: Check TOML formatting
         run: ./scripts/ci/taplo.sh --check --ci
 
+  binary-artifacts:
+    name: Check binary artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for binary artifacts
+        run: ./scripts/ci/binary-artifacts.sh --check --ci
+
   typos:
     name: Check typos
     runs-on: ubuntu-latest
@@ -249,6 +260,7 @@ jobs:
         trailing-whitespace,
         trailing-newline,
         toml-format,
+        binary-artifacts,
         typos,
       ]
     if: always()
@@ -349,6 +361,15 @@ jobs:
             echo "| ❌ Trailing Newline | failure | Missing trailing newlines detected |" >> $GITHUB_STEP_SUMMARY
           else
             echo "| ⏭️ Trailing Newline | $TRAILING_NL | Check skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          BINARY_ARTIFACTS="${{ needs.binary-artifacts.result }}"
+          if [ "$BINARY_ARTIFACTS" = "success" ]; then
+            echo "| ✅ Binary Artifacts | success | No binary artifacts found |" >> $GITHUB_STEP_SUMMARY
+          elif [ "$BINARY_ARTIFACTS" = "failure" ]; then
+            echo "| ❌ Binary Artifacts | failure | Binary artifacts detected in commit |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| ⏭️ Binary Artifacts | $BINARY_ARTIFACTS | Check skipped |" >> $GITHUB_STEP_SUMMARY
           fi
 
           TOML_FORMAT="${{ needs.toml-format.result }}"
