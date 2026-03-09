@@ -17,15 +17,8 @@
 
 package iggcon
 
-type GetTopic struct {
-	StreamId Identifier
-	TopicId  Identifier
-}
-
-func (g *GetTopic) Code() CommandCode {
-	return GetTopicCode
-}
-
-func (g *GetTopic) MarshalBinary() ([]byte, error) {
-	return marshalIdentifiers(g.StreamId, g.TopicId)
+type ConsumerOffsetInfo struct {
+	PartitionId   uint32 `json:"partitionId"`
+	CurrentOffset uint64 `json:"currentOffset"`
+	StoredOffset  uint64 `json:"storedOffset"`
 }

@@ -41,13 +41,15 @@ pub struct IggySnapshot {
 
 #[allow(unused)]
 impl IggySnapshot {
+    #[must_use]
     pub fn new(sequence_number: u64) -> Self {
         Self {
             snapshot: MetadataSnapshot::new(sequence_number),
         }
     }
 
-    pub fn snapshot(&self) -> &MetadataSnapshot {
+    #[must_use]
+    pub const fn snapshot(&self) -> &MetadataSnapshot {
         &self.snapshot
     }
 }
@@ -99,6 +101,7 @@ pub struct IggyMetadata<C, J, S, M> {
     pub mux_stm: M,
 }
 
+#[allow(clippy::future_not_send)]
 impl<B, J, S, M> Plane<VsrConsensus<B>> for IggyMetadata<VsrConsensus<B>, J, S, M>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
@@ -137,12 +140,13 @@ where
         };
 
         // TODO: Handle idx calculation, for now using header.op, but since the journal may get compacted, this may not be correct.
+        #[allow(clippy::cast_possible_truncation)]
         let is_old_prepare = fence_old_prepare_by_commit(consensus, header)
             || journal.handle().header(header.op as usize).is_some();
-        if !is_old_prepare {
-            self.replicate(message.clone()).await;
-        } else {
+        if is_old_prepare {
             warn!("received old prepare, not replicating");
+        } else {
+            self.replicate(message.clone()).await;
         }
 
         // TODO add assertions for valid state here.
@@ -245,7 +249,7 @@ where
                     .message_bus()
                     .send_to_client(prepare_header.client, generic_reply)
                     .await
-                    .unwrap()
+                    .unwrap();
             }
         }
     }
@@ -285,6 +289,7 @@ where
     /// - Primary sends to first backup
     /// - Each backup forwards to the next
     /// - Stops when we would forward back to primary
+    #[allow(clippy::future_not_send)]
     async fn replicate(&self, message: Message<PrepareHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
@@ -292,6 +297,7 @@ where
         let header = message.header();
 
         // TODO: calculate the index;
+        #[allow(clippy::cast_possible_truncation)]
         let idx = header.op as usize;
         assert_eq!(header.command, Command2::Prepare);
         assert!(
@@ -304,12 +310,14 @@ where
     // TODO: Implement jump_to_newer_op
     // fn jump_to_newer_op(&self, header: &PrepareHeader) {}
 
-    fn commit_journal(&self) {
+    #[allow(clippy::unused_self)]
+    const fn commit_journal(&self) {
         // TODO: Implement commit logic
         // Walk through journal from last committed to current commit number
         // Apply each entry to the state machine
     }
 
+    #[allow(clippy::future_not_send, clippy::cast_possible_truncation)]
     async fn send_prepare_ok(&self, header: &PrepareHeader) {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();

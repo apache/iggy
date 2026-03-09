@@ -15,35 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package iggcon
+package command
 
-import (
-	"encoding"
-	"encoding/binary"
-)
-
-type Command interface {
-	// Code returns the command code associated with this command.
-	Code() CommandCode
-
-	encoding.BinaryMarshaler
-}
-
-type GetClients struct{}
-
-func (c *GetClients) Code() CommandCode {
-	return GetClientsCode
-}
-
-func (c *GetClients) MarshalBinary() ([]byte, error) {
-	return []byte{}, nil
-}
+import "encoding/binary"
 
 type GetClient struct {
 	ClientID uint32
 }
 
-func (c *GetClient) Code() CommandCode {
+func (c *GetClient) Code() Code {
 	return GetClientCode
 }
 
@@ -51,4 +31,45 @@ func (c *GetClient) MarshalBinary() ([]byte, error) {
 	bytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(bytes, c.ClientID)
 	return bytes, nil
+}
+
+type GetClients struct{}
+
+func (c *GetClients) Code() Code {
+	return GetClientsCode
+}
+
+func (c *GetClients) MarshalBinary() ([]byte, error) {
+	return []byte{}, nil
+}
+
+type GetClusterMetadata struct {
+}
+
+func (m *GetClusterMetadata) Code() Code {
+	return GetClusterMetadataCode
+}
+
+func (m *GetClusterMetadata) MarshalBinary() ([]byte, error) {
+	return []byte{}, nil
+}
+
+type GetStats struct{}
+
+func (c *GetStats) Code() Code {
+	return GetStatsCode
+}
+
+func (c *GetStats) MarshalBinary() ([]byte, error) {
+	return []byte{}, nil
+}
+
+type Ping struct{}
+
+func (p *Ping) Code() Code {
+	return PingCode
+}
+
+func (p *Ping) MarshalBinary() ([]byte, error) {
+	return []byte{}, nil
 }

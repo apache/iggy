@@ -19,6 +19,7 @@
 use crate::permissioner::Permissioner;
 use iggy_common::IggyError;
 
+#[allow(clippy::missing_errors_doc)]
 impl Permissioner {
     pub fn get_stats(&self, user_id: u32) -> Result<(), IggyError> {
         self.get_server_info(user_id)

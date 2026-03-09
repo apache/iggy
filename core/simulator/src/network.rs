@@ -18,7 +18,7 @@
 //! Network abstraction layer for the cluster simulator.
 //!
 //! **Note:** Currently a thin passthrough over `PacketSimulator`. Once the
-//! Cluster and MessageBus layers are built, this will own
+//! Cluster and [`MessageBus`] layers are built, this will own
 //! process-to-bus routing, and node enable/disable logic.
 
 use crate::packet::{
@@ -40,6 +40,7 @@ pub struct Network {
 
 impl Network {
     /// Create a new network.
+    #[must_use]
     pub fn new(options: PacketSimulatorOptions) -> Self {
         Self {
             simulator: PacketSimulator::new(options),
@@ -50,8 +51,8 @@ impl Network {
     ///
     /// The message will be queued with a simulated delay and may be:
     /// - Delivered normally after the delay
-    /// - Dropped (based on packet_loss_probability)
-    /// - Replayed/duplicated (based on replay_probability)
+    /// - Dropped (based on `packet_loss_probability`)
+    /// - Replayed/duplicated (based on `replay_probability`)
     pub fn submit(&mut self, from: ProcessId, to: ProcessId, message: Message<GenericHeader>) {
         self.simulator.submit(from, to, message);
     }
@@ -80,7 +81,8 @@ impl Network {
     }
 
     /// Get the current network tick.
-    pub fn current_tick(&self) -> u64 {
+    #[must_use]
+    pub const fn current_tick(&self) -> u64 {
         self.simulator.current_tick()
     }
 
@@ -105,6 +107,7 @@ impl Network {
     }
 
     /// Check whether a specific link is enabled (filter is not empty).
+    #[must_use]
     pub fn is_link_enabled(&self, from: ProcessId, to: ProcessId) -> bool {
         self.simulator.is_link_enabled(from, to)
     }
@@ -144,6 +147,7 @@ impl Network {
     }
 
     /// Get the number of packets currently in flight.
+    #[must_use]
     pub fn packets_in_flight(&self) -> usize {
         self.simulator.packets_in_flight()
     }

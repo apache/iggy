@@ -36,7 +36,7 @@ const CLUSTER_ID: u128 = 1;
 pub type Replica =
     shard::IggyShard<SharedMemBus, SimJournal<MemStorage>, SimSnapshot, SimMuxStateMachine>;
 
-pub fn new_replica(id: u8, name: String, bus: Arc<MemBus>, replica_count: u8) -> Replica {
+pub fn new_replica(id: u8, name: String, bus: &Arc<MemBus>, replica_count: u8) -> Replica {
     let users: Users = UsersInner::new().into();
     let streams: Streams = StreamsInner::new().into();
     let consumer_groups: ConsumerGroups = ConsumerGroupsInner::new().into();
@@ -48,7 +48,7 @@ pub fn new_replica(id: u8, name: String, bus: Arc<MemBus>, replica_count: u8) ->
         id,
         replica_count,
         0,
-        SharedMemBus(Arc::clone(&bus)),
+        SharedMemBus(Arc::clone(bus)),
         LocalPipeline::new(),
     );
     metadata_consensus.init();
@@ -67,7 +67,7 @@ pub fn new_replica(id: u8, name: String, bus: Arc<MemBus>, replica_count: u8) ->
         segment_size: IggyByteSize::from(1024 * 1024 * 1024),
     };
 
-    let mut partitions = IggyPartitions::new(ShardId::new(id as u16), partitions_config);
+    let mut partitions = IggyPartitions::new(ShardId::new(u16::from(id)), partitions_config);
 
     // TODO: namespace=0 collides with metadata consensus. Safe for now because the simulator
     // routes by Operation type, but a shared view change bus would produce namespace collisions.
@@ -76,7 +76,7 @@ pub fn new_replica(id: u8, name: String, bus: Arc<MemBus>, replica_count: u8) ->
         id,
         replica_count,
         0,
-        SharedMemBus(Arc::clone(&bus)),
+        SharedMemBus(Arc::clone(bus)),
         NamespacedPipeline::new(),
     );
     partition_consensus.init();
@@ -86,5 +86,13 @@ pub fn new_replica(id: u8, name: String, bus: Arc<MemBus>, replica_count: u8) ->
     // but this is not possible with crossfire without mangling types due to Flavor trait in crossfire.
     // This needs to be revisited in the future.
     let (_tx, inbox) = shard::channel(1024);
-    shard::IggyShard::new(id as u16, name, metadata, partitions, Vec::new(), inbox, ())
+    shard::IggyShard::new(
+        u16::from(id),
+        name,
+        metadata,
+        partitions,
+        Vec::new(),
+        inbox,
+        (),
+    )
 }

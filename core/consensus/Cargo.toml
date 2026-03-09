@@ -38,3 +38,8 @@ rand_xoshiro = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "warn"

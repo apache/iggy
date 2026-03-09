@@ -15,16 +15,62 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package iggcon
+package command
+
+import iggcon "github.com/apache/iggy/foreign/go/contracts"
+
+const (
+	nameLengthOffset = 0
+	payloadOffset    = 1
+)
+
+type CreateStream struct {
+	Name string
+}
+
+func (request *CreateStream) Code() Code {
+	return CreateStreamCode
+}
+
+func (request *CreateStream) MarshalBinary() ([]byte, error) {
+	nameLength := len(request.Name)
+	serialized := make([]byte, payloadOffset+nameLength)
+	serialized[nameLengthOffset] = byte(nameLength)
+	copy(serialized[payloadOffset:], request.Name)
+	return serialized, nil
+}
+
+type GetStream struct {
+	StreamId iggcon.Identifier
+}
+
+func (g *GetStream) Code() Code {
+	return GetStreamCode
+}
+
+func (g *GetStream) MarshalBinary() ([]byte, error) {
+	return g.StreamId.MarshalBinary()
+}
+
+type GetStreams struct{}
+
+func (g *GetStreams) Code() Code {
+	return GetStreamsCode
+}
+
+func (g *GetStreams) MarshalBinary() ([]byte, error) {
+	return []byte{}, nil
+}
 
 type UpdateStream struct {
-	StreamId Identifier `json:"streamId"`
-	Name     string     `json:"name"`
+	StreamId iggcon.Identifier `json:"streamId"`
+	Name     string            `json:"name"`
 }
 
-func (u *UpdateStream) Code() CommandCode {
+func (u *UpdateStream) Code() Code {
 	return UpdateStreamCode
 }
+
 func (u *UpdateStream) MarshalBinary() ([]byte, error) {
 	streamIdBytes, err := u.StreamId.MarshalBinary()
 	if err != nil {
@@ -37,4 +83,16 @@ func (u *UpdateStream) MarshalBinary() ([]byte, error) {
 	bytes[position] = byte(nameLength)
 	copy(bytes[position+1:], u.Name)
 	return bytes, nil
+}
+
+type DeleteStream struct {
+	StreamId iggcon.Identifier
+}
+
+func (d *DeleteStream) Code() Code {
+	return DeleteStreamCode
+}
+
+func (d *DeleteStream) MarshalBinary() ([]byte, error) {
+	return d.StreamId.MarshalBinary()
 }
