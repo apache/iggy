@@ -171,7 +171,6 @@ public class AsyncIggyTcpClient {
         connectionPoolSize.ifPresent(poolConfigBuilder::setMaxConnections);
         acquireTimeout.ifPresent(timeout -> poolConfigBuilder.setAcquireTimeoutMillis(timeout.toMillis()));
         TCPConnectionPoolConfig poolConfig = poolConfigBuilder.build();
-        // TCPConnectionPoolConfig poolConfig = new TCPConnectionPoolConfig();
         connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate, poolConfig);
         return connection.connect().thenRun(() -> {
             messagesClient = new MessagesTcpClient(connection);
@@ -195,7 +194,7 @@ public class AsyncIggyTcpClient {
      * {@link UsersClient#login(String, String)} instead.
      *
      * @return a {@link CompletableFuture} that completes with the user's
-     *         {@link IdentityInfo} on success
+     * {@link IdentityInfo} on success
      * @throws IggyMissingCredentialsException if no credentials were provided at build time
      * @throws IggyNotConnectedException       if {@link #connect()} has not been called
      */
@@ -221,6 +220,7 @@ public class AsyncIggyTcpClient {
         }
         return usersClient;
     }
+
     /**
      * Returns the async messages client for producing and consuming messages.
      *

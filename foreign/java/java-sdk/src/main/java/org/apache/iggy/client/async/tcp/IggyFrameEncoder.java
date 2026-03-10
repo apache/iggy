@@ -24,26 +24,24 @@ import io.netty.buffer.ByteBufAllocator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public final class IggyFrameEncoder {
+final class IggyFrameEncoder {
     private static final Logger log = LoggerFactory.getLogger(IggyFrameEncoder.class);
 
     private IggyFrameEncoder() {}
 
-    public static ByteBuf encode(ByteBufAllocator alloc, int commandCode, ByteBuf payload) {
-
-        // Build the request frame exactly like the blocking client
-        // Frame format: [payload_size:4][command:4][payload:N]
-        // where payload_size = 4 (command size) + N (payload size)
+    /**
+     * Encodes a command into the Iggy TCP frame format: [payload_size:4][command:4][payload:N]
+     */
+    static ByteBuf encode(ByteBufAllocator alloc, int commandCode, ByteBuf payload) {
         int payloadSize = payload.readableBytes();
-        int framePayloadSize = 4 + payloadSize; // command (4 bytes) + payload
+        int framePayloadSize = 4 + payloadSize;
         ByteBuf frame = alloc.buffer(4 + framePayloadSize);
-        frame.writeIntLE(framePayloadSize); // Length field (includes command)
-        frame.writeIntLE(commandCode); // Command
-        frame.writeBytes(payload, payload.readerIndex(), payloadSize); // Payload
+        frame.writeIntLE(framePayloadSize);
+        frame.writeIntLE(commandCode);
+        frame.writeBytes(payload);
 
-        // Debug: print frame bytes
-        byte[] frameBytes = new byte[Math.min(frame.readableBytes(), 30)];
         if (log.isTraceEnabled()) {
+            byte[] frameBytes = new byte[Math.min(frame.readableBytes(), 30)];
             frame.getBytes(0, frameBytes);
             StringBuilder hex = new StringBuilder();
             for (byte b : frameBytes) {
@@ -55,7 +53,7 @@ public final class IggyFrameEncoder {
                     payloadSize,
                     framePayloadSize,
                     frame.readableBytes());
-            log.trace("Frame bytes (hex): {}", hex.toString());
+            log.trace("Frame bytes (hex): {}", hex);
         }
 
         return frame;
