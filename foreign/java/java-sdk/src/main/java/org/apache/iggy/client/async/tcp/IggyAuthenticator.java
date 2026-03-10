@@ -24,27 +24,42 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.util.AttributeKey;
 import org.apache.iggy.client.async.tcp.AsyncTcpConnection.IggyResponseHandler;
-import org.apache.iggy.exception.IggyAuthenticationException;
+import org.apache.iggy.exception.IggyNotConnectedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
-public final class IggyAuthenticator {
-    private static final AttributeKey<Boolean> AUTH_KEY = AttributeKey.valueOf("AUTH_KEY");
+final class IggyAuthenticator {
     private static final Logger log = LoggerFactory.getLogger(IggyAuthenticator.class);
+    private static final AttributeKey<Long> AUTH_GENERATION_KEY = AttributeKey.valueOf("AUTH_GENERATION");
 
     private IggyAuthenticator() {}
 
-    public static CompletableFuture<Void> ensureAuthenticated(Channel channel, ByteBuf loginPayload, int commandCode) {
-        Boolean isAuth = channel.attr(AUTH_KEY).get();
-        if (Boolean.TRUE.equals(isAuth)) {
+    /**
+     * Ensures the channel is authenticated for the current authentication generation.
+     * If the channel's stored generation matches the current one, it is already authenticated.
+     * Otherwise, sends a login command on the channel and updates the generation on success.
+     *
+     * @param channel           the channel to authenticate
+     * @param loginPayload      the login payload to send (will be released by this method)
+     * @param commandCode       the login command code
+     * @param currentGeneration the current authentication generation counter
+     * @return a future that completes when authentication is done
+     */
+    static CompletableFuture<Void> ensureAuthenticated(
+            Channel channel, ByteBuf loginPayload, int commandCode, AtomicLong currentGeneration) {
+        Long channelGeneration = channel.attr(AUTH_GENERATION_KEY).get();
+        long requiredGeneration = currentGeneration.get();
+
+        if (channelGeneration != null && channelGeneration == requiredGeneration) {
+            loginPayload.release();
             return CompletableFuture.completedFuture(null);
         }
-        if (loginPayload.equals(null)) {
-            return CompletableFuture.failedFuture(
-                    new IggyAuthenticationException(null, commandCode, "login first", null, null));
+
+        if (loginPayload == null) {
+            return CompletableFuture.failedFuture(new IggyNotConnectedException("Not authenticated, call login first"));
         }
 
         CompletableFuture<ByteBuf> loginFuture = new CompletableFuture<>();
@@ -54,14 +69,13 @@ public final class IggyAuthenticator {
         loginPayload.release();
         channel.writeAndFlush(frame).addListener((ChannelFutureListener) f -> {
             if (!f.isSuccess()) {
-                frame.release();
                 loginFuture.completeExceptionally(f.cause());
             }
         });
 
         return loginFuture.thenAccept(result -> {
             try {
-                channel.attr(AUTH_KEY).set(true);
+                channel.attr(AUTH_GENERATION_KEY).set(currentGeneration.get());
                 log.debug("Channel {} authenticated successfully", channel.id());
             } finally {
                 result.release();
@@ -69,11 +83,11 @@ public final class IggyAuthenticator {
         });
     }
 
-    public static void setAuthAttribute(Channel channel, AtomicBoolean value) {
-        channel.attr(AUTH_KEY).set(value.get());
+    static void setAuthGeneration(Channel channel, long generation) {
+        channel.attr(AUTH_GENERATION_KEY).set(generation);
     }
 
-    public static Boolean getAuthAttribute(Channel channel) {
-        return channel.attr(AUTH_KEY).get();
+    static void clearAuthGeneration(Channel channel) {
+        channel.attr(AUTH_GENERATION_KEY).set(null);
     }
 }
