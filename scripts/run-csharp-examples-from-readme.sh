@@ -189,12 +189,95 @@ for readme_file in README.md examples/csharp/README.md; do
         # Add a small delay between examples to avoid potential race conditions
         sleep 2
 
-    done < <(grep -E "^dotnet run --project" "${readme_file}")
+    done < <(grep -E "^dotnet run --project" "${readme_file}" | grep -v "TcpTls")
 done
 
-# Terminate server
+# Terminate non-TLS server
 kill -TERM "$(cat ${PID_FILE})"
 test -e ${PID_FILE} && rm ${PID_FILE}
+
+# Run TLS examples if non-TLS examples passed
+if [ "${exit_code}" -eq 0 ]; then
+    TLS_README="examples/csharp/README.md"
+    if [ -f "${TLS_README}" ] && grep -qE "^dotnet run --project.*TcpTls" "${TLS_README}"; then
+        echo ""
+        echo "=== Running TLS examples ==="
+        echo ""
+
+        # Clean up for fresh TLS start
+        test -d local_data && rm -fr local_data
+        test -e ${LOG_FILE} && rm ${LOG_FILE}
+
+        # Start TLS server
+        echo "Starting TLS server from ${SERVER_BIN}..."
+        IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+            IGGY_TCP_TLS_ENABLED=true \
+            IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
+            IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
+            ${SERVER_BIN} &>${LOG_FILE} &
+        echo $! >${PID_FILE}
+
+        # Wait for TLS server to start
+        SERVER_START_TIME=0
+        while ! grep -q "has started" ${LOG_FILE}; do
+            if [ ${SERVER_START_TIME} -gt ${TIMEOUT} ]; then
+                echo "TLS server did not start within ${TIMEOUT} seconds."
+                ps fx
+                cat ${LOG_FILE}
+                exit_code=1
+                break
+            fi
+            echo "Waiting for TLS Iggy server to start... ${SERVER_START_TIME}"
+            sleep 1
+            ((SERVER_START_TIME += 1))
+        done
+
+        if [ "${exit_code}" -eq 0 ]; then
+            while IFS= read -r command; do
+                # Remove backticks and comments from command
+                command=$(echo "${command}" | tr -d '`' | sed 's/^#.*//')
+                # Skip empty lines
+                if [ -z "${command}" ]; then
+                    continue
+                fi
+
+                # Add target flag if specified
+                if [ -n "${CSOS}" ]; then
+                    command="${command//dotnet run /dotnet run --os ${CSOS} }"
+                fi
+
+                if [ -n "${CSARCH}" ]; then
+                    command="${command//dotnet run /dotnet run --arch ${CSARCH} }"
+                fi
+
+                echo -e "\e[33mChecking TLS example command:\e[0m ${command}"
+                echo ""
+
+                set +e
+                eval "${command}"
+                exit_code=$?
+                set -e
+
+                # Stop at first failure
+                if [ ${exit_code} -ne 0 ]; then
+                    echo ""
+                    echo -e "\e[31mTLS example command failed:\e[0m ${command}"
+                    echo ""
+                    break
+                fi
+                # Add a small delay between examples to avoid potential race conditions
+                sleep 2
+
+            done < <(grep -E "^dotnet run --project.*TcpTls" "${TLS_README}")
+        fi
+
+        # Terminate TLS server
+        if [ -e ${PID_FILE} ]; then
+            kill -TERM "$(cat ${PID_FILE})" 2>/dev/null || true
+            rm -f ${PID_FILE}
+        fi
+    fi
+fi
 
 # If everything is ok remove log and pid files otherwise cat server log
 if [ "${exit_code}" -eq 0 ]; then

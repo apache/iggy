@@ -67,6 +67,19 @@ dotnet run --project  examples/csharp/src/MessageEnvelope/Iggy_SDK.Examples.Mess
 
 Uses MessagesGenerator to create OrderCreated, OrderConfirmed, and OrderRejected messages wrapped in JSON envelopes for type identification.
 
+## Security Examples
+
+### TCP/TLS
+
+Demonstrates secure TLS-encrypted TCP connections:
+
+```bash
+dotnet run --project  examples/csharp/src/TcpTls/Iggy_SDK.Examples.TcpTls.Producer
+dotnet run --project  examples/csharp/src/TcpTls/Iggy_SDK.Examples.TcpTls.Consumer
+```
+
+Uses `IggyClientConfigurator` with `TlsSettings` (Enabled, Hostname, CertificatePath) to establish TLS-encrypted TCP connections with CA certificate verification. The server must be started with TLS enabled (`IGGY_TCP_TLS_ENABLED=true`).
+
 ## Example Structure
 
 All examples can be executed directly from the repository. Follow these steps:
