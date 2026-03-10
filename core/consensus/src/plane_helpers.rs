@@ -466,7 +466,7 @@ mod tests {
         let mut buf = Vec::new();
         consensus.drain_loopback_into(&mut buf);
         assert_eq!(buf.len(), 1);
-        assert_eq!(buf[0].header().command, Command2::PrepareOk as u8);
+        assert_eq!(buf[0].header().command, Command2::PrepareOk);
 
         let typed: Message<PrepareOkHeader> = buf
             .remove(0)

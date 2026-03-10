@@ -245,11 +245,10 @@ where
         }
 
         let generic = self.as_generic();
-        if generic.header().command != T::COMMAND as u8 {
+        if generic.header().command != T::COMMAND {
             return Err(header::ConsensusError::InvalidCommand {
                 expected: T::COMMAND,
-                found: header::Command2::try_from(generic.header().command)
-                    .unwrap_or(header::Command2::Reserved),
+                found: generic.header().command,
             });
         }
 
@@ -281,11 +280,10 @@ where
 
         // check the command matches
         let generic = self.as_generic();
-        if generic.header().command != T::COMMAND as u8 {
+        if generic.header().command != T::COMMAND {
             return Err(header::ConsensusError::InvalidCommand {
                 expected: T::COMMAND,
-                found: header::Command2::try_from(generic.header().command)
-                    .unwrap_or(header::Command2::Reserved),
+                found: generic.header().command,
             });
         }
 
@@ -346,9 +344,6 @@ where
 
     fn try_from(value: Message<T>) -> Result<Self, Self::Error> {
         let command = value.as_generic().header().command;
-        let command = header::Command2::try_from(command)
-            .map_err(header::ConsensusError::InvalidCommandByte)?;
-
         let buffer = value.into_inner();
 
         // SAFETY: All Message<H> types have identical memory layout (only PhantomData differs).
@@ -395,13 +390,13 @@ mod tests {
 
             let mut buffer = BytesMut::zeroed(total_size);
 
-            // GenericHeader is Pod, so from_bytes_mut works on zeroed bytes.
-            let header = bytemuck::from_bytes_mut::<Self>(&mut buffer[..header_size]);
+            let header = bytemuck::checked::try_from_bytes_mut::<Self>(&mut buffer[..header_size])
+                .expect("zeroed bytes are valid");
 
             header.checksum = 123456;
             header.cluster = 12345;
             header.size = total_size as u32;
-            header.command = header::Command2::Reserved as u8;
+            header.command = header::Command2::Reserved;
 
             for (i, item) in buffer
                 .iter_mut()
@@ -496,7 +491,7 @@ mod tests {
         let message = header::GenericHeader::create_test();
 
         assert_eq!(message.header().cluster, 12345);
-        assert_eq!(message.header().command, header::Command2::Reserved as u8);
+        assert_eq!(message.header().command, header::Command2::Reserved);
         assert_eq!(
             message.body().len(),
             message.header().size() as usize - size_of::<header::GenericHeader>()
@@ -517,10 +512,7 @@ mod tests {
         let original_bytes = prepare_message.as_bytes().to_vec();
 
         let generic_message = prepare_message.into_generic();
-        assert_eq!(
-            generic_message.header().command,
-            header::Command2::Prepare as u8
-        );
+        assert_eq!(generic_message.header().command, header::Command2::Prepare);
 
         let prepare_again: Message<header::PrepareHeader> =
             generic_message.try_into_typed().unwrap();
