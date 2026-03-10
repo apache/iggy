@@ -78,7 +78,7 @@ pub async fn replicate_to_next_in_chain<B, P>(
 {
     let header = message.header();
 
-    assert_eq!(header.command, Command2::Prepare as u8);
+    assert_eq!(header.command, Command2::Prepare);
     assert!(header.op > consensus.commit());
 
     let next = (consensus.replica() + 1) % consensus.replica_count();
@@ -116,7 +116,7 @@ where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
     P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
 {
-    assert_eq!(header.command, Command2::Prepare as u8);
+    assert_eq!(header.command, Command2::Prepare);
 
     if consensus.is_syncing() {
         return Err("sync");
@@ -240,7 +240,8 @@ where
     let total_size = header_size + body.len();
     let mut buffer = bytes::BytesMut::zeroed(total_size);
 
-    let header = bytemuck::from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size]);
+    let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size])
+        .expect("zeroed bytes are valid");
     *header = ReplyHeader {
         checksum: 0,
         checksum_body: 0,
@@ -248,7 +249,7 @@ where
         size: total_size as u32,
         view: consensus.view(),
         release: 0,
-        command: Command2::Reply as u8,
+        command: Command2::Reply,
         replica: consensus.replica(),
         reserved_frame: [0; 66],
         request_checksum: prepare_header.request_checksum,
@@ -301,7 +302,7 @@ pub async fn send_prepare_ok<B, P>(
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
     P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
 {
-    assert_eq!(header.command, Command2::Prepare as u8);
+    assert_eq!(header.command, Command2::Prepare);
 
     if consensus.status() != Status::Normal {
         return;
@@ -327,7 +328,7 @@ pub async fn send_prepare_ok<B, P>(
     }
 
     let prepare_ok_header = PrepareOkHeader {
-        command: Command2::PrepareOk as u8,
+        command: Command2::PrepareOk,
         cluster: consensus.cluster(),
         replica: consensus.replica(),
         view: consensus.view(),
@@ -405,7 +406,7 @@ mod tests {
         Message::<PrepareHeader>::new(std::mem::size_of::<PrepareHeader>()).transmute_header(
             |_, new| {
                 *new = PrepareHeader {
-                    command: Command2::Prepare as u8,
+                    command: Command2::Prepare,
                     op,
                     parent,
                     checksum,
@@ -452,7 +453,7 @@ mod tests {
         consensus.init();
 
         let prepare_header = PrepareHeader {
-            command: Command2::Prepare as u8,
+            command: Command2::Prepare,
             cluster: 1,
             view: 0,
             op: 0,
@@ -471,7 +472,7 @@ mod tests {
             .remove(0)
             .try_into_typed()
             .expect("loopback message must be PrepareOk");
-        assert_eq!(typed.header().command, Command2::PrepareOk as u8);
+        assert_eq!(typed.header().command, Command2::PrepareOk);
     }
 
     #[test]
@@ -492,7 +493,7 @@ mod tests {
             size: 0,
             view: 3,
             release: 0,
-            command: Command2::StartViewChange as u8,
+            command: Command2::StartViewChange,
             replica: 1,
             reserved_frame: [0; 66],
             namespace: 0,
@@ -512,7 +513,7 @@ mod tests {
             size: 0,
             view: 3,
             release: 0,
-            command: Command2::DoViewChange as u8,
+            command: Command2::DoViewChange,
             replica: 2,
             reserved_frame: [0; 66],
             op: 0,
@@ -546,7 +547,7 @@ mod tests {
         consensus.init();
 
         let prepare_header = PrepareHeader {
-            command: Command2::Prepare as u8,
+            command: Command2::Prepare,
             cluster: 1,
             view: 0,
             op: 0,

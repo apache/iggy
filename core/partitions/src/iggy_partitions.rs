@@ -470,15 +470,14 @@ where
         {
             let entry_namespace = IggyNamespace::from_raw(prepare_header.namespace);
 
-            // operation byte already validated upstream, so we ignore the error here and throw warning.
-            match Operation::try_from(prepare_header.operation) {
-                Ok(Operation::SendMessages) => {
+            match prepare_header.operation {
+                Operation::SendMessages => {
                     if committed_ns.insert(entry_namespace) {
                         self.commit_messages(&entry_namespace).await;
                     }
                     debug!("on_ack: messages committed for op={}", prepare_header.op,);
                 }
-                Ok(Operation::StoreConsumerOffset) => {
+                Operation::StoreConsumerOffset => {
                     // TODO: Commit consumer offset update.
                     debug!(
                         "on_ack: consumer offset committed for op={}",
@@ -567,8 +566,8 @@ where
             .expect("apply_replicated_operation: consensus not initialized");
         let header = message.header();
 
-        match Operation::try_from(header.operation) {
-            Ok(Operation::SendMessages) => {
+        match header.operation {
+            Operation::SendMessages => {
                 let body = message.body_bytes();
                 self.append_send_messages_to_journal(namespace, body.as_ref())
                     .await;
@@ -579,7 +578,7 @@ where
                     "on_replicate: send_messages appended to partition journal"
                 );
             }
-            Ok(Operation::StoreConsumerOffset) => {
+            Operation::StoreConsumerOffset => {
                 // TODO: Deserialize consumer offset from prepare body
                 // and store in partition's consumer_offsets.
                 debug!(

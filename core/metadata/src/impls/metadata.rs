@@ -299,7 +299,7 @@ where
         // TODO: calculate the index;
         #[allow(clippy::cast_possible_truncation)]
         let idx = header.op as usize;
-        assert_eq!(header.command, Command2::Prepare as u8);
+        assert_eq!(header.command, Command2::Prepare);
         assert!(
             journal.handle().header(idx).is_none(),
             "replicate: must not already have prepare"

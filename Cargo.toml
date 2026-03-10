@@ -87,7 +87,7 @@ bit-set = "0.8.0"
 blake3 = "1.8.3"
 bon = "3.8.2"
 byte-unit = { version = "5.2.0", default-features = false, features = ["serde", "byte", "std"] }
-bytemuck = { version = "1.25" }
+bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
 bytes = "1.11.1"
 charming = "0.6.0"
 chrono = { version = "0.4.43", features = ["serde"] }

@@ -248,10 +248,9 @@ macro_rules! collect_handlers {
                     use ::iggy_common::BytesSerializable;
                     use ::iggy_common::Either;
                     use ::iggy_common::header::Operation;
-                    // operation byte already validated upstream, so we ignore the error here
-                    match Operation::try_from(input.header().operation).ok() {
+                    match input.header().operation {
                         $(
-                            Some(Operation::$operation) => {
+                            Operation::$operation => {
                                 let body = input.body_bytes();
                                 let cmd = $operation::from_bytes(body)?;
                                 Ok(Either::Left([<$state Command>]::$operation(cmd)))

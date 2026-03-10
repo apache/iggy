@@ -1158,7 +1158,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// - If `header.command` is not `Command2::PrepareOk`.
     /// - If `header.replica >= self.replica_count`.
     pub fn handle_prepare_ok(&self, header: &PrepareOkHeader) -> bool {
-        assert_eq!(header.command, Command2::PrepareOk as u8);
+        assert_eq!(header.command, Command2::PrepareOk);
         assert!(
             header.replica < self.replica_count,
             "handle_prepare_ok: invalid replica {}",
@@ -1271,7 +1271,7 @@ where
                 size: old.size,
                 view: consensus.view.get(),
                 release: old.release,
-                command: Command2::Prepare as u8,
+                command: Command2::Prepare,
                 replica: consensus.replica,
                 client: old.client,
                 parent: consensus.last_prepare_checksum(),
@@ -1298,7 +1298,7 @@ where
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareOkHeader> {
         self.transmute_header(|old, new| {
             *new = PrepareOkHeader {
-                command: Command2::PrepareOk as u8,
+                command: Command2::PrepareOk,
                 parent: old.parent,
                 prepare_checksum: old.checksum,
                 request: old.request,

@@ -110,8 +110,8 @@ impl SimClient {
         let total_size = header_size + payload.len();
 
         let header = RequestHeader {
-            command: iggy_common::header::Command2::Request as u8,
-            operation: operation as u8,
+            command: iggy_common::header::Command2::Request,
+            operation,
             size: total_size as u32,
             cluster: 0,
             checksum: 0,
@@ -145,8 +145,8 @@ impl SimClient {
         let total_size = header_size + payload.len();
 
         let header = RequestHeader {
-            command: iggy_common::header::Command2::Request as u8,
-            operation: operation as u8,
+            command: iggy_common::header::Command2::Request,
+            operation,
             size: total_size as u32,
             cluster: 0, // TODO: Get from config
             checksum: 0,

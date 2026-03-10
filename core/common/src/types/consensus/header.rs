@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytemuck::{Pod, Zeroable};
+use bytemuck::{CheckedBitPattern, NoUninit, Pod, Zeroable};
 use enumset::EnumSetType;
 use thiserror::Error;
 
 const HEADER_SIZE: usize = 256;
-pub trait ConsensusHeader: Sized + Pod + Zeroable {
+pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
     const COMMAND: Command2;
 
     fn validate(&self) -> Result<(), ConsensusError>;
@@ -49,6 +49,18 @@ pub enum Command2 {
     StartViewChange = 10,
     DoViewChange = 11,
     StartView = 12,
+}
+
+// SAFETY: Command2 is #[repr(u8)] with no padding bytes.
+unsafe impl NoUninit for Command2 {}
+
+// SAFETY: Command2 is #[repr(u8)]; is_valid_bit_pattern matches all defined discriminants.
+unsafe impl CheckedBitPattern for Command2 {
+    type Bits = u8;
+
+    fn is_valid_bit_pattern(bits: &u8) -> bool {
+        *bits <= 12
+    }
 }
 
 impl TryFrom<u8> for Command2 {
@@ -118,13 +130,16 @@ pub enum ConsensusError {
 
     #[error("context_padding must be 0")]
     ReplyContextPaddingNonZero,
+
+    #[error("invalid bit pattern in header (enum discriminant out of range)")]
+    InvalidBitPattern,
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, NoUninit, CheckedBitPattern)]
 #[repr(u8)]
 pub enum Operation {
     #[default]
-    Default = 0,
+    Reserved = 0,
     CreateStream = 128,
     UpdateStream = 129,
     DeleteStream = 130,
@@ -149,8 +164,6 @@ pub enum Operation {
     // Partition operations (replicated via consensus)
     SendMessages = 160,
     StoreConsumerOffset = 161,
-
-    Reserved = 200,
 }
 
 impl TryFrom<u8> for Operation {
@@ -158,7 +171,7 @@ impl TryFrom<u8> for Operation {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Operation::Default),
+            0 => Ok(Operation::Reserved),
             128 => Ok(Operation::CreateStream),
             129 => Ok(Operation::UpdateStream),
             130 => Ok(Operation::DeleteStream),
@@ -181,7 +194,6 @@ impl TryFrom<u8> for Operation {
             147 => Ok(Operation::DeletePersonalAccessToken),
             160 => Ok(Operation::SendMessages),
             161 => Ok(Operation::StoreConsumerOffset),
-            200 => Ok(Operation::Reserved),
             _ => Err(value),
         }
     }
@@ -264,7 +276,7 @@ impl ConsensusHeader for GenericHeader {
     const COMMAND: Command2 = Command2::Reserved;
 
     fn operation(&self) -> Operation {
-        Operation::Default
+        Operation::Reserved
     }
 
     fn command(&self) -> Command2 {
@@ -282,7 +294,7 @@ impl ConsensusHeader for GenericHeader {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct RequestHeader {
     pub checksum: u128,
     pub checksum_body: u128,
@@ -290,7 +302,7 @@ pub struct RequestHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: u8,
+    pub command: Command2,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -298,7 +310,7 @@ pub struct RequestHeader {
     pub request_checksum: u128,
     pub timestamp: u64,
     pub request: u64,
-    pub operation: u8,
+    pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
     pub reserved: [u8; 64],
@@ -327,14 +339,14 @@ impl Default for RequestHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: 0,
+            command: Command2::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             client: 0,
             request_checksum: 0,
             timestamp: 0,
             request: 0,
-            operation: 0,
+            operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
             reserved: [0; 64],
@@ -342,29 +354,24 @@ impl Default for RequestHeader {
     }
 }
 
-unsafe impl Pod for RequestHeader {}
-unsafe impl Zeroable for RequestHeader {}
-
 impl ConsensusHeader for RequestHeader {
     const COMMAND: Command2 = Command2::Request;
 
     fn operation(&self) -> Operation {
-        Operation::try_from(self.operation).expect("validate() must be called first")
+        self.operation
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        let cmd = Command2::try_from(self.command).map_err(ConsensusError::InvalidCommandByte)?;
-        if cmd != Command2::Request {
+        if self.command != Command2::Request {
             return Err(ConsensusError::InvalidCommand {
                 expected: Command2::Request,
-                found: cmd,
+                found: self.command,
             });
         }
-        Operation::try_from(self.operation).map_err(ConsensusError::InvalidOperationByte)?;
         Ok(())
     }
     fn command(&self) -> Command2 {
-        Command2::try_from(self.command).expect("validate() must be called first")
+        self.command
     }
 
     fn size(&self) -> u32 {
@@ -374,7 +381,7 @@ impl ConsensusHeader for RequestHeader {
 
 // TODO: Manually impl default (and use a const for the `release`)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct PrepareHeader {
     pub checksum: u128,
     pub checksum_body: u128,
@@ -382,7 +389,7 @@ pub struct PrepareHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: u8,
+    pub command: Command2,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -393,7 +400,7 @@ pub struct PrepareHeader {
     pub commit: u64,
     pub timestamp: u64,
     pub request: u64,
-    pub operation: u8,
+    pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
     pub reserved: [u8; 32],
@@ -413,29 +420,24 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for PrepareHeader {}
-unsafe impl Zeroable for PrepareHeader {}
-
 impl ConsensusHeader for PrepareHeader {
     const COMMAND: Command2 = Command2::Prepare;
 
     fn operation(&self) -> Operation {
-        Operation::try_from(self.operation).expect("validate() must be called first")
+        self.operation
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        let cmd = Command2::try_from(self.command).map_err(ConsensusError::InvalidCommandByte)?;
-        if cmd != Command2::Prepare {
+        if self.command != Command2::Prepare {
             return Err(ConsensusError::InvalidCommand {
                 expected: Command2::Prepare,
-                found: cmd,
+                found: self.command,
             });
         }
-        Operation::try_from(self.operation).map_err(ConsensusError::InvalidOperationByte)?;
         Ok(())
     }
     fn command(&self) -> Command2 {
-        Command2::try_from(self.command).expect("validate() must be called first")
+        self.command
     }
 
     fn size(&self) -> u32 {
@@ -452,7 +454,7 @@ impl Default for PrepareHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: 0,
+            command: Command2::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             client: 0,
@@ -462,7 +464,7 @@ impl Default for PrepareHeader {
             commit: 0,
             timestamp: 0,
             request: 0,
-            operation: 0,
+            operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
             reserved: [0; 32],
@@ -472,7 +474,7 @@ impl Default for PrepareHeader {
 
 // TODO: Manually impl default (and use a const for the `release`)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct PrepareOkHeader {
     pub checksum: u128,
     pub checksum_body: u128,
@@ -480,7 +482,7 @@ pub struct PrepareOkHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: u8,
+    pub command: Command2,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -490,7 +492,7 @@ pub struct PrepareOkHeader {
     pub commit: u64,
     pub timestamp: u64,
     pub request: u64,
-    pub operation: u8,
+    pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
     pub reserved: [u8; 48],
@@ -510,28 +512,23 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for PrepareOkHeader {}
-unsafe impl Zeroable for PrepareOkHeader {}
-
 impl ConsensusHeader for PrepareOkHeader {
     const COMMAND: Command2 = Command2::PrepareOk;
 
     fn operation(&self) -> Operation {
-        Operation::try_from(self.operation).expect("validate() must be called first")
+        self.operation
     }
     fn command(&self) -> Command2 {
-        Command2::try_from(self.command).expect("validate() must be called first")
+        self.command
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        let cmd = Command2::try_from(self.command).map_err(ConsensusError::InvalidCommandByte)?;
-        if cmd != Command2::PrepareOk {
+        if self.command != Command2::PrepareOk {
             return Err(ConsensusError::InvalidCommand {
                 expected: Command2::PrepareOk,
-                found: cmd,
+                found: self.command,
             });
         }
-        Operation::try_from(self.operation).map_err(ConsensusError::InvalidOperationByte)?;
         Ok(())
     }
 
@@ -549,7 +546,7 @@ impl Default for PrepareOkHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: 0,
+            command: Command2::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             parent: 0,
@@ -558,7 +555,7 @@ impl Default for PrepareOkHeader {
             commit: 0,
             timestamp: 0,
             request: 0,
-            operation: 0,
+            operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
             reserved: [0; 48],
@@ -567,7 +564,7 @@ impl Default for PrepareOkHeader {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct CommitHeader {
     pub checksum: u128,
     pub checksum_body: u128,
@@ -575,7 +572,7 @@ pub struct CommitHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: u8,
+    pub command: Command2,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -601,22 +598,18 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for CommitHeader {}
-unsafe impl Zeroable for CommitHeader {}
-
 impl ConsensusHeader for CommitHeader {
     const COMMAND: Command2 = Command2::Commit;
 
     fn operation(&self) -> Operation {
-        Operation::Default
+        Operation::Reserved
     }
     fn command(&self) -> Command2 {
-        Command2::try_from(self.command).expect("validate() must be called first")
+        self.command
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        let cmd = Command2::try_from(self.command).map_err(ConsensusError::InvalidCommandByte)?;
-        if cmd != Command2::Commit {
+        if self.command != Command2::Commit {
             return Err(ConsensusError::CommitInvalidCommand2);
         }
         if self.size != 256 {
@@ -631,7 +624,7 @@ impl ConsensusHeader for CommitHeader {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct ReplyHeader {
     pub checksum: u128,
     pub checksum_body: u128,
@@ -639,7 +632,7 @@ pub struct ReplyHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: u8,
+    pub command: Command2,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -649,7 +642,7 @@ pub struct ReplyHeader {
     pub commit: u64,
     pub timestamp: u64,
     pub request: u64,
-    pub operation: u8,
+    pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
     pub reserved: [u8; 48],
@@ -669,25 +662,20 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for ReplyHeader {}
-unsafe impl Zeroable for ReplyHeader {}
-
 impl ConsensusHeader for ReplyHeader {
     const COMMAND: Command2 = Command2::Reply;
 
     fn operation(&self) -> Operation {
-        Operation::try_from(self.operation).expect("validate() must be called first")
+        self.operation
     }
     fn command(&self) -> Command2 {
-        Command2::try_from(self.command).expect("validate() must be called first")
+        self.command
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        let cmd = Command2::try_from(self.command).map_err(ConsensusError::InvalidCommandByte)?;
-        if cmd != Command2::Reply {
+        if self.command != Command2::Reply {
             return Err(ConsensusError::ReplyInvalidCommand2);
         }
-        Operation::try_from(self.operation).map_err(ConsensusError::InvalidOperationByte)?;
         Ok(())
     }
 
@@ -705,7 +693,7 @@ impl Default for ReplyHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: 0,
+            command: Command2::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             request_checksum: 0,
@@ -714,7 +702,7 @@ impl Default for ReplyHeader {
             commit: 0,
             timestamp: 0,
             request: 0,
-            operation: 0,
+            operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
             reserved: [0; 48],
@@ -726,7 +714,7 @@ impl Default for ReplyHeader {
 ///
 /// Sent by a replica when it suspects the primary has failed.
 /// This is a header-only message with no body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct StartViewChangeHeader {
     pub checksum: u128,
@@ -735,7 +723,7 @@ pub struct StartViewChangeHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: u8,
+    pub command: Command2,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -757,25 +745,21 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for StartViewChangeHeader {}
-unsafe impl Zeroable for StartViewChangeHeader {}
-
 impl ConsensusHeader for StartViewChangeHeader {
     const COMMAND: Command2 = Command2::StartViewChange;
 
     fn operation(&self) -> Operation {
-        Operation::Default
+        Operation::Reserved
     }
     fn command(&self) -> Command2 {
-        Command2::try_from(self.command).expect("validate() must be called first")
+        self.command
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        let cmd = Command2::try_from(self.command).map_err(ConsensusError::InvalidCommandByte)?;
-        if cmd != Command2::StartViewChange {
+        if self.command != Command2::StartViewChange {
             return Err(ConsensusError::InvalidCommand {
                 expected: Command2::StartViewChange,
-                found: cmd,
+                found: self.command,
             });
         }
 
@@ -794,7 +778,7 @@ impl ConsensusHeader for StartViewChangeHeader {
 ///
 /// Sent by replicas to the primary candidate after collecting a quorum of
 /// StartViewChange messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct DoViewChangeHeader {
     pub checksum: u128,
@@ -803,7 +787,7 @@ pub struct DoViewChangeHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: u8,
+    pub command: Command2,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -835,25 +819,21 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for DoViewChangeHeader {}
-unsafe impl Zeroable for DoViewChangeHeader {}
-
 impl ConsensusHeader for DoViewChangeHeader {
     const COMMAND: Command2 = Command2::DoViewChange;
 
     fn operation(&self) -> Operation {
-        Operation::Default
+        Operation::Reserved
     }
     fn command(&self) -> Command2 {
-        Command2::try_from(self.command).expect("validate() must be called first")
+        self.command
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        let cmd = Command2::try_from(self.command).map_err(ConsensusError::InvalidCommandByte)?;
-        if cmd != Command2::DoViewChange {
+        if self.command != Command2::DoViewChange {
             return Err(ConsensusError::InvalidCommand {
                 expected: Command2::DoViewChange,
-                found: cmd,
+                found: self.command,
             });
         }
 
@@ -888,7 +868,7 @@ impl ConsensusHeader for DoViewChangeHeader {
 ///
 /// Sent by the new primary to all replicas after collecting a quorum of
 /// DoViewChange messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct StartViewHeader {
     pub checksum: u128,
@@ -897,7 +877,7 @@ pub struct StartViewHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: u8,
+    pub command: Command2,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -926,25 +906,21 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for StartViewHeader {}
-unsafe impl Zeroable for StartViewHeader {}
-
 impl ConsensusHeader for StartViewHeader {
     const COMMAND: Command2 = Command2::StartView;
 
     fn operation(&self) -> Operation {
-        Operation::Default
+        Operation::Reserved
     }
     fn command(&self) -> Command2 {
-        Command2::try_from(self.command).expect("validate() must be called first")
+        self.command
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        let cmd = Command2::try_from(self.command).map_err(ConsensusError::InvalidCommandByte)?;
-        if cmd != Command2::StartView {
+        if self.command != Command2::StartView {
             return Err(ConsensusError::InvalidCommand {
                 expected: Command2::StartView,
-                found: cmd,
+                found: self.command,
             });
         }
 
@@ -1012,7 +988,7 @@ mod tests {
     #[test]
     fn operation_try_from_valid() {
         let cases = [
-            (0, Operation::Default),
+            (0, Operation::Reserved),
             (128, Operation::CreateStream),
             (129, Operation::UpdateStream),
             (130, Operation::DeleteStream),
@@ -1035,7 +1011,6 @@ mod tests {
             (147, Operation::DeletePersonalAccessToken),
             (160, Operation::SendMessages),
             (161, Operation::StoreConsumerOffset),
-            (200, Operation::Reserved),
         ];
         for (byte, expected) in cases {
             assert_eq!(Operation::try_from(byte), Ok(expected), "byte {byte}");
@@ -1044,7 +1019,7 @@ mod tests {
 
     #[test]
     fn operation_try_from_invalid() {
-        for byte in [1, 127, 148, 159, 162, 199, 201, 255] {
+        for byte in [1, 127, 148, 159, 162, 199, 200, 201, 255] {
             assert_eq!(Operation::try_from(byte), Err(byte), "byte {byte}");
         }
     }
@@ -1053,7 +1028,7 @@ mod tests {
     fn operation_roundtrip() {
         let valid_bytes: &[u8] = &[
             0, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144,
-            145, 146, 147, 160, 161, 200,
+            145, 146, 147, 160, 161,
         ];
         for &byte in valid_bytes {
             let op = Operation::try_from(byte).unwrap();

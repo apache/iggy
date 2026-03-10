@@ -18,7 +18,7 @@
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, Receiver, ShardFrame};
 use futures::FutureExt;
-use iggy_common::header::{ConsensusError, GenericHeader, Operation, PrepareHeader};
+use iggy_common::header::{ConsensusError, GenericHeader, PrepareHeader};
 use iggy_common::message::{Message, MessageBag};
 use iggy_common::sharding::IggyNamespace;
 use journal::{Journal, JournalHandle};
@@ -44,7 +44,14 @@ where
     /// or `PrepareOk`) to access the operation and namespace, then resolves
     /// the target shard and enqueues the message via its channel sender.
     pub fn dispatch(&self, message: Message<GenericHeader>) {
-        let (operation_byte, namespace, generic) = match MessageBag::from(message) {
+        let bag = match MessageBag::try_from(message) {
+            Ok(bag) => bag,
+            Err(e) => {
+                tracing::warn!(shard = self.id, error = %e, "dropping message with invalid command");
+                return;
+            }
+        };
+        let (operation, namespace, generic) = match bag {
             MessageBag::Request(ref r) => {
                 let h = r.header();
                 (h.operation, h.namespace, r.as_generic().clone())
@@ -56,17 +63,6 @@ where
             MessageBag::PrepareOk(ref p) => {
                 let h = p.header();
                 (h.operation, h.namespace, p.as_generic().clone())
-            }
-        };
-        let operation = match Operation::try_from(operation_byte) {
-            Ok(op) => op,
-            Err(byte) => {
-                tracing::warn!(
-                    shard = self.id,
-                    byte,
-                    "dispatch: unknown operation byte, dropping message"
-                );
-                return;
             }
         };
         let namespace = IggyNamespace::from_raw(namespace);
@@ -91,11 +87,15 @@ where
 
     /// Dispatch a message and return a receiver that resolves when the target
     /// shard has finished processing it.
+    ///
+    /// # Errors
+    /// Returns `ConsensusError` if the message cannot be routed.
     pub fn dispatch_request(
         &self,
         message: Message<GenericHeader>,
     ) -> Result<Receiver<R>, ConsensusError> {
-        let (operation_byte, namespace, generic) = match MessageBag::from(message) {
+        let bag = MessageBag::try_from(message)?;
+        let (operation, namespace, generic) = match bag {
             MessageBag::Request(ref r) => {
                 let h = r.header();
                 (h.operation, h.namespace, r.as_generic().clone())
@@ -109,8 +109,6 @@ where
                 (h.operation, h.namespace, p.as_generic().clone())
             }
         };
-        let operation =
-            Operation::try_from(operation_byte).map_err(ConsensusError::InvalidOperationByte)?;
         let namespace = IggyNamespace::from_raw(namespace);
 
         // Determine which shard should handle a message given its operation and
