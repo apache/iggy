@@ -94,11 +94,12 @@ runs:
     - name: Install dependencies for Rust tests
       if: inputs.task == 'test' && runner.os == 'Linux'
       run: |
-        sudo apt-get update --yes && sudo apt-get install --yes musl-tools gnome-keyring keyutils dbus-x11
+        sudo apt-get update --yes && sudo apt-get install --yes musl-tools gnome-keyring keyutils dbus-x11 libsecret-tools
         rm -f $HOME/.local/share/keyrings/*
         eval $(dbus-launch --sh-syntax)
         echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> $GITHUB_ENV
-        echo -n "test" | gnome-keyring-daemon --unlock --components=secrets
+        eval $(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)
+        echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
       shell: bash
 
     - name: Install cargo-llvm-cov
