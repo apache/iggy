@@ -46,7 +46,7 @@ impl Storage for MemStorage {
     }
 
     async fn read(&self, offset: usize, len: usize) -> Self::Buffer {
-        let buffer = vec![0; len];
+        let mut buffer = vec![0; len];
         let data = self.data.borrow();
         let end = offset + buffer.len();
         if offset < data.len() && end <= data.len() {

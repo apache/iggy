@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use iggy_common::{
-    INDEX_SIZE, IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, PooledBuffer,
+    IggyMessagesBatchMut, IggyMessagesBatchSet,
     header::{Operation, PrepareHeader},
     message::Message,
 };
@@ -28,21 +28,6 @@ use std::{
 };
 
 const ZERO_LEN: usize = 0;
-
-// TODO: Fix that, we need to figure out how to store the `IggyMessagesBatchSet`.
-/// No-op storage backend for the in-memory partition journal.
-#[derive(Debug)]
-pub struct Noop;
-
-impl Storage for Noop {
-    type Buffer = ();
-
-    async fn write(&self, _buf: ()) -> usize {
-        0
-    }
-
-    async fn read(&self, _offset: usize, _len: usize) -> () {}
-}
 
 /// Lookup key for querying messages from the journal.
 #[derive(Debug, Clone, Copy)]
@@ -59,42 +44,7 @@ impl std::ops::Deref for MessageLookup {
     }
 }
 
-// [LEGACY]
-pub struct PartitionJournal {
-    batch_set: UnsafeCell<IggyMessagesBatchSet>,
-}
-
-impl PartitionJournal {
-    pub fn new() -> Self {
-        Self {
-            batch_set: UnsafeCell::new(IggyMessagesBatchSet::empty()),
-        }
-    }
-
-    /// Drain all accumulated batches, returning the batch set.
-    pub fn commit(&self) -> IggyMessagesBatchSet {
-        let batch_set = unsafe { &mut *self.batch_set.get() };
-        std::mem::take(batch_set)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        let batch_set = unsafe { &*self.batch_set.get() };
-        batch_set.is_empty()
-    }
-}
-
-impl Default for PartitionJournal {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Debug for PartitionJournal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PartitionJournal").finish()
-    }
-}
-
+#[allow(dead_code)]
 pub trait PartitionJournal2<S>: Journal<S>
 where
     S: Storage,
@@ -104,7 +54,7 @@ where
     fn get(&self, query: &Self::Query) -> impl Future<Output = Option<IggyMessagesBatchSet>>;
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct PartitionJournalMemStorage {
     entries: UnsafeCell<Vec<Bytes>>,
     op_to_index: UnsafeCell<HashMap<u64, usize>>,
@@ -154,6 +104,31 @@ where
     inner: UnsafeCell<JournalInner<S>>,
 }
 
+impl<S> Default for PartitionJournal2Impl<S>
+where
+    S: Storage<Buffer = Bytes> + Default,
+{
+    fn default() -> Self {
+        Self {
+            message_offset_to_op: UnsafeCell::new(BTreeMap::new()),
+            timestamp_to_op: UnsafeCell::new(BTreeMap::new()),
+            headers: UnsafeCell::new(Vec::new()),
+            inner: UnsafeCell::new(JournalInner {
+                storage: S::default(),
+            }),
+        }
+    }
+}
+
+impl<S> std::fmt::Debug for PartitionJournal2Impl<S>
+where
+    S: Storage<Buffer = Bytes>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartitionJournal2Impl").finish()
+    }
+}
+
 struct JournalInner<S>
 where
     S: Storage<Buffer = Bytes>,
@@ -161,49 +136,68 @@ where
     storage: S,
 }
 
+impl PartitionJournalMemStorage {
+    fn drain(&self) -> Vec<Bytes> {
+        let entries = unsafe { &mut *self.entries.get() };
+        let drained = std::mem::take(entries);
+        let op_to_index = unsafe { &mut *self.op_to_index.get() };
+        op_to_index.clear();
+        drained
+    }
+
+    fn is_empty(&self) -> bool {
+        let entries = unsafe { &*self.entries.get() };
+        entries.is_empty()
+    }
+}
+
+impl PartitionJournal2Impl<PartitionJournalMemStorage> {
+    /// Drain all accumulated batches, matching the legacy PartitionJournal API.
+    pub fn commit(&self) -> IggyMessagesBatchSet {
+        let entries = {
+            let inner = unsafe { &*self.inner.get() };
+            inner.storage.drain()
+        };
+
+        let mut messages = Vec::with_capacity(entries.len());
+        for bytes in entries {
+            if let Ok(message) = Message::from_bytes(bytes) {
+                messages.push(message);
+            }
+        }
+
+        let headers = unsafe { &mut *self.headers.get() };
+        headers.clear();
+        let offsets = unsafe { &mut *self.message_offset_to_op.get() };
+        offsets.clear();
+        let timestamps = unsafe { &mut *self.timestamp_to_op.get() };
+        timestamps.clear();
+
+        Self::messages_to_batch_set(&messages)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let inner = unsafe { &*self.inner.get() };
+        inner.storage.is_empty()
+    }
+}
+
 impl<S> PartitionJournal2Impl<S>
 where
     S: Storage<Buffer = Bytes>,
 {
-    fn decode_send_messages_batch(body: bytes::Bytes) -> Option<IggyMessagesBatchMut> {
-        // TODO: This is bad,
-        let mut body = body
-            .try_into_mut()
-            .unwrap_or_else(|body| BytesMut::from(body.as_ref()));
-
-        if body.len() < 4 {
-            return None;
-        }
-
-        let count_bytes = body.split_to(4);
-        let count = u32::from_le_bytes(count_bytes.as_ref().try_into().ok()?);
-        let indexes_len = (count as usize).checked_mul(INDEX_SIZE)?;
-
-        if body.len() < indexes_len {
-            return None;
-        }
-
-        let indexes_bytes = body.split_to(indexes_len);
-        let indexes = IggyIndexesMut::from_bytes(PooledBuffer::from(indexes_bytes), 0);
-        let messages = PooledBuffer::from(body);
-
-        Some(IggyMessagesBatchMut::from_indexes_and_messages(
-            indexes, messages,
-        ))
-    }
-
     fn message_to_batch(message: &Message<PrepareHeader>) -> Option<IggyMessagesBatchMut> {
         if message.header().operation != Operation::SendMessages {
             return None;
         }
 
-        Self::decode_send_messages_batch(message.body_bytes())
+        crate::decode_send_messages_batch(message.body_bytes())
     }
 
-    fn messages_to_batch_set(messages: Vec<Message<PrepareHeader>>) -> IggyMessagesBatchSet {
+    fn messages_to_batch_set(messages: &[Message<PrepareHeader>]) -> IggyMessagesBatchSet {
         let mut batch_set = IggyMessagesBatchSet::empty();
 
-        for message in &messages {
+        for message in messages {
             if let Some(batch) = Self::message_to_batch(message) {
                 batch_set.add_batch(batch);
             }
@@ -212,6 +206,7 @@ where
         batch_set
     }
 
+    #[allow(dead_code)]
     fn candidate_start_op(&self, query: &MessageLookup) -> Option<u64> {
         match query {
             MessageLookup::Offset { offset, .. } => {
@@ -240,9 +235,13 @@ where
             inner.storage.read(offset, ZERO_LEN).await
         };
 
-        Some(Message::from_bytes(bytes).expect("invalid message bytes read from storage"))
+        Some(
+            Message::from_bytes(bytes)
+                .expect("partition.journal.storage.read: invalid bytes for message"),
+        )
     }
 
+    #[allow(dead_code)]
     async fn load_messages_from_storage(
         &self,
         start_op: u64,
@@ -294,7 +293,7 @@ where
 
         let prev_op = header.op - 1;
         let headers = unsafe { &*self.headers.get() };
-        headers.get(prev_op as usize)
+        headers.iter().find(|candidate| candidate.op == prev_op)
     }
 
     async fn append(&self, entry: Self::Entry) {
@@ -344,7 +343,7 @@ where
 
         let messages = self.load_messages_from_storage(start_op, count).await;
 
-        let batch_set = Self::messages_to_batch_set(messages);
+        let batch_set = Self::messages_to_batch_set(&messages);
         let result = match query {
             MessageLookup::Offset { offset, count } => batch_set.get_by_offset(offset, count),
             MessageLookup::Timestamp { timestamp, count } => {
@@ -352,54 +351,6 @@ where
             }
         };
 
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
-        }
-    }
-}
-
-impl Journal<Noop> for PartitionJournal {
-    type Header = MessageLookup;
-    type Entry = IggyMessagesBatchMut;
-    type HeaderRef<'a> = MessageLookup;
-
-    fn header(&self, _idx: usize) -> Option<Self::HeaderRef<'_>> {
-        unreachable!("fn header: header lookup not supported for partition journal.");
-    }
-
-    fn previous_header(&self, _header: &Self::Header) -> Option<Self::HeaderRef<'_>> {
-        unreachable!("fn previous_header: header lookup not supported for partition journal.");
-    }
-
-    async fn append(&self, entry: Self::Entry) {
-        let batch_set = unsafe { &mut *self.batch_set.get() };
-        batch_set.add_batch(entry);
-    }
-
-    async fn entry(&self, header: &Self::Header) -> Option<Self::Entry> {
-        // Entry lookups go through SegmentedLog which uses JournalInfo
-        // to construct MessageLookup headers. The actual query is done
-        // via get() below, not through the Journal trait.
-        let _ = header;
-        unreachable!("fn entry: use SegmentedLog::get() instead for partition journal lookups.");
-    }
-}
-
-impl PartitionJournal {
-    /// Query messages by offset or timestamp with count.
-    ///
-    /// This is called by `SegmentedLog` using `MessageLookup` headers
-    /// constructed from `JournalInfo`.
-    pub fn get(&self, header: &MessageLookup) -> Option<IggyMessagesBatchSet> {
-        let batch_set = unsafe { &*self.batch_set.get() };
-        let result = match header {
-            MessageLookup::Offset { offset, count } => batch_set.get_by_offset(*offset, *count),
-            MessageLookup::Timestamp { timestamp, count } => {
-                batch_set.get_by_timestamp(*timestamp, *count)
-            }
-        };
         if result.is_empty() {
             None
         } else {
