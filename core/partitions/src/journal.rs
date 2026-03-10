@@ -32,7 +32,9 @@ const ZERO_LEN: usize = 0;
 /// Lookup key for querying messages from the journal.
 #[derive(Debug, Clone, Copy)]
 pub enum MessageLookup {
+    #[allow(dead_code)]
     Offset { offset: u64, count: u32 },
+    #[allow(dead_code)]
     Timestamp { timestamp: u64, count: u32 },
 }
 
@@ -152,7 +154,7 @@ impl PartitionJournalMemStorage {
 }
 
 impl PartitionJournal2Impl<PartitionJournalMemStorage> {
-    /// Drain all accumulated batches, matching the legacy PartitionJournal API.
+    /// Drain all accumulated batches, matching the legacy `PartitionJournal` API.
     pub fn commit(&self) -> IggyMessagesBatchSet {
         let entries = {
             let inner = unsafe { &*self.inner.get() };

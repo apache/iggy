@@ -57,7 +57,7 @@ impl IggyPartition {
         let count = batch.count();
         let body_len = 4 + indexes.len() + batch.len();
         let total_size = std::mem::size_of::<PrepareHeader>() + body_len;
-        header.size = total_size as u32;
+        header.size = u32::try_from(total_size).expect("prepare_message_from_batch: batch size exceeds u32::MAX");
 
         let message = Message::<PrepareHeader>::new(total_size).transmute_header(|_old, new| {
             *new = header;
