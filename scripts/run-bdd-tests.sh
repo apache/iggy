@@ -25,7 +25,7 @@ GO_TEST_EXTRA_FLAGS=""
 FEATURE=""
 for arg in "$@"; do
   case "$arg" in
-    -race) GO_TEST_EXTRA_FLAGS="-race -cpu 1,4" ;;
+    -race) GO_TEST_EXTRA_FLAGS="-race" ;;
     *)     FEATURE="$arg" ;;
   esac
 done

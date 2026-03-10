@@ -41,5 +41,5 @@ COPY bdd/scenarios ./bdd/scenarios
 # Change workdir to bdd/go
 WORKDIR /app/bdd/go
 
-# Default command (GO_TEST_EXTRA_FLAGS can inject -race -cpu 1,4)
+# Default command (GO_TEST_EXTRA_FLAGS can inject -race)
 CMD ["sh", "-c", "go test -v ${GO_TEST_EXTRA_FLAGS:-} ./..."]
