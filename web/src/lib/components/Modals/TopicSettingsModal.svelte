@@ -35,9 +35,8 @@
   import ModalConfirmation from '../ModalConfirmation.svelte';
   import { browser } from '$app/environment';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
-  import { numberSizes } from '$lib/utils/constants/numberSizes';
   import { page } from '$app/state';
-  import { durationFormatter } from '$lib/utils/formatters/durationFormatter';
+  import DurationInput from '../DurationInput.svelte';
 
   interface Props {
     topic: TopicDetails;
@@ -55,74 +54,71 @@
       .min(1, 'Name must contain at least 1 character')
       .max(255, 'Name must not exceed 255 characters')
       .default(topic.name),
-    message_expiry: z.number().min(0).max(numberSizes.max.u32).default(topic.messageExpiry)
+    message_expiry: z.number().min(0).max(Number.MAX_SAFE_INTEGER).default(topic.messageExpiry)
   });
 
-  const { form, errors, enhance, constraints, submitting, tainted } = superForm(
-    defaults(zod4(schema)),
-    {
-      SPA: true,
-      validators: zod4(schema),
-      invalidateAll: false,
-      taintedMessage: false,
-      async onUpdate({ form }) {
-        if (!form.valid) return;
-        if (!page.params.streamId) return;
+  const { form, errors, enhance, submitting, tainted } = superForm(defaults(zod4(schema)), {
+    SPA: true,
+    validators: zod4(schema),
+    invalidateAll: false,
+    taintedMessage: false,
+    async onUpdate({ form }) {
+      if (!form.valid) return;
+      if (!page.params.streamId) return;
 
-        const { data, ok } = await fetchRouteApi({
-          method: 'PUT',
-          path: `/streams/${+page.params.streamId}/topics/${topic.id}`,
-          body: {
-            name: form.data.name,
-            message_expiry: form.data.message_expiry,
-            compression_algorithm: topic.compressionAlgorithm,
-            max_topic_size: 0
-          }
-        });
-
-        if (!ok) {
-          // Handle API errors
-          if (data?.field && data?.reason) {
-            // Field-specific error - show in form
-            return setError(form, data.field, data.reason);
-          } else if (data?.reason) {
-            // General error with reason - show toast
-            let errorMessage = data.reason;
-            if (data.code && data.id) {
-              errorMessage += `\n${data.code} (${data.id})`;
-            } else if (data.code) {
-              errorMessage += `\n${data.code}`;
-            }
-            showToast({
-              type: 'error',
-              description: errorMessage,
-              duration: 5000
-            });
-          } else {
-            // Fallback error message
-            showToast({
-              type: 'error',
-              description: 'Operation failed',
-              duration: 5000
-            });
-          }
-          return;
+      const { data, ok } = await fetchRouteApi({
+        method: 'PUT',
+        path: `/streams/${+page.params.streamId}/topics/${topic.id}`,
+        body: {
+          name: form.data.name,
+          message_expiry: form.data.message_expiry,
+          compression_algorithm: topic.compressionAlgorithm,
+          max_topic_size: 0
         }
+      });
 
-        // Success
-        if (ok) {
-          closeModal(async () => {
-            await customInvalidateAll();
-            showToast({
-              type: 'success',
-              description: `Stream ${form.data.name} has been updated.`,
-              duration: 3500
-            });
+      if (!ok) {
+        // Handle API errors
+        if (data?.field && data?.reason) {
+          // Field-specific error - show in form
+          return setError(form, data.field, data.reason);
+        } else if (data?.reason) {
+          // General error with reason - show toast
+          let errorMessage = data.reason;
+          if (data.code && data.id) {
+            errorMessage += `\n${data.code} (${data.id})`;
+          } else if (data.code) {
+            errorMessage += `\n${data.code}`;
+          }
+          showToast({
+            type: 'error',
+            description: errorMessage,
+            duration: 5000
+          });
+        } else {
+          // Fallback error message
+          showToast({
+            type: 'error',
+            description: 'Operation failed',
+            duration: 5000
           });
         }
+        return;
+      }
+
+      // Success
+      if (ok) {
+        closeModal(async () => {
+          await customInvalidateAll();
+          showToast({
+            type: 'success',
+            description: `Stream ${form.data.name} has been updated.`,
+            duration: 3500
+          });
+        });
       }
     }
-  );
+  });
 
   const onConfirmationResult = async (e: any) => {
     const result = e.detail as boolean;
@@ -168,24 +164,7 @@
     <form method="POST" class="flex flex-col gap-4 flex-3 pb-5" use:enhance>
       <Input name="name" label="Name" bind:value={$form.name} errorMessage={$errors.name?.[0]} />
 
-      <Input
-        label="Message expiry"
-        type="number"
-        name="messageExpiry"
-        bind:value={$form.message_expiry}
-        {...$constraints.message_expiry}
-        errorMessage={$errors.message_expiry?.[0]}
-      />
-
-      <span class="-mt-1 text-xs text-shade-d200 dark:text-shade-l700">
-        {#if !$form.message_expiry || $form.message_expiry > numberSizes.max.u32}
-          {#if $form.message_expiry === 0}
-            never
-          {/if}
-        {:else}
-          {durationFormatter(+$form.message_expiry)}
-        {/if}
-      </span>
+      <DurationInput label="Message expiry" bind:value={$form.message_expiry} />
 
       <div class="flex justify-end gap-3 w-full mt-auto">
         <Button type="button" variant="text" class="w-2/5" onclick={() => closeModal()}

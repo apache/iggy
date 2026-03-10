@@ -17,12 +17,14 @@
  * under the License.
  */
 
-import { formatDuration, intervalToDuration, isValid } from 'date-fns';
+import { formatDuration, intervalToDuration } from 'date-fns';
 
-export const durationFormatter = (seconds: number) => {
-  if (seconds <= 0 || seconds.toString().length > 11 || !isValid(seconds)) return '';
+export const durationFormatter = (microseconds: number) => {
+  if (microseconds <= 0) return '';
 
-  const duration = intervalToDuration({ start: 0, end: seconds * 1000 });
+  if (microseconds < 1_000_000) return '< 1 second';
+
+  const duration = intervalToDuration({ start: 0, end: microseconds / 1000 });
 
   return formatDuration(duration, {
     format: ['years', 'months', 'days', 'hours', 'minutes', 'seconds'],

@@ -84,16 +84,10 @@ impl McpHandle {
     pub async fn create_client(&self) -> Result<McpClient, TestBinaryError> {
         let mcp_url = self.mcp_url();
         let transport = StreamableHttpClientTransport::from_uri(mcp_url.clone());
-        let client_info = ClientInfo {
-            protocol_version: Default::default(),
-            capabilities: ClientCapabilities::default(),
-            client_info: Implementation {
-                name: "test-mcp-client".to_string(),
-                version: "1.0.0".to_string(),
-                ..Default::default()
-            },
-            meta: None,
-        };
+        let client_info = ClientInfo::new(
+            ClientCapabilities::default(),
+            Implementation::new("test-mcp-client", "1.0.0"),
+        );
 
         client_info
             .serve(transport)

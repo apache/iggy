@@ -21,10 +21,11 @@ import (
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
 func (c *IggyTcpClient) GetStreams() ([]iggcon.Stream, error) {
-	buffer, err := c.do(&iggcon.GetStreams{})
+	buffer, err := c.do(&command.GetStreams{})
 	if err != nil {
 		return nil, err
 	}
@@ -33,7 +34,7 @@ func (c *IggyTcpClient) GetStreams() ([]iggcon.Stream, error) {
 }
 
 func (c *IggyTcpClient) GetStream(streamId iggcon.Identifier) (*iggcon.StreamDetails, error) {
-	buffer, err := c.do(&iggcon.GetStream{
+	buffer, err := c.do(&command.GetStream{
 		StreamId: streamId,
 	})
 	if err != nil {
@@ -55,7 +56,7 @@ func (c *IggyTcpClient) CreateStream(name string) (*iggcon.StreamDetails, error)
 	if len(name) == 0 || MaxStringLength < len(name) {
 		return nil, ierror.ErrInvalidStreamName
 	}
-	buffer, err := c.do(&iggcon.CreateStream{Name: name})
+	buffer, err := c.do(&command.CreateStream{Name: name})
 	if err != nil {
 		return nil, err
 	}
@@ -71,11 +72,11 @@ func (c *IggyTcpClient) UpdateStream(streamId iggcon.Identifier, name string) er
 	if len(name) > MaxStringLength || len(name) == 0 {
 		return ierror.ErrInvalidStreamName
 	}
-	_, err := c.do(&iggcon.UpdateStream{StreamId: streamId, Name: name})
+	_, err := c.do(&command.UpdateStream{StreamId: streamId, Name: name})
 	return err
 }
 
 func (c *IggyTcpClient) DeleteStream(id iggcon.Identifier) error {
-	_, err := c.do(&iggcon.DeleteStream{StreamId: id})
+	_, err := c.do(&command.DeleteStream{StreamId: id})
 	return err
 }

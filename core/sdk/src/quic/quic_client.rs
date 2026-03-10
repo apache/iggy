@@ -118,7 +118,13 @@ impl BinaryTransport for QuicClient {
         let error = result.unwrap_err();
         if !matches!(
             error,
-            IggyError::Disconnected | IggyError::EmptyResponse | IggyError::Unauthenticated
+            IggyError::Disconnected
+                | IggyError::EmptyResponse
+                | IggyError::Unauthenticated
+                | IggyError::StaleClient
+                | IggyError::NotConnected
+                | IggyError::CannotEstablishConnection
+                | IggyError::QuicError
         ) {
             return Err(error);
         }

@@ -47,6 +47,7 @@ iggy_connector_sdk = { workspace = true, features = ["api"] }
 keyring = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
+mongodb = { workspace = true }
 once_cell = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }

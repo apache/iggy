@@ -37,7 +37,8 @@ where
 {
     fn header(&self) -> &H {
         let header_bytes = &self.buffer[..size_of::<H>()];
-        bytemuck::from_bytes(header_bytes)
+        bytemuck::checked::try_from_bytes(header_bytes)
+            .expect("header validated at construction time")
     }
 }
 
@@ -55,22 +56,17 @@ where
     #[allow(unused)]
     pub fn header(&self) -> &H {
         let header_bytes = &self.buffer[..size_of::<H>()];
-        bytemuck::from_bytes(header_bytes)
+        bytemuck::checked::try_from_bytes(header_bytes)
+            .expect("header validated at construction time")
     }
 
     /// Create a new message from a buffer.
-    ///
-    /// # Safety
-    ///
-    /// The buffer must:
-    /// - be at least `size_of::<H>()` bytes long
-    /// - contain a valid header at the start
-    /// - be properly aligned for type H
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - buffer is too small for the header
+    /// - buffer contains invalid bit patterns (enum discriminants)
     /// - buffer is too small for the size specified in the header
     /// - header validation fails
     #[allow(unused)]
@@ -83,24 +79,27 @@ where
             });
         }
 
-        let message = Self {
-            buffer,
-            _marker: PhantomData,
-        };
+        // Validate bit patterns (enum discriminants) via try_from_bytes
+        let header_bytes = &buffer[..size_of::<H>()];
+        let header = bytemuck::checked::try_from_bytes::<H>(header_bytes)
+            .map_err(|_| header::ConsensusError::InvalidBitPattern)?;
 
         // validate the header
-        message.header().validate()?;
+        header.validate()?;
 
         // verify buffer size matches header.size
-        let header_size = message.header().size() as usize;
-        if message.buffer.len() < header_size {
+        let header_size = header.size() as usize;
+        if buffer.len() < header_size {
             return Err(header::ConsensusError::InvalidCommand {
                 expected: H::COMMAND,
                 found: header::Command2::Reserved,
             });
         }
 
-        Ok(message)
+        Ok(Self {
+            buffer,
+            _marker: PhantomData,
+        })
     }
 
     /// Create a new message with a specific size, initializing the buffer with zeros.
@@ -131,7 +130,10 @@ where
         unsafe {
             let ptr = buffer.as_ptr() as *mut u8;
             let slice = std::slice::from_raw_parts_mut(ptr, size_of::<T>());
-            let new_header = bytemuck::from_bytes_mut(slice);
+            // Zero out to ensure valid bit patterns before creating a typed reference.
+            slice.fill(0);
+            let new_header =
+                bytemuck::checked::try_from_bytes_mut(slice).expect("zeroed bytes are valid");
             f(old_header, new_header);
         }
 
@@ -250,11 +252,14 @@ where
             });
         }
 
-        let new_message = unsafe { Message::<T>::from_buffer_unchecked(self.buffer) };
+        // Validate bit patterns for the target type
+        let header_bytes = &self.buffer[..size_of::<T>()];
+        let header = bytemuck::checked::try_from_bytes::<T>(header_bytes)
+            .map_err(|_| header::ConsensusError::InvalidBitPattern)?;
 
-        new_message.header().validate()?;
+        header.validate()?;
 
-        Ok(new_message)
+        Ok(unsafe { Message::<T>::from_buffer_unchecked(self.buffer) })
     }
 
     /// Try to get a reference to this message as a different header type.
@@ -282,10 +287,13 @@ where
             });
         }
 
-        let typed_message = unsafe { &*(self as *const Self as *const Message<T>) };
+        // Validate bit patterns for the target type
+        let header_bytes = &self.buffer[..size_of::<T>()];
+        bytemuck::checked::try_from_bytes::<T>(header_bytes)
+            .map_err(|_| header::ConsensusError::InvalidBitPattern)?
+            .validate()?;
 
-        // validate the header
-        typed_message.header().validate()?;
+        let typed_message = unsafe { &*(self as *const Self as *const Message<T>) };
 
         Ok(typed_message)
     }
@@ -328,13 +336,14 @@ impl MessageBag {
     }
 }
 
-impl<T> From<Message<T>> for MessageBag
+impl<T> TryFrom<Message<T>> for MessageBag
 where
     T: ConsensusHeader,
 {
-    fn from(value: Message<T>) -> Self {
-        let command = value.as_generic().header().command;
+    type Error = header::ConsensusError;
 
+    fn try_from(value: Message<T>) -> Result<Self, Self::Error> {
+        let command = value.as_generic().header().command;
         let buffer = value.into_inner();
 
         // SAFETY: All Message<H> types have identical memory layout (only PhantomData differs).
@@ -343,19 +352,22 @@ where
             header::Command2::Prepare => {
                 let msg =
                     unsafe { Message::<header::PrepareHeader>::from_buffer_unchecked(buffer) };
-                MessageBag::Prepare(msg)
+                Ok(MessageBag::Prepare(msg))
             }
             header::Command2::Request => {
                 let msg =
                     unsafe { Message::<header::RequestHeader>::from_buffer_unchecked(buffer) };
-                MessageBag::Request(msg)
+                Ok(MessageBag::Request(msg))
             }
             header::Command2::PrepareOk => {
                 let msg =
                     unsafe { Message::<header::PrepareOkHeader>::from_buffer_unchecked(buffer) };
-                MessageBag::PrepareOk(msg)
+                Ok(MessageBag::PrepareOk(msg))
             }
-            _ => unreachable!(),
+            other => Err(header::ConsensusError::InvalidCommand {
+                expected: header::Command2::Reserved,
+                found: other,
+            }),
         }
     }
 }
@@ -378,7 +390,8 @@ mod tests {
 
             let mut buffer = BytesMut::zeroed(total_size);
 
-            let header = bytemuck::from_bytes_mut::<Self>(&mut buffer[..header_size]);
+            let header = bytemuck::checked::try_from_bytes_mut::<Self>(&mut buffer[..header_size])
+                .expect("zeroed bytes are valid");
 
             header.checksum = 123456;
             header.cluster = 12345;
@@ -406,7 +419,9 @@ mod tests {
 
             let mut buffer = BytesMut::zeroed(total_size);
 
-            let header = bytemuck::from_bytes_mut::<Self>(&mut buffer[..header_size]);
+            // Zeroed bytes are valid (Command2::Reserved=0, Operation::Reserved=0).
+            let header = bytemuck::checked::try_from_bytes_mut::<Self>(&mut buffer[..header_size])
+                .expect("zeroed bytes are valid");
 
             header.checksum = 123456;
             header.checksum_body = 789012;
@@ -431,7 +446,8 @@ mod tests {
 
             let mut buffer = BytesMut::zeroed(total_size);
 
-            let header = bytemuck::from_bytes_mut::<Self>(&mut buffer[..header_size]);
+            let header = bytemuck::checked::try_from_bytes_mut::<Self>(&mut buffer[..header_size])
+                .expect("zeroed bytes are valid");
 
             header.checksum = 123456;
             header.cluster = 12345;
@@ -453,7 +469,8 @@ mod tests {
 
             let mut buffer = BytesMut::zeroed(total_size);
 
-            let header = bytemuck::from_bytes_mut::<Self>(&mut buffer[..header_size]);
+            let header = bytemuck::checked::try_from_bytes_mut::<Self>(&mut buffer[..header_size])
+                .expect("zeroed bytes are valid");
 
             header.checksum = 123456;
             header.cluster = 12345;
@@ -515,7 +532,7 @@ mod tests {
     #[test]
     fn test_message_bag_from_prepare() {
         let prepare = header::PrepareHeader::create_test();
-        let bag = MessageBag::from(prepare);
+        let bag = MessageBag::try_from(prepare).expect("valid prepare message");
 
         assert_eq!(bag.command(), header::Command2::Prepare);
         assert!(matches!(bag, MessageBag::Prepare(_)));

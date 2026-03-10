@@ -42,10 +42,12 @@ impl<T: Ready> Default for ReadyQueue<T> {
 }
 
 impl<T: Ready> ReadyQueue<T> {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self { items: Vec::new() }
     }
 
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             items: Vec::with_capacity(capacity),
@@ -60,12 +62,13 @@ impl<T: Ready> ReadyQueue<T> {
     }
 
     /// Peek at the item with the smallest `ready_at`.
+    #[must_use]
     pub fn peek(&self) -> Option<&T> {
         self.items.first()
     }
 
     /// Reset the queue, removing all items but retaining the allocation.
-    /// Matches TigerBeetle's `reset()` which sets `items.len = 0`.
+    /// Matches `TigerBeetle`'s `reset()` which sets `items.len = 0`.
     pub fn clear(&mut self) {
         self.items.clear();
     }
@@ -120,16 +123,19 @@ impl<T: Ready> ReadyQueue<T> {
     }
 
     /// Number of items in the queue.
-    pub fn len(&self) -> usize {
+    #[must_use]
+    pub const fn len(&self) -> usize {
         self.items.len()
     }
 
     /// Whether the queue is empty.
-    pub fn is_empty(&self) -> bool {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
     /// Access all items in unspecified order.
+    #[must_use]
     pub fn as_slice(&self) -> &[T] {
         &self.items
     }

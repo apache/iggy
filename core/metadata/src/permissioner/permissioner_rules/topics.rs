@@ -19,8 +19,9 @@
 use crate::permissioner::Permissioner;
 use iggy_common::IggyError;
 
+#[allow(clippy::missing_errors_doc)]
 impl Permissioner {
-    /// Inheritance: manage_streams → read_streams → read_topics
+    /// Inheritance: `manage_streams` -> `read_streams` -> `read_topics`
     pub fn get_topic(
         &self,
         user_id: u32,
@@ -79,7 +80,7 @@ impl Permissioner {
         Err(IggyError::Unauthorized)
     }
 
-    /// Inheritance: manage_streams → manage_topics
+    /// Inheritance: `manage_streams` -> `manage_topics`
     pub fn create_topic(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
         if let Some(global) = self.users_permissions.get(&user_id)
             && (global.manage_streams || global.manage_topics)
@@ -123,7 +124,7 @@ impl Permissioner {
         self.manage_topic(user_id, stream_id, topic_id)
     }
 
-    /// Inheritance: manage_streams → manage_topics
+    /// Inheritance: `manage_streams` -> `manage_topics`
     fn manage_topic(
         &self,
         user_id: u32,

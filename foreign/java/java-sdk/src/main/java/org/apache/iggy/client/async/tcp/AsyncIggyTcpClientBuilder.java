@@ -73,6 +73,7 @@ public final class AsyncIggyTcpClientBuilder {
     private Duration requestTimeout;
     private Integer connectionPoolSize;
     private RetryPolicy retryPolicy;
+    private Duration acquireTimeout;
 
     AsyncIggyTcpClientBuilder() {}
 
@@ -156,6 +157,17 @@ public final class AsyncIggyTcpClientBuilder {
     }
 
     /**
+     * Sets channel acquire timeout
+     *
+     * @param acquireTimeout the acquire timeout duration
+     * @return this builder
+     */
+    public AsyncIggyTcpClientBuilder acquireTimeout(Duration acquireTimeout) {
+        this.acquireTimeout = acquireTimeout;
+        return this;
+    }
+
+    /**
      * Sets the connection timeout.
      *
      * @param connectionTimeout the connection timeout duration
@@ -212,6 +224,12 @@ public final class AsyncIggyTcpClientBuilder {
         }
         if (port == null || port <= 0) {
             throw new IggyInvalidArgumentException("Port must be a positive integer");
+        }
+        if (connectionPoolSize != null && connectionPoolSize <= 0) {
+            throw new IggyInvalidArgumentException("Connection pool size cannot by 0 or negative");
+        }
+        if (acquireTimeout != null && (acquireTimeout.equals(Duration.ZERO) || acquireTimeout.isNegative())) {
+            throw new IggyInvalidArgumentException("AcquireTimeout Cannot be 0 or Negative");
         }
         return new AsyncIggyTcpClient(
                 host,

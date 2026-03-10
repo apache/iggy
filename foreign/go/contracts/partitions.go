@@ -33,66 +33,6 @@ type PartitionContract struct {
 	SizeBytes     uint64 `json:"sizeBytes"`
 }
 
-type CreatePartitions struct {
-	StreamId        Identifier `json:"streamId"`
-	TopicId         Identifier `json:"topicId"`
-	PartitionsCount uint32     `json:"partitionsCount"`
-}
-
-func (c *CreatePartitions) Code() CommandCode {
-	return CreatePartitionsCode
-}
-
-func (c *CreatePartitions) MarshalBinary() ([]byte, error) {
-	streamIdBytes, err := c.StreamId.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	topicIdBytes, err := c.TopicId.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	bytes := make([]byte, len(streamIdBytes)+len(topicIdBytes)+4)
-	position := 0
-	copy(bytes[position:], streamIdBytes)
-	position += len(streamIdBytes)
-	copy(bytes[position:], topicIdBytes)
-	position += len(topicIdBytes)
-	binary.LittleEndian.PutUint32(bytes[position:position+4], c.PartitionsCount)
-
-	return bytes, nil
-}
-
-type DeletePartitions struct {
-	StreamId        Identifier `json:"streamId"`
-	TopicId         Identifier `json:"topicId"`
-	PartitionsCount uint32     `json:"partitionsCount"`
-}
-
-func (d *DeletePartitions) Code() CommandCode {
-	return DeletePartitionsCode
-}
-
-func (d *DeletePartitions) MarshalBinary() ([]byte, error) {
-	streamIdBytes, err := d.StreamId.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	topicIdBytes, err := d.TopicId.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	bytes := make([]byte, len(streamIdBytes)+len(topicIdBytes)+4)
-	position := 0
-	copy(bytes[position:], streamIdBytes)
-	position += len(streamIdBytes)
-	copy(bytes[position:], topicIdBytes)
-	position += len(topicIdBytes)
-	binary.LittleEndian.PutUint32(bytes[position:position+4], d.PartitionsCount)
-
-	return bytes, nil
-}
-
 type PartitioningKind int
 
 const (

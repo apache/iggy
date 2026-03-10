@@ -57,7 +57,8 @@ pub struct IggyMessageBus {
 }
 
 impl IggyMessageBus {
-    pub fn new(total_shards: usize, shard_id: u16, seed: u64) -> Self {
+    #[must_use]
+    pub fn new(total_shards: u16, shard_id: u16, seed: u64) -> Self {
         Self {
             clients: HashMap::new(),
             replicas: ShardedConnections {
@@ -81,6 +82,7 @@ impl IggyMessageBus {
     }
 }
 
+#[allow(clippy::future_not_send)] // Single-threaded runtime (compio), Rc/RefCell by design
 impl MessageBus for IggyMessageBus {
     type Client = u128;
     type Replica = u8;
@@ -112,6 +114,7 @@ impl MessageBus for IggyMessageBus {
         client_id: Self::Client,
         _message: Self::Data,
     ) -> Result<(), IggyError> {
+        #[allow(clippy::cast_possible_truncation)] // IggyError::ClientNotFound takes u32
         let _sender = self
             .clients
             .get(&client_id)
@@ -127,7 +130,7 @@ impl MessageBus for IggyMessageBus {
         // TODO: Handle lazily creating the connection.
         let _connection = self
             .get_replica_connection(replica)
-            .ok_or(IggyError::ResourceNotFound(format!("Replica {}", replica)))?;
+            .ok_or(IggyError::ResourceNotFound(format!("Replica {replica}")))?;
         Ok(())
     }
 }

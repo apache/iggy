@@ -20,10 +20,11 @@ package tcp
 import (
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
 func (c *IggyTcpClient) GetClients() ([]iggcon.ClientInfo, error) {
-	buffer, err := c.do(&iggcon.GetClients{})
+	buffer, err := c.do(&command.GetClients{})
 	if err != nil {
 		return nil, err
 	}
@@ -32,7 +33,7 @@ func (c *IggyTcpClient) GetClients() ([]iggcon.ClientInfo, error) {
 }
 
 func (c *IggyTcpClient) GetClient(clientId uint32) (*iggcon.ClientInfoDetails, error) {
-	buffer, err := c.do(&iggcon.GetClient{ClientID: clientId})
+	buffer, err := c.do(&command.GetClient{ClientID: clientId})
 	if err != nil {
 		return nil, err
 	}
