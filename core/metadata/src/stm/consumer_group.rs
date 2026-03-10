@@ -38,6 +38,7 @@ pub struct ConsumerGroupMember {
 }
 
 impl ConsumerGroupMember {
+    #[must_use]
     pub fn new(id: usize, client_id: u32) -> Self {
         Self {
             id,
@@ -57,7 +58,8 @@ pub struct ConsumerGroup {
 }
 
 impl ConsumerGroup {
-    pub fn new(name: Arc<str>) -> Self {
+    #[must_use]
+    pub const fn new(name: Arc<str>) -> Self {
         Self {
             id: 0,
             name,
@@ -74,16 +76,16 @@ impl ConsumerGroup {
             return;
         }
 
-        let member_ids: Vec<usize> = self.members.iter().map(|(id, _)| id).collect();
-        for &member_id in &member_ids {
+        let member_keys: Vec<usize> = self.members.iter().map(|(id, _)| id).collect();
+        for &member_id in &member_keys {
             if let Some(member) = self.members.get_mut(member_id) {
                 member.partitions.clear();
             }
         }
 
         for (i, &partition_id) in self.partitions.iter().enumerate() {
-            let member_idx = i % member_count;
-            if let Some(&member_id) = member_ids.get(member_idx)
+            let target = i % member_count;
+            if let Some(&member_id) = member_keys.get(target)
                 && let Some(member) = self.members.get_mut(member_id)
             {
                 member.partitions.push(partition_id);
@@ -180,7 +182,7 @@ impl StateHandler for CreateConsumerGroup {
         let id = state.items.insert(group);
         state.items[id].id = id;
 
-        state.name_index.insert(name.clone(), id);
+        state.name_index.insert(name, id);
 
         if let (Ok(s), Ok(t)) = (
             self.stream_id.get_u32_value(),
@@ -328,7 +330,7 @@ impl Snapshotable for ConsumerGroups {
         let mut group_entries: Vec<(usize, ConsumerGroup)> = Vec::new();
 
         for (slab_key, group_snap) in snapshot.items {
-            let member_entries: Vec<(usize, ConsumerGroupMember)> = group_snap
+            let members: Slab<ConsumerGroupMember> = group_snap
                 .members
                 .into_iter()
                 .map(|(member_key, member_snap)| {
@@ -341,7 +343,6 @@ impl Snapshotable for ConsumerGroups {
                     (member_key, member)
                 })
                 .collect();
-            let members: Slab<ConsumerGroupMember> = member_entries.into_iter().collect();
 
             let group_name: Arc<str> = Arc::from(group_snap.name.as_str());
             let group = ConsumerGroup {

@@ -31,9 +31,7 @@ impl Storage for Noop {
         0
     }
 
-    async fn read(&self, _offset: usize, buffer: ()) -> () {
-        buffer
-    }
+    async fn read(&self, _offset: usize, _buffer: ()) {}
 }
 
 /// Lookup key for querying messages from the journal.

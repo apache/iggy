@@ -103,7 +103,7 @@ func (id Identifier) AppendBinary(b []byte) ([]byte, error) {
 	return b, nil
 }
 
-func marshalIdentifiers(identifiers ...Identifier) ([]byte, error) {
+func MarshalIdentifiers(identifiers ...Identifier) ([]byte, error) {
 	size := 0
 	for i := 0; i < len(identifiers); i++ {
 		size += 2 + identifiers[i].Length

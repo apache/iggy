@@ -26,19 +26,23 @@ pub struct MuxPlane<T> {
 }
 
 impl<T> MuxPlane<T> {
-    pub fn new(inner: T) -> Self {
+    #[must_use]
+    pub const fn new(inner: T) -> Self {
         Self { inner }
     }
 
-    pub fn inner(&self) -> &T {
+    #[must_use]
+    pub const fn inner(&self) -> &T {
         &self.inner
     }
 
-    pub fn inner_mut(&mut self) -> &mut T {
+    pub const fn inner_mut(&mut self) -> &mut T {
         &mut self.inner
     }
 }
 
+// Consensus runs on single-threaded compio shards; futures are intentionally !Send.
+#[allow(clippy::future_not_send)]
 impl<C, T> Plane<C> for MuxPlane<T>
 where
     C: Consensus,
@@ -63,6 +67,8 @@ where
     }
 }
 
+// Consensus runs on single-threaded compio shards; futures are intentionally !Send.
+#[allow(clippy::future_not_send)]
 impl<C> Plane<C> for ()
 where
     C: Consensus,
@@ -134,6 +140,8 @@ impl<T: PartitionsHandle> PartitionsHandle for MuxPlane<T> {
     }
 }
 
+// Consensus runs on single-threaded compio shards; futures are intentionally !Send.
+#[allow(clippy::future_not_send)]
 impl<C, Head, Tail> Plane<C> for variadic!(Head, ...Tail)
 where
     C: Consensus,
