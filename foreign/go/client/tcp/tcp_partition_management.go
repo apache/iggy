@@ -19,10 +19,11 @@ package tcp
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
 func (c *IggyTcpClient) CreatePartitions(streamId iggcon.Identifier, topicId iggcon.Identifier, partitionsCount uint32) error {
-	_, err := c.do(&iggcon.CreatePartitions{
+	_, err := c.do(&command.CreatePartitions{
 		StreamId:        streamId,
 		TopicId:         topicId,
 		PartitionsCount: partitionsCount,
@@ -31,7 +32,7 @@ func (c *IggyTcpClient) CreatePartitions(streamId iggcon.Identifier, topicId igg
 }
 
 func (c *IggyTcpClient) DeletePartitions(streamId iggcon.Identifier, topicId iggcon.Identifier, partitionsCount uint32) error {
-	_, err := c.do(&iggcon.DeletePartitions{
+	_, err := c.do(&command.DeletePartitions{
 		StreamId:        streamId,
 		TopicId:         topicId,
 		PartitionsCount: partitionsCount,

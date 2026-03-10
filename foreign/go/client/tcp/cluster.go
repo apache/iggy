@@ -17,10 +17,13 @@
 
 package tcp
 
-import iggcon "github.com/apache/iggy/foreign/go/contracts"
+import (
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/internal/command"
+)
 
 func (c *IggyTcpClient) GetClusterMetadata() (*iggcon.ClusterMetadata, error) {
-	response, err := c.do(&iggcon.GetClusterMetadata{})
+	response, err := c.do(&command.GetClusterMetadata{})
 	if err != nil {
 		return nil, err
 	}
