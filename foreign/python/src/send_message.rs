@@ -29,7 +29,7 @@ use std::str::FromStr;
 ///
 /// This class wraps a Rust message meant for sending, facilitating
 /// the creation of such messages from Python and their subsequent use in Rust.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[gen_stub_pyclass]
 pub struct SendMessage {
     pub(crate) inner: RustIggyMessage,

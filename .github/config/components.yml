@@ -58,52 +58,34 @@ components:
     paths:
       - "core/binary_protocol/**"
 
-  rust-clock:
-    depends_on:
-      - "rust-workspace"
-    paths:
-      - "core/clock/**"
-
-  rust-journal:
-    depends_on:
-      - "rust-workspace"
-    paths:
-      - "core/journal/**"
-
-  rust-partitions:
-    depends_on:
-      - "rust-workspace"
-    paths:
-      - "core/partitions/**"
-
   rust-server:
     depends_on:
       - "rust-workspace"
       - "rust-configs"
       - "rust-common"
       - "rust-binary-protocol"
-      - "rust-journal"
-      - "rust-partitions"
+      - "rust-cluster"
     paths:
       - "core/server/**"
 
   rust-cluster:
     depends_on:
       - "rust-workspace"
-      - "rust-clock"
     paths:
+      - "core/clock/**"
       - "core/consensus/**"
+      - "core/journal/**"
+      - "core/shard/**"
       - "core/metadata/**"
       - "core/message_bus/**"
+      - "core/partitions/**"
+      - "core/simulator/**"
 
   # Main Rust workspace testing
   rust:
     depends_on:
       - "rust-workspace"
       - "rust-configs"
-      - "rust-clock"
-      - "rust-journal"
-      - "rust-partitions"
       - "rust-sdk"
       - "rust-common"
       - "rust-binary-protocol"
@@ -174,6 +156,7 @@ components:
       - "rust-configs"
     paths:
       - "core/integration/**"
+      - "core/harness_derive/**"
 
   sdk-python:
     depends_on:
@@ -299,32 +282,70 @@ components:
       - "bdd/scenarios/**"
     tasks: ["bdd-java"]
 
-  examples-suite:
+  examples-rust:
     depends_on:
       - "rust-sdk"
       - "rust-server"
-      - "sdk-go"
-      - "sdk-csharp"
-      - "sdk-python"
-      - "sdk-java"
-      - "ci-infrastructure" # CI changes trigger full regression
+      - "ci-infrastructure"
     paths:
-      - "examples/**"
+      - "examples/rust/**"
       - "scripts/run-rust-examples-from-readme.sh"
+    tasks: ["examples-rust"]
+
+  examples-go:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-go"
+      - "ci-infrastructure"
+    paths:
+      - "examples/go/**"
       - "scripts/run-go-examples-from-readme.sh"
+    tasks: ["examples-go"]
+
+  examples-csharp:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-csharp"
+      - "ci-infrastructure"
+    paths:
+      - "examples/csharp/**"
       - "scripts/run-csharp-examples-from-readme.sh"
+    tasks: ["examples-csharp"]
+
+  examples-python:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-python"
+      - "ci-infrastructure"
+    paths:
+      - "examples/python/**"
       - "scripts/run-python-examples-from-readme.sh"
+    tasks: ["examples-python"]
+
+  examples-node:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-node"
+      - "ci-infrastructure"
+    paths:
+      - "examples/node/**"
       - "scripts/run-node-examples-from-readme.sh"
+    tasks: ["examples-node"]
+
+  examples-java:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-java"
+      - "ci-infrastructure"
+    paths:
+      - "examples/java/**"
       - "scripts/run-java-examples-from-readme.sh"
-    tasks:
-      [
-        "examples-rust",
-        "examples-go",
-        "examples-csharp",
-        "examples-python",
-        "examples-node",
-        "examples-java",
-      ]
+    tasks: ["examples-java"]
 
   web-ui:
     paths:
