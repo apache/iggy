@@ -743,11 +743,8 @@ impl IggyService {
 #[tool_handler]
 impl ServerHandler for IggyService {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some("Iggy service".into()),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("Iggy service")
     }
 }
 
