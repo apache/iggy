@@ -47,7 +47,7 @@ impl std::ops::Deref for MessageLookup {
 }
 
 #[allow(dead_code)]
-pub trait PartitionJournal2<S>: Journal<S>
+pub trait QueryableJournal<S>: Journal<S>
 where
     S: Storage,
 {
@@ -96,7 +96,7 @@ impl Storage for PartitionJournalMemStorage {
     }
 }
 
-pub struct PartitionJournal2Impl<S>
+pub struct PartitionJournal<S>
 where
     S: Storage<Buffer = Bytes>,
 {
@@ -106,7 +106,7 @@ where
     inner: UnsafeCell<JournalInner<S>>,
 }
 
-impl<S> Default for PartitionJournal2Impl<S>
+impl<S> Default for PartitionJournal<S>
 where
     S: Storage<Buffer = Bytes> + Default,
 {
@@ -122,7 +122,7 @@ where
     }
 }
 
-impl<S> std::fmt::Debug for PartitionJournal2Impl<S>
+impl<S> std::fmt::Debug for PartitionJournal<S>
 where
     S: Storage<Buffer = Bytes>,
 {
@@ -153,7 +153,7 @@ impl PartitionJournalMemStorage {
     }
 }
 
-impl PartitionJournal2Impl<PartitionJournalMemStorage> {
+impl PartitionJournal<PartitionJournalMemStorage> {
     /// Drain all accumulated batches, matching the legacy `PartitionJournal` API.
     pub fn commit(&self) -> IggyMessagesBatchSet {
         let entries = {
@@ -184,7 +184,7 @@ impl PartitionJournal2Impl<PartitionJournalMemStorage> {
     }
 }
 
-impl<S> PartitionJournal2Impl<S>
+impl<S> PartitionJournal<S>
 where
     S: Storage<Buffer = Bytes>,
 {
@@ -274,7 +274,7 @@ where
     }
 }
 
-impl<S> Journal<S> for PartitionJournal2Impl<S>
+impl<S> Journal<S> for PartitionJournal<S>
 where
     S: Storage<Buffer = Bytes>,
 {
@@ -330,7 +330,7 @@ where
     }
 }
 
-impl<S> PartitionJournal2<S> for PartitionJournal2Impl<S>
+impl<S> QueryableJournal<S> for PartitionJournal<S>
 where
     S: Storage<Buffer = Bytes>,
 {

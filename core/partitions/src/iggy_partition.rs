@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::journal::{PartitionJournal2Impl, PartitionJournalMemStorage};
+use crate::journal::{PartitionJournal, PartitionJournalMemStorage};
 use crate::log::SegmentedLog;
 use crate::{AppendResult, Partition, decode_send_messages_batch};
 use iggy_common::{
@@ -33,7 +33,7 @@ use tokio::sync::Mutex as TokioMutex;
 #[derive(Debug)]
 pub struct IggyPartition {
     pub log:
-        SegmentedLog<PartitionJournal2Impl<PartitionJournalMemStorage>, PartitionJournalMemStorage>,
+        SegmentedLog<PartitionJournal<PartitionJournalMemStorage>, PartitionJournalMemStorage>,
     /// Committed offset — advanced only after quorum ack.
     pub offset: Arc<AtomicU64>,
     /// Dirty offset — advanced on every prepare (before commit).
