@@ -19,9 +19,19 @@
 set -Eeuo pipefail
 
 SDK=${1:-"all"}
-FEATURE=${2:-"scenarios/basic_messaging.feature"}
+shift || true
 
-export DOCKER_BUILDKIT=1 FEATURE
+GO_TEST_EXTRA_FLAGS=""
+FEATURE=""
+for arg in "$@"; do
+  case "$arg" in
+    -race) GO_TEST_EXTRA_FLAGS="-race -cpu 1,4" ;;
+    *)     FEATURE="$arg" ;;
+  esac
+done
+FEATURE=${FEATURE:-"scenarios/basic_messaging.feature"}
+
+export DOCKER_BUILDKIT=1 FEATURE GO_TEST_EXTRA_FLAGS
 
 cd "$(dirname "$0")/../bdd"
 
@@ -50,7 +60,11 @@ run_suite(){
 case "$SDK" in
   rust)   run_suite rust-bdd   "🦀"   "Running Rust BDD tests"   ;;
   python) run_suite python-bdd "🐍"   "Running Python BDD tests" ;;
-  go)     run_suite go-bdd     "🐹"   "Running Go BDD tests"     ;;
+  go)
+    _go_label="Running Go BDD tests"
+    [[ -n "$GO_TEST_EXTRA_FLAGS" ]] && _go_label="Running Go BDD tests (${GO_TEST_EXTRA_FLAGS})"
+    run_suite go-bdd "🐹" "$_go_label"
+    ;;
   node)   run_suite node-bdd   "🐢🚀" "Running Node BDD tests"   ;;
   csharp) run_suite csharp-bdd "🔷"   "Running C# BDD tests"     ;;
   java)   run_suite java-bdd   "☕"   "Running Java BDD tests"   ;;
@@ -66,7 +80,7 @@ case "$SDK" in
     cleanup; exit 0 ;;
   *)
     log "❌ Unknown SDK: ${SDK}"
-    log "📖 Usage: $0 [rust|python|go|node|csharp|java|all|clean] [feature_file]"
+    log "📖 Usage: $0 [rust|python|go|node|csharp|java|all|clean] [-race] [feature_file]"
     exit 2 ;;
 esac
 

@@ -17,6 +17,8 @@
 
 FROM golang:1.23.10-alpine
 
+RUN apk add --no-cache gcc musl-dev
+
 WORKDIR /app
 
 # Copy only go.mod and go.sum first to leverage Docker layer caching
@@ -39,5 +41,5 @@ COPY bdd/scenarios ./bdd/scenarios
 # Change workdir to bdd/go
 WORKDIR /app/bdd/go
 
-# Default command
-CMD ["go", "test", "-v", "./..."]
+# Default command (GO_TEST_EXTRA_FLAGS can inject -race -cpu 1,4)
+CMD ["sh", "-c", "go test -v ${GO_TEST_EXTRA_FLAGS:-} ./..."]
