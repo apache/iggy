@@ -171,12 +171,7 @@ async fn influxdb_sink_large_batch(harness: &TestHarness, fixture: InfluxDbSinkF
             .collect();
 
         client
-            .send_messages(
-                &stream_id,
-                &topic_id,
-                &Partitioning::balanced(),
-                &mut chunk,
-            )
+            .send_messages(&stream_id, &topic_id, &Partitioning::balanced(), &mut chunk)
             .await
             .expect("Failed to send messages");
     }
@@ -240,8 +235,7 @@ async fn influxdb_sink_multiple_partitions(harness: &TestHarness, fixture: Influ
     // Topic has only 1 partition — send 3 messages via balanced partitioning
     // (they all go to partition 1, which is correct for a 1-partition topic).
     for i in 1u32..=3 {
-        let payload =
-            serde_json::to_vec(&json!({"msg_index": i})).expect("Failed to serialize");
+        let payload = serde_json::to_vec(&json!({"msg_index": i})).expect("Failed to serialize");
         let mut messages = vec![
             IggyMessage::builder()
                 .id(i as u128)

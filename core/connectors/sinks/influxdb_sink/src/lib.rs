@@ -60,8 +60,8 @@ sink_connector!(InfluxDbSink);
 
 const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_RETRY_DELAY: &str = "1s";
-const DEFAULT_TIMEOUT: &str = "10s";
-const DEFAULT_PRECISION: &str = "ms";
+const DEFAULT_TIMEOUT: &str = "30s";
+const DEFAULT_PRECISION: &str = "ns";
 // [FIX-SINK-7] Maximum attempts for open() connectivity retries
 const DEFAULT_MAX_OPEN_RETRIES: u32 = 10;
 // [FIX-SINK-8] Cap for exponential backoff in open() — never wait longer than this

@@ -51,3 +51,4 @@ payload_format = "json"
 max_retries = 3
 retry_delay = "1s"
 timeout = "10s"
+precision = "ns"
