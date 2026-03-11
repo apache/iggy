@@ -282,6 +282,9 @@ impl HttpSink {
 
     /// Convert a `Payload` to a JSON value for metadata wrapping.
     /// Non-JSON payloads are base64-encoded with a `iggy_payload_encoding` marker.
+    ///
+    /// Note: All current `Payload` variants produce infallible conversions.
+    /// The `Result` return type exists as a safety net for future variants.
     fn payload_to_json(
         &self,
         payload: Payload,
@@ -293,16 +296,12 @@ impl HttpSink {
                 Ok(owned_value_to_serde_json(&value))
             }
             Payload::Text(text) => Ok(serde_json::Value::String(text)),
-            Payload::Raw(bytes) => Ok(serde_json::json!({
+            Payload::Raw(bytes) | Payload::FlatBuffer(bytes) => Ok(serde_json::json!({
                 "data": general_purpose::STANDARD.encode(&bytes),
                 "iggy_payload_encoding": "base64"
             })),
             Payload::Proto(proto_str) => Ok(serde_json::json!({
                 "data": general_purpose::STANDARD.encode(proto_str.as_bytes()),
-                "iggy_payload_encoding": "base64"
-            })),
-            Payload::FlatBuffer(bytes) => Ok(serde_json::json!({
-                "data": general_purpose::STANDARD.encode(&bytes),
                 "iggy_payload_encoding": "base64"
             })),
         }
@@ -516,7 +515,8 @@ impl HttpSink {
     ) -> Result<(), Error> {
         let total = messages.len();
         let mut delivered = 0u64;
-        let mut failed = 0u64;
+        let mut http_failures = 0u64;
+        let mut serialization_failures = 0u64;
         let mut consecutive_failures = 0u32;
         let mut last_error: Option<Error> = None;
 
@@ -530,7 +530,7 @@ impl HttpSink {
                         self.id, offset, e
                     );
                     self.errors_count.fetch_add(1, Ordering::Relaxed);
-                    failed += 1;
+                    serialization_failures += 1;
                     last_error = Some(e);
                     continue;
                 }
@@ -545,7 +545,7 @@ impl HttpSink {
                         self.id, offset, e
                     );
                     self.errors_count.fetch_add(1, Ordering::Relaxed);
-                    failed += 1;
+                    serialization_failures += 1;
                     last_error = Some(Error::Serialization(format!("Envelope serialize: {}", e)));
                     continue;
                 }
@@ -557,7 +557,7 @@ impl HttpSink {
                     self.id, offset, body.len(), self.max_payload_size_bytes,
                 );
                 self.errors_count.fetch_add(1, Ordering::Relaxed);
-                failed += 1;
+                serialization_failures += 1;
                 last_error = Some(Error::HttpRequestFailed(format!(
                     "Payload exceeds max size: {} bytes",
                     body.len()
@@ -575,17 +575,20 @@ impl HttpSink {
                         "HTTP sink ID: {} — failed to deliver message at offset {} after retries: {}",
                         self.id, offset, e
                     );
-                    failed += 1;
+                    http_failures += 1;
                     consecutive_failures += 1;
                     last_error = Some(e);
 
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        let remaining = total.saturating_sub(
+                            (delivered + http_failures + serialization_failures) as usize,
+                        );
                         error!(
-                            "HTTP sink ID: {} — aborting batch after {} consecutive failures \
+                            "HTTP sink ID: {} — aborting batch after {} consecutive HTTP failures \
                              ({} remaining messages skipped)",
                             self.id,
                             consecutive_failures,
-                            total - (delivered + failed) as usize,
+                            remaining,
                         );
                         break;
                     }
@@ -598,8 +601,9 @@ impl HttpSink {
         match last_error {
             Some(e) => {
                 error!(
-                    "HTTP sink ID: {} — partial delivery: {}/{} messages delivered, {} failed",
-                    self.id, delivered, total, failed,
+                    "HTTP sink ID: {} — partial delivery: {}/{} delivered, \
+                     {} HTTP failures, {} serialization errors",
+                    self.id, delivered, total, http_failures, serialization_failures,
                 );
                 Err(e)
             }
@@ -673,7 +677,16 @@ impl HttpSink {
             )));
         }
 
-        self.send_with_retry(client, body, self.content_type()).await?;
+        self.send_with_retry(client, body, self.content_type())
+            .await
+            .inspect_err(|_| {
+                if skipped > 0 {
+                    error!(
+                        "HTTP sink ID: {} — NDJSON batch failed with {} serialization skips",
+                        self.id, skipped,
+                    );
+                }
+            })?;
         self.messages_delivered.fetch_add(count, Ordering::Relaxed);
         if skipped > 0 {
             warn!(
@@ -722,8 +735,24 @@ impl HttpSink {
 
         let count = envelopes.len() as u64;
 
-        let body = serde_json::to_vec(&envelopes)
-            .map_err(|e| Error::Serialization(format!("JSON array serialize: {}", e)))?;
+        let body = match serde_json::to_vec(&envelopes) {
+            Ok(b) => b,
+            Err(e) => {
+                error!(
+                    "HTTP sink ID: {} — failed to serialize JSON array batch \
+                     ({} envelopes, {} skipped): {}",
+                    self.id,
+                    envelopes.len(),
+                    skipped,
+                    e,
+                );
+                return Err(Error::Serialization(format!(
+                    "JSON array serialize ({} envelopes): {}",
+                    envelopes.len(),
+                    e
+                )));
+            }
+        };
 
         if self.max_payload_size_bytes > 0 && body.len() as u64 > self.max_payload_size_bytes {
             error!(
@@ -738,7 +767,16 @@ impl HttpSink {
             )));
         }
 
-        self.send_with_retry(client, body, self.content_type()).await?;
+        self.send_with_retry(client, body, self.content_type())
+            .await
+            .inspect_err(|_| {
+                if skipped > 0 {
+                    error!(
+                        "HTTP sink ID: {} — JSON array batch failed with {} serialization skips",
+                        self.id, skipped,
+                    );
+                }
+            })?;
         self.messages_delivered.fetch_add(count, Ordering::Relaxed);
         if skipped > 0 {
             warn!(
@@ -758,7 +796,8 @@ impl HttpSink {
     ) -> Result<(), Error> {
         let total = messages.len();
         let mut delivered = 0u64;
-        let mut failed = 0u64;
+        let mut http_failures = 0u64;
+        let mut serialization_failures = 0u64;
         let mut consecutive_failures = 0u32;
         let mut last_error: Option<Error> = None;
 
@@ -772,7 +811,7 @@ impl HttpSink {
                         self.id, offset, e
                     );
                     self.errors_count.fetch_add(1, Ordering::Relaxed);
-                    failed += 1;
+                    serialization_failures += 1;
                     last_error = Some(Error::Serialization(format!("Raw payload convert: {}", e)));
                     continue;
                 }
@@ -784,7 +823,7 @@ impl HttpSink {
                     self.id, offset, body.len(), self.max_payload_size_bytes,
                 );
                 self.errors_count.fetch_add(1, Ordering::Relaxed);
-                failed += 1;
+                serialization_failures += 1;
                 last_error = Some(Error::HttpRequestFailed(format!(
                     "Raw payload exceeds max size: {} bytes",
                     body.len()
@@ -802,17 +841,20 @@ impl HttpSink {
                         "HTTP sink ID: {} — failed to deliver raw message at offset {}: {}",
                         self.id, offset, e
                     );
-                    failed += 1;
+                    http_failures += 1;
                     consecutive_failures += 1;
                     last_error = Some(e);
 
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        let remaining = total.saturating_sub(
+                            (delivered + http_failures + serialization_failures) as usize,
+                        );
                         error!(
-                            "HTTP sink ID: {} — aborting raw batch after {} consecutive failures \
+                            "HTTP sink ID: {} — aborting raw batch after {} consecutive HTTP failures \
                              ({} remaining messages skipped)",
                             self.id,
                             consecutive_failures,
-                            total - (delivered + failed) as usize,
+                            remaining,
                         );
                         break;
                     }
@@ -825,8 +867,9 @@ impl HttpSink {
         match last_error {
             Some(e) => {
                 error!(
-                    "HTTP sink ID: {} — partial raw delivery: {}/{} messages delivered, {} failed",
-                    self.id, delivered, total, failed,
+                    "HTTP sink ID: {} — partial raw delivery: {}/{} delivered, \
+                     {} HTTP failures, {} serialization errors",
+                    self.id, delivered, total, http_failures, serialization_failures,
                 );
                 Err(e)
             }
@@ -907,6 +950,13 @@ fn truncate_response(body: &str, max_len: usize) -> &str {
 #[async_trait]
 impl Sink for HttpSink {
     async fn open(&mut self) -> Result<(), Error> {
+        // Validate success_status_codes — empty would cause every response to be treated as failure
+        if self.success_status_codes.is_empty() {
+            return Err(Error::InitError(
+                "success_status_codes must not be empty — would cause retry storms against healthy endpoints".to_string(),
+            ));
+        }
+
         // Validate URL
         if self.url.is_empty() {
             return Err(Error::InitError(
