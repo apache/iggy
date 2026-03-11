@@ -238,7 +238,6 @@ if [ "${exit_code}" -eq 0 ]; then
     cd ../..
 
     # Terminate TLS server
-    kill -TERM "$(cat ${PID_FILE})"
     kill -TERM "$(cat ${PID_FILE})" 2>/dev/null || true
     test -e ${PID_FILE} && rm ${PID_FILE}
 fi

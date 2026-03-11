@@ -362,6 +362,7 @@ func (c *IggyTcpClient) connect() error {
 			// TLS logic
 			tlsConfig, err := c.createTLSConfig()
 			if err != nil {
+				_ = connection.Close()
 				return err
 			}
 

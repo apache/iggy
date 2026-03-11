@@ -20,22 +20,11 @@
 // These tests use testcontainers to spin up a TLS-enabled Iggy server,
 // making them fully self-contained and suitable for CI.
 //
-// The IGGY_SERVER_DOCKER_IMAGE environment variable must be set to a locally
-// built Docker image. Do NOT use images from DockerHub — CI must test the code
-// from the current PR, not a previously released version.
+// The tests default to using apache/iggy:edge. Override with:
 //
-// Build the image locally:
+//	IGGY_SERVER_DOCKER_IMAGE=custom-image go test -v ./tests
 //
-//	cargo build && docker build -f core/server/Dockerfile \
-//	  --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
-//	  --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
-//	  --build-arg LIBC=glibc --target runtime-prebuilt -t iggy-server:test .
-//
-// Then run tests:
-//
-//	IGGY_SERVER_DOCKER_IMAGE=iggy-server:test go test -v ./tests
-//
-// In CI, the image is built by .github/actions/utils/docker-build-test-server/action.yml
+// In CI, the image is built from the current PR by docker-build-test-server action.
 package tests_test
 
 import (
@@ -76,16 +65,11 @@ func setupTLSContainer(t *testing.T) (testcontainers.Container, string, string) 
 	_, err = os.Stat(caFile)
 	require.NoError(t, err, "CA cert not found at %s", caFile)
 
-	// Require locally built Docker image — never pull from DockerHub.
 	// In CI, the image is built by docker-build-test-server action.
-	// Locally, build with: cargo build && docker build -f core/server/Dockerfile ...
+	// Locally, defaults to apache/iggy:edge for convenience.
 	dockerImage := os.Getenv("IGGY_SERVER_DOCKER_IMAGE")
 	if dockerImage == "" {
-		t.Fatal("IGGY_SERVER_DOCKER_IMAGE env var is required. " +
-			"Build the image first: cargo build && docker build -f core/server/Dockerfile " +
-			"--build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server " +
-			"--build-arg PREBUILT_IGGY_CLI=target/debug/iggy " +
-			"--build-arg LIBC=glibc --target runtime-prebuilt -t iggy-server:test .")
+		dockerImage = "apache/iggy:edge"
 	}
 
 	req := testcontainers.ContainerRequest{
