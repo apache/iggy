@@ -3,8 +3,7 @@
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
+ * to you under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
  *   http://www.apache.org/licenses/LICENSE-2.0
@@ -131,7 +130,7 @@ async fn influxdb_source_message_payload_structure(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    assert_eq!(msgs.len(), 1, "Expected 1 message, got {}", msgs.len());
+    assert_eq!(msgs.len(), 1, "Expected 1 message, got {{msgs.len()}});
     let m = &msgs[0];
     assert!(m.get("measurement").is_some(), "missing 'measurement': {{m}}");
     assert!(m.get("timestamp").is_some(), "missing 'timestamp': {{m}}");
@@ -172,7 +171,7 @@ async fn influxdb_source_empty_bucket_produces_no_messages(
     assert_eq!(
         polled.messages.len(),
         0,
-        "Expected 0 messages for empty bucket, got {}",
+        "Expected 0 messages for empty bucket, got {{polled.messages.len()}}",
         polled.messages.len()
     );
 }
@@ -226,7 +225,7 @@ async fn influxdb_source_multiple_measurements(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    assert_eq!(msgs.len(), 3, "Expected 3 messages, got {}", msgs.len());
+    assert_eq!(msgs.len(), 3, "Expected 3 messages, got {{msgs.len()}});
 
     let measurements: Vec<&str> = msgs
         .iter()
