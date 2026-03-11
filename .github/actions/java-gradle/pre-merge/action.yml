@@ -146,6 +146,34 @@ runs:
         pid-file: ${{ steps.iggy.outputs.pid_file }}
         log-file: ${{ steps.iggy.outputs.log_file }}
 
+    - name: Start Iggy server (TLS)
+      id: iggy-tls
+      if: inputs.task == 'test'
+      uses: ./.github/actions/utils/server-start
+      with:
+        pid-file: ${{ runner.temp }}/iggy-server-tls.pid
+        log-file: ${{ runner.temp }}/iggy-server-tls.log
+      env:
+        IGGY_TCP_TLS_ENABLED: "true"
+        IGGY_TCP_TLS_CERT_FILE: core/certs/iggy_cert.pem
+        IGGY_TCP_TLS_KEY_FILE: core/certs/iggy_key.pem
+
+    - name: TLS integration tests
+      if: inputs.task == 'test'
+      shell: bash
+      working-directory: foreign/java
+      env:
+        USE_EXTERNAL_SERVER: true
+        IGGY_TCP_TLS_ENABLED: "true"
+      run: ./gradlew :iggy:test --tests "*TlsConnectionTest*"
+
+    - name: Stop Iggy server (TLS)
+      if: always() && inputs.task == 'test'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy-tls.outputs.pid_file }}
+        log-file: ${{ steps.iggy-tls.outputs.log_file }}
+
     - name: Test Summary
       uses: test-summary/action@v2
       with:
