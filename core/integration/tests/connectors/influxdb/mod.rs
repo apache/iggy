@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,9 +17,7 @@
  * under the License.
  */
 
-//! InfluxDB connector integration test module.
-//! File: core/integration/tests/connectors/influxdb/mod.rs
+mod influxdb_sink;
+mod influxdb_source;
 
-pub mod influxdb_sink; // sink integration tests
-pub mod influxdb_source;
-pub mod test_utils; // shared helpers (build_iggy_client, start_connector_runtime, …) // source integration tests
+const TEST_MESSAGE_COUNT: usize = 3;
