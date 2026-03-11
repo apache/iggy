@@ -37,10 +37,10 @@ pub enum RecoveryError {
 impl fmt::Display for RecoveryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RecoveryError::Snapshot(e) => write!(f, "recovery snapshot error: {}", e),
-            RecoveryError::Journal(e) => write!(f, "recovery journal error: {}", e),
-            RecoveryError::StateMachine(e) => write!(f, "recovery state machine error: {}", e),
-            RecoveryError::Io(e) => write!(f, "recovery I/O error: {}", e),
+            Self::Snapshot(e) => write!(f, "recovery snapshot error: {e}"),
+            Self::Journal(e) => write!(f, "recovery journal error: {e}"),
+            Self::StateMachine(e) => write!(f, "recovery state machine error: {e}"),
+            Self::Io(e) => write!(f, "recovery I/O error: {e}"),
         }
     }
 }
@@ -48,35 +48,35 @@ impl fmt::Display for RecoveryError {
 impl std::error::Error for RecoveryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            RecoveryError::Snapshot(e) => Some(e),
-            RecoveryError::Journal(e) => Some(e),
-            RecoveryError::StateMachine(e) => Some(e),
-            RecoveryError::Io(e) => Some(e),
+            Self::Snapshot(e) => Some(e),
+            Self::Journal(e) => Some(e),
+            Self::StateMachine(e) => Some(e),
+            Self::Io(e) => Some(e),
         }
     }
 }
 
 impl From<SnapshotError> for RecoveryError {
     fn from(e: SnapshotError) -> Self {
-        RecoveryError::Snapshot(e)
+        Self::Snapshot(e)
     }
 }
 
 impl From<JournalError> for RecoveryError {
     fn from(e: JournalError) -> Self {
-        RecoveryError::Journal(e)
+        Self::Journal(e)
     }
 }
 
 impl From<IggyError> for RecoveryError {
     fn from(e: IggyError) -> Self {
-        RecoveryError::StateMachine(e)
+        Self::StateMachine(e)
     }
 }
 
 impl From<std::io::Error> for RecoveryError {
     fn from(e: std::io::Error) -> Self {
-        RecoveryError::Io(e)
+        Self::Io(e)
     }
 }
 
@@ -97,9 +97,12 @@ pub struct RecoveredMetadata<M> {
 /// 3. Open WAL at `{data_dir}/metadata/journal.wal`, scan and rebuild index
 /// 4. Replay journal entries from `snapshot.sequence_number + 1` through the state machine
 /// 5. Return the assembled `RecoveredMetadata`
+///
+/// # Errors
+/// Returns `RecoveryError` if snapshot loading, journal opening, or replay fails.
 pub fn recover<M>(data_dir: &Path) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
-    M: StateMachine<Input = Message<PrepareHeader>, Output = (), Error = IggyError>
+    M: StateMachine<Input = Message<PrepareHeader>, Error = IggyError>
         + RestoreSnapshot<MetadataSnapshot>,
 {
     let metadata_dir = data_dir.join(super::METADATA_DIR);
@@ -151,6 +154,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
     use bytes::BytesMut;
@@ -167,7 +171,7 @@ mod tests {
     fn make_prepare(op: u64, body_size: usize) -> Message<PrepareHeader> {
         let total_size = HEADER_SIZE + body_size;
         let mut buffer = BytesMut::zeroed(total_size);
-        let header = bytemuck::from_bytes_mut::<PrepareHeader>(&mut buffer[..HEADER_SIZE]);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(&mut buffer[..HEADER_SIZE]);
         header.size = total_size as u32;
         header.command = Command2::Prepare;
         header.op = op;

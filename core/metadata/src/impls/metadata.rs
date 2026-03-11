@@ -55,6 +55,9 @@ impl IggySnapshot {
     }
 
     /// Persist the snapshot to disk.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError` if serialization or I/O fails.
     pub fn persist(&self, path: &Path) -> Result<(), SnapshotError> {
         use std::fs;
         use std::io::Write;
@@ -79,7 +82,10 @@ impl IggySnapshot {
         Ok(())
     }
 
-    /// Load a snapshot from disk
+    /// Load a snapshot from disk.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError` if the file cannot be read or deserialization fails.
     pub fn load(path: &Path) -> Result<Self, SnapshotError> {
         let data = std::fs::read(path)?;
 
@@ -161,6 +167,9 @@ where
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
+        // TODO: tune this margin size
+        const CHECKPOINT_MARGIN: usize = 64;
+
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
@@ -192,8 +201,6 @@ where
         // TODO handle gap in ops.
 
         // Force a checkpoint if the journal is running low on capacity.
-        // TODO: tune this margin size
-        const CHECKPOINT_MARGIN: usize = 64;
         if journal
             .handle()
             .remaining_capacity()
@@ -405,6 +412,9 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
     /// After the snapshot is durably persisted, advances the journal's
     /// snapshot watermark so that entries at or below `last_op` may be
     /// evicted from the ring buffer on future appends.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError` if snapshotting, persistence, or compaction fails.
     pub fn checkpoint(&self, data_dir: &Path, last_op: u64) -> Result<(), SnapshotError>
     where
         M: FillSnapshot<MetadataSnapshot>,

@@ -71,7 +71,7 @@ impl std::error::Error for SnapshotError {
 
 impl From<std::io::Error> for SnapshotError {
     fn from(e: std::io::Error) -> Self {
-        SnapshotError::Io(e)
+        Self::Io(e)
     }
 }
 

@@ -51,6 +51,7 @@ pub const SLOT_COUNT: usize = 1024;
 
 /// Error type for journal operations.
 #[derive(Debug)]
+#[allow(clippy::module_name_repetitions)]
 pub enum JournalError {
     Io(io::Error),
 }
@@ -58,7 +59,7 @@ pub enum JournalError {
 impl fmt::Display for JournalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            JournalError::Io(e) => write!(f, "journal I/O error: {}", e),
+            Self::Io(e) => write!(f, "journal I/O error: {e}"),
         }
     }
 }
@@ -66,14 +67,14 @@ impl fmt::Display for JournalError {
 impl std::error::Error for JournalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            JournalError::Io(e) => Some(e),
+            Self::Io(e) => Some(e),
         }
     }
 }
 
 impl From<io::Error> for JournalError {
     fn from(e: io::Error) -> Self {
-        JournalError::Io(e)
+        Self::Io(e)
     }
 }
 
@@ -91,7 +92,7 @@ pub struct MetadataJournal {
     last_op: Cell<Option<u64>>,
     /// Highest op that has been durably snapshotted. Entries with `op <= snapshot_op`
     /// are safe to evict from the slot array. Appending an entry that would evict
-    /// an un-snapshotted entry (op > snapshot_op) panics and the upper layer must
+    /// an un-snapshotted entry (op > `snapshot_op`) panics and the upper layer must
     /// take a snapshot before the journal wraps.
     snapshot_op: Cell<u64>,
 }
@@ -101,14 +102,16 @@ impl fmt::Debug for MetadataJournal {
         f.debug_struct("MetadataJournal")
             .field("write_offset", &self.storage.file_len())
             .field("last_op", &self.last_op.get())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
-fn slot_for_op(op: u64) -> usize {
+#[allow(clippy::cast_possible_truncation)]
+const fn slot_for_op(op: u64) -> usize {
     op as usize % SLOT_COUNT
 }
 
+#[allow(clippy::cast_possible_truncation)]
 impl MetadataJournal {
     /// Open the WAL file, scanning forward to rebuild the in-memory index.
     ///
@@ -118,6 +121,9 @@ impl MetadataJournal {
     ///
     /// If a truncated entry is found at the tail (crash during write),
     /// the file is truncated to the last complete entry.
+    ///
+    /// # Errors
+    /// Returns `JournalError::Io` if the WAL file cannot be opened or read.
     pub fn open(path: &Path, snapshot_op: u64) -> Result<Self, JournalError> {
         let storage = FileStorage::open(path)?;
         let file_len = storage.file_len();
@@ -136,14 +142,14 @@ impl MetadataJournal {
             // Validate: must be a Prepare command with sane size
             if header.command != Command2::Prepare
                 || (header.size as usize) < HEADER_SIZE
-                || header.size as u64 > MAX_ENTRY_SIZE
+                || u64::from(header.size) > MAX_ENTRY_SIZE
             {
                 // Corrupt or non-prepare entry, truncate here
                 storage.truncate(pos)?;
                 break;
             }
 
-            let entry_size = header.size as u64;
+            let entry_size = u64::from(header.size);
 
             // Check if the full entry fits
             if pos + entry_size > file_len {
@@ -195,13 +201,16 @@ impl MetadataJournal {
         result
     }
 
-    /// Highest op number in the index, or None if empty.
-    pub fn last_op(&self) -> Option<u64> {
+    /// Highest op number in the index, or `None` if empty.
+    pub const fn last_op(&self) -> Option<u64> {
         self.last_op.get()
     }
 
     /// Advance the snapshot watermark. The caller must ensure `op` is
     /// monotonically increasing and corresponds to a durable snapshot.
+    ///
+    /// # Panics
+    /// Panics if `op` is less than the current snapshot watermark.
     pub fn set_snapshot_op(&self, op: u64) {
         assert!(
             op >= self.snapshot_op.get(),
@@ -213,20 +222,21 @@ impl MetadataJournal {
     }
 
     /// Access the underlying storage (for fsync in tests, etc.).
-    pub fn storage_ref(&self) -> &FileStorage {
+    pub const fn storage_ref(&self) -> &FileStorage {
         &self.storage
     }
 
     /// Synchronous entry read for recovery.
     ///
-    /// Returns `Ok(None)` if the op is not in the index, or `Err` on I/O
-    /// or parse errors.
+    /// Returns `Ok(None)` if the op is not in the index.
+    ///
+    /// # Errors
+    /// Returns an I/O error if the read fails or the entry is malformed.
     pub fn entry_sync(&self, header: &PrepareHeader) -> io::Result<Option<Message<PrepareHeader>>> {
         let offsets = self.offsets.borrow();
         let slot = slot_for_op(header.op);
-        let offset = match offsets[slot] {
-            Some(o) => o,
-            None => return Ok(None),
+        let Some(offset) = offsets[slot] else {
+            return Ok(None);
         };
         let size = header.size as usize;
         drop(offsets);
@@ -238,6 +248,11 @@ impl MetadataJournal {
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::future_not_send
+)]
 impl Journal<FileStorage> for MetadataJournal {
     type Header = PrepareHeader;
     type Entry = Message<PrepareHeader>;
@@ -265,13 +280,12 @@ impl Journal<FileStorage> for MetadataJournal {
     }
 
     fn set_snapshot_op(&self, op: u64) {
-        MetadataJournal::set_snapshot_op(self, op);
+        Self::set_snapshot_op(self, op);
     }
 
     fn remaining_capacity(&self) -> Option<usize> {
-        let last = match self.last_op.get() {
-            Some(op) => op,
-            None => return Some(SLOT_COUNT),
+        let Some(last) = self.last_op.get() else {
+            return Some(SLOT_COUNT);
         };
         let snapshot = self.snapshot_op.get();
         let used = (last - snapshot) as usize;
@@ -336,7 +350,7 @@ impl Journal<FileStorage> for MetadataJournal {
         for (header, _) in &live {
             let slot = slot_for_op(header.op);
             offsets[slot] = Some(pos);
-            pos += header.size as u64;
+            pos += u64::from(header.size);
         }
 
         // Clear slots for snapshotted entries that were removed.
@@ -407,7 +421,7 @@ impl Journal<FileStorage> for MetadataJournal {
 
 impl JournalHandle for MetadataJournal {
     type Storage = FileStorage;
-    type Target = MetadataJournal;
+    type Target = Self;
 
     fn handle(&self) -> &Self::Target {
         self
@@ -415,6 +429,7 @@ impl JournalHandle for MetadataJournal {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 mod tests {
     use super::*;
     use bytes::BytesMut;
@@ -425,7 +440,7 @@ mod tests {
         let total_size = HEADER_SIZE + body_size;
         let mut buffer = BytesMut::zeroed(total_size);
 
-        let header = bytemuck::from_bytes_mut::<PrepareHeader>(&mut buffer[..HEADER_SIZE]);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(&mut buffer[..HEADER_SIZE]);
         header.size = total_size as u32;
         header.command = Command2::Prepare;
         header.op = op;

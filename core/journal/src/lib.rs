@@ -50,6 +50,9 @@ where
 
     /// Remove snapshotted entries from the WAL to reclaim disk space.
     /// The default is a no-op for journals that do not persist to disk.
+    ///
+    /// # Errors
+    /// Returns an I/O error if compaction fails.
     fn compact(&self) -> io::Result<()> {
         Ok(())
     }
