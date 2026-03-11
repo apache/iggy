@@ -19,19 +19,9 @@
 set -Eeuo pipefail
 
 SDK=${1:-"all"}
-shift || true
+FEATURE=${2:-"scenarios/basic_messaging.feature"}
 
-GO_TEST_EXTRA_FLAGS=""
-FEATURE=""
-for arg in "$@"; do
-  case "$arg" in
-    -race) GO_TEST_EXTRA_FLAGS="-race" ;;
-    *)     FEATURE="$arg" ;;
-  esac
-done
-FEATURE=${FEATURE:-"scenarios/basic_messaging.feature"}
-
-export DOCKER_BUILDKIT=1 FEATURE GO_TEST_EXTRA_FLAGS
+export DOCKER_BUILDKIT=1 FEATURE GO_TEST_EXTRA_FLAGS="${GO_TEST_EXTRA_FLAGS:-}"
 
 cd "$(dirname "$0")/../bdd"
 
@@ -58,29 +48,31 @@ run_suite(){
 }
 
 case "$SDK" in
-  rust)   run_suite rust-bdd   "🦀"   "Running Rust BDD tests"   ;;
-  python) run_suite python-bdd "🐍"   "Running Python BDD tests" ;;
-  go)
-    _go_label="Running Go BDD tests"
-    [[ -n "$GO_TEST_EXTRA_FLAGS" ]] && _go_label="Running Go BDD tests (${GO_TEST_EXTRA_FLAGS})"
-    run_suite go-bdd "🐹" "$_go_label"
+  rust)     run_suite rust-bdd   "🦀"   "Running Rust BDD tests"   ;;
+  python)   run_suite python-bdd "🐍"   "Running Python BDD tests" ;;
+  go)       run_suite go-bdd     "🐹"   "Running Go BDD tests"     ;;
+  go-race)
+    export GO_TEST_EXTRA_FLAGS="-race"
+    run_suite go-bdd "🐹⚡" "Running Go BDD tests with data race detector"
     ;;
-  node)   run_suite node-bdd   "🐢🚀" "Running Node BDD tests"   ;;
-  csharp) run_suite csharp-bdd "🔷"   "Running C# BDD tests"     ;;
-  java)   run_suite java-bdd   "☕"   "Running Java BDD tests"   ;;
+  node)     run_suite node-bdd   "🐢🚀" "Running Node BDD tests"   ;;
+  csharp)   run_suite csharp-bdd "🔷"   "Running C# BDD tests"     ;;
+  java)     run_suite java-bdd   "☕"   "Running Java BDD tests"   ;;
   all)
-    run_suite rust-bdd   "🦀"   "Running Rust BDD tests"   || exit $?
-    run_suite python-bdd "🐍"   "Running Python BDD tests" || exit $?
-    run_suite go-bdd     "🐹"   "Running Go BDD tests"     || exit $?
-    run_suite node-bdd   "🐢🚀" "Running Node BDD tests"   || exit $?
-    run_suite csharp-bdd "🔷"   "Running C# BDD tests"     || exit $?
-    run_suite java-bdd   "☕"   "Running Java BDD tests"   || exit $?
+    run_suite rust-bdd   "🦀"   "Running Rust BDD tests"                       || exit $?
+    run_suite python-bdd "🐍"   "Running Python BDD tests"                     || exit $?
+    run_suite go-bdd     "🐹"   "Running Go BDD tests"                         || exit $?
+    GO_TEST_EXTRA_FLAGS="-race" \
+    run_suite go-bdd     "🐹⚡" "Running Go BDD tests with data race detector"  || exit $?
+    run_suite node-bdd   "🐢🚀" "Running Node BDD tests"                       || exit $?
+    run_suite csharp-bdd "🔷"   "Running C# BDD tests"                         || exit $?
+    run_suite java-bdd   "☕"   "Running Java BDD tests"                       || exit $?
     ;;
   clean)
     cleanup; exit 0 ;;
   *)
     log "❌ Unknown SDK: ${SDK}"
-    log "📖 Usage: $0 [rust|python|go|node|csharp|java|all|clean] [-race] [feature_file]"
+    log "📖 Usage: $0 [rust|python|go|go-race|node|csharp|java|all|clean] [feature_file]"
     exit 2 ;;
 esac
 

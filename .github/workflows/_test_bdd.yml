@@ -82,18 +82,10 @@ jobs:
       - name: Run BDD tests
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
-          # Extract SDK name from task (format: bdd-<sdk> or bdd-<sdk>-race)
-          FULL_SDK=$(echo "${{ inputs.task }}" | sed 's/^bdd-//')
+          # Extract SDK name from task (format: bdd-<sdk>)
+          SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/^bdd-//')
 
-          EXTRA_FLAGS=""
-          if [[ "$FULL_SDK" == *-race ]]; then
-            SDK_NAME="${FULL_SDK%-race}"
-            EXTRA_FLAGS="-race"
-          else
-            SDK_NAME="$FULL_SDK"
-          fi
-
-          echo "Running BDD tests for SDK: $SDK_NAME ${EXTRA_FLAGS}"
+          echo "Running BDD tests for SDK: $SDK_NAME"
           echo "Current directory: $(pwd)"
           echo "Server binary location: $(ls -lh target/debug/iggy-server)"
           echo "CLI binary location: $(ls -lh target/debug/iggy)"
@@ -103,7 +95,7 @@ jobs:
           export IGGY_CLI_PATH="target/debug/iggy"
           export IGGY_ROOT_USERNAME="iggy"
           export IGGY_ROOT_PASSWORD="iggy"
-          ./scripts/run-bdd-tests.sh "$SDK_NAME" $EXTRA_FLAGS
+          ./scripts/run-bdd-tests.sh "$SDK_NAME"
 
       - name: Clean up Docker resources (BDD)
         if: always() && startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
