@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <string>
 
@@ -31,6 +32,7 @@ inline iggy::ffi::Identifier make_string_identifier(const std::string &value) {
     for (const char c : value) {
         identifier.value.push_back(static_cast<std::uint8_t>(c));
     }
+    assert(identifier.length == identifier.value.size());
     return identifier;
 }
 
@@ -42,6 +44,7 @@ inline iggy::ffi::Identifier make_numeric_identifier(const std::uint32_t value) 
     identifier.value.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFF));
     identifier.value.push_back(static_cast<std::uint8_t>((value >> 16) & 0xFF));
     identifier.value.push_back(static_cast<std::uint8_t>((value >> 24) & 0xFF));
+    assert(identifier.length == identifier.value.size());
     return identifier;
 }
 
