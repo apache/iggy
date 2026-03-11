@@ -52,7 +52,7 @@ once_cell = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
 rmcp = { workspace = true, features = [
@@ -61,7 +61,7 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
 ] }
-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
 server = { workspace = true }
@@ -72,7 +72,7 @@ sysinfo = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
 testcontainers-modules = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
