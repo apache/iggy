@@ -39,6 +39,9 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
 const DEFAULT_MAX_PAYLOAD_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 const DEFAULT_MAX_CONNECTIONS: usize = 10;
+/// Abort remaining messages in individual/raw mode after this many consecutive HTTP failures.
+/// Prevents hammering a dead endpoint with N sequential retry cycles per poll.
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 /// HTTP method enum — validated at deserialization, prevents invalid values like "DELET" or "GETS".
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +203,22 @@ impl HttpSink {
             );
         }
 
+        if batch_mode == BatchMode::Raw && include_metadata {
+            warn!(
+                "HTTP sink ID: {} — batch_mode=raw ignores include_metadata. \
+                 Raw mode sends payload bytes directly without metadata envelope.",
+                id
+            );
+        }
+
+        if matches!(method, HttpMethod::Get | HttpMethod::Head) && batch_mode != BatchMode::Individual {
+            warn!(
+                "HTTP sink ID: {} — {:?} with batch_mode={:?} will send a request body. \
+                 Some servers may reject GET/HEAD requests with a body.",
+                id, method, batch_mode,
+            );
+        }
+
         HttpSink {
             id,
             url,
@@ -242,19 +261,10 @@ impl HttpSink {
         })
     }
 
-    /// Apply the configured HTTP method to a `reqwest::Client` for the target URL.
+    /// Apply the configured HTTP method to a `reqwest::Client` for the target URL,
+    /// including custom headers.
     fn request_builder(&self, client: &reqwest::Client) -> reqwest::RequestBuilder {
-        let builder = match self.method {
-            HttpMethod::Get => client.get(&self.url),
-            HttpMethod::Head => client.head(&self.url),
-            HttpMethod::Post => client.post(&self.url),
-            HttpMethod::Put => client.put(&self.url),
-            HttpMethod::Patch => client.patch(&self.url),
-            HttpMethod::Delete => client.delete(&self.url),
-        };
-
-        // Apply custom headers
-        let mut builder = builder;
+        let mut builder = build_request(self.method, client, &self.url);
         for (key, value) in &self.headers {
             builder = builder.header(key, value);
         }
@@ -278,11 +288,9 @@ impl HttpSink {
     ) -> Result<serde_json::Value, Error> {
         match payload {
             Payload::Json(value) => {
-                // simd_json::OwnedValue → serde_json::Value via serialization roundtrip
-                let bytes = simd_json::to_vec(&value)
-                    .map_err(|e| Error::Serialization(format!("JSON serialize: {}", e)))?;
-                serde_json::from_slice(&bytes)
-                    .map_err(|e| Error::Serialization(format!("JSON re-parse: {}", e)))
+                // Direct structural conversion (not serialization roundtrip).
+                // Follows the Elasticsearch sink pattern. NaN/Infinity f64 → null.
+                Ok(owned_value_to_serde_json(&value))
             }
             Payload::Text(text) => Ok(serde_json::Value::String(text)),
             Payload::Raw(bytes) => Ok(serde_json::json!({
@@ -343,14 +351,15 @@ impl HttpSink {
         )
     }
 
-    /// Extract `Retry-After` header value as a Duration (seconds).
-    fn parse_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    /// Extract `Retry-After` header value as a Duration (seconds), capped to `max_retry_delay`.
+    fn parse_retry_after(&self, response: &reqwest::Response) -> Option<Duration> {
         response
             .headers()
-            .get("retry-after")
+            .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
             .map(Duration::from_secs)
+            .map(|d| d.min(self.max_retry_delay))
     }
 
     /// Compute the retry delay for a given attempt, applying exponential backoff
@@ -406,7 +415,7 @@ impl HttpSink {
                     let status = response.status();
 
                     // Check for Retry-After before consuming the response
-                    let retry_after = Self::parse_retry_after(&response);
+                    let retry_after = self.parse_retry_after(&response);
 
                     if self.success_status_codes.contains(&status.as_u16()) {
                         if self.verbose {
@@ -420,8 +429,11 @@ impl HttpSink {
                         return Ok(());
                     }
 
-                    // Non-success status
-                    let response_body = response.text().await.unwrap_or_default();
+                    // Non-success status — read body for diagnostics
+                    let response_body = match response.text().await {
+                        Ok(body) => body,
+                        Err(e) => format!("<body read error: {}>", e),
+                    };
 
                     if Self::is_transient_status(status) && attempt < self.max_retries {
                         let delay = retry_after.unwrap_or_else(|| self.compute_retry_delay(attempt));
@@ -505,6 +517,7 @@ impl HttpSink {
         let total = messages.len();
         let mut delivered = 0u64;
         let mut failed = 0u64;
+        let mut consecutive_failures = 0u32;
         let mut last_error: Option<Error> = None;
 
         for message in &messages {
@@ -553,14 +566,29 @@ impl HttpSink {
             }
 
             match self.send_with_retry(client, body, self.content_type()).await {
-                Ok(()) => delivered += 1,
+                Ok(()) => {
+                    delivered += 1;
+                    consecutive_failures = 0;
+                }
                 Err(e) => {
                     error!(
                         "HTTP sink ID: {} — failed to deliver message at offset {} after retries: {}",
                         self.id, offset, e
                     );
                     failed += 1;
+                    consecutive_failures += 1;
                     last_error = Some(e);
+
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        error!(
+                            "HTTP sink ID: {} — aborting batch after {} consecutive failures \
+                             ({} remaining messages skipped)",
+                            self.id,
+                            consecutive_failures,
+                            total - (delivered + failed) as usize,
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -580,6 +608,7 @@ impl HttpSink {
     }
 
     /// Send messages in `ndjson` mode — all messages in one request, newline-delimited.
+    /// Skips individual messages that fail serialization rather than aborting the batch.
     async fn send_ndjson(
         &self,
         client: &reqwest::Client,
@@ -587,19 +616,49 @@ impl HttpSink {
         messages_metadata: &MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
-        let count = messages.len() as u64;
         let mut lines = Vec::with_capacity(messages.len());
+        let mut skipped = 0u64;
 
         for message in &messages {
-            let payload_json = self.payload_to_json(message.payload.clone())?;
+            let payload_json = match self.payload_to_json(message.payload.clone()) {
+                Ok(json) => json,
+                Err(e) => {
+                    error!(
+                        "HTTP sink ID: {} — skipping message at offset {} in NDJSON batch: {}",
+                        self.id, message.offset, e
+                    );
+                    self.errors_count.fetch_add(1, Ordering::Relaxed);
+                    skipped += 1;
+                    continue;
+                }
+            };
             let envelope =
                 self.build_envelope(message, topic_metadata, messages_metadata, payload_json);
-            let line = serde_json::to_string(&envelope)
-                .map_err(|e| Error::Serialization(format!("NDJSON line serialize: {}", e)))?;
-            lines.push(line);
+            match serde_json::to_string(&envelope) {
+                Ok(line) => lines.push(line),
+                Err(e) => {
+                    error!(
+                        "HTTP sink ID: {} — skipping message at offset {} in NDJSON batch (serialize): {}",
+                        self.id, message.offset, e
+                    );
+                    self.errors_count.fetch_add(1, Ordering::Relaxed);
+                    skipped += 1;
+                    continue;
+                }
+            }
         }
 
-        let body = lines.join("\n").into_bytes();
+        if lines.is_empty() {
+            return Err(Error::Serialization(
+                "All messages in NDJSON batch failed serialization".to_string(),
+            ));
+        }
+
+        let count = lines.len() as u64;
+
+        let mut body_str = lines.join("\n");
+        body_str.push('\n'); // NDJSON spec requires trailing newline
+        let body = body_str.into_bytes();
 
         if self.max_payload_size_bytes > 0 && body.len() as u64 > self.max_payload_size_bytes {
             error!(
@@ -616,10 +675,17 @@ impl HttpSink {
 
         self.send_with_retry(client, body, self.content_type()).await?;
         self.messages_delivered.fetch_add(count, Ordering::Relaxed);
+        if skipped > 0 {
+            warn!(
+                "HTTP sink ID: {} — NDJSON batch: {} delivered, {} skipped (serialization errors)",
+                self.id, count, skipped,
+            );
+        }
         Ok(())
     }
 
     /// Send messages in `json_array` mode — all messages as a single JSON array.
+    /// Skips individual messages that fail serialization rather than aborting the batch.
     async fn send_json_array(
         &self,
         client: &reqwest::Client,
@@ -627,15 +693,34 @@ impl HttpSink {
         messages_metadata: &MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
-        let count = messages.len() as u64;
         let mut envelopes = Vec::with_capacity(messages.len());
+        let mut skipped = 0u64;
 
         for message in &messages {
-            let payload_json = self.payload_to_json(message.payload.clone())?;
+            let payload_json = match self.payload_to_json(message.payload.clone()) {
+                Ok(json) => json,
+                Err(e) => {
+                    error!(
+                        "HTTP sink ID: {} — skipping message at offset {} in JSON array batch: {}",
+                        self.id, message.offset, e
+                    );
+                    self.errors_count.fetch_add(1, Ordering::Relaxed);
+                    skipped += 1;
+                    continue;
+                }
+            };
             let envelope =
                 self.build_envelope(message, topic_metadata, messages_metadata, payload_json);
             envelopes.push(envelope);
         }
+
+        if envelopes.is_empty() {
+            return Err(Error::Serialization(
+                "All messages in JSON array batch failed serialization".to_string(),
+            ));
+        }
+
+        let count = envelopes.len() as u64;
 
         let body = serde_json::to_vec(&envelopes)
             .map_err(|e| Error::Serialization(format!("JSON array serialize: {}", e)))?;
@@ -655,6 +740,12 @@ impl HttpSink {
 
         self.send_with_retry(client, body, self.content_type()).await?;
         self.messages_delivered.fetch_add(count, Ordering::Relaxed);
+        if skipped > 0 {
+            warn!(
+                "HTTP sink ID: {} — JSON array batch: {} delivered, {} skipped (serialization errors)",
+                self.id, count, skipped,
+            );
+        }
         Ok(())
     }
 
@@ -668,6 +759,7 @@ impl HttpSink {
         let total = messages.len();
         let mut delivered = 0u64;
         let mut failed = 0u64;
+        let mut consecutive_failures = 0u32;
         let mut last_error: Option<Error> = None;
 
         for message in &messages {
@@ -701,14 +793,29 @@ impl HttpSink {
             }
 
             match self.send_with_retry(client, body, self.content_type()).await {
-                Ok(()) => delivered += 1,
+                Ok(()) => {
+                    delivered += 1;
+                    consecutive_failures = 0;
+                }
                 Err(e) => {
                     error!(
                         "HTTP sink ID: {} — failed to deliver raw message at offset {}: {}",
                         self.id, offset, e
                     );
                     failed += 1;
+                    consecutive_failures += 1;
                     last_error = Some(e);
+
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        error!(
+                            "HTTP sink ID: {} — aborting raw batch after {} consecutive failures \
+                             ({} remaining messages skipped)",
+                            self.id,
+                            consecutive_failures,
+                            total - (delivered + failed) as usize,
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -728,8 +835,52 @@ impl HttpSink {
     }
 }
 
-/// Format a u128 message ID as a UUID-style string (8-4-4-4-12 hex).
-/// Avoids pulling in the `uuid` crate for a single formatting operation.
+/// Convert `simd_json::OwnedValue` to `serde_json::Value` via direct structural mapping.
+/// NaN/Infinity f64 values are mapped to `null` (same as Elasticsearch sink).
+fn owned_value_to_serde_json(value: &simd_json::OwnedValue) -> serde_json::Value {
+    match value {
+        simd_json::OwnedValue::Static(s) => match s {
+            simd_json::StaticNode::Null => serde_json::Value::Null,
+            simd_json::StaticNode::Bool(b) => serde_json::Value::Bool(*b),
+            simd_json::StaticNode::I64(n) => serde_json::Value::Number((*n).into()),
+            simd_json::StaticNode::U64(n) => serde_json::Value::Number((*n).into()),
+            simd_json::StaticNode::F64(n) => serde_json::Number::from_f64(*n)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+        },
+        simd_json::OwnedValue::String(s) => serde_json::Value::String(s.to_string()),
+        simd_json::OwnedValue::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(owned_value_to_serde_json).collect())
+        }
+        simd_json::OwnedValue::Object(obj) => {
+            let map: serde_json::Map<String, serde_json::Value> = obj
+                .iter()
+                .map(|(k, v)| (k.to_string(), owned_value_to_serde_json(v)))
+                .collect();
+            serde_json::Value::Object(map)
+        }
+    }
+}
+
+/// Map an `HttpMethod` to a `reqwest::RequestBuilder` for the given URL.
+fn build_request(
+    method: HttpMethod,
+    client: &reqwest::Client,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    match method {
+        HttpMethod::Get => client.get(url),
+        HttpMethod::Head => client.head(url),
+        HttpMethod::Post => client.post(url),
+        HttpMethod::Put => client.put(url),
+        HttpMethod::Patch => client.patch(url),
+        HttpMethod::Delete => client.delete(url),
+    }
+}
+
+/// Format a u128 message ID as a UUID-style hex string (8-4-4-4-12).
+/// This is positional formatting only — no RFC 4122 version/variant bits are set.
+/// Downstream consumers should treat this as an opaque identifier, not a standards-compliant UUID.
 fn format_u128_as_uuid(id: u128) -> String {
     let hex = format!("{:032x}", id);
     format!(
@@ -756,25 +907,29 @@ fn truncate_response(body: &str, max_len: usize) -> &str {
 #[async_trait]
 impl Sink for HttpSink {
     async fn open(&mut self) -> Result<(), Error> {
-        // Validate URL is non-empty
+        // Validate URL
         if self.url.is_empty() {
-            return Err(Error::InvalidConfig);
+            return Err(Error::InitError(
+                "HTTP sink URL is empty — 'url' is required in [plugin_config]".to_string(),
+            ));
+        }
+        if reqwest::Url::parse(&self.url).is_err() {
+            return Err(Error::InitError(format!(
+                "HTTP sink URL '{}' is not a valid URL",
+                self.url,
+            )));
         }
 
         // Build the HTTP client with config-derived settings
         self.client = Some(self.build_client()?);
 
-        // Optional health check
+        // Optional health check — uses same success_status_codes and headers as consume()
         if self.health_check_enabled {
             let client = self.client.as_ref().expect("client just built");
-            let health_request = match self.health_check_method {
-                HttpMethod::Get => client.get(&self.url),
-                HttpMethod::Head => client.head(&self.url),
-                HttpMethod::Post => client.post(&self.url),
-                HttpMethod::Put => client.put(&self.url),
-                HttpMethod::Patch => client.patch(&self.url),
-                HttpMethod::Delete => client.delete(&self.url),
-            };
+            let mut health_request = build_request(self.health_check_method, client, &self.url);
+            for (key, value) in &self.headers {
+                health_request = health_request.header(key, value);
+            }
 
             let response = health_request.send().await.map_err(|e| {
                 Error::Connection(format!(
@@ -783,18 +938,18 @@ impl Sink for HttpSink {
                 ))
             })?;
 
-            if !response.status().is_success() {
+            let status = response.status();
+            if !self.success_status_codes.contains(&status.as_u16()) {
                 return Err(Error::Connection(format!(
-                    "Health check returned non-success status {} for URL '{}'",
-                    response.status(),
-                    self.url,
+                    "Health check returned status {} (not in success_status_codes {:?}) for URL '{}'",
+                    status.as_u16(), self.success_status_codes, self.url,
                 )));
             }
 
             info!(
                 "HTTP sink ID: {} — health check passed (status {})",
                 self.id,
-                response.status().as_u16()
+                status.as_u16()
             );
         }
 
@@ -823,7 +978,7 @@ impl Sink for HttpSink {
         }
 
         if self.verbose {
-            info!(
+            debug!(
                 "HTTP sink ID: {} — received {} messages (schema: {}, stream: {}, topic: {})",
                 self.id,
                 messages_count,
