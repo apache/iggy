@@ -25,6 +25,9 @@ use integration::harness::seeds;
 use integration::iggy_harness;
 use serde_json::Value;
 
+// seeds::connector_stream creates one topic with 1 partition (partition ID = 1, 1-based).
+// poll_messages must use partition_id = Some(1), NOT Some(0).
+
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
     seed = seeds::connector_stream
@@ -37,7 +40,7 @@ async fn influxdb_source_polls_and_produces_messages(
     let lines: Vec<String> = (0..TEST_MESSAGE_COUNT)
         .map(|i| {
             format!(
-                "sensor_readings,loc=lab v={v} {ts}",
+                "sensor_readings,loc=lab v={{v}} {{ts}}",
                 v = 20.0 + i as f64,
                 ts = base_ts + i as u64 * 1000,
             )
@@ -61,7 +64,7 @@ async fn influxdb_source_polls_and_produces_messages(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(1),
+                Some(1), // partition 1 (1-based, single-partition topic)
                 &consumer,
                 &PollingStrategy::next(),
                 100,
@@ -79,7 +82,7 @@ async fn influxdb_source_polls_and_produces_messages(
 
     assert_eq!(
         total, TEST_MESSAGE_COUNT,
-        "Expected {TEST_MESSAGE_COUNT} messages, got {total}"
+        "Expected {{TEST_MESSAGE_COUNT}} messages, got {{total}}"
     );
 }
 
@@ -93,7 +96,7 @@ async fn influxdb_source_message_payload_structure(
 ) {
     let ts: u64 = 1_700_000_100_000;
     fixture
-        .write_lines(&[&format!("sensor_readings,loc=roof humidity=78.5 {ts}")])
+        .write_lines(&[&format!("sensor_readings,loc=roof humidity=78.5 {{ts}}")])
         .await
         .expect("Failed to write line");
 
@@ -108,7 +111,7 @@ async fn influxdb_source_message_payload_structure(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(1),
+                Some(1), // partition 1 (1-based)
                 &consumer,
                 &PollingStrategy::next(),
                 10,
@@ -130,9 +133,9 @@ async fn influxdb_source_message_payload_structure(
 
     assert_eq!(msgs.len(), 1, "Expected 1 message, got {}", msgs.len());
     let m = &msgs[0];
-    assert!(m.get("measurement").is_some(), "missing 'measurement': {m}");
-    assert!(m.get("timestamp").is_some(), "missing 'timestamp': {m}");
-    assert!(m.get("value").is_some(), "missing 'value': {m}");
+    assert!(m.get("measurement").is_some(), "missing 'measurement': {{m}}");
+    assert!(m.get("timestamp").is_some(), "missing 'timestamp': {{m}}");
+    assert!(m.get("value").is_some(), "missing 'value': {{m}}");
 }
 
 #[iggy_harness(
@@ -157,7 +160,7 @@ async fn influxdb_source_empty_bucket_produces_no_messages(
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(1),
+            Some(1), // partition 1 (1-based)
             &consumer,
             &PollingStrategy::next(),
             100,
@@ -185,9 +188,9 @@ async fn influxdb_source_multiple_measurements(
     let ts: u64 = 1_700_200_000_000;
     fixture
         .write_lines(&[
-            &format!("temperature,room=living v=21.5 {ts}"),
-            &format!("humidity,room=living v=55.0 {}", ts + 1000),
-            &format!("pressure,room=living v=1013.25 {}", ts + 2000),
+            &format!("temperature,room=living v=21.5 {{ts}}"),
+            &format!("humidity,room=living v=55.0 {{}}", ts + 1000),
+            &format!("pressure,room=living v=1013.25 {{}}", ts + 2000),
         ])
         .await
         .expect("Failed to write lines");
@@ -203,7 +206,7 @@ async fn influxdb_source_multiple_measurements(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(1),
+                Some(1), // partition 1 (1-based)
                 &consumer,
                 &PollingStrategy::next(),
                 100,
