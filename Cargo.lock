@@ -5419,11 +5419,16 @@ name = "iggy_connector_http_sink"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "dashmap",
+ "humantime",
  "iggy_connector_sdk",
  "once_cell",
  "reqwest 0.13.2",
  "serde",
+ "serde_json",
+ "simd-json",
+ "tokio",
  "tracing",
 ]
 

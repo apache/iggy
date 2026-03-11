@@ -36,16 +36,14 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 async-trait = { workspace = true }
+base64 = { workspace = true }
 dashmap = { workspace = true }
+humantime = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 once_cell = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+simd-json = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
-
-# Dependencies below will be added as implementation progresses:
-# base64 = { workspace = true }        # Binary payload encoding (Commit 3)
-# humantime = { workspace = true }     # Duration parsing for timeout/retry_delay (Commit 2)
-# serde_json = { workspace = true }    # JSON payload handling (Commit 2)
-# simd-json = { workspace = true }     # High-perf JSON for payload types (Commit 3)
-# tokio = { workspace = true }         # Async sleep for retry delays (Commit 2)
