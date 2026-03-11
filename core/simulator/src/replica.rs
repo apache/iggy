@@ -58,6 +58,7 @@ pub fn new_replica(id: u8, name: String, bus: &Arc<MemBus>, replica_count: u8) -
         journal: Some(SimJournal::<MemStorage>::default()),
         snapshot: Some(SimSnapshot::default()),
         mux_stm: mux,
+        data_dir: None,
     };
 
     let partitions_config = PartitionsConfig {

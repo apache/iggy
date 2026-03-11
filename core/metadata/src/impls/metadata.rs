@@ -31,7 +31,8 @@ use iggy_common::{
 };
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use tracing::{debug, warn};
+use std::path::Path;
+use tracing::{debug, error, warn};
 
 #[derive(Debug, Clone)]
 #[allow(unused)]
@@ -51,6 +52,41 @@ impl IggySnapshot {
     #[must_use]
     pub const fn snapshot(&self) -> &MetadataSnapshot {
         &self.snapshot
+    }
+
+    /// Persist the snapshot to disk.
+    pub fn persist(&self, path: &Path) -> Result<(), SnapshotError> {
+        use std::fs;
+        use std::io::Write;
+
+        let encoded = self.encode()?;
+
+        let tmp_path = path.with_extension("bin.tmp");
+
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        drop(file);
+
+        fs::rename(&tmp_path, path)?;
+
+        // Fsync the parent directory to ensure the rename is durable.
+        if let Some(parent) = path.parent() {
+            let dir = fs::File::open(parent)?;
+            dir.sync_all()?;
+        }
+
+        Ok(())
+    }
+
+    /// Load a snapshot from disk
+    pub fn load(path: &Path) -> Result<Self, SnapshotError> {
+        let data = std::fs::read(path)?;
+
+        // TODO: when checksum is added we need to check
+        // if data.len() is atleast the size of checksum
+
+        Self::decode(data.as_slice())
     }
 }
 
@@ -99,6 +135,8 @@ pub struct IggyMetadata<C, J, S, M> {
     pub snapshot: Option<S>,
     /// State machine - lives on all shards
     pub mux_stm: M,
+    /// Root data directory, used by checkpoint to persist snapshots.
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 #[allow(clippy::future_not_send)]
@@ -111,7 +149,7 @@ where
             Input = Message<PrepareHeader>,
             Output = bytes::Bytes,
             Error = iggy_common::IggyError,
-        >,
+        > + FillSnapshot<MetadataSnapshot>,
 {
     async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
@@ -151,9 +189,37 @@ where
 
         // TODO add assertions for valid state here.
 
-        // TODO verify that the current prepare fits in the WAL.
-
         // TODO handle gap in ops.
+
+        // Force a checkpoint if the journal is running low on capacity.
+        // TODO: tune this margin size
+        const CHECKPOINT_MARGIN: usize = 64;
+        if journal
+            .handle()
+            .remaining_capacity()
+            .is_some_and(|c| c <= CHECKPOINT_MARGIN)
+        {
+            if let Some(data_dir) = &self.data_dir {
+                let snap_op = current_op;
+                if let Err(e) = self.checkpoint(data_dir, snap_op) {
+                    error!(
+                        replica = consensus.replica(),
+                        "on_replicate: forced checkpoint failed: {e}"
+                    );
+                    return;
+                }
+                debug!(
+                    replica = consensus.replica(),
+                    "on_replicate: forced checkpoint at op={snap_op}"
+                );
+            } else {
+                error!(
+                    replica = consensus.replica(),
+                    "on_replicate: journal nearly full but no data_dir configured for checkpoint"
+                );
+                return;
+            }
+        }
 
         // Verify hash chain integrity.
         if let Some(previous) = journal.handle().previous_header(header) {
@@ -166,7 +232,13 @@ where
         consensus.set_last_prepare_checksum(header.checksum);
 
         // Append to journal.
-        journal.handle().append(message.clone()).await;
+        if let Err(e) = journal.handle().append(message.clone()).await {
+            error!(
+                replica = consensus.replica(),
+                "on_replicate: journal append failed: {e}"
+            );
+            return;
+        }
 
         // After successful journal write, send prepare_ok to primary.
         self.send_prepare_ok(header).await;
@@ -323,5 +395,30 @@ where
         let journal = self.journal.as_ref().unwrap();
         let persisted = journal.handle().header(header.op as usize).is_some();
         send_prepare_ok_common(consensus, header, Some(persisted)).await;
+    }
+}
+
+#[allow(unused)]
+impl<C, J, S, M> IggyMetadata<C, J, S, M> {
+    /// Create a snapshot from the current state machine and persist it to disk.
+    ///
+    /// After the snapshot is durably persisted, advances the journal's
+    /// snapshot watermark so that entries at or below `last_op` may be
+    /// evicted from the ring buffer on future appends.
+    pub fn checkpoint(&self, data_dir: &Path, last_op: u64) -> Result<(), SnapshotError>
+    where
+        M: FillSnapshot<MetadataSnapshot>,
+        J: JournalHandle,
+    {
+        let snapshot = IggySnapshot::create(&self.mux_stm, last_op)?;
+        let path = data_dir.join(super::METADATA_DIR).join("snapshot.bin");
+        snapshot.persist(&path)?;
+
+        if let Some(journal) = &self.journal {
+            journal.handle().set_snapshot_op(last_op);
+            journal.handle().compact().map_err(SnapshotError::Io)?;
+        }
+
+        Ok(())
     }
 }

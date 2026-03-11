@@ -42,6 +42,12 @@ serde = { workspace = true, features = ["derive"] }
 slab = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+bytemuck = { workspace = true }
+bytes = { workspace = true }
+compio = { workspace = true }
+tempfile = { workspace = true }
+
 [lints.clippy]
 enum_glob_use = "deny"
 pedantic = "deny"

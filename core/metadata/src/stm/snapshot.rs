@@ -28,6 +28,12 @@ pub enum SnapshotError {
     Serialize(rmp_serde::encode::Error),
     /// Deserialization failed.
     Deserialize(rmp_serde::decode::Error),
+    /// I/O error during snapshot persist/load.
+    Io(std::io::Error),
+    /// Checksum mismatch on snapshot load.
+    ChecksumMismatch { expected: u32, actual: u32 },
+    /// Snapshot file is too short to contain a valid checksum.
+    Truncated { size: u64 },
 }
 
 impl fmt::Display for SnapshotError {
@@ -35,6 +41,19 @@ impl fmt::Display for SnapshotError {
         match self {
             Self::Serialize(e) => write!(f, "snapshot serialization failed: {e}"),
             Self::Deserialize(e) => write!(f, "snapshot deserialization failed: {e}"),
+            Self::Io(e) => write!(f, "snapshot I/O error: {e}"),
+            Self::ChecksumMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "snapshot checksum mismatch: expected {expected:#010x}, actual {actual:#010x}"
+                )
+            }
+            Self::Truncated { size } => {
+                write!(
+                    f,
+                    "snapshot file truncated: {size} bytes (too short for checksum)"
+                )
+            }
         }
     }
 }
@@ -44,7 +63,15 @@ impl std::error::Error for SnapshotError {
         match self {
             Self::Serialize(e) => Some(e),
             Self::Deserialize(e) => Some(e),
+            Self::Io(e) => Some(e),
+            Self::ChecksumMismatch { .. } | Self::Truncated { .. } => None,
         }
+    }
+}
+
+impl From<std::io::Error> for SnapshotError {
+    fn from(e: std::io::Error) -> Self {
+        SnapshotError::Io(e)
     }
 }
 
