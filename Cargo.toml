@@ -34,6 +34,7 @@ members = [
     "core/connectors/runtime",
     "core/connectors/sdk",
     "core/connectors/sinks/elasticsearch_sink",
+    "core/connectors/sinks/http_sink",
     "core/connectors/sinks/iceberg_sink",
     "core/connectors/sinks/influxdb_sink",
     "core/connectors/sinks/mongodb_sink",
