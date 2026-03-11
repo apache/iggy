@@ -2,18 +2,15 @@
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
+ * regarding copyright ownership.  The ASF licenses you to
+ * you under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
  *   http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
+ * software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the specific language governing permissions and limitations
  * under the License.
  */
 
@@ -25,11 +22,8 @@ use integration::harness::seeds;
 use integration::iggy_harness;
 use serde_json::Value;
 
-// seeds::connector_stream creates one topic with 1 partition (partition ID = 1, 1-based).
-// poll_messages must use partition_id = Some(1), NOT Some(0).
-
 #[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml"),
     seed = seeds::connector_stream
 )]
 async fn influxdb_source_polls_and_produces_messages(
@@ -64,7 +58,7 @@ async fn influxdb_source_polls_and_produces_messages(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(1), // partition 1 (1-based, single-partition topic)
+                Some(1),
                 &consumer,
                 &PollingStrategy::next(),
                 100,
@@ -87,7 +81,7 @@ async fn influxdb_source_polls_and_produces_messages(
 }
 
 #[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml"),
     seed = seeds::connector_stream
 )]
 async fn influxdb_source_message_payload_structure(
@@ -111,7 +105,7 @@ async fn influxdb_source_message_payload_structure(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(1), // partition 1 (1-based)
+                Some(1),
                 &consumer,
                 &PollingStrategy::next(),
                 10,
@@ -131,15 +125,15 @@ async fn influxdb_source_message_payload_structure(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    assert_eq!(msgs.len(), 1, "Expected 1 message, got {}", msgs.len());
+    assert_eq!(msgs.len(), 1, "Expected 1 message, got {{}}", msgs.len());
     let m = &msgs[0];
-    assert!(m.get("measurement").is_some(), "missing 'measurement': {{m}});
-    assert!(m.get("timestamp").is_some(), "missing 'timestamp': {{m}});
-    assert!(m.get("value").is_some(), "missing 'value': {{m}});
+    assert!(m.get("measurement").is_some(), "missing 'measurement': {{m}}");
+    assert!(m.get("timestamp").is_some(), "missing 'timestamp': {{m}}");
+    assert!(m.get("value").is_some(), "missing 'value': {{m}}");
 }
 
 #[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml"),
     seed = seeds::connector_stream
 )]
 async fn influxdb_source_empty_bucket_produces_no_messages(
@@ -160,7 +154,7 @@ async fn influxdb_source_empty_bucket_produces_no_messages(
         .poll_messages(
             &stream_id,
             &topic_id,
-            Some(1), // partition 1 (1-based)
+            Some(1),
             &consumer,
             &PollingStrategy::next(),
             100,
@@ -172,13 +166,13 @@ async fn influxdb_source_empty_bucket_produces_no_messages(
     assert_eq!(
         polled.messages.len(),
         0,
-        "Expected 0 messages for empty bucket, got {}",
+        "Expected 0 messages for empty bucket, got {{}}",
         polled.messages.len()
     );
 }
 
 #[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
+    server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml"),
     seed = seeds::connector_stream
 )]
 async fn influxdb_source_multiple_measurements(
@@ -206,7 +200,7 @@ async fn influxdb_source_multiple_measurements(
             .poll_messages(
                 &stream_id,
                 &topic_id,
-                Some(1), // partition 1 (1-based)
+                Some(1),
                 &consumer,
                 &PollingStrategy::next(),
                 100,
@@ -226,7 +220,7 @@ async fn influxdb_source_multiple_measurements(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    assert_eq!(msgs.len(), 3, "Expected 3 messages, got {}", msgs.len());
+    assert_eq!(msgs.len(), 3, "Expected 3 messages, got {{}}", msgs.len());
 
     let measurements: Vec<&str> = msgs
         .iter()
