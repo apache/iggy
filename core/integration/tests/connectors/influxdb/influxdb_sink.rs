@@ -28,6 +28,9 @@ use integration::harness::seeds;
 use integration::iggy_harness;
 use serde_json::json;
 
+// seeds::connector_stream creates the topic with 1 partition (Iggy partition IDs are 1-based).
+// Use Partitioning::balanced() so the runtime picks partition 1 automatically.
+
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink.toml")),
     seed = seeds::connector_stream
@@ -57,7 +60,7 @@ async fn influxdb_sink_writes_messages_to_bucket(
         .send_messages(
             &stream_id,
             &topic_id,
-            &Partitioning::partition_id(0),
+            &Partitioning::balanced(),
             &mut messages,
         )
         .await
@@ -95,7 +98,7 @@ async fn influxdb_sink_handles_bulk_messages(harness: &TestHarness, fixture: Inf
         .send_messages(
             &stream_id,
             &topic_id,
-            &Partitioning::partition_id(0),
+            &Partitioning::balanced(),
             &mut messages,
         )
         .await
@@ -133,7 +136,7 @@ async fn influxdb_sink_payload_fields_stored_correctly(
         .send_messages(
             &stream_id,
             &topic_id,
-            &Partitioning::partition_id(0),
+            &Partitioning::balanced(),
             &mut messages,
         )
         .await
@@ -171,7 +174,7 @@ async fn influxdb_sink_large_batch(harness: &TestHarness, fixture: InfluxDbSinkF
             .send_messages(
                 &stream_id,
                 &topic_id,
-                &Partitioning::partition_id(0),
+                &Partitioning::balanced(),
                 &mut chunk,
             )
             .await
@@ -212,7 +215,7 @@ async fn influxdb_sink_recovers_backlogged_messages(
         .send_messages(
             &stream_id,
             &topic_id,
-            &Partitioning::partition_id(0),
+            &Partitioning::balanced(),
             &mut messages,
         )
         .await
@@ -234,12 +237,14 @@ async fn influxdb_sink_multiple_partitions(harness: &TestHarness, fixture: Influ
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
-    for partition_id in 1u32..=3 {
+    // Topic has only 1 partition — send 3 messages via balanced partitioning
+    // (they all go to partition 1, which is correct for a 1-partition topic).
+    for i in 1u32..=3 {
         let payload =
-            serde_json::to_vec(&json!({"partition": partition_id})).expect("Failed to serialize");
+            serde_json::to_vec(&json!({"msg_index": i})).expect("Failed to serialize");
         let mut messages = vec![
             IggyMessage::builder()
-                .id(partition_id as u128)
+                .id(i as u128)
                 .payload(Bytes::from(payload))
                 .build()
                 .unwrap(),
@@ -249,7 +254,7 @@ async fn influxdb_sink_multiple_partitions(harness: &TestHarness, fixture: Influ
             .send_messages(
                 &stream_id,
                 &topic_id,
-                &Partitioning::partition_id(partition_id),
+                &Partitioning::balanced(),
                 &mut messages,
             )
             .await
@@ -259,5 +264,5 @@ async fn influxdb_sink_multiple_partitions(harness: &TestHarness, fixture: Influ
     fixture
         .wait_for_points("iggy_messages", 3)
         .await
-        .expect("Failed to wait for 3 InfluxDB points across partitions");
+        .expect("Failed to wait for 3 InfluxDB points");
 }
