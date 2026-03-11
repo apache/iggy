@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// TODO(slbotbm): create fixture for setup/teardown.
+
 #include <string>
 
 #include <gtest/gtest.h>
