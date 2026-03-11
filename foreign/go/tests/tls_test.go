@@ -20,19 +20,22 @@
 // These tests use testcontainers to spin up a TLS-enabled Iggy server,
 // making them fully self-contained and suitable for CI.
 //
-// Usage:
+// The IGGY_SERVER_DOCKER_IMAGE environment variable must be set to a locally
+// built Docker image. Do NOT use images from DockerHub — CI must test the code
+// from the current PR, not a previously released version.
 //
-//	go test -v ./tests
+// Build the image locally:
 //
-// The tests default to using apache/iggy:edge. Override with:
+//	cargo build && docker build -f core/server/Dockerfile \
+//	  --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
+//	  --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
+//	  --build-arg LIBC=glibc --target runtime-prebuilt -t iggy-server:test .
 //
-//	IGGY_SERVER_DOCKER_IMAGE=custom-image go test -v ./tests
+// Then run tests:
 //
-// Key Implementation Details:
-//   - Simple inline setup (Python-style, no fixtures)
-//   - Wait for both log AND listening port (Go connects immediately)
-//   - Use "localhost" not "127.0.0.1" for TLS hostname verification
-//   - Verify cert mounting to catch path issues early
+//	IGGY_SERVER_DOCKER_IMAGE=iggy-server:test go test -v ./tests
+//
+// In CI, the image is built by .github/actions/utils/docker-build-test-server/action.yml
 package tests_test
 
 import (
@@ -59,11 +62,9 @@ const (
 )
 
 // setupTLSContainer starts a TLS-enabled Iggy server container.
-// Mimics Python's approach from foreign/python/tests/test_tls.py.
 func setupTLSContainer(t *testing.T) (testcontainers.Container, string, string) {
 	ctx := context.Background()
 
-	// Get certs path - same as Python
 	repoRoot, err := filepath.Abs(filepath.Join("..", "..", ".."))
 	require.NoError(t, err)
 	certsPath := filepath.Join(repoRoot, "core", "certs")
@@ -75,13 +76,18 @@ func setupTLSContainer(t *testing.T) (testcontainers.Container, string, string) 
 	_, err = os.Stat(caFile)
 	require.NoError(t, err, "CA cert not found at %s", caFile)
 
-	// Get Docker image - allow override like Python does
+	// Require locally built Docker image — never pull from DockerHub.
+	// In CI, the image is built by docker-build-test-server action.
+	// Locally, build with: cargo build && docker build -f core/server/Dockerfile ...
 	dockerImage := os.Getenv("IGGY_SERVER_DOCKER_IMAGE")
 	if dockerImage == "" {
-		dockerImage = "apache/iggy:edge"
+		t.Fatal("IGGY_SERVER_DOCKER_IMAGE env var is required. " +
+			"Build the image first: cargo build && docker build -f core/server/Dockerfile " +
+			"--build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server " +
+			"--build-arg PREBUILT_IGGY_CLI=target/debug/iggy " +
+			"--build-arg LIBC=glibc --target runtime-prebuilt -t iggy-server:test .")
 	}
 
-	// Container request - exactly like Python
 	req := testcontainers.ContainerRequest{
 		Image:        dockerImage,
 		ExposedPorts: []string{"8090/tcp"},
@@ -109,14 +115,12 @@ func setupTLSContainer(t *testing.T) (testcontainers.Container, string, string) 
 		AutoRemove: true,
 	}
 
-	// Start container
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
 		Started:          true,
 	})
 	require.NoError(t, err, "Failed to start TLS container")
 
-	// Get address
 	host, err := container.Host(ctx)
 	require.NoError(t, err)
 	port, err := container.MappedPort(ctx, "8090")
@@ -127,14 +131,12 @@ func setupTLSContainer(t *testing.T) (testcontainers.Container, string, string) 
 	_, err = container.CopyFileFromContainer(ctx, "/app/certs/iggy_cert.pem")
 	require.NoError(t, err, "Failed to verify cert mount - check certs path")
 
-	// Wait for server to accept connections (Python-style)
 	waitForServer(t, addr, 60*time.Second)
 
 	return container, addr, caFile
 }
 
 // waitForServer waits for the TCP port to accept connections.
-// Mimics Python's wait_for_server function.
 func waitForServer(t *testing.T, addr string, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	interval := 1 * time.Second
@@ -143,7 +145,7 @@ func waitForServer(t *testing.T, addr string, timeout time.Duration) {
 		dialer := net.Dialer{Timeout: interval}
 		conn, err := dialer.Dial("tcp", addr)
 		if err == nil {
-			conn.Close()
+			_ = conn.Close()
 			return
 		}
 		time.Sleep(interval)
@@ -155,7 +157,6 @@ func waitForServer(t *testing.T, addr string, timeout time.Duration) {
 // TestTCPTLSConnection_WithCA_Success tests that a TLS connection succeeds
 // when the client is configured with the CA certificate.
 func TestTCPTLSConnection_WithCA_Success(t *testing.T) {
-	// Start TLS-enabled server
 	container, serverAddr, caFile := setupTLSContainer(t)
 	defer func() {
 		if err := container.Terminate(context.Background()); err != nil {
@@ -163,12 +164,10 @@ func TestTCPTLSConnection_WithCA_Success(t *testing.T) {
 		}
 	}()
 
-	// Use "localhost" for TLS hostname verification (cert is issued for localhost)
-	// container.Host() might return "127.0.0.1" which won't match the cert
+	// Use "localhost" because container.Host() may return "127.0.0.1" which won't match the cert
 	_, portStr, _ := net.SplitHostPort(serverAddr)
 	connectAddr := fmt.Sprintf("localhost:%s", portStr)
 
-	// Create TLS client with CA certificate
 	cli, err := client.NewIggyClient(
 		client.WithTcp(
 			tcp.WithServerAddress(connectAddr),
@@ -178,9 +177,8 @@ func TestTCPTLSConnection_WithCA_Success(t *testing.T) {
 		),
 	)
 	require.NoError(t, err, "Failed to create TLS client")
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
-	// Verify connection with login
 	_, err = cli.LoginUser(defaultUsername, defaultPassword)
 	require.NoError(t, err, "Login should succeed over TLS")
 }
@@ -188,7 +186,6 @@ func TestTCPTLSConnection_WithCA_Success(t *testing.T) {
 // TestTCPTLSConnection_WithoutTLS_Failure tests that a non-TLS connection
 // fails when the server requires TLS.
 func TestTCPTLSConnection_WithoutTLS_Failure(t *testing.T) {
-	// Start TLS-enabled server
 	container, serverAddr, _ := setupTLSContainer(t)
 	defer func() {
 		if err := container.Terminate(context.Background()); err != nil {
@@ -196,11 +193,9 @@ func TestTCPTLSConnection_WithoutTLS_Failure(t *testing.T) {
 		}
 	}()
 
-	// Use localhost for consistency
 	_, portStr, _ := net.SplitHostPort(serverAddr)
 	connectAddr := fmt.Sprintf("localhost:%s", portStr)
 
-	// Create non-TLS client - should fail
 	cli, err := client.NewIggyClient(
 		client.WithTcp(
 			tcp.WithServerAddress(connectAddr),
@@ -208,20 +203,17 @@ func TestTCPTLSConnection_WithoutTLS_Failure(t *testing.T) {
 		),
 	)
 
-	// If client creation succeeds, try login which should fail
 	if err == nil && cli != nil {
-		defer cli.Close()
+		defer func() { _ = cli.Close() }()
 		_, err = cli.LoginUser(defaultUsername, defaultPassword)
 	}
 
-	// Either client creation or login should fail
 	assert.Error(t, err, "Connection/login should fail when TLS is required but not used")
 }
 
 // TestTCPTLSConnection_MessageFlow_Success tests complete message flow
 // (create stream/topic, send messages, poll messages) over TLS.
 func TestTCPTLSConnection_MessageFlow_Success(t *testing.T) {
-	// Start TLS-enabled server
 	container, serverAddr, caFile := setupTLSContainer(t)
 	defer func() {
 		if err := container.Terminate(context.Background()); err != nil {
@@ -229,11 +221,9 @@ func TestTCPTLSConnection_MessageFlow_Success(t *testing.T) {
 		}
 	}()
 
-	// Use localhost for TLS hostname verification
 	_, portStr, _ := net.SplitHostPort(serverAddr)
 	connectAddr := fmt.Sprintf("localhost:%s", portStr)
 
-	// Create TLS client
 	cli, err := client.NewIggyClient(
 		client.WithTcp(
 			tcp.WithServerAddress(connectAddr),
@@ -243,24 +233,20 @@ func TestTCPTLSConnection_MessageFlow_Success(t *testing.T) {
 		),
 	)
 	require.NoError(t, err, "Failed to create TLS client")
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 
-	// Login
 	_, err = cli.LoginUser(defaultUsername, defaultPassword)
 	require.NoError(t, err, "Login should succeed")
 
-	// Create stream
 	streamName := "tls-test-stream"
 	_, err = cli.CreateStream(streamName)
 	require.NoError(t, err, "Failed to create stream")
 
-	// Cleanup stream at the end
 	defer func() {
 		streamIdentifier, _ := iggcon.NewIdentifier(streamName)
 		_ = cli.DeleteStream(streamIdentifier)
 	}()
 
-	// Create topic
 	topicName := "tls-test-topic"
 	streamIdentifier, _ := iggcon.NewIdentifier(streamName)
 	_, err = cli.CreateTopic(
@@ -274,7 +260,6 @@ func TestTCPTLSConnection_MessageFlow_Success(t *testing.T) {
 	)
 	require.NoError(t, err, "Failed to create topic")
 
-	// Send messages
 	messageCount := 10
 	messages := make([]iggcon.IggyMessage, messageCount)
 	for i := 0; i < messageCount; i++ {
@@ -289,7 +274,6 @@ func TestTCPTLSConnection_MessageFlow_Success(t *testing.T) {
 	err = cli.SendMessages(streamIdentifier, topicIdentifier, partitioning, messages)
 	require.NoError(t, err, "Failed to send messages over TLS")
 
-	// Poll messages
 	consumer := iggcon.DefaultConsumer()
 	offset := uint64(0)
 	pollMessages, err := cli.PollMessages(
@@ -303,10 +287,8 @@ func TestTCPTLSConnection_MessageFlow_Success(t *testing.T) {
 	)
 	require.NoError(t, err, "Failed to poll messages over TLS")
 
-	// Verify all messages received
 	assert.Len(t, pollMessages.Messages, messageCount, "Should receive all sent messages")
 
-	// Verify message contents
 	for i, msg := range pollMessages.Messages {
 		expectedPayload := fmt.Sprintf("message-%d", i+1)
 		assert.Equal(t, expectedPayload, string(msg.Payload), "Message payload should match")
