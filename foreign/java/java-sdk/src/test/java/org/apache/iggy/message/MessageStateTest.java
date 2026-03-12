@@ -24,8 +24,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class MessageStateTest {
 
@@ -34,12 +34,12 @@ class MessageStateTest {
     void fromCodeReturnsCorrectVariant(int code, MessageState expected) {
         var actual = MessageState.fromCode(code);
 
-        assertEquals(expected, actual);
+        assertThat(actual).isEqualTo(expected);
     }
 
     @ParameterizedTest
     @ValueSource(ints = {2, 5, 100})
     void fromCodeReturnsThrowsIggyInvalidArgumentExceptionForInvalidCode(int code) {
-        assertThrows(IggyInvalidArgumentException.class, () -> MessageState.fromCode(code));
+        assertThatThrownBy(() -> MessageState.fromCode(code)).isInstanceOf(IggyInvalidArgumentException.class);
     }
 }
