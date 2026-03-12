@@ -79,9 +79,10 @@ async fn individual_json_messages_delivered_as_separate_posts(
         .await
         .expect("WireMock did not receive expected number of requests");
 
-    assert!(
-        requests.len() >= TEST_MESSAGE_COUNT,
-        "Expected at least {TEST_MESSAGE_COUNT} individual requests, got {}",
+    assert_eq!(
+        requests.len(),
+        TEST_MESSAGE_COUNT,
+        "Expected exactly {TEST_MESSAGE_COUNT} individual requests, got {}",
         requests.len()
     );
 
@@ -119,12 +120,13 @@ async fn individual_json_messages_delivered_as_separate_posts(
     }
 
     // Verify the content type header.
-    if let Some(ct) = requests[0].header("Content-Type") {
-        assert!(
-            ct.contains("application/json"),
-            "Expected application/json content type, got: {ct}"
-        );
-    }
+    let ct = requests[0]
+        .header("Content-Type")
+        .expect("Content-Type header must be present");
+    assert!(
+        ct.contains("application/json"),
+        "Expected application/json content type, got: {ct}"
+    );
 }
 
 /// Send JSON messages via NDJSON batch mode and verify they arrive as a single
@@ -204,12 +206,13 @@ async fn ndjson_messages_delivered_as_single_request(
     }
 
     // Verify content type is NDJSON.
-    if let Some(ct) = req.header("Content-Type") {
-        assert!(
-            ct.contains("application/x-ndjson"),
-            "Expected application/x-ndjson content type, got: {ct}"
-        );
-    }
+    let ct = req
+        .header("Content-Type")
+        .expect("Content-Type header must be present");
+    assert!(
+        ct.contains("application/x-ndjson"),
+        "Expected application/x-ndjson content type, got: {ct}"
+    );
 }
 
 /// Send JSON messages via JSON array batch mode and verify they arrive as a
@@ -289,12 +292,13 @@ async fn json_array_messages_delivered_as_single_request(
     }
 
     // Verify content type is JSON.
-    if let Some(ct) = req.header("Content-Type") {
-        assert!(
-            ct.contains("application/json"),
-            "Expected application/json content type, got: {ct}"
-        );
-    }
+    let ct = req
+        .header("Content-Type")
+        .expect("Content-Type header must be present");
+    assert!(
+        ct.contains("application/json"),
+        "Expected application/json content type, got: {ct}"
+    );
 }
 
 /// Send binary messages via raw batch mode and verify each arrives as a
@@ -346,9 +350,10 @@ async fn raw_binary_messages_delivered_without_envelope(
         .await
         .expect("WireMock did not receive expected raw requests");
 
-    assert!(
-        requests.len() >= TEST_MESSAGE_COUNT,
-        "Expected at least {TEST_MESSAGE_COUNT} raw requests, got {}",
+    assert_eq!(
+        requests.len(),
+        TEST_MESSAGE_COUNT,
+        "Expected exactly {TEST_MESSAGE_COUNT} raw requests, got {}",
         requests.len()
     );
 
@@ -367,12 +372,13 @@ async fn raw_binary_messages_delivered_without_envelope(
     }
 
     // Verify content type is octet-stream for raw mode.
-    if let Some(ct) = requests[0].header("Content-Type") {
-        assert!(
-            ct.contains("application/octet-stream"),
-            "Expected application/octet-stream for raw mode, got: {ct}"
-        );
-    }
+    let ct = requests[0]
+        .header("Content-Type")
+        .expect("Content-Type header must be present");
+    assert!(
+        ct.contains("application/octet-stream"),
+        "Expected application/octet-stream for raw mode, got: {ct}"
+    );
 }
 
 /// Send JSON messages with metadata disabled and verify payloads arrive
@@ -484,7 +490,8 @@ async fn individual_messages_have_sequential_offsets(
         .await
         .expect("WireMock did not receive all 5 requests");
 
-    // Collect offsets from metadata and verify sequential ordering.
+    // Collect offsets from metadata and verify contiguous sequential ordering.
+    // Note: offsets may not start at 0 if the topic already had messages.
     let mut offsets: Vec<i64> = requests
         .iter()
         .filter_map(|r| {
@@ -497,10 +504,14 @@ async fn individual_messages_have_sequential_offsets(
     offsets.sort();
     assert_eq!(offsets.len(), 5, "Expected 5 offsets, got {}", offsets.len());
 
-    for (i, offset) in offsets.iter().enumerate() {
+    // Verify offsets are contiguous (each +1 from previous), regardless of base.
+    for window in offsets.windows(2) {
         assert_eq!(
-            *offset, i as i64,
-            "Expected sequential offset {i}, got {offset}"
+            window[1],
+            window[0] + 1,
+            "Offsets must be contiguous: got {} then {}",
+            window[0],
+            window[1]
         );
     }
 }
