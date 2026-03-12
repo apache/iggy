@@ -1084,3 +1084,656 @@ impl Sink for HttpSink {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_connector_sdk::Schema;
+
+    // ── Test helpers ──────────────────────────────────────────────────
+
+    /// Parse a JSON string into `simd_json::OwnedValue` for test construction.
+    fn simd_json_from_str(s: &str) -> simd_json::OwnedValue {
+        let mut bytes = s.as_bytes().to_vec();
+        simd_json::to_owned_value(&mut bytes).expect("valid JSON for test")
+    }
+
+    fn given_default_config() -> HttpSinkConfig {
+        HttpSinkConfig {
+            url: "https://api.example.com/ingest".to_string(),
+            method: None,
+            timeout: None,
+            max_payload_size_bytes: None,
+            headers: None,
+            batch_mode: None,
+            include_metadata: None,
+            include_checksum: None,
+            include_origin_timestamp: None,
+            health_check_enabled: None,
+            health_check_method: None,
+            max_retries: None,
+            retry_delay: None,
+            retry_backoff_multiplier: None,
+            max_retry_delay: None,
+            success_status_codes: None,
+            tls_danger_accept_invalid_certs: None,
+            max_connections: None,
+            verbose_logging: None,
+        }
+    }
+
+    fn given_sink_with_defaults() -> HttpSink {
+        HttpSink::new(1, given_default_config())
+    }
+
+    fn given_topic_metadata() -> TopicMetadata {
+        TopicMetadata {
+            stream: "test_stream".to_string(),
+            topic: "test_topic".to_string(),
+        }
+    }
+
+    fn given_messages_metadata() -> MessagesMetadata {
+        MessagesMetadata {
+            partition_id: 0,
+            current_offset: 0,
+            schema: Schema::Json,
+        }
+    }
+
+    fn given_json_message(id: u128, offset: u64) -> ConsumedMessage {
+        ConsumedMessage {
+            id,
+            offset,
+            checksum: 12345,
+            timestamp: 1710064800000000,
+            origin_timestamp: 1710064799000000,
+            headers: None,
+            payload: Payload::Json(simd_json_from_str(r#"{"key":"value"}"#)),
+        }
+    }
+
+    // ── Config resolution tests ──────────────────────────────────────
+
+    #[test]
+    fn given_all_none_config_should_apply_defaults() {
+        let sink = given_sink_with_defaults();
+
+        assert_eq!(sink.method, HttpMethod::Post);
+        assert_eq!(sink.timeout, Duration::from_secs(30));
+        assert_eq!(sink.max_payload_size_bytes, DEFAULT_MAX_PAYLOAD_SIZE);
+        assert_eq!(sink.batch_mode, BatchMode::Individual);
+        assert!(sink.include_metadata);
+        assert!(!sink.include_checksum);
+        assert!(!sink.include_origin_timestamp);
+        assert!(!sink.health_check_enabled);
+        assert_eq!(sink.health_check_method, HttpMethod::Head);
+        assert_eq!(sink.max_retries, DEFAULT_MAX_RETRIES);
+        assert_eq!(sink.retry_delay, Duration::from_secs(1));
+        assert_eq!(sink.retry_backoff_multiplier, DEFAULT_BACKOFF_MULTIPLIER);
+        assert_eq!(sink.max_retry_delay, Duration::from_secs(30));
+        assert_eq!(sink.success_status_codes, vec![200, 201, 202, 204]);
+        assert!(!sink.tls_danger_accept_invalid_certs);
+        assert_eq!(sink.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert!(!sink.verbose);
+        assert!(sink.client.is_none());
+    }
+
+    #[test]
+    fn given_explicit_config_values_should_override_defaults() {
+        let config = HttpSinkConfig {
+            url: "https://example.com".to_string(),
+            method: Some(HttpMethod::Put),
+            timeout: Some("10s".to_string()),
+            max_payload_size_bytes: Some(5000),
+            headers: Some(HashMap::from([("X-Key".to_string(), "val".to_string())])),
+            batch_mode: Some(BatchMode::Ndjson),
+            include_metadata: Some(false),
+            include_checksum: Some(true),
+            include_origin_timestamp: Some(true),
+            health_check_enabled: Some(true),
+            health_check_method: Some(HttpMethod::Get),
+            max_retries: Some(5),
+            retry_delay: Some("500ms".to_string()),
+            retry_backoff_multiplier: Some(3.0),
+            max_retry_delay: Some("60s".to_string()),
+            success_status_codes: Some(vec![200, 202]),
+            tls_danger_accept_invalid_certs: Some(true),
+            max_connections: Some(20),
+            verbose_logging: Some(true),
+        };
+
+        let sink = HttpSink::new(1, config);
+        assert_eq!(sink.method, HttpMethod::Put);
+        assert_eq!(sink.timeout, Duration::from_secs(10));
+        assert_eq!(sink.max_payload_size_bytes, 5000);
+        assert_eq!(sink.headers.len(), 1);
+        assert_eq!(sink.batch_mode, BatchMode::Ndjson);
+        assert!(!sink.include_metadata);
+        assert!(sink.include_checksum);
+        assert!(sink.include_origin_timestamp);
+        assert!(sink.health_check_enabled);
+        assert_eq!(sink.health_check_method, HttpMethod::Get);
+        assert_eq!(sink.max_retries, 5);
+        assert_eq!(sink.retry_delay, Duration::from_millis(500));
+        assert_eq!(sink.retry_backoff_multiplier, 3.0);
+        assert_eq!(sink.max_retry_delay, Duration::from_secs(60));
+        assert_eq!(sink.success_status_codes, vec![200, 202]);
+        assert!(sink.tls_danger_accept_invalid_certs);
+        assert_eq!(sink.max_connections, 20);
+        assert!(sink.verbose);
+    }
+
+    #[test]
+    fn given_backoff_multiplier_below_one_should_clamp_to_one() {
+        let mut config = given_default_config();
+        config.retry_backoff_multiplier = Some(0.5);
+        let sink = HttpSink::new(1, config);
+        assert_eq!(sink.retry_backoff_multiplier, 1.0);
+    }
+
+    #[test]
+    fn given_invalid_duration_string_should_fall_back_to_default() {
+        let mut config = given_default_config();
+        config.timeout = Some("not_a_duration".to_string());
+        config.retry_delay = Some("xyz".to_string());
+        let sink = HttpSink::new(1, config);
+        assert_eq!(sink.timeout, Duration::from_secs(30));
+        assert_eq!(sink.retry_delay, Duration::from_secs(1));
+    }
+
+    // ── Duration parsing tests ───────────────────────────────────────
+
+    #[test]
+    fn given_valid_duration_strings_should_parse_correctly() {
+        let cases = [
+            ("30s", Duration::from_secs(30)),
+            ("500ms", Duration::from_millis(500)),
+            ("2m", Duration::from_secs(120)),
+            ("1h", Duration::from_secs(3600)),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(parse_duration(Some(input), "1s"), expected, "input: {}", input);
+        }
+    }
+
+    #[test]
+    fn given_none_duration_should_use_default() {
+        assert_eq!(parse_duration(None, "5s"), Duration::from_secs(5));
+    }
+
+    // ── HttpMethod serde tests ───────────────────────────────────────
+
+    #[test]
+    fn given_http_method_should_serialize_as_uppercase() {
+        let cases = [
+            (HttpMethod::Get, "\"GET\""),
+            (HttpMethod::Head, "\"HEAD\""),
+            (HttpMethod::Post, "\"POST\""),
+            (HttpMethod::Put, "\"PUT\""),
+            (HttpMethod::Patch, "\"PATCH\""),
+            (HttpMethod::Delete, "\"DELETE\""),
+        ];
+
+        for (method, expected_json) in cases {
+            let json = serde_json::to_string(&method).unwrap();
+            assert_eq!(json, expected_json);
+        }
+    }
+
+    #[test]
+    fn given_uppercase_json_should_deserialize_to_method() {
+        let cases = [
+            ("\"GET\"", HttpMethod::Get),
+            ("\"POST\"", HttpMethod::Post),
+            ("\"DELETE\"", HttpMethod::Delete),
+        ];
+
+        for (json, expected) in cases {
+            let method: HttpMethod = serde_json::from_str(json).unwrap();
+            assert_eq!(method, expected);
+        }
+    }
+
+    #[test]
+    fn given_invalid_method_string_should_fail_deserialization() {
+        let result: Result<HttpMethod, _> = serde_json::from_str("\"DELET\"");
+        assert!(result.is_err());
+    }
+
+    // ── BatchMode serde tests ────────────────────────────────────────
+
+    #[test]
+    fn given_batch_mode_should_serialize_as_snake_case() {
+        let cases = [
+            (BatchMode::Individual, "\"individual\""),
+            (BatchMode::Ndjson, "\"ndjson\""),
+            (BatchMode::JsonArray, "\"json_array\""),
+            (BatchMode::Raw, "\"raw\""),
+        ];
+
+        for (mode, expected_json) in cases {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(json, expected_json);
+        }
+    }
+
+    // ── Content-type tests ───────────────────────────────────────────
+
+    #[test]
+    fn given_batch_mode_should_return_correct_content_type() {
+        let cases = [
+            (BatchMode::Individual, "application/json"),
+            (BatchMode::Ndjson, "application/x-ndjson"),
+            (BatchMode::JsonArray, "application/json"),
+            (BatchMode::Raw, "application/octet-stream"),
+        ];
+
+        for (mode, expected) in cases {
+            let mut config = given_default_config();
+            config.batch_mode = Some(mode);
+            let sink = HttpSink::new(1, config);
+            assert_eq!(sink.content_type(), expected);
+        }
+    }
+
+    // ── UUID formatting tests ────────────────────────────────────────
+
+    #[test]
+    fn given_zero_id_should_format_as_zero_uuid() {
+        assert_eq!(
+            format_u128_as_uuid(0),
+            "00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn given_max_u128_should_format_as_all_f_uuid() {
+        assert_eq!(
+            format_u128_as_uuid(u128::MAX),
+            "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        );
+    }
+
+    #[test]
+    fn given_specific_id_should_format_with_correct_grouping() {
+        // Verify 8-4-4-4-12 hex grouping
+        let id: u128 = 0x0123456789abcdef0123456789abcdef;
+        let formatted = format_u128_as_uuid(id);
+        assert_eq!(formatted, "01234567-89ab-cdef-0123-456789abcdef");
+        assert_eq!(formatted.len(), 36);
+    }
+
+    // ── Truncation tests ─────────────────────────────────────────────
+
+    #[test]
+    fn given_short_string_should_return_unchanged() {
+        assert_eq!(truncate_response("hello", 10), "hello");
+    }
+
+    #[test]
+    fn given_long_string_should_truncate_at_boundary() {
+        let result = truncate_response("hello world", 5);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn given_multibyte_string_should_not_panic() {
+        // "héllo" — 'é' is 2 bytes in UTF-8
+        let result = truncate_response("héllo", 2);
+        // Should truncate at a valid char boundary, not panic
+        assert!(result.len() <= 2);
+        assert!(result.is_char_boundary(result.len()));
+    }
+
+    // ── Payload conversion tests ─────────────────────────────────────
+
+    #[test]
+    fn given_json_payload_should_convert_to_serde_json() {
+        let sink = given_sink_with_defaults();
+        let payload = Payload::Json(simd_json_from_str(r#"{"name":"test","count":42}"#));
+
+        let result = sink.payload_to_json(payload).unwrap();
+        assert_eq!(result["name"], "test");
+        assert_eq!(result["count"], 42);
+    }
+
+    #[test]
+    fn given_text_payload_should_convert_to_string_value() {
+        let sink = given_sink_with_defaults();
+        let result = sink
+            .payload_to_json(Payload::Text("hello".to_string()))
+            .unwrap();
+        assert_eq!(result, serde_json::Value::String("hello".to_string()));
+    }
+
+    #[test]
+    fn given_raw_payload_should_base64_encode() {
+        let sink = given_sink_with_defaults();
+        let result = sink.payload_to_json(Payload::Raw(vec![1, 2, 3])).unwrap();
+        assert_eq!(result["iggy_payload_encoding"], "base64");
+        assert_eq!(result["data"], general_purpose::STANDARD.encode([1, 2, 3]));
+    }
+
+    #[test]
+    fn given_flatbuffer_payload_should_base64_encode() {
+        let sink = given_sink_with_defaults();
+        let result = sink
+            .payload_to_json(Payload::FlatBuffer(vec![4, 5, 6]))
+            .unwrap();
+        assert_eq!(result["iggy_payload_encoding"], "base64");
+        assert_eq!(result["data"], general_purpose::STANDARD.encode([4, 5, 6]));
+    }
+
+    #[test]
+    fn given_proto_payload_should_base64_encode_string_bytes() {
+        let sink = given_sink_with_defaults();
+        let result = sink
+            .payload_to_json(Payload::Proto("proto_data".to_string()))
+            .unwrap();
+        assert_eq!(result["iggy_payload_encoding"], "base64");
+        assert_eq!(
+            result["data"],
+            general_purpose::STANDARD.encode(b"proto_data")
+        );
+    }
+
+    // ── Metadata envelope tests ──────────────────────────────────────
+
+    #[test]
+    fn given_include_metadata_true_should_wrap_payload() {
+        let sink = given_sink_with_defaults();
+        let message = given_json_message(42, 10);
+        let topic_meta = given_topic_metadata();
+        let msg_meta = given_messages_metadata();
+        let payload_json = sink.payload_to_json(message.payload.clone()).unwrap();
+
+        let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json);
+
+        assert!(envelope.get("metadata").is_some());
+        assert!(envelope.get("payload").is_some());
+
+        let metadata = &envelope["metadata"];
+        assert_eq!(metadata["iggy_offset"], 10);
+        assert_eq!(metadata["iggy_stream"], "test_stream");
+        assert_eq!(metadata["iggy_topic"], "test_topic");
+        assert_eq!(metadata["iggy_partition_id"], 0);
+        assert_eq!(
+            metadata["iggy_id"],
+            format_u128_as_uuid(42)
+        );
+    }
+
+    #[test]
+    fn given_include_metadata_false_should_return_raw_payload() {
+        let mut config = given_default_config();
+        config.include_metadata = Some(false);
+        let sink = HttpSink::new(1, config);
+
+        let message = given_json_message(1, 0);
+        let topic_meta = given_topic_metadata();
+        let msg_meta = given_messages_metadata();
+        let payload_json = sink.payload_to_json(message.payload.clone()).unwrap();
+
+        let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json.clone());
+
+        // Should be the payload itself, not wrapped
+        assert_eq!(envelope, payload_json);
+        assert!(envelope.get("metadata").is_none());
+    }
+
+    #[test]
+    fn given_include_checksum_should_add_checksum_to_metadata() {
+        let mut config = given_default_config();
+        config.include_checksum = Some(true);
+        let sink = HttpSink::new(1, config);
+
+        let message = given_json_message(1, 0);
+        let topic_meta = given_topic_metadata();
+        let msg_meta = given_messages_metadata();
+        let payload_json = sink.payload_to_json(message.payload.clone()).unwrap();
+
+        let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json);
+        assert_eq!(envelope["metadata"]["iggy_checksum"], 12345);
+    }
+
+    #[test]
+    fn given_include_origin_timestamp_should_add_to_metadata() {
+        let mut config = given_default_config();
+        config.include_origin_timestamp = Some(true);
+        let sink = HttpSink::new(1, config);
+
+        let message = given_json_message(1, 0);
+        let topic_meta = given_topic_metadata();
+        let msg_meta = given_messages_metadata();
+        let payload_json = sink.payload_to_json(message.payload.clone()).unwrap();
+
+        let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json);
+        assert_eq!(
+            envelope["metadata"]["iggy_origin_timestamp"],
+            1710064799000000u64
+        );
+    }
+
+    // ── Retry delay computation tests ────────────────────────────────
+
+    #[test]
+    fn given_attempt_zero_should_return_base_delay() {
+        let sink = given_sink_with_defaults();
+        assert_eq!(sink.compute_retry_delay(0), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn given_increasing_attempts_should_apply_exponential_backoff() {
+        let sink = given_sink_with_defaults();
+        // attempt 0: 1s * 2.0^0 = 1s
+        assert_eq!(sink.compute_retry_delay(0), Duration::from_secs(1));
+        // attempt 1: 1s * 2.0^1 = 2s
+        assert_eq!(sink.compute_retry_delay(1), Duration::from_secs(2));
+        // attempt 2: 1s * 2.0^2 = 4s
+        assert_eq!(sink.compute_retry_delay(2), Duration::from_secs(4));
+    }
+
+    #[test]
+    fn given_large_attempt_should_cap_at_max_retry_delay() {
+        let sink = given_sink_with_defaults();
+        // attempt 10: 1s * 2.0^10 = 1024s, capped to 30s
+        assert_eq!(sink.compute_retry_delay(10), Duration::from_secs(30));
+    }
+
+    // ── Transient status classification tests ────────────────────────
+
+    #[test]
+    fn given_transient_status_codes_should_return_true() {
+        for code in [429, 500, 502, 503, 504] {
+            assert!(
+                HttpSink::is_transient_status(reqwest::StatusCode::from_u16(code).unwrap()),
+                "Expected {} to be transient",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn given_non_transient_status_codes_should_return_false() {
+        for code in [200, 201, 400, 401, 403, 404, 405] {
+            assert!(
+                !HttpSink::is_transient_status(reqwest::StatusCode::from_u16(code).unwrap()),
+                "Expected {} to be non-transient",
+                code
+            );
+        }
+    }
+
+    // ── owned_value_to_serde_json conversion tests ───────────────────
+
+    #[test]
+    fn given_null_value_should_convert_to_null() {
+        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::Null);
+        assert_eq!(owned_value_to_serde_json(&v), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn given_bool_value_should_convert_correctly() {
+        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::Bool(true));
+        assert_eq!(owned_value_to_serde_json(&v), serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn given_integer_values_should_convert_correctly() {
+        let i64_val = simd_json::OwnedValue::Static(simd_json::StaticNode::I64(-42));
+        assert_eq!(owned_value_to_serde_json(&i64_val), serde_json::json!(-42));
+
+        let u64_val = simd_json::OwnedValue::Static(simd_json::StaticNode::U64(42));
+        assert_eq!(owned_value_to_serde_json(&u64_val), serde_json::json!(42));
+    }
+
+    #[test]
+    fn given_f64_value_should_convert_correctly() {
+        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::F64(3.14));
+        let result = owned_value_to_serde_json(&v);
+        assert_eq!(result.as_f64().unwrap(), 3.14);
+    }
+
+    #[test]
+    fn given_nan_f64_should_convert_to_null() {
+        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::F64(f64::NAN));
+        assert_eq!(owned_value_to_serde_json(&v), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn given_infinity_f64_should_convert_to_null() {
+        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::F64(f64::INFINITY));
+        assert_eq!(owned_value_to_serde_json(&v), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn given_nested_object_should_convert_recursively() {
+        let v = simd_json_from_str(r#"{"nested":{"key":"val"},"arr":[1,2]}"#);
+
+        let result = owned_value_to_serde_json(&v);
+        assert_eq!(result["nested"]["key"], "val");
+        assert_eq!(result["arr"][0], 1);
+        assert_eq!(result["arr"][1], 2);
+    }
+
+    // ── Config TOML deserialization tests ─────────────────────────────
+
+    #[test]
+    fn given_minimal_toml_config_should_deserialize() {
+        let toml_str = r#"url = "https://example.com""#;
+        let config: HttpSinkConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.url, "https://example.com");
+        assert!(config.method.is_none());
+        assert!(config.headers.is_none());
+        assert!(config.batch_mode.is_none());
+    }
+
+    #[test]
+    fn given_full_toml_config_should_deserialize_all_fields() {
+        let toml_str = r#"
+            url = "https://example.com/api"
+            method = "PUT"
+            timeout = "10s"
+            max_payload_size_bytes = 5000
+            batch_mode = "ndjson"
+            include_metadata = false
+            include_checksum = true
+            include_origin_timestamp = true
+            health_check_enabled = true
+            health_check_method = "GET"
+            max_retries = 5
+            retry_delay = "2s"
+            retry_backoff_multiplier = 3.0
+            max_retry_delay = "60s"
+            success_status_codes = [200, 201]
+            tls_danger_accept_invalid_certs = true
+            max_connections = 20
+            verbose_logging = true
+
+            [headers]
+            Authorization = "Bearer token"
+            X-Custom = "value"
+        "#;
+
+        let config: HttpSinkConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.url, "https://example.com/api");
+        assert_eq!(config.method, Some(HttpMethod::Put));
+        assert_eq!(config.batch_mode, Some(BatchMode::Ndjson));
+        assert_eq!(config.max_retries, Some(5));
+        assert_eq!(config.success_status_codes, Some(vec![200, 201]));
+        let headers = config.headers.unwrap();
+        assert_eq!(headers["Authorization"], "Bearer token");
+        assert_eq!(headers["X-Custom"], "value");
+    }
+
+    #[test]
+    fn given_invalid_method_in_toml_should_fail() {
+        let toml_str = r#"
+            url = "https://example.com"
+            method = "DELET"
+        "#;
+        let result: Result<HttpSinkConfig, _> = toml::from_str(toml_str);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn given_invalid_batch_mode_in_toml_should_fail() {
+        let toml_str = r#"
+            url = "https://example.com"
+            batch_mode = "xml"
+        "#;
+        let result: Result<HttpSinkConfig, _> = toml::from_str(toml_str);
+        assert!(result.is_err());
+    }
+
+    // ── open() validation tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn given_empty_url_should_fail_open() {
+        let mut config = given_default_config();
+        config.url = String::new();
+        let mut sink = HttpSink::new(1, config);
+        let result = sink.open().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("empty"), "Error should mention empty URL: {}", err);
+    }
+
+    #[tokio::test]
+    async fn given_invalid_url_should_fail_open() {
+        let mut config = given_default_config();
+        config.url = "not a url".to_string();
+        let mut sink = HttpSink::new(1, config);
+        let result = sink.open().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not a valid URL"), "Error should mention invalid URL: {}", err);
+    }
+
+    #[tokio::test]
+    async fn given_empty_success_status_codes_should_fail_open() {
+        let mut config = given_default_config();
+        config.success_status_codes = Some(vec![]);
+        let mut sink = HttpSink::new(1, config);
+        let result = sink.open().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("success_status_codes"),
+            "Error should mention success_status_codes: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn given_valid_config_should_build_client_in_open() {
+        let mut sink = given_sink_with_defaults();
+        // Disable health check so open() doesn't try to connect
+        sink.health_check_enabled = false;
+        let result = sink.open().await;
+        assert!(result.is_ok());
+        assert!(sink.client.is_some());
+    }
+}
