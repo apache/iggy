@@ -218,15 +218,19 @@ impl WireMockRequest {
         })
     }
 
-    /// Get a header value by name (case-insensitive lookup via WireMock's format).
+    /// Get a header value by name (case-insensitive per RFC 7230).
+    /// WireMock may return header keys in any case, so we iterate and compare.
     pub fn header(&self, name: &str) -> Option<String> {
         // WireMock returns headers as {"Header-Name": {"values": ["value"]}}
         // or just as a direct string value depending on version.
-        if let Some(h) = self.headers.get(name) {
-            if let Some(values) = h.get("values") {
-                return values.get(0).and_then(|v| v.as_str()).map(String::from);
+        let obj = self.headers.as_object()?;
+        for (key, value) in obj {
+            if key.eq_ignore_ascii_case(name) {
+                if let Some(values) = value.get("values") {
+                    return values.get(0).and_then(|v| v.as_str()).map(String::from);
+                }
+                return value.as_str().map(String::from);
             }
-            return h.as_str().map(String::from);
         }
         None
     }
