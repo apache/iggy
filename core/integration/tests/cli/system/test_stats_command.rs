@@ -203,7 +203,7 @@ impl IggyCmdTestCase for TestStatsCmdWithMessages {
             .send_messages(
                 &self.stream_id.try_into().unwrap(),
                 &self.topic_id.try_into().unwrap(),
-                &Partitioning::partition_id(1),
+                &Partitioning::default(),
                 &mut messages,
             )
             .await;
