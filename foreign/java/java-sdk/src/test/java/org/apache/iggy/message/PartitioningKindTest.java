@@ -22,7 +22,7 @@ package org.apache.iggy.message;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.assertj.core.api.Assertions.assertThat;
 
 class PartitioningKindTest {
     @ParameterizedTest
@@ -32,6 +32,6 @@ class PartitioningKindTest {
         "MessagesKey, 3",
     })
     void asCodeReturnsExpectedCode(PartitioningKind kind, int expectedCode) {
-        assertEquals(expectedCode, kind.asCode());
+        assertThat(kind.asCode()).isEqualTo(expectedCode);
     }
 }
