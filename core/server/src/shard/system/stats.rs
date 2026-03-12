@@ -120,10 +120,12 @@ impl IggyShard {
                 }
             }
 
-            stats.free_disk_space =
-                fs2::available_space(&self.config.system.path).unwrap_or(0).into();
-            stats.total_disk_space =
-                fs2::total_space(&self.config.system.path).unwrap_or(0).into();
+            stats.free_disk_space = fs2::available_space(&self.config.system.path)
+                .unwrap_or(0)
+                .into();
+            stats.total_disk_space = fs2::total_space(&self.config.system.path)
+                .unwrap_or(0)
+                .into();
 
             Ok(stats)
         })
