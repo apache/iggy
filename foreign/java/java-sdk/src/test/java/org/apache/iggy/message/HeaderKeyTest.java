@@ -24,53 +24,50 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
+import static org.assertj.core.api.AssertionsForClassTypes.assertThatThrownBy;
 
 class HeaderKeyTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"", "  "})
     void fromStringThrowsIggyInvalidArgumentExceptionWhenStringIsBlank(String value) {
-        assertThrows(IggyInvalidArgumentException.class, () -> HeaderKey.fromString(value));
+        assertThatThrownBy(() -> HeaderKey.fromString(value)).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void fromStringThrowsIggyInvalidArgumentExceptionWhenStringIsTooLong() {
-        assertThrows(IggyInvalidArgumentException.class, () -> HeaderKey.fromString("a".repeat(256)));
+        assertThatThrownBy(() -> HeaderKey.fromString("a".repeat(256)))
+                .isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void fromStringCreatesHeaderKeyWhenValueIsValid() {
         var result = HeaderKey.fromString("foo");
 
-        assertEquals(HeaderKind.String, result.kind());
-        assertArrayEquals(new byte[] {102, 111, 111}, result.value());
+        assertThat(result.kind()).isEqualTo(HeaderKind.String);
+        assertThat(result.value()).isEqualTo(new byte[] {102, 111, 111});
     }
 
     @Test
     void equalsReturnsTrueForSameObject() {
         var foo = HeaderKey.fromString("foo");
 
-        assertTrue(foo.equals(foo));
+        assertThat(foo).isEqualTo(foo);
     }
 
     @Test
     void equalsReturnsFalseForNull() {
         var foo = HeaderKey.fromString("foo");
 
-        assertFalse(foo.equals(null));
+        assertThat(foo).isNotEqualTo(null);
     }
 
     @Test
     void equalsReturnsFalseForDifferentType() {
         var foo = HeaderKey.fromString("foo");
 
-        assertFalse(foo.equals("notaheaderkey"));
+        assertThat(foo).isNotEqualTo("notaheaderkey");
     }
 
     @Test
@@ -78,7 +75,7 @@ class HeaderKeyTest {
         var foo = HeaderKey.fromString("foo");
         var bar = HeaderKey.fromString("bar");
 
-        assertFalse(foo.equals(bar));
+        assertThat(foo).isNotEqualTo(bar);
     }
 
     @Test
@@ -86,7 +83,7 @@ class HeaderKeyTest {
         var first = HeaderKey.fromString("foo");
         var second = HeaderKey.fromString("foo");
 
-        assertTrue(first.equals(second));
+        assertThat(first).isEqualTo(second);
     }
 
     @Test
@@ -94,7 +91,7 @@ class HeaderKeyTest {
         var first = HeaderKey.fromString("foo");
         var second = HeaderKey.fromString("foo");
 
-        assertEquals(first.hashCode(), second.hashCode());
+        assertThat(first.hashCode()).isEqualTo(second.hashCode());
     }
 
     @Test
@@ -102,7 +99,7 @@ class HeaderKeyTest {
         var first = HeaderKey.fromString("foo");
         var second = HeaderKey.fromString("bar");
 
-        assertNotEquals(first.hashCode(), second.hashCode());
+        assertThat(first.hashCode()).isNotEqualTo(second.hashCode());
     }
 
     @Test
@@ -110,13 +107,13 @@ class HeaderKeyTest {
         var first = new HeaderKey(HeaderKind.Int16, "foo".getBytes());
         var second = new HeaderKey(HeaderKind.Int32, "foo".getBytes());
 
-        assertNotEquals(first.hashCode(), second.hashCode());
+        assertThat(first.hashCode()).isNotEqualTo(second.hashCode());
     }
 
     @Test
     void toStringReturnsStringRepresentationOfValue() {
         var foo = HeaderKey.fromString("foo");
 
-        assertEquals("foo", foo.toString());
+        assertThat(foo.toString()).isEqualTo("foo");
     }
 }
