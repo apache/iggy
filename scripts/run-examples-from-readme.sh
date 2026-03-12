@@ -25,10 +25,6 @@ set -euo pipefail
 #   --language LANG   Language to test: rust|go|node|python|java|csharp (default: all)
 #   --target TARGET   Cargo target architecture for the server binary
 #   --skip-tls        Skip TLS example tests
-#   --goos GOOS       Go OS target
-#   --goarch GOARCH   Go architecture target
-#   --csharpos OS     C# --os flag
-#   --csharparch ARCH C# --arch flag
 #
 # The script sources shared utilities from scripts/utils.sh, starts the iggy
 # server (built from source), parses example commands from each language's
@@ -47,23 +43,15 @@ ROOT_WORKDIR="$(pwd)"
 LANGUAGE="all"
 TARGET=""
 SKIP_TLS=false
-GOOS=""
-GOARCH=""
-CSOS=""
-CSARCH=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --language)   LANGUAGE="$2";  shift 2 ;;
         --target)     TARGET="$2";    shift 2 ;;
         --skip-tls)   SKIP_TLS=true;  shift   ;;
-        --goos)       GOOS="$2";      shift 2 ;;
-        --goarch)     GOARCH="$2";    shift 2 ;;
-        --csharpos)   CSOS="$2";      shift 2 ;;
-        --csharparch) CSARCH="$2";    shift 2 ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--language LANG] [--target TARGET] [--skip-tls] [--goos GOOS] [--goarch GOARCH] [--csharpos OS] [--csharparch ARCH]"
+            echo "Usage: $0 [--language LANG] [--target TARGET] [--skip-tls]"
             exit 1
             ;;
     esac
@@ -83,6 +71,7 @@ done
 #   $6 - grep pattern for TLS commands (empty = no TLS examples)
 #   $7 - per-command timeout in seconds (0 = no timeout)
 #   $8 - extra server args (e.g. "--fresh")
+#   $9 - optional pre-flight callback function name (run before non-TLS examples, with server already started)
 # shellcheck disable=SC2329
 run_language_examples() {
     local lang="$1"
@@ -93,6 +82,7 @@ run_language_examples() {
     local tls_grep_pattern="$6"
     local cmd_timeout="$7"
     local server_extra_args="$8"
+    local preflight_fn="${9:-}"
 
     echo ""
     echo "============================================================"
@@ -108,6 +98,17 @@ run_language_examples() {
     start_plain_server ${server_extra_args}
     wait_for_server_ready "${lang}"
 
+    # Run optional pre-flight callback (e.g. CLI commands from root README)
+    if [ -n "${preflight_fn}" ] && declare -f "${preflight_fn}" >/dev/null 2>&1; then
+        ${preflight_fn}
+        if [ "${EXAMPLES_EXIT_CODE}" -ne 0 ]; then
+            cd "${ROOT_WORKDIR}"
+            stop_server
+            report_result "${EXAMPLES_EXIT_CODE}"
+            return "${EXAMPLES_EXIT_CODE}"
+        fi
+    fi
+
     if [ "${workdir}" != "." ]; then
         cd "${workdir}"
     fi
@@ -116,45 +117,7 @@ run_language_examples() {
         if [ "${EXAMPLES_EXIT_CODE}" -ne 0 ]; then
             break
         fi
-        if [ -n "${grep_exclude}" ]; then
-            # Build a combined pattern that filters out the exclude
-            local filtered
-            filtered=$(grep -E "${grep_pattern}" "${readme}" 2>/dev/null | grep -v "${grep_exclude}" || true)
-            if [ -n "${filtered}" ]; then
-                while IFS= read -r command; do
-                    command=$(echo "${command}" | tr -d '`' | sed 's/^#.*//')
-                    if [ -z "${command}" ]; then
-                        continue
-                    fi
-                    if declare -f TRANSFORM_COMMAND >/dev/null 2>&1; then
-                        command=$(TRANSFORM_COMMAND "${command}")
-                    fi
-                    echo -e "\e[33mChecking command from ${readme}:\e[0m ${command}"
-                    echo ""
-                    set +e
-                    if [ "${cmd_timeout}" -gt 0 ] 2>/dev/null; then
-                        eval "portable_timeout ${cmd_timeout} ${command}"
-                        local test_exit_code=$?
-                        if [[ ${test_exit_code} -ne 0 && ${test_exit_code} -ne 124 ]]; then
-                            EXAMPLES_EXIT_CODE=${test_exit_code}
-                        fi
-                    else
-                        eval "${command}"
-                        EXAMPLES_EXIT_CODE=$?
-                    fi
-                    set -e
-                    if [ "${EXAMPLES_EXIT_CODE}" -ne 0 ]; then
-                        echo ""
-                        echo -e "\e[31mCommand failed:\e[0m ${command}"
-                        echo ""
-                        break
-                    fi
-                    sleep 2
-                done <<< "${filtered}"
-            fi
-        else
-            run_readme_commands "${readme}" "${grep_pattern}" "${cmd_timeout}"
-        fi
+        run_readme_commands "${readme}" "${grep_pattern}" "${cmd_timeout}" "${grep_exclude}"
     done
 
     cd "${ROOT_WORKDIR}"
@@ -213,7 +176,6 @@ run_rust_examples() {
     resolve_server_binary "${TARGET}"
     resolve_cli_binary "${TARGET}"
 
-    # Transform: inject --target flag when cross-compiling
     if [ -n "${TARGET}" ]; then
         TRANSFORM_COMMAND() {
             echo "$1" | sed "s|cargo r |cargo r --target ${TARGET} |g" | sed "s|cargo run |cargo run --target ${TARGET} |g"
@@ -222,81 +184,21 @@ run_rust_examples() {
         unset -f TRANSFORM_COMMAND 2>/dev/null || true
     fi
 
-    # First run CLI commands from root README.md (these match `cargo r --bin iggy -- `)
-    echo ""
-    echo "============================================================"
-    echo "  Running Rust CLI + example tests"
-    echo "============================================================"
-    echo ""
+    # Pre-flight: run CLI commands from root README
+    _rust_preflight() {
+        run_readme_commands "README.md" '^\`cargo r --bin iggy -- '
+    }
 
-    EXAMPLES_EXIT_CODE=0
-    cleanup_server_state
-    start_plain_server
-    wait_for_server_ready "Rust"
-
-    # CLI commands from root README (abbreviated `cargo r`, not `cargo run`)
-    run_readme_commands "README.md" '^\`cargo r --bin iggy -- '
-    if [ "${EXAMPLES_EXIT_CODE}" -ne 0 ]; then
-        cd "${ROOT_WORKDIR}"
-        stop_server
-        report_result "${EXAMPLES_EXIT_CODE}"
-        return "${EXAMPLES_EXIT_CODE}"
-    fi
-
-    # Non-TLS example commands
-    for readme in README.md examples/rust/README.md; do
-        if [ "${EXAMPLES_EXIT_CODE}" -ne 0 ]; then
-            break
-        fi
-        local filtered
-        filtered=$(grep -E "^cargo run --example" "${readme}" 2>/dev/null | grep -v "tcp-tls" || true)
-        if [ -n "${filtered}" ]; then
-            while IFS= read -r command; do
-                command=$(echo "${command}" | tr -d '`' | sed 's/^#.*//')
-                if [ -z "${command}" ]; then continue; fi
-                if declare -f TRANSFORM_COMMAND >/dev/null 2>&1; then
-                    command=$(TRANSFORM_COMMAND "${command}")
-                fi
-                echo -e "\e[33mChecking example command from ${readme}:\e[0m ${command}"
-                echo ""
-                set +e
-                eval "${command}"
-                EXAMPLES_EXIT_CODE=$?
-                set -e
-                if [ "${EXAMPLES_EXIT_CODE}" -ne 0 ]; then
-                    echo ""
-                    echo -e "\e[31mExample command failed:\e[0m ${command}"
-                    echo ""
-                    break 2
-                fi
-                sleep 2
-            done <<< "${filtered}"
-        fi
-    done
-
-    stop_server
-
-    # TLS pass
-    if [ "${EXAMPLES_EXIT_CODE}" -eq 0 ] && [ "${SKIP_TLS}" = false ]; then
-        local tls_readme="examples/rust/README.md"
-        if [ -f "${tls_readme}" ] && grep -qE "^cargo run --example.*tcp-tls" "${tls_readme}"; then
-            echo ""
-            echo "=== Running Rust TLS examples ==="
-            echo ""
-
-            cleanup_server_state
-            start_tls_server
-            wait_for_server_ready "Rust TLS"
-
-            run_readme_commands "${tls_readme}" "^cargo run --example.*tcp-tls"
-
-            stop_server
-        fi
-    fi
-
-    unset -f TRANSFORM_COMMAND 2>/dev/null || true
-    report_result "${EXAMPLES_EXIT_CODE}"
-    return "${EXAMPLES_EXIT_CODE}"
+    run_language_examples \
+        "Rust" \
+        "." \
+        "README.md examples/rust/README.md" \
+        "^cargo run --example" \
+        "tcp-tls" \
+        "^cargo run --example.*tcp-tls" \
+        0 \
+        "" \
+        "_rust_preflight"
 }
 
 # shellcheck disable=SC2329
@@ -320,17 +222,7 @@ run_node_examples() {
 # shellcheck disable=SC2329
 run_go_examples() {
     resolve_server_binary "${TARGET}"
-
-    if [ -n "${GOOS}" ] || [ -n "${GOARCH}" ]; then
-        TRANSFORM_COMMAND() {
-            local cmd="$1"
-            [ -n "${GOOS}" ] && cmd="GOOS=${GOOS} ${cmd}"
-            [ -n "${GOARCH}" ] && cmd="GOARCH=${GOARCH} ${cmd}"
-            echo "${cmd}"
-        }
-    else
-        unset -f TRANSFORM_COMMAND 2>/dev/null || true
-    fi
+    unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
     run_language_examples \
         "Go" \
@@ -341,8 +233,6 @@ run_go_examples() {
         "" \
         0 \
         ""
-
-    unset -f TRANSFORM_COMMAND 2>/dev/null || true
 }
 
 # shellcheck disable=SC2329
@@ -413,93 +303,23 @@ run_java_examples() {
 # shellcheck disable=SC2329
 run_csharp_examples() {
     resolve_server_binary "${TARGET}"
-
-    if [ -n "${CSOS}" ] || [ -n "${CSARCH}" ]; then
-        TRANSFORM_COMMAND() {
-            local cmd="$1"
-            [ -n "${CSOS}" ] && cmd="${cmd//dotnet run /dotnet run --os ${CSOS} }"
-            [ -n "${CSARCH}" ] && cmd="${cmd//dotnet run /dotnet run --arch ${CSARCH} }"
-            echo "${cmd}"
-        }
-    else
-        unset -f TRANSFORM_COMMAND 2>/dev/null || true
-    fi
-
-    # C# also runs CLI commands from root README
-    echo ""
-    echo "============================================================"
-    echo "  Running C# examples"
-    echo "============================================================"
-    echo ""
-
-    EXAMPLES_EXIT_CODE=0
-    cleanup_server_state
-    start_plain_server
-    wait_for_server_ready "C#"
-
-    # CLI commands from root README (abbreviated `cargo r`, not `cargo run`)
-    run_readme_commands "README.md" '^\`cargo r --bin iggy -- '
-    if [ "${EXAMPLES_EXIT_CODE}" -ne 0 ]; then
-        cd "${ROOT_WORKDIR}"
-        stop_server
-        report_result "${EXAMPLES_EXIT_CODE}"
-        return "${EXAMPLES_EXIT_CODE}"
-    fi
-
-    # Non-TLS dotnet examples (run from repo root since paths include examples/csharp/...)
-    for readme in README.md examples/csharp/README.md; do
-        if [ "${EXAMPLES_EXIT_CODE}" -ne 0 ]; then
-            break
-        fi
-        local filtered
-        filtered=$(grep -E "^dotnet run --project" "${readme}" 2>/dev/null | grep -v "TcpTls" || true)
-        if [ -n "${filtered}" ]; then
-            while IFS= read -r command; do
-                command=$(echo "${command}" | tr -d '`' | sed 's/^#.*//')
-                if [ -z "${command}" ]; then continue; fi
-                if declare -f TRANSFORM_COMMAND >/dev/null 2>&1; then
-                    command=$(TRANSFORM_COMMAND "${command}")
-                fi
-                echo -e "\e[33mChecking example command from ${readme}:\e[0m ${command}"
-                echo ""
-                set +e
-                eval "${command}"
-                EXAMPLES_EXIT_CODE=$?
-                set -e
-                if [ "${EXAMPLES_EXIT_CODE}" -ne 0 ]; then
-                    echo ""
-                    echo -e "\e[31mExample command failed:\e[0m ${command}"
-                    echo ""
-                    break 2
-                fi
-                sleep 2
-            done <<< "${filtered}"
-        fi
-    done
-
-    stop_server
-
-    # TLS pass
-    if [ "${EXAMPLES_EXIT_CODE}" -eq 0 ] && [ "${SKIP_TLS}" = false ]; then
-        local tls_readme="examples/csharp/README.md"
-        if [ -f "${tls_readme}" ] && grep -qE "^dotnet run --project.*TcpTls" "${tls_readme}"; then
-            echo ""
-            echo "=== Running C# TLS examples ==="
-            echo ""
-
-            cleanup_server_state
-            start_tls_server
-            wait_for_server_ready "C# TLS"
-
-            run_readme_commands "${tls_readme}" "^dotnet run --project.*TcpTls"
-
-            stop_server
-        fi
-    fi
-
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
-    report_result "${EXAMPLES_EXIT_CODE}"
-    return "${EXAMPLES_EXIT_CODE}"
+
+    # Pre-flight: run CLI commands from root README
+    _csharp_preflight() {
+        run_readme_commands "README.md" '^\`cargo r --bin iggy -- '
+    }
+
+    run_language_examples \
+        "C#" \
+        "." \
+        "README.md examples/csharp/README.md" \
+        "^dotnet run --project" \
+        "TcpTls" \
+        "^dotnet run --project.*TcpTls" \
+        0 \
+        "" \
+        "_csharp_preflight"
 }
 
 # ---------------------------------------------------------------------------
@@ -511,10 +331,17 @@ overall_exit_code=0
 run_one() {
     local lang_fn="$1"
     local lang_name="$2"
+
+    EXAMPLES_EXIT_CODE=0
+    unset -f TRANSFORM_COMMAND 2>/dev/null || true
+
     set +e
     ${lang_fn}
     local rc=$?
     set -e
+
+    unset -f TRANSFORM_COMMAND 2>/dev/null || true
+
     if [ ${rc} -ne 0 ]; then
         echo ""
         echo -e "\e[31m${lang_name} examples FAILED (exit code ${rc})\e[0m"
