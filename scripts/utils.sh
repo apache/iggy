@@ -157,6 +157,7 @@ function on_exit_bench() {
 readonly EXAMPLES_LOG_FILE="iggy-server.log"
 readonly EXAMPLES_PID_FILE="iggy-server.pid"
 readonly EXAMPLES_SERVER_TIMEOUT=300
+readonly EXAMPLES_STOP_TIMEOUT=5
 
 # Resolve and validate the server binary path.
 # Usage: resolve_server_binary [target]
@@ -251,13 +252,25 @@ function wait_for_server_ready() {
     done
 }
 
-# Gracefully stop the server using the PID file.
+# Gracefully stop the server: SIGTERM, wait up to EXAMPLES_STOP_TIMEOUT
+# seconds for exit, then SIGKILL if still alive.
 function stop_server() {
-    if [ -e "${EXAMPLES_PID_FILE}" ]; then
-        kill -TERM "$(cat "${EXAMPLES_PID_FILE}")" 2>/dev/null || true
-        sleep 2
-        rm -f "${EXAMPLES_PID_FILE}"
+    if [ ! -e "${EXAMPLES_PID_FILE}" ]; then
+        return
     fi
+    local pid
+    pid="$(cat "${EXAMPLES_PID_FILE}")"
+    rm -f "${EXAMPLES_PID_FILE}"
+
+    kill -TERM "${pid}" 2>/dev/null || true
+
+    if wait_for_process_pid "${pid}" "${EXAMPLES_STOP_TIMEOUT}" 2>/dev/null; then
+        return
+    fi
+
+    echo "Server PID ${pid} did not exit after ${EXAMPLES_STOP_TIMEOUT}s, sending SIGKILL..."
+    kill -KILL "${pid}" 2>/dev/null || true
+    wait_for_process_pid "${pid}" 2 2>/dev/null || true
 }
 
 # Print final result and dump the log on failure.
@@ -286,7 +299,7 @@ function portable_timeout() {
 }
 
 # Run commands extracted from a README file.
-# Usage: run_readme_commands readme_file grep_pattern [cmd_timeout]
+# Usage: run_readme_commands readme_file grep_pattern [cmd_timeout [grep_exclude]]
 # Reads matching lines, strips backticks/comments, executes each.
 # Calls TRANSFORM_COMMAND function on each command if defined.
 # Returns: sets global EXAMPLES_EXIT_CODE.
@@ -294,6 +307,7 @@ function run_readme_commands() {
     local readme_file="$1"
     local grep_pattern="$2"
     local cmd_timeout="${3:-0}"
+    local grep_exclude="${4:-}"
 
     if [ ! -f "${readme_file}" ]; then
         return
@@ -301,6 +315,9 @@ function run_readme_commands() {
 
     local commands
     commands=$(grep -E "${grep_pattern}" "${readme_file}" || true)
+    if [ -n "${grep_exclude}" ]; then
+        commands=$(echo "${commands}" | grep -v "${grep_exclude}" || true)
+    fi
     if [ -z "${commands}" ]; then
         return
     fi
@@ -322,7 +339,6 @@ function run_readme_commands() {
         if [ "${cmd_timeout}" -gt 0 ] 2>/dev/null; then
             eval "portable_timeout ${cmd_timeout} ${command}"
             local test_exit_code=$?
-            # timeout exit 124 is tolerated (command ran but exceeded timeout)
             if [[ ${test_exit_code} -ne 0 && ${test_exit_code} -ne 124 ]]; then
                 EXAMPLES_EXIT_CODE=${test_exit_code}
             fi
