@@ -53,6 +53,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
@@ -61,7 +63,7 @@ sink_connector!(InfluxDbSink);
 const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_RETRY_DELAY: &str = "1s";
 const DEFAULT_TIMEOUT: &str = "30s";
-const DEFAULT_PRECISION: &str = "ns";
+const DEFAULT_PRECISION: &str = "us";
 // [FIX-SINK-7] Maximum attempts for open() connectivity retries
 const DEFAULT_MAX_OPEN_RETRIES: u32 = 10;
 // [FIX-SINK-8] Cap for exponential backoff in open() — never wait longer than this
@@ -426,15 +428,15 @@ impl InfluxDbSink {
             .max(1)
     }
 
-    fn to_precision_timestamp(&self, millis: u64) -> u64 {
+    fn to_precision_timestamp(&self, micros: u64) -> u64 {
         match self.timestamp_precision() {
-            "ns" => millis.saturating_mul(1_000_000), // µs * 1_000_000 = way too large
-            "us" => millis.saturating_mul(1_000),
-            "s" => millis / 1_000,
-            _ => millis,
+            "ns" => micros.saturating_mul(1_000),
+            "us" => micros,
+            "ms" => micros / 1_000,
+            "s" => micros / 1_000_000,
+            _ => micros,
         }
     }
-
     fn line_from_message(
         &self,
         topic_metadata: &TopicMetadata,
@@ -540,7 +542,31 @@ impl InfluxDbSink {
             format!(",{}", tags.join(","))
         };
 
-        let ts = self.to_precision_timestamp(message.timestamp);
+        // [FIX-SINK-9] message.timestamp is microseconds since Unix epoch.
+        // If it is 0 (unset by the producer), fall back to now() so points are
+        // not stored at Unix epoch (year 1970), which falls outside every
+        // range(start: -1h) query window.
+        // We also blend the message offset as sub-microsecond nanoseconds so
+        // that multiple messages in the same batch get distinct timestamps and
+        // are not deduplicated by InfluxDB (same measurement+tags+time = 1 row).
+        let base_micros = if message.timestamp == 0 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64
+        } else {
+            message.timestamp
+        };
+        // Add offset mod 1000 as extra nanoseconds — shifts timestamp by at
+        // most 999 ns, which is imperceptible but unique per message.
+        let unique_micros = base_micros.saturating_add(message.offset % 1_000);
+        let ts = self.to_precision_timestamp(unique_micros);
+
+        debug!(
+            "InfluxDB sink ID: {} point — offset={}, raw_ts={}, influx_ts={ts}",
+            self.id, message.offset, message.timestamp
+        );
+
         Ok(format!(
             "{measurement}{tags_fragment} {} {ts}",
             fields.join(",")

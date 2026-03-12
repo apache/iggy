@@ -57,10 +57,11 @@ impl InfluxDbSinkFixture {
         expected: usize,
     ) -> Result<usize, TestBinaryError> {
         let flux = format!(
-            r#"from(bucket:"{b}") |> range(start:-1h) |> filter(fn:(r)=>r._measurement=="{m}") |> count()"#,
+            r#"from(bucket:"{b}") |> range(start:-1h) |> filter(fn:(r)=>r._measurement=="{m}") |> filter(fn:(r)=>r._field=="offset")"#,
             b = INFLUXDB_BUCKET,
             m = measurement,
         );
+        info!("Flux Query {} ", flux);
         for _ in 0..POLL_ATTEMPTS {
             match self.query_count(&flux).await {
                 Ok(n) if n >= expected => {

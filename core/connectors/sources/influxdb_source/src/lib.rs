@@ -723,8 +723,6 @@ impl Source for InfluxDbSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
-        tokio::time::sleep(self.poll_interval).await;
-
         // [FIX-SRC-5] Skip query if circuit breaker is open
         if self.circuit_breaker.is_open().await {
             warn!(
@@ -792,6 +790,7 @@ impl Source for InfluxDbSource {
                      Consecutive failures tracked by circuit breaker.",
                     self.id
                 );
+                tokio::time::sleep(self.poll_interval).await;
                 Err(e)
             }
         }

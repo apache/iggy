@@ -17,6 +17,7 @@
 use super::TEST_MESSAGE_COUNT;
 use crate::connectors::fixtures::InfluxDbSourceFixture;
 use iggy_binary_protocol::MessageClient;
+use iggy_common::Utc;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
 use integration::harness::seeds;
 use integration::iggy_harness;
@@ -30,13 +31,13 @@ async fn influxdb_source_polls_and_produces_messages(
     harness: &TestHarness,
     fixture: InfluxDbSourceFixture,
 ) {
-    let base_ts: u64 = 1_700_000_000_000;
+    let base_ts: u64 = Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
     let lines: Vec<String> = (0..TEST_MESSAGE_COUNT)
         .map(|i| {
             format!(
-                "sensor_readings,loc=lab v={v} {ts}",
+                "sensor_readings,loc=lab v={v} {base_ts}",
                 v = 20.0 + i as f64,
-                ts = base_ts + i as u64 * 1000,
+                base_ts = base_ts + i as u64 * 1000,
             )
         })
         .collect();
@@ -88,9 +89,9 @@ async fn influxdb_source_message_payload_structure(
     harness: &TestHarness,
     fixture: InfluxDbSourceFixture,
 ) {
-    let ts: u64 = 1_700_000_100_000;
+    let base_ts: u64 = Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
     fixture
-        .write_lines(&[&format!("sensor_readings,loc=roof humidity=78.5 {ts}")])
+        .write_lines(&[&format!("sensor_readings,loc=roof humidity=78.5 {base_ts}")])
         .await
         .expect("Failed to write line");
 
@@ -182,12 +183,12 @@ async fn influxdb_source_multiple_measurements(
     harness: &TestHarness,
     fixture: InfluxDbSourceFixture,
 ) {
-    let ts: u64 = 1_700_200_000_000;
+    let base_ts: u64 = Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
     fixture
         .write_lines(&[
-            &format!("temperature,room=living v=21.5 {ts}"),
-            &format!("humidity,room=living v=55.0 {}", ts + 1000),
-            &format!("pressure,room=living v=1013.25 {}", ts + 2000),
+            &format!("temperature,room=living v=21.5 {base_ts}"),
+            &format!("humidity,room=living v=55.0 {}", base_ts + 1000),
+            &format!("pressure,room=living v=1013.25 {}", base_ts + 2000),
         ])
         .await
         .expect("Failed to write lines");

@@ -149,7 +149,7 @@ pub trait InfluxDbOps: Sync {
     ) -> impl std::future::Future<Output = Result<(), TestBinaryError>> + Send {
         async move {
             let url = format!(
-                "{}/api/v2/write?org={}&bucket={}&precision=ms",
+                "{}/api/v2/write?org={}&bucket={}&precision=ns",
                 self.container().base_url,
                 INFLUXDB_ORG,
                 INFLUXDB_BUCKET,
@@ -182,7 +182,6 @@ pub trait InfluxDbOps: Sync {
         }
     }
 
-    /// Count documents matching a Flux query (returns row count from CSV).
     fn query_count(
         &self,
         flux: &str,
@@ -209,10 +208,30 @@ pub trait InfluxDbOps: Sync {
                 })?;
 
             let text = response.text().await.unwrap_or_default();
-            // Each non-header, non-empty CSV line is one result row.
+            eprintln!(
+                "DEBUG influxdb csv response:\n{}",
+                &text[..text.len().min(2000)]
+            );
+            // InfluxDB annotated CSV format:
+            //   - Annotation rows start with '#'
+            //   - Header row starts with ',result,table,...'  (empty first field)
+            //   - Data rows start with an empty annotation field, e.g. ',_result,0,...'
+            //     where the THIRD field (index 2) is the numeric table index.
+            //   - Empty lines separate tables
+            // Count lines whose third CSV field is a non-negative integer (data rows).
             let count = text
                 .lines()
-                .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with(",result"))
+                .filter(|l| {
+                    let mut fields = l.splitn(4, ',');
+                    let annotation = fields.next().unwrap_or("");
+                    // Data rows have an empty first field (the annotation column)
+                    if !annotation.is_empty() {
+                        return false;
+                    }
+                    fields.next(); // skip _result
+                    let table = fields.next().unwrap_or("");
+                    table.parse::<u64>().is_ok()
+                })
                 .count();
             Ok(count)
         }
