@@ -494,10 +494,19 @@ async fn individual_messages_have_sequential_offsets(
     // Note: offsets may not start at 0 if the topic already had messages.
     let mut offsets: Vec<i64> = requests
         .iter()
-        .filter_map(|r| {
-            r.body_as_json()
-                .ok()
-                .and_then(|b| b["metadata"]["iggy_offset"].as_i64())
+        .enumerate()
+        .map(|(i, r)| {
+            let body = r
+                .body_as_json()
+                .unwrap_or_else(|e| panic!("Request {i} body is not valid JSON: {e}"));
+            body["metadata"]["iggy_offset"]
+                .as_i64()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Request {i} missing or non-integer iggy_offset in metadata: {}",
+                        body["metadata"]
+                    )
+                })
         })
         .collect();
 

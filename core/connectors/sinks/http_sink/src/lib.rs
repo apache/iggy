@@ -589,7 +589,12 @@ impl HttpSink {
                     last_error = Some(e);
 
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                        let skipped = total as u64 - delivered - http_failures - serialization_failures;
+                        let processed = delivered + http_failures + serialization_failures;
+                        debug_assert!(
+                            processed <= total as u64,
+                            "processed ({processed}) > total ({total}) — accounting bug"
+                        );
+                        let skipped = (total as u64).saturating_sub(processed);
                         error!(
                             "HTTP sink ID: {} — aborting batch after {} consecutive HTTP failures \
                              ({} remaining messages skipped)",
@@ -685,16 +690,24 @@ impl HttpSink {
             )));
         }
 
-        self.send_with_retry(client, Bytes::from(body), self.content_type())
+        if let Err(e) = self
+            .send_with_retry(client, Bytes::from(body), self.content_type())
             .await
-            .inspect_err(|_| {
-                if skipped > 0 {
-                    error!(
-                        "HTTP sink ID: {} — NDJSON batch failed with {} serialization skips",
-                        self.id, skipped,
-                    );
-                }
-            })?;
+        {
+            // send_with_retry already added 1 to errors_count for the HTTP failure.
+            // Add the remaining messages that were serialized but not delivered.
+            if count > 1 {
+                self.errors_count
+                    .fetch_add(count - 1, Ordering::Relaxed);
+            }
+            if skipped > 0 {
+                error!(
+                    "HTTP sink ID: {} — NDJSON batch failed with {} serialization skips",
+                    self.id, skipped,
+                );
+            }
+            return Err(e);
+        }
         self.messages_delivered.fetch_add(count, Ordering::Relaxed);
         if skipped > 0 {
             warn!(
@@ -775,16 +788,24 @@ impl HttpSink {
             )));
         }
 
-        self.send_with_retry(client, Bytes::from(body), self.content_type())
+        if let Err(e) = self
+            .send_with_retry(client, Bytes::from(body), self.content_type())
             .await
-            .inspect_err(|_| {
-                if skipped > 0 {
-                    error!(
-                        "HTTP sink ID: {} — JSON array batch failed with {} serialization skips",
-                        self.id, skipped,
-                    );
-                }
-            })?;
+        {
+            // send_with_retry already added 1 to errors_count for the HTTP failure.
+            // Add the remaining messages that were serialized but not delivered.
+            if count > 1 {
+                self.errors_count
+                    .fetch_add(count - 1, Ordering::Relaxed);
+            }
+            if skipped > 0 {
+                error!(
+                    "HTTP sink ID: {} — JSON array batch failed with {} serialization skips",
+                    self.id, skipped,
+                );
+            }
+            return Err(e);
+        }
         self.messages_delivered.fetch_add(count, Ordering::Relaxed);
         if skipped > 0 {
             warn!(
@@ -854,7 +875,12 @@ impl HttpSink {
                     last_error = Some(e);
 
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                        let skipped = total as u64 - delivered - http_failures - serialization_failures;
+                        let processed = delivered + http_failures + serialization_failures;
+                        debug_assert!(
+                            processed <= total as u64,
+                            "processed ({processed}) > total ({total}) — accounting bug"
+                        );
+                        let skipped = (total as u64).saturating_sub(processed);
                         error!(
                             "HTTP sink ID: {} — aborting raw batch after {} consecutive HTTP failures \
                              ({} remaining messages skipped)",
@@ -980,12 +1006,26 @@ impl Sink for HttpSink {
                     )));
                 }
             }
-            Err(_) => {
+            Err(e) => {
                 return Err(Error::InitError(format!(
-                    "HTTP sink URL '{}' is not a valid URL",
-                    self.url,
+                    "HTTP sink URL '{}' is not a valid URL: {}",
+                    self.url, e,
                 )));
             }
+        }
+
+        // Warn if user supplied a Content-Type header — it will be overridden by batch_mode.
+        if self
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("content-type"))
+        {
+            warn!(
+                "HTTP sink ID: {} — custom 'Content-Type' header in [headers] is ignored. \
+                 Content-Type is set by batch_mode ({:?} -> '{}'). \
+                 Remove it from [headers] to silence this warning.",
+                self.id, self.batch_mode, self.content_type(),
+            );
         }
 
         // Validate custom headers — fail fast rather than per-request errors
@@ -1876,22 +1916,33 @@ mod tests {
 
     #[test]
     fn given_user_content_type_header_should_be_filtered_in_request_builder() {
+        // Note: This test validates the filter logic used in request_builder().
+        // We cannot call request_builder() directly without a live reqwest::Client,
+        // so we verify the filter predicate matches what request_builder() uses.
         let mut config = given_default_config();
         config.headers = Some(HashMap::from([
             ("Content-Type".to_string(), "text/plain".to_string()),
+            ("content-type".to_string(), "text/xml".to_string()),
             ("X-Custom".to_string(), "keep-me".to_string()),
         ]));
         let sink = HttpSink::new(1, config);
-        // Content-Type should be filtered, X-Custom should remain
-        // We can't inspect the builder directly, but we verify the filter logic
-        // by checking that Content-Type is excluded from iteration
-        let mut included_headers = Vec::new();
-        for (key, _value) in &sink.headers {
-            if !key.eq_ignore_ascii_case("content-type") {
-                included_headers.push(key.clone());
-            }
-        }
-        assert_eq!(included_headers, vec!["X-Custom"]);
+        // Count how many headers survive the Content-Type filter
+        let surviving: Vec<&String> = sink
+            .headers
+            .keys()
+            .filter(|k| !k.eq_ignore_ascii_case("content-type"))
+            .collect();
+        assert_eq!(
+            surviving.len(),
+            1,
+            "Only non-Content-Type headers should survive, got: {:?}",
+            surviving
+        );
+        assert!(
+            surviving.iter().any(|k| *k == "X-Custom"),
+            "X-Custom should survive the filter, got: {:?}",
+            surviving
+        );
     }
 
     // ── T4: consume() before open() test ─────────────────────────────
