@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::{AutoLogin, IggyDuration, IggyError, TcpClientConfig};
-use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 
 /// Builder for the TCP client configuration.
 /// Allows configuring the TCP client with custom settings or using defaults:
@@ -106,7 +106,7 @@ impl TcpClientConfigBuilder {
     pub fn build(self) -> Result<TcpClientConfig, IggyError> {
         let addr = self.config.server_address.trim();
 
-        if addr.parse::<SocketAddr>().is_err() {
+        if !addr.to_socket_addrs().is_ok_and(|mut f| f.next().is_some()) {
             let (ip, port) = addr.rsplit_once(':').unwrap_or((addr, ""));
             return Err(IggyError::InvalidIpAddress(ip.to_owned(), port.to_owned()));
         }
@@ -139,12 +139,16 @@ mod tests {
     }
 
     #[test]
-    fn valid_ipv6_without_brackets_should_fail() {
+    fn valid_ipv6_without_brackets_should_succeed() {
+        // Address resolution interprets this as the IPv6 socket [::1]:8080
         let builder = builder_with_address("::1:8080");
-        assert!(matches!(
-            builder.build(),
-            Err(IggyError::InvalidIpAddress(_, _))
-        ));
+        assert!(builder.build().is_ok());
+    }
+
+    #[test]
+    fn valid_dns_name_should_succeed() {
+        let builder = builder_with_address("localhost:8080");
+        assert!(builder.build().is_ok());
     }
 
     #[test]
