@@ -467,23 +467,6 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
         initial_counts.push(count);
     }
 
-    // for partition_id in 0..PARTITIONS_COUNT {
-    //     let partition_path = data_path
-    //         .join(format!(
-    //             "streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}"
-    //         ))
-    //         .display()
-    //         .to_string();
-    //     let segments = get_segment_paths_for_partition(&partition_path);
-    //     initial_counts.push(segments.len());
-    //     assert!(
-    //         segments.len() >= 2,
-    //         "Partition {} should have at least 2 segments, got {}",
-    //         partition_id,
-    //         segments.len()
-    //     );
-    // }
-
     // Wait for expiry + cleaner
     tokio::time::sleep(expiry + CLEANER_BUFFER).await;
 

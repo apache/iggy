@@ -162,13 +162,3 @@ fn make_mutable(batch: IggyMessagesBatch) -> IggyMessagesBatchMut {
 
     IggyMessagesBatchMut::from_indexes_and_messages(indexes_mut, messages_buffer_mut)
 }
-
-// fn make_mutable(_batch: IggyMessagesBatch) -> IggyMessagesBatchMut {
-//     todo!();
-//     // let (_, indexes, messages) = batch.decompose();
-//     // let (_, indexes_buffer) = indexes.decompose();
-//     // let indexes_buffer_mut = PooledBuffer::from_existing(indexes_buffer.into());
-//     // let indexes_mut = IggyIndexesMut::from_bytes(indexes_buffer_mut, 0);
-//     // let messages_buffer_mut = PooledBuffer::from_existing(messages.into());
-//     // IggyMessagesBatchMut::from_indexes_and_messages(indexes_mut, messages_buffer_mut)
-// }

@@ -56,7 +56,6 @@ impl ServerCommandHandler for PollMessages {
         let user_id = session.get_user_id();
         let client_id = session.client_id;
         let topic = shard.resolve_topic_for_poll(user_id, &stream_id, &topic_id)?;
-
         let (metadata, mut batch) = shard
             .poll_messages(client_id, topic, consumer, partition_id, args)
             .await?;
@@ -74,7 +73,6 @@ impl ServerCommandHandler for PollMessages {
         let mut partition_id_buf = PooledBuffer::with_capacity(4);
         let mut current_offset_buf = PooledBuffer::with_capacity(8);
         let mut count_buf = PooledBuffer::with_capacity(4);
-
         partition_id_buf.put_u32_le(metadata.partition_id);
         current_offset_buf.put_u64_le(metadata.current_offset);
         count_buf.put_u32_le(batch.count());
@@ -86,7 +84,6 @@ impl ServerCommandHandler for PollMessages {
         batch.iter_mut().for_each(|m| {
             bufs.push(m.take_messages());
         });
-
         trace!(
             "Sending {} messages to client ({} bytes) to client",
             batch.count(),

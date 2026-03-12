@@ -74,7 +74,6 @@ impl ServerCommandHandler for SendMessages {
             .read(metadata_buffer.slice(0..metadata_size as usize))
             .await;
         result?;
-
         let metadata_buf = metadata_buf.into_inner();
 
         let mut element_size = 0;
@@ -116,7 +115,6 @@ impl ServerCommandHandler for SendMessages {
         let indexes_buffer = PooledBuffer::with_capacity(indexes_size);
         let (result, indexes_buffer) = sender.read(indexes_buffer.slice(0..indexes_size)).await;
         result?;
-
         let indexes_buffer = indexes_buffer.into_inner();
 
         let messages_size = total_payload_size
@@ -128,12 +126,10 @@ impl ServerCommandHandler for SendMessages {
 
         let (result, messages_buffer) = sender.read(messages_buffer.slice(0..messages_size)).await;
         result?;
-
         let messages_buffer = messages_buffer.into_inner();
 
         let indexes = IggyIndexesMut::from_bytes(indexes_buffer, 0);
         let batch = IggyMessagesBatchMut::from_indexes_and_messages(indexes, messages_buffer);
-
         batch.validate()?;
 
         let topic = shard.resolve_topic_for_append(
