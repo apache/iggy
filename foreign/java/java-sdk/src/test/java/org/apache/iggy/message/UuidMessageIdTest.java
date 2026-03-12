@@ -29,8 +29,7 @@ import java.math.BigInteger;
 import java.util.UUID;
 import java.util.stream.Stream;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.assertj.core.api.Assertions.assertThat;
 
 class UuidMessageIdTest {
 
@@ -44,7 +43,7 @@ class UuidMessageIdTest {
 
         var result = messageId.toBigInteger();
 
-        assertEquals(expected, result);
+        assertThat(result).isEqualTo(expected);
     }
 
     public static Stream<Arguments> toBytesArgumentProvider() {
@@ -64,7 +63,7 @@ class UuidMessageIdTest {
 
         var result = messageId.toBytes();
 
-        assertArrayEquals(expected, result.array());
+        assertThat(result.array()).isEqualTo(expected);
     }
 
     @Test
@@ -72,6 +71,6 @@ class UuidMessageIdTest {
         var id = "c0d43e67-54d0-4671-8715-dfb3832cd367";
         var messageId = new UuidMessageId(UUID.fromString(id));
 
-        assertEquals(id, messageId.toString());
+        assertThat(messageId.toString()).isEqualTo(id);
     }
 }
