@@ -23,46 +23,46 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.assertj.core.api.Assertions.assertThat;
 
 class PollingStrategyTest {
     @Test
     void offsetReturnsStrategyWithOffsetKindAndProvidedValue() {
         var strategy = PollingStrategy.offset(BigInteger.ONE);
 
-        assertEquals(BigInteger.ONE, strategy.value());
-        assertEquals(PollingKind.Offset, strategy.kind());
+        assertThat(strategy.value()).isEqualTo(BigInteger.ONE);
+        assertThat(strategy.kind()).isEqualTo(PollingKind.Offset);
     }
 
     @Test
     void timestampReturnsStrategyWithTimestampKindAndProvidedValue() {
         var strategy = PollingStrategy.timestamp(new BigInteger("123456789"));
 
-        assertEquals(new BigInteger("123456789"), strategy.value());
-        assertEquals(PollingKind.Timestamp, strategy.kind());
+        assertThat(strategy.value()).isEqualTo(new BigInteger("123456789"));
+        assertThat(strategy.kind()).isEqualTo(PollingKind.Timestamp);
     }
 
     @Test
     void firstReturnsStrategyWithFirstKindAndZeroAsValue() {
         var strategy = PollingStrategy.first();
 
-        assertEquals(BigInteger.ZERO, strategy.value());
-        assertEquals(PollingKind.First, strategy.kind());
+        assertThat(strategy.value()).isEqualTo(BigInteger.ZERO);
+        assertThat(strategy.kind()).isEqualTo(PollingKind.First);
     }
 
     @Test
     void lastReturnsStrategyWithLastKindAndZeroAsValue() {
         var strategy = PollingStrategy.last();
 
-        assertEquals(BigInteger.ZERO, strategy.value());
-        assertEquals(PollingKind.Last, strategy.kind());
+        assertThat(strategy.value()).isEqualTo(BigInteger.ZERO);
+        assertThat(strategy.kind()).isEqualTo(PollingKind.Last);
     }
 
     @Test
     void nextReturnsStrategyWithNextKindAndZeroAsValue() {
         var strategy = PollingStrategy.next();
 
-        assertEquals(BigInteger.ZERO, strategy.value());
-        assertEquals(PollingKind.Next, strategy.kind());
+        assertThat(strategy.value()).isEqualTo(BigInteger.ZERO);
+        assertThat(strategy.kind()).isEqualTo(PollingKind.Next);
     }
 }
