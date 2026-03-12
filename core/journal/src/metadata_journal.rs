@@ -47,7 +47,7 @@ const MAX_ENTRY_SIZE: u64 = 64 * 1024 * 1024;
 /// entries in [`core::consensus::pipeline_prepare_queue_max`]. Because this number controls
 /// how many committed but not yet snapshotted entries that the buffer can
 /// hold. This may need to be tuned properly.
-pub const SLOT_COUNT: usize = 1024;
+pub(crate) const SLOT_COUNT: usize = 1024;
 
 /// Error type for journal operations.
 #[derive(Debug)]
@@ -288,6 +288,9 @@ impl Journal<FileStorage> for MetadataJournal {
             return Some(SLOT_COUNT);
         };
         let snapshot = self.snapshot_op.get();
+        if last <= snapshot {
+            return Some(SLOT_COUNT);
+        }
         let used = (last - snapshot) as usize;
         Some(SLOT_COUNT.saturating_sub(used))
     }

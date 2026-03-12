@@ -24,7 +24,6 @@ use iggy_common::sharding::IggyNamespace;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use metadata::stm::StateMachine;
-use metadata::stm::snapshot::{FillSnapshot, MetadataSnapshot};
 
 /// Inter-shard dispatch logic.
 ///
@@ -156,7 +155,7 @@ where
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            > + FillSnapshot<MetadataSnapshot>,
+            >,
     {
         loop {
             futures::select! {
@@ -190,7 +189,7 @@ where
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            > + FillSnapshot<MetadataSnapshot>,
+            >,
     {
         self.on_message(frame.message).await;
         // TODO: once on_message returns an R (e.g. ShardResponse), send it

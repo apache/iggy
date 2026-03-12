@@ -27,7 +27,6 @@ use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use metadata::IggyMetadata;
 use metadata::stm::StateMachine;
-use metadata::stm::snapshot::{FillSnapshot, MetadataSnapshot};
 use partitions::IggyPartitions;
 use shards_table::ShardsTable;
 
@@ -170,7 +169,7 @@ where
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            > + FillSnapshot<MetadataSnapshot>,
+            >,
     {
         match MessageBag::try_from(message) {
             Ok(MessageBag::Request(request)) => self.on_request(request).await,
@@ -196,7 +195,7 @@ where
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            > + FillSnapshot<MetadataSnapshot>,
+            >,
     {
         self.plane.on_request(request).await;
     }
@@ -215,7 +214,7 @@ where
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            > + FillSnapshot<MetadataSnapshot>,
+            >,
     {
         self.plane.on_replicate(prepare).await;
     }
@@ -234,7 +233,7 @@ where
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            > + FillSnapshot<MetadataSnapshot>,
+            >,
     {
         self.plane.on_ack(prepare_ok).await;
     }
@@ -264,7 +263,7 @@ where
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            > + FillSnapshot<MetadataSnapshot>,
+            >,
     {
         debug_assert!(buf.is_empty(), "buf must be empty on entry");
 

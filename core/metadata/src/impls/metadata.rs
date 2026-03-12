@@ -131,7 +131,6 @@ impl Snapshot for IggySnapshot {
     }
 }
 
-#[derive(Debug)]
 pub struct IggyMetadata<C, J, S, M> {
     /// Some on shard0, None on other shards
     pub consensus: Option<C>,
@@ -143,6 +142,35 @@ pub struct IggyMetadata<C, J, S, M> {
     pub mux_stm: M,
     /// Root data directory, used by checkpoint to persist snapshots.
     pub data_dir: Option<std::path::PathBuf>,
+    /// Snapshot creator captured at construction time.
+    create_snapshot: fn(&M, u64) -> Result<IggySnapshot, SnapshotError>,
+}
+
+impl<C, J, S, M> IggyMetadata<C, J, S, M>
+where
+    M: FillSnapshot<MetadataSnapshot>,
+{
+    /// Create a new `IggyMetadata` instance.
+    ///
+    /// The `FillSnapshot<MetadataSnapshot>` bound is captured here via a
+    /// function pointer so that no downstream caller needs the bound.
+    #[must_use]
+    pub fn new(
+        consensus: Option<C>,
+        journal: Option<J>,
+        snapshot: Option<S>,
+        mux_stm: M,
+        data_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            consensus,
+            journal,
+            snapshot,
+            mux_stm,
+            data_dir,
+            create_snapshot: |stm, seq| IggySnapshot::create(stm, seq),
+        }
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -155,7 +183,7 @@ where
             Input = Message<PrepareHeader>,
             Output = bytes::Bytes,
             Error = iggy_common::IggyError,
-        > + FillSnapshot<MetadataSnapshot>,
+        >,
 {
     async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
@@ -207,7 +235,7 @@ where
             .is_some_and(|c| c <= CHECKPOINT_MARGIN)
         {
             if let Some(data_dir) = &self.data_dir {
-                let snap_op = current_op;
+                let snap_op = consensus.commit();
                 if let Err(e) = self.checkpoint(data_dir, snap_op) {
                     error!(
                         replica = consensus.replica(),
@@ -417,10 +445,9 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
     /// Returns `SnapshotError` if snapshotting, persistence, or compaction fails.
     pub fn checkpoint(&self, data_dir: &Path, last_op: u64) -> Result<(), SnapshotError>
     where
-        M: FillSnapshot<MetadataSnapshot>,
         J: JournalHandle,
     {
-        let snapshot = IggySnapshot::create(&self.mux_stm, last_op)?;
+        let snapshot = (self.create_snapshot)(&self.mux_stm, last_op)?;
         let path = data_dir.join(super::METADATA_DIR).join("snapshot.bin");
         snapshot.persist(&path)?;
 
