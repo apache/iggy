@@ -1379,12 +1379,11 @@ mod tests {
     }
 
     #[test]
-    fn given_multibyte_string_should_not_panic() {
-        // "héllo" — 'é' is 2 bytes in UTF-8
+    fn given_multibyte_string_should_truncate_at_char_boundary() {
+        // "héllo" — 'é' is 2 bytes in UTF-8, so bytes are: h(1) é(2) l(1) l(1) o(1)
+        // floor_char_boundary(2) can't include the 2-byte 'é', returns 1 → "h"
         let result = truncate_response("héllo", 2);
-        // Should truncate at a valid char boundary, not panic
-        assert!(result.len() <= 2);
-        assert!(result.is_char_boundary(result.len()));
+        assert_eq!(result, "h");
     }
 
     // ── Payload conversion tests ─────────────────────────────────────
@@ -1456,6 +1455,7 @@ mod tests {
 
         let metadata = &envelope["metadata"];
         assert_eq!(metadata["iggy_offset"], 10);
+        assert_eq!(metadata["iggy_timestamp"], 1710064800000000u64);
         assert_eq!(metadata["iggy_stream"], "test_stream");
         assert_eq!(metadata["iggy_topic"], "test_topic");
         assert_eq!(metadata["iggy_partition_id"], 0);
@@ -1463,6 +1463,9 @@ mod tests {
             metadata["iggy_id"],
             format_u128_as_uuid(42)
         );
+        // Verify conditional fields are absent by default
+        assert!(metadata.get("iggy_checksum").is_none());
+        assert!(metadata.get("iggy_origin_timestamp").is_none());
     }
 
     #[test]
@@ -1735,5 +1738,20 @@ mod tests {
         let result = sink.open().await;
         assert!(result.is_ok());
         assert!(sink.client.is_some());
+    }
+
+    // ── Batch mode invariant tests ───────────────────────────────────
+
+    #[test]
+    fn given_raw_mode_with_include_metadata_should_still_use_raw_content_type() {
+        let mut config = given_default_config();
+        config.batch_mode = Some(BatchMode::Raw);
+        config.include_metadata = Some(true);
+        let sink = HttpSink::new(1, config);
+        // Raw mode uses octet-stream regardless of include_metadata
+        assert_eq!(sink.content_type(), "application/octet-stream");
+        assert_eq!(sink.batch_mode, BatchMode::Raw);
+        // include_metadata is set but irrelevant in raw mode (warned at construction)
+        assert!(sink.include_metadata);
     }
 }
