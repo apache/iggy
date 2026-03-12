@@ -257,11 +257,21 @@ impl PooledBuffer {
     /// return memory to the pool on drop (the frozen Bytes owns the allocation).
     /// The returned `Bytes` is Arc-backed, allowing cheap clones.
     pub fn freeze(&mut self) -> Bytes {
-        // TODO(tungotse): zero copy
-        let bytes = Bytes::copy_from_slice(&self.inner);
-        self.inner.clear();
+        let buf = std::mem::replace(&mut self.inner, AlignedBuffer::new(ALIGNMENT));
 
-        bytes
+        // Update pool accounting
+        if self.from_pool
+            && let Some(bucket_idx) = self.original_bucket_idx
+        {
+            memory_pool().dec_bucket_in_use(bucket_idx);
+        }
+        self.from_pool = false;
+        self.original_capacity = 0;
+        self.original_bucket_idx = None;
+
+        // Zero copy: Bytes takes ownership of the AlignedBuffer
+        // and will drop it when refcount reaches zero
+        Bytes::from_owner(buf)
     }
 }
 
