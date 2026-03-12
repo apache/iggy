@@ -24,8 +24,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class HeaderKindTest {
 
@@ -48,13 +48,13 @@ class HeaderKindTest {
         "15, Float64",
     })
     void fromCodeReturnsCorrectHeaderKindWhenGivenAValidCode(int code, HeaderKind expectedHeaderKind) {
-        assertEquals(expectedHeaderKind, HeaderKind.fromCode(code));
+        assertThat(HeaderKind.fromCode(code)).isEqualTo(expectedHeaderKind);
     }
 
     @ParameterizedTest
     @ValueSource(ints = {0, 16, 100})
     void fromCodeThrowsIggyInvalidArgumentExceptionWhenCodeInvalid(int code) {
-        assertThrows(IggyInvalidArgumentException.class, () -> HeaderKind.fromCode(code));
+        assertThatThrownBy(() -> HeaderKind.fromCode(code)).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @ParameterizedTest
@@ -76,6 +76,6 @@ class HeaderKindTest {
         "Float64, 15",
     })
     void asCodeReturnsCorrectCode(HeaderKind headerKind, int expectedCode) {
-        assertEquals(expectedCode, headerKind.asCode());
+        assertThat(headerKind.asCode()).isEqualTo(expectedCode);
     }
 }
