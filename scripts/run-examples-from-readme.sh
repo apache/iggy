@@ -257,7 +257,7 @@ run_python_examples() {
     echo "Syncing Python dependencies with uv..."
     uv sync --frozen
 
-    run_readme_commands "README.md" "^uv run " 10
+    run_readme_commands "README.md" "^uv run " 10 "--tls"
 
     cd "${ROOT_WORKDIR}"
     stop_server
