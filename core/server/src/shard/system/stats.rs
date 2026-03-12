@@ -120,19 +120,10 @@ impl IggyShard {
                 }
             }
 
-            let data_path = std::path::Path::new(&self.config.system.path);
-            let data_path =
-                std::fs::canonicalize(data_path).unwrap_or_else(|_| data_path.to_path_buf());
-            let disks = sysinfo::Disks::new_with_refreshed_list();
-            let mut best_mount_len = 0usize;
-            for disk in disks.list() {
-                let mount = disk.mount_point();
-                if data_path.starts_with(mount) && mount.as_os_str().len() > best_mount_len {
-                    best_mount_len = mount.as_os_str().len();
-                    stats.free_disk_space = disk.available_space().into();
-                    stats.total_disk_space = disk.total_space().into();
-                }
-            }
+            stats.free_disk_space =
+                fs2::available_space(&self.config.system.path).unwrap_or(0).into();
+            stats.total_disk_space =
+                fs2::total_space(&self.config.system.path).unwrap_or(0).into();
 
             Ok(stats)
         })
