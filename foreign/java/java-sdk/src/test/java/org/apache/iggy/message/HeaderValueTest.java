@@ -52,6 +52,7 @@ class HeaderValueTest {
     void fromStringReturnsValidHeaderValueWhenValueIsValid() {
         var headerValue = HeaderValue.fromString("foo");
 
+        assertEquals(HeaderKind.String, headerValue.kind());
         assertArrayEquals(new byte[] {102, 111, 111}, headerValue.value());
     }
 
