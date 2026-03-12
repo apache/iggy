@@ -25,9 +25,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PartitioningTest {
 
@@ -35,29 +34,29 @@ class PartitioningTest {
     void balancedReturnsPartitioningWithBalancedTypeAndEmptyValue() {
         var result = Partitioning.balanced();
 
-        assertEquals(PartitioningKind.Balanced, result.kind());
-        assertArrayEquals(new byte[] {}, result.value());
+        assertThat(result.kind()).isEqualTo(PartitioningKind.Balanced);
+        assertThat(result.value()).isEqualTo(new byte[] {});
     }
 
     @Test
     void partitionIdReturnsPartitioningWithPartitionIdKindAndExpectedValue() {
         var result = Partitioning.partitionId(1234L);
 
-        assertEquals(PartitioningKind.PartitionId, result.kind());
-        assertArrayEquals(new byte[] {-46, 4, 0, 0}, result.value());
+        assertThat(result.kind()).isEqualTo(PartitioningKind.PartitionId);
+        assertThat(result.value()).isEqualTo(new byte[] {-46, 4, 0, 0});
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"", "    "})
     @NullSource
     void messagesKeyThrowsIggyInvalidArgumentExceptionWhenGivenBlankValues(String id) {
-        assertThrows(IggyInvalidArgumentException.class, () -> Partitioning.messagesKey(id));
+        assertThatThrownBy(() -> Partitioning.messagesKey(id)).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void messagesKeyThrowsIggyInvalidArgumentExceptionWhenGivenValueThatIsTooLong() {
         var id = "0".repeat(256);
-        assertThrows(IggyInvalidArgumentException.class, () -> Partitioning.messagesKey(id));
+        assertThatThrownBy(() -> Partitioning.messagesKey(id)).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
@@ -65,14 +64,14 @@ class PartitioningTest {
         var id = "the-key";
         var result = Partitioning.messagesKey(id);
 
-        assertEquals(PartitioningKind.MessagesKey, result.kind());
-        assertArrayEquals(new byte[] {116, 104, 101, 45, 107, 101, 121}, result.value());
+        assertThat(result.kind()).isEqualTo(PartitioningKind.MessagesKey);
+        assertThat(result.value()).isEqualTo(new byte[] {116, 104, 101, 45, 107, 101, 121});
     }
 
     @Test
     void getSizeReturnsLengthOfValuePlus2() {
-        assertEquals(2, Partitioning.balanced().getSize());
-        assertEquals(6, Partitioning.partitionId(12345678L).getSize()); // 4 bytes for long ID
-        assertEquals(5, Partitioning.messagesKey("foo").getSize());
+        assertThat(Partitioning.balanced().getSize()).isEqualTo(2);
+        assertThat(Partitioning.partitionId(12345678L).getSize()).isEqualTo(6); // 4 bytes for long ID
+        assertThat(Partitioning.messagesKey("foo").getSize()).isEqualTo(5);
     }
 }
