@@ -28,148 +28,145 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.stream.Stream;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class HeaderValueTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"", "  "})
     void fromStringThrowsIggyInvalidArgumentExceptionWhenValueIsBlank(String value) {
-        assertThrows(IggyInvalidArgumentException.class, () -> HeaderValue.fromString(value));
+        assertThatThrownBy(() -> HeaderValue.fromString(value)).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void fromStringThrowsIggyInvalidArgumentExceptionWhenValueIsTooLong() {
-        assertThrows(IggyInvalidArgumentException.class, () -> HeaderValue.fromString("z".repeat(256)));
+        assertThatThrownBy(() -> HeaderValue.fromString("z".repeat(256)))
+                .isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void fromStringReturnsValidHeaderValueWhenValueIsValid() {
         var headerValue = HeaderValue.fromString("foo");
 
-        assertEquals(HeaderKind.String, headerValue.kind());
-        assertArrayEquals(new byte[] {102, 111, 111}, headerValue.value());
+        assertThat(headerValue.kind()).isEqualTo(HeaderKind.String);
+        assertThat(headerValue.value()).isEqualTo(new byte[] {102, 111, 111});
     }
 
     @Test
     void fromBoolReturnsExpectedHeaderValueWhenValueIsTrue() {
         var headerValue = HeaderValue.fromBool(true);
 
-        assertEquals(HeaderKind.Bool, headerValue.kind());
-        assertArrayEquals(new byte[] {1}, headerValue.value());
+        assertThat(headerValue.kind()).isEqualTo(HeaderKind.Bool);
+        assertThat(headerValue.value()).isEqualTo(new byte[] {1});
     }
 
     @Test
     void fromBoolReturnsExpectedHeaderValueWhenValueIsFalse() {
         var headerValue = HeaderValue.fromBool(false);
 
-        assertEquals(HeaderKind.Bool, headerValue.kind());
-        assertArrayEquals(new byte[] {0}, headerValue.value());
+        assertThat(headerValue.kind()).isEqualTo(HeaderKind.Bool);
+        assertThat(headerValue.value()).isEqualTo(new byte[] {0});
     }
 
     @Test
     void fromInt8ReturnsExpectedHeaderValue() {
         var headerValue = HeaderValue.fromInt8((byte) 127);
 
-        assertEquals(HeaderKind.Int8, headerValue.kind());
-        assertArrayEquals(new byte[] {127}, headerValue.value());
+        assertThat(headerValue.kind()).isEqualTo(HeaderKind.Int8);
+        assertThat(headerValue.value()).isEqualTo(new byte[] {127});
     }
 
     @Test
     void fromInt16ReturnsExpectedHeaderValue() {
         var headerValue = HeaderValue.fromInt16(Short.MAX_VALUE);
 
-        assertEquals(HeaderKind.Int16, headerValue.kind());
-        assertArrayEquals(new byte[] {-1, 127}, headerValue.value());
+        assertThat(headerValue.kind()).isEqualTo(HeaderKind.Int16);
+        assertThat(headerValue.value()).isEqualTo(new byte[] {-1, 127});
     }
 
     @Test
     void fromInt32ReturnsExpectedHeaderValue() {
         var headerValue = HeaderValue.fromInt32(Integer.MAX_VALUE);
 
-        assertEquals(HeaderKind.Int32, headerValue.kind());
-        assertArrayEquals(new byte[] {-1, -1, -1, 127}, headerValue.value());
+        assertThat(headerValue.kind()).isEqualTo(HeaderKind.Int32);
+        assertThat(headerValue.value()).isEqualTo(new byte[] {-1, -1, -1, 127});
     }
 
     @Test
     void fromInt64ReturnsExpectedHeaderValue() {
         var headerValue = HeaderValue.fromInt64(Long.MAX_VALUE);
 
-        assertEquals(HeaderKind.Int64, headerValue.kind());
-        assertArrayEquals(new byte[] {-1, -1, -1, -1, -1, -1, -1, 127}, headerValue.value());
+        assertThat(headerValue.kind()).isEqualTo(HeaderKind.Int64);
+        assertThat(headerValue.value()).isEqualTo(new byte[] {-1, -1, -1, -1, -1, -1, -1, 127});
     }
 
     @ParameterizedTest
     @ValueSource(shorts = {-1, 256})
     void fromUint8ThrowsIggyInvalidArgumentExceptionWhenValueOutOfBounds(short value) {
-        assertThrows(IggyInvalidArgumentException.class, () -> HeaderValue.fromUint8(value));
+        assertThatThrownBy(() -> HeaderValue.fromUint8(value)).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void fromUint8ReturnsExpectedHeaderValueWhenValueIsValid() {
         var headerValue = HeaderValue.fromUint8((short) 255);
 
-        assertEquals(HeaderKind.Uint8, headerValue.kind());
-        assertArrayEquals(new byte[] {-1}, headerValue.value());
+        assertThat(headerValue.kind()).isEqualTo(HeaderKind.Uint8);
+        assertThat(headerValue.value()).isEqualTo(new byte[] {-1});
     }
 
     @ParameterizedTest
     @ValueSource(ints = {-1, 65536})
     void fromUint16ThrowsIggyInvalidArgumentExceptionWhenValueOutOfBounds(int value) {
-        assertThrows(IggyInvalidArgumentException.class, () -> HeaderValue.fromUint16(value));
+        assertThatThrownBy(() -> HeaderValue.fromUint16(value)).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void fromUint16ReturnsExpectedHeaderValueWhenValueIsValid() {
         var headerValue = HeaderValue.fromUint16(65535);
 
-        assertEquals(HeaderKind.Uint16, headerValue.kind());
-        assertArrayEquals(new byte[] {-1, -1}, headerValue.value());
+        assertThat(headerValue.kind()).isEqualTo(HeaderKind.Uint16);
+        assertThat(headerValue.value()).isEqualTo(new byte[] {-1, -1});
     }
 
     @ParameterizedTest
     @ValueSource(longs = {-1, 4294967296L})
     void fromUint32ThrowsIggyInvalidArgumentExceptionWhenValueOutOfBounds(long value) {
-        assertThrows(IggyInvalidArgumentException.class, () -> HeaderValue.fromUint32(value));
+        assertThatThrownBy(() -> HeaderValue.fromUint32(value)).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void fromUint32ReturnsExpectedHeaderValueWhenValueIsValid() {
         var headerValue = HeaderValue.fromUint32(4294967295L);
 
-        assertEquals(HeaderKind.Uint32, headerValue.kind());
-        assertArrayEquals(new byte[] {-1, -1, -1, -1}, headerValue.value());
+        assertThat(headerValue.kind()).isEqualTo(HeaderKind.Uint32);
+        assertThat(headerValue.value()).isEqualTo(new byte[] {-1, -1, -1, -1});
     }
 
     @Test
     void fromFloat32ReturnsExpectedHeaderValue() {
         var headerValue = HeaderValue.fromFloat32(123.4f);
 
-        assertEquals(HeaderKind.Float32, headerValue.kind());
-        assertArrayEquals(new byte[] {-51, -52, -10, 66}, headerValue.value());
+        assertThat(headerValue.kind()).isEqualTo(HeaderKind.Float32);
+        assertThat(headerValue.value()).isEqualTo(new byte[] {-51, -52, -10, 66});
     }
 
     @Test
     void fromFloat64ReturnsExpectedHeaderValue() {
         var headerValue = HeaderValue.fromFloat64(123.4d);
 
-        assertEquals(HeaderKind.Float64, headerValue.kind());
-        assertArrayEquals(new byte[] {-102, -103, -103, -103, -103, -39, 94, 64}, headerValue.value());
+        assertThat(headerValue.kind()).isEqualTo(HeaderKind.Float64);
+        assertThat(headerValue.value()).isEqualTo(new byte[] {-102, -103, -103, -103, -103, -39, 94, 64});
     }
 
     @Test
     void fromRawThrowsIggyInvalidArgumentExceptionWhenInputArrayEmpty() {
-        assertThrows(IggyInvalidArgumentException.class, () -> HeaderValue.fromRaw(new byte[0]));
+        assertThatThrownBy(() -> HeaderValue.fromRaw(new byte[0])).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void fromRawThrowsIggyInvalidArgumentExceptionWhenInputArrayTooLong() {
-        assertThrows(IggyInvalidArgumentException.class, () -> HeaderValue.fromRaw(new byte[256]));
+        assertThatThrownBy(() -> HeaderValue.fromRaw(new byte[256])).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
@@ -178,171 +175,169 @@ class HeaderValueTest {
 
         var headerValue = HeaderValue.fromRaw(input);
 
-        assertEquals(HeaderKind.Raw, headerValue.kind());
-        assertArrayEquals(input, headerValue.value());
+        assertThat(headerValue.kind()).isEqualTo(HeaderKind.Raw);
+        assertThat(headerValue.value()).isEqualTo(input);
     }
 
     @Test
     void asStringThrowsIggyInvalidArgumentExceptionWhenKindNotAString() {
         var headerValue = HeaderValue.fromBool(true);
 
-        assertThrows(IggyInvalidArgumentException.class, headerValue::asString);
+        assertThatThrownBy(headerValue::asString).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void asStringReturnsStringRepresentationOfValue() {
         var headerValue = HeaderValue.fromString("foo");
 
-        assertEquals("foo", headerValue.asString());
+        assertThat(headerValue.asString()).isEqualTo("foo");
     }
 
     @Test
     void asBoolThrowsIggyInvalidArgumentExceptionWhenKindNotBool() {
         var headerValue = HeaderValue.fromInt32(123);
 
-        assertThrows(IggyInvalidArgumentException.class, headerValue::asBool);
+        assertThatThrownBy(headerValue::asBool).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void asBoolReturnsBoolRepresentationOfValue() {
         var headerValue = HeaderValue.fromBool(true);
 
-        assertTrue(headerValue.asBool());
+        assertThat(headerValue.asBool()).isTrue();
     }
 
     @Test
     void asInt8ThrowsIggyInvalidArgumentExceptionWhenKindNotInt8() {
         var headerValue = HeaderValue.fromFloat32(123.4f);
 
-        assertThrows(IggyInvalidArgumentException.class, headerValue::asInt8);
+        assertThatThrownBy(headerValue::asInt8).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void asInt8ReturnsInt8RepresentationOfValue() {
         var headerValue = HeaderValue.fromInt8((byte) 12);
 
-        assertEquals(12, headerValue.asInt8());
+        assertThat(headerValue.asInt8()).isEqualTo((byte) 12);
     }
 
     @Test
     void asInt16ThrowsIggyInvalidArgumentExceptionWhenKindNotInt16() {
         var headerValue = HeaderValue.fromInt32(12345);
 
-        assertThrows(IggyInvalidArgumentException.class, headerValue::asInt16);
+        assertThatThrownBy(headerValue::asInt16).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void asInt16ReturnsInt16RepresentationOfValue() {
         var headerValue = HeaderValue.fromInt16((short) 1234);
 
-        assertEquals(1234, headerValue.asInt16());
+        assertThat(headerValue.asInt16()).isEqualTo((short) 1234);
     }
 
     @Test
     void asInt32ThrowsIggyInvalidArgumentExceptionWhenKindNotInt32() {
         var headerValue = HeaderValue.fromBool(false);
 
-        assertThrows(IggyInvalidArgumentException.class, headerValue::asInt32);
+        assertThatThrownBy(headerValue::asInt32).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void asInt32ReturnsInt32RepresentationOfValue() {
         var headerValue = HeaderValue.fromInt32(Integer.MAX_VALUE);
 
-        assertEquals(Integer.MAX_VALUE, headerValue.asInt32());
+        assertThat(headerValue.asInt32()).isEqualTo(Integer.MAX_VALUE);
     }
 
     @Test
     void asInt64ThrowsIggyInvalidArgumentExceptionWhenKindNotInt64() {
         var headerValue = HeaderValue.fromString("foo");
 
-        assertThrows(IggyInvalidArgumentException.class, headerValue::asInt64);
+        assertThatThrownBy(headerValue::asInt64).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void asInt64ReturnsInt64RepresentationOfValue() {
         var headerValue = HeaderValue.fromInt64(Long.MAX_VALUE - 1);
 
-        assertEquals(Long.MAX_VALUE - 1, headerValue.asInt64());
+        assertThat(headerValue.asInt64()).isEqualTo(Long.MAX_VALUE - 1);
     }
 
     @Test
     void asUint8ThrowsIggyInvalidArgumentExceptionWhenKindNotUint8() {
         var headerValue = HeaderValue.fromInt8((byte) 127);
 
-        assertThrows(IggyInvalidArgumentException.class, headerValue::asUint8);
+        assertThatThrownBy(headerValue::asUint8).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void asUint8ReturnsUint8RepresentationOfValue() {
         var headerValue = HeaderValue.fromUint8((short) 1);
 
-        assertEquals(1, headerValue.asUint8());
+        assertThat(headerValue.asUint8()).isEqualTo((short) 1);
     }
 
     @Test
     void asUint16ThrowsIggyInvalidArgumentExceptionWhenKindNotUint16() {
         var headerValue = HeaderValue.fromFloat64(123.4d);
 
-        assertThrows(IggyInvalidArgumentException.class, headerValue::asUint16);
+        assertThatThrownBy(headerValue::asUint16).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void asUint16ReturnsUint16RepresentationOfValue() {
         var headerValue = HeaderValue.fromUint16(Short.MAX_VALUE);
 
-        assertEquals(Short.MAX_VALUE, headerValue.asUint16());
+        assertThat(headerValue.asUint16()).isEqualTo(Short.MAX_VALUE);
     }
 
     @Test
     void asUint32ThrowsIggyInvalidArgumentExceptionWhenKindNotUint32() {
         var headerValue = HeaderValue.fromRaw(new byte[] {1, 2, 3, 4});
 
-        assertThrows(IggyInvalidArgumentException.class, headerValue::asUint32);
+        assertThatThrownBy(headerValue::asUint32).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void asUint32ReturnsUint32RepresentationOfValue() {
         var headerValue = HeaderValue.fromUint32(Integer.MAX_VALUE);
 
-        assertEquals(Integer.MAX_VALUE, headerValue.asUint32());
+        assertThat(headerValue.asUint32()).isEqualTo(Integer.MAX_VALUE);
     }
 
     @Test
     void asFloat32ThrowsIggyInvalidArgumentExceptionWhenKindNotFloat32() {
         var headerValue = HeaderValue.fromUint8((short) 10);
 
-        assertThrows(IggyInvalidArgumentException.class, headerValue::asFloat32);
+        assertThatThrownBy(headerValue::asFloat32).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void asFloat32ReturnsFloat32RepresentationOfValue() {
         var headerValue = HeaderValue.fromFloat32(987654.321f);
 
-        assertEquals(987654.321f, headerValue.asFloat32());
+        assertThat(headerValue.asFloat32()).isEqualTo(987654.321f);
     }
 
     @Test
     void asFloat64ThrowsIggyInvalidArgumentExceptionWhenKindNotFloat64() {
         var headerValue = HeaderValue.fromString("bar");
 
-        assertThrows(IggyInvalidArgumentException.class, headerValue::asFloat64);
+        assertThatThrownBy(headerValue::asFloat64).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
     void asFloat64ReturnsFloat64RepresentationOfValue() {
         var headerValue = HeaderValue.fromFloat64(9999999999.99d);
 
-        assertEquals(9999999999.99d, headerValue.asFloat64());
+        assertThat(headerValue.asFloat64()).isEqualTo(9999999999.99d);
     }
 
     @Test
     void asRawReturnsRawRepresentationOfValueRegardlessOfType() {
-        assertArrayEquals(
-                new byte[] {1, 2, 3}, HeaderValue.fromRaw(new byte[] {1, 2, 3}).asRaw());
-        assertArrayEquals(
-                new byte[] {102, 111, 111}, HeaderValue.fromString("foo").asRaw());
-        assertArrayEquals(new byte[] {127}, HeaderValue.fromUint8((byte) 127).asRaw());
+        assertThat(HeaderValue.fromRaw(new byte[] {1, 2, 3}).asRaw()).isEqualTo(new byte[] {1, 2, 3});
+        assertThat(HeaderValue.fromString("foo").asRaw()).isEqualTo(new byte[] {102, 111, 111});
+        assertThat(HeaderValue.fromUint8((byte) 127).asRaw()).isEqualTo(new byte[] {127});
     }
 
     public static Stream<Arguments> toStringArgumentProvider() {
@@ -364,28 +359,28 @@ class HeaderValueTest {
     @ParameterizedTest
     @MethodSource("toStringArgumentProvider")
     void toString(HeaderValue headerValue, String expected) {
-        assertEquals(expected, headerValue.toString());
+        assertThat(headerValue.toString()).isEqualTo(expected);
     }
 
     @Test
     void equalsReturnsTrueForSameObject() {
         var headerValue = HeaderValue.fromRaw(new byte[] {1, 2, 3});
 
-        assertTrue(headerValue.equals(headerValue));
+        assertThat(headerValue.equals(headerValue)).isTrue();
     }
 
     @Test
     void equalsReturnsFalseWhenOtherIsNull() {
         var headerValue = HeaderValue.fromRaw(new byte[] {1, 2, 3});
 
-        assertFalse(headerValue.equals(null));
+        assertThat(headerValue.equals(null)).isFalse();
     }
 
     @Test
     void equalsReturnsFalseWhenOtherIsDifferentType() {
         var headerValue = HeaderValue.fromRaw(new byte[] {1, 2, 3});
 
-        assertFalse(headerValue.equals("foo"));
+        assertThat(headerValue.equals("foo")).isFalse();
     }
 
     @Test
@@ -393,7 +388,7 @@ class HeaderValueTest {
         var headerValue = HeaderValue.fromRaw(new byte[] {102, 111, 111});
         var other = HeaderValue.fromString("foo");
 
-        assertFalse(headerValue.equals(other));
+        assertThat(headerValue.equals(other)).isFalse();
     }
 
     @Test
@@ -401,43 +396,37 @@ class HeaderValueTest {
         var headerValue = HeaderValue.fromRaw(new byte[] {1, 2, 3});
         var other = HeaderValue.fromRaw(new byte[] {1, 2, 4});
 
-        assertFalse(headerValue.equals(other));
+        assertThat(headerValue.equals(other)).isFalse();
     }
 
     @Test
     void equalsReturnsTrueWhenSameKindAndValue() {
-        assertEquals(HeaderValue.fromBool(true), HeaderValue.fromBool(true));
-        assertEquals(HeaderValue.fromInt32(123), HeaderValue.fromInt32(123));
-        assertEquals(HeaderValue.fromRaw(new byte[] {1, 2, 3}), HeaderValue.fromRaw(new byte[] {1, 2, 3}));
+        assertThat(HeaderValue.fromBool(true)).isEqualTo(HeaderValue.fromBool(true));
+        assertThat(HeaderValue.fromInt32(123)).isEqualTo(HeaderValue.fromInt32(123));
+        assertThat(HeaderValue.fromRaw(new byte[] {1, 2, 3})).isEqualTo(HeaderValue.fromRaw(new byte[] {1, 2, 3}));
     }
 
     @Test
     void hashCodeMatchesWhenKindsAndValuesMatch() {
-        assertEquals(
-                HeaderValue.fromString("foo").hashCode(),
-                HeaderValue.fromString("foo").hashCode());
-        assertEquals(
-                HeaderValue.fromInt32(321).hashCode(),
-                HeaderValue.fromInt32(321).hashCode());
+        assertThat(HeaderValue.fromString("foo").hashCode())
+                .isEqualTo(HeaderValue.fromString("foo").hashCode());
+        assertThat(HeaderValue.fromInt32(321).hashCode())
+                .isEqualTo(HeaderValue.fromInt32(321).hashCode());
     }
 
     @Test
     void hashCodeIsDifferentWhenKindsAreDifferent() {
-        assertNotEquals(
-                HeaderValue.fromString("foo").hashCode(),
-                HeaderValue.fromRaw(new byte[] {102, 111, 111}).hashCode());
-        assertNotEquals(
-                HeaderValue.fromInt8((byte) 127).hashCode(),
-                HeaderValue.fromRaw(new byte[] {127}).hashCode());
+        assertThat(HeaderValue.fromString("foo").hashCode())
+                .isNotEqualTo(HeaderValue.fromRaw(new byte[] {102, 111, 111}).hashCode());
+        assertThat(HeaderValue.fromInt8((byte) 127).hashCode())
+                .isNotEqualTo(HeaderValue.fromRaw(new byte[] {127}).hashCode());
     }
 
     @Test
     void hashCodeIsDifferentWhenValuesAreDifferent() {
-        assertNotEquals(
-                HeaderValue.fromString("foo").hashCode(),
-                HeaderValue.fromString("bar").hashCode());
-        assertNotEquals(
-                HeaderValue.fromBool(true).hashCode(),
-                HeaderValue.fromBool(false).hashCode());
+        assertThat(HeaderValue.fromString("foo").hashCode())
+                .isNotEqualTo(HeaderValue.fromString("bar").hashCode());
+        assertThat(HeaderValue.fromBool(true).hashCode())
+                .isNotEqualTo(HeaderValue.fromBool(false).hashCode());
     }
 }
