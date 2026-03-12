@@ -24,16 +24,15 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BytesMessageIdTest {
 
     @Test
     void constructorThrowsIggyInvalidArgumentExceptionWhenInputNotExactly16Bytes() {
-        assertThrows(IggyInvalidArgumentException.class, () -> new BytesMessageId(new byte[15]));
-        assertThrows(IggyInvalidArgumentException.class, () -> new BytesMessageId(new byte[17]));
+        assertThatThrownBy(() -> new BytesMessageId(new byte[15])).isInstanceOf(IggyInvalidArgumentException.class);
+        assertThatThrownBy(() -> new BytesMessageId(new byte[17])).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
@@ -43,7 +42,7 @@ class BytesMessageIdTest {
 
         var result = messageId.toBigInteger();
 
-        assertEquals(BigInteger.TEN, result);
+        assertThat(result).isEqualTo(BigInteger.TEN);
     }
 
     @Test
@@ -53,7 +52,7 @@ class BytesMessageIdTest {
 
         var result = messageId.toBytes();
 
-        assertArrayEquals(bytes, result.array());
+        assertThat(result.array()).isEqualTo(bytes);
     }
 
     @Test
@@ -63,6 +62,6 @@ class BytesMessageIdTest {
 
         var result = messageId.toString();
 
-        assertEquals("[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]", result);
+        assertThat(result).isEqualTo("[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]");
     }
 }
