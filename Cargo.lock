@@ -9618,7 +9618,6 @@ name = "server"
 version = "0.7.2-edge.1"
 dependencies = [
  "ahash 0.8.12",
- "aligned-vec",
  "anyhow",
  "argon2",
  "async-channel",

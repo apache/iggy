@@ -39,7 +39,6 @@ iggy-web = ["dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
 ahash = { workspace = true }
-aligned-vec = { workspace = true }
 anyhow = { workspace = true }
 argon2 = { workspace = true }
 async-channel = { workspace = true }
