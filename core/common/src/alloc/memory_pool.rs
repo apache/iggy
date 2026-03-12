@@ -723,25 +723,25 @@ mod tests {
         }
 
         // Test put_bytes
-        // {
-        //     let initial_events = pool.resize_events();
-        //     let mut buffer = PooledBuffer::with_capacity(4 * 1024);
-        //     let orig_bucket_idx = pool.best_fit(buffer.capacity()).unwrap();
-        //     let orig_in_use = pool.bucket_current_elements(orig_bucket_idx);
-        //
-        //     buffer.put_bytes(0, 64 * 1024); // 64KiB of zeros
-        //
-        //     assert_eq!(
-        //         pool.resize_events(),
-        //         initial_events + 1,
-        //         "put_bytes should trigger resize event"
-        //     );
-        //     assert_eq!(
-        //         pool.bucket_current_elements(orig_bucket_idx),
-        //         orig_in_use - 1,
-        //         "put_bytes should update bucket accounting"
-        //     );
-        // }
+        {
+            let initial_events = pool.resize_events();
+            let mut buffer = PooledBuffer::with_capacity(4 * 1024);
+            let orig_bucket_idx = pool.best_fit(buffer.capacity()).unwrap();
+            let orig_in_use = pool.bucket_current_elements(orig_bucket_idx);
+
+            buffer.put_bytes(0, 64 * 1024); // 64KiB of zeros
+
+            assert_eq!(
+                pool.resize_events(),
+                initial_events + 1,
+                "put_bytes should trigger resize event"
+            );
+            assert_eq!(
+                pool.bucket_current_elements(orig_bucket_idx),
+                orig_in_use - 1,
+                "put_bytes should update bucket accounting"
+            );
+        }
 
         // Test extend_from_slice
         {

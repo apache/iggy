@@ -826,11 +826,3 @@ impl Index<usize> for IggyMessagesBatchMut {
         &self.messages[start..end]
     }
 }
-
-// impl Deref for IggyMessagesBatchMut {
-//     type Target = BytesMut;
-//
-//     fn deref(&self) -> &Self::Target {
-//         &self.messages
-//     }
-// }
