@@ -197,10 +197,10 @@ Set `include_metadata = false` to send the raw payload without wrapping.
 Exponential backoff with configurable parameters:
 
 ```
-Attempt 1: immediate
-Attempt 2: retry_delay (1s)
-Attempt 3: retry_delay * backoff_multiplier (2s)
-Attempt 4: min(retry_delay * backoff^2, max_retry_delay) (4s)
+Attempt 1: retry_delay (1s)
+Attempt 2: retry_delay * backoff_multiplier (2s)
+Attempt 3: retry_delay * backoff^2 (4s)
+Attempt 4: min(retry_delay * backoff^3, max_retry_delay) (8s, capped to 30s)
 ```
 
 **Transient errors** (retry): Network errors, HTTP 429, 500, 502, 503, 504.
