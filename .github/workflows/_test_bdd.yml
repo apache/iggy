@@ -83,7 +83,7 @@ jobs:
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         run: |
           # Extract SDK name from task (format: bdd-<sdk>)
-          SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/bdd-//')
+          SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/^bdd-//')
 
           echo "Running BDD tests for SDK: $SDK_NAME"
           echo "Current directory: $(pwd)"
