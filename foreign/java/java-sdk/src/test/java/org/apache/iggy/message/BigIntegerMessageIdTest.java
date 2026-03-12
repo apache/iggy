@@ -23,9 +23,7 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.assertj.core.api.Assertions.assertThat;
 
 class BigIntegerMessageIdTest {
 
@@ -33,7 +31,7 @@ class BigIntegerMessageIdTest {
     void defaultIdReturnsInstanceContainingZero() {
         var messageId = BigIntegerMessageId.defaultId();
 
-        assertEquals(BigInteger.ZERO, messageId.toBigInteger());
+        assertThat(messageId.toBigInteger()).isEqualTo(BigInteger.ZERO);
     }
 
     @Test
@@ -41,8 +39,8 @@ class BigIntegerMessageIdTest {
         var first = BigIntegerMessageId.defaultId();
         var second = BigIntegerMessageId.defaultId();
 
-        assertSame(first, second);
-        assertEquals(BigInteger.ZERO, first.toBigInteger());
+        assertThat(first).isSameAs(second);
+        assertThat(first.toBigInteger()).isEqualTo(BigInteger.ZERO);
     }
 
     @Test
@@ -50,7 +48,7 @@ class BigIntegerMessageIdTest {
         var value = new BigInteger("123");
         var messageId = new BigIntegerMessageId(value);
 
-        assertEquals(value, messageId.toBigInteger());
+        assertThat(messageId.toBigInteger()).isEqualTo(value);
     }
 
     @Test
@@ -59,7 +57,7 @@ class BigIntegerMessageIdTest {
 
         var result = messageId.toBytes();
 
-        assertArrayEquals(new byte[] {10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, result.array());
+        assertThat(result.array()).isEqualTo(new byte[] {10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
     }
 
     @Test
@@ -69,6 +67,6 @@ class BigIntegerMessageIdTest {
 
         var result = messageId.toString();
 
-        assertEquals("123456", result);
+        assertThat(result).isEqualTo("123456");
     }
 }
