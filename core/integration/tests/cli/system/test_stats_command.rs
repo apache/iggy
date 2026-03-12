@@ -159,18 +159,31 @@ impl IggyCmdTestCase for TestStatsCmd {
     }
 }
 
-struct TestStatsCmdWithMessages;
+struct TestStatsCmdWithMessages {
+    stream_id: u32,
+    topic_id: u32,
+}
+
+impl TestStatsCmdWithMessages {
+    fn new() -> Self {
+        Self {
+            stream_id: 0,
+            topic_id: 0,
+        }
+    }
+}
 
 #[async_trait]
 impl IggyCmdTestCase for TestStatsCmdWithMessages {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         let stream = client.create_stream("size-test").await;
         assert!(stream.is_ok());
+        let stream_details = stream.unwrap();
+        self.stream_id = stream_details.id;
 
-        let stream_id: Identifier = "size-test".try_into().unwrap();
         let topic = client
             .create_topic(
-                &stream_id,
+                &self.stream_id.try_into().unwrap(),
                 "topic",
                 1,
                 Default::default(),
@@ -180,15 +193,16 @@ impl IggyCmdTestCase for TestStatsCmdWithMessages {
             )
             .await;
         assert!(topic.is_ok());
+        let topic_details = topic.unwrap();
+        self.topic_id = topic_details.id;
 
-        let topic_id: Identifier = "topic".try_into().unwrap();
         let mut messages = (1..=10)
             .filter_map(|id| IggyMessage::from_str(format!("Test message {id}").as_str()).ok())
             .collect::<Vec<_>>();
         let send_status = client
             .send_messages(
-                &stream_id,
-                &topic_id,
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
                 &Partitioning::partition_id(1),
                 &mut messages,
             )
@@ -234,10 +248,17 @@ impl IggyCmdTestCase for TestStatsCmdWithMessages {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let stream_id: Identifier = "size-test".try_into().unwrap();
-        let topic_id: Identifier = "topic".try_into().unwrap();
-        client.delete_topic(&stream_id, &topic_id).await.unwrap();
-        client.delete_stream(&stream_id).await.unwrap();
+        client
+            .delete_topic(
+                &self.stream_id.try_into().unwrap(),
+                &self.topic_id.try_into().unwrap(),
+            )
+            .await
+            .unwrap();
+        client
+            .delete_stream(&self.stream_id.try_into().unwrap())
+            .await
+            .unwrap();
     }
 }
 
@@ -270,7 +291,9 @@ pub async fn should_be_successful() {
             GetStatsOutput::Toml,
         )))
         .await;
-    iggy_cmd_test.execute_test(TestStatsCmdWithMessages).await;
+    iggy_cmd_test
+        .execute_test(TestStatsCmdWithMessages::new())
+        .await;
 }
 
 #[tokio::test]
