@@ -428,7 +428,7 @@ impl InfluxDbSink {
 
     fn to_precision_timestamp(&self, millis: u64) -> u64 {
         match self.timestamp_precision() {
-            "ns" => millis.saturating_mul(1_000_000),
+            "ns" => millis.saturating_mul(1_000_000), // µs * 1_000_000 = way too large
             "us" => millis.saturating_mul(1_000),
             "s" => millis / 1_000,
             _ => millis,
@@ -481,17 +481,17 @@ impl InfluxDbSink {
         }
         if include_metadata && !self.config.include_partition_tag.unwrap_or(true) {
             fields.push(format!(
-                "iggy_partition={}i",
+                "iggy_partition={}",
                 messages_metadata.partition_id as i64
             ));
         }
 
         if include_checksum {
-            fields.push(format!("iggy_checksum={}i", message.checksum as i64));
+            fields.push(format!("iggy_checksum={}", message.checksum as i64));
         }
         if include_origin_timestamp {
             fields.push(format!(
-                "iggy_origin_timestamp={}i",
+                "iggy_origin_timestamp={}",
                 message.origin_timestamp as i64
             ));
         }

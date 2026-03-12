@@ -17,4 +17,4 @@
 config_type = "local"
 config_dir = "../connectors/sources/influxdb_source"
 [plugin_config]
-precision = "ns"
+precision = "us"
