@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView, IggyIndexesMut, PooledBuffer};
-use bytes::BytesMut;
 use compio::{
     buf::{IntoInner, IoBuf},
     fs::{File, OpenOptions},
@@ -336,12 +335,9 @@ impl IndexReader {
         &self,
         offset: u32,
         len: u32,
-        use_pool: bool,
+        _use_pool: bool,
     ) -> Result<PooledBuffer, std::io::Error> {
-        let mut buf = PooledBuffer::with_capacity(len as usize);
-        // unsafe {
-        //     buf.set_len(len as usize);
-        // }
+        let buf = PooledBuffer::with_capacity(len as usize);
 
         let (result, buf) = self
             .file

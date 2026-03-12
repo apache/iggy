@@ -25,7 +25,6 @@ use crate::{
     IggyTimestamp, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, Sizeable, Validatable,
 };
 use crate::{MessageDeduplicator, PooledBuffer, random_id};
-use bytes::BufMut;
 use lending_iterator::prelude::*;
 use std::ops::Index;
 use std::sync::Arc;

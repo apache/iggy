@@ -25,7 +25,6 @@ use std::{
     mem::MaybeUninit,
     ops::{Deref, DerefMut},
 };
-use tracing::debug;
 
 /// A buffer wrapper that participates in memory pooling.
 ///

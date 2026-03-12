@@ -31,7 +31,6 @@ use iggy_common::sharding::IggyNamespace;
 use iggy_common::{IggyError, PollingKind};
 use std::cell::RefCell;
 use std::sync::atomic::Ordering;
-use tracing::debug;
 
 /// Poll messages from a partition partitions.
 ///
