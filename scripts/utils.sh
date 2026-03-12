@@ -281,7 +281,7 @@ function portable_timeout() {
     elif command -v gtimeout >/dev/null 2>&1; then
         gtimeout "${secs}" "$@"
     else
-        eval "$@"
+        "$@"
     fi
 }
 

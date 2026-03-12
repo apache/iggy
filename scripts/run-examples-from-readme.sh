@@ -83,6 +83,7 @@ done
 #   $6 - grep pattern for TLS commands (empty = no TLS examples)
 #   $7 - per-command timeout in seconds (0 = no timeout)
 #   $8 - extra server args (e.g. "--fresh")
+# shellcheck disable=SC2329
 run_language_examples() {
     local lang="$1"
     local workdir="$2"
@@ -207,6 +208,7 @@ run_language_examples() {
 # Per-language runners
 # ---------------------------------------------------------------------------
 
+# shellcheck disable=SC2329
 run_rust_examples() {
     resolve_server_binary "${TARGET}"
     resolve_cli_binary "${TARGET}"
@@ -297,6 +299,7 @@ run_rust_examples() {
     return "${EXAMPLES_EXIT_CODE}"
 }
 
+# shellcheck disable=SC2329
 run_node_examples() {
     resolve_server_binary "${TARGET}"
 
@@ -314,6 +317,7 @@ run_node_examples() {
         ""
 }
 
+# shellcheck disable=SC2329
 run_go_examples() {
     resolve_server_binary "${TARGET}"
 
@@ -341,6 +345,7 @@ run_go_examples() {
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 }
 
+# shellcheck disable=SC2329
 run_python_examples() {
     resolve_server_binary "${TARGET}"
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
@@ -389,6 +394,7 @@ run_python_examples() {
     return "${EXAMPLES_EXIT_CODE}"
 }
 
+# shellcheck disable=SC2329
 run_java_examples() {
     resolve_server_binary "${TARGET}"
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
@@ -404,6 +410,7 @@ run_java_examples() {
         ""
 }
 
+# shellcheck disable=SC2329
 run_csharp_examples() {
     resolve_server_binary "${TARGET}"
 
