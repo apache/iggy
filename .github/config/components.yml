@@ -247,7 +247,7 @@ components:
     paths:
       - "bdd/go/**"
       - "bdd/scenarios/**"
-    tasks: ["bdd-go"]
+    tasks: ["bdd-go", "bdd-go-race"]
 
   bdd-node:
     depends_on:
