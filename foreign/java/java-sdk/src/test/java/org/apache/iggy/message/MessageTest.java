@@ -25,11 +25,7 @@ import java.math.BigInteger;
 import java.util.List;
 import java.util.Map;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNotSame;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
 
 class MessageTest {
     @Test
@@ -48,11 +44,12 @@ class MessageTest {
 
         var message = Message.of(header, payload, userHeaders);
 
-        assertEquals(header, message.header());
-        assertEquals(payload, message.payload());
-        assertEquals(1, message.userHeaders().size());
-        assertTrue(message.userHeaders().containsKey(HeaderKey.fromString("foo")));
-        assertEquals(HeaderValue.fromString("bar"), message.userHeaders().get(HeaderKey.fromString("foo")));
+        assertThat(message.header()).isEqualTo(header);
+        assertThat(message.payload()).isEqualTo(payload);
+        assertThat(message.userHeaders().size()).isEqualTo(1);
+        assertThat(message.userHeaders().containsKey(HeaderKey.fromString("foo")))
+                .isTrue();
+        assertThat(message.userHeaders().get(HeaderKey.fromString("foo"))).isEqualTo(HeaderValue.fromString("bar"));
     }
 
     @Test
@@ -70,31 +67,31 @@ class MessageTest {
 
         var message = Message.of(header, payload, null);
 
-        assertEquals(header, message.header());
-        assertEquals(payload, message.payload());
-        assertEquals(0, message.userHeaders().size());
+        assertThat(message.header()).isEqualTo(header);
+        assertThat(message.payload()).isEqualTo(payload);
+        assertThat(message.userHeaders().size()).isEqualTo(0);
     }
 
     @Test
     void ofCreatesExpectedMessageWhenGivenPayloadOnly() {
         var message = Message.of("foo");
 
-        assertArrayEquals(new byte[] {102, 111, 111}, message.payload());
-        assertEquals(0, message.userHeaders().size());
+        assertThat(message.payload()).isEqualTo(new byte[] {102, 111, 111});
+        assertThat(message.userHeaders().size()).isEqualTo(0);
         assertDefaultMessageHeaderValues(message.header());
-        assertEquals(0L, message.header().userHeadersLength());
-        assertEquals(3L, message.header().payloadLength());
+        assertThat(message.header().userHeadersLength()).isEqualTo(0L);
+        assertThat(message.header().payloadLength()).isEqualTo(3L);
     }
 
     @Test
     void ofCreatesMessageWhenGivenOnlyAPayloadAndUserHeaders() {
         var message = Message.of("foo", Map.of(HeaderKey.fromString("key"), HeaderValue.fromInt32(123)));
 
-        assertArrayEquals(new byte[] {102, 111, 111}, message.payload());
-        assertEquals(1, message.userHeaders().size());
+        assertThat(message.payload()).isEqualTo(new byte[] {102, 111, 111});
+        assertThat(message.userHeaders().size()).isEqualTo(1);
         assertDefaultMessageHeaderValues(message.header());
-        assertEquals(17L, message.header().userHeadersLength());
-        assertEquals(3L, message.header().payloadLength());
+        assertThat(message.header().userHeadersLength()).isEqualTo(17L);
+        assertThat(message.header().payloadLength()).isEqualTo(3L);
     }
 
     @Test
@@ -104,13 +101,13 @@ class MessageTest {
         var newMessage =
                 originalMessage.withUserHeaders(Map.of(HeaderKey.fromString("k2"), HeaderValue.fromInt32(456)));
 
-        assertNotSame(originalMessage, newMessage);
-        assertArrayEquals(new byte[] {102, 111, 111}, newMessage.payload());
-        assertEquals(2, newMessage.userHeaders().size());
-        assertEquals(HeaderValue.fromInt32(123), newMessage.userHeaders().get(HeaderKey.fromString("k1")));
-        assertEquals(HeaderValue.fromInt32(456), newMessage.userHeaders().get(HeaderKey.fromString("k2")));
-        assertTrue(originalMessage.header().userHeadersLength()
-                < newMessage.header().userHeadersLength());
+        assertThat(newMessage).isNotSameAs(originalMessage);
+        assertThat(newMessage.payload()).isEqualTo(new byte[] {102, 111, 111});
+        assertThat(newMessage.userHeaders().size()).isEqualTo(2);
+        assertThat(newMessage.userHeaders().get(HeaderKey.fromString("k1"))).isEqualTo(HeaderValue.fromInt32(123));
+        assertThat(newMessage.userHeaders().get(HeaderKey.fromString("k2"))).isEqualTo(HeaderValue.fromInt32(456));
+        assertThat(originalMessage.header().userHeadersLength())
+                .isLessThan(newMessage.header().userHeadersLength());
     }
 
     @Test
@@ -120,12 +117,12 @@ class MessageTest {
         var newMessage =
                 originalMessage.withUserHeaders(Map.of(HeaderKey.fromString("foo"), HeaderValue.fromString("bar")));
 
-        assertNotSame(originalMessage, newMessage);
-        assertArrayEquals(new byte[] {102, 111, 111}, newMessage.payload());
-        assertEquals(1, newMessage.userHeaders().size());
-        assertEquals(HeaderValue.fromString("bar"), newMessage.userHeaders().get(HeaderKey.fromString("foo")));
-        assertTrue(originalMessage.header().userHeadersLength()
-                < newMessage.header().userHeadersLength());
+        assertThat(newMessage).isNotSameAs(originalMessage);
+        assertThat(newMessage.payload()).isEqualTo(new byte[] {102, 111, 111});
+        assertThat(newMessage.userHeaders().size()).isEqualTo(1);
+        assertThat(newMessage.userHeaders().get(HeaderKey.fromString("foo"))).isEqualTo(HeaderValue.fromString("bar"));
+        assertThat(originalMessage.header().userHeadersLength())
+                .isLessThan(newMessage.header().userHeadersLength());
     }
 
     @Test
@@ -140,30 +137,30 @@ class MessageTest {
 
         var newMessage = originalMessage.withUserHeaders(Map.of());
 
-        assertNotSame(originalMessage, newMessage);
-        assertEquals(originalMessage, newMessage);
+        assertThat(newMessage).isNotSameAs(originalMessage);
+        assertThat(newMessage).isEqualTo(originalMessage);
     }
 
     @Test
     void getSizeReturnsExpectedSizeWhenThereAreNoUserHeaders() {
         var message = Message.of("foo");
 
-        assertEquals(67, message.getSize());
+        assertThat(message.getSize()).isEqualTo(67);
     }
 
     @Test
     void getSizeReturnsExpectedSizeWhenThereAreUserHeaders() {
         var message = Message.of("foo", Map.of(HeaderKey.fromString("k1"), HeaderValue.fromInt32(123)));
 
-        assertEquals(83, message.getSize());
+        assertThat(message.getSize()).isEqualTo(83);
     }
 
     private void assertDefaultMessageHeaderValues(MessageHeader header) {
-        assertEquals(BigInteger.ZERO, header.checksum());
-        assertNotNull(header.id());
-        assertEquals(BigInteger.ZERO, header.offset());
-        assertEquals(BigInteger.ZERO, header.timestamp());
-        assertEquals(BigInteger.ZERO, header.originTimestamp());
-        assertEquals(BigInteger.ZERO, header.reserved());
+        assertThat(header.checksum()).isEqualTo(BigInteger.ZERO);
+        assertThat(header.id()).isNotNull();
+        assertThat(header.offset()).isEqualTo(BigInteger.ZERO);
+        assertThat(header.timestamp()).isEqualTo(BigInteger.ZERO);
+        assertThat(header.originTimestamp()).isEqualTo(BigInteger.ZERO);
+        assertThat(header.reserved()).isEqualTo(BigInteger.ZERO);
     }
 }
