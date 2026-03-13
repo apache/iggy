@@ -28,16 +28,16 @@
 //! The HTTP sink runs inside the Iggy connector runtime as a dynamically loaded plugin:
 //!
 //! ```text
-//! ┌──────────────┐    ┌─────────────────────┐    ┌──────────────────┐
+//! ┌──────────────┐    ┌──────────────────────┐    ┌──────────────────┐
 //! │  Test Code   │    │  Connector Runtime   │    │    WireMock      │
 //! │              │    │                      │    │                  │
 //! │ send_messages├───►│  iggy-server (poll)  │    │  /__admin/       │
 //! │              │    │        │             │    │  (verify reqs)   │
 //! │              │    │  ┌─────▼──────────┐  │    │                  │
 //! │ wait_for_    │    │  │ HTTP Sink      │  │    │  /ingest         │
-//! │ requests ◄───┼────┤  │ (.so/.dylib)  ├──┼───►│  (accept POST)   │
+//! │ requests ◄───┼────┤  │ (.so/.dylib)   ├──┼───►│  (accept POST)   │
 //! │              │    │  └────────────────┘  │    │                  │
-//! └──────────────┘    └─────────────────────┘    └──────────────────┘
+//! └──────────────┘    └──────────────────────┘    └──────────────────┘
 //! ```
 //!
 //! **Key components**:
