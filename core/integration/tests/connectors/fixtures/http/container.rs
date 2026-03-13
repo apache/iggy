@@ -33,6 +33,7 @@ const WIREMOCK_PORT: u16 = 8080;
 
 pub(super) const DEFAULT_TEST_STREAM: &str = "test_stream";
 pub(super) const DEFAULT_TEST_TOPIC: &str = "test_topic";
+pub(super) const DEFAULT_TEST_TOPIC_2: &str = "test_topic_2";
 
 pub(super) const DEFAULT_POLL_ATTEMPTS: usize = 100;
 pub(super) const DEFAULT_POLL_INTERVAL_MS: u64 = 100;

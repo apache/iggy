@@ -18,11 +18,11 @@
  */
 
 use super::container::{
-    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_BATCH_MODE, ENV_SINK_INCLUDE_METADATA,
-    ENV_SINK_MAX_RETRIES, ENV_SINK_METHOD, ENV_SINK_PATH, ENV_SINK_RETRY_DELAY,
-    ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM,
-    ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_TIMEOUT, ENV_SINK_URL, ENV_SINK_VERBOSE_LOGGING,
-    HttpSinkWireMockContainer,
+    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, DEFAULT_TEST_TOPIC_2, ENV_SINK_BATCH_MODE,
+    ENV_SINK_INCLUDE_METADATA, ENV_SINK_MAX_RETRIES, ENV_SINK_METHOD, ENV_SINK_PATH,
+    ENV_SINK_RETRY_DELAY, ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA,
+    ENV_SINK_STREAMS_0_STREAM, ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_TIMEOUT, ENV_SINK_URL,
+    ENV_SINK_VERBOSE_LOGGING, HttpSinkWireMockContainer,
 };
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
@@ -181,6 +181,36 @@ impl TestFixture for HttpSinkNoMetadataFixture {
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         let mut envs = HttpSinkIndividualFixture::base_envs(&self.container);
         envs.insert(ENV_SINK_INCLUDE_METADATA.to_string(), "false".to_string());
+        envs
+    }
+}
+
+/// HTTP sink fixture subscribed to two topics on the same stream.
+/// Demonstrates the multi-topic single-connector deployment pattern.
+pub struct HttpSinkMultiTopicFixture {
+    container: HttpSinkWireMockContainer,
+}
+
+impl HttpSinkMultiTopicFixture {
+    pub fn container(&self) -> &HttpSinkWireMockContainer {
+        &self.container
+    }
+}
+
+#[async_trait]
+impl TestFixture for HttpSinkMultiTopicFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = HttpSinkWireMockContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HttpSinkIndividualFixture::base_envs(&self.container);
+        // Subscribe to both topics — runtime spawns one task per topic
+        envs.insert(
+            ENV_SINK_STREAMS_0_TOPICS.to_string(),
+            format!("[{},{}]", DEFAULT_TEST_TOPIC, DEFAULT_TEST_TOPIC_2),
+        );
         envs
     }
 }

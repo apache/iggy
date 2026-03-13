@@ -19,8 +19,8 @@
 
 use super::TEST_MESSAGE_COUNT;
 use crate::connectors::fixtures::{
-    HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkNdjsonFixture,
-    HttpSinkNoMetadataFixture, HttpSinkRawFixture,
+    HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture,
+    HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture, HttpSinkRawFixture,
 };
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
@@ -523,4 +523,118 @@ async fn individual_messages_have_sequential_offsets(
             window[1]
         );
     }
+}
+
+/// Multi-topic deployment pattern: one connector consuming from two topics on the
+/// same stream. The runtime spawns separate tasks for each topic and all messages
+/// arrive at the same WireMock endpoint, differentiated by `iggy_topic` metadata.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
+    seed = seeds::connector_multi_topic_stream
+)]
+async fn multi_topic_messages_delivered_with_correct_topic_metadata(
+    harness: &TestHarness,
+    fixture: HttpSinkMultiTopicFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_1_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let topic_2_id: Identifier = seeds::names::TOPIC_2.try_into().unwrap();
+
+    // Send 2 messages to topic 1
+    let mut topic_1_messages: Vec<IggyMessage> = vec![
+        IggyMessage::builder()
+            .payload(Bytes::from(
+                serde_json::to_vec(&serde_json::json!({"source": "topic_1", "idx": 0})).unwrap(),
+            ))
+            .build()
+            .unwrap(),
+        IggyMessage::builder()
+            .payload(Bytes::from(
+                serde_json::to_vec(&serde_json::json!({"source": "topic_1", "idx": 1})).unwrap(),
+            ))
+            .build()
+            .unwrap(),
+    ];
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_1_id,
+            &Partitioning::partition_id(0),
+            &mut topic_1_messages,
+        )
+        .await
+        .expect("Failed to send messages to topic 1");
+
+    // Send 1 message to topic 2
+    let mut topic_2_messages: Vec<IggyMessage> = vec![IggyMessage::builder()
+        .payload(Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"source": "topic_2", "idx": 0})).unwrap(),
+        ))
+        .build()
+        .unwrap()];
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_2_id,
+            &Partitioning::partition_id(0),
+            &mut topic_2_messages,
+        )
+        .await
+        .expect("Failed to send messages to topic 2");
+
+    // Wait for all 3 messages (2 from topic 1 + 1 from topic 2)
+    let requests = fixture
+        .container()
+        .wait_for_requests(3)
+        .await
+        .expect("WireMock did not receive all 3 requests");
+
+    // Parse and group by iggy_topic metadata
+    let mut topic_1_count = 0usize;
+    let mut topic_2_count = 0usize;
+
+    for (i, req) in requests.iter().enumerate() {
+        let body = req
+            .body_as_json()
+            .unwrap_or_else(|e| panic!("Request {i} body is not valid JSON: {e}"));
+
+        let iggy_topic = body["metadata"]["iggy_topic"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Request {i} missing iggy_topic in metadata: {}",
+                    body["metadata"]
+                )
+            });
+
+        match iggy_topic {
+            "test_topic" => {
+                topic_1_count += 1;
+                let source = body["payload"]["source"]
+                    .as_str()
+                    .expect("Missing source field");
+                assert_eq!(source, "topic_1", "Topic 1 message has wrong source");
+            }
+            "test_topic_2" => {
+                topic_2_count += 1;
+                let source = body["payload"]["source"]
+                    .as_str()
+                    .expect("Missing source field");
+                assert_eq!(source, "topic_2", "Topic 2 message has wrong source");
+            }
+            other => panic!("Unexpected iggy_topic value: {other}"),
+        }
+    }
+
+    assert_eq!(
+        topic_1_count, 2,
+        "Expected 2 messages from topic 1, got {topic_1_count}"
+    );
+    assert_eq!(
+        topic_2_count, 1,
+        "Expected 1 message from topic 2, got {topic_2_count}"
+    );
 }
