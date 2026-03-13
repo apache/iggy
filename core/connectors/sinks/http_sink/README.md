@@ -168,6 +168,43 @@ POST /ingest  Content-Type: application/octet-stream
 <raw bytes>
 ```
 
+## Message Flow: What Goes In vs. What Comes Out
+
+The connector does **not** require or expect any particular message structure. It receives raw bytes from the Iggy runtime — whatever you published to the topic is what arrives in `consume()`. The `{metadata: {}, payload: {}}` envelope is something the **sink adds on the way out**, not something it expects on the way in.
+
+```
+Your app publishes:  {"order_id": 123, "amount": 9.99}
+                          |
+                          v
+Iggy stores:         raw bytes of that JSON
+                          |
+                          v
+Runtime delivers:    those same raw bytes to consume()
+                          |
+                          v
+HTTP sink wraps:     {"metadata": {"iggy_offset": 0, ...},
+                      "payload": {"order_id": 123, "amount": 9.99}}
+                          |
+                          v
+HTTP endpoint gets:  the wrapped envelope
+```
+
+With `include_metadata = false`, the sink skips wrapping — your original message goes through as-is:
+
+```
+HTTP endpoint gets:  {"order_id": 123, "amount": 9.99}
+```
+
+The `schema` field in `[[streams]]` controls how the sink **interprets** the incoming bytes for output formatting:
+
+| Schema | Interpretation | Payload in envelope |
+|--------|---------------|---------------------|
+| `json` | Parses bytes as JSON | Embedded as JSON value |
+| `text` | Treats bytes as UTF-8 string | Embedded as string |
+| `raw` / `flatbuffer` / `proto` | Opaque binary | Base64-encoded with `"iggy_payload_encoding": "base64"` |
+
+You can publish any struct serialized in any format (JSON, protobuf, raw bytes). Set the matching `schema` in `[[streams]]`, and choose whether you want the metadata envelope (`include_metadata`) or not.
+
 ## Metadata Envelope
 
 When `include_metadata = true` (default), payloads are wrapped:
