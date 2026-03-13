@@ -234,5 +234,6 @@ Before opening a pull request:
 
 1. **Format code:** `./gradlew spotlessApply`
 2. **Validate build:** `./gradlew check`
+3. **Use AssertJ for assertions:** Tests should use [AssertJ](https://assertj.github.io/doc/) (`assertThat(...)`) instead of JUnit assertions.
 
 This ensures code style compliance and that all tests and checkstyle validations pass.
