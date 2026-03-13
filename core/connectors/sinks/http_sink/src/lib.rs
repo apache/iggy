@@ -180,7 +180,9 @@ impl HttpSink {
         let url = config.url;
         let method = config.method.unwrap_or_default();
         let timeout = parse_duration(config.timeout.as_deref(), DEFAULT_TIMEOUT);
-        let max_payload_size_bytes = config.max_payload_size_bytes.unwrap_or(DEFAULT_MAX_PAYLOAD_SIZE);
+        let max_payload_size_bytes = config
+            .max_payload_size_bytes
+            .unwrap_or(DEFAULT_MAX_PAYLOAD_SIZE);
         let headers = config.headers.unwrap_or_default();
         let batch_mode = config.batch_mode.unwrap_or_default();
         let include_metadata = config.include_metadata.unwrap_or(true);
@@ -194,7 +196,8 @@ impl HttpSink {
             .retry_backoff_multiplier
             .unwrap_or(DEFAULT_BACKOFF_MULTIPLIER)
             .max(1.0);
-        let max_retry_delay = parse_duration(config.max_retry_delay.as_deref(), DEFAULT_MAX_RETRY_DELAY);
+        let max_retry_delay =
+            parse_duration(config.max_retry_delay.as_deref(), DEFAULT_MAX_RETRY_DELAY);
         let success_status_codes = config
             .success_status_codes
             .unwrap_or_else(|| vec![200, 201, 202, 204]);
@@ -227,7 +230,9 @@ impl HttpSink {
             );
         }
 
-        if matches!(method, HttpMethod::Get | HttpMethod::Head) && batch_mode != BatchMode::Individual {
+        if matches!(method, HttpMethod::Get | HttpMethod::Head)
+            && batch_mode != BatchMode::Individual
+        {
             warn!(
                 "HTTP sink ID: {} — {:?} with batch_mode={:?} will send a request body. \
                  Some servers may reject GET/HEAD requests with a body.",
@@ -274,9 +279,9 @@ impl HttpSink {
             .tcp_keepalive(Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS))
             .danger_accept_invalid_certs(self.tls_danger_accept_invalid_certs);
 
-        builder.build().map_err(|e| {
-            Error::InitError(format!("Failed to build HTTP client: {}", e))
-        })
+        builder
+            .build()
+            .map_err(|e| Error::InitError(format!("Failed to build HTTP client: {}", e)))
     }
 
     /// Apply the configured HTTP method to a `reqwest::Client` for the target URL,
@@ -306,10 +311,7 @@ impl HttpSink {
     ///
     /// Note: All current `Payload` variants produce infallible conversions.
     /// The `Result` return type exists as a safety net for future variants.
-    fn payload_to_json(
-        &self,
-        payload: Payload,
-    ) -> Result<serde_json::Value, Error> {
+    fn payload_to_json(&self, payload: Payload) -> Result<serde_json::Value, Error> {
         match payload {
             Payload::Json(value) => {
                 // Direct structural conversion (not serialization roundtrip).
@@ -365,17 +367,12 @@ impl HttpSink {
 
     /// Classify whether an HTTP status code is transient (worth retrying).
     fn is_transient_status(status: reqwest::StatusCode) -> bool {
-        matches!(
-            status.as_u16(),
-            429 | 500 | 502 | 503 | 504
-        )
+        matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
     }
 
     /// Extract `Retry-After` header value as a Duration (seconds), capped to `max_retry_delay`.
     fn parse_retry_after(&self, response: &reqwest::Response) -> Option<Duration> {
-        let header_raw = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)?;
+        let header_raw = response.headers().get(reqwest::header::RETRY_AFTER)?;
         let header_value = match header_raw.to_str() {
             Ok(s) => s,
             Err(e) => {
@@ -404,8 +401,8 @@ impl HttpSink {
     /// capped at `max_retry_delay`. Clamps before `Duration::from_secs_f64` to avoid
     /// panics when extreme backoff configs produce infinity (e.g., multiplier=1000, retries=200).
     fn compute_retry_delay(&self, attempt: u32) -> Duration {
-        let delay_secs = self.retry_delay.as_secs_f64()
-            * self.retry_backoff_multiplier.powi(attempt as i32);
+        let delay_secs =
+            self.retry_delay.as_secs_f64() * self.retry_backoff_multiplier.powi(attempt as i32);
         let capped_secs = delay_secs.min(self.max_retry_delay.as_secs_f64());
         if !capped_secs.is_finite() || capped_secs < 0.0 {
             return self.max_retry_delay;
@@ -482,7 +479,8 @@ impl HttpSink {
                     };
 
                     if Self::is_transient_status(status) && attempt < self.max_retries {
-                        let delay = retry_after.unwrap_or_else(|| self.compute_retry_delay(attempt));
+                        let delay =
+                            retry_after.unwrap_or_else(|| self.compute_retry_delay(attempt));
                         warn!(
                             "HTTP sink ID: {} — transient error (status {}, attempt {}/{}). \
                              Retrying in {:?}. Response: {}",
@@ -585,7 +583,8 @@ impl HttpSink {
                 }
             };
 
-            let envelope = self.build_envelope(message, topic_metadata, messages_metadata, payload_json);
+            let envelope =
+                self.build_envelope(message, topic_metadata, messages_metadata, payload_json);
             let body = match serde_json::to_vec(&envelope) {
                 Ok(b) => b,
                 Err(e) => {
@@ -603,7 +602,10 @@ impl HttpSink {
             if self.max_payload_size_bytes > 0 && body.len() as u64 > self.max_payload_size_bytes {
                 error!(
                     "HTTP sink ID: {} — payload at offset {} exceeds max size ({} > {} bytes). Skipping.",
-                    self.id, offset, body.len(), self.max_payload_size_bytes,
+                    self.id,
+                    offset,
+                    body.len(),
+                    self.max_payload_size_bytes,
                 );
                 self.errors_count.fetch_add(1, Ordering::Relaxed);
                 serialization_failures += 1;
@@ -614,7 +616,10 @@ impl HttpSink {
                 continue;
             }
 
-            match self.send_with_retry(client, Bytes::from(body), self.content_type()).await {
+            match self
+                .send_with_retry(client, Bytes::from(body), self.content_type())
+                .await
+            {
                 Ok(()) => {
                     delivered += 1;
                     consecutive_failures = 0;
@@ -638,9 +643,7 @@ impl HttpSink {
                         error!(
                             "HTTP sink ID: {} — aborting batch after {} consecutive HTTP failures \
                              ({} remaining messages skipped)",
-                            self.id,
-                            consecutive_failures,
-                            skipped,
+                            self.id, consecutive_failures, skipped,
                         );
                         self.errors_count.fetch_add(skipped, Ordering::Relaxed);
                         break;
@@ -649,7 +652,8 @@ impl HttpSink {
             }
         }
 
-        self.messages_delivered.fetch_add(delivered, Ordering::Relaxed);
+        self.messages_delivered
+            .fetch_add(delivered, Ordering::Relaxed);
 
         match last_error {
             Some(e) => {
@@ -676,7 +680,10 @@ impl HttpSink {
         skipped: u64,
         batch_mode: &str,
     ) -> Result<(), Error> {
-        debug_assert!(count > 0, "send_batch_body called with count=0 — callers must guard against empty batches");
+        debug_assert!(
+            count > 0,
+            "send_batch_body called with count=0 — callers must guard against empty batches"
+        );
         if let Err(e) = self
             .send_with_retry(client, body, self.content_type())
             .await
@@ -684,8 +691,7 @@ impl HttpSink {
             // send_with_retry already added 1 to errors_count for the HTTP failure.
             // Add the remaining messages that were serialized but not delivered.
             if count > 1 {
-                self.errors_count
-                    .fetch_add(count - 1, Ordering::Relaxed);
+                self.errors_count.fetch_add(count - 1, Ordering::Relaxed);
             }
             if skipped > 0 {
                 error!(
@@ -888,7 +894,10 @@ impl HttpSink {
             if self.max_payload_size_bytes > 0 && body.len() as u64 > self.max_payload_size_bytes {
                 error!(
                     "HTTP sink ID: {} — raw payload at offset {} exceeds max size ({} > {} bytes). Skipping.",
-                    self.id, offset, body.len(), self.max_payload_size_bytes,
+                    self.id,
+                    offset,
+                    body.len(),
+                    self.max_payload_size_bytes,
                 );
                 self.errors_count.fetch_add(1, Ordering::Relaxed);
                 serialization_failures += 1;
@@ -899,7 +908,10 @@ impl HttpSink {
                 continue;
             }
 
-            match self.send_with_retry(client, Bytes::from(body), self.content_type()).await {
+            match self
+                .send_with_retry(client, Bytes::from(body), self.content_type())
+                .await
+            {
                 Ok(()) => {
                     delivered += 1;
                     consecutive_failures = 0;
@@ -923,9 +935,7 @@ impl HttpSink {
                         error!(
                             "HTTP sink ID: {} — aborting raw batch after {} consecutive HTTP failures \
                              ({} remaining messages skipped)",
-                            self.id,
-                            consecutive_failures,
-                            skipped,
+                            self.id, consecutive_failures, skipped,
                         );
                         self.errors_count.fetch_add(skipped, Ordering::Relaxed);
                         break;
@@ -934,7 +944,8 @@ impl HttpSink {
             }
         }
 
-        self.messages_delivered.fetch_add(delivered, Ordering::Relaxed);
+        self.messages_delivered
+            .fetch_add(delivered, Ordering::Relaxed);
 
         match last_error {
             Some(e) => {
@@ -1071,23 +1082,18 @@ impl Sink for HttpSink {
                 "HTTP sink ID: {} — custom 'Content-Type' header in [headers] is ignored. \
                  Content-Type is set by batch_mode ({:?} -> '{}'). \
                  Remove it from [headers] to silence this warning.",
-                self.id, self.batch_mode, self.content_type(),
+                self.id,
+                self.batch_mode,
+                self.content_type(),
             );
         }
 
         // Validate custom headers — fail fast rather than per-request errors
         for (key, value) in &self.headers {
-            reqwest::header::HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
-                Error::InitError(format!(
-                    "Invalid header name '{}': {}",
-                    key, e
-                ))
-            })?;
+            reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                .map_err(|e| Error::InitError(format!("Invalid header name '{}': {}", key, e)))?;
             reqwest::header::HeaderValue::from_str(value).map_err(|e| {
-                Error::InitError(format!(
-                    "Invalid header value for '{}': {}",
-                    key, e
-                ))
+                Error::InitError(format!("Invalid header value for '{}': {}", key, e))
             })?;
         }
 
@@ -1103,17 +1109,16 @@ impl Sink for HttpSink {
             }
 
             let response = health_request.send().await.map_err(|e| {
-                Error::Connection(format!(
-                    "Health check failed for URL '{}': {}",
-                    self.url, e
-                ))
+                Error::Connection(format!("Health check failed for URL '{}': {}", self.url, e))
             })?;
 
             let status = response.status();
             if !self.success_status_codes.contains(&status.as_u16()) {
                 return Err(Error::Connection(format!(
                     "Health check returned status {} (not in success_status_codes {:?}) for URL '{}'",
-                    status.as_u16(), self.success_status_codes, self.url,
+                    status.as_u16(),
+                    self.success_status_codes,
+                    self.url,
                 )));
             }
 
@@ -1376,7 +1381,12 @@ mod tests {
         ];
 
         for (input, expected) in cases {
-            assert_eq!(parse_duration(Some(input), "1s"), expected, "input: {}", input);
+            assert_eq!(
+                parse_duration(Some(input), "1s"),
+                expected,
+                "input: {}",
+                input
+            );
         }
     }
 
@@ -1581,10 +1591,7 @@ mod tests {
         assert_eq!(metadata["iggy_stream"], "test_stream");
         assert_eq!(metadata["iggy_topic"], "test_topic");
         assert_eq!(metadata["iggy_partition_id"], 0);
-        assert_eq!(
-            metadata["iggy_id"],
-            format_u128_as_uuid(42)
-        );
+        assert_eq!(metadata["iggy_id"], format_u128_as_uuid(42));
         // Verify conditional fields are absent by default
         assert!(metadata.get("iggy_checksum").is_none());
         assert!(metadata.get("iggy_origin_timestamp").is_none());
@@ -1716,9 +1723,9 @@ mod tests {
 
     #[test]
     fn given_f64_value_should_convert_correctly() {
-        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::F64(3.14));
+        let v = simd_json::OwnedValue::Static(simd_json::StaticNode::F64(3.54));
         let result = owned_value_to_serde_json(&v);
-        assert_eq!(result.as_f64().unwrap(), 3.14);
+        assert_eq!(result.as_f64().unwrap(), 3.54);
     }
 
     #[test]
@@ -1823,7 +1830,11 @@ mod tests {
         let result = sink.open().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("empty"), "Error should mention empty URL: {}", err);
+        assert!(
+            err.contains("empty"),
+            "Error should mention empty URL: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -1834,7 +1845,11 @@ mod tests {
         let result = sink.open().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("not a valid URL"), "Error should mention invalid URL: {}", err);
+        assert!(
+            err.contains("not a valid URL"),
+            "Error should mention invalid URL: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -1887,7 +1902,11 @@ mod tests {
         let result = sink.open().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("not allowed"), "Expected scheme rejection: {}", err);
+        assert!(
+            err.contains("not allowed"),
+            "Expected scheme rejection: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -1898,7 +1917,11 @@ mod tests {
         let result = sink.open().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("not allowed"), "Expected scheme rejection: {}", err);
+        assert!(
+            err.contains("not allowed"),
+            "Expected scheme rejection: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -1924,27 +1947,37 @@ mod tests {
     #[tokio::test]
     async fn given_invalid_header_name_should_fail_open() {
         let mut config = given_default_config();
-        config.headers = Some(HashMap::from([
-            ("Invalid Header\r\n".to_string(), "value".to_string()),
-        ]));
+        config.headers = Some(HashMap::from([(
+            "Invalid Header\r\n".to_string(),
+            "value".to_string(),
+        )]));
         let mut sink = HttpSink::new(1, config);
         let result = sink.open().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Invalid header name"), "Expected header name error: {}", err);
+        assert!(
+            err.contains("Invalid header name"),
+            "Expected header name error: {}",
+            err
+        );
     }
 
     #[tokio::test]
     async fn given_invalid_header_value_should_fail_open() {
         let mut config = given_default_config();
-        config.headers = Some(HashMap::from([
-            ("X-Good-Name".to_string(), "bad\r\nvalue".to_string()),
-        ]));
+        config.headers = Some(HashMap::from([(
+            "X-Good-Name".to_string(),
+            "bad\r\nvalue".to_string(),
+        )]));
         let mut sink = HttpSink::new(1, config);
         let result = sink.open().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Invalid header value"), "Expected header value error: {}", err);
+        assert!(
+            err.contains("Invalid header value"),
+            "Expected header value error: {}",
+            err
+        );
     }
 
     #[tokio::test]
@@ -2017,7 +2050,11 @@ mod tests {
         let result = sink.open().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("999"), "Expected invalid code in error: {}", err);
+        assert!(
+            err.contains("999"),
+            "Expected invalid code in error: {}",
+            err
+        );
     }
 
     #[tokio::test]

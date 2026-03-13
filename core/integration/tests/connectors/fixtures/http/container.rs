@@ -188,6 +188,7 @@ impl HttpSinkWireMockContainer {
     }
 
     /// Reset WireMock's request journal (clear received requests).
+    #[allow(dead_code)]
     pub async fn reset_requests(&self) -> Result<(), TestBinaryError> {
         let url = format!("{}/__admin/requests", self.base_url);
         let client = reqwest::Client::new();
