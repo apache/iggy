@@ -100,7 +100,8 @@ pub struct RecoveredMetadata<M> {
 ///
 /// # Errors
 /// Returns `RecoveryError` if snapshot loading, journal opening, or replay fails.
-pub fn recover<M>(data_dir: &Path) -> Result<RecoveredMetadata<M>, RecoveryError>
+#[allow(clippy::future_not_send)]
+pub async fn recover<M>(data_dir: &Path) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
     M: StateMachine<Input = Message<PrepareHeader>, Error = IggyError>
         + RestoreSnapshot<MetadataSnapshot>,
@@ -124,7 +125,7 @@ where
 
     // 3. Open journal, scan the WAL and build index
     let journal_path = metadata_dir.join("journal.wal");
-    let journal = MetadataJournal::open(&journal_path, snapshot.sequence_number())?;
+    let journal = MetadataJournal::open(&journal_path, snapshot.sequence_number()).await?;
 
     // 4. Replay journal entries after snapshot
     let headers_to_replay = journal.iter_headers_from(replay_from);
@@ -135,7 +136,7 @@ where
         // same-view break, stop replay here and mark the remaining entries for
         // repair via VSR instead of panicking.
 
-        let entry = journal.entry_sync(header)?.ok_or_else(|| {
+        let entry = journal.entry_at(header).await?.ok_or_else(|| {
             RecoveryError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("failed to read journal entry for op={}", header.op),
@@ -179,17 +180,17 @@ mod tests {
         Message::from_bytes(buffer.freeze()).unwrap()
     }
 
-    #[test]
-    fn recover_empty_state() {
+    #[compio::test]
+    async fn recover_empty_state() {
         let dir = tempdir().unwrap();
-        let recovered = recover::<TestStm>(dir.path()).unwrap();
+        let recovered = recover::<TestStm>(dir.path()).await.unwrap();
 
         assert_eq!(recovered.last_applied_op, None);
         assert!(recovered.journal.last_op().is_none());
     }
 
-    #[test]
-    fn recover_snapshot_only() {
+    #[compio::test]
+    async fn recover_snapshot_only() {
         let dir = tempdir().unwrap();
         let metadata_dir = dir.path().join("metadata");
         std::fs::create_dir_all(&metadata_dir).unwrap();
@@ -199,34 +200,34 @@ mod tests {
             .persist(&metadata_dir.join("snapshot.bin"))
             .unwrap();
 
-        let recovered = recover::<TestStm>(dir.path()).unwrap();
+        let recovered = recover::<TestStm>(dir.path()).await.unwrap();
         assert_eq!(recovered.snapshot.sequence_number(), 42);
         assert_eq!(recovered.last_applied_op, None);
     }
 
-    #[test]
-    fn recover_journal_only() {
+    #[compio::test]
+    async fn recover_journal_only() {
         let dir = tempdir().unwrap();
         let metadata_dir = dir.path().join("metadata");
         std::fs::create_dir_all(&metadata_dir).unwrap();
 
         {
-            let journal = MetadataJournal::open(&metadata_dir.join("journal.wal"), 0).unwrap();
-            compio::runtime::Runtime::new().unwrap().block_on(async {
-                journal.append(make_prepare(1, 32)).await.unwrap();
-                journal.append(make_prepare(2, 32)).await.unwrap();
-                journal.append(make_prepare(3, 32)).await.unwrap();
-            });
-            journal.storage_ref().fsync().unwrap();
+            let journal = MetadataJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            journal.append(make_prepare(1, 32)).await.unwrap();
+            journal.append(make_prepare(2, 32)).await.unwrap();
+            journal.append(make_prepare(3, 32)).await.unwrap();
+            journal.storage_ref().fsync().await.unwrap();
         }
 
-        let recovered = recover::<TestStm>(dir.path()).unwrap();
+        let recovered = recover::<TestStm>(dir.path()).await.unwrap();
         assert_eq!(recovered.last_applied_op, Some(3));
         assert_eq!(recovered.journal.last_op(), Some(3));
     }
 
-    #[test]
-    fn recover_snapshot_plus_journal() {
+    #[compio::test]
+    async fn recover_snapshot_plus_journal() {
         let dir = tempdir().unwrap();
         let metadata_dir = dir.path().join("metadata");
         std::fs::create_dir_all(&metadata_dir).unwrap();
@@ -239,16 +240,16 @@ mod tests {
 
         // WAL has ops 1-10
         {
-            let journal = MetadataJournal::open(&metadata_dir.join("journal.wal"), 0).unwrap();
-            compio::runtime::Runtime::new().unwrap().block_on(async {
-                for op in 1..=10 {
-                    journal.append(make_prepare(op, 32)).await.unwrap();
-                }
-            });
-            journal.storage_ref().fsync().unwrap();
+            let journal = MetadataJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            for op in 1..=10 {
+                journal.append(make_prepare(op, 32)).await.unwrap();
+            }
+            journal.storage_ref().fsync().await.unwrap();
         }
 
-        let recovered = recover::<TestStm>(dir.path()).unwrap();
+        let recovered = recover::<TestStm>(dir.path()).await.unwrap();
         // Should replay ops 6-10 (snapshot was at 5)
         assert_eq!(recovered.last_applied_op, Some(10));
         assert_eq!(recovered.snapshot.sequence_number(), 5);

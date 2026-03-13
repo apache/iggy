@@ -236,7 +236,7 @@ where
         {
             if let Some(data_dir) = &self.data_dir {
                 let snap_op = consensus.commit();
-                if let Err(e) = self.checkpoint(data_dir, snap_op) {
+                if let Err(e) = self.checkpoint(data_dir, snap_op).await {
                     error!(
                         replica = consensus.replica(),
                         "on_replicate: forced checkpoint failed: {e}"
@@ -443,7 +443,8 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
     ///
     /// # Errors
     /// Returns `SnapshotError` if snapshotting, persistence, or compaction fails.
-    pub fn checkpoint(&self, data_dir: &Path, last_op: u64) -> Result<(), SnapshotError>
+    #[allow(clippy::future_not_send)]
+    pub async fn checkpoint(&self, data_dir: &Path, last_op: u64) -> Result<(), SnapshotError>
     where
         J: JournalHandle,
     {
@@ -453,7 +454,11 @@ impl<C, J, S, M> IggyMetadata<C, J, S, M> {
 
         if let Some(journal) = &self.journal {
             journal.handle().set_snapshot_op(last_op);
-            journal.handle().compact().map_err(SnapshotError::Io)?;
+            journal
+                .handle()
+                .compact()
+                .await
+                .map_err(SnapshotError::Io)?;
         }
 
         Ok(())

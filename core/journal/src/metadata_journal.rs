@@ -18,13 +18,12 @@
 use crate::file_storage::FileStorage;
 use crate::{Journal, JournalHandle};
 use bytes::Bytes;
+use compio::io::AsyncWriteAtExt;
 use iggy_common::header::{Command2, PrepareHeader};
 use iggy_common::message::Message;
 use std::cell::{Cell, Ref, RefCell};
 use std::fmt;
-use std::fs;
 use std::io;
-use std::io::Write;
 use std::path::Path;
 
 const HEADER_SIZE: usize = size_of::<PrepareHeader>();
@@ -124,8 +123,9 @@ impl MetadataJournal {
     ///
     /// # Errors
     /// Returns `JournalError::Io` if the WAL file cannot be opened or read.
-    pub fn open(path: &Path, snapshot_op: u64) -> Result<Self, JournalError> {
-        let storage = FileStorage::open(path)?;
+    #[allow(clippy::future_not_send)]
+    pub async fn open(path: &Path, snapshot_op: u64) -> Result<Self, JournalError> {
+        let storage = FileStorage::open(path).await?;
         let file_len = storage.file_len();
         let mut headers: Vec<Option<PrepareHeader>> = vec![None; SLOT_COUNT];
         let mut offsets: Vec<Option<u64>> = vec![None; SLOT_COUNT];
@@ -135,7 +135,7 @@ impl MetadataJournal {
 
         while pos + HEADER_SIZE as u64 <= file_len {
             // Read the 256-byte header
-            storage.read_sync(pos, &mut header_buf)?;
+            header_buf = storage.read_at(pos, header_buf).await?;
             let header: PrepareHeader =
                 *bytemuck::checked::from_bytes::<PrepareHeader>(&header_buf);
 
@@ -145,7 +145,7 @@ impl MetadataJournal {
                 || u64::from(header.size) > MAX_ENTRY_SIZE
             {
                 // Corrupt or non-prepare entry, truncate here
-                storage.truncate(pos)?;
+                storage.truncate(pos).await?;
                 break;
             }
 
@@ -156,7 +156,7 @@ impl MetadataJournal {
                 // Truncated entry at tail
                 // This handles the case where crash happened during write and
                 // only header was written and body was not. so we truncate the file to the start of the entry.
-                storage.truncate(pos)?;
+                storage.truncate(pos).await?;
                 break;
             }
 
@@ -178,7 +178,7 @@ impl MetadataJournal {
 
         // If there are leftover bytes less than a header, truncate them
         if pos < storage.file_len() {
-            storage.truncate(pos)?;
+            storage.truncate(pos).await?;
         }
 
         Ok(Self {
@@ -226,22 +226,32 @@ impl MetadataJournal {
         &self.storage
     }
 
-    /// Synchronous entry read for recovery.
+    /// Async entry read for recovery.
     ///
     /// Returns `Ok(None)` if the op is not in the index.
     ///
     /// # Errors
     /// Returns an I/O error if the read fails or the entry is malformed.
-    pub fn entry_sync(&self, header: &PrepareHeader) -> io::Result<Option<Message<PrepareHeader>>> {
-        let offsets = self.offsets.borrow();
-        let slot = slot_for_op(header.op);
-        let Some(offset) = offsets[slot] else {
-            return Ok(None);
+    #[allow(clippy::future_not_send)]
+    pub async fn entry_at(
+        &self,
+        header: &PrepareHeader,
+    ) -> io::Result<Option<Message<PrepareHeader>>> {
+        let (offset, size) = {
+            let headers = self.headers.borrow();
+            let offsets = self.offsets.borrow();
+            let slot = slot_for_op(header.op);
+            let stored = match headers[slot].as_ref() {
+                Some(h) if h.op == header.op => h,
+                _ => return Ok(None),
+            };
+            let Some(offset) = offsets[slot] else {
+                return Ok(None);
+            };
+            (offset, stored.size as usize)
         };
-        let size = header.size as usize;
-        drop(offsets);
-        let mut buf = vec![0u8; size];
-        self.storage.read_sync(offset, &mut buf)?;
+        let buf = vec![0u8; size];
+        let buf = self.storage.read_at(offset, buf).await?;
         let msg = Message::from_bytes(Bytes::from(buf))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         Ok(Some(msg))
@@ -302,49 +312,53 @@ impl Journal<FileStorage> for MetadataJournal {
     /// 3. Fsync + rename over the WAL
     /// 4. Fsync parent directory
     /// 5. Reopen the file descriptor and update in-memory offsets
-    fn compact(&self) -> io::Result<()> {
+    async fn compact(&self) -> io::Result<()> {
         let snapshot_op = self.snapshot_op.get();
-        let headers = self.headers.borrow();
-        let offsets = self.offsets.borrow();
 
         // Collect (header, old_offset) for live entries, sorted by op.
-        let mut live: Vec<(PrepareHeader, u64)> = Vec::new();
-        for slot in 0..SLOT_COUNT {
-            if let (Some(h), Some(off)) = (&headers[slot], offsets[slot])
-                && h.op > snapshot_op
-            {
-                live.push((*h, off));
+        let mut live: Vec<(PrepareHeader, u64)> = {
+            let headers = self.headers.borrow();
+            let offsets = self.offsets.borrow();
+            let mut live = Vec::new();
+            for slot in 0..SLOT_COUNT {
+                if let (Some(h), Some(off)) = (&headers[slot], offsets[slot])
+                    && h.op > snapshot_op
+                {
+                    live.push((*h, off));
+                }
             }
-        }
+            live
+        };
         live.sort_unstable_by_key(|(h, _)| h.op);
 
         // Write live entries to a temp file.
         let wal_path = self.storage.path();
         let tmp_path = wal_path.with_extension("wal.tmp");
         {
-            let mut tmp = fs::File::create(&tmp_path)?;
+            let mut tmp = compio::fs::File::create(&tmp_path).await?;
+            let mut write_pos: u64 = 0;
             for (header, old_offset) in &live {
                 let size = header.size as usize;
-                let mut buf = vec![0u8; size];
-                self.storage.read_sync(*old_offset, &mut buf)?;
-                tmp.write_all(&buf)?;
+                let buf = vec![0u8; size];
+                let buf = self.storage.read_at(*old_offset, buf).await?;
+                let (result, _buf) = tmp.write_all_at(buf, write_pos).await.into();
+                result?;
+                write_pos += size as u64;
             }
-            tmp.sync_all()?;
+            tmp.sync_all().await?;
         }
 
         // Atomic replace.
-        fs::rename(&tmp_path, wal_path)?;
+        compio::fs::rename(&tmp_path, wal_path).await?;
 
         // Fsync parent directory to make the rename durable.
         if let Some(parent) = wal_path.parent() {
-            let dir = fs::File::open(parent)?;
-            dir.sync_all()?;
+            let dir = compio::fs::File::open(parent).await?;
+            dir.sync_all().await?;
         }
 
         // Reopen the file descriptor at the same path.
-        drop(headers);
-        drop(offsets);
-        self.storage.reopen()?;
+        self.storage.reopen().await?;
 
         // Rebuild offsets for the compacted layout.
         let mut headers = self.headers.borrow_mut();
@@ -371,11 +385,10 @@ impl Journal<FileStorage> for MetadataJournal {
 
     async fn append(&self, entry: Self::Entry) -> io::Result<()> {
         let header = *entry.header();
-        let message_bytes = entry.as_bytes();
         let offset = self.storage.file_len();
 
-        self.storage.write_sync(message_bytes)?;
-        self.storage.fsync()?;
+        self.storage.write_append(entry.into_inner()).await?;
+        self.storage.fsync().await?;
 
         let slot = slot_for_op(header.op);
         let mut headers = self.headers.borrow_mut();
@@ -416,8 +429,8 @@ impl Journal<FileStorage> for MetadataJournal {
             (stored.size as usize, offsets[slot]?)
         };
 
-        let mut buffer = vec![0u8; size];
-        self.storage.read_sync(offset, &mut buffer).ok()?;
+        let buffer = vec![0u8; size];
+        let buffer = self.storage.read_at(offset, buffer).await.ok()?;
         Message::from_bytes(Bytes::from(buffer)).ok()
     }
 }
@@ -457,11 +470,11 @@ mod tests {
         Message::from_bytes(buffer.freeze()).unwrap()
     }
 
-    #[test]
-    fn open_empty_wal() {
+    #[compio::test]
+    async fn open_empty_wal() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let journal = MetadataJournal::open(&path, 0).unwrap();
+        let journal = MetadataJournal::open(&path, 0).await.unwrap();
 
         assert!(journal.last_op().is_none());
         assert!(journal.header(0).is_none());
@@ -471,7 +484,7 @@ mod tests {
     async fn append_and_read() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let journal = MetadataJournal::open(&path, 0).unwrap();
+        let journal = MetadataJournal::open(&path, 0).await.unwrap();
 
         let msg1 = make_prepare(1, 64);
         let msg2 = make_prepare(2, 32);
@@ -499,21 +512,21 @@ mod tests {
         let path = dir.path().join("journal.wal");
 
         {
-            let journal = MetadataJournal::open(&path, 0).unwrap();
+            let journal = MetadataJournal::open(&path, 0).await.unwrap();
             journal.append(make_prepare(1, 64)).await.unwrap();
             journal.append(make_prepare(2, 128)).await.unwrap();
             journal.append(make_prepare(3, 32)).await.unwrap();
-            journal.storage.fsync().unwrap();
+            journal.storage.fsync().await.unwrap();
         }
 
         // Reopen and verify index is rebuilt
-        let journal = MetadataJournal::open(&path, 0).unwrap();
+        let journal = MetadataJournal::open(&path, 0).await.unwrap();
         assert_eq!(journal.last_op(), Some(3));
 
         for op in 1..=3 {
-            let header = journal.header(op).unwrap();
+            let header = *journal.header(op).unwrap();
             assert_eq!(header.op, op as u64);
-            let entry = journal.entry_sync(&header).unwrap().unwrap();
+            let entry = journal.entry_at(&header).await.unwrap().unwrap();
             assert_eq!(entry.header().op, op as u64);
         }
     }
@@ -524,43 +537,41 @@ mod tests {
         let path = dir.path().join("journal.wal");
 
         {
-            let journal = MetadataJournal::open(&path, 0).unwrap();
+            let journal = MetadataJournal::open(&path, 0).await.unwrap();
             journal.append(make_prepare(1, 64)).await.unwrap();
             journal.append(make_prepare(2, 128)).await.unwrap();
-            journal.storage.fsync().unwrap();
+            journal.storage.fsync().await.unwrap();
         }
 
         // Simulate crash: truncate the file to cut the second entry short
         {
-            let storage = FileStorage::open(&path).unwrap();
+            let storage = FileStorage::open(&path).await.unwrap();
             let full_len = storage.file_len();
             // Remove the last 10 bytes (partial second entry)
-            storage.truncate(full_len - 10).unwrap();
-            storage.fsync().unwrap();
+            storage.truncate(full_len - 10).await.unwrap();
+            storage.fsync().await.unwrap();
         }
 
         // Reopen, should recover only the first entry
-        let journal = MetadataJournal::open(&path, 0).unwrap();
+        let journal = MetadataJournal::open(&path, 0).await.unwrap();
         assert_eq!(journal.last_op(), Some(1));
         assert!(journal.header(2).is_none());
 
-        let h1 = journal.header(1).unwrap();
-        let entry = journal.entry_sync(&h1).unwrap().unwrap();
+        let h1 = *journal.header(1).unwrap();
+        let entry = journal.entry_at(&h1).await.unwrap().unwrap();
         assert_eq!(entry.header().op, 1);
     }
 
-    #[test]
-    fn iter_headers_from() {
+    #[compio::test]
+    async fn iter_headers_from() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let journal = MetadataJournal::open(&path, 0).unwrap();
+        let journal = MetadataJournal::open(&path, 0).await.unwrap();
 
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            journal.append(make_prepare(1, 32)).await.unwrap();
-            journal.append(make_prepare(2, 32)).await.unwrap();
-            journal.append(make_prepare(3, 32)).await.unwrap();
-            journal.append(make_prepare(5, 32)).await.unwrap();
-        });
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        journal.append(make_prepare(2, 32)).await.unwrap();
+        journal.append(make_prepare(3, 32)).await.unwrap();
+        journal.append(make_prepare(5, 32)).await.unwrap();
 
         let from_2 = journal.iter_headers_from(2);
         assert_eq!(from_2.len(), 3);
@@ -576,16 +587,14 @@ mod tests {
         assert!(from_10.is_empty());
     }
 
-    #[test]
-    fn previous_header_navigation() {
+    #[compio::test]
+    async fn previous_header_navigation() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let journal = MetadataJournal::open(&path, 0).unwrap();
+        let journal = MetadataJournal::open(&path, 0).await.unwrap();
 
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            journal.append(make_prepare(0, 32)).await.unwrap();
-            journal.append(make_prepare(1, 32)).await.unwrap();
-        });
+        journal.append(make_prepare(0, 32)).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
 
         let h1 = journal.header(1).unwrap();
         let h0 = journal.previous_header(&h1).unwrap();
@@ -593,24 +602,22 @@ mod tests {
         assert!(journal.previous_header(&h0).is_none());
     }
 
-    #[test]
-    fn slot_wraparound_evicts_snapshotted_entry() {
+    #[compio::test]
+    async fn slot_wraparound_evicts_snapshotted_entry() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let journal = MetadataJournal::open(&path, 0).unwrap();
+        let journal = MetadataJournal::open(&path, 0).await.unwrap();
 
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            // Op 3 goes to slot 3
-            journal.append(make_prepare(3, 32)).await.unwrap();
-            // Mark op 3 as snapshotted — safe to evict
-            journal.set_snapshot_op(3);
-            // Op 3 + SLOT_COUNT goes to the same slot, evicting op 3
-            let wraparound_op = 3 + SLOT_COUNT as u64;
-            journal
-                .append(make_prepare(wraparound_op, 32))
-                .await
-                .unwrap();
-        });
+        // Op 3 goes to slot 3
+        journal.append(make_prepare(3, 32)).await.unwrap();
+        // Mark op 3 as snapshotted — safe to evict
+        journal.set_snapshot_op(3);
+        // Op 3 + SLOT_COUNT goes to the same slot, evicting op 3
+        let wraparound_op = 3 + SLOT_COUNT as u64;
+        journal
+            .append(make_prepare(wraparound_op, 32))
+            .await
+            .unwrap();
 
         // Op 3 is evicted from the index
         assert!(journal.header(3).is_none());
@@ -623,7 +630,7 @@ mod tests {
     async fn compact_shrinks_wal_and_preserves_live_entries() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let journal = MetadataJournal::open(&path, 0).unwrap();
+        let journal = MetadataJournal::open(&path, 0).await.unwrap();
 
         // Append 5 entries
         for op in 1..=5 {
@@ -633,7 +640,7 @@ mod tests {
 
         // Snapshot at op 3, then compact — entries 1-3 should be removed
         journal.set_snapshot_op(3);
-        journal.compact().unwrap();
+        journal.compact().await.unwrap();
 
         let size_after = journal.storage.file_len();
         assert!(
@@ -651,40 +658,38 @@ mod tests {
 
         // Live entries are still readable
         for op in 4..=5 {
-            let h = journal.header(op as usize).unwrap();
+            let h = *journal.header(op as usize).unwrap();
             assert_eq!(h.op, op);
-            let entry = journal.entry_sync(&h).unwrap().unwrap();
+            let entry = journal.entry_at(&h).await.unwrap().unwrap();
             assert_eq!(entry.header().op, op);
             assert_eq!(entry.body().len(), 64);
         }
 
         // Reopen and verify the compacted WAL is valid
         drop(journal);
-        let journal = MetadataJournal::open(&path, 3).unwrap();
+        let journal = MetadataJournal::open(&path, 3).await.unwrap();
         assert_eq!(journal.last_op(), Some(5));
         for op in 4..=5 {
-            let h = journal.header(op as usize).unwrap();
-            let entry = journal.entry_sync(&h).unwrap().unwrap();
+            let h = *journal.header(op as usize).unwrap();
+            let entry = journal.entry_at(&h).await.unwrap().unwrap();
             assert_eq!(entry.header().op, op);
             assert_eq!(entry.body().len(), 64);
         }
     }
 
-    #[test]
+    #[compio::test]
     #[should_panic(expected = "journal slot collision")]
-    fn append_panics_on_evicting_unsnapshotted_entry() {
+    async fn append_panics_on_evicting_unsnapshotted_entry() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let journal = MetadataJournal::open(&path, 0).unwrap();
+        let journal = MetadataJournal::open(&path, 0).await.unwrap();
 
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            journal.append(make_prepare(3, 32)).await.unwrap();
-            // No snapshot taken, evicting op 3 must panic
-            let wraparound_op = 3 + SLOT_COUNT as u64;
-            journal
-                .append(make_prepare(wraparound_op, 32))
-                .await
-                .unwrap();
-        });
+        journal.append(make_prepare(3, 32)).await.unwrap();
+        // No snapshot taken, evicting op 3 must panic
+        let wraparound_op = 3 + SLOT_COUNT as u64;
+        journal
+            .append(make_prepare(wraparound_op, 32))
+            .await
+            .unwrap();
     }
 }

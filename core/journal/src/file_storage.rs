@@ -16,32 +16,34 @@
 // under the License.
 
 use crate::Storage;
+use compio::buf::IoBuf;
+use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use std::cell::{Cell, RefCell};
-use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 /// File-backed storage implementing the `Storage` trait.
 pub struct FileStorage {
-    file: RefCell<File>,
+    file: RefCell<compio::fs::File>,
     write_offset: Cell<u64>,
     path: PathBuf,
 }
 
+#[allow(clippy::future_not_send, clippy::await_holding_refcell_ref)]
 impl FileStorage {
     /// Open or create the file at `path`, setting `write_offset` to current file length.
     ///
     /// # Errors
     /// Returns an I/O error if the file cannot be opened or created.
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
+    pub async fn open(path: &Path) -> io::Result<Self> {
+        let file = compio::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)?;
-        let len = file.metadata()?.len();
+            .open(path)
+            .await?;
+        let len = file.metadata().await?.len();
         Ok(Self {
             file: RefCell::new(file),
             write_offset: Cell::new(len),
@@ -58,8 +60,8 @@ impl FileStorage {
     ///
     /// # Errors
     /// Returns an I/O error if truncation fails.
-    pub fn truncate(&self, len: u64) -> io::Result<()> {
-        self.file.borrow().set_len(len)?;
+    pub async fn truncate(&self, len: u64) -> io::Result<()> {
+        self.file.borrow().set_len(len).await?;
         self.write_offset.set(len);
         Ok(())
     }
@@ -68,16 +70,18 @@ impl FileStorage {
     ///
     /// # Errors
     /// Returns an I/O error if sync fails.
-    pub fn fsync(&self) -> io::Result<()> {
-        self.file.borrow().sync_data()
+    pub async fn fsync(&self) -> io::Result<()> {
+        self.file.borrow().sync_data().await
     }
 
-    /// Positional read into `buf`.
+    /// Positional read into `buf`. Returns the buffer with data filled in.
     ///
     /// # Errors
     /// Returns an I/O error if the read fails.
-    pub fn read_sync(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.file.borrow().read_exact_at(buf, offset)
+    pub async fn read_at(&self, offset: u64, buf: Vec<u8>) -> io::Result<Vec<u8>> {
+        let (result, buf) = self.file.borrow().read_exact_at(buf, offset).await.into();
+        result?;
+        Ok(buf)
     }
 
     /// Append write, returns bytes written.
@@ -85,11 +89,12 @@ impl FileStorage {
     /// # Errors
     /// Returns an I/O error if the write fails.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn write_sync(&self, buf: &[u8]) -> io::Result<usize> {
-        self.file
-            .borrow()
-            .write_all_at(buf, self.write_offset.get())?;
-        let len = buf.len();
+    pub async fn write_append<B: IoBuf>(&self, buf: B) -> io::Result<usize> {
+        let len = buf.buf_len();
+        let mut file = self.file.borrow_mut();
+        let (result, _buf) = file.write_all_at(buf, self.write_offset.get()).await.into();
+        drop(file);
+        result?;
         self.write_offset.set(self.write_offset.get() + len as u64);
         Ok(len)
     }
@@ -105,9 +110,13 @@ impl FileStorage {
     ///
     /// # Errors
     /// Returns an I/O error if the file cannot be reopened.
-    pub fn reopen(&self) -> io::Result<()> {
-        let file = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        let len = file.metadata()?.len();
+    pub async fn reopen(&self) -> io::Result<()> {
+        let file = compio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .await?;
+        let len = file.metadata().await?.len();
         *self.file.borrow_mut() = file;
         self.write_offset.set(len);
         Ok(())
@@ -119,11 +128,10 @@ impl Storage for FileStorage {
     type Buffer = Vec<u8>;
 
     async fn write(&self, buf: Self::Buffer) -> io::Result<usize> {
-        self.write_sync(&buf)
+        self.write_append(buf).await
     }
 
-    async fn read(&self, offset: usize, mut buffer: Self::Buffer) -> io::Result<Self::Buffer> {
-        self.read_sync(offset as u64, &mut buffer)?;
-        Ok(buffer)
+    async fn read(&self, offset: usize, buffer: Self::Buffer) -> io::Result<Self::Buffer> {
+        self.read_at(offset as u64, buffer).await
     }
 }

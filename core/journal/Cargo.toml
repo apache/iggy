@@ -30,10 +30,10 @@ readme = "../../../README.md"
 [dependencies]
 bytemuck = { workspace = true }
 bytes = { workspace = true }
+compio = { workspace = true }
 iggy_common = { workspace = true }
 
 [dev-dependencies]
-compio = { workspace = true }
 tempfile = { workspace = true }
 
 [lints.clippy]

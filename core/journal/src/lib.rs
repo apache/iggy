@@ -53,8 +53,8 @@ where
     ///
     /// # Errors
     /// Returns an I/O error if compaction fails.
-    fn compact(&self) -> io::Result<()> {
-        Ok(())
+    fn compact(&self) -> impl Future<Output = io::Result<()>> {
+        async { Ok(()) }
     }
 }
 
