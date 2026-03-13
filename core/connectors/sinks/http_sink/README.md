@@ -211,6 +211,413 @@ Attempt 4: min(retry_delay * backoff^3, max_retry_delay) (8s, capped to 30s)
 
 **Partial delivery** (`individual`/`raw` modes): If a message fails after exhausting retries, subsequent messages continue processing. After 3 consecutive HTTP failures, the remaining batch is aborted to avoid hammering a dead endpoint.
 
+## Use Cases
+
+### Webhook Delivery
+
+Forward stream events to webhook endpoints (Slack, PagerDuty, GitHub, custom). Use `individual` mode for one notification per event:
+
+```toml
+[plugin_config]
+url = "https://hooks.slack.com/services/T00/B00/xxx"
+batch_mode = "individual"
+include_metadata = false    # Slack expects bare JSON payload
+```
+
+### REST API Ingestion
+
+Push data into downstream REST APIs (analytics, CRM, data warehouse loaders). Use `ndjson` or `json_array` for bulk efficiency:
+
+```toml
+[plugin_config]
+url = "https://analytics.example.com/v1/events"
+batch_mode = "ndjson"
+include_metadata = true     # downstream can route by iggy_stream/iggy_topic
+
+[plugin_config.headers]
+Authorization = "Bearer my-api-token"
+```
+
+### Serverless Function Trigger
+
+Invoke AWS Lambda, Google Cloud Functions, or Azure Functions via their HTTP endpoints:
+
+```toml
+[plugin_config]
+url = "https://abc123.execute-api.us-east-1.amazonaws.com/prod/ingest"
+batch_mode = "json_array"
+timeout = "10s"
+
+[plugin_config.headers]
+x-api-key = "my-api-key"
+```
+
+### IoT / Sensor Data Relay
+
+Forward binary sensor payloads to processing services without JSON overhead:
+
+```toml
+[[streams]]
+stream = "sensors"
+topics = ["temperature", "pressure"]
+schema = "raw"
+batch_length = 200
+poll_interval = "50ms"
+consumer_group = "sensor_relay"
+
+[plugin_config]
+url = "https://iot-gateway.example.com/ingest"
+batch_mode = "raw"
+max_retries = 5
+timeout = "5s"
+```
+
+### Multi-Service Event Fan-Out
+
+Route different event types to their respective microservices. See [Deployment Patterns](#deployment-patterns) for how to set this up with multiple connector instances.
+
+### Observability Pipeline
+
+Forward structured logs or metrics from Iggy streams to external observability platforms:
+
+```toml
+[[streams]]
+stream = "logs"
+topics = ["application", "infrastructure", "security"]
+schema = "json"
+batch_length = 500
+poll_interval = "200ms"
+consumer_group = "log_forwarder"
+
+[plugin_config]
+url = "https://logs.example.com/api/v1/ingest"
+batch_mode = "ndjson"
+max_connections = 20
+timeout = "60s"
+max_payload_size_bytes = 52428800   # 50MB for large log batches
+include_metadata = true             # iggy_stream/iggy_topic for routing
+
+[plugin_config.headers]
+Authorization = "Bearer observability-token"
+```
+
+## Authentication
+
+The HTTP sink supports authentication via custom headers in `[plugin_config.headers]`. All headers are sent with every request, including health checks.
+
+### Bearer Token
+
+```toml
+[plugin_config.headers]
+Authorization = "Bearer eyJhbGciOiJSUzI1NiIs..."
+```
+
+### API Key
+
+```toml
+[plugin_config.headers]
+x-api-key = "my-secret-api-key"
+```
+
+### Basic Auth
+
+```toml
+[plugin_config.headers]
+# Base64-encoded "username:password"
+Authorization = "Basic dXNlcm5hbWU6cGFzc3dvcmQ="
+```
+
+### Multiple Auth Headers
+
+Some services require multiple authentication headers (e.g., API key + tenant ID):
+
+```toml
+[plugin_config.headers]
+Authorization = "Bearer token"
+X-Tenant-ID = "tenant-123"
+X-Client-Version = "iggy-http-sink/0.1"
+```
+
+### Limitations
+
+- **No OAuth2 / OIDC token refresh**: Bearer tokens are static. For services requiring token rotation, use an auth proxy (e.g., OAuth2 Proxy, Envoy with ext_authz) that handles token lifecycle and forwards requests to the upstream.
+- **No AWS SigV4 signing**: For AWS services (API Gateway with IAM auth, S3, etc.), place the connector behind an API Gateway endpoint with API key auth, or use a signing proxy.
+- **No mTLS client certificates**: Use `tls_danger_accept_invalid_certs` only for development. For production mTLS, terminate at a sidecar proxy.
+- **Secrets in config file**: Header values (including tokens) are stored in plaintext in `config.toml`. Protect the config file with appropriate file permissions. Environment variable expansion in config values is not currently supported by the connector runtime.
+
+## Deployment Patterns
+
+The connector runtime binds a single `[plugin_config]` (including `url`) to all streams configured in that connector instance. To route different topics to different destinations, deploy multiple connector instances with separate config files.
+
+### Single Destination, Multiple Topics
+
+When all topics go to the same endpoint, use one connector with multiple `[[streams]]` entries. The downstream service can distinguish topics via the `iggy_stream` and `iggy_topic` fields in the metadata envelope.
+
+```
+┌─────────────────────────┐      ┌────────────────────────┐
+│  Iggy Server            │      │  HTTP Endpoint         │
+│  ├── stream: events     │      │  POST /ingest          │
+│  │   ├── topic: clicks  │─────▶│  (routes internally    │
+│  │   └── topic: views   │      │   by iggy_topic)       │
+│  └── stream: orders     │      │                        │
+│      └── topic: created │─────▶│                        │
+└─────────────────────────┘      └────────────────────────┘
+         connector-a (single instance)
+```
+
+**`connector-a/sink.toml`**:
+
+```toml
+type = "sink"
+key = "http"
+enabled = true
+version = 0
+name = "all_events"
+path = "target/release/libiggy_connector_http_sink"
+
+[[streams]]
+stream = "events"
+topics = ["clicks", "views"]
+schema = "json"
+batch_length = 100
+poll_interval = "100ms"
+consumer_group = "http_sink_events"
+
+[[streams]]
+stream = "orders"
+topics = ["created"]
+schema = "json"
+batch_length = 50
+poll_interval = "200ms"
+consumer_group = "http_sink_orders"
+
+[plugin_config]
+url = "https://api.example.com/ingest"
+batch_mode = "ndjson"
+include_metadata = true
+
+[plugin_config.headers]
+Authorization = "Bearer shared-token"
+```
+
+### Multiple Destinations (One Connector Per Destination)
+
+When different topics need to go to different services, deploy separate connector instances. Each gets its own config directory and runs as a separate `iggy-connectors` process.
+
+```
+┌───────────────────┐
+│  Iggy Server      │
+│  └── stream: app  │
+│      ├── clicks ──┼──▶  connector-analytics ──▶ analytics-api.example.com
+│      ├── orders ──┼──▶  connector-billing   ──▶ billing-api.example.com
+│      └── alerts ──┼──▶  connector-slack     ──▶ hooks.slack.com
+└───────────────────┘
+     3 separate connector instances
+```
+
+**Directory layout**:
+
+```
+/opt/connectors/
+├── analytics/
+│   ├── config.toml           # shared iggy connection settings
+│   └── connectors/
+│       └── sink.toml         # clicks → analytics API
+├── billing/
+│   ├── config.toml
+│   └── connectors/
+│       └── sink.toml         # orders → billing API
+└── slack/
+    ├── config.toml
+    └── connectors/
+        └── sink.toml         # alerts → Slack webhook
+```
+
+**`analytics/connectors/sink.toml`**:
+
+```toml
+type = "sink"
+key = "http"
+enabled = true
+version = 0
+name = "analytics"
+path = "/opt/connectors/libiggy_connector_http_sink"
+
+[[streams]]
+stream = "app"
+topics = ["clicks"]
+schema = "json"
+batch_length = 500
+poll_interval = "50ms"
+consumer_group = "analytics_sink"
+
+[plugin_config]
+url = "https://analytics-api.example.com/v1/events"
+batch_mode = "ndjson"
+max_connections = 20
+
+[plugin_config.headers]
+Authorization = "Bearer analytics-token"
+```
+
+**`billing/connectors/sink.toml`**:
+
+```toml
+type = "sink"
+key = "http"
+enabled = true
+version = 0
+name = "billing"
+path = "/opt/connectors/libiggy_connector_http_sink"
+
+[[streams]]
+stream = "app"
+topics = ["orders"]
+schema = "json"
+batch_length = 50
+poll_interval = "200ms"
+consumer_group = "billing_sink"
+
+[plugin_config]
+url = "https://billing-api.example.com/v2/orders"
+batch_mode = "individual"
+include_metadata = false
+timeout = "10s"
+
+[plugin_config.headers]
+Authorization = "Basic YmlsbGluZzpzZWNyZXQ="
+X-Idempotency-Source = "iggy"
+```
+
+**`slack/connectors/sink.toml`**:
+
+```toml
+type = "sink"
+key = "http"
+enabled = true
+version = 0
+name = "slack_alerts"
+path = "/opt/connectors/libiggy_connector_http_sink"
+
+[[streams]]
+stream = "app"
+topics = ["alerts"]
+schema = "json"
+batch_length = 1
+poll_interval = "500ms"
+consumer_group = "slack_sink"
+
+[plugin_config]
+url = "https://hooks.slack.com/services/T00/B00/xxx"
+batch_mode = "individual"
+include_metadata = false
+max_retries = 5
+```
+
+**Running** (3 processes, or 3 containers in Docker/ECS):
+
+```bash
+IGGY_CONNECTORS_CONFIG_PATH=/opt/connectors/analytics/config.toml iggy-connectors &
+IGGY_CONNECTORS_CONFIG_PATH=/opt/connectors/billing/config.toml  iggy-connectors &
+IGGY_CONNECTORS_CONFIG_PATH=/opt/connectors/slack/config.toml    iggy-connectors &
+```
+
+### Fan-Out: One Topic to Multiple Destinations
+
+When a single topic needs to be delivered to multiple HTTP endpoints (e.g., send order events to both the billing service AND an analytics pipeline), deploy multiple connector instances that consume from the **same topic with different consumer groups**.
+
+```
+                              connector-billing  ──▶ billing-api.example.com
+                             (consumer_group: billing_sink)
+┌─────────────────┐         /
+│ stream: orders  │────────<
+│ topic: created  │         \
+└─────────────────┘          connector-analytics ──▶ analytics.example.com
+                             (consumer_group: analytics_sink)
+```
+
+Each consumer group maintains its own offset, so both connectors independently receive every message. This is the standard Iggy fan-out pattern — not an antipattern.
+
+**Key requirement**: Each connector instance MUST use a **different `consumer_group`**. If they share a consumer group, messages are load-balanced (split) across instances rather than duplicated.
+
+**`billing/connectors/sink.toml`**:
+
+```toml
+[[streams]]
+stream = "orders"
+topics = ["created"]
+schema = "json"
+consumer_group = "billing_sink"       # unique consumer group
+
+[plugin_config]
+url = "https://billing-api.example.com/v2/orders"
+batch_mode = "individual"
+```
+
+**`analytics/connectors/sink.toml`**:
+
+```toml
+[[streams]]
+stream = "orders"
+topics = ["created"]
+schema = "json"
+consumer_group = "analytics_sink"     # different consumer group = fan-out
+
+[plugin_config]
+url = "https://analytics.example.com/v1/events"
+batch_mode = "ndjson"
+```
+
+### Docker / Container Deployment
+
+Each connector instance maps naturally to a container. Share the compiled `.so`/`.dylib` via a volume mount or bake it into the image:
+
+```dockerfile
+FROM rust:latest AS builder
+WORKDIR /app
+COPY . .
+RUN cargo build -p iggy_connector_http_sink --release
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/libiggy_connector_http_sink.so /opt/connector/
+COPY --from=builder /app/target/release/iggy-connectors /usr/local/bin/
+COPY config/ /opt/connector/config/
+ENV IGGY_CONNECTORS_CONFIG_PATH=/opt/connector/config/config.toml
+CMD ["iggy-connectors"]
+```
+
+For multiple destinations, run multiple containers from the same image with different config mounts:
+
+```yaml
+# docker-compose.yml
+services:
+  connector-analytics:
+    image: iggy-http-sink
+    volumes:
+      - ./analytics-config:/opt/connector/config
+    environment:
+      IGGY_CONNECTORS_CONFIG_PATH: /opt/connector/config/config.toml
+
+  connector-billing:
+    image: iggy-http-sink
+    volumes:
+      - ./billing-config:/opt/connector/config
+    environment:
+      IGGY_CONNECTORS_CONFIG_PATH: /opt/connector/config/config.toml
+```
+
+### Environment Variable Overrides
+
+The connector runtime supports overriding any config field via environment variables using the convention `IGGY_CONNECTORS_SINK_{KEY}_<SECTION>_<FIELD>`. This is useful for keeping secrets out of config files:
+
+```bash
+# Override the URL and auth token at runtime
+export IGGY_CONNECTORS_SINK_HTTP_PLUGIN_CONFIG_URL="https://prod-api.example.com/ingest"
+export IGGY_CONNECTORS_SINK_HTTP_PLUGIN_CONFIG_HEADERS_AUTHORIZATION="Bearer prod-token"
+iggy-connectors
+```
+
 ## Example Configs
 
 ### Lambda Webhook
@@ -225,16 +632,6 @@ include_metadata = true
 
 [plugin_config.headers]
 x-api-key = "my-api-key"
-```
-
-### Slack Notification
-
-```toml
-[plugin_config]
-url = "https://hooks.slack.com/services/T00/B00/xxx"
-method = "POST"
-batch_mode = "individual"
-include_metadata = false
 ```
 
 ### High-Throughput Bulk Ingestion
@@ -257,6 +654,12 @@ Unit tests (no external dependencies):
 cargo test -p iggy_connector_http_sink
 ```
 
+Integration tests (requires Docker for WireMock container):
+
+```bash
+cargo test -p integration --test connectors -- http_sink
+```
+
 ## Delivery Semantics
 
 All retry logic lives inside `consume()`. The connector runtime currently discards the `Result` returned by `consume()` and commits consumer group offsets before processing ([runtime issue #1](#known-limitations)). This means:
@@ -268,12 +671,18 @@ The effective delivery guarantee is **at-most-once** at the runtime level. The s
 
 ## Known Limitations
 
-1. **Runtime discards `consume()` errors**: The connector runtime (`sink.rs:585`) ignores the return value from `consume()`. Errors are logged internally but do not trigger runtime-level retry or alerting.
+1. **Runtime discards `consume()` errors**: The connector runtime (`runtime/src/sink.rs:585`) ignores the return value from `consume()`. Errors are logged internally but do not trigger runtime-level retry or alerting. ([#2927](https://github.com/apache/iggy/issues/2927))
 
-2. **Offsets committed before processing**: The `PollingMessages` auto-commit strategy commits consumer group offsets before `consume()` is called. Combined with limitation 1, at-least-once delivery is not achievable.
+2. **Offsets committed before processing**: The `PollingMessages` auto-commit strategy commits consumer group offsets before `consume()` is called. Combined with limitation 1, at-least-once delivery is not achievable. ([#2928](https://github.com/apache/iggy/issues/2928))
 
-3. **`Retry-After` HTTP-date format not supported**: Only integer `Retry-After` values (delay-seconds) are parsed. HTTP-date format (RFC 7231 §7.1.3) falls back to exponential backoff. This is a v1 limitation.
+3. **`Retry-After` HTTP-date format not supported**: Only integer `Retry-After` values (delay-seconds) are parsed. HTTP-date format (RFC 7231 §7.1.3) falls back to exponential backoff.
 
 4. **No dead letter queue**: Failed messages are logged at `error!` level but not persisted to a DLQ. DLQ support would be a runtime-level feature.
 
 5. **No request signing**: AWS SigV4, HMAC, or other signing schemes are not supported. Use custom headers or an auth proxy for signed endpoints.
+
+6. **No per-topic URL routing**: All topics configured in a single connector instance share the same `url`. For topic-specific routing, deploy separate connector instances (see [Deployment Patterns](#deployment-patterns)). A future enhancement could add a `[plugin_config.routing]` table for URL-per-topic within a single instance.
+
+7. **No OAuth2 token refresh**: Bearer tokens are static. Use an auth proxy for services requiring automatic token rotation.
+
+8. **No environment variable expansion in config values**: Secrets in `[plugin_config.headers]` are stored as plaintext. Use environment variable overrides (see [Environment Variable Overrides](#environment-variable-overrides)) or mount secrets from a secrets manager.
