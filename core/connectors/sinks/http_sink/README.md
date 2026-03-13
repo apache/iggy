@@ -351,7 +351,14 @@ X-Client-Version = "iggy-http-sink/0.1"
 
 A **connector instance** is a single OS process — the `iggy-connectors` binary loading one shared library (`libiggy_connector_http_sink.so`/`.dylib`) with one config file. Each process reads exactly one `config.toml` (set via `IGGY_CONNECTORS_CONFIG_PATH`), which defines one `[plugin_config]` block — including the target `url`, authentication headers, batch mode, and retry settings.
 
-Within that single process, the runtime spawns one async task per topic listed in `[[streams]]`. All tasks share the same HTTP client and the same `[plugin_config]`. There is no built-in orchestrator, no multi-connector-in-one-process mode, and no routing table that maps different topics to different URLs.
+Within that single process, the runtime spawns one async task per topic listed in `[[streams]]`. All tasks share the same plugin instance (and therefore the same HTTP client and `[plugin_config]`). There is no built-in orchestrator, no multi-connector-in-one-process mode, and no routing table that maps different topics to different URLs.
+
+How this works in the runtime source code:
+
+- **One consumer per topic**: The runtime iterates `for topic in stream.topics.iter()` and creates a separate `IggyConsumer` for each topic ([`runtime/src/sink.rs:418`](../../../runtime/src/sink.rs)).
+- **One async task per consumer**: Each consumer is wrapped in `tokio::spawn` ([`runtime/src/sink.rs:211-216`](../../../runtime/src/sink.rs)), so topics are consumed concurrently within the same process.
+- **One plugin instance per connector**: The `sink_connector!` macro creates a `static INSTANCES: DashMap<u32, SinkContainer>` — each connector gets one entry, and all topic tasks call `consume()` on the same instance ([`sdk/src/sink.rs:218-229`](../../sdk/src/sink.rs)).
+- **Sequential consume within each topic**: The runtime awaits `consume()` before polling the next batch — there is no pipelining within a single topic task ([`runtime/src/sink.rs:246-345`](../../../runtime/src/sink.rs)).
 
 **"Deploying multiple instances"** means running N separate `iggy-connectors` processes — each with its own config directory, its own `[plugin_config]` (and therefore its own destination URL, headers, batch mode, etc.). In Docker or Kubernetes, this means N containers from the same image with different config mounts or environment variables. In systemd, N service units. In ECS, N task definitions.
 
@@ -666,13 +673,17 @@ In `ndjson` and `json_array` modes, the entire batch is serialized into memory b
 
 ### Connection Pooling and Keep-Alive
 
-The connector uses reqwest's built-in connection pool with HTTP/1.1 persistent connections (keep-alive):
+The connector builds one `reqwest::Client` per plugin instance (in `open()`). Because the runtime calls `consume()` sequentially within each topic task, a single-topic connector uses at most **one connection at a time**. Multi-topic connectors may use up to N concurrent connections (one per topic task), since each task calls `consume()` independently.
 
-- **`max_connections`** (default: 10) — Maximum idle connections kept warm per host
-- **TCP keep-alive** (30s) — Probes idle connections to detect silent drops by cloud load balancers (ALB drops after ~60s, GCP after ~600s)
-- **Pool idle timeout** (90s) — Closes connections unused for 90 seconds to prevent stale connection accumulation
+reqwest uses HTTP/1.1 persistent connections (keep-alive) by default. The connector configures:
 
-For high-throughput deployments, increase `max_connections` to match expected concurrency. The pool creates additional connections beyond `max_connections` as needed — this setting only controls how many idle connections are retained.
+- **`max_connections`** (default: 10) — Maximum idle connections retained per host. The pool creates additional connections beyond this limit as needed — this setting only controls how many idle connections are kept warm for reuse.
+- **TCP keep-alive** (30s) — Sends TCP keep-alive probes on idle connections to detect silent drops by cloud load balancers. Without this, a connection silently closed by an intermediate LB (AWS ALB drops idle connections after ~60s, GCP after ~600s) would only be discovered on the next HTTP request, causing a failed attempt and retry delay.
+- **Pool idle timeout** (90s) — Closes connections unused for 90 seconds to prevent stale connection accumulation in the pool.
+
+Because `reqwest::Client` clones are cheap (they share the same connection pool via `Arc`), all topic tasks within a single connector process share one pool. This means multi-topic connectors benefit from connection reuse when all topics target the same host — a connection returned to the pool by topic A's task can be reused by topic B's task.
+
+For multiple connector instances (separate processes), each process has its own independent `reqwest::Client` and its own connection pool. There is no cross-process connection sharing.
 
 ### Retry Impact on Throughput
 
