@@ -40,6 +40,13 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
 const DEFAULT_MAX_PAYLOAD_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 const DEFAULT_MAX_CONNECTIONS: usize = 10;
+/// TCP keep-alive interval for detecting dead connections behind load balancers.
+/// Cloud LBs (ALB, GCP) silently drop idle connections after 60-350s;
+/// probing at 30s detects these before requests fail.
+const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
+/// Close pooled connections unused for this long. Prevents stale connections
+/// from accumulating when traffic is bursty.
+const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 /// Abort remaining messages in individual/raw mode after this many consecutive HTTP failures.
 /// Prevents hammering a dead endpoint with N sequential retry cycles per poll.
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -255,6 +262,8 @@ impl HttpSink {
         let builder = reqwest::Client::builder()
             .timeout(self.timeout)
             .pool_max_idle_per_host(self.max_connections)
+            .pool_idle_timeout(Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS))
+            .tcp_keepalive(Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS))
             .danger_accept_invalid_certs(self.tls_danger_accept_invalid_certs);
 
         builder.build().map_err(|e| {
