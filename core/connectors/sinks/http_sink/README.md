@@ -618,6 +618,53 @@ export IGGY_CONNECTORS_SINK_HTTP_PLUGIN_CONFIG_HEADERS_AUTHORIZATION="Bearer pro
 iggy-connectors
 ```
 
+## Performance Considerations
+
+### Batch Mode Selection
+
+The connector runtime calls `consume()` **sequentially** — the next poll cycle does not start until the current batch completes. Batch mode choice directly impacts throughput:
+
+| Mode | HTTP Requests per Poll | Latency per Poll | Best For |
+|------|----------------------|-------------------|----------|
+| `individual` | N (one per message) | N × round-trip | Low-volume webhooks, order-sensitive delivery |
+| `ndjson` | 1 | 1 × round-trip | High-throughput bulk ingestion |
+| `json_array` | 1 | 1 × round-trip | APIs expecting array payloads |
+| `raw` | N (one per message) | N × round-trip | Binary payloads (protobuf, avro) |
+
+With `batch_length=50` in `individual` mode, each poll cycle performs 50 sequential HTTP round trips. If each takes 100ms, the poll cycle takes 5 seconds — during which no new messages are consumed from that topic. Use `ndjson` or `json_array` to collapse this to a single round trip.
+
+### Memory
+
+In `ndjson` and `json_array` modes, the entire batch is serialized into memory before sending. With `batch_length=1000` and 10KB messages, this allocates ~10MB per poll cycle. The `max_payload_size_bytes` check runs **after** serialization (the batch must be built to know its size). For very large batches, tune `batch_length` and `max_payload_size_bytes` together.
+
+### Connection Pooling and Keep-Alive
+
+The connector uses reqwest's built-in connection pool with HTTP/1.1 persistent connections (keep-alive):
+
+- **`max_connections`** (default: 10) — Maximum idle connections kept warm per host
+- **TCP keep-alive** (30s) — Probes idle connections to detect silent drops by cloud load balancers (ALB drops after ~60s, GCP after ~600s)
+- **Pool idle timeout** (90s) — Closes connections unused for 90 seconds to prevent stale connection accumulation
+
+For high-throughput deployments, increase `max_connections` to match expected concurrency. The pool creates additional connections beyond `max_connections` as needed — this setting only controls how many idle connections are retained.
+
+### Retry Impact on Throughput
+
+Each failed message in `individual`/`raw` mode burns through the retry budget (default: 3 retries with exponential backoff up to 30s) before moving to the next message. A dead endpoint with `batch_length=50` and `max_retries=3` could block for: 50 messages × (1s + 2s + 4s) = 350 seconds before the consecutive failure abort kicks in (after 3 consecutive failures).
+
+The consecutive failure abort (`MAX_CONSECUTIVE_FAILURES = 3`) mitigates this: after 3 consecutive HTTP failures, remaining messages in the batch are skipped. This limits worst-case blocking to: 3 × (1s + 2s + 4s + 8s) = 45 seconds.
+
+### Multiple Instances vs. Single Instance
+
+Multiple connector instances (one per destination) provide:
+
+- **Performance isolation**: A slow destination doesn't block other topics
+- **Failure isolation**: One dead endpoint doesn't affect unrelated connectors
+- **Independent tuning**: Different `batch_length`, `timeout`, `max_retries` per destination
+- **Security isolation**: Each instance has its own credentials; compromise of one config doesn't expose others
+- **Independent scaling**: Scale high-volume connectors without over-provisioning low-volume ones
+
+The overhead of multiple processes is minimal — each connector is a single-threaded async runtime consuming <10MB RSS at idle.
+
 ## Example Configs
 
 ### Lambda Webhook
