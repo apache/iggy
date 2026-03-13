@@ -347,9 +347,30 @@ X-Client-Version = "iggy-http-sink/0.1"
 
 ## Deployment Patterns
 
-The connector runtime binds a single `[plugin_config]` (including `url`) to all streams configured in that connector instance. To route different topics to different destinations, deploy multiple connector instances with separate config files.
+### Connector Runtime Model
+
+A **connector instance** is a single OS process — the `iggy-connectors` binary loading one shared library (`libiggy_connector_http_sink.so`/`.dylib`) with one config file. Each process reads exactly one `config.toml` (set via `IGGY_CONNECTORS_CONFIG_PATH`), which defines one `[plugin_config]` block — including the target `url`, authentication headers, batch mode, and retry settings.
+
+Within that single process, the runtime spawns one async task per topic listed in `[[streams]]`. All tasks share the same HTTP client and the same `[plugin_config]`. There is no built-in orchestrator, no multi-connector-in-one-process mode, and no routing table that maps different topics to different URLs.
+
+**"Deploying multiple instances"** means running N separate `iggy-connectors` processes — each with its own config directory, its own `[plugin_config]` (and therefore its own destination URL, headers, batch mode, etc.). In Docker or Kubernetes, this means N containers from the same image with different config mounts or environment variables. In systemd, N service units. In ECS, N task definitions.
+
+### What's Achievable Today vs. Not
+
+| Pattern | Achievable Today | How |
+|---------|:---:|-----|
+| Single destination, single topic | Yes | One connector instance, one `[[streams]]` entry |
+| Single destination, multiple topics | Yes | One connector instance, multiple topics in `[[streams]]` |
+| Multiple destinations (topic-per-destination) | Yes | N connector instances, one per destination, each a separate OS process |
+| Fan-out (same topic to multiple destinations) | Yes | N connector instances consuming same topic with different `consumer_group` names |
+| Per-topic URL routing within one instance | **No** | Not supported — each instance has exactly one `url`. Requires N instances. See [Known Limitations](#known-limitations) item 6 |
+| OAuth2 / OIDC token refresh | **No** | Static headers only. Use an auth proxy |
+| mTLS client certificates | **No** | Use a sidecar proxy for mTLS termination |
+| Environment variable expansion in config values | **No** | Use env var overrides at the process level (see [Environment Variable Overrides](#environment-variable-overrides)) |
 
 ### Single Destination, Multiple Topics
+
+*Achievable today — single connector instance.*
 
 When all topics go to the same endpoint, use one connector with multiple `[[streams]]` entries. The downstream service can distinguish topics via the `iggy_stream` and `iggy_topic` fields in the metadata envelope.
 
@@ -402,7 +423,9 @@ Authorization = "Bearer shared-token"
 
 ### Multiple Destinations (One Connector Per Destination)
 
-When different topics need to go to different services, deploy separate connector instances. Each gets its own config directory and runs as a separate `iggy-connectors` process.
+*Achievable today — requires N separate OS processes.*
+
+When different topics need to go to different services, deploy separate connector instances. Each gets its own config directory and runs as a **separate `iggy-connectors` process** (not a config option within one process — see [Connector Runtime Model](#connector-runtime-model)).
 
 ```
 ┌───────────────────┐
@@ -524,7 +547,9 @@ IGGY_CONNECTORS_CONFIG_PATH=/opt/connectors/slack/config.toml    iggy-connectors
 
 ### Fan-Out: One Topic to Multiple Destinations
 
-When a single topic needs to be delivered to multiple HTTP endpoints (e.g., send order events to both the billing service AND an analytics pipeline), deploy multiple connector instances that consume from the **same topic with different consumer groups**.
+*Achievable today — requires N separate OS processes with different consumer groups.*
+
+When a single topic needs to be delivered to multiple HTTP endpoints (e.g., send order events to both the billing service AND an analytics pipeline), deploy multiple connector instances that consume from the **same topic with different consumer groups**. Each instance is a separate `iggy-connectors` process (see [Connector Runtime Model](#connector-runtime-model)).
 
 ```
                               connector-billing  ──▶ billing-api.example.com
@@ -570,7 +595,9 @@ batch_mode = "ndjson"
 
 ### Docker / Container Deployment
 
-Each connector instance maps naturally to a container. Share the compiled `.so`/`.dylib` via a volume mount or bake it into the image:
+*Achievable today.*
+
+Each connector instance maps naturally to one container (one process = one container). Share the compiled `.so`/`.dylib` via a volume mount or bake it into the image:
 
 ```dockerfile
 FROM rust:latest AS builder
