@@ -51,7 +51,7 @@ const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 /// Prevents hammering a dead endpoint with N sequential retry cycles per poll.
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
-/// HTTP method enum — validated at deserialization, prevents invalid values like "DELET" or "GETS".
+/// HTTP method enum — validated at deserialization, prevents invalid values like "DELEET" or "GETX".
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum HttpMethod {
@@ -1430,7 +1430,7 @@ mod tests {
 
     #[test]
     fn given_invalid_method_string_should_fail_deserialization() {
-        let result: Result<HttpMethod, _> = serde_json::from_str("\"DELET\"");
+        let result: Result<HttpMethod, _> = serde_json::from_str("\"DELEET\"");
         assert!(result.is_err());
     }
 
@@ -1804,7 +1804,7 @@ mod tests {
     fn given_invalid_method_in_toml_should_fail() {
         let toml_str = r#"
             url = "https://example.com"
-            method = "DELET"
+            method = "DELEET"
         "#;
         let result: Result<HttpSinkConfig, _> = toml::from_str(toml_str);
         assert!(result.is_err());

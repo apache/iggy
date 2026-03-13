@@ -53,10 +53,8 @@ pub(super) const ENV_SINK_INCLUDE_METADATA: &str =
     "IGGY_CONNECTORS_SINK_HTTP_PLUGIN_CONFIG_INCLUDE_METADATA";
 pub(super) const ENV_SINK_METHOD: &str = "IGGY_CONNECTORS_SINK_HTTP_PLUGIN_CONFIG_METHOD";
 pub(super) const ENV_SINK_TIMEOUT: &str = "IGGY_CONNECTORS_SINK_HTTP_PLUGIN_CONFIG_TIMEOUT";
-pub(super) const ENV_SINK_MAX_RETRIES: &str =
-    "IGGY_CONNECTORS_SINK_HTTP_PLUGIN_CONFIG_MAX_RETRIES";
-pub(super) const ENV_SINK_RETRY_DELAY: &str =
-    "IGGY_CONNECTORS_SINK_HTTP_PLUGIN_CONFIG_RETRY_DELAY";
+pub(super) const ENV_SINK_MAX_RETRIES: &str = "IGGY_CONNECTORS_SINK_HTTP_PLUGIN_CONFIG_MAX_RETRIES";
+pub(super) const ENV_SINK_RETRY_DELAY: &str = "IGGY_CONNECTORS_SINK_HTTP_PLUGIN_CONFIG_RETRY_DELAY";
 pub(super) const ENV_SINK_VERBOSE_LOGGING: &str =
     "IGGY_CONNECTORS_SINK_HTTP_PLUGIN_CONFIG_VERBOSE_LOGGING";
 
@@ -121,38 +119,30 @@ impl HttpSinkWireMockContainer {
     }
 
     /// Query WireMock's admin API and return all received requests.
-    pub async fn get_received_requests(
-        &self,
-    ) -> Result<Vec<WireMockRequest>, TestBinaryError> {
+    pub async fn get_received_requests(&self) -> Result<Vec<WireMockRequest>, TestBinaryError> {
         let url = format!("{}/__admin/requests", self.base_url);
-        let response = reqwest::get(&url).await.map_err(|e| {
-            TestBinaryError::InvalidState {
+        let response = reqwest::get(&url)
+            .await
+            .map_err(|e| TestBinaryError::InvalidState {
                 message: format!("Failed to query WireMock admin API: {e}"),
-            }
-        })?;
+            })?;
 
         let body: serde_json::Value =
-            response.json().await.map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to parse WireMock admin response: {e}"),
-            })?;
+            response
+                .json()
+                .await
+                .map_err(|e| TestBinaryError::InvalidState {
+                    message: format!("Failed to parse WireMock admin response: {e}"),
+                })?;
 
         let requests = body["requests"]
             .as_array()
             .unwrap_or(&vec![])
             .iter()
             .map(|r| WireMockRequest {
-                method: r["request"]["method"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string(),
-                url: r["request"]["url"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string(),
-                body: r["request"]["body"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string(),
+                method: r["request"]["method"].as_str().unwrap_or("").to_string(),
+                url: r["request"]["url"].as_str().unwrap_or("").to_string(),
+                body: r["request"]["body"].as_str().unwrap_or("").to_string(),
                 headers: r["request"]["headers"].clone(),
             })
             .collect();
