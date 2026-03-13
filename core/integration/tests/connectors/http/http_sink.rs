@@ -23,9 +23,9 @@ use crate::connectors::fixtures::{
     HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture, HttpSinkRawFixture,
 };
 use bytes::Bytes;
-use iggy::prelude::{IggyMessage, Partitioning};
+use iggy::prelude::{IggyMessage, Partitioning, TopicClient};
 use iggy_binary_protocol::MessageClient;
-use iggy_common::Identifier;
+use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
 use integration::harness::seeds;
 use integration::iggy_harness;
 
@@ -525,12 +525,20 @@ async fn individual_messages_have_sequential_offsets(
     }
 }
 
+/// Second topic name for the multi-topic test. Defined locally to avoid
+/// polluting the shared harness seeds with HTTP-sink-specific constants.
+const TEST_TOPIC_2: &str = "test_topic_2";
+
 /// Multi-topic deployment pattern: one connector consuming from two topics on the
 /// same stream. The runtime spawns separate tasks for each topic and all messages
 /// arrive at the same WireMock endpoint, differentiated by `iggy_topic` metadata.
+///
+/// Uses the standard `connector_stream` seed (creates stream + test_topic), then
+/// creates the second topic inline to avoid adding connector-specific seeds to the
+/// shared harness.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
-    seed = seeds::connector_multi_topic_stream
+    seed = seeds::connector_stream
 )]
 async fn multi_topic_messages_delivered_with_correct_topic_metadata(
     harness: &TestHarness,
@@ -539,7 +547,21 @@ async fn multi_topic_messages_delivered_with_correct_topic_metadata(
     let client = harness.root_client().await.unwrap();
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_1_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
-    let topic_2_id: Identifier = seeds::names::TOPIC_2.try_into().unwrap();
+
+    // Create second topic inline — seed only creates the first topic
+    client
+        .create_topic(
+            &stream_id,
+            TEST_TOPIC_2,
+            1,
+            CompressionAlgorithm::None,
+            None,
+            IggyExpiry::ServerDefault,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .expect("Failed to create second topic");
+    let topic_2_id: Identifier = TEST_TOPIC_2.try_into().unwrap();
 
     // Send 2 messages to topic 1
     let mut topic_1_messages: Vec<IggyMessage> = vec![
@@ -611,14 +633,14 @@ async fn multi_topic_messages_delivered_with_correct_topic_metadata(
             });
 
         match iggy_topic {
-            "test_topic" => {
+            t if t == seeds::names::TOPIC => {
                 topic_1_count += 1;
                 let source = body["payload"]["source"]
                     .as_str()
                     .expect("Missing source field");
                 assert_eq!(source, "topic_1", "Topic 1 message has wrong source");
             }
-            "test_topic_2" => {
+            t if t == TEST_TOPIC_2 => {
                 topic_2_count += 1;
                 let source = body["payload"]["source"]
                     .as_str()

@@ -234,10 +234,9 @@ Set `include_metadata = false` to send the raw payload without wrapping.
 Exponential backoff with configurable parameters:
 
 ```
-Attempt 1: retry_delay (1s)
-Attempt 2: retry_delay * backoff_multiplier (2s)
-Attempt 3: retry_delay * backoff^2 (4s)
-Attempt 4: min(retry_delay * backoff^3, max_retry_delay) (8s, capped to 30s)
+Attempt 1: retry_delay = 1s
+Attempt 2: retry_delay * backoff = 2s
+Attempt 3: retry_delay * backoff^2 = min(4s, 30s) = 4s
 ```
 
 **Transient errors** (retry): Network errors, HTTP 429, 500, 502, 503, 504.
@@ -392,10 +391,10 @@ Within that single process, the runtime spawns one async task per topic listed i
 
 How this works in the runtime source code:
 
-- **One consumer per topic**: The runtime iterates `for topic in stream.topics.iter()` and creates a separate `IggyConsumer` for each topic ([`runtime/src/sink.rs:418`](../../../runtime/src/sink.rs)).
-- **One async task per consumer**: Each consumer is wrapped in `tokio::spawn` ([`runtime/src/sink.rs:211-216`](../../../runtime/src/sink.rs)), so topics are consumed concurrently within the same process.
-- **One plugin instance per connector**: The `sink_connector!` macro creates a `static INSTANCES: DashMap<u32, SinkContainer>` — each connector gets one entry, and all topic tasks call `consume()` on the same instance ([`sdk/src/sink.rs:218-229`](../../sdk/src/sink.rs)).
-- **Sequential consume within each topic**: The runtime awaits `consume()` before polling the next batch — there is no pipelining within a single topic task ([`runtime/src/sink.rs:246-345`](../../../runtime/src/sink.rs)).
+- **One consumer per topic**: `setup_sink_consumers()` in [`runtime/src/sink.rs`](../../../runtime/src/sink.rs) iterates `for topic in stream.topics.iter()` and creates a separate `IggyConsumer` for each topic.
+- **One async task per consumer**: `spawn_consume_tasks()` in [`runtime/src/sink.rs`](../../../runtime/src/sink.rs) wraps each consumer in `tokio::spawn`, so topics are consumed concurrently within the same process.
+- **One plugin instance per ID**: The `sink_connector!` macro in [`sdk/src/sink.rs`](../../sdk/src/sink.rs) creates a `static INSTANCES: DashMap<u32, SinkContainer>` — each `plugin_id` passed to `iggy_sink_open` gets its own entry, and all topic tasks call `consume()` on the same instance.
+- **Sequential consume within each topic**: `consume_messages()` in [`runtime/src/sink.rs`](../../../runtime/src/sink.rs) awaits `consume()` before polling the next batch — there is no pipelining within a single topic task.
 
 **"Deploying multiple instances"** means running N separate `iggy-connectors` processes — each with its own config directory, its own `[plugin_config]` (and therefore its own destination URL, headers, batch mode, etc.). In Docker or Kubernetes, this means N containers from the same image with different config mounts or environment variables. In systemd, N service units. In ECS, N task definitions.
 
@@ -724,9 +723,9 @@ For multiple connector instances (separate processes), each process has its own 
 
 ### Retry Impact on Throughput
 
-Each failed message in `individual`/`raw` mode burns through the retry budget (default: 3 retries with exponential backoff up to 30s) before moving to the next message. A dead endpoint with `batch_length=50` and `max_retries=3` could block for: 50 messages × (1s + 2s + 4s) = 350 seconds before the consecutive failure abort kicks in (after 3 consecutive failures).
+Each failed message in `individual`/`raw` mode burns through the retry budget (default: 3 retries with exponential backoff up to 30s) before moving to the next message. The backoff delays are 1s + 2s + 4s = 7 seconds per message, but each attempt also incurs the request timeout (default 30s) for a dead endpoint. Worst case per message: 4 attempts × 30s timeout + 7s backoff = 127 seconds.
 
-The consecutive failure abort (`MAX_CONSECUTIVE_FAILURES = 3`) mitigates this: after 3 consecutive HTTP failures, remaining messages in the batch are skipped. This limits worst-case blocking to: 3 × (1s + 2s + 4s + 8s) = 45 seconds.
+The consecutive failure abort (`MAX_CONSECUTIVE_FAILURES = 3`) mitigates this: after 3 consecutive HTTP failures, remaining messages in the batch are skipped. This limits worst-case blocking to: 3 × (4 × 30s + 1s + 2s + 4s) = 381 seconds with default timeout, or 3 × 7s = 21 seconds of backoff delay alone.
 
 ### Multiple Instances vs. Single Instance
 
@@ -738,7 +737,7 @@ Multiple connector instances (one per destination) provide:
 - **Security isolation**: Each instance has its own credentials; compromise of one config doesn't expose others
 - **Independent scaling**: Scale high-volume connectors without over-provisioning low-volume ones
 
-The overhead of multiple processes is minimal — each connector is a single-threaded async runtime consuming <10MB RSS at idle.
+The overhead of multiple processes is minimal — each connector is a lightweight async runtime with low memory footprint at idle.
 
 ## Example Configs
 
@@ -784,7 +783,7 @@ cargo test -p integration --test connectors -- http_sink
 
 ## Delivery Semantics
 
-All retry logic lives inside `consume()`. The connector runtime currently discards the `Result` returned by `consume()` and commits consumer group offsets before processing ([runtime issue #1](#known-limitations)). This means:
+All retry logic lives inside `consume()`. The connector runtime invokes `consume()` via an FFI callback that returns an `i32` status code. The runtime does not inspect this return value (see `process_messages()` in `runtime/src/sink.rs`), so errors logged by the sink are not propagated to the runtime's retry or alerting mechanisms. Additionally, consumer group offsets are committed before processing ([runtime issue #1](#known-limitations)). This means:
 
 - Failed messages are **not retried by the runtime** — only by the sink's internal retry loop
 - Messages are committed **before delivery** — a crash after commit but before delivery loses messages
@@ -793,7 +792,7 @@ The effective delivery guarantee is **at-most-once** at the runtime level. The s
 
 ## Known Limitations
 
-1. **Runtime discards `consume()` errors**: The connector runtime (`runtime/src/sink.rs:585`) ignores the return value from `consume()`. Errors are logged internally but do not trigger runtime-level retry or alerting. ([#2927](https://github.com/apache/iggy/issues/2927))
+1. **Runtime ignores `consume()` status**: The connector runtime invokes `consume()` via an FFI callback returning `i32`. The `process_messages()` function in `runtime/src/sink.rs` does not inspect the return value. Errors are logged internally by the sink but do not trigger runtime-level retry or alerting. ([#2927](https://github.com/apache/iggy/issues/2927))
 
 2. **Offsets committed before processing**: The `PollingMessages` auto-commit strategy commits consumer group offsets before `consume()` is called. Combined with limitation 1, at-least-once delivery is not achievable. ([#2928](https://github.com/apache/iggy/issues/2928))
 
