@@ -36,6 +36,7 @@ pub mod names {
 
     pub const STREAM: &str = "test_stream";
     pub const TOPIC: &str = "test_topic";
+    pub const TOPIC_2: &str = "test_topic_2";
     pub const MESSAGE_PAYLOAD: &str = "test_message";
     pub const CONSUMER_GROUP: &str = "test_consumer_group";
     pub const CONSUMER: &str = "mcp";
@@ -76,6 +77,39 @@ pub async fn connector_stream(client: &IggyClient) -> Result<(), SeedError> {
         .create_topic(
             &stream_id,
             names::TOPIC,
+            1,
+            CompressionAlgorithm::None,
+            None,
+            IggyExpiry::ServerDefault,
+            MaxTopicSize::ServerDefault,
+        )
+        .await?;
+
+    Ok(())
+}
+
+/// Seed for connector multi-topic tests: creates one stream with two topics.
+pub async fn connector_multi_topic_stream(client: &IggyClient) -> Result<(), SeedError> {
+    let stream_id: Identifier = names::STREAM.try_into()?;
+
+    client.create_stream(names::STREAM).await?;
+
+    client
+        .create_topic(
+            &stream_id,
+            names::TOPIC,
+            1,
+            CompressionAlgorithm::None,
+            None,
+            IggyExpiry::ServerDefault,
+            MaxTopicSize::ServerDefault,
+        )
+        .await?;
+
+    client
+        .create_topic(
+            &stream_id,
+            names::TOPIC_2,
             1,
             CompressionAlgorithm::None,
             None,

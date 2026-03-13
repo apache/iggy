@@ -22,6 +22,6 @@ mod sink;
 
 pub use container::{HttpSinkWireMockContainer, WireMockRequest};
 pub use sink::{
-    HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkNdjsonFixture,
-    HttpSinkNoMetadataFixture, HttpSinkRawFixture,
+    HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture,
+    HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture, HttpSinkRawFixture,
 };
