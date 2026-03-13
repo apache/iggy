@@ -182,9 +182,9 @@ use crate::connectors::fixtures::{
     HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture, HttpSinkRawFixture,
 };
 use bytes::Bytes;
-use iggy::prelude::{IggyMessage, Partitioning, TopicClient};
+use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_binary_protocol::MessageClient;
-use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
+use iggy_common::Identifier;
 use integration::harness::seeds;
 use integration::iggy_harness;
 
@@ -941,7 +941,7 @@ async fn individual_messages_have_sequential_offsets(
 /// (`connector_stream`, `mcp_standard`) used by all connector types. Adding HTTP-sink-specific
 /// constants there would create coupling. Instead, this test creates the second topic inline
 /// after the seed runs, keeping the harness generic. See code review finding H1.
-const TEST_TOPIC_2: &str = "test_topic_2";
+const TEST_TOPIC_2: &str = seeds::names::TOPIC_2;
 
 /// Test 7: Multi-Topic Messages Delivered with Correct Topic Metadata
 ///
@@ -998,12 +998,13 @@ const TEST_TOPIC_2: &str = "test_topic_2";
 /// **Test History**:
 /// - **2026-03-11**: Created with shared harness seed (`connector_multi_topic_stream`).
 /// - **2026-03-12**: Code review H1 — removed `TOPIC_2` and `connector_multi_topic_stream`
-///   from shared `seeds.rs`. Second topic now created inline. Local constant `TEST_TOPIC_2`
-///   defined in this file. Match arms use `seeds::names::TOPIC` constant instead of magic
-///   strings (M9).
+///   from shared `seeds.rs`. Second topic now created inline.
+/// - **2026-03-13**: Restored `connector_multi_topic_stream` seed and `names::TOPIC_2` in
+///   shared `seeds.rs` — connector runtime health check requires all configured topics to
+///   exist before startup (CI failure: 1000 retry timeout).
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_multi_topic_stream
 )]
 async fn multi_topic_messages_delivered_with_correct_topic_metadata(
     harness: &TestHarness,
@@ -1013,20 +1014,8 @@ async fn multi_topic_messages_delivered_with_correct_topic_metadata(
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_1_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
-    // Step 1: Create second topic inline — seed only creates the first topic.
-    // This avoids adding HTTP-sink-specific seeds to the shared harness.
-    client
-        .create_topic(
-            &stream_id,
-            TEST_TOPIC_2,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ServerDefault,
-            MaxTopicSize::ServerDefault,
-        )
-        .await
-        .expect("Failed to create second topic");
+    // Step 1: Both topics created by connector_multi_topic_stream seed (runs before
+    // connector runtime starts — runtime health check requires all configured topics).
     let topic_2_id: Identifier = TEST_TOPIC_2.try_into().unwrap();
 
     // Step 2: Send 2 messages to topic 1 with source identifier in payload

@@ -471,7 +471,7 @@ Authorization = "Bearer shared-token"
 
 When different topics need to go to different services, deploy separate connector instances. Each gets its own config directory and runs as a **separate `iggy-connectors` process** (not a config option within one process — see [Connector Runtime Model](#connector-runtime-model)).
 
-```
+```text
 ┌───────────────────┐
 │  Iggy Server      │
 │  └── stream: app  │
@@ -484,7 +484,7 @@ When different topics need to go to different services, deploy separate connecto
 
 **Directory layout**:
 
-```
+```text
 /opt/connectors/
 ├── analytics/
 │   ├── config.toml           # shared iggy connection settings
@@ -595,7 +595,7 @@ IGGY_CONNECTORS_CONFIG_PATH=/opt/connectors/slack/config.toml    iggy-connectors
 
 When a single topic needs to be delivered to multiple HTTP endpoints (e.g., send order events to both the billing service AND an analytics pipeline), deploy multiple connector instances that consume from the **same topic with different consumer groups**. Each instance is a separate `iggy-connectors` process (see [Connector Runtime Model](#connector-runtime-model)).
 
-```
+```text
                               connector-billing  ──▶ billing-api.example.com
                              (consumer_group: billing_sink)
 ┌─────────────────┐         /
@@ -696,7 +696,7 @@ iggy-connectors
 The connector runtime calls `consume()` **sequentially** — the next poll cycle does not start until the current batch completes. Batch mode choice directly impacts throughput:
 
 | Mode | HTTP Requests per Poll | Latency per Poll | Best For |
-|------|----------------------|-------------------|----------|
+| ---- | ---------------------- | ----------------- | -------- |
 | `individual` | N (one per message) | N × round-trip | Low-volume webhooks, order-sensitive delivery |
 | `ndjson` | 1 | 1 × round-trip | High-throughput bulk ingestion |
 | `json_array` | 1 | 1 × round-trip | APIs expecting array payloads |
