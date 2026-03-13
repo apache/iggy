@@ -203,6 +203,14 @@ impl HttpSink {
         let max_connections = config.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS);
         let verbose = config.verbose_logging.unwrap_or(false);
 
+        if retry_delay > max_retry_delay {
+            warn!(
+                "HTTP sink ID: {} — retry_delay ({:?}) exceeds max_retry_delay ({:?}). \
+                 All retry delays will be capped to max_retry_delay.",
+                id, retry_delay, max_retry_delay,
+            );
+        }
+
         if tls_danger_accept_invalid_certs {
             warn!(
                 "HTTP sink ID: {} — tls_danger_accept_invalid_certs is enabled. \
@@ -365,10 +373,20 @@ impl HttpSink {
 
     /// Extract `Retry-After` header value as a Duration (seconds), capped to `max_retry_delay`.
     fn parse_retry_after(&self, response: &reqwest::Response) -> Option<Duration> {
-        let header_value = response
+        let header_raw = response
             .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())?;
+            .get(reqwest::header::RETRY_AFTER)?;
+        let header_value = match header_raw.to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "HTTP sink ID: {} — Retry-After header contains non-ASCII bytes: {}. \
+                     Using computed backoff.",
+                    self.id, e,
+                );
+                return None;
+            }
+        };
         match header_value.parse::<u64>() {
             Ok(secs) => Some(Duration::from_secs(secs).min(self.max_retry_delay)),
             Err(_) => {
@@ -658,6 +676,7 @@ impl HttpSink {
         skipped: u64,
         batch_mode: &str,
     ) -> Result<(), Error> {
+        debug_assert!(count > 0, "send_batch_body called with count=0 — callers must guard against empty batches");
         if let Err(e) = self
             .send_with_retry(client, body, self.content_type())
             .await
@@ -1010,9 +1029,9 @@ impl Sink for HttpSink {
             ));
         }
         for &code in &self.success_status_codes {
-            if !(100..=599).contains(&code) {
+            if !(200..=599).contains(&code) {
                 return Err(Error::InitError(format!(
-                    "Invalid status code {} in success_status_codes — must be 100-599",
+                    "Invalid status code {} in success_status_codes — must be 200-599",
                     code,
                 )));
             }
@@ -1115,7 +1134,7 @@ impl Sink for HttpSink {
 
     /// Deliver messages to the configured HTTP endpoint.
     ///
-    /// **Runtime note**: The connector runtime (`runtime/src/sink.rs:585`) currently discards the `Result`
+    /// **Runtime note**: The connector runtime's `process_messages()` in `runtime/src/sink.rs` currently discards the `Result`
     /// returned by `consume()`. All retry logic lives inside this method — returning `Err`
     /// does not trigger a runtime-level retry. This is a known upstream issue.
     async fn consume(
@@ -2005,6 +2024,16 @@ mod tests {
     async fn given_zero_status_code_should_fail_open() {
         let mut config = given_default_config();
         config.success_status_codes = Some(vec![0]);
+        let mut sink = HttpSink::new(1, config);
+        sink.health_check_enabled = false;
+        let result = sink.open().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn given_informational_status_code_should_fail_open() {
+        let mut config = given_default_config();
+        config.success_status_codes = Some(vec![100]);
         let mut sink = HttpSink::new(1, config);
         sink.health_check_enabled = false;
         let result = sink.open().await;
