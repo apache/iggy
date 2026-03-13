@@ -864,8 +864,8 @@ async fn individual_messages_have_sequential_offsets(
     // Step 1: Build 5 messages (more than default 3 to better test ordering)
     let mut messages: Vec<IggyMessage> = (0..5)
         .map(|i| {
-            let payload = serde_json::to_vec(&serde_json::json!({"idx": i}))
-                .expect("Failed to serialize");
+            let payload =
+                serde_json::to_vec(&serde_json::json!({"idx": i})).expect("Failed to serialize");
             IggyMessage::builder()
                 .id((i + 1) as u128)
                 .payload(Bytes::from(payload))
@@ -901,20 +901,23 @@ async fn individual_messages_have_sequential_offsets(
             let body = r
                 .body_as_json()
                 .unwrap_or_else(|e| panic!("Request {i} body is not valid JSON: {e}"));
-            body["metadata"]["iggy_offset"]
-                .as_i64()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Request {i} missing or non-integer iggy_offset in metadata: {}",
-                        body["metadata"]
-                    )
-                })
+            body["metadata"]["iggy_offset"].as_i64().unwrap_or_else(|| {
+                panic!(
+                    "Request {i} missing or non-integer iggy_offset in metadata: {}",
+                    body["metadata"]
+                )
+            })
         })
         .collect();
 
     // Step 5: Sort and verify contiguous offsets (delivery order may vary)
     offsets.sort();
-    assert_eq!(offsets.len(), 5, "Expected 5 offsets, got {}", offsets.len());
+    assert_eq!(
+        offsets.len(),
+        5,
+        "Expected 5 offsets, got {}",
+        offsets.len()
+    );
 
     for window in offsets.windows(2) {
         assert_eq!(
@@ -1053,12 +1056,14 @@ async fn multi_topic_messages_delivered_with_correct_topic_metadata(
         .expect("Failed to send messages to topic 1");
 
     // Step 3: Send 1 message to topic 2 with different source identifier
-    let mut topic_2_messages: Vec<IggyMessage> = vec![IggyMessage::builder()
-        .payload(Bytes::from(
-            serde_json::to_vec(&serde_json::json!({"source": "topic_2", "idx": 0})).unwrap(),
-        ))
-        .build()
-        .unwrap()];
+    let mut topic_2_messages: Vec<IggyMessage> = vec![
+        IggyMessage::builder()
+            .payload(Bytes::from(
+                serde_json::to_vec(&serde_json::json!({"source": "topic_2", "idx": 0})).unwrap(),
+            ))
+            .build()
+            .unwrap(),
+    ];
 
     client
         .send_messages(
@@ -1086,14 +1091,12 @@ async fn multi_topic_messages_delivered_with_correct_topic_metadata(
             .body_as_json()
             .unwrap_or_else(|e| panic!("Request {i} body is not valid JSON: {e}"));
 
-        let iggy_topic = body["metadata"]["iggy_topic"]
-            .as_str()
-            .unwrap_or_else(|| {
-                panic!(
-                    "Request {i} missing iggy_topic in metadata: {}",
-                    body["metadata"]
-                )
-            });
+        let iggy_topic = body["metadata"]["iggy_topic"].as_str().unwrap_or_else(|| {
+            panic!(
+                "Request {i} missing iggy_topic in metadata: {}",
+                body["metadata"]
+            )
+        });
 
         // Match against constants — not magic strings (code review M9)
         match iggy_topic {
