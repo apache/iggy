@@ -653,13 +653,13 @@ impl HttpSink {
     async fn send_batch_body(
         &self,
         client: &reqwest::Client,
-        body: Vec<u8>,
+        body: Bytes,
         count: u64,
         skipped: u64,
         batch_mode: &str,
     ) -> Result<(), Error> {
         if let Err(e) = self
-            .send_with_retry(client, Bytes::from(body), self.content_type())
+            .send_with_retry(client, body, self.content_type())
             .await
         {
             // send_with_retry already added 1 to errors_count for the HTTP failure.
@@ -754,7 +754,7 @@ impl HttpSink {
             )));
         }
 
-        self.send_batch_body(client, body, count, skipped, "NDJSON")
+        self.send_batch_body(client, Bytes::from(body), count, skipped, "NDJSON")
             .await
     }
 
@@ -832,7 +832,7 @@ impl HttpSink {
             )));
         }
 
-        self.send_batch_body(client, body, count, skipped, "JSON array")
+        self.send_batch_body(client, Bytes::from(body), count, skipped, "JSON array")
             .await
     }
 
