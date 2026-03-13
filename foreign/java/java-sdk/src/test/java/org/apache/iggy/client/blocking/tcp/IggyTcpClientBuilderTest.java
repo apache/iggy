@@ -29,8 +29,8 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.List;
 
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
@@ -55,7 +55,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
 
         // Then: Client should be able to fetch system info
         List<ClientInfo> clients = client.system().getClients();
-        assertNotNull(clients);
+        assertThat(clients).isNotNull();
     }
 
     @Test
@@ -70,7 +70,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
         // When: Try to access system info (auto-login should have happened)
         // Then: Should succeed without explicit login
         List<ClientInfo> clients = client.system().getClients();
-        assertNotNull(clients);
+        assertThat(clients).isNotNull();
     }
 
     @Test
@@ -86,7 +86,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
 
         // Then: Should succeed
         List<ClientInfo> clients = client.system().getClients();
-        assertNotNull(clients);
+        assertThat(clients).isNotNull();
     }
 
     @Test
@@ -101,7 +101,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
 
         // Then: Should succeed
         List<ClientInfo> clients = client.system().getClients();
-        assertNotNull(clients);
+        assertThat(clients).isNotNull();
     }
 
     @Test
@@ -116,7 +116,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
 
         // Then: Should succeed
         List<ClientInfo> clients = client.system().getClients();
-        assertNotNull(clients);
+        assertThat(clients).isNotNull();
     }
 
     @Test
@@ -131,7 +131,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
 
         // Then: Should succeed
         List<ClientInfo> clients = client.system().getClients();
-        assertNotNull(clients);
+        assertThat(clients).isNotNull();
     }
 
     @Test
@@ -146,7 +146,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
 
         // Then: Should succeed
         List<ClientInfo> clients = client.system().getClients();
-        assertNotNull(clients);
+        assertThat(clients).isNotNull();
     }
 
     @Test
@@ -164,7 +164,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
 
         // Then: Should succeed
         List<ClientInfo> clients = client.system().getClients();
-        assertNotNull(clients);
+        assertThat(clients).isNotNull();
     }
 
     @Test
@@ -180,7 +180,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
 
         // Then: Should succeed
         List<ClientInfo> clients = client.system().getClients();
-        assertNotNull(clients);
+        assertThat(clients).isNotNull();
     }
 
     @Test
@@ -189,7 +189,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
         IggyTcpClientBuilder builder = IggyTcpClient.builder().host("").port(serverTcpPort());
 
         // When/Then: Building should throw IggyInvalidArgumentException
-        assertThrows(IggyInvalidArgumentException.class, builder::build);
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
@@ -198,7 +198,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
         IggyTcpClientBuilder builder = IggyTcpClient.builder().host(null).port(serverTcpPort());
 
         // When/Then: Building should throw IggyInvalidArgumentException
-        assertThrows(IggyInvalidArgumentException.class, builder::build);
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
@@ -208,7 +208,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
                 IggyTcpClient.builder().host(serverHost()).port(-1);
 
         // When/Then: Building should throw IggyInvalidArgumentException
-        assertThrows(IggyInvalidArgumentException.class, builder::build);
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
@@ -218,7 +218,7 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
                 IggyTcpClient.builder().host(serverHost()).port(0);
 
         // When/Then: Building should throw IggyInvalidArgumentException
-        assertThrows(IggyInvalidArgumentException.class, builder::build);
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
@@ -232,6 +232,6 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
         List<ClientInfo> clients = client.system().getClients();
 
         // Then: Should work
-        assertNotNull(clients);
+        assertThat(clients).isNotNull();
     }
 }
