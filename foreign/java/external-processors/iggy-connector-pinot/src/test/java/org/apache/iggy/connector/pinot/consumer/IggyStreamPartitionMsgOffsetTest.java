@@ -21,16 +21,14 @@ package org.apache.iggy.connector.pinot.consumer;
 
 import org.junit.jupiter.api.Test;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
 
 class IggyStreamPartitionMsgOffsetTest {
 
     @Test
     void testOffsetCreation() {
         IggyStreamPartitionMsgOffset offset = new IggyStreamPartitionMsgOffset(100L);
-        assertEquals(100L, offset.getOffset());
+        assertThat(offset.getOffset()).isEqualTo(100L);
     }
 
     @Test
@@ -39,9 +37,9 @@ class IggyStreamPartitionMsgOffsetTest {
         IggyStreamPartitionMsgOffset offset2 = new IggyStreamPartitionMsgOffset(200L);
         IggyStreamPartitionMsgOffset offset3 = new IggyStreamPartitionMsgOffset(100L);
 
-        assertTrue(offset1.compareTo(offset2) < 0);
-        assertTrue(offset2.compareTo(offset1) > 0);
-        assertEquals(0, offset1.compareTo(offset3));
+        assertThat(offset1.compareTo(offset2)).isNegative();
+        assertThat(offset2.compareTo(offset1)).isPositive();
+        assertThat(offset1.compareTo(offset3)).isZero();
     }
 
     @Test
@@ -50,11 +48,11 @@ class IggyStreamPartitionMsgOffsetTest {
         IggyStreamPartitionMsgOffset offset2 = new IggyStreamPartitionMsgOffset(100L);
         IggyStreamPartitionMsgOffset offset3 = new IggyStreamPartitionMsgOffset(200L);
 
-        assertEquals(offset1, offset2);
-        assertNotEquals(offset1, offset3);
-        assertEquals(offset1, offset1);
-        assertNotEquals(offset1, null);
-        assertNotEquals(offset1, "string");
+        assertThat(offset1).isEqualTo(offset2);
+        assertThat(offset1).isNotEqualTo(offset3);
+        assertThat(offset1).isEqualTo(offset1);
+        assertThat(offset1).isNotEqualTo(null);
+        assertThat(offset1).isNotEqualTo("string");
     }
 
     @Test
@@ -63,28 +61,28 @@ class IggyStreamPartitionMsgOffsetTest {
         IggyStreamPartitionMsgOffset offset2 = new IggyStreamPartitionMsgOffset(100L);
         IggyStreamPartitionMsgOffset offset3 = new IggyStreamPartitionMsgOffset(200L);
 
-        assertEquals(offset1.hashCode(), offset2.hashCode());
-        assertNotEquals(offset1.hashCode(), offset3.hashCode());
+        assertThat(offset1.hashCode()).isEqualTo(offset2.hashCode());
+        assertThat(offset1.hashCode()).isNotEqualTo(offset3.hashCode());
     }
 
     @Test
     void testToString() {
         IggyStreamPartitionMsgOffset offset = new IggyStreamPartitionMsgOffset(12345L);
-        assertEquals("12345", offset.toString());
+        assertThat(offset.toString()).isEqualTo("12345");
     }
 
     @Test
     void testZeroOffset() {
         IggyStreamPartitionMsgOffset offset = new IggyStreamPartitionMsgOffset(0L);
-        assertEquals(0L, offset.getOffset());
-        assertEquals("0", offset.toString());
+        assertThat(offset.getOffset()).isEqualTo(0L);
+        assertThat(offset.toString()).isEqualTo("0");
     }
 
     @Test
     void testLargeOffset() {
         long largeOffset = Long.MAX_VALUE - 1;
         IggyStreamPartitionMsgOffset offset = new IggyStreamPartitionMsgOffset(largeOffset);
-        assertEquals(largeOffset, offset.getOffset());
-        assertEquals(String.valueOf(largeOffset), offset.toString());
+        assertThat(offset.getOffset()).isEqualTo(largeOffset);
+        assertThat(offset.toString()).isEqualTo(String.valueOf(largeOffset));
     }
 }
