@@ -144,15 +144,24 @@ impl PooledBuffer {
     ///
     /// # Panic
     /// Panics if at > len
-    ///
-    /// TODO(tungtose): write unit tests
     pub fn split_to(&mut self, at: usize) -> PooledBuffer {
-        assert!(at <= self.len(), "split_to out of bounds");
+        assert!(
+            at <= self.len(),
+            "split_to out of bounds: at={}, len={}",
+            at,
+            self.len()
+        );
 
         let mut new_buff = PooledBuffer::with_capacity(at);
-
         new_buff.inner.extend_from_slice(&self.inner[..at]);
 
+        // SAFETY:
+        // - `self.inner.as_ptr().add(at)` is valid for `new_len` because
+        // `at + new_len === old_len <= cap`. Similar with `self.inner.as_mut_ptr()`
+        //
+        // -  source range is `[at, at + new_len)` and the destination is
+        //   `[0, new_len)`.  These ranges do not overlap when `at > 0`.
+        // - when `at == 0`, the operation is noop
         let new_len = self.len() - at;
         if new_len > 0 {
             unsafe {
@@ -200,12 +209,12 @@ impl PooledBuffer {
 
     /// Wrapper for put_slice which might cause resize
     pub fn put_slice(&mut self, src: &[u8]) {
-        let before_cap = self.inner.capacity();
         self.extend_from_slice(src);
-
-        if self.inner.capacity() != before_cap {
-            self.check_for_resize();
-        }
+        // let before_cap = self.inner.capacity();
+        //
+        // if self.inner.capacity() != before_cap {
+        //     self.check_for_resize();
+        // }
     }
 
     /// Wrapper for put_u32_le which might cause resize

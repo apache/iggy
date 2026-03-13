@@ -22,7 +22,7 @@ use human_repr::HumanCount;
 use once_cell::sync::OnceCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tracing::{debug, info, trace, warn};
+use tracing::{info, trace, warn};
 
 pub const ALIGNMENT: usize = 4096;
 pub type AlignedBuffer = AVec<u8, ConstAlign<4096>>;
@@ -476,17 +476,12 @@ impl AlignedBufferExt for AlignedBuffer {
 }
 
 fn allocate_aligned_buffer(capacity: usize) -> AlignedBuffer {
-    // if capacity == 0 {
-    //     return AVec::new(0);
-    // }
-
     let aligned_capacity = if capacity < ALIGNMENT {
         ALIGNMENT
     } else {
         (capacity + ALIGNMENT - 1) & !(ALIGNMENT - 1)
     };
 
-    debug!("Allocate aligned buf cap: {aligned_capacity}");
     let mut buffer = AlignedBuffer::with_capacity(ALIGNMENT, aligned_capacity);
 
     // Force the capacity if AVec didn't allocate enough
