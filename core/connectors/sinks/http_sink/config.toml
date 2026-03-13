@@ -83,7 +83,8 @@ max_connections = 10
 # Verbose request/response logging (default: false).
 verbose_logging = false
 
-# Custom HTTP headers.
+# Custom HTTP headers. Replace placeholder values with real credentials.
+# Do not commit actual secrets — use environment variable overrides for production.
 [plugin_config.headers]
 Authorization = "Bearer my-secret-token"
 X-Custom-Header = "custom-value"

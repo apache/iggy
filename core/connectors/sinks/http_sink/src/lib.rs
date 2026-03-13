@@ -41,7 +41,7 @@ const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
 const DEFAULT_MAX_PAYLOAD_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 const DEFAULT_MAX_CONNECTIONS: usize = 10;
 /// TCP keep-alive interval for detecting dead connections behind load balancers.
-/// Cloud LBs (ALB, GCP) silently drop idle connections after 60-350s;
+/// Cloud LBs silently drop idle connections (AWS ALB ~60s, GCP ~600s);
 /// probing at 30s detects these before requests fail.
 const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 /// Close pooled connections unused for this long. Prevents stale connections
@@ -365,21 +365,34 @@ impl HttpSink {
 
     /// Extract `Retry-After` header value as a Duration (seconds), capped to `max_retry_delay`.
     fn parse_retry_after(&self, response: &reqwest::Response) -> Option<Duration> {
-        response
+        let header_value = response
             .headers()
             .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .map(|d| d.min(self.max_retry_delay))
+            .and_then(|v| v.to_str().ok())?;
+        match header_value.parse::<u64>() {
+            Ok(secs) => Some(Duration::from_secs(secs).min(self.max_retry_delay)),
+            Err(_) => {
+                warn!(
+                    "HTTP sink ID: {} — Retry-After header '{}' is not an integer delay; \
+                     HTTP-date format is not supported. Using computed backoff.",
+                    self.id, header_value,
+                );
+                None
+            }
+        }
     }
 
     /// Compute the retry delay for a given attempt, applying exponential backoff
-    /// capped at `max_retry_delay`.
+    /// capped at `max_retry_delay`. Clamps before `Duration::from_secs_f64` to avoid
+    /// panics when extreme backoff configs produce infinity (e.g., multiplier=1000, retries=200).
     fn compute_retry_delay(&self, attempt: u32) -> Duration {
         let delay_secs = self.retry_delay.as_secs_f64()
             * self.retry_backoff_multiplier.powi(attempt as i32);
-        Duration::from_secs_f64(delay_secs).min(self.max_retry_delay)
+        let capped_secs = delay_secs.min(self.max_retry_delay.as_secs_f64());
+        if !capped_secs.is_finite() || capped_secs < 0.0 {
+            return self.max_retry_delay;
+        }
+        Duration::from_secs_f64(capped_secs)
     }
 
     /// Record a successful request timestamp.
@@ -633,6 +646,46 @@ impl HttpSink {
         }
     }
 
+    /// Sends a batch body and updates delivery/error accounting.
+    ///
+    /// Shared by `send_ndjson` and `send_json_array` — the post-send accounting logic
+    /// (error propagation, skip warnings) is identical across batch modes.
+    async fn send_batch_body(
+        &self,
+        client: &reqwest::Client,
+        body: Vec<u8>,
+        count: u64,
+        skipped: u64,
+        batch_mode: &str,
+    ) -> Result<(), Error> {
+        if let Err(e) = self
+            .send_with_retry(client, Bytes::from(body), self.content_type())
+            .await
+        {
+            // send_with_retry already added 1 to errors_count for the HTTP failure.
+            // Add the remaining messages that were serialized but not delivered.
+            if count > 1 {
+                self.errors_count
+                    .fetch_add(count - 1, Ordering::Relaxed);
+            }
+            if skipped > 0 {
+                error!(
+                    "HTTP sink ID: {} — {} batch failed with {} serialization skips",
+                    self.id, batch_mode, skipped,
+                );
+            }
+            return Err(e);
+        }
+        self.messages_delivered.fetch_add(count, Ordering::Relaxed);
+        if skipped > 0 {
+            warn!(
+                "HTTP sink ID: {} — {} batch: {} delivered, {} skipped (serialization errors)",
+                self.id, batch_mode, count, skipped,
+            );
+        }
+        Ok(())
+    }
+
     /// Send messages in `ndjson` mode — all messages in one request, newline-delimited.
     /// Skips individual messages that fail serialization rather than aborting the batch.
     async fn send_ndjson(
@@ -693,38 +746,16 @@ impl HttpSink {
                 body.len(),
                 self.max_payload_size_bytes,
             );
+            // Count all successfully-serialized messages as errors (skipped already counted individually)
+            self.errors_count.fetch_add(count, Ordering::Relaxed);
             return Err(Error::HttpRequestFailed(format!(
                 "NDJSON batch exceeds max size: {} bytes",
                 body.len()
             )));
         }
 
-        if let Err(e) = self
-            .send_with_retry(client, Bytes::from(body), self.content_type())
+        self.send_batch_body(client, body, count, skipped, "NDJSON")
             .await
-        {
-            // send_with_retry already added 1 to errors_count for the HTTP failure.
-            // Add the remaining messages that were serialized but not delivered.
-            if count > 1 {
-                self.errors_count
-                    .fetch_add(count - 1, Ordering::Relaxed);
-            }
-            if skipped > 0 {
-                error!(
-                    "HTTP sink ID: {} — NDJSON batch failed with {} serialization skips",
-                    self.id, skipped,
-                );
-            }
-            return Err(e);
-        }
-        self.messages_delivered.fetch_add(count, Ordering::Relaxed);
-        if skipped > 0 {
-            warn!(
-                "HTTP sink ID: {} — NDJSON batch: {} delivered, {} skipped (serialization errors)",
-                self.id, count, skipped,
-            );
-        }
-        Ok(())
     }
 
     /// Send messages in `json_array` mode — all messages as a single JSON array.
@@ -776,6 +807,8 @@ impl HttpSink {
                     skipped,
                     e,
                 );
+                // Count all successfully-built envelopes as errors (skipped already counted individually)
+                self.errors_count.fetch_add(count, Ordering::Relaxed);
                 return Err(Error::Serialization(format!(
                     "JSON array serialize ({} envelopes): {}",
                     envelopes.len(),
@@ -791,38 +824,16 @@ impl HttpSink {
                 body.len(),
                 self.max_payload_size_bytes,
             );
+            // Count all successfully-serialized messages as errors (skipped already counted individually)
+            self.errors_count.fetch_add(count, Ordering::Relaxed);
             return Err(Error::HttpRequestFailed(format!(
                 "JSON array batch exceeds max size: {} bytes",
                 body.len()
             )));
         }
 
-        if let Err(e) = self
-            .send_with_retry(client, Bytes::from(body), self.content_type())
+        self.send_batch_body(client, body, count, skipped, "JSON array")
             .await
-        {
-            // send_with_retry already added 1 to errors_count for the HTTP failure.
-            // Add the remaining messages that were serialized but not delivered.
-            if count > 1 {
-                self.errors_count
-                    .fetch_add(count - 1, Ordering::Relaxed);
-            }
-            if skipped > 0 {
-                error!(
-                    "HTTP sink ID: {} — JSON array batch failed with {} serialization skips",
-                    self.id, skipped,
-                );
-            }
-            return Err(e);
-        }
-        self.messages_delivered.fetch_add(count, Ordering::Relaxed);
-        if skipped > 0 {
-            warn!(
-                "HTTP sink ID: {} — JSON array batch: {} delivered, {} skipped (serialization errors)",
-                self.id, count, skipped,
-            );
-        }
-        Ok(())
     }
 
     /// Send messages in `raw` mode — one HTTP request per message with raw bytes.
@@ -998,6 +1009,14 @@ impl Sink for HttpSink {
                 "success_status_codes must not be empty — would cause retry storms against healthy endpoints".to_string(),
             ));
         }
+        for &code in &self.success_status_codes {
+            if !(100..=599).contains(&code) {
+                return Err(Error::InitError(format!(
+                    "Invalid status code {} in success_status_codes — must be 100-599",
+                    code,
+                )));
+            }
+        }
 
         // Validate URL
         if self.url.is_empty() {
@@ -1143,7 +1162,7 @@ impl Sink for HttpSink {
 
         if let Err(ref e) = result {
             error!(
-                "HTTP sink ID: {} — consume() returning error (runtime will discard): {}",
+                "HTTP sink ID: {} — consume() returning error (runtime ignores FFI status code): {}",
                 self.id, e
             );
         }
@@ -1156,11 +1175,12 @@ impl Sink for HttpSink {
         let delivered = self.messages_delivered.load(Ordering::Relaxed);
         let errors = self.errors_count.load(Ordering::Relaxed);
         let retries = self.retries_count.load(Ordering::Relaxed);
+        let last_success = self.last_success_timestamp.load(Ordering::Relaxed);
 
         info!(
             "HTTP sink connector ID: {} closed. Stats: {} requests sent, \
-             {} messages delivered, {} errors, {} retries.",
-            self.id, requests, delivered, errors, retries,
+             {} messages delivered, {} errors, {} retries, last success epoch: {}.",
+            self.id, requests, delivered, errors, retries, last_success,
         );
 
         self.client = None;
@@ -1952,6 +1972,43 @@ mod tests {
             "X-Custom should survive the filter, got: {:?}",
             surviving
         );
+    }
+
+    // ── M1: compute_retry_delay overflow safety ──────────────────────
+
+    #[test]
+    fn given_extreme_backoff_config_should_not_panic() {
+        let mut config = given_default_config();
+        config.retry_backoff_multiplier = Some(1000.0);
+        config.max_retries = Some(200);
+        let sink = HttpSink::new(1, config);
+        // This would panic with Duration::from_secs_f64(Infinity) without the clamp
+        let delay = sink.compute_retry_delay(199);
+        assert_eq!(delay, sink.max_retry_delay);
+    }
+
+    // ── M2: success_status_codes validation ────────────────────────────
+
+    #[tokio::test]
+    async fn given_invalid_status_code_should_fail_open() {
+        let mut config = given_default_config();
+        config.success_status_codes = Some(vec![200, 999]);
+        let mut sink = HttpSink::new(1, config);
+        sink.health_check_enabled = false;
+        let result = sink.open().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("999"), "Expected invalid code in error: {}", err);
+    }
+
+    #[tokio::test]
+    async fn given_zero_status_code_should_fail_open() {
+        let mut config = given_default_config();
+        config.success_status_codes = Some(vec![0]);
+        let mut sink = HttpSink::new(1, config);
+        sink.health_check_enabled = false;
+        let result = sink.open().await;
+        assert!(result.is_err());
     }
 
     // ── T4: consume() before open() test ─────────────────────────────
