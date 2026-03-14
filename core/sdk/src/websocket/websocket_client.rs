@@ -32,6 +32,7 @@ use iggy_common::{
     WebSocketConnectionStringOptions,
 };
 use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
+use secrecy::ExposeSecret;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
@@ -496,14 +497,15 @@ impl WebSocketClient {
                 self.set_state(ClientState::Authenticating).await;
                 match credentials {
                     Credentials::UsernamePassword(username, password) => {
-                        self.login_user(username, password).await?;
+                        self.login_user(username, password.expose_secret()).await?;
                         info!(
                             "{NAME} client: {client_address} has signed in with the user credentials, username: {username}",
                         );
                         Ok(())
                     }
                     Credentials::PersonalAccessToken(token) => {
-                        self.login_with_personal_access_token(token).await?;
+                        self.login_with_personal_access_token(token.expose_secret())
+                            .await?;
                         info!(
                             "{NAME} client: {client_address} has signed in with a personal access token.",
                         );

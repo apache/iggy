@@ -17,7 +17,7 @@
 
 use crate::Credentials;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum AutoLogin {
     Disabled,
     Enabled(Credentials),

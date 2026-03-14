@@ -18,14 +18,23 @@
 
 use crate::utils::timestamp::IggyTimestamp;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// `RawPersonalAccessToken` represents the raw personal access token - the secured token which is returned only once during the creation.
 /// It consists of the following fields:
 /// - `token`: the unique token that should be securely stored by the user and can be used for authentication.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct RawPersonalAccessToken {
     /// The unique token that should be securely stored by the user and can be used for authentication.
     pub token: String,
+}
+
+impl fmt::Debug for RawPersonalAccessToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawPersonalAccessToken")
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// `PersonalAccessToken` represents the personal access token. It does not contain the token itself, but the information about the token.

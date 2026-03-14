@@ -23,6 +23,7 @@ use iggy_common::Client;
 use iggy_common::Permissions;
 use iggy_common::UserStatus;
 use iggy_common::create_user::CreateUser;
+use secrecy::{ExposeSecret, SecretString};
 use tracing::{Level, event};
 
 pub struct CreateUserCmd {
@@ -39,7 +40,7 @@ impl CreateUserCmd {
         Self {
             create_user: CreateUser {
                 username,
-                password,
+                password: SecretString::from(password),
                 status,
                 permissions,
             },
@@ -50,31 +51,28 @@ impl CreateUserCmd {
 #[async_trait]
 impl CliCommand for CreateUserCmd {
     fn explain(&self) -> String {
-        format!(
-            "create user with username: {} and password: {}",
-            self.create_user.username, self.create_user.password
-        )
+        format!("create user with username: {}", self.create_user.username)
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
             .create_user(
                 &self.create_user.username,
-                &self.create_user.password,
+                self.create_user.password.expose_secret(),
                 self.create_user.status,
                 self.create_user.permissions.clone(),
             )
             .await
             .with_context(|| {
                 format!(
-                    "Problem creating user (username: {} and password: {})",
-                    self.create_user.username, self.create_user.password
+                    "Problem creating user (username: {})",
+                    self.create_user.username
                 )
             })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
-            "User with username: {} and password: {} created",
-            self.create_user.username, self.create_user.password
+            "User with username: {} created",
+            self.create_user.username
         );
 
         Ok(())

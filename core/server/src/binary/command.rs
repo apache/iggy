@@ -424,9 +424,9 @@ mod tests {
         let mut bytes = BytesMut::with_capacity(payload.len());
         bytes.put_slice(&payload);
         let bytes = Bytes::from(bytes);
-        assert_eq!(
-            &ServerCommand::from_code_and_payload(command_id, bytes).unwrap(),
-            command
-        );
+        let deserialized = ServerCommand::from_code_and_payload(command_id, bytes).unwrap();
+        // SecretString doesn't implement PartialEq, so we compare serialized bytes instead.
+        // This is sufficient since to_bytes() covers all wire-protocol-relevant fields.
+        assert_eq!(deserialized.to_bytes(), command.to_bytes());
     }
 }

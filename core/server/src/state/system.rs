@@ -31,6 +31,7 @@ use iggy_common::PersonalAccessToken;
 use iggy_common::create_user::CreateUser;
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{IdKind, Identifier, Permissions, UserStatus};
+use secrecy::{ExposeSecret, SecretString};
 use std::collections::BTreeMap;
 use std::fmt::Display;
 use tracing::{debug, error, info};
@@ -122,7 +123,7 @@ impl SystemState {
             let root = create_root_user();
             let command = CreateUser {
                 username: root.username.clone(),
-                password: root.password.clone(),
+                password: SecretString::from(root.password.clone()),
                 status: root.status,
                 permissions: root.permissions.clone(),
             };
@@ -379,7 +380,7 @@ impl SystemState {
                     let user = UserState {
                         id: user_id,
                         username: command.username,
-                        password_hash: command.password, // This is already hashed
+                        password_hash: command.password.expose_secret().to_owned(), // This is already hashed
                         status: command.status,
                         created_at: entry.timestamp,
                         permissions: command.permissions,
@@ -408,7 +409,7 @@ impl SystemState {
                     let user = users
                         .get_mut(&user_id)
                         .unwrap_or_else(|| panic!("{}", format!("User: {user_id} not found")));
-                    user.password_hash = command.new_password // This is already hashed
+                    user.password_hash = command.new_password.expose_secret().to_owned() // This is already hashed
                 }
                 EntryCommand::UpdatePermissions(command) => {
                     let user_id = find_user_id(&users, &command.user_id);
