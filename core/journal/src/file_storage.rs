@@ -18,18 +18,18 @@
 use crate::Storage;
 use compio::buf::IoBuf;
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, UnsafeCell};
 use std::io;
 use std::path::{Path, PathBuf};
 
 /// File-backed storage implementing the `Storage` trait.
 pub struct FileStorage {
-    file: RefCell<compio::fs::File>,
+    file: UnsafeCell<compio::fs::File>,
     write_offset: Cell<u64>,
     path: PathBuf,
 }
 
-#[allow(clippy::future_not_send, clippy::await_holding_refcell_ref)]
+#[allow(clippy::future_not_send)]
 impl FileStorage {
     /// Open or create the file at `path`, setting `write_offset` to current file length.
     ///
@@ -45,7 +45,7 @@ impl FileStorage {
             .await?;
         let len = file.metadata().await?.len();
         Ok(Self {
-            file: RefCell::new(file),
+            file: UnsafeCell::new(file),
             write_offset: Cell::new(len),
             path: path.to_path_buf(),
         })
@@ -61,7 +61,8 @@ impl FileStorage {
     /// # Errors
     /// Returns an I/O error if truncation fails.
     pub async fn truncate(&self, len: u64) -> io::Result<()> {
-        self.file.borrow().set_len(len).await?;
+        let file = unsafe { &*self.file.get() };
+        file.set_len(len).await?;
         self.write_offset.set(len);
         Ok(())
     }
@@ -71,7 +72,8 @@ impl FileStorage {
     /// # Errors
     /// Returns an I/O error if sync fails.
     pub async fn fsync(&self) -> io::Result<()> {
-        self.file.borrow().sync_data().await
+        // SAFETY: single-threaded compio runtime, no concurrent access to the file.
+        unsafe { &*self.file.get() }.sync_data().await
     }
 
     /// Positional read into `buf`. Returns the buffer with data filled in.
@@ -79,7 +81,9 @@ impl FileStorage {
     /// # Errors
     /// Returns an I/O error if the read fails.
     pub async fn read_at(&self, offset: u64, buf: Vec<u8>) -> io::Result<Vec<u8>> {
-        let (result, buf) = self.file.borrow().read_exact_at(buf, offset).await.into();
+        // SAFETY: single-threaded compio runtime, no concurrent access to the file.
+        let file = unsafe { &*self.file.get() };
+        let (result, buf) = file.read_exact_at(buf, offset).await.into();
         result?;
         Ok(buf)
     }
@@ -91,9 +95,9 @@ impl FileStorage {
     #[allow(clippy::cast_possible_truncation)]
     pub async fn write_append<B: IoBuf>(&self, buf: B) -> io::Result<usize> {
         let len = buf.buf_len();
-        let mut file = self.file.borrow_mut();
+        // SAFETY: single-threaded compio runtime, no concurrent access to the file.
+        let file = unsafe { &mut *self.file.get() };
         let (result, _buf) = file.write_all_at(buf, self.write_offset.get()).await.into();
-        drop(file);
         result?;
         self.write_offset.set(self.write_offset.get() + len as u64);
         Ok(len)
@@ -117,7 +121,8 @@ impl FileStorage {
             .open(&self.path)
             .await?;
         let len = file.metadata().await?.len();
-        *self.file.borrow_mut() = file;
+        // SAFETY: single-threaded compio runtime, no concurrent access to the file.
+        unsafe { *self.file.get() = file };
         self.write_offset.set(len);
         Ok(())
     }
