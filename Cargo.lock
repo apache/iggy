@@ -5442,35 +5442,12 @@ dependencies = [
  "iggy_connector_sdk",
  "mongodb",
  "once_cell",
- "rand 0.9.2",
- "reqwest",
+ "rand 0.10.0",
+ "reqwest 0.13.2",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "iggy_connector_influxdb_source"
-version = "0.2.2-edge.1"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "csv",
- "dashmap",
- "futures",
- "humantime",
- "iggy_common",
- "iggy_connector_influxdb_sink",
- "iggy_connector_sdk",
- "once_cell",
- "rand 0.9.2",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
