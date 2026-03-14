@@ -39,6 +39,7 @@ dirs = { workspace = true }
 iggy_common = { workspace = true }
 keyring = { workspace = true, optional = false }
 passterm = { workspace = true, optional = false }
+secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

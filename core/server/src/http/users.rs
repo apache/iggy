@@ -41,6 +41,7 @@ use iggy_common::Identifier;
 use iggy_common::IdentityInfo;
 use iggy_common::Validatable;
 use iggy_common::{IggyError, UserInfo, UserInfoDetails};
+use secrecy::ExposeSecret;
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -229,7 +230,7 @@ async fn login_user(
     let user = state
         .shard
         .shard()
-        .login_user(&command.username, &command.password, None)
+        .login_user(&command.username, command.password.expose_secret(), None)
         .error(|e: &IggyError| {
             format!(
                 "{COMPONENT} (error: {e}) - failed to login, username: {}",

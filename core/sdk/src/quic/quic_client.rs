@@ -34,6 +34,7 @@ use iggy_common::{
 use quinn::crypto::rustls::QuicClientConfig as QuinnQuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, VarInt};
 use rustls::crypto::CryptoProvider;
+use secrecy::ExposeSecret;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -395,7 +396,7 @@ impl QuicClient {
                     self.set_state(ClientState::Authenticating).await;
                     match credentials {
                         Credentials::UsernamePassword(username, password) => {
-                            self.login_user(username, password).await?;
+                            self.login_user(username, password.expose_secret()).await?;
                             self.publish_event(DiagnosticEvent::SignedIn).await;
                             info!(
                                 "{NAME} client: {} has signed in with the user credentials, username: {username}",
@@ -403,7 +404,8 @@ impl QuicClient {
                             );
                         }
                         Credentials::PersonalAccessToken(token) => {
-                            self.login_with_personal_access_token(token).await?;
+                            self.login_with_personal_access_token(token.expose_secret())
+                                .await?;
                             self.publish_event(DiagnosticEvent::SignedIn).await;
                             info!(
                                 "{NAME} client: {} has signed in with a personal access token.",
@@ -787,13 +789,13 @@ mod tests {
             quic_client_config.server_address,
             format!("{server_address}:{port}")
         );
-        assert_eq!(
-            quic_client_config.auto_login,
-            AutoLogin::Enabled(Credentials::UsernamePassword(
-                username.to_string(),
-                password.to_string()
-            ))
-        );
+        match &quic_client_config.auto_login {
+            AutoLogin::Enabled(Credentials::UsernamePassword(u, p)) => {
+                assert_eq!(u, &username.to_string());
+                assert_eq!(p.expose_secret(), password);
+            }
+            other => panic!("expected UsernamePassword auto_login, got {other:?}"),
+        }
 
         assert_eq!(quic_client_config.response_buffer_size, 10_000_000);
         assert_eq!(quic_client_config.max_concurrent_bidi_streams, 10_000);
@@ -842,13 +844,13 @@ mod tests {
             quic_client_config.server_address,
             format!("{server_address}:{port}")
         );
-        assert_eq!(
-            quic_client_config.auto_login,
-            AutoLogin::Enabled(Credentials::UsernamePassword(
-                username.to_string(),
-                password.to_string()
-            ))
-        );
+        match &quic_client_config.auto_login {
+            AutoLogin::Enabled(Credentials::UsernamePassword(u, p)) => {
+                assert_eq!(u, &username.to_string());
+                assert_eq!(p.expose_secret(), password);
+            }
+            other => panic!("expected UsernamePassword auto_login, got {other:?}"),
+        }
 
         assert_eq!(quic_client_config.response_buffer_size, 10_000_000);
         assert_eq!(quic_client_config.max_concurrent_bidi_streams, 10_000);
@@ -895,10 +897,12 @@ mod tests {
             quic_client_config.server_address,
             format!("{server_address}:{port}")
         );
-        assert_eq!(
-            quic_client_config.auto_login,
-            AutoLogin::Enabled(Credentials::PersonalAccessToken(pat.to_string()))
-        );
+        match &quic_client_config.auto_login {
+            AutoLogin::Enabled(Credentials::PersonalAccessToken(t)) => {
+                assert_eq!(t.expose_secret(), pat);
+            }
+            other => panic!("expected PersonalAccessToken auto_login, got {other:?}"),
+        }
 
         assert_eq!(quic_client_config.response_buffer_size, 10_000_000);
         assert_eq!(quic_client_config.max_concurrent_bidi_streams, 10_000);
