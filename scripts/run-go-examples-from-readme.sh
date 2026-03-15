@@ -169,9 +169,84 @@ cd ../..
 kill -TERM "$(cat ${PID_FILE})"
 test -e ${PID_FILE} && rm ${PID_FILE}
 
+# --- TLS Test Pass ---
+if [ "${exit_code}" -eq 0 ]; then
+    echo ""
+    echo -e "\e[36m=== Starting TLS test pass ===\e[0m"
+    echo ""
+
+    # Clean data and logs for fresh TLS start
+    rm -fr local_data
+    rm -f ${LOG_FILE}
+
+    # Start server with TLS enabled
+    echo "Starting server with TLS enabled..."
+    IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy IGGY_TCP_TLS_ENABLED=true ${SERVER_BIN} &>${LOG_FILE} &
+    echo $! >${PID_FILE}
+
+    # Wait for server to start
+    SERVER_START_TIME=0
+    while ! grep -q "has started" ${LOG_FILE}; do
+        if [ ${SERVER_START_TIME} -gt ${TIMEOUT} ]; then
+            echo "TLS server did not start within ${TIMEOUT} seconds."
+            ps fx
+            cat ${LOG_FILE}
+            exit 1
+        fi
+        echo "Waiting for Iggy TLS server to start... ${SERVER_START_TIME}"
+        sleep 1
+        ((SERVER_START_TIME += 1))
+    done
+
+    # Verify TLS is enabled
+    if ! grep -q "tls: { enabled: true" ${LOG_FILE}; then
+        echo -e "\e[31mError: TLS not enabled on server\e[0m"
+        grep -A 5 "tcp:" ${LOG_FILE} || true
+        exit 1
+    fi
+    echo -e "\e[32m✓ TLS enabled on server\e[0m"
+
+    cd examples/go || exit 1
+
+    # Run getting-started examples with TLS flags
+    # Use localhost instead of 127.0.0.1 to match the cert's SAN (DNS:localhost)
+    TLS_CA_FILE="../../core/certs/iggy_ca_cert.pem"
+    TLS_ADDR="localhost:8090"
+
+    for cmd in \
+        "go run getting-started/producer/main.go --tcp-server-address ${TLS_ADDR} --tls --tls-ca-file ${TLS_CA_FILE}" \
+        "go run getting-started/consumer/main.go --tcp-server-address ${TLS_ADDR} --tls --tls-ca-file ${TLS_CA_FILE}"; do
+
+        echo -e "\e[33mChecking TLS example:\e[0m ${cmd}"
+        echo ""
+
+        set +e
+        eval "timeout 10 ${cmd}"
+        test_exit_code=$?
+        set -e
+
+        if [[ $test_exit_code -ne 0 && $test_exit_code -ne 124 ]]; then
+            echo ""
+            echo -e "\e[31mTLS example command failed:\e[0m ${cmd}"
+            echo ""
+            exit_code=$test_exit_code
+            break
+        fi
+        sleep 2
+    done
+
+    cd ../..
+
+    # Terminate TLS server
+    kill -TERM "$(cat ${PID_FILE})" 2>/dev/null || true
+    test -e ${PID_FILE} && rm ${PID_FILE}
+fi
+
 # If everything is ok remove log and pid files otherwise cat server log
 if [ "${exit_code}" -eq 0 ]; then
-    echo "Test passed"
+    echo ""
+    echo -e "\e[32m✓ All tests passed (non-TLS + TLS)\e[0m"
+    echo ""
 else
     echo "Test failed, see log file:"
     test -e ${LOG_FILE} && cat ${LOG_FILE}

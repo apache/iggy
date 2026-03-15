@@ -25,7 +25,7 @@ inputs:
   go-version:
     description: "Go version to use"
     required: false
-    default: "1.23.0"
+    default: "1.25.0"
   read-cache:
     description: "Whether to read from cache"
     required: false
