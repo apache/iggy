@@ -17,28 +17,10 @@
  * under the License.
  */
 
-mod elasticsearch;
-mod http;
-mod iceberg;
-mod mongodb;
-mod postgres;
-mod quickwit;
-mod wiremock;
+mod container;
+mod sink;
 
-pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
-pub use http::{
+pub use sink::{
     HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture,
     HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture, HttpSinkRawFixture,
 };
-pub use iceberg::{DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergOps, IcebergPreCreatedFixture};
-pub use mongodb::{
-    MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
-    MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
-};
-pub use postgres::{
-    PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
-    PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceJsonFixture,
-    PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceOps,
-};
-pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
-pub use wiremock::{WireMockDirectFixture, WireMockWrappedFixture};

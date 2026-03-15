@@ -5415,6 +5415,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_http_sink"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "humantime",
+ "iggy_connector_sdk",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "simd-json",
+ "tokio",
+ "toml 1.0.6+spec-1.1.0",
+ "tracing",
+]
+
+[[package]]
 name = "iggy_connector_iceberg_sink"
 version = "0.3.2-edge.1"
 dependencies = [
