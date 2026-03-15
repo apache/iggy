@@ -39,7 +39,10 @@ pub trait Storage {
     type Buffer;
 
     fn write(&self, buf: Self::Buffer) -> impl Future<Output = usize>;
-    fn read(&self, offset: usize, buffer: Self::Buffer) -> impl Future<Output = Self::Buffer>;
+    // TODO: Get rid of the `len` usize, we need to do changes in `Simulator` in order to support that.
+    // Maybe we should go back to passing in the `Buffer` again, but I am not sure how to handle it in the `Partitions Journal`, since we use in-memory impl
+    // which extracts the buffer out of the `Vec<Message>` and we don't need to allocate a new buffer.
+    fn read(&self, offset: usize, len: usize) -> impl Future<Output = Self::Buffer>;
 }
 
 pub trait JournalHandle {
