@@ -17,25 +17,26 @@
  * under the License.
  */
 
-package org.apache.iggy.system;
+package org.apache.iggy.consumergroup;
+
+import org.junit.jupiter.api.Test;
 
 import java.util.List;
-import java.util.Optional;
 
-public record ClientInfoDetails(
-        Long clientId,
-        Optional<Long> userId,
-        String address,
-        String transport,
-        Long consumerGroupsCount,
-        List<ConsumerGroupInfo> consumerGroups) {
-    public ClientInfoDetails(ClientInfo clientInfo, List<ConsumerGroupInfo> consumerGroups) {
-        this(
-                clientInfo.clientId(),
-                clientInfo.userId(),
-                clientInfo.address(),
-                clientInfo.transport(),
-                clientInfo.consumerGroupsCount(),
-                consumerGroups);
+import static org.assertj.core.api.Assertions.assertThat;
+
+class ConsumerGroupDetailsTest {
+    @Test
+    void constructorWithConsumerGroupCreatesExpectedConsumerGroupDetails() {
+        var consumerGroup = new ConsumerGroup(2L, "group", 3L, 1L);
+        var members = List.of(new ConsumerGroupMember(1L, 3L, List.of()));
+
+        var consumerGroupDetails = new ConsumerGroupDetails(consumerGroup, members);
+
+        assertThat(consumerGroupDetails.id()).isEqualTo(2L);
+        assertThat(consumerGroupDetails.name()).isEqualTo("group");
+        assertThat(consumerGroupDetails.partitionsCount()).isEqualTo(3);
+        assertThat(consumerGroupDetails.membersCount()).isEqualTo(1L);
+        assertThat(consumerGroupDetails.members()).isEqualTo(members);
     }
 }
