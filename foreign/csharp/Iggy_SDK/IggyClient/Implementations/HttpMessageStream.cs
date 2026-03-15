@@ -690,6 +690,7 @@ public class HttpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task<AuthResponse?> LoginUser(string userName, string password, CancellationToken token = default)
     {
+        // TODO: Add binary protocol version
         var json = JsonSerializer.Serialize(new LoginUserRequest(userName, password, SdkVersion.Value, Context),
             _jsonSerializerOptions);
 
