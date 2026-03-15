@@ -159,6 +159,19 @@ impl CliCommand for GetStatsCmd {
                     format!("{}", stats.consumer_groups_count).as_str(),
                 ]);
 
+                table.add_row(vec![
+                    "Threads Count",
+                    format!("{}", stats.threads_count).as_str(),
+                ]);
+                table.add_row(vec![
+                    "Free Disk Space",
+                    stats.free_disk_space.as_bytes_u64().to_string().as_str(),
+                ]);
+                table.add_row(vec![
+                    "Total Disk Space",
+                    stats.total_disk_space.as_bytes_u64().to_string().as_str(),
+                ]);
+
                 table.add_row(vec!["OS Name", stats.os_name.as_str()]);
                 table.add_row(vec!["OS Version", stats.os_version.as_str()]);
                 table.add_row(vec!["Kernel Version", stats.kernel_version.as_str()]);
@@ -206,6 +219,16 @@ impl CliCommand for GetStatsCmd {
                 list.push(format!(
                     "Consumer Groups Count|{}",
                     stats.consumer_groups_count
+                ));
+
+                list.push(format!("Threads Count|{}", stats.threads_count));
+                list.push(format!(
+                    "Free Disk Space|{}",
+                    stats.free_disk_space.as_bytes_u64()
+                ));
+                list.push(format!(
+                    "Total Disk Space|{}",
+                    stats.total_disk_space.as_bytes_u64()
                 ));
 
                 list.push(format!("OS Name|{}", stats.os_name));
