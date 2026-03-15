@@ -116,7 +116,11 @@ impl Partition for IggyPartition {
             journal.info.end_timestamp = ts;
         }
 
-        journal.inner.append(batch).await;
+        journal
+            .inner
+            .append(batch)
+            .await
+            .map_err(|e| IggyError::IoError(e.to_string()))?;
 
         Ok(AppendResult::new(
             dirty_offset,

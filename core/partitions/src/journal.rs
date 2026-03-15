@@ -27,11 +27,13 @@ pub struct Noop;
 impl Storage for Noop {
     type Buffer = ();
 
-    async fn write(&self, _buf: ()) -> usize {
-        0
+    async fn write_at(&self, _offset: usize, _buf: ()) -> std::io::Result<usize> {
+        Ok(0)
     }
 
-    async fn read(&self, _offset: usize, _buffer: ()) {}
+    async fn read_at(&self, _offset: usize, _buffer: ()) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Lookup key for querying messages from the journal.
@@ -105,9 +107,10 @@ impl Journal<Noop> for PartitionJournal {
         unreachable!("fn previous_header: header lookup not supported for partition journal.");
     }
 
-    async fn append(&self, entry: Self::Entry) {
+    async fn append(&self, entry: Self::Entry) -> std::io::Result<()> {
         let batch_set = unsafe { &mut *self.batch_set.get() };
         batch_set.add_batch(entry);
+        Ok(())
     }
 
     async fn entry(&self, header: &Self::Header) -> Option<Self::Entry> {
