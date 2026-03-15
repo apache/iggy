@@ -17,7 +17,7 @@
 
 [package]
 name = "server"
-version = "0.7.1-edge.1"
+version = "0.7.2-edge.1"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -79,7 +79,6 @@ opentelemetry_sdk = { workspace = true }
 papaya = { workspace = true }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls-no-provider"] }
 ringbuffer = { workspace = true }
 rmp-serde = { workspace = true }
 rolling-file = { workspace = true }

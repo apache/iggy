@@ -741,7 +741,8 @@ mod tests {
     fn create_test_message_with_command(command: Command2) -> Message<GenericHeader> {
         let size = std::mem::size_of::<GenericHeader>();
         let mut buf = vec![0u8; size];
-        let header: &mut GenericHeader = bytemuck::from_bytes_mut(&mut buf);
+        let header: &mut GenericHeader =
+            bytemuck::checked::try_from_bytes_mut(&mut buf).expect("zeroed bytes are valid");
         header.command = command;
         Message::<GenericHeader>::from_bytes(bytes::Bytes::from(buf)).unwrap()
     }

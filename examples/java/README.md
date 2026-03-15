@@ -174,6 +174,28 @@ The async client uses Netty's event loop threads for I/O operations. **NEVER** b
 
 If your message processing involves blocking operations, offload to a separate thread pool using `thenApplyAsync(fn, executor)`.
 
+## Security Examples
+
+### TCP/TLS
+
+Demonstrates secure TLS-encrypted TCP connections:
+
+```bash
+./gradlew runTcpTlsProducer
+./gradlew runTcpTlsConsumer
+```
+
+These examples require a TLS-enabled Iggy server. Start the server with:
+
+```bash
+IGGY_TCP_TLS_ENABLED=true \
+IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
+IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
+cargo r --bin iggy-server
+```
+
+Uses `IggyTcpClientBuilder` with TLS options (`enableTls`, `tlsDomain`, `tlsCaCertPath`) to establish TLS-encrypted TCP connections with CA certificate verification.
+
 ## Blocking vs. Async - When to Use Each
 
 The Iggy Java SDK provides two client types: **blocking (synchronous)** and **async (non-blocking)**. Choose based on your use case:

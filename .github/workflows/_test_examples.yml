@@ -22,7 +22,7 @@ on:
       component:
         type: string
         required: true
-        description: "Component to test (should be 'examples-suite')"
+        description: "Component to test (e.g., 'examples-rust', 'examples-go')"
       task:
         type: string
         required: true
@@ -44,11 +44,11 @@ jobs:
         run: echo "No changes detected, skipping tests"
 
       - name: Setup Rust with cache for examples
-        if: inputs.component == 'examples-suite'
+        if: startsWith(inputs.component, 'examples-')
         uses: ./.github/actions/utils/setup-rust-with-cache
 
       - name: Setup Node with cache for examples
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-node'
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-node'
         uses: ./.github/actions/utils/setup-node-with-cache
         with:
           node-version: "23"
@@ -56,36 +56,36 @@ jobs:
           workspace: examples/node
 
       - name: Setup Python
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
       - name: Setup uv
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
         uses: astral-sh/setup-uv@v7
 
       - name: Cache uv
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
         uses: actions/cache@v4
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('examples/python/uv.lock', 'foreign/python/uv.lock', 'bdd/python/uv.lock') }}
 
       - name: Setup Java with cache for examples
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-java'
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-java'
         uses: ./.github/actions/utils/setup-java-with-cache
         with:
           gradle-cache-disabled: "true"
 
       - name: Setup Go for examples
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-go'
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-go'
         uses: ./.github/actions/utils/setup-go-with-cache
         with:
           download-deps: "false"
 
       - name: Build common binaries for all examples
-        if: inputs.component == 'examples-suite'
+        if: startsWith(inputs.component, 'examples-')
         run: |
           echo "Building common binaries for all examples tests..."
           echo "Current directory: $(pwd)"
@@ -124,31 +124,31 @@ jobs:
           fi
 
       - name: Run Rust examples
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-rust'
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-rust'
         run: |
           echo "Running Rust examples tests..."
           ./scripts/run-rust-examples-from-readme.sh
 
       - name: Run Go examples
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-go'
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-go'
         run: |
           echo "Running Go examples tests..."
           ./scripts/run-go-examples-from-readme.sh
 
       - name: Run Csharp examples
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-csharp'
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-csharp'
         run: |
           echo "Running Csharp examples tests..."
           ./scripts/run-csharp-examples-from-readme.sh
 
       - name: Run Python examples
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
         run: |
           echo "Running Python examples tests..."
           ./scripts/run-python-examples-from-readme.sh
 
       - name: Run Node.js examples
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-node'
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-node'
         run: |
           echo "Running Node.js examples tests..."
           # Build the local Node SDK first (examples use file: link to it)
@@ -163,7 +163,7 @@ jobs:
           ./scripts/run-node-examples-from-readme.sh
 
       - name: Run Java examples
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-java'
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-java'
         run: |
           echo "Running Java examples tests..."
           ./scripts/run-java-examples-from-readme.sh

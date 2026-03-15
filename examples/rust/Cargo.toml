@@ -125,3 +125,11 @@ path = "src/stream-builder/stream-producer-config/main.rs"
 [[example]]
 name = "sink-data-producer"
 path = "src/sink-data-producer/main.rs"
+
+[[example]]
+name = "tcp-tls-producer"
+path = "src/tcp-tls/producer/main.rs"
+
+[[example]]
+name = "tcp-tls-consumer"
+path = "src/tcp-tls/consumer/main.rs"

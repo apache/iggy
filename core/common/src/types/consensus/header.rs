@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytemuck::{Pod, Zeroable};
+use bytemuck::{CheckedBitPattern, NoUninit};
 use enumset::EnumSetType;
 use thiserror::Error;
 
 const HEADER_SIZE: usize = 256;
-pub trait ConsensusHeader: Sized + Pod + Zeroable {
+pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
     const COMMAND: Command2;
 
     fn validate(&self) -> Result<(), ConsensusError>;
@@ -49,6 +49,18 @@ pub enum Command2 {
     StartViewChange = 10,
     DoViewChange = 11,
     StartView = 12,
+}
+
+// SAFETY: Command2 is #[repr(u8)] with no padding bytes.
+unsafe impl NoUninit for Command2 {}
+
+// SAFETY: Command2 is #[repr(u8)]; is_valid_bit_pattern matches all defined discriminants.
+unsafe impl CheckedBitPattern for Command2 {
+    type Bits = u8;
+
+    fn is_valid_bit_pattern(bits: &u8) -> bool {
+        *bits <= 12
+    }
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -89,13 +101,16 @@ pub enum ConsensusError {
 
     #[error("context_padding must be 0")]
     ReplyContextPaddingNonZero,
+
+    #[error("invalid bit pattern in header (enum discriminant out of range)")]
+    InvalidBitPattern,
 }
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, NoUninit, CheckedBitPattern)]
 #[repr(u8)]
 pub enum Operation {
     #[default]
-    Default = 0,
+    Reserved = 0,
     CreateStream = 128,
     UpdateStream = 129,
     DeleteStream = 130,
@@ -120,8 +135,6 @@ pub enum Operation {
     // Partition operations (replicated via consensus)
     SendMessages = 160,
     StoreConsumerOffset = 161,
-
-    Reserved = 200,
 }
 
 impl Operation {
@@ -165,7 +178,7 @@ impl Operation {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct GenericHeader {
     pub checksum: u128,
     pub checksum_body: u128,
@@ -194,14 +207,11 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for GenericHeader {}
-unsafe impl Zeroable for GenericHeader {}
-
 impl ConsensusHeader for GenericHeader {
     const COMMAND: Command2 = Command2::Reserved;
 
     fn operation(&self) -> Operation {
-        Operation::Default
+        Operation::Reserved
     }
 
     fn command(&self) -> Command2 {
@@ -218,7 +228,7 @@ impl ConsensusHeader for GenericHeader {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct RequestHeader {
     pub checksum: u128,
     pub checksum_body: u128,
@@ -263,23 +273,20 @@ impl Default for RequestHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Default::default(),
+            command: Command2::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             client: 0,
             request_checksum: 0,
             timestamp: 0,
             request: 0,
-            operation: Default::default(),
+            operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
             reserved: [0; 64],
         }
     }
 }
-
-unsafe impl Pod for RequestHeader {}
-unsafe impl Zeroable for RequestHeader {}
 
 impl ConsensusHeader for RequestHeader {
     const COMMAND: Command2 = Command2::Request;
@@ -308,7 +315,7 @@ impl ConsensusHeader for RequestHeader {
 
 // TODO: Manually impl default (and use a const for the `release`)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct PrepareHeader {
     pub checksum: u128,
     pub checksum_body: u128,
@@ -347,9 +354,6 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for PrepareHeader {}
-unsafe impl Zeroable for PrepareHeader {}
-
 impl ConsensusHeader for PrepareHeader {
     const COMMAND: Command2 = Command2::Prepare;
 
@@ -384,7 +388,7 @@ impl Default for PrepareHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Default::default(),
+            command: Command2::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             client: 0,
@@ -394,7 +398,7 @@ impl Default for PrepareHeader {
             commit: 0,
             timestamp: 0,
             request: 0,
-            operation: Default::default(),
+            operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
             reserved: [0; 32],
@@ -404,7 +408,7 @@ impl Default for PrepareHeader {
 
 // TODO: Manually impl default (and use a const for the `release`)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct PrepareOkHeader {
     pub checksum: u128,
     pub checksum_body: u128,
@@ -442,9 +446,6 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for PrepareOkHeader {}
-unsafe impl Zeroable for PrepareOkHeader {}
-
 impl ConsensusHeader for PrepareOkHeader {
     const COMMAND: Command2 = Command2::PrepareOk;
 
@@ -479,7 +480,7 @@ impl Default for PrepareOkHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Default::default(),
+            command: Command2::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             parent: 0,
@@ -488,7 +489,7 @@ impl Default for PrepareOkHeader {
             commit: 0,
             timestamp: 0,
             request: 0,
-            operation: Default::default(),
+            operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
             reserved: [0; 48],
@@ -497,7 +498,7 @@ impl Default for PrepareOkHeader {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct CommitHeader {
     pub checksum: u128,
     pub checksum_body: u128,
@@ -531,14 +532,11 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for CommitHeader {}
-unsafe impl Zeroable for CommitHeader {}
-
 impl ConsensusHeader for CommitHeader {
     const COMMAND: Command2 = Command2::Commit;
 
     fn operation(&self) -> Operation {
-        Operation::Default
+        Operation::Reserved
     }
     fn command(&self) -> Command2 {
         self.command
@@ -560,7 +558,7 @@ impl ConsensusHeader for CommitHeader {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
 pub struct ReplyHeader {
     pub checksum: u128,
     pub checksum_body: u128,
@@ -598,9 +596,6 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for ReplyHeader {}
-unsafe impl Zeroable for ReplyHeader {}
-
 impl ConsensusHeader for ReplyHeader {
     const COMMAND: Command2 = Command2::Reply;
 
@@ -632,7 +627,7 @@ impl Default for ReplyHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Default::default(),
+            command: Command2::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             request_checksum: 0,
@@ -641,7 +636,7 @@ impl Default for ReplyHeader {
             commit: 0,
             timestamp: 0,
             request: 0,
-            operation: Default::default(),
+            operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
             reserved: [0; 48],
@@ -653,7 +648,7 @@ impl Default for ReplyHeader {
 ///
 /// Sent by a replica when it suspects the primary has failed.
 /// This is a header-only message with no body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct StartViewChangeHeader {
     pub checksum: u128,
@@ -684,14 +679,11 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for StartViewChangeHeader {}
-unsafe impl Zeroable for StartViewChangeHeader {}
-
 impl ConsensusHeader for StartViewChangeHeader {
     const COMMAND: Command2 = Command2::StartViewChange;
 
     fn operation(&self) -> Operation {
-        Operation::Default
+        Operation::Reserved
     }
     fn command(&self) -> Command2 {
         self.command
@@ -720,7 +712,7 @@ impl ConsensusHeader for StartViewChangeHeader {
 ///
 /// Sent by replicas to the primary candidate after collecting a quorum of
 /// StartViewChange messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct DoViewChangeHeader {
     pub checksum: u128,
@@ -761,14 +753,11 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for DoViewChangeHeader {}
-unsafe impl Zeroable for DoViewChangeHeader {}
-
 impl ConsensusHeader for DoViewChangeHeader {
     const COMMAND: Command2 = Command2::DoViewChange;
 
     fn operation(&self) -> Operation {
-        Operation::Default
+        Operation::Reserved
     }
     fn command(&self) -> Command2 {
         self.command
@@ -813,7 +802,7 @@ impl ConsensusHeader for DoViewChangeHeader {
 ///
 /// Sent by the new primary to all replicas after collecting a quorum of
 /// DoViewChange messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct StartViewHeader {
     pub checksum: u128,
@@ -851,14 +840,11 @@ const _: () = {
     );
 };
 
-unsafe impl Pod for StartViewHeader {}
-unsafe impl Zeroable for StartViewHeader {}
-
 impl ConsensusHeader for StartViewHeader {
     const COMMAND: Command2 = Command2::StartView;
 
     fn operation(&self) -> Operation {
-        Operation::Default
+        Operation::Reserved
     }
     fn command(&self) -> Command2 {
         self.command

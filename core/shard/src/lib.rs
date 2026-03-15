@@ -171,10 +171,13 @@ where
                 Error = iggy_common::IggyError,
             >,
     {
-        match MessageBag::from(message) {
-            MessageBag::Request(request) => self.on_request(request).await,
-            MessageBag::Prepare(prepare) => self.on_replicate(prepare).await,
-            MessageBag::PrepareOk(prepare_ok) => self.on_ack(prepare_ok).await,
+        match MessageBag::try_from(message) {
+            Ok(MessageBag::Request(request)) => self.on_request(request).await,
+            Ok(MessageBag::Prepare(prepare)) => self.on_replicate(prepare).await,
+            Ok(MessageBag::PrepareOk(prepare_ok)) => self.on_ack(prepare_ok).await,
+            Err(e) => {
+                tracing::warn!(shard = self.id, error = %e, "dropping message with invalid command");
+            }
         }
     }
 

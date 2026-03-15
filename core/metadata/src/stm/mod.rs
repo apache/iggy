@@ -248,7 +248,6 @@ macro_rules! collect_handlers {
                     use ::iggy_common::BytesSerializable;
                     use ::iggy_common::Either;
                     use ::iggy_common::header::Operation;
-
                     match input.header().operation {
                         $(
                             Operation::$operation => {

@@ -240,7 +240,8 @@ where
     let total_size = header_size + body.len();
     let mut buffer = bytes::BytesMut::zeroed(total_size);
 
-    let header = bytemuck::from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size]);
+    let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size])
+        .expect("zeroed bytes are valid");
     *header = ReplyHeader {
         checksum: 0,
         checksum_body: 0,

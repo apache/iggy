@@ -84,7 +84,7 @@ impl ReceiveMessage {
 
 #[derive(Clone, Copy)]
 #[gen_stub_pyclass_complex_enum]
-#[pyclass]
+#[pyclass(from_py_object)]
 pub enum PollingStrategy {
     Offset { value: u64 },
     Timestamp { value: u64 },
