@@ -62,8 +62,10 @@ where
 pub trait Storage {
     type Buffer;
 
-    fn write(&self, buf: Self::Buffer) -> impl Future<Output = io::Result<usize>>;
-    fn read(
+    fn write_at(&self, offset: usize, buf: Self::Buffer)
+    -> impl Future<Output = io::Result<usize>>;
+
+    fn read_at(
         &self,
         offset: usize,
         buffer: Self::Buffer,
