@@ -25,10 +25,8 @@ import org.junit.jupiter.api.Test;
 import java.util.HashMap;
 import java.util.Map;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class IggyStreamConfigTest {
 
@@ -38,16 +36,16 @@ class IggyStreamConfigTest {
         StreamConfig streamConfig = new StreamConfig("test_table_REALTIME", props);
         IggyStreamConfig config = new IggyStreamConfig(streamConfig);
 
-        assertEquals("localhost", config.getHost());
-        assertEquals(8090, config.getPort());
-        assertEquals("iggy", config.getUsername());
-        assertEquals("iggy", config.getPassword());
-        assertEquals("analytics", config.getStreamId());
-        assertEquals("events", config.getTopicId());
-        assertEquals("test-consumer-group", config.getConsumerGroup());
-        assertEquals(100, config.getPollBatchSize());
-        assertEquals(4, config.getConnectionPoolSize());
-        assertFalse(config.isEnableTls());
+        assertThat(config.getHost()).isEqualTo("localhost");
+        assertThat(config.getPort()).isEqualTo(8090);
+        assertThat(config.getUsername()).isEqualTo("iggy");
+        assertThat(config.getPassword()).isEqualTo("iggy");
+        assertThat(config.getStreamId()).isEqualTo("analytics");
+        assertThat(config.getTopicId()).isEqualTo("events");
+        assertThat(config.getConsumerGroup()).isEqualTo("test-consumer-group");
+        assertThat(config.getPollBatchSize()).isEqualTo(100);
+        assertThat(config.getConnectionPoolSize()).isEqualTo(4);
+        assertThat(config.isEnableTls()).isFalse();
     }
 
     @Test
@@ -63,12 +61,12 @@ class IggyStreamConfigTest {
         StreamConfig streamConfig = new StreamConfig("test_table_REALTIME", props);
         IggyStreamConfig config = new IggyStreamConfig(streamConfig);
 
-        assertEquals(9090, config.getPort());
-        assertEquals("custom-user", config.getUsername());
-        assertEquals("custom-pass", config.getPassword());
-        assertEquals(500, config.getPollBatchSize());
-        assertEquals(8, config.getConnectionPoolSize());
-        assertTrue(config.isEnableTls());
+        assertThat(config.getPort()).isEqualTo(9090);
+        assertThat(config.getUsername()).isEqualTo("custom-user");
+        assertThat(config.getPassword()).isEqualTo("custom-pass");
+        assertThat(config.getPollBatchSize()).isEqualTo(500);
+        assertThat(config.getConnectionPoolSize()).isEqualTo(8);
+        assertThat(config.isEnableTls()).isTrue();
     }
 
     @Test
@@ -78,10 +76,9 @@ class IggyStreamConfigTest {
 
         StreamConfig streamConfig = new StreamConfig("test_table_REALTIME", props);
 
-        IllegalArgumentException exception =
-                assertThrows(IllegalArgumentException.class, () -> new IggyStreamConfig(streamConfig));
-
-        assertTrue(exception.getMessage().contains("host"));
+        assertThatThrownBy(() -> new IggyStreamConfig(streamConfig))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("host");
     }
 
     @Test
@@ -91,10 +88,9 @@ class IggyStreamConfigTest {
 
         StreamConfig streamConfig = new StreamConfig("test_table_REALTIME", props);
 
-        IllegalArgumentException exception =
-                assertThrows(IllegalArgumentException.class, () -> new IggyStreamConfig(streamConfig));
-
-        assertTrue(exception.getMessage().contains("stream ID"));
+        assertThatThrownBy(() -> new IggyStreamConfig(streamConfig))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("stream ID");
     }
 
     @Test
@@ -104,10 +100,9 @@ class IggyStreamConfigTest {
 
         StreamConfig streamConfig = new StreamConfig("test_table_REALTIME", props);
 
-        IllegalArgumentException exception =
-                assertThrows(IllegalArgumentException.class, () -> new IggyStreamConfig(streamConfig));
-
-        assertTrue(exception.getMessage().contains("topic ID"));
+        assertThatThrownBy(() -> new IggyStreamConfig(streamConfig))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("topic ID");
     }
 
     @Test
@@ -117,10 +112,9 @@ class IggyStreamConfigTest {
 
         StreamConfig streamConfig = new StreamConfig("test_table_REALTIME", props);
 
-        IllegalArgumentException exception =
-                assertThrows(IllegalArgumentException.class, () -> new IggyStreamConfig(streamConfig));
-
-        assertTrue(exception.getMessage().contains("consumer group"));
+        assertThatThrownBy(() -> new IggyStreamConfig(streamConfig))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("consumer group");
     }
 
     @Test
@@ -129,7 +123,7 @@ class IggyStreamConfigTest {
         StreamConfig streamConfig = new StreamConfig("test_table_REALTIME", props);
         IggyStreamConfig config = new IggyStreamConfig(streamConfig);
 
-        assertEquals("localhost:8090", config.getServerAddress());
+        assertThat(config.getServerAddress()).isEqualTo("localhost:8090");
     }
 
     @Test
@@ -138,7 +132,7 @@ class IggyStreamConfigTest {
         StreamConfig streamConfig = new StreamConfig("events_REALTIME", props);
         IggyStreamConfig config = new IggyStreamConfig(streamConfig);
 
-        assertEquals("events_REALTIME", config.getTableNameWithType());
+        assertThat(config.getTableNameWithType()).isEqualTo("events_REALTIME");
     }
 
     @Test
@@ -148,11 +142,12 @@ class IggyStreamConfigTest {
         IggyStreamConfig config = new IggyStreamConfig(streamConfig);
 
         String str = config.toString();
-        assertTrue(str.contains("localhost"));
-        assertTrue(str.contains("8090"));
-        assertTrue(str.contains("analytics"));
-        assertTrue(str.contains("events"));
-        assertTrue(str.contains("test-consumer-group"));
+        assertThat(str)
+                .contains("localhost")
+                .contains("8090")
+                .contains("analytics")
+                .contains("events")
+                .contains("test-consumer-group");
     }
 
     @Test
@@ -164,8 +159,8 @@ class IggyStreamConfigTest {
         StreamConfig streamConfig = new StreamConfig("test_table_REALTIME", props);
         IggyStreamConfig config = new IggyStreamConfig(streamConfig);
 
-        assertEquals("123", config.getStreamId());
-        assertEquals("456", config.getTopicId());
+        assertThat(config.getStreamId()).isEqualTo("123");
+        assertThat(config.getTopicId()).isEqualTo("456");
     }
 
     private Map<String, String> createValidConfig() {
