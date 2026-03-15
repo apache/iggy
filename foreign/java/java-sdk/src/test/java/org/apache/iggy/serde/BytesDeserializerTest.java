@@ -34,6 +34,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
 
 import static org.apache.iggy.serde.BytesDeserializer.readClientInfo;
+import static org.apache.iggy.serde.BytesDeserializer.readClientInfoDetails;
 import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroup;
 import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupDetails;
 import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupInfo;
@@ -485,6 +486,31 @@ class BytesDeserializerTest {
             assertThat(clientInfo.userId()).isPresent().hasValue(5L);
             assertThat(clientInfo.address()).isEqualTo("127.0.0.1");
             assertThat(clientInfo.transport()).isEqualTo("Tcp");
+        }
+
+        @Test
+        void shouldDeserializeClientInfoDetails() {
+            var buffer = Unpooled.buffer();
+            buffer.writeIntLE(100); // client ID
+            buffer.writeIntLE(5); // user ID
+            buffer.writeByte(2); // transport (Quic)
+            buffer.writeIntLE(9); // address length
+            buffer.writeBytes("127.0.0.1".getBytes());
+            buffer.writeIntLE(1); // consumer groups count
+            buffer.writeIntLE(1); // first consumer group stream ID
+            buffer.writeIntLE(2); // first consumer group topic ID
+            buffer.writeIntLE(3); // first consumer group's consumer group ID
+
+            var clientInfo = readClientInfoDetails(buffer);
+
+            assertThat(clientInfo.clientId()).isEqualTo(100L);
+            assertThat(clientInfo.userId()).isPresent().hasValue(5L);
+            assertThat(clientInfo.address()).isEqualTo("127.0.0.1");
+            assertThat(clientInfo.transport()).isEqualTo("Quic");
+            assertThat(clientInfo.consumerGroups()).hasSize(1);
+            assertThat(clientInfo.consumerGroups().getFirst().streamId()).isEqualTo(1L);
+            assertThat(clientInfo.consumerGroups().getFirst().topicId()).isEqualTo(2L);
+            assertThat(clientInfo.consumerGroups().getFirst().consumerGroupId()).isEqualTo(3L);
         }
 
         @Test
