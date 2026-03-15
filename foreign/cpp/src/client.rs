@@ -190,6 +190,7 @@ pub unsafe fn delete_connection(client: *mut Client) -> Result<(), String> {
         return Ok(());
     }
 
+    // TODO(slbotbm): Address comment from @hubcio: if logout_user will fail you will have a leak, this will be tagged by e.g. valgrind if someone will test iggy rigorously
     let logout_result = RUNTIME.block_on(async { unsafe { &*client }.inner.logout_user().await });
 
     unsafe {
