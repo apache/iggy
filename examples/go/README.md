@@ -44,4 +44,4 @@ All examples can be executed directly from the repository. Follow these steps:
 
 These examples use IggyClient with TCP transport and demonstrate automatic stream/topic creation with basic message handling.
 
-The examples are automatically tested via `scripts/run-go-examples-from-readme.sh` to ensure they remain functional and up-to-date with the latest API changes.
+The examples are automatically tested via `scripts/run-examples-from-readme.sh --language go` to ensure they remain functional and up-to-date with the latest API changes.
