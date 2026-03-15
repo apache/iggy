@@ -32,6 +32,8 @@ mod stdout;
 use iggy_common::IggyTimestamp;
 use serde::{Deserialize, Serialize};
 
+const ONE_DAY_MICROS: u64 = 24 * 60 * 60 * 1_000_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TestMessage {
     pub id: u64,
@@ -41,6 +43,7 @@ pub struct TestMessage {
     pub active: bool,
     pub timestamp: i64,
 }
+
 pub fn create_test_messages(count: usize) -> Vec<TestMessage> {
     let base_timestamp = IggyTimestamp::now().as_micros();
     (1..=count)
@@ -50,7 +53,7 @@ pub fn create_test_messages(count: usize) -> Vec<TestMessage> {
             count: ((i - 1) * 10) as u32,
             amount: (i - 1) as f64 * 100.0,
             active: (i - 1) % 2 == 0,
-            timestamp: (base_timestamp + (i - 1) as u64 * 1000) as i64,
+            timestamp: (base_timestamp + (i - 1) as u64 * ONE_DAY_MICROS) as i64,
         })
         .collect()
 }

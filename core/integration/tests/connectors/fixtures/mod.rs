@@ -19,7 +19,7 @@
 
 mod elasticsearch;
 mod iceberg;
-pub mod influxdb;
+mod influxdb;
 mod mongodb;
 mod postgres;
 mod quickwit;
