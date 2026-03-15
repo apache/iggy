@@ -16,18 +16,22 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-/* adding a dummy comment */
-pub mod elasticsearch;
-pub mod iceberg;
+
+mod elasticsearch;
+mod iceberg;
 pub mod influxdb;
-pub mod mongodb;
+mod mongodb;
 mod postgres;
-pub mod quickwit;
-pub mod wiremock;
+mod quickwit;
+mod wiremock;
 
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use iceberg::{DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergOps, IcebergPreCreatedFixture};
 pub use influxdb::{InfluxDbSinkFixture, InfluxDbSourceFixture};
+pub use mongodb::{
+    MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
+    MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
+};
 pub use postgres::{
     PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
     PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceJsonFixture,
