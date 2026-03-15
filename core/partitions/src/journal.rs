@@ -35,11 +35,11 @@ pub struct Noop;
 impl Storage for Noop {
     type Buffer = ();
 
-    async fn write(&self, _buf: ()) -> std::io::Result<usize> {
+    async fn write_at(&self, _offset: usize, _buf: ()) -> std::io::Result<usize> {
         Ok(0)
     }
 
-    async fn read(&self, _offset: usize, _buffer: ()) -> std::io::Result<()> {
+    async fn read_at(&self, _offset: usize, _buffer: ()) -> std::io::Result<()> {
         Ok(())
     }
 }
