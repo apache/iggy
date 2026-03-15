@@ -85,9 +85,15 @@ impl From<io::Error> for JournalError {
 /// The in-memory index is a fixed-size slot array indexed by
 /// `op % SLOT_COUNT`.
 pub struct MetadataJournal {
+    /// File-backed append-only WAL.
     storage: FileStorage,
+    /// In-memory slot array of entry headers, indexed by `op % SLOT_COUNT`.
+    /// A slot is `None` if no entry occupies it (or it has been drained).
     headers: RefCell<Vec<Option<PrepareHeader>>>,
+    /// Byte offset within the WAL file for each slot's entry, mirrors `headers`.
     offsets: RefCell<Vec<Option<u64>>>,
+    /// Highest op number appended to the journal, or `None` if empty.
+    /// Used to detect forward progress and validate append ordering.
     last_op: Cell<Option<u64>>,
     /// Highest op that has been durably snapshotted. Entries with `op <= snapshot_op`
     /// are safe to evict from the slot array. Appending an entry that would evict

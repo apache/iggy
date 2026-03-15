@@ -59,6 +59,7 @@ impl IggySnapshot {
     /// # Errors
     /// Returns `SnapshotError` if serialization or I/O fails.
     pub fn persist(&self, path: &Path) -> Result<(), SnapshotError> {
+        use crate::stm::snapshot::PersistStage;
         use std::fs;
         use std::io::Write;
 
@@ -66,17 +67,36 @@ impl IggySnapshot {
 
         let tmp_path = path.with_extension("bin.tmp");
 
-        let mut file = fs::File::create(&tmp_path)?;
-        file.write_all(&encoded)?;
-        file.sync_all()?;
+        let mut file = fs::File::create(&tmp_path).map_err(|e| SnapshotError::Persist {
+            stage: PersistStage::Write,
+            source: e,
+        })?;
+        file.write_all(&encoded)
+            .map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::Write,
+                source: e,
+            })?;
+        file.sync_all().map_err(|e| SnapshotError::Persist {
+            stage: PersistStage::Sync,
+            source: e,
+        })?;
         drop(file);
 
-        fs::rename(&tmp_path, path)?;
+        fs::rename(&tmp_path, path).map_err(|e| SnapshotError::Persist {
+            stage: PersistStage::Rename,
+            source: e,
+        })?;
 
         // Fsync the parent directory to ensure the rename is durable.
         if let Some(parent) = path.parent() {
-            let dir = fs::File::open(parent)?;
-            dir.sync_all()?;
+            let dir = fs::File::open(parent).map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::DirSync,
+                source: e,
+            })?;
+            dir.sync_all().map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::DirSync,
+                source: e,
+            })?;
         }
 
         Ok(())

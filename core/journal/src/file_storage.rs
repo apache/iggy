@@ -132,11 +132,18 @@ impl FileStorage {
 impl Storage for FileStorage {
     type Buffer = Vec<u8>;
 
-    async fn write(&self, buf: Self::Buffer) -> io::Result<usize> {
-        self.write_append(buf).await
+    async fn write_at(&self, offset: usize, buf: Self::Buffer) -> io::Result<usize> {
+        let len = buf.buf_len();
+        let file = unsafe { &mut *self.file.get() };
+        let (result, _buf) = file.write_all_at(buf, offset as u64).await.into();
+        result?;
+        Ok(len)
     }
 
-    async fn read(&self, offset: usize, buffer: Self::Buffer) -> io::Result<Self::Buffer> {
-        self.read_at(offset as u64, buffer).await
+    async fn read_at(&self, offset: usize, buffer: Self::Buffer) -> io::Result<Self::Buffer> {
+        let file = unsafe { &*self.file.get() };
+        let (result, buffer) = file.read_exact_at(buffer, offset as u64).await.into();
+        result?;
+        Ok(buffer)
     }
 }
