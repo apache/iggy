@@ -362,12 +362,13 @@ func (c *IggyTcpClient) connect() error {
 			// TLS logic
 			tlsConfig, err := c.createTLSConfig()
 			if err != nil {
+				_ = connection.Close()
 				return err
 			}
 
 			tlsConn := tls.Client(connection, tlsConfig)
 			if err := tlsConn.Handshake(); err != nil {
-				connection.Close()
+				_ = connection.Close()
 				return fmt.Errorf("TLS handshake failed: %w", err)
 			}
 
