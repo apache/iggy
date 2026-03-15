@@ -508,9 +508,9 @@ class BytesDeserializerTest {
             assertThat(clientInfo.address()).isEqualTo("127.0.0.1");
             assertThat(clientInfo.transport()).isEqualTo("Quic");
             assertThat(clientInfo.consumerGroups()).hasSize(1);
-            assertThat(clientInfo.consumerGroups().getFirst().streamId()).isEqualTo(1L);
-            assertThat(clientInfo.consumerGroups().getFirst().topicId()).isEqualTo(2L);
-            assertThat(clientInfo.consumerGroups().getFirst().consumerGroupId()).isEqualTo(3L);
+            assertThat(clientInfo.consumerGroups().get(0).streamId()).isEqualTo(1L);
+            assertThat(clientInfo.consumerGroups().get(0).topicId()).isEqualTo(2L);
+            assertThat(clientInfo.consumerGroups().get(0).consumerGroupId()).isEqualTo(3L);
         }
 
         @Test
