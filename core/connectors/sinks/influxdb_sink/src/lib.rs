@@ -16,37 +16,13 @@
  * under the License.
  */
 
-// =============================================================================
-// CHANGES FROM ORIGINAL — all fixes are marked with [FIX-SINK-N] comments:
-//
-// [FIX-SINK-1] open() now retries connectivity with exponential backoff+jitter
-//              instead of failing hard when InfluxDB is unavailable at startup.
-// [FIX-SINK-2] write_with_retry() uses true exponential backoff (2^attempt)
-//              instead of linear (delay * attempt).
-// [FIX-SINK-3] Added random jitter (±20%) to every retry delay to avoid
-//              thundering herd across multiple connector instances.
-// [FIX-SINK-4] On HTTP 429 Too Many Requests, the Retry-After response header
-//              is parsed and honoured instead of using the fixed retry_delay.
-// [FIX-SINK-5] Added a circuit breaker (ConsecutiveFailureBreaker) that opens
-//              after max_retries consecutive batch failures, pausing writes for
-//              a configurable cool-down before attempting again.
-// [FIX-SINK-6] consume() now propagates batch write errors to the runtime
-//              instead of silently dropping messages with Ok(()). Individual
-//              batch errors are collected and the first failure is returned,
-//              which prevents silent data loss.
-// [FIX-SINK-7] Added DEFAULT_MAX_OPEN_RETRIES / max_open_retries config field
-//              to control how many times open() retries before giving up.
-// [FIX-SINK-8] Added DEFAULT_OPEN_RETRY_MAX_DELAY cap so backoff in open()
-//              doesn't grow unboundedly.
-// =============================================================================
-
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
-use rand::Rng;
+use rand::RngExt;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -64,13 +40,13 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_RETRY_DELAY: &str = "1s";
 const DEFAULT_TIMEOUT: &str = "30s";
 const DEFAULT_PRECISION: &str = "us";
-// [FIX-SINK-7] Maximum attempts for open() connectivity retries
+// Maximum attempts for open() connectivity retries
 const DEFAULT_MAX_OPEN_RETRIES: u32 = 10;
-// [FIX-SINK-8] Cap for exponential backoff in open() — never wait longer than this
+// Cap for exponential backoff in open() — never wait longer than this
 const DEFAULT_OPEN_RETRY_MAX_DELAY: &str = "60s";
-// [FIX-SINK-5] How many consecutive batch failures open the circuit breaker
+// How many consecutive batch failures open the circuit breaker
 const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
-// [FIX-SINK-5] How long the circuit stays open before allowing a probe attempt
+// How long the circuit stays open before allowing a probe attempt
 const DEFAULT_CIRCUIT_COOL_DOWN: &str = "30s";
 
 // ---------------------------------------------------------------------------
@@ -224,14 +200,14 @@ fn jitter(base: Duration) -> Duration {
     Duration::from_millis(millis.saturating_sub(jitter_range) + delta)
 }
 
-// [FIX-SINK-2] True exponential backoff: base * 2^attempt, capped at max_delay
+// True exponential backoff: base * 2^attempt, capped at max_delay
 fn exponential_backoff(base: Duration, attempt: u32, max_delay: Duration) -> Duration {
     let factor = 2u64.saturating_pow(attempt);
     let raw = Duration::from_millis(base.as_millis().saturating_mul(factor as u128) as u64);
     raw.min(max_delay)
 }
 
-// [FIX-SINK-4] Parse Retry-After header value (integer seconds or HTTP date)
+// Parse Retry-After header value (integer seconds or HTTP date)
 fn parse_retry_after(value: &str) -> Option<Duration> {
     if let Ok(secs) = value.trim().parse::<u64>() {
         return Some(Duration::from_secs(secs));
@@ -268,7 +244,7 @@ impl InfluxDbSink {
         let verbose = config.verbose_logging.unwrap_or(false);
         let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
 
-        // [FIX-SINK-5] Build circuit breaker from config
+        // Build circuit breaker from config
         let cb_threshold = config
             .circuit_breaker_threshold
             .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD);
@@ -347,7 +323,7 @@ impl InfluxDbSink {
         Ok(())
     }
 
-    // [FIX-SINK-1] Retry connectivity check with exponential backoff + jitter
+    // Retry connectivity check with exponential backoff + jitter
     // instead of failing hard on the first attempt.
     async fn check_connectivity_with_retry(&self) -> Result<(), Error> {
         let max_open_retries = self
@@ -384,7 +360,7 @@ impl InfluxDbSink {
                         );
                         return Err(e);
                     }
-                    // [FIX-SINK-2] Exponential backoff, [FIX-SINK-3] with jitter
+                    // Exponential backoff, with jitter
                     let backoff = jitter(exponential_backoff(self.retry_delay, attempt, max_delay));
                     warn!(
                         "InfluxDB health check failed (attempt {attempt}/{max_open_retries}) \
@@ -542,7 +518,7 @@ impl InfluxDbSink {
             format!(",{}", tags.join(","))
         };
 
-        // [FIX-SINK-9] message.timestamp is microseconds since Unix epoch.
+        // message.timestamp is microseconds since Unix epoch.
         // If it is 0 (unset by the producer), fall back to now() so points are
         // not stored at Unix epoch (year 1970), which falls outside every
         // range(start: -1h) query window.
@@ -598,7 +574,7 @@ impl InfluxDbSink {
         let max_retries = self.get_max_retries();
         let token = self.config.token.clone();
 
-        // [FIX-SINK-8] Cap for per-write backoff
+        // Cap for per-write backoff
         let max_delay = parse_duration(
             self.config.open_retry_max_delay.as_deref(),
             DEFAULT_OPEN_RETRY_MAX_DELAY,
@@ -621,7 +597,7 @@ impl InfluxDbSink {
                         return Ok(());
                     }
 
-                    // [FIX-SINK-4] Honour Retry-After on 429 before our own backoff
+                    // Honour Retry-After on 429 before our own backoff
                     let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
                         response
                             .headers()
@@ -639,9 +615,9 @@ impl InfluxDbSink {
 
                     attempts += 1;
                     if is_transient_status(status) && attempts < max_retries {
-                        // [FIX-SINK-4] Use server-supplied delay when available
+                        // Use server-supplied delay when available
                         let delay = retry_after.unwrap_or_else(|| {
-                            // [FIX-SINK-2] Exponential, [FIX-SINK-3] with jitter
+                            // Exponential, with jitter
                             jitter(exponential_backoff(self.retry_delay, attempts, max_delay))
                         });
                         warn!(
@@ -659,7 +635,7 @@ impl InfluxDbSink {
                 Err(e) => {
                     attempts += 1;
                     if attempts < max_retries {
-                        // [FIX-SINK-2] Exponential, [FIX-SINK-3] with jitter
+                        // Exponential, with jitter
                         let delay =
                             jitter(exponential_backoff(self.retry_delay, attempts, max_delay));
                         warn!(
@@ -693,7 +669,7 @@ impl Sink for InfluxDbSink {
 
         self.client = Some(self.build_client()?);
 
-        // [FIX-SINK-1] Use retrying connectivity check instead of hard-fail
+        // Use retrying connectivity check instead of hard-fail
         self.check_connectivity_with_retry().await?;
 
         info!(
@@ -712,20 +688,20 @@ impl Sink for InfluxDbSink {
         let batch_size = self.config.batch_size.unwrap_or(500) as usize;
         let total_messages = messages.len();
 
-        // [FIX-SINK-5] Skip writes entirely if circuit breaker is open
+        // Skip writes entirely if circuit breaker is open
         if self.circuit_breaker.is_open().await {
             warn!(
                 "InfluxDB sink ID: {} — circuit breaker is OPEN. \
                  Skipping {} messages to avoid hammering a down InfluxDB.",
                 self.id, total_messages
             );
-            // [FIX-SINK-6] Return an error so the runtime knows messages were not written
+            // Return an error so the runtime knows messages were not written
             return Err(Error::CannotStoreData(
                 "Circuit breaker is open — InfluxDB write skipped".to_string(),
             ));
         }
 
-        // [FIX-SINK-6] Collect the first batch error rather than silently dropping
+        // Collect the first batch error rather than silently dropping
         let mut first_error: Option<Error> = None;
 
         for batch in messages.chunks(batch_size.max(1)) {
@@ -734,11 +710,11 @@ impl Sink for InfluxDbSink {
                 .await
             {
                 Ok(()) => {
-                    // [FIX-SINK-5] Successful write — reset circuit breaker
+                    // Successful write — reset circuit breaker
                     self.circuit_breaker.record_success();
                 }
                 Err(e) => {
-                    // [FIX-SINK-5] Failed write — notify circuit breaker
+                    // Failed write — notify circuit breaker
                     self.circuit_breaker.record_failure().await;
 
                     let mut state = self.state.lock().await;
@@ -750,7 +726,7 @@ impl Sink for InfluxDbSink {
                     );
                     drop(state);
 
-                    // [FIX-SINK-6] Capture first error; continue attempting remaining
+                    // Capture first error; continue attempting remaining
                     // batches to maximise data delivery, but record the failure.
                     if first_error.is_none() {
                         first_error = Some(e);
@@ -776,7 +752,7 @@ impl Sink for InfluxDbSink {
             );
         }
 
-        // [FIX-SINK-6] Propagate the first batch error to the runtime so it can
+        // ropagate the first batch error to the runtime so it can
         // decide whether to retry, halt, or dead-letter — instead of returning Ok(())
         // and silently losing messages.
         if let Some(err) = first_error {
@@ -787,6 +763,7 @@ impl Sink for InfluxDbSink {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
+        self.client = None; // release connection pool
         let state = self.state.lock().await;
         info!(
             "InfluxDB sink connector with ID: {} closed. Processed: {}, errors: {}",

@@ -101,7 +101,7 @@ impl TestFixture for InfluxDbSourceFixture {
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         let default_flux = format!(
-            r#"from(bucket:"{b}") |> range(start: -1h) |> limit(n:100)"#,
+            r#"from(bucket:"{b}") |> range(start: -1h) |> filter(fn: (r) => r._time > time(v: "$cursor")) |> sort(columns: ["_time"]) |> limit(n: $limit)"#,
             b = INFLUXDB_BUCKET,
         );
 

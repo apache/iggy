@@ -32,7 +32,6 @@ mod stdout;
 use iggy_common::IggyTimestamp;
 use serde::{Deserialize, Serialize};
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TestMessage {
     pub id: u64,

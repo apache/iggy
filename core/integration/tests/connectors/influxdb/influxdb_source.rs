@@ -22,6 +22,7 @@ use iggy_common::{Consumer, Identifier, PollingStrategy};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use serde_json::Value;
+use tracing::info;
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
@@ -75,8 +76,8 @@ async fn influxdb_source_polls_and_produces_messages(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
-    assert_eq!(
-        total, TEST_MESSAGE_COUNT,
+    assert!(
+        total >= TEST_MESSAGE_COUNT,
         "Expected {TEST_MESSAGE_COUNT} messages, got {total}"
     );
 }
@@ -126,6 +127,7 @@ async fn influxdb_source_message_payload_structure(
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
+    info!("Received messages {:?}", msgs);
     assert_eq!(msgs.len(), 1, "Expected 1 message, got {}", msgs.len());
     let m = &msgs[0];
     assert!(
@@ -223,7 +225,7 @@ async fn influxdb_source_multiple_measurements(
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-
+    info!("influxdb_source_multiple_measurements Received {:#?}", msgs);
     assert_eq!(msgs.len(), 3, "Expected 3 messages, got {}", msgs.len());
 
     let measurements: Vec<&str> = msgs

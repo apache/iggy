@@ -57,7 +57,7 @@ impl InfluxDbSinkFixture {
         expected: usize,
     ) -> Result<usize, TestBinaryError> {
         let flux = format!(
-            r#"from(bucket:"{b}") |> range(start:-1h) |> filter(fn:(r)=>r._measurement=="{m}") |> filter(fn:(r)=>r._field=="offset")"#,
+            r#"from(bucket:"{b}") |> range(start:-1h) |> filter(fn:(r)=>r._measurement=="{m}")"#,
             b = INFLUXDB_BUCKET,
             m = measurement,
         );

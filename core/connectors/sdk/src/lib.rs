@@ -341,7 +341,11 @@ pub enum Error {
     #[error("Invalid config")]
     InvalidConfig,
     #[error("Invalid record")]
+    InvalidConfigValue(String),
+    #[error("Invalid record")]
     InvalidRecord,
+    #[error("Invalid record value : {0}")]
+    InvalidRecordValue(String),
     #[error("Invalid transformer")]
     InvalidTransformer,
     #[error("HTTP request failed: {0}")]
