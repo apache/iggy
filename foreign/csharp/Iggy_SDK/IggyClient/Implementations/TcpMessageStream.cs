@@ -728,7 +728,7 @@ public sealed class TcpMessageStream : IIggyClient
             throw new NotConnectedException();
         }
 
-        var message = TcpContracts.LoginUser(userName, password, "0.5.0", "csharp-sdk");
+        var message = TcpContracts.LoginUser(userName, password, SdkVersion.Value, "csharp-sdk");
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGIN_USER_CODE);
 

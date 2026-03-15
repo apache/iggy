@@ -176,8 +176,8 @@ public class HttpMessageStream : IIggyClient
         ulong maxTopicSize = 0, TimeSpan? messageExpiry = null, byte? replicationFactor = null,
         CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(
-            new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize, DurationHelpers.ToDuration(messageExpiry),
+        var json = JsonSerializer.Serialize(new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize,
+                DurationHelpers.ToDuration(messageExpiry),
                 replicationFactor),
             _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
@@ -690,8 +690,7 @@ public class HttpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task<AuthResponse?> LoginUser(string userName, string password, CancellationToken token = default)
     {
-        // TODO: get version
-        var json = JsonSerializer.Serialize(new LoginUserRequest(userName, password, "", Context),
+        var json = JsonSerializer.Serialize(new LoginUserRequest(userName, password, SdkVersion.Value, Context),
             _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
