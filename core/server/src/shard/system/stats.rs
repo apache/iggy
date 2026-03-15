@@ -120,12 +120,24 @@ impl IggyShard {
                 }
             }
 
-            stats.free_disk_space = fs2::available_space(&self.config.system.path)
-                .unwrap_or(0)
-                .into();
-            stats.total_disk_space = fs2::total_space(&self.config.system.path)
-                .unwrap_or(0)
-                .into();
+            match fs2::available_space(&self.config.system.path) {
+                Ok(space) => stats.free_disk_space = space.into(),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to get available disk space for '{}': {err}",
+                        self.config.system.path
+                    );
+                }
+            }
+            match fs2::total_space(&self.config.system.path) {
+                Ok(space) => stats.total_disk_space = space.into(),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to get total disk space for '{}': {err}",
+                        self.config.system.path
+                    );
+                }
+            }
 
             Ok(stats)
         })
