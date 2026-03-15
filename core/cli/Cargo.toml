@@ -49,6 +49,7 @@ iggy = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 keyring = { workspace = true, optional = true }
 passterm = { workspace = true }
+secrecy = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
