@@ -18,9 +18,7 @@
 
 use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
 use crate::prelude::AutoLogin;
-use iggy_binary_protocol::{
-    BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient,
-};
+use iggy_common::{BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient};
 
 use crate::prelude::{IggyDuration, IggyError, IggyTimestamp, QuicClientConfig};
 use crate::quic::skip_server_verification::SkipServerVerification;

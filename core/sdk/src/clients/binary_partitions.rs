@@ -18,7 +18,7 @@
 
 use crate::prelude::IggyClient;
 use async_trait::async_trait;
-use iggy_binary_protocol::PartitionClient;
+use iggy_common::PartitionClient;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{Identifier, IggyError};
 
