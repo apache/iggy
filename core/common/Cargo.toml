@@ -30,6 +30,7 @@ readme = "../../README.md"
 [dependencies]
 aes-gcm = { workspace = true }
 ahash = { workspace = true }
+aligned-vec = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 bon = { workspace = true }

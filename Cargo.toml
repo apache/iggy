@@ -65,6 +65,7 @@ actix-files = "0.6.10"
 actix-web = "4.13.0"
 aes-gcm = "0.10.3"
 ahash = { version = "0.8.12", features = ["serde"] }
+aligned-vec = "0.6.4"
 anyhow = "1.0.102"
 argon2 = "0.5.3"
 arrow = "57.3.0"

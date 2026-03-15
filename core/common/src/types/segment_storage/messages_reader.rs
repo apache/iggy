@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::{IggyError, IggyIndexesMut, IggyMessagesBatchMut, PooledBuffer};
-use bytes::BytesMut;
 use compio::buf::{IntoInner, IoBuf};
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncReadAtExt;
@@ -133,25 +132,18 @@ impl MessagesReader {
         &self,
         offset: u32,
         len: u32,
-        use_pool: bool,
+        _use_pool: bool,
     ) -> Result<PooledBuffer, std::io::Error> {
-        if use_pool {
-            let buf = PooledBuffer::with_capacity(len as usize);
-            let len = len as usize;
-            let (result, buf) = self
-                .file
-                .read_exact_at(buf.slice(..len), offset as u64)
-                .await
-                .into();
-            let buf = buf.into_inner();
-            result?;
-            Ok(buf)
-        } else {
-            let mut buf = BytesMut::with_capacity(len as usize);
-            unsafe { buf.set_len(len as usize) };
-            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await.into();
-            result?;
-            Ok(PooledBuffer::from_existing(buf))
-        }
+        let buf = PooledBuffer::with_capacity(len as usize);
+
+        let (result, buf) = self
+            .file
+            .read_exact_at(buf.slice(..len as usize), offset as u64)
+            .await
+            .into();
+
+        let buf = buf.into_inner();
+        result?;
+        Ok(buf)
     }
 }
