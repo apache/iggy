@@ -32,8 +32,7 @@ class CompressionAlgorithmTest {
     @ParameterizedTest
     @CsvSource({"1, None", "2, Gzip"})
     void fromCodeReturnsCorrectCompressionAlgorithmForValidCode(
-            byte code, CompressionAlgorithm expectedCompressionAlgorithm) {
-        // TODO - check if byte was intended here
+            int code, CompressionAlgorithm expectedCompressionAlgorithm) {
         assertThat(CompressionAlgorithm.fromCode(code)).isEqualTo(expectedCompressionAlgorithm);
     }
 
