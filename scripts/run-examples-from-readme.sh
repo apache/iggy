@@ -229,8 +229,8 @@ run_go_examples() {
         "examples/go" \
         "README.md" \
         "^go run" \
-        "" \
-        "" \
+        "--tls" \
+        "^go run.*--tls" \
         0 \
         ""
 }

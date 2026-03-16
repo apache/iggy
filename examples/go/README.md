@@ -34,6 +34,15 @@ go run ./getting-started/producer/main.go
 go run ./getting-started/consumer/main.go
 ```
 
+## TLS Examples
+
+To test with a TLS-enabled server, start the server with TLS configured (see main README), then run:
+
+```bash
+go run ./getting-started/producer/main.go --tcp-server-address localhost:8090 --tls --tls-ca-file ../../core/certs/iggy_ca_cert.pem
+go run ./getting-started/consumer/main.go --tcp-server-address localhost:8090 --tls --tls-ca-file ../../core/certs/iggy_ca_cert.pem
+```
+
 ## Example Structure
 
 All examples can be executed directly from the repository. Follow these steps:
