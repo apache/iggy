@@ -99,5 +99,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         return true;
     }
 
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
