@@ -24,44 +24,27 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.serde.BytesDeserializer;
-import org.apache.iggy.serde.CommandCode;
 
 import java.math.BigInteger;
 import java.util.Optional;
 
-import static org.apache.iggy.serde.BytesSerializer.toBytes;
-import static org.apache.iggy.serde.BytesSerializer.toBytesAsU64;
+final class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
 
-class ConsumerOffsetTcpClient implements ConsumerOffsetsClient {
+    private final org.apache.iggy.client.async.ConsumerOffsetsClient delegate;
 
-    private final InternalTcpClient tcpClient;
-
-    public ConsumerOffsetTcpClient(InternalTcpClient tcpClient) {
-        this.tcpClient = tcpClient;
+    ConsumerOffsetsTcpClient(org.apache.iggy.client.async.ConsumerOffsetsClient delegate) {
+        this.delegate = delegate;
     }
 
     @Override
     public void storeConsumerOffset(
             StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer, BigInteger offset) {
-        var payload = toBytes(consumer);
-        payload.writeBytes(toBytes(streamId));
-        payload.writeBytes(toBytes(topicId));
-        payload.writeBytes(toBytes(partitionId));
-        payload.writeBytes(toBytesAsU64(offset));
-
-        tcpClient.send(CommandCode.ConsumerOffset.STORE, payload);
+        FutureUtil.resolve(delegate.storeConsumerOffset(streamId, topicId, partitionId, consumer, offset));
     }
 
     @Override
     public Optional<ConsumerOffsetInfo> getConsumerOffset(
             StreamId streamId, TopicId topicId, Optional<Long> partitionId, Consumer consumer) {
-        var payload = toBytes(consumer);
-        payload.writeBytes(toBytes(streamId));
-        payload.writeBytes(toBytes(topicId));
-        payload.writeBytes(toBytes(partitionId));
-
-        return tcpClient.exchangeForOptional(
-                CommandCode.ConsumerOffset.GET, payload, BytesDeserializer::readConsumerOffsetInfo);
+        return FutureUtil.resolve(delegate.getConsumerOffset(streamId, topicId, partitionId, consumer));
     }
 }

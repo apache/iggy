@@ -19,25 +19,33 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import org.apache.iggy.client.blocking.PartitionsClient;
-import org.apache.iggy.identifier.StreamId;
-import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.exception.IggyClientException;
 
-final class PartitionsTcpClient implements PartitionsClient {
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
-    private final org.apache.iggy.client.async.PartitionsClient delegate;
+final class FutureUtil {
 
-    PartitionsTcpClient(org.apache.iggy.client.async.PartitionsClient delegate) {
-        this.delegate = delegate;
+    private FutureUtil() {}
+
+    static <T> T resolve(CompletableFuture<T> future) {
+        try {
+            return future.join();
+        } catch (CompletionException e) {
+            throw unwrap(e.getCause());
+        } catch (CancellationException e) {
+            throw new IggyClientException("Operation was cancelled", e);
+        }
     }
 
-    @Override
-    public void createPartitions(StreamId streamId, TopicId topicId, Long partitionsCount) {
-        FutureUtil.resolve(delegate.createPartitions(streamId, topicId, partitionsCount));
-    }
-
-    @Override
-    public void deletePartitions(StreamId streamId, TopicId topicId, Long partitionsCount) {
-        FutureUtil.resolve(delegate.deletePartitions(streamId, topicId, partitionsCount));
+    private static RuntimeException unwrap(Throwable cause) {
+        if (cause instanceof RuntimeException re) {
+            return re;
+        }
+        if (cause instanceof Error err) {
+            throw err;
+        }
+        return new IggyClientException("Unexpected exception", cause);
     }
 }

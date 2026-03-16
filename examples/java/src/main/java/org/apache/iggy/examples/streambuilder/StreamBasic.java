@@ -56,27 +56,27 @@ public final class StreamBasic {
 
     public static void main(String[] args) {
         log.info("Build iggy client and connect it.");
-        var client = IggyTcpClient.builder()
+        try (var client = IggyTcpClient.builder()
                 .host("localhost")
                 .port(8090)
                 .credentials("iggy", "iggy")
-                .buildAndLogin();
+                .buildAndLogin()) {
+            try {
+                ensureStreamAndTopic(client);
 
-        try {
-            ensureStreamAndTopic(client);
+                log.info("Build iggy producer & consumer");
+                log.info("Send 3 test messages...");
+                sendMessage(client, "Hello World");
+                sendMessage(client, "Hola Iggy");
+                sendMessage(client, "Hi Apache");
 
-            log.info("Build iggy producer & consumer");
-            log.info("Send 3 test messages...");
-            sendMessage(client, "Hello World");
-            sendMessage(client, "Hola Iggy");
-            sendMessage(client, "Hi Apache");
+                log.info("Consume the messages");
+                consumeMessages(client);
 
-            log.info("Consume the messages");
-            consumeMessages(client);
-
-            log.info("Stop the message stream and shutdown iggy client");
-        } finally {
-            deleteStreamIfExists(client);
+                log.info("Stop the message stream and shutdown iggy client");
+            } finally {
+                deleteStreamIfExists(client);
+            }
         }
     }
 

@@ -75,7 +75,7 @@ public final class AsyncIggyTcpClientBuilder {
     private RetryPolicy retryPolicy;
     private Duration acquireTimeout;
 
-    AsyncIggyTcpClientBuilder() {}
+    public AsyncIggyTcpClientBuilder() {}
 
     /**
      * Sets the host address for the Iggy server.
