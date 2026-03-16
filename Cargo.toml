@@ -84,7 +84,7 @@ bench-dashboard-server = { path = "core/bench/dashboard/server" }
 bench-dashboard-shared = { path = "core/bench/dashboard/shared" }
 bench-report = { path = "core/bench/report" }
 bench-runner = { path = "core/bench/runner" }
-bit-set = "0.8.0"
+bit-set = "0.9.1"
 blake3 = "1.8.3"
 bon = "3.9.0"
 byte-unit = { version = "5.2.0", default-features = false, features = ["serde", "byte", "std"] }
