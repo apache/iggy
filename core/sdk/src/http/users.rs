@@ -20,7 +20,7 @@ use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::{Identifier, IggyError};
 use async_trait::async_trait;
-use iggy_binary_protocol::UserClient;
+use iggy_common::UserClient;
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_user::CreateUser;
 use iggy_common::login_user::LoginUser;

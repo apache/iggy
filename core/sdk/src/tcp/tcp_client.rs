@@ -25,12 +25,12 @@ use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy_binary_protocol::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use iggy_common::{
     AutoLogin, ClientState, Command, ConnectionString, ConnectionStringUtils, Credentials,
     DiagnosticEvent, IggyDuration, IggyError, IggyErrorDiscriminants, IggyTimestamp,
     TcpConnectionStringOptions, TransportProtocol,
 };
+use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use std::net::SocketAddr;
 use std::str::FromStr;

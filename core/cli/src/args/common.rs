@@ -17,15 +17,15 @@
  */
 
 use clap::ValueEnum;
-use iggy_binary_protocol::cli::binary_client::get_clients::GetClientsOutput;
-use iggy_binary_protocol::cli::binary_cluster::get_cluster_metadata::GetClusterMetadataOutput;
-use iggy_binary_protocol::cli::binary_consumer_groups::get_consumer_groups::GetConsumerGroupsOutput;
-use iggy_binary_protocol::cli::binary_context::get_contexts::GetContextsOutput;
-use iggy_binary_protocol::cli::binary_personal_access_tokens::get_personal_access_tokens::GetPersonalAccessTokensOutput;
-use iggy_binary_protocol::cli::binary_streams::get_streams::GetStreamsOutput;
-use iggy_binary_protocol::cli::binary_system::stats::GetStatsOutput;
-use iggy_binary_protocol::cli::binary_topics::get_topics::GetTopicsOutput;
-use iggy_binary_protocol::cli::binary_users::get_users::GetUsersOutput;
+use iggy_cli::commands::binary_client::get_clients::GetClientsOutput;
+use iggy_cli::commands::binary_cluster::get_cluster_metadata::GetClusterMetadataOutput;
+use iggy_cli::commands::binary_consumer_groups::get_consumer_groups::GetConsumerGroupsOutput;
+use iggy_cli::commands::binary_context::get_contexts::GetContextsOutput;
+use iggy_cli::commands::binary_personal_access_tokens::get_personal_access_tokens::GetPersonalAccessTokensOutput;
+use iggy_cli::commands::binary_streams::get_streams::GetStreamsOutput;
+use iggy_cli::commands::binary_system::stats::GetStatsOutput;
+use iggy_cli::commands::binary_topics::get_topics::GetTopicsOutput;
+use iggy_cli::commands::binary_users::get_users::GetUsersOutput;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum ListMode {

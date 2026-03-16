@@ -26,12 +26,12 @@ use crate::prelude::Client;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy_binary_protocol::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use iggy_common::{
     AutoLogin, ClientState, Command, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
     IggyError, IggyErrorDiscriminants, IggyTimestamp, WebSocketClientConfig,
     WebSocketConnectionStringOptions,
 };
+use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;

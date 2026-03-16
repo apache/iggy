@@ -21,13 +21,13 @@ use crate::error::{CmdToolError, IggyCmdError};
 use anyhow::{Context, bail};
 use iggy::clients::client::IggyClient;
 use iggy::prelude::{Args, IggyError, PersonalAccessTokenClient, UserClient};
-use iggy_binary_protocol::cli::binary_system::session::ServerSession;
+use iggy_cli::commands::binary_system::session::ServerSession;
 use passterm::{Stream, isatty, prompt_password_stdin, prompt_password_tty};
 use std::env::var;
 
 #[cfg(feature = "login-session")]
 mod credentials_login_session {
-    pub(crate) use iggy_binary_protocol::cli::cli_command::PRINT_TARGET;
+    pub(crate) use iggy_cli::commands::cli_command::PRINT_TARGET;
     pub(crate) use keyring::Entry;
     pub(crate) use tracing::{Level, event};
 }
