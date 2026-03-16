@@ -75,6 +75,7 @@ pub struct PartitionState {
     pub created_at: IggyTimestamp,
 }
 
+// TODO: consider converting token_hash to SecretString (requires updating the full hash flow across crates)
 #[derive(Clone)]
 pub struct PersonalAccessTokenState {
     pub name: String,
@@ -92,6 +93,7 @@ impl std::fmt::Debug for PersonalAccessTokenState {
     }
 }
 
+// TODO: consider converting password_hash to SecretString (requires updating the full hash flow across crates)
 #[derive(Clone)]
 pub struct UserState {
     pub id: u32,
