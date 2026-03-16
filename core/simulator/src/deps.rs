@@ -45,7 +45,8 @@ impl Storage for MemStorage {
         len
     }
 
-    async fn read(&self, offset: usize, mut buffer: Self::Buffer) -> Self::Buffer {
+    async fn read(&self, offset: usize, len: usize) -> Self::Buffer {
+        let mut buffer = vec![0; len];
         let data = self.data.borrow();
         let end = offset + buffer.len();
         if offset < data.len() && end <= data.len() {
@@ -106,8 +107,7 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
         let header = headers.get(&header.op)?;
         let offset = *offsets.get(&header.op)?;
 
-        let buffer = vec![0; header.size as usize];
-        let buffer = self.storage.read(offset, buffer).await;
+        let buffer = self.storage.read(offset, header.size as usize).await;
         let message =
             Message::from_bytes(Bytes::from(buffer)).expect("simulator: bytes should be valid");
         Some(message)
