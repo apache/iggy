@@ -64,6 +64,8 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
 
         // then
         assertThat(user).isPresent();
+        assertThat(user.get().id()).isEqualTo(0L);
+        assertThat(user.get().username()).isEqualTo("iggy");
     }
 
     @Test
@@ -101,6 +103,40 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
         // then
         users = usersClient.getUsers();
         assertThat(users).hasSize(1);
+    }
+
+    @Test
+    void shouldUpdateUsername() {
+        // given
+        login();
+        UserInfoDetails user = usersClient.createUser("test", "test", UserStatus.Active, Optional.empty());
+        trackUser(user.id());
+
+        // when
+        usersClient.updateUser(user.id(), Optional.of("new-name"), Optional.empty());
+
+        // then
+        var updatedUser = usersClient.getUser(user.id());
+        assertThat(updatedUser).isPresent();
+        assertThat(updatedUser.get().username()).isEqualTo("new-name");
+        assertThat(updatedUser.get().status()).isEqualTo(UserStatus.Active);
+    }
+
+    @Test
+    void shouldUpdateUsernameAndStatusTogether() {
+        // given
+        login();
+        UserInfoDetails user = usersClient.createUser("test", "test", UserStatus.Active, Optional.empty());
+        trackUser(user.id());
+
+        // when
+        usersClient.updateUser(user.id(), Optional.of("renamed"), Optional.of(UserStatus.Inactive));
+
+        // then
+        var updatedUser = usersClient.getUser(user.id());
+        assertThat(updatedUser).isPresent();
+        assertThat(updatedUser.get().username()).isEqualTo("renamed");
+        assertThat(updatedUser.get().status()).isEqualTo(UserStatus.Inactive);
     }
 
     @Test
@@ -145,18 +181,32 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
     @Test
     void shouldChangePassword() {
         // given
-        IdentityInfo identity = usersClient.login("iggy", "iggy");
-
-        // when
-        usersClient.changePassword(identity.userId(), "iggy", "new-pass");
+        login();
+        UserInfoDetails testUser = usersClient.createUser("test", "test", UserStatus.Active, Optional.empty());
+        trackUser(testUser.id());
         usersClient.logout();
-        IdentityInfo newLogin = usersClient.login("iggy", "new-pass");
+
+        IdentityInfo identity = usersClient.login("test", "test");
+        assertThat(identity).isNotNull();
+        assertThat(identity.userId()).isEqualTo(testUser.id());
+
+        // when — first password change
+        usersClient.changePassword(identity.userId(), "test", "new-pass");
+        usersClient.logout();
+        IdentityInfo afterFirstChange = usersClient.login("test", "new-pass");
 
         // then
-        assertThat(newLogin).isNotNull();
+        assertThat(afterFirstChange).isNotNull();
+        assertThat(afterFirstChange.userId()).isEqualTo(testUser.id());
 
-        // restore original password for other tests
-        usersClient.changePassword(identity.userId(), "new-pass", "iggy");
+        // when — second password change
+        usersClient.changePassword(identity.userId(), "new-pass", "final-pass");
+        usersClient.logout();
+        IdentityInfo afterSecondChange = usersClient.login("test", "final-pass");
+
+        // then
+        assertThat(afterSecondChange).isNotNull();
+        assertThat(afterSecondChange.userId()).isEqualTo(testUser.id());
     }
 
     @Test

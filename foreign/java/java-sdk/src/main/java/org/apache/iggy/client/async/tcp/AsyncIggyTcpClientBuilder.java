@@ -28,6 +28,7 @@ import java.io.File;
 import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 
 /**
  * Builder for creating configured AsyncIggyTcpClient instances.
@@ -259,6 +260,20 @@ public final class AsyncIggyTcpClientBuilder {
                     "Credentials must be provided to use buildAndLogin(). Use credentials(username, password).");
         }
         AsyncIggyTcpClient client = build();
-        return client.connect().thenCompose(v -> client.login()).thenApply(v -> client);
+        return client.connect()
+                .thenCompose(v -> client.login())
+                .thenApply(v -> client)
+                .handle((result, ex) -> {
+                    if (ex == null) {
+                        return CompletableFuture.completedFuture(result);
+                    }
+                    return client.close().<AsyncIggyTcpClient>handle((ignored, closeEx) -> {
+                        if (closeEx != null) {
+                            ex.addSuppressed(closeEx);
+                        }
+                        throw (RuntimeException) ex;
+                    });
+                })
+                .thenCompose(Function.identity());
     }
 }

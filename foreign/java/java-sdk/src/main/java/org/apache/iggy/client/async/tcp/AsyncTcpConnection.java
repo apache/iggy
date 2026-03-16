@@ -193,16 +193,19 @@ public class AsyncTcpConnection {
             }
 
             Channel channel = f.getNow();
-            boolean isLoginOp = (commandCode == CommandCode.User.LOGIN.getValue()
+            boolean isLoginCommand = (commandCode == CommandCode.User.LOGIN.getValue()
                     || commandCode == CommandCode.PersonalAccessToken.LOGIN.getValue());
+            boolean requiresAuth = !isLoginCommand
+                    && commandCode != CommandCode.System.PING.getValue()
+                    && commandCode != CommandCode.System.GET_STATS.getValue();
 
             responseFuture.handle((res, ex) -> {
-                handlePostResponse(channel, commandCode, isLoginOp, ex);
+                handlePostResponse(channel, commandCode, isLoginCommand, ex);
                 return null;
             });
 
             CompletableFuture<Void> authStep;
-            if (isLoginOp) {
+            if (!requiresAuth) {
                 authStep = CompletableFuture.completedFuture(null);
             } else if (!authenticated) {
                 payload.release();
@@ -316,15 +319,16 @@ public class AsyncTcpConnection {
             return CompletableFuture.completedFuture(null);
         }
         releaseLoginPayload();
-        channelPool.close();
         CompletableFuture<Void> shutdownFuture = new CompletableFuture<>();
-        eventLoopGroup.shutdownGracefully().addListener(f -> {
-            if (f.isSuccess()) {
-                shutdownFuture.complete(null);
-            } else {
-                shutdownFuture.completeExceptionally(f.cause());
-            }
-        });
+        channelPool
+                .closeAsync()
+                .addListener(f -> eventLoopGroup.shutdownGracefully().addListener(sf -> {
+                    if (sf.isSuccess()) {
+                        shutdownFuture.complete(null);
+                    } else {
+                        shutdownFuture.completeExceptionally(sf.cause());
+                    }
+                }));
         return shutdownFuture;
     }
 
