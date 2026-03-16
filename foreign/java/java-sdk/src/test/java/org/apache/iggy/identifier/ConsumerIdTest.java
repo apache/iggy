@@ -17,25 +17,17 @@
  * under the License.
  */
 
-package org.apache.iggy.system;
+package org.apache.iggy.identifier;
 
-import java.util.List;
-import java.util.Optional;
+class ConsumerIdTest extends BaseIdentifierTest<ConsumerId> {
 
-public record ClientInfoDetails(
-        Long clientId,
-        Optional<Long> userId,
-        String address,
-        String transport,
-        Long consumerGroupsCount,
-        List<ConsumerGroupInfo> consumerGroups) {
-    public ClientInfoDetails(ClientInfo clientInfo, List<ConsumerGroupInfo> consumerGroups) {
-        this(
-                clientInfo.clientId(),
-                clientInfo.userId(),
-                clientInfo.address(),
-                clientInfo.transport(),
-                clientInfo.consumerGroupsCount(),
-                consumerGroups);
+    @Override
+    protected ConsumerId ofName(String name) {
+        return ConsumerId.of(name);
+    }
+
+    @Override
+    protected ConsumerId ofId(Long id) {
+        return ConsumerId.of(id);
     }
 }
