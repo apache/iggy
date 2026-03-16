@@ -214,7 +214,7 @@ components:
       - "ci-infrastructure"
     paths:
       - "foreign/cpp/**"
-    tasks: ["lint", "build", "test"]
+    tasks: ["lint", "build", "test", "e2e"]
 
   # Individual BDD tests per SDK - only run when specific SDK changes
   bdd-rust:

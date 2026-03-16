@@ -15,14 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-fn main() {
-    cxx_build::bridge("src/lib.rs")
-        .std("c++17")
-        .compile("iggy-cpp-bridge");
+use crate::ffi;
+use iggy::prelude::Topic as RustTopic;
 
-    println!("cargo:rerun-if-changed=src/client.rs");
-    println!("cargo:rerun-if-changed=src/identifier.rs");
-    println!("cargo:rerun-if-changed=src/lib.rs");
-    println!("cargo:rerun-if-changed=src/stream.rs");
-    println!("cargo:rerun-if-changed=src/topic.rs");
+impl From<RustTopic> for ffi::Topic {
+    fn from(topic: RustTopic) -> Self {
+        ffi::Topic {
+            id: topic.id,
+            created_at: topic.created_at.as_micros(),
+            name: topic.name,
+            size_bytes: topic.size.as_bytes_u64(),
+            message_expiry: topic.message_expiry.into(),
+            compression_algorithm: topic.compression_algorithm.to_string(),
+            max_topic_size: topic.max_topic_size.into(),
+            replication_factor: topic.replication_factor,
+            messages_count: topic.messages_count,
+            partitions_count: topic.partitions_count,
+        }
+    }
 }
