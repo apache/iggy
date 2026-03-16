@@ -19,31 +19,25 @@
 
 package org.apache.iggy.exception;
 
-/**
- * Base exception class for all Iggy SDK exceptions.
- *
- * <p>This is the root of the Iggy exception hierarchy. All exceptions thrown by the SDK
- * extend this class, allowing callers to catch all Iggy-related exceptions with a single
- * catch block if desired.
- */
-public abstract class IggyException extends RuntimeException {
+import org.junit.jupiter.api.Test;
 
-    /**
-     * Constructs a new IggyException with the specified message.
-     *
-     * @param message the detail message
-     */
-    protected IggyException(String message) {
-        super(message);
+import static org.assertj.core.api.Assertions.assertThat;
+
+class IggyMissingCredentialsExceptionTest {
+    @Test
+    void constructorWithNoArgsCreatesExpectedIggyMissingCredentialsException() {
+        var exception = new IggyMissingCredentialsException();
+
+        assertThat(exception.getMessage())
+                .isEqualToIgnoringCase(
+                        "No credentials provided. Use login(username, password) or provide credentials when building the client.");
     }
 
-    /**
-     * Constructs a new IggyException with the specified message and cause.
-     *
-     * @param message the detail message
-     * @param cause the cause of the exception
-     */
-    protected IggyException(String message, Throwable cause) {
-        super(message, cause);
+    @Test
+    void constructorWithMessageCreatesExpectedIggyMissingCredentialsException() {
+        var exception = new IggyMissingCredentialsException("message");
+
+        assertThat(exception.getMessage()).isEqualTo("message");
+        assertThat(exception.getCause()).isNull();
     }
 }

@@ -19,31 +19,23 @@
 
 package org.apache.iggy.exception;
 
-/**
- * Base exception class for all Iggy SDK exceptions.
- *
- * <p>This is the root of the Iggy exception hierarchy. All exceptions thrown by the SDK
- * extend this class, allowing callers to catch all Iggy-related exceptions with a single
- * catch block if desired.
- */
-public abstract class IggyException extends RuntimeException {
+import org.junit.jupiter.api.Test;
 
-    /**
-     * Constructs a new IggyException with the specified message.
-     *
-     * @param message the detail message
-     */
-    protected IggyException(String message) {
-        super(message);
+import static org.assertj.core.api.Assertions.assertThat;
+
+class IggyNotConnectedExceptionTest {
+    @Test
+    void constructorWithNoArgsCreatesExpectedIggyNotConnectedException() {
+        var exception = new IggyNotConnectedException();
+
+        assertThat(exception.getMessage()).isEqualToIgnoringCase("Client not connected. Call connect() first.");
     }
 
-    /**
-     * Constructs a new IggyException with the specified message and cause.
-     *
-     * @param message the detail message
-     * @param cause the cause of the exception
-     */
-    protected IggyException(String message, Throwable cause) {
-        super(message, cause);
+    @Test
+    void constructorWithMessageCreatesExpectedIggyNotConnectedException() {
+        var exception = new IggyNotConnectedException("message");
+
+        assertThat(exception.getMessage()).isEqualTo("message");
+        assertThat(exception.getCause()).isNull();
     }
 }

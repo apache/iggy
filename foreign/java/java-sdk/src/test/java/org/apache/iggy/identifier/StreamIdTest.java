@@ -17,25 +17,17 @@
  * under the License.
  */
 
-package org.apache.iggy.system;
+package org.apache.iggy.identifier;
 
-import java.util.List;
-import java.util.Optional;
+public class StreamIdTest extends BaseIdentifierTest<StreamId> {
 
-public record ClientInfoDetails(
-        Long clientId,
-        Optional<Long> userId,
-        String address,
-        String transport,
-        Long consumerGroupsCount,
-        List<ConsumerGroupInfo> consumerGroups) {
-    public ClientInfoDetails(ClientInfo clientInfo, List<ConsumerGroupInfo> consumerGroups) {
-        this(
-                clientInfo.clientId(),
-                clientInfo.userId(),
-                clientInfo.address(),
-                clientInfo.transport(),
-                clientInfo.consumerGroupsCount(),
-                consumerGroups);
+    @Override
+    protected StreamId ofName(String name) {
+        return StreamId.of(name);
+    }
+
+    @Override
+    protected StreamId ofId(Long id) {
+        return StreamId.of(id);
     }
 }

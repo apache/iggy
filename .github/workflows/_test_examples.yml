@@ -123,50 +123,40 @@ jobs:
             fi
           fi
 
-      - name: Run Rust examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-rust'
-        run: |
-          echo "Running Rust examples tests..."
-          ./scripts/run-rust-examples-from-readme.sh
-
-      - name: Run Go examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-go'
-        run: |
-          echo "Running Go examples tests..."
-          ./scripts/run-go-examples-from-readme.sh
-
-      - name: Run Csharp examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-csharp'
-        run: |
-          echo "Running Csharp examples tests..."
-          ./scripts/run-csharp-examples-from-readme.sh
-
-      - name: Run Python examples
-        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
-        run: |
-          echo "Running Python examples tests..."
-          ./scripts/run-python-examples-from-readme.sh
-
-      - name: Run Node.js examples
+      - name: Build Node SDK for examples
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-node'
         run: |
-          echo "Running Node.js examples tests..."
-          # Build the local Node SDK first (examples use file: link to it)
           cd foreign/node
           npm ci
           npm run build
           cd ../..
-          # Install examples dependencies (will use the local SDK)
           cd examples/node
           npm ci
           cd ../..
-          ./scripts/run-node-examples-from-readme.sh
+
+      - name: Run Rust examples
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-rust'
+        run: ./scripts/run-examples-from-readme.sh --language rust
+
+      - name: Run Go examples
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-go'
+        run: ./scripts/run-examples-from-readme.sh --language go
+
+      - name: Run C# examples
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-csharp'
+        run: ./scripts/run-examples-from-readme.sh --language csharp
+
+      - name: Run Python examples
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
+        run: ./scripts/run-examples-from-readme.sh --language python
+
+      - name: Run Node.js examples
+        if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-node'
+        run: ./scripts/run-examples-from-readme.sh --language node
 
       - name: Run Java examples
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-java'
-        run: |
-          echo "Running Java examples tests..."
-          ./scripts/run-java-examples-from-readme.sh
+        run: ./scripts/run-examples-from-readme.sh --language java
 
       - name: Upload reports
         if: always()
