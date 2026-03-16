@@ -21,7 +21,6 @@ genrule(
     name = "cargo_build",
     srcs = glob(["src/**/*.rs"]) + [
         "Cargo.toml",
-        "Cargo.lock",
         "build.rs",
     ],
     outs = [
@@ -52,7 +51,7 @@ genrule(
         fi
 
         mkdir -p "$$CARGO_TARGET_DIR"
-        env -u PWD CARGO_TARGET_DIR="$$CARGO_TARGET_DIR" "$$CARGO" build $$FLAGS --locked
+        env -u PWD CARGO_TARGET_DIR="$$CARGO_TARGET_DIR" "$$CARGO" build $$FLAGS
 
         cp "$$CARGO_TARGET_DIR/$$PROFILE/libiggy_cpp.a" "$$OUT_LIB"
 
