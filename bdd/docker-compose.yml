@@ -249,18 +249,11 @@ services:
       context: ..
       dockerfile: bdd/csharp/Dockerfile
     depends_on:
-      iggy-server:
-        condition: service_healthy
-      iggy-leader:
-        condition: service_healthy
-      iggy-follower:
-        condition: service_healthy
+      - iggy-server
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
       - IGGY_TCP_ADDRESS=iggy-server:8090
-      - IGGY_TCP_ADDRESS_LEADER=iggy-leader:8091
-      - IGGY_TCP_ADDRESS_FOLLOWER=iggy-follower:8092
     command: [ "dotnet", "test" ]
     networks:
       - iggy-bdd-network
