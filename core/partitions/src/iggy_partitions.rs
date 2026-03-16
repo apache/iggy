@@ -549,7 +549,7 @@ where
         let header = *message.header();
 
         // TODO: WE have to distinguish between an `message` recv by leader and follower.
-        // In the follower path, we have to skip the `prepare_for_persistance` path, just append to journal.
+        // In the follower path, we have to skip the `prepare_for_persistence` path, just append to journal.
         match header.operation {
             Operation::SendMessages => {
                 self.append_send_messages_to_journal(namespace, message)
