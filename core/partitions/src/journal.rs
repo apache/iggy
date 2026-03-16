@@ -59,35 +59,34 @@ where
 #[derive(Debug, Default)]
 pub struct PartitionJournalMemStorage {
     entries: UnsafeCell<Vec<Bytes>>,
-    op_to_index: UnsafeCell<HashMap<u64, usize>>,
+    /// Maps byte offset (as if disk-backed) to index in entries Vec
+    offset_to_index: UnsafeCell<HashMap<usize, usize>>,
+    /// Current write position (cumulative byte offset)
+    current_offset: UnsafeCell<usize>,
 }
 
 impl Storage for PartitionJournalMemStorage {
     type Buffer = Bytes;
 
     async fn write(&self, buf: Self::Buffer) -> usize {
-        let op = Message::<PrepareHeader>::from_bytes(buf.clone())
-            .ok()
-            .map(|message| message.header().op);
-
+        let len = buf.len();
         let entries = unsafe { &mut *self.entries.get() };
+        let offset_to_index = unsafe { &mut *self.offset_to_index.get() };
+        let current_offset = unsafe { &mut *self.current_offset.get() };
+
         let index = entries.len();
-        entries.push(buf.clone());
+        offset_to_index.insert(*current_offset, index);
+        entries.push(buf);
 
-        if let Some(op) = op {
-            let op_to_index = unsafe { &mut *self.op_to_index.get() };
-            op_to_index.insert(op, index);
-        }
+        let write_offset = *current_offset;
+        *current_offset += len;
 
-        buf.len()
+        write_offset
     }
 
     async fn read(&self, offset: usize, _len: usize) -> Self::Buffer {
-        let op = offset as u64;
-        let Some(index) = ({
-            let op_to_index = unsafe { &*self.op_to_index.get() };
-            op_to_index.get(&op).copied()
-        }) else {
+        let offset_to_index = unsafe { &*self.offset_to_index.get() };
+        let Some(&index) = offset_to_index.get(&offset) else {
             return Bytes::new();
         };
 
@@ -100,7 +99,11 @@ pub struct PartitionJournal<S>
 where
     S: Storage<Buffer = Bytes>,
 {
-    message_offset_to_op: UnsafeCell<BTreeMap<u64, u64>>,
+    /// Maps op -> storage byte offset (for all entries)
+    op_to_storage_offset: UnsafeCell<BTreeMap<u64, usize>>,
+    /// Maps message offset -> op (for queryable entries)
+    offset_to_op: UnsafeCell<BTreeMap<u64, u64>>,
+    /// Maps timestamp -> op (for queryable entries)
     timestamp_to_op: UnsafeCell<BTreeMap<u64, u64>>,
     headers: UnsafeCell<Vec<PrepareHeader>>,
     inner: UnsafeCell<JournalInner<S>>,
@@ -112,7 +115,8 @@ where
 {
     fn default() -> Self {
         Self {
-            message_offset_to_op: UnsafeCell::new(BTreeMap::new()),
+            op_to_storage_offset: UnsafeCell::new(BTreeMap::new()),
+            offset_to_op: UnsafeCell::new(BTreeMap::new()),
             timestamp_to_op: UnsafeCell::new(BTreeMap::new()),
             headers: UnsafeCell::new(Vec::new()),
             inner: UnsafeCell::new(JournalInner {
@@ -141,10 +145,13 @@ where
 impl PartitionJournalMemStorage {
     fn drain(&self) -> Vec<Bytes> {
         let entries = unsafe { &mut *self.entries.get() };
-        let drained = std::mem::take(entries);
-        let op_to_index = unsafe { &mut *self.op_to_index.get() };
-        op_to_index.clear();
-        drained
+        let offset_to_index = unsafe { &mut *self.offset_to_index.get() };
+        let current_offset = unsafe { &mut *self.current_offset.get() };
+
+        offset_to_index.clear();
+        *current_offset = 0;
+
+        std::mem::take(entries)
     }
 
     fn is_empty(&self) -> bool {
@@ -170,10 +177,12 @@ impl PartitionJournal<PartitionJournalMemStorage> {
 
         let headers = unsafe { &mut *self.headers.get() };
         headers.clear();
-        let offsets = unsafe { &mut *self.message_offset_to_op.get() };
-        offsets.clear();
-        let timestamps = unsafe { &mut *self.timestamp_to_op.get() };
-        timestamps.clear();
+        let op_to_storage_offset = unsafe { &mut *self.op_to_storage_offset.get() };
+        op_to_storage_offset.clear();
+        let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
+        offset_to_op.clear();
+        let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
+        timestamp_to_op.clear();
 
         Self::messages_to_batch_set(&messages)
     }
@@ -212,30 +221,38 @@ where
     fn candidate_start_op(&self, query: &MessageLookup) -> Option<u64> {
         match query {
             MessageLookup::Offset { offset, .. } => {
-                let offsets = unsafe { &*self.message_offset_to_op.get() };
-                offsets
+                let offset_to_op = unsafe { &*self.offset_to_op.get() };
+                offset_to_op
                     .range(..=*offset)
                     .next_back()
-                    .or_else(|| offsets.range(*offset..).next())
+                    .or_else(|| offset_to_op.range(*offset..).next())
                     .map(|(_, op)| *op)
             }
             MessageLookup::Timestamp { timestamp, .. } => {
-                let timestamps = unsafe { &*self.timestamp_to_op.get() };
-                timestamps
+                let timestamp_to_op = unsafe { &*self.timestamp_to_op.get() };
+                timestamp_to_op
                     .range(..=*timestamp)
                     .next_back()
-                    .or_else(|| timestamps.range(*timestamp..).next())
+                    .or_else(|| timestamp_to_op.range(*timestamp..).next())
                     .map(|(_, op)| *op)
             }
         }
     }
 
     async fn message_by_op(&self, op: u64) -> Option<Message<PrepareHeader>> {
-        let offset = usize::try_from(op).ok()?;
+        let storage_offset = {
+            let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+            *op_to_storage_offset.get(&op)?
+        };
+
         let bytes = {
             let inner = unsafe { &*self.inner.get() };
-            inner.storage.read(offset, ZERO_LEN).await
+            inner.storage.read(storage_offset, ZERO_LEN).await
         };
+
+        if bytes.is_empty() {
+            return None;
+        }
 
         Some(
             Message::from_bytes(bytes)
@@ -253,21 +270,40 @@ where
             return Vec::new();
         }
 
+        // Get (op, storage_offset) pairs directly from the mapping
+        // BTreeMap is already sorted by op
+        let op_offsets: Vec<(u64, usize)> = {
+            let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+            op_to_storage_offset
+                .range(start_op..)
+                .map(|(op, offset)| (*op, *offset))
+                .collect()
+        };
+
         let mut messages = Vec::new();
         let mut loaded_messages = 0u32;
-        let mut op = start_op;
 
-        while loaded_messages < count {
-            let Some(message) = self.message_by_op(op).await else {
+        for (_, storage_offset) in op_offsets {
+            if loaded_messages >= count {
                 break;
+            }
+
+            let bytes = {
+                let inner = unsafe { &*self.inner.get() };
+                inner.storage.read(storage_offset, ZERO_LEN).await
             };
+
+            if bytes.is_empty() {
+                continue;
+            }
+
+            let message = Message::from_bytes(bytes)
+                .expect("partition.journal.storage.read: invalid bytes for message");
 
             if let Some(batch) = Self::message_to_batch(&message) {
                 loaded_messages = loaded_messages.saturating_add(batch.count());
                 messages.push(message);
             }
-
-            op += 1;
         }
 
         messages
@@ -311,17 +347,22 @@ where
         };
 
         let bytes = entry.into_inner();
-        {
+        let storage_offset = {
             let inner = unsafe { &*self.inner.get() };
-            let _ = inner.storage.write(bytes).await;
+            inner.storage.write(bytes).await
+        };
+
+        {
+            let op_to_storage_offset = unsafe { &mut *self.op_to_storage_offset.get() };
+            op_to_storage_offset.insert(op, storage_offset);
         }
 
         if let Some((offset, timestamp)) = first_offset_and_timestamp {
-            let offsets = unsafe { &mut *self.message_offset_to_op.get() };
-            offsets.insert(offset, op);
+            let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
+            offset_to_op.insert(offset, op);
 
-            let timestamps = unsafe { &mut *self.timestamp_to_op.get() };
-            timestamps.insert(timestamp, op);
+            let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
+            timestamp_to_op.insert(timestamp, op);
         }
     }
 

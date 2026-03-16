@@ -32,8 +32,7 @@ use tokio::sync::Mutex as TokioMutex;
 // This struct aliases in terms of the code contained the `LocalPartition from `core/server/src/streaming/partitions/local_partition.rs`.
 #[derive(Debug)]
 pub struct IggyPartition {
-    pub log:
-        SegmentedLog<PartitionJournal<PartitionJournalMemStorage>, PartitionJournalMemStorage>,
+    pub log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>, PartitionJournalMemStorage>,
     /// Committed offset — advanced only after quorum ack.
     pub offset: Arc<AtomicU64>,
     /// Dirty offset — advanced on every prepare (before commit).
@@ -57,7 +56,8 @@ impl IggyPartition {
         let count = batch.count();
         let body_len = 4 + indexes.len() + batch.len();
         let total_size = std::mem::size_of::<PrepareHeader>() + body_len;
-        header.size = u32::try_from(total_size).expect("prepare_message_from_batch: batch size exceeds u32::MAX");
+        header.size = u32::try_from(total_size)
+            .expect("prepare_message_from_batch: batch size exceeds u32::MAX");
 
         let message = Message::<PrepareHeader>::new(total_size).transmute_header(|_old, new| {
             *new = header;
