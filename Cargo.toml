@@ -173,7 +173,7 @@ left-right = "0.11"
 lending-iterator = "0.1.7"
 libc = "0.2.183"
 log = "0.4.29"
-lz4_flex = "0.12.0"
+lz4_flex = "0.13.0"
 message_bus = { path = "core/message_bus" }
 metadata = { path = "core/metadata" }
 mimalloc = "0.1"
