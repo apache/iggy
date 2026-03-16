@@ -17,7 +17,7 @@
 
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode};
-use crate::identifier::WireName;
+use crate::primitives::identifier::WireName;
 use bytes::BytesMut;
 
 /// `CreateStream` request. Wire format: `[name_len:1][name:N]`

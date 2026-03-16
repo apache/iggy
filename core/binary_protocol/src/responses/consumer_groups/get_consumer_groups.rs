@@ -1,0 +1,109 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::consumer_group_response::ConsumerGroupResponse;
+use crate::WireError;
+use crate::codec::{WireDecode, WireEncode};
+use bytes::BytesMut;
+
+/// `GetConsumerGroups` response: sequential consumer group headers.
+///
+/// Wire format:
+/// ```text
+/// [ConsumerGroupResponse]*
+/// ```
+///
+/// Empty payload means zero groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetConsumerGroupsResponse {
+    pub groups: Vec<ConsumerGroupResponse>,
+}
+
+impl WireEncode for GetConsumerGroupsResponse {
+    fn encoded_size(&self) -> usize {
+        self.groups.iter().map(WireEncode::encoded_size).sum()
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        for group in &self.groups {
+            group.encode(buf);
+        }
+    }
+}
+
+impl WireDecode for GetConsumerGroupsResponse {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
+        let mut groups = Vec::new();
+        let mut pos = 0;
+        while pos < buf.len() {
+            let (group, consumed) = ConsumerGroupResponse::decode(&buf[pos..])?;
+            pos += consumed;
+            groups.push(group);
+        }
+        Ok((Self { groups }, pos))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::WireName;
+
+    fn sample_group(id: u32, name: &str) -> ConsumerGroupResponse {
+        ConsumerGroupResponse {
+            id,
+            partitions_count: 4,
+            members_count: 2,
+            name: WireName::new(name).unwrap(),
+        }
+    }
+
+    #[test]
+    fn roundtrip_empty() {
+        let resp = GetConsumerGroupsResponse { groups: vec![] };
+        let bytes = resp.to_bytes();
+        assert!(bytes.is_empty());
+        let (decoded, consumed) = GetConsumerGroupsResponse::decode(&bytes).unwrap();
+        assert_eq!(consumed, 0);
+        assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn roundtrip_multiple() {
+        let resp = GetConsumerGroupsResponse {
+            groups: vec![sample_group(1, "group-a"), sample_group(2, "group-b")],
+        };
+        let bytes = resp.to_bytes();
+        let (decoded, consumed) = GetConsumerGroupsResponse::decode(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn truncated_returns_error() {
+        let resp = GetConsumerGroupsResponse {
+            groups: vec![sample_group(1, "g")],
+        };
+        let bytes = resp.to_bytes();
+        for i in 1..bytes.len() {
+            assert!(
+                GetConsumerGroupsResponse::decode(&bytes[..i]).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
+    }
+}

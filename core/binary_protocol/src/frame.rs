@@ -15,6 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// TODO(hubcio): Legacy framing constants for the current binary protocol.
+// Once VSR consensus is integrated, both client-server and
+// replica-replica traffic will use the unified 256-byte
+// consensus header (`consensus::header::HEADER_SIZE`).
+// These constants will be removed at that point.
+
 /// Request frame: `[length:4 LE][code:4 LE][payload:N]`
 /// `length` = size of code + payload = 4 + N
 pub const REQUEST_HEADER_SIZE: usize = 4;
