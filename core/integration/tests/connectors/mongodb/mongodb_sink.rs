@@ -261,7 +261,7 @@ async fn large_batch_processed_correctly(harness: &TestHarness, fixture: MongoDb
     server(connectors_runtime(config_path = "tests/connectors/mongodb/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn duplicate_key_is_explicit_failure_and_not_silent_success(
+async fn duplicate_key_is_idempotent_replay_not_sink_error(
     harness: &TestHarness,
     fixture: MongoDbSinkFixture,
 ) {
