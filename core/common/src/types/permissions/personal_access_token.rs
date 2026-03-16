@@ -16,7 +16,9 @@
  * under the License.
  */
 
+use crate::utils::serde_secret::serialize_secret;
 use crate::utils::timestamp::IggyTimestamp;
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -26,7 +28,8 @@ use std::fmt;
 #[derive(Serialize, Deserialize)]
 pub struct RawPersonalAccessToken {
     /// The unique token that should be securely stored by the user and can be used for authentication.
-    pub token: String,
+    #[serde(serialize_with = "serialize_secret")]
+    pub token: SecretString,
 }
 
 impl fmt::Debug for RawPersonalAccessToken {

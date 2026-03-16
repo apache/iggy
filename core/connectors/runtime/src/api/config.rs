@@ -21,6 +21,8 @@ use crate::configs::connectors::ConfigFormat;
 use crate::error::RuntimeError;
 use axum::http::{HeaderValue, Method};
 use configs_derive::ConfigEnv;
+use iggy_common::serde_secret::serialize_secret;
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -35,8 +37,9 @@ pub const TEXT_HEADER: HeaderValue = HeaderValue::from_static("text/plain");
 pub struct HttpConfig {
     pub enabled: bool,
     pub address: String,
-    #[config_env(secret)]
-    pub api_key: String,
+    #[config_env(secret, leaf)]
+    #[serde(serialize_with = "serialize_secret")]
+    pub api_key: SecretString,
     pub cors: HttpCorsConfig,
     pub tls: HttpTlsConfig,
     pub metrics: HttpMetricsConfig,
@@ -179,7 +182,7 @@ impl Default for HttpConfig {
         Self {
             enabled: true,
             address: "localhost:8081".to_owned(),
-            api_key: "".to_owned(),
+            api_key: SecretString::from(""),
             cors: HttpCorsConfig::default(),
             tls: HttpTlsConfig::default(),
             metrics: HttpMetricsConfig::default(),

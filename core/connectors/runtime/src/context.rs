@@ -68,7 +68,7 @@ pub fn init(
     RuntimeContext {
         sinks,
         sources,
-        api_key: SecretString::from(config.http.api_key.to_owned()),
+        api_key: config.http.api_key.clone(),
         config_provider: Arc::from(config_provider),
         metrics,
         start_time: IggyTimestamp::now(),

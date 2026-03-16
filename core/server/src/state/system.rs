@@ -75,14 +75,24 @@ pub struct PartitionState {
     pub created_at: IggyTimestamp,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PersonalAccessTokenState {
     pub name: String,
     pub token_hash: String,
     pub expiry_at: Option<IggyTimestamp>,
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for PersonalAccessTokenState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersonalAccessTokenState")
+            .field("name", &self.name)
+            .field("token_hash", &"[REDACTED]")
+            .field("expiry_at", &self.expiry_at)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct UserState {
     pub id: u32,
     pub username: String,
@@ -91,6 +101,20 @@ pub struct UserState {
     pub created_at: IggyTimestamp,
     pub permissions: Option<Permissions>,
     pub personal_access_tokens: AHashMap<String, PersonalAccessTokenState>,
+}
+
+impl std::fmt::Debug for UserState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserState")
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .field("password_hash", &"[REDACTED]")
+            .field("status", &self.status)
+            .field("created_at", &self.created_at)
+            .field("permissions", &self.permissions)
+            .field("personal_access_tokens", &self.personal_access_tokens)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

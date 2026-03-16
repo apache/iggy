@@ -51,3 +51,56 @@ pub fn serialize_optional_secret<S: serde::Serializer>(
         None => serializer.serialize_none(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    struct WithSecret {
+        #[serde(serialize_with = "serialize_secret")]
+        password: SecretString,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct WithOptionalSecret {
+        #[serde(serialize_with = "serialize_optional_secret")]
+        token: Option<SecretString>,
+    }
+
+    #[test]
+    fn serialize_secret_preserves_value_in_json() {
+        let s = WithSecret {
+            password: SecretString::from("my_password"),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, r#"{"password":"my_password"}"#);
+    }
+
+    #[test]
+    fn serialize_secret_roundtrips_through_json() {
+        let original = WithSecret {
+            password: SecretString::from("roundtrip"),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: WithSecret = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.password.expose_secret(), "roundtrip");
+    }
+
+    #[test]
+    fn serialize_optional_secret_with_some_value() {
+        let s = WithOptionalSecret {
+            token: Some(SecretString::from("tok_123")),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, r#"{"token":"tok_123"}"#);
+    }
+
+    #[test]
+    fn serialize_optional_secret_with_none() {
+        let s = WithOptionalSecret { token: None };
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(json, r#"{"token":null}"#);
+    }
+}

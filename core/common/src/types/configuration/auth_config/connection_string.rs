@@ -106,7 +106,7 @@ impl<T: ConnectionStringOptions + Default> ConnectionString<T> {
             return Ok(ConnectionString {
                 server_address: server_address.to_owned(),
                 auto_login: AutoLogin::Enabled(Credentials::PersonalAccessToken(
-                    SecretString::from(pat_token.to_owned()),
+                    SecretString::from(pat_token),
                 )),
                 options: connection_string_options,
             });
@@ -116,7 +116,7 @@ impl<T: ConnectionStringOptions + Default> ConnectionString<T> {
             server_address: server_address.to_owned(),
             auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
                 username.to_owned(),
-                SecretString::from(password.to_owned()),
+                SecretString::from(password),
             )),
             options: connection_string_options,
         })

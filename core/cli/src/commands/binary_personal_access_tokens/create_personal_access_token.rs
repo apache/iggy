@@ -23,6 +23,7 @@ use iggy_common::Client;
 use iggy_common::PersonalAccessTokenExpiry;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use keyring::Entry;
+use secrecy::ExposeSecret;
 use tracing::{Level, event};
 
 pub struct CreatePersonalAccessTokenCmd {
@@ -84,7 +85,7 @@ impl CliCommand for CreatePersonalAccessTokenCmd {
         if self.store_token {
             let server_address = format!("iggy:{}", self.server_address);
             let entry = Entry::new(&server_address, &self.create_token.name)?;
-            entry.set_password(&token.token)?;
+            entry.set_password(token.token.expose_secret())?;
             event!(target: PRINT_TARGET, Level::DEBUG,"Stored token under service: {} and name: {}", server_address,
                     self.create_token.name);
             event!(target: PRINT_TARGET, Level::INFO,
@@ -96,7 +97,7 @@ impl CliCommand for CreatePersonalAccessTokenCmd {
                 },
             );
         } else if self.quiet_mode {
-            println!("{}", token.token);
+            println!("{}", token.token.expose_secret());
         } else {
             event!(target: PRINT_TARGET, Level::INFO,
                 "Personal access token with name: {} and {} created",
@@ -107,7 +108,7 @@ impl CliCommand for CreatePersonalAccessTokenCmd {
                 },
             );
             event!(target: PRINT_TARGET, Level::INFO,"Token: {}",
-                            token.token);
+                            token.token.expose_secret());
         }
 
         Ok(())

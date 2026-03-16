@@ -31,6 +31,7 @@ use rmcp::{
     serde::de::DeserializeOwned,
     serde_json::{self, json},
 };
+use secrecy::ExposeSecret;
 
 async fn invoke<T: DeserializeOwned>(
     client: &McpClient,
@@ -512,7 +513,7 @@ async fn should_create_personal_access_token(harness: &TestHarness) {
     )
     .await;
 
-    assert!(!token.token.is_empty());
+    assert!(!token.token.expose_secret().is_empty());
 }
 
 #[iggy_harness(server(mcp), seed = seeds::mcp_standard)]

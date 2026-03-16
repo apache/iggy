@@ -17,6 +17,8 @@
  */
 
 use crate::UserId;
+use crate::utils::serde_secret::serialize_secret;
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -39,7 +41,8 @@ pub struct IdentityInfo {
 #[derive(Serialize, Deserialize)]
 pub struct TokenInfo {
     /// The value of token.
-    pub token: String,
+    #[serde(serialize_with = "serialize_secret")]
+    pub token: SecretString,
     /// The expiry of token.
     pub expiry: u64,
 }
