@@ -25,7 +25,7 @@ use crate::prelude::{
 };
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
-use iggy_binary_protocol::Client;
+use iggy_common::Client;
 use iggy_common::{
     AutoLogin, Credentials, TransportProtocol, WebSocketClientConfig,
     WebSocketClientReconnectionConfig, WebSocketConfig,

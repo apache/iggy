@@ -50,20 +50,17 @@ const caCertPath = process.env.E2E_ROOT_CA_CERT
   || resolve(process.cwd(), '../../core/certs/iggy_ca_cert.pem');
 
 const getTlsClient = () => {
-  const [host, port] = getIggyAddress();
+  const [, port] = getIggyAddress();
   const caCert = readFileSync(caCertPath);
 
-  // The server certificate is issued for 'localhost'. When IGGY_TCP_ADDRESS uses
-  // an IP (e.g. 127.0.0.1), the default TLS hostname check would fail because
-  // the cert CN/SAN does not match an IP literal. Providing a custom
-  // checkServerIdentity that always succeeds works around this for local testing.
+  // The server certificate SAN is DNS:localhost, so we connect via 'localhost'
+  // for proper hostname verification (consistent with Python and C# TLS tests).
   return new Client({
     transport: 'TLS',
     options: {
       port,
-      host,
+      host: 'localhost',
       ca: caCert,
-      checkServerIdentity: () => undefined,
     },
     credentials: { username: 'iggy', password: 'iggy' },
   });

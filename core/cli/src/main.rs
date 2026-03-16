@@ -40,12 +40,12 @@ use clap::Parser;
 use iggy::client_provider::{self, ClientProviderConfig};
 use iggy::clients::client::IggyClient;
 use iggy::prelude::{Aes256GcmEncryptor, Args, EncryptorKind, PersonalAccessTokenExpiry};
-use iggy_binary_protocol::cli::binary_context::common::ContextManager;
-use iggy_binary_protocol::cli::binary_context::use_context::UseContextCmd;
-use iggy_binary_protocol::cli::binary_segments::delete_segments::DeleteSegmentsCmd;
-use iggy_binary_protocol::cli::binary_system::snapshot::GetSnapshotCmd;
-use iggy_binary_protocol::cli::cli_command::{CliCommand, PRINT_TARGET};
-use iggy_binary_protocol::cli::{
+use iggy_cli::commands::binary_context::common::ContextManager;
+use iggy_cli::commands::binary_context::use_context::UseContextCmd;
+use iggy_cli::commands::binary_segments::delete_segments::DeleteSegmentsCmd;
+use iggy_cli::commands::binary_system::snapshot::GetSnapshotCmd;
+use iggy_cli::commands::cli_command::{CliCommand, PRINT_TARGET};
+use iggy_cli::commands::{
     binary_client::{get_client::GetClientCmd, get_clients::GetClientsCmd},
     binary_cluster::get_cluster_metadata::GetClusterMetadataCmd,
     binary_consumer_groups::{
@@ -93,8 +93,8 @@ use tracing::{Level, event};
 
 #[cfg(feature = "login-session")]
 mod main_login_session {
-    pub(crate) use iggy_binary_protocol::cli::binary_system::{login::LoginCmd, logout::LogoutCmd};
-    pub(crate) use iggy_binary_protocol::cli::utils::login_session_expiry::LoginSessionExpiry;
+    pub(crate) use iggy_cli::commands::binary_system::{login::LoginCmd, logout::LogoutCmd};
+    pub(crate) use iggy_cli::commands::utils::login_session_expiry::LoginSessionExpiry;
 }
 
 #[cfg(feature = "login-session")]

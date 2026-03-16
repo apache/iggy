@@ -214,7 +214,7 @@ components:
       - "ci-infrastructure"
     paths:
       - "foreign/cpp/**"
-    tasks: ["lint", "build", "test"]
+    tasks: ["lint", "build", "test", "e2e"]
 
   # Individual BDD tests per SDK - only run when specific SDK changes
   bdd-rust:
@@ -247,7 +247,7 @@ components:
     paths:
       - "bdd/go/**"
       - "bdd/scenarios/**"
-    tasks: ["bdd-go"]
+    tasks: ["bdd-go", "bdd-go-race"]
 
   bdd-node:
     depends_on:
@@ -289,7 +289,8 @@ components:
       - "ci-infrastructure"
     paths:
       - "examples/rust/**"
-      - "scripts/run-rust-examples-from-readme.sh"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
     tasks: ["examples-rust"]
 
   examples-go:
@@ -300,7 +301,8 @@ components:
       - "ci-infrastructure"
     paths:
       - "examples/go/**"
-      - "scripts/run-go-examples-from-readme.sh"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
     tasks: ["examples-go"]
 
   examples-csharp:
@@ -311,7 +313,8 @@ components:
       - "ci-infrastructure"
     paths:
       - "examples/csharp/**"
-      - "scripts/run-csharp-examples-from-readme.sh"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
     tasks: ["examples-csharp"]
 
   examples-python:
@@ -322,7 +325,8 @@ components:
       - "ci-infrastructure"
     paths:
       - "examples/python/**"
-      - "scripts/run-python-examples-from-readme.sh"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
     tasks: ["examples-python"]
 
   examples-node:
@@ -333,7 +337,8 @@ components:
       - "ci-infrastructure"
     paths:
       - "examples/node/**"
-      - "scripts/run-node-examples-from-readme.sh"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
     tasks: ["examples-node"]
 
   examples-java:
@@ -344,7 +349,8 @@ components:
       - "ci-infrastructure"
     paths:
       - "examples/java/**"
-      - "scripts/run-java-examples-from-readme.sh"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
     tasks: ["examples-java"]
 
   web-ui:

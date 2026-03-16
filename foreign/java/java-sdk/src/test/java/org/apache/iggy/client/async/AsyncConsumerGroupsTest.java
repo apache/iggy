@@ -44,7 +44,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Dedicated async-specific tests for {@link ConsumerGroupsClient} via
@@ -382,16 +382,20 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
     void shouldFailToDeleteNonExistentGroup() {
         var future = client.consumerGroups().deleteConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(999_999L));
 
-        var exception = assertThrows(ExecutionException.class, () -> future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
-        assertThat(exception.getCause()).isInstanceOf(IggyResourceNotFoundException.class);
+        assertThatThrownBy(() -> future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class)
+                .cause()
+                .isInstanceOf(IggyResourceNotFoundException.class);
     }
 
     @Test
     void shouldFailToJoinNonExistentGroup() {
         var future = client.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(999_999L));
 
-        var exception = assertThrows(ExecutionException.class, () -> future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
-        assertThat(exception.getCause()).isInstanceOf(IggyResourceNotFoundException.class);
+        assertThatThrownBy(() -> future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class)
+                .cause()
+                .isInstanceOf(IggyResourceNotFoundException.class);
     }
 
     @Test
@@ -404,8 +408,10 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
 
         var future = client.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(created.id()));
 
-        var exception = assertThrows(ExecutionException.class, () -> future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
-        assertThat(exception.getCause()).isInstanceOf(IggyResourceNotFoundException.class);
+        assertThatThrownBy(() -> future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class)
+                .cause()
+                .isInstanceOf(IggyResourceNotFoundException.class);
     }
 
     // ===== CompletableFuture-specific tests =====

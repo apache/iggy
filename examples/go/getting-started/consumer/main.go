@@ -37,10 +37,10 @@ var (
 )
 
 func main() {
+	serverAddr, tcpOptions := getTcpOptions()
+
 	cli, err := client.NewIggyClient(
-		client.WithTcp(
-			tcp.WithServerAddress(getTcpServerAddr()),
-		),
+		client.WithTcp(tcpOptions...),
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -51,6 +51,7 @@ func main() {
 		}
 	}()
 
+	log.Printf("Connecting to server at %s", serverAddr)
 	_, err = cli.LoginUser(common.DefaultRootUsername, common.DefaultRootPassword)
 	if err != nil {
 		log.Fatal(err)
@@ -121,14 +122,31 @@ func handleMessage(message iggcon.IggyMessage) error {
 	return nil
 }
 
-func getTcpServerAddr() string {
+func getTcpOptions() (string, []tcp.Option) {
 	tcpServerAddr := flag.String("tcp-server-address", "127.0.0.1:8090", "TCP server address")
+	tlsEnabled := flag.Bool("tls", false, "Enable TLS")
+	tlsCAFile := flag.String("tls-ca-file", "", "Path to CA certificate file for TLS")
+	tlsDomain := flag.String("tls-domain", "", "TLS server domain name for SNI")
 	flag.Parse()
 
 	if _, err := net.ResolveTCPAddr("tcp", *tcpServerAddr); err != nil {
 		log.Fatalf("Invalid server address %s! Usage: --tcp-server-address <server-address>", *tcpServerAddr)
 	}
 
-	log.Printf("Using server address: %s\n", *tcpServerAddr)
-	return *tcpServerAddr
+	tcpOptions := []tcp.Option{
+		tcp.WithServerAddress(*tcpServerAddr),
+	}
+
+	if *tlsEnabled {
+		tcpOptions = append(tcpOptions, tcp.WithTLS(true))
+		if *tlsCAFile != "" {
+			tcpOptions = append(tcpOptions, tcp.WithTLSCAFile(*tlsCAFile))
+		}
+		if *tlsDomain != "" {
+			tcpOptions = append(tcpOptions, tcp.WithTLSDomain(*tlsDomain))
+		}
+		log.Printf("TLS enabled with CA file: %s, domain: %s", *tlsCAFile, *tlsDomain)
+	}
+
+	return *tcpServerAddr, tcpOptions
 }
