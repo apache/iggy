@@ -340,6 +340,41 @@ pub fn map_stats(payload: Bytes) -> Result<Stats, IggyError> {
         }
     }
 
+    let mut threads_count = 0u32;
+    if current_position + 4 <= payload.len() {
+        threads_count = u32::from_le_bytes(
+            payload[current_position..current_position + 4]
+                .try_into()
+                .map_err(|_| IggyError::InvalidNumberEncoding)?,
+        );
+        current_position += 4;
+    }
+
+    let mut free_disk_space: IggyByteSize = 0.into();
+    if current_position + 8 <= payload.len() {
+        free_disk_space = u64::from_le_bytes(
+            payload[current_position..current_position + 8]
+                .try_into()
+                .map_err(|_| IggyError::InvalidNumberEncoding)?,
+        )
+        .into();
+        current_position += 8;
+    }
+
+    let mut total_disk_space: IggyByteSize = 0.into();
+    if current_position + 8 <= payload.len() {
+        total_disk_space = u64::from_le_bytes(
+            payload[current_position..current_position + 8]
+                .try_into()
+                .map_err(|_| IggyError::InvalidNumberEncoding)?,
+        )
+        .into();
+        #[allow(unused_assignments)]
+        {
+            current_position += 8;
+        }
+    }
+
     Ok(Stats {
         process_id,
         cpu_usage,
@@ -366,6 +401,9 @@ pub fn map_stats(payload: Bytes) -> Result<Stats, IggyError> {
         iggy_server_version,
         iggy_server_semver,
         cache_metrics,
+        threads_count,
+        free_disk_space,
+        total_disk_space,
     })
 }
 

@@ -87,6 +87,8 @@ impl IggyShard {
                 let disk_usage = process.disk_usage();
                 stats.read_bytes = disk_usage.total_read_bytes.into();
                 stats.written_bytes = disk_usage.total_written_bytes.into();
+
+                stats.threads_count = process.tasks().map(|t| t.len() as u32).unwrap_or(0);
             }
 
             let (streams_count, topics_count, partitions_count, consumer_groups_count, stream_ids) =
@@ -115,6 +117,20 @@ impl IggyShard {
                     stats.messages_count += stream_stat.messages_count_inconsistent();
                     stats.segments_count += stream_stat.segments_count_inconsistent();
                     stats.messages_size_bytes += stream_stat.size_bytes_inconsistent().into();
+                }
+            }
+
+            let data_path = std::path::Path::new(&self.config.system.path);
+            let data_path =
+                std::fs::canonicalize(data_path).unwrap_or_else(|_| data_path.to_path_buf());
+            let disks = sysinfo::Disks::new_with_refreshed_list();
+            let mut best_mount_len = 0usize;
+            for disk in disks.list() {
+                let mount = disk.mount_point();
+                if data_path.starts_with(mount) && mount.as_os_str().len() > best_mount_len {
+                    best_mount_len = mount.as_os_str().len();
+                    stats.free_disk_space = disk.available_space().into();
+                    stats.total_disk_space = disk.total_space().into();
                 }
             }
 
