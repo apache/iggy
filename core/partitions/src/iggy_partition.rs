@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::journal::{Noop, PartitionJournal};
+use crate::journal::{PartitionJournal, PartitionJournalMemStorage};
 use crate::log::SegmentedLog;
-use crate::{AppendResult, Partition};
+use crate::{AppendResult, Partition, decode_send_messages_batch};
 use iggy_common::{
     ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, IggyMessagesBatchMut,
     IggyTimestamp, PartitionStats,
+    header::{Operation, PrepareHeader},
+    message::Message,
 };
 use journal::Journal as _;
 use std::sync::Arc;
@@ -30,7 +32,7 @@ use tokio::sync::Mutex as TokioMutex;
 // This struct aliases in terms of the code contained the `LocalPartition from `core/server/src/streaming/partitions/local_partition.rs`.
 #[derive(Debug)]
 pub struct IggyPartition {
-    pub log: SegmentedLog<PartitionJournal, Noop>,
+    pub log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>, PartitionJournalMemStorage>,
     /// Committed offset — advanced only after quorum ack.
     pub offset: Arc<AtomicU64>,
     /// Dirty offset — advanced on every prepare (before commit).
@@ -46,6 +48,36 @@ pub struct IggyPartition {
 }
 
 impl IggyPartition {
+    fn prepare_message_from_batch(
+        mut header: PrepareHeader,
+        batch: &IggyMessagesBatchMut,
+    ) -> Message<PrepareHeader> {
+        let indexes = batch.indexes();
+        let count = batch.count();
+        let body_len = 4 + indexes.len() + batch.len();
+        let total_size = std::mem::size_of::<PrepareHeader>() + body_len;
+        header.size = u32::try_from(total_size)
+            .expect("prepare_message_from_batch: batch size exceeds u32::MAX");
+
+        let message = Message::<PrepareHeader>::new(total_size).transmute_header(|_old, new| {
+            *new = header;
+        });
+
+        let mut bytes = message
+            .into_inner()
+            .try_into_mut()
+            .expect("prepare_message_from_batch: expected unique bytes buffer");
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        bytes[header_size..header_size + 4].copy_from_slice(&count.to_le_bytes());
+        let mut position = header_size + 4;
+        bytes[position..position + indexes.len()].copy_from_slice(indexes);
+        position += indexes.len();
+        bytes[position..position + batch.len()].copy_from_slice(batch);
+
+        Message::<PrepareHeader>::from_bytes(bytes.freeze())
+            .expect("prepare_message_from_batch: invalid prepared message bytes")
+    }
+
     pub fn new(stats: Arc<PartitionStats>) -> Self {
         Self {
             log: SegmentedLog::default(),
@@ -65,8 +97,16 @@ impl IggyPartition {
 impl Partition for IggyPartition {
     async fn append_messages(
         &mut self,
-        mut batch: IggyMessagesBatchMut,
+        message: Message<PrepareHeader>,
     ) -> Result<AppendResult, IggyError> {
+        let header = *message.header();
+        if header.operation != Operation::SendMessages {
+            return Err(IggyError::CannotAppendMessage);
+        }
+
+        let mut batch = decode_send_messages_batch(message.body_bytes())
+            .ok_or(IggyError::CannotAppendMessage)?;
+
         if batch.count() == 0 {
             return Ok(AppendResult::new(0, 0, 0));
         }
@@ -116,7 +156,8 @@ impl Partition for IggyPartition {
             journal.info.end_timestamp = ts;
         }
 
-        journal.inner.append(batch).await;
+        let message = Self::prepare_message_from_batch(header, &batch);
+        journal.inner.append(message).await;
 
         Ok(AppendResult::new(
             dirty_offset,

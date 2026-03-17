@@ -27,6 +27,7 @@ use crate::streaming::session::Session;
 use err_trail::ErrContext;
 use iggy_common::login_user::LoginUser;
 use iggy_common::{IggyError, SenderKind};
+use secrecy::ExposeSecret;
 use std::rc::Rc;
 use tracing::{debug, info, instrument, warn};
 
@@ -54,7 +55,7 @@ impl ServerCommandHandler for LoginUser {
         } = self;
         info!("Logging in user: {} ...", &username);
         let user = shard
-            .login_user(&username, &password, Some(session))
+            .login_user(&username, password.expose_secret(), Some(session))
             .error(|e: &IggyError| {
                 format!(
                     "{COMPONENT} (error: {e}) - failed to login user with name: {}, session: {session}",

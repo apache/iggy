@@ -23,13 +23,44 @@ mod journal;
 mod log;
 mod types;
 
-use iggy_common::{IggyError, IggyMessagesBatchMut, IggyMessagesBatchSet};
+use bytes::{Bytes, BytesMut};
+use iggy_common::{
+    INDEX_SIZE, IggyError, IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet,
+    PooledBuffer, header::PrepareHeader, message::Message,
+};
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;
 pub use types::{
     AppendResult, PartitionOffsets, PartitionsConfig, PollingArgs, PollingConsumer,
     SendMessagesResult,
 };
+
+pub(crate) fn decode_send_messages_batch(body: Bytes) -> Option<IggyMessagesBatchMut> {
+    // TODO: This very is bad, IGGY-114 Fixes this.
+    let mut body = body
+        .try_into_mut()
+        .unwrap_or_else(|body| BytesMut::from(body.as_ref()));
+
+    if body.len() < 4 {
+        return None;
+    }
+
+    let count_bytes = body.split_to(4);
+    let count = u32::from_le_bytes(count_bytes.as_ref().try_into().ok()?);
+    let indexes_len = (count as usize).checked_mul(INDEX_SIZE)?;
+
+    if body.len() < indexes_len {
+        return None;
+    }
+
+    let indexes_bytes = body.split_to(indexes_len);
+    let indexes = IggyIndexesMut::from_bytes(PooledBuffer::from(indexes_bytes), 0);
+    let messages = PooledBuffer::from(body);
+
+    Some(IggyMessagesBatchMut::from_indexes_and_messages(
+        indexes, messages,
+    ))
+}
 
 /// Partition-level data plane operations.
 ///
@@ -38,7 +69,7 @@ pub use types::{
 pub trait Partition {
     fn append_messages(
         &mut self,
-        batch: IggyMessagesBatchMut,
+        message: Message<PrepareHeader>,
     ) -> impl Future<Output = Result<AppendResult, IggyError>>;
 
     fn poll_messages(

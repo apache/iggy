@@ -19,62 +19,44 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.blocking.StreamsClient;
 import org.apache.iggy.identifier.StreamId;
-import org.apache.iggy.serde.BytesDeserializer;
-import org.apache.iggy.serde.BytesSerializer;
-import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
 
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.serde.BytesSerializer.toBytes;
+final class StreamsTcpClient implements StreamsClient {
 
-class StreamsTcpClient implements StreamsClient {
+    private final org.apache.iggy.client.async.StreamsClient delegate;
 
-    private final InternalTcpClient tcpClient;
-
-    StreamsTcpClient(InternalTcpClient tcpClient) {
-        this.tcpClient = tcpClient;
-    }
-
-    @Override
-    public StreamDetails createStream(String name) {
-        var payloadSize = 1 + name.length();
-        var payload = Unpooled.buffer(payloadSize);
-
-        payload.writeBytes(BytesSerializer.toBytes(name));
-        return tcpClient.exchangeForEntity(CommandCode.Stream.CREATE, payload, BytesDeserializer::readStreamDetails);
+    StreamsTcpClient(org.apache.iggy.client.async.StreamsClient delegate) {
+        this.delegate = delegate;
     }
 
     @Override
     public Optional<StreamDetails> getStream(StreamId streamId) {
-        var payload = toBytes(streamId);
-        return tcpClient.exchangeForOptional(CommandCode.Stream.GET, payload, BytesDeserializer::readStreamDetails);
+        return FutureUtil.resolve(delegate.getStream(streamId));
     }
 
     @Override
     public List<StreamBase> getStreams() {
-        return tcpClient.exchangeForList(CommandCode.Stream.GET_ALL, BytesDeserializer::readStreamBase);
+        return FutureUtil.resolve(delegate.getStreams());
+    }
+
+    @Override
+    public StreamDetails createStream(String name) {
+        return FutureUtil.resolve(delegate.createStream(name));
     }
 
     @Override
     public void updateStream(StreamId streamId, String name) {
-        var payloadSize = 1 + name.length();
-        var idBytes = toBytes(streamId);
-        var payload = Unpooled.buffer(payloadSize + idBytes.capacity());
-
-        payload.writeBytes(idBytes);
-        payload.writeBytes(BytesSerializer.toBytes(name));
-        tcpClient.send(CommandCode.Stream.UPDATE, payload);
+        FutureUtil.resolve(delegate.updateStream(streamId, name));
     }
 
     @Override
     public void deleteStream(StreamId streamId) {
-        var payload = toBytes(streamId);
-        tcpClient.send(CommandCode.Stream.DELETE, payload);
+        FutureUtil.resolve(delegate.deleteStream(streamId));
     }
 }
