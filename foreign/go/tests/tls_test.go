@@ -155,9 +155,10 @@ func TestTCPTLSConnection_WithCA_Success(t *testing.T) {
 	cli, err := client.NewIggyClient(
 		client.WithTcp(
 			tcp.WithServerAddress(connectAddr),
-			tcp.WithTLS(true),
-			tcp.WithTLSCAFile(caFile),
-			tcp.WithTLSDomain("localhost"),
+			tcp.WithTLS(
+				tcp.WithTLSCAFile(caFile),
+				tcp.WithTLSDomain("localhost"),
+			),
 		),
 	)
 	require.NoError(t, err, "Failed to create TLS client")
@@ -183,7 +184,6 @@ func TestTCPTLSConnection_WithoutTLS_Failure(t *testing.T) {
 	cli, err := client.NewIggyClient(
 		client.WithTcp(
 			tcp.WithServerAddress(connectAddr),
-			tcp.WithTLS(false),
 		),
 	)
 
@@ -211,9 +211,10 @@ func TestTCPTLSConnection_MessageFlow_Success(t *testing.T) {
 	cli, err := client.NewIggyClient(
 		client.WithTcp(
 			tcp.WithServerAddress(connectAddr),
-			tcp.WithTLS(true),
-			tcp.WithTLSCAFile(caFile),
-			tcp.WithTLSDomain("localhost"),
+			tcp.WithTLS(
+				tcp.WithTLSCAFile(caFile),
+				tcp.WithTLSDomain("localhost"),
+			),
 		),
 	)
 	require.NoError(t, err, "Failed to create TLS client")
