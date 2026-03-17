@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Net.Sockets;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
@@ -50,17 +51,19 @@ public class LeaderRedirectionSteps
     }
 
     [Given(@"I start server (\d+) on port (\d+) as (leader|follower)")]
-    public void GivenIStartServerOnPortAs(int nodeId, int port, string role)
+    public async Task GivenIStartServerOnPortAs(int nodeId, int port, string role)
     {
         _ = nodeId;
         var address = ResolveAddressForRole(role);
         address.ShouldEndWith($":{port}");
+        await WaitForServerPortAsync(address);
     }
 
     [Given(@"I start a single server on port (\d+) without clustering enabled")]
-    public void GivenIStartASingleServerOnPortWithoutClusteringEnabled(int port)
+    public async Task GivenIStartASingleServerOnPortWithoutClusteringEnabled(int port)
     {
         _context.TcpUrl.ShouldEndWith($":{port}");
+        await WaitForServerPortAsync(_context.TcpUrl);
     }
 
     [When(@"I create a client connecting to (follower|leader) on port (\d+)")]
@@ -227,5 +230,49 @@ public class LeaderRedirectionSteps
             8092 => _context.FollowerTcpUrl,
             _ => throw new ArgumentOutOfRangeException(nameof(port), port, "Unsupported test port")
         };
+    }
+
+    private static async Task WaitForServerPortAsync(string address)
+    {
+        var (host, port) = ParseTcpEndpoint(address);
+        const int maxAttempts = 50;
+
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            using var tcpClient = new TcpClient();
+
+            try
+            {
+                var connectTask = tcpClient.ConnectAsync(host, port);
+                var completedTask = await Task.WhenAny(connectTask, Task.Delay(200));
+                if (completedTask == connectTask && tcpClient.Connected)
+                {
+                    return;
+                }
+            }
+            catch (SocketException)
+            {
+                // Retry until the container starts accepting connections.
+            }
+
+            await Task.Delay(200);
+        }
+
+        throw new TimeoutException($"Timed out waiting for server at {address} to accept TCP connections.");
+    }
+
+    private static (string Host, int Port) ParseTcpEndpoint(string address)
+    {
+        if (Uri.TryCreate(address, UriKind.Absolute, out var absoluteUri))
+        {
+            return (absoluteUri.Host, absoluteUri.Port);
+        }
+
+        if (Uri.TryCreate($"tcp://{address}", UriKind.Absolute, out var tcpUri))
+        {
+            return (tcpUri.Host, tcpUri.Port);
+        }
+
+        throw new ArgumentException($"Invalid server address: {address}", nameof(address));
     }
 }
