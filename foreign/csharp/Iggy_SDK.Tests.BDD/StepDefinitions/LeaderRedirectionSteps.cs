@@ -263,14 +263,15 @@ public class LeaderRedirectionSteps
 
     private static (string Host, int Port) ParseTcpEndpoint(string address)
     {
-        if (Uri.TryCreate(address, UriKind.Absolute, out var absoluteUri))
+        var normalizedAddress = address.Contains("://", StringComparison.Ordinal)
+            ? address
+            : $"tcp://{address}";
+
+        if (Uri.TryCreate(normalizedAddress, UriKind.Absolute, out var absoluteUri) &&
+            !string.IsNullOrWhiteSpace(absoluteUri.Host) &&
+            absoluteUri.Port > 0)
         {
             return (absoluteUri.Host, absoluteUri.Port);
-        }
-
-        if (Uri.TryCreate($"tcp://{address}", UriKind.Absolute, out var tcpUri))
-        {
-            return (tcpUri.Host, tcpUri.Port);
         }
 
         throw new ArgumentException($"Invalid server address: {address}", nameof(address));
