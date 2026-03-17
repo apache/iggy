@@ -22,7 +22,7 @@ use crate::connectors::fixtures::InfluxDbSinkFixture;
 use bytes::Bytes;
 use iggy::prelude::IggyMessage;
 use iggy::prelude::Partitioning;
-use iggy_binary_protocol::MessageClient;
+use iggy_common::MessageClient;
 use iggy_common::Identifier;
 use integration::harness::seeds;
 use integration::iggy_harness;

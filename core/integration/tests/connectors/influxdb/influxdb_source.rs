@@ -16,7 +16,7 @@
 
 use super::TEST_MESSAGE_COUNT;
 use crate::connectors::fixtures::InfluxDbSourceFixture;
-use iggy_binary_protocol::MessageClient;
+use iggy_common::MessageClient;
 use iggy_common::Utc;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
 use integration::harness::seeds;

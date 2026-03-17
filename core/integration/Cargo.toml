@@ -61,7 +61,6 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
 ] }
-serde = { workspace = true, features = ["derive"] }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
