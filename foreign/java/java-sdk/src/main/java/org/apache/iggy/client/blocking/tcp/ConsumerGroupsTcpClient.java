@@ -19,84 +19,51 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.blocking.ConsumerGroupsClient;
 import org.apache.iggy.consumergroup.ConsumerGroup;
 import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.serde.BytesDeserializer;
-import org.apache.iggy.serde.BytesSerializer;
-import org.apache.iggy.serde.CommandCode;
 
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.serde.BytesSerializer.toBytes;
+final class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
-class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
+    private final org.apache.iggy.client.async.ConsumerGroupsClient delegate;
 
-    private final InternalTcpClient tcpClient;
-
-    public ConsumerGroupsTcpClient(InternalTcpClient tcpClient) {
-        this.tcpClient = tcpClient;
+    ConsumerGroupsTcpClient(org.apache.iggy.client.async.ConsumerGroupsClient delegate) {
+        this.delegate = delegate;
     }
 
     @Override
     public Optional<ConsumerGroupDetails> getConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId) {
-        var payload = toBytes(streamId);
-        payload.writeBytes(toBytes(topicId));
-        payload.writeBytes(toBytes(groupId));
-        return tcpClient.exchangeForOptional(
-                CommandCode.ConsumerGroup.GET, payload, BytesDeserializer::readConsumerGroupDetails);
+        return FutureUtil.resolve(delegate.getConsumerGroup(streamId, topicId, groupId));
     }
 
     @Override
     public List<ConsumerGroup> getConsumerGroups(StreamId streamId, TopicId topicId) {
-        var payload = toBytes(streamId);
-        payload.writeBytes(toBytes(topicId));
-        return tcpClient.exchangeForList(
-                CommandCode.ConsumerGroup.GET_ALL, payload, BytesDeserializer::readConsumerGroup);
+        return FutureUtil.resolve(delegate.getConsumerGroups(streamId, topicId));
     }
 
     @Override
     public ConsumerGroupDetails createConsumerGroup(StreamId streamId, TopicId topicId, String name) {
-        var streamIdBytes = toBytes(streamId);
-        var topicIdBytes = toBytes(topicId);
-        var payload = Unpooled.buffer(1 + streamIdBytes.readableBytes() + topicIdBytes.readableBytes() + name.length());
-
-        payload.writeBytes(streamIdBytes);
-        payload.writeBytes(topicIdBytes);
-        payload.writeBytes(BytesSerializer.toBytes(name));
-
-        return tcpClient.exchangeForEntity(
-                CommandCode.ConsumerGroup.CREATE, payload, BytesDeserializer::readConsumerGroupDetails);
+        return FutureUtil.resolve(delegate.createConsumerGroup(streamId, topicId, name));
     }
 
     @Override
     public void deleteConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId) {
-        var payload = toBytes(streamId);
-        payload.writeBytes(toBytes(topicId));
-        payload.writeBytes(toBytes(groupId));
-        tcpClient.send(CommandCode.ConsumerGroup.DELETE, payload);
+        FutureUtil.resolve(delegate.deleteConsumerGroup(streamId, topicId, groupId));
     }
 
     @Override
     public void joinConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId) {
-        var payload = toBytes(streamId);
-        payload.writeBytes(toBytes(topicId));
-        payload.writeBytes(toBytes(groupId));
-
-        tcpClient.send(CommandCode.ConsumerGroup.JOIN, payload);
+        FutureUtil.resolve(delegate.joinConsumerGroup(streamId, topicId, groupId));
     }
 
     @Override
     public void leaveConsumerGroup(StreamId streamId, TopicId topicId, ConsumerId groupId) {
-        var payload = toBytes(streamId);
-        payload.writeBytes(toBytes(topicId));
-        payload.writeBytes(toBytes(groupId));
-
-        tcpClient.send(CommandCode.ConsumerGroup.LEAVE, payload);
+        FutureUtil.resolve(delegate.leaveConsumerGroup(streamId, topicId, groupId));
     }
 }

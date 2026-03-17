@@ -70,3 +70,12 @@ python basic/consumer.py
 ```
 
 Demonstrates fundamental client connection, authentication, batch message sending, and polling with support for TCP/QUIC/HTTP protocols.
+
+## TLS Examples
+
+To test with a TLS-enabled server, start the server with TLS configured (see main README), then run:
+
+```bash
+uv run getting-started/producer.py --tcp-server-address localhost:8090 --tls --tls-ca-file ../../core/certs/iggy_ca_cert.pem
+uv run getting-started/consumer.py --tcp-server-address localhost:8090 --tls --tls-ca-file ../../core/certs/iggy_ca_cert.pem
+```

@@ -21,6 +21,7 @@ package org.apache.iggy.client.async.tcp;
 
 import org.apache.iggy.client.BaseIntegrationTest;
 import org.apache.iggy.config.RetryPolicy;
+import org.apache.iggy.exception.IggyAuthenticationException;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
@@ -29,6 +30,8 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -553,6 +556,82 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         client.login().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
         assertThat(client.users()).isNotNull();
+    }
+
+    @Test
+    void shouldCompleteExceptionallyWhenBuildAndLoginWithWrongCredentials() {
+        // given
+        CompletableFuture<AsyncIggyTcpClient> future = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .credentials(TEST_USERNAME, "wrong_password")
+                .buildAndLogin();
+
+        // when/then
+        assertThatThrownBy(() -> future.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class)
+                .hasCauseInstanceOf(IggyAuthenticationException.class)
+                .extracting(e -> e.getCause().getSuppressed())
+                .satisfies(suppressed -> assertThat(suppressed).isEmpty());
+    }
+
+    @Test
+    void shouldCleanUpResourcesWhenBuildAndLoginFailsWithWrongCredentials() throws Exception {
+        // given: a buildAndLogin that will fail due to wrong credentials
+        CompletableFuture<AsyncIggyTcpClient> future = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .credentials(TEST_USERNAME, "wrong_password")
+                .buildAndLogin();
+
+        // when: wait for the failure to complete (including close cleanup)
+        try {
+            future.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (ExecutionException ignored) {
+            // expected
+        }
+
+        // then: resources should be cleaned up — a subsequent buildAndLogin should succeed
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .credentials(TEST_USERNAME, TEST_PASSWORD)
+                .buildAndLogin()
+                .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        assertThat(client.users()).isNotNull();
+    }
+
+    @Test
+    void shouldWaitForCloseBeforeCompletingExceptionally() {
+        // given
+        CompletableFuture<AsyncIggyTcpClient> future = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .credentials(TEST_USERNAME, "wrong_password")
+                .buildAndLogin();
+
+        // when: the future completes exceptionally
+        assertThatThrownBy(() -> future.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class);
+
+        // then: after get() returns, the future is done — close() has already completed
+        assertThat(future).isCompletedExceptionally();
+    }
+
+    @Test
+    void shouldPreserveOriginalExceptionTypeFromBuildAndLogin() {
+        // given
+        CompletableFuture<AsyncIggyTcpClient> future = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .credentials(TEST_USERNAME, "wrong_password")
+                .buildAndLogin();
+
+        // when/then: the cause chain should contain the authentication exception directly
+        assertThatThrownBy(() -> future.join())
+                .isInstanceOf(CompletionException.class)
+                .cause()
+                .isInstanceOf(IggyAuthenticationException.class);
     }
 
     @Test

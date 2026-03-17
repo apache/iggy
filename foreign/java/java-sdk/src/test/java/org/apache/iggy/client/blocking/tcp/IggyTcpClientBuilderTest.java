@@ -22,7 +22,9 @@ package org.apache.iggy.client.blocking.tcp;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.IntegrationTest;
 import org.apache.iggy.config.RetryPolicy;
+import org.apache.iggy.exception.IggyAuthenticationException;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
+import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.system.ClientInfo;
 import org.junit.jupiter.api.Test;
 
@@ -219,6 +221,72 @@ class IggyTcpClientBuilderTest extends IntegrationTest {
 
         // When/Then: Building should throw IggyInvalidArgumentException
         assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldThrowMissingCredentialsForBuildAndLoginWithoutCredentials() {
+        // given
+        IggyTcpClientBuilder builder =
+                IggyTcpClient.builder().host(serverHost()).port(serverTcpPort());
+
+        // when/then
+        assertThatThrownBy(builder::buildAndLogin).isInstanceOf(IggyMissingCredentialsException.class);
+    }
+
+    @Test
+    void shouldThrowMissingCredentialsForBuildAndLoginWithNullUsername() {
+        // given
+        IggyTcpClientBuilder builder =
+                IggyTcpClient.builder().host(serverHost()).port(serverTcpPort()).credentials(null, "iggy");
+
+        // when/then
+        assertThatThrownBy(builder::buildAndLogin).isInstanceOf(IggyMissingCredentialsException.class);
+    }
+
+    @Test
+    void shouldThrowMissingCredentialsForBuildAndLoginWithNullPassword() {
+        // given
+        IggyTcpClientBuilder builder =
+                IggyTcpClient.builder().host(serverHost()).port(serverTcpPort()).credentials("iggy", null);
+
+        // when/then
+        assertThatThrownBy(builder::buildAndLogin).isInstanceOf(IggyMissingCredentialsException.class);
+    }
+
+    @Test
+    void shouldThrowAuthenticationExceptionForBuildAndLoginWithWrongCredentials() {
+        // given
+        IggyTcpClientBuilder builder =
+                IggyTcpClient.builder().host(serverHost()).port(serverTcpPort()).credentials("iggy", "wrong_password");
+
+        // when/then
+        assertThatThrownBy(builder::buildAndLogin)
+                .isInstanceOf(IggyAuthenticationException.class)
+                .hasNoSuppressedExceptions();
+    }
+
+    @Test
+    void shouldCleanUpResourcesWhenBuildAndLoginFailsWithWrongCredentials() {
+        // given
+        IggyTcpClientBuilder builder =
+                IggyTcpClient.builder().host(serverHost()).port(serverTcpPort()).credentials("iggy", "wrong_password");
+
+        // when
+        try {
+            builder.buildAndLogin();
+        } catch (IggyAuthenticationException ignored) {
+            // expected
+        }
+
+        // then: building and logging in with correct credentials should succeed,
+        // proving the previous failed attempt did not leak connections
+        IggyTcpClient client = IggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .credentials("iggy", "iggy")
+                .buildAndLogin();
+        assertThat(client.system().getClients()).isNotNull();
+        client.close();
     }
 
     @Test

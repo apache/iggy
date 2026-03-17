@@ -31,7 +31,7 @@ public enum CompressionAlgorithm {
         this.code = code;
     }
 
-    public static CompressionAlgorithm fromCode(byte code) {
+    public static CompressionAlgorithm fromCode(int code) {
         for (CompressionAlgorithm algorithm : values()) {
             if (algorithm.code == code) {
                 return algorithm;

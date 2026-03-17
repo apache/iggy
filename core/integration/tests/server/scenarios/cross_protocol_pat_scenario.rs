@@ -24,6 +24,7 @@ use iggy::prelude::*;
 use iggy_common::TransportProtocol;
 use integration::harness::TestHarness;
 use integration::iggy_harness;
+use secrecy::ExposeSecret;
 
 const PAT_NAME: &str = "cross-protocol-test-pat";
 const TCP_CLIENT_COUNT: usize = 20;
@@ -48,7 +49,7 @@ pub async fn should_see_pat_created_via_http_when_listing_via_tcp(harness: &Test
         .await
         .expect("Failed to create PAT via HTTP");
 
-    assert!(!created_pat.token.is_empty());
+    assert!(!created_pat.token.expose_secret().is_empty());
 
     let http_pats = http_client
         .get_personal_access_tokens()
@@ -107,7 +108,7 @@ pub async fn should_see_pat_created_via_tcp_when_listing_via_http(harness: &Test
         .await
         .expect("Failed to create PAT via TCP");
 
-    assert!(!created_pat.token.is_empty());
+    assert!(!created_pat.token.expose_secret().is_empty());
 
     let http_client = create_root_client(harness, TransportProtocol::Http).await;
 

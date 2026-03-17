@@ -17,6 +17,7 @@
  */
 
 use crate::{AutoLogin, ConnectionStringOptions, Credentials, IggyError, TransportProtocol};
+use secrecy::SecretString;
 use std::str::FromStr;
 
 const DEFAULT_CONNECTION_STRING_PREFIX: &str = "iggy://";
@@ -105,7 +106,7 @@ impl<T: ConnectionStringOptions + Default> ConnectionString<T> {
             return Ok(ConnectionString {
                 server_address: server_address.to_owned(),
                 auto_login: AutoLogin::Enabled(Credentials::PersonalAccessToken(
-                    pat_token.to_owned(),
+                    SecretString::from(pat_token),
                 )),
                 options: connection_string_options,
             });
@@ -115,7 +116,7 @@ impl<T: ConnectionStringOptions + Default> ConnectionString<T> {
             server_address: server_address.to_owned(),
             auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
                 username.to_owned(),
-                password.to_owned(),
+                SecretString::from(password),
             )),
             options: connection_string_options,
         })
@@ -160,6 +161,7 @@ mod tests {
     use super::*;
     use crate::IggyDuration;
     use crate::TcpConnectionStringOptions;
+    use secrecy::ExposeSecret;
 
     #[test]
     fn should_fail_without_username() {
@@ -243,13 +245,13 @@ mod tests {
             connection_string.server_address,
             format!("{server_address}:{port}")
         );
-        assert_eq!(
-            connection_string.auto_login,
-            AutoLogin::Enabled(Credentials::UsernamePassword(
-                username.to_string(),
-                password.to_string()
-            ))
-        );
+        match &connection_string.auto_login {
+            AutoLogin::Enabled(Credentials::UsernamePassword(u, p)) => {
+                assert_eq!(u, username);
+                assert_eq!(p.expose_secret(), password);
+            }
+            _ => panic!("Expected UsernamePassword credentials"),
+        }
 
         assert!(connection_string.options.retries().is_none());
         assert_eq!(
@@ -277,13 +279,13 @@ mod tests {
             connection_string.server_address,
             format!("{server_address}:{port}")
         );
-        assert_eq!(
-            connection_string.auto_login,
-            AutoLogin::Enabled(Credentials::UsernamePassword(
-                username.to_string(),
-                password.to_string()
-            ))
-        );
+        match &connection_string.auto_login {
+            AutoLogin::Enabled(Credentials::UsernamePassword(u, p)) => {
+                assert_eq!(u, username);
+                assert_eq!(p.expose_secret(), password);
+            }
+            _ => panic!("Expected UsernamePassword credentials"),
+        }
 
         assert_eq!(connection_string.options.retries().unwrap(), 3);
         assert_eq!(
@@ -306,10 +308,12 @@ mod tests {
             connection_string.server_address,
             format!("{server_address}:{port}")
         );
-        assert_eq!(
-            connection_string.auto_login,
-            AutoLogin::Enabled(Credentials::PersonalAccessToken(pat.to_string()))
-        );
+        match &connection_string.auto_login {
+            AutoLogin::Enabled(Credentials::PersonalAccessToken(token)) => {
+                assert_eq!(token.expose_secret(), pat);
+            }
+            _ => panic!("Expected PersonalAccessToken credentials"),
+        }
 
         assert!(connection_string.options.retries().is_none());
         assert_eq!(

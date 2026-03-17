@@ -19,7 +19,7 @@
 
 use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::fixtures::ElasticsearchSourcePreCreatedFixture;
-use iggy_binary_protocol::MessageClient;
+use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
 use integration::harness::seeds;
 use integration::iggy_harness;
