@@ -37,8 +37,9 @@ async fn should_not_persist_plaintext_password_or_pat_to_disk(harness: &mut Test
         .create_personal_access_token(PAT_NAME, IggyExpiry::NeverExpire)
         .await
         .unwrap();
+    let raw_pat_token = raw_pat.token.as_str();
 
-    assert!(!raw_pat.token.is_empty(), "Expected non-empty PAT value");
+    assert!(!raw_pat_token.is_empty(), "Expected non-empty PAT value");
 
     let data_path = harness.server().data_path();
 
@@ -46,7 +47,7 @@ async fn should_not_persist_plaintext_password_or_pat_to_disk(harness: &mut Test
     harness.stop().await.unwrap();
 
     assert_secret_not_persisted(&data_path, PLAINTEXT_PASSWORD, "plaintext password");
-    assert_secret_not_persisted(&data_path, &raw_pat.token, "raw PAT");
+    assert_secret_not_persisted(&data_path, raw_pat_token, "raw PAT");
 }
 
 fn assert_secret_not_persisted(root: &Path, secret: &str, secret_name: &str) {
