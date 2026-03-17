@@ -25,7 +25,7 @@ const USERNAME: &str = "plaintext-regression-user";
 const PLAINTEXT_PASSWORD: &str = "plaintext-password-regression-2943";
 const PAT_NAME: &str = "plaintext-regression-pat";
 
-#[iggy_harness(test_client_transport = [Tcp, Http, Quic, WebSocket])]
+#[iggy_harness]
 async fn should_not_persist_plaintext_password_or_pat_to_disk(harness: &mut TestHarness) {
     let root_client = harness.root_client().await.unwrap();
     root_client
