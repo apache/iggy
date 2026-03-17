@@ -16,26 +16,6 @@
  * under the License.
  */
 
-// =============================================================================
-// CHANGES FROM ORIGINAL — all fixes are marked with [FIX-SRC-N] comments:
-//
-// [FIX-SRC-1] open() now retries connectivity with exponential backoff+jitter
-//             instead of failing hard when InfluxDB is unavailable at startup.
-// [FIX-SRC-2] run_query_with_retry() uses true exponential backoff (2^attempt)
-//             instead of linear (delay * attempt).
-// [FIX-SRC-3] Added random jitter (±20%) to every retry delay to avoid
-//             thundering herd across multiple connector instances.
-// [FIX-SRC-4] On HTTP 429 Too Many Requests, the Retry-After response header
-//             is parsed and honoured instead of using the fixed retry_delay.
-// [FIX-SRC-5] Added a circuit breaker (ConsecutiveFailureBreaker) that opens
-//             after max_retries consecutive poll failures, pausing queries for
-//             a configurable cool-down before attempting again.
-// [FIX-SRC-6] Added DEFAULT_MAX_OPEN_RETRIES / max_open_retries config field
-//             to control how many times open() retries before giving up.
-// [FIX-SRC-7] Added DEFAULT_OPEN_RETRY_MAX_DELAY cap so backoff in open()
-//             doesn't grow unboundedly.
-// =============================================================================
-
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use csv::StringRecord;
@@ -45,12 +25,14 @@ use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
 use rand::RngExt as _;
+use regex::Regex;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -65,17 +47,26 @@ const DEFAULT_RETRY_DELAY: &str = "1s";
 const DEFAULT_POLL_INTERVAL: &str = "5s";
 const DEFAULT_TIMEOUT: &str = "10s";
 const DEFAULT_CURSOR: &str = "1970-01-01T00:00:00Z";
-// [FIX-SRC-6] Maximum attempts for open() connectivity retries
+// Maximum attempts for open() connectivity retries
 const DEFAULT_MAX_OPEN_RETRIES: u32 = 10;
-// [FIX-SRC-7] Cap for exponential backoff in open() — never wait longer than this
+// Cap for exponential backoff in open() — never wait longer than this
 const DEFAULT_OPEN_RETRY_MAX_DELAY: &str = "60s";
-// [FIX-SRC-5] How many consecutive poll failures open the circuit breaker
+// How many consecutive poll failures open the circuit breaker
 const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
-// [FIX-SRC-5] How long the circuit stays open before allowing a probe attempt
+// How long the circuit stays open before allowing a probe attempt
 const DEFAULT_CIRCUIT_COOL_DOWN: &str = "30s";
 
+/// RFC 3339 / ISO 8601 datetime pattern.
+/// Matches the forms InfluxDB stores in `_time`:
+///   "2024-01-15T10:30:00Z"
+///   "2024-01-15T10:30:00.123456789Z"
+///   "2024-01-15T10:30:00+05:30"
+/// Intentionally strict: only digits, T, Z, colon, dot, plus, hyphen.
+/// Any Flux syntax character (pipe, quote, paren, space, slash) is rejected.
+static CURSOR_RE: OnceLock<Regex> = OnceLock::new();
+
 // ---------------------------------------------------------------------------
-// [FIX-SRC-5] Simple consecutive-failure circuit breaker
+// Simple consecutive-failure circuit breaker
 // ---------------------------------------------------------------------------
 #[derive(Debug)]
 struct CircuitBreaker {
@@ -144,7 +135,6 @@ pub struct InfluxDbSource {
     verbose: bool,
     retry_delay: Duration,
     poll_interval: Duration,
-    // [FIX-SRC-5]
     circuit_breaker: Arc<CircuitBreaker>,
 }
 
@@ -165,11 +155,11 @@ pub struct InfluxDbSourceConfig {
     pub max_retries: Option<u32>,
     pub retry_delay: Option<String>,
     pub timeout: Option<String>,
-    // [FIX-SRC-6] How many times open() will retry before giving up
+    // How many times open() will retry before giving up
     pub max_open_retries: Option<u32>,
-    // [FIX-SRC-7] Upper cap on open() backoff delay
+    // Upper cap on open() backoff delay
     pub open_retry_max_delay: Option<String>,
-    // [FIX-SRC-5] Circuit breaker configuration
+    // Circuit breaker configuration
     pub circuit_breaker_threshold: Option<u32>,
     pub circuit_breaker_cool_down: Option<String>,
 }
@@ -244,25 +234,29 @@ fn is_transient_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
-// [FIX-SRC-3] Apply ±20% random jitter to a duration to spread retry storms
-fn jitter(base: Duration) -> Duration {
+// Apply ±20% random jitter to a duration to spread retry storms
+pub fn jitter(base: Duration) -> Duration {
     let millis = base.as_millis() as u64;
     let jitter_range = millis / 5; // 20% of base
     if jitter_range == 0 {
         return base;
     }
     let delta = rand::rng().random_range(0..=jitter_range * 2);
-    Duration::from_millis(millis.saturating_sub(jitter_range) + delta)
+    Duration::from_millis(millis.saturating_sub(jitter_range).saturating_add(delta))
 }
 
-// [FIX-SRC-2] True exponential backoff: base * 2^attempt, capped at max_delay
-fn exponential_backoff(base: Duration, attempt: u32, max_delay: Duration) -> Duration {
+// True exponential backoff: base * 2^attempt, capped at max_delay
+pub fn exponential_backoff(base: Duration, attempt: u32, max_delay: Duration) -> Duration {
     let factor = 2u64.saturating_pow(attempt);
-    let raw = Duration::from_millis(base.as_millis().saturating_mul(factor as u128) as u64);
-    raw.min(max_delay)
+    let millis = base
+        .as_millis() // u128
+        .saturating_mul(factor as u128) // u128, no overflow
+        .min(max_delay.as_millis()); // always keep below max_delay.as_millis()
+    let millis_u64 = u64::try_from(millis).unwrap_or(u64::MAX);
+    Duration::from_millis(millis_u64)
 }
 
-// [FIX-SRC-4] Parse Retry-After header value (integer seconds or HTTP date)
+// Parse Retry-After header value (integer seconds or HTTP date)
 fn parse_retry_after(value: &str) -> Option<Duration> {
     // First try plain integer seconds
     if let Ok(secs) = value.trim().parse::<u64>() {
@@ -283,7 +277,7 @@ impl InfluxDbSource {
         let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
         let poll_interval = parse_duration(config.poll_interval.as_deref(), DEFAULT_POLL_INTERVAL);
 
-        // [FIX-SRC-5] Build circuit breaker from config
+        // Build circuit breaker from config
         let cb_threshold = config
             .circuit_breaker_threshold
             .unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD);
@@ -387,7 +381,7 @@ impl InfluxDbSource {
         Ok(())
     }
 
-    // [FIX-SRC-1] Retry connectivity check with exponential backoff + jitter
+    // Retry connectivity check with exponential backoff + jitter
     // instead of failing hard on the first attempt.
     async fn check_connectivity_with_retry(&self) -> Result<(), Error> {
         let max_open_retries = self
@@ -424,7 +418,7 @@ impl InfluxDbSource {
                         );
                         return Err(e);
                     }
-                    // [FIX-SRC-2] Exponential backoff, [FIX-SRC-3] with jitter
+                    // Exponential backoff, with jitter
                     let backoff = jitter(exponential_backoff(self.retry_delay, attempt, max_delay));
                     warn!(
                         "InfluxDB health check failed (attempt {attempt}/{max_open_retries}) \
@@ -446,15 +440,62 @@ impl InfluxDbSource {
             .unwrap_or_else(|| DEFAULT_CURSOR.to_string())
     }
 
-    fn query_with_params(&self, cursor: &str) -> String {
+    fn cursor_re() -> &'static Regex {
+        CURSOR_RE.get_or_init(|| {
+            Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+                .expect("hardcoded regex is valid")
+        })
+    }
+
+    fn validate_cursor(cursor: &str) -> Result<(), Error> {
+        if Self::cursor_re().is_match(cursor) {
+            // ← call on &Regex, not on OnceLock
+            Ok(())
+        } else {
+            Err(Error::InvalidConfigValue(format!(
+                "cursor value {:?} is not a valid RFC 3339 timestamp; \
+             refusing substitution to prevent Flux query injection",
+                cursor
+            )))
+        }
+    }
+
+    /// Reject cursor fields that would produce incorrect results.
+    ///
+    /// Cursor advancement compares values as `String`s (lexicographic order).
+    /// This is correct for ISO 8601 / RFC 3339 timestamps — the default
+    /// `cursor_field` of `"_time"` — because their fixed-width format makes
+    /// lexicographic and chronological order identical.
+    fn validate_cursor_field(field: &str) -> Result<(), Error> {
+        match field {
+            "_time" | "time" => Ok(()),
+            other => Err(Error::InvalidConfigValue(format!(
+                "cursor_field {:?} is not supported — cursor values are compared as strings \
+                 (lexicographic order), which is only correct for ISO 8601 timestamp columns. \
+                 Use the default \"_time\" column, or omit cursor_field entirely.",
+                other
+            ))),
+        }
+    }
+
+    fn query_with_params(&self, cursor: &str) -> Result<String, Error> {
+        // Reject anything that is not a well-formed RFC 3339 timestamp.
+        // This prevents a crafted or corrupted _time value (e.g. containing
+        // Flux syntax like `") |> drop() //`) from being injected into the
+        // query string before it is sent to /api/v2/query.
+        // Note: InfluxDB OSS v2 does not support the `params` JSON field for
+        // parameterized queries (Cloud-only feature), so substitution is
+        // unavoidable for OSS — validation is the correct mitigation here.
+        Self::validate_cursor(cursor)?;
+        let limit = self.config.batch_size.unwrap_or(500).to_string();
         let mut query = self.config.query.clone();
         if query.contains("$cursor") {
             query = query.replace("$cursor", cursor);
         }
         if query.contains("$limit") {
-            query = query.replace("$limit", &self.config.batch_size.unwrap_or(500).to_string());
+            query = query.replace("$limit", &limit);
         }
-        query
+        Ok(query)
     }
 
     async fn run_query_with_retry(&self, query: &str) -> Result<String, Error> {
@@ -463,7 +504,7 @@ impl InfluxDbSource {
         let max_retries = self.get_max_retries();
         let token = self.config.token.clone();
 
-        // [FIX-SRC-7] Cap for per-query backoff (reuse open_retry_max_delay config)
+        // Cap for per-query backoff (reuse open_retry_max_delay config)
         let max_delay = parse_duration(
             self.config.open_retry_max_delay.as_deref(),
             DEFAULT_OPEN_RETRY_MAX_DELAY,
@@ -500,7 +541,7 @@ impl InfluxDbSource {
                         });
                     }
 
-                    // [FIX-SRC-4] Honour Retry-After on 429 before our own backoff
+                    // Honour Retry-After on 429 before our own backoff
                     let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
                         response
                             .headers()
@@ -518,9 +559,9 @@ impl InfluxDbSource {
 
                     attempts += 1;
                     if is_transient_status(status) && attempts < max_retries {
-                        // [FIX-SRC-4] Use server-supplied delay when available
+                        // Use server-supplied delay when available
                         let delay = retry_after.unwrap_or_else(|| {
-                            // [FIX-SRC-2] Exponential, [FIX-SRC-3] with jitter
+                            // Exponential, with jitter
                             jitter(exponential_backoff(self.retry_delay, attempts, max_delay))
                         });
                         warn!(
@@ -538,7 +579,7 @@ impl InfluxDbSource {
                 Err(e) => {
                     attempts += 1;
                     if attempts < max_retries {
-                        // [FIX-SRC-2] Exponential, [FIX-SRC-3] with jitter
+                        // Exponential, with jitter
                         let delay =
                             jitter(exponential_backoff(self.retry_delay, attempts, max_delay));
                         warn!(
@@ -634,8 +675,7 @@ impl InfluxDbSource {
                 PayloadFormat::Text => Ok(raw_value.into_bytes()),
                 PayloadFormat::Raw => general_purpose::STANDARD
                     .decode(raw_value.as_bytes())
-                    .or_else(|_| Ok(raw_value.into_bytes()))
-                    .map_err(|e: base64::DecodeError| {
+                    .map_err(|e| {
                         Error::InvalidRecordValue(format!(
                             "Failed to decode payload as base64: {e}"
                         ))
@@ -664,7 +704,13 @@ impl InfluxDbSource {
 
     async fn poll_messages(&self) -> Result<(Vec<ProducedMessage>, Option<String>), Error> {
         let cursor = self.current_cursor().await;
-        let query = self.query_with_params(&cursor);
+        let query = self.query_with_params(&cursor).map_err(|e| {
+            error!(
+                "InfluxDB source ID: {} — invalid cursor, skipping poll: {e}",
+                self.id
+            );
+            e
+        })?;
         let csv_data = self.run_query_with_retry(&query).await?;
 
         let rows = self.parse_csv_rows(&csv_data)?;
@@ -684,11 +730,16 @@ impl InfluxDbSource {
             }
 
             let payload = self.build_payload(&row, include_metadata)?;
+            // correct unit, single clock read
+            // Capture once so timestamp and origin_timestamp are guaranteed identical
+            // and we make exactly one syscall regardless of how many fields use it.
+            let now_micros = Utc::now().timestamp_micros() as u64;
+
             messages.push(ProducedMessage {
                 id: Some(Uuid::new_v4().as_u128()),
                 checksum: None,
-                timestamp: Some(Utc::now().timestamp_millis() as u64),
-                origin_timestamp: Some(Utc::now().timestamp_millis() as u64),
+                timestamp: Some(now_micros),
+                origin_timestamp: Some(now_micros),
                 headers: None,
                 payload,
             });
@@ -712,7 +763,11 @@ impl Source for InfluxDbSource {
 
         self.client = Some(self.build_client()?);
 
-        // [FIX-SRC-1] Use retrying connectivity check instead of hard-fail
+        // Validate cursor_field before touching the network: string comparison
+        // is only safe for timestamp columns. See validate_cursor_field for details.
+        Self::validate_cursor_field(self.cursor_field())?;
+
+        // Use retrying connectivity check instead of hard-fail
         self.check_connectivity_with_retry().await?;
 
         info!(
@@ -723,7 +778,7 @@ impl Source for InfluxDbSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
-        // [FIX-SRC-5] Skip query if circuit breaker is open
+        // Skip query if circuit breaker is open
         if self.circuit_breaker.is_open().await {
             warn!(
                 "InfluxDB source ID: {} — circuit breaker is OPEN. Skipping poll.",
@@ -738,7 +793,7 @@ impl Source for InfluxDbSource {
 
         match self.poll_messages().await {
             Ok((messages, max_cursor)) => {
-                // [FIX-SRC-5] Successful poll — reset circuit breaker
+                // Successful poll — reset circuit breaker
                 self.circuit_breaker.record_success();
 
                 let mut state = self.state.lock().await;
@@ -783,7 +838,7 @@ impl Source for InfluxDbSource {
                 })
             }
             Err(e) => {
-                // [FIX-SRC-5] Failed poll — notify circuit breaker
+                // Failed poll — notify circuit breaker
                 self.circuit_breaker.record_failure().await;
                 error!(
                     "InfluxDB source ID: {} poll failed: {e}. \
@@ -797,6 +852,7 @@ impl Source for InfluxDbSource {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
+        self.client = None;
         let state = self.state.lock().await;
         info!(
             "InfluxDB source connector ID: {} closed. Total rows processed: {}",

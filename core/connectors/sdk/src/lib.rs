@@ -144,6 +144,7 @@ pub enum Payload {
 }
 
 impl Payload {
+    /// Consuming conversion — transfers ownership of inner buffers.
     pub fn try_into_vec(self) -> Result<Vec<u8>, Error> {
         match self {
             Payload::Json(value) => {
@@ -153,6 +154,29 @@ impl Payload {
             Payload::Text(text) => Ok(text.into_bytes()),
             Payload::Proto(text) => Ok(text.into_bytes()),
             Payload::FlatBuffer(value) => Ok(value),
+        }
+    }
+
+    /// Borrowing serialisation — no clone, no ownership transfer.
+    ///
+    ///Json: serialises the `OwnedValue` in place → one allocation
+    ///  for the output `Vec<u8>`, zero clone of the value tree.
+    ///Raw:  returns a copy of the inner bytes (unavoidable — caller
+    ///  needs owned bytes and we only have a reference).
+    ///Text/`Proto: copies the string bytes (same reasoning).
+    ///FlatBuffer:  copies the buffer bytes.
+    ///
+    /// For `Json` this replaces a deep clone of the entire `OwnedValue` tree
+    /// with a single serialisation pass — O(n) work either way, but the clone
+    /// path does O(n) allocation + O(n) serialisation, while this path does
+    /// only O(n) serialisation.
+    pub fn try_as_bytes(&self) -> Result<Vec<u8>, Error> {
+        match self {
+            Payload::Json(value) => simd_json::to_vec(value).map_err(|_| Error::InvalidJsonPayload),
+            Payload::Raw(value) => Ok(value.clone()),
+            Payload::Text(text) => Ok(text.as_bytes().to_vec()),
+            Payload::Proto(text) => Ok(text.as_bytes().to_vec()),
+            Payload::FlatBuffer(value) => Ok(value.clone()),
         }
     }
 }
@@ -340,11 +364,11 @@ pub trait StreamEncoder: Send + Sync {
 pub enum Error {
     #[error("Invalid config")]
     InvalidConfig,
-    #[error("Invalid record")]
+    #[error("Invalid Config Value: {0}")]
     InvalidConfigValue(String),
     #[error("Invalid record")]
     InvalidRecord,
-    #[error("Invalid record value : {0}")]
+    #[error("Invalid record value: {0}")]
     InvalidRecordValue(String),
     #[error("Invalid transformer")]
     InvalidTransformer,

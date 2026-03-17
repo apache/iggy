@@ -36,6 +36,7 @@ consumer_group = "influxdb_sink"
 url = "http://localhost:8086"
 org = "iggy"
 bucket = "events"
+/*token = "replace_token_with_secret_token"*/
 token = "my_super_secret_token_123"
 measurement = "iggy_messages"
 precision = "ns"

@@ -5460,6 +5460,7 @@ version = "0.2.2-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "dashmap",
  "futures",
  "humantime",
@@ -5487,6 +5488,7 @@ dependencies = [
  "iggy_connector_sdk",
  "once_cell",
  "rand 0.10.0",
+ "regex",
  "reqwest 0.13.2",
  "serde",
  "serde_json",

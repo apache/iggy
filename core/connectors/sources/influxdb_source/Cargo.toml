@@ -45,6 +45,7 @@ iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 once_cell = { workspace = true }
 rand.workspace = true
+regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

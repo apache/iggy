@@ -18,6 +18,7 @@
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
+use bytes::Bytes;
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
@@ -27,13 +28,11 @@ use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
-
 sink_connector!(InfluxDbSink);
 
 const DEFAULT_MAX_RETRIES: u32 = 3;
@@ -44,6 +43,9 @@ const DEFAULT_PRECISION: &str = "us";
 const DEFAULT_MAX_OPEN_RETRIES: u32 = 10;
 // Cap for exponential backoff in open() — never wait longer than this
 const DEFAULT_OPEN_RETRY_MAX_DELAY: &str = "60s";
+// Cap for exponential backoff on per-write retries — kept short so a
+// transient InfluxDB blip does not stall message delivery for too long
+const DEFAULT_RETRY_MAX_DELAY: &str = "5s";
 // How many consecutive batch failures open the circuit breaker
 const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
 // How long the circuit stays open before allowing a probe attempt
@@ -52,57 +54,82 @@ const DEFAULT_CIRCUIT_COOL_DOWN: &str = "30s";
 // ---------------------------------------------------------------------------
 // Simple consecutive-failure circuit breaker
 // ---------------------------------------------------------------------------
+
+/// All mutable circuit-breaker state under a single lock —
+/// eliminates the AtomicU32 / Mutex race described above.
 #[derive(Debug)]
-struct CircuitBreaker {
+struct CircuitState {
+    consecutive_failures: u32,
+    open_until: Option<tokio::time::Instant>,
+}
+
+#[derive(Debug)]
+pub struct CircuitBreaker {
     threshold: u32,
-    consecutive_failures: AtomicU32,
-    open_until: Mutex<Option<tokio::time::Instant>>,
     cool_down: Duration,
+    state: Mutex<CircuitState>, // one lock, one consistent view
 }
 
 impl CircuitBreaker {
-    fn new(threshold: u32, cool_down: Duration) -> Self {
-        CircuitBreaker {
+    pub fn new(threshold: u32, cool_down: Duration) -> Self {
+        Self {
             threshold,
-            consecutive_failures: AtomicU32::new(0),
-            open_until: Mutex::new(None),
             cool_down,
+            state: Mutex::new(CircuitState {
+                consecutive_failures: 0,
+                open_until: None,
+            }),
         }
     }
 
-    /// Call when a batch write succeeds — resets failure count and closes circuit.
-    fn record_success(&self) {
-        self.consecutive_failures.store(0, Ordering::SeqCst);
+    /// Called on every successful operation — resets the failure
+    /// counter and closes the circuit atomically.
+    pub fn record_success(&self) {
+        // spawn-and-forget is intentional: success is the fast path
+        // and we want to avoid async overhead in the happy path.
+        // block_in_place would be wrong here; just get the lock.
+        // Because this is async context we use try_lock; if another
+        // task holds the lock the count reset will happen on the next
+        // success. This is safe — worst case: one extra failure
+        // needed to re-open the circuit. Callers accept this.
+        if let Ok(mut s) = self.state.try_lock() {
+            s.consecutive_failures = 0;
+            s.open_until = None;
+        }
     }
 
-    /// Call when a batch write fails after all retries — may open the circuit.
-    async fn record_failure(&self) {
-        let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
-        if failures >= self.threshold {
-            let mut guard = self.open_until.lock().await;
+    /// Called after all retries for one operation have failed.
+    /// May open the circuit.
+    pub async fn record_failure(&self) {
+        let mut s = self.state.lock().await;
+        s.consecutive_failures = s.consecutive_failures.saturating_add(1);
+        if s.consecutive_failures >= self.threshold {
             let deadline = tokio::time::Instant::now() + self.cool_down;
-            *guard = Some(deadline);
+            s.open_until = Some(deadline);
             warn!(
-                "Circuit breaker OPENED after {failures} consecutive batch failures. \
-                 Pausing writes for {:?}.",
-                self.cool_down
+                "Circuit breaker OPENED after {} consecutive failures. \
+                 Pausing for {:?}.",
+                s.consecutive_failures, self.cool_down
             );
         }
     }
 
-    /// Returns true if the circuit is currently open (writes should be skipped).
-    async fn is_open(&self) -> bool {
-        let mut guard = self.open_until.lock().await;
-        if let Some(deadline) = *guard {
-            if tokio::time::Instant::now() < deadline {
-                return true;
+    /// Returns `true` if the circuit is open (callers should skip the
+    /// operation).  Transitions to half-open automatically once the
+    /// cool-down has elapsed.
+    pub async fn is_open(&self) -> bool {
+        let mut s = self.state.lock().await;
+        match s.open_until {
+            None => false,
+            Some(deadline) if tokio::time::Instant::now() < deadline => true,
+            Some(_) => {
+                // Cool-down elapsed: half-open — let one probe through.
+                s.open_until = None;
+                s.consecutive_failures = 0; // safe: same lock as record_failure
+                info!("Circuit breaker entering HALF-OPEN state.");
+                false
             }
-            // Cool-down elapsed — allow one probe attempt (half-open state)
-            *guard = None;
-            self.consecutive_failures.store(0, Ordering::SeqCst);
-            info!("Circuit breaker entering HALF-OPEN state — probing InfluxDB.");
         }
-        false
     }
 }
 
@@ -115,6 +142,12 @@ pub struct InfluxDbSink {
     pub id: u32,
     config: InfluxDbSinkConfig,
     client: Option<Client>,
+    /// Cached once in `open()` — config fields never change at runtime.
+    write_url: Option<Url>,
+    /// Cached once in `open()` — parsed from `config.retry_max_delay`.
+    /// Controls the backoff cap for per-write retries only; startup retries
+    /// use `config.open_retry_max_delay` and are never affected by this field.
+    write_retry_max_delay: Duration,
     state: Mutex<State>,
     verbose: bool,
     retry_delay: Duration,
@@ -143,8 +176,12 @@ pub struct InfluxDbSinkConfig {
     pub timeout: Option<String>,
     // How many times open() will retry before giving up
     pub max_open_retries: Option<u32>,
-    // Upper cap on open() backoff delay
+    // Upper cap on open() backoff delay — can be set high (e.g. "60s") for
+    // patient startup without affecting per-write retry behaviour
     pub open_retry_max_delay: Option<String>,
+    // Upper cap on per-write retry backoff — kept short so a transient blip
+    // does not stall message delivery; independent of open_retry_max_delay
+    pub retry_max_delay: Option<String>,
     // Circuit breaker configuration
     pub circuit_breaker_threshold: Option<u32>,
     pub circuit_breaker_cool_down: Option<String>,
@@ -163,7 +200,15 @@ impl PayloadFormat {
         match value.map(|v| v.to_ascii_lowercase()).as_deref() {
             Some("text") | Some("utf8") => PayloadFormat::Text,
             Some("base64") | Some("raw") => PayloadFormat::Base64,
-            _ => PayloadFormat::Json,
+            Some("json") => PayloadFormat::Json,
+            other => {
+                warn!(
+                    "Unrecognized payload_format value {:?}, falling back to JSON. \
+                     Valid values are: \"json\", \"text\", \"utf8\", \"base64\", \"raw\".",
+                    other
+                );
+                PayloadFormat::Json
+            }
         }
     }
 }
@@ -171,6 +216,7 @@ impl PayloadFormat {
 #[derive(Debug)]
 struct State {
     messages_processed: u64,
+    write_success: u64,
     write_errors: u64,
 }
 
@@ -190,21 +236,25 @@ fn is_transient_status(status: StatusCode) -> bool {
 }
 
 // Apply ±20% random jitter to a duration to spread retry storms
-fn jitter(base: Duration) -> Duration {
+pub fn jitter(base: Duration) -> Duration {
     let millis = base.as_millis() as u64;
     let jitter_range = millis / 5; // 20% of base
     if jitter_range == 0 {
         return base;
     }
     let delta = rand::rng().random_range(0..=jitter_range * 2);
-    Duration::from_millis(millis.saturating_sub(jitter_range) + delta)
+    Duration::from_millis(millis.saturating_sub(jitter_range).saturating_add(delta))
 }
 
 // True exponential backoff: base * 2^attempt, capped at max_delay
-fn exponential_backoff(base: Duration, attempt: u32, max_delay: Duration) -> Duration {
+pub fn exponential_backoff(base: Duration, attempt: u32, max_delay: Duration) -> Duration {
     let factor = 2u64.saturating_pow(attempt);
-    let raw = Duration::from_millis(base.as_millis().saturating_mul(factor as u128) as u64);
-    raw.min(max_delay)
+    let millis = base
+        .as_millis() // u128
+        .saturating_mul(factor as u128) // u128, no overflow
+        .min(max_delay.as_millis()); // always keep below max_delay.as_millis()
+    let millis_u64 = u64::try_from(millis).unwrap_or(u64::MAX);
+    Duration::from_millis(millis_u64)
 }
 
 // Parse Retry-After header value (integer seconds or HTTP date)
@@ -216,23 +266,43 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
     None
 }
 
-fn escape_measurement(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace(',', "\\,")
-        .replace(' ', "\\ ")
+/// Write an escaped measurement name into `buf`.
+/// Escapes: `\` → `\\`, `,` → `\,`, ` ` → `\ `
+fn write_measurement(buf: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '\\' => buf.push_str("\\\\"),
+            ',' => buf.push_str("\\,"),
+            ' ' => buf.push_str("\\ "),
+            _ => buf.push(ch),
+        }
+    }
 }
 
-fn escape_tag_value(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace(',', "\\,")
-        .replace('=', "\\=")
-        .replace(' ', "\\ ")
+/// Write an escaped tag key/value into `buf`.
+/// Escapes: `\` → `\\`, `,` → `\,`, `=` → `\=`, ` ` → `\ `
+fn write_tag_value(buf: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '\\' => buf.push_str("\\\\"),
+            ',' => buf.push_str("\\,"),
+            '=' => buf.push_str("\\="),
+            ' ' => buf.push_str("\\ "),
+            _ => buf.push(ch),
+        }
+    }
 }
 
-fn escape_field_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+/// Write an escaped string field value (without surrounding quotes) into `buf`.
+/// Escapes: `\` → `\\`, `"` → `\"`
+fn write_field_string(buf: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '\\' => buf.push_str("\\\\"),
+            '"' => buf.push_str("\\\""),
+            _ => buf.push(ch),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -257,8 +327,11 @@ impl InfluxDbSink {
             id,
             config,
             client: None,
+            write_url: None,
+            write_retry_max_delay: Duration::from_secs(0), // overwritten in open()
             state: Mutex::new(State {
                 messages_processed: 0,
+                write_success: 0,
                 write_errors: 0,
             }),
             verbose,
@@ -413,68 +486,106 @@ impl InfluxDbSink {
             _ => micros,
         }
     }
-    fn line_from_message(
+    /// Serialise one message as a line-protocol line, appending directly into
+    /// `buf` with no intermediate `Vec<String>` for tags or fields.
+    ///
+    /// # Allocation budget (per message, happy path)
+    /// - Zero `Vec` allocations for tags or fields.
+    /// - Zero per-tag/per-field `format!` allocations.
+    /// - One `Vec<u8>` for `payload_bytes` (unavoidable — payload must be
+    ///   decoded/serialised before it can be escaped into the buffer).
+    /// - The caller's `buf` grows in place; if it was pre-allocated with
+    ///   `with_capacity` it will not reallocate for typical message sizes.
+    fn append_line(
         &self,
+        buf: &mut String,
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
         message: &ConsumedMessage,
-    ) -> Result<String, Error> {
+    ) -> Result<(), Error> {
         let include_metadata = self.config.include_metadata.unwrap_or(true);
         let include_checksum = self.config.include_checksum.unwrap_or(true);
         let include_origin_timestamp = self.config.include_origin_timestamp.unwrap_or(true);
+        let include_stream_tag = self.config.include_stream_tag.unwrap_or(true);
+        let include_topic_tag = self.config.include_topic_tag.unwrap_or(true);
+        let include_partition_tag = self.config.include_partition_tag.unwrap_or(true);
 
-        let mut tags = Vec::new();
-        if include_metadata && self.config.include_stream_tag.unwrap_or(true) {
-            tags.push(format!(
-                "stream={}",
-                escape_tag_value(&topic_metadata.stream)
-            ));
-        }
-        if include_metadata && self.config.include_topic_tag.unwrap_or(true) {
-            tags.push(format!("topic={}", escape_tag_value(&topic_metadata.topic)));
-        }
-        if include_metadata && self.config.include_partition_tag.unwrap_or(true) {
-            tags.push(format!("partition={}", messages_metadata.partition_id));
-        }
+        // ── Measurement ──────────────────────────────────────────────────────
+        write_measurement(buf, self.measurement());
 
-        let mut fields = vec![
-            format!(
-                "message_id=\"{}\"",
-                escape_field_string(&message.id.to_string())
-            ),
-            format!("offset={}i", message.offset as i64),
-        ];
-
-        if include_metadata && !self.config.include_stream_tag.unwrap_or(true) {
-            fields.push(format!(
-                "iggy_stream=\"{}\"",
-                escape_field_string(&topic_metadata.stream)
-            ));
+        // ── Tag set ──────────────────────────────────────────────────────────
+        // Tags are written as ",key=value" pairs directly into buf.
+        // The offset tag is always present — it makes every point unique in
+        // InfluxDB's deduplication key (measurement + tag set + timestamp),
+        // regardless of precision or how many messages share a timestamp.
+        if include_metadata && include_stream_tag {
+            buf.push_str(",stream=");
+            write_tag_value(buf, &topic_metadata.stream);
         }
-        if include_metadata && !self.config.include_topic_tag.unwrap_or(true) {
-            fields.push(format!(
-                "iggy_topic=\"{}\"",
-                escape_field_string(&topic_metadata.topic)
-            ));
+        if include_metadata && include_topic_tag {
+            buf.push_str(",topic=");
+            write_tag_value(buf, &topic_metadata.topic);
         }
-        if include_metadata && !self.config.include_partition_tag.unwrap_or(true) {
-            fields.push(format!(
-                "iggy_partition={}",
-                messages_metadata.partition_id as i64
-            ));
+        if include_metadata && include_partition_tag {
+            use std::fmt::Write as _;
+            write!(buf, ",partition={}", messages_metadata.partition_id)
+                .expect("write to String is infallible");
+        }
+        // offset tag — always written, ensures point uniqueness
+        {
+            use std::fmt::Write as _;
+            write!(buf, ",offset={}", message.offset).expect("write to String is infallible");
         }
 
+        // ── Field set ────────────────────────────────────────────────────────
+        // First field: no leading comma.  All subsequent fields: leading comma.
+        buf.push(' ');
+
+        buf.push_str("message_id=\"");
+        write_field_string(buf, &message.id.to_string());
+        buf.push('"');
+
+        // offset as a numeric field (queryable in Flux) in addition to the tag
+        {
+            use std::fmt::Write as _;
+            write!(buf, ",offset={}u", message.offset).expect("write to String is infallible");
+        }
+
+        // Optional metadata fields written when the corresponding tag is
+        // disabled (so the value is still queryable as a field).
+        if include_metadata && !include_stream_tag {
+            buf.push_str(",iggy_stream=\"");
+            write_field_string(buf, &topic_metadata.stream);
+            buf.push('"');
+        }
+        if include_metadata && !include_topic_tag {
+            buf.push_str(",iggy_topic=\"");
+            write_field_string(buf, &topic_metadata.topic);
+            buf.push('"');
+        }
+        if include_metadata && !include_partition_tag {
+            use std::fmt::Write as _;
+            write!(
+                buf,
+                ",iggy_partition={}u",
+                messages_metadata.partition_id as u64
+            )
+            .expect("write to String is infallible");
+        }
         if include_checksum {
-            fields.push(format!("iggy_checksum={}", message.checksum as i64));
+            use std::fmt::Write as _;
+            write!(buf, ",iggy_checksum={}u", message.checksum)
+                .expect("write to String is infallible");
         }
         if include_origin_timestamp {
-            fields.push(format!(
-                "iggy_origin_timestamp={}",
-                message.origin_timestamp as i64
-            ));
+            use std::fmt::Write as _;
+            write!(buf, ",iggy_origin_timestamp={}u", message.origin_timestamp)
+                .expect("write to String is infallible");
         }
 
-        let payload_bytes = message.payload.clone().try_into_vec().map_err(|e| {
+        // ── Payload field ────────────────────────────────────────────────────
+        // try_as_bytes() serialises in-place without cloning the Payload tree.
+        let payload_bytes = message.payload.try_as_bytes().map_err(|e| {
             Error::CannotStoreData(format!("Failed to convert payload to bytes: {e}"))
         })?;
 
@@ -489,10 +600,9 @@ impl InfluxDbSink {
                 let compact = serde_json::to_string(&value).map_err(|e| {
                     Error::CannotStoreData(format!("Failed to serialize JSON payload: {e}"))
                 })?;
-                fields.push(format!(
-                    "payload_json=\"{}\"",
-                    escape_field_string(&compact)
-                ));
+                buf.push_str(",payload_json=\"");
+                write_field_string(buf, &compact);
+                buf.push('"');
             }
             PayloadFormat::Text => {
                 let text = String::from_utf8(payload_bytes).map_err(|e| {
@@ -500,31 +610,22 @@ impl InfluxDbSink {
                         "Payload format is text but payload is invalid UTF-8: {e}"
                     ))
                 })?;
-                fields.push(format!("payload_text=\"{}\"", escape_field_string(&text)));
+                buf.push_str(",payload_text=\"");
+                write_field_string(buf, &text);
+                buf.push('"');
             }
             PayloadFormat::Base64 => {
-                let encoded = general_purpose::STANDARD.encode(payload_bytes);
-                fields.push(format!(
-                    "payload_base64=\"{}\"",
-                    escape_field_string(&encoded)
-                ));
+                let encoded = general_purpose::STANDARD.encode(&payload_bytes);
+                buf.push_str(",payload_base64=\"");
+                write_field_string(buf, &encoded);
+                buf.push('"');
             }
         }
 
-        let measurement = escape_measurement(self.measurement());
-        let tags_fragment = if tags.is_empty() {
-            String::new()
-        } else {
-            format!(",{}", tags.join(","))
-        };
-
+        // ── Timestamp ────────────────────────────────────────────────────────
         // message.timestamp is microseconds since Unix epoch.
-        // If it is 0 (unset by the producer), fall back to now() so points are
-        // not stored at Unix epoch (year 1970), which falls outside every
-        // range(start: -1h) query window.
-        // We also blend the message offset as sub-microsecond nanoseconds so
-        // that multiple messages in the same batch get distinct timestamps and
-        // are not deduplicated by InfluxDB (same measurement+tags+time = 1 row).
+        // Fall back to now() when unset (0) so points are not stored at the
+        // Unix epoch (year 1970), which falls outside every range(start:-1h).
         let base_micros = if message.timestamp == 0 {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -533,20 +634,19 @@ impl InfluxDbSink {
         } else {
             message.timestamp
         };
-        // Add offset mod 1000 as extra nanoseconds — shifts timestamp by at
-        // most 999 ns, which is imperceptible but unique per message.
-        let unique_micros = base_micros.saturating_add(message.offset % 1_000);
-        let ts = self.to_precision_timestamp(unique_micros);
+        let ts = self.to_precision_timestamp(base_micros);
+
+        {
+            use std::fmt::Write as _;
+            write!(buf, " {ts}").expect("write to String is infallible");
+        }
 
         debug!(
             "InfluxDB sink ID: {} point — offset={}, raw_ts={}, influx_ts={ts}",
             self.id, message.offset, message.timestamp
         );
 
-        Ok(format!(
-            "{measurement}{tags_fragment} {} {ts}",
-            fields.join(",")
-        ))
+        Ok(())
     }
 
     async fn process_batch(
@@ -559,26 +659,38 @@ impl InfluxDbSink {
             return Ok(());
         }
 
-        let mut lines = Vec::with_capacity(messages.len());
-        for message in messages {
-            lines.push(self.line_from_message(topic_metadata, messages_metadata, message)?);
+        // Single buffer for the entire batch — reused across all messages.
+        // Pre-allocate a generous estimate (256 bytes per message) to avoid
+        // reallocation in the common case.  The buffer is passed into
+        // append_line() which writes each line directly, with '\n' separators
+        // between lines.  No per-message String is allocated.
+        let mut body = String::with_capacity(messages.len() * 256);
+
+        for (i, message) in messages.iter().enumerate() {
+            if i > 0 {
+                body.push('\n');
+            }
+            self.append_line(&mut body, topic_metadata, messages_metadata, message)?;
         }
 
-        let body = lines.join("\n");
         self.write_with_retry(body).await
     }
 
     async fn write_with_retry(&self, body: String) -> Result<(), Error> {
         let client = self.get_client()?;
-        let url = self.build_write_url()?;
+        let url = self.write_url.clone().ok_or_else(|| {
+            Error::Connection("write_url not initialised — was open() called?".to_string())
+        })?;
         let max_retries = self.get_max_retries();
         let token = self.config.token.clone();
 
-        // Cap for per-write backoff
-        let max_delay = parse_duration(
-            self.config.open_retry_max_delay.as_deref(),
-            DEFAULT_OPEN_RETRY_MAX_DELAY,
-        );
+        // Cap for per-write backoff — cached in open(), no re-parse needed.
+        let max_delay = self.write_retry_max_delay;
+
+        // Convert once before the loop — Bytes is a reference-counted view over
+        // the same allocation. Every .clone() inside the loop is a pointer bump
+        // (O(1)), not a deep copy of the string data (O(n)).
+        let body: Bytes = Bytes::from(body);
 
         let mut attempts = 0u32;
         loop {
@@ -669,6 +781,15 @@ impl Sink for InfluxDbSink {
 
         self.client = Some(self.build_client()?);
 
+        // Cache once here — both are derived purely from config fields that
+        // never change at runtime, so recomputing them on every batch write
+        // is wasteful.
+        self.write_url = Some(self.build_write_url()?);
+        self.write_retry_max_delay = parse_duration(
+            self.config.retry_max_delay.as_deref(),
+            DEFAULT_RETRY_MAX_DELAY,
+        );
+
         // Use retrying connectivity check instead of hard-fail
         self.check_connectivity_with_retry().await?;
 
@@ -712,6 +833,8 @@ impl Sink for InfluxDbSink {
                 Ok(()) => {
                     // Successful write — reset circuit breaker
                     self.circuit_breaker.record_success();
+                    let mut state = self.state.lock().await;
+                    state.write_success += batch.len() as u64;
                 }
                 Err(e) => {
                     // Failed write — notify circuit breaker
@@ -741,8 +864,12 @@ impl Sink for InfluxDbSink {
         if self.verbose {
             info!(
                 "InfluxDB sink ID: {} processed {} messages. \
-                 Total processed: {}, write errors: {}",
-                self.id, total_messages, state.messages_processed, state.write_errors
+                 Total processed: {}, Success: {} , write errors: {}",
+                self.id,
+                total_messages,
+                state.messages_processed,
+                state.write_success,
+                state.write_errors
             );
         } else {
             debug!(
@@ -752,7 +879,7 @@ impl Sink for InfluxDbSink {
             );
         }
 
-        // ropagate the first batch error to the runtime so it can
+        // Propagate the first batch error to the runtime so it can
         // decide whether to retry, halt, or dead-letter — instead of returning Ok(())
         // and silently losing messages.
         if let Some(err) = first_error {
