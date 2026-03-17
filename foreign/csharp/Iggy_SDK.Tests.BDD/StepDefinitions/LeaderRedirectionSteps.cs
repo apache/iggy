@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Net.Sockets;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
@@ -40,30 +39,30 @@ public class LeaderRedirectionSteps
     [Given(@"I have cluster configuration enabled with (\d+) nodes")]
     public void GivenIHaveClusterConfigurationEnabledWithNodes(int nodeCount)
     {
-        nodeCount.ShouldBe(2);
+        _context.ClusterNodeCount = nodeCount;
     }
 
     [Given(@"node (\d+) is configured on port (\d+)")]
     public void GivenNodeIsConfiguredOnPort(int nodeId, int port)
     {
-        _ = nodeId;
+        _context.ClusterNodePorts[nodeId] = port;
         ResolveAddressForPort(port).ShouldNotBeNullOrEmpty();
     }
 
     [Given(@"I start server (\d+) on port (\d+) as (leader|follower)")]
-    public async Task GivenIStartServerOnPortAs(int nodeId, int port, string role)
+    public void GivenIStartServerOnPortAs(int nodeId, int port, string role)
     {
-        _ = nodeId;
+        _context.ClusterNodeCount.ShouldBeGreaterThan(0);
+        _context.ClusterNodePorts.TryGetValue(nodeId, out var configuredPort).ShouldBeTrue();
+        configuredPort.ShouldBe(port);
         var address = ResolveAddressForRole(role);
         address.ShouldEndWith($":{port}");
-        await WaitForServerPortAsync(address);
     }
 
     [Given(@"I start a single server on port (\d+) without clustering enabled")]
-    public async Task GivenIStartASingleServerOnPortWithoutClusteringEnabled(int port)
+    public void GivenIStartASingleServerOnPortWithoutClusteringEnabled(int port)
     {
         _context.TcpUrl.ShouldEndWith($":{port}");
-        await WaitForServerPortAsync(_context.TcpUrl);
     }
 
     [When(@"I create a client connecting to (follower|leader) on port (\d+)")]
@@ -73,7 +72,6 @@ public class LeaderRedirectionSteps
         address.ShouldEndWith($":{port}");
 
         await CreateAndConnectClient("main", address);
-        _context.InitialAddress = address;
     }
 
     [When(@"I create a client connecting directly to leader on port (\d+)")]
@@ -83,7 +81,6 @@ public class LeaderRedirectionSteps
         address.ShouldEndWith($":{port}");
 
         await CreateAndConnectClient("main", address);
-        _context.InitialAddress = address;
     }
 
     [When(@"I create a client connecting to port (\d+)")]
@@ -91,7 +88,6 @@ public class LeaderRedirectionSteps
     {
         var address = ResolveAddressForPort(port);
         await CreateAndConnectClient("main", address);
-        _context.InitialAddress = address;
     }
 
     [When(@"I create client ([A-Z]) connecting to port (\d+)")]
@@ -132,7 +128,7 @@ public class LeaderRedirectionSteps
     public async Task ThenTheClientShouldAutomaticallyRedirectToLeaderOnPort(int port)
     {
         await AssertClientAddress("main", port);
-        GetClient("main").GetCurrentAddress().ShouldNotBe(_context.InitialAddress);
+        GetClient("main").GetCurrentAddress().ShouldNotBe(GetClientConnection("main").InitialAddress);
     }
 
     [Then(@"the stream should be created successfully on the leader")]
@@ -145,7 +141,7 @@ public class LeaderRedirectionSteps
     [Then(@"the client should not perform any redirection")]
     public void ThenTheClientShouldNotPerformAnyRedirection()
     {
-        GetClient("main").GetCurrentAddress().ShouldBe(_context.InitialAddress);
+        GetClient("main").GetCurrentAddress().ShouldBe(GetClientConnection("main").InitialAddress);
     }
 
     [Then(@"the connection should remain on port (\d+)")]
@@ -158,19 +154,24 @@ public class LeaderRedirectionSteps
     public void ThenTheClientShouldConnectSuccessfullyWithoutRedirection()
     {
         GetClient("main").ShouldNotBeNull();
-        GetClient("main").GetCurrentAddress().ShouldBe(_context.InitialAddress);
+        GetClient("main").GetCurrentAddress().ShouldBe(GetClientConnection("main").InitialAddress);
     }
 
-    [Then(@"client ([A-Z]) should stay connected to port (\d+)")]
-    public async Task ThenClientShouldStayConnectedToPort(string clientName, int port)
+    [Then(@"client ([A-Z]) should (stay connected to|redirect to) port (\d+)")]
+    public async Task ThenClientShouldStayConnectedOrRedirectToPort(string clientName, string expectation, int port)
     {
         await AssertClientAddress(clientName, port);
-    }
 
-    [Then(@"client ([A-Z]) should redirect to port (\d+)")]
-    public async Task ThenClientShouldRedirectToPort(string clientName, int port)
-    {
-        await AssertClientAddress(clientName, port);
+        var currentAddress = GetClient(clientName).GetCurrentAddress();
+        var initialAddress = GetClientConnection(clientName).InitialAddress;
+
+        if (expectation == "stay connected to")
+        {
+            currentAddress.ShouldBe(initialAddress);
+            return;
+        }
+
+        currentAddress.ShouldNotBe(initialAddress);
     }
 
     [Then(@"both clients should be using the same server")]
@@ -193,6 +194,10 @@ public class LeaderRedirectionSteps
         await client.PingAsync();
 
         _context.Clients[name] = client;
+        _context.ClientConnections[name] = new ClientConnectionMetadata
+        {
+            InitialAddress = address
+        };
         if (name == "main")
         {
             _context.IggyClient = client;
@@ -202,6 +207,11 @@ public class LeaderRedirectionSteps
     private IIggyClient GetClient(string name)
     {
         return _context.Clients[name];
+    }
+
+    private ClientConnectionMetadata GetClientConnection(string name)
+    {
+        return _context.ClientConnections[name];
     }
 
     private async Task AssertClientAddress(string clientName, int expectedPort)
@@ -230,50 +240,5 @@ public class LeaderRedirectionSteps
             8092 => _context.FollowerTcpUrl,
             _ => throw new ArgumentOutOfRangeException(nameof(port), port, "Unsupported test port")
         };
-    }
-
-    private static async Task WaitForServerPortAsync(string address)
-    {
-        var (host, port) = ParseTcpEndpoint(address);
-        const int maxAttempts = 50;
-
-        for (var attempt = 0; attempt < maxAttempts; attempt++)
-        {
-            using var tcpClient = new TcpClient();
-
-            try
-            {
-                var connectTask = tcpClient.ConnectAsync(host, port);
-                var completedTask = await Task.WhenAny(connectTask, Task.Delay(200));
-                if (completedTask == connectTask && tcpClient.Connected)
-                {
-                    return;
-                }
-            }
-            catch (SocketException)
-            {
-                // Retry until the container starts accepting connections.
-            }
-
-            await Task.Delay(200);
-        }
-
-        throw new TimeoutException($"Timed out waiting for server at {address} to accept TCP connections.");
-    }
-
-    private static (string Host, int Port) ParseTcpEndpoint(string address)
-    {
-        var normalizedAddress = address.Contains("://", StringComparison.Ordinal)
-            ? address
-            : $"tcp://{address}";
-
-        if (Uri.TryCreate(normalizedAddress, UriKind.Absolute, out var absoluteUri) &&
-            !string.IsNullOrWhiteSpace(absoluteUri.Host) &&
-            absoluteUri.Port > 0)
-        {
-            return (absoluteUri.Host, absoluteUri.Port);
-        }
-
-        throw new ArgumentException($"Invalid server address: {address}", nameof(address));
     }
 }
