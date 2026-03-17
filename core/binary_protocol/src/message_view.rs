@@ -26,6 +26,7 @@ use crate::message_layout::{
     MSG_PAYLOAD_LEN_OFFSET, MSG_TIMESTAMP_OFFSET, MSG_USER_HEADERS_LEN_OFFSET,
     WIRE_MESSAGE_HEADER_SIZE,
 };
+use std::borrow::Cow;
 
 // Private helpers for infallible reads on validated buffers
 
@@ -72,7 +73,9 @@ fn validate_frame(buf: &[u8]) -> Result<(usize, usize, usize), WireError> {
     let total = WIRE_MESSAGE_HEADER_SIZE
         .checked_add(payload_len)
         .and_then(|s| s.checked_add(user_headers_len))
-        .ok_or_else(|| WireError::Validation("message frame size overflow".to_string()))?;
+        .ok_or(WireError::Validation(Cow::Borrowed(
+            "message frame size overflow",
+        )))?;
 
     if buf.len() < total {
         return Err(WireError::UnexpectedEof {
@@ -371,9 +374,9 @@ impl<'a> WireMessageIteratorMut<'a> {
                 .and_then(|s| s.checked_add(user_headers_len))
             else {
                 self.remaining = 0;
-                return Some(Err(WireError::Validation(
-                    "message frame size overflow".to_string(),
-                )));
+                return Some(Err(WireError::Validation(Cow::Borrowed(
+                    "message frame size overflow",
+                ))));
             };
             (total, rest.len())
         };
