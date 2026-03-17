@@ -74,17 +74,17 @@ public final class TcpTlsProducer {
         // Build a TCP client with TLS enabled.
         // enableTls()           activates TLS on the TCP transport
         // tlsCertificate(...)   points to the CA certificate used to verify the server cert
-        var client = IggyTcpClient.builder()
+        try (var client = IggyTcpClient.builder()
                 .host("localhost")
                 .port(8090)
                 .enableTls()
                 .tlsCertificate("../../core/certs/iggy_ca_cert.pem")
                 .credentials("iggy", "iggy")
-                .buildAndLogin();
-
-        createStream(client);
-        createTopic(client);
-        produceMessages(client);
+                .buildAndLogin()) {
+            createStream(client);
+            createTopic(client);
+            produceMessages(client);
+        }
     }
 
     private static void produceMessages(IggyTcpClient client) {

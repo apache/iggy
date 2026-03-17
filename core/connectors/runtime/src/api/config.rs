@@ -21,6 +21,8 @@ use crate::configs::connectors::ConfigFormat;
 use crate::error::RuntimeError;
 use axum::http::{HeaderValue, Method};
 use configs_derive::ConfigEnv;
+use iggy_common::serde_secret::serialize_secret;
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -31,15 +33,29 @@ pub const YAML_HEADER: HeaderValue = HeaderValue::from_static("application/yaml"
 pub const TOML_HEADER: HeaderValue = HeaderValue::from_static("application/toml");
 pub const TEXT_HEADER: HeaderValue = HeaderValue::from_static("text/plain");
 
-#[derive(Debug, Clone, Deserialize, Serialize, ConfigEnv)]
+#[derive(Clone, Deserialize, Serialize, ConfigEnv)]
 pub struct HttpConfig {
     pub enabled: bool,
     pub address: String,
-    #[config_env(secret)]
-    pub api_key: String,
+    #[config_env(secret, leaf)]
+    #[serde(serialize_with = "serialize_secret")]
+    pub api_key: SecretString,
     pub cors: HttpCorsConfig,
     pub tls: HttpTlsConfig,
     pub metrics: HttpMetricsConfig,
+}
+
+impl std::fmt::Debug for HttpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpConfig")
+            .field("enabled", &self.enabled)
+            .field("address", &self.address)
+            .field("api_key", &"[REDACTED]")
+            .field("cors", &self.cors)
+            .field("tls", &self.tls)
+            .field("metrics", &self.metrics)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ConfigEnv)]
@@ -166,7 +182,7 @@ impl Default for HttpConfig {
         Self {
             enabled: true,
             address: "localhost:8081".to_owned(),
-            api_key: "".to_owned(),
+            api_key: SecretString::from(""),
             cors: HttpCorsConfig::default(),
             tls: HttpTlsConfig::default(),
             metrics: HttpMetricsConfig::default(),
@@ -178,8 +194,8 @@ impl std::fmt::Display for HttpConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ address: {}, api_key: {}, cors: {}, tls: {}, metrics: {} }}",
-            self.address, self.api_key, self.cors, self.tls, self.metrics
+            "{{ address: {}, api_key: ******, cors: {}, tls: {}, metrics: {} }}",
+            self.address, self.cors, self.tls, self.metrics
         )
     }
 }

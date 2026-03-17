@@ -19,14 +19,13 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import org.apache.commons.lang3.StringUtils;
+import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
+import org.apache.iggy.client.async.tcp.AsyncIggyTcpClientBuilder;
 import org.apache.iggy.config.RetryPolicy;
-import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 
 import java.io.File;
 import java.time.Duration;
-import java.util.Optional;
 
 /**
  * Builder for creating configured IggyTcpClient instances.
@@ -60,16 +59,10 @@ import java.util.Optional;
  * @see IggyTcpClient#builder()
  */
 public final class IggyTcpClientBuilder {
-    private String host = "localhost";
-    private Integer port = 8090;
+
+    private final AsyncIggyTcpClientBuilder asyncBuilder = new AsyncIggyTcpClientBuilder();
     private String username;
     private String password;
-    private Duration connectionTimeout;
-    private Duration requestTimeout;
-    private Integer connectionPoolSize;
-    private RetryPolicy retryPolicy;
-    private boolean enableTls = false;
-    private File tlsCertificate;
 
     IggyTcpClientBuilder() {}
 
@@ -80,7 +73,7 @@ public final class IggyTcpClientBuilder {
      * @return this builder
      */
     public IggyTcpClientBuilder host(String host) {
-        this.host = host;
+        asyncBuilder.host(host);
         return this;
     }
 
@@ -91,7 +84,7 @@ public final class IggyTcpClientBuilder {
      * @return this builder
      */
     public IggyTcpClientBuilder port(Integer port) {
-        this.port = port;
+        asyncBuilder.port(port);
         return this;
     }
 
@@ -106,6 +99,7 @@ public final class IggyTcpClientBuilder {
     public IggyTcpClientBuilder credentials(String username, String password) {
         this.username = username;
         this.password = password;
+        asyncBuilder.credentials(username, password);
         return this;
     }
 
@@ -116,7 +110,7 @@ public final class IggyTcpClientBuilder {
      * @return this builder
      */
     public IggyTcpClientBuilder connectionTimeout(Duration connectionTimeout) {
-        this.connectionTimeout = connectionTimeout;
+        asyncBuilder.connectionTimeout(connectionTimeout);
         return this;
     }
 
@@ -127,7 +121,7 @@ public final class IggyTcpClientBuilder {
      * @return this builder
      */
     public IggyTcpClientBuilder requestTimeout(Duration requestTimeout) {
-        this.requestTimeout = requestTimeout;
+        asyncBuilder.requestTimeout(requestTimeout);
         return this;
     }
 
@@ -138,7 +132,7 @@ public final class IggyTcpClientBuilder {
      * @return this builder
      */
     public IggyTcpClientBuilder connectionPoolSize(Integer connectionPoolSize) {
-        this.connectionPoolSize = connectionPoolSize;
+        asyncBuilder.connectionPoolSize(connectionPoolSize);
         return this;
     }
 
@@ -149,7 +143,7 @@ public final class IggyTcpClientBuilder {
      * @return this builder
      */
     public IggyTcpClientBuilder retryPolicy(RetryPolicy retryPolicy) {
-        this.retryPolicy = retryPolicy;
+        asyncBuilder.retryPolicy(retryPolicy);
         return this;
     }
 
@@ -160,7 +154,7 @@ public final class IggyTcpClientBuilder {
      * @return this builder
      */
     public IggyTcpClientBuilder tls(boolean enableTls) {
-        this.enableTls = enableTls;
+        asyncBuilder.tls(enableTls);
         return this;
     }
 
@@ -170,7 +164,7 @@ public final class IggyTcpClientBuilder {
      * @return this builder
      */
     public IggyTcpClientBuilder enableTls() {
-        this.enableTls = true;
+        asyncBuilder.enableTls();
         return this;
     }
 
@@ -181,7 +175,7 @@ public final class IggyTcpClientBuilder {
      * @return this builder
      */
     public IggyTcpClientBuilder tlsCertificate(File tlsCertificate) {
-        this.tlsCertificate = tlsCertificate;
+        asyncBuilder.tlsCertificate(tlsCertificate);
         return this;
     }
 
@@ -192,7 +186,7 @@ public final class IggyTcpClientBuilder {
      * @return this builder
      */
     public IggyTcpClientBuilder tlsCertificate(String tlsCertificatePath) {
-        this.tlsCertificate = StringUtils.isBlank(tlsCertificatePath) ? null : new File(tlsCertificatePath);
+        asyncBuilder.tlsCertificate(tlsCertificatePath);
         return this;
     }
 
@@ -201,26 +195,11 @@ public final class IggyTcpClientBuilder {
      * Note: You still need to call {@link IggyTcpClient#connect()} on the returned client.
      *
      * @return a new IggyTcpClient instance
-     * @throws IggyInvalidArgumentException if the host is null or empty, or if the port is not positive
+     * @throws org.apache.iggy.exception.IggyInvalidArgumentException if the host is null or empty, or if the port is not positive
      */
     public IggyTcpClient build() {
-        if (host == null || host.isEmpty()) {
-            throw new IggyInvalidArgumentException("Host cannot be null or empty");
-        }
-        if (port == null || port <= 0) {
-            throw new IggyInvalidArgumentException("Port must be a positive integer");
-        }
-        return new IggyTcpClient(
-                host,
-                port,
-                username,
-                password,
-                connectionTimeout,
-                requestTimeout,
-                connectionPoolSize,
-                retryPolicy,
-                this.enableTls,
-                Optional.ofNullable(tlsCertificate));
+        AsyncIggyTcpClient asyncClient = asyncBuilder.build();
+        return new IggyTcpClient(asyncClient);
     }
 
     /**
@@ -230,7 +209,7 @@ public final class IggyTcpClientBuilder {
      *
      * @return a new IggyTcpClient instance that is connected and logged in
      * @throws IggyMissingCredentialsException if no credentials were provided
-     * @throws IggyInvalidArgumentException if the host is null or empty, or if the port is not positive
+     * @throws org.apache.iggy.exception.IggyInvalidArgumentException if the host is null or empty, or if the port is not positive
      */
     public IggyTcpClient buildAndLogin() {
         if (username == null || password == null) {

@@ -21,10 +21,10 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::Stream;
 use futures_util::{FutureExt, StreamExt};
-use iggy_binary_protocol::{
+use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
+use iggy_common::{
     Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, StreamClient, TopicClient,
 };
-use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     Consumer, ConsumerKind, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
     IggyError, IggyMessage, IggyTimestamp, PolledMessages, PollingKind, PollingStrategy,

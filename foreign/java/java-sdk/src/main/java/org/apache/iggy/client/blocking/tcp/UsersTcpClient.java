@@ -19,13 +19,8 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
-import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.blocking.UsersClient;
 import org.apache.iggy.identifier.UserId;
-import org.apache.iggy.serde.BytesDeserializer;
-import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
@@ -35,116 +30,57 @@ import org.apache.iggy.user.UserStatus;
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.serde.BytesSerializer.toBytes;
+final class UsersTcpClient implements UsersClient {
 
-class UsersTcpClient implements UsersClient {
+    private final org.apache.iggy.client.async.UsersClient delegate;
 
-    private final InternalTcpClient tcpClient;
-
-    UsersTcpClient(InternalTcpClient tcpClient) {
-        this.tcpClient = tcpClient;
+    UsersTcpClient(org.apache.iggy.client.async.UsersClient delegate) {
+        this.delegate = delegate;
     }
 
     @Override
     public Optional<UserInfoDetails> getUser(UserId userId) {
-        var payload = toBytes(userId);
-        return tcpClient.exchangeForOptional(CommandCode.User.GET, payload, BytesDeserializer::readUserInfoDetails);
+        return FutureUtil.resolve(delegate.getUser(userId));
     }
 
     @Override
     public List<UserInfo> getUsers() {
-        return tcpClient.exchangeForList(CommandCode.User.GET_ALL, BytesDeserializer::readUserInfo);
+        return FutureUtil.resolve(delegate.getUsers());
     }
 
     @Override
     public UserInfoDetails createUser(
             String username, String password, UserStatus status, Optional<Permissions> permissions) {
-        var payload = Unpooled.buffer();
-        payload.writeBytes(toBytes(username));
-        payload.writeBytes(toBytes(password));
-        payload.writeByte(status.asCode());
-        permissions.ifPresentOrElse(
-                perms -> {
-                    payload.writeByte(1);
-                    var permissionBytes = toBytes(perms);
-                    payload.writeIntLE(permissionBytes.readableBytes());
-                    payload.writeBytes(permissionBytes);
-                },
-                () -> payload.writeByte(0));
-
-        return tcpClient.exchangeForEntity(CommandCode.User.CREATE, payload, BytesDeserializer::readUserInfoDetails);
+        return FutureUtil.resolve(delegate.createUser(username, password, status, permissions));
     }
 
     @Override
     public void deleteUser(UserId userId) {
-        var payload = toBytes(userId);
-        tcpClient.send(CommandCode.User.DELETE, payload);
+        FutureUtil.resolve(delegate.deleteUser(userId));
     }
 
     @Override
-    public void updateUser(UserId userId, Optional<String> usernameOptional, Optional<UserStatus> statusOptional) {
-        var payload = toBytes(userId);
-        usernameOptional.ifPresentOrElse(
-                (username) -> {
-                    payload.writeByte(1);
-                    payload.writeBytes(toBytes(username));
-                },
-                () -> payload.writeByte(0));
-        statusOptional.ifPresentOrElse(
-                (status) -> {
-                    payload.writeByte(1);
-                    payload.writeByte(status.asCode());
-                },
-                () -> payload.writeByte(0));
-
-        tcpClient.send(CommandCode.User.UPDATE, payload);
+    public void updateUser(UserId userId, Optional<String> username, Optional<UserStatus> status) {
+        FutureUtil.resolve(delegate.updateUser(userId, username, status));
     }
 
     @Override
-    public void updatePermissions(UserId userId, Optional<Permissions> permissionsOptional) {
-        var payload = toBytes(userId);
-
-        permissionsOptional.ifPresentOrElse(
-                permissions -> {
-                    payload.writeByte(1);
-                    var permissionBytes = toBytes(permissions);
-                    payload.writeIntLE(permissionBytes.readableBytes());
-                    payload.writeBytes(permissionBytes);
-                },
-                () -> payload.writeByte(0));
-
-        tcpClient.send(CommandCode.User.UPDATE_PERMISSIONS, payload);
+    public void updatePermissions(UserId userId, Optional<Permissions> permissions) {
+        FutureUtil.resolve(delegate.updatePermissions(userId, permissions));
     }
 
     @Override
     public void changePassword(UserId userId, String currentPassword, String newPassword) {
-        var payload = toBytes(userId);
-        payload.writeBytes(toBytes(currentPassword));
-        payload.writeBytes(toBytes(newPassword));
-
-        tcpClient.send(CommandCode.User.CHANGE_PASSWORD, payload);
+        FutureUtil.resolve(delegate.changePassword(userId, currentPassword, newPassword));
     }
 
     @Override
     public IdentityInfo login(String username, String password) {
-        String version = IggyVersion.getInstance().getUserAgent();
-        String context = IggyVersion.getInstance().toString();
-        var payloadSize = 2 + username.length() + password.length() + 4 + version.length() + 4 + context.length();
-        var payload = Unpooled.buffer(payloadSize);
-
-        payload.writeBytes(toBytes(username));
-        payload.writeBytes(toBytes(password));
-        payload.writeIntLE(version.length());
-        payload.writeBytes(version.getBytes());
-        payload.writeIntLE(context.length());
-        payload.writeBytes(context.getBytes());
-
-        var userId = tcpClient.exchangeForEntity(CommandCode.User.LOGIN, payload, ByteBuf::readUnsignedIntLE);
-        return new IdentityInfo(userId, Optional.empty());
+        return FutureUtil.resolve(delegate.login(username, password));
     }
 
     @Override
     public void logout() {
-        tcpClient.send(CommandCode.User.LOGOUT);
+        FutureUtil.resolve(delegate.logout());
     }
 }

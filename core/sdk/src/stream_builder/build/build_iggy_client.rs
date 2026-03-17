@@ -16,7 +16,7 @@
  * under the License.
  */
 use crate::prelude::{IggyClient, IggyError};
-use iggy_binary_protocol::Client;
+use iggy_common::Client;
 
 /// Builds an `IggyClient` from the given connection string.
 ///

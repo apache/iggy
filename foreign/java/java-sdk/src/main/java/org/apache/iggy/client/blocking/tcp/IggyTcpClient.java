@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
+import org.apache.iggy.client.async.tcp.AsyncIggyTcpClient;
 import org.apache.iggy.client.blocking.ConsumerGroupsClient;
 import org.apache.iggy.client.blocking.ConsumerOffsetsClient;
 import org.apache.iggy.client.blocking.IggyBaseClient;
@@ -29,73 +30,48 @@ import org.apache.iggy.client.blocking.StreamsClient;
 import org.apache.iggy.client.blocking.SystemClient;
 import org.apache.iggy.client.blocking.TopicsClient;
 import org.apache.iggy.client.blocking.UsersClient;
-import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.user.IdentityInfo;
 
-import java.io.File;
-import java.time.Duration;
-import java.util.Optional;
+import java.io.Closeable;
 
-public class IggyTcpClient implements IggyBaseClient {
+public class IggyTcpClient implements IggyBaseClient, Closeable {
 
-    private final String host;
-    private final int port;
-    private final boolean enableTls;
-    private final Optional<File> tlsCertificate;
-    private final Optional<String> username;
-    private final Optional<String> password;
+    private final AsyncIggyTcpClient asyncClient;
 
-    private UsersTcpClient usersClient;
-    private StreamsTcpClient streamsClient;
-    private TopicsTcpClient topicsClient;
-    private PartitionsTcpClient partitionsClient;
-    private ConsumerGroupsTcpClient consumerGroupsClient;
-    private ConsumerOffsetTcpClient consumerOffsetsClient;
-    private MessagesTcpClient messagesClient;
-    private SystemTcpClient systemClient;
-    private PersonalAccessTokensTcpClient personalAccessTokensClient;
+    private UsersClient usersClient;
+    private StreamsClient streamsClient;
+    private TopicsClient topicsClient;
+    private PartitionsClient partitionsClient;
+    private ConsumerGroupsClient consumerGroupsClient;
+    private ConsumerOffsetsClient consumerOffsetsClient;
+    private MessagesClient messagesClient;
+    private SystemClient systemClient;
+    private PersonalAccessTokensClient personalAccessTokensClient;
 
     public IggyTcpClient(String host, Integer port) {
-        this(host, port, null, null, null, null, null, null, false, Optional.empty());
+        this(new AsyncIggyTcpClient(host, port));
     }
 
-    @SuppressWarnings("checkstyle:ParameterNumber")
-    IggyTcpClient(
-            String host,
-            Integer port,
-            String username,
-            String password,
-            Duration connectionTimeout,
-            Duration requestTimeout,
-            Integer connectionPoolSize,
-            RetryPolicy retryPolicy,
-            boolean enableTls,
-            Optional<File> tlsCertificate) {
-        this.host = host;
-        this.port = port;
-        this.username = Optional.ofNullable(username);
-        this.password = Optional.ofNullable(password);
-        this.enableTls = enableTls;
-        this.tlsCertificate = tlsCertificate;
+    IggyTcpClient(AsyncIggyTcpClient asyncClient) {
+        this.asyncClient = asyncClient;
     }
 
     /**
      * Connects to the Iggy server.
      */
     public void connect() {
-        InternalTcpClient tcpClient = new InternalTcpClient(host, port, enableTls, tlsCertificate);
-        tcpClient.connect();
-        usersClient = new UsersTcpClient(tcpClient);
-        streamsClient = new StreamsTcpClient(tcpClient);
-        topicsClient = new TopicsTcpClient(tcpClient);
-        partitionsClient = new PartitionsTcpClient(tcpClient);
-        consumerGroupsClient = new ConsumerGroupsTcpClient(tcpClient);
-        consumerOffsetsClient = new ConsumerOffsetTcpClient(tcpClient);
-        messagesClient = new MessagesTcpClient(tcpClient);
-        systemClient = new SystemTcpClient(tcpClient);
-        personalAccessTokensClient = new PersonalAccessTokensTcpClient(tcpClient);
+        FutureUtil.resolve(asyncClient.connect());
+        usersClient = new UsersTcpClient(asyncClient.users());
+        streamsClient = new StreamsTcpClient(asyncClient.streams());
+        topicsClient = new TopicsTcpClient(asyncClient.topics());
+        partitionsClient = new PartitionsTcpClient(asyncClient.partitions());
+        consumerGroupsClient = new ConsumerGroupsTcpClient(asyncClient.consumerGroups());
+        consumerOffsetsClient = new ConsumerOffsetsTcpClient(asyncClient.consumerOffsets());
+        messagesClient = new MessagesTcpClient(asyncClient.messages());
+        systemClient = new SystemTcpClient(asyncClient.system());
+        personalAccessTokensClient = new PersonalAccessTokensTcpClient(asyncClient.personalAccessTokens());
     }
 
     /**
@@ -114,13 +90,12 @@ public class IggyTcpClient implements IggyBaseClient {
      * @throws IggyNotConnectedException if client is not connected
      */
     public IdentityInfo login() {
-        if (usersClient == null) {
-            throw new IggyNotConnectedException();
-        }
-        if (username.isEmpty() || password.isEmpty()) {
-            throw new IggyMissingCredentialsException();
-        }
-        return usersClient.login(username.get(), password.get());
+        return FutureUtil.resolve(asyncClient.login());
+    }
+
+    @Override
+    public void close() {
+        FutureUtil.resolve(asyncClient.close());
     }
 
     @Override

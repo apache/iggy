@@ -101,10 +101,10 @@ impl IggyCmdTestCase for TestUserCreateCmd {
     }
 
     fn verify_command(&self, command_state: Assert) {
-        command_state
-            .success()
-            .stdout(diff(format!("Executing create user with username: {} and password: {}\nUser with username: {} and password: {} created\n",
-                                            self.username, self.password, self.username, self.password)));
+        command_state.success().stdout(diff(format!(
+            "Executing create user with username: {}\nUser with username: {} created\n",
+            self.username, self.username
+        )));
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {

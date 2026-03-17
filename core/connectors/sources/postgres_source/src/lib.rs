@@ -23,6 +23,7 @@ use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Column, Pool, Postgres, Row, TypeInfo};
@@ -51,7 +52,8 @@ pub struct PostgresSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostgresSourceConfig {
-    pub connection_string: String,
+    #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
+    pub connection_string: SecretString,
     pub mode: String,
     pub tables: Vec<String>,
     pub poll_interval: Option<String>,
@@ -263,13 +265,13 @@ impl Source for PostgresSource {
 impl PostgresSource {
     async fn connect(&mut self) -> Result<(), Error> {
         let max_connections = self.config.max_connections.unwrap_or(10);
-        let redacted = redact_connection_string(&self.config.connection_string);
+        let redacted = redact_connection_string(self.config.connection_string.expose_secret());
 
         info!("Connecting to PostgreSQL with max {max_connections} connections: {redacted}");
 
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
-            .connect(&self.config.connection_string)
+            .connect(self.config.connection_string.expose_secret())
             .await
             .map_err(|e| Error::InitError(format!("Failed to connect to PostgreSQL: {e}")))?;
 
@@ -1143,7 +1145,7 @@ mod tests {
 
     fn test_config() -> PostgresSourceConfig {
         PostgresSourceConfig {
-            connection_string: "postgres://localhost/db".to_string(),
+            connection_string: SecretString::from("postgres://localhost/db"),
             mode: "polling".to_string(),
             tables: vec!["users".to_string()],
             poll_interval: Some("5s".to_string()),

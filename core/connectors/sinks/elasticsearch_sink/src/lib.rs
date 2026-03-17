@@ -28,6 +28,7 @@ use iggy_common::IggyTimestamp;
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use simd_json::{OwnedValue, prelude::*};
@@ -73,7 +74,8 @@ pub struct ElasticsearchSinkConfig {
     pub url: String,
     pub index: String,
     pub username: Option<String>,
-    pub password: Option<String>,
+    #[serde(serialize_with = "iggy_common::serde_secret::serialize_optional_secret")]
+    pub password: Option<SecretString>,
     pub batch_size: Option<usize>,
     pub timeout_seconds: Option<u64>,
     pub create_index_if_not_exists: Option<bool>,
@@ -110,7 +112,8 @@ impl ElasticsearchSink {
         let mut transport_builder = TransportBuilder::new(conn_pool);
 
         if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
-            let credentials = Credentials::Basic(username.clone(), password.clone());
+            let credentials =
+                Credentials::Basic(username.clone(), password.expose_secret().to_string());
             transport_builder = transport_builder.auth(credentials);
         }
 
