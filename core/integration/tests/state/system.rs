@@ -25,6 +25,7 @@ use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::create_user::CreateUser;
 use iggy_common::delete_stream::DeleteStream;
+use secrecy::{ExposeSecret, SecretString};
 use server::state::command::EntryCommand;
 use server::state::models::{
     CreateConsumerGroupWithId, CreatePersonalAccessTokenWithHash, CreateStreamWithId,
@@ -41,13 +42,13 @@ async fn should_be_initialized_based_on_state_entries() {
     let user_id = 0;
     let create_user = CreateUser {
         username: "user".to_string(),
-        password: "secret".to_string(),
+        password: SecretString::from("secret"),
         status: Default::default(),
         permissions: None,
     };
     let create_user_clone = CreateUser {
         username: "user".to_string(),
-        password: "secret".to_string(),
+        password: SecretString::from("secret"),
         status: Default::default(),
         permissions: None,
     };
@@ -222,7 +223,10 @@ async fn should_be_initialized_based_on_state_entries() {
     let mut user = system.users.remove(&user_id).unwrap();
     assert_eq!(user.id, user_id);
     assert_eq!(user.username, create_user_clone.username);
-    assert_eq!(user.password_hash, create_user_clone.password);
+    assert_eq!(
+        user.password_hash,
+        create_user_clone.password.expose_secret()
+    );
     assert_eq!(user.personal_access_tokens.len(), 1);
 
     let personal_access_token = user

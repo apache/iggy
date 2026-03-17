@@ -28,6 +28,7 @@ use crate::streaming::session::Session;
 use err_trail::ErrContext;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::{IggyError, SenderKind};
+use secrecy::ExposeSecret;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for LoginWithPersonalAccessToken {
@@ -44,16 +45,12 @@ impl ServerCommandHandler for LoginWithPersonalAccessToken {
         shard: &Rc<IggyShard>,
     ) -> Result<HandlerResult, IggyError> {
         debug!("session: {session}, command: {self}");
+        let token = self.token.expose_secret();
         let user = shard
-            .login_with_personal_access_token(&self.token, Some(session))
+            .login_with_personal_access_token(token, Some(session))
             .error(|e: &IggyError| {
-                let redacted_token = if self.token.len() > 4 {
-                    format!("{}****", &self.token[..4])
-                } else {
-                    "****".to_string()
-                };
                 format!(
-                    "{COMPONENT} (error: {e}) - failed to login with personal access token: {redacted_token}, session: {session}",
+                    "{COMPONENT} (error: {e}) - failed to login with personal access token, session: {session}",
                 )
             })?;
         let identity_info = mapper::map_identity_info(user.id);

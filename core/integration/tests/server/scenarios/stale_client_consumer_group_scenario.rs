@@ -20,6 +20,7 @@ use futures::StreamExt;
 use iggy::prelude::*;
 use iggy_common::Credentials;
 use integration::iggy_harness;
+use secrecy::SecretString;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,7 +51,7 @@ async fn create_reconnecting_client(server_addr: &str) -> IggyClient {
         nodelay: true,
         auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
             DEFAULT_ROOT_USERNAME.to_string(),
-            DEFAULT_ROOT_PASSWORD.to_string(),
+            SecretString::from(DEFAULT_ROOT_PASSWORD),
         )),
         reconnection: TcpClientReconnectionConfig {
             enabled: true,

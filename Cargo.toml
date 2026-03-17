@@ -237,6 +237,7 @@ rust-embed = "8.11.0"
 rust-s3 = { version = "0.37.1", default-features = false, features = ["tokio-rustls-tls", "tags"] }
 rustls = { version = "0.23.37", features = ["ring"] }
 rustls-pemfile = "2.2.0"
+secrecy = { version = "0.10", features = ["serde"] }
 send_wrapper = "0.6.0"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.149"

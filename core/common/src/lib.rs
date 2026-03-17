@@ -130,6 +130,7 @@ pub use utils::expiry::IggyExpiry;
 pub use utils::hash::*;
 pub use utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
 pub use utils::random_id;
+pub use utils::serde_secret;
 pub use utils::text;
 pub use utils::timestamp::*;
 pub use utils::topic_size::MaxTopicSize;

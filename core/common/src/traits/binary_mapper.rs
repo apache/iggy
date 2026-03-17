@@ -24,6 +24,7 @@ use crate::{
     Stream, StreamDetails, Topic, TopicDetails, UserInfo, UserInfoDetails, UserStatus,
 };
 use bytes::Bytes;
+use secrecy::SecretString;
 use std::collections::HashMap;
 use std::str::from_utf8;
 
@@ -469,7 +470,9 @@ pub fn map_raw_pat(payload: Bytes) -> Result<RawPersonalAccessToken, IggyError> 
     let token = from_utf8(&payload[1..1 + token_length as usize])
         .map_err(|_| IggyError::InvalidUtf8)?
         .to_string();
-    Ok(RawPersonalAccessToken { token })
+    Ok(RawPersonalAccessToken {
+        token: SecretString::from(token),
+    })
 }
 
 pub fn map_client(payload: Bytes) -> Result<ClientInfoDetails, IggyError> {

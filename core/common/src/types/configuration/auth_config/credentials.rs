@@ -15,8 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[derive(Debug, Clone, PartialEq)]
+use secrecy::SecretString;
+use std::fmt;
+
+#[derive(Clone)]
 pub enum Credentials {
-    UsernamePassword(String, String),
-    PersonalAccessToken(String),
+    UsernamePassword(String, SecretString),
+    PersonalAccessToken(SecretString),
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Credentials::UsernamePassword(username, _) => f
+                .debug_tuple("UsernamePassword")
+                .field(username)
+                .field(&"[REDACTED]")
+                .finish(),
+            Credentials::PersonalAccessToken(_) => f
+                .debug_tuple("PersonalAccessToken")
+                .field(&"[REDACTED]")
+                .finish(),
+        }
+    }
 }

@@ -30,6 +30,7 @@ use iggy_common::{
     AutoLogin, Credentials, TransportProtocol, WebSocketClientConfig,
     WebSocketClientReconnectionConfig, WebSocketConfig,
 };
+use secrecy::SecretString;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -106,7 +107,7 @@ impl ClientProviderConfig {
                     auto_login: if auto_login {
                         AutoLogin::Enabled(Credentials::UsernamePassword(
                             args.username,
-                            args.password,
+                            SecretString::from(args.password),
                         ))
                     } else {
                         AutoLogin::Disabled
@@ -150,7 +151,7 @@ impl ClientProviderConfig {
                     auto_login: if auto_login {
                         AutoLogin::Enabled(Credentials::UsernamePassword(
                             args.username,
-                            args.password,
+                            SecretString::from(args.password),
                         ))
                     } else {
                         AutoLogin::Disabled
@@ -175,7 +176,7 @@ impl ClientProviderConfig {
                     auto_login: if auto_login {
                         AutoLogin::Enabled(Credentials::UsernamePassword(
                             args.username,
-                            args.password,
+                            SecretString::from(args.password),
                         ))
                     } else {
                         AutoLogin::Disabled

@@ -58,6 +58,7 @@ iggy = { workspace = true }
 iggy_common = { workspace = true }
 keyring = { workspace = true, optional = true }
 passterm = { workspace = true }
+secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

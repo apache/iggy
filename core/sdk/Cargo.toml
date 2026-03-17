@@ -45,6 +45,7 @@ reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
 reqwest-tracing = { workspace = true }
 rustls = { workspace = true }
+secrecy = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
