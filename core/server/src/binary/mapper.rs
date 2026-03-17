@@ -72,6 +72,10 @@ pub fn map_stats(stats: &Stats) -> Bytes {
         bytes.put_f32_le(metrics.hit_ratio);
     }
 
+    bytes.put_u32_le(stats.threads_count);
+    bytes.put_u64_le(stats.free_disk_space.as_bytes_u64());
+    bytes.put_u64_le(stats.total_disk_space.as_bytes_u64());
+
     bytes.freeze()
 }
 
