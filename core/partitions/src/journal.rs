@@ -83,7 +83,7 @@ pub struct PartitionJournalMemStorage {
 impl Storage for PartitionJournalMemStorage {
     type Buffer = Bytes;
 
-    async fn write(&self, buf: Self::Buffer) -> std::io::Result<usize> {
+    async fn write_at(&self, _offset: usize, buf: Self::Buffer) -> std::io::Result<usize> {
         let len = buf.len();
         let entries = unsafe { &mut *self.entries.get() };
         let offset_to_index = unsafe { &mut *self.offset_to_index.get() };
@@ -99,7 +99,7 @@ impl Storage for PartitionJournalMemStorage {
         Ok(write_offset)
     }
 
-    async fn read(&self, offset: usize, _buffer: Self::Buffer) -> std::io::Result<Self::Buffer> {
+    async fn read_at(&self, offset: usize, _buffer: Self::Buffer) -> std::io::Result<Self::Buffer> {
         let offset_to_index = unsafe { &*self.offset_to_index.get() };
         let Some(&index) = offset_to_index.get(&offset) else {
             return Ok(Bytes::new());
@@ -264,7 +264,7 @@ where
             let inner = unsafe { &*self.inner.get() };
             inner
                 .storage
-                .read(storage_offset, Bytes::new())
+                .read_at(storage_offset, Bytes::new())
                 .await
                 .unwrap_or_default()
         };
@@ -311,7 +311,7 @@ where
                 let inner = unsafe { &*self.inner.get() };
                 inner
                     .storage
-                    .read(storage_offset, Bytes::new())
+                    .read_at(storage_offset, Bytes::new())
                     .await
                     .unwrap_or_default()
             };
@@ -372,7 +372,7 @@ where
         let bytes = entry.into_inner();
         let storage_offset = {
             let inner = unsafe { &*self.inner.get() };
-            inner.storage.write(bytes).await?
+            inner.storage.write_at(0, bytes).await?
         };
 
         {
