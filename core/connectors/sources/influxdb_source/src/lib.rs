@@ -19,21 +19,20 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use csv::StringRecord;
-use humantime::Duration as HumanDuration;
 use iggy_common::{DateTime, Utc};
+use iggy_connector_sdk::retry::{
+    CircuitBreaker, exponential_backoff, jitter, parse_duration, parse_retry_after,
+};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
-use rand::RngExt as _;
 use regex::Regex;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -64,63 +63,6 @@ const DEFAULT_CIRCUIT_COOL_DOWN: &str = "30s";
 /// Intentionally strict: only digits, T, Z, colon, dot, plus, hyphen.
 /// Any Flux syntax character (pipe, quote, paren, space, slash) is rejected.
 static CURSOR_RE: OnceLock<Regex> = OnceLock::new();
-
-// ---------------------------------------------------------------------------
-// Simple consecutive-failure circuit breaker
-// ---------------------------------------------------------------------------
-#[derive(Debug)]
-struct CircuitBreaker {
-    threshold: u32,
-    consecutive_failures: AtomicU32,
-    open_until: Mutex<Option<tokio::time::Instant>>,
-    cool_down: Duration,
-}
-
-impl CircuitBreaker {
-    fn new(threshold: u32, cool_down: Duration) -> Self {
-        CircuitBreaker {
-            threshold,
-            consecutive_failures: AtomicU32::new(0),
-            open_until: Mutex::new(None),
-            cool_down,
-        }
-    }
-
-    /// Call when a poll attempt succeeds — resets failure count and closes circuit.
-    fn record_success(&self) {
-        self.consecutive_failures.store(0, Ordering::SeqCst);
-    }
-
-    /// Call when a poll attempt fails after all retries — may open the circuit.
-    async fn record_failure(&self) {
-        let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
-        if failures >= self.threshold {
-            let mut guard = self.open_until.lock().await;
-            let deadline = tokio::time::Instant::now() + self.cool_down;
-            *guard = Some(deadline);
-            warn!(
-                "Circuit breaker OPENED after {failures} consecutive failures. \
-                 Pausing queries for {:?}.",
-                self.cool_down
-            );
-        }
-    }
-
-    /// Returns true if the circuit is currently open (queries should be skipped).
-    async fn is_open(&self) -> bool {
-        let mut guard = self.open_until.lock().await;
-        if let Some(deadline) = *guard {
-            if tokio::time::Instant::now() < deadline {
-                return true;
-            }
-            // Cool-down elapsed — allow one probe attempt (half-open state)
-            *guard = None;
-            self.consecutive_failures.store(0, Ordering::SeqCst);
-            info!("Circuit breaker entering HALF-OPEN state — probing InfluxDB.");
-        }
-        false
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Main connector structs
@@ -201,13 +143,6 @@ struct State {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn parse_duration(value: Option<&str>, default_value: &str) -> Duration {
-    let raw = value.unwrap_or(default_value);
-    HumanDuration::from_str(raw)
-        .map(|d| d.into())
-        .unwrap_or_else(|_| Duration::from_secs(1))
-}
-
 fn parse_scalar(value: &str) -> serde_json::Value {
     if value.is_empty() {
         return serde_json::Value::Null;
@@ -232,39 +167,6 @@ fn is_header_record(record: &StringRecord) -> bool {
 
 fn is_transient_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-}
-
-// Apply ±20% random jitter to a duration to spread retry storms
-pub fn jitter(base: Duration) -> Duration {
-    let millis = base.as_millis() as u64;
-    let jitter_range = millis / 5; // 20% of base
-    if jitter_range == 0 {
-        return base;
-    }
-    let delta = rand::rng().random_range(0..=jitter_range * 2);
-    Duration::from_millis(millis.saturating_sub(jitter_range).saturating_add(delta))
-}
-
-// True exponential backoff: base * 2^attempt, capped at max_delay
-pub fn exponential_backoff(base: Duration, attempt: u32, max_delay: Duration) -> Duration {
-    let factor = 2u64.saturating_pow(attempt);
-    let millis = base
-        .as_millis() // u128
-        .saturating_mul(factor as u128) // u128, no overflow
-        .min(max_delay.as_millis()); // always keep below max_delay.as_millis()
-    let millis_u64 = u64::try_from(millis).unwrap_or(u64::MAX);
-    Duration::from_millis(millis_u64)
-}
-
-// Parse Retry-After header value (integer seconds or HTTP date)
-fn parse_retry_after(value: &str) -> Option<Duration> {
-    // First try plain integer seconds
-    if let Ok(secs) = value.trim().parse::<u64>() {
-        return Some(Duration::from_secs(secs));
-    }
-    // Then try HTTP-date (best-effort via httpdate crate if available,
-    // otherwise fall back to None so caller uses its own backoff)
-    None
 }
 
 // ---------------------------------------------------------------------------

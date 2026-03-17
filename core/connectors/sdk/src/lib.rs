@@ -41,6 +41,7 @@ pub mod api;
 pub mod decoders;
 pub mod encoders;
 pub mod log;
+pub mod retry;
 pub mod sink;
 pub mod source;
 pub mod transforms;

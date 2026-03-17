@@ -19,20 +19,19 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
-use humantime::Duration as HumanDuration;
+use iggy_connector_sdk::retry::{
+    CircuitBreaker, exponential_backoff, jitter, parse_duration, parse_retry_after,
+};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
-use rand::RngExt;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
-use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 sink_connector!(InfluxDbSink);
 
@@ -51,88 +50,6 @@ const DEFAULT_RETRY_MAX_DELAY: &str = "5s";
 const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
 // How long the circuit stays open before allowing a probe attempt
 const DEFAULT_CIRCUIT_COOL_DOWN: &str = "30s";
-
-// ---------------------------------------------------------------------------
-// Simple consecutive-failure circuit breaker
-// ---------------------------------------------------------------------------
-
-/// All mutable circuit-breaker state under a single lock —
-/// eliminates the AtomicU32 / Mutex race described above.
-#[derive(Debug)]
-struct CircuitState {
-    consecutive_failures: u32,
-    open_until: Option<tokio::time::Instant>,
-}
-
-#[derive(Debug)]
-pub struct CircuitBreaker {
-    threshold: u32,
-    cool_down: Duration,
-    state: Mutex<CircuitState>, // one lock, one consistent view
-}
-
-impl CircuitBreaker {
-    pub fn new(threshold: u32, cool_down: Duration) -> Self {
-        Self {
-            threshold,
-            cool_down,
-            state: Mutex::new(CircuitState {
-                consecutive_failures: 0,
-                open_until: None,
-            }),
-        }
-    }
-
-    /// Called on every successful operation — resets the failure
-    /// counter and closes the circuit atomically.
-    pub fn record_success(&self) {
-        // spawn-and-forget is intentional: success is the fast path
-        // and we want to avoid async overhead in the happy path.
-        // block_in_place would be wrong here; just get the lock.
-        // Because this is async context we use try_lock; if another
-        // task holds the lock the count reset will happen on the next
-        // success. This is safe — worst case: one extra failure
-        // needed to re-open the circuit. Callers accept this.
-        if let Ok(mut s) = self.state.try_lock() {
-            s.consecutive_failures = 0;
-            s.open_until = None;
-        }
-    }
-
-    /// Called after all retries for one operation have failed.
-    /// May open the circuit.
-    pub async fn record_failure(&self) {
-        let mut s = self.state.lock().await;
-        s.consecutive_failures = s.consecutive_failures.saturating_add(1);
-        if s.consecutive_failures >= self.threshold {
-            let deadline = tokio::time::Instant::now() + self.cool_down;
-            s.open_until = Some(deadline);
-            warn!(
-                "Circuit breaker OPENED after {} consecutive failures. \
-                 Pausing for {:?}.",
-                s.consecutive_failures, self.cool_down
-            );
-        }
-    }
-
-    /// Returns `true` if the circuit is open (callers should skip the
-    /// operation).  Transitions to half-open automatically once the
-    /// cool-down has elapsed.
-    pub async fn is_open(&self) -> bool {
-        let mut s = self.state.lock().await;
-        match s.open_until {
-            None => false,
-            Some(deadline) if tokio::time::Instant::now() < deadline => true,
-            Some(_) => {
-                // Cool-down elapsed: half-open — let one probe through.
-                s.open_until = None;
-                s.consecutive_failures = 0; // safe: same lock as record_failure
-                info!("Circuit breaker entering HALF-OPEN state.");
-                false
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Main connector structs
@@ -216,51 +133,12 @@ impl PayloadFormat {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn parse_duration(value: Option<&str>, default_value: &str) -> Duration {
-    let raw = value.unwrap_or(default_value);
-    HumanDuration::from_str(raw)
-        .map(|d| d.into())
-        .unwrap_or_else(|_| Duration::from_secs(1))
-}
-
 fn is_transient_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-}
-
-// Apply ±20% random jitter to a duration to spread retry storms
-pub fn jitter(base: Duration) -> Duration {
-    let millis = base.as_millis() as u64;
-    let jitter_range = millis / 5; // 20% of base
-    if jitter_range == 0 {
-        return base;
-    }
-    let delta = rand::rng().random_range(0..=jitter_range * 2);
-    Duration::from_millis(millis.saturating_sub(jitter_range).saturating_add(delta))
-}
-
-// True exponential backoff: base * 2^attempt, capped at max_delay
-pub fn exponential_backoff(base: Duration, attempt: u32, max_delay: Duration) -> Duration {
-    let factor = 2u64.saturating_pow(attempt);
-    let millis = base
-        .as_millis() // u128
-        .saturating_mul(factor as u128) // u128, no overflow
-        .min(max_delay.as_millis()); // always keep below max_delay.as_millis()
-    let millis_u64 = u64::try_from(millis).unwrap_or(u64::MAX);
-    Duration::from_millis(millis_u64)
-}
-
-// Parse Retry-After header value (integer seconds or HTTP date)
-fn parse_retry_after(value: &str) -> Option<Duration> {
-    if let Ok(secs) = value.trim().parse::<u64>() {
-        return Some(Duration::from_secs(secs));
-    }
-    // HTTP-date fallback would require httpdate crate; return None to use own backoff
-    None
 }
 
 /// Write an escaped measurement name into `buf`.
@@ -828,12 +706,14 @@ impl Sink for InfluxDbSink {
                 Ok(()) => {
                     // Successful write — reset circuit breaker
                     self.circuit_breaker.record_success();
-                    self.write_success.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    self.write_success
+                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
                 }
                 Err(e) => {
                     // Failed write — notify circuit breaker
                     self.circuit_breaker.record_failure().await;
-                    self.write_errors.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    self.write_errors
+                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
                     error!(
                         "InfluxDB sink ID: {} failed to write batch of {} messages: {e}",
                         self.id,
