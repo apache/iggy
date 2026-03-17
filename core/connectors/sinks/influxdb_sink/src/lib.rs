@@ -28,6 +28,7 @@ use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -148,7 +149,9 @@ pub struct InfluxDbSink {
     /// Controls the backoff cap for per-write retries only; startup retries
     /// use `config.open_retry_max_delay` and are never affected by this field.
     write_retry_max_delay: Duration,
-    state: Mutex<State>,
+    messages_processed: AtomicU64,
+    write_success: AtomicU64,
+    write_errors: AtomicU64,
     verbose: bool,
     retry_delay: Duration,
     circuit_breaker: Arc<CircuitBreaker>,
@@ -213,12 +216,6 @@ impl PayloadFormat {
     }
 }
 
-#[derive(Debug)]
-struct State {
-    messages_processed: u64,
-    write_success: u64,
-    write_errors: u64,
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -329,11 +326,9 @@ impl InfluxDbSink {
             client: None,
             write_url: None,
             write_retry_max_delay: Duration::from_secs(0), // overwritten in open()
-            state: Mutex::new(State {
-                messages_processed: 0,
-                write_success: 0,
-                write_errors: 0,
-            }),
+            messages_processed: AtomicU64::new(0),
+            write_success: AtomicU64::new(0),
+            write_errors: AtomicU64::new(0),
             verbose,
             retry_delay,
             circuit_breaker: Arc::new(CircuitBreaker::new(cb_threshold, cb_cool_down)),
@@ -833,21 +828,17 @@ impl Sink for InfluxDbSink {
                 Ok(()) => {
                     // Successful write — reset circuit breaker
                     self.circuit_breaker.record_success();
-                    let mut state = self.state.lock().await;
-                    state.write_success += batch.len() as u64;
+                    self.write_success.fetch_add(batch.len() as u64, Ordering::Relaxed);
                 }
                 Err(e) => {
                     // Failed write — notify circuit breaker
                     self.circuit_breaker.record_failure().await;
-
-                    let mut state = self.state.lock().await;
-                    state.write_errors += batch.len() as u64;
+                    self.write_errors.fetch_add(batch.len() as u64, Ordering::Relaxed);
                     error!(
                         "InfluxDB sink ID: {} failed to write batch of {} messages: {e}",
                         self.id,
                         batch.len()
                     );
-                    drop(state);
 
                     // Capture first error; continue attempting remaining
                     // batches to maximise data delivery, but record the failure.
@@ -858,24 +849,30 @@ impl Sink for InfluxDbSink {
             }
         }
 
-        let mut state = self.state.lock().await;
-        state.messages_processed += total_messages as u64;
+        let total_processed = self
+            .messages_processed
+            .fetch_add(total_messages as u64, Ordering::Relaxed)
+            + total_messages as u64;
 
         if self.verbose {
             info!(
                 "InfluxDB sink ID: {} processed {} messages. \
-                 Total processed: {}, Success: {} , write errors: {}",
+                 Total processed: {}, Success: {}, write errors: {}",
                 self.id,
                 total_messages,
-                state.messages_processed,
-                state.write_success,
-                state.write_errors
+                total_processed,
+                self.write_success.load(Ordering::Relaxed),
+                self.write_errors.load(Ordering::Relaxed),
             );
         } else {
             debug!(
                 "InfluxDB sink ID: {} processed {} messages. \
-                 Total processed: {}, write errors: {}",
-                self.id, total_messages, state.messages_processed, state.write_errors
+                 Total processed: {}, Success: {}, write errors: {}",
+                self.id,
+                total_messages,
+                total_processed,
+                self.write_success.load(Ordering::Relaxed),
+                self.write_errors.load(Ordering::Relaxed),
             );
         }
 
@@ -891,10 +888,12 @@ impl Sink for InfluxDbSink {
 
     async fn close(&mut self) -> Result<(), Error> {
         self.client = None; // release connection pool
-        let state = self.state.lock().await;
         info!(
-            "InfluxDB sink connector with ID: {} closed. Processed: {}, errors: {}",
-            self.id, state.messages_processed, state.write_errors
+            "InfluxDB sink connector with ID: {} closed. Processed: {}, Success: {}, errors: {}",
+            self.id,
+            self.messages_processed.load(Ordering::Relaxed),
+            self.write_success.load(Ordering::Relaxed),
+            self.write_errors.load(Ordering::Relaxed),
         );
         Ok(())
     }
