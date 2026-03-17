@@ -5143,6 +5143,7 @@ dependencies = [
  "reqwest-retry",
  "reqwest-tracing",
  "rustls",
+ "secrecy",
  "serde",
  "tokio",
  "tokio-rustls",
@@ -5227,6 +5228,7 @@ dependencies = [
  "iggy_common",
  "keyring",
  "passterm",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -5272,6 +5274,7 @@ dependencies = [
  "reqwest-middleware",
  "reqwest-retry",
  "reqwest-tracing",
+ "secrecy",
  "serde",
  "serde_json",
  "serde_with",
@@ -5323,6 +5326,12 @@ dependencies = [
 [[package]]
 name = "iggy_binary_protocol"
 version = "0.9.2-edge.1"
+dependencies = [
+ "bytemuck",
+ "bytes",
+ "enumset",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "iggy_common"
@@ -5356,6 +5365,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rustls",
+ "secrecy",
  "serde",
  "serde_json",
  "serde_with",
@@ -5381,6 +5391,7 @@ dependencies = [
  "iggy_common",
  "iggy_connector_sdk",
  "once_cell",
+ "secrecy",
  "serde",
  "serde_json",
  "simd-json",
@@ -5399,6 +5410,7 @@ dependencies = [
  "iggy_common",
  "iggy_connector_sdk",
  "once_cell",
+ "secrecy",
  "serde",
  "serde_json",
  "simd-json",
@@ -5431,8 +5443,10 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "humantime",
+ "iggy_common",
  "iggy_connector_sdk",
  "mongodb",
+ "secrecy",
  "serde",
  "serde_json",
  "tokio",
@@ -5450,6 +5464,7 @@ dependencies = [
  "iggy_common",
  "iggy_connector_sdk",
  "once_cell",
+ "secrecy",
  "serde",
  "serde_json",
  "simd-json",
@@ -5470,6 +5485,7 @@ dependencies = [
  "iggy_common",
  "iggy_connector_sdk",
  "once_cell",
+ "secrecy",
  "serde",
  "serde_json",
  "simd-json",
@@ -5767,6 +5783,7 @@ dependencies = [
  "reqwest-middleware",
  "reqwest-retry",
  "rmcp",
+ "secrecy",
  "serde",
  "serde_json",
  "serial_test",
@@ -6572,6 +6589,7 @@ dependencies = [
  "message_bus",
  "paste",
  "rmp-serde",
+ "secrecy",
  "serde",
  "slab",
  "tracing",
@@ -9331,6 +9349,7 @@ version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
 dependencies = [
+ "serde",
  "zeroize",
 ]
 
@@ -9656,6 +9675,7 @@ dependencies = [
  "rust-embed",
  "rustls",
  "rustls-pemfile",
+ "secrecy",
  "send_wrapper",
  "serde",
  "slab",

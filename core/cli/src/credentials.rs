@@ -23,6 +23,7 @@ use iggy::clients::client::IggyClient;
 use iggy::prelude::{Args, IggyError, PersonalAccessTokenClient, UserClient};
 use iggy_cli::commands::binary_system::session::ServerSession;
 use passterm::{Stream, isatty, prompt_password_stdin, prompt_password_tty};
+use secrecy::{ExposeSecret, SecretString};
 use std::env::var;
 
 #[cfg(feature = "login-session")]
@@ -40,13 +41,13 @@ static ENV_IGGY_PASSWORD: &str = "IGGY_PASSWORD";
 
 struct IggyUserClient {
     username: String,
-    password: String,
+    password: SecretString,
 }
 
 enum Credentials {
     UserNameAndPassword(IggyUserClient),
-    PersonalAccessToken(String),
-    SessionWithToken(String, String),
+    PersonalAccessToken(SecretString),
+    SessionWithToken(SecretString, String),
 }
 
 pub(crate) struct IggyCredentials<'a> {
@@ -73,7 +74,10 @@ impl<'a> IggyCredentials<'a> {
             let server_session = ServerSession::new(server_address.clone());
             if let Some(token) = server_session.get_token() {
                 return Ok(Self {
-                    credentials: Some(Credentials::SessionWithToken(token, server_address)),
+                    credentials: Some(Credentials::SessionWithToken(
+                        SecretString::from(token),
+                        server_address,
+                    )),
                     iggy_client: None,
                     login_required,
                 });
@@ -91,7 +95,9 @@ impl<'a> IggyCredentials<'a> {
                     let token = entry.get_password()?;
 
                     Ok(Self {
-                        credentials: Some(Credentials::PersonalAccessToken(token)),
+                        credentials: Some(Credentials::PersonalAccessToken(SecretString::from(
+                            token,
+                        ))),
                         iggy_client: None,
                         login_required,
                     })
@@ -102,19 +108,22 @@ impl<'a> IggyCredentials<'a> {
 
         if let Some(token) = &cli_options.token {
             Ok(Self {
-                credentials: Some(Credentials::PersonalAccessToken(token.clone())),
+                credentials: Some(Credentials::PersonalAccessToken(SecretString::from(
+                    token.clone(),
+                ))),
                 iggy_client: None,
                 login_required,
             })
         } else if let Some(username) = &cli_options.username {
             let password = match &cli_options.password {
-                Some(password) => password.clone(),
+                Some(password) => SecretString::from(password.clone()),
                 None => {
-                    if isatty(Stream::Stdin) {
+                    let pwd = if isatty(Stream::Stdin) {
                         prompt_password_tty(Some("Password: "))?
                     } else {
                         prompt_password_stdin(None, Stream::Stdout)?
-                    }
+                    };
+                    SecretString::from(pwd)
                 }
             };
 
@@ -130,7 +139,7 @@ impl<'a> IggyCredentials<'a> {
             Ok(Self {
                 credentials: Some(Credentials::UserNameAndPassword(IggyUserClient {
                     username: var(ENV_IGGY_USERNAME)?,
-                    password: var(ENV_IGGY_PASSWORD)?,
+                    password: SecretString::from(var(ENV_IGGY_PASSWORD)?),
                 })),
                 iggy_client: None,
                 login_required,
@@ -154,7 +163,7 @@ impl<'a> IggyCredentials<'a> {
                     let _ = client
                         .login_user(
                             &username_and_password.username,
-                            &username_and_password.password,
+                            username_and_password.password.expose_secret(),
                         )
                         .await
                         .with_context(|| {
@@ -166,14 +175,14 @@ impl<'a> IggyCredentials<'a> {
                 }
                 Credentials::PersonalAccessToken(token_value) => {
                     let _ = client
-                        .login_with_personal_access_token(token_value)
+                        .login_with_personal_access_token(token_value.expose_secret())
                         .await
-                        .with_context(|| {
-                            format!("Problem with server login with token: {token_value}")
-                        })?;
+                        .with_context(|| "Problem with server login with token".to_string())?;
                 }
                 Credentials::SessionWithToken(token_value, server_address) => {
-                    let login_result = client.login_with_personal_access_token(token_value).await;
+                    let login_result = client
+                        .login_with_personal_access_token(token_value.expose_secret())
+                        .await;
                     if let Err(err) = login_result {
                         if matches!(
                             err,
@@ -187,7 +196,7 @@ impl<'a> IggyCredentials<'a> {
                                 "Login session expired for Iggy server: {server_address}, please login again or use other authentication method"
                             );
                         } else {
-                            bail!("Problem with server login with token: {token_value}");
+                            bail!("Problem with server login with token");
                         }
                     }
                 }

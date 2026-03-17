@@ -19,6 +19,7 @@ use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_common::Credentials;
 use integration::harness::TestHarness;
+use secrecy::SecretString;
 use std::fs::{metadata, read_dir};
 use std::path::Path;
 use std::str::FromStr;
@@ -961,7 +962,7 @@ fn build_root_client(harness: &TestHarness) -> IggyClient {
         .with_server_address(addr.to_string())
         .with_auto_sign_in(AutoLogin::Enabled(Credentials::UsernamePassword(
             DEFAULT_ROOT_USERNAME.to_string(),
-            DEFAULT_ROOT_PASSWORD.to_string(),
+            SecretString::from(DEFAULT_ROOT_PASSWORD),
         )))
         .with_reconnection_max_retries(Some(10))
         .with_reconnection_interval(interval)

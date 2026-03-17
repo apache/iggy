@@ -19,56 +19,39 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.blocking.PersonalAccessTokensClient;
 import org.apache.iggy.personalaccesstoken.PersonalAccessTokenInfo;
 import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
-import org.apache.iggy.serde.BytesDeserializer;
-import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.user.IdentityInfo;
 
 import java.math.BigInteger;
 import java.util.List;
-import java.util.Optional;
 
-import static org.apache.iggy.serde.BytesSerializer.toBytes;
-import static org.apache.iggy.serde.BytesSerializer.toBytesAsU64;
+final class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient {
 
-class PersonalAccessTokensTcpClient implements PersonalAccessTokensClient {
+    private final org.apache.iggy.client.async.PersonalAccessTokensClient delegate;
 
-    private final InternalTcpClient tcpClient;
-
-    public PersonalAccessTokensTcpClient(InternalTcpClient tcpClient) {
-        this.tcpClient = tcpClient;
+    PersonalAccessTokensTcpClient(org.apache.iggy.client.async.PersonalAccessTokensClient delegate) {
+        this.delegate = delegate;
     }
 
     @Override
     public RawPersonalAccessToken createPersonalAccessToken(String name, BigInteger expiry) {
-        var payload = Unpooled.buffer();
-        payload.writeBytes(toBytes(name));
-        payload.writeBytes(toBytesAsU64(expiry));
-        return tcpClient.exchangeForEntity(
-                CommandCode.PersonalAccessToken.CREATE, payload, BytesDeserializer::readRawPersonalAccessToken);
+        return FutureUtil.resolve(delegate.createPersonalAccessToken(name, expiry));
     }
 
     @Override
     public List<PersonalAccessTokenInfo> getPersonalAccessTokens() {
-        return tcpClient.exchangeForList(
-                CommandCode.PersonalAccessToken.GET_ALL, BytesDeserializer::readPersonalAccessTokenInfo);
+        return FutureUtil.resolve(delegate.getPersonalAccessTokens());
     }
 
     @Override
     public void deletePersonalAccessToken(String name) {
-        var payload = toBytes(name);
-        tcpClient.send(CommandCode.PersonalAccessToken.DELETE, payload);
+        FutureUtil.resolve(delegate.deletePersonalAccessToken(name));
     }
 
     @Override
     public IdentityInfo loginWithPersonalAccessToken(String token) {
-        var payload = toBytes(token);
-        return tcpClient.exchangeForEntity(CommandCode.PersonalAccessToken.LOGIN, payload, buf -> {
-            var userId = buf.readUnsignedIntLE();
-            return new IdentityInfo(userId, Optional.empty());
-        });
+        return FutureUtil.resolve(delegate.loginWithPersonalAccessToken(token));
     }
 }

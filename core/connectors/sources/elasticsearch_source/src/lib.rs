@@ -26,6 +26,7 @@ use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::str::FromStr;
@@ -95,7 +96,8 @@ pub struct ElasticsearchSourceConfig {
     pub url: String,
     pub index: String,
     pub username: Option<String>,
-    pub password: Option<String>,
+    #[serde(serialize_with = "iggy_common::serde_secret::serialize_optional_secret")]
+    pub password: Option<SecretString>,
     pub query: Option<Value>,
     pub polling_interval: Option<String>,
     pub batch_size: Option<usize>,
@@ -303,7 +305,8 @@ impl ElasticsearchSource {
         let mut transport_builder = TransportBuilder::new(conn_pool);
 
         if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
-            let credentials = Credentials::Basic(username.clone(), password.clone());
+            let credentials =
+                Credentials::Basic(username.clone(), password.expose_secret().to_string());
             transport_builder = transport_builder.auth(credentials);
         }
 

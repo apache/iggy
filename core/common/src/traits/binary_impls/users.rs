@@ -32,6 +32,7 @@ use crate::{
     ClientState, DiagnosticEvent, Identifier, IdentityInfo, IggyError, Permissions, UserClient,
     UserInfo, UserInfoDetails, UserStatus,
 };
+use secrecy::SecretString;
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> UserClient for B {
@@ -66,7 +67,7 @@ impl<B: BinaryClient> UserClient for B {
         let response = self
             .send_with_response(&CreateUser {
                 username: username.to_string(),
-                password: password.to_string(),
+                password: SecretString::from(password),
                 status,
                 permissions,
             })
@@ -122,8 +123,8 @@ impl<B: BinaryClient> UserClient for B {
         fail_if_not_authenticated(self).await?;
         self.send_with_response(&ChangePassword {
             user_id: user_id.clone(),
-            current_password: current_password.to_string(),
-            new_password: new_password.to_string(),
+            current_password: SecretString::from(current_password),
+            new_password: SecretString::from(new_password),
         })
         .await?;
         Ok(())
@@ -133,7 +134,7 @@ impl<B: BinaryClient> UserClient for B {
         let response = self
             .send_with_response(&LoginUser {
                 username: username.to_string(),
-                password: password.to_string(),
+                password: SecretString::from(password),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 context: Some("".to_string()),
             })

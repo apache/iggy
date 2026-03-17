@@ -28,6 +28,7 @@ use crate::{
     ClientState, DiagnosticEvent, IdentityInfo, IggyError, PersonalAccessTokenClient,
     PersonalAccessTokenExpiry, PersonalAccessTokenInfo, RawPersonalAccessToken,
 };
+use secrecy::SecretString;
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> PersonalAccessTokenClient for B {
@@ -67,7 +68,7 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
     ) -> Result<IdentityInfo, IggyError> {
         let response = self
             .send_with_response(&LoginWithPersonalAccessToken {
-                token: token.to_string(),
+                token: SecretString::from(token),
             })
             .await?;
         self.set_state(ClientState::Authenticated).await;

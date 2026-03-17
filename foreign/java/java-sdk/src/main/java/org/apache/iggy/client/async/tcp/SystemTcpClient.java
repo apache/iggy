@@ -122,7 +122,7 @@ public class SystemTcpClient implements SystemClient {
 
         return connection.send(CommandCode.System.PING.getValue(), payload).thenApply(response -> {
             response.release();
-            return "";
+            return "pong";
         });
     }
 }

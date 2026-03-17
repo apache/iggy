@@ -55,8 +55,8 @@ class MessagesHttpClient implements MessagesClient {
                 partitionId
                         .map(id -> new BasicNameValuePair("partition_id", id.toString()))
                         .orElse(null),
-                new BasicNameValuePair("strategy_kind", strategy.kind().name()),
-                new BasicNameValuePair("strategy_value", strategy.value().toString()),
+                new BasicNameValuePair("kind", strategy.kind().name().toLowerCase()),
+                new BasicNameValuePair("value", strategy.value().toString()),
                 new BasicNameValuePair("count", count.toString()),
                 new BasicNameValuePair("auto_commit", Boolean.toString(autoCommit)));
         return httpClient.execute(request, PolledMessages.class);

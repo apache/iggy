@@ -26,6 +26,7 @@ use iggy_common::PersonalAccessTokenExpiry;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::{PersonalAccessTokenInfo, RawPersonalAccessToken};
+use secrecy::SecretString;
 
 const PATH: &str = "/personal-access-tokens";
 
@@ -74,7 +75,7 @@ impl PersonalAccessTokenClient for HttpClient {
             .post(
                 &format!("{PATH}/login"),
                 &LoginWithPersonalAccessToken {
-                    token: token.to_string(),
+                    token: SecretString::from(token),
                 },
             )
             .await?;

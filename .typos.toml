@@ -29,6 +29,8 @@ bais = "bais"
 Strat = "Strat"
 # Same as above
 strin = "strin"
+# Valid prefix in Unicode escape test strings (e.g. "caf\u{00e9}" = cafe)
+caf = "caf"
 
 # Exclude auto-generated/non-editable files from typos check
 [files]
