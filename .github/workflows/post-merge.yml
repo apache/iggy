@@ -190,10 +190,6 @@ jobs:
           sudo apt-get update --yes
           sudo apt-get install --yes gnome-keyring keyutils dbus-x11 libsecret-tools
           rm -f $HOME/.local/share/keyrings/*
-          eval $(dbus-launch --sh-syntax)
-          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> $GITHUB_ENV
-          eval $(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)
-          echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -207,6 +203,13 @@ jobs:
 
       - name: Build and test with coverage
         run: |
+          # Start D-Bus and unlock keyring in the same shell that runs tests,
+          # so daemons are guaranteed alive for the entire test execution.
+          eval $(dbus-launch --sh-syntax)
+          export DBUS_SESSION_BUS_ADDRESS
+          eval $(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)
+          echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
+
           source <(cargo llvm-cov show-env --export-prefix)
           cargo build --locked
           cargo test --locked --no-run
