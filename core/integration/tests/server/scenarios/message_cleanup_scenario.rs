@@ -563,6 +563,146 @@ pub async fn run_fair_size_based_cleanup_multipartition(client: &IggyClient, dat
         .unwrap();
 }
 
+/// Reproduces Bug 2 from #2924: the time-based cleaner deletes expired segments
+/// without checking whether consumers have read them. The size-based
+/// `delete_oldest_segments` checks `min_committed_offset` but the time-based
+/// `delete_expired_segments_for_partition` does not.
+///
+/// Scenario:
+/// 1. Send 300 messages (3 segments at 100KB each)
+/// 2. Consumer reads only 50 messages (stored offset ~49, within segment 0)
+/// 3. Wait for all segments to expire (2s expiry)
+/// 4. Verify consumer can still poll Next() and get contiguous offsets
+///
+/// On unfixed code: the cleaner deletes segments 0+1 (expired, consumer offset
+/// not checked), consumer's Next() jumps to segment 2, skipping ~250 messages.
+pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path: &Path) {
+    const TEST_STREAM: &str = "test_cleaner_barrier_stream";
+    const TEST_TOPIC: &str = "test_cleaner_barrier_topic";
+
+    let stream = client.create_stream(TEST_STREAM).await.unwrap();
+    let stream_id = stream.id;
+
+    let expiry = Duration::from_secs(2);
+    let topic = client
+        .create_topic(
+            &Identifier::named(TEST_STREAM).unwrap(),
+            TEST_TOPIC,
+            1,
+            CompressionAlgorithm::None,
+            None,
+            IggyExpiry::ExpireDuration(IggyDuration::from(expiry)),
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+    let topic_id = topic.id;
+
+    let partition_path = data_path
+        .join(format!(
+            "streams/{stream_id}/topics/{topic_id}/partitions/{PARTITION_ID}"
+        ))
+        .display()
+        .to_string();
+
+    // Send 300 messages (1KB each) -> 3 sealed segments + active
+    let payload = make_payload('B');
+    let total_messages = 300u32;
+    for i in 0..total_messages {
+        let message = IggyMessage::builder()
+            .id(i as u128)
+            .payload(payload.clone())
+            .build()
+            .unwrap();
+        client
+            .send_messages(
+                &Identifier::named(TEST_STREAM).unwrap(),
+                &Identifier::named(TEST_TOPIC).unwrap(),
+                &Partitioning::partition_id(PARTITION_ID),
+                &mut [message],
+            )
+            .await
+            .unwrap();
+    }
+
+    let initial_segments = get_segment_paths_for_partition(&partition_path);
+    assert!(
+        initial_segments.len() >= 3,
+        "Need at least 3 segments, got {}",
+        initial_segments.len()
+    );
+
+    // Consumer reads only 50 messages with auto_commit, storing offset ~49.
+    // This means the consumer has NOT read segments 1, 2, etc.
+    let consumer = Consumer::new(Identifier::numeric(42).unwrap());
+    let mut consumed_offsets = Vec::new();
+    let mut remaining = 50u32;
+    while remaining > 0 {
+        let batch_size = remaining.min(10);
+        let polled = client
+            .poll_messages(
+                &Identifier::named(TEST_STREAM).unwrap(),
+                &Identifier::named(TEST_TOPIC).unwrap(),
+                Some(PARTITION_ID),
+                &consumer,
+                &PollingStrategy::next(),
+                batch_size,
+                true, // auto_commit
+            )
+            .await
+            .unwrap();
+        for msg in &polled.messages {
+            consumed_offsets.push(msg.header.offset);
+        }
+        remaining -= polled.messages.len() as u32;
+    }
+    let last_committed = *consumed_offsets.last().unwrap();
+    assert_eq!(
+        last_committed, 49,
+        "Consumer should have read through offset 49"
+    );
+
+    // Wait for expiry + cleaner buffer
+    tokio::time::sleep(expiry + CLEANER_BUFFER + CLEANER_BUFFER).await;
+
+    // Now poll Next() - consumer should continue from offset 50 without gaps.
+    // BUG: on unfixed code, the cleaner deleted the segment containing offsets
+    // 50-99 (expired, no consumer barrier check), so Next() jumps to offset 100+.
+    let polled = client
+        .poll_messages(
+            &Identifier::named(TEST_STREAM).unwrap(),
+            &Identifier::named(TEST_TOPIC).unwrap(),
+            Some(PARTITION_ID),
+            &consumer,
+            &PollingStrategy::next(),
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !polled.messages.is_empty(),
+        "Consumer should still be able to poll messages after expiry"
+    );
+
+    let first_offset = polled.messages[0].header.offset;
+    assert_eq!(
+        first_offset,
+        last_committed + 1,
+        "BUG #2924: cleaner deleted unconsumed segments! \
+         Expected next offset {}, got {} (skipped {} messages)",
+        last_committed + 1,
+        first_offset,
+        first_offset - last_committed - 1,
+    );
+
+    client
+        .delete_stream(&Identifier::named(TEST_STREAM).unwrap())
+        .await
+        .unwrap();
+}
+
 fn get_segment_paths_for_partition(partition_path: &str) -> Vec<DirEntry> {
     read_dir(partition_path)
         .map(|read_dir| {
