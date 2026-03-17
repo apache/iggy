@@ -138,9 +138,16 @@ public final class MultiTenantConsumer {
             }
         }
 
-        waitFor(tasks);
-        executor.shutdown();
-        log.info("Finished consuming messages for all tenants");
+        try {
+            waitFor(tasks);
+        } finally {
+            executor.shutdown();
+            for (Tenant tenant : tenants) {
+                tenant.client().close();
+            }
+            rootClient.close();
+            log.info("Finished consuming messages for all tenants");
+        }
     }
 
     private static void consume(int tenantId, TenantConsumer tenantConsumer) {

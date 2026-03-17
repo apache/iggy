@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.async.ConsumerGroupsClient;
 import org.apache.iggy.client.async.ConsumerOffsetsClient;
 import org.apache.iggy.client.async.MessagesClient;
@@ -33,6 +34,8 @@ import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.user.IdentityInfo;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.time.Duration;
@@ -90,6 +93,8 @@ import java.util.concurrent.CompletableFuture;
  * @see org.apache.iggy.Iggy#tcpClientBuilder()
  */
 public class AsyncIggyTcpClient {
+
+    private static final Logger log = LoggerFactory.getLogger(AsyncIggyTcpClient.class);
 
     private final String host;
     private final int port;
@@ -173,6 +178,7 @@ public class AsyncIggyTcpClient {
         TCPConnectionPoolConfig poolConfig = poolConfigBuilder.build();
         connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate, poolConfig);
         return connection.connect().thenRun(() -> {
+            log.debug("Connected to {}:{} | {}", host, port, IggyVersion.getInstance());
             messagesClient = new MessagesTcpClient(connection);
             consumerGroupsClient = new ConsumerGroupsTcpClient(connection);
             consumerOffsetsClient = new ConsumerOffsetsTcpClient(connection);

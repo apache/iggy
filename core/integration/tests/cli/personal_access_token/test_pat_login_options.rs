@@ -23,6 +23,7 @@ use iggy::prelude::Client;
 use iggy::prelude::PersonalAccessTokenExpiry;
 use keyring::Entry;
 use predicates::str::{contains, starts_with};
+use secrecy::ExposeSecret;
 use serial_test::parallel;
 use std::fmt::{Display, Formatter, Result};
 
@@ -88,11 +89,11 @@ impl IggyCmdTestCase for TestLoginOptions {
             .await;
         assert!(token.is_ok());
         let token = token.unwrap();
-        let token_value = token.token.clone();
-        self.token_value = Some(token.token);
+        let token_value = token.token.expose_secret().to_owned();
         self.keyring
-            .set_password(token_value.as_str())
+            .set_password(&token_value)
             .expect("Failed to set token");
+        self.token_value = Some(token_value);
     }
 
     fn get_command(&self) -> IggyCmdCommand {

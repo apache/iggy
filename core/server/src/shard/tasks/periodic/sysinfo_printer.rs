@@ -69,6 +69,12 @@ async fn print_sysinfo(shard: Rc<IggyShard>) -> Result<(), IggyError> {
         / stats.total_memory.as_bytes_u64() as f64)
         * 100f64;
 
+    let threads_info = if stats.threads_count > 0 {
+        format!(", Threads: {}", stats.threads_count)
+    } else {
+        String::new()
+    };
+
     let open_files_info = if let Some(open_files) = get_open_file_descriptors() {
         format!(", OpenFDs: {}", open_files)
     } else {
@@ -76,17 +82,21 @@ async fn print_sysinfo(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     };
 
     info!(
-        "CPU: {:.2}%/{:.2}% (IggyUsage/Total), Mem: {:.2}%/{}/{}/{} (Free/IggyUsage/TotalUsed/Total), Clients: {}, Messages: {}, Read: {}, Written: {}{}",
+        "CPU: {:.2}%/{:.2}% (IggyUsage/Total), Mem: {:.2}%/{}/{}/{} (Free/IggyUsage/TotalUsed/Total), Disk: {}/{} (Free/Total), IggyUsage: {}, Clients: {}, Messages: {}, Read: {}, Written: {}{}{}",
         stats.cpu_usage,
         stats.total_cpu_usage,
         free_memory_percent,
         stats.memory_usage,
         stats.total_memory - stats.available_memory,
         stats.total_memory,
+        stats.free_disk_space,
+        stats.total_disk_space,
+        stats.messages_size_bytes,
         stats.clients_count.human_count_bare().to_string(),
         stats.messages_count.human_count_bare().to_string(),
         stats.read_bytes,
         stats.written_bytes,
+        threads_info,
         open_files_info,
     );
 

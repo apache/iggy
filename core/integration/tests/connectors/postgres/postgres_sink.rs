@@ -24,8 +24,8 @@ use crate::connectors::fixtures::{
 use crate::connectors::{TestMessage, create_test_messages};
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
-use iggy_binary_protocol::MessageClient;
 use iggy_common::Identifier;
+use iggy_common::MessageClient;
 use integration::harness::seeds;
 use integration::iggy_harness;
 

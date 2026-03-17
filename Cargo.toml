@@ -159,6 +159,7 @@ hwlocality = "1.0.0-alpha.11"
 iceberg = "0.8.0"
 iceberg-catalog-rest = "0.8.0"
 iggy = { path = "core/sdk", version = "0.9.2-edge.1" }
+iggy-cli = { path = "core/cli", version = "0.11.2-edge.1" }
 iggy_binary_protocol = { path = "core/binary_protocol", version = "0.9.2-edge.1" }
 iggy_common = { path = "core/common", version = "0.9.2-edge.1" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.2.1-edge.1" }
@@ -236,6 +237,7 @@ rust-embed = "8.11.0"
 rust-s3 = { version = "0.37.1", default-features = false, features = ["tokio-rustls-tls", "tags"] }
 rustls = { version = "0.23.37", features = ["ring"] }
 rustls-pemfile = "2.2.0"
+secrecy = { version = "0.10", features = ["serde"] }
 send_wrapper = "0.6.0"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.149"

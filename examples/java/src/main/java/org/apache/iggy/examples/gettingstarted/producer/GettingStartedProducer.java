@@ -57,15 +57,15 @@ public final class GettingStartedProducer {
     private GettingStartedProducer() {}
 
     public static void main(String[] args) {
-        var client = IggyTcpClient.builder()
+        try (var client = IggyTcpClient.builder()
                 .host("localhost")
                 .port(8090)
                 .credentials("iggy", "iggy")
-                .buildAndLogin();
-
-        createStream(client);
-        createTopic(client);
-        produceMessages(client);
+                .buildAndLogin()) {
+            createStream(client);
+            createTopic(client);
+            produceMessages(client);
+        }
     }
 
     private static void produceMessages(IggyTcpClient client) {

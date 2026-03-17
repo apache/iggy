@@ -19,13 +19,9 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.blocking.TopicsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.serde.BytesDeserializer;
-import org.apache.iggy.serde.BytesSerializer;
-import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
@@ -34,28 +30,22 @@ import java.math.BigInteger;
 import java.util.List;
 import java.util.Optional;
 
-import static org.apache.iggy.serde.BytesSerializer.toBytes;
-import static org.apache.iggy.serde.BytesSerializer.toBytesAsU64;
+final class TopicsTcpClient implements TopicsClient {
 
-class TopicsTcpClient implements TopicsClient {
+    private final org.apache.iggy.client.async.TopicsClient delegate;
 
-    private final InternalTcpClient tcpClient;
-
-    TopicsTcpClient(InternalTcpClient tcpClient) {
-        this.tcpClient = tcpClient;
+    TopicsTcpClient(org.apache.iggy.client.async.TopicsClient delegate) {
+        this.delegate = delegate;
     }
 
     @Override
     public Optional<TopicDetails> getTopic(StreamId streamId, TopicId topicId) {
-        var payload = toBytes(streamId);
-        payload.writeBytes(toBytes(topicId));
-        return tcpClient.exchangeForOptional(CommandCode.Topic.GET, payload, BytesDeserializer::readTopicDetails);
+        return FutureUtil.resolve(delegate.getTopic(streamId, topicId));
     }
 
     @Override
     public List<Topic> getTopics(StreamId streamId) {
-        var payload = toBytes(streamId);
-        return tcpClient.exchangeForList(CommandCode.Topic.GET_ALL, payload, BytesDeserializer::readTopic);
+        return FutureUtil.resolve(delegate.getTopics(streamId));
     }
 
     @Override
@@ -67,18 +57,8 @@ class TopicsTcpClient implements TopicsClient {
             BigInteger maxTopicSize,
             Optional<Short> replicationFactor,
             String name) {
-        var streamIdBytes = toBytes(streamId);
-        var payload = Unpooled.buffer(23 + streamIdBytes.readableBytes() + name.length());
-
-        payload.writeBytes(streamIdBytes);
-        payload.writeIntLE(partitionsCount.intValue());
-        payload.writeByte(compressionAlgorithm.asCode());
-        payload.writeBytes(toBytesAsU64(messageExpiry));
-        payload.writeBytes(toBytesAsU64(maxTopicSize));
-        payload.writeByte(replicationFactor.orElse((short) 0));
-        payload.writeBytes(BytesSerializer.toBytes(name));
-
-        return tcpClient.exchangeForEntity(CommandCode.Topic.CREATE, payload, BytesDeserializer::readTopicDetails);
+        return FutureUtil.resolve(delegate.createTopic(
+                streamId, partitionsCount, compressionAlgorithm, messageExpiry, maxTopicSize, replicationFactor, name));
     }
 
     @Override
@@ -90,22 +70,12 @@ class TopicsTcpClient implements TopicsClient {
             BigInteger maxTopicSize,
             Optional<Short> replicationFactor,
             String name) {
-        var payload = Unpooled.buffer();
-        payload.writeBytes(toBytes(streamId));
-        payload.writeBytes(toBytes(topicId));
-        payload.writeByte(compressionAlgorithm.asCode());
-        payload.writeBytes(toBytesAsU64(messageExpiry));
-        payload.writeBytes(toBytesAsU64(maxTopicSize));
-        payload.writeByte(replicationFactor.orElse((short) 0));
-        payload.writeBytes(BytesSerializer.toBytes(name));
-
-        tcpClient.send(CommandCode.Topic.UPDATE, payload);
+        FutureUtil.resolve(delegate.updateTopic(
+                streamId, topicId, compressionAlgorithm, messageExpiry, maxTopicSize, replicationFactor, name));
     }
 
     @Override
     public void deleteTopic(StreamId streamId, TopicId topicId) {
-        var payload = toBytes(streamId);
-        payload.writeBytes(toBytes(topicId));
-        tcpClient.send(CommandCode.Topic.DELETE, payload);
+        FutureUtil.resolve(delegate.deleteTopic(streamId, topicId));
     }
 }

@@ -25,13 +25,14 @@ use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy_binary_protocol::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use iggy_common::{
     AutoLogin, ClientState, Command, ConnectionString, ConnectionStringUtils, Credentials,
     DiagnosticEvent, IggyDuration, IggyError, IggyErrorDiscriminants, IggyTimestamp,
     TcpConnectionStringOptions, TransportProtocol,
 };
+use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+use secrecy::ExposeSecret;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -443,13 +444,14 @@ impl TcpClient {
                     self.set_state(ClientState::Authenticating).await;
                     match credentials {
                         Credentials::UsernamePassword(username, password) => {
-                            self.login_user(username, password).await?;
+                            self.login_user(username, password.expose_secret()).await?;
                             info!(
                                 "{NAME} client: {client_address} has signed in with the user credentials, username: {username}",
                             );
                         }
                         Credentials::PersonalAccessToken(token) => {
-                            self.login_with_personal_access_token(token).await?;
+                            self.login_with_personal_access_token(token.expose_secret())
+                                .await?;
                             info!(
                                 "{NAME} client: {client_address} has signed in with a personal access token.",
                             );
@@ -766,13 +768,13 @@ mod tests {
             tcp_client_config.server_address,
             format!("{server_address}:{port}")
         );
-        assert_eq!(
-            tcp_client_config.auto_login,
-            AutoLogin::Enabled(Credentials::UsernamePassword(
-                username.to_string(),
-                password.to_string()
-            ))
-        );
+        match &tcp_client_config.auto_login {
+            AutoLogin::Enabled(Credentials::UsernamePassword(u, p)) => {
+                assert_eq!(u, &username.to_string());
+                assert_eq!(p.expose_secret(), password);
+            }
+            other => panic!("expected UsernamePassword auto_login, got {other:?}"),
+        }
 
         assert!(!tcp_client_config.tls_enabled);
         assert!(tcp_client_config.tls_domain.is_empty());
@@ -815,13 +817,13 @@ mod tests {
             tcp_client_config.server_address,
             format!("{server_address}:{port}")
         );
-        assert_eq!(
-            tcp_client_config.auto_login,
-            AutoLogin::Enabled(Credentials::UsernamePassword(
-                username.to_string(),
-                password.to_string()
-            ))
-        );
+        match &tcp_client_config.auto_login {
+            AutoLogin::Enabled(Credentials::UsernamePassword(u, p)) => {
+                assert_eq!(u, &username.to_string());
+                assert_eq!(p.expose_secret(), password);
+            }
+            other => panic!("expected UsernamePassword auto_login, got {other:?}"),
+        }
 
         assert!(!tcp_client_config.tls_enabled);
         assert!(tcp_client_config.tls_domain.is_empty());
@@ -862,10 +864,12 @@ mod tests {
             tcp_client_config.server_address,
             format!("{server_address}:{port}")
         );
-        assert_eq!(
-            tcp_client_config.auto_login,
-            AutoLogin::Enabled(Credentials::PersonalAccessToken(pat.to_string()))
-        );
+        match &tcp_client_config.auto_login {
+            AutoLogin::Enabled(Credentials::PersonalAccessToken(t)) => {
+                assert_eq!(t.expose_secret(), pat);
+            }
+            other => panic!("expected PersonalAccessToken auto_login, got {other:?}"),
+        }
 
         assert!(!tcp_client_config.tls_enabled);
         assert!(tcp_client_config.tls_domain.is_empty());

@@ -24,6 +24,7 @@ import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 
 import java.io.File;
+import java.io.IOException;
 import java.time.Duration;
 
 /**
@@ -231,7 +232,16 @@ public final class IggyHttpClientBuilder {
                     "Credentials must be provided to use buildAndLogin(). Use credentials(username, password).");
         }
         IggyHttpClient client = build();
-        client.login();
-        return client;
+        try {
+            client.login();
+            return client;
+        } catch (RuntimeException e) {
+            try {
+                client.close();
+            } catch (IOException closeEx) {
+                e.addSuppressed(closeEx);
+            }
+            throw e;
+        }
     }
 }

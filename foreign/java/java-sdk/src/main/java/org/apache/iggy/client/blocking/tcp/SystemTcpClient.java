@@ -19,52 +19,43 @@
 
 package org.apache.iggy.client.blocking.tcp;
 
-import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.blocking.SystemClient;
-import org.apache.iggy.serde.BytesDeserializer;
-import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
 import org.apache.iggy.system.Stats;
 
 import java.util.List;
 
-class SystemTcpClient implements SystemClient {
+final class SystemTcpClient implements SystemClient {
 
-    private final InternalTcpClient tcpClient;
+    private final org.apache.iggy.client.async.SystemClient delegate;
 
-    SystemTcpClient(InternalTcpClient tcpClient) {
-        this.tcpClient = tcpClient;
+    SystemTcpClient(org.apache.iggy.client.async.SystemClient delegate) {
+        this.delegate = delegate;
     }
 
     @Override
     public Stats getStats() {
-        return tcpClient.exchangeForEntity(
-                CommandCode.System.GET_STATS, Unpooled.EMPTY_BUFFER, BytesDeserializer::readStats);
+        return FutureUtil.resolve(delegate.getStats());
     }
 
     @Override
     public ClientInfoDetails getMe() {
-        return tcpClient.exchangeForEntity(
-                CommandCode.System.GET_ME, Unpooled.EMPTY_BUFFER, BytesDeserializer::readClientInfoDetails);
+        return FutureUtil.resolve(delegate.getMe());
     }
 
     @Override
     public ClientInfoDetails getClient(Long clientId) {
-        var payload = Unpooled.buffer(4);
-        payload.writeIntLE(clientId.intValue());
-        return tcpClient.exchangeForEntity(
-                CommandCode.System.GET_CLIENT, payload, BytesDeserializer::readClientInfoDetails);
+        return FutureUtil.resolve(delegate.getClient(clientId));
     }
 
     @Override
     public List<ClientInfo> getClients() {
-        return tcpClient.exchangeForList(CommandCode.System.GET_ALL_CLIENTS, BytesDeserializer::readClientInfo);
+        return FutureUtil.resolve(delegate.getClients());
     }
 
     @Override
     public String ping() {
-        tcpClient.send(CommandCode.System.PING);
-        return "";
+        return FutureUtil.resolve(delegate.ping());
     }
 }
