@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.blocking.http;
 
+import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.blocking.ConsumerGroupsClient;
 import org.apache.iggy.client.blocking.ConsumerOffsetsClient;
 import org.apache.iggy.client.blocking.IggyBaseClient;
@@ -30,6 +31,8 @@ import org.apache.iggy.client.blocking.SystemClient;
 import org.apache.iggy.client.blocking.TopicsClient;
 import org.apache.iggy.client.blocking.UsersClient;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.File;
@@ -40,6 +43,8 @@ import java.util.Optional;
 public class IggyHttpClient implements IggyBaseClient, Closeable {
 
     static final int DEFAULT_HTTP_PORT = 3000;
+
+    private static final Logger log = LoggerFactory.getLogger(IggyHttpClient.class);
 
     private final InternalHttpClient internalHttpClient;
     private final SystemHttpClient systemClient;
@@ -81,6 +86,7 @@ public class IggyHttpClient implements IggyBaseClient, Closeable {
         consumerOffsetsClient = new ConsumerOffsetsHttpClient(internalHttpClient);
         messagesClient = new MessagesHttpClient(internalHttpClient);
         personalAccessTokensHttpClient = new PersonalAccessTokensHttpClient(internalHttpClient);
+        log.debug("Initialized HTTP client for {} | {}", url, IggyVersion.getInstance());
     }
 
     /**

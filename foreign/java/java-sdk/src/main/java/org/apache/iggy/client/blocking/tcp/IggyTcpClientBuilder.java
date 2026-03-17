@@ -217,8 +217,17 @@ public final class IggyTcpClientBuilder {
                     "Credentials must be provided to use buildAndLogin(). Use credentials(username, password).");
         }
         IggyTcpClient client = build();
-        client.connect();
-        client.login();
-        return client;
+        try {
+            client.connect();
+            client.login();
+            return client;
+        } catch (RuntimeException e) {
+            try {
+                client.close();
+            } catch (RuntimeException closeEx) {
+                e.addSuppressed(closeEx);
+            }
+            throw e;
+        }
     }
 }

@@ -58,7 +58,7 @@ public class BasicMessagingSteps {
                 IggyTcpClient.builder().host(hostPort.host).port(hostPort.port).build();
 
         client.connect();
-        // client.system().ping(); //TODO: uncomment when ping does not require auth
+        client.system().ping();
         context.client = client;
     }
 
