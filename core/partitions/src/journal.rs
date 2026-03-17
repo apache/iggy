@@ -29,6 +29,7 @@ use std::{
 
 // TODO: Fix that, we need to figure out how to store the `IggyMessagesBatchSet`.
 /// No-op storage backend for the in-memory partition journal.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Noop;
 
