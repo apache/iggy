@@ -74,6 +74,12 @@ pub struct Stats {
     /// Cache metrics per partition
     #[serde(with = "cache_metrics_serializer")]
     pub cache_metrics: HashMap<CacheMetricsKey, CacheMetrics>,
+    /// The number of threads in the server process.
+    pub threads_count: u32,
+    /// The available (free) disk space for the data directory.
+    pub free_disk_space: IggyByteSize,
+    /// The total disk space for the data directory.
+    pub total_disk_space: IggyByteSize,
 }
 
 /// Key for identifying a specific partition's cache metrics
@@ -181,6 +187,9 @@ impl Default for Stats {
             iggy_server_version: "unknown_iggy_version".to_string(),
             iggy_server_semver: None,
             cache_metrics: HashMap::new(),
+            threads_count: 0,
+            free_disk_space: 0.into(),
+            total_disk_space: 0.into(),
         }
     }
 }
