@@ -40,9 +40,7 @@ pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
     fn size(&self) -> u32;
 }
 
-// ---------------------------------------------------------------------------
 // GenericHeader - type-erased dispatch
-// ---------------------------------------------------------------------------
 
 /// Type-erased 256-byte header for initial message dispatch.
 #[repr(C)]
@@ -84,9 +82,7 @@ impl ConsensusHeader for GenericHeader {
     }
 }
 
-// ---------------------------------------------------------------------------
 // RequestHeader - client -> primary
-// ---------------------------------------------------------------------------
 
 /// Client -> primary request header. 256 bytes.
 #[repr(C)]
@@ -167,9 +163,7 @@ impl ConsensusHeader for RequestHeader {
     }
 }
 
-// ---------------------------------------------------------------------------
 // ReplyHeader - primary -> client
-// ---------------------------------------------------------------------------
 
 /// Primary -> client reply header. 256 bytes.
 #[repr(C)]
@@ -251,9 +245,7 @@ impl ConsensusHeader for ReplyHeader {
     }
 }
 
-// ---------------------------------------------------------------------------
 // PrepareHeader - primary -> replicas (replication)
-// ---------------------------------------------------------------------------
 
 /// Primary -> replicas: replicate this operation.
 #[repr(C)]
@@ -340,9 +332,7 @@ impl ConsensusHeader for PrepareHeader {
     }
 }
 
-// ---------------------------------------------------------------------------
 // PrepareOkHeader - replica -> primary (acknowledgement)
-// ---------------------------------------------------------------------------
 
 /// Replica -> primary: acknowledge a Prepare.
 #[repr(C)]
@@ -427,9 +417,7 @@ impl ConsensusHeader for PrepareOkHeader {
     }
 }
 
-// ---------------------------------------------------------------------------
 // CommitHeader - primary -> replicas (commit, header-only)
-// ---------------------------------------------------------------------------
 
 /// Primary -> replicas: commit up to this op. Header-only (no body).
 #[repr(C)]
@@ -484,9 +472,7 @@ impl ConsensusHeader for CommitHeader {
     }
 }
 
-// ---------------------------------------------------------------------------
 // StartViewChangeHeader - failure detection (header-only)
-// ---------------------------------------------------------------------------
 
 /// Replica suspects primary failure. Header-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
@@ -540,9 +526,7 @@ impl ConsensusHeader for StartViewChangeHeader {
     }
 }
 
-// ---------------------------------------------------------------------------
 // DoViewChangeHeader - view change vote (header-only)
-// ---------------------------------------------------------------------------
 
 /// Replica -> primary candidate: vote for view change. Header-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
@@ -614,9 +598,7 @@ impl ConsensusHeader for DoViewChangeHeader {
     }
 }
 
-// ---------------------------------------------------------------------------
 // StartViewHeader - new view announcement (header-only)
-// ---------------------------------------------------------------------------
 
 /// New primary -> all replicas: start new view. Header-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
@@ -681,9 +663,7 @@ impl ConsensusHeader for StartViewHeader {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
