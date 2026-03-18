@@ -26,9 +26,9 @@
 
 ---
 
-**Iggy** is a persistent message streaming platform written in Rust, supporting QUIC, WebSocket, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, capable of processing millions of messages per second with low latency.
+**Iggy** is a persistent message streaming platform written in Rust, supporting QUIC, WebSocket, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at ultra-low latency**.
 
-Iggy provides high throughput and predictable performance while utilizing minimal computing resources.
+Iggy provides **exceptionally high throughput and performance** while utilizing minimal computing resources.
 
 This is **not yet another extension** running on top of existing infrastructure, such as Kafka or SQL database.
 
@@ -174,7 +174,7 @@ fields = ["email", "created_at"]
 
 ## Model Context Protocol
 
-The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open protocol that standardizes how applications provide context to LLMs. The **[Iggy MCP Server](https://github.com/apache/iggy/tree/master/core/ai/mcp)** is an implementation of the MCP protocol for the message streaming infrastructure. It can be used to provide context to LLMs in real-time.
+The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open protocol that standardizes how applications provide context to LLMs. The **[Iggy MCP Server](https://github.com/apache/iggy/tree/master/core/ai/mcp)** is an implementation of the MCP protocol for the message streaming infrastructure. It can be used to provide context to LLMs in real-time, allowing for more accurate and relevant responses.
 
 ![server](assets/iggy_mcp_server.png)
 
@@ -399,7 +399,7 @@ while let Some(message) = consumer.next().await {
 
 ## Benchmarks
 
-Please check, why we believe that the **[transparent
+**Benchmarks should be the first-class citizens**. We believe that performance is crucial for any system, and we strive to provide the best possible performance for our users. Please check, why we believe that the **[transparent
 benchmarking](https://iggy.apache.org/blogs/2025/02/17/transparent-benchmarks)** is so important.
 
 We've also built the **[benchmarking platform](https://benchmarks.iggy.apache.org)** where anyone can upload the benchmarks and compare the results with others. Source code for the platform is available in the `core/bench/dashboard` directory.
@@ -464,7 +464,7 @@ These benchmarks would start the server with the default configuration, create a
 
 For example, to run the benchmark for the already started server, provide the additional argument `--server-address 0.0.0.0:8090`.
 
- Depending on the hardware, transport protocol (`quic`, `websocket`, `tcp` or `http`) and payload size (`messages-per-batch * message-size`) you might expect **over 5000 MB/s (e.g. 5M of 1 KB msg/sec) throughput for writes and reads**.
+ **Iggy is already capable of processing millions of messages per second at the microseconds range for p99+ latency** Depending on the hardware, transport protocol (`quic`, `websocket`, `tcp` or `http`) and payload size (`messages-per-batch * message-size`) you might expect **over 5000 MB/s (e.g. 5M of 1 KB msg/sec) throughput for writes and reads**.
 
 Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.apache.org) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
 
