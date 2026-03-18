@@ -34,7 +34,7 @@ func (u *UpdateUser) MarshalBinary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	length := len(userIdBytes)
+	length := len(userIdBytes) + 2
 
 	if u.Username == nil {
 		u.Username = new(string)
@@ -43,14 +43,14 @@ func (u *UpdateUser) MarshalBinary() ([]byte, error) {
 	username := *u.Username
 
 	if len(username) != 0 {
-		length += 2 + len(username)
+		length += 1 + len(username)
 	}
 
 	if u.Status != nil {
-		length += 2
+		length += 1
 	}
 
-	bytes := make([]byte, length+1)
+	bytes := make([]byte, length)
 	position := 0
 
 	copy(bytes[position:position+len(userIdBytes)], userIdBytes)
