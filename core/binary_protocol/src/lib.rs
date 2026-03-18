@@ -68,9 +68,9 @@ pub mod responses;
 
 pub use codec::{WireDecode, WireEncode};
 pub use consensus::{
-    Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, GenericHeader,
-    HEADER_SIZE, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader, RequestHeader,
-    StartViewChangeHeader, StartViewHeader, message::Message,
+    Command2, CommitHeader, ConsensusError, ConsensusHeader, ConsensusMessage, DoViewChangeHeader,
+    GenericHeader, HEADER_SIZE, MessageBag, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader,
+    RequestHeader, StartViewChangeHeader, StartViewHeader, message::Message,
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;

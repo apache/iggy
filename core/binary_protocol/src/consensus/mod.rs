@@ -51,4 +51,5 @@ pub use header::{
     CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader, HEADER_SIZE, PrepareHeader,
     PrepareOkHeader, ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
+pub use message::{ConsensusMessage, MessageBag};
 pub use operation::Operation;

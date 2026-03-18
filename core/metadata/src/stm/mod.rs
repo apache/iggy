@@ -241,13 +241,13 @@ macro_rules! collect_handlers {
 
             impl $crate::stm::Command for [<$state Inner>] {
                 type Cmd = [<$state Command>];
-                type Input = ::iggy_common::message::Message<::iggy_common::header::PrepareHeader>;
+                type Input = ::iggy_binary_protocol::Message<::iggy_binary_protocol::PrepareHeader>;
                 type Error = ::iggy_common::IggyError;
 
                 fn parse(input: Self::Input) -> Result<::iggy_common::Either<Self::Cmd, Self::Input>, Self::Error> {
                     use ::iggy_common::BytesSerializable;
                     use ::iggy_common::Either;
-                    use ::iggy_common::header::Operation;
+                    use ::iggy_binary_protocol::Operation;
                     match input.header().operation {
                         $(
                             Operation::$operation => {
