@@ -1,5 +1,7 @@
+use std::alloc::{Layout, alloc, dealloc};
 use std::mem::ManuallyDrop;
-use std::ptr::NonNull;
+use std::ops::{Deref, RangeBounds, Bound};
+use std::ptr::{self, NonNull, slice_from_raw_parts_mut};
 use std::slice;
 use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
@@ -98,6 +100,7 @@ impl Owned {
 
 impl Half {
     fn as_slice(&self) -> &[u8] {
+        self.ptr.as_ptr();
         // SAFETY: `ptr,len` always describe a live allocation owned by `ctrlb`.
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
@@ -379,3 +382,159 @@ mod tests {
         assert!(!clone2.is_unique());
     }
 }
+
+// =============================================================================
+// DESIGN: Packed Wide Pointer with Inline ControlBlock
+// =============================================================================
+//
+// GOAL: 16-byte sliceable refcounted buffer view, reusing ControlBlock for
+//       both Frozen and TwoHalves.
+//
+// -----------------------------------------------------------------------------
+// MEMORY LAYOUT
+// -----------------------------------------------------------------------------
+//
+//     ┌─────────────────────────┬────────────────────────────────────────────┐
+//     │  ControlBlock (16B)     │  data bytes                                │
+//     │  ref_count: AtomicUsize │  [0] [1] [2] [3] [4] [5] [6] [7] ...       │
+//     │  capacity:  usize       │                                            │
+//     └─────────────────────────┴────────────────────────────────────────────┘
+//     ^                         ^
+//     │                         │
+//     alloc_ptr            data_start (offset = 0)
+//
+// -----------------------------------------------------------------------------
+// PACKED VIEW STRUCT (16 bytes)
+// -----------------------------------------------------------------------------
+//
+//     struct PackedView {
+//         data: NonNull<[u8]>,   // fat pointer: (ptr, packed_len)
+//     }
+//
+//     The "length" portion of the fat pointer is PACKED:
+//
+//         packed_len = (alloc_offset << 32) | actual_len
+//
+//         ┌────────────────────────────────────────────────────────────────┐
+//         │  63 .............. 32 │ 31 ............................ 0     │
+//         │     alloc_offset      │         actual_len                    │
+//         └────────────────────────────────────────────────────────────────┘
+//
+//     - actual_len:   length of current view (max 4GB)
+//     - alloc_offset: distance from data_start to current ptr (max 4GB)
+//
+// -----------------------------------------------------------------------------
+// EXAMPLE: SLICING
+// -----------------------------------------------------------------------------
+//
+//     Initial (full buffer, len=8):
+//
+//         data.ptr ────────────────────────┐
+//                                          ▼
+//         ┌──────────────┬─────────────────────────────────────┐
+//         │ ControlBlock │ [0] [1] [2] [3] [4] [5] [6] [7]     │
+//         └──────────────┴─────────────────────────────────────┘
+//
+//         packed_len = (0 << 32) | 8   // offset=0, len=8
+//
+//
+//     After slice(3..6):
+//
+//                       data.ptr ──────────┐
+//                                          ▼
+//         ┌──────────────┬─────────────────────────────────────┐
+//         │ ControlBlock │ [0] [1] [2] [3] [4] [5] [6] [7]     │
+//         └──────────────┴─────────────────────────────────────┘
+//
+//         packed_len = (3 << 32) | 3   // offset=3, len=3
+//
+// -----------------------------------------------------------------------------
+// RECONSTRUCTING CONTROLBLOCK
+// -----------------------------------------------------------------------------
+//
+//     fn ctrl_block(&self) -> &ControlBlock {
+//         let data_ptr = self.data.as_ptr() as *const u8;
+//         let offset = self.data.len() >> 32;
+//         let data_start = data_ptr.sub(offset);
+//         let ctrl_ptr = data_start.sub(size_of::<ControlBlock>());
+//         &*ctrl_ptr.cast::<ControlBlock>()
+//     }
+//
+// -----------------------------------------------------------------------------
+// CONTROLBLOCK (shared by Frozen, TwoHalves, etc.)
+// -----------------------------------------------------------------------------
+//
+//     #[repr(C)]
+//     struct ControlBlock {
+//         ref_count: AtomicUsize,  // 8 bytes - atomic refcount
+//         capacity:  usize,        // 8 bytes - original alloc size for dealloc
+//     }
+//
+//     - ref_count: shared by all views into this allocation
+//     - capacity:  needed to reconstruct Layout for dealloc
+//
+//     NOTE: No need for `base` or `len` - both reconstructable from PackedView!
+//
+// -----------------------------------------------------------------------------
+// USAGE IN FROZEN
+// -----------------------------------------------------------------------------
+//
+//     pub struct Frozen(PackedView);  // 16 bytes
+//
+//     impl Frozen {
+//         fn slice(self, range: Range<usize>) -> Frozen {
+//             // Adjust ptr forward, update packed offset+len
+//             // No allocation, no refcount change (consumes self)
+//         }
+//
+//         fn clone(&self) -> Frozen {
+//             self.ctrl_block().ref_count.fetch_add(1, Relaxed);
+//             Frozen(PackedView { data: self.0.data })
+//         }
+//
+//         fn drop(&mut self) {
+//             if self.ctrl_block().ref_count.fetch_sub(1, Release) == 1 {
+//                 fence(Acquire);
+//                 let layout = Layout::from_size_align(
+//                     size_of::<ControlBlock>() + self.ctrl_block().capacity,
+//                     align_of::<ControlBlock>(),
+//                 );
+//                 dealloc(self.alloc_ptr(), layout);
+//             }
+//         }
+//     }
+//
+// -----------------------------------------------------------------------------
+// USAGE IN TWOHALVES
+// -----------------------------------------------------------------------------
+//
+//     pub struct TwoHalves {
+//         head: PackedView,   // 16 bytes - view into [0..split_at]
+//         tail: PackedView,   // 16 bytes - view into [split_at..len]
+//         split_at: usize,    // 8 bytes
+//     }
+//
+//     Memory:
+//
+//         head.ptr ───────────────┐
+//                                 ▼
+//         ┌──────────────┬───────────────┬───────────────────┐
+//         │ ControlBlock │ [head bytes]  │ [tail bytes]      │
+//         └──────────────┴───────────────┴───────────────────┘
+//                                         ^
+//                                         │
+//         tail.ptr ───────────────────────┘
+//
+//         head.packed_len = (0 << 32) | split_at
+//         tail.packed_len = (split_at << 32) | (total_len - split_at)
+//
+//     Both head and tail reconstruct the SAME ControlBlock.
+//
+
+// The downside of this solution is that we allow up to 4GB buffers 
+// (if somebody would send batch taht is bigger that, we'd have to reject it)
+// The upside is that we can fit more of those in a single cache-line and the size is an power of 2 number
+// smaller than 64, so there is no wasted space, I think it's a worthwhile tradeoff,
+// given that the access pattern (especially for Frozen), could invole, iterating through 
+// collection of those two times, once when searching for the right batch
+// and once when submitting the buffer to the kernel, so the cache locality is important.
