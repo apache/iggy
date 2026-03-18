@@ -30,6 +30,9 @@ namespace Apache.Iggy.Tests.BDD.StepDefinitions;
 public class LeaderRedirectionSteps
 {
     private readonly TestContext _context;
+    private readonly Dictionary<string, string> _clientInitialAddresses = [];
+    private readonly Dictionary<int, int> _clusterNodePorts = [];
+    private int _clusterNodeCount;
 
     public LeaderRedirectionSteps(TestContext context)
     {
@@ -39,21 +42,21 @@ public class LeaderRedirectionSteps
     [Given(@"I have cluster configuration enabled with (\d+) nodes")]
     public void GivenIHaveClusterConfigurationEnabledWithNodes(int nodeCount)
     {
-        _context.ClusterNodeCount = nodeCount;
+        _clusterNodeCount = nodeCount;
     }
 
     [Given(@"node (\d+) is configured on port (\d+)")]
     public void GivenNodeIsConfiguredOnPort(int nodeId, int port)
     {
-        _context.ClusterNodePorts[nodeId] = port;
+        _clusterNodePorts[nodeId] = port;
         ResolveAddressForPort(port).ShouldNotBeNullOrEmpty();
     }
 
     [Given(@"I start server (\d+) on port (\d+) as (leader|follower)")]
     public void GivenIStartServerOnPortAs(int nodeId, int port, string role)
     {
-        _context.ClusterNodeCount.ShouldBeGreaterThan(0);
-        _context.ClusterNodePorts.TryGetValue(nodeId, out var configuredPort).ShouldBeTrue();
+        _clusterNodeCount.ShouldBeGreaterThan(0);
+        _clusterNodePorts.TryGetValue(nodeId, out var configuredPort).ShouldBeTrue();
         configuredPort.ShouldBe(port);
         var address = ResolveAddressForRole(role);
         address.ShouldEndWith($":{port}");
@@ -128,7 +131,7 @@ public class LeaderRedirectionSteps
     public async Task ThenTheClientShouldAutomaticallyRedirectToLeaderOnPort(int port)
     {
         await AssertClientAddress("main", port);
-        GetClient("main").GetCurrentAddress().ShouldNotBe(GetClientConnection("main").InitialAddress);
+        GetClient("main").GetCurrentAddress().ShouldNotBe(GetClientInitialAddress("main"));
     }
 
     [Then(@"the stream should be created successfully on the leader")]
@@ -141,7 +144,7 @@ public class LeaderRedirectionSteps
     [Then(@"the client should not perform any redirection")]
     public void ThenTheClientShouldNotPerformAnyRedirection()
     {
-        GetClient("main").GetCurrentAddress().ShouldBe(GetClientConnection("main").InitialAddress);
+        GetClient("main").GetCurrentAddress().ShouldBe(GetClientInitialAddress("main"));
     }
 
     [Then(@"the connection should remain on port (\d+)")]
@@ -154,7 +157,7 @@ public class LeaderRedirectionSteps
     public void ThenTheClientShouldConnectSuccessfullyWithoutRedirection()
     {
         GetClient("main").ShouldNotBeNull();
-        GetClient("main").GetCurrentAddress().ShouldBe(GetClientConnection("main").InitialAddress);
+        GetClient("main").GetCurrentAddress().ShouldBe(GetClientInitialAddress("main"));
     }
 
     [Then(@"client ([A-Z]) should (stay connected to|redirect to) port (\d+)")]
@@ -163,7 +166,7 @@ public class LeaderRedirectionSteps
         await AssertClientAddress(clientName, port);
 
         var currentAddress = GetClient(clientName).GetCurrentAddress();
-        var initialAddress = GetClientConnection(clientName).InitialAddress;
+        var initialAddress = GetClientInitialAddress(clientName);
 
         if (expectation == "stay connected to")
         {
@@ -194,10 +197,7 @@ public class LeaderRedirectionSteps
         await client.PingAsync();
 
         _context.Clients[name] = client;
-        _context.ClientConnections[name] = new ClientConnectionMetadata
-        {
-            InitialAddress = address
-        };
+        _clientInitialAddresses[name] = address;
         if (name == "main")
         {
             _context.IggyClient = client;
@@ -209,9 +209,9 @@ public class LeaderRedirectionSteps
         return _context.Clients[name];
     }
 
-    private ClientConnectionMetadata GetClientConnection(string name)
+    private string GetClientInitialAddress(string name)
     {
-        return _context.ClientConnections[name];
+        return _clientInitialAddresses[name];
     }
 
     private async Task AssertClientAddress(string clientName, int expectedPort)
