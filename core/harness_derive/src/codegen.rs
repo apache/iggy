@@ -184,10 +184,11 @@ fn generate_single_test(
     let has_fixtures = needs_fixtures(params);
     let fixture_setup = generate_fixture_setup(params);
     let fixture_envs = generate_fixture_envs_collection(params);
+    let fixture_param_bindings = generate_fixture_param_bindings(params);
     let harness_setup = generate_harness_setup(variant, has_fixtures, attrs);
     let fixture_seed = generate_fixture_seed(params);
     let start_and_seed = generate_start_and_seed(attrs, fixture_seed);
-    let param_bindings = generate_param_bindings(params);
+    let harness_param_bindings = generate_harness_param_bindings(params);
 
     Ok(quote! {
         #(#other_attrs)*
@@ -196,9 +197,13 @@ fn generate_single_test(
         #fn_vis async fn #fn_name() {
             #fixture_setup
             #fixture_envs
+            // Fixture vars are declared before __harness so that __harness drops
+            // first (Rust LIFO), stopping the connector runtime before the
+            // external container (e.g. InfluxDB) is terminated.
+            #fixture_param_bindings
             #harness_setup
             #start_and_seed
-            #param_bindings
+            #harness_param_bindings
             #fn_body
         }
     })
@@ -216,8 +221,9 @@ fn generate_test_module(
     let has_fixtures = needs_fixtures(params);
     let fixture_setup = generate_fixture_setup(params);
     let fixture_envs = generate_fixture_envs_collection(params);
+    let fixture_param_bindings = generate_fixture_param_bindings(params);
     let fixture_seed = generate_fixture_seed(params);
-    let param_bindings = generate_param_bindings(params);
+    let harness_param_bindings = generate_harness_param_bindings(params);
 
     let mut test_fns = Vec::new();
 
@@ -233,9 +239,13 @@ fn generate_test_module(
             async fn #test_name() {
                 #fixture_setup
                 #fixture_envs
+                // Fixture vars are declared before __harness so that __harness drops
+                // first (Rust LIFO), stopping the connector runtime before the
+                // external container (e.g. InfluxDB) is terminated.
+                #fixture_param_bindings
                 #harness_setup
                 #start_and_seed
-                #param_bindings
+                #harness_param_bindings
                 #fn_body
             }
         });
@@ -284,8 +294,9 @@ fn generate_impl_functions_for_test_matrix(
     let has_fixtures = needs_fixtures(params);
     let fixture_setup = generate_fixture_setup(params);
     let fixture_envs = generate_fixture_envs_collection(params);
+    let fixture_param_bindings = generate_fixture_param_bindings(params);
     let fixture_seed = generate_fixture_seed(params);
-    let param_bindings = generate_param_bindings(params);
+    let harness_param_bindings = generate_harness_param_bindings(params);
     let start_and_seed = generate_start_and_seed(attrs, fixture_seed.clone());
 
     if variants.len() == 1 {
@@ -299,9 +310,13 @@ fn generate_impl_functions_for_test_matrix(
             #fn_vis async fn #fn_name(#(#param_names: #param_types),*) {
                 #fixture_setup
                 #fixture_envs
+                // Fixture vars are declared before __harness so that __harness drops
+                // first (Rust LIFO), stopping the connector runtime before the
+                // external container (e.g. InfluxDB) is terminated.
+                #fixture_param_bindings
                 #harness_setup
                 #start_and_seed
-                #param_bindings
+                #harness_param_bindings
                 #fn_body
             }
         });
@@ -318,9 +333,13 @@ fn generate_impl_functions_for_test_matrix(
             async fn #impl_name(#(#param_names: #param_types),*) {
                 #fixture_setup
                 #fixture_envs
+                // Fixture vars are declared before __harness so that __harness drops
+                // first (Rust LIFO), stopping the connector runtime before the
+                // external container (e.g. InfluxDB) is terminated.
+                #fixture_param_bindings
                 #harness_setup
                 #start_and_seed
-                #param_bindings
+                #harness_param_bindings
                 #fn_body
             }
         });
@@ -602,41 +621,39 @@ fn generate_fixture_seed(_params: &[DetectedParam]) -> TokenStream {
     quote!()
 }
 
-fn generate_param_bindings(params: &[DetectedParam]) -> TokenStream {
-    let mut bindings = Vec::new();
-
-    for param in params {
-        match param {
-            DetectedParam::HarnessRef { name } => {
-                bindings.push(quote! {
-                    let #name = &__harness;
-                });
-            }
-            DetectedParam::HarnessMut { name } => {
-                bindings.push(quote! {
-                    let #name = &mut __harness;
-                });
-            }
-            DetectedParam::HarnessOwned { name } => {
-                bindings.push(quote! {
-                    let #name = __harness;
-                });
-            }
-            DetectedParam::HarnessOwnedMut { name } => {
-                bindings.push(quote! {
-                    let mut #name = __harness;
-                });
-            }
-            DetectedParam::Fixture { name, .. } => {
+/// Emit bindings that move each fixture's internal variable (`__fixture_X`) into
+/// the user-facing name.  These are emitted **before** `__harness` is declared so
+/// that Rust's LIFO drop order destroys `__harness` (connector runtime) first and
+/// the fixture containers second.
+fn generate_fixture_param_bindings(params: &[DetectedParam]) -> TokenStream {
+    let bindings: Vec<_> = params
+        .iter()
+        .filter_map(|param| {
+            if let DetectedParam::Fixture { name, .. } = param {
                 let fixture_var = fixture_var_ident(name);
-                bindings.push(quote! {
-                    let #name = #fixture_var;
-                });
+                Some(quote! { let #name = #fixture_var; })
+            } else {
+                None
             }
-            DetectedParam::MatrixParam { .. } => {}
-        }
-    }
+        })
+        .collect();
+    quote!(#(#bindings)*)
+}
 
+/// Emit bindings that expose `__harness` under the user-facing name.  These are
+/// emitted **after** `__harness` is declared (and after fixture bindings), so the
+/// harness is the last thing declared and therefore the first to be dropped.
+fn generate_harness_param_bindings(params: &[DetectedParam]) -> TokenStream {
+    let bindings: Vec<_> = params
+        .iter()
+        .filter_map(|param| match param {
+            DetectedParam::HarnessRef { name } => Some(quote! { let #name = &__harness; }),
+            DetectedParam::HarnessMut { name } => Some(quote! { let #name = &mut __harness; }),
+            DetectedParam::HarnessOwned { name } => Some(quote! { let #name = __harness; }),
+            DetectedParam::HarnessOwnedMut { name } => Some(quote! { let mut #name = __harness; }),
+            DetectedParam::Fixture { .. } | DetectedParam::MatrixParam { .. } => None,
+        })
+        .collect();
     quote!(#(#bindings)*)
 }
 

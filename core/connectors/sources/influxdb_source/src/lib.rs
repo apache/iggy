@@ -169,6 +169,20 @@ fn is_transient_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+/// Compare two RFC 3339 timestamp strings chronologically.
+///
+/// InfluxDB strips trailing fractional-second zeros, producing timestamps like
+/// `"2026-03-18T12:00:00.60952Z"` (= 609520µs).  A naïve `>` string comparison
+/// treats this as *greater* than `"2026-03-18T12:00:00.609521Z"` because `'Z'`
+/// (ASCII 90) > `'1'` (ASCII 49), even though the former is chronologically
+/// *earlier*.  Always parse to `DateTime<Utc>` so the comparison is correct.
+fn is_timestamp_after(a: &str, b: &str) -> bool {
+    match (a.parse::<DateTime<Utc>>(), b.parse::<DateTime<Utc>>()) {
+        (Ok(dt_a), Ok(dt_b)) => dt_a > dt_b,
+        _ => a > b,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // InfluxDbSource implementation
 // ---------------------------------------------------------------------------
@@ -626,7 +640,7 @@ impl InfluxDbSource {
             if let Some(cursor_value) = row.get(&cursor_field)
                 && max_cursor
                     .as_ref()
-                    .is_none_or(|current| cursor_value > current)
+                    .is_none_or(|current| is_timestamp_after(cursor_value, current))
             {
                 max_cursor = Some(cursor_value.clone());
             }
