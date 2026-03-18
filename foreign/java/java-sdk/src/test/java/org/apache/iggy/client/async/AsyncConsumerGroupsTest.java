@@ -47,11 +47,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Dedicated async-specific tests for {@link ConsumerGroupsClient} via
- * {@link org.apache.iggy.client.async.tcp.ConsumerGroupsTcpClient}.
+ * Async-specific tests for {@link ConsumerGroupsClient}: error scenarios,
+ * multi-client membership, and CompletableFuture patterns (chaining, concurrency).
  *
- * <p>Covers all CRUD operations, join/leave membership, error scenarios, and
- * CompletableFuture-specific patterns (chaining, concurrency, exception propagation).
+ * <p>Basic CRUD and join/leave operations are covered by the blocking
+ * {@code ConsumerGroupsClientBaseTest} and {@code ConsumerGroupsTcpClientTest}.
  */
 public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
 
@@ -74,10 +74,7 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
         client = new AsyncIggyTcpClient(serverHost(), serverTcpPort());
 
         client.connect()
-                .thenCompose(v -> {
-                    log.info("Connected to Iggy server");
-                    return client.users().login(USERNAME, PASSWORD);
-                })
+                .thenCompose(v -> client.users().login(USERNAME, PASSWORD))
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
         client.streams().createStream(TEST_STREAM).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -91,213 +88,150 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
                         Optional.empty(),
                         TEST_TOPIC)
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-        log.info("Created stream '{}' and topic '{}'", TEST_STREAM, TEST_TOPIC);
     }
 
     @AfterAll
     public static void tearDown() throws Exception {
-        log.info("Cleaning up async consumer groups test resources");
         try {
             client.streams().deleteStream(STREAM_ID).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            log.info("Deleted test stream: {}", TEST_STREAM);
         } catch (RuntimeException e) {
             log.debug("Stream cleanup failed (may not exist): {}", e.getMessage());
         }
         if (client != null) {
             client.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            log.info("Closed async client");
         }
     }
 
-    // ===== Happy path tests =====
+    // ===== Error scenario tests =====
 
     @Test
-    void shouldCreateConsumerGroupAsync() throws Exception {
-        String groupName = "create-test-" + UUID.randomUUID();
-
-        ConsumerGroupDetails group = client.consumerGroups()
-                .createConsumerGroup(STREAM_ID, TOPIC_ID, groupName)
+    void shouldReturnEmptyForNonExistentGroup() throws Exception {
+        // when
+        Optional<ConsumerGroupDetails> result = client.consumerGroups()
+                .getConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(999_999L))
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertThat(group).isNotNull();
-        assertThat(group.id()).isNotNull();
-        assertThat(group.name()).isEqualTo(groupName);
-        assertThat(group.membersCount()).isEqualTo(0);
-        assertThat(group.members()).isEmpty();
+        // then
+        assertThat(result).isEmpty();
     }
 
     @Test
-    void shouldGetConsumerGroupByIdAsync() throws Exception {
-        String groupName = "get-by-id-test-" + UUID.randomUUID();
+    void shouldFailToDeleteNonExistentGroup() {
+        // when
+        var future = client.consumerGroups().deleteConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(999_999L));
 
+        // then
+        assertThatThrownBy(() -> future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class)
+                .cause()
+                .isInstanceOf(IggyResourceNotFoundException.class);
+    }
+
+    @Test
+    void shouldFailToJoinNonExistentGroup() {
+        // when
+        var future = client.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(999_999L));
+
+        // then
+        assertThatThrownBy(() -> future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class)
+                .cause()
+                .isInstanceOf(IggyResourceNotFoundException.class);
+    }
+
+    @Test
+    void shouldFailToLeaveGroupNotJoined() throws Exception {
+        // given
+        String groupName = "leave-not-joined-test-" + UUID.randomUUID();
         ConsumerGroupDetails created = client.consumerGroups()
                 .createConsumerGroup(STREAM_ID, TOPIC_ID, groupName)
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        Optional<ConsumerGroupDetails> retrieved = client.consumerGroups()
-                .getConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(created.id()))
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        // when
+        var future = client.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(created.id()));
 
-        assertThat(retrieved).isPresent();
-        assertThat(retrieved.get().id()).isEqualTo(created.id());
-        assertThat(retrieved.get().name()).isEqualTo(groupName);
+        // then
+        assertThatThrownBy(() -> future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class)
+                .cause()
+                .isInstanceOf(IggyResourceNotFoundException.class);
     }
 
     @Test
-    void shouldGetConsumerGroupByNameAsync() throws Exception {
-        String groupName = "get-by-name-test-" + UUID.randomUUID();
-
+    void shouldHandleMultipleClientsJoiningGroup() throws Exception {
+        // given
+        String groupName = "multi-client-test-" + UUID.randomUUID();
         ConsumerGroupDetails created = client.consumerGroups()
                 .createConsumerGroup(STREAM_ID, TOPIC_ID, groupName)
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        ConsumerId groupId = ConsumerId.of(created.id());
 
-        Optional<ConsumerGroupDetails> byId = client.consumerGroups()
-                .getConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(created.id()))
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        Optional<ConsumerGroupDetails> byName = client.consumerGroups()
-                .getConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(groupName))
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-        assertThat(byName).isPresent();
-        assertThat(byName.get().name()).isEqualTo(groupName);
-        assertThat(byId).isEqualTo(byName);
-    }
-
-    @Test
-    void shouldListAllConsumerGroupsAsync() throws Exception {
-        String streamName = "list-all-stream-" + UUID.randomUUID();
-        String topicName = "list-all-topic";
-        StreamId streamId = StreamId.of(streamName);
-        TopicId topicId = TopicId.of(topicName);
-
+        AsyncIggyTcpClient secondClient = new AsyncIggyTcpClient(serverHost(), serverTcpPort());
         try {
-            client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            client.topics()
-                    .createTopic(
-                            streamId,
-                            1L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            Optional.empty(),
-                            topicName)
+            secondClient
+                    .connect()
+                    .thenCompose(v -> secondClient.users().login(USERNAME, PASSWORD))
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
+            // when
             client.consumerGroups()
-                    .createConsumerGroup(streamId, topicId, "group-a")
+                    .joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            client.consumerGroups()
-                    .createConsumerGroup(streamId, topicId, "group-b")
-                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            client.consumerGroups()
-                    .createConsumerGroup(streamId, topicId, "group-c")
+            secondClient
+                    .consumerGroups()
+                    .joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-            List<ConsumerGroup> groups =
-                    client.consumerGroups().getConsumerGroups(streamId, topicId).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            // then
+            ConsumerGroupDetails group = client.consumerGroups()
+                    .getConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
+                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                    .get();
 
-            assertThat(groups).hasSize(3);
-            assertThat(groups).map(ConsumerGroup::name).containsExactlyInAnyOrder("group-a", "group-b", "group-c");
+            assertThat(group.membersCount()).isEqualTo(2);
+            assertThat(group.members()).hasSize(2);
+
+            // cleanup — leave before closing
+            client.consumerGroups()
+                    .leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
+                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            secondClient
+                    .consumerGroups()
+                    .leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
+                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } finally {
-            client.streams().deleteStream(streamId).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            secondClient.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         }
     }
 
     @Test
-    void shouldDeleteConsumerGroupAsync() throws Exception {
-        String groupName = "delete-test-" + UUID.randomUUID();
+    void shouldChainCreateAndGetWithThenCompose() throws Exception {
+        // given
+        String groupName = "chain-test-" + UUID.randomUUID();
 
-        ConsumerGroupDetails created = client.consumerGroups()
+        // when
+        Optional<ConsumerGroupDetails> result = client.consumerGroups()
                 .createConsumerGroup(STREAM_ID, TOPIC_ID, groupName)
+                .thenCompose(created ->
+                        client.consumerGroups().getConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(created.id())))
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        client.consumerGroups()
-                .deleteConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(created.id()))
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-        Optional<ConsumerGroupDetails> deleted = client.consumerGroups()
-                .getConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(created.id()))
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-        assertThat(deleted).isEmpty();
+        // then
+        assertThat(result).isPresent();
+        assertThat(result.get().name()).isEqualTo(groupName);
+        assertThat(result.get().membersCount()).isEqualTo(0);
     }
 
     @Test
-    void shouldDeleteConsumerGroupByNameAsync() throws Exception {
-        String groupName = "delete-by-name-test-" + UUID.randomUUID();
-
-        client.consumerGroups()
-                .createConsumerGroup(STREAM_ID, TOPIC_ID, groupName)
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-        client.consumerGroups()
-                .deleteConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(groupName))
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-        Optional<ConsumerGroupDetails> deleted = client.consumerGroups()
-                .getConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(groupName))
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-        assertThat(deleted).isEmpty();
-    }
-
-    // ===== Join/Leave tests =====
-
-    @Test
-    void shouldJoinConsumerGroupAsync() throws Exception {
-        String groupName = "join-test-" + UUID.randomUUID();
-
+    void shouldChainJoinVerifyLeaveVerify() throws Exception {
+        // given
+        String groupName = "sequential-chain-test-" + UUID.randomUUID();
         ConsumerGroupDetails created = client.consumerGroups()
                 .createConsumerGroup(STREAM_ID, TOPIC_ID, groupName)
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         ConsumerId groupId = ConsumerId.of(created.id());
 
-        client.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-        ConsumerGroupDetails group = client.consumerGroups()
-                .getConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                .get();
-
-        assertThat(group.membersCount()).isEqualTo(1);
-        assertThat(group.members()).hasSize(1);
-        assertThat(group.members().get(0).partitionsCount()).isGreaterThan(0);
-
-        client.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-    }
-
-    @Test
-    void shouldLeaveConsumerGroupAsync() throws Exception {
-        String groupName = "leave-test-" + UUID.randomUUID();
-
-        ConsumerGroupDetails created = client.consumerGroups()
-                .createConsumerGroup(STREAM_ID, TOPIC_ID, groupName)
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        ConsumerId groupId = ConsumerId.of(created.id());
-
-        client.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-        client.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-        ConsumerGroupDetails group = client.consumerGroups()
-                .getConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                .get();
-
-        assertThat(group.membersCount()).isEqualTo(0);
-        assertThat(group.members()).isEmpty();
-    }
-
-    @Test
-    void shouldJoinAndLeaveConsumerGroupSequentiallyAsync() throws Exception {
-        String groupName = "sequential-test-" + UUID.randomUUID();
-
-        ConsumerGroupDetails created = client.consumerGroups()
-                .createConsumerGroup(STREAM_ID, TOPIC_ID, groupName)
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        ConsumerId groupId = ConsumerId.of(created.id());
-
+        // when
         ConsumerGroupDetails afterLeave = client.consumerGroups()
                 .joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
                 .thenCompose(v -> client.consumerGroups().getConsumerGroup(STREAM_ID, TOPIC_ID, groupId))
@@ -313,126 +247,13 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
                 })
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
+        // then
         assertThat(afterLeave.membersCount()).isEqualTo(0);
     }
 
     @Test
-    void shouldHandleMultipleClientsJoiningGroupAsync() throws Exception {
-        String groupName = "multi-client-test-" + UUID.randomUUID();
-
-        ConsumerGroupDetails created = client.consumerGroups()
-                .createConsumerGroup(STREAM_ID, TOPIC_ID, groupName)
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        ConsumerId groupId = ConsumerId.of(created.id());
-
-        AsyncIggyTcpClient secondClient = new AsyncIggyTcpClient(serverHost(), serverTcpPort());
-        try {
-            secondClient
-                    .connect()
-                    .thenCompose(v -> secondClient.users().login(USERNAME, PASSWORD))
-                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-            client.consumerGroups()
-                    .joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
-                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            secondClient
-                    .consumerGroups()
-                    .joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
-                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-            ConsumerGroupDetails group = client.consumerGroups()
-                    .getConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
-                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                    .get();
-
-            assertThat(group.membersCount()).isEqualTo(2);
-            assertThat(group.members()).hasSize(2);
-
-            client.consumerGroups()
-                    .leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
-                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            secondClient
-                    .consumerGroups()
-                    .leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
-                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-            ConsumerGroupDetails afterLeave = client.consumerGroups()
-                    .getConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
-                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                    .get();
-
-            assertThat(afterLeave.membersCount()).isEqualTo(0);
-        } finally {
-            secondClient.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        }
-    }
-
-    // ===== Error scenario tests =====
-
-    @Test
-    void shouldReturnEmptyForNonExistentGroup() throws Exception {
-        Optional<ConsumerGroupDetails> result = client.consumerGroups()
-                .getConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(999_999L))
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-        assertThat(result).isEmpty();
-    }
-
-    @Test
-    void shouldFailToDeleteNonExistentGroup() {
-        var future = client.consumerGroups().deleteConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(999_999L));
-
-        assertThatThrownBy(() -> future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class)
-                .cause()
-                .isInstanceOf(IggyResourceNotFoundException.class);
-    }
-
-    @Test
-    void shouldFailToJoinNonExistentGroup() {
-        var future = client.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(999_999L));
-
-        assertThatThrownBy(() -> future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class)
-                .cause()
-                .isInstanceOf(IggyResourceNotFoundException.class);
-    }
-
-    @Test
-    void shouldFailToLeaveGroupNotJoined() throws Exception {
-        String groupName = "leave-not-joined-test-" + UUID.randomUUID();
-
-        ConsumerGroupDetails created = client.consumerGroups()
-                .createConsumerGroup(STREAM_ID, TOPIC_ID, groupName)
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-        var future = client.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(created.id()));
-
-        assertThatThrownBy(() -> future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS))
-                .isInstanceOf(ExecutionException.class)
-                .cause()
-                .isInstanceOf(IggyResourceNotFoundException.class);
-    }
-
-    // ===== CompletableFuture-specific tests =====
-
-    @Test
-    void shouldChainCreateAndGetWithThenCompose() throws Exception {
-        String groupName = "chain-test-" + UUID.randomUUID();
-
-        Optional<ConsumerGroupDetails> result = client.consumerGroups()
-                .createConsumerGroup(STREAM_ID, TOPIC_ID, groupName)
-                .thenCompose(created ->
-                        client.consumerGroups().getConsumerGroup(STREAM_ID, TOPIC_ID, ConsumerId.of(created.id())))
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-        assertThat(result).isPresent();
-        assertThat(result.get().name()).isEqualTo(groupName);
-        assertThat(result.get().membersCount()).isEqualTo(0);
-    }
-
-    @Test
     void shouldHandleConcurrentGroupCreations() throws Exception {
+        // given
         String streamName = "concurrent-create-stream-" + UUID.randomUUID();
         String topicName = "concurrent-create-topic";
         StreamId streamId = StreamId.of(streamName);
@@ -451,14 +272,15 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
                             topicName)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
+            // when
             List<CompletableFuture<ConsumerGroupDetails>> futures = new ArrayList<>();
             for (int i = 0; i < 5; i++) {
                 futures.add(client.consumerGroups().createConsumerGroup(streamId, topicId, "concurrent-group-" + i));
             }
-
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
                     .get(TIMEOUT_SECONDS * 2, TimeUnit.SECONDS);
 
+            // then
             for (CompletableFuture<ConsumerGroupDetails> f : futures) {
                 assertThat(f.isDone()).isTrue();
                 assertThat(f.isCompletedExceptionally()).isFalse();
@@ -466,7 +288,6 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
 
             List<ConsumerGroup> groups =
                     client.consumerGroups().getConsumerGroups(streamId, topicId).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
             assertThat(groups).hasSize(5);
             assertThat(groups)
                     .map(ConsumerGroup::name)
@@ -483,8 +304,8 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
 
     @Test
     void shouldHandleConcurrentJoinAndLeaveOperations() throws Exception {
+        // given
         String groupName = "concurrent-join-leave-test-" + UUID.randomUUID();
-
         ConsumerGroupDetails created = client.consumerGroups()
                 .createConsumerGroup(STREAM_ID, TOPIC_ID, groupName)
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -502,30 +323,32 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
                     .thenCompose(v -> thirdClient.users().login(USERNAME, PASSWORD))
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
+            // when — join concurrently
             CompletableFuture.allOf(
                             client.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId),
                             secondClient.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId),
                             thirdClient.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, groupId))
                     .get(TIMEOUT_SECONDS * 2, TimeUnit.SECONDS);
 
+            // then
             ConsumerGroupDetails afterJoin = client.consumerGroups()
                     .getConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
                     .get();
-
             assertThat(afterJoin.membersCount()).isEqualTo(3);
 
+            // when — leave concurrently
             CompletableFuture.allOf(
                             client.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId),
                             secondClient.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId),
                             thirdClient.consumerGroups().leaveConsumerGroup(STREAM_ID, TOPIC_ID, groupId))
                     .get(TIMEOUT_SECONDS * 2, TimeUnit.SECONDS);
 
+            // then
             ConsumerGroupDetails afterLeave = client.consumerGroups()
                     .getConsumerGroup(STREAM_ID, TOPIC_ID, groupId)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
                     .get();
-
             assertThat(afterLeave.membersCount()).isEqualTo(0);
         } finally {
             secondClient.close().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);

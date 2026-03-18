@@ -206,12 +206,6 @@ impl TestBinary for McpHandle {
         })?;
         self.child_handle = Some(child);
 
-        // Release port reservation immediately after spawn to avoid SO_REUSEPORT
-        // load-balancing conflicts during health checks.
-        if let Some(reserver) = self.port_reserver.take() {
-            reserver.release();
-        }
-
         Ok(())
     }
 
@@ -250,6 +244,12 @@ impl IggyServerDependent for McpHandle {
     }
 
     async fn wait_ready(&mut self) -> Result<(), TestBinaryError> {
+        // Release port reservation just before health-checking. Holds the port
+        // while the child initializes, matching the server handle pattern.
+        if let Some(reserver) = self.port_reserver.take() {
+            reserver.release();
+        }
+
         let http_address = format!(
             "http://{}:{}",
             self.server_address.ip(),

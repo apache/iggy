@@ -29,6 +29,7 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigInteger;
 import java.util.List;
+import java.util.Optional;
 
 import static java.util.Optional.empty;
 import static org.apache.iggy.TestConstants.STREAM_NAME;
@@ -66,6 +67,87 @@ public abstract class MessagesClientBaseTest extends IntegrationTest {
 
         // then
         assertThat(polledMessages.messages()).hasSize(1);
+    }
+
+    @Test
+    void shouldPollMessagesWithFirstStrategy() {
+        // given
+        setUpStreamAndTopic();
+        messagesClient.sendMessages(
+                STREAM_NAME,
+                TOPIC_NAME,
+                Partitioning.partitionId(0L),
+                List.of(Message.of("first"), Message.of("second"), Message.of("third")));
+
+        // when
+        var polledMessages = messagesClient.pollMessages(
+                STREAM_NAME, TOPIC_NAME, Optional.of(0L), Consumer.of(0L), PollingStrategy.first(), 10L, false);
+
+        // then
+        assertThat(polledMessages.messages()).hasSize(3);
+        assertThat(new String(polledMessages.messages().get(0).payload())).isEqualTo("first");
+    }
+
+    @Test
+    void shouldPollMessagesWithOffsetStrategy() {
+        // given
+        setUpStreamAndTopic();
+        messagesClient.sendMessages(
+                STREAM_NAME,
+                TOPIC_NAME,
+                Partitioning.partitionId(0L),
+                List.of(Message.of("msg-0"), Message.of("msg-1"), Message.of("msg-2")));
+
+        // when — poll starting from offset 1 (skip first message)
+        var polledMessages = messagesClient.pollMessages(
+                STREAM_NAME,
+                TOPIC_NAME,
+                Optional.of(0L),
+                Consumer.of(0L),
+                PollingStrategy.offset(BigInteger.ONE),
+                10L,
+                false);
+
+        // then
+        assertThat(polledMessages.messages()).hasSize(2);
+        assertThat(new String(polledMessages.messages().get(0).payload())).isEqualTo("msg-1");
+        assertThat(new String(polledMessages.messages().get(1).payload())).isEqualTo("msg-2");
+    }
+
+    @Test
+    void shouldPollMessagesWithLastStrategy() {
+        // given
+        setUpStreamAndTopic();
+        messagesClient.sendMessages(
+                STREAM_NAME,
+                TOPIC_NAME,
+                Partitioning.partitionId(0L),
+                List.of(Message.of("msg-0"), Message.of("msg-1"), Message.of("msg-2")));
+
+        // when
+        var polledMessages = messagesClient.pollMessages(
+                STREAM_NAME, TOPIC_NAME, Optional.of(0L), Consumer.of(0L), PollingStrategy.last(), 1L, false);
+
+        // then
+        assertThat(polledMessages.messages()).hasSize(1);
+        assertThat(new String(polledMessages.messages().get(0).payload())).isEqualTo("msg-2");
+    }
+
+    @Test
+    void shouldVerifyMessageContentRoundTrip() {
+        // given
+        setUpStreamAndTopic();
+        String content = "hello from java sdk – special chars: łóżko, 日本語, emoji 🎉";
+        messagesClient.sendMessages(
+                STREAM_NAME, TOPIC_NAME, Partitioning.partitionId(0L), List.of(Message.of(content)));
+
+        // when
+        var polledMessages = messagesClient.pollMessages(
+                STREAM_NAME, TOPIC_NAME, Optional.of(0L), Consumer.of(0L), PollingStrategy.first(), 10L, false);
+
+        // then
+        assertThat(polledMessages.messages()).hasSize(1);
+        assertThat(new String(polledMessages.messages().get(0).payload())).isEqualTo(content);
     }
 
     @Test
