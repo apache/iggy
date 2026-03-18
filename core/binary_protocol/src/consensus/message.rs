@@ -49,7 +49,7 @@ impl<H: ConsensusHeader> Message<H> {
             });
         }
 
-        // TODO: bytemuck::checked::try_from_bytes requires the buffer to be aligned
+        // TODO(hubcio): bytemuck::checked::try_from_bytes requires the buffer to be aligned
         // to the target type's alignment. Consensus headers contain u128 fields (16-byte
         // alignment), but Bytes from Vec<u8> only guarantees 8-byte alignment. The checked
         // variant returns Err on misalignment (no UB), but production code can fail on

@@ -17,7 +17,7 @@
 
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
-use crate::identifier::WireName;
+use crate::primitives::identifier::WireName;
 use bytes::{BufMut, BytesMut};
 
 /// Stream header on the wire. Used in both single-stream and multi-stream responses.
