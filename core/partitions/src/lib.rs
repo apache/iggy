@@ -54,8 +54,8 @@ pub(crate) fn decode_send_messages_batch(body: Bytes) -> Option<IggyMessagesBatc
     }
 
     let indexes_bytes = body.split_to(indexes_len);
-    let indexes = IggyIndexesMut::from_bytes(PooledBuffer::from(indexes_bytes), 0);
-    let messages = PooledBuffer::from(body);
+    let indexes = IggyIndexesMut::from_bytes(PooledBuffer::from(indexes_bytes.as_ref()), 0);
+    let messages = PooledBuffer::from(body.as_ref());
 
     Some(IggyMessagesBatchMut::from_indexes_and_messages(
         indexes, messages,

@@ -118,6 +118,11 @@ impl IggyMessagesBatchMut {
         self.messages.len() as u32
     }
 
+    /// Returns the raw message bytes as a slice.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.messages
+    }
+
     /// Prepares all messages in the batch for persistence by setting their offsets,
     /// timestamps, and other necessary fields.
     ///
@@ -254,6 +259,11 @@ impl IggyMessagesBatchMut {
     /// Checks if the batch is empty.
     pub fn is_empty(&self) -> bool {
         self.count() == 0
+    }
+
+    /// Return total size of all messages in bytes.
+    pub fn len(&self) -> usize {
+        self.messages.len()
     }
 
     /// Decomposes the batch into its constituent parts.
