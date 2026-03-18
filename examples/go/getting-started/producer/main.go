@@ -142,13 +142,14 @@ func getTcpOptions() (string, []tcp.Option) {
 	}
 
 	if *tlsEnabled {
-		tcpOptions = append(tcpOptions, tcp.WithTLS(true))
+		var tlsOpts []tcp.TLSOption
 		if *tlsCAFile != "" {
-			tcpOptions = append(tcpOptions, tcp.WithTLSCAFile(*tlsCAFile))
+			tlsOpts = append(tlsOpts, tcp.WithTLSCAFile(*tlsCAFile))
 		}
 		if *tlsDomain != "" {
-			tcpOptions = append(tcpOptions, tcp.WithTLSDomain(*tlsDomain))
+			tlsOpts = append(tlsOpts, tcp.WithTLSDomain(*tlsDomain))
 		}
+		tcpOptions = append(tcpOptions, tcp.WithTLS(tlsOpts...))
 		log.Printf("TLS enabled with CA file: %s, domain: %s", *tlsCAFile, *tlsDomain)
 	}
 
