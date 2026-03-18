@@ -18,6 +18,7 @@
 
 use iggy::prelude::*;
 use integration::iggy_harness;
+use secrecy::ExposeSecret;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -37,7 +38,7 @@ async fn should_not_persist_plaintext_password_or_pat_to_disk(harness: &mut Test
         .create_personal_access_token(PAT_NAME, IggyExpiry::NeverExpire)
         .await
         .unwrap();
-    let raw_pat_token = &raw_pat.token;
+    let raw_pat_token = raw_pat.token.expose_secret();
 
     assert!(!raw_pat_token.is_empty(), "Expected non-empty PAT value");
 
