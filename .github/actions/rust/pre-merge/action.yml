@@ -31,6 +31,7 @@ runs:
   using: "composite"
   steps:
     - name: Cleanup disk space
+      if: runner.os == 'Linux'
       run: |
         echo "Disk space before cleanup:"
         df -h
@@ -200,4 +201,10 @@ runs:
     - name: Build macOS aarch64
       if: inputs.task == 'build-macos-aarch64'
       run: cargo build --locked
+      shell: bash
+
+    # Windows builds (SDK and CLI only - iggy-server does not support Windows)
+    - name: Build Windows SDK and CLI
+      if: inputs.task == 'build-windows-sdk'
+      run: cargo build --locked -p iggy -p iggy-cli
       shell: bash

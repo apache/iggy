@@ -114,6 +114,7 @@ components:
       - "build-aarch64-gnu"
       - "build-aarch64-musl"
       - "build-macos-aarch64"
+      - "build-windows-sdk"
 
   # CLI component
   rust-cli:
