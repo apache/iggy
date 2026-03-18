@@ -22,6 +22,7 @@ use crate::Validatable;
 use crate::error::IggyError;
 use crate::{Command, LOGIN_USER_CODE};
 use bytes::{BufMut, Bytes, BytesMut};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::str::from_utf8;
@@ -30,12 +31,13 @@ use std::str::from_utf8;
 /// It has additional payload:
 /// - `username` - username, must be between 3 and 50 characters long.
 /// - `password` - password, must be between 3 and 100 characters long.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LoginUser {
     /// Username, must be between 3 and 50 characters long.
     pub username: String,
     /// Password, must be between 3 and 100 characters long.
-    pub password: String,
+    #[serde(serialize_with = "crate::utils::serde_secret::serialize_secret")]
+    pub password: SecretString,
     // Version metadata added by SDK.
     pub version: Option<String>,
     // Context metadata added by SDK.
@@ -52,7 +54,7 @@ impl Default for LoginUser {
     fn default() -> Self {
         LoginUser {
             username: "user".to_string(),
-            password: "secret".to_string(),
+            password: SecretString::from("secret"),
             version: None,
             context: None,
         }
@@ -68,9 +70,10 @@ impl Validatable<IggyError> for LoginUser {
             return Err(IggyError::InvalidUsername);
         }
 
-        if self.password.is_empty()
-            || self.password.len() > MAX_PASSWORD_LENGTH
-            || self.password.len() < MIN_PASSWORD_LENGTH
+        let password = self.password.expose_secret();
+        if password.is_empty()
+            || password.len() > MAX_PASSWORD_LENGTH
+            || password.len() < MIN_PASSWORD_LENGTH
         {
             return Err(IggyError::InvalidPassword);
         }
@@ -81,13 +84,14 @@ impl Validatable<IggyError> for LoginUser {
 
 impl BytesSerializable for LoginUser {
     fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::with_capacity(2 + self.username.len() + self.password.len());
+        let password = self.password.expose_secret();
+        let mut bytes = BytesMut::with_capacity(2 + self.username.len() + password.len());
         #[allow(clippy::cast_possible_truncation)]
         bytes.put_u8(self.username.len() as u8);
         bytes.put_slice(self.username.as_bytes());
         #[allow(clippy::cast_possible_truncation)]
-        bytes.put_u8(self.password.len() as u8);
-        bytes.put_slice(self.password.as_bytes());
+        bytes.put_u8(password.len() as u8);
+        bytes.put_slice(password.as_bytes());
         match &self.version {
             Some(version) => {
                 bytes.put_u32_le(version.len() as u32);
@@ -200,7 +204,7 @@ impl BytesSerializable for LoginUser {
 
         let command = LoginUser {
             username,
-            password,
+            password: SecretString::from(password),
             version,
             context,
         };
@@ -222,7 +226,7 @@ mod tests {
     fn should_be_serialized_as_bytes() {
         let command = LoginUser {
             username: "user".to_string(),
-            password: "secret".to_string(),
+            password: SecretString::from("secret"),
             version: Some("1.0.0".to_string()),
             context: Some("test".to_string()),
         };
@@ -253,7 +257,7 @@ mod tests {
 
         assert!(!bytes.is_empty());
         assert_eq!(username, command.username);
-        assert_eq!(password, command.password);
+        assert_eq!(password, command.password.expose_secret());
         assert_eq!(version, command.version);
         assert_eq!(context, command.context);
     }
@@ -267,7 +271,7 @@ mod tests {
     fn from_bytes_should_fail_on_truncated_input() {
         let command = LoginUser {
             username: "user".to_string(),
-            password: "secret".to_string(),
+            password: SecretString::from("secret"),
             version: Some("1.0.0".to_string()),
             context: Some("test".to_string()),
         };
@@ -275,7 +279,7 @@ mod tests {
         // Truncate at every position up to (but not including) the version field.
         // Positions within username/password must error; positions at or past the
         // version boundary are valid old-SDK payloads.
-        let version_offset = 2 + command.username.len() + command.password.len();
+        let version_offset = 2 + command.username.len() + command.password.expose_secret().len();
         for i in 0..version_offset {
             let truncated = bytes.slice(..i);
             assert!(
@@ -332,7 +336,7 @@ mod tests {
 
         let command = LoginUser::from_bytes(bytes.freeze()).unwrap();
         assert_eq!(command.username, username);
-        assert_eq!(command.password, password);
+        assert_eq!(command.password.expose_secret(), password);
         assert_eq!(command.version, None);
         assert_eq!(command.context, None);
     }
@@ -359,8 +363,37 @@ mod tests {
 
         let command = command.unwrap();
         assert_eq!(command.username, username);
-        assert_eq!(command.password, password);
+        assert_eq!(command.password.expose_secret(), password);
         assert_eq!(command.version, Some(version));
         assert_eq!(command.context, Some(context));
+    }
+
+    #[test]
+    fn should_fail_validation_for_empty_username() {
+        let command = LoginUser {
+            username: "".to_string(),
+            ..LoginUser::default()
+        };
+        assert!(command.validate().is_err());
+    }
+
+    #[test]
+    fn should_fail_validation_for_invalid_password() {
+        for password in ["", "ab"] {
+            let command = LoginUser {
+                password: SecretString::from(password),
+                ..LoginUser::default()
+            };
+            assert!(
+                command.validate().is_err(),
+                "expected validation error for password: {password:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_pass_validation_for_valid_command() {
+        let command = LoginUser::default();
+        assert!(command.validate().is_ok());
     }
 }

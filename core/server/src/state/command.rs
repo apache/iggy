@@ -47,7 +47,7 @@ use iggy_common::{
 };
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum EntryCommand {
     CreateStream(CreateStreamWithId),
     UpdateStream(UpdateStream),

@@ -22,6 +22,7 @@ use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
 use mongodb::{Client, Collection, bson, options::ClientOptions};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,7 +53,8 @@ pub struct MongoDbSink {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MongoDbSinkConfig {
-    pub connection_uri: String,
+    #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
+    pub connection_uri: SecretString,
     pub database: String,
     pub collection: String,
     pub max_pool_size: Option<u32>,
@@ -169,11 +171,11 @@ impl Sink for MongoDbSink {
 impl MongoDbSink {
     /// Build a MongoDB client using ClientOptions so max_pool_size can be applied.
     async fn connect(&mut self) -> Result<(), Error> {
-        let redacted = redact_connection_uri(&self.config.connection_uri);
+        let redacted = redact_connection_uri(self.config.connection_uri.expose_secret());
 
         info!("Connecting to MongoDB: {redacted}");
 
-        let mut options = ClientOptions::parse(&self.config.connection_uri)
+        let mut options = ClientOptions::parse(self.config.connection_uri.expose_secret())
             .await
             .map_err(|e| Error::InitError(format!("Failed to parse connection URI: {e}")))?;
 
@@ -598,7 +600,7 @@ mod tests {
 
     fn given_default_config() -> MongoDbSinkConfig {
         MongoDbSinkConfig {
-            connection_uri: "mongodb://localhost:27017".to_string(),
+            connection_uri: SecretString::from("mongodb://localhost:27017"),
             database: "test_db".to_string(),
             collection: "test_collection".to_string(),
             max_pool_size: None,

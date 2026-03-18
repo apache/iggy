@@ -24,6 +24,7 @@ use crate::Validatable;
 use crate::error::IggyError;
 use crate::{CREATE_USER_CODE, Command};
 use bytes::{BufMut, Bytes, BytesMut};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::str::from_utf8;
@@ -34,12 +35,13 @@ use std::str::from_utf8;
 /// - `password` - password of the user, must be between 3 and 100 characters long.
 /// - `status` - status of the user, can be either `active` or `inactive`.
 /// - `permissions` - optional permissions of the user. If not provided, user will have no permissions.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CreateUser {
     /// Unique name of the user, must be between 3 and 50 characters long.
     pub username: String,
     /// Password of the user, must be between 3 and 100 characters long.
-    pub password: String,
+    #[serde(serialize_with = "crate::utils::serde_secret::serialize_secret")]
+    pub password: SecretString,
     /// Status of the user, can be either `active` or `inactive`.
     pub status: UserStatus,
     /// Optional permissions of the user. If not provided, user will have no permissions.
@@ -56,7 +58,7 @@ impl Default for CreateUser {
     fn default() -> Self {
         CreateUser {
             username: "user".to_string(),
-            password: "secret".to_string(),
+            password: SecretString::from("secret"),
             status: UserStatus::Active,
             permissions: None,
         }
@@ -72,9 +74,10 @@ impl Validatable<IggyError> for CreateUser {
             return Err(IggyError::InvalidUsername);
         }
 
-        if self.password.is_empty()
-            || self.password.len() > MAX_PASSWORD_LENGTH
-            || self.password.len() < MIN_PASSWORD_LENGTH
+        let password = self.password.expose_secret();
+        if password.is_empty()
+            || password.len() > MAX_PASSWORD_LENGTH
+            || password.len() < MIN_PASSWORD_LENGTH
         {
             return Err(IggyError::InvalidPassword);
         }
@@ -85,13 +88,14 @@ impl Validatable<IggyError> for CreateUser {
 
 impl BytesSerializable for CreateUser {
     fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::with_capacity(2 + self.username.len() + self.password.len());
+        let password = self.password.expose_secret();
+        let mut bytes = BytesMut::with_capacity(2 + self.username.len() + password.len());
         #[allow(clippy::cast_possible_truncation)]
         bytes.put_u8(self.username.len() as u8);
         bytes.put_slice(self.username.as_bytes());
         #[allow(clippy::cast_possible_truncation)]
-        bytes.put_u8(self.password.len() as u8);
-        bytes.put_slice(self.password.as_bytes());
+        bytes.put_u8(password.len() as u8);
+        bytes.put_slice(password.as_bytes());
         bytes.put_u8(self.status.as_code());
         if let Some(permissions) = &self.permissions {
             bytes.put_u8(1);
@@ -161,7 +165,7 @@ impl BytesSerializable for CreateUser {
 
         let command = CreateUser {
             username,
-            password,
+            password: SecretString::from(password),
             status,
             permissions,
         };
@@ -193,7 +197,7 @@ mod tests {
     fn should_be_serialized_as_bytes() {
         let command = CreateUser {
             username: "user".to_string(),
-            password: "secret".to_string(),
+            password: SecretString::from("secret"),
             status: UserStatus::Active,
             permissions: Some(Permissions {
                 global: GlobalPermissions {
@@ -234,7 +238,7 @@ mod tests {
 
         assert!(!bytes.is_empty());
         assert_eq!(username, command.username);
-        assert_eq!(password, command.password);
+        assert_eq!(password, command.password.expose_secret());
         assert_eq!(status, command.status);
         assert_eq!(has_permissions, 1);
         assert_eq!(permissions, command.permissions.unwrap());
@@ -306,9 +310,38 @@ mod tests {
 
         let command = command.unwrap();
         assert_eq!(command.username, username);
-        assert_eq!(command.password, password);
+        assert_eq!(command.password.expose_secret(), password);
         assert_eq!(command.status, status);
         assert!(command.permissions.is_some());
         assert_eq!(command.permissions.unwrap(), permissions);
+    }
+
+    #[test]
+    fn should_fail_validation_for_empty_username() {
+        let command = CreateUser {
+            username: "".to_string(),
+            ..CreateUser::default()
+        };
+        assert!(command.validate().is_err());
+    }
+
+    #[test]
+    fn should_fail_validation_for_invalid_password() {
+        for password in ["", "ab"] {
+            let command = CreateUser {
+                password: SecretString::from(password),
+                ..CreateUser::default()
+            };
+            assert!(
+                command.validate().is_err(),
+                "expected validation error for password: {password:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_pass_validation_for_valid_command() {
+        let command = CreateUser::default();
+        assert!(command.validate().is_ok());
     }
 }

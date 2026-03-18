@@ -17,6 +17,15 @@
  * under the License.
  */
 
+/**
+ * Blocking TCP client implementation for Apache Iggy.
+ *
+ * <p>This package provides blocking (synchronous) wrappers over the
+ * {@link org.apache.iggy.client.async.tcp async TCP client} implementation.
+ * Each blocking sub-client delegates to its async counterpart and unwraps
+ * the {@link java.util.concurrent.CompletableFuture} result via
+ * {@code FutureUtil.resolve()}.
+ */
 @NonNullApi
 package org.apache.iggy.client.blocking.tcp;
 

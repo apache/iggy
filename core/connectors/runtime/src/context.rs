@@ -30,6 +30,7 @@ use crate::{
 use iggy_common::IggyTimestamp;
 use iggy_connector_sdk::api::ConnectorError;
 use iggy_connector_sdk::api::ConnectorStatus;
+use secrecy::SecretString;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -38,7 +39,7 @@ use tracing::error;
 pub struct RuntimeContext {
     pub sinks: SinkManager,
     pub sources: SourceManager,
-    pub api_key: String,
+    pub api_key: SecretString,
     pub config_provider: Arc<dyn ConnectorsConfigProvider>,
     pub metrics: Arc<Metrics>,
     pub start_time: IggyTimestamp,
@@ -67,7 +68,7 @@ pub fn init(
     RuntimeContext {
         sinks,
         sources,
-        api_key: config.http.api_key.to_owned(),
+        api_key: config.http.api_key.clone(),
         config_provider: Arc::from(config_provider),
         metrics,
         start_time: IggyTimestamp::now(),

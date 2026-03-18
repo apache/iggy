@@ -85,6 +85,7 @@ rolling-file = { workspace = true }
 rust-embed = { workspace = true, optional = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+secrecy = { workspace = true }
 send_wrapper = { workspace = true }
 serde = { workspace = true }
 slab = { workspace = true }

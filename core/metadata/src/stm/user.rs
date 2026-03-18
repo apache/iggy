@@ -32,6 +32,7 @@ use iggy_common::{
     GlobalPermissions, IggyTimestamp, Permissions, PersonalAccessToken, StreamPermissions, UserId,
     UserStatus,
 };
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use slab::Slab;
 use std::sync::Arc;
@@ -137,7 +138,7 @@ impl StateHandler for CreateUser {
         let user = User {
             id: 0,
             username: username_arc.clone(),
-            password_hash: Arc::from(self.password.as_str()),
+            password_hash: Arc::from(self.password.expose_secret()),
             status: self.status,
             created_at: iggy_common::IggyTimestamp::now(),
             permissions: self.permissions.as_ref().map(|p| Arc::new(p.clone())),
@@ -214,7 +215,7 @@ impl StateHandler for ChangePassword {
         };
 
         if let Some(user) = state.items.get_mut(user_id) {
-            user.password_hash = Arc::from(self.new_password.as_str());
+            user.password_hash = Arc::from(self.new_password.expose_secret());
         }
         Bytes::new()
     }

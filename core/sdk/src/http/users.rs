@@ -27,6 +27,7 @@ use iggy_common::login_user::LoginUser;
 use iggy_common::update_permissions::UpdatePermissions;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::{IdentityInfo, Permissions, UserInfo, UserInfoDetails, UserStatus};
+use secrecy::SecretString;
 
 const PATH: &str = "/users";
 
@@ -70,7 +71,7 @@ impl UserClient for HttpClient {
                 PATH,
                 &CreateUser {
                     username: username.to_string(),
-                    password: password.to_string(),
+                    password: SecretString::from(password),
                     status,
                     permissions,
                 },
@@ -133,8 +134,8 @@ impl UserClient for HttpClient {
             &format!("{PATH}/{}/password", &user_id.as_cow_str()),
             &ChangePassword {
                 user_id: user_id.clone(),
-                current_password: current_password.to_string(),
-                new_password: new_password.to_string(),
+                current_password: SecretString::from(current_password),
+                new_password: SecretString::from(new_password),
             },
         )
         .await?;
@@ -147,7 +148,7 @@ impl UserClient for HttpClient {
                 &format!("{PATH}/login"),
                 &LoginUser {
                     username: username.to_string(),
-                    password: password.to_string(),
+                    password: SecretString::from(password),
                     version: Some(env!("CARGO_PKG_VERSION").to_string()),
                     context: Some("".to_string()),
                 },

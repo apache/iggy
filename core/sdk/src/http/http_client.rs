@@ -29,6 +29,7 @@ use reqwest::{Response, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
+use secrecy::ExposeSecret;
 use serde::Serialize;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -249,7 +250,7 @@ impl HttpTransport for HttpClient {
         }
 
         let access_token = identity.access_token.as_ref().unwrap();
-        self.set_access_token(Some(access_token.token.clone()))
+        self.set_access_token(Some(access_token.token.expose_secret().to_owned()))
             .await;
         Ok(())
     }

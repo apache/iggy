@@ -24,6 +24,7 @@ use crate::{
     Stream, StreamDetails, Topic, TopicDetails, UserInfo, UserInfoDetails, UserStatus,
 };
 use bytes::Bytes;
+use secrecy::SecretString;
 use std::collections::HashMap;
 use std::str::from_utf8;
 
@@ -339,6 +340,41 @@ pub fn map_stats(payload: Bytes) -> Result<Stats, IggyError> {
         }
     }
 
+    let mut threads_count = 0u32;
+    if current_position + 4 <= payload.len() {
+        threads_count = u32::from_le_bytes(
+            payload[current_position..current_position + 4]
+                .try_into()
+                .map_err(|_| IggyError::InvalidNumberEncoding)?,
+        );
+        current_position += 4;
+    }
+
+    let mut free_disk_space: IggyByteSize = 0.into();
+    if current_position + 8 <= payload.len() {
+        free_disk_space = u64::from_le_bytes(
+            payload[current_position..current_position + 8]
+                .try_into()
+                .map_err(|_| IggyError::InvalidNumberEncoding)?,
+        )
+        .into();
+        current_position += 8;
+    }
+
+    let mut total_disk_space: IggyByteSize = 0.into();
+    if current_position + 8 <= payload.len() {
+        total_disk_space = u64::from_le_bytes(
+            payload[current_position..current_position + 8]
+                .try_into()
+                .map_err(|_| IggyError::InvalidNumberEncoding)?,
+        )
+        .into();
+        #[allow(unused_assignments)]
+        {
+            current_position += 8;
+        }
+    }
+
     Ok(Stats {
         process_id,
         cpu_usage,
@@ -365,6 +401,9 @@ pub fn map_stats(payload: Bytes) -> Result<Stats, IggyError> {
         iggy_server_version,
         iggy_server_semver,
         cache_metrics,
+        threads_count,
+        free_disk_space,
+        total_disk_space,
     })
 }
 
@@ -469,7 +508,9 @@ pub fn map_raw_pat(payload: Bytes) -> Result<RawPersonalAccessToken, IggyError> 
     let token = from_utf8(&payload[1..1 + token_length as usize])
         .map_err(|_| IggyError::InvalidUtf8)?
         .to_string();
-    Ok(RawPersonalAccessToken { token })
+    Ok(RawPersonalAccessToken {
+        token: SecretString::from(token),
+    })
 }
 
 pub fn map_client(payload: Bytes) -> Result<ClientInfoDetails, IggyError> {

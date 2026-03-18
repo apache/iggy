@@ -23,6 +23,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use iggy_common::Client;
 use iggy_common::SEC_IN_MICRO;
+use secrecy::ExposeSecret;
 use tracing::{Level, event};
 
 const DEFAULT_LOGIN_SESSION_TIMEOUT: u64 = SEC_IN_MICRO * 15 * 60;
@@ -94,7 +95,7 @@ impl CliCommand for LoginCmd {
                 )
             })?;
 
-        self.server_session.store(&token.token)?;
+        self.server_session.store(token.token.expose_secret())?;
 
         event!(target: PRINT_TARGET, Level::INFO,
             "Successfully logged into Iggy server {}",
