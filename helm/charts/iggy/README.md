@@ -31,20 +31,18 @@ cd iggy
 
 # Install with persistence enabled
 helm install iggy ./helm/charts/iggy \
-  --set server.persistence.enabled=true \
-  --set server.serviceMonitor.enabled=false
+  --set server.persistence.enabled=true
 
 # Install with custom root credentials
 helm install iggy ./helm/charts/iggy \
   --set server.persistence.enabled=true \
-  --set server.serviceMonitor.enabled=false \
   --set server.users.root.username=admin \
   --set server.users.root.password=secretpassword
 ```
 
-> **Note:** Set `server.serviceMonitor.enabled=false` if Prometheus Operator is not installed.
-> On clean local clusters such as `kind` or `minikube`, this setting should usually be disabled unless Prometheus Operator is already installed.
-> This only avoids the missing `ServiceMonitor` CRD error. The Iggy server still requires node/kernel support for `io_uring`.
+> **Note:** `server.serviceMonitor.enabled` defaults to `false`.
+> Enable it only if Prometheus Operator is installed and you want a `ServiceMonitor` resource.
+> The server still requires node/kernel support for `io_uring`, including on clean local clusters such as `kind` or `minikube`.
 
 ## Installation
 
@@ -53,8 +51,7 @@ helm install iggy ./helm/charts/iggy \
 ```bash
 git clone https://github.com/apache/iggy.git
 cd iggy
-helm install iggy ./helm/charts/iggy \
-  --set server.serviceMonitor.enabled=false
+helm install iggy ./helm/charts/iggy
 ```
 
 ### With Persistence
@@ -62,7 +59,6 @@ helm install iggy ./helm/charts/iggy \
 ```bash
 helm install iggy ./helm/charts/iggy \
   --set server.persistence.enabled=true \
-  --set server.serviceMonitor.enabled=false \
   --set server.persistence.size=50Gi
 ```
 
@@ -72,8 +68,9 @@ helm install iggy ./helm/charts/iggy \
 helm install iggy ./helm/charts/iggy -f custom-values.yaml
 ```
 
-If Prometheus Operator is not installed, either set `server.serviceMonitor.enabled=false` in `custom-values.yaml`
-or pass it on the command line with `--set server.serviceMonitor.enabled=false`.
+If Prometheus Operator is installed and you want monitoring, set
+`server.serviceMonitor.enabled=true` in `custom-values.yaml` or pass it on the
+command line with `--set server.serviceMonitor.enabled=true`.
 
 ## Uninstallation
 
@@ -120,7 +117,7 @@ helm uninstall iggy
 
 | Key | Type | Default | Description |
 | --- | ---- | ------- | ----------- |
-| `server.serviceMonitor.enabled` | bool | `true` | Enable ServiceMonitor for Prometheus Operator |
+| `server.serviceMonitor.enabled` | bool | `false` | Enable ServiceMonitor for Prometheus Operator |
 | `server.serviceMonitor.interval` | string | `"30s"` | Scrape interval |
 | `server.serviceMonitor.path` | string | `"/metrics"` | Metrics endpoint path |
 

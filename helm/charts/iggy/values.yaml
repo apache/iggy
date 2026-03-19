@@ -36,7 +36,7 @@ server:
 
   serviceMonitor:
     # -- Enable this if you're using [Prometheus Operator](https://github.com/coreos/prometheus-operator)
-    enabled: true
+    enabled: false
     # -- Namespace to deploy the ServiceMonitor
     namespace: ""
     # -- Fallback to the prometheus default unless specified

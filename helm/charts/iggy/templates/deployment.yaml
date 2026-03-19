@@ -168,11 +168,11 @@ spec:
               protocol: TCP
           livenessProbe:
             httpGet:
-              path: /auth/sign-in
+              path: /
               port: http
           readinessProbe:
             httpGet:
-              path: /auth/sign-in
+              path: /
               port: http
           resources:
             {{ toYaml .Values.ui.resources | nindent 12 }}
