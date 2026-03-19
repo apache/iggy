@@ -98,11 +98,11 @@ spec:
 
           livenessProbe:
             httpGet:
-              path: /
+              path: /ping
               port: http
           readinessProbe:
             httpGet:
-              path: /
+              path: /ping
               port: http
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
