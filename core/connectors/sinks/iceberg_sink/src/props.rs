@@ -30,14 +30,49 @@ pub fn init_props(config: &IcebergSinkConfig) -> Result<HashMap<String, String>,
 fn get_props_s3(config: &IcebergSinkConfig) -> Result<HashMap<String, String>, Error> {
     let mut props: HashMap<String, String> = HashMap::new();
     props.insert("s3.region".to_string(), config.store_region.clone());
-    props.insert(
-        "s3.access-key-id".to_string(),
-        config.store_access_key_id.clone(),
-    );
-    props.insert(
-        "s3.secret-access-key".to_string(),
-        config.store_secret_access_key.clone(),
-    );
+    if let Some(access_key_id) = &config.store_access_key_id {
+        props.insert("s3.access-key-id".to_string(), access_key_id.clone());
+    }
+    if let Some(secret_access_key) = &config.store_secret_access_key {
+        props.insert(
+            "s3.secret-access-key".to_string(),
+            secret_access_key.clone(),
+        );
+    }
     props.insert("s3.endpoint".to_string(), config.store_url.clone());
     Ok(props)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{IcebergSinkConfig, IcebergSinkStoreClass, IcebergSinkTypes};
+
+    #[test]
+    fn test_get_props_s3() {
+        let mut config = IcebergSinkConfig {
+            tables: vec![],
+            catalog_type: IcebergSinkTypes::REST,
+            warehouse: "warehouse".to_string(),
+            uri: "http://localhost:8181".to_string(),
+            dynamic_routing: false,
+            dynamic_route_field: "".to_string(),
+            store_url: "http://localhost:9000".to_string(),
+            store_access_key_id: None,
+            store_secret_access_key: None,
+            store_region: "us-east-1".to_string(),
+            store_class: IcebergSinkStoreClass::S3,
+        };
+
+        let props_none = get_props_s3(&config).expect("Should return S3 properties");
+        assert!(!props_none.contains_key("s3.access-key-id"));
+        assert!(!props_none.contains_key("s3.secret-access-key"));
+
+        config.store_access_key_id = Some("admin".to_string());
+        config.store_secret_access_key = Some("password".to_string());
+
+        let props_some = get_props_s3(&config).expect("Should return S3 properties");
+        assert_eq!(props_some.get("s3.access-key-id").unwrap(), "admin");
+        assert_eq!(props_some.get("s3.secret-access-key").unwrap(), "password");
+    }
 }
