@@ -1,0 +1,91 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Docker Compose override for coverage collection.
+# Activated by: ./scripts/run-bdd-tests.sh --coverage <sdk>
+#
+# Mounts a shared ../reports volume into each BDD container and overrides
+# the test command with the SDK-specific coverage-instrumented variant.
+
+services:
+  rust-bdd:
+    volumes:
+      - ../reports:/reports
+    command:
+      - sh
+      - -c
+      - >-
+        rustup component add llvm-tools-preview
+        && cargo install cargo-llvm-cov
+        && cargo llvm-cov test -p bdd --features bdd
+        --lcov --output-path /reports/rust-bdd-coverage.lcov
+
+  python-bdd:
+    volumes:
+      - ../reports:/reports
+    command:
+      - sh
+      - -c
+      - >-
+        uv run --project /workspace/bdd/python
+        pytest tests/ -v
+        --cov --cov-report=xml:/reports/python-bdd-coverage.xml
+
+  go-bdd:
+    volumes:
+      - ../reports:/reports
+    command:
+      - sh
+      - -c
+      - >-
+        go test -v ${GO_TEST_EXTRA_FLAGS}
+        -coverpkg=github.com/apache/iggy/foreign/go/...
+        -coverprofile=/reports/go-bdd-coverage.out
+        ./...
+
+  node-bdd:
+    user: "0"
+    volumes:
+      - ../reports:/reports
+    command:
+      - sh
+      - -c
+      - npx c8 --reporter=lcov --reports-dir=/reports/node-bdd-coverage npm run test:bdd
+
+  csharp-bdd:
+    volumes:
+      - ../reports:/reports
+    command:
+      - dotnet
+      - test
+      - --coverage
+      - --coverage-output-format
+      - cobertura
+      - --coverage-output
+      - csharp-bdd-coverage.cobertura.xml
+      - --results-directory
+      - /reports
+
+  java-bdd:
+    volumes:
+      - ../reports:/reports
+    command:
+      - sh
+      - -c
+      - >-
+        gradle --no-daemon test jacocoTestReport
+        && cp build/reports/jacoco/test/jacocoTestReport.xml /reports/java-bdd-coverage.xml

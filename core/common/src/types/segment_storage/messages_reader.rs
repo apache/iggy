@@ -52,8 +52,8 @@ impl MessagesReader {
             .error(|e: &std::io::Error| format!("Failed to open messages file: {file_path}. {e}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
-        // posix_fadvise() doesn't exist on MacOS
-        #[cfg(not(target_os = "macos"))]
+        // posix_fadvise() is Linux-only in the nix crate
+        #[cfg(target_os = "linux")]
         {
             let _ = nix::fcntl::posix_fadvise(
                 &file,

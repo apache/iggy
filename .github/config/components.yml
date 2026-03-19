@@ -114,6 +114,7 @@ components:
       - "build-aarch64-gnu"
       - "build-aarch64-musl"
       - "build-macos-aarch64"
+      - "build-windows-sdk"
 
   # CLI component
   rust-cli:
@@ -216,11 +217,19 @@ components:
       - "foreign/cpp/**"
     tasks: ["lint", "build", "test", "e2e"]
 
+  # Shared BDD infrastructure that affects all BDD tests
+  bdd-infrastructure:
+    paths:
+      - "scripts/run-bdd-tests.sh"
+      - "bdd/docker-compose.yml"
+      - "bdd/docker-compose.coverage.yml"
+
   # Individual BDD tests per SDK - only run when specific SDK changes
   bdd-rust:
     depends_on:
       - "rust-sdk"
       - "rust-server"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/rust/**"
@@ -230,8 +239,9 @@ components:
   bdd-python:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-python"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/python/**"
@@ -241,8 +251,9 @@ components:
   bdd-go:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-go"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/go/**"
@@ -252,8 +263,9 @@ components:
   bdd-node:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-node"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/node/**"
@@ -263,8 +275,9 @@ components:
   bdd-csharp:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-csharp"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/csharp/**"
@@ -274,8 +287,9 @@ components:
   bdd-java:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-java"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/java/**"
