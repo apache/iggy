@@ -51,7 +51,7 @@ impl<const ALIGN: usize> Owned<ALIGN> {
     /// Split `Owned` buffer into two halves
     ///
     /// # Panics
-    /// Panics if `split_at > self.len()` or if `split_at` is not a multiple of `ALIGN` bytes.
+    /// Panics if `split_at > self.len()`.
     pub fn split_at(self, split_at: usize) -> TwoHalves<ALIGN> {
         assert!(split_at <= self.inner.len());
 
@@ -89,6 +89,11 @@ pub struct TwoHalves<const ALIGN: usize> {
     inner: (Extent, Extent),
 }
 
+// SAFETY: `TwoHalves` can be sent across threads as long as the caller ensures that the head half is not shared between 
+// threads (e.g. by cloning, which creates a new head half), 
+// and that the tail half is only shared immutably (e.g. by cloning, which shares the tail half immutably).
+unsafe impl<const ALIGN: usize> Send for TwoHalves<ALIGN> {}
+
 impl<const ALIGN: usize> TwoHalves<ALIGN> {
     pub fn head(&self) -> &[u8] {
         self.inner.0.as_slice()
@@ -104,7 +109,7 @@ impl<const ALIGN: usize> TwoHalves<ALIGN> {
         self.inner.1.as_slice()
     }
 
-    pub fn split_at(&self) -> usize {
+    pub fn split_point(&self) -> usize {
         self.inner.0.len
     }
 
@@ -191,7 +196,7 @@ impl<const ALIGN: usize> Drop for TwoHalves<ALIGN> {
 impl<const ALIGN: usize> std::fmt::Debug for TwoHalves<ALIGN> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TwoHalves")
-            .field("split_at", &self.split_at())
+            .field("split_point", &self.split_point())
             .field("head_len", &self.inner.0.len)
             .field("tail_len", &self.inner.1.len)
             .field("halves_alias", &(self.inner.0.ctrlb == self.inner.1.ctrlb))
@@ -216,7 +221,6 @@ struct ControlBlock {
     base: NonNull<u8>,
     len: usize,
     capacity: usize,
-    _pad: [u8; 32],
 }
 
 impl ControlBlock {
@@ -226,7 +230,6 @@ impl ControlBlock {
             base,
             len,
             capacity,
-            _pad: [0; 32],
         });
         // SAFETY: Box::into_raw returns a valid pointer
         unsafe { NonNull::new_unchecked(Box::into_raw(ctrl)) }
@@ -237,6 +240,10 @@ struct Extent {
     ptr: NonNull<u8>,
     len: usize,
     ctrlb: NonNull<ControlBlock>,
+    // Padded to 32 bytes in order to avoid false sharing when used by `TwoHalves`
+    // If `Extent` would be smaller than 32 bytes, two `Extent`s that are adjacent in memory 
+    // could potentially share the same cache line + some extra
+    // that extra could lead to false sharing, in case of invalidation of extra
     _pad: usize,
 }
 
@@ -368,7 +375,7 @@ mod tests {
 
         assert_eq!(buffer.head(), &[1, 2]);
         assert_eq!(buffer.tail(), &[3, 4, 5]);
-        assert_eq!(buffer.split_at(), 2);
+        assert_eq!(buffer.split_point(), 2);
         assert_eq!(buffer.total_len(), 5);
 
         buffer.head_mut().copy_from_slice(&[9, 8]);
@@ -457,5 +464,129 @@ mod tests {
         assert!(!original.is_unique());
         assert!(!clone1.is_unique());
         assert!(!clone2.is_unique());
+    }
+
+    #[test]
+    fn owned_as_slice_returns_correct_data() {
+        let owned = make_owned(&[10, 20, 30, 40, 50]);
+        assert_eq!(owned.as_slice(), &[10, 20, 30, 40, 50]);
+    }
+
+    #[test]
+    fn owned_as_slice_empty_buffer() {
+        let owned = make_owned(&[]);
+        assert_eq!(owned.as_slice(), &[]);
+    }
+
+    #[test]
+    fn owned_as_mut_slice_allows_modification() {
+        let mut owned = make_owned(&[1, 2, 3, 4, 5]);
+        let slice = owned.as_mut_slice();
+        slice[0] = 100;
+        slice[4] = 200;
+
+        assert_eq!(owned.as_slice(), &[100, 2, 3, 4, 200]);
+    }
+
+    #[test]
+    fn owned_as_mut_slice_full_overwrite() {
+        let mut owned = make_owned(&[1, 2, 3]);
+        owned.as_mut_slice().copy_from_slice(&[7, 8, 9]);
+
+        assert_eq!(owned.as_slice(), &[7, 8, 9]);
+    }
+
+    #[test]
+    fn owned_modifications_persist_after_split() {
+        let mut owned = make_owned(&[1, 2, 3, 4, 5]);
+        owned.as_mut_slice()[0] = 99;
+        owned.as_mut_slice()[4] = 88;
+
+        let buffer = owned.split_at(2);
+        assert_eq!(buffer.head(), &[99, 2]);
+        assert_eq!(buffer.tail(), &[3, 4, 88]);
+    }
+
+    #[test]
+    fn two_halves_head_returns_correct_slice() {
+        let owned = make_owned(&[10, 20, 30, 40, 50]);
+        let buffer = owned.split_at(3);
+
+        assert_eq!(buffer.head(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn two_halves_tail_returns_correct_slice() {
+        let owned = make_owned(&[10, 20, 30, 40, 50]);
+        let buffer = owned.split_at(3);
+
+        assert_eq!(buffer.tail(), &[40, 50]);
+    }
+
+    #[test]
+    fn two_halves_head_mut_allows_modification() {
+        let owned = make_owned(&[1, 2, 3, 4, 5]);
+        let mut buffer = owned.split_at(3);
+
+        buffer.head_mut()[0] = 100;
+        buffer.head_mut()[2] = 200;
+
+        assert_eq!(buffer.head(), &[100, 2, 200]);
+        assert_eq!(buffer.tail(), &[4, 5]);
+    }
+
+    #[test]
+    fn two_halves_head_mut_full_overwrite() {
+        let owned = make_owned(&[1, 2, 3, 4, 5]);
+        let mut buffer = owned.split_at(3);
+
+        buffer.head_mut().copy_from_slice(&[7, 8, 9]);
+
+        assert_eq!(buffer.head(), &[7, 8, 9]);
+        assert_eq!(buffer.tail(), &[4, 5]);
+    }
+
+    #[test]
+    fn two_halves_head_empty_slice() {
+        let owned = make_owned(&[1, 2, 3]);
+        let buffer = owned.split_at(0);
+
+        assert_eq!(buffer.head(), &[]);
+        assert_eq!(buffer.tail(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn two_halves_tail_empty_slice() {
+        let owned = make_owned(&[1, 2, 3]);
+        let buffer = owned.split_at(3);
+
+        assert_eq!(buffer.head(), &[1, 2, 3]);
+        assert_eq!(buffer.tail(), &[]);
+    }
+
+    #[test]
+    fn two_halves_head_mut_does_not_affect_tail() {
+        let owned = make_owned(&[1, 2, 3, 4, 5]);
+        let mut buffer = owned.split_at(2);
+
+        let original_tail: Vec<u8> = buffer.tail().to_vec();
+        buffer.head_mut().copy_from_slice(&[99, 99]);
+
+        assert_eq!(buffer.tail(), original_tail.as_slice());
+    }
+
+    #[test]
+    fn two_halves_cloned_head_mut_independent() {
+        let owned = make_owned(&[1, 2, 3, 4, 5]);
+        let mut original = owned.split_at(2);
+        let mut cloned = original.clone();
+
+        original.head_mut().copy_from_slice(&[10, 20]);
+        cloned.head_mut().copy_from_slice(&[30, 40]);
+
+        assert_eq!(original.head(), &[10, 20]);
+        assert_eq!(cloned.head(), &[30, 40]);
+        // Tail is shared, both should see the same data
+        assert_eq!(original.tail(), cloned.tail());
     }
 }
