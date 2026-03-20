@@ -15,12 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::journal::{PartitionJournal, PartitionJournalMemStorage};
+use crate::journal::{
+    MessageLookup, PartitionJournal, PartitionJournalMemStorage, QueryableJournal,
+};
 use crate::log::SegmentedLog;
-use crate::{AppendResult, Partition, decode_send_messages_batch};
+use crate::{
+    AppendResult, Partition, PartitionOffsets, PollingArgs, PollingConsumer,
+    decode_send_messages_batch,
+};
 use iggy_common::{
-    ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, IggyMessagesBatchMut,
-    IggyTimestamp, PartitionStats,
+    ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
+    IggyByteSize, IggyError, IggyMessagesBatchMut, IggyMessagesBatchSet, IggyTimestamp,
+    PartitionStats, PollingKind,
     header::{Operation, PrepareHeader},
     message::Message,
 };
@@ -28,6 +34,7 @@ use journal::Journal as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as TokioMutex;
+use tracing::warn;
 
 // This struct aliases in terms of the code contained the `LocalPartition from `core/server/src/streaming/partitions/local_partition.rs`.
 #[derive(Debug)]
@@ -164,5 +171,146 @@ impl Partition for IggyPartition {
             last_dirty_offset,
             batch_messages_count,
         ))
+    }
+
+    async fn poll_messages(
+        &self,
+        consumer: PollingConsumer,
+        args: PollingArgs,
+    ) -> Result<IggyMessagesBatchSet, IggyError> {
+        if !self.should_increment_offset || args.count == 0 {
+            return Ok(IggyMessagesBatchSet::empty());
+        }
+
+        let committed_offset = self.offset.load(Ordering::Relaxed);
+
+        let start_offset = match args.strategy.kind {
+            PollingKind::Offset => args.strategy.value,
+            PollingKind::First => 0,
+            PollingKind::Last => committed_offset.saturating_sub(u64::from(args.count) - 1),
+            PollingKind::Timestamp => {
+                let result = self
+                    .log
+                    .journal()
+                    .inner
+                    .get(&MessageLookup::Timestamp {
+                        timestamp: args.strategy.value,
+                        count: args.count,
+                    })
+                    .await;
+                let batch_set = result.unwrap_or_else(IggyMessagesBatchSet::empty);
+                if let Some(first) = batch_set.first_offset() {
+                    if first > committed_offset {
+                        return Ok(IggyMessagesBatchSet::empty());
+                    }
+                    let max_count = u32::try_from(committed_offset - first + 1).unwrap_or(u32::MAX);
+                    return Ok(batch_set.get_by_offset(first, batch_set.count().min(max_count)));
+                }
+                return Ok(batch_set);
+            }
+            PollingKind::Next => self
+                .get_consumer_offset(consumer)
+                .map_or(0, |offset| offset + 1),
+        };
+
+        if start_offset > committed_offset {
+            return Ok(IggyMessagesBatchSet::empty());
+        }
+
+        let max_count = u32::try_from(committed_offset - start_offset + 1).unwrap_or(u32::MAX);
+        let count = args.count.min(max_count);
+
+        let result = self
+            .log
+            .journal()
+            .inner
+            .get(&MessageLookup::Offset {
+                offset: start_offset,
+                count,
+            })
+            .await;
+
+        let batch_set = result.unwrap_or_else(IggyMessagesBatchSet::empty);
+
+        if args.auto_commit && !batch_set.is_empty() {
+            let last_offset = start_offset + u64::from(batch_set.count()) - 1;
+            if let Err(err) = self.store_consumer_offset(consumer, last_offset) {
+                // warning for now.
+                warn!(
+                    consumer = ?consumer,
+                    last_offset,
+                    %err,
+                    "poll_messages: failed to store consumer offset"
+                );
+            }
+        }
+
+        Ok(batch_set)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn store_consumer_offset(
+        &self,
+        consumer: PollingConsumer,
+        offset: u64,
+    ) -> Result<(), IggyError> {
+        match consumer {
+            PollingConsumer::Consumer(id, _) => {
+                let guard = self.consumer_offsets.pin();
+                if let Some(existing) = guard.get(&id) {
+                    existing.offset.store(offset, Ordering::Relaxed);
+                } else {
+                    guard.insert(
+                        id,
+                        ConsumerOffset::new(
+                            ConsumerKind::Consumer,
+                            id as u32,
+                            offset,
+                            String::new(),
+                        ),
+                    );
+                }
+            }
+            PollingConsumer::ConsumerGroup(group_id, _) => {
+                let guard = self.consumer_group_offsets.pin();
+                let key = ConsumerGroupId(group_id);
+                if let Some(existing) = guard.get(&key) {
+                    existing.offset.store(offset, Ordering::Relaxed);
+                } else {
+                    guard.insert(
+                        key,
+                        ConsumerOffset::new(
+                            ConsumerKind::ConsumerGroup,
+                            group_id as u32,
+                            offset,
+                            String::new(),
+                        ),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn get_consumer_offset(&self, consumer: PollingConsumer) -> Option<u64> {
+        match consumer {
+            PollingConsumer::Consumer(id, _) => self
+                .consumer_offsets
+                .pin()
+                .get(&id)
+                .map(|co| co.offset.load(Ordering::Relaxed)),
+            PollingConsumer::ConsumerGroup(group_id, _) => self
+                .consumer_group_offsets
+                .pin()
+                .get(&ConsumerGroupId(group_id))
+                .map(|co| co.offset.load(Ordering::Relaxed)),
+        }
+    }
+
+    fn offsets(&self) -> PartitionOffsets {
+        PartitionOffsets::new(
+            self.offset.load(Ordering::Relaxed),
+            self.dirty_offset.load(Ordering::Relaxed),
+        )
     }
 }

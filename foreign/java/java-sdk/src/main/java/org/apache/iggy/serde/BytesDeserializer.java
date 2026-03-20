@@ -37,6 +37,8 @@ import org.apache.iggy.personalaccesstoken.PersonalAccessTokenInfo;
 import org.apache.iggy.personalaccesstoken.RawPersonalAccessToken;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
+import org.apache.iggy.system.CacheMetrics;
+import org.apache.iggy.system.CacheMetricsKey;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
 import org.apache.iggy.system.ConsumerGroupInfo;
@@ -255,6 +257,30 @@ public final class BytesDeserializer {
         var kernelVersion = response.readCharSequence(toInt(kernelVersionLength), StandardCharsets.UTF_8)
                 .toString();
 
+        var iggyServerVersionLength = response.readUnsignedIntLE();
+        var iggyServerVersion = response.readCharSequence(toInt(iggyServerVersionLength), StandardCharsets.UTF_8)
+                .toString();
+
+        var semverValue = response.readUnsignedIntLE();
+        var iggyServerSemver = semverValue != 0 ? Optional.of(semverValue) : Optional.<Long>empty();
+
+        var metricsCount = response.readUnsignedIntLE();
+        Map<CacheMetricsKey, CacheMetrics> cacheMetrics = new HashMap<>();
+        for (int i = 0; i < metricsCount; i++) {
+            var streamId = response.readUnsignedIntLE();
+            var topicId = response.readUnsignedIntLE();
+            var partitionId = response.readUnsignedIntLE();
+            var hits = readU64AsBigInteger(response);
+            var misses = readU64AsBigInteger(response);
+            var hitRatio = response.readFloatLE();
+            var key = new CacheMetricsKey(streamId, topicId, partitionId);
+            cacheMetrics.put(key, new CacheMetrics(hits, misses, hitRatio));
+        }
+
+        var threadsCount = response.readUnsignedIntLE();
+        var freeDiskSpace = readU64AsBigInteger(response);
+        var totalDiskSpace = readU64AsBigInteger(response);
+
         return new Stats(
                 processId,
                 cpuUsage,
@@ -277,7 +303,13 @@ public final class BytesDeserializer {
                 hostname,
                 osName,
                 osVersion,
-                kernelVersion);
+                kernelVersion,
+                iggyServerVersion,
+                iggyServerSemver,
+                cacheMetrics,
+                threadsCount,
+                freeDiskSpace.toString(),
+                totalDiskSpace.toString());
     }
 
     public static ClientInfoDetails readClientInfoDetails(ByteBuf response) {
