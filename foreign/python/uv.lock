@@ -4,7 +4,7 @@ requires-python = ">=3.10"
 
 [[package]]
 name = "apache-iggy"
-version = "0.7.2.dev1"
+version = "0.7.3.dev1"
 source = { editable = "." }
 
 [package.optional-dependencies]
