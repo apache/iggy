@@ -1,3 +1,20 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::slice;
@@ -44,7 +61,7 @@ impl<const ALIGN: usize> Owned<ALIGN> {
 
         // SAFETY: both pointers are constructed from the same `Inner` allocation, the split_at bounds are validated.
         // The control block captures original `Inner` metadata to allow reconstructing the original frame for merging/dropping.
-        // The ptr provenence rules are maintained by the use of `NonNull` apis.
+        // The ptr provenance rules are maintained by the use of `NonNull` apis.
         let base: NonNull<u8> = unsafe { NonNull::new_unchecked(ptr) };
         let tail = unsafe { NonNull::new_unchecked(ptr.add(split_at)) };
         let ctrlb = ControlBlock::new(base, len, capacity);
@@ -114,10 +131,10 @@ impl<const ALIGN: usize> TwoHalves<ALIGN> {
             return Err(self);
         }
 
-        // Transfer ownership to prevent double-free
+        // Transfer ownership to prevent double-free.
+        // SAFETY: We read the inner tuple out of ManuallyDrop, which won't run TwoHalves::drop.
         let this = ManuallyDrop::new(self);
-        let head = this.inner.0;
-        let tail = this.inner.1;
+        let (head, tail) = unsafe { std::ptr::read(&this.inner) };
         let split_at = head.len;
 
         // SAFETY: `tail.ctrlb` is unique at this point,
@@ -216,7 +233,6 @@ impl ControlBlock {
     }
 }
 
-#[derive(Copy)]
 struct Extent {
     ptr: NonNull<u8>,
     len: usize,
@@ -262,7 +278,12 @@ impl Clone for Extent {
                 .ref_count
                 .fetch_add(1, Ordering::Relaxed);
         }
-        *self
+        Self {
+            ptr: self.ptr,
+            len: self.len,
+            ctrlb: self.ctrlb,
+            _pad: 0,
+        }
     }
 }
 
