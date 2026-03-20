@@ -151,6 +151,88 @@ impl Snapshot for IggySnapshot {
     }
 }
 
+/// Coordinates snapshot creation, persistence, and WAL compaction.
+///
+/// Owns the data directory path and the snapshot creation function.
+pub struct SnapshotCoordinator<M> {
+    data_dir: std::path::PathBuf,
+    create_snapshot: fn(&M, u64) -> Result<IggySnapshot, SnapshotError>,
+}
+
+impl<M> SnapshotCoordinator<M> {
+    /// Number of remaining journal slots at which a checkpoint is forced.
+    // TODO: tune this margin size
+    const CHECKPOINT_MARGIN: usize = 64;
+
+    #[must_use]
+    pub fn new(
+        data_dir: std::path::PathBuf,
+        create_snapshot: fn(&M, u64) -> Result<IggySnapshot, SnapshotError>,
+    ) -> Self {
+        Self {
+            data_dir,
+            create_snapshot,
+        }
+    }
+
+    /// Create a snapshot, persist it, and drain snapshotted entries from the
+    /// journal to reclaim WAL space.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError` if snapshotting, persistence, or drain fails.
+    #[allow(clippy::future_not_send)]
+    pub async fn checkpoint<J>(
+        &self,
+        stm: &M,
+        journal: &J,
+        last_op: u64,
+    ) -> Result<(), SnapshotError>
+    where
+        J: JournalHandle,
+    {
+        let snapshot = (self.create_snapshot)(stm, last_op)?;
+        let path = self.data_dir.join(super::METADATA_DIR).join("snapshot.bin");
+        snapshot.persist(&path)?;
+
+        let _ = journal
+            .handle()
+            .drain(0, last_op)
+            .await
+            .map_err(SnapshotError::Io)?;
+
+        Ok(())
+    }
+
+    /// Force a checkpoint if the journal is running low on capacity.
+    ///
+    /// Returns `Ok(true)` if a checkpoint was taken, `Ok(false)` if not needed.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError` if the checkpoint fails.
+    #[allow(clippy::future_not_send)]
+    pub async fn checkpoint_if_needed<J>(
+        &self,
+        stm: &M,
+        journal: &J,
+        commit_op: u64,
+    ) -> Result<bool, SnapshotError>
+    where
+        J: JournalHandle,
+    {
+        let needs_checkpoint = journal
+            .handle()
+            .remaining_capacity()
+            .is_some_and(|c| c <= Self::CHECKPOINT_MARGIN);
+
+        if needs_checkpoint {
+            self.checkpoint(stm, journal, commit_op).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
 pub struct IggyMetadata<C, J, S, M> {
     /// Some on shard0, None on other shards
     pub consensus: Option<C>,
@@ -160,10 +242,8 @@ pub struct IggyMetadata<C, J, S, M> {
     pub snapshot: Option<S>,
     /// State machine - lives on all shards
     pub mux_stm: M,
-    /// Root data directory, used by checkpoint to persist snapshots.
-    pub data_dir: Option<std::path::PathBuf>,
-    /// Snapshot creator captured at construction time.
-    create_snapshot: fn(&M, u64) -> Result<IggySnapshot, SnapshotError>,
+    /// Snapshot coordinator - present when persistent checkpointing is configured.
+    pub coordinator: Option<SnapshotCoordinator<M>>,
 }
 
 impl<C, J, S, M> IggyMetadata<C, J, S, M>
@@ -182,13 +262,14 @@ where
         mux_stm: M,
         data_dir: Option<std::path::PathBuf>,
     ) -> Self {
+        let coordinator = data_dir
+            .map(|dir| SnapshotCoordinator::new(dir, |stm, seq| IggySnapshot::create(stm, seq)));
         Self {
             consensus,
             journal,
             snapshot,
             mux_stm,
-            data_dir,
-            create_snapshot: |stm, seq| IggySnapshot::create(stm, seq),
+            coordinator,
         }
     }
 }
@@ -215,9 +296,6 @@ where
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
-        // TODO: tune this margin size
-        const CHECKPOINT_MARGIN: usize = 64;
-
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
@@ -249,30 +327,26 @@ where
         // TODO handle gap in ops.
 
         // Force a checkpoint if the journal is running low on capacity.
-        if journal
-            .handle()
-            .remaining_capacity()
-            .is_some_and(|c| c <= CHECKPOINT_MARGIN)
-        {
-            if let Some(data_dir) = &self.data_dir {
-                let snap_op = consensus.commit();
-                if let Err(e) = self.checkpoint(data_dir, snap_op).await {
+        if let Some(coordinator) = &self.coordinator {
+            let snap_op = consensus.commit();
+            match coordinator
+                .checkpoint_if_needed(&self.mux_stm, journal, snap_op)
+                .await
+            {
+                Ok(true) => {
+                    debug!(
+                        replica = consensus.replica(),
+                        "on_replicate: forced checkpoint at op={snap_op}"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
                     error!(
                         replica = consensus.replica(),
                         "on_replicate: forced checkpoint failed: {e}"
                     );
                     return;
                 }
-                debug!(
-                    replica = consensus.replica(),
-                    "on_replicate: forced checkpoint at op={snap_op}"
-                );
-            } else {
-                error!(
-                    replica = consensus.replica(),
-                    "on_replicate: journal nearly full but no data_dir configured for checkpoint"
-                );
-                return;
             }
         }
 
@@ -450,37 +524,5 @@ where
         let journal = self.journal.as_ref().unwrap();
         let persisted = journal.handle().header(header.op as usize).is_some();
         send_prepare_ok_common(consensus, header, Some(persisted)).await;
-    }
-}
-
-#[allow(unused)]
-impl<C, J, S, M> IggyMetadata<C, J, S, M> {
-    /// Create a snapshot from the current state machine and persist it to disk.
-    ///
-    /// After the snapshot is durably persisted, advances the journal's
-    /// snapshot watermark so that entries at or below `last_op` may be
-    /// evicted from the ring buffer on future appends.
-    ///
-    /// # Errors
-    /// Returns `SnapshotError` if snapshotting, persistence, or compaction fails.
-    #[allow(clippy::future_not_send)]
-    pub async fn checkpoint(&self, data_dir: &Path, last_op: u64) -> Result<(), SnapshotError>
-    where
-        J: JournalHandle,
-    {
-        let snapshot = (self.create_snapshot)(&self.mux_stm, last_op)?;
-        let path = data_dir.join(super::METADATA_DIR).join("snapshot.bin");
-        snapshot.persist(&path)?;
-
-        if let Some(journal) = &self.journal {
-            journal.handle().set_snapshot_op(last_op);
-            journal
-                .handle()
-                .compact()
-                .await
-                .map_err(SnapshotError::Io)?;
-        }
-
-        Ok(())
     }
 }

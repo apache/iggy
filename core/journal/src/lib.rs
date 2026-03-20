@@ -37,24 +37,27 @@ where
     fn append(&self, entry: Self::Entry) -> impl Future<Output = io::Result<()>>;
     fn entry(&self, header: &Self::Header) -> impl Future<Output = Option<Self::Entry>>;
 
-    /// Advance the snapshot watermark so entries at or below `op` may be
-    /// evicted from the journal's in-memory index. The default is a no-op
-    /// for journals that do not require this watermark.
-    fn set_snapshot_op(&self, _op: u64) {}
-
     /// Number of entries that can be appended before the journal would need
     /// to evict un-snapshotted slots. Returns `None` for journals that don't persist to disk.
     fn remaining_capacity(&self) -> Option<usize> {
         None
     }
 
-    /// Remove snapshotted entries from the WAL to reclaim disk space.
-    /// The default is a no-op for journals that do not persist to disk.
+    /// Remove entries with ops in `[start_op, end_op]` from the journal,
+    /// returning the removed entries sorted by op.
+    ///
+    /// Implementations that persist to disk should rewrite the underlying
+    /// storage to reclaim space. The default is a no-op for journals that
+    /// do not persist to disk.
     ///
     /// # Errors
-    /// Returns an I/O error if compaction fails.
-    fn compact(&self) -> impl Future<Output = io::Result<()>> {
-        async { Ok(()) }
+    /// Returns an I/O error if the drain fails.
+    fn drain(
+        &self,
+        _start_op: u64,
+        _end_op: u64,
+    ) -> impl Future<Output = io::Result<Vec<Self::Entry>>> {
+        async { Ok(Vec::new()) }
     }
 }
 

@@ -295,10 +295,6 @@ impl Journal<FileStorage> for MetadataJournal {
         self.header((header.op - 1) as usize)
     }
 
-    fn set_snapshot_op(&self, op: u64) {
-        Self::set_snapshot_op(self, op);
-    }
-
     fn remaining_capacity(&self) -> Option<usize> {
         let Some(last) = self.last_op.get() else {
             return Some(SLOT_COUNT);
@@ -311,31 +307,47 @@ impl Journal<FileStorage> for MetadataJournal {
         Some(SLOT_COUNT.saturating_sub(used))
     }
 
-    /// Rewrite the WAL keeping only entries with `op > snapshot_op`.
+    /// Remove entries with ops in `[start_op, end_op]` from the journal,
+    /// returning the removed entries sorted by op.
     ///
-    /// 1. Collect live entries from the slot array
-    /// 2. Write them sequentially to `{path}.tmp`
-    /// 3. Fsync + rename over the WAL
-    /// 4. Fsync parent directory
-    /// 5. Reopen the file descriptor and update in-memory offsets
-    async fn compact(&self) -> io::Result<()> {
-        let snapshot_op = self.snapshot_op.get();
+    /// Internally advances the snapshot watermark to `end_op` so that
+    /// future appends treat drained slots as safe to overwrite. Rewrites
+    /// the WAL file keeping only entries outside the drained range.
+    async fn drain(&self, start_op: u64, end_op: u64) -> io::Result<Vec<Self::Entry>> {
+        // Advance the snapshot watermark so future appends treat
+        // drained ops as safe to overwrite.
+        if end_op > self.snapshot_op.get() {
+            self.snapshot_op.set(end_op);
+        }
 
-        // Collect (header, old_offset) for live entries, sorted by op.
-        let mut live: Vec<(PrepareHeader, u64)> = {
+        // Partition slots into drained and live entries.
+        let mut to_drain: Vec<(PrepareHeader, u64)> = Vec::new();
+        let mut live: Vec<(PrepareHeader, u64)> = Vec::new();
+        {
             let headers = self.headers.borrow();
             let offsets = self.offsets.borrow();
-            let mut live = Vec::new();
             for slot in 0..SLOT_COUNT {
-                if let (Some(h), Some(off)) = (&headers[slot], offsets[slot])
-                    && h.op > snapshot_op
-                {
-                    live.push((*h, off));
+                if let (Some(h), Some(off)) = (&headers[slot], offsets[slot]) {
+                    if h.op >= start_op && h.op <= end_op {
+                        to_drain.push((*h, off));
+                    } else {
+                        live.push((*h, off));
+                    }
                 }
             }
-            live
-        };
+        }
+        to_drain.sort_unstable_by_key(|(h, _)| h.op);
         live.sort_unstable_by_key(|(h, _)| h.op);
+
+        // Read drained entries from disk before rewriting the WAL.
+        let mut drained = Vec::with_capacity(to_drain.len());
+        for (header, offset) in &to_drain {
+            let buf = vec![0u8; header.size as usize];
+            let buf = self.storage.read_at(*offset, buf).await?;
+            let msg = Message::from_bytes(Bytes::from(buf))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            drained.push(msg);
+        }
 
         // Write live entries to a temp file.
         let wal_path = self.storage.path();
@@ -366,7 +378,7 @@ impl Journal<FileStorage> for MetadataJournal {
         // Reopen the file descriptor at the same path.
         self.storage.reopen().await?;
 
-        // Rebuild offsets for the compacted layout.
+        // Rebuild offsets for the compacted layout and clear drained slots.
         let mut headers = self.headers.borrow_mut();
         let mut offsets = self.offsets.borrow_mut();
         let mut pos: u64 = 0;
@@ -375,18 +387,17 @@ impl Journal<FileStorage> for MetadataJournal {
             offsets[slot] = Some(pos);
             pos += u64::from(header.size);
         }
-
-        // Clear slots for snapshotted entries that were removed.
         for slot in 0..SLOT_COUNT {
             if let Some(h) = &headers[slot]
-                && h.op <= snapshot_op
+                && h.op >= start_op
+                && h.op <= end_op
             {
                 headers[slot] = None;
                 offsets[slot] = None;
             }
         }
 
-        Ok(())
+        Ok(drained)
     }
 
     async fn append(&self, entry: Self::Entry) -> io::Result<()> {
@@ -633,7 +644,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn compact_shrinks_wal_and_preserves_live_entries() {
+    async fn drain_shrinks_wal_and_preserves_live_entries() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
         let journal = MetadataJournal::open(&path, 0).await.unwrap();
@@ -644,17 +655,20 @@ mod tests {
         }
         let size_before = journal.storage.file_len();
 
-        // Snapshot at op 3, then compact — entries 1-3 should be removed
-        journal.set_snapshot_op(3);
-        journal.compact().await.unwrap();
+        // Drain entries 1-3
+        let drained = journal.drain(1, 3).await.unwrap();
+        assert_eq!(drained.len(), 3);
+        assert_eq!(drained[0].header().op, 1);
+        assert_eq!(drained[1].header().op, 2);
+        assert_eq!(drained[2].header().op, 3);
 
         let size_after = journal.storage.file_len();
         assert!(
             size_after < size_before,
-            "WAL should shrink after compaction: {size_before} -> {size_after}"
+            "WAL should shrink after drain: {size_before} -> {size_after}"
         );
 
-        // Snapshotted entries are gone from the index
+        // Drained entries are gone from the index
         for op in 1..=3 {
             assert!(
                 journal.header(op as usize).is_none(),
@@ -671,7 +685,7 @@ mod tests {
             assert_eq!(entry.body().len(), 64);
         }
 
-        // Reopen and verify the compacted WAL is valid
+        // Reopen and verify the drained WAL is valid
         drop(journal);
         let journal = MetadataJournal::open(&path, 3).await.unwrap();
         assert_eq!(journal.last_op(), Some(5));
