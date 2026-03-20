@@ -69,6 +69,7 @@ mod ffi {
         fn create_stream(&self, stream_name: String) -> Result<()>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(&self, stream_id: Identifier) -> Result<()>;
+        fn purge_stream(&self, stream_id: Identifier) -> Result<()>;
         #[allow(clippy::too_many_arguments)]
         fn create_topic(
             &self,
@@ -80,6 +81,19 @@ mod ffi {
             message_expiry_kind: String,
             message_expiry_value: u64,
             max_topic_size: String,
+        ) -> Result<()>;
+        fn purge_topic(&self, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
+        fn create_partitions(
+            &self,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partitions_count: u32,
+        ) -> Result<()>;
+        fn delete_partitions(
+            &self,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partitions_count: u32,
         ) -> Result<()>;
 
         unsafe fn delete_connection(client: *mut Client) -> Result<()>;

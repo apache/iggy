@@ -20,7 +20,7 @@ use iggy::prelude::{
     Client as IggyConnectionClient, CompressionAlgorithm as RustCompressionAlgorithm,
     Identifier as RustIdentifier, IggyClient as RustIggyClient,
     IggyClientBuilder as RustIggyClientBuilder, IggyError, IggyExpiry as RustIggyExpiry,
-    MaxTopicSize as RustMaxTopicSize, StreamClient, TopicClient, UserClient,
+    MaxTopicSize as RustMaxTopicSize, PartitionClient, StreamClient, TopicClient, UserClient,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -114,6 +114,19 @@ impl Client {
         })
     }
 
+    pub fn purge_stream(&self, stream_id: ffi::Identifier) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not purge stream: {error}"))?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .purge_stream(&rust_stream_id)
+                .await
+                .map_err(|error| format!("Could not purge stream '{}': {error}", rust_stream_id))?;
+            Ok(())
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -144,7 +157,9 @@ impl Client {
         let rust_message_expiry = match message_expiry_kind.as_str() {
             "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
             "never_expire" => RustIggyExpiry::NeverExpire,
-            "duration" => RustIggyExpiry::ExpireDuration(message_expiry_value.into()),
+            "duration" => RustIggyExpiry::ExpireDuration(iggy::prelude::IggyDuration::from(
+                message_expiry_value,
+            )),
             _ => {
                 return Err(format!(
                     "Could not create topic '{}': invalid message expiry kind '{}'",
@@ -178,6 +193,85 @@ impl Client {
                     format!(
                         "Could not create topic '{}' on stream '{}': {error}",
                         topic_name, rust_stream_id
+                    )
+                })?;
+            Ok(())
+        })
+    }
+
+    pub fn purge_topic(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
+            format!("Could not purge topic: invalid stream identifier: {error}")
+        })?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not purge topic: invalid topic identifier: {error}"))?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .purge_topic(&rust_stream_id, &rust_topic_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not purge topic '{}' on stream '{}': {error}",
+                        rust_topic_id, rust_stream_id
+                    )
+                })?;
+            Ok(())
+        })
+    }
+
+    pub fn create_partitions(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partitions_count: u32,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
+            format!("Could not create partitions: invalid stream identifier: {error}")
+        })?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id).map_err(|error| {
+            format!("Could not create partitions: invalid topic identifier: {error}")
+        })?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .create_partitions(&rust_stream_id, &rust_topic_id, partitions_count)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not create {partitions_count} partitions for topic '{}' on stream '{}': {error}",
+                        rust_topic_id, rust_stream_id
+                    )
+                })?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_partitions(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partitions_count: u32,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
+            format!("Could not delete partitions: invalid stream identifier: {error}")
+        })?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id).map_err(|error| {
+            format!("Could not delete partitions: invalid topic identifier: {error}")
+        })?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .delete_partitions(&rust_stream_id, &rust_topic_id, partitions_count)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not delete {partitions_count} partitions for topic '{}' on stream '{}': {error}",
+                        rust_topic_id, rust_stream_id
                     )
                 })?;
             Ok(())
