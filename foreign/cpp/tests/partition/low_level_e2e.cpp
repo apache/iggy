@@ -26,7 +26,7 @@
 #include "lib.rs.h"
 #include "tests/common/test_helpers.hpp"
 
-TEST(LowLevelE2E_Partition, CreatePartitionsHappyPath) {
+TEST(LowLevelE2E_Partition, CreatePartitionsSucceeds) {
     RecordProperty("description", "Creates partitions for an existing topic and verifies the resulting count.");
     const std::string stream_name = "cpp-create-partitions-happy-path";
     const std::string topic_name  = "topic-create-partitions-happy-path";
@@ -72,42 +72,12 @@ TEST(LowLevelE2E_Partition, CreatePartitionsBeforeLoginThrows) {
     client = nullptr;
 }
 
-TEST(LowLevelE2E_Partition, CreatePartitionsOnNonExistentStreamThrows) {
-    RecordProperty("description", "Throws when create_partitions is called for a stream that does not exist.");
-    const std::string stream_name = "cpp-create-partitions-missing-stream";
-    const std::string topic_name  = "topic-create-partitions-missing-stream";
-
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
-
-    ASSERT_THROW(client->create_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 1),
-                 std::exception);
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
-}
-
-TEST(LowLevelE2E_Partition, CreatePartitionsOnNonExistentTopicThrows) {
-    RecordProperty("description", "Throws when create_partitions is called for a topic that does not exist.");
-    const std::string stream_name = "cpp-create-partitions-missing-topic";
-    const std::string topic_name  = "topic-create-partitions-missing-topic";
-
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
-
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    ASSERT_THROW(client->create_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 1),
-                 std::exception);
-
-    ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
-}
-
-TEST(LowLevelE2E_Partition, CreatePartitionsWithInvalidStreamIdentifierThrows) {
-    RecordProperty("description", "Rejects create_partitions requests that use invalid stream identifier formats.");
-    const std::string stream_name = "cpp-create-partitions-invalid-stream-identifier";
-    const std::string topic_name  = "topic-create-partitions-invalid-stream-identifier";
+TEST(LowLevelE2E_Partition, CreatePartitionsOnNonExistentResourcesThrows) {
+    RecordProperty("description", "Throws when create_partitions is called for a stream or topic that does not exist.");
+    const std::string stream_name         = "cpp-create-partitions-missing-resource-stream";
+    const std::string topic_name          = "topic-create-partitions-missing-resource-topic";
+    const std::string missing_stream_name = "cpp-create-partitions-missing-stream";
+    const std::string missing_topic_name  = "topic-create-partitions-missing-topic";
 
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -116,29 +86,22 @@ TEST(LowLevelE2E_Partition, CreatePartitionsWithInvalidStreamIdentifierThrows) {
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
 
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->create_partitions(std::move(invalid_kind_id), make_string_identifier(topic_name), 1),
-                 std::exception);
-
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->create_partitions(std::move(invalid_numeric_id), make_string_identifier(topic_name), 1),
-                 std::exception);
+    ASSERT_THROW(
+        client->create_partitions(make_string_identifier(missing_stream_name), make_string_identifier(topic_name), 1),
+        std::exception);
+    ASSERT_THROW(
+        client->create_partitions(make_string_identifier(stream_name), make_string_identifier(missing_topic_name), 1),
+        std::exception);
 
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
     client = nullptr;
 }
 
-TEST(LowLevelE2E_Partition, CreatePartitionsWithInvalidTopicIdentifierThrows) {
-    RecordProperty("description", "Rejects create_partitions requests that use invalid topic identifier formats.");
-    const std::string stream_name = "cpp-create-partitions-invalid-topic-identifier";
-    const std::string topic_name  = "topic-create-partitions-invalid-topic-identifier";
+TEST(LowLevelE2E_Partition, CreatePartitionsWithInvalidIdentifiersThrows) {
+    RecordProperty("description", "Rejects create_partitions requests that use invalid stream or topic identifiers.");
+    const std::string stream_name = "cpp-create-partitions-invalid-identifier";
+    const std::string topic_name  = "topic-create-partitions-invalid-identifier";
 
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -147,18 +110,32 @@ TEST(LowLevelE2E_Partition, CreatePartitionsWithInvalidTopicIdentifierThrows) {
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
 
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->create_partitions(make_string_identifier(stream_name), std::move(invalid_kind_id), 1),
+    iggy::ffi::Identifier invalid_stream_kind_id;
+    invalid_stream_kind_id.kind   = "invalid";
+    invalid_stream_kind_id.length = 4;
+    invalid_stream_kind_id.value  = {1, 0, 0, 0};
+    ASSERT_THROW(client->create_partitions(std::move(invalid_stream_kind_id), make_string_identifier(topic_name), 1),
                  std::exception);
 
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->create_partitions(make_string_identifier(stream_name), std::move(invalid_numeric_id), 1),
+    iggy::ffi::Identifier invalid_stream_numeric_id;
+    invalid_stream_numeric_id.kind   = "numeric";
+    invalid_stream_numeric_id.length = 1;
+    invalid_stream_numeric_id.value.push_back(1);
+    ASSERT_THROW(client->create_partitions(std::move(invalid_stream_numeric_id), make_string_identifier(topic_name), 1),
+                 std::exception);
+
+    iggy::ffi::Identifier invalid_topic_kind_id;
+    invalid_topic_kind_id.kind   = "invalid";
+    invalid_topic_kind_id.length = 4;
+    invalid_topic_kind_id.value  = {1, 0, 0, 0};
+    ASSERT_THROW(client->create_partitions(make_string_identifier(stream_name), std::move(invalid_topic_kind_id), 1),
+                 std::exception);
+
+    iggy::ffi::Identifier invalid_topic_numeric_id;
+    invalid_topic_numeric_id.kind   = "numeric";
+    invalid_topic_numeric_id.length = 1;
+    invalid_topic_numeric_id.value.push_back(1);
+    ASSERT_THROW(client->create_partitions(make_string_identifier(stream_name), std::move(invalid_topic_numeric_id), 1),
                  std::exception);
 
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
@@ -262,7 +239,7 @@ TEST(LowLevelE2E_Partition, CreatePartitionsWithNumericIdentifiersSucceeds) {
     client = nullptr;
 }
 
-TEST(LowLevelE2E_Partition, DeletePartitionsHappyPath) {
+TEST(LowLevelE2E_Partition, DeletePartitionsSucceeds) {
     RecordProperty("description", "Deletes partitions from an existing topic and verifies the resulting count.");
     const std::string stream_name = "cpp-delete-partitions-happy-path";
     const std::string topic_name  = "topic-delete-partitions-happy-path";
@@ -426,42 +403,12 @@ TEST(LowLevelE2E_Partition, DeletePartitionsBeforeLoginThrows) {
     client = nullptr;
 }
 
-TEST(LowLevelE2E_Partition, DeletePartitionsOnNonExistentStreamThrows) {
-    RecordProperty("description", "Throws when delete_partitions is called for a stream that does not exist.");
-    const std::string stream_name = "cpp-delete-partitions-missing-stream";
-    const std::string topic_name  = "topic-delete-partitions-missing-stream";
-
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
-
-    ASSERT_THROW(client->delete_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 1),
-                 std::exception);
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
-}
-
-TEST(LowLevelE2E_Partition, DeletePartitionsOnNonExistentTopicThrows) {
-    RecordProperty("description", "Throws when delete_partitions is called for a topic that does not exist.");
-    const std::string stream_name = "cpp-delete-partitions-missing-topic";
-    const std::string topic_name  = "topic-delete-partitions-missing-topic";
-
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
-
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    ASSERT_THROW(client->delete_partitions(make_string_identifier(stream_name), make_string_identifier(topic_name), 1),
-                 std::exception);
-
-    ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
-}
-
-TEST(LowLevelE2E_Partition, DeletePartitionsWithInvalidStreamIdentifierThrows) {
-    RecordProperty("description", "Rejects delete_partitions requests that use invalid stream identifier formats.");
-    const std::string stream_name = "cpp-delete-partitions-invalid-stream-identifier";
-    const std::string topic_name  = "topic-delete-partitions-invalid-stream-identifier";
+TEST(LowLevelE2E_Partition, DeletePartitionsOnNonExistentResourcesThrows) {
+    RecordProperty("description", "Throws when delete_partitions is called for a stream or topic that does not exist.");
+    const std::string stream_name         = "cpp-delete-partitions-missing-resource-stream";
+    const std::string topic_name          = "topic-delete-partitions-missing-resource-topic";
+    const std::string missing_stream_name = "cpp-delete-partitions-missing-stream";
+    const std::string missing_topic_name  = "topic-delete-partitions-missing-topic";
 
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -470,29 +417,22 @@ TEST(LowLevelE2E_Partition, DeletePartitionsWithInvalidStreamIdentifierThrows) {
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "none", 0,
                                          "server_default", 0, "server_default"));
 
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->delete_partitions(std::move(invalid_kind_id), make_string_identifier(topic_name), 1),
-                 std::exception);
-
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->delete_partitions(std::move(invalid_numeric_id), make_string_identifier(topic_name), 1),
-                 std::exception);
+    ASSERT_THROW(
+        client->delete_partitions(make_string_identifier(missing_stream_name), make_string_identifier(topic_name), 1),
+        std::exception);
+    ASSERT_THROW(
+        client->delete_partitions(make_string_identifier(stream_name), make_string_identifier(missing_topic_name), 1),
+        std::exception);
 
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
     client = nullptr;
 }
 
-TEST(LowLevelE2E_Partition, DeletePartitionsWithInvalidTopicIdentifierThrows) {
-    RecordProperty("description", "Rejects delete_partitions requests that use invalid topic identifier formats.");
-    const std::string stream_name = "cpp-delete-partitions-invalid-topic-identifier";
-    const std::string topic_name  = "topic-delete-partitions-invalid-topic-identifier";
+TEST(LowLevelE2E_Partition, DeletePartitionsWithInvalidIdentifiersThrows) {
+    RecordProperty("description", "Rejects delete_partitions requests that use invalid stream or topic identifiers.");
+    const std::string stream_name = "cpp-delete-partitions-invalid-identifier";
+    const std::string topic_name  = "topic-delete-partitions-invalid-identifier";
 
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -501,18 +441,32 @@ TEST(LowLevelE2E_Partition, DeletePartitionsWithInvalidTopicIdentifierThrows) {
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 3, "none", 0,
                                          "server_default", 0, "server_default"));
 
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->delete_partitions(make_string_identifier(stream_name), std::move(invalid_kind_id), 1),
+    iggy::ffi::Identifier invalid_stream_kind_id;
+    invalid_stream_kind_id.kind   = "invalid";
+    invalid_stream_kind_id.length = 4;
+    invalid_stream_kind_id.value  = {1, 0, 0, 0};
+    ASSERT_THROW(client->delete_partitions(std::move(invalid_stream_kind_id), make_string_identifier(topic_name), 1),
                  std::exception);
 
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->delete_partitions(make_string_identifier(stream_name), std::move(invalid_numeric_id), 1),
+    iggy::ffi::Identifier invalid_stream_numeric_id;
+    invalid_stream_numeric_id.kind   = "numeric";
+    invalid_stream_numeric_id.length = 1;
+    invalid_stream_numeric_id.value.push_back(1);
+    ASSERT_THROW(client->delete_partitions(std::move(invalid_stream_numeric_id), make_string_identifier(topic_name), 1),
+                 std::exception);
+
+    iggy::ffi::Identifier invalid_topic_kind_id;
+    invalid_topic_kind_id.kind   = "invalid";
+    invalid_topic_kind_id.length = 4;
+    invalid_topic_kind_id.value  = {1, 0, 0, 0};
+    ASSERT_THROW(client->delete_partitions(make_string_identifier(stream_name), std::move(invalid_topic_kind_id), 1),
+                 std::exception);
+
+    iggy::ffi::Identifier invalid_topic_numeric_id;
+    invalid_topic_numeric_id.kind   = "numeric";
+    invalid_topic_numeric_id.length = 1;
+    invalid_topic_numeric_id.value.push_back(1);
+    ASSERT_THROW(client->delete_partitions(make_string_identifier(stream_name), std::move(invalid_topic_numeric_id), 1),
                  std::exception);
 
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));

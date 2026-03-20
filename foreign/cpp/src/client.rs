@@ -114,18 +114,18 @@ impl Client {
         })
     }
 
-    pub fn purge_stream(&self, stream_id: ffi::Identifier) -> Result<(), String> {
-        let rust_stream_id = RustIdentifier::try_from(stream_id)
-            .map_err(|error| format!("Could not purge stream: {error}"))?;
+    // pub fn purge_stream(&self, stream_id: ffi::Identifier) -> Result<(), String> {
+    //     let rust_stream_id = RustIdentifier::try_from(stream_id)
+    //         .map_err(|error| format!("Could not purge stream: {error}"))?;
 
-        RUNTIME.block_on(async {
-            self.inner
-                .purge_stream(&rust_stream_id)
-                .await
-                .map_err(|error| format!("Could not purge stream '{}': {error}", rust_stream_id))?;
-            Ok(())
-        })
-    }
+    //     RUNTIME.block_on(async {
+    //         self.inner
+    //             .purge_stream(&rust_stream_id)
+    //             .await
+    //             .map_err(|error| format!("Could not purge stream '{}': {error}", rust_stream_id))?;
+    //         Ok(())
+    //     })
+    // }
 
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
@@ -199,30 +199,30 @@ impl Client {
         })
     }
 
-    pub fn purge_topic(
-        &self,
-        stream_id: ffi::Identifier,
-        topic_id: ffi::Identifier,
-    ) -> Result<(), String> {
-        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
-            format!("Could not purge topic: invalid stream identifier: {error}")
-        })?;
-        let rust_topic_id = RustIdentifier::try_from(topic_id)
-            .map_err(|error| format!("Could not purge topic: invalid topic identifier: {error}"))?;
+    // pub fn purge_topic(
+    //     &self,
+    //     stream_id: ffi::Identifier,
+    //     topic_id: ffi::Identifier,
+    // ) -> Result<(), String> {
+    //     let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
+    //         format!("Could not purge topic: invalid stream identifier: {error}")
+    //     })?;
+    //     let rust_topic_id = RustIdentifier::try_from(topic_id)
+    //         .map_err(|error| format!("Could not purge topic: invalid topic identifier: {error}"))?;
 
-        RUNTIME.block_on(async {
-            self.inner
-                .purge_topic(&rust_stream_id, &rust_topic_id)
-                .await
-                .map_err(|error| {
-                    format!(
-                        "Could not purge topic '{}' on stream '{}': {error}",
-                        rust_topic_id, rust_stream_id
-                    )
-                })?;
-            Ok(())
-        })
-    }
+    //     RUNTIME.block_on(async {
+    //         self.inner
+    //             .purge_topic(&rust_stream_id, &rust_topic_id)
+    //             .await
+    //             .map_err(|error| {
+    //                 format!(
+    //                     "Could not purge topic '{}' on stream '{}': {error}",
+    //                     rust_topic_id, rust_stream_id
+    //                 )
+    //             })?;
+    //         Ok(())
+    //     })
+    // }
 
     pub fn create_partitions(
         &self,
