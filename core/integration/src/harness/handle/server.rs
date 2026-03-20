@@ -410,7 +410,13 @@ impl ServerHandle {
             }
 
             if config_path.exists() {
-                return self.verify_bound_ports(&config_path);
+                match self.verify_bound_ports(&config_path) {
+                    Ok(()) => return Ok(()),
+                    Err(TestBinaryError::InvalidState { message })
+                        if message.starts_with("Failed to read server config at ")
+                            || message.starts_with("Failed to parse server config:") => {}
+                    Err(err) => return Err(err),
+                }
             }
 
             if Instant::now() >= deadline {
