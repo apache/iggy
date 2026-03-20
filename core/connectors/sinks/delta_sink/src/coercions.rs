@@ -97,7 +97,7 @@ pub(crate) fn coerce(value: &mut Value, coercion_tree: &CoercionTree) {
 fn apply_coercion(value: &mut Value, node: &CoercionNode) {
     match node {
         CoercionNode::Coercion(Coercion::ToString) => {
-            if !value.is_string() {
+            if !value.is_null() && !value.is_string() {
                 *value = Value::String(value.to_string());
             }
         }
@@ -507,10 +507,7 @@ mod tests {
         });
         let expected = value.clone();
         coerce(&mut value, &tree);
-        // Null values should pass through without panicking.
-        // ToString coercion converts null to "null" since it's not a string.
-        let mut expected = expected;
-        *expected.get_mut("level1_string").unwrap() = json!("null");
+        // Null values should pass through unchanged — null on a string field stays null.
         assert_eq!(value, expected);
     }
 
@@ -568,33 +565,28 @@ mod tests {
     }
 
     #[test]
-    fn test_coerce_tostring_various_types() {
+    fn test_tostring_coercion() {
         let delta_schema: DeltaSchema = serde_json::from_value(SCHEMA.clone()).unwrap();
         let tree = create_coercion_tree(&delta_schema);
 
-        // Boolean
-        let mut value = json!({ "level1_string": true });
+        // Non-string types get converted; null passes through unchanged.
+        let mut value = json!({
+            "level1_string": null,
+            "level2": {
+                "level2_string": null,
+            },
+            "array_string": ["a", null, 42, true, 3.15, [1, 2, 3], {"x": 1}],
+        });
         coerce(&mut value, &tree);
-        assert_eq!(value["level1_string"], json!("true"));
 
-        // Float
-        let mut value = json!({ "level1_string": 3.15 });
-        coerce(&mut value, &tree);
-        assert_eq!(value["level1_string"], json!("3.15"));
-
-        // Integer
-        let mut value = json!({ "level1_string": 42 });
-        coerce(&mut value, &tree);
-        assert_eq!(value["level1_string"], json!("42"));
-
-        // Null gets stringified
-        let mut value = json!({ "level1_string": null });
-        coerce(&mut value, &tree);
-        assert_eq!(value["level1_string"], json!("null"));
-
-        // Array gets stringified
-        let mut value = json!({ "level1_string": [1, 2, 3] });
-        coerce(&mut value, &tree);
-        assert_eq!(value["level1_string"], json!("[1,2,3]"));
+        assert_eq!(value["level1_string"], json!(null));
+        assert_eq!(value["level2"]["level2_string"], json!(null));
+        assert_eq!(value["array_string"][0], json!("a"));
+        assert_eq!(value["array_string"][1], json!(null));
+        assert_eq!(value["array_string"][2], json!("42"));
+        assert_eq!(value["array_string"][3], json!("true"));
+        assert_eq!(value["array_string"][4], json!("3.15"));
+        assert_eq!(value["array_string"][5], json!("[1,2,3]"));
+        assert_eq!(value["array_string"][6], json!(r#"{"x":1}"#));
     }
 }
