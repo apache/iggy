@@ -18,6 +18,8 @@
 
 use crate::args::common::ListMode;
 use clap::{Args, Subcommand};
+use iggy_cli::commands::binary_context::common::ContextConfig;
+use iggy_common::ArgsOptional;
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum ContextAction {
@@ -35,6 +37,29 @@ pub(crate) enum ContextAction {
     ///  iggy context use default
     #[clap(verbatim_doc_comment, visible_alias = "u")]
     Use(ContextUseArgs),
+
+    /// Create a new context
+    ///
+    /// Creates a new named context in the contexts configuration file.
+    /// After creating a context, use 'iggy context use <name>' to activate it.
+    ///
+    /// Examples
+    ///  iggy context create production --transport tcp --tcp-server-address 10.0.0.1:8090
+    ///  iggy context create dev --transport http --http-api-url http://localhost:3000
+    ///  iggy context create local --username iggy --password iggy
+    #[clap(verbatim_doc_comment, visible_alias = "c")]
+    Create(ContextCreateArgs),
+
+    /// Delete an existing context
+    ///
+    /// Removes a named context from the contexts configuration file.
+    /// The 'default' context cannot be deleted. If the deleted context
+    /// was the active context, the active context resets to 'default'.
+    ///
+    /// Examples
+    ///  iggy context delete production
+    #[clap(verbatim_doc_comment, visible_alias = "d")]
+    Delete(ContextDeleteArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -47,6 +72,75 @@ pub(crate) struct ContextListArgs {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ContextUseArgs {
     /// Name of the context to use
+    #[arg(value_parser = clap::value_parser!(String))]
+    pub(crate) context_name: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ContextCreateArgs {
+    /// Name of the context to create
+    #[arg(value_parser = clap::value_parser!(String))]
+    pub(crate) context_name: String,
+
+    /// Transport protocol (tcp, quic, http, ws)
+    #[clap(long)]
+    pub(crate) transport: Option<String>,
+
+    /// TCP server address (e.g., 127.0.0.1:8090)
+    #[clap(long)]
+    pub(crate) tcp_server_address: Option<String>,
+
+    /// HTTP API URL (e.g., http://localhost:3000)
+    #[clap(long)]
+    pub(crate) http_api_url: Option<String>,
+
+    /// QUIC server address (e.g., 127.0.0.1:8080)
+    #[clap(long)]
+    pub(crate) quic_server_address: Option<String>,
+
+    /// Enable TLS for TCP transport
+    #[clap(long)]
+    pub(crate) tcp_tls_enabled: Option<bool>,
+
+    /// Username for authentication
+    #[clap(long)]
+    pub(crate) username: Option<String>,
+
+    /// Password for authentication
+    #[clap(long)]
+    pub(crate) password: Option<String>,
+
+    /// Personal access token
+    #[clap(long)]
+    pub(crate) token: Option<String>,
+
+    /// Personal access token name (for keyring lookup)
+    #[clap(long)]
+    pub(crate) token_name: Option<String>,
+}
+
+impl From<ContextCreateArgs> for ContextConfig {
+    fn from(args: ContextCreateArgs) -> Self {
+        ContextConfig {
+            username: args.username,
+            password: args.password,
+            token: args.token,
+            token_name: args.token_name,
+            iggy: ArgsOptional {
+                transport: args.transport,
+                tcp_server_address: args.tcp_server_address,
+                http_api_url: args.http_api_url,
+                quic_server_address: args.quic_server_address,
+                tcp_tls_enabled: args.tcp_tls_enabled,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ContextDeleteArgs {
+    /// Name of the context to delete
     #[arg(value_parser = clap::value_parser!(String))]
     pub(crate) context_name: String,
 }

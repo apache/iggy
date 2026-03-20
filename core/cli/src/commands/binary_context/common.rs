@@ -126,6 +126,69 @@ impl ContextManager {
         Ok(context_state.contexts.clone())
     }
 
+    pub async fn create_context(&mut self, name: &str, config: ContextConfig) -> Result<()> {
+        self.get_context_state().await?;
+        let cs = self.context_state.as_ref().unwrap();
+
+        if cs.contexts.contains_key(name) {
+            bail!("context '{name}' already exists in {CONTEXTS_FILE_NAME}")
+        }
+
+        let mut new_contexts = cs.contexts.clone();
+        new_contexts.insert(name.to_string(), config);
+
+        self.context_rw.ensure_iggy_home_exists()?;
+        self.context_rw
+            .write_contexts(new_contexts.clone())
+            .await
+            .context(format!("failed writing contexts after creating '{name}'"))?;
+
+        self.context_state.replace(ContextState {
+            active_context: cs.active_context.clone(),
+            contexts: new_contexts,
+        });
+
+        Ok(())
+    }
+
+    pub async fn delete_context(&mut self, name: &str) -> Result<()> {
+        if name == DEFAULT_CONTEXT_NAME {
+            bail!("cannot delete the '{DEFAULT_CONTEXT_NAME}' context")
+        }
+
+        self.get_context_state().await?;
+        let cs = self.context_state.take().unwrap();
+
+        if !cs.contexts.contains_key(name) {
+            bail!("context '{name}' not found in {CONTEXTS_FILE_NAME}")
+        }
+
+        let mut new_contexts = cs.contexts;
+        new_contexts.remove(name);
+
+        let active_context = if cs.active_context == name {
+            self.context_rw
+                .write_active_context(DEFAULT_CONTEXT_NAME)
+                .await
+                .context("failed resetting active context to default")?;
+            DEFAULT_CONTEXT_NAME.to_string()
+        } else {
+            cs.active_context
+        };
+
+        self.context_rw
+            .write_contexts(new_contexts.clone())
+            .await
+            .context(format!("failed writing contexts after deleting '{name}'"))?;
+
+        self.context_state.replace(ContextState {
+            active_context,
+            contexts: new_contexts,
+        });
+
+        Ok(())
+    }
+
     async fn get_context_state(&mut self) -> Result<&ContextState> {
         if self.context_state.is_none() {
             let (active_context_res, contexts_res) = join!(
@@ -255,6 +318,18 @@ impl ContextReaderWriter {
                 ))?;
         }
 
+        Ok(())
+    }
+
+    pub fn ensure_iggy_home_exists(&self) -> Result<()> {
+        if let Some(ref iggy_home) = self.iggy_home
+            && !iggy_home.exists()
+        {
+            std::fs::create_dir_all(iggy_home).context(format!(
+                "failed creating iggy home directory {}",
+                iggy_home.display()
+            ))?;
+        }
         Ok(())
     }
 
