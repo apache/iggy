@@ -33,7 +33,7 @@ batch_length = 100
 [plugin_config]
 url = "http://localhost:8086"
 org = "iggy_org"
-token = "my_super_secret_token_123"
+token = "replace_token_with_secret_token"
 query = '''
 from(bucket: "iggy_bucket")
   |> range(start: -1h)
