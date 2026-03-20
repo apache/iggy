@@ -5,6 +5,194 @@ use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
 use aligned_vec::{AVec, ConstAlign};
 
+#[derive(Debug)]
+pub struct Owned<const ALIGN: usize = 4096> {
+    inner: AVec<u8, ConstAlign<ALIGN>>,
+}
+
+impl<const ALIGN: usize> From<AVec<u8, ConstAlign<ALIGN>>> for Owned<ALIGN> {
+    fn from(vec: AVec<u8, ConstAlign<ALIGN>>) -> Self {
+        Self { inner: vec }
+    }
+}
+
+impl<const ALIGN: usize> From<Owned<ALIGN>> for AVec<u8, ConstAlign<ALIGN>> {
+    fn from(value: Owned<ALIGN>) -> Self {
+        value.inner
+    }
+}
+
+impl<const ALIGN: usize> Owned<ALIGN> {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.inner
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.inner
+    }
+
+    /// Split `Owned` buffer into two halves
+    ///
+    /// # Panics
+    /// Panics if `split_at > self.len()` or if `split_at` is not a multiple of `ALIGN` bytes.
+    pub fn split_at(self, split_at: usize) -> TwoHalves<ALIGN> {
+        assert!(split_at <= self.inner.len());
+
+        // Take ownership of the AVec's allocation. After this, we are responsible
+        // for deallocating via `AVec::from_raw_parts` or equivalent.
+        let (ptr, _, len, capacity) = self.inner.into_raw_parts();
+
+        // SAFETY: both pointers are constructed from the same `Inner` allocation, the split_at bounds are validated.
+        // The control block captures original `Inner` metadata to allow reconstructing the original frame for merging/dropping.
+        // The ptr provenence rules are maintained by the use of `NonNull` apis.
+        let base: NonNull<u8> = unsafe { NonNull::new_unchecked(ptr) };
+        let tail = unsafe { NonNull::new_unchecked(ptr.add(split_at)) };
+        let ctrlb = ControlBlock::new(base, len, capacity);
+
+        TwoHalves {
+            inner: (
+                Extent {
+                    ptr: base,
+                    len: split_at,
+                    ctrlb,
+                    _pad: 0,
+                },
+                Extent {
+                    ptr: tail,
+                    len: len - split_at,
+                    ctrlb,
+                    _pad: 0,
+                },
+            ),
+        }
+    }
+}
+
+pub struct TwoHalves<const ALIGN: usize> {
+    inner: (Extent, Extent),
+}
+
+impl<const ALIGN: usize> TwoHalves<ALIGN> {
+    pub fn head(&self) -> &[u8] {
+        self.inner.0.as_slice()
+    }
+
+    pub fn head_mut(&mut self) -> &mut [u8] {
+        // SAFETY: We are accessing the head half mutably, this is the only correct operation, as the head is not shared between clones,
+        // instead it gets copied.
+        unsafe { self.inner.0.as_mut_slice() }
+    }
+
+    pub fn tail(&self) -> &[u8] {
+        self.inner.1.as_slice()
+    }
+
+    pub fn split_at(&self) -> usize {
+        self.inner.0.len
+    }
+
+    pub fn total_len(&self) -> usize {
+        self.inner.0.len + self.inner.1.len
+    }
+
+    pub fn is_unique(&self) -> bool {
+        // `inner.1` is the authoritative owner of the original frame allocation.
+        // SAFETY: `inner.1.ctrlb` points to a live control block while `self` is alive.
+        unsafe {
+            self.inner
+                .1
+                .ctrlb
+                .as_ref()
+                .ref_count
+                .load(Ordering::Acquire)
+                == 1
+        }
+    }
+
+    pub fn try_merge(self) -> Result<Owned<ALIGN>, Self> {
+        if !self.is_unique() {
+            return Err(self);
+        }
+
+        // Transfer ownership to prevent double-free
+        let this = ManuallyDrop::new(self);
+        let head = this.inner.0;
+        let tail = this.inner.1;
+        let split_at = head.len;
+
+        // SAFETY: `tail.ctrlb` is unique at this point,
+        // If `head.ctrlb != tail.ctrlb`, the head owns a standalone allocation
+        // that must be released after copying.
+        unsafe {
+            let ctrlb_eq = std::ptr::addr_eq(head.ctrlb.as_ptr(), tail.ctrlb.as_ptr());
+
+            if !ctrlb_eq {
+                let tail_ctrlb = tail.ctrlb.as_ref();
+
+                // We are patching up the original allocation, with the current head data, so that the resulting `Owned` has correct content.
+                let dst = slice::from_raw_parts_mut(tail_ctrlb.base.as_ptr(), split_at);
+                dst.copy_from_slice(head.as_slice());
+                release_control_block_w_allocation::<ALIGN>(head.ctrlb);
+            }
+
+            let ctrlb = reclaim_unique_control_block(tail.ctrlb);
+            // SAFETY: `ctrlb.base,capacity` were captured from an `AVec<u8>` allocation and
+            // are now exclusively owned by this path.
+            let inner = AVec::from_raw_parts(ctrlb.base.as_ptr(), ALIGN, ctrlb.len, ctrlb.capacity);
+            Ok(Owned { inner })
+        }
+    }
+}
+
+impl<const ALIGN: usize> Clone for TwoHalves<ALIGN> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: (
+                Extent::copy_from_slice::<ALIGN>(self.head()),
+                self.inner.1.clone(),
+            ),
+        }
+    }
+}
+
+impl<const ALIGN: usize> Drop for TwoHalves<ALIGN> {
+    fn drop(&mut self) {
+        // SAFETY: `inner.0.ctrlb` / `inner.1.ctrlb` point to live control blocks while `self` is alive.
+        let ctrlb_eq = std::ptr::addr_eq(self.inner.0.ctrlb.as_ptr(), self.inner.1.ctrlb.as_ptr());
+        unsafe {
+            if ctrlb_eq {
+                release_control_block_w_allocation::<ALIGN>(self.inner.1.ctrlb);
+            } else {
+                // Different control blocks, release both
+                release_control_block_w_allocation::<ALIGN>(self.inner.0.ctrlb);
+                release_control_block_w_allocation::<ALIGN>(self.inner.1.ctrlb);
+            }
+        }
+    }
+}
+
+impl<const ALIGN: usize> std::fmt::Debug for TwoHalves<ALIGN> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoHalves")
+            .field("split_at", &self.split_at())
+            .field("head_len", &self.inner.0.len)
+            .field("tail_len", &self.inner.1.len)
+            .field("halves_alias", &(self.inner.0.ctrlb == self.inner.1.ctrlb))
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct Frozen<const ALIGN: usize> {
+    inner: Extent,
+}
+
+impl<const ALIGN: usize> Frozen<ALIGN> {
+    pub fn as_slice(&self) -> &[u8] {
+        self.inner.as_slice()
+    }
+}
+
 #[repr(C, align(64))]
 struct ControlBlock {
     ref_count: AtomicUsize,
@@ -135,175 +323,11 @@ unsafe fn reclaim_unique_control_block(ctrlb: NonNull<ControlBlock>) -> ControlB
     unsafe { *Box::from_raw(ctrlb.as_ptr()) }
 }
 
-#[derive(Debug)]
-pub struct Owned<const ALIGN: usize = 4096> {
-    inner: AVec<u8, ConstAlign<ALIGN>>,
-}
+// =============================================================================
+// Tests
+// =============================================================================
 
-impl<const ALIGN: usize> From<AVec<u8, ConstAlign<ALIGN>>> for Owned<ALIGN> {
-    fn from(vec: AVec<u8, ConstAlign<ALIGN>>) -> Self {
-        Self { inner: vec }
-    }
-}
-
-impl<const ALIGN: usize> From<Owned<ALIGN>> for AVec<u8, ConstAlign<ALIGN>> {
-    fn from(value: Owned<ALIGN>) -> Self {
-        value.inner
-    }
-}
-
-impl<const ALIGN: usize> Owned<ALIGN> {
-    pub fn as_slice(&self) -> &[u8] {
-        &self.inner
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.inner
-    }
-
-    /// Split `Owned` buffer into two halves
-    ///
-    /// # Panics
-    /// Panics if `split_at > self.len()` or if `split_at` is not a multiple of `ALIGN` bytes.
-    pub fn split_at(self, split_at: usize) -> TwoHalves<ALIGN> {
-        assert!(split_at <= self.inner.len());
-
-        // Take ownership of the AVec's allocation. After this, we are responsible
-        // for deallocating via `AVec::from_raw_parts` or equivalent.
-        let (ptr, _, len, capacity) = self.inner.into_raw_parts();
-
-        // SAFETY: both pointers are constructed from the same `Inner` allocation, the split_at bounds are validated.
-        // The control block captures original `Inner` metadata to allow reconstructing the original frame for merging/dropping.
-        // The ptr provenence rules are maintained by the use of `NonNull` apis.
-        let base: NonNull<u8> = unsafe { NonNull::new_unchecked(ptr) };
-        let tail = unsafe { NonNull::new_unchecked(ptr.add(split_at)) };
-        let ctrlb = ControlBlock::new(base, len, capacity);
-
-        TwoHalves {
-            buf: (
-                Extent {
-                    ptr: base,
-                    len: split_at,
-                    ctrlb,
-                    _pad: 0,
-                },
-                Extent {
-                    ptr: tail,
-                    len: len - split_at,
-                    ctrlb,
-                    _pad: 0,
-                },
-            ),
-        }
-    }
-}
-
-pub struct TwoHalves<const ALIGN: usize> {
-    buf: (Extent, Extent),
-}
-
-impl<const ALIGN: usize> TwoHalves<ALIGN> {
-    pub fn head(&self) -> &[u8] {
-        self.buf.0.as_slice()
-    }
-
-    pub fn head_mut(&mut self) -> &mut [u8] {
-        // SAFETY: We are accessing the head half mutably, this is the only correct operation, as the head is not shared between clones,
-        // instead it gets copied.
-        unsafe { self.buf.0.as_mut_slice() }
-    }
-
-    pub fn tail(&self) -> &[u8] {
-        self.buf.1.as_slice()
-    }
-
-    pub fn split_at(&self) -> usize {
-        self.buf.0.len
-    }
-
-    pub fn total_len(&self) -> usize {
-        self.buf.0.len + self.buf.1.len
-    }
-
-    pub fn is_unique(&self) -> bool {
-        // `buf.1` is the authoritative owner of the original frame allocation.
-        // SAFETY: `buf.1.ctrlb` points to a live control block while `self` is alive.
-        unsafe { self.buf.1.ctrlb.as_ref().ref_count.load(Ordering::Acquire) == 1 }
-    }
-
-    pub fn try_merge(self) -> Result<Owned<ALIGN>, Self> {
-        if !self.is_unique() {
-            return Err(self);
-        }
-
-        // Transfer ownership to prevent double-free
-        let this = ManuallyDrop::new(self);
-        let head = this.buf.0;
-        let tail = this.buf.1;
-        let split_at = head.len;
-
-        // SAFETY: `tail.ctrlb` is unique at this point,
-        // If `head.ctrlb != tail.ctrlb`, the head owns a standalone allocation
-        // that must be released after copying.
-        unsafe {
-            let ctrlb_eq = std::ptr::addr_eq(head.ctrlb.as_ptr(), tail.ctrlb.as_ptr());
-
-            if !ctrlb_eq {
-                let tail_ctrlb = tail.ctrlb.as_ref();
-
-                // We are patching up the original allocation, with the current head data, so that the resulting `Owned` has correct content.
-                let dst = slice::from_raw_parts_mut(tail_ctrlb.base.as_ptr(), split_at);
-                dst.copy_from_slice(head.as_slice());
-                release_control_block_w_allocation::<ALIGN>(head.ctrlb);
-            }
-
-            let ctrlb = reclaim_unique_control_block(tail.ctrlb);
-            // SAFETY: `ctrlb.base,capacity` were captured from an `AVec<u8>` allocation and
-            // are now exclusively owned by this path.
-            let inner = AVec::from_raw_parts(ctrlb.base.as_ptr(), ALIGN, ctrlb.len, ctrlb.capacity);
-            Ok(Owned { inner })
-        }
-    }
-}
-
-impl<const ALIGN: usize> Clone for TwoHalves<ALIGN> {
-    fn clone(&self) -> Self {
-        Self {
-            buf: (
-                Extent::copy_from_slice::<ALIGN>(self.head()),
-                self.buf.1.clone(),
-            ),
-        }
-    }
-}
-
-impl<const ALIGN: usize> Drop for TwoHalves<ALIGN> {
-    fn drop(&mut self) {
-        // SAFETY: `buf.0.ctrlb` / `buf.1.ctrlb` point to live control blocks while `self` is alive.
-        let ctrlb_eq = std::ptr::addr_eq(self.buf.0.ctrlb.as_ptr(), self.buf.1.ctrlb.as_ptr());
-        unsafe {
-            if ctrlb_eq {
-                release_control_block_w_allocation::<ALIGN>(self.buf.1.ctrlb);
-            } else {
-                // Different control blocks, release both
-                release_control_block_w_allocation::<ALIGN>(self.buf.0.ctrlb);
-                release_control_block_w_allocation::<ALIGN>(self.buf.1.ctrlb);
-            }
-        }
-    }
-}
-
-impl<const ALIGN: usize> std::fmt::Debug for TwoHalves<ALIGN> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TwoHalves")
-            .field("split_at", &self.split_at())
-            .field("head_len", &self.buf.0.len)
-            .field("tail_len", &self.buf.1.len)
-            .field("halves_alias", &(self.buf.0.ctrlb == self.buf.1.ctrlb))
-            .finish()
-    }
-}
-
+// TODO: Better tests & miri.
 #[cfg(test)]
 mod tests {
     use super::Owned;
