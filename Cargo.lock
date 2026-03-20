@@ -5460,7 +5460,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_influxdb_sink"
-version = "0.2.2-edge.1"
+version = "0.1.0-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5478,7 +5478,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_influxdb_source"
-version = "0.2.2-edge.1"
+version = "0.1.0-edge.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
