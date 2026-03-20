@@ -26,7 +26,7 @@ use iggy::clients::client::IggyClient;
 use iggy::prelude::*;
 use std::sync::Arc;
 use tokio::task::JoinSet;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::balanced_consumer_group::BalancedConsumerGroupBenchmark;
 use super::balanced_producer::BalancedProducerBenchmark;
@@ -105,37 +105,49 @@ pub trait Benchmarkable: Send {
             self.client_factory().password(),
         )
         .await;
+        let reuse_streams = self.args().reuse_streams();
         let streams = client.get_streams().await?;
         for i in 1..=number_of_streams {
             let stream_name = format!("bench-stream-{i}");
             let stream_id: Identifier = stream_name.as_str().try_into()?;
-            if streams.iter().all(|s| s.name != stream_name) {
-                info!("Creating the test stream '{}'", stream_name);
-                client.create_stream(&stream_name).await?;
-                let topic_name = "topic-1".to_string();
-                let max_topic_size = self
-                    .args()
-                    .max_topic_size()
-                    .map_or(MaxTopicSize::Unlimited, MaxTopicSize::Custom);
-                let message_expiry = self.args().message_expiry();
-
-                info!(
-                    "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}",
-                    topic_name, stream_name, max_topic_size, message_expiry
+            if streams.iter().any(|s| s.name == stream_name) {
+                if reuse_streams {
+                    info!("Appending to existing stream '{}'", stream_name);
+                    continue;
+                }
+                warn!(
+                    "Deleting pre-existing stream '{}' - {:?} benchmark requires fresh streams to avoid stale data in consumers",
+                    stream_name,
+                    self.kind()
                 );
-
-                client
-                    .create_topic(
-                        &stream_id,
-                        &topic_name,
-                        partitions_count,
-                        CompressionAlgorithm::default(),
-                        None,
-                        message_expiry,
-                        max_topic_size,
-                    )
-                    .await?;
+                client.delete_stream(&stream_id).await?;
             }
+
+            info!("Creating the test stream '{}'", stream_name);
+            client.create_stream(&stream_name).await?;
+            let topic_name = "topic-1".to_string();
+            let max_topic_size = self
+                .args()
+                .max_topic_size()
+                .map_or(MaxTopicSize::Unlimited, MaxTopicSize::Custom);
+            let message_expiry = self.args().message_expiry();
+
+            info!(
+                "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}",
+                topic_name, stream_name, max_topic_size, message_expiry
+            );
+
+            client
+                .create_topic(
+                    &stream_id,
+                    &topic_name,
+                    partitions_count,
+                    CompressionAlgorithm::default(),
+                    None,
+                    message_expiry,
+                    max_topic_size,
+                )
+                .await?;
         }
         Ok(())
     }
