@@ -476,29 +476,8 @@ impl AlignedBufferExt for AlignedBuffer {
 }
 
 fn allocate_aligned_buffer(capacity: usize) -> AlignedBuffer {
-    let aligned_capacity = if capacity < ALIGNMENT {
-        ALIGNMENT
-    } else {
-        (capacity + ALIGNMENT - 1) & !(ALIGNMENT - 1)
-    };
-
-    let mut buffer = AlignedBuffer::with_capacity(ALIGNMENT, aligned_capacity);
-
-    // Force the capacity if AVec didn't allocate enough
-    if buffer.capacity() < aligned_capacity {
-        buffer.reserve(aligned_capacity - buffer.capacity());
-    }
-
-    // Verify final capacity
-    let actual_capacity = buffer.capacity();
-    assert!(
-        actual_capacity >= aligned_capacity,
-        "Failed to allocate buffer with capacity {}, got {}",
-        aligned_capacity,
-        actual_capacity
-    );
-
-    buffer
+    let aligned_capacity = capacity.next_multiple_of(ALIGNMENT).max(ALIGNMENT);
+    AlignedBuffer::with_capacity(ALIGNMENT, aligned_capacity)
 }
 
 /// Convert a size in bytes to a string like "8KiB" or "2MiB".
