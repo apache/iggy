@@ -36,30 +36,22 @@ pub(crate) fn build_storage_options(
                 .as_ref()
                 .ok_or(Error::InvalidConfig)?;
             let region = config.aws_s3_region.as_ref().ok_or(Error::InvalidConfig)?;
-            let endpoint_url = config
-                .aws_s3_endpoint_url
-                .as_ref()
-                .ok_or(Error::InvalidConfig)?;
-            let allow_http = config.aws_s3_allow_http.ok_or(Error::InvalidConfig)?;
 
             opts.insert("AWS_ACCESS_KEY_ID".into(), access_key.clone());
             opts.insert("AWS_SECRET_ACCESS_KEY".into(), secret_key.clone());
             opts.insert("AWS_REGION".into(), region.clone());
-            opts.insert("AWS_ENDPOINT_URL".into(), endpoint_url.clone());
-            opts.insert("AWS_ALLOW_HTTP".into(), allow_http.to_string());
-            opts.insert("AWS_S3_ALLOW_HTTP".into(), allow_http.to_string());
+
+            if let Some(endpoint_url) = config.aws_s3_endpoint_url.as_ref() {
+                opts.insert("AWS_ENDPOINT_URL".into(), endpoint_url.clone());
+            }
+            if let Some(allow_http) = config.aws_s3_allow_http {
+                opts.insert("AWS_ALLOW_HTTP".into(), allow_http.to_string());
+                opts.insert("AWS_S3_ALLOW_HTTP".into(), allow_http.to_string());
+            }
         }
         Some("azure") => {
             let account_name = config
                 .azure_storage_account_name
-                .as_ref()
-                .ok_or(Error::InvalidConfig)?;
-            let account_key = config
-                .azure_storage_account_key
-                .as_ref()
-                .ok_or(Error::InvalidConfig)?;
-            let sas_token = config
-                .azure_storage_sas_token
                 .as_ref()
                 .ok_or(Error::InvalidConfig)?;
             let container_name = config
@@ -68,9 +60,22 @@ pub(crate) fn build_storage_options(
                 .ok_or(Error::InvalidConfig)?;
 
             opts.insert("AZURE_STORAGE_ACCOUNT_NAME".into(), account_name.clone());
-            opts.insert("AZURE_STORAGE_ACCOUNT_KEY".into(), account_key.clone());
-            opts.insert("AZURE_STORAGE_SAS_TOKEN".into(), sas_token.clone());
             opts.insert("AZURE_CONTAINER_NAME".into(), container_name.clone());
+
+            match (
+                config.azure_storage_account_key.as_ref(),
+                config.azure_storage_sas_token.as_ref(),
+            ) {
+                (Some(key), None) => {
+                    opts.insert("AZURE_STORAGE_ACCOUNT_KEY".into(), key.clone());
+                }
+                (None, Some(sas)) => {
+                    opts.insert("AZURE_STORAGE_SAS_TOKEN".into(), sas.clone());
+                }
+                (Some(_), Some(_)) | (None, None) => {
+                    return Err(Error::InvalidConfig);
+                }
+            }
         }
         Some("gcs") => {
             let service_account_key = config
@@ -136,11 +141,22 @@ mod tests {
         }
     }
 
-    fn azure_config() -> DeltaSinkConfig {
+    fn azure_config_with_key() -> DeltaSinkConfig {
         DeltaSinkConfig {
             storage_backend_type: Some("azure".into()),
             azure_storage_account_name: Some("myaccount".into()),
             azure_storage_account_key: Some("mykey".into()),
+            azure_storage_sas_token: None,
+            azure_container_name: Some("mycontainer".into()),
+            ..default_config()
+        }
+    }
+
+    fn azure_config_with_sas() -> DeltaSinkConfig {
+        DeltaSinkConfig {
+            storage_backend_type: Some("azure".into()),
+            azure_storage_account_name: Some("myaccount".into()),
+            azure_storage_account_key: None,
             azure_storage_sas_token: Some("mysas".into()),
             azure_container_name: Some("mycontainer".into()),
             ..default_config()
@@ -192,52 +208,70 @@ mod tests {
     }
 
     #[test]
-    fn s3_backend_missing_endpoint_url_errors() {
+    fn s3_backend_without_endpoint_url_succeeds() {
         let mut config = s3_config();
         config.aws_s3_endpoint_url = None;
-        assert!(build_storage_options(&config).is_err());
+        let opts = build_storage_options(&config).unwrap();
+        assert!(!opts.contains_key("AWS_ENDPOINT_URL"));
     }
 
     #[test]
-    fn s3_backend_missing_allow_http_errors() {
+    fn s3_backend_without_allow_http_succeeds() {
         let mut config = s3_config();
         config.aws_s3_allow_http = None;
-        assert!(build_storage_options(&config).is_err());
+        let opts = build_storage_options(&config).unwrap();
+        assert!(!opts.contains_key("AWS_ALLOW_HTTP"));
+        assert!(!opts.contains_key("AWS_S3_ALLOW_HTTP"));
     }
 
     #[test]
-    fn azure_backend_maps_all_fields() {
-        let opts = build_storage_options(&azure_config()).unwrap();
+    fn azure_backend_maps_account_key() {
+        let opts = build_storage_options(&azure_config_with_key()).unwrap();
         assert_eq!(opts.get("AZURE_STORAGE_ACCOUNT_NAME").unwrap(), "myaccount");
         assert_eq!(opts.get("AZURE_STORAGE_ACCOUNT_KEY").unwrap(), "mykey");
-        assert_eq!(opts.get("AZURE_STORAGE_SAS_TOKEN").unwrap(), "mysas");
+        assert!(!opts.contains_key("AZURE_STORAGE_SAS_TOKEN"));
         assert_eq!(opts.get("AZURE_CONTAINER_NAME").unwrap(), "mycontainer");
     }
 
     #[test]
+    fn azure_backend_maps_sas_token() {
+        let opts = build_storage_options(&azure_config_with_sas()).unwrap();
+        assert_eq!(opts.get("AZURE_STORAGE_ACCOUNT_NAME").unwrap(), "myaccount");
+        assert_eq!(opts.get("AZURE_STORAGE_SAS_TOKEN").unwrap(), "mysas");
+        assert!(!opts.contains_key("AZURE_STORAGE_ACCOUNT_KEY"));
+        assert_eq!(opts.get("AZURE_CONTAINER_NAME").unwrap(), "mycontainer");
+    }
+
+    #[test]
+    fn azure_backend_both_auth_methods_errors() {
+        let config = DeltaSinkConfig {
+            azure_storage_account_key: Some("mykey".into()),
+            azure_storage_sas_token: Some("mysas".into()),
+            ..azure_config_with_key()
+        };
+        assert!(build_storage_options(&config).is_err());
+    }
+
+    #[test]
+    fn azure_backend_no_auth_method_errors() {
+        let config = DeltaSinkConfig {
+            azure_storage_account_key: None,
+            azure_storage_sas_token: None,
+            ..azure_config_with_key()
+        };
+        assert!(build_storage_options(&config).is_err());
+    }
+
+    #[test]
     fn azure_backend_missing_account_name_errors() {
-        let mut config = azure_config();
+        let mut config = azure_config_with_key();
         config.azure_storage_account_name = None;
         assert!(build_storage_options(&config).is_err());
     }
 
     #[test]
-    fn azure_backend_missing_account_key_errors() {
-        let mut config = azure_config();
-        config.azure_storage_account_key = None;
-        assert!(build_storage_options(&config).is_err());
-    }
-
-    #[test]
-    fn azure_backend_missing_sas_token_errors() {
-        let mut config = azure_config();
-        config.azure_storage_sas_token = None;
-        assert!(build_storage_options(&config).is_err());
-    }
-
-    #[test]
     fn azure_backend_missing_container_name_errors() {
-        let mut config = azure_config();
+        let mut config = azure_config_with_key();
         config.azure_container_name = None;
         assert!(build_storage_options(&config).is_err());
     }

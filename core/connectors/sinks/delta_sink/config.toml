@@ -47,10 +47,10 @@ table_uri = "file:///tmp/iggy_delta_table"
 # aws_s3_access_key = "your-access-key"
 # aws_s3_secret_key = "your-secret-key"
 # aws_s3_region = "us-east-1"
-# aws_s3_endpoint_url = "http://localhost:9000"
-# aws_s3_allow_http = true
+# aws_s3_endpoint_url = "http://localhost:9000"  # optional, for custom endpoints (e.g. MinIO)
+# aws_s3_allow_http = true                        # optional, default false
 
-# Azure options:
+# Azure options (use either account_key OR sas_token, not both):
 # storage_backend_type = "azure"
 # azure_storage_account_name = "your-account"
 # azure_storage_account_key = "your-key"
