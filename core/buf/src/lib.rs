@@ -65,6 +65,8 @@ impl<const ALIGN: usize> Owned<ALIGN> {
         let base: NonNull<u8> = unsafe { NonNull::new_unchecked(ptr) };
         let tail = unsafe { NonNull::new_unchecked(ptr.add(split_at)) };
         let ctrlb = ControlBlock::new(base, len, capacity);
+        // We need to increment the ref_count as the resulting halves will both point to the same control block.
+        unsafe { ctrlb.as_ref().ref_count.fetch_add(1, Ordering::Relaxed) };
 
         TwoHalves {
             inner: (
@@ -86,11 +88,11 @@ impl<const ALIGN: usize> Owned<ALIGN> {
 }
 
 pub struct TwoHalves<const ALIGN: usize> {
-    inner: (Extent, Extent),
+    inner: (Extent<ALIGN>, Extent<ALIGN>),
 }
 
-// SAFETY: `TwoHalves` can be sent across threads as long as the caller ensures that the head half is not shared between 
-// threads (e.g. by cloning, which creates a new head half), 
+// SAFETY: `TwoHalves` can be sent across threads as long as the caller ensures that the head half is not shared between
+// threads (e.g. by cloning, which creates a new head half),
 // and that the tail half is only shared immutably (e.g. by cloning, which shares the tail half immutably).
 unsafe impl<const ALIGN: usize> Send for TwoHalves<ALIGN> {}
 
@@ -117,47 +119,55 @@ impl<const ALIGN: usize> TwoHalves<ALIGN> {
         self.inner.0.len + self.inner.1.len
     }
 
-    pub fn is_unique(&self) -> bool {
-        // `inner.1` is the authoritative owner of the original frame allocation.
+    pub fn try_merge(self) -> Result<Owned<ALIGN>, Self> {
+        let ctrlb_eq = std::ptr::addr_eq(self.inner.0.ctrlb.as_ptr(), self.inner.1.ctrlb.as_ptr());
         // SAFETY: `inner.1.ctrlb` points to a live control block while `self` is alive.
-        unsafe {
+        let ref_count = unsafe {
             self.inner
                 .1
                 .ctrlb
                 .as_ref()
                 .ref_count
                 .load(Ordering::Acquire)
-                == 1
-        }
-    }
+        };
+        // When ctrlb_eq, both extents share the same control block with refcount 2.
+        // When !ctrlb_eq (after clone), the tail has its own refcount.
+        let is_unique = if ctrlb_eq {
+            ref_count == 2
+        } else {
+            ref_count == 1
+        };
 
-    pub fn try_merge(self) -> Result<Owned<ALIGN>, Self> {
-        if !self.is_unique() {
+        if !is_unique {
             return Err(self);
         }
 
-        // Transfer ownership to prevent double-free.
-        // SAFETY: We read the inner tuple out of ManuallyDrop, which won't run TwoHalves::drop.
+        // Transfer ownership to prevent Extent::drop from running.
+        // SAFETY: We read the inner tuple out of ManuallyDrop, which won't run the compiler-generated drop.
         let this = ManuallyDrop::new(self);
         let (head, tail) = unsafe { std::ptr::read(&this.inner) };
         let split_at = head.len;
 
-        // SAFETY: `tail.ctrlb` is unique at this point,
+        // SAFETY: `tail.ctrlb` is unique at this point (is_unique checked above),
         // If `head.ctrlb != tail.ctrlb`, the head owns a standalone allocation
         // that must be released after copying.
         unsafe {
-            let ctrlb_eq = std::ptr::addr_eq(head.ctrlb.as_ptr(), tail.ctrlb.as_ptr());
-
             if !ctrlb_eq {
-                let tail_ctrlb = tail.ctrlb.as_ref();
+                let dst_ctrlb = tail.ctrlb.as_ref();
 
                 // We are patching up the original allocation, with the current head data, so that the resulting `Owned` has correct content.
-                let dst = slice::from_raw_parts_mut(tail_ctrlb.base.as_ptr(), split_at);
+                let dst = slice::from_raw_parts_mut(dst_ctrlb.base.as_ptr(), split_at);
                 dst.copy_from_slice(head.as_slice());
-                release_control_block_w_allocation::<ALIGN>(head.ctrlb);
             }
 
-            let ctrlb = reclaim_unique_control_block(tail.ctrlb);
+            // Dropping the head in `ctrlb_eq` case, should decrease the refcount to 1, so it's safe to reuse tail control block.
+            // In case when head was it's own allocation, we guarantee that it's always unique.
+            drop(head);
+            let tail_ctrlb = tail.ctrlb;
+            // Prevent tail Drop from running, we're taking ownership of the control block.
+            std::mem::forget(tail);
+
+            let ctrlb = reclaim_unique_control_block(tail_ctrlb);
             // SAFETY: `ctrlb.base,capacity` were captured from an `AVec<u8>` allocation and
             // are now exclusively owned by this path.
             let inner = AVec::from_raw_parts(ctrlb.base.as_ptr(), ALIGN, ctrlb.len, ctrlb.capacity);
@@ -170,25 +180,9 @@ impl<const ALIGN: usize> Clone for TwoHalves<ALIGN> {
     fn clone(&self) -> Self {
         Self {
             inner: (
-                Extent::copy_from_slice::<ALIGN>(self.head()),
+                Extent::<ALIGN>::copy_from_slice(self.head()),
                 self.inner.1.clone(),
             ),
-        }
-    }
-}
-
-impl<const ALIGN: usize> Drop for TwoHalves<ALIGN> {
-    fn drop(&mut self) {
-        // SAFETY: `inner.0.ctrlb` / `inner.1.ctrlb` point to live control blocks while `self` is alive.
-        let ctrlb_eq = std::ptr::addr_eq(self.inner.0.ctrlb.as_ptr(), self.inner.1.ctrlb.as_ptr());
-        unsafe {
-            if ctrlb_eq {
-                release_control_block_w_allocation::<ALIGN>(self.inner.1.ctrlb);
-            } else {
-                // Different control blocks, release both
-                release_control_block_w_allocation::<ALIGN>(self.inner.0.ctrlb);
-                release_control_block_w_allocation::<ALIGN>(self.inner.1.ctrlb);
-            }
         }
     }
 }
@@ -206,7 +200,7 @@ impl<const ALIGN: usize> std::fmt::Debug for TwoHalves<ALIGN> {
 
 #[derive(Clone)]
 pub struct Frozen<const ALIGN: usize> {
-    inner: Extent,
+    inner: Extent<ALIGN>,
 }
 
 impl<const ALIGN: usize> Frozen<ALIGN> {
@@ -236,18 +230,25 @@ impl ControlBlock {
     }
 }
 
-struct Extent {
+struct Extent<const ALIGN: usize> {
     ptr: NonNull<u8>,
     len: usize,
     ctrlb: NonNull<ControlBlock>,
     // Padded to 32 bytes in order to avoid false sharing when used by `TwoHalves`
-    // If `Extent` would be smaller than 32 bytes, two `Extent`s that are adjacent in memory 
+    // If `Extent` would be smaller than 32 bytes, two `Extent`s that are adjacent in memory
     // could potentially share the same cache line + some extra
     // that extra could lead to false sharing, in case of invalidation of extra
     _pad: usize,
 }
 
-impl Extent {
+impl<const ALIGN: usize> Drop for Extent<ALIGN> {
+    fn drop(&mut self) {
+        // SAFETY: `self.ctrlb` points to a live control block while `self` is alive.
+        unsafe { release_control_block_w_allocation::<ALIGN>(self.ctrlb) }
+    }
+}
+
+impl<const ALIGN: usize> Extent<ALIGN> {
     fn as_slice(&self) -> &[u8] {
         // SAFETY: ptr and len describe a valid allocation
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
@@ -258,7 +259,7 @@ impl Extent {
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
-    fn copy_from_slice<const ALIGN: usize>(src: &[u8]) -> Self {
+    fn copy_from_slice(src: &[u8]) -> Self {
         let mut v: AVec<u8, ConstAlign<ALIGN>> = AVec::new(ALIGN);
         v.extend_from_slice(src);
 
@@ -276,7 +277,7 @@ impl Extent {
     }
 }
 
-impl Clone for Extent {
+impl<const ALIGN: usize> Clone for Extent<ALIGN> {
     fn clone(&self) -> Self {
         // SAFETY: `self.ctrlb` points to a live control block while `self` is alive.
         unsafe {
@@ -341,7 +342,7 @@ unsafe fn release_control_block_w_allocation<const ALIGN: usize>(ctrlb: NonNull<
 }
 
 unsafe fn reclaim_unique_control_block(ctrlb: NonNull<ControlBlock>) -> ControlBlock {
-    debug_assert_eq!(
+    assert_eq!(
         // SAFETY: caller guarantees `ctrlb` points to a live control block.
         unsafe { ctrlb.as_ref() }.ref_count.load(Ordering::Acquire),
         1
@@ -350,10 +351,6 @@ unsafe fn reclaim_unique_control_block(ctrlb: NonNull<ControlBlock>) -> ControlB
     // SAFETY: caller guarantees uniqueness, so ownership of the control block can be reclaimed directly.
     unsafe { *Box::from_raw(ctrlb.as_ptr()) }
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 // TODO: Better tests & miri.
 #[cfg(test)]
@@ -389,9 +386,6 @@ mod tests {
         let mut original = owned.split_at(2);
         let mut cloned = original.clone();
 
-        assert!(!original.is_unique());
-        assert!(!cloned.is_unique());
-
         original.head_mut().copy_from_slice(&[9, 9]);
         cloned.head_mut().copy_from_slice(&[7, 7]);
 
@@ -417,11 +411,12 @@ mod tests {
         let buffer = owned.split_at(2);
         let clone = buffer.clone();
 
+        // Merge fails because tail is shared
         let buffer = buffer.try_merge().unwrap_err();
-        assert!(!buffer.is_unique());
 
         drop(clone);
 
+        // Now merge succeeds
         let merged: AVec<u8, ConstAlign<4096>> = buffer.try_merge().unwrap().into();
         assert_eq!(merged.as_slice(), &[1, 2, 3, 4, 5]);
     }
@@ -435,7 +430,6 @@ mod tests {
         drop(buffer);
 
         clone.head_mut().copy_from_slice(&[4, 2]);
-        assert!(clone.is_unique());
 
         let merged: AVec<u8, ConstAlign<4096>> = clone.try_merge().unwrap().into();
         assert_eq!(merged.as_slice(), &[4, 2, 3, 4, 5]);
@@ -455,15 +449,14 @@ mod tests {
     }
 
     #[test]
-    fn clone_of_clone_keeps_tail_sharing_semantics() {
+    fn clone_of_clone_shares_tail() {
         let owned = make_owned(&[1, 2, 3, 4, 5]);
         let original = owned.split_at(2);
         let clone1 = original.clone();
-        let clone2 = clone1.clone();
+        let _clone2 = clone1.clone();
 
-        assert!(!original.is_unique());
-        assert!(!clone1.is_unique());
-        assert!(!clone2.is_unique());
+        // All clones share tail, so merge should fail
+        assert!(original.try_merge().is_err());
     }
 
     #[test]
