@@ -32,5 +32,4 @@ public class TestContext
     public TopicResponse? CreatedTopic { get; set; }
     public List<MessageResponse> PolledMessages { get; set; } = new();
     public Message? LastSendMessage { get; set; }
-    public string? InitialAddress { get; set; }
 }

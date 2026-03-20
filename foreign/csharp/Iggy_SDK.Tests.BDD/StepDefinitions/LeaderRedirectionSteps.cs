@@ -198,10 +198,6 @@ public class LeaderRedirectionSteps
 
         _context.Clients[name] = client;
         _clientInitialAddresses[name] = address;
-        if (name == "main")
-        {
-            _context.IggyClient = client;
-        }
     }
 
     private IIggyClient GetClient(string name)
