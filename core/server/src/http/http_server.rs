@@ -272,20 +272,37 @@ async fn build_app_state(
     let mut jwt_config = config.jwt.clone();
     let encoding_empty = jwt_config.encoding_secret.is_empty();
     let decoding_empty = jwt_config.decoding_secret.is_empty();
-    if encoding_empty || decoding_empty {
-        let secret = crypto::generate_secret(32..64);
-        let redacted = secret.chars().take(3).collect::<String>();
-        if encoding_empty {
+    match (encoding_empty, decoding_empty) {
+        (true, true) => {
+            let secret = crypto::generate_secret(32..64);
+            let redacted: String = secret.chars().take(3).collect();
+            warn!(
+                "JWT encoding and decoding secrets are not configured - generated a random secret: {redacted}***. JWT tokens will be invalidated on server restart. Set 'encoding_secret' and 'decoding_secret' in the config to use persistent secrets."
+            );
             jwt_config.encoding_secret = secret.clone();
-            warn!(
-                "JWT encoding secret is not configured - generated a random secret: {redacted}***. JWT tokens will be invalidated on server restart. Set 'encoding_secret' in the config to use a persistent secret."
-            );
-        }
-        if decoding_empty {
             jwt_config.decoding_secret = secret;
+        }
+        (true, false) => {
             warn!(
-                "JWT decoding secret is not configured - generated a random secret: {redacted}***. JWT tokens will be invalidated on server restart. Set 'decoding_secret' in the config to use a persistent secret."
+                "JWT encoding secret is not configured but decoding secret is set - using decoding secret for both. Set 'encoding_secret' in the config to avoid this warning."
             );
+            jwt_config.encoding_secret = jwt_config.decoding_secret.clone();
+        }
+        (false, true) => {
+            warn!(
+                "JWT decoding secret is not configured but encoding secret is set - using encoding secret for both. Set 'decoding_secret' in the config to avoid this warning."
+            );
+            jwt_config.decoding_secret = jwt_config.encoding_secret.clone();
+        }
+        (false, false) => {
+            if jwt_config.encoding_secret != jwt_config.decoding_secret
+                && jwt_config.algorithm.starts_with("HS")
+            {
+                warn!(
+                    "JWT encoding and decoding secrets are different but algorithm is {} (HMAC) - both secrets must be identical for symmetric algorithms.",
+                    jwt_config.algorithm
+                );
+            }
         }
     }
 
