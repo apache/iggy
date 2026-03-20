@@ -9632,7 +9632,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.7.2-edge.1"
+version = "0.7.3-edge.1"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
