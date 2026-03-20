@@ -63,7 +63,7 @@ jobs:
 
       - name: Setup uv
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7.3.1
 
       - name: Cache uv
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
