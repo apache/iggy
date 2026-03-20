@@ -15,15 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-fn main() {
-    cxx_build::bridge("src/lib.rs")
-        .std("c++17")
-        .compile("iggy-cpp-bridge");
+use crate::ffi;
+use iggy::prelude::ConsumerGroupDetails as RustConsumerGroupDetails;
 
-    println!("cargo:rerun-if-changed=src/client.rs");
-    println!("cargo:rerun-if-changed=src/consumer_group.rs");
-    println!("cargo:rerun-if-changed=src/identifier.rs");
-    println!("cargo:rerun-if-changed=src/lib.rs");
-    println!("cargo:rerun-if-changed=src/stream.rs");
-    println!("cargo:rerun-if-changed=src/topic.rs");
+impl From<RustConsumerGroupDetails> for ffi::ConsumerGroupDetails {
+    fn from(group: RustConsumerGroupDetails) -> Self {
+        ffi::ConsumerGroupDetails {
+            id: group.id,
+            name: group.name,
+            partitions_count: group.partitions_count,
+            members_count: group.members_count,
+            members: group
+                .members
+                .into_iter()
+                .map(|member| ffi::ConsumerGroupMember {
+                    id: member.id,
+                    partitions_count: member.partitions_count,
+                    partitions: member.partitions,
+                })
+                .collect(),
+        }
+    }
 }

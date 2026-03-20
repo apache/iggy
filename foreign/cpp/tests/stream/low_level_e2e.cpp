@@ -25,6 +25,8 @@
 #include "lib.rs.h"
 #include "tests/common/test_helpers.hpp"
 
+// TODO(slbotbm): Add tests for purge_stream after implementing send_messages(...).
+
 TEST(LowLevelE2E_Stream, CreateStreamAfterLogin) {
     RecordProperty("description", "Creates a stream successfully after authenticating.");
     const std::string stream_name = "cpp-create-stream-after-login";

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 mod client;
+mod consumer_group;
 mod identifier;
 mod stream;
 mod topic;
@@ -60,6 +61,20 @@ mod ffi {
         topics: Vec<Topic>,
     }
 
+    struct ConsumerGroupMember {
+        id: u32,
+        partitions_count: u32,
+        partitions: Vec<u32>,
+    }
+
+    struct ConsumerGroupDetails {
+        id: u32,
+        name: String,
+        partitions_count: u32,
+        members_count: u32,
+        members: Vec<ConsumerGroupMember>,
+    }
+
     extern "Rust" {
         type Client;
 
@@ -94,6 +109,36 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             partitions_count: u32,
+        ) -> Result<()>;
+        fn create_consumer_group(
+            &self,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            name: String,
+        ) -> Result<ConsumerGroupDetails>;
+        fn get_consumer_group(
+            &self,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            group_id: Identifier,
+        ) -> Result<ConsumerGroupDetails>;
+        fn join_consumer_group(
+            &self,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            group_id: Identifier,
+        ) -> Result<()>;
+        fn leave_consumer_group(
+            &self,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            group_id: Identifier,
+        ) -> Result<()>;
+        fn delete_consumer_group(
+            &self,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            group_id: Identifier,
         ) -> Result<()>;
 
         unsafe fn delete_connection(client: *mut Client) -> Result<()>;
