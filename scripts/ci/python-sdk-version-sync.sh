@@ -87,16 +87,21 @@ if [ -z "$PYPROJECT_VERSION" ]; then
     exit 1
 fi
 
-# Normalize versions for comparison (both to PEP 440 format with .dev)
+# Normalize versions for comparison (both to strict PEP 440 format: X.Y.Z.devN)
+# Handles both old format (0.7.2-dev.1 / 0.7.2.dev.1) and new (0.7.2-dev1 / 0.7.2.dev1)
 normalize_version() {
     local v="$1"
-    echo "${v//-dev/.dev}"
+    # -dev -> .dev (Cargo to PEP 440 separator)
+    v="${v//-dev/.dev}"
+    # .dev.N -> .devN (strip dot before counter if present)
+    v=$(echo "$v" | sed -E 's/\.dev\.([0-9])/\.dev\1/')
+    echo "$v"
 }
 
-# Convert PEP 440 format to Cargo format
+# Convert PEP 440 format to Cargo format: .devN -> -devN
 to_cargo_format() {
     local v="$1"
-    echo "${v//.dev/-dev}"
+    echo "$v" | sed -E 's/\.dev([0-9])/-dev\1/'
 }
 
 # Compare two versions, returns:

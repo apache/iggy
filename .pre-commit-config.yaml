@@ -79,9 +79,9 @@ repos:
         files: ^rust-toolchain\.toml$
         pass_filenames: false
 
-      - id: python-version-sync
+      - id: python-sdk-version-sync
         name: python sdk version sync
-        entry: ./scripts/ci/python-version-sync.sh
+        entry: ./scripts/ci/python-sdk-version-sync.sh
         args: ["--fix"]
         language: system
         files: ^foreign/python/(Cargo\.toml|pyproject\.toml)$
@@ -93,6 +93,14 @@ repos:
         args: ["--fix"]
         language: system
         files: ^(foreign|bdd|examples)/python/(pyproject\.toml|uv\.lock)$
+        pass_filenames: false
+
+      - id: version-consistency
+        name: version consistency
+        entry: ./scripts/extract-version.sh
+        args: ["--check"]
+        language: system
+        files: (^Cargo\.toml$|^(core|foreign)/.*Cargo\.toml$|^foreign/node/package\.json$|^foreign/python/pyproject\.toml$|^foreign/csharp/.*\.csproj$|^foreign/java/gradle\.properties$|^foreign/go/contracts/version\.go$|^\.github/config/publish\.yml$)
         pass_filenames: false
 
       - id: trailing-whitespace

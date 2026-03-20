@@ -86,7 +86,7 @@ if [ "$MODE" = "fix" ]; then
   FAILED=0
   while IFS= read -r -d '' script; do
     echo "Checking: $script"
-    if ! shellcheck -f gcc "$script"; then
+    if ! shellcheck -x -f gcc "$script"; then
       FAILED=1
     fi
     echo ""
@@ -103,7 +103,7 @@ else
   echo "🔍 Checking shell scripts..."
 
   # Run shellcheck on all shell scripts (checks all severities: error, warning, info, style)
-  if find . -type f -name "*.sh" "${FIND_EXCLUDE_ARGS[@]}" -exec shellcheck {} +; then
+  if find . -type f -name "*.sh" "${FIND_EXCLUDE_ARGS[@]}" -exec shellcheck -x {} +; then
     echo "✅ All shell scripts passed shellcheck"
   else
     echo ""
