@@ -26,7 +26,7 @@ members = [
     "core/bench/report",
     "core/bench/runner",
     "core/binary_protocol",
-    "core/buf",
+    "core/iobuf",
     "core/cli",
     "core/clock",
     "core/common",

@@ -16,7 +16,7 @@
 # under the License.
 
 [package]
-name = "buf"
+name = "iobuf"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"

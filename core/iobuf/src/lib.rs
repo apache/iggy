@@ -203,6 +203,25 @@ pub struct Frozen<const ALIGN: usize> {
     inner: Extent<ALIGN>,
 }
 
+impl<const ALIGN: usize> From<Owned<ALIGN>> for Frozen<ALIGN> {
+    fn from(value: Owned<ALIGN>) -> Self {
+        let inner = value.inner;
+        let (ptr, _, len, capacity) = inner.into_raw_parts();
+
+        // SAFETY: The `Owned` buffer is guaranteed to have a valid allocation, and we are taking ownership of it, so it's safe to construct the control block and extent.
+        let base: NonNull<u8> = unsafe { NonNull::new_unchecked(ptr) };
+        let ctrlb = ControlBlock::new(base, len, capacity);
+        Self {
+            inner: Extent {
+                ptr: base,
+                len,
+                ctrlb,
+                _pad: 0,
+            }
+        }
+    }
+}
+
 impl<const ALIGN: usize> Frozen<ALIGN> {
     pub fn as_slice(&self) -> &[u8] {
         self.inner.as_slice()

@@ -1539,13 +1539,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "buf"
-version = "0.1.0"
-dependencies = [
- "aligned-vec",
-]
-
-[[package]]
 name = "built"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5851,6 +5844,13 @@ dependencies = [
  "bytes",
  "io-uring",
  "rustix 1.1.4",
+]
+
+[[package]]
+name = "iobuf"
+version = "0.1.0"
+dependencies = [
+ "aligned-vec",
 ]
 
 [[package]]
