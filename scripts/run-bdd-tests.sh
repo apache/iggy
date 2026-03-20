@@ -18,32 +18,50 @@
 
 set -Eeuo pipefail
 
-SDK=${1:-"all"}
-FEATURE=${2:-"scenarios/basic_messaging.feature"}
+COVERAGE=0
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --coverage) COVERAGE=1 ;;
+    *) ARGS+=("$arg") ;;
+  esac
+done
+
+SDK="${ARGS[0]:-all}"
+FEATURE="${ARGS[1]:-scenarios/basic_messaging.feature}"
 
 export DOCKER_BUILDKIT=1 FEATURE GO_TEST_EXTRA_FLAGS="${GO_TEST_EXTRA_FLAGS:-}"
 
 cd "$(dirname "$0")/../bdd"
 
+COMPOSE_CMD=(docker compose -f docker-compose.yml)
+if [ "$COVERAGE" = "1" ]; then
+  COMPOSE_CMD+=(-f docker-compose.coverage.yml)
+  mkdir -p ../reports
+fi
+
 log(){ printf "%b\n" "$*"; }
 
 cleanup(){
   log "🧹  cleaning up containers & volumes…"
-  docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+  "${COMPOSE_CMD[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
 log "🧪 Running BDD tests for SDK: ${SDK}"
 log "📁 Feature file: ${FEATURE}"
+if [ "$COVERAGE" = "1" ]; then
+  log "📊 Coverage collection enabled → reports will be in ./reports/"
+fi
 
 run_suite(){
   local svc="$1" emoji="$2" label="$3"
   log "${emoji}  ${label}…"
   set +e
-  docker compose up --build --abort-on-container-exit --exit-code-from "$svc" "$svc"
+  "${COMPOSE_CMD[@]}" up --build --abort-on-container-exit --exit-code-from "$svc" "$svc"
   local code=$?
   set -e
-  docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+  "${COMPOSE_CMD[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
   return "$code"
 }
 
@@ -72,7 +90,7 @@ case "$SDK" in
     cleanup; exit 0 ;;
   *)
     log "❌ Unknown SDK: ${SDK}"
-    log "📖 Usage: $0 [rust|python|go|go-race|node|csharp|java|all|clean] [feature_file]"
+    log "📖 Usage: $0 [--coverage] [rust|python|go|go-race|node|csharp|java|all|clean] [feature_file]"
     exit 2 ;;
 esac
 

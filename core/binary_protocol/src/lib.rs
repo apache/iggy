@@ -23,7 +23,7 @@
 //!
 //! # Design
 //!
-//! Protocol types are independent from domain types (`iggy_common`).
+//! Protocol types are independent from domain types.
 //! Conversion between wire types and domain types happens at the boundary
 //! (SDK client impls, server handlers).
 //!
@@ -47,7 +47,9 @@ pub mod codes;
 pub mod consensus;
 pub mod error;
 pub mod frame;
-pub mod identifier;
+pub mod message_layout;
+pub mod message_view;
+pub mod primitives;
 pub mod requests;
 pub mod responses;
 
@@ -55,4 +57,11 @@ pub use codec::{WireDecode, WireEncode};
 pub use codes::*;
 pub use error::WireError;
 pub use frame::*;
-pub use identifier::{MAX_WIRE_NAME_LENGTH, WireIdentifier, WireName};
+pub use message_layout::*;
+pub use primitives::consumer::WireConsumer;
+pub use primitives::identifier::{MAX_WIRE_NAME_LENGTH, WireIdentifier, WireName};
+pub use primitives::partitioning::{MAX_MESSAGES_KEY_LENGTH, WirePartitioning};
+pub use primitives::permissions::{
+    WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
+};
+pub use primitives::polling_strategy::WirePollingStrategy;

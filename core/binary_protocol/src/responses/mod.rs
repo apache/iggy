@@ -15,7 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod clients;
+pub mod consumer_groups;
+pub mod consumer_offsets;
+pub mod messages;
+pub mod personal_access_tokens;
 pub mod streams;
+pub mod system;
+pub mod topics;
+pub mod users;
 
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode};
