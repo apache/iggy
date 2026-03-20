@@ -17,42 +17,20 @@
  * under the License.
  */
 
-plugins {
-    java
-    jacoco
-    id("com.diffplug.spotless") version "8.1.0"
-}
+package org.apache.iggy.system;
 
-repositories {
-    mavenCentral()
-}
+public record CacheMetricsKey(Long streamId, Long topicId, Long partitionId) {
 
-dependencies {
-    testImplementation("org.apache.iggy:iggy")
-    testImplementation("io.cucumber:cucumber-java:7.33.0")
-    testImplementation("io.cucumber:cucumber-junit-platform-engine:7.33.0")
-    testImplementation("org.junit.jupiter:junit-jupiter:5.11.0")
-    testImplementation("org.junit.platform:junit-platform-suite:1.11.0")
-}
-
-spotless {
-    java {
-        palantirJavaFormat()
-        endWithNewline()
-        trimTrailingWhitespace()
-        importOrder("", "\n", "javax|java", "\n", "\\#")
-        removeUnusedImports()
-        forbidWildcardImports()
-        formatAnnotations()
+    public static CacheMetricsKey fromString(String key) {
+        String[] parts = key.split("-");
+        if (parts.length != 3) {
+            throw new IllegalArgumentException("Invalid cache metrics key: " + key);
+        }
+        return new CacheMetricsKey(Long.parseLong(parts[0]), Long.parseLong(parts[1]), Long.parseLong(parts[2]));
     }
-}
 
-tasks.test {
-    useJUnitPlatform()
-}
-
-tasks.jacocoTestReport {
-    reports {
-        xml.required.set(true)
+    @Override
+    public String toString() {
+        return streamId + "-" + topicId + "-" + partitionId;
     }
 }

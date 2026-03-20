@@ -19,6 +19,7 @@
 
 use crate::IggyPartition;
 use crate::Partition;
+use crate::PollingConsumer;
 use crate::log::JournalInfo;
 use crate::types::PartitionsConfig;
 use consensus::PlaneIdentity;
@@ -562,11 +563,36 @@ where
                 );
             }
             Operation::StoreConsumerOffset => {
-                // TODO: Deserialize consumer offset from prepare body
-                // and store in partition's consumer_offsets.
+                let body = message.body_bytes();
+                let body = body.as_ref();
+                let consumer_kind = body[0];
+                let consumer_id = u32::from_le_bytes(body[1..5].try_into().unwrap()) as usize;
+                let offset = u64::from_le_bytes(body[5..13].try_into().unwrap());
+                let consumer = match consumer_kind {
+                    1 => PollingConsumer::Consumer(consumer_id, 0),
+                    2 => PollingConsumer::ConsumerGroup(consumer_id, 0),
+                    _ => {
+                        warn!(
+                            replica = consensus.replica(),
+                            op = header.op,
+                            consumer_kind,
+                            "on_replicate: unknown consumer kind"
+                        );
+                        return;
+                    }
+                };
+
+                let partition = self
+                    .get_by_ns(namespace)
+                    .expect("store_consumer_offset: partition not found for namespace");
+                let _ = partition.store_consumer_offset(consumer, offset);
+
                 debug!(
                     replica = consensus.replica(),
                     op = header.op,
+                    consumer_kind,
+                    consumer_id,
+                    offset,
                     "on_replicate: consumer offset stored"
                 );
             }

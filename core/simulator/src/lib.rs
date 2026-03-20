@@ -24,9 +24,13 @@ pub mod ready_queue;
 pub mod replica;
 
 use bus::MemBus;
+use consensus::PartitionsHandle;
 use iggy_common::header::ReplyHeader;
 use iggy_common::message::Message;
+use iggy_common::sharding::IggyNamespace;
+use iggy_common::{IggyError, IggyMessagesBatchSet};
 use message_bus::MessageBus;
+use partitions::{Partition, PartitionOffsets, PollingArgs, PollingConsumer};
 use replica::{Replica, new_replica};
 use std::sync::Arc;
 
@@ -136,6 +140,44 @@ impl Simulator {
             0,
             "on_ack must not re-enqueue loopback messages"
         );
+    }
+}
+
+impl Simulator {
+    /// Poll messages directly from a replica's partition.
+    ///
+    /// # Errors
+    /// Returns `IggyError::ResourceNotFound` if the namespace does not exist on this replica.
+    #[allow(clippy::future_not_send)]
+    pub async fn poll_messages(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+        consumer: PollingConsumer,
+        args: PollingArgs,
+    ) -> Result<IggyMessagesBatchSet, IggyError> {
+        let replica = &self.replicas[replica_idx];
+        let partition =
+            replica
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .ok_or(IggyError::ResourceNotFound(format!(
+                    "partition not found for namespace {namespace:?} on replica {replica_idx}"
+                )))?;
+        partition.poll_messages(consumer, args).await
+    }
+
+    /// Get partition offsets from a replica.
+    #[must_use]
+    pub fn offsets(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+    ) -> Option<PartitionOffsets> {
+        let replica = &self.replicas[replica_idx];
+        let partition = replica.plane.partitions().get_by_ns(&namespace)?;
+        Some(partition.offsets())
     }
 }
 
