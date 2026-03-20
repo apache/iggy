@@ -36,7 +36,6 @@ public class TestHooks
         _context.LeaderTcpUrl = Environment.GetEnvironmentVariable("IGGY_TCP_ADDRESS_LEADER") ?? "127.0.0.1:8091";
         _context.FollowerTcpUrl = Environment.GetEnvironmentVariable("IGGY_TCP_ADDRESS_FOLLOWER") ?? "127.0.0.1:8092";
         _context.Clients.Clear();
-        _context.InitialAddress = null;
         _context.CreatedStream = null;
     }
 
