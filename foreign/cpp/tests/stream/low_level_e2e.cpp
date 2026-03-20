@@ -85,6 +85,27 @@ TEST(LowLevelE2E_Stream, CreateStreamValidatesNameConstraintsAndUniqueness) {
     client = nullptr;
 }
 
+TEST(LowLevelE2E_Stream, CreateStreamWithEmojiName) {
+    RecordProperty("description", "Creates a stream with a UTF-8 emoji name.");
+    const std::string stream_name = "🚀🚀🚀🚀Apache Iggy🚀🚀🚀🚀";
+    iggy::ffi::Client *client     = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW({
+        const auto stream_details              = client->get_stream(make_string_identifier(stream_name));
+        const std::string returned_stream_name = static_cast<std::string>(stream_details.name);
+        EXPECT_NE(stream_details.id, 0u);
+        EXPECT_EQ(returned_stream_name, stream_name);
+        EXPECT_EQ(stream_details.topics_count, 0u);
+        EXPECT_EQ(stream_details.topics.size(), 0u);
+    });
+
+    ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    client = nullptr;
+}
+
 TEST(LowLevelE2E_Stream, StreamCreatedAndDeletedSuccessfully) {
     RecordProperty("description", "Creates a stream and deletes it successfully by string identifier.");
     const std::string stream_name = "cpp-delete-stream-created-and-deleted";

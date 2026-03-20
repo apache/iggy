@@ -100,6 +100,13 @@ cc_library(
         "cxxbridge",
         "include",
     ],
+    copts = select({
+        "@platforms//os:windows": ["/utf-8"],
+        "//conditions:default": [
+            "-finput-charset=UTF-8",
+            "-fexec-charset=UTF-8",
+        ],
+    }),
     linkopts = [
         "-ldl",
         "-lpthread",
@@ -120,6 +127,13 @@ cc_test(
     srcs = [
         "tests/unit_tests.cpp",
     ],
+    copts = select({
+        "@platforms//os:windows": ["/utf-8"],
+        "//conditions:default": [
+            "-finput-charset=UTF-8",
+            "-fexec-charset=UTF-8",
+        ],
+    }),
     deps = [
         ":iggy-cpp",
         "@googletest//:gtest_main",
@@ -133,6 +147,13 @@ cc_test(
     ]) + [
         "tests/common/test_helpers.hpp",
     ],
+    copts = select({
+        "@platforms//os:windows": ["/utf-8"],
+        "//conditions:default": [
+            "-finput-charset=UTF-8",
+            "-fexec-charset=UTF-8",
+        ],
+    }),
     tags = [
         "e2e",
     ],
