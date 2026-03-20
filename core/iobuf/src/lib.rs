@@ -217,7 +217,7 @@ impl<const ALIGN: usize> From<Owned<ALIGN>> for Frozen<ALIGN> {
                 len,
                 ctrlb,
                 _pad: 0,
-            }
+            },
         }
     }
 }
