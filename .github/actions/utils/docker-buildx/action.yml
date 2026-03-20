@@ -135,11 +135,8 @@ runs:
         platforms: all
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-      with:
-        driver-opts: |
-          network=host
-          image=moby/buildkit:latest
+      run: docker buildx create --use --driver-opt network=host --driver-opt image=moby/buildkit:latest
+      shell: bash
 
     - name: Login to Docker Hub
       if: steps.config.outputs.should_push == 'true'
