@@ -91,6 +91,12 @@ pub struct IggyBenchArgs {
     /// Password for server authentication
     #[arg(long, short = 'p', default_value_t = DEFAULT_ROOT_PASSWORD.to_string())]
     pub password: String,
+
+    /// Reuse existing bench streams instead of deleting and recreating them.
+    /// Without this flag, existing bench streams are deleted to ensure
+    /// consumers start with fresh data and accurate latency measurements.
+    #[arg(long, default_value_t = false)]
+    pub reuse_streams: bool,
 }
 
 impl IggyBenchArgs {
@@ -312,6 +318,10 @@ impl IggyBenchArgs {
 
     pub const fn high_level_api(&self) -> bool {
         self.high_level_api
+    }
+
+    pub const fn reuse_streams(&self) -> bool {
+        self.reuse_streams
     }
 
     pub fn username(&self) -> &str {

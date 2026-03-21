@@ -58,15 +58,21 @@ pub fn run_bench_and_wait_for_finish(
     let messages_total: u64 = MESSAGES_PER_BATCH * MESSAGE_BATCHES;
     let message_size = total_bytes_to_process_per_stream / messages_total;
 
+    let messages_per_batch_str = MESSAGES_PER_BATCH.to_string();
+    let message_batches_str = MESSAGE_BATCHES.to_string();
+    let message_size_str = message_size.to_string();
+    let transport_str = transport.to_string();
+
     command.args([
         "--messages-per-batch",
-        &MESSAGES_PER_BATCH.to_string(),
+        messages_per_batch_str.as_str(),
         "--message-batches",
-        &MESSAGE_BATCHES.to_string(),
+        message_batches_str.as_str(),
         "--message-size",
-        &message_size.to_string(),
+        message_size_str.as_str(),
+        "--reuse-streams",
         bench,
-        &transport.to_string(),
+        transport_str.as_str(),
         "--server-address",
         server_addr,
     ]);
