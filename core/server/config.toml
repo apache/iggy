@@ -114,10 +114,12 @@ clock_skew = "5 s"
 not_before = "0 s"
 
 # Secret key for encoding JWTs.
-encoding_secret = "top_secret$iggy123$_jwt_HS256_key#!"
+# If left empty, a secure random secret will be generated on each server start.
+encoding_secret = ""
 
 # Secret key for decoding JWTs.
-decoding_secret = "top_secret$iggy123$_jwt_HS256_key#!"
+# If left empty, a secure random secret will be generated on each server start.
+decoding_secret = ""
 
 # Indicates if the secret key is base64 encoded.
 # `true` means the secret is base64 encoded.

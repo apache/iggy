@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,7 +17,22 @@
  * under the License.
  */
 
-mod verify_after_server_restart;
-mod verify_consumer_group_partition_assignment;
-mod verify_no_plaintext_credentials_on_disk;
-mod verify_user_login_after_restart;
+package org.apache.iggy.client.blocking.http;
+
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonValue;
+import org.apache.iggy.system.CacheMetricsKey;
+
+/**
+ * Jackson mixin for {@link CacheMetricsKey} to keep the domain object free of serialization annotations.
+ */
+abstract class CacheMetricsKeyMixin {
+
+    @JsonCreator
+    static CacheMetricsKey fromString(String key) {
+        throw new UnsupportedOperationException("Mixin method should not be called directly");
+    }
+
+    @JsonValue
+    public abstract String toString();
+}
