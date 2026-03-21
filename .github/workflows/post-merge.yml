@@ -15,6 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Auto-publish: detects pre-release crate/SDK versions without tags
+# and publishes them to crates.io, Docker Hub, PyPI, npm, Maven, NuGet.
+# Runs on every push to master.
+
 name: Post-merge
 
 on:

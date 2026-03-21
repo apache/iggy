@@ -15,6 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Full coverage baseline for all 6 languages (Rust, Java, C#, Python,
+# Node, Go). Runs on every push to master so Codecov has complete data
+# for carryforward on PR builds where only a subset of SDKs is tested.
+
 name: Coverage baseline
 
 on:

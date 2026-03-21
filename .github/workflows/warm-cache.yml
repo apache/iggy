@@ -15,6 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Pre-populates the GitHub Actions Rust build cache on ubuntu-latest and
+# macos-14 so that subsequent PR builds get cache hits and start faster.
+
 name: Warm cache
 
 on:
