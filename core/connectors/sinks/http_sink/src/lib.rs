@@ -22,7 +22,8 @@ use base64::engine::general_purpose;
 use bytes::Bytes;
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
+    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
+    convert::owned_value_to_serde_json, sink_connector,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -957,33 +958,6 @@ impl HttpSink {
                 Err(e)
             }
             None => Ok(()),
-        }
-    }
-}
-
-/// Convert `simd_json::OwnedValue` to `serde_json::Value` via direct structural mapping.
-/// NaN/Infinity f64 values are mapped to `null` (same as Elasticsearch sink).
-fn owned_value_to_serde_json(value: &simd_json::OwnedValue) -> serde_json::Value {
-    match value {
-        simd_json::OwnedValue::Static(s) => match s {
-            simd_json::StaticNode::Null => serde_json::Value::Null,
-            simd_json::StaticNode::Bool(b) => serde_json::Value::Bool(*b),
-            simd_json::StaticNode::I64(n) => serde_json::Value::Number((*n).into()),
-            simd_json::StaticNode::U64(n) => serde_json::Value::Number((*n).into()),
-            simd_json::StaticNode::F64(n) => serde_json::Number::from_f64(*n)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
-        },
-        simd_json::OwnedValue::String(s) => serde_json::Value::String(s.to_string()),
-        simd_json::OwnedValue::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(owned_value_to_serde_json).collect())
-        }
-        simd_json::OwnedValue::Object(obj) => {
-            let map: serde_json::Map<String, serde_json::Value> = obj
-                .iter()
-                .map(|(k, v)| (k.to_string(), owned_value_to_serde_json(v)))
-                .collect();
-            serde_json::Value::Object(map)
         }
     }
 }

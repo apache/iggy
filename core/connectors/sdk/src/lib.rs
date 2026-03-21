@@ -38,6 +38,7 @@ use tokio::runtime::Runtime;
 
 #[cfg(feature = "api")]
 pub mod api;
+pub mod convert;
 pub mod decoders;
 pub mod encoders;
 pub mod log;
@@ -46,6 +47,7 @@ pub mod sink;
 pub mod source;
 pub mod transforms;
 
+pub use convert::owned_value_to_serde_json;
 pub use log::LogCallback;
 pub use transforms::Transform;
 
