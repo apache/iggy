@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_common::PollingStrategy;
 use iggy_common::header::ReplyHeader;
 use iggy_common::message::Message;
 use iggy_common::sharding::IggyNamespace;
+use iggy_common::{IggyByteSize, MemoryPool, MemoryPoolConfigOther};
 use message_bus::MessageBus;
+use partitions::{PollingArgs, PollingConsumer};
 use simulator::{Simulator, client::SimClient};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -39,7 +42,16 @@ impl Responses {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() {
+    // PooledBuffer::from (used by poll_messages) panics if the global pool is uninitialized.
+    // Disabled pooling just falls through to the system allocator.
+    MemoryPool::init_pool(&MemoryPoolConfigOther {
+        enabled: false,
+        size: IggyByteSize::from(0u64),
+        bucket_capacity: 1,
+    });
+
     let client_id: u128 = 1;
     let leader: u8 = 0;
     let mut sim = Simulator::new(3, std::iter::once(client_id));
@@ -125,6 +137,52 @@ fn main() {
             if client_handle.is_finished() {
                 break;
             }
+        }
+
+        // Poll messages directly from the leader's partition (bypassing consensus)
+        let consumer = PollingConsumer::Consumer(1, 0);
+        let args = PollingArgs::new(PollingStrategy::first(), 10, false);
+        match sim
+            .poll_messages(leader as usize, test_namespace, consumer, args)
+            .await
+        {
+            Ok(batch_set) => {
+                println!(
+                    "[sim] Poll returned {} messages (expected 3)",
+                    batch_set.count()
+                );
+            }
+            Err(e) => {
+                println!("[sim] Poll failed: {e}");
+            }
+        }
+
+        let args_auto = PollingArgs::new(PollingStrategy::first(), 2, true);
+        if let Ok(batch) = sim
+            .poll_messages(leader as usize, test_namespace, consumer, args_auto)
+            .await
+        {
+            println!("[sim] Auto-commit poll returned {} messages", batch.count());
+        }
+
+        // Next poll should start from offset 2 (after auto-commit of 0,1)
+        let args_next = PollingArgs::new(PollingStrategy::next(), 10, false);
+        if let Ok(batch) = sim
+            .poll_messages(leader as usize, test_namespace, consumer, args_next)
+            .await
+        {
+            println!(
+                "[sim] Next poll returned {} messages (expected 1)",
+                batch.count()
+            );
+        }
+
+        // Check offsets
+        if let Some(offsets) = sim.offsets(leader as usize, test_namespace) {
+            println!(
+                "[sim] Partition offsets: commit={}, write={}",
+                offsets.commit_offset, offsets.write_offset
+            );
         }
     });
 

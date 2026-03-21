@@ -55,6 +55,7 @@
   {#snippet suffix()}
     <span>
       <Button
+        type="button"
         variant="rounded"
         class="w-[33px] h-[33px] p-0 flex items-center justify-center"
         onclick={(e) => {

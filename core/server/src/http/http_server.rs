@@ -30,6 +30,7 @@ use crate::shard::task_registry::ShutdownToken;
 use crate::shard::tasks::periodic::spawn_jwt_token_cleaner;
 use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::persistence::persister::PersisterKind;
+use crate::streaming::utils::crypto;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::connect_info::Connected;
 use axum::http::Method;
@@ -45,7 +46,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Copy)]
 pub struct CompioSocketAddr(pub SocketAddr);
@@ -268,12 +269,47 @@ async fn build_app_state(
         tokens_path = shard.config.system.get_state_tokens_path();
     }
 
-    let jwt_manager = JwtManager::from_config(persister, &tokens_path, &config.jwt);
-    if let Err(e) = jwt_manager {
-        panic!("Failed to initialize JWT manager: {e}");
+    let mut jwt_config = config.jwt.clone();
+    let encoding_empty = jwt_config.encoding_secret.is_empty();
+    let decoding_empty = jwt_config.decoding_secret.is_empty();
+    match (encoding_empty, decoding_empty) {
+        (true, true) => {
+            let secret = crypto::generate_secret(32..64);
+            let redacted: String = secret.chars().take(3).collect();
+            warn!(
+                "JWT encoding and decoding secrets are not configured - generated a random secret: {redacted}***. JWT tokens will be invalidated on server restart. Set 'encoding_secret' and 'decoding_secret' in the config to use persistent secrets."
+            );
+            jwt_config.encoding_secret = secret.clone();
+            jwt_config.decoding_secret = secret;
+        }
+        (true, false) => {
+            warn!(
+                "JWT encoding secret is not configured but decoding secret is set - using decoding secret for both. Set 'encoding_secret' in the config to avoid this warning."
+            );
+            jwt_config.encoding_secret = jwt_config.decoding_secret.clone();
+        }
+        (false, true) => {
+            warn!(
+                "JWT decoding secret is not configured but encoding secret is set - using encoding secret for both. Set 'decoding_secret' in the config to avoid this warning."
+            );
+            jwt_config.decoding_secret = jwt_config.encoding_secret.clone();
+        }
+        (false, false) => {
+            if jwt_config.encoding_secret != jwt_config.decoding_secret
+                && jwt_config.algorithm.starts_with("HS")
+            {
+                warn!(
+                    "JWT encoding and decoding secrets are different but algorithm is {} (HMAC) - both secrets must be identical for symmetric algorithms.",
+                    jwt_config.algorithm
+                );
+            }
+        }
     }
 
-    let jwt_manager = jwt_manager.unwrap();
+    let jwt_manager = match JwtManager::from_config(persister, &tokens_path, &jwt_config) {
+        Ok(manager) => manager,
+        Err(error) => panic!("Failed to initialize JWT manager: {error}"),
+    };
     if jwt_manager.load_revoked_tokens().await.is_err() {
         panic!("Failed to load revoked access tokens");
     }

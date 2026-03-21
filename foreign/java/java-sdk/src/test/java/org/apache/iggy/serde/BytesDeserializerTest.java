@@ -24,6 +24,7 @@ import io.netty.buffer.Unpooled;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
+import org.apache.iggy.system.CacheMetricsKey;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.user.UserStatus;
 import org.junit.jupiter.api.Nested;
@@ -421,10 +422,7 @@ class BytesDeserializerTest {
     @Nested
     class StatsDeserialization {
 
-        @Test
-        void shouldDeserializeStats() {
-            // given
-            ByteBuf buffer = Unpooled.buffer();
+        private void writeBaseStatsFields(ByteBuf buffer) {
             buffer.writeIntLE(1234); // process ID
             buffer.writeFloatLE(12.5f); // CPU usage
             buffer.writeFloatLE(50.0f); // total CPU usage
@@ -451,6 +449,24 @@ class BytesDeserializerTest {
             buffer.writeBytes("5.4.0".getBytes());
             buffer.writeIntLE(7); // kernel version length
             buffer.writeBytes("5.4.0-1".getBytes());
+        }
+
+        private void writeServerVersionFields(ByteBuf buffer) {
+            buffer.writeIntLE(5); // iggy_server_version length
+            buffer.writeBytes("0.6.1".getBytes());
+            buffer.writeIntLE(601000); // iggy_server_semver
+        }
+
+        @Test
+        void shouldDeserializeStats() {
+            // given
+            ByteBuf buffer = Unpooled.buffer();
+            writeBaseStatsFields(buffer);
+            writeServerVersionFields(buffer);
+            buffer.writeIntLE(0); // cache_metrics (empty)
+            buffer.writeIntLE(42); // threads count
+            writeU64(buffer, BigInteger.valueOf(500_000_000_000L)); // free disk space
+            writeU64(buffer, BigInteger.valueOf(1_000_000_000_000L)); // total disk space
 
             // when
             var stats = readStats(buffer);
@@ -458,9 +474,101 @@ class BytesDeserializerTest {
             // then
             assertThat(stats.processId()).isEqualTo(1234L);
             assertThat(stats.cpuUsage()).isEqualTo(12.5f);
+            assertThat(stats.totalCpuUsage()).isEqualTo(50.0f);
+            assertThat(stats.memoryUsage()).isEqualTo("1000000");
+            assertThat(stats.totalMemory()).isEqualTo("8000000");
+            assertThat(stats.availableMemory()).isEqualTo("7000000");
+            assertThat(stats.runTime()).isEqualTo(BigInteger.valueOf(3600));
+            assertThat(stats.startTime()).isEqualTo(BigInteger.valueOf(1000000));
+            assertThat(stats.readBytes()).isEqualTo("500");
+            assertThat(stats.writtenBytes()).isEqualTo("600");
+            assertThat(stats.messagesSizeBytes()).isEqualTo("1000");
             assertThat(stats.streamsCount()).isEqualTo(5L);
+            assertThat(stats.topicsCount()).isEqualTo(10L);
+            assertThat(stats.partitionsCount()).isEqualTo(20L);
+            assertThat(stats.segmentsCount()).isEqualTo(100L);
+            assertThat(stats.messagesCount()).isEqualTo(BigInteger.valueOf(5000));
+            assertThat(stats.clientsCount()).isEqualTo(3L);
+            assertThat(stats.consumerGroupsCount()).isEqualTo(2L);
             assertThat(stats.hostname()).isEqualTo("localhost");
             assertThat(stats.osName()).isEqualTo("Linux");
+            assertThat(stats.osVersion()).isEqualTo("5.4.0");
+            assertThat(stats.kernelVersion()).isEqualTo("5.4.0-1");
+            assertThat(stats.iggyServerVersion()).isEqualTo("0.6.1");
+            assertThat(stats.iggyServerSemver()).isPresent().hasValue(601000L);
+            assertThat(stats.cacheMetrics()).isEmpty();
+            assertThat(stats.threadsCount()).isEqualTo(42L);
+            assertThat(stats.freeDiskSpace()).isEqualTo("500000000000");
+            assertThat(stats.totalDiskSpace()).isEqualTo("1000000000000");
+        }
+
+        @Test
+        void shouldDeserializeStatsWithNullSemver() {
+            // given
+            ByteBuf buffer = Unpooled.buffer();
+            writeBaseStatsFields(buffer);
+            buffer.writeIntLE(5); // iggy_server_version length
+            buffer.writeBytes("0.6.1".getBytes());
+            buffer.writeIntLE(0); // iggy_server_semver = 0 (None)
+            buffer.writeIntLE(0); // cache_metrics (empty)
+            buffer.writeIntLE(8); // threads count
+            writeU64(buffer, BigInteger.valueOf(100_000_000_000L)); // free disk space
+            writeU64(buffer, BigInteger.valueOf(200_000_000_000L)); // total disk space
+
+            // when
+            var stats = readStats(buffer);
+
+            // then
+            assertThat(stats.iggyServerVersion()).isEqualTo("0.6.1");
+            assertThat(stats.iggyServerSemver()).isEmpty();
+            assertThat(stats.threadsCount()).isEqualTo(8L);
+        }
+
+        @Test
+        void shouldDeserializeStatsWithCacheMetrics() {
+            // given
+            ByteBuf buffer = Unpooled.buffer();
+            writeBaseStatsFields(buffer);
+            writeServerVersionFields(buffer);
+            // cache_metrics (2 entries)
+            buffer.writeIntLE(2); // count
+            // entry 1: key "1-1-1"
+            buffer.writeIntLE(1); // stream_id
+            buffer.writeIntLE(1); // topic_id
+            buffer.writeIntLE(1); // partition_id
+            writeU64(buffer, BigInteger.valueOf(100)); // hits
+            writeU64(buffer, BigInteger.valueOf(10)); // misses
+            buffer.writeFloatLE(0.91f); // hit_ratio
+            // entry 2: key "1-2-1"
+            buffer.writeIntLE(1); // stream_id
+            buffer.writeIntLE(2); // topic_id
+            buffer.writeIntLE(1); // partition_id
+            writeU64(buffer, BigInteger.valueOf(200)); // hits
+            writeU64(buffer, BigInteger.valueOf(50)); // misses
+            buffer.writeFloatLE(0.80f); // hit_ratio
+            // new fields
+            buffer.writeIntLE(16); // threads count
+            writeU64(buffer, BigInteger.valueOf(250_000_000_000L)); // free disk space
+            writeU64(buffer, BigInteger.valueOf(500_000_000_000L)); // total disk space
+
+            // when
+            var stats = readStats(buffer);
+
+            // then
+            var key1 = new CacheMetricsKey(1L, 1L, 1L);
+            var key2 = new CacheMetricsKey(1L, 2L, 1L);
+            assertThat(stats.cacheMetrics()).hasSize(2);
+            assertThat(stats.cacheMetrics()).containsKey(key1);
+            assertThat(stats.cacheMetrics()).containsKey(key2);
+            assertThat(stats.cacheMetrics().get(key1).hits()).isEqualTo(BigInteger.valueOf(100));
+            assertThat(stats.cacheMetrics().get(key1).misses()).isEqualTo(BigInteger.valueOf(10));
+            assertThat(stats.cacheMetrics().get(key1).hitRatio())
+                    .isCloseTo(0.91f, org.assertj.core.data.Offset.offset(0.01f));
+            assertThat(stats.cacheMetrics().get(key2).hits()).isEqualTo(BigInteger.valueOf(200));
+            assertThat(stats.cacheMetrics().get(key2).misses()).isEqualTo(BigInteger.valueOf(50));
+            assertThat(stats.threadsCount()).isEqualTo(16L);
+            assertThat(stats.freeDiskSpace()).isEqualTo("250000000000");
+            assertThat(stats.totalDiskSpace()).isEqualTo("500000000000");
         }
     }
 
