@@ -47,6 +47,7 @@ members = [
     "core/consensus",
     "core/harness_derive",
     "core/integration",
+    "core/iobuf",
     "core/journal",
     "core/message_bus",
     "core/metadata",

@@ -22,6 +22,7 @@ package org.apache.iggy.client.blocking.http;
 import com.fasterxml.jackson.annotation.JsonSetter;
 import com.fasterxml.jackson.annotation.Nulls;
 import org.apache.iggy.message.Message;
+import org.apache.iggy.system.CacheMetricsKey;
 import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.EnumNamingStrategies;
 import tools.jackson.databind.MapperFeature;
@@ -43,6 +44,7 @@ final class ObjectMapperFactory {
             .withConfigOverride(
                     List.class, list -> list.setNullHandling(JsonSetter.Value.forValueNulls(Nulls.AS_EMPTY)))
             .addMixIn(Message.class, MessageMixin.class)
+            .addMixIn(CacheMetricsKey.class, CacheMetricsKeyMixin.class)
             .build();
 
     private ObjectMapperFactory() {}

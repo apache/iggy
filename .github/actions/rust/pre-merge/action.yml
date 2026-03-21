@@ -108,15 +108,6 @@ runs:
     - name: Build and test with coverage
       if: inputs.task == 'test'
       run: |
-        # Start D-Bus and unlock keyring in the same shell that runs tests,
-        # so daemons are guaranteed alive for the entire test execution.
-        if [[ "$RUNNER_OS" == "Linux" ]]; then
-          eval $(dbus-launch --sh-syntax)
-          export DBUS_SESSION_BUS_ADDRESS
-          eval $(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)
-          echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
-        fi
-
         source <(cargo llvm-cov show-env --export-prefix)
 
         bins_start=$(date +%s)
@@ -130,6 +121,17 @@ runs:
         compile_end=$(date +%s)
         compile_duration=$((compile_end - compile_start))
         echo "::notice::Tests compiled in ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
+
+        # Start D-Bus and unlock keyring right before test execution to avoid
+        # gnome-keyring auto-locking the collection during the build phase.
+        # Previously this ran before `cargo build`, leaving a 7+ minute idle
+        # window that triggered org.freedesktop.Secret.Error.IsLocked ~10% of runs.
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
+          eval $(dbus-launch --sh-syntax)
+          export DBUS_SESSION_BUS_ADDRESS
+          eval $(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)
+          echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
+        fi
 
         test_start=$(date +%s)
         if command -v cargo-nextest &> /dev/null; then
