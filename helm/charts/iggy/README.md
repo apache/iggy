@@ -16,7 +16,9 @@ Iggy server uses `io_uring` for high-performance async I/O. This requires:
 1. **IPC_LOCK capability** - For locking memory required by io_uring
 2. **Unconfined seccomp profile** - To allow io_uring syscalls
 
-These are configured by default in the chart's `securityContext` and `podSecurityContext`.
+These are configured by default for the Iggy server via the chart's root-level
+`securityContext` and `podSecurityContext`. The web UI uses `ui.securityContext`
+and `ui.podSecurityContext`, which default to empty.
 
 Some local or container-based Kubernetes environments may still fail during Iggy runtime
 initialization if the node/kernel does not provide the `io_uring` support required by the
@@ -110,8 +112,8 @@ helm uninstall iggy
 | `server.users.root.password` | string | `"changeit"` | Root user password |
 | `server.users.root.createSecret` | bool | `true` | Create secret for root user |
 | `server.users.root.existingSecret.name` | string | `""` | Use existing secret |
-| `securityContext.capabilities.add` | list | `["IPC_LOCK"]` | Container capabilities (required for io_uring) |
-| `podSecurityContext.seccompProfile.type` | string | `"Unconfined"` | Seccomp profile (required for io_uring) |
+| `securityContext.capabilities.add` | list | `["IPC_LOCK"]` | Server container capabilities (required for io_uring) |
+| `podSecurityContext.seccompProfile.type` | string | `"Unconfined"` | Server pod seccomp profile (required for io_uring) |
 
 ### Monitoring Configuration
 
@@ -130,6 +132,8 @@ helm uninstall iggy
 | `ui.image.repository` | string | `"apache/iggy-web-ui"` | UI image repository |
 | `ui.ports.http` | int | `3050` | UI HTTP port |
 | `ui.server.endpoint` | string | `""` | Iggy server endpoint (auto-detected if empty) |
+| `ui.securityContext` | object | `{}` | UI container security context |
+| `ui.podSecurityContext` | object | `{}` | UI pod security context |
 
 ## Troubleshooting
 
@@ -146,7 +150,7 @@ This means io_uring cannot lock sufficient memory. Ensure:
 1. `securityContext.capabilities.add` includes `IPC_LOCK`
 2. `podSecurityContext.seccompProfile.type` is `Unconfined`
 
-These are set by default but may be overridden.
+These server settings are set by default but may be overridden.
 
 ### Pod CrashLoopBackOff with "Invalid argument" during server startup
 
