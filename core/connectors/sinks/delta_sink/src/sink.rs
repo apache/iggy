@@ -46,7 +46,7 @@ impl Sink for DeltaSink {
         })?;
 
         let table =
-            match deltalake::open_table_with_storage_options(table_url, storage_options.clone())
+            match deltalake::open_table_with_storage_options(table_url, storage_options)
                 .await
             {
                 Ok(table) => table,
@@ -121,7 +121,7 @@ impl Sink for DeltaSink {
         let mut state_guard = self.state.lock().await;
         let state = state_guard.as_mut().ok_or_else(|| {
             error!("Delta sink state not initialized — was open() called?");
-            Error::InvalidConfig
+            Error::InvalidState
         })?;
 
         // Apply coercions to match Delta table schema
@@ -168,6 +168,8 @@ impl Sink for DeltaSink {
     }
 }
 
+// TODO: Similar logic exists in the Elasticsearch sink.
+// Refactor to use a common utility when it is implemented.
 fn owned_value_to_serde_json(value: &simd_json::OwnedValue) -> serde_json::Value {
     match value {
         simd_json::OwnedValue::Static(s) => match s {

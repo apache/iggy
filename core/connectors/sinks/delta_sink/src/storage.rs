@@ -30,12 +30,15 @@ pub(crate) fn build_storage_options(
             let access_key = config
                 .aws_s3_access_key
                 .as_ref()
-                .ok_or(Error::InvalidConfig)?;
+                .ok_or_else(|| Error::InitError("S3 backend requires 'aws_s3_access_key'".into()))?;
             let secret_key = config
                 .aws_s3_secret_key
                 .as_ref()
-                .ok_or(Error::InvalidConfig)?;
-            let region = config.aws_s3_region.as_ref().ok_or(Error::InvalidConfig)?;
+                .ok_or_else(|| Error::InitError("S3 backend requires 'aws_s3_secret_key'".into()))?;
+            let region = config
+                .aws_s3_region
+                .as_ref()
+                .ok_or_else(|| Error::InitError("S3 backend requires 'aws_s3_region'".into()))?;
 
             opts.insert("AWS_ACCESS_KEY_ID".into(), access_key.clone());
             opts.insert("AWS_SECRET_ACCESS_KEY".into(), secret_key.clone());
@@ -53,11 +56,11 @@ pub(crate) fn build_storage_options(
             let account_name = config
                 .azure_storage_account_name
                 .as_ref()
-                .ok_or(Error::InvalidConfig)?;
+                .ok_or_else(|| Error::InitError("Azure backend requires 'azure_storage_account_name'".into()))?;
             let container_name = config
                 .azure_container_name
                 .as_ref()
-                .ok_or(Error::InvalidConfig)?;
+                .ok_or_else(|| Error::InitError("Azure backend requires 'azure_container_name'".into()))?;
 
             opts.insert("AZURE_STORAGE_ACCOUNT_NAME".into(), account_name.clone());
             opts.insert("AZURE_CONTAINER_NAME".into(), container_name.clone());
@@ -72,8 +75,11 @@ pub(crate) fn build_storage_options(
                 (None, Some(sas)) => {
                     opts.insert("AZURE_STORAGE_SAS_TOKEN".into(), sas.clone());
                 }
-                (Some(_), Some(_)) | (None, None) => {
-                    return Err(Error::InvalidConfig);
+                (Some(_), Some(_)) => {
+                    return Err(Error::InitError("Azure backend requires exactly one of 'azure_storage_account_key' or 'azure_storage_sas_token', but both were provided".into()));
+                }
+                (None, None) => {
+                    return Err(Error::InitError("Azure backend requires one of 'azure_storage_account_key' or 'azure_storage_sas_token'".into()));
                 }
             }
         }
@@ -81,8 +87,11 @@ pub(crate) fn build_storage_options(
             let service_account_key = config
                 .gcs_service_account_key
                 .as_ref()
-                .ok_or(Error::InvalidConfig)?;
-            let bucket = config.gcs_bucket.as_ref().ok_or(Error::InvalidConfig)?;
+                .ok_or_else(|| Error::InitError("GCS backend requires 'gcs_service_account_key'".into()))?;
+            let bucket = config
+                .gcs_bucket
+                .as_ref()
+                .ok_or_else(|| Error::InitError("GCS backend requires 'gcs_bucket'".into()))?;
 
             opts.insert(
                 "GOOGLE_SERVICE_ACCOUNT_KEY".into(),
@@ -90,8 +99,8 @@ pub(crate) fn build_storage_options(
             );
             opts.insert("GCS_BUCKET".into(), bucket.clone());
         }
-        Some(_) => {
-            return Err(Error::InvalidConfig);
+        Some(unknown) => {
+            return Err(Error::InitError(format!("Unknown storage backend type: '{unknown}'. Valid options are 's3', 'azure', 'gcs'")));
         }
         None => {}
     }

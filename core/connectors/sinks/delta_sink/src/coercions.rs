@@ -25,7 +25,6 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(unused)]
 enum CoercionNode {
     Coercion(Coercion),
     Tree(CoercionTree),
@@ -61,7 +60,9 @@ fn build_coercion_node(data_type: &DataType) -> Option<CoercionNode> {
     match data_type {
         DataType::Primitive(primitive) => match primitive {
             PrimitiveType::String => Some(CoercionNode::Coercion(Coercion::ToString)),
-            PrimitiveType::Timestamp => Some(CoercionNode::Coercion(Coercion::ToTimestamp)),
+            PrimitiveType::Timestamp | PrimitiveType::TimestampNtz => {
+                Some(CoercionNode::Coercion(Coercion::ToTimestamp))
+            }
             _ => None,
         },
         DataType::Struct(st) => {
@@ -142,7 +143,7 @@ fn apply_coercion(value: &mut Value, node: &CoercionNode) {
 fn string_to_timestamp(string: &str) -> Option<Value> {
     let parsed = DateTime::from_str(string);
     if let Err(e) = parsed {
-        tracing::error!(
+        tracing::warn!(
             "Error coercing timestamp from string. String: {}. Error: {}",
             string,
             e
