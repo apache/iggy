@@ -6219,7 +6219,11 @@ dependencies = [
  "twox-hash",
  "uuid",
  "wiremock",
+<<<<<<< HEAD
  "zip 8.5.0",
+=======
+ "zip 8.3.0",
+>>>>>>> 26f5c26062 (fix(jwt): implement Display for Audience to satisfy clippy)
 ]
 
 [[package]]
@@ -13153,16 +13157,12 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
 name = "winnow"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09dac053f1cd375980747450bfc7250c264eaae0583872e845c0c7cd578872b5"
 
 [[package]]
-=======
-<<<<<<< HEAD
->>>>>>> 9da4738204 (test(integration): add A2A JWT unit test and e2e tests using iggy_harness macro)
 name = "winsafe"
 version = "0.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"

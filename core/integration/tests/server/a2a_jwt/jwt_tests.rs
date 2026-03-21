@@ -18,7 +18,7 @@
  */
 
 use iggy::prelude::{GlobalPermissions, IggyClientBuilder, Permissions, UserStatus};
-use iggy_binary_protocol::{StreamClient, UserClient};
+use iggy_common::{StreamClient, UserClient};
 use integration::iggy_harness;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};

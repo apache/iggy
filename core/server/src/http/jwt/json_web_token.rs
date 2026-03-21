@@ -19,6 +19,7 @@
 use iggy_common::UserId;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::net::SocketAddr;
+use std::{fmt, fmt::Display};
 
 #[derive(Debug, Clone)]
 pub struct Identity {
@@ -41,11 +42,13 @@ impl Audience {
             Audience::Multiple(auds) => auds.iter().any(|a| a == audience),
         }
     }
+}
 
-    pub fn to_string(&self) -> String {
+impl Display for Audience {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Audience::Single(aud) => aud.clone(),
-            Audience::Multiple(auds) => auds.join(","),
+            Audience::Single(aud) => f.write_str(aud),
+            Audience::Multiple(auds) => f.write_str(&auds.join(",")),
         }
     }
 }
