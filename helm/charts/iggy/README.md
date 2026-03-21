@@ -203,7 +203,7 @@ ingress implementation:
 server:
   ingress:
     enabled: true
-    className: ""
+    className: "<your-ingress-class>"
     hosts:
       - host: iggy.example.com
         paths:
