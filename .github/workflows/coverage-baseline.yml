@@ -30,7 +30,7 @@ permissions:
 
 concurrency:
   group: coverage-baseline-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   IGGY_CI_BUILD: true
@@ -406,11 +406,24 @@ jobs:
       - name: Merge coverage profiles
         run: |
           mkdir -p reports
+          if [[ ! -s reports/go-coverage-unit.out ]]; then
+            echo "::warning::Unit coverage profile is empty or missing"
+            if [[ -s reports/go-coverage-bdd.out ]]; then
+              cp reports/go-coverage-bdd.out reports/go-coverage.out
+            else
+              echo "::warning::Both unit and BDD coverage profiles are empty or missing, no coverage will be uploaded"
+            fi
+            exit 0
+          fi
           # Start with the mode line from the unit profile
           head -1 reports/go-coverage-unit.out > reports/go-coverage.out
           # Append data lines (skip mode line) from both profiles
           tail -n +2 reports/go-coverage-unit.out >> reports/go-coverage.out
-          tail -n +2 reports/go-coverage-bdd.out >> reports/go-coverage.out
+          if [[ -s reports/go-coverage-bdd.out ]]; then
+            tail -n +2 reports/go-coverage-bdd.out >> reports/go-coverage.out
+          else
+            echo "::warning::BDD coverage profile is empty or missing, using unit coverage only"
+          fi
 
       - name: Stop Iggy server
         if: always()
@@ -427,3 +440,21 @@ jobs:
           disable_search: true
           flags: go
           fail_ci_if_error: false
+
+  warm-cache-macos:
+    name: Warm macOS cache
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "true"
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Compile tests
+        run: cargo test --no-run --locked

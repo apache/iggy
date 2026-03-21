@@ -50,7 +50,6 @@ flag_management:
     - name: rust
       paths:
         - core/
-      carryforward: false
     - name: java
       paths:
         - foreign/java/
