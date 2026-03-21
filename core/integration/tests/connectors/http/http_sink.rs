@@ -192,46 +192,8 @@ use integration::iggy_harness;
 // Test 1: Individual Batch Mode
 // ============================================================================
 
-/// Test 1: Individual JSON Messages Delivered as Separate HTTP POSTs
-///
-/// **Purpose**: Validates that `batch_mode=individual` sends one HTTP request per Iggy
-/// message, with each request containing the full metadata envelope.
-///
-/// **Behavior Under Test**:
-/// When configured with `batch_mode=individual`, the HTTP sink's `send_individual()` method
-/// iterates over each message in the consumed batch and calls `send_with_retry()` for each
-/// one independently. The metadata envelope wraps each message with Iggy context:
-/// ```json
-/// {
-///   "metadata": { "iggy_stream": "...", "iggy_topic": "...", "iggy_offset": N, ... },
-///   "payload": { ... original message ... }
-/// }
-/// ```
-///
-/// **Why This Matters**:
-/// Individual mode is the simplest and most compatible delivery pattern. It works with any
-/// HTTP endpoint that accepts POST requests — no special parsing logic needed on the receiver.
-/// Each message is independently retryable: if message 2 of 5 fails, only message 2 is retried.
-/// This is the default batch mode and the most common deployment pattern.
-///
-/// **Test Flow**:
-/// 1. Send 3 JSON messages to Iggy (`test_stream`/`test_topic`, partition 0)
-/// 2. Wait for WireMock to receive exactly 3 HTTP requests
-/// 3. Verify each request: POST method, `/ingest` URL
-/// 4. Verify each body: `metadata` and `payload` fields present
-/// 5. Verify metadata: `iggy_stream`, `iggy_topic`, `iggy_offset` fields present
-/// 6. Verify content type: `application/json`
-///
-/// **Key Validations**:
-/// - Request count = message count (1:1 mapping)
-/// - Metadata envelope structure is correct
-/// - Content-Type header is `application/json`
-/// - All 3 standard metadata fields present (`iggy_stream`, `iggy_topic`, `iggy_offset`)
-///
-/// **Related Code**:
-/// - `send_individual()` in `sinks/http_sink/src/lib.rs` — per-message delivery loop
-/// - `build_envelope()` in `sinks/http_sink/src/lib.rs` — metadata envelope construction
-/// - `HttpSinkIndividualFixture` in `fixtures/http/sink.rs` — base fixture with env overrides
+/// Validates `batch_mode=individual`: one HTTP POST per message, each with metadata envelope.
+/// Checks request count = message count, envelope structure, and `application/json` content type.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
     seed = seeds::connector_stream
@@ -337,42 +299,8 @@ async fn individual_json_messages_delivered_as_separate_posts(
 // Test 2: NDJSON Batch Mode
 // ============================================================================
 
-/// Test 2: NDJSON Batch Mode — All Messages in One Newline-Delimited Request
-///
-/// **Purpose**: Validates that `batch_mode=ndjson` combines all messages into a single
-/// HTTP request with newline-delimited JSON body (`application/x-ndjson`).
-///
-/// **Behavior Under Test**:
-/// The HTTP sink's `send_ndjson()` method serializes each message as a JSON envelope,
-/// joins them with `\n`, and sends the result as a single HTTP request. This mode is
-/// optimal for endpoints that accept streaming JSON (e.g., Elasticsearch `_bulk` API,
-/// cloud logging services, data lake ingestion). The `send_batch_body()` helper handles
-/// the post-send accounting (error counting, skip warnings) shared with `send_json_array`.
-///
-/// **Why This Matters**:
-/// NDJSON reduces HTTP overhead from N requests to 1 request for a batch of N messages.
-/// For high-throughput streams (thousands of messages per second), this can reduce
-/// connection overhead by orders of magnitude. Individual serialization failures are
-/// skipped (with error counting) rather than aborting the entire batch — partial delivery
-/// is preferred over total failure.
-///
-/// **Test Flow**:
-/// 1. Send 3 JSON event messages to Iggy
-/// 2. Wait for WireMock to receive exactly 1 HTTP request
-/// 3. Split response body by newlines — expect 3 lines
-/// 4. Parse each line as JSON, verify `metadata` and `payload` fields
-/// 5. Verify content type: `application/x-ndjson`
-///
-/// **Key Validations**:
-/// - Single HTTP request (all messages batched)
-/// - Line count = message count
-/// - Each NDJSON line is valid JSON with metadata envelope
-/// - Content-Type is `application/x-ndjson`
-///
-/// **Related Code**:
-/// - `send_ndjson()` in `sinks/http_sink/src/lib.rs` — NDJSON serialization and size check
-/// - `send_batch_body()` in `sinks/http_sink/src/lib.rs` — shared batch delivery + accounting
-/// - `HttpSinkNdjsonFixture` in `fixtures/http/sink.rs` — overrides `BATCH_MODE=ndjson`
+/// Validates `batch_mode=ndjson`: all messages in one request as newline-delimited JSON.
+/// Checks single request, line count = message count, per-line envelope, `application/x-ndjson`.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
     seed = seeds::connector_stream
@@ -463,42 +391,8 @@ async fn ndjson_messages_delivered_as_single_request(
 // Test 3: JSON Array Batch Mode
 // ============================================================================
 
-/// Test 3: JSON Array Batch Mode — All Messages as a Single JSON Array
-///
-/// **Purpose**: Validates that `batch_mode=json_array` combines all messages into a single
-/// HTTP request with a JSON array body (`[{envelope1}, {envelope2}, ...]`).
-///
-/// **Behavior Under Test**:
-/// The HTTP sink's `send_json_array()` method builds envelope structs for each message,
-/// collects them into a `Vec`, and serializes the entire vector as a JSON array via
-/// `serde_json::to_vec()`. Like NDJSON, individual serialization failures are skipped.
-/// The whole-batch serialization (the final `to_vec` call) is a separate failure point —
-/// if it fails, all successfully-built envelopes are counted as errors.
-///
-/// **Why This Matters**:
-/// JSON array mode is compatible with APIs that expect a standard JSON array (e.g., REST
-/// bulk endpoints, webhook aggregators). Unlike NDJSON, the entire body is a single valid
-/// JSON document, which simplifies parsing on the receiver side. The trade-off is that the
-/// entire body must fit in memory as a single allocation.
-///
-/// **Test Flow**:
-/// 1. Send 3 JSON messages to Iggy (order, payment, refund events)
-/// 2. Wait for WireMock to receive exactly 1 HTTP request
-/// 3. Parse body as JSON array, verify array length = 3
-/// 4. Verify each array item has `metadata` and `payload` fields
-/// 5. Verify content type: `application/json`
-///
-/// **Key Validations**:
-/// - Single HTTP request (all messages batched)
-/// - Body is a valid JSON array
-/// - Array length = message count
-/// - Each item has metadata envelope
-/// - Content-Type is `application/json`
-///
-/// **Related Code**:
-/// - `send_json_array()` in `sinks/http_sink/src/lib.rs` — array serialization + size check
-/// - `send_batch_body()` in `sinks/http_sink/src/lib.rs` — shared batch delivery + accounting
-/// - `HttpSinkJsonArrayFixture` in `fixtures/http/sink.rs` — overrides `BATCH_MODE=json_array`
+/// Validates `batch_mode=json_array`: all messages as a single JSON array in one request.
+/// Checks single request, array length = message count, per-item envelope, `application/json`.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
     seed = seeds::connector_stream
@@ -590,41 +484,8 @@ async fn json_array_messages_delivered_as_single_request(
 // Test 4: Raw Batch Mode
 // ============================================================================
 
-/// Test 4: Raw Binary Messages Delivered Without Metadata Envelope
-///
-/// **Purpose**: Validates that `batch_mode=raw` sends each message as raw bytes in a
-/// separate HTTP request, without the metadata envelope wrapper.
-///
-/// **Behavior Under Test**:
-/// The HTTP sink's `send_raw()` method extracts raw bytes from each message payload
-/// via `try_into_vec()` and sends them directly as the HTTP body. No JSON serialization,
-/// no metadata envelope — the body is exactly the bytes that were published to Iggy.
-/// This mode is intended for binary protocols (Protobuf, FlatBuffers) or when the
-/// receiver expects unmodified passthrough.
-///
-/// **Why This Matters**:
-/// Raw mode enables the HTTP sink to forward arbitrary binary data — protocol buffers,
-/// Avro records, compressed payloads, or any format the receiver understands. The connector
-/// acts as a transparent bridge between Iggy and the HTTP endpoint. The `include_metadata`
-/// config is ignored in raw mode (metadata requires JSON serialization which contradicts
-/// raw byte passthrough).
-///
-/// **Test Flow**:
-/// 1. Send 3 raw byte messages to Iggy (plain text for verification simplicity)
-/// 2. Wait for WireMock to receive exactly 3 HTTP requests (1:1, like individual)
-/// 3. Verify each request: POST method, `/ingest` URL
-/// 4. Verify body does NOT contain metadata envelope
-/// 5. Verify content type: `application/octet-stream`
-///
-/// **Key Validations**:
-/// - Request count = message count (raw is always 1:1)
-/// - No metadata envelope in body (raw bytes only)
-/// - Content-Type is `application/octet-stream`
-///
-/// **Related Code**:
-/// - `send_raw()` in `sinks/http_sink/src/lib.rs` — raw byte extraction and delivery
-/// - `content_type()` in `sinks/http_sink/src/lib.rs` — returns `application/octet-stream` for raw
-/// - `HttpSinkRawFixture` in `fixtures/http/sink.rs` — overrides `BATCH_MODE=raw`, `SCHEMA=raw`
+/// Validates `batch_mode=raw`: each message as raw bytes without metadata envelope.
+/// Checks request count = message count, no envelope wrapper, `application/octet-stream`.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
     seed = seeds::connector_stream
@@ -710,35 +571,8 @@ async fn raw_binary_messages_delivered_without_envelope(
 // Test 5: Metadata Disabled
 // ============================================================================
 
-/// Test 5: Metadata Disabled — Bare Payload Without Envelope
-///
-/// **Purpose**: Validates that `include_metadata=false` sends the original message payload
-/// directly as the HTTP body, without the `{metadata, payload}` envelope wrapper.
-///
-/// **Behavior Under Test**:
-/// When `include_metadata=false`, the `build_envelope()` method is skipped and the
-/// serialized payload JSON is sent directly. For a message containing `{"key": "value1"}`,
-/// the HTTP body is exactly `{"key": "value1"}` — not `{"metadata": {...}, "payload": {"key": "value1"}}`.
-///
-/// **Why This Matters**:
-/// Many webhook receivers and REST APIs expect a specific JSON schema and cannot handle
-/// unexpected wrapper fields. Disabling metadata allows the HTTP sink to act as a transparent
-/// JSON forwarder. This is the correct setting when the receiver already has its own
-/// deduplication/ordering mechanism and doesn't need Iggy's stream/topic/offset context.
-///
-/// **Test Flow**:
-/// 1. Send 3 simple JSON messages to Iggy
-/// 2. Wait for WireMock to receive all 3 requests
-/// 3. Verify each body: NO `metadata` field present
-/// 4. Verify each body: original `key` field present at top level
-///
-/// **Key Validations**:
-/// - No `metadata` field in body (envelope disabled)
-/// - Original payload fields at top level (not nested under `payload`)
-///
-/// **Related Code**:
-/// - `consume()` in `sinks/http_sink/src/lib.rs` — conditional envelope based on `include_metadata`
-/// - `HttpSinkNoMetadataFixture` in `fixtures/http/sink.rs` — overrides `INCLUDE_METADATA=false`
+/// Validates `include_metadata=false`: bare payload without `{metadata, payload}` envelope.
+/// Checks no metadata field in body, original payload fields at top level.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
     seed = seeds::connector_stream
@@ -813,42 +647,8 @@ async fn metadata_disabled_sends_bare_payload(
 // Test 6: Sequential Offset Verification
 // ============================================================================
 
-/// Test 6: Individual Messages Have Sequential Contiguous Offsets
-///
-/// **Purpose**: Validates that `iggy_offset` values in metadata are contiguous (each
-/// offset = previous + 1), proving the connector preserves Iggy's message ordering
-/// through the entire delivery pipeline.
-///
-/// **Behavior Under Test**:
-/// Each message published to an Iggy topic partition receives a monotonically increasing
-/// offset. The HTTP sink includes this offset in the metadata envelope as `iggy_offset`.
-/// This test verifies that the sink faithfully reproduces these offsets without gaps,
-/// reordering, or duplication — critical for consumers that use offsets for deduplication
-/// or ordering guarantees.
-///
-/// **Why This Matters**:
-/// Offset integrity is the foundation for exactly-once processing at the application level.
-/// If offsets arrive out of order or with gaps, downstream consumers cannot reliably detect
-/// duplicates or missing messages. A broken offset chain could indicate a bug in the
-/// connector's message handling, a race condition in multi-topic task scheduling, or a
-/// fundamental issue with how the runtime passes messages to the plugin.
-///
-/// **Test Flow**:
-/// 1. Send 5 JSON messages to Iggy (more than default 3 to better validate ordering)
-/// 2. Wait for WireMock to receive all 5 requests
-/// 3. Extract `iggy_offset` from each request's metadata
-/// 4. Sort offsets (delivery order may differ from publish order)
-/// 5. Verify offsets are contiguous: each offset = previous + 1
-///
-/// **Key Validations**:
-/// - All 5 messages delivered
-/// - Offsets are contiguous (no gaps)
-/// - Offsets use sliding window check (`windows(2)`) — works regardless of starting offset
-///
-/// **Related Code**:
-/// - `build_envelope()` in `sinks/http_sink/src/lib.rs` — writes `iggy_offset` from
-///   `ConsumedMessage.offset`
-/// - Iggy server assigns offsets sequentially per partition
+/// Validates sequential offset integrity: `iggy_offset` values are contiguous across
+/// 5 delivered messages. Sorts by offset and checks each = previous + 1.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
     seed = seeds::connector_stream
@@ -934,74 +734,9 @@ async fn individual_messages_have_sequential_offsets(
 // Test 7: Multi-Topic Delivery
 // ============================================================================
 
-/// Second topic name for the multi-topic test. Defined locally to avoid
-/// polluting the shared harness seeds with HTTP-sink-specific constants.
-///
-/// **Design Decision**: The shared `seeds.rs` module provides generic seed functions
-/// (`connector_stream`, `mcp_standard`) used by all connector types. Adding HTTP-sink-specific
-/// constants there would create coupling. Instead, this test creates the second topic inline
-/// after the seed runs, keeping the harness generic. See code review finding H1.
-const TEST_TOPIC_2: &str = seeds::names::TOPIC_2;
 
-/// Test 7: Multi-Topic Messages Delivered with Correct Topic Metadata
-///
-/// **Purpose**: Validates the multi-topic single-connector deployment pattern — one
-/// connector consuming from two topics on the same stream. Messages from each topic
-/// must arrive with the correct `iggy_topic` metadata value.
-///
-/// **Behavior Under Test**:
-/// The connector runtime's `setup_sink_consumers()` iterates over `stream.topics` in
-/// the config, and `spawn_consume_tasks()` creates one `tokio::spawn` per topic. Each
-/// task creates an independent `IggyConsumer` and polls its topic sequentially. All tasks
-/// share the same `Client` instance (via `Arc` — connection pool is shared) and the same
-/// WireMock endpoint URL. The `iggy_topic` field in the metadata envelope identifies which
-/// topic each message originated from.
-///
-/// **Why This Matters**:
-/// Multi-topic subscriptions are a common deployment pattern: a single connector instance
-/// consuming events from related topics (e.g., `orders` and `payments` on the same stream)
-/// and forwarding them to one HTTP endpoint. The receiver uses `iggy_topic` to route or
-/// process messages differently. If topic metadata is incorrect, the receiver cannot
-/// distinguish message origins — a data integrity issue.
-///
-/// This test also exercises the runtime's task spawning and concurrent consumption,
-/// verifying that independent topic tasks don't interfere with each other.
-///
-/// **Test Flow**:
-/// 1. Seed creates stream + `test_topic` (via `connector_stream`)
-/// 2. Create second topic (`test_topic_2`) inline
-/// 3. Send 2 messages to `test_topic` with `{"source": "topic_1"}`
-/// 4. Send 1 message to `test_topic_2` with `{"source": "topic_2"}`
-/// 5. Wait for WireMock to receive all 3 requests
-/// 6. Group requests by `iggy_topic` metadata value
-/// 7. Verify: 2 requests from `test_topic`, 1 from `test_topic_2`
-/// 8. Verify: payload `source` field matches topic origin
-///
-/// **Key Validations**:
-/// - Total request count = 3 (2 + 1)
-/// - `iggy_topic` metadata correctly identifies source topic
-/// - Payload content matches expected topic origin
-/// - Both topics consumed and delivered independently
-///
-/// **Configuration**:
-/// The `HttpSinkMultiTopicFixture` sets `STREAMS_0_TOPICS=[test_topic,test_topic_2]`
-/// in the connector runtime environment. The runtime parses this and spawns one task
-/// per topic.
-///
-/// **Related Code**:
-/// - `setup_sink_consumers()` in `runtime/src/sink.rs` — topic iteration
-/// - `spawn_consume_tasks()` in `runtime/src/sink.rs` — per-topic task spawning
-/// - `build_envelope()` in `sinks/http_sink/src/lib.rs` — writes `iggy_topic` from
-///   `TopicMetadata.topic`
-/// - `HttpSinkMultiTopicFixture` in `fixtures/http/sink.rs` — two-topic env config
-///
-/// **Test History**:
-/// - **2026-03-11**: Created with shared harness seed (`connector_multi_topic_stream`).
-/// - **2026-03-12**: Code review H1 — removed `TOPIC_2` and `connector_multi_topic_stream`
-///   from shared `seeds.rs`. Second topic now created inline.
-/// - **2026-03-13**: Restored `connector_multi_topic_stream` seed and `names::TOPIC_2` in
-///   shared `seeds.rs` — connector runtime health check requires all configured topics to
-///   exist before startup (CI failure: 1000 retry timeout).
+/// Validates multi-topic delivery: one connector consuming two topics on the same stream.
+/// Sends 2 messages to topic 1, 1 to topic 2, verifies `iggy_topic` metadata matches source.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
     seed = seeds::connector_multi_topic_stream
@@ -1016,7 +751,7 @@ async fn multi_topic_messages_delivered_with_correct_topic_metadata(
 
     // Step 1: Both topics created by connector_multi_topic_stream seed (runs before
     // connector runtime starts — runtime health check requires all configured topics).
-    let topic_2_id: Identifier = TEST_TOPIC_2.try_into().unwrap();
+    let topic_2_id: Identifier = seeds::names::TOPIC_2.try_into().unwrap();
 
     // Step 2: Send 2 messages to topic 1 with source identifier in payload
     let mut topic_1_messages: Vec<IggyMessage> = vec![
@@ -1096,7 +831,7 @@ async fn multi_topic_messages_delivered_with_correct_topic_metadata(
                     .expect("Missing source field");
                 assert_eq!(source, "topic_1", "Topic 1 message has wrong source");
             }
-            t if t == TEST_TOPIC_2 => {
+            t if t == seeds::names::TOPIC_2 => {
                 topic_2_count += 1;
                 let source = body["payload"]["source"]
                     .as_str()

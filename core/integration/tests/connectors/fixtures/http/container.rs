@@ -137,7 +137,7 @@ impl HttpSinkWireMockContainer {
 
         let requests = body["requests"]
             .as_array()
-            .unwrap_or(&vec![])
+            .unwrap_or(&[])
             .iter()
             .map(|r| WireMockRequest {
                 method: r["request"]["method"].as_str().unwrap_or("").to_string(),

@@ -86,5 +86,5 @@ verbose_logging = false
 # Custom HTTP headers. Replace placeholder values with real credentials.
 # Do not commit actual secrets — use environment variable overrides for production.
 [plugin_config.headers]
-Authorization = "Bearer my-secret-token"
+Authorization = "Bearer <YOUR_TOKEN_HERE>"
 X-Custom-Header = "custom-value"
