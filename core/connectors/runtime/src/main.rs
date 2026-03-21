@@ -25,7 +25,7 @@ use configs::runtime::ConnectorsRuntimeConfig;
 use dlopen2::wrapper::{Container, WrapperApi};
 use dotenvy::dotenv;
 use error::RuntimeError;
-use figlet_rs::FIGfont;
+use figlet_rs::FIGlet;
 use iggy::prelude::{Client, IggyConsumer, IggyProducer};
 use iggy_connector_sdk::{
     StreamDecoder, StreamEncoder,
@@ -108,7 +108,7 @@ pub(crate) struct SinkApi {
 }
 
 fn print_ascii_art(text: &str) {
-    let standard_font = FIGfont::standard().unwrap();
+    let standard_font = FIGlet::standard().unwrap();
     let figure = standard_font.convert(text);
     println!("{}", figure.unwrap());
 }
