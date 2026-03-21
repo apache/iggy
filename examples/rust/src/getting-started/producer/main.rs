@@ -19,7 +19,6 @@
 use iggy::prelude::*;
 use std::env;
 use std::error::Error;
-use std::net::ToSocketAddrs;
 use std::str::FromStr;
 use tracing::{info, warn};
 use tracing_subscriber::layer::SubscriberExt;
@@ -168,10 +167,7 @@ fn get_tcp_server_addr() -> String {
             );
         }
         let tcp_server_addr = tcp_server_addr.unwrap();
-        if !tcp_server_addr
-            .to_socket_addrs()
-            .is_ok_and(|mut f| f.next().is_some())
-        {
+        if parse_server_address(tcp_server_addr.trim()).is_err() {
             panic!(
                 "Invalid server address {}! Usage: {} --tcp-server-address <server-address>",
                 tcp_server_addr,

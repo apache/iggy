@@ -68,6 +68,7 @@ pub use iggy_common::{
     TcpClientReconnectionConfig, Topic, TopicDetails, TopicPermissions, TransportEndpoints,
     TransportProtocol, UserId, UserStatus, Validatable, WebSocketClientConfig,
     WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, defaults, locking,
+    parse_server_address,
 };
 pub use iggy_common::{
     IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADER_SIZE,

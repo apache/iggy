@@ -16,8 +16,7 @@
  * under the License.
  */
 
-use crate::{AutoLogin, IggyDuration, IggyError, WebSocketClientConfig};
-use std::net::ToSocketAddrs;
+use crate::{AutoLogin, IggyDuration, IggyError, WebSocketClientConfig, parse_server_address};
 
 /// Builder for the WebSocket client configuration.
 /// Allows configuring the WebSocket client with custom settings or using defaults:
@@ -141,17 +140,7 @@ impl WebSocketClientConfigBuilder {
     /// Builds the WebSocket client configuration.
     pub fn build(self) -> Result<WebSocketClientConfig, IggyError> {
         let addr = self.config.server_address.trim();
-
-        // Internal lookup to verify the address resolves to at least one SocketAddr (supports hostnames)
-        if !addr.to_socket_addrs().is_ok_and(|mut f| f.next().is_some()) {
-            let (host, port) = addr.rsplit_once(':').unwrap_or((addr, ""));
-            if port.is_empty() || port.parse::<u16>().is_err() {
-                return Err(IggyError::InvalidIpAddress(
-                    host.to_owned(),
-                    port.to_owned(),
-                ));
-            }
-        }
+        parse_server_address(addr)?;
 
         Ok(self.config)
     }

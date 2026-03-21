@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{AutoLogin, IggyDuration, IggyError, TcpClientConfig};
-use std::net::ToSocketAddrs;
+use crate::{AutoLogin, IggyDuration, IggyError, TcpClientConfig, parse_server_address};
 
 /// Builder for the TCP client configuration.
 /// Allows configuring the TCP client with custom settings or using defaults:
@@ -105,11 +104,7 @@ impl TcpClientConfigBuilder {
     /// Builds the TCP client configuration.
     pub fn build(self) -> Result<TcpClientConfig, IggyError> {
         let addr = self.config.server_address.trim();
-
-        if !addr.to_socket_addrs().is_ok_and(|mut f| f.next().is_some()) {
-            let (ip, port) = addr.rsplit_once(':').unwrap_or((addr, ""));
-            return Err(IggyError::InvalidIpAddress(ip.to_owned(), port.to_owned()));
-        }
+        parse_server_address(addr)?;
 
         Ok(self.config)
     }
@@ -139,10 +134,12 @@ mod tests {
     }
 
     #[test]
-    fn valid_ipv6_without_brackets_should_succeed() {
-        // Address resolution interprets this as the IPv6 socket [::1]:8080
+    fn valid_ipv6_without_brackets_should_fail() {
         let builder = builder_with_address("::1:8080");
-        assert!(builder.build().is_ok());
+        assert!(matches!(
+            builder.build(),
+            Err(IggyError::InvalidIpAddress(_, _))
+        ));
     }
 
     #[test]
@@ -152,12 +149,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_ip_should_fail() {
+    fn unresolvable_hostname_should_succeed() {
+        // Format is valid; DNS resolution is not attempted
         let builder = builder_with_address("invalid.ip:8080");
-        assert!(matches!(
-            builder.build(),
-            Err(IggyError::InvalidIpAddress(_, _))
-        ));
+        assert!(builder.build().is_ok());
     }
 
     #[test]
@@ -185,5 +180,11 @@ mod tests {
             builder.build(),
             Err(IggyError::InvalidIpAddress(_, _))
         ));
+    }
+
+    #[test]
+    fn docker_compose_service_name_should_succeed() {
+        let builder = builder_with_address("iggy-server:8090");
+        assert!(builder.build().is_ok());
     }
 }
