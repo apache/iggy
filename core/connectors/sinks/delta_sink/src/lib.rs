@@ -19,7 +19,8 @@
 use deltalake::DeltaTable;
 use deltalake::writer::JsonWriter;
 use iggy_connector_sdk::sink_connector;
-use serde::{Deserialize, Serialize};
+use secrecy::SecretString;
+use serde::Deserialize;
 use tokio::sync::Mutex;
 
 mod coercions;
@@ -44,7 +45,7 @@ struct SinkState {
     coercion_tree: CoercionTree,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct DeltaSinkConfig {
     pub table_uri: String,
     #[serde(default)]
@@ -54,7 +55,7 @@ pub struct DeltaSinkConfig {
     #[serde(default)]
     pub aws_s3_access_key: Option<String>,
     #[serde(default)]
-    pub aws_s3_secret_key: Option<String>,
+    pub aws_s3_secret_key: Option<SecretString>,
     #[serde(default)]
     pub aws_s3_region: Option<String>,
     #[serde(default)]
@@ -66,15 +67,15 @@ pub struct DeltaSinkConfig {
     #[serde(default)]
     pub azure_storage_account_name: Option<String>,
     #[serde(default)]
-    pub azure_storage_account_key: Option<String>,
+    pub azure_storage_account_key: Option<SecretString>,
     #[serde(default)]
-    pub azure_storage_sas_token: Option<String>,
+    pub azure_storage_sas_token: Option<SecretString>,
     #[serde(default)]
     pub azure_container_name: Option<String>,
 
     // Google Cloud Storage
     #[serde(default)]
-    pub gcs_service_account_key: Option<String>,
+    pub gcs_service_account_key: Option<SecretString>,
     #[serde(default)]
     pub gcs_bucket: Option<String>,
 }

@@ -90,7 +90,11 @@ impl DeltaFixture {
             StructField::new("count", DataType::Primitive(PrimitiveType::Integer), true),
             StructField::new("amount", DataType::Primitive(PrimitiveType::Double), true),
             StructField::new("active", DataType::Primitive(PrimitiveType::Boolean), true),
-            StructField::new("timestamp", DataType::Primitive(PrimitiveType::Long), true),
+            StructField::new(
+                "timestamp",
+                DataType::Primitive(PrimitiveType::TimestampNtz),
+                true,
+            ),
         ];
         CreateBuilder::new()
             .with_location(table_uri)
@@ -245,7 +249,11 @@ impl DeltaS3Fixture {
             StructField::new("count", DataType::Primitive(PrimitiveType::Integer), true),
             StructField::new("amount", DataType::Primitive(PrimitiveType::Double), true),
             StructField::new("active", DataType::Primitive(PrimitiveType::Boolean), true),
-            StructField::new("timestamp", DataType::Primitive(PrimitiveType::Long), true),
+            StructField::new(
+                "timestamp",
+                DataType::Primitive(PrimitiveType::TimestampNtz),
+                true,
+            ),
         ];
         let storage_options = HashMap::from([
             ("AWS_ACCESS_KEY_ID".into(), MINIO_ACCESS_KEY.into()),

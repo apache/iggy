@@ -46,9 +46,7 @@ impl Sink for DeltaSink {
         })?;
 
         let table =
-            match deltalake::open_table_with_storage_options(table_url, storage_options)
-                .await
-            {
+            match deltalake::open_table_with_storage_options(table_url, storage_options).await {
                 Ok(table) => table,
                 Err(e) => {
                     error!("Failed to load Delta table: {e}");
@@ -101,9 +99,10 @@ impl Sink for DeltaSink {
         let mut json_values: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
         for msg in &messages {
             match &msg.payload {
-                Payload::Json(simd_value) => {
-                    json_values.push(owned_value_to_serde_json(simd_value));
-                }
+                Payload::Json(simd_value) => match owned_value_to_serde_json(simd_value) {
+                    Some(v) => json_values.push(v),
+                    None => continue,
+                },
                 other => {
                     error!(
                         "Unsupported payload type: {other}. Delta sink only supports JSON payloads."
@@ -130,10 +129,13 @@ impl Sink for DeltaSink {
         }
 
         // Write JSON values to internal Parquet buffers
-        state.writer.write(json_values).await.map_err(|e| {
+        if let Err(e) = state.writer.write(json_values).await {
+            state.writer.reset();
             error!("Failed to write to Delta writer: {e}");
-            Error::Storage(format!("Failed to write to Delta writer: {e}"))
-        })?;
+            return Err(Error::Storage(format!(
+                "Failed to write to Delta writer: {e}"
+            )));
+        }
 
         // Flush buffers to object store and commit to Delta log
         let version = match state.writer.flush_and_commit(&mut state.table).await {
@@ -170,27 +172,32 @@ impl Sink for DeltaSink {
 
 // TODO: Similar logic exists in the Elasticsearch sink.
 // Refactor to use a common utility when it is implemented.
-fn owned_value_to_serde_json(value: &simd_json::OwnedValue) -> serde_json::Value {
+fn owned_value_to_serde_json(value: &simd_json::OwnedValue) -> Option<serde_json::Value> {
     match value {
         simd_json::OwnedValue::Static(s) => match s {
-            simd_json::StaticNode::Null => serde_json::Value::Null,
-            simd_json::StaticNode::Bool(b) => serde_json::Value::Bool(*b),
-            simd_json::StaticNode::I64(n) => serde_json::Value::Number((*n).into()),
-            simd_json::StaticNode::U64(n) => serde_json::Value::Number((*n).into()),
-            simd_json::StaticNode::F64(n) => serde_json::Number::from_f64(*n)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
+            simd_json::StaticNode::Null => Some(serde_json::Value::Null),
+            simd_json::StaticNode::Bool(b) => Some(serde_json::Value::Bool(*b)),
+            simd_json::StaticNode::I64(n) => Some(serde_json::Value::Number((*n).into())),
+            simd_json::StaticNode::U64(n) => Some(serde_json::Value::Number((*n).into())),
+            simd_json::StaticNode::F64(n) => match serde_json::Number::from_f64(*n) {
+                Some(num) => Some(serde_json::Value::Number(num)),
+                None => {
+                    tracing::warn!("Dropping message containing non-finite float value: {n}");
+                    None
+                }
+            },
         },
-        simd_json::OwnedValue::String(s) => serde_json::Value::String(s.to_string()),
+        simd_json::OwnedValue::String(s) => Some(serde_json::Value::String(s.to_string())),
         simd_json::OwnedValue::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(owned_value_to_serde_json).collect())
+            let converted: Option<Vec<_>> = arr.iter().map(owned_value_to_serde_json).collect();
+            converted.map(serde_json::Value::Array)
         }
         simd_json::OwnedValue::Object(obj) => {
-            let map: serde_json::Map<String, serde_json::Value> = obj
+            let map: Option<serde_json::Map<String, serde_json::Value>> = obj
                 .iter()
-                .map(|(k, v)| (k.to_string(), owned_value_to_serde_json(v)))
+                .map(|(k, v)| owned_value_to_serde_json(v).map(|v| (k.to_string(), v)))
                 .collect();
-            serde_json::Value::Object(map)
+            map.map(serde_json::Value::Object)
         }
     }
 }
@@ -204,7 +211,7 @@ mod tests {
     fn test_null() {
         assert_eq!(
             owned_value_to_serde_json(&OwnedValue::Static(StaticNode::Null)),
-            serde_json::Value::Null
+            Some(serde_json::Value::Null)
         );
     }
 
@@ -212,11 +219,11 @@ mod tests {
     fn test_bool() {
         assert_eq!(
             owned_value_to_serde_json(&OwnedValue::Static(StaticNode::Bool(true))),
-            serde_json::Value::Bool(true)
+            Some(serde_json::Value::Bool(true))
         );
         assert_eq!(
             owned_value_to_serde_json(&OwnedValue::Static(StaticNode::Bool(false))),
-            serde_json::Value::Bool(false)
+            Some(serde_json::Value::Bool(false))
         );
     }
 
@@ -224,7 +231,7 @@ mod tests {
     fn test_i64() {
         assert_eq!(
             owned_value_to_serde_json(&OwnedValue::Static(StaticNode::I64(-42))),
-            serde_json::json!(-42)
+            Some(serde_json::json!(-42))
         );
     }
 
@@ -232,7 +239,7 @@ mod tests {
     fn test_u64() {
         assert_eq!(
             owned_value_to_serde_json(&OwnedValue::Static(StaticNode::U64(100))),
-            serde_json::json!(100)
+            Some(serde_json::json!(100))
         );
     }
 
@@ -240,27 +247,26 @@ mod tests {
     fn test_f64_finite() {
         assert_eq!(
             owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(1.5))),
-            serde_json::json!(1.5)
+            Some(serde_json::json!(1.5))
         );
     }
 
     #[test]
-    fn test_f64_nan_becomes_null() {
-        assert_eq!(
-            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(f64::NAN))),
-            serde_json::Value::Null
+    fn test_f64_nan_drops_message() {
+        assert!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(f64::NAN))).is_none()
         );
     }
 
     #[test]
-    fn test_f64_infinity_becomes_null() {
-        assert_eq!(
-            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(f64::INFINITY))),
-            serde_json::Value::Null
+    fn test_f64_infinity_drops_message() {
+        assert!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(f64::INFINITY)))
+                .is_none()
         );
-        assert_eq!(
-            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(f64::NEG_INFINITY))),
-            serde_json::Value::Null
+        assert!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(f64::NEG_INFINITY)))
+                .is_none()
         );
     }
 
@@ -268,7 +274,7 @@ mod tests {
     fn test_string() {
         assert_eq!(
             owned_value_to_serde_json(&OwnedValue::String("hello".into())),
-            serde_json::Value::String("hello".to_string())
+            Some(serde_json::Value::String("hello".to_string()))
         );
     }
 
@@ -280,7 +286,7 @@ mod tests {
         ]));
         assert_eq!(
             owned_value_to_serde_json(&input),
-            serde_json::json!([null, true])
+            Some(serde_json::json!([null, true]))
         );
     }
 
@@ -291,7 +297,7 @@ mod tests {
         let input = OwnedValue::Object(Box::new(obj));
         assert_eq!(
             owned_value_to_serde_json(&input),
-            serde_json::json!({"k": 1})
+            Some(serde_json::json!({"k": 1}))
         );
     }
 
@@ -304,7 +310,7 @@ mod tests {
         let input = OwnedValue::Object(Box::new(outer));
         assert_eq!(
             owned_value_to_serde_json(&input),
-            serde_json::json!({"a": {"b": "v"}})
+            Some(serde_json::json!({"a": {"b": "v"}}))
         );
     }
 }

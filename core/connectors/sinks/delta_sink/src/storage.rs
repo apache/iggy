@@ -18,6 +18,7 @@
 
 use crate::DeltaSinkConfig;
 use iggy_connector_sdk::Error;
+use secrecy::ExposeSecret;
 use std::collections::HashMap;
 
 pub(crate) fn build_storage_options(
@@ -27,21 +28,22 @@ pub(crate) fn build_storage_options(
 
     match config.storage_backend_type.as_deref() {
         Some("s3") => {
-            let access_key = config
-                .aws_s3_access_key
-                .as_ref()
-                .ok_or_else(|| Error::InitError("S3 backend requires 'aws_s3_access_key'".into()))?;
-            let secret_key = config
-                .aws_s3_secret_key
-                .as_ref()
-                .ok_or_else(|| Error::InitError("S3 backend requires 'aws_s3_secret_key'".into()))?;
+            let access_key = config.aws_s3_access_key.as_ref().ok_or_else(|| {
+                Error::InitError("S3 backend requires 'aws_s3_access_key'".into())
+            })?;
+            let secret_key = config.aws_s3_secret_key.as_ref().ok_or_else(|| {
+                Error::InitError("S3 backend requires 'aws_s3_secret_key'".into())
+            })?;
             let region = config
                 .aws_s3_region
                 .as_ref()
                 .ok_or_else(|| Error::InitError("S3 backend requires 'aws_s3_region'".into()))?;
 
             opts.insert("AWS_ACCESS_KEY_ID".into(), access_key.clone());
-            opts.insert("AWS_SECRET_ACCESS_KEY".into(), secret_key.clone());
+            opts.insert(
+                "AWS_SECRET_ACCESS_KEY".into(),
+                secret_key.expose_secret().to_owned(),
+            );
             opts.insert("AWS_REGION".into(), region.clone());
 
             if let Some(endpoint_url) = config.aws_s3_endpoint_url.as_ref() {
@@ -53,14 +55,12 @@ pub(crate) fn build_storage_options(
             }
         }
         Some("azure") => {
-            let account_name = config
-                .azure_storage_account_name
-                .as_ref()
-                .ok_or_else(|| Error::InitError("Azure backend requires 'azure_storage_account_name'".into()))?;
-            let container_name = config
-                .azure_container_name
-                .as_ref()
-                .ok_or_else(|| Error::InitError("Azure backend requires 'azure_container_name'".into()))?;
+            let account_name = config.azure_storage_account_name.as_ref().ok_or_else(|| {
+                Error::InitError("Azure backend requires 'azure_storage_account_name'".into())
+            })?;
+            let container_name = config.azure_container_name.as_ref().ok_or_else(|| {
+                Error::InitError("Azure backend requires 'azure_container_name'".into())
+            })?;
 
             opts.insert("AZURE_STORAGE_ACCOUNT_NAME".into(), account_name.clone());
             opts.insert("AZURE_CONTAINER_NAME".into(), container_name.clone());
@@ -70,10 +70,16 @@ pub(crate) fn build_storage_options(
                 config.azure_storage_sas_token.as_ref(),
             ) {
                 (Some(key), None) => {
-                    opts.insert("AZURE_STORAGE_ACCOUNT_KEY".into(), key.clone());
+                    opts.insert(
+                        "AZURE_STORAGE_ACCOUNT_KEY".into(),
+                        key.expose_secret().to_owned(),
+                    );
                 }
                 (None, Some(sas)) => {
-                    opts.insert("AZURE_STORAGE_SAS_TOKEN".into(), sas.clone());
+                    opts.insert(
+                        "AZURE_STORAGE_SAS_TOKEN".into(),
+                        sas.expose_secret().to_owned(),
+                    );
                 }
                 (Some(_), Some(_)) => {
                     return Err(Error::InitError("Azure backend requires exactly one of 'azure_storage_account_key' or 'azure_storage_sas_token', but both were provided".into()));
@@ -84,10 +90,9 @@ pub(crate) fn build_storage_options(
             }
         }
         Some("gcs") => {
-            let service_account_key = config
-                .gcs_service_account_key
-                .as_ref()
-                .ok_or_else(|| Error::InitError("GCS backend requires 'gcs_service_account_key'".into()))?;
+            let service_account_key = config.gcs_service_account_key.as_ref().ok_or_else(|| {
+                Error::InitError("GCS backend requires 'gcs_service_account_key'".into())
+            })?;
             let bucket = config
                 .gcs_bucket
                 .as_ref()
@@ -95,12 +100,14 @@ pub(crate) fn build_storage_options(
 
             opts.insert(
                 "GOOGLE_SERVICE_ACCOUNT_KEY".into(),
-                service_account_key.clone(),
+                service_account_key.expose_secret().to_owned(),
             );
             opts.insert("GCS_BUCKET".into(), bucket.clone());
         }
         Some(unknown) => {
-            return Err(Error::InitError(format!("Unknown storage backend type: '{unknown}'. Valid options are 's3', 'azure', 'gcs'")));
+            return Err(Error::InitError(format!(
+                "Unknown storage backend type: '{unknown}'. Valid options are 's3', 'azure', 'gcs'"
+            )));
         }
         None => {}
     }
@@ -142,7 +149,7 @@ mod tests {
         DeltaSinkConfig {
             storage_backend_type: Some("s3".into()),
             aws_s3_access_key: Some("AKID".into()),
-            aws_s3_secret_key: Some("SECRET".into()),
+            aws_s3_secret_key: Some("SECRET".to_string().into()),
             aws_s3_region: Some("us-east-1".into()),
             aws_s3_endpoint_url: Some("http://localhost:9000".into()),
             aws_s3_allow_http: Some(true),
@@ -154,7 +161,7 @@ mod tests {
         DeltaSinkConfig {
             storage_backend_type: Some("azure".into()),
             azure_storage_account_name: Some("myaccount".into()),
-            azure_storage_account_key: Some("mykey".into()),
+            azure_storage_account_key: Some("mykey".to_string().into()),
             azure_storage_sas_token: None,
             azure_container_name: Some("mycontainer".into()),
             ..default_config()
@@ -166,7 +173,7 @@ mod tests {
             storage_backend_type: Some("azure".into()),
             azure_storage_account_name: Some("myaccount".into()),
             azure_storage_account_key: None,
-            azure_storage_sas_token: Some("mysas".into()),
+            azure_storage_sas_token: Some("mysas".to_string().into()),
             azure_container_name: Some("mycontainer".into()),
             ..default_config()
         }
@@ -175,7 +182,7 @@ mod tests {
     fn gcs_config() -> DeltaSinkConfig {
         DeltaSinkConfig {
             storage_backend_type: Some("gcs".into()),
-            gcs_service_account_key: Some("{\"key\": \"value\"}".into()),
+            gcs_service_account_key: Some("{\"key\": \"value\"}".to_string().into()),
             gcs_bucket: Some("mybucket".into()),
             ..default_config()
         }
@@ -254,8 +261,8 @@ mod tests {
     #[test]
     fn azure_backend_both_auth_methods_errors() {
         let config = DeltaSinkConfig {
-            azure_storage_account_key: Some("mykey".into()),
-            azure_storage_sas_token: Some("mysas".into()),
+            azure_storage_account_key: Some("mykey".to_string().into()),
+            azure_storage_sas_token: Some("mysas".to_string().into()),
             ..azure_config_with_key()
         };
         assert!(build_storage_options(&config).is_err());

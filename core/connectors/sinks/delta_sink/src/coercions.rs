@@ -80,6 +80,8 @@ fn build_coercion_node(data_type: &DataType) -> Option<CoercionNode> {
                 _ => None,
             })
         }
+        // TODO: Map and Variant column types are not coerced. Values inside these columns
+        // pass through to the Delta writer unchanged. Add support if these types are needed.
         _ => None,
     }
 }
@@ -103,10 +105,12 @@ fn apply_coercion(value: &mut Value, node: &CoercionNode) {
             }
         }
         CoercionNode::Coercion(Coercion::ToTimestamp) => {
-            if let Some(as_str) = value.as_str()
-                && let Some(parsed) = string_to_timestamp(as_str)
-            {
-                *value = parsed
+            if let Some(as_str) = value.as_str() {
+                if let Some(parsed) = string_to_timestamp(as_str) {
+                    *value = parsed
+                }
+            } else if value.is_i64() || value.is_u64() {
+                // Already epoch microseconds — valid timestamp representation, pass through.
             }
         }
         CoercionNode::Tree(tree) => {
@@ -129,11 +133,15 @@ fn apply_coercion(value: &mut Value, node: &CoercionNode) {
             }
         }
         CoercionNode::ArrayTree(tree) => {
-            let values = value.as_array_mut();
-            if let Some(values) = values {
-                let node = CoercionNode::Tree(tree.clone());
+            if let Some(values) = value.as_array_mut() {
                 for value in values {
-                    apply_coercion(value, &node);
+                    for (name, node) in tree.root.iter() {
+                        if let Some(fields) = value.as_object_mut()
+                            && let Some(field_value) = fields.get_mut(name)
+                        {
+                            apply_coercion(field_value, node);
+                        }
+                    }
                 }
             }
         }
@@ -589,5 +597,17 @@ mod tests {
         assert_eq!(value["array_string"][4], json!("3.15"));
         assert_eq!(value["array_string"][5], json!("[1,2,3]"));
         assert_eq!(value["array_string"][6], json!(r#"{"x":1}"#));
+    }
+
+    #[test]
+    fn test_timestamp_coercion_i64_passthrough() {
+        let delta_schema: DeltaSchema = serde_json::from_value(SCHEMA.clone()).unwrap();
+        let tree = create_coercion_tree(&delta_schema);
+
+        let epoch_micros = 1636668718000000i64;
+        let mut value = json!({ "level1_timestamp": epoch_micros });
+        coerce(&mut value, &tree);
+
+        assert_eq!(value["level1_timestamp"], json!(epoch_micros));
     }
 }
