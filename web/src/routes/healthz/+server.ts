@@ -24,7 +24,6 @@ export const prerender = true;
 export const GET = () =>
   new Response(STATUS_OK, {
     headers: {
-      'cache-control': 'no-store',
       'content-type': 'text/plain; charset=utf-8'
     }
   });

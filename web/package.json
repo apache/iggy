@@ -8,7 +8,6 @@
     "build:static": "STATIC_BUILD=true PUBLIC_IGGY_API_URL= vite build",
     "preview": "vite preview",
     "server": "vite server",
-    "test": "node --test",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "lint": "eslint . && prettier --check .",
