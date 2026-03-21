@@ -20,9 +20,7 @@ use crate::codec::{WireDecode, WireEncode, read_bytes, read_str, read_u8};
 use bytes::{BufMut, BytesMut};
 use std::ops::Deref;
 
-// ---------------------------------------------------------------------------
 // WireName
-// ---------------------------------------------------------------------------
 
 /// Maximum byte length for a wire name (fits in a u8 length prefix).
 pub const MAX_WIRE_NAME_LENGTH: usize = 255;
@@ -113,9 +111,7 @@ impl WireDecode for WireName {
     }
 }
 
-// ---------------------------------------------------------------------------
 // WireIdentifier
-// ---------------------------------------------------------------------------
 
 const KIND_NUMERIC: u8 = 1;
 const KIND_STRING: u8 = 2;
@@ -243,9 +239,7 @@ impl std::fmt::Display for WireIdentifier {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

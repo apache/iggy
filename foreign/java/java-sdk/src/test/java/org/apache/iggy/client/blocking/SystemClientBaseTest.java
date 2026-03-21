@@ -42,6 +42,11 @@ public abstract class SystemClientBaseTest extends IntegrationTest {
 
         // then
         assertThat(stats).isNotNull();
+        assertThat(stats.processId()).isNotNull();
+        assertThat(stats.hostname()).isNotEmpty();
+        assertThat(stats.threadsCount()).isNotNull();
+        assertThat(stats.freeDiskSpace()).isNotNull();
+        assertThat(stats.totalDiskSpace()).isNotNull();
     }
 
     @Test

@@ -4,13 +4,13 @@ requires-python = ">=3.10"
 
 [[package]]
 name = "apache-iggy"
-version = "0.7.0"
+version = "0.7.3.dev1"
 source = { directory = "../../foreign/python" }
 
 [package.metadata]
 requires-dist = [
-    { name = "black", marker = "extra == 'all'", specifier = ">=23.0,<25.0" },
-    { name = "black", marker = "extra == 'dev'", specifier = ">=23.0,<25.0" },
+    { name = "black", marker = "extra == 'all'", specifier = ">=23.0,<27.0" },
+    { name = "black", marker = "extra == 'dev'", specifier = ">=23.0,<27.0" },
     { name = "isort", marker = "extra == 'all'", specifier = ">=5.12.0,<6.0" },
     { name = "isort", marker = "extra == 'dev'", specifier = ">=5.12.0,<6.0" },
     { name = "loguru", marker = "extra == 'all'", specifier = ">=0.7.0,<1.0" },
@@ -22,6 +22,8 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'testing'", specifier = ">=7.0,<9.0" },
     { name = "pytest-asyncio", marker = "extra == 'all'", specifier = ">=0.21.0,<1.0" },
     { name = "pytest-asyncio", marker = "extra == 'testing'", specifier = ">=0.21.0,<1.0" },
+    { name = "pytest-cov", marker = "extra == 'all'", specifier = ">=4.0,<7.0" },
+    { name = "pytest-cov", marker = "extra == 'testing'", specifier = ">=4.0,<7.0" },
     { name = "pytest-timeout", marker = "extra == 'all'", specifier = ">=2.0,<3.0" },
     { name = "pytest-timeout", marker = "extra == 'testing'", specifier = ">=2.0,<3.0" },
     { name = "pytest-xdist", marker = "extra == 'all'", specifier = ">=3.0,<4.0" },

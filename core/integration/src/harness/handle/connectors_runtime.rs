@@ -190,12 +190,6 @@ impl TestBinary for ConnectorsRuntimeHandle {
         })?;
         self.child_handle = Some(child);
 
-        // Release port reservation immediately after spawn to avoid SO_REUSEPORT
-        // load-balancing conflicts during health checks.
-        if let Some(reserver) = self.port_reserver.take() {
-            reserver.release();
-        }
-
         Ok(())
     }
 
@@ -251,6 +245,16 @@ impl IggyServerDependent for ConnectorsRuntimeHandle {
     }
 
     async fn wait_ready(&mut self) -> Result<(), TestBinaryError> {
+        // Release port reservation just before health-checking. The reservation
+        // holds the port while the child process initializes, preventing another
+        // process from claiming it. By the time we reach here the child has had
+        // enough time to bind (or will bind within the first few health-check
+        // retries). This matches the server handle pattern where the reservation
+        // is held until the process has bound.
+        if let Some(reserver) = self.port_reserver.take() {
+            reserver.release();
+        }
+
         let http_address = self.http_url();
         let client = reqwest::Client::new();
 

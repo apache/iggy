@@ -152,6 +152,58 @@ pub fn read_str(buf: &[u8], offset: usize, len: usize) -> Result<String, WireErr
         .map_err(|_| WireError::InvalidUtf8 { offset })
 }
 
+/// Helper to read a `u128` LE from `buf` at `offset`.
+///
+/// # Errors
+/// Returns `WireError::UnexpectedEof` if fewer than 16 bytes remain.
+#[allow(clippy::missing_panics_doc)]
+#[inline]
+pub fn read_u128_le(buf: &[u8], offset: usize) -> Result<u128, WireError> {
+    let end = offset
+        .checked_add(16)
+        .ok_or_else(|| WireError::UnexpectedEof {
+            offset,
+            need: 16,
+            have: buf.len().saturating_sub(offset),
+        })?;
+    let slice = buf
+        .get(offset..end)
+        .ok_or_else(|| WireError::UnexpectedEof {
+            offset,
+            need: 16,
+            have: buf.len().saturating_sub(offset),
+        })?;
+    Ok(u128::from_le_bytes(
+        slice.try_into().expect("slice is exactly 16 bytes"),
+    ))
+}
+
+/// Helper to read an `f32` LE from `buf` at `offset`.
+///
+/// # Errors
+/// Returns `WireError::UnexpectedEof` if fewer than 4 bytes remain.
+#[allow(clippy::missing_panics_doc)]
+#[inline]
+pub fn read_f32_le(buf: &[u8], offset: usize) -> Result<f32, WireError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| WireError::UnexpectedEof {
+            offset,
+            need: 4,
+            have: buf.len().saturating_sub(offset),
+        })?;
+    let slice = buf
+        .get(offset..end)
+        .ok_or_else(|| WireError::UnexpectedEof {
+            offset,
+            need: 4,
+            have: buf.len().saturating_sub(offset),
+        })?;
+    Ok(f32::from_le_bytes(
+        slice.try_into().expect("slice is exactly 4 bytes"),
+    ))
+}
+
 /// Helper to read a byte slice of `len` bytes from `buf` at `offset`.
 ///
 /// # Errors

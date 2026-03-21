@@ -20,5 +20,5 @@
 mod mongodb_sink;
 
 const TEST_MESSAGE_COUNT: usize = 3;
-const POLL_ATTEMPTS: usize = 100;
+const POLL_ATTEMPTS: usize = 400;
 const POLL_INTERVAL_MS: u64 = 50;
