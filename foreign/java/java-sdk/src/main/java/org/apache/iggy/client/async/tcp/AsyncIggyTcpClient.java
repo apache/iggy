@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.async.ConsumerGroupsClient;
 import org.apache.iggy.client.async.ConsumerOffsetsClient;
 import org.apache.iggy.client.async.MessagesClient;
@@ -28,10 +29,13 @@ import org.apache.iggy.client.async.StreamsClient;
 import org.apache.iggy.client.async.SystemClient;
 import org.apache.iggy.client.async.TopicsClient;
 import org.apache.iggy.client.async.UsersClient;
+import org.apache.iggy.client.async.tcp.AsyncTcpConnection.TCPConnectionPoolConfig;
 import org.apache.iggy.config.RetryPolicy;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.user.IdentityInfo;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.time.Duration;
@@ -90,11 +94,13 @@ import java.util.concurrent.CompletableFuture;
  */
 public class AsyncIggyTcpClient {
 
+    private static final Logger log = LoggerFactory.getLogger(AsyncIggyTcpClient.class);
+
     private final String host;
     private final int port;
     private final Optional<String> username;
     private final Optional<String> password;
-    private final Optional<Duration> connectionTimeout;
+    private final Optional<Duration> acquireTimeout;
     private final Optional<Duration> requestTimeout;
     private final Optional<Integer> connectionPoolSize;
     private final Optional<RetryPolicy> retryPolicy;
@@ -129,7 +135,7 @@ public class AsyncIggyTcpClient {
             int port,
             String username,
             String password,
-            Duration connectionTimeout,
+            Duration acquireTimeout,
             Duration requestTimeout,
             Integer connectionPoolSize,
             RetryPolicy retryPolicy,
@@ -139,7 +145,7 @@ public class AsyncIggyTcpClient {
         this.port = port;
         this.username = Optional.ofNullable(username);
         this.password = Optional.ofNullable(password);
-        this.connectionTimeout = Optional.ofNullable(connectionTimeout);
+        this.acquireTimeout = Optional.ofNullable(acquireTimeout);
         this.requestTimeout = Optional.ofNullable(requestTimeout);
         this.connectionPoolSize = Optional.ofNullable(connectionPoolSize);
         this.retryPolicy = Optional.ofNullable(retryPolicy);
@@ -166,8 +172,13 @@ public class AsyncIggyTcpClient {
      * @return a {@link CompletableFuture} that completes when the connection is established
      */
     public CompletableFuture<Void> connect() {
-        connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate);
+        TCPConnectionPoolConfig.Builder poolConfigBuilder = new TCPConnectionPoolConfig.Builder();
+        connectionPoolSize.ifPresent(poolConfigBuilder::setMaxConnections);
+        acquireTimeout.ifPresent(timeout -> poolConfigBuilder.setAcquireTimeoutMillis(timeout.toMillis()));
+        TCPConnectionPoolConfig poolConfig = poolConfigBuilder.build();
+        connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate, poolConfig);
         return connection.connect().thenRun(() -> {
+            log.debug("Connected to {}:{} | {}", host, port, IggyVersion.getInstance());
             messagesClient = new MessagesTcpClient(connection);
             consumerGroupsClient = new ConsumerGroupsTcpClient(connection);
             consumerOffsetsClient = new ConsumerOffsetsTcpClient(connection);
@@ -189,7 +200,7 @@ public class AsyncIggyTcpClient {
      * {@link UsersClient#login(String, String)} instead.
      *
      * @return a {@link CompletableFuture} that completes with the user's
-     *         {@link IdentityInfo} on success
+     * {@link IdentityInfo} on success
      * @throws IggyMissingCredentialsException if no credentials were provided at build time
      * @throws IggyNotConnectedException       if {@link #connect()} has not been called
      */

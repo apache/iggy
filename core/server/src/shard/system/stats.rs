@@ -87,6 +87,8 @@ impl IggyShard {
                 let disk_usage = process.disk_usage();
                 stats.read_bytes = disk_usage.total_read_bytes.into();
                 stats.written_bytes = disk_usage.total_written_bytes.into();
+
+                stats.threads_count = process.tasks().map(|t| t.len() as u32).unwrap_or(0);
             }
 
             let (streams_count, topics_count, partitions_count, consumer_groups_count, stream_ids) =
@@ -115,6 +117,25 @@ impl IggyShard {
                     stats.messages_count += stream_stat.messages_count_inconsistent();
                     stats.segments_count += stream_stat.segments_count_inconsistent();
                     stats.messages_size_bytes += stream_stat.size_bytes_inconsistent().into();
+                }
+            }
+
+            match fs2::available_space(&self.config.system.path) {
+                Ok(space) => stats.free_disk_space = space.into(),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to get available disk space for '{}': {err}",
+                        self.config.system.path
+                    );
+                }
+            }
+            match fs2::total_space(&self.config.system.path) {
+                Ok(space) => stats.total_disk_space = space.into(),
+                Err(err) => {
+                    tracing::warn!(
+                        "Failed to get total disk space for '{}': {err}",
+                        self.config.system.path
+                    );
                 }
             }
 

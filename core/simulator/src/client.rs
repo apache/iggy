@@ -16,7 +16,7 @@
 // under the License.
 
 use iggy_common::{
-    BytesSerializable, INDEX_SIZE, Identifier,
+    BytesSerializable, IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, Identifier,
     create_stream::CreateStream,
     delete_stream::DeleteStream,
     header::{Operation, RequestHeader},
@@ -32,7 +32,8 @@ pub struct SimClient {
 }
 
 impl SimClient {
-    pub fn new(client_id: u128) -> Self {
+    #[must_use]
+    pub const fn new(client_id: u128) -> Self {
         Self {
             client_id,
             request_counter: Cell::new(0),
@@ -51,56 +52,82 @@ impl SimClient {
         };
         let payload = create_stream.to_bytes();
 
-        self.build_request(Operation::CreateStream, payload)
+        self.build_request(Operation::CreateStream, &payload)
     }
 
+    /// # Panics
+    /// Panics if the stream name cannot be converted to an `Identifier`.
     pub fn delete_stream(&self, name: &str) -> Message<RequestHeader> {
         let delete_stream = DeleteStream {
             stream_id: Identifier::named(name).unwrap(),
         };
         let payload = delete_stream.to_bytes();
 
-        self.build_request(Operation::DeleteStream, payload)
+        self.build_request(Operation::DeleteStream, &payload)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     pub fn send_messages(
         &self,
         namespace: IggyNamespace,
-        messages: Vec<&[u8]>,
+        messages: &[&[u8]],
     ) -> Message<RequestHeader> {
-        // Build batch: count | indexes | messages
         let count = messages.len() as u32;
         let mut indexes = Vec::with_capacity(count as usize * INDEX_SIZE);
         let mut messages_buf = Vec::new();
 
         let mut current_position = 0u32;
-        for msg in &messages {
-            // Write index: position (u32) + length (u32)
-            indexes.extend_from_slice(&current_position.to_le_bytes());
-            indexes.extend_from_slice(&(msg.len() as u32).to_le_bytes());
+        for (i, msg) in messages.iter().enumerate() {
+            let msg_total_len = (IGGY_MESSAGE_HEADER_SIZE + msg.len()) as u32;
 
-            // Append message
+            // Index: offset(u32) + position(u32) + timestamp(u64)
+            indexes.extend_from_slice(&(i as u32).to_le_bytes()); // offset (relative)
+            indexes.extend_from_slice(&current_position.to_le_bytes()); // position
+            indexes.extend_from_slice(&0u64.to_le_bytes()); // timestamp (set in prepare)
+
+            // Message header (64 bytes)
+            messages_buf.extend_from_slice(&0u64.to_le_bytes()); // checksum
+            messages_buf.extend_from_slice(&0u128.to_le_bytes()); // id
+            messages_buf.extend_from_slice(&0u64.to_le_bytes()); // offset
+            messages_buf.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+            messages_buf.extend_from_slice(&0u64.to_le_bytes()); // origin_timestamp
+            messages_buf.extend_from_slice(&0u32.to_le_bytes()); // user_headers_length
+            messages_buf.extend_from_slice(&(msg.len() as u32).to_le_bytes()); // payload_length
+            messages_buf.extend_from_slice(&0u64.to_le_bytes()); // reserved
+
+            // Payload
             messages_buf.extend_from_slice(msg);
-            current_position += msg.len() as u32;
+            current_position += msg_total_len;
         }
 
-        // Build payload: count | indexes | messages
         let mut payload = Vec::with_capacity(4 + indexes.len() + messages_buf.len());
         payload.extend_from_slice(&count.to_le_bytes());
         payload.extend_from_slice(&indexes);
         payload.extend_from_slice(&messages_buf);
 
-        self.build_request_with_namespace(
-            Operation::SendMessages,
-            bytes::Bytes::from(payload),
-            namespace,
-        )
+        self.build_request_with_namespace(Operation::SendMessages, &payload, namespace)
     }
 
+    pub fn store_consumer_offset(
+        &self,
+        namespace: IggyNamespace,
+        consumer_kind: u8,
+        consumer_id: u32,
+        offset: u64,
+    ) -> Message<RequestHeader> {
+        let mut payload = Vec::with_capacity(13);
+        payload.push(consumer_kind);
+        payload.extend_from_slice(&consumer_id.to_le_bytes());
+        payload.extend_from_slice(&offset.to_le_bytes());
+
+        self.build_request_with_namespace(Operation::StoreConsumerOffset, &payload, namespace)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
     fn build_request_with_namespace(
         &self,
         operation: Operation,
-        payload: bytes::Bytes,
+        payload: &[u8],
         namespace: IggyNamespace,
     ) -> Message<RequestHeader> {
         use bytes::Bytes;
@@ -130,13 +157,14 @@ impl SimClient {
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
         buffer.extend_from_slice(header_bytes);
-        buffer.extend_from_slice(&payload);
+        buffer.extend_from_slice(payload);
 
         Message::<RequestHeader>::from_bytes(Bytes::from(buffer))
             .expect("failed to build request message")
     }
 
-    fn build_request(&self, operation: Operation, payload: bytes::Bytes) -> Message<RequestHeader> {
+    #[allow(clippy::cast_possible_truncation)]
+    fn build_request(&self, operation: Operation, payload: &[u8]) -> Message<RequestHeader> {
         use bytes::Bytes;
 
         let header_size = std::mem::size_of::<RequestHeader>();
@@ -163,7 +191,7 @@ impl SimClient {
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
         buffer.extend_from_slice(header_bytes);
-        buffer.extend_from_slice(&payload);
+        buffer.extend_from_slice(payload);
 
         Message::<RequestHeader>::from_bytes(Bytes::from(buffer))
             .expect("failed to build request message")

@@ -36,3 +36,8 @@ message_bus = { workspace = true }
 ringbuffer = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "warn"

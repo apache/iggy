@@ -22,7 +22,7 @@ build-backend = "maturin"
 [project]
 name = "apache-iggy"
 requires-python = ">=3.10"
-version = "0.7.1.dev.1"
+version = "0.7.3.dev1"
 description = "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -87,7 +87,7 @@ testing-docker = ["testcontainers[docker]>=3.7.0,<5.0"]
 # Development tools
 dev = [
     "maturin>=1.2,<2.0",
-    "black>=23.0,<25.0",
+    "black>=23.0,<27.0",
     "isort>=5.12.0,<6.0",
     "mypy>=1.5.0,<2.0",
     "ruff>=0.1.0,<1.0",
@@ -103,7 +103,7 @@ all = [
     "loguru>=0.7.0,<1.0",
     "testcontainers[docker]>=3.7.0,<5.0",
     "maturin>=1.2,<2.0",
-    "black>=23.0,<25.0",
+    "black>=23.0,<27.0",
     "isort>=5.12.0,<6.0",
     "mypy>=1.5.0,<2.0",
     "ruff>=0.1.0,<1.0",

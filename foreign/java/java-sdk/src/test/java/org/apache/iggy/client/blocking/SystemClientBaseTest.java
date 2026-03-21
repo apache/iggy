@@ -42,5 +42,31 @@ public abstract class SystemClientBaseTest extends IntegrationTest {
 
         // then
         assertThat(stats).isNotNull();
+        assertThat(stats.processId()).isNotNull();
+        assertThat(stats.hostname()).isNotEmpty();
+        assertThat(stats.threadsCount()).isNotNull();
+        assertThat(stats.freeDiskSpace()).isNotNull();
+        assertThat(stats.totalDiskSpace()).isNotNull();
+    }
+
+    @Test
+    void shouldPing() {
+        // when
+        var result = systemClient.ping();
+
+        // then
+        assertThat(result).isEqualTo("pong");
+    }
+
+    @Test
+    void shouldPingWithoutAuthentication() {
+        // given — fresh client, connected but not logged in
+        var unauthenticatedClient = getClient();
+
+        // when
+        var result = unauthenticatedClient.system().ping();
+
+        // then
+        assertThat(result).isEqualTo("pong");
     }
 }

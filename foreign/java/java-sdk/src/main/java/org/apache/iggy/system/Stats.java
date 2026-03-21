@@ -20,6 +20,8 @@
 package org.apache.iggy.system;
 
 import java.math.BigInteger;
+import java.util.Map;
+import java.util.Optional;
 
 public record Stats(
         Long processId,
@@ -43,4 +45,10 @@ public record Stats(
         String hostname,
         String osName,
         String osVersion,
-        String kernelVersion) {}
+        String kernelVersion,
+        String iggyServerVersion,
+        Optional<Long> iggyServerSemver,
+        Map<CacheMetricsKey, CacheMetrics> cacheMetrics,
+        Long threadsCount,
+        String freeDiskSpace,
+        String totalDiskSpace) {}

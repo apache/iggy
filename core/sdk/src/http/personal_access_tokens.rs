@@ -20,12 +20,13 @@ use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::IggyError;
 use async_trait::async_trait;
-use iggy_binary_protocol::PersonalAccessTokenClient;
 use iggy_common::IdentityInfo;
+use iggy_common::PersonalAccessTokenClient;
 use iggy_common::PersonalAccessTokenExpiry;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::{PersonalAccessTokenInfo, RawPersonalAccessToken};
+use secrecy::SecretString;
 
 const PATH: &str = "/personal-access-tokens";
 
@@ -74,7 +75,7 @@ impl PersonalAccessTokenClient for HttpClient {
             .post(
                 &format!("{PATH}/login"),
                 &LoginWithPersonalAccessToken {
-                    token: token.to_string(),
+                    token: SecretString::from(token),
                 },
             )
             .await?;

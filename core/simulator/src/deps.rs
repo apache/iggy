@@ -34,6 +34,7 @@ pub struct MemStorage {
     offset: Cell<u64>,
 }
 
+#[allow(clippy::future_not_send)]
 impl Storage for MemStorage {
     type Buffer = Vec<u8>;
 
@@ -44,7 +45,8 @@ impl Storage for MemStorage {
         len
     }
 
-    async fn read(&self, offset: usize, mut buffer: Self::Buffer) -> Self::Buffer {
+    async fn read(&self, offset: usize, len: usize) -> Self::Buffer {
+        let mut buffer = vec![0; len];
         let data = self.data.borrow();
         let end = offset + buffer.len();
         if offset < data.len() && end <= data.len() {
@@ -74,6 +76,7 @@ impl<S: Storage + Default> Default for SimJournal<S> {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl<S: Storage> std::fmt::Debug for SimJournal<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SimJournal")
@@ -85,6 +88,7 @@ impl<S: Storage> std::fmt::Debug for SimJournal<S> {
     }
 }
 
+#[allow(clippy::future_not_send)]
 impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
     type Header = PrepareHeader;
     type Entry = Message<PrepareHeader>;
@@ -103,8 +107,7 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
         let header = headers.get(&header.op)?;
         let offset = *offsets.get(&header.op)?;
 
-        let buffer = vec![0; header.size as usize];
-        let buffer = self.storage.read(offset, buffer).await;
+        let buffer = self.storage.read(offset, header.size as usize).await;
         let message =
             Message::from_bytes(Bytes::from(buffer)).expect("simulator: bytes should be valid");
         Some(message)
@@ -137,7 +140,7 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
 
 impl JournalHandle for SimJournal<MemStorage> {
     type Storage = MemStorage;
-    type Target = SimJournal<MemStorage>;
+    type Target = Self;
 
     fn handle(&self) -> &Self::Target {
         self

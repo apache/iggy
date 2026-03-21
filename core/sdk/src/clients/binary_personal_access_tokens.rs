@@ -18,8 +18,8 @@
 
 use crate::prelude::{ClientWrapper, IggyClient};
 use async_trait::async_trait;
-use iggy_binary_protocol::{Client, PersonalAccessTokenClient};
 use iggy_common::locking::IggyRwLockFn;
+use iggy_common::{Client, PersonalAccessTokenClient};
 use iggy_common::{
     IdentityInfo, IggyError, PersonalAccessTokenExpiry, PersonalAccessTokenInfo,
     RawPersonalAccessToken,

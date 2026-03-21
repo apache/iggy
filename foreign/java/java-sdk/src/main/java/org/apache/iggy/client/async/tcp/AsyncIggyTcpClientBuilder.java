@@ -28,6 +28,7 @@ import java.io.File;
 import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 
 /**
  * Builder for creating configured AsyncIggyTcpClient instances.
@@ -73,8 +74,9 @@ public final class AsyncIggyTcpClientBuilder {
     private Duration requestTimeout;
     private Integer connectionPoolSize;
     private RetryPolicy retryPolicy;
+    private Duration acquireTimeout;
 
-    AsyncIggyTcpClientBuilder() {}
+    public AsyncIggyTcpClientBuilder() {}
 
     /**
      * Sets the host address for the Iggy server.
@@ -156,6 +158,17 @@ public final class AsyncIggyTcpClientBuilder {
     }
 
     /**
+     * Sets channel acquire timeout
+     *
+     * @param acquireTimeout the acquire timeout duration
+     * @return this builder
+     */
+    public AsyncIggyTcpClientBuilder acquireTimeout(Duration acquireTimeout) {
+        this.acquireTimeout = acquireTimeout;
+        return this;
+    }
+
+    /**
      * Sets the connection timeout.
      *
      * @param connectionTimeout the connection timeout duration
@@ -213,6 +226,12 @@ public final class AsyncIggyTcpClientBuilder {
         if (port == null || port <= 0) {
             throw new IggyInvalidArgumentException("Port must be a positive integer");
         }
+        if (connectionPoolSize != null && connectionPoolSize <= 0) {
+            throw new IggyInvalidArgumentException("Connection pool size cannot by 0 or negative");
+        }
+        if (acquireTimeout != null && (acquireTimeout.equals(Duration.ZERO) || acquireTimeout.isNegative())) {
+            throw new IggyInvalidArgumentException("AcquireTimeout Cannot be 0 or Negative");
+        }
         return new AsyncIggyTcpClient(
                 host,
                 port,
@@ -241,6 +260,20 @@ public final class AsyncIggyTcpClientBuilder {
                     "Credentials must be provided to use buildAndLogin(). Use credentials(username, password).");
         }
         AsyncIggyTcpClient client = build();
-        return client.connect().thenCompose(v -> client.login()).thenApply(v -> client);
+        return client.connect()
+                .thenCompose(v -> client.login())
+                .thenApply(v -> client)
+                .handle((result, ex) -> {
+                    if (ex == null) {
+                        return CompletableFuture.completedFuture(result);
+                    }
+                    return client.close().<AsyncIggyTcpClient>handle((ignored, closeEx) -> {
+                        if (closeEx != null) {
+                            ex.addSuppressed(closeEx);
+                        }
+                        throw (RuntimeException) ex;
+                    });
+                })
+                .thenCompose(Function.identity());
     }
 }

@@ -21,6 +21,7 @@ use bytes::Bytes;
 use iggy::prelude::BytesSerializable;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::create_user::CreateUser;
+use secrecy::SecretString;
 use server::state::command::EntryCommand;
 use server::state::entry::StateEntry;
 use server::state::models::{CreateStreamWithId, CreateUserWithId};
@@ -45,7 +46,7 @@ async fn should_apply_single_entry() {
         user_id: 1,
         command: CreateUser {
             username: "test".to_string(),
-            password: "secret".to_string(),
+            password: SecretString::from("secret"),
             status: Default::default(),
             permissions: None,
         },
@@ -71,7 +72,7 @@ async fn should_apply_encrypted_entry() {
         user_id: 1,
         command: CreateUser {
             username: "test".to_string(),
-            password: "secret".to_string(),
+            password: SecretString::from("secret"),
             status: Default::default(),
             permissions: None,
         },
@@ -103,7 +104,7 @@ async fn should_apply_multiple_entries() {
         user_id: created_user_id,
         command: CreateUser {
             username: "test".to_string(),
-            password: "secret".to_string(),
+            password: SecretString::from("secret"),
             status: Default::default(),
             permissions: None,
         },

@@ -21,6 +21,7 @@ package org.apache.iggy.client.async.tcp;
 
 import org.apache.iggy.client.BaseIntegrationTest;
 import org.apache.iggy.config.RetryPolicy;
+import org.apache.iggy.exception.IggyAuthenticationException;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
@@ -29,12 +30,12 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
@@ -68,15 +69,15 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
         // Then: Client should be connected and functional
-        assertNotNull(client.users());
-        assertNotNull(client.messages());
-        assertNotNull(client.streams());
-        assertNotNull(client.topics());
-        assertNotNull(client.consumerGroups());
-        assertNotNull(client.system());
-        assertNotNull(client.personalAccessTokens());
-        assertNotNull(client.partitions());
-        assertNotNull(client.consumerOffsets());
+        assertThat(client.users()).isNotNull();
+        assertThat(client.messages()).isNotNull();
+        assertThat(client.streams()).isNotNull();
+        assertThat(client.topics()).isNotNull();
+        assertThat(client.consumerGroups()).isNotNull();
+        assertThat(client.system()).isNotNull();
+        assertThat(client.personalAccessTokens()).isNotNull();
+        assertThat(client.partitions()).isNotNull();
+        assertThat(client.consumerOffsets()).isNotNull();
     }
 
     @Test
@@ -93,7 +94,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
         // Then: Should succeed
-        assertNotNull(client.users());
+        assertThat(client.users()).isNotNull();
     }
 
     @Test
@@ -103,7 +104,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 AsyncIggyTcpClient.builder().host("").port(serverTcpPort());
 
         // When/Then: Building should throw IggyInvalidArgumentException
-        assertThrows(IggyInvalidArgumentException.class, builder::build);
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
@@ -113,7 +114,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 AsyncIggyTcpClient.builder().host(null).port(serverTcpPort());
 
         // When/Then: Building should throw IggyInvalidArgumentException
-        assertThrows(IggyInvalidArgumentException.class, builder::build);
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
@@ -123,7 +124,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 AsyncIggyTcpClient.builder().host(serverHost()).port(-1);
 
         // When/Then: Building should throw IggyInvalidArgumentException
-        assertThrows(IggyInvalidArgumentException.class, builder::build);
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
@@ -133,7 +134,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 AsyncIggyTcpClient.builder().host(serverHost()).port(0);
 
         // When/Then: Building should throw IggyInvalidArgumentException
-        assertThrows(IggyInvalidArgumentException.class, builder::build);
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
     }
 
     @Test
@@ -145,7 +146,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
         // Then: Should work as before
-        assertNotNull(client.users());
+        assertThat(client.users()).isNotNull();
     }
 
     @Test
@@ -160,15 +161,23 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
         // Then: Should be able to access all clients
-        assertNotNull(client.users(), "Users client should not be null");
-        assertNotNull(client.messages(), "Messages client should not be null");
-        assertNotNull(client.streams(), "Streams client should not be null");
-        assertNotNull(client.topics(), "Topics client should not be null");
-        assertNotNull(client.consumerGroups(), "Consumer groups client should not be null");
-        assertNotNull(client.system(), "System client should not be null");
-        assertNotNull(client.personalAccessTokens(), "Personal access tokens client should not be null");
-        assertNotNull(client.partitions(), "Partitions client should not be null");
-        assertNotNull(client.consumerOffsets(), "Consumer offsets client should not be null");
+        assertThat(client.users()).as("Users client should not be null").isNotNull();
+        assertThat(client.messages()).as("Messages client should not be null").isNotNull();
+        assertThat(client.streams()).as("Streams client should not be null").isNotNull();
+        assertThat(client.topics()).as("Topics client should not be null").isNotNull();
+        assertThat(client.consumerGroups())
+                .as("Consumer groups client should not be null")
+                .isNotNull();
+        assertThat(client.system()).as("System client should not be null").isNotNull();
+        assertThat(client.personalAccessTokens())
+                .as("Personal access tokens client should not be null")
+                .isNotNull();
+        assertThat(client.partitions())
+                .as("Partitions client should not be null")
+                .isNotNull();
+        assertThat(client.consumerOffsets())
+                .as("Consumer offsets client should not be null")
+                .isNotNull();
     }
 
     @Test
@@ -185,8 +194,8 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         closeFuture.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
         // Then: Should complete without exception
-        assertTrue(closeFuture.isDone());
-        assertFalse(closeFuture.isCompletedExceptionally());
+        assertThat(closeFuture.isDone()).isTrue();
+        assertThat(closeFuture.isCompletedExceptionally()).isFalse();
     }
 
     @Test
@@ -197,7 +206,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .credentials(TEST_USERNAME, TEST_PASSWORD)
                 .build();
 
-        assertThrows(IggyNotConnectedException.class, () -> client.login());
+        assertThatThrownBy(() -> client.login()).isInstanceOf(IggyNotConnectedException.class);
     }
 
     @Test
@@ -207,7 +216,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .port(serverTcpPort())
                 .build();
 
-        assertThrows(IggyNotConnectedException.class, () -> client.users());
+        assertThatThrownBy(() -> client.users()).isInstanceOf(IggyNotConnectedException.class);
     }
 
     @Test
@@ -217,7 +226,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .port(serverTcpPort())
                 .build();
 
-        assertThrows(IggyNotConnectedException.class, () -> client.messages());
+        assertThatThrownBy(() -> client.messages()).isInstanceOf(IggyNotConnectedException.class);
     }
 
     @Test
@@ -227,7 +236,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .port(serverTcpPort())
                 .build();
 
-        assertThrows(IggyNotConnectedException.class, () -> client.streams());
+        assertThatThrownBy(() -> client.streams()).isInstanceOf(IggyNotConnectedException.class);
     }
 
     @Test
@@ -237,7 +246,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .port(serverTcpPort())
                 .build();
 
-        assertThrows(IggyNotConnectedException.class, () -> client.topics());
+        assertThatThrownBy(() -> client.topics()).isInstanceOf(IggyNotConnectedException.class);
     }
 
     @Test
@@ -247,7 +256,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .port(serverTcpPort())
                 .build();
 
-        assertThrows(IggyNotConnectedException.class, () -> client.consumerGroups());
+        assertThatThrownBy(() -> client.consumerGroups()).isInstanceOf(IggyNotConnectedException.class);
     }
 
     @Test
@@ -257,7 +266,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .port(serverTcpPort())
                 .build();
 
-        assertThrows(IggyNotConnectedException.class, () -> client.system());
+        assertThatThrownBy(() -> client.system()).isInstanceOf(IggyNotConnectedException.class);
     }
 
     @Test
@@ -267,7 +276,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .port(serverTcpPort())
                 .build();
 
-        assertThrows(IggyNotConnectedException.class, () -> client.personalAccessTokens());
+        assertThatThrownBy(() -> client.personalAccessTokens()).isInstanceOf(IggyNotConnectedException.class);
     }
 
     @Test
@@ -277,7 +286,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .port(serverTcpPort())
                 .build();
 
-        assertThrows(IggyNotConnectedException.class, () -> client.partitions());
+        assertThatThrownBy(() -> client.partitions()).isInstanceOf(IggyNotConnectedException.class);
     }
 
     @Test
@@ -287,7 +296,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .port(serverTcpPort())
                 .build();
 
-        assertThrows(IggyNotConnectedException.class, () -> client.consumerOffsets());
+        assertThatThrownBy(() -> client.consumerOffsets()).isInstanceOf(IggyNotConnectedException.class);
     }
 
     @Test
@@ -298,7 +307,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .build();
         client.connect().get(5, TimeUnit.SECONDS);
 
-        assertThrows(IggyMissingCredentialsException.class, () -> client.login());
+        assertThatThrownBy(() -> client.login()).isInstanceOf(IggyMissingCredentialsException.class);
     }
 
     @Test
@@ -306,7 +315,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         AsyncIggyTcpClientBuilder builder =
                 AsyncIggyTcpClient.builder().host(serverHost()).port(serverTcpPort());
 
-        assertThrows(IggyMissingCredentialsException.class, builder::buildAndLogin);
+        assertThatThrownBy(builder::buildAndLogin).isInstanceOf(IggyMissingCredentialsException.class);
     }
 
     @Test
@@ -316,7 +325,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .port(serverTcpPort())
                 .credentials(null, TEST_PASSWORD);
 
-        assertThrows(IggyMissingCredentialsException.class, builder::buildAndLogin);
+        assertThatThrownBy(builder::buildAndLogin).isInstanceOf(IggyMissingCredentialsException.class);
     }
 
     @Test
@@ -326,7 +335,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .port(serverTcpPort())
                 .credentials(TEST_USERNAME, null);
 
-        assertThrows(IggyMissingCredentialsException.class, builder::buildAndLogin);
+        assertThatThrownBy(builder::buildAndLogin).isInstanceOf(IggyMissingCredentialsException.class);
     }
 
     @Test
@@ -338,7 +347,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertNotNull(client.users());
+        assertThat(client.users()).isNotNull();
     }
 
     @Test
@@ -350,7 +359,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertNotNull(client.users());
+        assertThat(client.users()).isNotNull();
     }
 
     @Test
@@ -362,7 +371,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertNotNull(client.users());
+        assertThat(client.users()).isNotNull();
     }
 
     @Test
@@ -374,7 +383,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertNotNull(client.users());
+        assertThat(client.users()).isNotNull();
     }
 
     @Test
@@ -386,7 +395,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertNotNull(client.users());
+        assertThat(client.users()).isNotNull();
     }
 
     @Test
@@ -398,7 +407,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertNotNull(client.users());
+        assertThat(client.users()).isNotNull();
     }
 
     @Test
@@ -410,7 +419,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertNotNull(client.users());
+        assertThat(client.users()).isNotNull();
     }
 
     @Test
@@ -422,7 +431,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertNotNull(client.users());
+        assertThat(client.users()).isNotNull();
     }
 
     @Test
@@ -433,7 +442,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .enableTls()
                 .build();
 
-        assertNotNull(client);
+        assertThat(client).isNotNull();
     }
 
     @Test
@@ -450,15 +459,15 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .build();
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertNotNull(client.users());
-        assertNotNull(client.messages());
-        assertNotNull(client.streams());
-        assertNotNull(client.topics());
-        assertNotNull(client.consumerGroups());
-        assertNotNull(client.system());
-        assertNotNull(client.personalAccessTokens());
-        assertNotNull(client.partitions());
-        assertNotNull(client.consumerOffsets());
+        assertThat(client.users()).isNotNull();
+        assertThat(client.messages()).isNotNull();
+        assertThat(client.streams()).isNotNull();
+        assertThat(client.topics()).isNotNull();
+        assertThat(client.consumerGroups()).isNotNull();
+        assertThat(client.system()).isNotNull();
+        assertThat(client.personalAccessTokens()).isNotNull();
+        assertThat(client.partitions()).isNotNull();
+        assertThat(client.consumerOffsets()).isNotNull();
     }
 
     @Test
@@ -470,15 +479,15 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
                 .buildAndLogin()
                 .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertNotNull(client.users());
-        assertNotNull(client.messages());
-        assertNotNull(client.streams());
-        assertNotNull(client.topics());
-        assertNotNull(client.consumerGroups());
-        assertNotNull(client.system());
-        assertNotNull(client.personalAccessTokens());
-        assertNotNull(client.partitions());
-        assertNotNull(client.consumerOffsets());
+        assertThat(client.users()).isNotNull();
+        assertThat(client.messages()).isNotNull();
+        assertThat(client.streams()).isNotNull();
+        assertThat(client.topics()).isNotNull();
+        assertThat(client.consumerGroups()).isNotNull();
+        assertThat(client.system()).isNotNull();
+        assertThat(client.personalAccessTokens()).isNotNull();
+        assertThat(client.partitions()).isNotNull();
+        assertThat(client.consumerOffsets()).isNotNull();
     }
 
     @Test
@@ -491,8 +500,8 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         CompletableFuture<Void> closeFuture = client.close();
         closeFuture.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertTrue(closeFuture.isDone());
-        assertFalse(closeFuture.isCompletedExceptionally());
+        assertThat(closeFuture.isDone()).isTrue();
+        assertThat(closeFuture.isCompletedExceptionally()).isFalse();
     }
 
     @Test
@@ -508,31 +517,31 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         CompletableFuture<Void> secondClose = client.close();
         secondClose.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertTrue(firstClose.isDone());
-        assertFalse(firstClose.isCompletedExceptionally());
-        assertTrue(secondClose.isDone());
-        assertFalse(secondClose.isCompletedExceptionally());
+        assertThat(firstClose.isDone()).isTrue();
+        assertThat(firstClose.isCompletedExceptionally()).isFalse();
+        assertThat(secondClose.isDone()).isTrue();
+        assertThat(secondClose.isCompletedExceptionally()).isFalse();
     }
 
     @Test
     void testHandleNullTlsCertificateString() {
         AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().tlsCertificate((String) null);
 
-        assertNotNull(builder);
+        assertThat(builder).isNotNull();
     }
 
     @Test
     void testHandleEmptyTlsCertificateString() {
         AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().tlsCertificate("");
 
-        assertNotNull(builder);
+        assertThat(builder).isNotNull();
     }
 
     @Test
     void testHandleBlankTlsCertificateString() {
         AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().tlsCertificate("   ");
 
-        assertNotNull(builder);
+        assertThat(builder).isNotNull();
     }
 
     @Test
@@ -546,7 +555,83 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         client.connect().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         client.login().get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertNotNull(client.users());
+        assertThat(client.users()).isNotNull();
+    }
+
+    @Test
+    void shouldCompleteExceptionallyWhenBuildAndLoginWithWrongCredentials() {
+        // given
+        CompletableFuture<AsyncIggyTcpClient> future = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .credentials(TEST_USERNAME, "wrong_password")
+                .buildAndLogin();
+
+        // when/then
+        assertThatThrownBy(() -> future.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class)
+                .hasCauseInstanceOf(IggyAuthenticationException.class)
+                .extracting(e -> e.getCause().getSuppressed())
+                .satisfies(suppressed -> assertThat(suppressed).isEmpty());
+    }
+
+    @Test
+    void shouldCleanUpResourcesWhenBuildAndLoginFailsWithWrongCredentials() throws Exception {
+        // given: a buildAndLogin that will fail due to wrong credentials
+        CompletableFuture<AsyncIggyTcpClient> future = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .credentials(TEST_USERNAME, "wrong_password")
+                .buildAndLogin();
+
+        // when: wait for the failure to complete (including close cleanup)
+        try {
+            future.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (ExecutionException ignored) {
+            // expected
+        }
+
+        // then: resources should be cleaned up — a subsequent buildAndLogin should succeed
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .credentials(TEST_USERNAME, TEST_PASSWORD)
+                .buildAndLogin()
+                .get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        assertThat(client.users()).isNotNull();
+    }
+
+    @Test
+    void shouldWaitForCloseBeforeCompletingExceptionally() {
+        // given
+        CompletableFuture<AsyncIggyTcpClient> future = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .credentials(TEST_USERNAME, "wrong_password")
+                .buildAndLogin();
+
+        // when: the future completes exceptionally
+        assertThatThrownBy(() -> future.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                .isInstanceOf(ExecutionException.class);
+
+        // then: after get() returns, the future is done — close() has already completed
+        assertThat(future).isCompletedExceptionally();
+    }
+
+    @Test
+    void shouldPreserveOriginalExceptionTypeFromBuildAndLogin() {
+        // given
+        CompletableFuture<AsyncIggyTcpClient> future = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .credentials(TEST_USERNAME, "wrong_password")
+                .buildAndLogin();
+
+        // when/then: the cause chain should contain the authentication exception directly
+        assertThatThrownBy(() -> future.join())
+                .isInstanceOf(CompletionException.class)
+                .cause()
+                .isInstanceOf(IggyAuthenticationException.class);
     }
 
     @Test
@@ -559,6 +644,6 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
         client.connect().get(5, TimeUnit.SECONDS);
         client.users().login(TEST_USERNAME, TEST_PASSWORD).get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
-        assertNotNull(client.users());
+        assertThat(client.users()).isNotNull();
     }
 }

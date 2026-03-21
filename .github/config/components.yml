@@ -58,52 +58,34 @@ components:
     paths:
       - "core/binary_protocol/**"
 
-  rust-clock:
-    depends_on:
-      - "rust-workspace"
-    paths:
-      - "core/clock/**"
-
-  rust-journal:
-    depends_on:
-      - "rust-workspace"
-    paths:
-      - "core/journal/**"
-
-  rust-partitions:
-    depends_on:
-      - "rust-workspace"
-    paths:
-      - "core/partitions/**"
-
   rust-server:
     depends_on:
       - "rust-workspace"
       - "rust-configs"
       - "rust-common"
       - "rust-binary-protocol"
-      - "rust-journal"
-      - "rust-partitions"
+      - "rust-cluster"
     paths:
       - "core/server/**"
 
   rust-cluster:
     depends_on:
       - "rust-workspace"
-      - "rust-clock"
     paths:
+      - "core/clock/**"
       - "core/consensus/**"
+      - "core/journal/**"
+      - "core/shard/**"
       - "core/metadata/**"
       - "core/message_bus/**"
+      - "core/partitions/**"
+      - "core/simulator/**"
 
   # Main Rust workspace testing
   rust:
     depends_on:
       - "rust-workspace"
       - "rust-configs"
-      - "rust-clock"
-      - "rust-journal"
-      - "rust-partitions"
       - "rust-sdk"
       - "rust-common"
       - "rust-binary-protocol"
@@ -127,11 +109,13 @@ components:
       - "sort"
       - "doctest"
       - "machete"
-      - "test"
+      - "test-1"
+      - "test-2"
       - "compat"
       - "build-aarch64-gnu"
       - "build-aarch64-musl"
       - "build-macos-aarch64"
+      - "build-windows-sdk"
 
   # CLI component
   rust-cli:
@@ -174,6 +158,7 @@ components:
       - "rust-configs"
     paths:
       - "core/integration/**"
+      - "core/harness_derive/**"
 
   sdk-python:
     depends_on:
@@ -231,13 +216,21 @@ components:
       - "ci-infrastructure"
     paths:
       - "foreign/cpp/**"
-    tasks: ["lint", "build", "test"]
+    tasks: ["lint", "build", "test", "e2e"]
+
+  # Shared BDD infrastructure that affects all BDD tests
+  bdd-infrastructure:
+    paths:
+      - "scripts/run-bdd-tests.sh"
+      - "bdd/docker-compose.yml"
+      - "bdd/docker-compose.coverage.yml"
 
   # Individual BDD tests per SDK - only run when specific SDK changes
   bdd-rust:
     depends_on:
       - "rust-sdk"
       - "rust-server"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/rust/**"
@@ -247,8 +240,9 @@ components:
   bdd-python:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-python"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/python/**"
@@ -258,19 +252,21 @@ components:
   bdd-go:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-go"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/go/**"
       - "bdd/scenarios/**"
-    tasks: ["bdd-go"]
+    tasks: ["bdd-go", "bdd-go-race"]
 
   bdd-node:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-node"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/node/**"
@@ -280,8 +276,9 @@ components:
   bdd-csharp:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-csharp"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/csharp/**"
@@ -291,40 +288,85 @@ components:
   bdd-java:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-java"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/java/**"
       - "bdd/scenarios/**"
     tasks: ["bdd-java"]
 
-  examples-suite:
+  examples-rust:
     depends_on:
       - "rust-sdk"
       - "rust-server"
-      - "sdk-go"
-      - "sdk-csharp"
-      - "sdk-python"
-      - "sdk-java"
-      - "ci-infrastructure" # CI changes trigger full regression
+      - "ci-infrastructure"
     paths:
-      - "examples/**"
-      - "scripts/run-rust-examples-from-readme.sh"
-      - "scripts/run-go-examples-from-readme.sh"
-      - "scripts/run-csharp-examples-from-readme.sh"
-      - "scripts/run-python-examples-from-readme.sh"
-      - "scripts/run-node-examples-from-readme.sh"
-      - "scripts/run-java-examples-from-readme.sh"
-    tasks:
-      [
-        "examples-rust",
-        "examples-go",
-        "examples-csharp",
-        "examples-python",
-        "examples-node",
-        "examples-java",
-      ]
+      - "examples/rust/**"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
+    tasks: ["examples-rust"]
+
+  examples-go:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-go"
+      - "ci-infrastructure"
+    paths:
+      - "examples/go/**"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
+    tasks: ["examples-go"]
+
+  examples-csharp:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-csharp"
+      - "ci-infrastructure"
+    paths:
+      - "examples/csharp/**"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
+    tasks: ["examples-csharp"]
+
+  examples-python:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-python"
+      - "ci-infrastructure"
+    paths:
+      - "examples/python/**"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
+    tasks: ["examples-python"]
+
+  examples-node:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-node"
+      - "ci-infrastructure"
+    paths:
+      - "examples/node/**"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
+    tasks: ["examples-node"]
+
+  examples-java:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "sdk-java"
+      - "ci-infrastructure"
+    paths:
+      - "examples/java/**"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
+    tasks: ["examples-java"]
 
   web-ui:
     paths:

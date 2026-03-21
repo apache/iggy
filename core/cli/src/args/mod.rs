@@ -21,10 +21,10 @@ use std::path::PathBuf;
 use clap::{Args, Command as ClapCommand};
 use clap::{Parser, Subcommand};
 use clap_complete::{Generator, Shell, generate};
-use figlet_rs::FIGfont;
+use figlet_rs::FIGlet;
 
 use iggy::prelude::{Args as IggyArgs, ArgsOptional as IggyArgsOptional};
-use iggy_binary_protocol::cli::binary_context::common::ContextConfig;
+use iggy_cli::commands::binary_context::common::ContextConfig;
 use segment::SegmentAction;
 use system::SnapshotArgs;
 
@@ -231,7 +231,7 @@ impl IggyConsoleArgs {
             "",
         );
 
-        let standard_font = FIGfont::standard().unwrap();
+        let standard_font = FIGlet::standard().unwrap();
         let figure = standard_font.convert("Iggy CLI").unwrap();
 
         println!("{figure}");

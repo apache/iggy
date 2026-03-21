@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-connectors"
-version = "0.3.1-edge.1"
+version = "0.3.2-edge.1"
 description = "Connectors runtime for Iggy message streaming platform"
 edition = "2024"
 license = "Apache-2.0"
@@ -60,6 +60,7 @@ reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
 reqwest-tracing = { workspace = true }
+secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }

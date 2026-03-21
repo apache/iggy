@@ -24,6 +24,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use secrecy::ExposeSecret;
 use std::sync::Arc;
 
 const API_KEY_HEADER: &str = "api-key";
@@ -38,7 +39,7 @@ pub async fn resolve_api_key(
         return Ok(next.run(request).await);
     }
 
-    if context.api_key.is_empty() {
+    if context.api_key.expose_secret().is_empty() {
         return Ok(next.run(request).await);
     };
 
@@ -50,7 +51,7 @@ pub async fn resolve_api_key(
         return Err(StatusCode::UNAUTHORIZED);
     };
 
-    if api_key != context.api_key {
+    if api_key != context.api_key.expose_secret() {
         return Err(StatusCode::UNAUTHORIZED);
     }
 

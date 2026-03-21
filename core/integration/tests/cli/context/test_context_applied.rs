@@ -22,7 +22,7 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::ArgsOptional;
 use iggy::prelude::Client;
-use iggy_binary_protocol::cli::binary_context::common::ContextConfig;
+use iggy_cli::commands::binary_context::common::ContextConfig;
 use integration::harness::ServerHandle;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;

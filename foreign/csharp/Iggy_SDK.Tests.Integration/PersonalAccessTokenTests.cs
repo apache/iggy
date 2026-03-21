@@ -88,7 +88,7 @@ public class PersonalAccessTokenTests
         var response = await client.CreatePersonalAccessTokenAsync(name, Expiry);
 
         var loginClient = await Fixture.CreateClient(protocol);
-        var authResponse = await loginClient.LoginWithPersonalAccessToken(response!.Token);
+        var authResponse = await loginClient.LoginWithPersonalAccessTokenAsync(response!.Token);
 
         authResponse.ShouldNotBeNull();
         authResponse.UserId.ShouldBeGreaterThanOrEqualTo(0);

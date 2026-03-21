@@ -26,7 +26,8 @@ pub struct PollingArgs {
 }
 
 impl PollingArgs {
-    pub fn new(strategy: PollingStrategy, count: u32, auto_commit: bool) -> Self {
+    #[must_use]
+    pub const fn new(strategy: PollingStrategy, count: u32, auto_commit: bool) -> Self {
         Self {
             strategy,
             count,
@@ -45,9 +46,9 @@ pub struct SendMessagesResult {
 // TODO(hubcio): unify with server's `PollingConsumer` in `streaming/polling_consumer.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollingConsumer {
-    /// Regular consumer with (consumer_id, partition_id)
+    /// Regular consumer with (`consumer_id`, `partition_id`)
     Consumer(usize, usize),
-    /// Consumer group with (group_id, member_id)
+    /// Consumer group with (`group_id`, `member_id`)
     ConsumerGroup(usize, usize),
 }
 
@@ -65,7 +66,8 @@ pub struct AppendResult {
 }
 
 impl AppendResult {
-    pub fn new(start_offset: u64, end_offset: u64, messages_count: u32) -> Self {
+    #[must_use]
+    pub const fn new(start_offset: u64, end_offset: u64, messages_count: u32) -> Self {
         Self {
             start_offset,
             end_offset,
@@ -75,7 +77,8 @@ impl AppendResult {
 
     /// Returns the number of offsets in the range.
     #[inline]
-    pub fn offset_count(&self) -> u64 {
+    #[must_use]
+    pub const fn offset_count(&self) -> u64 {
         self.end_offset - self.start_offset + 1
     }
 }
@@ -114,12 +117,11 @@ pub struct PartitionOffsets {
 }
 
 impl PartitionOffsets {
+    #[must_use]
     pub fn new(commit_offset: u64, write_offset: u64) -> Self {
         debug_assert!(
             write_offset >= commit_offset,
-            "write_offset ({}) must be >= commit_offset ({})",
-            write_offset,
-            commit_offset
+            "write_offset ({write_offset}) must be >= commit_offset ({commit_offset})",
         );
         Self {
             commit_offset,
@@ -128,7 +130,8 @@ impl PartitionOffsets {
     }
 
     /// Create offsets for an empty partition.
-    pub fn empty() -> Self {
+    #[must_use]
+    pub const fn empty() -> Self {
         Self {
             commit_offset: 0,
             write_offset: 0,
@@ -136,17 +139,20 @@ impl PartitionOffsets {
     }
 
     /// Returns true if there are uncommitted (prepared) messages.
-    pub fn has_uncommitted(&self) -> bool {
+    #[must_use]
+    pub const fn has_uncommitted(&self) -> bool {
         self.write_offset > self.commit_offset
     }
 
     /// Returns the number of uncommitted messages.
-    pub fn uncommitted_count(&self) -> u64 {
+    #[must_use]
+    pub const fn uncommitted_count(&self) -> u64 {
         self.write_offset - self.commit_offset
     }
 
     /// Returns true if commit and write offsets are equal.
-    pub fn is_fully_committed(&self) -> bool {
+    #[must_use]
+    pub const fn is_fully_committed(&self) -> bool {
         self.write_offset == self.commit_offset
     }
 }
@@ -179,6 +185,7 @@ impl PartitionsConfig {
     /// TODO: This is a stub waiting for completion of issue to move server config
     /// to shared module. Real implementation should use:
     /// `{base_path}/{streams_path}/{stream_id}/{topics_path}/{topic_id}/{partitions_path}/{partition_id}/{start_offset:0>20}.log`
+    #[must_use]
     pub fn get_messages_path(
         &self,
         stream_id: usize,
@@ -187,8 +194,7 @@ impl PartitionsConfig {
         start_offset: u64,
     ) -> String {
         format!(
-            "/tmp/iggy_stub/streams/{}/topics/{}/partitions/{}/{:0>20}.log",
-            stream_id, topic_id, partition_id, start_offset
+            "/tmp/iggy_stub/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}/{start_offset:0>20}.log",
         )
     }
 
@@ -197,6 +203,7 @@ impl PartitionsConfig {
     /// TODO: This is a stub waiting for completion of issue to move server config
     /// to shared module. Real implementation should use:
     /// `{base_path}/{streams_path}/{stream_id}/{topics_path}/{topic_id}/{partitions_path}/{partition_id}/{start_offset:0>20}.index`
+    #[must_use]
     pub fn get_index_path(
         &self,
         stream_id: usize,
@@ -205,8 +212,7 @@ impl PartitionsConfig {
         start_offset: u64,
     ) -> String {
         format!(
-            "/tmp/iggy_stub/streams/{}/topics/{}/partitions/{}/{:0>20}.index",
-            stream_id, topic_id, partition_id, start_offset
+            "/tmp/iggy_stub/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}/{start_offset:0>20}.index",
         )
     }
 }

@@ -84,16 +84,10 @@ impl McpHandle {
     pub async fn create_client(&self) -> Result<McpClient, TestBinaryError> {
         let mcp_url = self.mcp_url();
         let transport = StreamableHttpClientTransport::from_uri(mcp_url.clone());
-        let client_info = ClientInfo {
-            protocol_version: Default::default(),
-            capabilities: ClientCapabilities::default(),
-            client_info: Implementation {
-                name: "test-mcp-client".to_string(),
-                version: "1.0.0".to_string(),
-                ..Default::default()
-            },
-            meta: None,
-        };
+        let client_info = ClientInfo::new(
+            ClientCapabilities::default(),
+            Implementation::new("test-mcp-client", "1.0.0"),
+        );
 
         client_info
             .serve(transport)
@@ -212,12 +206,6 @@ impl TestBinary for McpHandle {
         })?;
         self.child_handle = Some(child);
 
-        // Release port reservation immediately after spawn to avoid SO_REUSEPORT
-        // load-balancing conflicts during health checks.
-        if let Some(reserver) = self.port_reserver.take() {
-            reserver.release();
-        }
-
         Ok(())
     }
 
@@ -256,6 +244,12 @@ impl IggyServerDependent for McpHandle {
     }
 
     async fn wait_ready(&mut self) -> Result<(), TestBinaryError> {
+        // Release port reservation just before health-checking. Holds the port
+        // while the child initializes, matching the server handle pattern.
+        if let Some(reserver) = self.port_reserver.take() {
+            reserver.release();
+        }
+
         let http_address = format!(
             "http://{}:{}",
             self.server_address.ip(),

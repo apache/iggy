@@ -196,7 +196,7 @@ public class ConsumerGroupTests
         {
             var memberClient = await Fixture.CreateClient(Protocol.Tcp);
             clients.Add(memberClient);
-            await memberClient.LoginUser("iggy", "iggy");
+            await memberClient.LoginUserAsync("iggy", "iggy");
             await memberClient.JoinConsumerGroupAsync(Identifier.String(streamName),
                 Identifier.String(TopicName), Identifier.Numeric(cg!.Id));
         }

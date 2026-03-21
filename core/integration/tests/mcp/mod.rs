@@ -31,19 +31,20 @@ use rmcp::{
     serde::de::DeserializeOwned,
     serde_json::{self, json},
 };
+use secrecy::ExposeSecret;
 
 async fn invoke<T: DeserializeOwned>(
     client: &McpClient,
     method: &str,
     data: Option<serde_json::Value>,
 ) -> T {
+    let params = CallToolRequestParams::new(method.to_owned());
+    let params = match data.and_then(|v| v.as_object().cloned()) {
+        Some(args) => params.with_arguments(args),
+        None => params,
+    };
     let mut result = client
-        .call_tool(CallToolRequestParams {
-            name: method.to_owned().into(),
-            arguments: data.and_then(|v| v.as_object().cloned()),
-            task: None,
-            meta: None,
-        })
+        .call_tool(params)
         .await
         .unwrap_or_else(|e| panic!("Failed to invoke {method}: {e}"));
 
@@ -56,13 +57,13 @@ async fn invoke<T: DeserializeOwned>(
 }
 
 async fn invoke_empty(client: &McpClient, method: &str, data: Option<serde_json::Value>) {
+    let params = CallToolRequestParams::new(method.to_owned());
+    let params = match data.and_then(|v| v.as_object().cloned()) {
+        Some(args) => params.with_arguments(args),
+        None => params,
+    };
     let result = client
-        .call_tool(CallToolRequestParams {
-            name: method.to_owned().into(),
-            arguments: data.and_then(|v| v.as_object().cloned()),
-            task: None,
-            meta: None,
-        })
+        .call_tool(params)
         .await
         .unwrap_or_else(|e| panic!("Failed to invoke {method}: {e}"));
 
@@ -512,7 +513,7 @@ async fn should_create_personal_access_token(harness: &TestHarness) {
     )
     .await;
 
-    assert!(!token.token.is_empty());
+    assert!(!token.token.expose_secret().is_empty());
 }
 
 #[iggy_harness(server(mcp), seed = seeds::mcp_standard)]

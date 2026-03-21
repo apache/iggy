@@ -46,13 +46,4 @@ public abstract class IggyException extends RuntimeException {
     protected IggyException(String message, Throwable cause) {
         super(message, cause);
     }
-
-    /**
-     * Constructs a new IggyException with the specified cause.
-     *
-     * @param cause the cause of the exception
-     */
-    protected IggyException(Throwable cause) {
-        super(cause);
-    }
 }

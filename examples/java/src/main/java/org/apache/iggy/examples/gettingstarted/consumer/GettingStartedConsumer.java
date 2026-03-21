@@ -50,13 +50,13 @@ public final class GettingStartedConsumer {
     private GettingStartedConsumer() {}
 
     public static void main(String[] args) {
-        var client = IggyTcpClient.builder()
+        try (var client = IggyTcpClient.builder()
                 .host("localhost")
                 .port(8090)
                 .credentials("iggy", "iggy")
-                .buildAndLogin();
-
-        consumeMessages(client);
+                .buildAndLogin()) {
+            consumeMessages(client);
+        }
     }
 
     private static void consumeMessages(IggyTcpClient client) {

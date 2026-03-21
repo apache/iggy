@@ -188,11 +188,8 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update --yes
-          sudo apt-get install --yes gnome-keyring keyutils dbus-x11
+          sudo apt-get install --yes gnome-keyring keyutils dbus-x11 libsecret-tools
           rm -f $HOME/.local/share/keyrings/*
-          eval $(dbus-launch --sh-syntax)
-          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> $GITHUB_ENV
-          echo -n "test" | gnome-keyring-daemon --unlock --components=secrets
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -209,6 +206,16 @@ jobs:
           source <(cargo llvm-cov show-env --export-prefix)
           cargo build --locked
           cargo test --locked --no-run
+
+          # Start D-Bus and unlock keyring right before test execution to avoid
+          # gnome-keyring auto-locking the collection during the build phase.
+          # Previously this ran before `cargo build`, leaving a 7+ minute idle
+          # window that triggered org.freedesktop.Secret.Error.IsLocked ~10% of runs.
+          eval $(dbus-launch --sh-syntax)
+          export DBUS_SESSION_BUS_ADDRESS
+          eval $(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)
+          echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
+
           if command -v cargo-nextest &> /dev/null; then
             cargo nextest run --locked --no-fail-fast
           else
@@ -368,7 +375,7 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7.3.1
 
       - name: Install dependencies
         run: |
@@ -508,7 +515,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Go with cache
+      - name: Setup Go
         uses: ./.github/actions/utils/setup-go-with-cache
 
       - name: Setup Rust with cache
@@ -520,11 +527,31 @@ jobs:
         id: iggy
         uses: ./.github/actions/utils/server-start
 
-      - name: Run tests with coverage
+      - name: Run unit tests with coverage
         run: |
           cd foreign/go
           mkdir -p ../../reports
-          go test -v -race -coverprofile=../../reports/go-coverage.out ./...
+          go test -v -race -coverprofile=../../reports/go-coverage-unit.out ./...
+
+      - name: Run BDD tests with coverage
+        run: |
+          cd bdd/go
+          mkdir -p ../../reports
+          # Run only tcp_test suite (ginkgo); godog leader_redirection
+          # tests require a multi-node cluster not available in CI.
+          go test -v -race \
+            -coverpkg=github.com/apache/iggy/foreign/go/... \
+            -coverprofile=../../reports/go-coverage-bdd.out \
+            ./tests/tcp_test/...
+
+      - name: Merge coverage profiles
+        run: |
+          mkdir -p reports
+          # Start with the mode line from the unit profile
+          head -1 reports/go-coverage-unit.out > reports/go-coverage.out
+          # Append data lines (skip mode line) from both profiles
+          tail -n +2 reports/go-coverage-unit.out >> reports/go-coverage.out
+          tail -n +2 reports/go-coverage-bdd.out >> reports/go-coverage.out
 
       - name: Stop Iggy server
         if: always()

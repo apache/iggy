@@ -59,37 +59,37 @@ public final class MessageEnvelopeProducer {
     private MessageEnvelopeProducer() {}
 
     public static void main(String[] args) {
-        var client = IggyTcpClient.builder()
+        try (var client = IggyTcpClient.builder()
                 .host("localhost")
                 .port(8090)
                 .credentials("iggy", "iggy")
-                .buildAndLogin();
+                .buildAndLogin()) {
+            Optional<StreamDetails> stream = client.streams().getStream(STREAM_ID);
+            if (stream.isPresent()) {
+                log.warn("Stream {} already exists and will not be created again.", STREAM_NAME);
+            } else {
+                client.streams().createStream(STREAM_NAME);
+                log.info("Stream {} was created.", STREAM_NAME);
+            }
 
-        Optional<StreamDetails> stream = client.streams().getStream(STREAM_ID);
-        if (stream.isPresent()) {
-            log.warn("Stream {} already exists and will not be created again.", STREAM_NAME);
-        } else {
-            client.streams().createStream(STREAM_NAME);
-            log.info("Stream {} was created.", STREAM_NAME);
+            Optional<TopicDetails> topic = client.topics().getTopic(STREAM_ID, TOPIC_ID);
+            if (topic.isPresent()) {
+                log.warn("Topic already exists and will not be created again.");
+            } else {
+                client.topics()
+                        .createTopic(
+                                STREAM_ID,
+                                1L,
+                                CompressionAlgorithm.None,
+                                BigInteger.ZERO,
+                                BigInteger.ZERO,
+                                Optional.empty(),
+                                TOPIC_NAME);
+                log.info("Topic {} was created.", TOPIC_NAME);
+            }
+
+            produceMessages(client);
         }
-
-        Optional<TopicDetails> topic = client.topics().getTopic(STREAM_ID, TOPIC_ID);
-        if (topic.isPresent()) {
-            log.warn("Topic already exists and will not be created again.");
-        } else {
-            client.topics()
-                    .createTopic(
-                            STREAM_ID,
-                            1L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            Optional.empty(),
-                            TOPIC_NAME);
-            log.info("Topic {} was created.", TOPIC_NAME);
-        }
-
-        produceMessages(client);
     }
 
     public static void produceMessages(IggyTcpClient client) {
