@@ -449,9 +449,7 @@ impl HttpSink {
 
         loop {
             let headers = self.request_headers.as_ref().ok_or_else(|| {
-                Error::InitError(
-                    "HTTP headers not initialized — was open() called?".to_string(),
-                )
+                Error::InitError("HTTP headers not initialized — was open() called?".to_string())
             })?;
             let request = build_request(self.method, client, &self.url)
                 .headers(headers.clone())
@@ -615,7 +613,11 @@ impl HttpSink {
             if self.max_payload_size_bytes > 0 && body.len() as u64 > self.max_payload_size_bytes {
                 error!(
                     "HTTP sink ID: {} — {} payload at offset {} exceeds max size ({} > {} bytes). Skipping.",
-                    self.id, mode_name, offset, body.len(), self.max_payload_size_bytes,
+                    self.id,
+                    mode_name,
+                    offset,
+                    body.len(),
+                    self.max_payload_size_bytes,
                 );
                 self.errors_count.fetch_add(1, Ordering::Relaxed);
                 serialization_failures += 1;
@@ -694,12 +696,8 @@ impl HttpSink {
             |mut message| {
                 let payload = std::mem::replace(&mut message.payload, Payload::Raw(vec![]));
                 let payload_json = self.payload_to_json(payload)?;
-                let envelope = self.build_envelope(
-                    &message,
-                    topic_metadata,
-                    messages_metadata,
-                    payload_json,
-                );
+                let envelope =
+                    self.build_envelope(&message, topic_metadata, messages_metadata, payload_json);
                 serde_json::to_vec(&envelope)
                     .map_err(|e| Error::Serialization(format!("Envelope serialize: {}", e)))
             },
@@ -1060,9 +1058,12 @@ impl Sink for HttpSink {
         // Optional health check — uses same pre-built headers and success_status_codes as consume()
         if self.health_check_enabled {
             let client = self.client.as_ref().expect("client just built");
-            let headers = self.request_headers.as_ref().expect("request_headers just built");
-            let health_request = build_request(self.health_check_method, client, &self.url)
-                .headers(headers.clone());
+            let headers = self
+                .request_headers
+                .as_ref()
+                .expect("request_headers just built");
+            let health_request =
+                build_request(self.health_check_method, client, &self.url).headers(headers.clone());
 
             let response = health_request.send().await.map_err(|e| {
                 Error::Connection(format!("Health check failed for URL '{}': {}", self.url, e))
@@ -1262,7 +1263,10 @@ mod tests {
         assert_eq!(sink.retry_delay, Duration::from_secs(1));
         assert_eq!(sink.retry_backoff_multiplier, DEFAULT_BACKOFF_MULTIPLIER);
         assert_eq!(sink.max_retry_delay, Duration::from_secs(30));
-        assert_eq!(sink.success_status_codes, HashSet::from([200, 201, 202, 204]));
+        assert_eq!(
+            sink.success_status_codes,
+            HashSet::from([200, 201, 202, 204])
+        );
         assert!(!sink.tls_danger_accept_invalid_certs);
         assert_eq!(sink.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert!(!sink.verbose);

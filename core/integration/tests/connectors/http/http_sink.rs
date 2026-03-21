@@ -737,7 +737,6 @@ async fn individual_messages_have_sequential_offsets(
 // Test 7: Multi-Topic Delivery
 // ============================================================================
 
-
 /// Validates multi-topic delivery: one connector consuming two topics on the same stream.
 /// Sends 2 messages to topic 1, 1 to topic 2, verifies `iggy_topic` metadata matches source.
 #[iggy_harness(
