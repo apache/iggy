@@ -17,6 +17,17 @@
 
 use crate::ffi;
 use iggy::prelude::ConsumerGroupDetails as RustConsumerGroupDetails;
+use iggy_common::ConsumerGroupMember as RustConsumerGroupMember;
+
+impl From<RustConsumerGroupMember> for ffi::ConsumerGroupMember {
+    fn from(member: RustConsumerGroupMember) -> Self {
+        ffi::ConsumerGroupMember {
+            id: member.id,
+            partitions_count: member.partitions_count,
+            partitions: member.partitions,
+        }
+    }
+}
 
 impl From<RustConsumerGroupDetails> for ffi::ConsumerGroupDetails {
     fn from(group: RustConsumerGroupDetails) -> Self {
@@ -28,11 +39,7 @@ impl From<RustConsumerGroupDetails> for ffi::ConsumerGroupDetails {
             members: group
                 .members
                 .into_iter()
-                .map(|member| ffi::ConsumerGroupMember {
-                    id: member.id,
-                    partitions_count: member.partitions_count,
-                    partitions: member.partitions,
-                })
+                .map(ffi::ConsumerGroupMember::from)
                 .collect(),
         }
     }
