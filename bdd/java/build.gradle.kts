@@ -19,6 +19,7 @@
 
 plugins {
     java
+    jacoco
     id("com.diffplug.spotless") version "8.1.0"
 }
 
@@ -48,4 +49,10 @@ spotless {
 
 tasks.test {
     useJUnitPlatform()
+}
+
+tasks.jacocoTestReport {
+    reports {
+        xml.required.set(true)
+    }
 }
