@@ -30,7 +30,9 @@ clock_skew = "5s"
 # Configure trusted A2A issuer
 [[http.jwt.trusted_issuers]]
 issuer = "https://test-issuer.com"
+audience = "iggy"
 jwks_url = "http://localhost:8080/.well-known/jwks.json"
+user_id = 1
 
 [system]
 path = "local_data"

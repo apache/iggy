@@ -142,6 +142,7 @@ impl TestHarness {
                     jwks_url.as_str(),
                 );
                 server.add_env("IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_AUDIENCE", "iggy");
+                server.add_env("IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_USER_ID", "1");
             }
 
             self.jwks_server = Some(mock_server);
