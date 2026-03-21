@@ -15,6 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 {{ if .Values.server.enabled }}
+{{- if hasKey .Values.server "podSecurityContext" }}
+{{- fail "server.podSecurityContext has been moved to podSecurityContext (root level). Please update your values." }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -96,6 +99,12 @@ spec:
               mountPath: /app/local_data
               subPath: {{ ternary "root" (printf "%s/root" .Values.server.persistence.subPath) (empty .Values.server.persistence.subPath) }}
 
+          startupProbe:
+            httpGet:
+              path: /ping
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
           livenessProbe:
             httpGet:
               path: /ping
