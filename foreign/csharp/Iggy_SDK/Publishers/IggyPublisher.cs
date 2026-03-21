@@ -91,7 +91,7 @@ public partial class IggyPublisher : IAsyncDisposable
         {
             try
             {
-                await _client.LogoutUser();
+                await _client.LogoutUserAsync();
                 _client.Dispose();
             }
             catch (Exception e)
@@ -160,12 +160,12 @@ public partial class IggyPublisher : IAsyncDisposable
         LogInitializingPublisher(_config.StreamId, _config.TopicId);
         if (_config.CreateIggyClient)
         {
-            await _client.LoginUser(_config.Login, _config.Password, ct);
+            await _client.LoginUserAsync(_config.Login, _config.Password, ct);
             LogUserLoggedIn(_config.Login);
         }
 
-        await CreateStreamIfNeeded(ct);
-        await CreateTopicIfNeeded(ct);
+        await CreateStreamIfNeededAsync(ct);
+        await CreateTopicIfNeededAsync(ct);
 
         if (_config.EnableBackgroundSending)
         {
@@ -182,7 +182,7 @@ public partial class IggyPublisher : IAsyncDisposable
     /// </summary>
     /// <param name="ct">Cancellation token to cancel the operation.</param>
     /// <exception cref="StreamNotFoundException">Thrown when the stream doesn't exist and auto-creation is disabled.</exception>
-    private async Task CreateStreamIfNeeded(CancellationToken ct)
+    private async Task CreateStreamIfNeededAsync(CancellationToken ct)
     {
         if (await _client.GetStreamByIdAsync(_config.StreamId, ct) != null)
         {
@@ -215,7 +215,7 @@ public partial class IggyPublisher : IAsyncDisposable
     /// </summary>
     /// <param name="ct">Cancellation token to cancel the operation.</param>
     /// <exception cref="TopicNotFoundException">Thrown when the topic doesn't exist and auto-creation is disabled.</exception>
-    private async Task CreateTopicIfNeeded(CancellationToken ct)
+    private async Task CreateTopicIfNeededAsync(CancellationToken ct)
     {
         if (await _client.GetTopicByIdAsync(_config.StreamId, _config.TopicId, ct) != null)
         {
@@ -255,7 +255,7 @@ public partial class IggyPublisher : IAsyncDisposable
     /// <param name="messages">The messages to send.</param>
     /// <param name="ct">Cancellation token to cancel the send operation.</param>
     /// <exception cref="PublisherNotInitializedException">Thrown when attempting to send before initialization.</exception>
-    public async Task SendMessages(IList<Message> messages, CancellationToken ct = default)
+    public async Task SendMessagesAsync(IList<Message> messages, CancellationToken ct = default)
     {
         if (!_isInitialized)
         {
@@ -290,7 +290,7 @@ public partial class IggyPublisher : IAsyncDisposable
     ///     Only applicable when background sending is enabled. Returns immediately otherwise.
     /// </summary>
     /// <param name="ct">Cancellation token to cancel the wait operation.</param>
-    public async Task WaitUntilAllSends(CancellationToken ct = default)
+    public async Task WaitUntilAllSendsAsync(CancellationToken ct = default)
     {
         if (!_config.EnableBackgroundSending || _backgroundProcessor == null)
         {
