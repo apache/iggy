@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, fmt, clippy, sort, machete, doctest, test, compat)"
+    description: "Task to run (check, fmt, clippy, sort, machete, doctest, test-1, test-2, compat)"
     required: true
   component:
     description: "Component name (for context)"
@@ -45,7 +45,7 @@ runs:
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
-        print-cache-status: ${{ inputs.task == 'test' }}
+        print-cache-status: ${{ startsWith(inputs.task, 'test-') }}
 
     - name: Install tools for specific tasks
       run: |
@@ -93,28 +93,28 @@ runs:
       shell: bash
 
     - name: Install dependencies for Rust tests
-      if: inputs.task == 'test' && runner.os == 'Linux'
+      if: startsWith(inputs.task, 'test-') && runner.os == 'Linux'
       run: |
         sudo apt-get update --yes && sudo apt-get install --yes musl-tools gnome-keyring keyutils dbus-x11 libsecret-tools
         rm -f $HOME/.local/share/keyrings/*
       shell: bash
 
     - name: Install cargo-llvm-cov
-      if: inputs.task == 'test'
+      if: startsWith(inputs.task, 'test-')
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-llvm-cov
 
     - name: Build and test with coverage
-      if: inputs.task == 'test'
+      if: startsWith(inputs.task, 'test-')
       run: |
-        # Start D-Bus and unlock keyring in the same shell that runs tests,
-        # so daemons are guaranteed alive for the entire test execution.
-        if [[ "$RUNNER_OS" == "Linux" ]]; then
-          eval $(dbus-launch --sh-syntax)
-          export DBUS_SESSION_BUS_ADDRESS
-          eval $(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)
-          echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
+        # Parse partition index from task name (test-1 -> hash:1/2, test-2 -> hash:2/2)
+        TASK="${{ inputs.task }}"
+        PARTITION_FLAG=""
+        if [[ "$TASK" =~ ^test-([0-9]+)$ ]]; then
+          PARTITION_INDEX="${BASH_REMATCH[1]}"
+          PARTITION_FLAG="--partition hash:${PARTITION_INDEX}/2"
+          echo "::notice::Running test partition ${PARTITION_INDEX}/2"
         fi
 
         source <(cargo llvm-cov show-env --export-prefix)
@@ -131,9 +131,20 @@ runs:
         compile_duration=$((compile_end - compile_start))
         echo "::notice::Tests compiled in ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
 
+        # Start D-Bus and unlock keyring right before test execution to avoid
+        # gnome-keyring auto-locking the collection during the build phase.
+        # Previously this ran before `cargo build`, leaving a 7+ minute idle
+        # window that triggered org.freedesktop.Secret.Error.IsLocked ~10% of runs.
+        if [[ "$RUNNER_OS" == "Linux" ]]; then
+          eval $(dbus-launch --sh-syntax)
+          export DBUS_SESSION_BUS_ADDRESS
+          eval $(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)
+          echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
+        fi
+
         test_start=$(date +%s)
         if command -v cargo-nextest &> /dev/null; then
-          cargo nextest run --locked --no-fail-fast
+          cargo nextest run --locked --no-fail-fast $PARTITION_FLAG
         else
           cargo test --locked --no-fail-fast
         fi
