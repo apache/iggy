@@ -55,6 +55,7 @@ jobs:
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
+          # Also warms the GitHub Actions build cache for subsequent PR builds
           save-cache: "true"
 
       - name: Install cargo-llvm-cov
@@ -77,11 +78,7 @@ jobs:
           eval $(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)
           echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
 
-          if command -v cargo-nextest &> /dev/null; then
-            cargo nextest run --locked --no-fail-fast
-          else
-            cargo test --locked --no-fail-fast
-          fi
+          cargo test --locked --no-fail-fast
         shell: bash
 
       - name: Generate coverage report
