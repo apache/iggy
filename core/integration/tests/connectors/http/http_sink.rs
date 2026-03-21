@@ -170,11 +170,14 @@
 //!
 //! - **2026-03-10**: Initial test suite — 6 tests covering all batch modes, metadata toggle,
 //!   and sequential offset verification.
-//! - **2026-03-11**: Added multi-topic test (Test 7). Initially used shared harness seed
-//!   (`connector_multi_topic_stream`) with `TOPIC_2` constant in `seeds.rs`. Removed during
-//!   code review remediation — second topic now created inline to keep harness generic.
+//! - **2026-03-11**: Added multi-topic test (Test 7) using `seeds::connector_multi_topic_stream`
+//!   and `seeds::names::TOPIC_2`. Connector runtime requires all configured topics to exist
+//!   before startup, so the seed creates both topics.
 //! - **2026-03-12**: Code review rounds 3+4 (double-review protocol). Fixed: magic string
-//!   match arms replaced with constants (M9), harness pollution removed (H1).
+//!   match arms replaced with constants (M9).
+//! - **2026-03-20**: Maintainer review (hubcio). Addressed 13 items: consuming iterator,
+//!   DRY refactor, pre-built HeaderMap, HashSet status codes, UUID v8, iggy headers forwarding,
+//!   overlap warning, latency docs, test doc trimming, config cleanup.
 
 use super::TEST_MESSAGE_COUNT;
 use crate::connectors::fixtures::{

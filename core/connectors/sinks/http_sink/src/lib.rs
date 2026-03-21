@@ -359,10 +359,17 @@ impl HttpSink {
             let headers_map: serde_json::Map<String, serde_json::Value> = headers
                 .iter()
                 .map(|(k, v)| {
-                    (
-                        k.to_string_value(),
-                        serde_json::Value::String(v.to_string_value()),
-                    )
+                    // Raw bytes: base64-encode to avoid Rust debug format in JSON output.
+                    // as_raw() returns Ok only for HeaderKind::Raw.
+                    let value = if let Ok(raw) = v.as_raw() {
+                        serde_json::json!({
+                            "data": general_purpose::STANDARD.encode(raw),
+                            "iggy_header_encoding": "base64"
+                        })
+                    } else {
+                        serde_json::Value::String(v.to_string_value())
+                    };
+                    (k.to_string_value(), value)
                 })
                 .collect();
             metadata["iggy_headers"] = serde_json::Value::Object(headers_map);
@@ -441,10 +448,11 @@ impl HttpSink {
         let mut attempt = 0u32;
 
         loop {
-            let headers = self
-                .request_headers
-                .as_ref()
-                .expect("request_headers not initialized — was open() called?");
+            let headers = self.request_headers.as_ref().ok_or_else(|| {
+                Error::InitError(
+                    "HTTP headers not initialized — was open() called?".to_string(),
+                )
+            })?;
             let request = build_request(self.method, client, &self.url)
                 .headers(headers.clone())
                 .header("content-type", content_type)
@@ -567,6 +575,9 @@ impl HttpSink {
     /// Iterates `messages`, builds a body for each via `build_body`, enforces payload size
     /// limits, sends via `send_with_retry`, and tracks partial delivery.
     /// Aborts after `MAX_CONSECUTIVE_FAILURES` consecutive HTTP failures.
+    ///
+    /// `build_body` takes ownership of each `ConsumedMessage` — callers must extract
+    /// all needed fields (payload, metadata) within the closure.
     async fn send_per_message<F>(
         &self,
         client: &reqwest::Client,
@@ -927,6 +938,8 @@ fn build_request(
 ///
 /// Uses `Uuid::new_v8()` which sets version=8 and variant=RFC4122 bits,
 /// producing UUIDs that downstream libraries accept as valid.
+/// Note: `new_v8()` overwrites 6 bits (version nibble + variant bits), so the
+/// UUID is not round-trippable to the original u128 value.
 fn format_u128_as_uuid(id: u128) -> String {
     uuid::Uuid::new_v8(id.to_be_bytes()).to_string()
 }
@@ -1044,13 +1057,12 @@ impl Sink for HttpSink {
         // Build the HTTP client with config-derived settings
         self.client = Some(self.build_client()?);
 
-        // Optional health check — uses same success_status_codes and headers as consume()
+        // Optional health check — uses same pre-built headers and success_status_codes as consume()
         if self.health_check_enabled {
             let client = self.client.as_ref().expect("client just built");
-            let mut health_request = build_request(self.health_check_method, client, &self.url);
-            for (key, value) in &self.headers {
-                health_request = health_request.header(key, value);
-            }
+            let headers = self.request_headers.as_ref().expect("request_headers just built");
+            let health_request = build_request(self.health_check_method, client, &self.url)
+                .headers(headers.clone());
 
             let response = health_request.send().await.map_err(|e| {
                 Error::Connection(format!("Health check failed for URL '{}': {}", self.url, e))
@@ -1083,14 +1095,15 @@ impl Sink for HttpSink {
 
     /// Deliver messages to the configured HTTP endpoint.
     ///
-    /// **Worst-case latency** (individual/raw modes):
-    /// `batch_length * (max_retries + 1) * max_retry_delay`.
-    /// Example: 50 messages * 4 attempts * 30s = 6000s. `MAX_CONSECUTIVE_FAILURES` (3)
+    /// **Worst-case latency upper bound** (individual/raw modes):
+    /// `batch_length * (max_retries + 1) * (timeout + max_retry_delay)`.
+    /// Example: 50 * 4 * (30s + 30s) = 12000s. `MAX_CONSECUTIVE_FAILURES` (3)
     /// mitigates this by aborting early, but a fail-succeed-fail pattern can bypass it.
     ///
-    /// **Runtime note**: The connector runtime's `process_messages()` in `runtime/src/sink.rs`
-    /// currently discards the `Result` returned by `consume()`. All retry logic lives inside
-    /// this method — returning `Err` does not trigger a runtime-level retry.
+    /// **Runtime note**: The FFI boundary in `sdk/src/sink.rs` maps `consume()`'s `Result` to
+    /// `i32` (0=ok, 1=err), but the runtime's `process_messages()` in `runtime/src/sink.rs`
+    /// discards that return code. All retry logic lives inside this method — returning `Err`
+    /// does not trigger a runtime-level retry.
     async fn consume(
         &self,
         topic_metadata: &TopicMetadata,
@@ -2002,10 +2015,9 @@ mod tests {
     // ── H1: Content-Type deduplication test ──────────────────────────
 
     #[test]
-    fn given_user_content_type_header_should_be_filtered_in_request_builder() {
-        // Note: This test validates the filter logic used in request_builder().
-        // We cannot call request_builder() directly without a live reqwest::Client,
-        // so we verify the filter predicate matches what request_builder() uses.
+    fn given_user_content_type_header_should_be_filtered_in_open() {
+        // Note: This test validates the Content-Type filter used when building
+        // request_headers in open(). We verify the predicate matches what open() uses.
         let mut config = given_default_config();
         config.headers = Some(HashMap::from([
             ("Content-Type".to_string(), "text/plain".to_string()),
