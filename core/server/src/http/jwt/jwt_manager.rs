@@ -18,7 +18,7 @@
 
 use crate::configs::http::{HttpJwtConfig, TrustedIssuerConfig};
 use crate::http::jwt::COMPONENT;
-use crate::http::jwt::json_web_token::{GeneratedToken, JwtClaims, RevokedAccessToken};
+use crate::http::jwt::json_web_token::{Audience, GeneratedToken, JwtClaims, RevokedAccessToken};
 use crate::http::jwt::jwks::JwksClient;
 use crate::http::jwt::storage::TokenStorage;
 use crate::streaming::persistence::persister::PersisterKind;
@@ -35,6 +35,23 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, TokenData, Valid
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
+
+fn normalize_issuer_url(url: &str) -> String {
+    // Only lowercase the scheme and host, preserve path case
+    // Example: "HTTPS://Example.COM/PATH" -> "https://example.com/PATH"
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let scheme = scheme.to_lowercase();
+            // Find end of host (first '/' or end of string)
+            let (host, path) = match rest.find('/') {
+                Some(idx) => rest.split_at(idx),
+                None => (rest, ""),
+            };
+            format!("{}://{}{}", scheme, host.to_lowercase(), path)
+        }
+        None => url.trim_end_matches('/').to_lowercase(),
+    }
+}
 
 pub struct IssuerOptions {
     pub issuer: String,
@@ -115,9 +132,10 @@ impl JwtManager {
 
         if let Some(trusted_issuers) = config.trusted_issuers.as_ref() {
             for issuer_config in trusted_issuers {
+                let normalized_issuer = normalize_issuer_url(&issuer_config.issuer);
                 manager
                     .trusted_issuer
-                    .insert(issuer_config.issuer.clone(), issuer_config.clone());
+                    .insert(normalized_issuer, issuer_config.clone());
             }
         }
 
@@ -198,7 +216,7 @@ impl JwtManager {
         let claims = JwtClaims {
             jti: uuid::Uuid::now_v7().to_string(),
             sub: user_id.to_string(),
-            aud: self.issuer.audience.to_string(),
+            aud: Audience::from(self.issuer.audience.clone()),
             iss: self.issuer.issuer.to_string(),
             iat,
             exp,
@@ -227,6 +245,18 @@ impl JwtManager {
         let token_header =
             jsonwebtoken::decode_header(token).map_err(|_| IggyError::InvalidAccessToken)?;
         let jwt_claims = self.decode(token, token_header.alg).await?;
+
+        // Security fix: Reject A2A tokens from external trusted issuers
+        // A2A tokens should not be refreshable - they have their own lifecycle
+        let normalized_iss = normalize_issuer_url(&jwt_claims.claims.iss);
+        if self.trusted_issuer.contains_key(&normalized_iss) {
+            error!(
+                "Cannot refresh A2A token from external issuer: {}",
+                jwt_claims.claims.iss
+            );
+            return Err(IggyError::InvalidAccessToken);
+        }
+
         let id = jwt_claims.claims.jti;
         let expiry = jwt_claims.claims.exp;
         if self
@@ -273,12 +303,8 @@ impl JwtManager {
             }
         };
 
-        /* debug!(
-            "JWT decoded insecurely, issuer: {}, kid: {:?}",
-            insecure.claims.iss, kid
-        ); */
-
-        let config = match self.trusted_issuer.get(&insecure.claims.iss) {
+        let normalized_iss = normalize_issuer_url(&insecure.claims.iss);
+        let config = match self.trusted_issuer.get(&normalized_iss) {
             Some(config) => config,
             None => {
                 debug!("No trusted issuer found for: {}", insecure.claims.iss);
@@ -286,7 +312,13 @@ impl JwtManager {
             }
         };
 
-        // debug!("Found trusted issuer config: {}", config.issuer);
+        if config.user_id == 0 {
+            error!(
+                "A2A token cannot map to root user (user_id = 0) for issuer: {}",
+                config.issuer
+            );
+            return Err(IggyError::Unauthenticated);
+        }
 
         let kid_str = match kid.as_deref() {
             Some(kid) => kid,
@@ -307,18 +339,19 @@ impl JwtManager {
                 return self.decode_with_fallback(token, validation, algorithm);
             }
         };
-
-        // debug!("Got decoding key from JWKS for kid: {}", kid_str);
-
         let mut validation = Validation::new(algorithm);
         validation.set_issuer(std::slice::from_ref(&config.issuer));
         validation.set_audience(std::slice::from_ref(&config.audience));
-        debug!("Validation configured, attempting to decode JWT");
 
-        jsonwebtoken::decode::<JwtClaims>(token, &decoding_key, &validation).map_err(|e| {
-            error!("Failed to decode JWT: {}", e);
-            IggyError::Unauthenticated
-        })
+        let mut result = jsonwebtoken::decode::<JwtClaims>(token, &decoding_key, &validation)
+            .map_err(|e| {
+                error!("Failed to decode JWT: {}", e);
+                IggyError::Unauthenticated
+            })?;
+
+        result.claims.sub = config.user_id.to_string();
+
+        Ok(result)
     }
 
     /// fallback to standard JWT validation if JWKS validation fails

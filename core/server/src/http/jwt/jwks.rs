@@ -127,6 +127,25 @@ impl JwksClient {
         let jwks: JwkSet = serde_json::from_str(&body)
             .map_err(|e| IggyError::CannotFetchJwks(format!("Failed to parse JWKS: {}", e)))?;
 
+        // Collect all current kids from the JWKS response
+        let current_kids: std::collections::HashSet<String> =
+            jwks.keys.iter().filter_map(|key| key.kid.clone()).collect();
+
+        // Remove cached keys for this issuer that are no longer in the JWKS response
+        // Security fix: Clean up revoked/rotated keys to prevent accepting tokens signed with old keys
+        let keys_to_remove: Vec<CacheKey> = self
+            .cache
+            .iter()
+            .filter(|entry| {
+                entry.key().issuer == issuer && !current_kids.contains(&entry.key().kid)
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for key in keys_to_remove {
+            self.cache.remove(&key);
+        }
+
         for key in jwks.keys {
             if let Some(kid) = key.kid {
                 let decoding_key: DecodingKey = match key.kty {
