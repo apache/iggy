@@ -31,6 +31,8 @@ pub struct TrustedIssuerConfig {
     pub issuer: String,
     pub audience: String,
     pub jwks_url: String,
+    #[serde(default)]
+    pub user_id: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
