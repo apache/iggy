@@ -27,6 +27,7 @@ use server::http::jwt::json_web_token::Audience;
 const TEST_ISSUER: &str = "https://test-issuer.com";
 const TEST_AUDIENCE: &str = "iggy";
 const TEST_KEY_ID: &str = "iggy-jwt-key-1";
+const TEST_PRIVATE_KEY: &[u8] = include_bytes!("../../../../certs/iggy_key.pem");
 
 /// Seed function to create the A2A user with proper permissions
 async fn seed_a2a_user(
@@ -101,8 +102,7 @@ fn create_valid_jwt(exp_seconds: u64) -> String {
 
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(TEST_KEY_ID.to_string());
-    let private_key = include_bytes!("test_private_key.pem");
-    let encoding_key = EncodingKey::from_rsa_pem(private_key).unwrap();
+    let encoding_key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY).unwrap();
 
     encode(&header, &claims, &encoding_key).unwrap()
 }
@@ -126,8 +126,7 @@ fn create_valid_jwt_with_array_aud(exp_seconds: u64) -> String {
 
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(TEST_KEY_ID.to_string());
-    let private_key = include_bytes!("test_private_key.pem");
-    let encoding_key = EncodingKey::from_rsa_pem(private_key).unwrap();
+    let encoding_key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY).unwrap();
 
     encode(&header, &claims, &encoding_key).unwrap()
 }
@@ -147,8 +146,7 @@ fn create_expired_jwt() -> String {
 
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(TEST_KEY_ID.to_string());
-    let private_key = include_bytes!("test_private_key.pem");
-    let encoding_key = EncodingKey::from_rsa_pem(private_key).unwrap();
+    let encoding_key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY).unwrap();
 
     encode(&header, &claims, &encoding_key).unwrap()
 }
@@ -168,8 +166,7 @@ fn create_unknown_issuer_jwt() -> String {
 
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(TEST_KEY_ID.to_string());
-    let private_key = include_bytes!("test_private_key.pem");
-    let encoding_key = EncodingKey::from_rsa_pem(private_key).unwrap();
+    let encoding_key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY).unwrap();
 
     encode(&header, &claims, &encoding_key).unwrap()
 }
