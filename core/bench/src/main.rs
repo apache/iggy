@@ -26,7 +26,7 @@ mod utils;
 
 use crate::{args::common::IggyBenchArgs, runner::BenchmarkRunner};
 use clap::Parser;
-use figlet_rs::FIGfont;
+use figlet_rs::FIGlet;
 use iggy::prelude::IggyError;
 use std::fs;
 use std::path::Path;
@@ -36,7 +36,7 @@ use utils::cpu_name::append_cpu_name_lowercase;
 
 #[tokio::main]
 async fn main() -> Result<(), IggyError> {
-    let standard_font = FIGfont::standard().unwrap();
+    let standard_font = FIGlet::standard().unwrap();
     let figure = standard_font.convert("Iggy Bench");
     println!("{}", figure.unwrap());
 

@@ -15,16 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
----
-apiVersion: v2
-name: iggy
-description: A Helm chart for Apache Iggy server and web-ui
-type: application
-version: 0.5.0
-appVersion: "0.7.0"
-sources:
-  - https://github.com/apache/iggy
-keywords:
-  - iggy
-  - messages
-  - streaming
+[package]
+name = "iobuf"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+aligned-vec = "0.6"

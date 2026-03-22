@@ -40,7 +40,7 @@ public class ClusterRedirectionTests
             AutoLoginSettings = new AutoLoginSettings { Enabled = false }
         });
         await client.ConnectAsync();
-        await client.LoginUser("iggy", "iggy");
+        await client.LoginUserAsync("iggy", "iggy");
 
         var metadata = await client.GetClusterMetadataAsync();
 
@@ -84,7 +84,7 @@ public class ClusterRedirectionTests
             AutoLoginSettings = new AutoLoginSettings { Enabled = false }
         });
         await client.ConnectAsync();
-        await client.LoginUser("iggy", "iggy");
+        await client.LoginUserAsync("iggy", "iggy");
 
         var address = client.GetCurrentAddress();
         address.ShouldNotBeNullOrEmpty();
@@ -103,7 +103,7 @@ public class ClusterRedirectionTests
             AutoLoginSettings = new AutoLoginSettings { Enabled = false }
         });
         await leaderClient.ConnectAsync();
-        await leaderClient.LoginUser("iggy", "iggy");
+        await leaderClient.LoginUserAsync("iggy", "iggy");
 
         var name = $"pat-{Guid.NewGuid():N}"[..20];
         var pat = await leaderClient.CreatePersonalAccessTokenAsync(name, TimeSpan.FromHours(1));
@@ -117,7 +117,7 @@ public class ClusterRedirectionTests
             AutoLoginSettings = new AutoLoginSettings { Enabled = false }
         });
         await client.ConnectAsync();
-        var authResponse = await client.LoginWithPersonalAccessToken(pat.Token);
+        var authResponse = await client.LoginWithPersonalAccessTokenAsync(pat.Token);
 
         authResponse.ShouldNotBeNull();
         authResponse.UserId.ShouldBeGreaterThanOrEqualTo(0);

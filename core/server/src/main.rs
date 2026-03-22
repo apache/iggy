@@ -22,7 +22,7 @@ use clap::Parser;
 use dashmap::DashMap;
 use dotenvy::dotenv;
 use err_trail::ErrContext;
-use figlet_rs::FIGfont;
+use figlet_rs::FIGlet;
 use iggy_common::SemanticVersion;
 use iggy_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError, MemoryPool};
@@ -99,7 +99,7 @@ fn extract_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 fn print_ascii_art(text: &str) {
-    let standard_font = FIGfont::standard().unwrap();
+    let standard_font = FIGlet::standard().unwrap();
     let figure = standard_font.convert(text);
     println!("{}", figure.unwrap());
 }

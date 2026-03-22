@@ -56,7 +56,7 @@ for (var i = 0; i < producerCount; i++)
 #endif
     });
 
-    await bus.LoginUser("iggy", "iggy");
+    await bus.LoginUserAsync("iggy", "iggy");
     clients[i] = bus;
 }
 
