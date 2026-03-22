@@ -89,7 +89,6 @@ secrecy = { workspace = true }
 send_wrapper = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_with = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true }
 strum = { workspace = true }
@@ -102,7 +101,6 @@ tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
-tungstenite = { workspace = true }
 ulid = { workspace = true }
 ureq = { workspace = true }
 uuid = { workspace = true }
