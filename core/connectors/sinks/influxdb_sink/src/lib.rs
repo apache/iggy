@@ -66,7 +66,7 @@ pub struct InfluxDbSink {
     /// Controls the backoff cap for per-write retries only; startup retries
     /// use `config.open_retry_max_delay` and are never affected by this field.
     write_retry_max_delay: Duration,
-    messages_processed: AtomicU64,
+    messages_attempted: AtomicU64,
     write_success: AtomicU64,
     write_errors: AtomicU64,
     verbose: bool,
@@ -204,7 +204,7 @@ impl InfluxDbSink {
             client: None,
             write_url: None,
             write_retry_max_delay: Duration::from_secs(0), // overwritten in open()
-            messages_processed: AtomicU64::new(0),
+            messages_attempted: AtomicU64::new(0),
             write_success: AtomicU64::new(0),
             write_errors: AtomicU64::new(0),
             verbose,
@@ -730,7 +730,7 @@ impl Sink for InfluxDbSink {
         }
 
         let total_processed = self
-            .messages_processed
+            .messages_attempted
             .fetch_add(total_messages as u64, Ordering::Relaxed)
             + total_messages as u64;
 
@@ -771,7 +771,7 @@ impl Sink for InfluxDbSink {
         info!(
             "InfluxDB sink connector with ID: {} closed. Processed: {}, Success: {}, errors: {}",
             self.id,
-            self.messages_processed.load(Ordering::Relaxed),
+            self.messages_attempted.load(Ordering::Relaxed),
             self.write_success.load(Ordering::Relaxed),
             self.write_errors.load(Ordering::Relaxed),
         );

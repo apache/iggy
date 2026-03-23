@@ -120,7 +120,7 @@ configs_derive = { path = "core/configs_derive", version = "0.1.0" }
 consensus = { path = "core/consensus" }
 console-subscriber = "0.5.0"
 crossbeam = "0.8.4"
-crossfire = "3.1.5"
+crossfire = "3.1.7"
 csv = "1.3.1"
 ctor = "0.6.3"
 ctrlc = { version = "3.5", features = ["termination"] }
