@@ -16,57 +16,47 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
+use crate::binary::dispatch::{HandlerResult, domain_permissions_to_wire, wire_id_to_identifier};
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::requests::users::GetUserRequest;
+use iggy_binary_protocol::responses::users::{UserDetailsResponse, UserResponse};
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
-use iggy_common::get_user::GetUser;
+use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetUser {
-    fn code(&self) -> u32 {
-        iggy_common::GET_USER_CODE
-    }
+pub async fn handle_get_user(
+    req: GetUserRequest,
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    debug!(
+        "session: {session}, command: get_user, user_id: {:?}",
+        req.user_id
+    );
+    shard.ensure_authenticated(session)?;
 
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
+    let user_id = wire_id_to_identifier(&req.user_id)?;
 
-        let Some(user) = shard
-            .metadata
-            .query_user(session.get_user_id(), &self.user_id)?
-        else {
-            sender.send_empty_ok_response().await?;
-            return Ok(HandlerResult::Finished);
-        };
+    let Some(user) = shard.metadata.query_user(session.get_user_id(), &user_id)? else {
+        sender.send_empty_ok_response().await?;
+        return Ok(HandlerResult::Finished);
+    };
 
-        let bytes = mapper::map_user_meta(&user);
-        sender.send_ok_response(&bytes).await?;
-        Ok(HandlerResult::Finished)
-    }
-}
-
-impl BinaryServerCommand for GetUser {
-    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::GetUser(get_user) => Ok(get_user),
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+    let response = UserDetailsResponse {
+        user: UserResponse {
+            id: user.id,
+            created_at: user.created_at.as_micros(),
+            status: user.status.as_code(),
+            username: WireName::new(user.username.as_ref())
+                .map_err(|_| IggyError::InvalidCommand)?,
+        },
+        permissions: user.permissions.as_deref().map(domain_permissions_to_wire),
+    };
+    sender.send_ok_response(&response.to_bytes()).await?;
+    Ok(HandlerResult::Finished)
 }

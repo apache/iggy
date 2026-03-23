@@ -48,19 +48,40 @@ impl<'a> RequestFrame<'a> {
     /// Size of the frame header: `[length:4][code:4]`.
     pub const HEADER_SIZE: usize = 8;
 
+    /// Validate a frame length field and return the payload size.
+    ///
+    /// Transport layers that read the length and code fields incrementally
+    /// (e.g. compio completion-based I/O) can use this to validate the length
+    /// before reading the payload, without buffering the entire frame.
+    ///
+    /// # Errors
+    /// Returns `WireError::Validation` if `frame_length < 4` (too small to
+    /// contain even the command code).
+    pub fn payload_length(frame_length: u32) -> Result<u32, WireError> {
+        frame_length
+            .checked_sub(4)
+            .ok_or(WireError::Validation(Cow::Borrowed(
+                "request frame length must be at least 4 (code size)",
+            )))
+    }
+
+    /// Construct a frame from pre-parsed header fields and a payload slice.
+    ///
+    /// Used by transport layers that read the header incrementally (e.g.
+    /// compio completion-based I/O) and then read the payload separately.
+    #[must_use]
+    pub const fn from_parts(code: u32, payload: &'a [u8]) -> Self {
+        Self { code, payload }
+    }
+
     /// Decode a request frame from a complete buffer.
     ///
     /// # Errors
     /// Returns `WireError::UnexpectedEof` if the buffer is too short.
     pub fn decode(buf: &'a [u8]) -> Result<(Self, usize), WireError> {
-        let length = read_u32_le(buf, 0)? as usize;
-        if length < 4 {
-            return Err(WireError::Validation(Cow::Borrowed(
-                "request frame length must be at least 4 (code size)",
-            )));
-        }
+        let frame_length = read_u32_le(buf, 0)?;
+        let payload_len = Self::payload_length(frame_length)? as usize;
         let code = read_u32_le(buf, 4)?;
-        let payload_len = length - 4;
         let payload = read_bytes(buf, Self::HEADER_SIZE, payload_len)?;
         let total = Self::HEADER_SIZE + payload_len;
         Ok((Self { code, payload }, total))
@@ -220,6 +241,23 @@ mod tests {
         buf.put_u32_le(3); // length < 4 (must include code)
         buf.put_u32_le(1);
         assert!(RequestFrame::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn payload_length_valid() {
+        assert_eq!(RequestFrame::payload_length(4).unwrap(), 0);
+        assert_eq!(RequestFrame::payload_length(104).unwrap(), 100);
+        assert_eq!(
+            RequestFrame::payload_length(u32::MAX).unwrap(),
+            u32::MAX - 4
+        );
+    }
+
+    #[test]
+    fn payload_length_too_small() {
+        assert!(RequestFrame::payload_length(0).is_err());
+        assert!(RequestFrame::payload_length(1).is_err());
+        assert!(RequestFrame::payload_length(3).is_err());
     }
 
     #[test]
