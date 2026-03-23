@@ -233,7 +233,7 @@ Run the tests:
 
 Set root user credentials (OPTIONAL):
 
-Iggy requires credentials to authenticate request to the server.
+Iggy requires credentials to authenticate requests to the server.
 You can set the root user **before** starting the server.
 
 (macOS/Linux)
