@@ -20,6 +20,7 @@ use crate::codec::{WireDecode, WireEncode, read_str, read_u8, read_u32_le};
 use crate::primitives::identifier::WireName;
 use crate::primitives::permissions::WirePermissions;
 use bytes::{BufMut, BytesMut};
+use std::borrow::Cow;
 
 /// `CreateUser` request.
 ///
@@ -85,9 +86,9 @@ impl WireDecode for CreateUserRequest {
         let permissions = if has_permissions == 1 && perm_len > 0 {
             let (perms, consumed) = WirePermissions::decode(&buf[pos..])?;
             if consumed != perm_len {
-                return Err(WireError::Validation(format!(
+                return Err(WireError::Validation(Cow::Owned(format!(
                     "permissions length mismatch: header says {perm_len}, decoded {consumed}"
-                )));
+                ))));
             }
             pos += consumed;
             Some(perms)
