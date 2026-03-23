@@ -104,9 +104,9 @@ func TestPermissions_MarshalBinary_WithStreamsAndTopics(t *testing.T) {
 		if streamID == 0 {
 			break
 		}
-		position += 4  // stream ID
-		position += 6  // stream permissions
-		position += 1  // has_topics flag
+		position += 4 // stream ID
+		position += 6 // stream permissions
+		position += 1 // has_topics flag
 
 		// Skip topics if present
 		if bytes[position-1] == 1 {
@@ -115,8 +115,8 @@ func TestPermissions_MarshalBinary_WithStreamsAndTopics(t *testing.T) {
 				if position+4 > len(bytes) {
 					break
 				}
-				position += 4  // topic ID
-				position += 4  // topic permissions
+				position += 4 // topic ID
+				position += 4 // topic permissions
 				if position >= len(bytes) {
 					t.Fatalf("Unexpected end of bytes while reading topic continuation flag")
 				}
