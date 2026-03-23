@@ -128,7 +128,7 @@ public class IggyPublisherTests
             new(Guid.NewGuid(), Encoding.UTF8.GetBytes("Test message"))
         };
 
-        await Should.ThrowAsync<PublisherNotInitializedException>(() => publisher.SendMessages(messages));
+        await Should.ThrowAsync<PublisherNotInitializedException>(() => publisher.SendMessagesAsync(messages));
         await publisher.DisposeAsync();
     }
 
@@ -155,7 +155,7 @@ public class IggyPublisherTests
             messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes($"Test message {i}")));
         }
 
-        await Should.NotThrowAsync(() => publisher.SendMessages(messages));
+        await Should.NotThrowAsync(() => publisher.SendMessagesAsync(messages));
 
         // Verify messages were sent by polling them
         var polledMessages = await client.PollMessagesAsync(
@@ -189,7 +189,7 @@ public class IggyPublisherTests
         await publisher.InitAsync();
 
         var emptyMessages = new List<Message>();
-        await Should.NotThrowAsync(() => publisher.SendMessages(emptyMessages));
+        await Should.NotThrowAsync(() => publisher.SendMessagesAsync(emptyMessages));
         await publisher.DisposeAsync();
     }
 
@@ -320,8 +320,8 @@ public class IggyPublisherTests
             messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes($"Background message {i}")));
         }
 
-        await publisher.SendMessages(messages);
-        await publisher.WaitUntilAllSends();
+        await publisher.SendMessagesAsync(messages);
+        await publisher.WaitUntilAllSendsAsync();
 
         // Verify messages were sent
         var polledMessages = await client.PollMessagesAsync(
@@ -361,11 +361,11 @@ public class IggyPublisherTests
             messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes($"Wait test message {i}")));
         }
 
-        await publisher.SendMessages(messages);
+        await publisher.SendMessagesAsync(messages);
 
         // Should not return immediately
         var startTime = DateTime.UtcNow;
-        await publisher.WaitUntilAllSends();
+        await publisher.WaitUntilAllSendsAsync();
         var elapsed = DateTime.UtcNow - startTime;
 
         // Should have taken some time to flush
@@ -393,7 +393,7 @@ public class IggyPublisherTests
         await publisher.InitAsync();
 
         // Should return immediately without background sending
-        await Should.NotThrowAsync(() => publisher.WaitUntilAllSends());
+        await Should.NotThrowAsync(() => publisher.WaitUntilAllSendsAsync());
         await publisher.DisposeAsync();
     }
 
@@ -424,7 +424,7 @@ public class IggyPublisherTests
                     Encoding.UTF8.GetBytes($"Partition {partitionId} message {i}")));
             }
 
-            await publisher.SendMessages(messages);
+            await publisher.SendMessagesAsync(messages);
             await publisher.DisposeAsync();
         }
 
@@ -468,7 +468,7 @@ public class IggyPublisherTests
             messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes($"Balanced message {i}")));
         }
 
-        await publisher.SendMessages(messages);
+        await publisher.SendMessagesAsync(messages);
 
         // Verify messages are distributed across partitions
         var totalMessages = 0;
@@ -610,8 +610,8 @@ public class IggyPublisherTests
             messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes($"Large batch message {i}")));
         }
 
-        await publisher.SendMessages(messages);
-        await publisher.WaitUntilAllSends();
+        await publisher.SendMessagesAsync(messages);
+        await publisher.WaitUntilAllSendsAsync();
 
         // Verify at least most messages were sent
         var polledMessages = await client.PollMessagesAsync(

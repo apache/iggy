@@ -36,7 +36,7 @@ server:
 
   serviceMonitor:
     # -- Enable this if you're using [Prometheus Operator](https://github.com/coreos/prometheus-operator)
-    enabled: true
+    enabled: false
     # -- Namespace to deploy the ServiceMonitor
     namespace: ""
     # -- Fallback to the prometheus default unless specified
@@ -170,6 +170,12 @@ ui:
     #   cpu: 100m
     #   memory: 128Mi
 
+  # -- Web UI pod security context. Leave empty unless your UI deployment needs explicit pod-level settings.
+  podSecurityContext: {}
+
+  # -- Web UI container security context. Leave empty unless your UI deployment needs explicit container-level settings.
+  securityContext: {}
+
   nodeSelector: {}
 
   tolerations: []
@@ -195,14 +201,14 @@ serviceAccount:
 podAnnotations: {}
 
 podSecurityContext:
-  # Required for io_uring syscalls in containerized environments
+  # Required for Iggy server io_uring syscalls in containerized environments
   seccompProfile:
     type: Unconfined
 
 securityContext:
   capabilities:
     add:
-      # Required for memlock (io_uring memory)
+      # Required for Iggy server memlock (io_uring memory)
       - IPC_LOCK
 
 resources:

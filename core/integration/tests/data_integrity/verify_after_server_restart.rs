@@ -174,7 +174,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
         );
     }
 
-    // Run send bench again to add more data
+    // Run send bench again to add more data (--reuse-streams is always passed)
     run_bench_and_wait_for_finish(
         &server_addr,
         &TransportProtocol::Tcp,

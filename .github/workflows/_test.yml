@@ -63,7 +63,7 @@ jobs:
           component: ${{ inputs.component }}
 
       - name: Upload coverage to Codecov
-        if: startsWith(inputs.component, 'rust') && inputs.task == 'test'
+        if: startsWith(inputs.component, 'rust') && startsWith(inputs.task, 'test-')
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

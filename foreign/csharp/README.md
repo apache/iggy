@@ -113,7 +113,7 @@ await client.ConnectAsync();
 Begin by using the root account (note: the root account cannot be removed or updated):
 
 ```c#
-var response = await client.LoginUser("iggy", "iggy");
+var response = await client.LoginUserAsync("iggy", "iggy");
 ```
 
 ### Creating Users
@@ -138,10 +138,10 @@ var permissions = new Permissions
     }
 };
 
-await client.CreateUser("test_user", "secure_password", UserStatus.Active, permissions);
+await client.CreateUserAsync("test_user", "secure_password", UserStatus.Active, permissions);
 
 // Login with the new user
-var loginResponse = await client.LoginUser("test_user", "secure_password");
+var loginResponse = await client.LoginUserAsync("test_user", "secure_password");
 ```
 
 ### Personal Access Tokens
@@ -153,7 +153,7 @@ Create and use Personal Access Tokens (PAT) for programmatic access:
 var patResponse = await client.CreatePersonalAccessTokenAsync("api-token", 3600);
 
 // Login with PAT
-await client.LoginWithPersonalAccessToken(patResponse.Token);
+await client.LoginWithPersonalAccessTokenAsync(patResponse.Token);
 ```
 
 ## Streams and Topics

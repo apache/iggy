@@ -21,7 +21,7 @@ use ::configs::ConfigProvider;
 use configs::{McpServerConfig, McpTransport};
 use dotenvy::dotenv;
 use error::McpRuntimeError;
-use figlet_rs::FIGfont;
+use figlet_rs::FIGlet;
 use iggy::prelude::{Client, Identifier};
 use rmcp::{ServiceExt, model::ErrorData, transport::stdio};
 use service::IggyService;
@@ -41,7 +41,7 @@ const DEFAULT_CONFIG_PATH: &str = "core/ai/mcp/config.toml";
 
 #[tokio::main]
 async fn main() -> Result<(), McpRuntimeError> {
-    let standard_font = FIGfont::standard().unwrap();
+    let standard_font = FIGlet::standard().unwrap();
     let figure = standard_font.convert("Iggy MCP Server");
     eprintln!("{}", figure.unwrap());
 

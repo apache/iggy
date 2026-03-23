@@ -39,6 +39,7 @@ async-trait = { workspace = true }
 dashmap = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 once_cell = { workspace = true }
 parquet = { workspace = true }

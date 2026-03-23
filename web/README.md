@@ -10,6 +10,12 @@ The Iggy Web UI provides a user-friendly panel for managing various aspects of t
 
 The [docker image](https://hub.docker.com/r/apache/iggy-web-ui) is available, and can be fetched via `docker pull apache/iggy-web-ui`.
 
+## Tooling
+
+- Node.js: use a version supported by the current frontend toolchain, `^20.19.0 || ^22.13.0 || >=24`. `22.13+` LTS is the safest default.
+- Package manager: `npm`
+- `pnpm` and `yarn` are not part of the supported workflow for this package. CI, Docker builds, and the committed lockfile use `npm`.
+
 ### Getting Started
 
 1. **Run Iggy server first**
@@ -32,7 +38,7 @@ The [docker image](https://hub.docker.com/r/apache/iggy-web-ui) is available, an
 
    ```sh
    cd web
-   npm install
+   npm ci
    ```
 
 4. **Run the project:**

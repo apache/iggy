@@ -45,7 +45,7 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
 });
 
 await client.ConnectAsync();
-await client.LoginUser(settings.Username, settings.Password);
+await client.LoginUserAsync(settings.Username, settings.Password);
 
 logger.LogInformation("Basic consumer has logged on successfully");
 

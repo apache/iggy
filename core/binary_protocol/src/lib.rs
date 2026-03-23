@@ -41,12 +41,25 @@
 //!
 //! All multi-byte integers are little-endian. Strings are length-prefixed
 //! (u8 length for names, u32 length for longer strings).
+//!
+//! # VSR consensus framing
+//!
+//! All consensus headers are 256 bytes with `#[repr(C)]` layout.
+//! Deserialization is zero-copy via `bytemuck`. The [`Message`] type
+//! wraps a `Bytes` buffer with typed header access.
+//!
+//! - Client-facing: [`RequestHeader`], [`ReplyHeader`]
+//! - Replication: [`PrepareHeader`], [`PrepareOkHeader`], [`CommitHeader`]
+//! - View change: [`StartViewChangeHeader`], [`DoViewChangeHeader`],
+//!   [`StartViewHeader`]
+//! - Dispatch: [`GenericHeader`] for type-erased initial parsing
 
 pub mod codec;
 pub mod codes;
 pub mod consensus;
+pub mod dispatch;
 pub mod error;
-pub mod frame;
+pub mod framing;
 pub mod message_layout;
 pub mod message_view;
 pub mod primitives;
@@ -54,10 +67,17 @@ pub mod requests;
 pub mod responses;
 
 pub use codec::{WireDecode, WireEncode};
-pub use codes::*;
+pub use consensus::{
+    Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, GenericHeader,
+    HEADER_SIZE, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader, RequestHeader,
+    StartViewChangeHeader, StartViewHeader, message::Message,
+};
+pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;
-pub use frame::*;
-pub use message_layout::*;
+pub use framing::{RequestFrame, ResponseFrame, STATUS_OK};
+pub use message_view::{
+    WireMessageIterator, WireMessageIteratorMut, WireMessageView, WireMessageViewMut,
+};
 pub use primitives::consumer::WireConsumer;
 pub use primitives::identifier::{MAX_WIRE_NAME_LENGTH, WireIdentifier, WireName};
 pub use primitives::partitioning::{MAX_MESSAGES_KEY_LENGTH, WirePartitioning};

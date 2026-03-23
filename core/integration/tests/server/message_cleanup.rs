@@ -73,6 +73,12 @@ fn fair_size_cleanup_multipartition() -> CleanupScenarioFn {
     }
 }
 
+fn expiry_respects_consumer_offset() -> CleanupScenarioFn {
+    |client, path| {
+        Box::pin(message_cleanup_scenario::run_expiry_respects_consumer_offset(client, path))
+    }
+}
+
 async fn run_cleanup_scenario(scenario: CleanupScenarioFn) {
     let mut harness = TestHarness::builder()
         .server(
@@ -116,6 +122,7 @@ async fn run_cleanup_scenario(scenario: CleanupScenarioFn) {
     combined_retention(),
     expiry_multipartition(),
     fair_size_cleanup_multipartition(),
+    expiry_respects_consumer_offset(),
 ])]
 #[tokio::test]
 #[parallel]

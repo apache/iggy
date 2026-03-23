@@ -151,11 +151,13 @@ runs:
         echo "View on PyPI: https://pypi.org/project/apache-iggy/$VERSION/"
       shell: bash
 
-    - name: Publish to PyPI using maturin
+    - name: Install uv
       if: inputs.dry_run == 'false'
-      uses: PyO3/maturin-action@v1
+      uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7.3.1
+
+    - name: Publish to PyPI
+      if: inputs.dry_run == 'false'
+      run: uv publish --check-url https://pypi.org/simple/ --token "$PYPI_API_TOKEN" ${{ inputs.wheels_path }}/*
+      shell: bash
       env:
-        MATURIN_PYPI_TOKEN: ${{ env.PYPI_API_TOKEN }}
-      with:
-        command: upload
-        args: --non-interactive --skip-existing ${{ inputs.wheels_path }}/*
+        PYPI_API_TOKEN: ${{ env.PYPI_API_TOKEN }}

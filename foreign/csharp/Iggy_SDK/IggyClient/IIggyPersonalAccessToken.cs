@@ -65,5 +65,5 @@ public interface IIggyPersonalAccessToken
     ///     A task that represents the asynchronous operation and returns authentication response with session
     ///     information, or null if login failed.
     /// </returns>
-    Task<AuthResponse?> LoginWithPersonalAccessToken(string token, CancellationToken ct = default);
+    Task<AuthResponse?> LoginWithPersonalAccessTokenAsync(string token, CancellationToken ct = default);
 }

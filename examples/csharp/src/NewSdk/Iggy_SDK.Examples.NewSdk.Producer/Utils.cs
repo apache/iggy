@@ -71,7 +71,7 @@ public static class Utils
 
             logger.LogInformation("Sending messages count: {Count}", messagesPerBatch);
 
-            await publisher.SendMessages(messages.ToArray());
+            await publisher.SendMessagesAsync(messages.ToArray());
 
             sentBatches++;
             logger.LogInformation("Sent messages: {Messages}", serializableMessages);

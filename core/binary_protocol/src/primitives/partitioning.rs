@@ -18,6 +18,7 @@
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_bytes, read_u8, read_u32_le};
 use bytes::{BufMut, BytesMut};
+use std::borrow::Cow;
 
 const KIND_BALANCED: u8 = 1;
 const KIND_PARTITION_ID: u8 = 2;
@@ -49,15 +50,15 @@ impl WirePartitioning {
     /// Returns `WireError::Validation` if `key` is empty or exceeds 255 bytes.
     pub fn messages_key(key: Vec<u8>) -> Result<Self, WireError> {
         if key.is_empty() {
-            return Err(WireError::Validation(
-                "messages_key partitioning cannot have empty key".to_string(),
-            ));
+            return Err(WireError::Validation(Cow::Borrowed(
+                "messages_key partitioning cannot have empty key",
+            )));
         }
         if key.len() > MAX_MESSAGES_KEY_LENGTH {
-            return Err(WireError::Validation(format!(
+            return Err(WireError::Validation(Cow::Owned(format!(
                 "messages_key length {} exceeds maximum {MAX_MESSAGES_KEY_LENGTH}",
                 key.len()
-            )));
+            ))));
         }
         Ok(Self::MessagesKey(key))
     }
@@ -107,26 +108,26 @@ impl WireDecode for WirePartitioning {
         match kind {
             KIND_BALANCED => {
                 if length != 0 {
-                    return Err(WireError::Validation(format!(
+                    return Err(WireError::Validation(Cow::Owned(format!(
                         "balanced partitioning must have length 0, got {length}"
-                    )));
+                    ))));
                 }
                 Ok((Self::Balanced, 2))
             }
             KIND_PARTITION_ID => {
                 if length != 4 {
-                    return Err(WireError::Validation(format!(
+                    return Err(WireError::Validation(Cow::Owned(format!(
                         "partition_id partitioning must have length 4, got {length}"
-                    )));
+                    ))));
                 }
                 let id = read_u32_le(buf, 2)?;
                 Ok((Self::PartitionId(id), 6))
             }
             KIND_MESSAGES_KEY => {
                 if length == 0 {
-                    return Err(WireError::Validation(
-                        "messages_key partitioning cannot have empty key".to_string(),
-                    ));
+                    return Err(WireError::Validation(Cow::Borrowed(
+                        "messages_key partitioning cannot have empty key",
+                    )));
                 }
                 let key = read_bytes(buf, 2, length)?;
                 Ok((Self::MessagesKey(key.to_vec()), 2 + length))

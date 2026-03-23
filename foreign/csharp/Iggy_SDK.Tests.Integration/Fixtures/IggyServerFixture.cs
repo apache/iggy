@@ -174,7 +174,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 
         if (connect)
         {
-            await client.LoginUser(userName, password);
+            await client.LoginUserAsync(userName, password);
         }
 
         return client;
@@ -184,7 +184,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     {
         var client = await CreateClient(Protocol.Http);
 
-        await client.LoginUser(userName, password);
+        await client.LoginUserAsync(userName, password);
 
         return client;
     }
