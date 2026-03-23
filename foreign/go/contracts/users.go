@@ -60,10 +60,12 @@ func (p *Permissions) MarshalBinary() ([]byte, error) {
 
 	position := 10
 
-	if p.Streams != nil {
+	if p.Streams != nil && len(p.Streams) > 0 {
 		bytes[position] = byte(1)
 		position += 1
 
+		streamsCount := len(p.Streams)
+		currentStream := 1
 		for streamID, stream := range p.Streams {
 			binary.LittleEndian.PutUint32(bytes[position:position+4], uint32(streamID))
 			position += 4
@@ -76,10 +78,12 @@ func (p *Permissions) MarshalBinary() ([]byte, error) {
 			bytes[position+5] = boolToByte(stream.SendMessages)
 			position += 6
 
-			if stream.Topics != nil {
+			if stream.Topics != nil && len(stream.Topics) > 0 {
 				bytes[position] = byte(1)
 				position += 1
 
+				topicsCount := len(stream.Topics)
+				currentTopic := 1
 				for topicID, topic := range stream.Topics {
 					binary.LittleEndian.PutUint32(bytes[position:position+4], uint32(topicID))
 					position += 4
@@ -90,16 +94,29 @@ func (p *Permissions) MarshalBinary() ([]byte, error) {
 					bytes[position+3] = boolToByte(topic.SendMessages)
 					position += 4
 
-					bytes[position] = byte(0)
+					if currentTopic < topicsCount {
+						currentTopic++
+						bytes[position] = byte(1)
+					} else {
+						bytes[position] = byte(0)
+					}
 					position += 1
 				}
 			} else {
 				bytes[position] = byte(0)
 				position += 1
 			}
+
+			if currentStream < streamsCount {
+				currentStream++
+				bytes[position] = byte(1)
+			} else {
+				bytes[position] = byte(0)
+			}
+			position += 1
 		}
 	} else {
-		bytes[0] = byte(0)
+		bytes[position] = byte(0)
 	}
 
 	return bytes, nil
