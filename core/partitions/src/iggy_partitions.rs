@@ -19,6 +19,7 @@
 
 use crate::IggyPartition;
 use crate::Partition;
+use crate::PollingConsumer;
 use crate::log::JournalInfo;
 use crate::types::PartitionsConfig;
 use consensus::PlaneIdentity;
@@ -30,8 +31,7 @@ use consensus::{
 };
 use iggy_common::header::Command2;
 use iggy_common::{
-    INDEX_SIZE, IggyByteSize, IggyIndexesMut, IggyMessagesBatchMut, PartitionStats, PooledBuffer,
-    Segment, SegmentStorage,
+    IggyByteSize, PartitionStats, Segment, SegmentStorage,
     header::{
         ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
     },
@@ -355,13 +355,13 @@ where
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
-        let header = message.header();
+        let header = *message.header();
         let namespace = IggyNamespace::from_raw(header.namespace);
         let consensus = self
             .consensus()
             .expect("on_replicate: consensus not initialized");
 
-        let current_op = match replicate_preflight(consensus, header) {
+        let current_op = match replicate_preflight(consensus, &header) {
             Ok(current_op) => current_op,
             Err(reason) => {
                 warn!(
@@ -372,7 +372,7 @@ where
             }
         };
 
-        let is_old_prepare = fence_old_prepare_by_commit(consensus, header);
+        let is_old_prepare = fence_old_prepare_by_commit(consensus, &header);
         if is_old_prepare {
             warn!("received old prepare, not replicating");
         } else {
@@ -387,9 +387,9 @@ where
         // TODO: Figure out the flow of the partition operations.
         // In metadata layer we assume that when an `on_request` or `on_replicate` is called, it's called from correct shard.
         // I think we need to do the same here, which means that the code from below is unfallable, the partition should always exist by now!
-        self.apply_replicated_operation(&namespace, &message).await;
+        self.apply_replicated_operation(&namespace, message).await;
 
-        self.send_prepare_ok(header).await;
+        self.send_prepare_ok(&header).await;
 
         if consensus.is_follower() {
             self.commit_journal(namespace);
@@ -539,37 +539,21 @@ where
             .register_namespace(ns);
     }
 
-    // TODO: Move this elsewhere, also do not reallocate, we do reallocationg now becauise we use PooledBuffer for the batch body
-    // but `Bytes` for `Message` payload.
-    fn batch_from_body(body: &[u8]) -> IggyMessagesBatchMut {
-        assert!(body.len() >= 4, "prepare body too small for batch header");
-        let count = u32::from_le_bytes(body[0..4].try_into().unwrap());
-        let indexes_len = count as usize * INDEX_SIZE;
-        let indexes_end = 4 + indexes_len;
-        assert!(
-            body.len() >= indexes_end,
-            "prepare body too small for {count} indexes",
-        );
-
-        let indexes = IggyIndexesMut::from_bytes(PooledBuffer::from(&body[4..indexes_end]), 0);
-        let messages = PooledBuffer::from(&body[indexes_end..]);
-        IggyMessagesBatchMut::from_indexes_and_messages(indexes, messages)
-    }
-
     async fn apply_replicated_operation(
         &self,
         namespace: &IggyNamespace,
-        message: &Message<PrepareHeader>,
+        message: Message<PrepareHeader>,
     ) {
         let consensus = self
             .consensus()
             .expect("apply_replicated_operation: consensus not initialized");
-        let header = message.header();
+        let header = *message.header();
 
+        // TODO: WE have to distinguish between an `message` recv by leader and follower.
+        // In the follower path, we have to skip the `prepare_for_persistence` path, just append to journal.
         match header.operation {
             Operation::SendMessages => {
-                let body = message.body_bytes();
-                self.append_send_messages_to_journal(namespace, body.as_ref())
+                self.append_send_messages_to_journal(namespace, message)
                     .await;
                 debug!(
                     replica = consensus.replica(),
@@ -579,11 +563,36 @@ where
                 );
             }
             Operation::StoreConsumerOffset => {
-                // TODO: Deserialize consumer offset from prepare body
-                // and store in partition's consumer_offsets.
+                let body = message.body_bytes();
+                let body = body.as_ref();
+                let consumer_kind = body[0];
+                let consumer_id = u32::from_le_bytes(body[1..5].try_into().unwrap()) as usize;
+                let offset = u64::from_le_bytes(body[5..13].try_into().unwrap());
+                let consumer = match consumer_kind {
+                    1 => PollingConsumer::Consumer(consumer_id, 0),
+                    2 => PollingConsumer::ConsumerGroup(consumer_id, 0),
+                    _ => {
+                        warn!(
+                            replica = consensus.replica(),
+                            op = header.op,
+                            consumer_kind,
+                            "on_replicate: unknown consumer kind"
+                        );
+                        return;
+                    }
+                };
+
+                let partition = self
+                    .get_by_ns(namespace)
+                    .expect("store_consumer_offset: partition not found for namespace");
+                let _ = partition.store_consumer_offset(consumer, offset);
+
                 debug!(
                     replica = consensus.replica(),
                     op = header.op,
+                    consumer_kind,
+                    consumer_id,
+                    offset,
                     "on_replicate: consumer offset stored"
                 );
             }
@@ -598,12 +607,7 @@ where
         }
     }
 
-    async fn append_send_messages_to_journal(&self, namespace: &IggyNamespace, body: &[u8]) {
-        let batch = Self::batch_from_body(body);
-        self.append_messages_to_journal(namespace, batch).await;
-    }
-
-    /// Append a batch to a partition's journal with offset assignment.
+    /// Append a prepare message to a partition's journal with offset assignment.
     ///
     /// Updates `segment.current_position` (logical position for indexing) but
     /// not `segment.end_offset` or `segment.end_timestamp` (committed state).
@@ -611,15 +615,15 @@ where
     ///
     /// Uses `dirty_offset` for offset assignment so that multiple prepares
     /// can be pipelined before any commit.
-    async fn append_messages_to_journal(
+    async fn append_send_messages_to_journal(
         &self,
         namespace: &IggyNamespace,
-        batch: IggyMessagesBatchMut,
+        message: Message<PrepareHeader>,
     ) {
         let partition = self
             .get_mut_by_ns(namespace)
-            .expect("append_messages_to_journal: partition not found for namespace");
-        let _ = partition.append_messages(batch).await;
+            .expect("append_send_messages_to_journal: partition not found for namespace");
+        let _ = partition.append_messages(message).await;
     }
 
     /// Replicate a prepare message to the next replica in the chain.

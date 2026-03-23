@@ -15,7 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod binary_auth;
+pub(crate) mod binary_client;
+mod binary_impls;
+pub(crate) mod binary_mapper;
+pub(crate) mod binary_transport;
 pub(crate) mod bytes_serializable;
+pub(crate) mod client;
+pub(crate) mod cluster_client;
+pub(crate) mod consumer_group_client;
+pub(crate) mod consumer_offset_client;
+pub(crate) mod message_client;
+pub(crate) mod partition_client;
 pub(crate) mod partitioner;
+pub(crate) mod personal_access_token_client;
+pub(crate) mod segment_client;
 pub(crate) mod sizeable;
+pub(crate) mod stream_client;
+pub(crate) mod system_client;
+pub(crate) mod topic_client;
+pub(crate) mod user_client;
 pub(crate) mod validatable;

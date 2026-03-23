@@ -137,10 +137,11 @@ This connector provides **at-least-once** delivery semantics.
 ### Behavior
 
 - Messages may be delivered more than once on retry or restart
-- Uses Iggy message ID as MongoDB `_id` for document identity
-- **Insert-only mode**: duplicate key error is a hard failure (not upsert)
+- Uses a deterministic composite MongoDB `_id`: `stream:topic:partition:message_id`
+- Duplicate key collisions are treated as idempotent replay of already-written messages
+- The sink remains insert-only; it does not upsert existing documents
 
 ### Known Limitations
 
-- On network timeout during insert, retry may cause duplicate key error
-- Sink does not upsert on duplicate (future improvement)
+- On network timeout during insert, MongoDB may partially commit a batch before returning an error
+- The sink does not upsert on duplicate; replay safety relies on deterministic `_id` values and duplicate-key tolerance

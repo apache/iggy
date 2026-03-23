@@ -20,7 +20,7 @@ description: C++ pre-merge testing github iggy actions
 
 inputs:
   task:
-    description: "Task to run (lint, build, test)"
+    description: "Task to run (lint, build, test, e2e)"
     required: true
 
 runs:
@@ -70,11 +70,26 @@ runs:
       shell: bash
       run: |
         cd foreign/cpp
-        bazel test --config=ci //:iggy-cpp-test
+        bazel test --config=ci //:unit
 
-    - name: Validate task
-      if: inputs.task != 'lint' && inputs.task != 'build' && inputs.task != 'test'
+    - name: Setup server for e2e tests
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+
+    - name: Run e2e tests
+      if: inputs.task == 'e2e'
       shell: bash
       run: |
-        echo "::error::Unsupported task '${{ inputs.task }}'. Expected one of: lint, build, test."
+        cd foreign/cpp
+        bazel test --config=ci //:low-level-e2e
+
+    - name: Stop server after e2e tests
+      if: always() && inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop
+
+    - name: Validate task
+      if: inputs.task != 'lint' && inputs.task != 'build' && inputs.task != 'test' && inputs.task != 'e2e'
+      shell: bash
+      run: |
+        echo "::error::Unsupported task '${{ inputs.task }}'. Expected one of: lint, build, test, e2e."
         exit 1

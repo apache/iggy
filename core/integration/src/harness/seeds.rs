@@ -18,12 +18,12 @@
  */
 
 use iggy::prelude::{IggyClient, StreamClient, TopicClient};
-use iggy_binary_protocol::{
-    ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PersonalAccessTokenClient, UserClient,
-};
 use iggy_common::{
     CompressionAlgorithm, Consumer, Identifier, IggyExpiry, IggyMessage, MaxTopicSize,
     Partitioning, PersonalAccessTokenExpiry, UserStatus,
+};
+use iggy_common::{
+    ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PersonalAccessTokenClient, UserClient,
 };
 use std::error::Error;
 

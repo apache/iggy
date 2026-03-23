@@ -60,7 +60,7 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
 });
 
 await client.ConnectAsync();
-await client.LoginUser("iggy", "iggy");
+await client.LoginUserAsync("iggy", "iggy");
 logger.LogInformation("Connected and logged in over TLS.");
 
 await ConsumeMessages();

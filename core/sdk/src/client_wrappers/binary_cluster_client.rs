@@ -18,7 +18,7 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
-use iggy_binary_protocol::ClusterClient;
+use iggy_common::ClusterClient;
 use iggy_common::{ClusterMetadata, IggyError};
 
 #[async_trait]

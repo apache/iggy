@@ -59,42 +59,42 @@ public final class SinkDataProducer {
         String topic = "records";
 
         HostAndPort hostAndPort = parseAddress(address);
-        var client = IggyTcpClient.builder()
+        try (var client = IggyTcpClient.builder()
                 .host(hostAndPort.host())
                 .port(hostAndPort.port())
                 .credentials(username, password)
-                .buildAndLogin();
+                .buildAndLogin()) {
+            StreamId streamId = StreamId.of(stream);
+            TopicId topicId = TopicId.of(topic);
+            Partitioning partitioning = Partitioning.balanced();
 
-        StreamId streamId = StreamId.of(stream);
-        TopicId topicId = TopicId.of(topic);
-        Partitioning partitioning = Partitioning.balanced();
+            Random random = new Random();
+            int batchesCount = 0;
+            log.info("Starting data producer...");
 
-        Random random = new Random();
-        int batchesCount = 0;
-        log.info("Starting data producer...");
+            createStreamIfMissing(client, streamId);
+            createTopicIfMissing(client, streamId, topicId);
 
-        createStreamIfMissing(client, streamId);
-        createTopicIfMissing(client, streamId, topicId);
+            while (batchesCount < MAX_BATCHES) {
+                int recordsCount = random.nextInt(100) + 1000;
+                List<Message> messages = new ArrayList<>(recordsCount);
 
-        while (batchesCount < MAX_BATCHES) {
-            int recordsCount = random.nextInt(100) + 1000;
-            List<Message> messages = new ArrayList<>(recordsCount);
-
-            for (int i = 0; i < recordsCount; i++) {
-                UserRecord record = randomRecord(random);
-                try {
-                    messages.add(Message.of(record.toJson(MAPPER)));
-                } catch (JacksonException e) {
-                    log.warn("Failed to serialize record, skipping.", e);
+                for (int i = 0; i < recordsCount; i++) {
+                    UserRecord record = randomRecord(random);
+                    try {
+                        messages.add(Message.of(record.toJson(MAPPER)));
+                    } catch (JacksonException e) {
+                        log.warn("Failed to serialize record, skipping.", e);
+                    }
                 }
+
+                client.messages().sendMessages(streamId, topicId, partitioning, messages);
+                log.info("Sent {} messages", recordsCount);
+                batchesCount++;
             }
 
-            client.messages().sendMessages(streamId, topicId, partitioning, messages);
-            log.info("Sent {} messages", recordsCount);
-            batchesCount++;
+            log.info("Reached maximum batches count");
         }
-
-        log.info("Reached maximum batches count");
     }
 
     private static void createStreamIfMissing(IggyTcpClient client, StreamId streamId) {

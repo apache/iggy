@@ -17,7 +17,10 @@
  */
 
 use crate::UserId;
+use crate::utils::serde_secret::serialize_secret;
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// `IdentityInfo` represents the information about an identity.
 /// It consists of the following fields:
@@ -35,10 +38,20 @@ pub struct IdentityInfo {
 /// It consists of the following fields:
 /// - `token`: the value of token.
 /// - `expiry`: the expiry of token.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TokenInfo {
     /// The value of token.
-    pub token: String,
+    #[serde(serialize_with = "serialize_secret")]
+    pub token: SecretString,
     /// The expiry of token.
     pub expiry: u64,
+}
+
+impl fmt::Debug for TokenInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenInfo")
+            .field("token", &"[REDACTED]")
+            .field("expiry", &self.expiry)
+            .finish()
+    }
 }

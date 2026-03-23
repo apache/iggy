@@ -19,8 +19,8 @@
 use crate::cli::common::{IggyCmdTest, help::TestHelpCmd};
 use serial_test::parallel;
 
-const FIGLET_INDENT: &str = " ";
-const FIGLET_FILL: &str = "                         ";
+const FIGLET_SP: &str = " ";
+const FIGLET_FILL: &str = "                   ";
 
 #[tokio::test]
 #[parallel]
@@ -32,12 +32,12 @@ pub async fn should_help_match() {
         .execute_test_for_help_command(TestHelpCmd::new(
             no_arg,
             format!(
-                r#"  ___                              ____   _       ___{FIGLET_INDENT}
- |_ _|   __ _    __ _   _   _     / ___| | |     |_ _|
-  | |   / _` |  / _` | | | | |   | |     | |      | |{FIGLET_INDENT}
-  | |  | (_| | | (_| | | |_| |   | |___  | |___   | |{FIGLET_INDENT}
- |___|  \__, |  \__, |  \__, |    \____| |_____| |___|
-        |___/   |___/   |___/{FIGLET_FILL}
+                r#" ___                     ____ _     ___{FIGLET_SP}
+|_ _|__ _  __ _ _   _   / ___| |   |_ _|
+ | |/ _` |/ _` | | | | | |   | |    | |{FIGLET_SP}
+ | | (_| | (_| | |_| | | |___| |___ | |{FIGLET_SP}
+|___\__, |\__, |\__, |  \____|_____|___|
+    |___/ |___/ |___/{FIGLET_FILL}
 
 CLI for Iggy message streaming platform
 

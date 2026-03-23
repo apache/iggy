@@ -109,11 +109,13 @@ components:
       - "sort"
       - "doctest"
       - "machete"
-      - "test"
+      - "test-1"
+      - "test-2"
       - "compat"
       - "build-aarch64-gnu"
       - "build-aarch64-musl"
       - "build-macos-aarch64"
+      - "build-windows-sdk"
 
   # CLI component
   rust-cli:
@@ -214,13 +216,21 @@ components:
       - "ci-infrastructure"
     paths:
       - "foreign/cpp/**"
-    tasks: ["lint", "build", "test"]
+    tasks: ["lint", "build", "test", "e2e"]
+
+  # Shared BDD infrastructure that affects all BDD tests
+  bdd-infrastructure:
+    paths:
+      - "scripts/run-bdd-tests.sh"
+      - "bdd/docker-compose.yml"
+      - "bdd/docker-compose.coverage.yml"
 
   # Individual BDD tests per SDK - only run when specific SDK changes
   bdd-rust:
     depends_on:
       - "rust-sdk"
       - "rust-server"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/rust/**"
@@ -230,8 +240,9 @@ components:
   bdd-python:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-python"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/python/**"
@@ -241,8 +252,9 @@ components:
   bdd-go:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-go"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/go/**"
@@ -252,8 +264,9 @@ components:
   bdd-node:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-node"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/node/**"
@@ -263,8 +276,9 @@ components:
   bdd-csharp:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-csharp"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/csharp/**"
@@ -274,8 +288,9 @@ components:
   bdd-java:
     depends_on:
       - "rust-server"
-      - "rust-sdk" # All SDKs depend on core SDK changes
+      - "rust-sdk"
       - "sdk-java"
+      - "bdd-infrastructure"
       - "ci-infrastructure"
     paths:
       - "bdd/java/**"
@@ -289,7 +304,8 @@ components:
       - "ci-infrastructure"
     paths:
       - "examples/rust/**"
-      - "scripts/run-rust-examples-from-readme.sh"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
     tasks: ["examples-rust"]
 
   examples-go:
@@ -300,7 +316,8 @@ components:
       - "ci-infrastructure"
     paths:
       - "examples/go/**"
-      - "scripts/run-go-examples-from-readme.sh"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
     tasks: ["examples-go"]
 
   examples-csharp:
@@ -311,7 +328,8 @@ components:
       - "ci-infrastructure"
     paths:
       - "examples/csharp/**"
-      - "scripts/run-csharp-examples-from-readme.sh"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
     tasks: ["examples-csharp"]
 
   examples-python:
@@ -322,7 +340,8 @@ components:
       - "ci-infrastructure"
     paths:
       - "examples/python/**"
-      - "scripts/run-python-examples-from-readme.sh"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
     tasks: ["examples-python"]
 
   examples-node:
@@ -333,7 +352,8 @@ components:
       - "ci-infrastructure"
     paths:
       - "examples/node/**"
-      - "scripts/run-node-examples-from-readme.sh"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
     tasks: ["examples-node"]
 
   examples-java:
@@ -344,7 +364,8 @@ components:
       - "ci-infrastructure"
     paths:
       - "examples/java/**"
-      - "scripts/run-java-examples-from-readme.sh"
+      - "scripts/run-examples-from-readme.sh"
+      - "scripts/utils.sh"
     tasks: ["examples-java"]
 
   web-ui:

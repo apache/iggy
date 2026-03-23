@@ -34,7 +34,7 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
 });
 
 await client.ConnectAsync();
-await client.LoginUser("iggy", "iggy");
+await client.LoginUserAsync("iggy", "iggy");
 
 var publisher = client.CreatePublisherBuilder(Identifier.String("new-sdk-stream"), Identifier.String("new-sdk-topic"))
     .CreateStreamIfNotExists("new-sdk-stream")
@@ -45,4 +45,4 @@ var publisher = client.CreatePublisherBuilder(Identifier.String("new-sdk-stream"
 
 await publisher.InitAsync();
 await Utils.ProduceMessages(publisher, logger);
-await publisher.WaitUntilAllSends();
+await publisher.WaitUntilAllSendsAsync();

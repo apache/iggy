@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy_binary_protocol::cli::cli_command::PRINT_TARGET;
+use iggy_cli::commands::cli_command::PRINT_TARGET;
 use std::path::PathBuf;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{

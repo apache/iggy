@@ -23,8 +23,8 @@ use crate::prelude::{
     PolledMessages, PollingStrategy, SendMessages,
 };
 use async_trait::async_trait;
-use iggy_binary_protocol::MessageClient;
 use iggy_common::IggyMessagesBatch;
+use iggy_common::MessageClient;
 
 #[async_trait]
 impl MessageClient for HttpClient {

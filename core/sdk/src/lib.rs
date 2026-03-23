@@ -16,6 +16,7 @@
  * under the License.
  */
 
+pub mod binary;
 pub mod client_provider;
 pub mod client_wrappers;
 pub mod clients;

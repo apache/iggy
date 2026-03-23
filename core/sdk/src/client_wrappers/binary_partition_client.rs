@@ -18,7 +18,7 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
-use iggy_binary_protocol::PartitionClient;
+use iggy_common::PartitionClient;
 use iggy_common::{Identifier, IggyError};
 
 #[async_trait]

@@ -26,6 +26,7 @@ pub(crate) mod hash;
 pub mod net;
 pub(crate) mod personal_access_token_expiry;
 pub mod random_id;
+pub mod serde_secret;
 pub mod text;
 pub(crate) mod timestamp;
 pub(crate) mod topic_size;
