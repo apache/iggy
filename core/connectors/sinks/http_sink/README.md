@@ -135,7 +135,7 @@ One HTTP request per message. Best for webhooks and endpoints that accept single
 > With `batch_length = 50`, this produces 50 sequential HTTP round trips per poll cycle.
 > For production throughput, use `ndjson` or `json_array`.
 
-```
+```text
 POST /ingest  Content-Type: application/json
 {"metadata": {"iggy_offset": 1, ...}, "payload": {"key": "value"}}
 ```
@@ -144,7 +144,7 @@ POST /ingest  Content-Type: application/json
 
 All messages in one request, [newline-delimited JSON](https://github.com/ndjson/ndjson-spec). Best for bulk ingestion endpoints.
 
-```
+```text
 POST /ingest  Content-Type: application/x-ndjson
 {"metadata": {"iggy_offset": 1}, "payload": {"key": "value1"}}
 {"metadata": {"iggy_offset": 2}, "payload": {"key": "value2"}}
@@ -154,7 +154,7 @@ POST /ingest  Content-Type: application/x-ndjson
 
 All messages as a single JSON array. Best for APIs expecting array payloads.
 
-```
+```text
 POST /ingest  Content-Type: application/json
 [{"metadata": {"iggy_offset": 1}, "payload": {"key": "value1"}}, ...]
 ```
@@ -163,7 +163,7 @@ POST /ingest  Content-Type: application/json
 
 Raw bytes, one request per message. For non-JSON payloads (protobuf, binary). Metadata envelope is not applied in raw mode.
 
-```
+```text
 POST /ingest  Content-Type: application/octet-stream
 <raw bytes>
 ```
@@ -172,7 +172,7 @@ POST /ingest  Content-Type: application/octet-stream
 
 The connector does **not** require or expect any particular message structure. It receives raw bytes from the Iggy runtime — whatever you published to the topic is what arrives in `consume()`. The `{metadata: {}, payload: {}}` envelope is something the **sink adds on the way out**, not something it expects on the way in.
 
-```
+```text
 Your app publishes:  {"order_id": 123, "amount": 9.99}
                           |
                           v
@@ -191,14 +191,14 @@ HTTP endpoint gets:  the wrapped envelope
 
 With `include_metadata = false`, the sink skips wrapping — your original message goes through as-is:
 
-```
+```text
 HTTP endpoint gets:  {"order_id": 123, "amount": 9.99}
 ```
 
 The `schema` field in `[[streams]]` controls how the sink **interprets** the incoming bytes for output formatting:
 
 | Schema | Interpretation | Payload in envelope |
-|--------|---------------|---------------------|
+| ------ | -------------- | ------------------- |
 | `json` | Parses bytes as JSON | Embedded as JSON value |
 | `text` | Treats bytes as UTF-8 string | Embedded as string |
 | `raw` / `flatbuffer` / `proto` | Opaque binary | Base64-encoded with `"iggy_payload_encoding": "base64"` |
@@ -233,7 +233,7 @@ Set `include_metadata = false` to send the raw payload without wrapping.
 
 Exponential backoff with configurable parameters:
 
-```
+```text
 Initial request: no delay
 Retry 1: retry_delay = 1s
 Retry 2: retry_delay * backoff = 2s
@@ -402,7 +402,7 @@ How this works in the runtime source code:
 ### What's Achievable Today vs. Not
 
 | Pattern | Achievable Today | How |
-|---------|:---:|-----|
+| ------- | :-: | --- |
 | Single destination, single topic | Yes | One connector instance, one `[[streams]]` entry |
 | Single destination, multiple topics | Yes | One connector instance, multiple topics in `[[streams]]` |
 | Multiple destinations (topic-per-destination) | Yes | N connector instances, one per destination, each a separate OS process |
@@ -418,7 +418,7 @@ How this works in the runtime source code:
 
 When all topics go to the same endpoint, use one connector with multiple `[[streams]]` entries. The downstream service can distinguish topics via the `iggy_stream` and `iggy_topic` fields in the metadata envelope.
 
-```
+```text
 ┌─────────────────────────┐      ┌────────────────────────┐
 │  Iggy Server            │      │  HTTP Endpoint         │
 │  ├── stream: events     │      │  POST /ingest          │
