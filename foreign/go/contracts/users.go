@@ -60,7 +60,7 @@ func (p *Permissions) MarshalBinary() ([]byte, error) {
 
 	position := 10
 
-	if p.Streams != nil && len(p.Streams) > 0 {
+	if len(p.Streams) > 0 {
 		bytes[position] = byte(1)
 		position += 1
 
@@ -78,7 +78,7 @@ func (p *Permissions) MarshalBinary() ([]byte, error) {
 			bytes[position+5] = boolToByte(stream.SendMessages)
 			position += 6
 
-			if stream.Topics != nil && len(stream.Topics) > 0 {
+			if len(stream.Topics) > 0 {
 				bytes[position] = byte(1)
 				position += 1
 
