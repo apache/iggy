@@ -57,7 +57,7 @@ public class SystemTests
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
         var tcpClient = await Fixture.CreateClient(Protocol.Tcp);
-        await tcpClient.LoginUser("iggy", "iggy");
+        await tcpClient.LoginUserAsync("iggy", "iggy");
         var clientInfo = await tcpClient.GetMeAsync();
         clientInfo.ShouldNotBeNull();
 
@@ -105,7 +105,7 @@ public class SystemTests
 
         var streamName = $"sys-cg-{Guid.NewGuid():N}";
         var tcpClient = await Fixture.CreateClient(Protocol.Tcp);
-        await tcpClient.LoginUser("iggy", "iggy");
+        await tcpClient.LoginUserAsync("iggy", "iggy");
 
         var stream = await tcpClient.CreateStreamAsync(streamName);
         await tcpClient.CreateTopicAsync(Identifier.String(streamName), "first_topic", 2);

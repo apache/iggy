@@ -63,6 +63,7 @@ const EXAMPLES: &str = r#"EXAMPLES:
     --moving-average-window (-W): Window size for moving average [default: 20]
     --username (-u): Username for server authentication [default: iggy]
     --password (-p): Password for server authentication [default: iggy]
+    --reuse-streams: Reuse existing bench streams instead of deleting them
 
     Benchmark-specific options (after the benchmark command):
     --streams (-s): Number of streams

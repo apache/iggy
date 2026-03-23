@@ -32,14 +32,14 @@ public interface IIggyUsers
     /// <param name="userId">The identifier of the user to retrieve (numeric ID or username).</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation and returns the user information, or null if not found.</returns>
-    Task<UserResponse?> GetUser(Identifier userId, CancellationToken token = default);
+    Task<UserResponse?> GetUserAsync(Identifier userId, CancellationToken token = default);
 
     /// <summary>
     ///     Retrieves information about all users in the system.
     /// </summary>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task that represents the asynchronous operation and returns a read-only collection of user information.</returns>
-    Task<IReadOnlyList<UserResponse>> GetUsers(CancellationToken token = default);
+    Task<IReadOnlyList<UserResponse>> GetUsersAsync(CancellationToken token = default);
 
     /// <summary>
     ///     Creates a new user with the specified credentials and permissions.
@@ -53,7 +53,7 @@ public interface IIggyUsers
     ///     A task that represents the asynchronous operation and returns the created user information, or null if
     ///     creation failed.
     /// </returns>
-    Task<UserResponse?> CreateUser(string userName, string password, UserStatus status, Permissions? permissions = null,
+    Task<UserResponse?> CreateUserAsync(string userName, string password, UserStatus status, Permissions? permissions = null,
         CancellationToken token = default);
 
     /// <summary>
@@ -62,7 +62,7 @@ public interface IIggyUsers
     /// <param name="userId">The identifier of the user to delete (numeric ID or username).</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task representing the asynchronous operation.</returns>
-    Task DeleteUser(Identifier userId, CancellationToken token = default);
+    Task DeleteUserAsync(Identifier userId, CancellationToken token = default);
 
     /// <summary>
     ///     Updates user properties such as username and status.
@@ -72,7 +72,7 @@ public interface IIggyUsers
     /// <param name="status">The new status (optional).</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task representing the asynchronous operation.</returns>
-    Task UpdateUser(Identifier userId, string? userName = null, UserStatus? status = null,
+    Task UpdateUserAsync(Identifier userId, string? userName = null, UserStatus? status = null,
         CancellationToken token = default);
 
     /// <summary>
@@ -82,7 +82,7 @@ public interface IIggyUsers
     /// <param name="permissions">The new permissions to assign (null will remove all permissions).</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task representing the asynchronous operation.</returns>
-    Task UpdatePermissions(Identifier userId, Permissions? permissions = null, CancellationToken token = default);
+    Task UpdatePermissionsAsync(Identifier userId, Permissions? permissions = null, CancellationToken token = default);
 
     /// <summary>
     ///     Changes the password for a user.
@@ -92,7 +92,7 @@ public interface IIggyUsers
     /// <param name="newPassword">The new password for the user.</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task representing the asynchronous operation.</returns>
-    Task ChangePassword(Identifier userId, string currentPassword, string newPassword,
+    Task ChangePasswordAsync(Identifier userId, string currentPassword, string newPassword,
         CancellationToken token = default);
 
     /// <summary>
@@ -108,12 +108,12 @@ public interface IIggyUsers
     ///     A task that represents the asynchronous operation and returns authentication response with session
     ///     information, or null if login failed.
     /// </returns>
-    Task<AuthResponse?> LoginUser(string userName, string password, CancellationToken token = default);
+    Task<AuthResponse?> LoginUserAsync(string userName, string password, CancellationToken token = default);
 
     /// <summary>
     ///     Logs out the current user, invalidating the current session.
     /// </summary>
     /// <param name="token">The cancellation token to cancel the operation.</param>
     /// <returns>A task representing the asynchronous operation.</returns>
-    Task LogoutUser(CancellationToken token = default);
+    Task LogoutUserAsync(CancellationToken token = default);
 }

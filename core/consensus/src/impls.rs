@@ -108,7 +108,7 @@ impl PipelineEntry {
     /// Returns the new count of acknowledgments.
     pub fn add_ack(&mut self, replica: u8) -> usize {
         self.ok_from_replicas.insert(replica as usize);
-        self.ok_from_replicas.len()
+        self.ok_from_replicas.count()
     }
 
     /// Check if we have an ack from the given replica.
@@ -120,7 +120,7 @@ impl PipelineEntry {
     /// Get the number of acks received.
     #[must_use]
     pub fn ack_count(&self) -> usize {
-        self.ok_from_replicas.len()
+        self.ok_from_replicas.count()
     }
 }
 
@@ -650,7 +650,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Count SVCs from OTHER replicas (excluding self).
     fn svc_count_excluding_self(&self) -> usize {
         let svc = self.start_view_change_from_all_replicas.borrow();
-        let total = svc.len();
+        let total = svc.count();
         if svc.contains(self.replica as usize) {
             total.saturating_sub(1)
         } else {
@@ -662,7 +662,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     fn reset_svc_quorum(&self) {
         self.start_view_change_from_all_replicas
             .borrow_mut()
-            .clear();
+            .make_empty();
     }
 
     /// Reset DVC quorum tracking.
