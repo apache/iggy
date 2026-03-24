@@ -333,7 +333,7 @@ impl IggyMessagesBatchMut {
         let first_offset = self.first_offset()?;
 
         if start_offset < first_offset {
-            return self.slice_by_index(0, count);
+            return None;
         }
 
         let last_offset = self.last_offset()?;

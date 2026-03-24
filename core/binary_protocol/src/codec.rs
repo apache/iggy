@@ -75,6 +75,32 @@ pub fn read_u8(buf: &[u8], offset: usize) -> Result<u8, WireError> {
         })
 }
 
+/// Helper to read a `u16` LE from `buf` at `offset`.
+///
+/// # Errors
+/// Returns `WireError::UnexpectedEof` if fewer than 2 bytes remain.
+#[allow(clippy::missing_panics_doc)]
+#[inline]
+pub fn read_u16_le(buf: &[u8], offset: usize) -> Result<u16, WireError> {
+    let end = offset
+        .checked_add(2)
+        .ok_or_else(|| WireError::UnexpectedEof {
+            offset,
+            need: 2,
+            have: buf.len().saturating_sub(offset),
+        })?;
+    let slice = buf
+        .get(offset..end)
+        .ok_or_else(|| WireError::UnexpectedEof {
+            offset,
+            need: 2,
+            have: buf.len().saturating_sub(offset),
+        })?;
+    Ok(u16::from_le_bytes(
+        slice.try_into().expect("slice is exactly 2 bytes"),
+    ))
+}
+
 /// Helper to read a `u32` LE from `buf` at `offset`.
 ///
 /// # Errors
@@ -223,4 +249,36 @@ pub fn read_bytes(buf: &[u8], offset: usize, len: usize) -> Result<&[u8], WireEr
             need: len,
             have: buf.len().saturating_sub(offset),
         })
+}
+
+/// Cap a pre-allocation hint so a bogus wire count cannot cause OOM.
+/// The actual count is validated by the decode loop - this only limits
+/// the upfront allocation.
+#[inline]
+#[must_use]
+pub fn capped_capacity(count: usize, remaining: usize, min_item_size: usize) -> usize {
+    if min_item_size == 0 {
+        return count;
+    }
+    count.min(remaining / min_item_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capped_capacity_limits_allocation() {
+        assert_eq!(capped_capacity(1_000_000, 100, 10), 10);
+        assert_eq!(capped_capacity(5, 100, 10), 5);
+        assert_eq!(capped_capacity(10, 100, 10), 10);
+        assert_eq!(capped_capacity(11, 100, 10), 10);
+        assert_eq!(capped_capacity(0, 100, 10), 0);
+        assert_eq!(capped_capacity(100, 0, 10), 0);
+    }
+
+    #[test]
+    fn capped_capacity_zero_item_size_returns_count() {
+        assert_eq!(capped_capacity(1_000_000, 100, 0), 1_000_000);
+    }
 }

@@ -19,11 +19,11 @@ use crate::streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet};
 use iggy_common::{IggyByteSize, IggyError};
 use std::fmt::Debug;
 
-// TODO: Will have to revisit this Journal abstraction....
-// I don't like that it has to leak impl detail via the `Inner` struct in order to be functional.
-
 #[derive(Default, Debug)]
 pub struct Inner {
+    /// Base offset for the next journal epoch. After commit(), set to
+    /// current_offset + 1. Used in `append()`: `current_offset = base_offset +
+    /// messages_count - 1`.
     pub base_offset: u64,
     pub current_offset: u64,
     pub first_timestamp: u64,
@@ -32,17 +32,30 @@ pub struct Inner {
     pub size: IggyByteSize,
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct MemoryMessageJournal {
     batches: IggyMessagesBatchSet,
     inner: Inner,
 }
 
-impl Clone for MemoryMessageJournal {
-    fn clone(&self) -> Self {
+impl MemoryMessageJournal {
+    /// Create an empty journal for a fresh partition (no existing data).
+    pub fn empty() -> Self {
         Self {
-            batches: Default::default(),
-            inner: Default::default(),
+            batches: IggyMessagesBatchSet::default(),
+            inner: Inner::default(),
+        }
+    }
+
+    /// Create an empty journal positioned at the given offset. Used after
+    /// bootstrap when the partition already has data on disk up to some offset.
+    pub fn at_offset(base_offset: u64) -> Self {
+        Self {
+            batches: IggyMessagesBatchSet::default(),
+            inner: Inner {
+                base_offset,
+                ..Default::default()
+            },
         }
     }
 }
@@ -62,6 +75,26 @@ impl Journal for MemoryMessageJournal {
             self.inner.messages_count,
             batch_messages_count
         );
+
+        // Defense-in-depth: on first append after empty/default state, correct
+        // base_offset from the batch's actual first offset. Mirrors the existing
+        // first_timestamp initialization pattern below. Catches code paths that
+        // create a journal without calling init().
+        if self.inner.messages_count == 0
+            && let Some(first_offset) = entry.first_offset()
+        {
+            // Allow disagreement when either side is 0 (fresh partition or
+            // reset after purge). Only flag when both are non-zero and differ.
+            debug_assert!(
+                self.inner.base_offset == 0
+                    || first_offset == 0
+                    || self.inner.base_offset == first_offset,
+                "journal base_offset ({}) disagrees with batch first_offset ({})",
+                self.inner.base_offset,
+                first_offset
+            );
+            self.inner.base_offset = first_offset;
+        }
 
         let batch_size = entry.size();
         let first_timestamp = entry.first_timestamp().unwrap();
@@ -107,6 +140,38 @@ impl Journal for MemoryMessageJournal {
     fn inner(&self) -> &Self::Inner {
         &self.inner
     }
+
+    fn first_offset(&self) -> Option<u64> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.inner.base_offset)
+        }
+    }
+
+    fn last_offset(&self) -> Option<u64> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.inner.current_offset)
+        }
+    }
+
+    fn first_timestamp(&self) -> Option<u64> {
+        if self.is_empty() || self.inner.first_timestamp == 0 {
+            None
+        } else {
+            Some(self.inner.first_timestamp)
+        }
+    }
+
+    fn last_timestamp(&self) -> Option<u64> {
+        if self.is_empty() || self.inner.end_timestamp == 0 {
+            None
+        } else {
+            Some(self.inner.end_timestamp)
+        }
+    }
 }
 
 pub trait Journal {
@@ -126,6 +191,18 @@ pub trait Journal {
     fn is_empty(&self) -> bool;
 
     fn inner(&self) -> &Self::Inner;
+
+    /// First offset of data in the journal, or None if empty.
+    fn first_offset(&self) -> Option<u64>;
+
+    /// Last offset of data in the journal, or None if empty.
+    fn last_offset(&self) -> Option<u64>;
+
+    /// Timestamp of first message in journal, or None if empty.
+    fn first_timestamp(&self) -> Option<u64>;
+
+    /// Timestamp of last message in journal, or None if empty.
+    fn last_timestamp(&self) -> Option<u64>;
 
     // `flush` is only useful in case of an journal that has disk backed WAL.
     // This could be merged together with `append`, but not doing this for two reasons.

@@ -18,6 +18,7 @@
 
 pub mod authentication_scenario;
 pub mod bench_scenario;
+pub mod concurrent_produce_consume_scenario;
 pub mod concurrent_scenario;
 pub mod consumer_group_auto_commit_reconnection_scenario;
 pub mod consumer_group_join_scenario;
@@ -39,6 +40,7 @@ pub mod permissions_scenario;
 pub mod purge_delete_scenario;
 pub mod read_during_persistence_scenario;
 pub mod reconnect_after_restart_scenario;
+pub mod restart_offset_skip_scenario;
 pub mod segment_rotation_race_scenario;
 pub mod single_message_per_batch_scenario;
 pub mod snapshot_scenario;
