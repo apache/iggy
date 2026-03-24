@@ -33,7 +33,7 @@ pub struct ConsumerGroupInfoResponse {
 }
 
 impl ConsumerGroupInfoResponse {
-    const SIZE: usize = 12;
+    pub(crate) const SIZE: usize = 12;
 }
 
 impl WireEncode for ConsumerGroupInfoResponse {
