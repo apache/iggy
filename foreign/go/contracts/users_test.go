@@ -77,12 +77,15 @@ func TestPermissions_MarshalBinary_WithStreamsAndTopics(t *testing.T) {
 		t.Fatalf("MarshalBinary failed: %v", err)
 	}
 
-	// Verify structure
+	// Verify structure and values
 	position := 0
 
-	// Global permissions (10 bytes)
-	if bytes[position] != 1 {
-		t.Errorf("Expected ManageServers=1, got %d", bytes[position])
+	// Verify global permissions (10 bytes)
+	expectedGlobal := []byte{1, 0, 1, 0, 1, 0, 1, 0, 1, 0}
+	for i := 0; i < 10; i++ {
+		if bytes[position+i] != expectedGlobal[i] {
+			t.Errorf("Global permission byte %d: expected %d, got %d", i, expectedGlobal[i], bytes[position+i])
+		}
 	}
 	position += 10
 
@@ -92,52 +95,116 @@ func TestPermissions_MarshalBinary_WithStreamsAndTopics(t *testing.T) {
 	}
 	position++
 
-	// Verify continuation flags are present for streams
-	// We should have 2 streams, so we need to find stream continuation flags
-	streamsFound := 0
-	for position < len(bytes) {
-		// Each stream has: 4 bytes (ID) + 6 bytes (perms) + 1 byte (has_topics) + topics + 1 byte (has_next_stream)
-		if position+4 > len(bytes) {
-			break
-		}
-		streamID := binary.LittleEndian.Uint32(bytes[position : position+4])
-		if streamID == 0 {
-			break
-		}
-		position += 4 // stream ID
-		position += 6 // stream permissions
-		position += 1 // has_topics flag
+	// Track streams found (map because order is non-deterministic)
+	streamsFound := make(map[uint32]bool)
 
-		// Skip topics if present
-		if bytes[position-1] == 1 {
-			// Topics exist, need to skip them
-			for position+4 <= len(bytes) {
-				position += 4 // topic ID
-				position += 4 // topic permissions
-				if position >= len(bytes) {
-					t.Fatalf("Unexpected end of bytes while reading topic continuation flag")
+	// Read and verify streams
+	for position+4 <= len(bytes) {
+		// Read stream ID
+		streamID := binary.LittleEndian.Uint32(bytes[position : position+4])
+		position += 4
+
+		// Verify stream permissions based on stream ID
+		var expectedStreamPerms []byte
+		switch streamID {
+		case 1:
+			expectedStreamPerms = []byte{1, 0, 1, 0, 1, 0} // ManageStream=true, ReadStream=false, etc.
+		case 2:
+			expectedStreamPerms = []byte{0, 1, 0, 1, 0, 1}
+		default:
+			t.Fatalf("Unexpected stream ID: %d", streamID)
+		}
+
+		for i := 0; i < 6; i++ {
+			if bytes[position+i] != expectedStreamPerms[i] {
+				t.Errorf("Stream %d permission byte %d: expected %d, got %d", streamID, i, expectedStreamPerms[i], bytes[position+i])
+			}
+		}
+		position += 6
+
+		// Read has_topics flag
+		hasTopics := bytes[position]
+		position++
+
+		// Verify and read topics if present
+		if hasTopics == 1 {
+			if streamID != 1 {
+				t.Errorf("Stream %d should not have topics", streamID)
+			}
+
+			topicsFound := make(map[uint32]bool)
+			for {
+				if position+4 > len(bytes) {
+					t.Fatalf("Unexpected end while reading topic ID")
 				}
+
+				// Read topic ID
+				topicID := binary.LittleEndian.Uint32(bytes[position : position+4])
+				position += 4
+
+				// Verify topic permissions
+				var expectedTopicPerms []byte
+				switch topicID {
+				case 10:
+					expectedTopicPerms = []byte{1, 0, 1, 0}
+				case 20:
+					expectedTopicPerms = []byte{0, 1, 0, 1}
+				default:
+					t.Fatalf("Unexpected topic ID: %d", topicID)
+				}
+
+				for i := 0; i < 4; i++ {
+					if bytes[position+i] != expectedTopicPerms[i] {
+						t.Errorf("Topic %d permission byte %d: expected %d, got %d", topicID, i, expectedTopicPerms[i], bytes[position+i])
+					}
+				}
+				position += 4
+
+				topicsFound[topicID] = true
+
+				// Read has_next_topic flag
 				hasNextTopic := bytes[position]
 				position++
+
+				// Verify continuation flag logic
+				if len(topicsFound) == 1 && hasNextTopic != 1 {
+					t.Errorf("Expected has_next_topic=1 for first topic, got %d", hasNextTopic)
+				}
+				if len(topicsFound) == 2 && hasNextTopic != 0 {
+					t.Errorf("Expected has_next_topic=0 for last topic, got %d", hasNextTopic)
+				}
+
 				if hasNextTopic == 0 {
 					break
 				}
 			}
+
+			// Verify all topics were found
+			if len(topicsFound) != 2 {
+				t.Errorf("Expected 2 topics, found %d", len(topicsFound))
+			}
+			if !topicsFound[10] || !topicsFound[20] {
+				t.Errorf("Expected topics 10 and 20, found: %v", topicsFound)
+			}
+		} else if streamID == 1 {
+			t.Errorf("Stream 1 should have topics")
 		}
 
-		// Check stream continuation flag
+		streamsFound[streamID] = true
+
+		// Read has_next_stream flag
 		if position >= len(bytes) {
-			t.Fatalf("Unexpected end of bytes while reading stream continuation flag")
+			t.Fatalf("Unexpected end while reading stream continuation flag")
 		}
 		hasNextStream := bytes[position]
 		position++
-		streamsFound++
 
-		if streamsFound == 1 && hasNextStream != 1 {
+		// Verify continuation flag logic
+		if len(streamsFound) == 1 && hasNextStream != 1 {
 			t.Errorf("Expected has_next_stream=1 for first stream, got %d", hasNextStream)
 		}
-		if streamsFound == 2 && hasNextStream != 0 {
-			t.Errorf("Expected has_next_stream=0 for second stream, got %d", hasNextStream)
+		if len(streamsFound) == 2 && hasNextStream != 0 {
+			t.Errorf("Expected has_next_stream=0 for last stream, got %d", hasNextStream)
 		}
 
 		if hasNextStream == 0 {
@@ -145,8 +212,12 @@ func TestPermissions_MarshalBinary_WithStreamsAndTopics(t *testing.T) {
 		}
 	}
 
-	if streamsFound != 2 {
-		t.Errorf("Expected 2 streams, found %d", streamsFound)
+	// Verify all streams were found
+	if len(streamsFound) != 2 {
+		t.Errorf("Expected 2 streams, found %d", len(streamsFound))
+	}
+	if !streamsFound[1] || !streamsFound[2] {
+		t.Errorf("Expected streams 1 and 2, found: %v", streamsFound)
 	}
 }
 
