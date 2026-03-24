@@ -212,7 +212,10 @@ validate() {
     --set server.users.root.createSecret=false \
     --set server.users.root.existingSecret.name=supersecret \
     > "$HELM_RENDER_DIR/existing-secret.yaml"
-  ! grep -q 'root-credentials' "$HELM_RENDER_DIR/existing-secret.yaml"
+  if grep -q 'root-credentials' "$HELM_RENDER_DIR/existing-secret.yaml"; then
+    echo "Error: existing-secret render should not include generated root credentials" >&2
+    exit 1
+  fi
   grep -q 'name: supersecret' "$HELM_RENDER_DIR/existing-secret.yaml"
 }
 
