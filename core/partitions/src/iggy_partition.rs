@@ -79,7 +79,7 @@ impl IggyPartition {
         let mut position = header_size + 4;
         bytes[position..position + indexes.len()].copy_from_slice(indexes);
         position += indexes.len();
-        bytes[position..position + batch.len()].copy_from_slice(batch);
+        bytes[position..position + batch.len()].copy_from_slice(batch.as_bytes());
 
         Message::<PrepareHeader>::from_bytes(bytes.freeze())
             .expect("prepare_message_from_batch: invalid prepared message bytes")
