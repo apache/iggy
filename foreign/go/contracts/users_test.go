@@ -111,10 +111,7 @@ func TestPermissions_MarshalBinary_WithStreamsAndTopics(t *testing.T) {
 		// Skip topics if present
 		if bytes[position-1] == 1 {
 			// Topics exist, need to skip them
-			for {
-				if position+4 > len(bytes) {
-					break
-				}
+			for position+4 <= len(bytes) {
 				position += 4 // topic ID
 				position += 4 // topic permissions
 				if position >= len(bytes) {
