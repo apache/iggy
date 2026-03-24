@@ -19,8 +19,12 @@ use crate::{
     header::RequestHeader,
     types::consensus::header::{self, ConsensusHeader, PrepareHeader, PrepareOkHeader},
 };
-use bytes::Bytes;
+use iobuf::{Frozen, Owned, Prefix};
 use std::marker::PhantomData;
+
+const MESSAGE_ALIGN: usize = 4096;
+type MessageOwned = Owned<MESSAGE_ALIGN>;
+type MessageBuffer = (Prefix<MESSAGE_ALIGN>, Frozen<MESSAGE_ALIGN>);
 
 // TODO: Rename this to Message and ConsensusHeader to Header.
 pub trait ConsensusMessage<H>
@@ -36,7 +40,7 @@ where
     H: ConsensusHeader,
 {
     fn header(&self) -> &H {
-        let header_bytes = &self.buffer[..size_of::<H>()];
+        let header_bytes = &self.prefix[..size_of::<H>()];
         bytemuck::checked::try_from_bytes(header_bytes)
             .expect("header validated at construction time")
     }
@@ -44,7 +48,8 @@ where
 
 #[derive(Debug, Clone)]
 pub struct Message<H: ConsensusHeader> {
-    buffer: Bytes,
+    prefix: Prefix<MESSAGE_ALIGN>,
+    tail: Frozen<MESSAGE_ALIGN>,
     _marker: PhantomData<H>,
 }
 
@@ -55,41 +60,30 @@ where
     #[inline]
     #[allow(unused)]
     pub fn header(&self) -> &H {
-        let header_bytes = &self.buffer[..size_of::<H>()];
+        let header_bytes = &self.prefix[..size_of::<H>()];
         bytemuck::checked::try_from_bytes(header_bytes)
             .expect("header validated at construction time")
     }
 
-    /// Create a new message from a buffer.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - buffer is too small for the header
-    /// - buffer contains invalid bit patterns (enum discriminants)
-    /// - buffer is too small for the size specified in the header
-    /// - header validation fails
     #[allow(unused)]
-    pub fn from_bytes(buffer: Bytes) -> Result<Self, header::ConsensusError> {
-        // verify minimum size
-        if buffer.len() < size_of::<H>() {
+    pub fn from_inner(buffer: MessageBuffer) -> Result<Self, header::ConsensusError> {
+        let (prefix, tail) = buffer;
+        let total_len = prefix.len() + tail.len();
+
+        if total_len < size_of::<H>() || prefix.len() < size_of::<H>() {
             return Err(header::ConsensusError::InvalidCommand {
                 expected: H::COMMAND,
                 found: header::Command2::Reserved,
             });
         }
 
-        // Validate bit patterns (enum discriminants) via try_from_bytes
-        let header_bytes = &buffer[..size_of::<H>()];
+        let header_bytes = &prefix[..size_of::<H>()];
         let header = bytemuck::checked::try_from_bytes::<H>(header_bytes)
             .map_err(|_| header::ConsensusError::InvalidBitPattern)?;
 
-        // validate the header
         header.validate()?;
 
-        // verify buffer size matches header.size
-        let header_size = header.size() as usize;
-        if buffer.len() < header_size {
+        if total_len < header.size() as usize {
             return Err(header::ConsensusError::InvalidCommand {
                 expected: H::COMMAND,
                 found: header::Command2::Reserved,
@@ -97,7 +91,8 @@ where
         }
 
         Ok(Self {
-            buffer,
+            prefix,
+            tail,
             _marker: PhantomData,
         })
     }
@@ -108,9 +103,10 @@ where
     #[allow(unused)]
     pub fn new(size: usize) -> Self {
         assert!(size >= size_of::<H>(), "Size must be at least header size");
-        let buffer = Bytes::from(vec![0u8; size]);
+        let (prefix, tail) = MessageOwned::zeroed(size).split_at(size_of::<H>());
         Self {
-            buffer,
+            prefix,
+            tail,
             _marker: PhantomData,
         }
     }
@@ -123,71 +119,27 @@ where
         let old_header = *self.header();
 
         // Safety: We ensured that size_of::<H>() == size_of::<T>()
-        // On top of that, there is going to be only one reference to buffer during this function call
-        // so no other references can observe the mutation.
-        // In the future we can replace the `Bytes` buffer with something that does not allow sharing between different threads.
-        let buffer = self.into_inner();
-        unsafe {
-            let ptr = buffer.as_ptr() as *mut u8;
-            let slice = std::slice::from_raw_parts_mut(ptr, size_of::<T>());
-            // Zero out to ensure valid bit patterns before creating a typed reference.
-            slice.fill(0);
-            let new_header =
-                bytemuck::checked::try_from_bytes_mut(slice).expect("zeroed bytes are valid");
-            f(old_header, new_header);
-        }
+        // Only the consensus header bytes are mutated. The command-specific
+        // prefix and immutable tail remain untouched.
+        let (mut prefix, tail) = self.into_inner();
+        let slice = &mut prefix[..size_of::<T>()];
+        slice.fill(0);
+        let new_header =
+            bytemuck::checked::try_from_bytes_mut(slice).expect("zeroed bytes are valid");
+        f(old_header, new_header);
 
         Message {
-            buffer,
+            prefix,
+            tail,
             _marker: PhantomData,
         }
-    }
-
-    /// Get a reference to the message body (everything after the header).
-    ///
-    /// Returns an empty slice if there is no body.
-    #[inline]
-    #[allow(unused)]
-    pub fn body(&self) -> &[u8] {
-        let header_size = size_of::<H>();
-        let total_size = self.header().size() as usize;
-
-        if total_size > header_size {
-            &self.buffer[header_size..total_size]
-        } else {
-            &[]
-        }
-    }
-
-    /// Get the message body as zero-copy `Bytes`.
-    ///
-    /// Returns an empty `Bytes` if there is no body.
-    #[inline]
-    #[allow(unused)]
-    pub fn body_bytes(&self) -> Bytes {
-        let header_size = size_of::<H>();
-        let total_size = self.header().size() as usize;
-
-        if total_size > header_size {
-            self.buffer.slice(header_size..total_size)
-        } else {
-            Bytes::new()
-        }
-    }
-
-    /// Get the complete message as bytes (header + body).
-    #[inline]
-    #[allow(unused)]
-    pub fn as_bytes(&self) -> &[u8] {
-        let total_size = self.header().size() as usize;
-        &self.buffer[..total_size]
     }
 
     /// Convert into the underlying buffer.
     #[inline]
     #[allow(unused)]
-    pub fn into_inner(self) -> Bytes {
-        self.buffer
+    pub fn into_inner(self) -> MessageBuffer {
+        (self.prefix, self.tail)
     }
 
     /// Create a message from a buffer without validation.
@@ -199,9 +151,11 @@ where
     /// - If doing a zero-cost type conversion (like to GenericHeader)
     #[inline]
     #[allow(unused)]
-    unsafe fn from_buffer_unchecked(buffer: Bytes) -> Self {
+    unsafe fn from_buffer_unchecked(buffer: MessageBuffer) -> Self {
+        let (prefix, tail) = buffer;
         Self {
-            buffer,
+            prefix,
+            tail,
             _marker: PhantomData,
         }
     }
@@ -211,7 +165,7 @@ where
     /// This allows treating any message as a generic message for common operations.
     #[allow(unused)]
     pub fn into_generic(self) -> Message<header::GenericHeader> {
-        unsafe { Message::from_buffer_unchecked(self.buffer) }
+        unsafe { Message::from_buffer_unchecked((self.prefix, self.tail)) }
     }
 
     /// Get a reference to this message as a generic message.
@@ -237,7 +191,7 @@ where
     where
         T: ConsensusHeader,
     {
-        if self.buffer.len() < size_of::<T>() {
+        if self.total_len() < size_of::<T>() || self.prefix.len() < size_of::<T>() {
             return Err(header::ConsensusError::InvalidCommand {
                 expected: T::COMMAND,
                 found: header::Command2::Reserved,
@@ -253,13 +207,13 @@ where
         }
 
         // Validate bit patterns for the target type
-        let header_bytes = &self.buffer[..size_of::<T>()];
+        let header_bytes = &self.prefix[..size_of::<T>()];
         let header = bytemuck::checked::try_from_bytes::<T>(header_bytes)
             .map_err(|_| header::ConsensusError::InvalidBitPattern)?;
 
         header.validate()?;
 
-        Ok(unsafe { Message::<T>::from_buffer_unchecked(self.buffer) })
+        Ok(unsafe { Message::<T>::from_buffer_unchecked((self.prefix, self.tail)) })
     }
 
     /// Try to get a reference to this message as a different header type.
@@ -271,7 +225,7 @@ where
         T: ConsensusHeader,
     {
         // check buffer size
-        if self.buffer.len() < size_of::<T>() {
+        if self.total_len() < size_of::<T>() || self.prefix.len() < size_of::<T>() {
             return Err(header::ConsensusError::InvalidCommand {
                 expected: T::COMMAND,
                 found: header::Command2::Reserved,
@@ -288,7 +242,7 @@ where
         }
 
         // Validate bit patterns for the target type
-        let header_bytes = &self.buffer[..size_of::<T>()];
+        let header_bytes = &self.prefix[..size_of::<T>()];
         bytemuck::checked::try_from_bytes::<T>(header_bytes)
             .map_err(|_| header::ConsensusError::InvalidBitPattern)?
             .validate()?;
@@ -296,6 +250,21 @@ where
         let typed_message = unsafe { &*(self as *const Self as *const Message<T>) };
 
         Ok(typed_message)
+    }
+
+    fn total_len(&self) -> usize {
+        self.prefix.len() + self.tail.len()
+    }
+}
+
+impl<H> TryFrom<MessageBuffer> for Message<H>
+where
+    H: ConsensusHeader,
+{
+    type Error = header::ConsensusError;
+
+    fn try_from(buffer: MessageBuffer) -> Result<Self, Self::Error> {
+        Self::from_inner(buffer)
     }
 }
 
@@ -378,6 +347,28 @@ mod tests {
 
     use super::*;
 
+    fn merged_body<H>(message: &Message<H>) -> Vec<u8>
+    where
+        H: ConsensusHeader,
+    {
+        let total_size = message.header().size() as usize;
+        let header_size = size_of::<H>();
+        let split_at = message.prefix.len();
+
+        if total_size <= split_at {
+            return message.prefix[header_size..total_size].to_vec();
+        }
+
+        if split_at <= header_size {
+            return message.tail[..total_size - header_size].to_vec();
+        }
+
+        let mut body = Vec::with_capacity(total_size - header_size);
+        body.extend_from_slice(&message.prefix[header_size..split_at]);
+        body.extend_from_slice(&message.tail[..total_size - split_at]);
+        body
+    }
+
     trait MessageFactory: ConsensusHeader + Sized {
         fn create_test() -> Message<Self>;
     }
@@ -407,7 +398,8 @@ mod tests {
                 *item = (i % 256) as u8;
             }
 
-            Message::<Self>::from_bytes(buffer.freeze()).unwrap()
+            Message::try_from(MessageOwned::copy_from_slice(buffer.as_ref()).split_at(header_size))
+                .expect("test buffer must contain a valid consensus message")
         }
     }
 
@@ -435,7 +427,8 @@ mod tests {
             header.timestamp = 1234567890;
             header.operation = header::Operation::CreateStream;
 
-            Message::<Self>::from_bytes(buffer.freeze()).unwrap()
+            Message::try_from(MessageOwned::copy_from_slice(buffer.as_ref()).split_at(header_size))
+                .expect("test buffer must contain a valid consensus message")
         }
     }
 
@@ -457,7 +450,8 @@ mod tests {
             header.replica = 2;
             header.commit = 50;
 
-            Message::<Self>::from_bytes(buffer.freeze()).unwrap()
+            Message::try_from(MessageOwned::copy_from_slice(buffer.as_ref()).split_at(header_size))
+                .expect("test buffer must contain a valid consensus message")
         }
     }
 
@@ -482,7 +476,8 @@ mod tests {
             header.commit = 99;
             header.operation = header::Operation::CreateStream;
 
-            Message::<Self>::from_bytes(buffer.freeze()).unwrap()
+            Message::try_from(MessageOwned::copy_from_slice(buffer.as_ref()).split_at(header_size))
+                .expect("test buffer must contain a valid consensus message")
         }
     }
 
@@ -493,13 +488,13 @@ mod tests {
         assert_eq!(message.header().cluster, 12345);
         assert_eq!(message.header().command, header::Command2::Reserved);
         assert_eq!(
-            message.body().len(),
+            merged_body(&message).len(),
             message.header().size() as usize - size_of::<header::GenericHeader>()
         );
 
-        let body = message.body();
+        let body = merged_body(&message);
         let header_size = size_of::<header::GenericHeader>();
-        for (i, &byte) in body.iter().enumerate() {
+        for (i, byte) in body.into_iter().enumerate() {
             let expected = ((i + header_size) % 256) as u8;
             assert_eq!(byte, expected);
         }
@@ -508,8 +503,8 @@ mod tests {
     #[test]
     fn test_message_conversion() {
         let prepare_message = header::PrepareHeader::create_test();
-
-        let original_bytes = prepare_message.as_bytes().to_vec();
+        let original_header = *prepare_message.header();
+        let original_body = merged_body(&prepare_message);
 
         let generic_message = prepare_message.into_generic();
         assert_eq!(generic_message.header().command, header::Command2::Prepare);
@@ -521,12 +516,12 @@ mod tests {
         assert_eq!(prepare_again.header().view, 1);
         assert_eq!(prepare_again.header().cluster, 12345);
 
-        let roundtrip_bytes = prepare_again.as_bytes().to_vec();
-
         assert_eq!(
-            original_bytes, roundtrip_bytes,
-            "Bytes should be identical after round-trip conversion"
+            bytemuck::bytes_of(&original_header),
+            bytemuck::bytes_of(prepare_again.header()),
+            "Header should be identical after round-trip conversion"
         );
+        assert_eq!(original_body, merged_body(&prepare_again));
     }
 
     #[test]

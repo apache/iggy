@@ -23,6 +23,7 @@ use iggy_common::{
     message::Message,
     sharding::IggyNamespace,
 };
+use iobuf::Owned;
 use std::cell::Cell;
 
 // TODO: Proper client which implements the full client SDK API
@@ -130,8 +131,6 @@ impl SimClient {
         payload: &[u8],
         namespace: IggyNamespace,
     ) -> Message<RequestHeader> {
-        use bytes::Bytes;
-
         let header_size = std::mem::size_of::<RequestHeader>();
         let total_size = header_size + payload.len();
 
@@ -159,14 +158,12 @@ impl SimClient {
         buffer.extend_from_slice(header_bytes);
         buffer.extend_from_slice(payload);
 
-        Message::<RequestHeader>::from_bytes(Bytes::from(buffer))
-            .expect("failed to build request message")
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer).split_at(header_size))
+            .expect("request buffer must contain a valid request message")
     }
 
     #[allow(clippy::cast_possible_truncation)]
     fn build_request(&self, operation: Operation, payload: &[u8]) -> Message<RequestHeader> {
-        use bytes::Bytes;
-
         let header_size = std::mem::size_of::<RequestHeader>();
         let total_size = header_size + payload.len();
 
@@ -193,7 +190,7 @@ impl SimClient {
         buffer.extend_from_slice(header_bytes);
         buffer.extend_from_slice(payload);
 
-        Message::<RequestHeader>::from_bytes(Bytes::from(buffer))
-            .expect("failed to build request message")
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer).split_at(header_size))
+            .expect("request buffer must contain a valid request message")
     }
 }

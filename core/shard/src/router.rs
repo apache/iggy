@@ -22,7 +22,7 @@ use iggy_common::header::{ConsensusError, GenericHeader, PrepareHeader};
 use iggy_common::message::{Message, MessageBag};
 use iggy_common::sharding::IggyNamespace;
 use journal::{Journal, JournalHandle};
-use message_bus::MessageBus;
+use message_bus::{ClientBuffers, MessageBus};
 use metadata::stm::StateMachine;
 
 /// Inter-shard dispatch logic.
@@ -144,7 +144,12 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn run_message_pump(&self, stop: Receiver<()>)
     where
-        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        B: MessageBus<
+                Replica = u8,
+                Data = Message<GenericHeader>,
+                Client = u128,
+                ClientData = ClientBuffers,
+            >,
         J: JournalHandle,
         <J as JournalHandle>::Target: Journal<
                 <J as JournalHandle>::Storage,
@@ -178,7 +183,12 @@ where
     #[allow(clippy::future_not_send)]
     async fn process_frame(&self, frame: ShardFrame<R>)
     where
-        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        B: MessageBus<
+                Replica = u8,
+                Data = Message<GenericHeader>,
+                Client = u128,
+                ClientData = ClientBuffers,
+            >,
         J: JournalHandle,
         <J as JournalHandle>::Target: Journal<
                 <J as JournalHandle>::Storage,

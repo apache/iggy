@@ -15,13 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::{
-    INDEX_SIZE, IggyByteSize, IggyIndexesMut, IggyMessagesBatch, IggyMessagesBatchSetInFlight,
-    Segment, SegmentStorage,
-};
+use crate::frozen_messages_writer::FrozenMessagesWriter;
+use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndexCache};
+use crate::iggy_index_writer::IggyIndexWriter;
+use crate::segment::Segment;
+use iggy_common::{IggyByteSize, IggyMessagesBatch, IggyMessagesBatchSetInFlight, SegmentStorage};
 use journal::{Journal, Storage};
 use ringbuffer::AllocRingBuffer;
 use std::fmt::Debug;
+use std::rc::Rc;
 
 const SEGMENTS_CAPACITY: usize = 1024;
 const ACCESS_MAP_CAPACITY: usize = 8;
@@ -38,6 +40,7 @@ pub struct JournalInfo {
     pub current_offset: u64,
     pub first_timestamp: u64,
     pub end_timestamp: u64,
+    pub max_timestamp: u64,
     pub messages_count: u32,
     pub size: IggyByteSize,
 }
@@ -104,8 +107,10 @@ where
     _access_map: AllocRingBuffer<usize>,
     _cache: (),
     segments: Vec<Segment>,
-    indexes: Vec<Option<IggyIndexesMut>>,
+    indexes: Vec<Option<IggyIndexCache>>,
     storage: Vec<SegmentStorage>,
+    frozen_writers: Vec<Option<Rc<FrozenMessagesWriter>>>,
+    index_writers: Vec<Option<Rc<IggyIndexWriter>>>,
     in_flight: IggyMessagesBatchSetInFlight,
 }
 
@@ -123,6 +128,8 @@ where
             segments: Vec::with_capacity(SEGMENTS_CAPACITY),
             storage: Vec::with_capacity(SEGMENTS_CAPACITY),
             indexes: Vec::with_capacity(SEGMENTS_CAPACITY),
+            frozen_writers: Vec::with_capacity(SEGMENTS_CAPACITY),
+            index_writers: Vec::with_capacity(SEGMENTS_CAPACITY),
             in_flight: IggyMessagesBatchSetInFlight::default(),
         }
     }
@@ -153,6 +160,22 @@ where
         &self.storage
     }
 
+    pub const fn frozen_writers(&self) -> &Vec<Option<Rc<FrozenMessagesWriter>>> {
+        &self.frozen_writers
+    }
+
+    pub const fn frozen_writers_mut(&mut self) -> &mut Vec<Option<Rc<FrozenMessagesWriter>>> {
+        &mut self.frozen_writers
+    }
+
+    pub const fn index_writers(&self) -> &Vec<Option<Rc<IggyIndexWriter>>> {
+        &self.index_writers
+    }
+
+    pub const fn index_writers_mut(&mut self) -> &mut Vec<Option<Rc<IggyIndexWriter>>> {
+        &mut self.index_writers
+    }
+
     pub fn active_segment(&self) -> &Segment {
         self.segments
             .last()
@@ -177,22 +200,22 @@ where
             .expect("active storage called on empty log")
     }
 
-    pub const fn indexes(&self) -> &Vec<Option<IggyIndexesMut>> {
+    pub const fn indexes(&self) -> &Vec<Option<IggyIndexCache>> {
         &self.indexes
     }
 
-    pub const fn indexes_mut(&mut self) -> &mut Vec<Option<IggyIndexesMut>> {
+    pub const fn indexes_mut(&mut self) -> &mut Vec<Option<IggyIndexCache>> {
         &mut self.indexes
     }
 
-    pub fn active_indexes(&self) -> Option<&IggyIndexesMut> {
+    pub fn active_indexes(&self) -> Option<&IggyIndexCache> {
         self.indexes
             .last()
             .expect("active indexes called on empty log")
             .as_ref()
     }
 
-    pub fn active_indexes_mut(&mut self) -> Option<&mut IggyIndexesMut> {
+    pub fn active_indexes_mut(&mut self) -> Option<&mut IggyIndexCache> {
         self.indexes
             .last_mut()
             .expect("active indexes called on empty log")
@@ -213,18 +236,26 @@ where
             .last_mut()
             .expect("active indexes called on empty log");
         if indexes.is_none() {
-            let capacity = SIZE_16MB / INDEX_SIZE;
-            *indexes = Some(IggyIndexesMut::with_capacity(capacity, 0));
+            let capacity = SIZE_16MB / IGGY_INDEX_SIZE;
+            *indexes = Some(IggyIndexCache::with_capacity(capacity));
         }
     }
 
-    pub fn add_persisted_segment(&mut self, segment: Segment, storage: SegmentStorage) {
+    pub fn add_persisted_segment(
+        &mut self,
+        segment: Segment,
+        storage: SegmentStorage,
+        frozen_writer: Option<Rc<FrozenMessagesWriter>>,
+        index_writer: Option<Rc<IggyIndexWriter>>,
+    ) {
         self.segments.push(segment);
         self.storage.push(storage);
         self.indexes.push(None);
+        self.frozen_writers.push(frozen_writer);
+        self.index_writers.push(index_writer);
     }
 
-    pub fn set_segment_indexes(&mut self, segment_index: usize, indexes: IggyIndexesMut) {
+    pub fn set_segment_indexes(&mut self, segment_index: usize, indexes: IggyIndexCache) {
         if let Some(segment_indexes) = self.indexes.get_mut(segment_index) {
             *segment_indexes = Some(indexes);
         }

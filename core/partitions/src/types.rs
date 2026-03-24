@@ -16,6 +16,7 @@
 // under the License.
 
 use iggy_common::{IggyByteSize, PollingStrategy};
+use iobuf::Frozen;
 
 /// Arguments for polling messages from a partition.
 #[derive(Debug, Clone)]
@@ -23,6 +24,35 @@ pub struct PollingArgs {
     pub strategy: PollingStrategy,
     pub count: u32,
     pub auto_commit: bool,
+}
+
+/// Poll result returned as an ordered fragment stream plus message-space metadata.
+#[derive(Debug, Clone, Default)]
+pub struct PolledBatches<const ALIGN: usize = 4096> {
+    pub fragments: Vec<Frozen<ALIGN>>,
+    pub last_matching_offset: Option<u64>,
+    pub matched_messages: u32,
+}
+
+impl<const ALIGN: usize> PolledBatches<ALIGN> {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.fragments.is_empty()
+    }
+
+    #[must_use]
+    pub const fn count(&self) -> u32 {
+        self.matched_messages
+    }
+
+    pub fn push_fragment(&mut self, fragment: Frozen<ALIGN>) {
+        self.fragments.push(fragment);
+    }
 }
 
 impl PollingArgs {

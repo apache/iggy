@@ -132,6 +132,7 @@ pub struct RequestEntry {
 }
 
 impl RequestEntry {
+    #[must_use]
     pub const fn new(message: Message<RequestHeader>) -> Self {
         Self {
             message,

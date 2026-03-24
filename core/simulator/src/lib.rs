@@ -23,14 +23,14 @@ pub mod packet;
 pub mod ready_queue;
 pub mod replica;
 
-use bus::MemBus;
+use bus::{EnvelopePayload, MemBus};
 use consensus::PartitionsHandle;
+use iggy_common::IggyError;
 use iggy_common::header::ReplyHeader;
 use iggy_common::message::Message;
 use iggy_common::sharding::IggyNamespace;
-use iggy_common::{IggyError, IggyMessagesBatchSet};
 use message_bus::MessageBus;
-use partitions::{Partition, PartitionOffsets, PollingArgs, PollingConsumer};
+use partitions::{Partition, PartitionOffsets, PolledBatches, PollingArgs, PollingConsumer};
 use replica::{Replica, new_replica};
 use std::sync::Arc;
 
@@ -108,17 +108,28 @@ impl Simulator {
     pub async fn step(&self) -> Option<Message<ReplyHeader>> {
         if let Some(envelope) = self.message_bus.receive() {
             if let Some(_client_id) = envelope.to_client {
-                let reply: Message<ReplyHeader> = envelope
-                    .message
-                    .try_into_typed()
-                    .expect("invalid message, wrong command type for an client response");
+                let EnvelopePayload::Client(mut fragments) = envelope.payload else {
+                    panic!("client envelope must carry frozen fragments");
+                };
+                assert_eq!(
+                    fragments.len(),
+                    1,
+                    "client fragment decoding for multi-fragment payloads is not implemented"
+                );
+                let frozen = fragments.pop().expect("client envelope must contain data");
+                let split_at = std::mem::size_of::<ReplyHeader>().min(frozen.len());
+                let reply: Message<ReplyHeader> = Message::try_from(frozen.split_at(split_at))
+                    .expect("invalid message, wrong command type for a client response");
                 return Some(reply);
             }
 
             if let Some(replica_id) = envelope.to_replica
                 && let Some(replica) = self.replicas.get(replica_id as usize)
             {
-                self.dispatch_to_replica(replica, envelope.message).await;
+                let EnvelopePayload::Replica(message) = envelope.payload else {
+                    panic!("replica envelope must carry a replica message");
+                };
+                self.dispatch_to_replica(replica, message).await;
             }
         }
 
@@ -155,7 +166,7 @@ impl Simulator {
         namespace: IggyNamespace,
         consumer: PollingConsumer,
         args: PollingArgs,
-    ) -> Result<IggyMessagesBatchSet, IggyError> {
+    ) -> Result<PolledBatches<4096>, IggyError> {
         let replica = &self.replicas[replica_idx];
         let partition =
             replica

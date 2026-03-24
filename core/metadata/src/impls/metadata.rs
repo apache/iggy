@@ -29,9 +29,16 @@ use iggy_common::{
     },
     message::Message,
 };
+use iobuf::TryMerge;
 use journal::{Journal, JournalHandle};
-use message_bus::MessageBus;
+use message_bus::{ClientBuffers, MessageBus};
 use tracing::{debug, warn};
+
+fn freeze_client_reply(message: Message<GenericHeader>) -> ClientBuffers {
+    let owned = unsafe { message.into_inner().try_merge() }
+        .expect("client reply expects a mergeable message buffer");
+    vec![owned.into()]
+}
 
 #[derive(Debug, Clone)]
 #[allow(unused)]
@@ -104,7 +111,12 @@ pub struct IggyMetadata<C, J, S, M> {
 #[allow(clippy::future_not_send)]
 impl<B, J, S, M> Plane<VsrConsensus<B>> for IggyMetadata<VsrConsensus<B>, J, S, M>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus<
+            Replica = u8,
+            Data = Message<GenericHeader>,
+            Client = u128,
+            ClientData = ClientBuffers,
+        >,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StateMachine<
@@ -239,6 +251,7 @@ where
 
                 let generic_reply =
                     build_reply_message(consensus, &prepare_header, response).into_generic();
+                let reply_buffers = freeze_client_reply(generic_reply);
                 debug!(
                     "on_ack: sending reply to client={} for op={}",
                     prepare_header.client, prepare_header.op
@@ -247,7 +260,7 @@ where
                 // TODO: Propagate send error instead of panicking; requires bus error design.
                 consensus
                     .message_bus()
-                    .send_to_client(prepare_header.client, generic_reply)
+                    .send_to_client(prepare_header.client, reply_buffers)
                     .await
                     .unwrap();
             }

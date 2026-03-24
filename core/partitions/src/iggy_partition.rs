@@ -20,13 +20,12 @@ use crate::journal::{
 };
 use crate::log::SegmentedLog;
 use crate::{
-    AppendResult, Partition, PartitionOffsets, PollingArgs, PollingConsumer,
-    decode_send_messages_batch,
+    AppendResult, Partition, PartitionOffsets, PolledBatches, PollingArgs, PollingConsumer,
+    send_messages2::stamp_prepare_for_persistence,
 };
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
-    IggyByteSize, IggyError, IggyMessagesBatchMut, IggyMessagesBatchSet, IggyTimestamp,
-    PartitionStats, PollingKind,
+    IggyByteSize, IggyError, IggyTimestamp, PartitionStats, PollingKind,
     header::{Operation, PrepareHeader},
     message::Message,
 };
@@ -55,36 +54,6 @@ pub struct IggyPartition {
 }
 
 impl IggyPartition {
-    fn prepare_message_from_batch(
-        mut header: PrepareHeader,
-        batch: &IggyMessagesBatchMut,
-    ) -> Message<PrepareHeader> {
-        let indexes = batch.indexes();
-        let count = batch.count();
-        let body_len = 4 + indexes.len() + batch.len();
-        let total_size = std::mem::size_of::<PrepareHeader>() + body_len;
-        header.size = u32::try_from(total_size)
-            .expect("prepare_message_from_batch: batch size exceeds u32::MAX");
-
-        let message = Message::<PrepareHeader>::new(total_size).transmute_header(|_old, new| {
-            *new = header;
-        });
-
-        let mut bytes = message
-            .into_inner()
-            .try_into_mut()
-            .expect("prepare_message_from_batch: expected unique bytes buffer");
-        let header_size = std::mem::size_of::<PrepareHeader>();
-        bytes[header_size..header_size + 4].copy_from_slice(&count.to_le_bytes());
-        let mut position = header_size + 4;
-        bytes[position..position + indexes.len()].copy_from_slice(indexes);
-        position += indexes.len();
-        bytes[position..position + batch.len()].copy_from_slice(batch);
-
-        Message::<PrepareHeader>::from_bytes(bytes.freeze())
-            .expect("prepare_message_from_batch: invalid prepared message bytes")
-    }
-
     pub fn new(stats: Arc<PartitionStats>) -> Self {
         Self {
             log: SegmentedLog::default(),
@@ -111,29 +80,25 @@ impl Partition for IggyPartition {
             return Err(IggyError::CannotAppendMessage);
         }
 
-        let mut batch = decode_send_messages_batch(message.body_bytes())
-            .ok_or(IggyError::CannotAppendMessage)?;
-
-        if batch.count() == 0 {
-            return Ok(AppendResult::new(0, 0, 0));
-        }
-
         let dirty_offset = if self.should_increment_offset {
             self.dirty_offset.load(Ordering::Relaxed) + 1
         } else {
             0
         };
 
-        let segment = self.log.active_segment();
-        let segment_start_offset = segment.start_offset;
-        let current_position = segment.current_position;
+        // TODO: Replace this with monotonic broker timestamp assignment. If wall clock
+        // time goes backwards, clamp to the partition/log max timestamp instead.
+        let batch_timestamp = IggyTimestamp::now().as_micros();
+        let (message, batch, batch_messages_count) =
+            stamp_prepare_for_persistence(message, dirty_offset, batch_timestamp)
+                .map_err(|_| IggyError::CannotAppendMessage)?;
 
-        batch
-            .prepare_for_persistence(segment_start_offset, dirty_offset, current_position, None)
-            .await;
+        if batch_messages_count == 0 {
+            return Ok(AppendResult::new(0, 0, 0));
+        }
 
-        let batch_messages_count = batch.count();
-        let batch_messages_size = batch.size();
+        let batch_messages_size =
+            u32::try_from(batch.total_size()).map_err(|_| IggyError::CannotAppendMessage)?;
 
         let last_dirty_offset = if batch_messages_count == 0 {
             dirty_offset
@@ -154,16 +119,11 @@ impl Partition for IggyPartition {
         journal.info.messages_count += batch_messages_count;
         journal.info.size += IggyByteSize::from(u64::from(batch_messages_size));
         journal.info.current_offset = last_dirty_offset;
-        if let Some(ts) = batch.first_timestamp()
-            && journal.info.first_timestamp == 0
-        {
-            journal.info.first_timestamp = ts;
+        if journal.info.first_timestamp == 0 {
+            journal.info.first_timestamp = batch.base_timestamp;
         }
-        if let Some(ts) = batch.last_timestamp() {
-            journal.info.end_timestamp = ts;
-        }
-
-        let message = Self::prepare_message_from_batch(header, &batch);
+        journal.info.end_timestamp = batch.base_timestamp;
+        journal.info.max_timestamp = journal.info.max_timestamp.max(batch.base_timestamp);
         journal.inner.append(message).await;
 
         Ok(AppendResult::new(
@@ -177,63 +137,56 @@ impl Partition for IggyPartition {
         &self,
         consumer: PollingConsumer,
         args: PollingArgs,
-    ) -> Result<IggyMessagesBatchSet, IggyError> {
+    ) -> Result<PolledBatches<4096>, IggyError> {
         if !self.should_increment_offset || args.count == 0 {
-            return Ok(IggyMessagesBatchSet::empty());
+            return Ok(PolledBatches::empty());
         }
 
-        let committed_offset = self.offset.load(Ordering::Relaxed);
+        let write_offset = self.dirty_offset.load(Ordering::Relaxed);
 
-        let start_offset = match args.strategy.kind {
-            PollingKind::Offset => args.strategy.value,
-            PollingKind::First => 0,
-            PollingKind::Last => committed_offset.saturating_sub(u64::from(args.count) - 1),
+        let result = match args.strategy.kind {
             PollingKind::Timestamp => {
-                let result = self
-                    .log
+                self.log
                     .journal()
                     .inner
                     .get(&MessageLookup::Timestamp {
                         timestamp: args.strategy.value,
                         count: args.count,
                     })
-                    .await;
-                let batch_set = result.unwrap_or_else(IggyMessagesBatchSet::empty);
-                if let Some(first) = batch_set.first_offset() {
-                    if first > committed_offset {
-                        return Ok(IggyMessagesBatchSet::empty());
-                    }
-                    let max_count = u32::try_from(committed_offset - first + 1).unwrap_or(u32::MAX);
-                    return Ok(batch_set.get_by_offset(first, batch_set.count().min(max_count)));
-                }
-                return Ok(batch_set);
+                    .await
             }
-            PollingKind::Next => self
-                .get_consumer_offset(consumer)
-                .map_or(0, |offset| offset + 1),
+            kind => {
+                let start_offset = match kind {
+                    PollingKind::Offset => args.strategy.value,
+                    PollingKind::First => 0,
+                    PollingKind::Last => write_offset.saturating_sub(u64::from(args.count) - 1),
+                    PollingKind::Next => self
+                        .get_consumer_offset(consumer)
+                        .map_or(0, |offset| offset + 1),
+                    PollingKind::Timestamp => unreachable!(),
+                };
+
+                if start_offset > write_offset {
+                    return Ok(PolledBatches::empty());
+                }
+
+                self.log
+                    .journal()
+                    .inner
+                    .get(&MessageLookup::Offset {
+                        offset: start_offset,
+                        count: args.count,
+                    })
+                    .await
+            }
         };
 
-        if start_offset > committed_offset {
-            return Ok(IggyMessagesBatchSet::empty());
-        }
+        let messages = result.unwrap_or_else(PolledBatches::empty);
 
-        let max_count = u32::try_from(committed_offset - start_offset + 1).unwrap_or(u32::MAX);
-        let count = args.count.min(max_count);
-
-        let result = self
-            .log
-            .journal()
-            .inner
-            .get(&MessageLookup::Offset {
-                offset: start_offset,
-                count,
-            })
-            .await;
-
-        let batch_set = result.unwrap_or_else(IggyMessagesBatchSet::empty);
-
-        if args.auto_commit && !batch_set.is_empty() {
-            let last_offset = start_offset + u64::from(batch_set.count()) - 1;
+        if args.auto_commit && !messages.is_empty() {
+            let last_offset = messages
+                .last_matching_offset
+                .expect("non-empty poll result must have a last offset");
             if let Err(err) = self.store_consumer_offset(consumer, last_offset) {
                 // warning for now.
                 warn!(
@@ -245,7 +198,7 @@ impl Partition for IggyPartition {
             }
         }
 
-        Ok(batch_set)
+        Ok(messages)
     }
 
     #[allow(clippy::cast_possible_truncation)]

@@ -157,6 +157,7 @@ hostname = "0.4.2"
 human-repr = "1.1.0"
 humantime = "2.3.0"
 hwlocality = "1.0.0-alpha.11"
+iobuf = { path = "core/iobuf" }
 iceberg = "0.9.0"
 iceberg-catalog-rest = "0.9.0"
 iceberg-storage-opendal = "0.9.0"

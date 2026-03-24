@@ -20,7 +20,11 @@
 use crate::IggyPartition;
 use crate::Partition;
 use crate::PollingConsumer;
+use crate::frozen_messages_writer::FrozenMessagesWriter;
+use crate::iggy_index_writer::IggyIndexWriter;
 use crate::log::JournalInfo;
+use crate::segment::Segment;
+use crate::send_messages2::convert_request_message;
 use crate::types::PartitionsConfig;
 use consensus::PlaneIdentity;
 use consensus::{
@@ -31,16 +35,18 @@ use consensus::{
 };
 use iggy_common::header::Command2;
 use iggy_common::{
-    IggyByteSize, PartitionStats, Segment, SegmentStorage,
+    IggyByteSize, PartitionStats, SegmentStorage,
     header::{
         ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
     },
     message::Message,
     sharding::{IggyNamespace, LocalIdx, ShardId},
 };
-use message_bus::MessageBus;
+use iobuf::{Frozen, TryMerge};
+use message_bus::{ClientBuffers, MessageBus};
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{debug, warn};
@@ -65,6 +71,12 @@ pub struct IggyPartitions<C> {
     partitions: UnsafeCell<Vec<IggyPartition>>,
     namespace_to_local: HashMap<IggyNamespace, LocalIdx>,
     consensus: Option<C>,
+}
+
+fn freeze_client_reply(message: Message<GenericHeader>) -> ClientBuffers {
+    let owned = unsafe { message.into_inner().try_merge() }
+        .expect("client reply expects a mergeable message buffer");
+    vec![owned.into()]
 }
 
 impl<C> IggyPartitions<C> {
@@ -262,7 +274,9 @@ impl<C> IggyPartitions<C> {
         // Create partition with initialized log
         let stats = Arc::new(PartitionStats::default());
         let mut partition = IggyPartition::new(stats);
-        partition.log.add_persisted_segment(segment, storage);
+        partition
+            .log
+            .add_persisted_segment(segment, storage, None, None);
         partition.offset.store(start_offset, Ordering::Relaxed);
         partition
             .dirty_offset
@@ -323,11 +337,40 @@ impl<C> IggyPartitions<C> {
         )
         .await
         .expect("Failed to create segment storage");
+        let messages_size_bytes = storage
+            .messages_writer
+            .as_ref()
+            .expect("Messages writer not initialized")
+            .size_counter();
+        let frozen_writer = Rc::new(
+            FrozenMessagesWriter::new(
+                &messages_path,
+                messages_size_bytes,
+                self.config.enforce_fsync,
+                false,
+            )
+            .await
+            .expect("Failed to create frozen messages writer"),
+        );
+        let index_writer = Rc::new(
+            IggyIndexWriter::new(
+                &index_path,
+                Rc::new(std::sync::atomic::AtomicU64::new(0)),
+                false,
+            )
+            .await
+            .expect("Failed to create sparse index writer"),
+        );
 
         // Create partition with initialized log
         let stats = Arc::new(PartitionStats::default());
         let mut partition = IggyPartition::new(stats);
-        partition.log.add_persisted_segment(segment, storage);
+        partition.log.add_persisted_segment(
+            segment,
+            storage,
+            Some(frozen_writer),
+            Some(index_writer),
+        );
         partition.offset.store(start_offset, Ordering::Relaxed);
         partition
             .dirty_offset
@@ -341,7 +384,12 @@ impl<C> IggyPartitions<C> {
 
 impl<B> Plane<VsrConsensus<B>> for IggyPartitions<VsrConsensus<B, NamespacedPipeline>>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus<
+            Replica = u8,
+            Data = Message<GenericHeader>,
+            Client = u128,
+            ClientData = ClientBuffers,
+        >,
 {
     async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let namespace = IggyNamespace::from_raw(message.header().namespace);
@@ -350,6 +398,17 @@ where
             .expect("on_request: consensus not initialized");
 
         debug!(?namespace, "handling partition request");
+        let message = if message.header().operation == Operation::SendMessages {
+            match convert_request_message(namespace, message) {
+                Ok(message) => message,
+                Err(error) => {
+                    warn!(?namespace, %error, "on_request: failed to convert SendMessages");
+                    return;
+                }
+            }
+        } else {
+            message
+        };
         let prepare = message.project(consensus);
         pipeline_prepare_common(consensus, prepare, |prepare| self.on_replicate(prepare)).await;
     }
@@ -494,6 +553,7 @@ where
 
             let generic_reply =
                 build_reply_message(consensus, &prepare_header, bytes::Bytes::new()).into_generic();
+            let reply_buffers = freeze_client_reply(generic_reply);
             debug!(
                 "on_ack: sending reply to client={} for op={}",
                 prepare_header.client, prepare_header.op
@@ -502,7 +562,7 @@ where
             // TODO: Propagate send error instead of panicking; requires bus error design.
             consensus
                 .message_bus()
-                .send_to_client(prepare_header.client, generic_reply)
+                .send_to_client(prepare_header.client, reply_buffers)
                 .await
                 .unwrap();
         }
@@ -563,8 +623,10 @@ where
                 );
             }
             Operation::StoreConsumerOffset => {
-                let body = message.body_bytes();
-                let body = body.as_ref();
+                let total_size = header.size() as usize;
+                let owned = unsafe { message.into_inner().try_merge() }
+                    .expect("consumer offset prepare expects a unique message buffer");
+                let body = &owned.as_slice()[std::mem::size_of::<PrepareHeader>()..total_size];
                 let consumer_kind = body[0];
                 let consumer_id = u32::from_le_bytes(body[1..5].try_into().unwrap()) as usize;
                 let offset = u64::from_le_bytes(body[5..13].try_into().unwrap());
@@ -669,6 +731,7 @@ where
             segment.start_timestamp = journal_info.first_timestamp;
         }
         segment.end_timestamp = journal_info.end_timestamp;
+        segment.max_timestamp = segment.max_timestamp.max(journal_info.max_timestamp);
         segment.end_offset = journal_info.current_offset;
 
         // 2. Update stats.
@@ -689,23 +752,61 @@ where
 
         if is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded {
             // Freeze journal batches.
-            let frozen_batches = {
-                let batches = partition.log.journal_mut().inner.commit();
+            let (frozen_batches, index_bytes, batch_count) = {
+                let entries = partition.log.journal_mut().inner.commit();
+                let segment = partition.log.active_segment();
+                let mut file_position = segment.size.as_bytes_u64();
                 partition.log.ensure_indexes();
-                batches.append_indexes_to(partition.log.active_indexes_mut().unwrap());
+                let indexes = partition.log.active_indexes_mut().unwrap();
+                let mut flush_index = None;
+                let mut frozen = Vec::with_capacity(entries.len());
+                let mut batch_count = 0u32;
 
-                let frozen: Vec<_> = batches
-                    .into_inner()
-                    .into_iter()
-                    .map(|mut b| b.freeze())
-                    .collect();
-                partition.log.set_in_flight(frozen.clone());
-                frozen
+                for entry in entries {
+                    let owned = unsafe { entry.into_inner().try_merge() }
+                        .expect("journal commit expects mergeable prepare buffers");
+                    let Ok(batch) = crate::send_messages2::decode_prepare_slice(owned.as_slice())
+                    else {
+                        continue;
+                    };
+                    let Ok(message_count) = batch.message_count() else {
+                        continue;
+                    };
+                    if message_count == 0 {
+                        continue;
+                    }
+
+                    let index = crate::iggy_index::IggyIndex::new(
+                        batch.header.base_offset,
+                        batch.header.base_timestamp,
+                        file_position,
+                    );
+                    if flush_index.is_none() {
+                        indexes.insert(index.offset, index.timestamp, index.position);
+                        flush_index = Some(index);
+                    }
+                    file_position += batch.header.total_size() as u64;
+                    batch_count += message_count;
+                    frozen.push(owned.into());
+                }
+
+                (
+                    frozen,
+                    flush_index
+                        .map(|index| crate::iggy_index::IggyIndexCache::serialize(&index))
+                        .expect("commit_messages: no index to flush"),
+                    batch_count,
+                )
             };
 
             // Persist to disk.
-            self.persist_frozen_batches_to_disk(namespace, frozen_batches)
-                .await;
+            self.persist_frozen_batches_to_disk(
+                namespace,
+                frozen_batches,
+                index_bytes,
+                batch_count,
+            )
+            .await;
 
             if is_full {
                 self.rotate_segment(namespace).await;
@@ -731,13 +832,10 @@ where
     async fn persist_frozen_batches_to_disk(
         &self,
         namespace: &IggyNamespace,
-        frozen_batches: Vec<iggy_common::IggyMessagesBatch>,
+        frozen_batches: Vec<Frozen<4096>>,
+        index_bytes: Vec<u8>,
+        batch_count: u32,
     ) {
-        let batch_count: u32 = frozen_batches
-            .iter()
-            .map(iggy_common::IggyMessagesBatch::count)
-            .sum();
-
         if batch_count == 0 {
             return;
         }
@@ -750,41 +848,32 @@ where
             return;
         }
 
+        let stripped_batches: Vec<_> = frozen_batches
+            .into_iter()
+            .map(|batch| batch.slice(std::mem::size_of::<PrepareHeader>()..))
+            .collect();
         let messages_writer = partition
             .log
-            .active_storage()
-            .messages_writer
-            .as_ref()
-            .expect("Messages writer not initialized")
-            .clone();
+            .frozen_writers()
+            .last()
+            .and_then(|writer| writer.as_ref())
+            .cloned()
+            .expect("Frozen messages writer not initialized");
         let index_writer = partition
             .log
-            .active_storage()
-            .index_writer
-            .as_ref()
-            .expect("Index writer not initialized")
-            .clone();
+            .index_writers()
+            .last()
+            .and_then(|writer| writer.as_ref())
+            .cloned()
+            .expect("Sparse index writer not initialized");
 
         let saved = messages_writer
-            .as_ref()
-            .save_frozen_batches(&frozen_batches)
+            .save_frozen_batches(&stripped_batches)
             .await
             .expect("persist: failed to save frozen batches");
 
-        let unsaved_indexes_slice = {
-            let partition = self
-                .get_by_ns(namespace)
-                .expect("persist: partition not found");
-            let segment_index = partition.log.segments().len() - 1;
-            partition.log.indexes()[segment_index]
-                .as_ref()
-                .expect("indexes must exist for segment being persisted")
-                .unsaved_slice()
-        };
-
         index_writer
-            .as_ref()
-            .save_indexes(unsaved_indexes_slice)
+            .save_indexes(index_bytes)
             .await
             .expect("persist: failed to save indexes");
 
@@ -796,11 +885,6 @@ where
 
         // Recalculate index: segment deletion during async I/O shifts indices.
         let segment_index = partition.log.segments().len() - 1;
-
-        let indexes = partition.log.indexes_mut()[segment_index]
-            .as_mut()
-            .expect("indexes must exist for segment being persisted");
-        indexes.mark_saved();
 
         let segment = &mut partition.log.segments_mut()[segment_index];
         segment.size = IggyByteSize::from(segment.size.as_bytes_u64() + saved.as_bytes_u64());
@@ -847,20 +931,43 @@ where
         )
         .await
         .expect("Failed to create segment storage");
-
-        // Clear old segment's indexes.
-        // TODO: Waiting for issue to move server config to shared module.
-        // Once complete, conditionally clear based on cache_indexes config:
-        // if !matches!(self.config.cache_indexes, CacheIndexesConfig::All) {
-        //     partition.log.indexes_mut()[old_segment_index] = None;
-        // }
-        partition.log.indexes_mut()[old_segment_index] = None;
+        let messages_size_bytes = storage
+            .messages_writer
+            .as_ref()
+            .expect("Messages writer not initialized")
+            .size_counter();
+        let frozen_writer = Rc::new(
+            FrozenMessagesWriter::new(
+                &messages_path,
+                messages_size_bytes,
+                self.config.enforce_fsync,
+                false,
+            )
+            .await
+            .expect("Failed to create frozen messages writer"),
+        );
+        let index_writer = Rc::new(
+            IggyIndexWriter::new(
+                &index_path,
+                Rc::new(std::sync::atomic::AtomicU64::new(0)),
+                false,
+            )
+            .await
+            .expect("Failed to create sparse index writer"),
+        );
 
         // Close writers for the sealed segment.
         let old_storage = &mut partition.log.storages_mut()[old_segment_index];
         let _ = old_storage.shutdown();
+        partition.log.frozen_writers_mut()[old_segment_index] = None;
+        partition.log.index_writers_mut()[old_segment_index] = None;
 
-        partition.log.add_persisted_segment(segment, storage);
+        partition.log.add_persisted_segment(
+            segment,
+            storage,
+            Some(frozen_writer),
+            Some(index_writer),
+        );
         partition.stats.increment_segments_count(1);
 
         debug!(?namespace, start_offset, "rotated to new segment");

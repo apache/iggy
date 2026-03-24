@@ -18,6 +18,7 @@
 use crate::{Consensus, Pipeline, PipelineEntry, Sequencer, Status, VsrConsensus};
 use iggy_common::header::{Command2, GenericHeader, PrepareHeader, PrepareOkHeader, ReplyHeader};
 use iggy_common::message::Message;
+use iobuf::Owned;
 use message_bus::MessageBus;
 use std::ops::AsyncFnOnce;
 
@@ -267,8 +268,8 @@ where
         buffer[header_size..].copy_from_slice(&body);
     }
 
-    Message::<ReplyHeader>::from_bytes(buffer.freeze())
-        .expect("build_reply_message: constructed header must be valid")
+    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()).split_at(header_size))
+        .expect("reply buffer must contain a valid reply message")
 }
 
 /// Verify hash chain would not break if we add this header.
@@ -359,6 +360,7 @@ mod tests {
     use super::*;
     use crate::{Consensus, LocalPipeline};
     use iggy_common::IggyError;
+    use message_bus::ClientBuffers;
 
     #[derive(Debug, Default)]
     struct NoopBus;
@@ -367,6 +369,7 @@ mod tests {
         type Client = u128;
         type Replica = u8;
         type Data = Message<GenericHeader>;
+        type ClientData = ClientBuffers;
         type Sender = ();
 
         fn add_client(&mut self, _client: Self::Client, _sender: Self::Sender) -> bool {
@@ -388,17 +391,17 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: Self::Client,
-            _data: Self::Data,
-        ) -> Result<(), IggyError> {
-            Ok(())
+            data: Self::ClientData,
+        ) -> Result<Self::ClientData, IggyError> {
+            Ok(data)
         }
 
         async fn send_to_replica(
             &self,
             _replica: Self::Replica,
-            _data: Self::Data,
-        ) -> Result<(), IggyError> {
-            Ok(())
+            data: Self::Data,
+        ) -> Result<Self::Data, IggyError> {
+            Ok(data)
         }
     }
 
@@ -579,6 +582,7 @@ mod tests {
         type Client = u128;
         type Replica = u8;
         type Data = Message<GenericHeader>;
+        type ClientData = ClientBuffers;
         type Sender = ();
 
         fn add_client(&mut self, _client: Self::Client, _sender: Self::Sender) -> bool {
@@ -596,17 +600,17 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: Self::Client,
-            _data: Self::Data,
-        ) -> Result<(), IggyError> {
-            Ok(())
+            data: Self::ClientData,
+        ) -> Result<Self::ClientData, IggyError> {
+            Ok(data)
         }
         async fn send_to_replica(
             &self,
             replica: Self::Replica,
             data: Self::Data,
-        ) -> Result<(), IggyError> {
-            self.sent.borrow_mut().push((replica, data));
-            Ok(())
+        ) -> Result<Self::Data, IggyError> {
+            self.sent.borrow_mut().push((replica, data.clone()));
+            Ok(data)
         }
     }
 

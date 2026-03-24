@@ -32,6 +32,7 @@ ahash = { workspace = true }
 bytes = { workspace = true }
 consensus = { workspace = true }
 iggy_common = { workspace = true }
+iobuf = { workspace = true }
 journal = { workspace = true }
 left-right = { workspace = true }
 message_bus = { workspace = true }

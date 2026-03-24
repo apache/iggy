@@ -16,18 +16,24 @@
 // under the License.
 
 use iggy_common::{IggyError, header::GenericHeader, message::Message};
-use message_bus::MessageBus;
+use message_bus::{ClientBuffers, MessageBus};
 use std::collections::{HashSet, VecDeque};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 /// Message envelope for tracking sender/recipient
 #[derive(Debug, Clone)]
+pub enum EnvelopePayload {
+    Replica(Message<GenericHeader>),
+    Client(ClientBuffers),
+}
+
+#[derive(Debug, Clone)]
 pub struct Envelope {
     pub from_replica: Option<u8>,
     pub to_replica: Option<u8>,
     pub to_client: Option<u128>,
-    pub message: Message<GenericHeader>,
+    pub payload: EnvelopePayload,
 }
 
 // TODO: Proper bus with an `Network` component which would simulate sending packets.
@@ -64,6 +70,7 @@ impl MessageBus for MemBus {
     type Client = u128;
     type Replica = u8;
     type Data = Message<GenericHeader>;
+    type ClientData = ClientBuffers;
     type Sender = ();
 
     fn add_client(&mut self, client: Self::Client, _sender: Self::Sender) -> bool {
@@ -93,8 +100,8 @@ impl MessageBus for MemBus {
     async fn send_to_client(
         &self,
         client_id: Self::Client,
-        message: Self::Data,
-    ) -> Result<(), IggyError> {
+        buffers: Self::ClientData,
+    ) -> Result<Self::ClientData, IggyError> {
         if !self.clients.lock().unwrap().contains(&client_id) {
             #[allow(clippy::cast_possible_truncation)]
             return Err(IggyError::ClientNotFound(client_id as u32));
@@ -104,17 +111,17 @@ impl MessageBus for MemBus {
             from_replica: None,
             to_replica: None,
             to_client: Some(client_id),
-            message,
+            payload: EnvelopePayload::Client(buffers.clone()),
         });
 
-        Ok(())
+        Ok(buffers)
     }
 
     async fn send_to_replica(
         &self,
         replica: Self::Replica,
         message: Self::Data,
-    ) -> Result<(), IggyError> {
+    ) -> Result<Self::Data, IggyError> {
         if !self.replicas.lock().unwrap().contains(&replica) {
             return Err(IggyError::ResourceNotFound(format!("Replica {replica}")));
         }
@@ -123,10 +130,10 @@ impl MessageBus for MemBus {
             from_replica: None,
             to_replica: Some(replica),
             to_client: None,
-            message,
+            payload: EnvelopePayload::Replica(message.clone()),
         });
 
-        Ok(())
+        Ok(message)
     }
 }
 
@@ -145,6 +152,7 @@ impl MessageBus for SharedMemBus {
     type Client = u128;
     type Replica = u8;
     type Data = Message<GenericHeader>;
+    type ClientData = ClientBuffers;
     type Sender = ();
 
     fn add_client(&mut self, client: Self::Client, _sender: Self::Sender) -> bool {
@@ -166,16 +174,16 @@ impl MessageBus for SharedMemBus {
     async fn send_to_client(
         &self,
         client_id: Self::Client,
-        message: Self::Data,
-    ) -> Result<(), IggyError> {
-        self.0.send_to_client(client_id, message).await
+        buffers: Self::ClientData,
+    ) -> Result<Self::ClientData, IggyError> {
+        self.0.send_to_client(client_id, buffers).await
     }
 
     async fn send_to_replica(
         &self,
         replica: Self::Replica,
         message: Self::Data,
-    ) -> Result<(), IggyError> {
+    ) -> Result<Self::Data, IggyError> {
         self.0.send_to_replica(replica, message).await
     }
 }

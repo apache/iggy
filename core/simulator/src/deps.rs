@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytes::Bytes;
 use iggy_common::header::PrepareHeader;
 use iggy_common::message::Message;
 use iggy_common::variadic;
+use iobuf::{Owned, TryMerge};
 use journal::{Journal, JournalHandle, Storage};
 use metadata::MuxStateMachine;
 use metadata::stm::consumer_group::ConsumerGroups;
@@ -108,8 +108,10 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
         let offset = *offsets.get(&header.op)?;
 
         let buffer = self.storage.read(offset, header.size as usize).await;
-        let message =
-            Message::from_bytes(Bytes::from(buffer)).expect("simulator: bytes should be valid");
+        let message = Message::try_from(
+            Owned::<4096>::copy_from_slice(&buffer).split_at(std::mem::size_of::<PrepareHeader>()),
+        )
+        .expect("prepare buffer must contain a valid prepare message");
         Some(message)
     }
 
@@ -122,9 +124,10 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
 
     async fn append(&self, entry: Self::Entry) {
         let header = *entry.header();
-        let message_bytes = entry.as_bytes();
+        let message_bytes = unsafe { entry.into_inner().try_merge() }
+            .expect("simulator journal append expects a unique message buffer");
 
-        let bytes_written = self.storage.write(message_bytes.to_vec()).await;
+        let bytes_written = self.storage.write(message_bytes.as_slice().to_vec()).await;
 
         let offset = self.write_offset.get();
         unsafe { &mut *self.headers.get() }.insert(header.op, header);

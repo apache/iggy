@@ -32,6 +32,7 @@ bit-set = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
 iggy_common = { workspace = true }
+iobuf = { workspace = true }
 message_bus = { workspace = true }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }

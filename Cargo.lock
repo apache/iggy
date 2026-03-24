@@ -2232,6 +2232,7 @@ dependencies = [
  "bytes",
  "futures",
  "iggy_common",
+ "iobuf",
  "message_bus",
  "rand 0.10.0",
  "rand_xoshiro",
@@ -5427,6 +5428,7 @@ dependencies = [
  "err_trail",
  "human-repr",
  "humantime",
+ "iobuf",
  "lending-iterator",
  "moka",
  "nix",
@@ -5922,6 +5924,7 @@ name = "iobuf"
 version = "0.1.0"
 dependencies = [
  "aligned-vec",
+ "compio-buf",
 ]
 
 [[package]]
@@ -6660,6 +6663,7 @@ name = "message_bus"
 version = "0.1.0"
 dependencies = [
  "iggy_common",
+ "iobuf",
  "rand 0.10.0",
 ]
 
@@ -6671,6 +6675,7 @@ dependencies = [
  "bytes",
  "consensus",
  "iggy_common",
+ "iobuf",
  "journal",
  "left-right",
  "message_bus",
@@ -7645,9 +7650,12 @@ dependencies = [
 name = "partitions"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "bytes",
+ "compio",
  "consensus",
  "iggy_common",
+ "iobuf",
  "journal",
  "message_bus",
  "ringbuffer",
@@ -9942,6 +9950,7 @@ dependencies = [
  "enumset",
  "futures",
  "iggy_common",
+ "iobuf",
  "journal",
  "message_bus",
  "metadata",
