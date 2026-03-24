@@ -216,7 +216,34 @@ jobs:
       - name: Create kind cluster
         if: inputs.component == 'helm' && inputs.task == 'smoke'
         run: |
-          kind create cluster --name iggy-helm-smoke --wait 120s
+          cat > /tmp/iggy-kind.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+              kubeadmConfigPatches:
+                - |
+                  kind: InitConfiguration
+                  nodeRegistration:
+                    kubeletExtraArgs:
+                      node-labels: "ingress-ready=true"
+              extraPortMappings:
+                - containerPort: 80
+                  hostPort: 80
+                  protocol: TCP
+                - containerPort: 443
+                  hostPort: 443
+                  protocol: TCP
+          EOF
+
+          kind create cluster --name iggy-helm-smoke --wait 120s --config /tmp/iggy-kind.yaml
+
+      - name: Install ingress-nginx
+        if: inputs.component == 'helm' && inputs.task == 'smoke'
+        run: |
+          INGRESS_NGINX_VERSION="controller-v1.15.1"
+          kubectl apply -f "https://raw.githubusercontent.com/kubernetes/ingress-nginx/${INGRESS_NGINX_VERSION}/deploy/static/provider/kind/deploy.yaml"
+          kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=5m
 
       - name: Validate Helm chart
         if: inputs.component == 'helm' && inputs.task == 'validate'
@@ -292,6 +319,8 @@ jobs:
           namespace=iggy-smoke
           release=iggy-smoke
           report_dir=reports/helm-smoke
+          server_host=server.iggy.local
+          ui_host=ui.iggy.local
           mkdir -p "$report_dir"
           ui_image_tag=$(python3 - <<'PY'
           import json
@@ -305,35 +334,40 @@ jobs:
             --create-namespace \
             --wait \
             --timeout 5m \
+            --set server.ingress.enabled=true \
+            --set-string server.ingress.className=nginx \
+            --set-string server.ingress.hosts[0].host="$server_host" \
+            --set-string server.ingress.hosts[0].paths[0].path=/ \
+            --set-string server.ingress.hosts[0].paths[0].pathType=Prefix \
+            --set ui.ingress.enabled=true \
+            --set-string ui.ingress.className=nginx \
+            --set-string ui.ingress.hosts[0].host="$ui_host" \
+            --set-string ui.ingress.hosts[0].paths[0].path=/ \
+            --set-string ui.ingress.hosts[0].paths[0].pathType=Prefix \
             --set-string ui.image.tag="$ui_image_tag"
 
           kubectl version --client=true > "$report_dir/kubectl-version.txt"
           kubectl -n "$namespace" rollout status "deployment/$release" --timeout=5m
           kubectl -n "$namespace" rollout status "deployment/${release}-ui" --timeout=5m
-          kubectl -n "$namespace" get pods,svc > "$report_dir/resources.txt"
-
-          kubectl -n "$namespace" port-forward "svc/$release" 3000:3000 > "$report_dir/port-forward.log" 2>&1 &
-          server_port_forward_pid=$!
-          kubectl -n "$namespace" port-forward "svc/${release}-ui" 3050:3050 > "$report_dir/ui-port-forward.log" 2>&1 &
-          ui_port_forward_pid=$!
-          cleanup() {
-            kill "$server_port_forward_pid" >/dev/null 2>&1 || true
-            kill "$ui_port_forward_pid" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
+          kubectl -n "$namespace" get pods,svc,ingress > "$report_dir/resources.txt"
 
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:3000/ping > "$report_dir/ping.txt"; then
+            server_ping_status=$(curl -sS -o "$report_dir/ping.txt" -w '%{http_code}' \
+              -H "Host: ${server_host}" \
+              http://127.0.0.1/ping || true)
+            if [ "$server_ping_status" = "200" ] && grep -qx 'pong' "$report_dir/ping.txt"; then
               break
             fi
             sleep 2
           done
 
+          test "$server_ping_status" = "200"
           grep -qx 'pong' "$report_dir/ping.txt"
 
           for _ in $(seq 1 30); do
             ui_healthz_status=$(curl -sS -o "$report_dir/ui-healthz.txt" -w '%{http_code}' \
-              http://127.0.0.1:3050/healthz || true)
+              -H "Host: ${ui_host}" \
+              http://127.0.0.1/healthz || true)
             if [ "$ui_healthz_status" = "200" ]; then
               break
             fi
@@ -353,12 +387,15 @@ jobs:
 
           helm list -A > "$report_dir/helm-list.txt" 2>&1 || true
           kubectl get namespaces > "$report_dir/namespaces.txt" 2>&1 || true
+          kubectl -n ingress-nginx get all > "$report_dir/ingress-nginx.txt" 2>&1 || true
           kubectl -n "$namespace" get all > "$report_dir/get-all.txt" 2>&1 || true
+          kubectl -n "$namespace" get ingress > "$report_dir/ingresses.txt" 2>&1 || true
           kubectl -n "$namespace" describe "deployment/$release" > "$report_dir/describe-deployment.txt" 2>&1 || true
           kubectl -n "$namespace" describe "deployment/${release}-ui" > "$report_dir/describe-ui-deployment.txt" 2>&1 || true
           kubectl -n "$namespace" describe pods > "$report_dir/describe-pods.txt" 2>&1 || true
           kubectl -n "$namespace" logs "deployment/$release" --all-containers=true > "$report_dir/server.log" 2>&1 || true
           kubectl -n "$namespace" logs "deployment/${release}-ui" --all-containers=true > "$report_dir/ui.log" 2>&1 || true
+          kubectl -n ingress-nginx logs deployment/ingress-nginx-controller --all-containers=true > "$report_dir/ingress-nginx-controller.log" 2>&1 || true
 
           if command -v kind >/dev/null 2>&1; then
             kind export logs "$report_dir/kind-logs" --name iggy-helm-smoke >/dev/null 2>&1 || true
