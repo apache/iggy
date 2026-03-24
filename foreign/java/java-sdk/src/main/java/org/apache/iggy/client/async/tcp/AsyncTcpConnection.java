@@ -49,6 +49,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.net.ssl.SSLException;
 import java.io.File;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -65,6 +66,7 @@ import java.util.function.Function;
  */
 public class AsyncTcpConnection {
     private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
+    private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
 
     private final IoEventLoopGroup eventLoopGroup;
     private final FixedChannelPool channelPool;
@@ -80,7 +82,8 @@ public class AsyncTcpConnection {
             int port,
             boolean enableTls,
             Optional<File> tlsCertificate,
-            TCPConnectionPoolConfig poolConfig) {
+            TCPConnectionPoolConfig poolConfig,
+            Optional<Duration> connectionTimeout) {
         this.eventLoopGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
 
         SslContext sslContext = null;
@@ -98,7 +101,8 @@ public class AsyncTcpConnection {
                 .group(eventLoopGroup)
                 .channel(NioSocketChannel.class)
                 .option(ChannelOption.TCP_NODELAY, true)
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 3000)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int)
+                        connectionTimeout.orElse(DEFAULT_CONNECTION_TIMEOUT).toMillis())
                 .option(ChannelOption.SO_KEEPALIVE, true)
                 .remoteAddress(host, port);
 

@@ -229,6 +229,9 @@ public final class AsyncIggyTcpClientBuilder {
         if (connectionPoolSize != null && connectionPoolSize <= 0) {
             throw new IggyInvalidArgumentException("Connection pool size cannot by 0 or negative");
         }
+        if (connectionTimeout != null && (connectionTimeout.equals(Duration.ZERO) || connectionTimeout.isNegative())) {
+            throw new IggyInvalidArgumentException("ConnectionTimeout Cannot be 0 or Negative");
+        }
         if (acquireTimeout != null && (acquireTimeout.equals(Duration.ZERO) || acquireTimeout.isNegative())) {
             throw new IggyInvalidArgumentException("AcquireTimeout Cannot be 0 or Negative");
         }
@@ -238,6 +241,7 @@ public final class AsyncIggyTcpClientBuilder {
                 username,
                 password,
                 connectionTimeout,
+                acquireTimeout,
                 requestTimeout,
                 connectionPoolSize,
                 retryPolicy,
