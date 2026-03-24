@@ -220,6 +220,13 @@ jobs:
           test "$(grep -c '^kind: Service$' "$out/default.yaml")" -eq 2
           test "$(grep -c '^kind: ServiceAccount$' "$out/default.yaml")" -eq 1
           test "$(grep -c '^kind: Secret$' "$out/default.yaml")" -eq 1
+          # Intentionally pin current chart metadata and image tags so version
+          # bumps require an explicit CI update instead of changing silently.
+          grep -q 'helm.sh/chart: iggy-0.5.0' "$out/default.yaml"
+          grep -q 'helm.sh/chart: iggy-ui-0.5.0' "$out/default.yaml"
+          grep -q 'app.kubernetes.io/version: "0.7.0"' "$out/default.yaml"
+          grep -q 'image: "apache/iggy:0.7.0"' "$out/default.yaml"
+          grep -q 'image: "apache/iggy-web-ui:edge"' "$out/default.yaml"
 
           helm template iggy "$chart" \
             --set server.persistence.enabled=true \
