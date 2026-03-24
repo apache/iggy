@@ -20,9 +20,9 @@
 use crate::IggyPartition;
 use crate::Partition;
 use crate::PollingConsumer;
-use crate::frozen_messages_writer::FrozenMessagesWriter;
 use crate::iggy_index_writer::IggyIndexWriter;
 use crate::log::JournalInfo;
+use crate::messages_writer::MessagesWriter;
 use crate::segment::Segment;
 use crate::send_messages2::convert_request_message;
 use crate::types::PartitionsConfig;
@@ -342,15 +342,15 @@ impl<C> IggyPartitions<C> {
             .as_ref()
             .expect("Messages writer not initialized")
             .size_counter();
-        let frozen_writer = Rc::new(
-            FrozenMessagesWriter::new(
+        let messages_writer = Rc::new(
+            MessagesWriter::new(
                 &messages_path,
                 messages_size_bytes,
                 self.config.enforce_fsync,
                 false,
             )
             .await
-            .expect("Failed to create frozen messages writer"),
+            .expect("Failed to create messages writer"),
         );
         let index_writer = Rc::new(
             IggyIndexWriter::new(
@@ -368,7 +368,7 @@ impl<C> IggyPartitions<C> {
         partition.log.add_persisted_segment(
             segment,
             storage,
-            Some(frozen_writer),
+            Some(messages_writer),
             Some(index_writer),
         );
         partition.offset.store(start_offset, Ordering::Relaxed);
@@ -854,11 +854,11 @@ where
             .collect();
         let messages_writer = partition
             .log
-            .frozen_writers()
+            .messages_writers()
             .last()
             .and_then(|writer| writer.as_ref())
             .cloned()
-            .expect("Frozen messages writer not initialized");
+            .expect("Messages writer not initialized");
         let index_writer = partition
             .log
             .index_writers()
@@ -936,15 +936,15 @@ where
             .as_ref()
             .expect("Messages writer not initialized")
             .size_counter();
-        let frozen_writer = Rc::new(
-            FrozenMessagesWriter::new(
+        let messages_writer = Rc::new(
+            MessagesWriter::new(
                 &messages_path,
                 messages_size_bytes,
                 self.config.enforce_fsync,
                 false,
             )
             .await
-            .expect("Failed to create frozen messages writer"),
+            .expect("Failed to create messages writer"),
         );
         let index_writer = Rc::new(
             IggyIndexWriter::new(
@@ -959,13 +959,13 @@ where
         // Close writers for the sealed segment.
         let old_storage = &mut partition.log.storages_mut()[old_segment_index];
         let _ = old_storage.shutdown();
-        partition.log.frozen_writers_mut()[old_segment_index] = None;
+        partition.log.messages_writers_mut()[old_segment_index] = None;
         partition.log.index_writers_mut()[old_segment_index] = None;
 
         partition.log.add_persisted_segment(
             segment,
             storage,
-            Some(frozen_writer),
+            Some(messages_writer),
             Some(index_writer),
         );
         partition.stats.increment_segments_count(1);

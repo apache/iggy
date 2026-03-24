@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::frozen_messages_writer::FrozenMessagesWriter;
 use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndexCache};
 use crate::iggy_index_writer::IggyIndexWriter;
+use crate::messages_writer::MessagesWriter;
 use crate::segment::Segment;
 use iggy_common::{IggyByteSize, IggyMessagesBatch, IggyMessagesBatchSetInFlight, SegmentStorage};
 use journal::{Journal, Storage};
@@ -109,7 +109,7 @@ where
     segments: Vec<Segment>,
     indexes: Vec<Option<IggyIndexCache>>,
     storage: Vec<SegmentStorage>,
-    frozen_writers: Vec<Option<Rc<FrozenMessagesWriter>>>,
+    messages_writers: Vec<Option<Rc<MessagesWriter>>>,
     index_writers: Vec<Option<Rc<IggyIndexWriter>>>,
     in_flight: IggyMessagesBatchSetInFlight,
 }
@@ -128,7 +128,7 @@ where
             segments: Vec::with_capacity(SEGMENTS_CAPACITY),
             storage: Vec::with_capacity(SEGMENTS_CAPACITY),
             indexes: Vec::with_capacity(SEGMENTS_CAPACITY),
-            frozen_writers: Vec::with_capacity(SEGMENTS_CAPACITY),
+            messages_writers: Vec::with_capacity(SEGMENTS_CAPACITY),
             index_writers: Vec::with_capacity(SEGMENTS_CAPACITY),
             in_flight: IggyMessagesBatchSetInFlight::default(),
         }
@@ -160,12 +160,12 @@ where
         &self.storage
     }
 
-    pub const fn frozen_writers(&self) -> &Vec<Option<Rc<FrozenMessagesWriter>>> {
-        &self.frozen_writers
+    pub const fn messages_writers(&self) -> &Vec<Option<Rc<MessagesWriter>>> {
+        &self.messages_writers
     }
 
-    pub const fn frozen_writers_mut(&mut self) -> &mut Vec<Option<Rc<FrozenMessagesWriter>>> {
-        &mut self.frozen_writers
+    pub const fn messages_writers_mut(&mut self) -> &mut Vec<Option<Rc<MessagesWriter>>> {
+        &mut self.messages_writers
     }
 
     pub const fn index_writers(&self) -> &Vec<Option<Rc<IggyIndexWriter>>> {
@@ -245,13 +245,13 @@ where
         &mut self,
         segment: Segment,
         storage: SegmentStorage,
-        frozen_writer: Option<Rc<FrozenMessagesWriter>>,
+        messages_writer: Option<Rc<MessagesWriter>>,
         index_writer: Option<Rc<IggyIndexWriter>>,
     ) {
         self.segments.push(segment);
         self.storage.push(storage);
         self.indexes.push(None);
-        self.frozen_writers.push(frozen_writer);
+        self.messages_writers.push(messages_writer);
         self.index_writers.push(index_writer);
     }
 

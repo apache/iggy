@@ -17,13 +17,13 @@
 
 #![allow(clippy::future_not_send)]
 
-mod frozen_messages_writer;
 mod iggy_index;
 mod iggy_index_writer;
 mod iggy_partition;
 mod iggy_partitions;
 mod journal;
 mod log;
+mod messages_writer;
 mod segment;
 mod send_messages2;
 mod types;

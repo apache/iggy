@@ -30,14 +30,14 @@ use tracing::error;
 const MAX_IOV_COUNT: usize = 1024;
 
 #[derive(Debug)]
-pub struct FrozenMessagesWriter {
+pub struct MessagesWriter {
     file_path: String,
     file: File,
     messages_size_bytes: Rc<AtomicU64>,
     fsync: bool,
 }
 
-impl FrozenMessagesWriter {
+impl MessagesWriter {
     pub async fn new(
         file_path: &str,
         messages_size_bytes: Rc<AtomicU64>,
