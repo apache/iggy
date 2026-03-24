@@ -203,12 +203,20 @@ jobs:
           chmod +x /tmp/linux-amd64/helm
           sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm
 
+      - name: Install kind
+        if: inputs.component == 'helm' && inputs.task == 'smoke'
+        run: |
+          KIND_VERSION="v0.31.0"
+          KIND_CHECKSUM="eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa"
+          wget -qO /tmp/kind "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          echo "${KIND_CHECKSUM}  /tmp/kind" | sha256sum -c -
+          chmod +x /tmp/kind
+          sudo mv /tmp/kind /usr/local/bin/kind
+
       - name: Create kind cluster
         if: inputs.component == 'helm' && inputs.task == 'smoke'
-        uses: helm/kind-action@v1.14.0
-        with:
-          cluster_name: iggy-helm-smoke
-          wait: 120s
+        run: |
+          kind create cluster --name iggy-helm-smoke --wait 120s
 
       - name: Validate Helm chart
         if: inputs.component == 'helm' && inputs.task == 'validate'
