@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::borrow::Cow;
+
 /// Protocol-local error type for wire format encode/decode failures.
 ///
 /// Intentionally decoupled from `IggyError` to keep the protocol crate
@@ -46,5 +48,5 @@ pub enum WireError {
     PayloadTooLarge { size: usize, max: usize },
 
     #[error("validation failed: {0}")]
-    Validation(String),
+    Validation(Cow<'static, str>),
 }

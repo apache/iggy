@@ -15,18 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// TODO(hubcio): Legacy framing constants for the current binary protocol.
-// Once VSR consensus is integrated, both client-server and
-// replica-replica traffic will use the unified 256-byte
-// consensus header (`consensus::header::HEADER_SIZE`).
-// These constants will be removed at that point.
-
-/// Request frame: `[length:4 LE][code:4 LE][payload:N]`
-/// `length` = size of code + payload = 4 + N
-pub const REQUEST_HEADER_SIZE: usize = 4;
-
-/// Response frame: `[status:4 LE][length:4 LE][payload:N]`
-pub const RESPONSE_HEADER_SIZE: usize = 8;
-
-/// Status code for a successful response.
-pub const STATUS_OK: u32 = 0;
+/// `GetMe` response: same wire format as `ClientDetailsResponse`.
+///
+/// The server returns the authenticated client's own info using the
+/// same `map_client` serialization as `GetClient`.
+pub type GetMeResponse = crate::responses::clients::get_client::ClientDetailsResponse;
