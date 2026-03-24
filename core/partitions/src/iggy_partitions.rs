@@ -29,7 +29,8 @@ use consensus::PlaneIdentity;
 use consensus::{
     CommitLogEvent, Consensus, NamespacedPipeline, Pipeline, PipelineEntry, Plane, PlaneKind,
     Project, ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus,
-    ack_preflight, build_reply_message, emit_namespace_progress_event, emit_sim_event,
+    ack_preflight, build_reply_message, clients_table::RequestStatus,
+    emit_namespace_progress_event, emit_sim_event,
     fence_old_prepare_by_commit, pipeline_prepare_common, replicate_preflight,
     replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
 };
@@ -398,6 +399,34 @@ where
         let consensus = self
             .consensus()
             .expect("on_request: consensus not initialized");
+        let client_id = message.header().client;
+        let request = message.header().request;
+
+        // Duplicate detection via client-table
+        let status = consensus
+            .clients_table()
+            .borrow()
+            .check_request(client_id, request);
+        match status {
+            RequestStatus::Duplicate(cached_reply) => {
+                debug!(
+                    "on_request: duplicate request={request} for client={client_id}, re-sending cached reply"
+                );
+                consensus
+                    .message_bus()
+                    .send_to_client(client_id, cached_reply.into_generic())
+                    .await
+                    .unwrap();
+                return;
+            }
+            RequestStatus::InProgress => {
+                debug!(
+                    "on_request: request={request} for client={client_id} already in progress, dropping"
+                );
+                return;
+            }
+            RequestStatus::New => {}
+        }
 
         emit_sim_event(
             SimEventKind::ClientRequestReceived,
@@ -941,9 +970,15 @@ where
                 pipeline_depth,
             );
 
-            let generic_reply =
-                build_reply_message(consensus, &prepare_header, bytes::Bytes::new()).into_generic();
-            let reply_buffers = freeze_client_reply(generic_reply);
+            let reply =
+                build_reply_message(consensus, &prepare_header, bytes::Bytes::new());
+            // Cache reply for duplicate detection:
+            consensus
+                .clients_table()
+                .borrow_mut()
+                .commit_reply(prepare_header.client, reply.clone());
+
+            let reply_buffers = freeze_client_reply(reply.into_generic());
             emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
 
             if let Err(error) = consensus

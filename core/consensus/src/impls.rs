@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::clients_table::ClientsTable;
 use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
 use crate::{
     AckLogEvent, Consensus, ControlActionLogEvent, DvcQuorumArray, IgnoreReason, Pipeline,
@@ -85,6 +86,10 @@ pub const PIPELINE_PREPARE_QUEUE_MAX: usize = 8;
 
 /// Maximum number of replicas in a cluster.
 pub const REPLICAS_MAX: usize = 32;
+
+/// Maximum number of clients tracked in the clients table.
+/// When exceeded, the client with the oldest committed request is evicted.
+pub const CLIENTS_TABLE_MAX: usize = 8192;
 
 #[derive(Debug)]
 pub struct PipelineEntry {
@@ -502,6 +507,9 @@ where
     sent_own_do_view_change: Cell<bool>,
 
     timeouts: RefCell<TimeoutManager>,
+
+    /// VSR client-table for duplicate detection and reply caching.
+    clients_table: RefCell<ClientsTable>,
 }
 
 impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
@@ -546,6 +554,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             sent_own_start_view_change: Cell::new(false),
             sent_own_do_view_change: Cell::new(false),
             timeouts: RefCell::new(TimeoutManager::new(timeout_seed)),
+            clients_table: RefCell::new(ClientsTable::new(CLIENTS_TABLE_MAX)),
         }
     }
 
@@ -630,6 +639,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub const fn pipeline_mut(&mut self) -> &mut RefCell<P> {
         &mut self.pipeline
+    }
+
+    #[must_use]
+    pub const fn clients_table(&self) -> &RefCell<ClientsTable> {
+        &self.clients_table
     }
 
     #[must_use]

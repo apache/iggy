@@ -19,10 +19,10 @@ use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotErr
 use consensus::{
     CommitLogEvent, Consensus, Pipeline, PipelineEntry, Plane, PlaneIdentity, PlaneKind, Project,
     ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
-    ack_quorum_reached, build_reply_message, drain_committable_prefix, emit_sim_event,
-    fence_old_prepare_by_commit, panic_if_hash_chain_would_break_in_same_view,
-    pipeline_prepare_common, replicate_preflight, replicate_to_next_in_chain,
-    send_prepare_ok as send_prepare_ok_common,
+    ack_quorum_reached, build_reply_message, clients_table::RequestStatus,
+    drain_committable_prefix, emit_sim_event, fence_old_prepare_by_commit,
+    panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, replicate_preflight,
+    replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, GenericHeader, Message, PrepareHeader, PrepareOkHeader,
@@ -291,6 +291,34 @@ where
 {
     async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
+        let client_id = message.header().client;
+        let request = message.header().request;
+
+        // Duplicate detection via client-table
+        let status = consensus
+            .clients_table()
+            .borrow()
+            .check_request(client_id, request);
+        match status {
+            RequestStatus::Duplicate(cached_reply) => {
+                debug!(
+                    "on_request: duplicate request={request} for client={client_id}, re-sending cached reply"
+                );
+                consensus
+                    .message_bus()
+                    .send_to_client(client_id, cached_reply.into_generic())
+                    .await
+                    .unwrap();
+                return;
+            }
+            RequestStatus::InProgress => {
+                debug!(
+                    "on_request: request={request} for client={client_id} already in progress, dropping"
+                );
+                return;
+            }
+            RequestStatus::New => {}
+        }
 
         emit_sim_event(
             SimEventKind::ClientRequestReceived,
@@ -517,11 +545,18 @@ where
                 };
                 emit_sim_event(SimEventKind::OperationCommitted, &event);
 
-                let generic_reply =
-                    build_reply_message(consensus, &prepare_header, response).into_generic();
+                let reply = build_reply_message(consensus, &prepare_header, response);
+                // Cache reply for duplicate detection:
+                consensus
+                    .clients_table()
+                    .borrow_mut()
+                    .commit_reply(prepare_header.client, reply.clone());
+
+                let generic_reply = reply.into_generic();
                 let reply_buffers = freeze_client_reply(generic_reply);
                 emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
 
+                // Wire delivery to the client socket:
                 // TODO: Propagate send error instead of panicking; requires bus error design.
                 consensus
                     .message_bus()
