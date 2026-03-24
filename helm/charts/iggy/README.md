@@ -135,6 +135,77 @@ helm uninstall iggy
 | `ui.securityContext` | object | `{}` | UI container security context |
 | `ui.podSecurityContext` | object | `{}` | UI pod security context |
 
+## Testing
+
+The chart CI paths are also available locally from the repository root.
+
+### Render Validation
+
+If `helm` is already installed locally:
+
+```bash
+scripts/ci/test_helm.sh validate
+```
+
+If you want the pinned Linux CI tool version instead:
+
+```bash
+scripts/ci/setup-helm-tools.sh
+scripts/ci/test_helm.sh validate
+```
+
+This runs `helm lint --strict` plus the CI render scenarios, including:
+
+* default chart output
+* all-features render
+* legacy Kubernetes 1.18 API coverage
+* server-only render
+* UI-only render
+* existing-secret render
+
+### Runtime Smoke Test
+
+The smoke path requires `helm`, `kind`, `kubectl`, `curl`, and `python3`.
+
+If `helm` and `kind` are already installed:
+
+```bash
+scripts/ci/setup-helm-smoke-cluster.sh
+scripts/ci/test_helm.sh smoke
+```
+
+If you want the pinned Linux CI tool versions:
+
+```bash
+scripts/ci/setup-helm-tools.sh --install-kind
+scripts/ci/setup-helm-smoke-cluster.sh
+scripts/ci/test_helm.sh smoke
+```
+
+If a previous local smoke install failed and left resources behind, reset the smoke namespace with:
+
+```bash
+scripts/ci/test_helm.sh cleanup-smoke
+```
+
+On Apple Silicon hosts, the released `apache/iggy:0.7.0` `arm64` image may still fail during the runtime smoke path in kind. If your Docker setup supports amd64 emulation well enough, you can try recreating the dedicated smoke cluster with:
+
+```bash
+HELM_SMOKE_KIND_PLATFORM=linux/amd64 scripts/ci/setup-helm-smoke-cluster.sh
+```
+
+The smoke script defaults `IGGY_SYSTEM_SHARDING_CPU_ALLOCATION=1` for the server pod so the local kind path avoids the chart's `numa:auto` default and keeps the local runtime to a single shard, which has been more reliable on containerized local nodes. If you need a different local override, set `HELM_SMOKE_SERVER_CPU_ALLOCATION` before running `scripts/ci/test_helm.sh smoke`.
+
+On smoke-test failures you can collect the same diagnostics as CI with:
+
+```bash
+scripts/ci/test_helm.sh collect-smoke-diagnostics
+```
+
+> **Note:** `scripts/ci/setup-helm-tools.sh` currently supports Linux `x86_64` only.
+> On other local platforms, install equivalent `helm` and `kind` binaries yourself and then use the same scripts above.
+> The runtime smoke test may still fail on some local/containerized clusters if the node/kernel does not provide the `io_uring` support required by the server runtime even after the local sharding override.
+
 ## Troubleshooting
 
 ### Pod CrashLoopBackOff with "Out of memory" error

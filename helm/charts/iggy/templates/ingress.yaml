@@ -97,7 +97,7 @@ apiVersion: extensions/v1beta1
 {{- end }}
 kind: Ingress
 metadata:
-  name: {{ $fullName }}
+  name: {{ $fullName }}-ui
   labels:
     {{- include "iggy.labels" . | nindent 4 }}
   {{- with .Values.ui.ingress.annotations }}
