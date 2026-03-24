@@ -376,7 +376,7 @@ components:
   helm:
     paths:
       - "helm/**"
-    tasks: ["validate"]
+    tasks: ["validate", "smoke"]
 
   rust-bench-dashboard:
     paths:
