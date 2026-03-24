@@ -396,7 +396,7 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
     let stream = client.create_stream(STREAM_NAME).await.unwrap();
     let stream_id = stream.id;
 
-    let expiry = Duration::from_secs(3);
+    let expiry = Duration::from_secs(5);
     let topic = client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -439,6 +439,8 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
 
     // Collect initial segment counts
     let mut initial_counts: Vec<usize> = Vec::new();
+
+    // Wait until all partitions have >= 2 segments (up to 5s)
     for partition_id in 0..PARTITIONS_COUNT {
         let partition_path = data_path
             .join(format!(
@@ -446,14 +448,23 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
             ))
             .display()
             .to_string();
-        let segments = get_segment_paths_for_partition(&partition_path);
-        initial_counts.push(segments.len());
-        assert!(
-            segments.len() >= 2,
-            "Partition {} should have at least 2 segments, got {}",
-            partition_id,
-            segments.len()
-        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let count = loop {
+            let segments = get_segment_paths_for_partition(&partition_path);
+            if segments.len() >= 2 {
+                break segments.len();
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "Partition {} should have at least 2 segments after 5s, got {}",
+                    partition_id,
+                    segments.len()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        initial_counts.push(count);
     }
 
     // Wait for expiry + cleaner
