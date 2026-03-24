@@ -185,9 +185,7 @@ use crate::connectors::fixtures::{
     HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture, HttpSinkRawFixture,
 };
 use bytes::Bytes;
-use iggy::prelude::{IggyMessage, Partitioning};
-use iggy_binary_protocol::MessageClient;
-use iggy_common::Identifier;
+use iggy_common::{Identifier, IggyMessage, MessageClient, Partitioning};
 use integration::harness::seeds;
 use integration::iggy_harness;
 

@@ -135,9 +135,10 @@ impl HttpSinkWireMockContainer {
                     message: format!("Failed to parse WireMock admin response: {e}"),
                 })?;
 
+        let empty = vec![];
         let requests = body["requests"]
             .as_array()
-            .unwrap_or(&[])
+            .unwrap_or(&empty)
             .iter()
             .map(|r| WireMockRequest {
                 method: r["request"]["method"].as_str().unwrap_or("").to_string(),
