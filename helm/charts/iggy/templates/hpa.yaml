@@ -16,7 +16,7 @@
 # under the License.
 
 {{ if .Values.autoscaling.enabled }}
-{{- if .Capabilities.APIVersions.Has "autoscaling/v2" -}}
+{{- if semverCompare ">=1.23-0" .Capabilities.KubeVersion.GitVersion -}}
 apiVersion: autoscaling/v2
 {{- else -}}
 apiVersion: autoscaling/v2beta2
@@ -38,24 +38,24 @@ spec:
     - type: Resource
       resource:
         name: cpu
-        {{- if .Capabilities.APIVersions.Has "autoscaling/v2" }}
+        {{ if semverCompare ">=1.23-0" .Capabilities.KubeVersion.GitVersion }}
         target:
           type: Utilization
           averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
-        {{- else }}
-          targetAverageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
-        {{- end }}
+        {{ else }}
+        targetAverageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+        {{ end }}
     {{- end }}
     {{- if .Values.autoscaling.targetMemoryUtilizationPercentage }}
     - type: Resource
       resource:
         name: memory
-        {{- if .Capabilities.APIVersions.Has "autoscaling/v2" }}
+        {{ if semverCompare ">=1.23-0" .Capabilities.KubeVersion.GitVersion }}
         target:
           type: Utilization
           averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
-        {{- else }}
-          targetAverageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
-        {{- end }}
+        {{ else }}
+        targetAverageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
+        {{ end }}
     {{- end }}
 {{- end }}

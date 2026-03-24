@@ -243,6 +243,8 @@ jobs:
             --set server.ingress.enabled=true \
             --set ui.ingress.enabled=true \
             > "$out/legacy-k8s-1.18.yaml"
+          test "$(grep -c '^apiVersion: networking.k8s.io/v1beta1$' "$out/legacy-k8s-1.18.yaml")" -eq 2
+          grep -q '^apiVersion: autoscaling/v2beta2$' "$out/legacy-k8s-1.18.yaml"
 
           helm template iggy "$chart" --set ui.enabled=false > "$out/server-only.yaml"
           test "$(grep -c '^kind: Deployment$' "$out/server-only.yaml")" -eq 1
