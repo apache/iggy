@@ -50,6 +50,9 @@ const DEFAULT_CURSOR: &str = "1970-01-01T00:00:00Z";
 const DEFAULT_MAX_OPEN_RETRIES: u32 = 10;
 // Cap for exponential backoff in open() — never wait longer than this
 const DEFAULT_OPEN_RETRY_MAX_DELAY: &str = "60s";
+// Cap for exponential backoff on per-query retries — kept short so a
+// transient InfluxDB blip does not stall polling for too long
+const DEFAULT_RETRY_MAX_DELAY: &str = "5s";
 // How many consecutive poll failures open the circuit breaker
 const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
 // How long the circuit stays open before allowing a probe attempt
@@ -77,6 +80,10 @@ pub struct InfluxDbSource {
     verbose: bool,
     retry_delay: Duration,
     poll_interval: Duration,
+    /// Cached once in `open()` — parsed from `config.retry_max_delay`.
+    /// Controls the backoff cap for per-query retries only; startup retries
+    /// use `config.open_retry_max_delay` and are never affected by this field.
+    query_retry_max_delay: Duration,
     circuit_breaker: Arc<CircuitBreaker>,
 }
 
@@ -99,8 +106,12 @@ pub struct InfluxDbSourceConfig {
     pub timeout: Option<String>,
     // How many times open() will retry before giving up
     pub max_open_retries: Option<u32>,
-    // Upper cap on open() backoff delay
+    // Upper cap on open() backoff delay — can be set high (e.g. "60s") for
+    // patient startup without affecting per-query retry behaviour
     pub open_retry_max_delay: Option<String>,
+    // Upper cap on per-query retry backoff — kept short so a transient blip
+    // does not stall polling; independent of open_retry_max_delay
+    pub retry_max_delay: Option<String>,
     // Circuit breaker configuration
     pub circuit_breaker_threshold: Option<u32>,
     pub circuit_breaker_cool_down: Option<String>,
@@ -119,7 +130,15 @@ impl PayloadFormat {
         match value.map(|v| v.to_ascii_lowercase()).as_deref() {
             Some("text") | Some("utf8") => PayloadFormat::Text,
             Some("raw") | Some("base64") => PayloadFormat::Raw,
-            _ => PayloadFormat::Json,
+            Some("json") => PayloadFormat::Json,
+            other => {
+                warn!(
+                    "Unrecognized payload_format value {:?}, falling back to JSON. \
+                     Valid values are: \"json\", \"text\", \"utf8\", \"base64\", \"raw\".",
+                    other
+                );
+                PayloadFormat::Json
+            }
         }
     }
 
@@ -224,6 +243,7 @@ impl InfluxDbSource {
             verbose,
             retry_delay,
             poll_interval,
+            query_retry_max_delay: Duration::from_secs(0), // overwritten in open()
             circuit_breaker: Arc::new(CircuitBreaker::new(cb_threshold, cb_cool_down)),
         }
     }
@@ -420,11 +440,8 @@ impl InfluxDbSource {
         let max_retries = self.get_max_retries();
         let token = self.config.token.clone();
 
-        // Cap for per-query backoff (reuse open_retry_max_delay config)
-        let max_delay = parse_duration(
-            self.config.open_retry_max_delay.as_deref(),
-            DEFAULT_OPEN_RETRY_MAX_DELAY,
-        );
+        // Cap for per-query backoff — cached in open(), no re-parse needed.
+        let max_delay = self.query_retry_max_delay;
 
         let body = json!({
             "query": query,
@@ -678,6 +695,13 @@ impl Source for InfluxDbSource {
         );
 
         self.client = Some(self.build_client()?);
+
+        // Cache once here — derived purely from a config field that never
+        // changes at runtime, so re-parsing on every poll is wasteful.
+        self.query_retry_max_delay = parse_duration(
+            self.config.retry_max_delay.as_deref(),
+            DEFAULT_RETRY_MAX_DELAY,
+        );
 
         // Validate cursor_field before touching the network: string comparison
         // is only safe for timestamp columns. See validate_cursor_field for details.

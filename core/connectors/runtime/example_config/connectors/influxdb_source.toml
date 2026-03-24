@@ -20,7 +20,7 @@ key = "influxdb"
 enabled = true
 version = 0
 name = "InfluxDB source"
-path = "target/release/libiggy_connector_influxdb_source"
+path = "<BASE_DIR>/target/release/libiggy_connector_influxdb_source"
 plugin_config_format = "toml"
 verbose = false
 
@@ -32,10 +32,10 @@ batch_length = 100
 
 [plugin_config]
 url = "http://localhost:8086"
-org = "iggy"
-token = "replace-with-token"
+org = "iggy_org"
+token = "replace_token_with_secret_token"
 query = '''
-from(bucket: "events")
+from(bucket: "iggy_bucket")
   |> range(start: -1h)
   |> filter(fn: (r) => r._measurement == "iggy_messages")
   |> filter(fn: (r) => r._time > time(v: "$cursor"))

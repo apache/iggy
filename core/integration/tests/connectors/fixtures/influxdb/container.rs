@@ -207,10 +207,6 @@ pub trait InfluxDbOps: Sync {
                 })?;
 
             let text = response.text().await.unwrap_or_default();
-            eprintln!(
-                "DEBUG influxdb csv response:\n{}",
-                &text[..text.len().min(2000)]
-            );
             // InfluxDB annotated CSV format:
             //   - Annotation rows start with '#'
             //   - Header row starts with ',result,table,...'  (empty first field)
