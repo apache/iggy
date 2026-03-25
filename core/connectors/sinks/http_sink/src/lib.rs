@@ -334,6 +334,13 @@ impl HttpSink {
             .map_err(|e| Error::InitError(format!("Failed to build HTTP client: {}", e)))
     }
 
+    /// Returns the initialized HTTP client, or an error if `open()` was not called.
+    fn client(&self) -> Result<&reqwest::Client, Error> {
+        self.client.as_ref().ok_or_else(|| {
+            Error::InitError("HTTP client not initialized — was open() called?".to_string())
+        })
+    }
+
     /// Convert a `Payload` to a JSON value for metadata wrapping.
     /// Non-JSON payloads are base64-encoded with a `iggy_payload_encoding` marker.
     ///
@@ -489,12 +496,8 @@ impl HttpSink {
     ///
     /// Takes `Bytes` instead of `Vec<u8>` so retries clone via reference-count increment (O(1))
     /// rather than copying the entire payload on each attempt.
-    async fn send_with_retry(
-        &self,
-        client: &reqwest::Client,
-        body: Bytes,
-        content_type: &str,
-    ) -> Result<(), Error> {
+    async fn send_with_retry(&self, body: Bytes, content_type: &str) -> Result<(), Error> {
+        let client = self.client()?;
         let mut attempt = 0u32;
 
         loop {
@@ -628,7 +631,6 @@ impl HttpSink {
     /// all needed fields (payload, metadata) within the closure.
     async fn send_per_message<F>(
         &self,
-        client: &reqwest::Client,
         messages: Vec<ConsumedMessage>,
         content_type: &str,
         mut build_body: F,
@@ -677,10 +679,7 @@ impl HttpSink {
                 continue;
             }
 
-            match self
-                .send_with_retry(client, Bytes::from(body), content_type)
-                .await
-            {
+            match self.send_with_retry(Bytes::from(body), content_type).await {
                 Ok(()) => {
                     delivered += 1;
                     consecutive_failures = 0;
@@ -737,24 +736,18 @@ impl HttpSink {
     /// Send messages in `individual` mode — one HTTP request per message.
     async fn send_individual(
         &self,
-        client: &reqwest::Client,
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
-        self.send_per_message(
-            client,
-            messages,
-            self.batch_mode.content_type(),
-            |mut message| {
-                let payload = std::mem::replace(&mut message.payload, Payload::Raw(vec![]));
-                let payload_json = self.payload_to_json(payload)?;
-                let envelope =
-                    self.build_envelope(&message, topic_metadata, messages_metadata, payload_json);
-                serde_json::to_vec(&envelope)
-                    .map_err(|e| Error::Serialization(format!("Envelope serialize: {}", e)))
-            },
-        )
+        self.send_per_message(messages, self.batch_mode.content_type(), |mut message| {
+            let payload = std::mem::replace(&mut message.payload, Payload::Raw(vec![]));
+            let payload_json = self.payload_to_json(payload)?;
+            let envelope =
+                self.build_envelope(&message, topic_metadata, messages_metadata, payload_json);
+            serde_json::to_vec(&envelope)
+                .map_err(|e| Error::Serialization(format!("Envelope serialize: {}", e)))
+        })
         .await
     }
 
@@ -762,19 +755,13 @@ impl HttpSink {
     ///
     /// Shared by `send_ndjson` and `send_json_array` — the post-send accounting logic
     /// (error propagation, skip warnings) is identical across batch modes.
-    async fn send_batch_body(
-        &self,
-        client: &reqwest::Client,
-        body: Bytes,
-        count: u64,
-        skipped: u64,
-    ) -> Result<(), Error> {
+    async fn send_batch_body(&self, body: Bytes, count: u64, skipped: u64) -> Result<(), Error> {
         debug_assert!(
             count > 0,
             "send_batch_body called with count=0 — callers must guard against empty batches"
         );
         if let Err(e) = self
-            .send_with_retry(client, body, self.batch_mode.content_type())
+            .send_with_retry(body, self.batch_mode.content_type())
             .await
         {
             // send_with_retry already added 1 to errors_count for the HTTP failure.
@@ -804,7 +791,6 @@ impl HttpSink {
     /// Skips individual messages that fail serialization rather than aborting the batch.
     async fn send_ndjson(
         &self,
-        client: &reqwest::Client,
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
         messages: Vec<ConsumedMessage>,
@@ -869,7 +855,7 @@ impl HttpSink {
             )));
         }
 
-        self.send_batch_body(client, Bytes::from(body), count, skipped)
+        self.send_batch_body(Bytes::from(body), count, skipped)
             .await
     }
 
@@ -877,7 +863,6 @@ impl HttpSink {
     /// Skips individual messages that fail serialization rather than aborting the batch.
     async fn send_json_array(
         &self,
-        client: &reqwest::Client,
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
         messages: Vec<ConsumedMessage>,
@@ -948,27 +933,18 @@ impl HttpSink {
             )));
         }
 
-        self.send_batch_body(client, Bytes::from(body), count, skipped)
+        self.send_batch_body(Bytes::from(body), count, skipped)
             .await
     }
 
     /// Send messages in `raw` mode — one HTTP request per message with raw bytes.
-    async fn send_raw(
-        &self,
-        client: &reqwest::Client,
-        messages: Vec<ConsumedMessage>,
-    ) -> Result<(), Error> {
-        self.send_per_message(
-            client,
-            messages,
-            self.batch_mode.content_type(),
-            |message| {
-                message
-                    .payload
-                    .try_into_vec()
-                    .map_err(|e| Error::Serialization(format!("Raw payload convert: {}", e)))
-            },
-        )
+    async fn send_raw(&self, messages: Vec<ConsumedMessage>) -> Result<(), Error> {
+        self.send_per_message(messages, self.batch_mode.content_type(), |message| {
+            message
+                .payload
+                .try_into_vec()
+                .map_err(|e| Error::Serialization(format!("Raw payload convert: {}", e)))
+        })
         .await
     }
 }
@@ -1198,24 +1174,20 @@ impl Sink for HttpSink {
             );
         }
 
-        let client = self.client.as_ref().ok_or_else(|| {
-            Error::InitError("HTTP client not initialized — was open() called?".to_string())
-        })?;
-
         let result = match self.batch_mode {
             BatchMode::Individual => {
-                self.send_individual(client, topic_metadata, &messages_metadata, messages)
+                self.send_individual(topic_metadata, &messages_metadata, messages)
                     .await
             }
             BatchMode::NdJson => {
-                self.send_ndjson(client, topic_metadata, &messages_metadata, messages)
+                self.send_ndjson(topic_metadata, &messages_metadata, messages)
                     .await
             }
             BatchMode::JsonArray => {
-                self.send_json_array(client, topic_metadata, &messages_metadata, messages)
+                self.send_json_array(topic_metadata, &messages_metadata, messages)
                     .await
             }
-            BatchMode::Raw => self.send_raw(client, messages).await,
+            BatchMode::Raw => self.send_raw(messages).await,
         };
 
         if let Err(ref e) = result {
