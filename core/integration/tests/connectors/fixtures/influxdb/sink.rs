@@ -18,11 +18,13 @@
  */
 
 use super::container::{
-    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_BUCKET, ENV_SINK_ORG, ENV_SINK_PATH,
-    ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM,
-    ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_TOKEN, ENV_SINK_URL, HEALTH_CHECK_ATTEMPTS,
-    HEALTH_CHECK_INTERVAL_MS, INFLUXDB_BUCKET, INFLUXDB_ORG, INFLUXDB_TOKEN, InfluxDbContainer,
-    InfluxDbOps, create_http_client,
+    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_BUCKET, ENV_SINK_INCLUDE_CHECKSUM,
+    ENV_SINK_INCLUDE_METADATA, ENV_SINK_INCLUDE_ORIGIN_TIMESTAMP, ENV_SINK_INCLUDE_PARTITION_TAG,
+    ENV_SINK_INCLUDE_STREAM_TAG, ENV_SINK_INCLUDE_TOPIC_TAG, ENV_SINK_ORG, ENV_SINK_PATH,
+    ENV_SINK_PAYLOAD_FORMAT, ENV_SINK_PRECISION, ENV_SINK_STREAMS_0_CONSUMER_GROUP,
+    ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM, ENV_SINK_STREAMS_0_TOPICS,
+    ENV_SINK_TOKEN, ENV_SINK_URL, HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, INFLUXDB_BUCKET,
+    INFLUXDB_ORG, INFLUXDB_TOKEN, InfluxDbContainer, InfluxDbOps, create_http_client,
 };
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
@@ -35,9 +37,25 @@ use tracing::info;
 const POLL_ATTEMPTS: usize = 100;
 const POLL_INTERVAL_MS: u64 = 50;
 
+/// Controls which variant of the sink fixture is instantiated.
+#[derive(Debug, Clone, Default)]
+pub struct InfluxDbSinkOptions {
+    /// Override `payload_format` sent to the connector runtime. `None` → "json".
+    pub payload_format: Option<String>,
+    /// Override `precision`. `None` → "us".
+    pub precision: Option<String>,
+    pub include_metadata: Option<bool>,
+    pub include_checksum: Option<bool>,
+    pub include_origin_timestamp: Option<bool>,
+    pub include_stream_tag: Option<bool>,
+    pub include_topic_tag: Option<bool>,
+    pub include_partition_tag: Option<bool>,
+}
+
 pub struct InfluxDbSinkFixture {
     container: InfluxDbContainer,
     http_client: HttpClient,
+    pub options: InfluxDbSinkOptions,
 }
 
 impl InfluxDbOps for InfluxDbSinkFixture {
@@ -50,7 +68,7 @@ impl InfluxDbOps for InfluxDbSinkFixture {
 }
 
 impl InfluxDbSinkFixture {
-    /// Poll until at least `expected` points exist in the bucket.
+    /// Poll until at least `expected` points exist in the bucket under `measurement`.
     pub async fn wait_for_points(
         &self,
         measurement: &str,
@@ -76,20 +94,17 @@ impl InfluxDbSinkFixture {
             message: format!("Expected at least {expected} points after {POLL_ATTEMPTS} attempts"),
         })
     }
-}
 
-#[async_trait]
-impl TestFixture for InfluxDbSinkFixture {
-    async fn setup() -> Result<Self, TestBinaryError> {
+    pub async fn setup_with_options(options: InfluxDbSinkOptions) -> Result<Self, TestBinaryError> {
         let container = InfluxDbContainer::start().await?;
         let http_client = create_http_client();
 
         let fixture = Self {
             container,
             http_client,
+            options,
         };
 
-        // Same /ping readiness probe as the source fixture.
         for attempt in 0..HEALTH_CHECK_ATTEMPTS {
             let url = format!("{}/ping", fixture.container.base_url);
             match fixture.http_client.get(&url).send().await {
@@ -118,6 +133,13 @@ impl TestFixture for InfluxDbSinkFixture {
             ),
         })
     }
+}
+
+#[async_trait]
+impl TestFixture for InfluxDbSinkFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        Self::setup_with_options(InfluxDbSinkOptions::default()).await
+    }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         let mut envs = HashMap::new();
@@ -133,7 +155,42 @@ impl TestFixture for InfluxDbSinkFixture {
             ENV_SINK_STREAMS_0_TOPICS.to_string(),
             format!("[{}]", DEFAULT_TEST_TOPIC),
         );
-        envs.insert(ENV_SINK_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+
+        let payload_format = self
+            .options
+            .payload_format
+            .clone()
+            .unwrap_or_else(|| "json".to_string());
+        let schema = match payload_format.as_str() {
+            "text" | "utf8" => "text",
+            "base64" | "raw" => "raw",
+            _ => "json",
+        };
+        envs.insert(ENV_SINK_PAYLOAD_FORMAT.to_string(), payload_format);
+        envs.insert(ENV_SINK_STREAMS_0_SCHEMA.to_string(), schema.to_string());
+
+        if let Some(precision) = &self.options.precision {
+            envs.insert(ENV_SINK_PRECISION.to_string(), precision.clone());
+        }
+        if let Some(v) = self.options.include_metadata {
+            envs.insert(ENV_SINK_INCLUDE_METADATA.to_string(), v.to_string());
+        }
+        if let Some(v) = self.options.include_checksum {
+            envs.insert(ENV_SINK_INCLUDE_CHECKSUM.to_string(), v.to_string());
+        }
+        if let Some(v) = self.options.include_origin_timestamp {
+            envs.insert(ENV_SINK_INCLUDE_ORIGIN_TIMESTAMP.to_string(), v.to_string());
+        }
+        if let Some(v) = self.options.include_stream_tag {
+            envs.insert(ENV_SINK_INCLUDE_STREAM_TAG.to_string(), v.to_string());
+        }
+        if let Some(v) = self.options.include_topic_tag {
+            envs.insert(ENV_SINK_INCLUDE_TOPIC_TAG.to_string(), v.to_string());
+        }
+        if let Some(v) = self.options.include_partition_tag {
+            envs.insert(ENV_SINK_INCLUDE_PARTITION_TAG.to_string(), v.to_string());
+        }
+
         envs.insert(
             ENV_SINK_STREAMS_0_CONSUMER_GROUP.to_string(),
             "influxdb_sink_cg".to_string(),
@@ -145,3 +202,76 @@ impl TestFixture for InfluxDbSinkFixture {
         envs
     }
 }
+
+// ── Typed fixture variants used by format-specific test files ─────────────────
+
+pub struct InfluxDbSinkTextFixture(pub InfluxDbSinkFixture);
+pub struct InfluxDbSinkBase64Fixture(pub InfluxDbSinkFixture);
+pub struct InfluxDbSinkNoMetadataFixture(pub InfluxDbSinkFixture);
+pub struct InfluxDbSinkNsPrecisionFixture(pub InfluxDbSinkFixture);
+
+macro_rules! delegate_fixture {
+    ($wrapper:ident, $opts:expr) => {
+        #[async_trait]
+        impl TestFixture for $wrapper {
+            async fn setup() -> Result<Self, TestBinaryError> {
+                InfluxDbSinkFixture::setup_with_options($opts)
+                    .await
+                    .map(Self)
+            }
+
+            fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+                self.0.connectors_runtime_envs()
+            }
+        }
+
+        impl $wrapper {
+            pub async fn wait_for_points(
+                &self,
+                measurement: &str,
+                expected: usize,
+            ) -> Result<usize, TestBinaryError> {
+                self.0.wait_for_points(measurement, expected).await
+            }
+        }
+    };
+}
+
+delegate_fixture!(
+    InfluxDbSinkTextFixture,
+    InfluxDbSinkOptions {
+        payload_format: Some("text".to_string()),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    InfluxDbSinkBase64Fixture,
+    InfluxDbSinkOptions {
+        payload_format: Some("base64".to_string()),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    InfluxDbSinkNoMetadataFixture,
+    InfluxDbSinkOptions {
+        payload_format: Some("json".to_string()),
+        include_metadata: Some(false),
+        include_checksum: Some(false),
+        include_origin_timestamp: Some(false),
+        include_stream_tag: Some(false),
+        include_topic_tag: Some(false),
+        include_partition_tag: Some(false),
+        ..Default::default()
+    }
+);
+
+delegate_fixture!(
+    InfluxDbSinkNsPrecisionFixture,
+    InfluxDbSinkOptions {
+        payload_format: Some("json".to_string()),
+        precision: Some("ns".to_string()),
+        ..Default::default()
+    }
+);

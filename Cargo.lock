@@ -5890,6 +5890,7 @@ dependencies = [
  "ahash 0.8.12",
  "assert_cmd",
  "async-trait",
+ "base64 0.22.1",
  "bon",
  "bytes",
  "compio",

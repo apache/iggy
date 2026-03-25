@@ -27,7 +27,11 @@ mod wiremock;
 
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use iceberg::{DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergOps, IcebergPreCreatedFixture};
-pub use influxdb::{InfluxDbSinkFixture, InfluxDbSourceFixture};
+pub use influxdb::{
+    InfluxDbSinkBase64Fixture, InfluxDbSinkFixture, InfluxDbSinkNoMetadataFixture,
+    InfluxDbSinkNsPrecisionFixture, InfluxDbSinkTextFixture, InfluxDbSourceFixture,
+    InfluxDbSourceRawFixture, InfluxDbSourceTextFixture,
+};
 pub use mongodb::{
     MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,

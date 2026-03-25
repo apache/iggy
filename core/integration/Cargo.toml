@@ -30,6 +30,7 @@ ci-qemu = []
 ahash = { workspace = true }
 assert_cmd = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bon = { workspace = true }
 bytes = { workspace = true }
 compio = { workspace = true }
