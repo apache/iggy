@@ -84,7 +84,7 @@ async fn run_cleanup_scenario(scenario: CleanupScenarioFn) {
         .server(
             TestServerConfig::builder()
                 .extra_envs(HashMap::from([
-                    ("IGGY_SYSTEM_SEGMENT_SIZE".to_string(), "100KiB".to_string()),
+                    ("IGGY_SYSTEM_SEGMENT_SIZE".to_string(), "10KiB".to_string()),
                     (
                         "IGGY_DATA_MAINTENANCE_MESSAGES_CLEANER_ENABLED".to_string(),
                         "true".to_string(),
