@@ -32,7 +32,6 @@ bytemuck = { workspace = true }
 bytes = { workspace = true }
 compio = { workspace = true }
 iggy_binary_protocol = { workspace = true }
-iggy_common = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
