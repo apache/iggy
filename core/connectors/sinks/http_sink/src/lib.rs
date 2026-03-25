@@ -1604,8 +1604,11 @@ mod tests {
     fn given_raw_payload_should_base64_encode() {
         let sink = given_sink_with_defaults();
         let result = sink.payload_to_json(Payload::Raw(vec![1, 2, 3])).unwrap();
-        assert_eq!(result["iggy_payload_encoding"], "base64");
-        assert_eq!(result["data"], general_purpose::STANDARD.encode([1, 2, 3]));
+        assert_eq!(result[FIELD_PAYLOAD_ENCODING], "base64");
+        assert_eq!(
+            result[FIELD_DATA],
+            general_purpose::STANDARD.encode([1, 2, 3])
+        );
     }
 
     #[test]
@@ -1614,8 +1617,11 @@ mod tests {
         let result = sink
             .payload_to_json(Payload::FlatBuffer(vec![4, 5, 6]))
             .unwrap();
-        assert_eq!(result["iggy_payload_encoding"], "base64");
-        assert_eq!(result["data"], general_purpose::STANDARD.encode([4, 5, 6]));
+        assert_eq!(result[FIELD_PAYLOAD_ENCODING], "base64");
+        assert_eq!(
+            result[FIELD_DATA],
+            general_purpose::STANDARD.encode([4, 5, 6])
+        );
     }
 
     #[test]
@@ -1624,9 +1630,9 @@ mod tests {
         let result = sink
             .payload_to_json(Payload::Proto("proto_data".to_string()))
             .unwrap();
-        assert_eq!(result["iggy_payload_encoding"], "base64");
+        assert_eq!(result[FIELD_PAYLOAD_ENCODING], "base64");
         assert_eq!(
-            result["data"],
+            result[FIELD_DATA],
             general_purpose::STANDARD.encode(b"proto_data")
         );
     }
@@ -1643,19 +1649,19 @@ mod tests {
 
         let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json);
 
-        assert!(envelope.get("metadata").is_some());
-        assert!(envelope.get("payload").is_some());
+        assert!(envelope.get(FIELD_METADATA).is_some());
+        assert!(envelope.get(FIELD_PAYLOAD).is_some());
 
-        let metadata = &envelope["metadata"];
-        assert_eq!(metadata["iggy_offset"], 10);
-        assert_eq!(metadata["iggy_timestamp"], 1710064800000000u64);
-        assert_eq!(metadata["iggy_stream"], "test_stream");
-        assert_eq!(metadata["iggy_topic"], "test_topic");
-        assert_eq!(metadata["iggy_partition_id"], 0);
-        assert_eq!(metadata["iggy_id"], format_u128_as_uuid(42));
+        let metadata = &envelope[FIELD_METADATA];
+        assert_eq!(metadata[FIELD_OFFSET], 10);
+        assert_eq!(metadata[FIELD_TIMESTAMP], 1710064800000000u64);
+        assert_eq!(metadata[FIELD_STREAM], "test_stream");
+        assert_eq!(metadata[FIELD_TOPIC], "test_topic");
+        assert_eq!(metadata[FIELD_PARTITION_ID], 0);
+        assert_eq!(metadata[FIELD_ID], format_u128_as_uuid(42));
         // Verify conditional fields are absent by default
-        assert!(metadata.get("iggy_checksum").is_none());
-        assert!(metadata.get("iggy_origin_timestamp").is_none());
+        assert!(metadata.get(FIELD_CHECKSUM).is_none());
+        assert!(metadata.get(FIELD_ORIGIN_TIMESTAMP).is_none());
     }
 
     #[test]
@@ -1673,7 +1679,7 @@ mod tests {
 
         // Should be the payload itself, not wrapped
         assert_eq!(envelope, payload_json);
-        assert!(envelope.get("metadata").is_none());
+        assert!(envelope.get(FIELD_METADATA).is_none());
     }
 
     #[test]
@@ -1688,7 +1694,7 @@ mod tests {
         let payload_json = sink.payload_to_json(message.payload.clone()).unwrap();
 
         let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json);
-        assert_eq!(envelope["metadata"]["iggy_checksum"], 12345);
+        assert_eq!(envelope[FIELD_METADATA][FIELD_CHECKSUM], 12345);
     }
 
     #[test]
@@ -1704,7 +1710,7 @@ mod tests {
 
         let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json);
         assert_eq!(
-            envelope["metadata"]["iggy_origin_timestamp"],
+            envelope[FIELD_METADATA][FIELD_ORIGIN_TIMESTAMP],
             1710064799000000u64
         );
     }
@@ -1736,7 +1742,7 @@ mod tests {
         let payload_json = sink.payload_to_json(message.payload.clone()).unwrap();
         let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json);
 
-        let iggy_headers = &envelope["metadata"]["iggy_headers"];
+        let iggy_headers = &envelope[FIELD_METADATA][FIELD_HEADERS];
         assert!(
             !iggy_headers.is_null(),
             "Expected iggy_headers in metadata when message has headers"
@@ -1757,7 +1763,7 @@ mod tests {
 
         let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json);
         assert!(
-            envelope["metadata"].get("iggy_headers").is_none(),
+            envelope[FIELD_METADATA].get(FIELD_HEADERS).is_none(),
             "Expected no iggy_headers when message has no headers"
         );
     }
