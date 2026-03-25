@@ -103,6 +103,17 @@ pub enum BatchMode {
     Raw,
 }
 
+impl BatchMode {
+    /// Determine the Content-Type header based on batch mode.
+    fn content_type(&self) -> &'static str {
+        match self {
+            BatchMode::Individual | BatchMode::JsonArray => "application/json",
+            BatchMode::NdJson => "application/x-ndjson",
+            BatchMode::Raw => "application/octet-stream",
+        }
+    }
+}
+
 /// Configuration for the HTTP sink connector, deserialized from [plugin_config] in config.toml.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HttpSinkConfig {
@@ -311,15 +322,6 @@ impl HttpSink {
         builder
             .build()
             .map_err(|e| Error::InitError(format!("Failed to build HTTP client: {}", e)))
-    }
-
-    /// Determine the Content-Type header based on batch mode.
-    fn content_type(&self) -> &'static str {
-        match self.batch_mode {
-            BatchMode::Individual | BatchMode::JsonArray => "application/json",
-            BatchMode::NdJson => "application/x-ndjson",
-            BatchMode::Raw => "application/octet-stream",
-        }
     }
 
     /// Convert a `Payload` to a JSON value for metadata wrapping.
@@ -714,14 +716,19 @@ impl HttpSink {
         messages_metadata: &MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
-        self.send_per_message(client, messages, self.content_type(), |mut message| {
-            let payload = std::mem::replace(&mut message.payload, Payload::Raw(vec![]));
-            let payload_json = self.payload_to_json(payload)?;
-            let envelope =
-                self.build_envelope(&message, topic_metadata, messages_metadata, payload_json);
-            serde_json::to_vec(&envelope)
-                .map_err(|e| Error::Serialization(format!("Envelope serialize: {}", e)))
-        })
+        self.send_per_message(
+            client,
+            messages,
+            self.batch_mode.content_type(),
+            |mut message| {
+                let payload = std::mem::replace(&mut message.payload, Payload::Raw(vec![]));
+                let payload_json = self.payload_to_json(payload)?;
+                let envelope =
+                    self.build_envelope(&message, topic_metadata, messages_metadata, payload_json);
+                serde_json::to_vec(&envelope)
+                    .map_err(|e| Error::Serialization(format!("Envelope serialize: {}", e)))
+            },
+        )
         .await
     }
 
@@ -741,7 +748,7 @@ impl HttpSink {
             "send_batch_body called with count=0 — callers must guard against empty batches"
         );
         if let Err(e) = self
-            .send_with_retry(client, body, self.content_type())
+            .send_with_retry(client, body, self.batch_mode.content_type())
             .await
         {
             // send_with_retry already added 1 to errors_count for the HTTP failure.
@@ -925,12 +932,17 @@ impl HttpSink {
         client: &reqwest::Client,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
-        self.send_per_message(client, messages, self.content_type(), |message| {
-            message
-                .payload
-                .try_into_vec()
-                .map_err(|e| Error::Serialization(format!("Raw payload convert: {}", e)))
-        })
+        self.send_per_message(
+            client,
+            messages,
+            self.batch_mode.content_type(),
+            |message| {
+                message
+                    .payload
+                    .try_into_vec()
+                    .map_err(|e| Error::Serialization(format!("Raw payload convert: {}", e)))
+            },
+        )
         .await
     }
 }
@@ -1043,7 +1055,7 @@ impl Sink for HttpSink {
                  Remove it from [headers] to silence this warning.",
                 self.id,
                 self.batch_mode,
-                self.content_type(),
+                self.batch_mode.content_type(),
             );
         }
 
@@ -1457,10 +1469,7 @@ mod tests {
         ];
 
         for (mode, expected) in cases {
-            let mut config = given_default_config();
-            config.batch_mode = Some(mode);
-            let sink = HttpSink::new(1, config);
-            assert_eq!(sink.content_type(), expected);
+            assert_eq!(mode.content_type(), expected);
         }
     }
 
@@ -1936,7 +1945,7 @@ mod tests {
         config.include_metadata = Some(true);
         let sink = HttpSink::new(1, config);
         // Raw mode uses octet-stream regardless of include_metadata
-        assert_eq!(sink.content_type(), "application/octet-stream");
+        assert_eq!(sink.batch_mode.content_type(), "application/octet-stream");
         assert_eq!(sink.batch_mode, BatchMode::Raw);
         // include_metadata is set but irrelevant in raw mode (warned at construction)
         assert!(sink.include_metadata);
