@@ -95,64 +95,48 @@ impl Operation {
     }
 
     /// Bidirectional mapping: `Operation` -> client command code.
+    ///
+    /// Delegates to the dispatch table as the single source of truth.
     #[must_use]
     pub const fn to_command_code(&self) -> Option<u32> {
-        use crate::codes;
         match self {
             Self::Reserved => None,
-            Self::CreateStream => Some(codes::CREATE_STREAM_CODE),
-            Self::UpdateStream => Some(codes::UPDATE_STREAM_CODE),
-            Self::DeleteStream => Some(codes::DELETE_STREAM_CODE),
-            Self::PurgeStream => Some(codes::PURGE_STREAM_CODE),
-            Self::CreateTopic => Some(codes::CREATE_TOPIC_CODE),
-            Self::UpdateTopic => Some(codes::UPDATE_TOPIC_CODE),
-            Self::DeleteTopic => Some(codes::DELETE_TOPIC_CODE),
-            Self::PurgeTopic => Some(codes::PURGE_TOPIC_CODE),
-            Self::CreatePartitions => Some(codes::CREATE_PARTITIONS_CODE),
-            Self::DeletePartitions => Some(codes::DELETE_PARTITIONS_CODE),
-            Self::DeleteSegments => Some(codes::DELETE_SEGMENTS_CODE),
-            Self::CreateConsumerGroup => Some(codes::CREATE_CONSUMER_GROUP_CODE),
-            Self::DeleteConsumerGroup => Some(codes::DELETE_CONSUMER_GROUP_CODE),
-            Self::CreateUser => Some(codes::CREATE_USER_CODE),
-            Self::UpdateUser => Some(codes::UPDATE_USER_CODE),
-            Self::DeleteUser => Some(codes::DELETE_USER_CODE),
-            Self::ChangePassword => Some(codes::CHANGE_PASSWORD_CODE),
-            Self::UpdatePermissions => Some(codes::UPDATE_PERMISSIONS_CODE),
-            Self::CreatePersonalAccessToken => Some(codes::CREATE_PERSONAL_ACCESS_TOKEN_CODE),
-            Self::DeletePersonalAccessToken => Some(codes::DELETE_PERSONAL_ACCESS_TOKEN_CODE),
-            Self::SendMessages => Some(codes::SEND_MESSAGES_CODE),
-            Self::StoreConsumerOffset => Some(codes::STORE_CONSUMER_OFFSET_CODE),
+            Self::CreateStream
+            | Self::UpdateStream
+            | Self::DeleteStream
+            | Self::PurgeStream
+            | Self::CreateTopic
+            | Self::UpdateTopic
+            | Self::DeleteTopic
+            | Self::PurgeTopic
+            | Self::CreatePartitions
+            | Self::DeletePartitions
+            | Self::DeleteSegments
+            | Self::CreateConsumerGroup
+            | Self::DeleteConsumerGroup
+            | Self::CreateUser
+            | Self::UpdateUser
+            | Self::DeleteUser
+            | Self::ChangePassword
+            | Self::UpdatePermissions
+            | Self::CreatePersonalAccessToken
+            | Self::DeletePersonalAccessToken
+            | Self::SendMessages
+            | Self::StoreConsumerOffset => match crate::dispatch::lookup_by_operation(*self) {
+                Some(meta) => Some(meta.code),
+                None => None,
+            },
         }
     }
 
     /// Bidirectional mapping: client command code -> `Operation`.
+    ///
+    /// Delegates to the dispatch table as the single source of truth.
     #[must_use]
     pub const fn from_command_code(code: u32) -> Option<Self> {
-        use crate::codes;
-        match code {
-            codes::CREATE_STREAM_CODE => Some(Self::CreateStream),
-            codes::UPDATE_STREAM_CODE => Some(Self::UpdateStream),
-            codes::DELETE_STREAM_CODE => Some(Self::DeleteStream),
-            codes::PURGE_STREAM_CODE => Some(Self::PurgeStream),
-            codes::CREATE_TOPIC_CODE => Some(Self::CreateTopic),
-            codes::UPDATE_TOPIC_CODE => Some(Self::UpdateTopic),
-            codes::DELETE_TOPIC_CODE => Some(Self::DeleteTopic),
-            codes::PURGE_TOPIC_CODE => Some(Self::PurgeTopic),
-            codes::CREATE_PARTITIONS_CODE => Some(Self::CreatePartitions),
-            codes::DELETE_PARTITIONS_CODE => Some(Self::DeletePartitions),
-            codes::DELETE_SEGMENTS_CODE => Some(Self::DeleteSegments),
-            codes::CREATE_CONSUMER_GROUP_CODE => Some(Self::CreateConsumerGroup),
-            codes::DELETE_CONSUMER_GROUP_CODE => Some(Self::DeleteConsumerGroup),
-            codes::CREATE_USER_CODE => Some(Self::CreateUser),
-            codes::UPDATE_USER_CODE => Some(Self::UpdateUser),
-            codes::DELETE_USER_CODE => Some(Self::DeleteUser),
-            codes::CHANGE_PASSWORD_CODE => Some(Self::ChangePassword),
-            codes::UPDATE_PERMISSIONS_CODE => Some(Self::UpdatePermissions),
-            codes::CREATE_PERSONAL_ACCESS_TOKEN_CODE => Some(Self::CreatePersonalAccessToken),
-            codes::DELETE_PERSONAL_ACCESS_TOKEN_CODE => Some(Self::DeletePersonalAccessToken),
-            codes::SEND_MESSAGES_CODE => Some(Self::SendMessages),
-            codes::STORE_CONSUMER_OFFSET_CODE => Some(Self::StoreConsumerOffset),
-            _ => None,
+        match crate::dispatch::lookup_command(code) {
+            Some(meta) => meta.operation,
+            None => None,
         }
     }
 }
@@ -204,10 +188,11 @@ mod tests {
 
     #[test]
     fn read_only_commands_have_no_operation() {
-        assert!(Operation::from_command_code(crate::PING_CODE).is_none());
-        assert!(Operation::from_command_code(crate::GET_STATS_CODE).is_none());
-        assert!(Operation::from_command_code(crate::GET_STREAM_CODE).is_none());
-        assert!(Operation::from_command_code(crate::POLL_MESSAGES_CODE).is_none());
+        use crate::codes::{GET_STATS_CODE, GET_STREAM_CODE, PING_CODE, POLL_MESSAGES_CODE};
+        assert!(Operation::from_command_code(PING_CODE).is_none());
+        assert!(Operation::from_command_code(GET_STATS_CODE).is_none());
+        assert!(Operation::from_command_code(GET_STREAM_CODE).is_none());
+        assert!(Operation::from_command_code(POLL_MESSAGES_CODE).is_none());
     }
 
     #[test]

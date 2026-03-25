@@ -15,6 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 {{ if .Values.server.enabled }}
+{{- if hasKey .Values.server "podSecurityContext" }}
+{{- fail "server.podSecurityContext has been moved to podSecurityContext (root level). Please update your values." }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -44,7 +47,7 @@ spec:
       {{- end }}
       serviceAccountName: {{ include "iggy.serviceAccountName" . }}
       securityContext:
-        {{ toYaml .Values.server.podSecurityContext | nindent 8 }}
+        {{ toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -96,13 +99,19 @@ spec:
               mountPath: /app/local_data
               subPath: {{ ternary "root" (printf "%s/root" .Values.server.persistence.subPath) (empty .Values.server.persistence.subPath) }}
 
+          startupProbe:
+            httpGet:
+              path: /ping
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
           livenessProbe:
             httpGet:
-              path: /
+              path: /ping
               port: http
           readinessProbe:
             httpGet:
-              path: /
+              path: /ping
               port: http
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
@@ -154,12 +163,16 @@ spec:
         {{ toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "iggy.serviceAccountName" . }}
+      {{- with .Values.ui.podSecurityContext }}
       securityContext:
-        {{ toYaml .Values.podSecurityContext | nindent 8 }}
+        {{ toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}
+          {{- with .Values.ui.securityContext }}
           securityContext:
-            {{ toYaml .Values.securityContext | nindent 12 }}
+            {{ toYaml . | nindent 12 }}
+          {{- end }}
           image: "{{ .Values.ui.image.repository }}:{{ .Values.ui.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.ui.image.pullPolicy }}
           ports:
@@ -168,11 +181,11 @@ spec:
               protocol: TCP
           livenessProbe:
             httpGet:
-              path: /
+              path: /healthz
               port: http
           readinessProbe:
             httpGet:
-              path: /
+              path: /healthz
               port: http
           resources:
             {{ toYaml .Values.ui.resources | nindent 12 }}

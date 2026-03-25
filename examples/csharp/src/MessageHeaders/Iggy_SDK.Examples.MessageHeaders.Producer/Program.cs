@@ -32,7 +32,7 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
 });
 
 await client.ConnectAsync();
-await client.LoginUser("iggy", "iggy");
+await client.LoginUserAsync("iggy", "iggy");
 
 await Utils.InitSystem(client, logger);
 await Utils.ProduceMessages(client, logger);

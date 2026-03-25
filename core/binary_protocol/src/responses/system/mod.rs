@@ -15,9 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod get_cluster_metadata;
+pub mod get_me;
+pub mod get_snapshot;
 pub mod get_stats;
 mod ping;
 
 pub use super::EmptyResponse;
+pub use get_cluster_metadata::{ClusterMetadataResponse, ClusterNodeResponse};
+pub use get_me::GetMeResponse;
+pub use get_snapshot::GetSnapshotResponse;
 pub use get_stats::StatsResponse;
 pub use ping::PingResponse;

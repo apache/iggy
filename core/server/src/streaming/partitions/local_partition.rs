@@ -56,7 +56,9 @@ impl LocalPartition {
         should_increment_offset: bool,
     ) -> Self {
         Self {
-            log: SegmentedLog::default(),
+            log: SegmentedLog::new(
+                crate::streaming::partitions::journal::MemoryMessageJournal::empty(),
+            ),
             offset,
             consumer_offsets,
             consumer_group_offsets,

@@ -18,6 +18,7 @@
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_bytes, read_str, read_u8};
 use bytes::{BufMut, BytesMut};
+use std::borrow::Cow;
 use std::ops::Deref;
 
 // WireName
@@ -40,10 +41,10 @@ impl WireName {
     pub fn new(s: impl Into<String>) -> Result<Self, WireError> {
         let s = s.into();
         if s.is_empty() || s.len() > MAX_WIRE_NAME_LENGTH {
-            return Err(WireError::Validation(format!(
+            return Err(WireError::Validation(Cow::Owned(format!(
                 "wire name must be 1-{MAX_WIRE_NAME_LENGTH} bytes, got {}",
                 s.len()
-            )));
+            ))));
         }
         Ok(Self(s))
     }
@@ -102,9 +103,9 @@ impl WireDecode for WireName {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let name_len = read_u8(buf, 0)? as usize;
         if name_len == 0 || name_len > MAX_WIRE_NAME_LENGTH {
-            return Err(WireError::Validation(format!(
+            return Err(WireError::Validation(Cow::Owned(format!(
                 "wire name must be 1-{MAX_WIRE_NAME_LENGTH} bytes, got {name_len}"
-            )));
+            ))));
         }
         let name = read_str(buf, 1, name_len)?;
         Ok((Self(name), 1 + name_len))
@@ -199,9 +200,9 @@ impl WireDecode for WireIdentifier {
         match kind {
             KIND_NUMERIC => {
                 if length != NUMERIC_VALUE_LEN as usize {
-                    return Err(WireError::Validation(format!(
+                    return Err(WireError::Validation(Cow::Owned(format!(
                         "numeric identifier must be {NUMERIC_VALUE_LEN} bytes, got {length}"
-                    )));
+                    ))));
                 }
                 let id = u32::from_le_bytes(
                     value
@@ -212,9 +213,9 @@ impl WireDecode for WireIdentifier {
             }
             KIND_STRING => {
                 if length == 0 {
-                    return Err(WireError::Validation(
-                        "string identifier cannot be empty".to_string(),
-                    ));
+                    return Err(WireError::Validation(Cow::Borrowed(
+                        "string identifier cannot be empty",
+                    )));
                 }
                 let s =
                     std::str::from_utf8(value).map_err(|_| WireError::InvalidUtf8 { offset: 2 })?;

@@ -15,18 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// TODO(hubcio): Legacy framing constants for the current binary protocol.
-// Once VSR consensus is integrated, both client-server and
-// replica-replica traffic will use the unified 256-byte
-// consensus header (`consensus::header::HEADER_SIZE`).
-// These constants will be removed at that point.
+package command
 
-/// Request frame: `[length:4 LE][code:4 LE][payload:N]`
-/// `length` = size of code + payload = 4 + N
-pub const REQUEST_HEADER_SIZE: usize = 4;
+import (
+	"encoding/binary"
+	"testing"
 
-/// Response frame: `[status:4 LE][length:4 LE][payload:N]`
-pub const RESPONSE_HEADER_SIZE: usize = 8;
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+)
 
-/// Status code for a successful response.
-pub const STATUS_OK: u32 = 0;
+func TestSerialize_LoginUser_ContainsVersion(t *testing.T) {
+	request := LoginUser{
+		Username: "iggy",
+		Password: "iggy",
+	}
+
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Failed to serialize LoginUser: %v", err)
+	}
+
+	// Skip past username (1-byte len + "iggy") and password (1-byte len + "iggy")
+	pos := 1 + len("iggy") + 1 + len("iggy")
+
+	// Read version length (u32 LE)
+	versionLen := binary.LittleEndian.Uint32(serialized[pos : pos+4])
+	pos += 4
+
+	// Read version string
+	version := string(serialized[pos : pos+int(versionLen)])
+
+	if version != iggcon.Version {
+		t.Errorf("Version mismatch. Expected: %q, Got: %q", iggcon.Version, version)
+	}
+}

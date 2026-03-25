@@ -36,7 +36,7 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
 });
 
 await client.ConnectAsync();
-await client.LoginUser("iggy", "iggy");
+await client.LoginUserAsync("iggy", "iggy");
 
 var consumer = client.CreateConsumerBuilder(Identifier.String("new-sdk-stream"), Identifier.String("new-sdk-topic"),
         Consumer.Group("new-sdk-consumer-group"))

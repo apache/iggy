@@ -56,7 +56,7 @@ public class IggyPublisher<T> : IggyPublisher
         Dictionary<HeaderKey, HeaderValue>? userHeaders = null, CancellationToken ct = default)
     {
         var message = CreateMessage(data, messageId, userHeaders);
-        await SendMessages([message], ct);
+        await SendMessagesAsync([message], ct);
     }
 
     /// <summary>
@@ -67,7 +67,7 @@ public class IggyPublisher<T> : IggyPublisher
     public async Task SendAsync(IEnumerable<T> data, CancellationToken ct = default)
     {
         var messages = data.Select(item => CreateMessage(item, null, null)).ToList();
-        await SendMessages(messages, ct);
+        await SendMessagesAsync(messages, ct);
     }
 
     /// <summary>
@@ -79,7 +79,7 @@ public class IggyPublisher<T> : IggyPublisher
         CancellationToken ct = default)
     {
         var messages = items.Select(item => CreateMessage(item.data, item.messageId, item.userHeaders)).ToList();
-        await SendMessages(messages, ct);
+        await SendMessagesAsync(messages, ct);
     }
 
     /// <summary>

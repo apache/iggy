@@ -123,6 +123,7 @@ impl ServerCommandHandler for SendMessages {
             .and_then(|s| s.checked_sub(metadata_len_field_size))
             .ok_or(IggyError::InvalidCommand)?;
         let messages_buffer = PooledBuffer::with_capacity(messages_size);
+
         let (result, messages_buffer) = sender.read(messages_buffer.slice(0..messages_size)).await;
         result?;
         let messages_buffer = messages_buffer.into_inner();

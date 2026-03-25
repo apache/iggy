@@ -76,7 +76,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
         if (_isInitialized)
         {
-            _client.UnsubscribeConnectionEvents(OnClientConnectionStateChanged);
+            _client.UnsubscribeConnectionEvents(OnClientConnectionStateChangedAsync);
         }
 
         if (!string.IsNullOrEmpty(_consumerGroupName) && _isInitialized)
@@ -98,7 +98,7 @@ public partial class IggyConsumer : IAsyncDisposable
         {
             try
             {
-                await _client.LogoutUser();
+                await _client.LogoutUserAsync();
                 _client.Dispose();
             }
             catch (Exception e)
@@ -144,12 +144,12 @@ public partial class IggyConsumer : IAsyncDisposable
 
             if (_config.CreateIggyClient)
             {
-                await _client.LoginUser(_config.Login, _config.Password, ct);
+                await _client.LoginUserAsync(_config.Login, _config.Password, ct);
             }
 
             await InitializeConsumerGroupAsync(ct);
 
-            _client.SubscribeConnectionEvents(OnClientConnectionStateChanged);
+            _client.SubscribeConnectionEvents(OnClientConnectionStateChangedAsync);
 
             _isInitialized = true;
         }
@@ -473,7 +473,7 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     Handles connection state changes from the client.
     /// </summary>
     /// <param name="e">Event object</param>
-    private async Task OnClientConnectionStateChanged(ConnectionStateChangedEventArgs e)
+    private async Task OnClientConnectionStateChangedAsync(ConnectionStateChangedEventArgs e)
     {
         LogConnectionStateChanged(e.PreviousState, e.CurrentState);
 

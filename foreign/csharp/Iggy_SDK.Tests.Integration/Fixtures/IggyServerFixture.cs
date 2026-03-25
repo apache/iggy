@@ -72,7 +72,11 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         var builder = new ContainerBuilder(DockerImage)
             .WithPortBinding(3000, true)
             .WithPortBinding(8090, true)
-            .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(8090))
+            .WithWaitStrategy(Wait.ForUnixContainer()
+                .UntilInternalTcpPortIsAvailable(8090)
+                .UntilHttpRequestIsSucceeded(request => request
+                    .ForPort(3000)
+                    .ForPath("/ping")))
             .WithName(_containerId)
             .WithPrivileged(true)
             .WithCleanUp(true);
@@ -174,7 +178,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 
         if (connect)
         {
-            await client.LoginUser(userName, password);
+            await client.LoginUserAsync(userName, password);
         }
 
         return client;
@@ -184,7 +188,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     {
         var client = await CreateClient(Protocol.Http);
 
-        await client.LoginUser(userName, password);
+        await client.LoginUserAsync(userName, password);
 
         return client;
     }

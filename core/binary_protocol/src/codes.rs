@@ -87,58 +87,14 @@ pub const DELETE_CONSUMER_GROUP_CODE: u32 = 603;
 pub const JOIN_CONSUMER_GROUP_CODE: u32 = 604;
 pub const LEAVE_CONSUMER_GROUP_CODE: u32 = 605;
 
+/// Lookup the human-readable name for a command code.
+///
 /// # Errors
 /// Returns `WireError::UnknownCommand` if the code is not recognized.
 pub const fn command_name(code: u32) -> Result<&'static str, WireError> {
-    match code {
-        PING_CODE => Ok("ping"),
-        GET_STATS_CODE => Ok("stats"),
-        GET_SNAPSHOT_FILE_CODE => Ok("snapshot"),
-        GET_CLUSTER_METADATA_CODE => Ok("cluster.metadata"),
-        GET_ME_CODE => Ok("me"),
-        GET_CLIENT_CODE => Ok("client.get"),
-        GET_CLIENTS_CODE => Ok("client.list"),
-        GET_USER_CODE => Ok("user.get"),
-        GET_USERS_CODE => Ok("user.list"),
-        CREATE_USER_CODE => Ok("user.create"),
-        DELETE_USER_CODE => Ok("user.delete"),
-        UPDATE_USER_CODE => Ok("user.update"),
-        UPDATE_PERMISSIONS_CODE => Ok("user.permissions"),
-        CHANGE_PASSWORD_CODE => Ok("user.password"),
-        LOGIN_USER_CODE => Ok("user.login"),
-        LOGOUT_USER_CODE => Ok("user.logout"),
-        GET_PERSONAL_ACCESS_TOKENS_CODE => Ok("personal_access_token.list"),
-        CREATE_PERSONAL_ACCESS_TOKEN_CODE => Ok("personal_access_token.create"),
-        DELETE_PERSONAL_ACCESS_TOKEN_CODE => Ok("personal_access_token.delete"),
-        LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE => Ok("personal_access_token.login"),
-        POLL_MESSAGES_CODE => Ok("message.poll"),
-        SEND_MESSAGES_CODE => Ok("message.send"),
-        FLUSH_UNSAVED_BUFFER_CODE => Ok("message.flush_unsaved_buffer"),
-        GET_CONSUMER_OFFSET_CODE => Ok("consumer_offset.get"),
-        STORE_CONSUMER_OFFSET_CODE => Ok("consumer_offset.store"),
-        DELETE_CONSUMER_OFFSET_CODE => Ok("consumer_offset.delete"),
-        GET_STREAM_CODE => Ok("stream.get"),
-        GET_STREAMS_CODE => Ok("stream.list"),
-        CREATE_STREAM_CODE => Ok("stream.create"),
-        DELETE_STREAM_CODE => Ok("stream.delete"),
-        UPDATE_STREAM_CODE => Ok("stream.update"),
-        PURGE_STREAM_CODE => Ok("stream.purge"),
-        GET_TOPIC_CODE => Ok("topic.get"),
-        GET_TOPICS_CODE => Ok("topic.list"),
-        CREATE_TOPIC_CODE => Ok("topic.create"),
-        DELETE_TOPIC_CODE => Ok("topic.delete"),
-        UPDATE_TOPIC_CODE => Ok("topic.update"),
-        PURGE_TOPIC_CODE => Ok("topic.purge"),
-        CREATE_PARTITIONS_CODE => Ok("partition.create"),
-        DELETE_PARTITIONS_CODE => Ok("partition.delete"),
-        DELETE_SEGMENTS_CODE => Ok("segment.delete"),
-        GET_CONSUMER_GROUP_CODE => Ok("consumer_group.get"),
-        GET_CONSUMER_GROUPS_CODE => Ok("consumer_group.list"),
-        CREATE_CONSUMER_GROUP_CODE => Ok("consumer_group.create"),
-        DELETE_CONSUMER_GROUP_CODE => Ok("consumer_group.delete"),
-        JOIN_CONSUMER_GROUP_CODE => Ok("consumer_group.join"),
-        LEAVE_CONSUMER_GROUP_CODE => Ok("consumer_group.leave"),
-        _ => Err(WireError::UnknownCommand(code)),
+    match crate::dispatch::lookup_command(code) {
+        Some(meta) => Ok(meta.name),
+        None => Err(WireError::UnknownCommand(code)),
     }
 }
 

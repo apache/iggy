@@ -221,7 +221,12 @@ impl WireDecode for StatsResponse {
         let cache_count = read_u32_le(buf, pos)? as usize;
         pos += 4;
 
-        let mut cache_metrics = Vec::with_capacity(cache_count);
+        let remaining = buf.len().saturating_sub(pos);
+        let mut cache_metrics = Vec::with_capacity(crate::codec::capped_capacity(
+            cache_count,
+            remaining,
+            CacheMetricEntry::SIZE,
+        ));
         for _ in 0..cache_count {
             let stream_id = read_u32_le(buf, pos)?;
             let topic_id = read_u32_le(buf, pos + 4)?;

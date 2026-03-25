@@ -143,11 +143,19 @@ pub async fn run_consumer(harness: &mut TestHarness) {
         .await
         .expect("Failed to initialize consumer");
 
+    let pre_payloads = consume_messages_validated(&mut consumer, 3, Duration::from_secs(10)).await;
     assert_eq!(
-        consume_messages(&mut consumer, 3, Duration::from_secs(10)).await,
+        pre_payloads.len(),
         3,
         "Should consume all pre-restart messages"
     );
+    for (i, payload) in pre_payloads.iter().enumerate() {
+        assert_eq!(
+            payload,
+            &format!("pre-restart-{i}"),
+            "Pre-restart message {i} has wrong payload"
+        );
+    }
 
     harness.server_mut().stop().expect("Failed to stop server");
     sleep(Duration::from_secs(2)).await;
@@ -162,11 +170,19 @@ pub async fn run_consumer(harness: &mut TestHarness) {
         .expect("Failed to create post-restart client");
     send_messages(&post_client, "post-restart", 3).await;
 
+    let post_payloads = consume_messages_validated(&mut consumer, 3, Duration::from_secs(30)).await;
     assert_eq!(
-        consume_messages(&mut consumer, 3, Duration::from_secs(30)).await,
+        post_payloads.len(),
         3,
         "Should consume all post-restart messages after reconnect"
     );
+    for (i, payload) in post_payloads.iter().enumerate() {
+        assert_eq!(
+            payload,
+            &format!("post-restart-{i}"),
+            "Post-restart message {i} has wrong payload"
+        );
+    }
 }
 
 fn create_client(harness: &TestHarness) -> IggyClient {
@@ -209,18 +225,286 @@ async fn send_messages(client: &IggyClient, prefix: &str, count: u32) {
     }
 }
 
-async fn consume_messages(consumer: &mut IggyConsumer, expected: u32, max_wait: Duration) -> u32 {
-    let mut consumed = 0u32;
+/// Consumes up to `expected` messages, returning their payloads in order.
+async fn consume_messages_validated(
+    consumer: &mut IggyConsumer,
+    expected: u32,
+    max_wait: Duration,
+) -> Vec<String> {
+    let mut payloads = Vec::with_capacity(expected as usize);
     let deadline = tokio::time::Instant::now() + max_wait;
-    while consumed < expected && tokio::time::Instant::now() < deadline {
+    while (payloads.len() as u32) < expected && tokio::time::Instant::now() < deadline {
         let poll_result: Option<Result<ReceivedMessage, IggyError>> =
             tokio::time::timeout(Duration::from_millis(500), consumer.next())
                 .await
                 .ok()
                 .flatten();
-        if let Some(Ok(_)) = poll_result {
-            consumed += 1;
+        if let Some(Ok(msg)) = poll_result {
+            let payload = String::from_utf8_lossy(&msg.message.payload).to_string();
+            payloads.push(payload);
         }
     }
-    consumed
+    payloads
+}
+
+/// Regression test: a partition with exactly one message at offset 0 must not
+/// reassign offset 0 to the next message after server restart.
+///
+/// Root cause: `should_increment_offset = current_offset > 0` is false when
+/// current_offset == 0, but a segment with 1 message at offset 0 has
+/// end_offset = 0. The next append after restart reuses offset 0.
+pub async fn run_single_message_offset_zero_restart(harness: &mut TestHarness) {
+    const STREAM: &str = "offset-zero-restart-stream";
+    const TOPIC: &str = "offset-zero-restart-topic";
+    const CONSUMER_ID: u32 = 77;
+
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to create client");
+
+    client.create_stream(STREAM).await.unwrap();
+    client
+        .create_topic(
+            &Identifier::named(STREAM).unwrap(),
+            TOPIC,
+            1,
+            Default::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+
+    // Send exactly 1 message (gets offset 0)
+    let mut msg = [IggyMessage::from_str("single-msg-0").unwrap()];
+    client
+        .send_messages(
+            &Identifier::named(STREAM).unwrap(),
+            &Identifier::named(TOPIC).unwrap(),
+            &Partitioning::partition_id(0),
+            &mut msg,
+        )
+        .await
+        .unwrap();
+
+    // Consumer polls to commit offset 0
+    let consumer = Consumer::new(Identifier::numeric(CONSUMER_ID).unwrap());
+    let polled = client
+        .poll_messages(
+            &Identifier::named(STREAM).unwrap(),
+            &Identifier::named(TOPIC).unwrap(),
+            Some(0),
+            &consumer,
+            &PollingStrategy::next(),
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(polled.messages.len(), 1, "Should get the single message");
+    assert_eq!(polled.messages[0].header.offset, 0);
+
+    // Wait for data to flush
+    sleep(Duration::from_secs(1)).await;
+    drop(client);
+
+    // Restart
+    harness.server_mut().stop().expect("Failed to stop server");
+    sleep(Duration::from_secs(2)).await;
+    harness
+        .server_mut()
+        .start()
+        .expect("Failed to start server");
+
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to create post-restart client");
+
+    // Send a second message - it MUST get offset 1, not 0
+    let mut msg = [IggyMessage::from_str("single-msg-1").unwrap()];
+    client
+        .send_messages(
+            &Identifier::named(STREAM).unwrap(),
+            &Identifier::named(TOPIC).unwrap(),
+            &Partitioning::partition_id(0),
+            &mut msg,
+        )
+        .await
+        .unwrap();
+
+    // Consumer polls with Next - should get offset 1
+    let consumer = Consumer::new(Identifier::numeric(CONSUMER_ID).unwrap());
+    let polled = client
+        .poll_messages(
+            &Identifier::named(STREAM).unwrap(),
+            &Identifier::named(TOPIC).unwrap(),
+            Some(0),
+            &consumer,
+            &PollingStrategy::next(),
+            10,
+            true,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !polled.messages.is_empty(),
+        "BUG: consumer got empty result after restart - offset stuck"
+    );
+    assert_eq!(
+        polled.messages[0].header.offset, 1,
+        "BUG: second message got offset {} instead of 1. \
+         should_increment_offset was incorrectly false after restart \
+         with single message at offset 0",
+        polled.messages[0].header.offset,
+    );
+
+    let payload = String::from_utf8_lossy(&polled.messages[0].payload);
+    assert_eq!(payload, "single-msg-1");
+}
+
+/// Regression test: consumer offset persisted ahead of partition data (crash
+/// simulation). After restart the consumer must not be permanently stuck.
+///
+/// Simulates: OOM/kill-9 where consumer auto_commit wrote offset to disk but
+/// journal data was not flushed. On restart, consumer offset file says 999 but
+/// partition only has 10 messages (offsets 0-9).
+pub async fn run_consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
+    const STREAM: &str = "offset-ahead-crash-stream";
+    const TOPIC: &str = "offset-ahead-crash-topic";
+    const CONSUMER_ID: u32 = 88;
+
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to create client");
+
+    let stream = client.create_stream(STREAM).await.unwrap();
+    let stream_id = stream.id;
+
+    let topic = client
+        .create_topic(
+            &Identifier::named(STREAM).unwrap(),
+            TOPIC,
+            1,
+            Default::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+    let topic_id = topic.id;
+
+    // Send 10 messages (offsets 0-9)
+    for i in 0..10u32 {
+        let mut msg = [IggyMessage::from_str(&format!("crash-msg-{i}")).unwrap()];
+        client
+            .send_messages(
+                &Identifier::named(STREAM).unwrap(),
+                &Identifier::named(TOPIC).unwrap(),
+                &Partitioning::partition_id(0),
+                &mut msg,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Consumer reads all 10 with auto_commit (stored offset = 9)
+    let consumer = Consumer::new(Identifier::numeric(CONSUMER_ID).unwrap());
+    let polled = client
+        .poll_messages(
+            &Identifier::named(STREAM).unwrap(),
+            &Identifier::named(TOPIC).unwrap(),
+            Some(0),
+            &consumer,
+            &PollingStrategy::next(),
+            100,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(polled.messages.len(), 10);
+
+    // Wait for flush
+    sleep(Duration::from_secs(1)).await;
+    drop(client);
+
+    // Stop server
+    harness.server_mut().stop().expect("Failed to stop server");
+    sleep(Duration::from_secs(1)).await;
+
+    // Tamper with consumer offset file to simulate crash scenario:
+    // consumer offset persisted ahead of actual data
+    let data_path = harness.server().data_path();
+    let offset_file = data_path.join(format!(
+        "streams/{stream_id}/topics/{topic_id}/partitions/0/offsets/consumers/{CONSUMER_ID}"
+    ));
+    assert!(
+        offset_file.exists(),
+        "Consumer offset file should exist at {}",
+        offset_file.display()
+    );
+    std::fs::write(&offset_file, 999_u64.to_le_bytes()).expect("Failed to write offset file");
+
+    // Verify the tampered value
+    let bytes = std::fs::read(&offset_file).unwrap();
+    let stored = u64::from_le_bytes(bytes.try_into().unwrap());
+    assert_eq!(stored, 999, "Offset file should contain 999");
+
+    // Restart server
+    harness
+        .server_mut()
+        .start()
+        .expect("Failed to start server");
+
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to create post-restart client");
+
+    // Send 5 more messages (should get offsets 10-14)
+    for i in 0..5u32 {
+        let mut msg = [IggyMessage::from_str(&format!("post-crash-{i}")).unwrap()];
+        client
+            .send_messages(
+                &Identifier::named(STREAM).unwrap(),
+                &Identifier::named(TOPIC).unwrap(),
+                &Partitioning::partition_id(0),
+                &mut msg,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Consumer polls with Next - must NOT be stuck at offset 1000 (999+1)
+    let consumer = Consumer::new(Identifier::numeric(CONSUMER_ID).unwrap());
+    let polled = client
+        .poll_messages(
+            &Identifier::named(STREAM).unwrap(),
+            &Identifier::named(TOPIC).unwrap(),
+            Some(0),
+            &consumer,
+            &PollingStrategy::next(),
+            100,
+            true,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !polled.messages.is_empty(),
+        "BUG: consumer is permanently stuck - offset 999 is ahead of partition data. \
+         After crash recovery, consumer offsets must be clamped to partition offset."
+    );
+
+    // Verify we got the new messages
+    let first_offset = polled.messages[0].header.offset;
+    assert!(
+        first_offset <= 14,
+        "BUG: consumer skipped to offset {first_offset}, expected messages in range 10-14"
+    );
 }

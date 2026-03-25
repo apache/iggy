@@ -22,7 +22,7 @@ use clap::Parser;
 use dashmap::DashMap;
 use dotenvy::dotenv;
 use err_trail::ErrContext;
-use figlet_rs::FIGfont;
+use figlet_rs::FIGlet;
 use iggy_common::SemanticVersion;
 use iggy_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError, MemoryPool};
@@ -32,7 +32,10 @@ use server::bootstrap::{
     create_directories, create_shard_connections, create_shard_executor, load_config,
     load_metadata, resolve_persister, update_system_info,
 };
-use server::diagnostics::{print_io_uring_permission_info, print_locked_memory_limit_info};
+use server::diagnostics::{
+    print_invalid_io_uring_args_info, print_io_uring_permission_info,
+    print_locked_memory_limit_info,
+};
 use server::io::fs_utils;
 use server::log::logger::Logging;
 use server::metadata::{Metadata, create_metadata_handles};
@@ -60,6 +63,7 @@ const SHARDS_TABLE_CAPACITY: usize = 16384;
 
 static SHUTDOWN_START_TIME: AtomicU64 = AtomicU64::new(0);
 static SHUTDOWN_INITIATED: AtomicBool = AtomicBool::new(false);
+static SHARD_EXECUTOR_DIAGNOSTIC: std::sync::Once = std::sync::Once::new();
 
 enum ShardExitStatus {
     Success,
@@ -99,7 +103,7 @@ fn extract_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 fn print_ascii_art(text: &str) {
-    let standard_font = FIGfont::standard().unwrap();
+    let standard_font = FIGlet::standard().unwrap();
     let figure = standard_font.convert(text);
     println!("{}", figure.unwrap());
 }
@@ -395,7 +399,27 @@ fn main() -> Result<(), ServerError> {
                             error!("Failed to bind memory: {e:?}");
                         }
 
-                        let rt = create_shard_executor();
+                        let rt = match create_shard_executor() {
+                            Ok(rt) => rt,
+                            Err(e) => {
+                                match e.kind() {
+                                    std::io::ErrorKind::InvalidInput => {
+                                        SHARD_EXECUTOR_DIAGNOSTIC
+                                            .call_once(print_invalid_io_uring_args_info);
+                                    }
+                                    std::io::ErrorKind::OutOfMemory => {
+                                        SHARD_EXECUTOR_DIAGNOSTIC
+                                            .call_once(print_locked_memory_limit_info);
+                                    }
+                                    std::io::ErrorKind::PermissionDenied => {
+                                        SHARD_EXECUTOR_DIAGNOSTIC
+                                            .call_once(print_io_uring_permission_info);
+                                    }
+                                    _ => {}
+                                }
+                                panic!("Cannot create shard-{id} executor: {e}");
+                            }
+                        };
                         rt.block_on(async move {
                             let mut builder = IggyShard::builder();
                             builder = builder
