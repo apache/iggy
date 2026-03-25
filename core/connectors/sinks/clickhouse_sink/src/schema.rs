@@ -119,7 +119,7 @@ pub enum ChType {
     FixedString(usize),
     /// Decimal(precision, scale). Serialised as Int32 / Int64 / Int128.
     Decimal(u8, u8),
-    /// IPv4 address — 4 bytes, big-endian.
+    /// IPv4 address — UInt32, 4 bytes little-endian.
     IPv4,
     /// IPv6 address — 16 bytes, big-endian.
     IPv6,

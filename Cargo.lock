@@ -5459,7 +5459,7 @@ dependencies = [
  "humantime",
  "iggy_connector_sdk",
  "once_cell",
- "reqwest",
+ "reqwest 0.13.2",
  "serde",
  "serde_json",
  "simd-json",

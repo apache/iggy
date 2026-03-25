@@ -214,7 +214,7 @@ pub(crate) fn serialize_value(
                 error!("Invalid IPv4 address: {s}");
                 Error::InvalidRecord
             })?;
-            buf.extend_from_slice(&addr.octets()); // big-endian
+            buf.extend_from_slice(&u32::from(addr).to_le_bytes());
         }
         ChType::IPv6 => {
             let s = coerce_to_string(value)?;
@@ -1055,7 +1055,7 @@ mod tests {
     fn serialize_ipv4() {
         let mut buf = vec![];
         serialize_value(&json_str("127.0.0.1"), &ChType::IPv4, &mut buf).unwrap();
-        assert_eq!(buf, [127, 0, 0, 1]);
+        assert_eq!(buf, [1, 0, 0, 127]); // little-endian u32
     }
 
     #[test]
