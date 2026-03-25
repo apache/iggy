@@ -31,6 +31,7 @@ readme = "../../../README.md"
 bit-set = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
+iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 message_bus = { workspace = true }
 rand = { workspace = true }

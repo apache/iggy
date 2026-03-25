@@ -25,8 +25,7 @@ pub mod replica;
 
 use bus::MemBus;
 use consensus::PartitionsHandle;
-use iggy_common::header::ReplyHeader;
-use iggy_common::message::Message;
+use iggy_binary_protocol::{GenericHeader, Message, ReplyHeader};
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::{IggyError, IggyMessagesBatchSet};
 use message_bus::MessageBus;
@@ -126,11 +125,7 @@ impl Simulator {
     }
 
     #[allow(clippy::future_not_send)]
-    async fn dispatch_to_replica(
-        &self,
-        replica: &Replica,
-        message: Message<iggy_common::header::GenericHeader>,
-    ) {
+    async fn dispatch_to_replica(&self, replica: &Replica, message: Message<GenericHeader>) {
         replica.on_message(message).await;
 
         let mut buf = Vec::new();
