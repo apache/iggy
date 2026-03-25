@@ -52,6 +52,22 @@ const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 /// Prevents hammering a dead endpoint with N sequential retry cycles per poll.
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
+const FIELD_DATA: &str = "data";
+const FIELD_PAYLOAD_ENCODING: &str = "iggy_payload_encoding";
+const FIELD_HEADER_ENCODING: &str = "iggy_header_encoding";
+const FIELD_METADATA: &str = "metadata";
+const FIELD_PAYLOAD: &str = "payload";
+const FIELD_ID: &str = "iggy_id";
+const FIELD_OFFSET: &str = "iggy_offset";
+const FIELD_TIMESTAMP: &str = "iggy_timestamp";
+const FIELD_STREAM: &str = "iggy_stream";
+const FIELD_TOPIC: &str = "iggy_topic";
+const FIELD_PARTITION_ID: &str = "iggy_partition_id";
+const FIELD_CHECKSUM: &str = "iggy_checksum";
+const FIELD_ORIGIN_TIMESTAMP: &str = "iggy_origin_timestamp";
+const FIELD_HEADERS: &str = "iggy_headers";
+const ENCODING_BASE64: &str = "base64";
+
 /// HTTP method enum — validated at deserialization, prevents invalid values like "DELEET" or "GETX".
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -314,12 +330,12 @@ impl HttpSink {
             }
             Payload::Text(text) => Ok(serde_json::Value::String(text)),
             Payload::Raw(bytes) | Payload::FlatBuffer(bytes) => Ok(serde_json::json!({
-                "data": general_purpose::STANDARD.encode(&bytes),
-                "iggy_payload_encoding": "base64"
+                FIELD_DATA: general_purpose::STANDARD.encode(&bytes),
+                FIELD_PAYLOAD_ENCODING: ENCODING_BASE64
             })),
             Payload::Proto(proto_str) => Ok(serde_json::json!({
-                "data": general_purpose::STANDARD.encode(proto_str.as_bytes()),
-                "iggy_payload_encoding": "base64"
+                FIELD_DATA: general_purpose::STANDARD.encode(proto_str.as_bytes()),
+                FIELD_PAYLOAD_ENCODING: ENCODING_BASE64
             })),
         }
     }
@@ -337,20 +353,20 @@ impl HttpSink {
         }
 
         let mut metadata = serde_json::json!({
-            "iggy_id": format_u128_as_uuid(message.id),
-            "iggy_offset": message.offset,
-            "iggy_timestamp": message.timestamp,
-            "iggy_stream": topic_metadata.stream,
-            "iggy_topic": topic_metadata.topic,
-            "iggy_partition_id": messages_metadata.partition_id,
+            FIELD_ID: format_u128_as_uuid(message.id),
+            FIELD_OFFSET: message.offset,
+            FIELD_TIMESTAMP: message.timestamp,
+            FIELD_STREAM: topic_metadata.stream,
+            FIELD_TOPIC: topic_metadata.topic,
+            FIELD_PARTITION_ID: messages_metadata.partition_id,
         });
 
         if self.include_checksum {
-            metadata["iggy_checksum"] = serde_json::json!(message.checksum);
+            metadata[FIELD_CHECKSUM] = serde_json::json!(message.checksum);
         }
 
         if self.include_origin_timestamp {
-            metadata["iggy_origin_timestamp"] = serde_json::json!(message.origin_timestamp);
+            metadata[FIELD_ORIGIN_TIMESTAMP] = serde_json::json!(message.origin_timestamp);
         }
 
         if let Some(ref headers) = message.headers
@@ -363,8 +379,8 @@ impl HttpSink {
                     // as_raw() returns Ok only for HeaderKind::Raw.
                     let value = if let Ok(raw) = v.as_raw() {
                         serde_json::json!({
-                            "data": general_purpose::STANDARD.encode(raw),
-                            "iggy_header_encoding": "base64"
+                            FIELD_DATA: general_purpose::STANDARD.encode(raw),
+                            FIELD_HEADER_ENCODING: ENCODING_BASE64
                         })
                     } else {
                         serde_json::Value::String(v.to_string_value())
@@ -372,12 +388,12 @@ impl HttpSink {
                     (k.to_string_value(), value)
                 })
                 .collect();
-            metadata["iggy_headers"] = serde_json::Value::Object(headers_map);
+            metadata[FIELD_HEADERS] = serde_json::Value::Object(headers_map);
         }
 
         serde_json::json!({
-            "metadata": metadata,
-            "payload": payload_json,
+            FIELD_METADATA: metadata,
+            FIELD_PAYLOAD: payload_json,
         })
     }
 
