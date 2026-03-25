@@ -25,9 +25,8 @@ use crate::{
     IggyTimestamp, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, Sizeable, Validatable,
 };
 use crate::{MessageDeduplicator, PooledBuffer, random_id};
-use bytes::{BufMut, BytesMut};
 use lending_iterator::prelude::*;
-use std::ops::{Deref, Index};
+use std::ops::Index;
 use std::sync::Arc;
 use tracing::{error, warn};
 
@@ -117,6 +116,11 @@ impl IggyMessagesBatchMut {
     /// Returns the total size of all messages in bytes.
     pub fn size(&self) -> u32 {
         self.messages.len() as u32
+    }
+
+    /// Returns the raw message bytes as a slice.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.messages
     }
 
     /// Prepares all messages in the batch for persistence by setting their offsets,
@@ -255,6 +259,11 @@ impl IggyMessagesBatchMut {
     /// Checks if the batch is empty.
     pub fn is_empty(&self) -> bool {
         self.count() == 0
+    }
+
+    /// Return total size of all messages in bytes.
+    pub fn len(&self) -> usize {
+        self.messages.len()
     }
 
     /// Decomposes the batch into its constituent parts.
@@ -489,7 +498,7 @@ impl IggyMessagesBatchMut {
     /// subsequent messages in the new buffer.
     #[allow(clippy::too_many_arguments)]
     fn rebuild_indexes_for_chunk(
-        new_buffer: &BytesMut,
+        new_buffer: &PooledBuffer,
         new_indexes: &mut IggyIndexesMut,
         offset_in_new_buffer: &mut u32,
         chunk_start: usize,
@@ -825,13 +834,5 @@ impl Index<usize> for IggyMessagesBatchMut {
             .expect("Invalid message boundaries");
 
         &self.messages[start..end]
-    }
-}
-
-impl Deref for IggyMessagesBatchMut {
-    type Target = BytesMut;
-
-    fn deref(&self) -> &Self::Target {
-        &self.messages
     }
 }
