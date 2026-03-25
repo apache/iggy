@@ -52,20 +52,6 @@ const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 /// Prevents hammering a dead endpoint with N sequential retry cycles per poll.
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
-const FIELD_DATA: &str = "data";
-const FIELD_PAYLOAD_ENCODING: &str = "iggy_payload_encoding";
-const FIELD_HEADER_ENCODING: &str = "iggy_header_encoding";
-const FIELD_METADATA: &str = "metadata";
-const FIELD_PAYLOAD: &str = "payload";
-const FIELD_ID: &str = "iggy_id";
-const FIELD_OFFSET: &str = "iggy_offset";
-const FIELD_TIMESTAMP: &str = "iggy_timestamp";
-const FIELD_STREAM: &str = "iggy_stream";
-const FIELD_TOPIC: &str = "iggy_topic";
-const FIELD_PARTITION_ID: &str = "iggy_partition_id";
-const FIELD_CHECKSUM: &str = "iggy_checksum";
-const FIELD_ORIGIN_TIMESTAMP: &str = "iggy_origin_timestamp";
-const FIELD_HEADERS: &str = "iggy_headers";
 const ENCODING_BASE64: &str = "base64";
 
 /// HTTP method enum — validated at deserialization, prevents invalid values like "DELEET" or "GETX".
@@ -112,6 +98,44 @@ impl BatchMode {
             BatchMode::Raw => "application/octet-stream",
         }
     }
+}
+
+/// Metadata envelope wrapping a payload with Iggy message metadata.
+#[derive(Debug, Serialize)]
+struct MetadataEnvelope {
+    metadata: IggyMetadata,
+    payload: serde_json::Value,
+}
+
+/// Iggy message metadata fields.
+#[derive(Debug, Serialize)]
+struct IggyMetadata {
+    iggy_id: String,
+    iggy_offset: u64,
+    iggy_timestamp: u64,
+    iggy_stream: String,
+    iggy_topic: String,
+    iggy_partition_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iggy_checksum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iggy_origin_timestamp: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iggy_headers: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Binary payload with base64 encoding marker.
+#[derive(Debug, Serialize)]
+struct EncodedPayload {
+    data: String,
+    iggy_payload_encoding: &'static str,
+}
+
+/// Binary header value with base64 encoding marker.
+#[derive(Debug, Serialize)]
+struct EncodedHeader {
+    data: String,
+    iggy_header_encoding: &'static str,
 }
 
 /// Configuration for the HTTP sink connector, deserialized from [plugin_config] in config.toml.
@@ -337,14 +361,22 @@ impl HttpSink {
                 Ok(owned_value_to_serde_json(&value))
             }
             Payload::Text(text) => Ok(serde_json::Value::String(text)),
-            Payload::Raw(bytes) | Payload::FlatBuffer(bytes) => Ok(serde_json::json!({
-                FIELD_DATA: general_purpose::STANDARD.encode(&bytes),
-                FIELD_PAYLOAD_ENCODING: ENCODING_BASE64
-            })),
-            Payload::Proto(proto_str) => Ok(serde_json::json!({
-                FIELD_DATA: general_purpose::STANDARD.encode(proto_str.as_bytes()),
-                FIELD_PAYLOAD_ENCODING: ENCODING_BASE64
-            })),
+            Payload::Raw(bytes) | Payload::FlatBuffer(bytes) => {
+                let encoded = EncodedPayload {
+                    data: general_purpose::STANDARD.encode(&bytes),
+                    iggy_payload_encoding: ENCODING_BASE64,
+                };
+                serde_json::to_value(encoded)
+                    .map_err(|e| Error::Serialization(format!("EncodedPayload: {}", e)))
+            }
+            Payload::Proto(proto_str) => {
+                let encoded = EncodedPayload {
+                    data: general_purpose::STANDARD.encode(proto_str.as_bytes()),
+                    iggy_payload_encoding: ENCODING_BASE64,
+                };
+                serde_json::to_value(encoded)
+                    .map_err(|e| Error::Serialization(format!("EncodedPayload: {}", e)))
+            }
         }
     }
 
@@ -360,49 +392,57 @@ impl HttpSink {
             return payload_json;
         }
 
-        let mut metadata = serde_json::json!({
-            FIELD_ID: format_u128_as_uuid(message.id),
-            FIELD_OFFSET: message.offset,
-            FIELD_TIMESTAMP: message.timestamp,
-            FIELD_STREAM: topic_metadata.stream,
-            FIELD_TOPIC: topic_metadata.topic,
-            FIELD_PARTITION_ID: messages_metadata.partition_id,
-        });
-
-        if self.include_checksum {
-            metadata[FIELD_CHECKSUM] = serde_json::json!(message.checksum);
-        }
-
-        if self.include_origin_timestamp {
-            metadata[FIELD_ORIGIN_TIMESTAMP] = serde_json::json!(message.origin_timestamp);
-        }
-
-        if let Some(ref headers) = message.headers
+        let headers_map = if let Some(ref headers) = message.headers
             && !headers.is_empty()
         {
-            let headers_map: serde_json::Map<String, serde_json::Value> = headers
+            let map: serde_json::Map<String, serde_json::Value> = headers
                 .iter()
                 .map(|(k, v)| {
                     // Raw bytes: base64-encode to avoid Rust debug format in JSON output.
                     // as_raw() returns Ok only for HeaderKind::Raw.
                     let value = if let Ok(raw) = v.as_raw() {
-                        serde_json::json!({
-                            FIELD_DATA: general_purpose::STANDARD.encode(raw),
-                            FIELD_HEADER_ENCODING: ENCODING_BASE64
-                        })
+                        let encoded = EncodedHeader {
+                            data: general_purpose::STANDARD.encode(raw),
+                            iggy_header_encoding: ENCODING_BASE64,
+                        };
+                        serde_json::to_value(encoded).unwrap_or(serde_json::Value::Null)
                     } else {
                         serde_json::Value::String(v.to_string_value())
                     };
                     (k.to_string_value(), value)
                 })
                 .collect();
-            metadata[FIELD_HEADERS] = serde_json::Value::Object(headers_map);
-        }
+            Some(map)
+        } else {
+            None
+        };
 
-        serde_json::json!({
-            FIELD_METADATA: metadata,
-            FIELD_PAYLOAD: payload_json,
-        })
+        let metadata = IggyMetadata {
+            iggy_id: format_u128_as_uuid(message.id),
+            iggy_offset: message.offset,
+            iggy_timestamp: message.timestamp,
+            iggy_stream: topic_metadata.stream.clone(),
+            iggy_topic: topic_metadata.topic.clone(),
+            iggy_partition_id: messages_metadata.partition_id,
+            iggy_checksum: if self.include_checksum {
+                Some(message.checksum)
+            } else {
+                None
+            },
+            iggy_origin_timestamp: if self.include_origin_timestamp {
+                Some(message.origin_timestamp)
+            } else {
+                None
+            },
+            iggy_headers: headers_map,
+        };
+
+        let envelope = MetadataEnvelope {
+            metadata,
+            payload: payload_json,
+        };
+
+        serde_json::to_value(envelope).unwrap_or(serde_json::Value::Null)
     }
 
     /// Classify whether an HTTP status code is transient (worth retrying).
@@ -1211,6 +1251,21 @@ impl Sink for HttpSink {
 mod tests {
     use super::*;
     use iggy_connector_sdk::Schema;
+
+    const FIELD_DATA: &str = "data";
+    const FIELD_PAYLOAD_ENCODING: &str = "iggy_payload_encoding";
+    const FIELD_HEADER_ENCODING: &str = "iggy_header_encoding";
+    const FIELD_METADATA: &str = "metadata";
+    const FIELD_PAYLOAD: &str = "payload";
+    const FIELD_ID: &str = "iggy_id";
+    const FIELD_OFFSET: &str = "iggy_offset";
+    const FIELD_TIMESTAMP: &str = "iggy_timestamp";
+    const FIELD_STREAM: &str = "iggy_stream";
+    const FIELD_TOPIC: &str = "iggy_topic";
+    const FIELD_PARTITION_ID: &str = "iggy_partition_id";
+    const FIELD_CHECKSUM: &str = "iggy_checksum";
+    const FIELD_ORIGIN_TIMESTAMP: &str = "iggy_origin_timestamp";
+    const FIELD_HEADERS: &str = "iggy_headers";
 
     // ── Test helpers ──────────────────────────────────────────────────
 
