@@ -44,7 +44,6 @@ simd-json = { workspace = true }
 strum_macros = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true, features = ["v8"] }
 
 [dev-dependencies]
 toml = { workspace = true }

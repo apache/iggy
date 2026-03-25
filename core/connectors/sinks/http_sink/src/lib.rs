@@ -411,7 +411,7 @@ impl HttpSink {
         };
 
         let metadata = IggyMetadata {
-            iggy_id: format_u128_as_uuid(message.id),
+            iggy_id: format_u128_as_hex(message.id),
             iggy_offset: message.offset,
             iggy_timestamp: message.timestamp,
             iggy_stream: topic_metadata.stream.clone(),
@@ -979,14 +979,9 @@ fn build_request(
     }
 }
 
-/// Format a u128 message ID as an RFC 4122 v8 (custom) UUID.
-///
-/// Uses `Uuid::new_v8()` which sets version=8 and variant=RFC4122 bits,
-/// producing UUIDs that downstream libraries accept as valid.
-/// Note: `new_v8()` overwrites 6 bits (version nibble + variant bits), so the
-/// UUID is not round-trippable to the original u128 value.
-fn format_u128_as_uuid(id: u128) -> String {
-    uuid::Uuid::new_v8(id.to_be_bytes()).to_string()
+/// Format a u128 message ID as a 32-character lowercase hex string (no dashes).
+fn format_u128_as_hex(id: u128) -> String {
+    format!("{:032x}", id)
 }
 
 /// Truncate a response body string for log output, respecting UTF-8 char boundaries.
@@ -1428,31 +1423,25 @@ mod tests {
     }
 
     #[test]
-    fn given_zero_id_should_format_as_valid_v8_uuid() {
-        let result = format_u128_as_uuid(0);
-        let parsed = uuid::Uuid::parse_str(&result).expect("should be valid UUID");
-        assert_eq!(parsed.get_version_num(), 8, "expected v8 UUID");
-        // v8 sets version nibble (byte 6 high) and variant bits (byte 8 high 2)
-        assert_eq!(result, "00000000-0000-8000-8000-000000000000");
+    fn given_zero_id_should_format_as_32_char_hex() {
+        let result = format_u128_as_hex(0);
+        assert_eq!(result.len(), 32);
+        assert_eq!(result, "00000000000000000000000000000000");
     }
 
     #[test]
-    fn given_max_u128_should_format_as_valid_v8_uuid() {
-        let result = format_u128_as_uuid(u128::MAX);
-        let parsed = uuid::Uuid::parse_str(&result).expect("should be valid UUID");
-        assert_eq!(parsed.get_version_num(), 8, "expected v8 UUID");
-        assert_eq!(result, "ffffffff-ffff-8fff-bfff-ffffffffffff");
+    fn given_max_u128_should_format_as_32_char_hex() {
+        let result = format_u128_as_hex(u128::MAX);
+        assert_eq!(result.len(), 32);
+        assert_eq!(result, "ffffffffffffffffffffffffffffffff");
     }
 
     #[test]
-    fn given_specific_id_should_produce_valid_v8_uuid() {
+    fn given_specific_id_should_produce_correct_hex() {
         let id: u128 = 0x0123456789abcdef0123456789abcdef;
-        let result = format_u128_as_uuid(id);
-        let parsed = uuid::Uuid::parse_str(&result).expect("should be valid UUID");
-        assert_eq!(parsed.get_version_num(), 8, "expected v8 UUID");
-        assert_eq!(result.len(), 36, "UUID should be 36 chars");
-        // Original bits preserved except version nibble and variant bits
-        assert_eq!(result, "01234567-89ab-8def-8123-456789abcdef");
+        let result = format_u128_as_hex(id);
+        assert_eq!(result.len(), 32);
+        assert_eq!(result, "0123456789abcdef0123456789abcdef");
     }
 
     #[test]
@@ -1549,7 +1538,7 @@ mod tests {
         assert_eq!(metadata[FIELD_STREAM], "test_stream");
         assert_eq!(metadata[FIELD_TOPIC], "test_topic");
         assert_eq!(metadata[FIELD_PARTITION_ID], 0);
-        assert_eq!(metadata[FIELD_ID], format_u128_as_uuid(42));
+        assert_eq!(metadata[FIELD_ID], format_u128_as_hex(42));
         // Verify conditional fields are absent by default
         assert!(metadata.get(FIELD_CHECKSUM).is_none());
         assert!(metadata.get(FIELD_ORIGIN_TIMESTAMP).is_none());
