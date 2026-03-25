@@ -511,3 +511,47 @@ async fn influxdb_sink_json_nested_payload(harness: &TestHarness, fixture: Influ
         .await
         .expect("Expected 1 point for nested JSON payload");
 }
+
+// ─── Line-protocol escaping: newline/carriage-return ─────────────────────────
+
+/// Sends a text payload containing a literal newline character (`\n`).
+///
+/// In InfluxDB line protocol the newline byte is the record delimiter.
+/// `write_field_string` must escape it as `\\n` so the batch is not split.
+/// This test verifies the point lands in InfluxDB (i.e. the line protocol
+/// was valid after escaping).
+/// Covers: `'\n' => buf.push_str("\\n")` branch in `write_field_string`.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/influxdb/sink_text.toml")),
+    seed = seeds::connector_stream
+)]
+async fn influxdb_sink_text_with_newline(harness: &TestHarness, fixture: InfluxDbSinkTextFixture) {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+
+    // Payload contains a literal newline — must be escaped to \n in line protocol.
+    let payload = b"line one\nline two";
+    let mut messages = vec![
+        IggyMessage::builder()
+            .id(1u128)
+            .payload(Bytes::from(payload.to_vec()))
+            .build()
+            .unwrap(),
+    ];
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::balanced(),
+            &mut messages,
+        )
+        .await
+        .expect("Failed to send");
+
+    fixture
+        .wait_for_points("iggy_messages", 1)
+        .await
+        .expect("Expected 1 point for newline-containing text payload");
+}

@@ -471,11 +471,7 @@ async fn influxdb_source_scalar_type_bool(harness: &TestHarness, fixture: Influx
 ///   filtering is strict-greater-than, the first batch is excluded after the
 ///   first poll and the total stays at exactly `2 * TEST_MESSAGE_COUNT`).
 /// Covers: `max_cursor` update in `poll_messages`, `is_timestamp_after`,
-/// `current_cursor` returning `state.last_timestamp`.
-#[iggy_harness(
-    server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
-    seed = seeds::connector_stream
-)]
+/// cursor state persisted via `state.last_timestamp`.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
     seed = seeds::connector_stream

@@ -138,20 +138,29 @@ impl PayloadFormat {
 // ---------------------------------------------------------------------------
 
 /// Write an escaped measurement name into `buf`.
-/// Escapes: `\` → `\\`, `,` → `\,`, ` ` → `\ `
+/// Escapes: `\` → `\\`, `,` → `\,`, ` ` → `\ `, `\n` → `\\n`, `\r` → `\\r`
+///
+/// Newline (`\n`) and carriage-return (`\r`) are the InfluxDB line-protocol
+/// record delimiters; a literal newline inside a measurement name would split
+/// the line and corrupt the batch.
 fn write_measurement(buf: &mut String, value: &str) {
     for ch in value.chars() {
         match ch {
             '\\' => buf.push_str("\\\\"),
             ',' => buf.push_str("\\,"),
             ' ' => buf.push_str("\\ "),
+            '\n' => buf.push_str("\\n"),
+            '\r' => buf.push_str("\\r"),
             _ => buf.push(ch),
         }
     }
 }
 
 /// Write an escaped tag key/value into `buf`.
-/// Escapes: `\` → `\\`, `,` → `\,`, `=` → `\=`, ` ` → `\ `
+/// Escapes: `\` → `\\`, `,` → `\,`, `=` → `\=`, ` ` → `\ `, `\n` → `\\n`, `\r` → `\\r`
+///
+/// Newline and carriage-return are escaped for the same reason as in
+/// [`write_measurement`]: they are InfluxDB line-protocol record delimiters.
 fn write_tag_value(buf: &mut String, value: &str) {
     for ch in value.chars() {
         match ch {
@@ -159,18 +168,26 @@ fn write_tag_value(buf: &mut String, value: &str) {
             ',' => buf.push_str("\\,"),
             '=' => buf.push_str("\\="),
             ' ' => buf.push_str("\\ "),
+            '\n' => buf.push_str("\\n"),
+            '\r' => buf.push_str("\\r"),
             _ => buf.push(ch),
         }
     }
 }
 
 /// Write an escaped string field value (without surrounding quotes) into `buf`.
-/// Escapes: `\` → `\\`, `"` → `\"`
+/// Escapes: `\` → `\\`, `"` → `\"`, `\n` → `\\n`, `\r` → `\\r`
+///
+/// Newline and carriage-return are the InfluxDB line-protocol record
+/// delimiters; a literal newline inside a string field value (e.g. from a
+/// multi-line text payload) would split the line and corrupt the batch.
 fn write_field_string(buf: &mut String, value: &str) {
     for ch in value.chars() {
         match ch {
             '\\' => buf.push_str("\\\\"),
             '"' => buf.push_str("\\\""),
+            '\n' => buf.push_str("\\n"),
+            '\r' => buf.push_str("\\r"),
             _ => buf.push(ch),
         }
     }
@@ -854,10 +871,23 @@ mod tests {
     }
 
     #[test]
+    fn measurement_escapes_newlines() {
+        let mut buf = String::new();
+        write_measurement(&mut buf, "meas\nurea\rment");
+        assert_eq!(buf, "meas\\nurea\\rment");
+    }
+    #[test]
     fn tag_value_escapes_equals_sign() {
         let mut buf = String::new();
         write_tag_value(&mut buf, "a=b,c d\\e");
         assert_eq!(buf, "a\\=b\\,c\\ d\\\\e");
+    }
+
+    #[test]
+    fn tag_value_escapes_newlines() {
+        let mut buf = String::new();
+        write_tag_value(&mut buf, "line1\nline2\r");
+        assert_eq!(buf, "line1\\nline2\\r");
     }
 
     #[test]
@@ -867,6 +897,13 @@ mod tests {
         assert_eq!(buf, r#"say \"hello\" \\world\\"#);
     }
 
+    #[test]
+    fn field_string_escapes_newlines() {
+        // A \n inside a string field value would split the line-protocol record.
+        let mut buf = String::new();
+        write_field_string(&mut buf, "line1\nline2\r");
+        assert_eq!(buf, "line1\\nline2\\r");
+    }
     // ── append_line error paths ──────────────────────────────────────────
 
     #[test]

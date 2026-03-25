@@ -156,6 +156,18 @@ struct State {
     last_poll_time: DateTime<Utc>,
     last_timestamp: Option<String>,
     processed_rows: u64,
+    /// How many rows at `last_timestamp` have already been delivered downstream.
+    ///
+    /// When the user's Flux query uses `>= $cursor`, consecutive polls may
+    /// return the same rows for the current cursor timestamp.  This counter
+    /// lets `poll_messages` skip those already-delivered rows and inflate
+    /// `$limit` accordingly, preventing both duplicates and data loss at
+    /// batch boundaries where multiple rows share the same timestamp.
+    ///
+    /// `#[serde(default)]` keeps existing persisted state files forward-compatible:
+    /// the field defaults to 0 when the state was saved by an older version.
+    #[serde(default)]
+    cursor_row_count: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +247,7 @@ impl InfluxDbSource {
                 last_poll_time: Utc::now(),
                 last_timestamp: None,
                 processed_rows: 0,
+                cursor_row_count: 0,
             })),
             verbose,
             retry_delay,
@@ -368,15 +381,6 @@ impl InfluxDbSource {
         }
     }
 
-    async fn current_cursor(&self) -> String {
-        let state = self.state.lock().await;
-        state
-            .last_timestamp
-            .clone()
-            .or_else(|| self.config.initial_offset.clone())
-            .unwrap_or_else(|| DEFAULT_CURSOR.to_string())
-    }
-
     fn cursor_re() -> &'static Regex {
         CURSOR_RE.get_or_init(|| {
             Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
@@ -414,7 +418,7 @@ impl InfluxDbSource {
         }
     }
 
-    fn query_with_params(&self, cursor: &str) -> Result<String, Error> {
+    fn query_with_params(&self, cursor: &str, already_seen: u64) -> Result<String, Error> {
         // Reject anything that is not a well-formed RFC 3339 timestamp.
         // This prevents a crafted or corrupted _time value (e.g. containing
         // Flux syntax like `") |> drop() //`) from being injected into the
@@ -423,7 +427,11 @@ impl InfluxDbSource {
         // parameterized queries (Cloud-only feature), so substitution is
         // unavoidable for OSS — validation is the correct mitigation here.
         Self::validate_cursor(cursor)?;
-        let limit = self.config.batch_size.unwrap_or(500).to_string();
+        // Inflate the limit so that after skipping `already_seen` rows at the
+        // cursor timestamp we still return a full batch of new rows.  This is
+        // a no-op when `already_seen == 0` (first poll or `>` queries).
+        let batch_size = self.config.batch_size.unwrap_or(500) as u64;
+        let limit = batch_size.saturating_add(already_seen).to_string();
         let mut query = self.config.query.clone();
         if query.contains("$cursor") {
             query = query.replace("$cursor", cursor);
@@ -583,9 +591,26 @@ impl InfluxDbSource {
             .map_err(|e| Error::Serialization(format!("JSON serialization failed: {e}")))
     }
 
-    async fn poll_messages(&self) -> Result<(Vec<ProducedMessage>, Option<String>), Error> {
-        let cursor = self.current_cursor().await;
-        let query = self.query_with_params(&cursor).map_err(|e| {
+    /// Returns `(messages, max_cursor, rows_at_max_cursor)`.
+    ///
+    /// `rows_at_max_cursor` is the count of delivered messages whose cursor
+    /// field value equals `max_cursor`.  The caller stores this in
+    /// [`State::cursor_row_count`] so the next poll can skip those rows when
+    /// the query uses `>= $cursor`.
+    async fn poll_messages(&self) -> Result<(Vec<ProducedMessage>, Option<String>, u64), Error> {
+        // Read cursor and already_seen atomically from the same lock acquisition
+        // so the two values are always consistent with each other.
+        let (cursor, already_seen) = {
+            let state = self.state.lock().await;
+            let c = state
+                .last_timestamp
+                .clone()
+                .or_else(|| self.config.initial_offset.clone())
+                .unwrap_or_else(|| DEFAULT_CURSOR.to_string());
+            (c, state.cursor_row_count)
+        };
+
+        let query = self.query_with_params(&cursor, already_seen).map_err(|e| {
             error!(
                 "InfluxDB source ID: {} — invalid cursor, skipping poll: {e}",
                 self.id
@@ -600,14 +625,38 @@ impl InfluxDbSource {
 
         let mut messages = Vec::with_capacity(rows.len());
         let mut max_cursor: Option<String> = None;
+        let mut rows_at_max_cursor = 0u64;
+        let mut skipped = 0u64;
 
         for row in rows {
-            if let Some(cursor_value) = row.get(&cursor_field)
-                && max_cursor
-                    .as_ref()
-                    .is_none_or(|current| is_timestamp_after(cursor_value, current))
+            // Skip rows at the current cursor that were already delivered in a
+            // previous batch.  This deduplicate rows when the query uses
+            // `>= $cursor` and a batch boundary landed inside a group of rows
+            // sharing the same timestamp.
+            if let Some(cv) = row.get(&cursor_field)
+                && cv == &cursor
+                && skipped < already_seen
             {
-                max_cursor = Some(cursor_value.clone());
+                skipped += 1;
+                continue;
+            }
+
+            // Track the new max cursor and how many delivered rows share it.
+            if let Some(cv) = row.get(&cursor_field) {
+                match &max_cursor {
+                    None => {
+                        max_cursor = Some(cv.clone());
+                        rows_at_max_cursor = 1;
+                    }
+                    Some(current) => {
+                        if is_timestamp_after(cv, current) {
+                            max_cursor = Some(cv.clone());
+                            rows_at_max_cursor = 1;
+                        } else if cv == current {
+                            rows_at_max_cursor += 1;
+                        }
+                    }
+                }
             }
 
             let payload = self.build_payload(&row, include_metadata)?;
@@ -625,7 +674,7 @@ impl InfluxDbSource {
             });
         }
 
-        Ok((messages, max_cursor))
+        Ok((messages, max_cursor, rows_at_max_cursor))
     }
 }
 
@@ -676,12 +725,14 @@ impl Source for InfluxDbSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
-        // Skip query if circuit breaker is open
+        // Skip query if circuit breaker is open; sleep so the runtime does not
+        // spin-call poll() in a hot loop while the circuit is held open.
         if self.circuit_breaker.is_open().await {
             warn!(
                 "InfluxDB source ID: {} — circuit breaker is OPEN. Skipping poll.",
                 self.id
             );
+            tokio::time::sleep(self.poll_interval).await;
             return Ok(ProducedMessages {
                 schema: Schema::Json,
                 messages: vec![],
@@ -690,15 +741,30 @@ impl Source for InfluxDbSource {
         }
 
         match self.poll_messages().await {
-            Ok((messages, max_cursor)) => {
+            Ok((messages, max_cursor, rows_at_max_cursor)) => {
                 // Successful poll — reset circuit breaker
                 self.circuit_breaker.record_success();
 
                 let mut state = self.state.lock().await;
                 state.last_poll_time = Utc::now();
                 state.processed_rows += messages.len() as u64;
-                if let Some(cursor) = max_cursor {
-                    state.last_timestamp = Some(cursor);
+                match max_cursor {
+                    Some(ref new_cursor)
+                        if state.last_timestamp.as_deref() != Some(new_cursor.as_str()) =>
+                    {
+                        // Cursor advanced to a new timestamp — reset the row counter.
+                        state.last_timestamp = max_cursor.clone();
+                        state.cursor_row_count = rows_at_max_cursor;
+                    }
+                    Some(_) => {
+                        // Cursor stayed at the same timestamp — accumulate so the
+                        // next poll skips all already-delivered rows at this timestamp.
+                        state.cursor_row_count =
+                            state.cursor_row_count.saturating_add(rows_at_max_cursor);
+                    }
+                    None => {
+                        // No rows returned — leave cursor and count unchanged.
+                    }
                 }
 
                 if self.verbose {
@@ -1117,6 +1183,9 @@ mod tests {
         let mut config = make_config();
         config.circuit_breaker_threshold = Some(1);
         config.circuit_breaker_cool_down = Some("60s".to_string());
+        // Use a short poll_interval so the circuit-open sleep does not stall
+        // the test suite for a full second.
+        config.poll_interval = Some("1ms".to_string());
         let source = InfluxDbSource::new(1, config, None);
 
         // Force the circuit open
@@ -1129,6 +1198,36 @@ mod tests {
         assert!(
             produced.messages.is_empty(),
             "no messages should be produced when circuit is open"
+        );
+    }
+
+    // ── query_with_params — limit inflation ──────────────────────────────
+
+    #[test]
+    fn query_with_params_inflates_limit_by_already_seen() {
+        let mut config = make_config();
+        config.batch_size = Some(10);
+        config.query =
+            "from(bucket:\"b\") |> range(start: $cursor) |> limit(n: $limit)".to_string();
+        let source = InfluxDbSource::new(1, config, None);
+
+        // With already_seen=5, limit should be 10+5=15
+        let q = source.query_with_params("2024-01-01T00:00:00Z", 5).unwrap();
+        assert!(q.contains("limit(n: 15)"), "inflated limit not found: {q}");
+    }
+
+    #[test]
+    fn query_with_params_no_inflation_when_already_seen_is_zero() {
+        let mut config = make_config();
+        config.batch_size = Some(100);
+        config.query =
+            "from(bucket:\"b\") |> range(start: $cursor) |> limit(n: $limit)".to_string();
+        let source = InfluxDbSource::new(1, config, None);
+
+        let q = source.query_with_params("2024-01-01T00:00:00Z", 0).unwrap();
+        assert!(
+            q.contains("limit(n: 100)"),
+            "limit should be batch_size: {q}"
         );
     }
 
