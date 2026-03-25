@@ -73,7 +73,7 @@ Expected output on the Python receiver:
 ```json
 {
   "metadata": {
-    "iggy_id": "00000000-0000-0000-0000-000000000001",
+    "iggy_id": "00000000000000000000000000000001",
     "iggy_offset": 0,
     "iggy_stream": "demo_stream",
     "iggy_topic": "demo_topic"
@@ -99,7 +99,7 @@ consumer_group = "http_sink"
 
 [plugin_config]
 url = "https://api.example.com/ingest"
-batch_mode = "ndjson"
+batch_mode = "nd_json"
 ```
 
 ## Configuration
@@ -110,7 +110,7 @@ batch_mode = "ndjson"
 | `method` | string | `POST` | HTTP method: `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` |
 | `timeout` | string | `30s` | Request timeout (e.g., `10s`, `500ms`) |
 | `max_payload_size_bytes` | u64 | `10485760` | Max body size in bytes (10MB). `0` to disable |
-| `batch_mode` | string | `individual` | `individual`, `ndjson`, `json_array`, or `raw` |
+| `batch_mode` | string | `individual` | `individual`, `nd_json`, `json_array`, or `raw` |
 | `include_metadata` | bool | `true` | Wrap payload in metadata envelope |
 | `include_checksum` | bool | `false` | Add message checksum to metadata |
 | `include_origin_timestamp` | bool | `false` | Add origin timestamp to metadata |
@@ -118,7 +118,7 @@ batch_mode = "ndjson"
 | `health_check_method` | string | `HEAD` | HTTP method for health check |
 | `max_retries` | u32 | `3` | Retry attempts for transient errors |
 | `retry_delay` | string | `1s` | Base delay between retries |
-| `retry_backoff_multiplier` | f64 | `2.0` | Exponential backoff multiplier (min 1.0) |
+| `retry_backoff_multiplier` | u32 | `2` | Exponential backoff multiplier (min 1) |
 | `max_retry_delay` | string | `30s` | Maximum retry delay cap |
 | `success_status_codes` | [u16] | `[200, 201, 202, 204]` | Status codes considered successful |
 | `tls_danger_accept_invalid_certs` | bool | `false` | Skip TLS certificate validation |
@@ -133,14 +133,14 @@ batch_mode = "ndjson"
 One HTTP request per message. Best for webhooks and endpoints that accept single events.
 
 > With `batch_length = 50`, this produces 50 sequential HTTP round trips per poll cycle.
-> For production throughput, use `ndjson` or `json_array`.
+> For production throughput, use `nd_json` or `json_array`.
 
 ```text
 POST /ingest  Content-Type: application/json
 {"metadata": {"iggy_offset": 1, ...}, "payload": {"key": "value"}}
 ```
 
-### `ndjson`
+### `nd_json`
 
 All messages in one request, [newline-delimited JSON](https://github.com/ndjson/ndjson-spec). Best for bulk ingestion endpoints.
 
@@ -212,7 +212,7 @@ When `include_metadata = true` (default), payloads are wrapped:
 ```json
 {
   "metadata": {
-    "iggy_id": "01234567-89ab-cdef-0123-456789abcdef",
+    "iggy_id": "0123456789abcdef0123456789abcdef",
     "iggy_offset": 42,
     "iggy_timestamp": 1710064800000000,
     "iggy_stream": "my_stream",
@@ -223,7 +223,7 @@ When `include_metadata = true` (default), payloads are wrapped:
 }
 ```
 
-- **`iggy_id`**: Message ID formatted as UUID hex string (not RFC 4122 compliant — positional formatting only)
+- **`iggy_id`**: Message ID formatted as 32-character lowercase hex string (no dashes)
 - **Non-JSON payloads** (Raw, FlatBuffer, Proto): base64-encoded with `"iggy_payload_encoding": "base64"` in payload
 - **JSON/Text payloads**: Embedded as-is
 
@@ -231,7 +231,7 @@ Set `include_metadata = false` to send the raw payload without wrapping.
 
 ## Retry Strategy
 
-Exponential backoff with configurable parameters:
+Uses `reqwest-middleware` with `RetryTransientMiddleware` for automatic exponential backoff:
 
 ```text
 Initial request: no delay
@@ -240,11 +240,13 @@ Retry 2: retry_delay * backoff = 2s
 Retry 3: retry_delay * backoff^2 = min(4s, 30s) = 4s
 ```
 
+A custom `HttpSinkRetryStrategy` respects user-configured `success_status_codes` — codes in the success set are never retried, even if normally transient (e.g., 429 configured as "queued").
+
 **Transient errors** (retry): Network errors, HTTP 429, 500, 502, 503, 504.
 
 **Non-transient errors** (fail immediately): HTTP 400, 401, 403, 404, 405, etc.
 
-**HTTP 429 `Retry-After`**: Integer-valued `Retry-After` headers are respected, capped to `max_retry_delay`.
+**HTTP 429 `Retry-After`**: The middleware does not natively support `Retry-After` headers. When a response carries `Retry-After`, a warning is logged with the header value. The middleware uses computed exponential backoff instead.
 
 **Partial delivery** (`individual`/`raw` modes): If a message fails after exhausting retries, subsequent messages continue processing. After 3 consecutive HTTP failures, the remaining batch is aborted to avoid hammering a dead endpoint.
 
@@ -263,12 +265,12 @@ include_metadata = false    # Slack expects bare JSON payload
 
 ### REST API Ingestion
 
-Push data into downstream REST APIs (analytics, CRM, data warehouse loaders). Use `ndjson` or `json_array` for bulk efficiency:
+Push data into downstream REST APIs (analytics, CRM, data warehouse loaders). Use `nd_json` or `json_array` for bulk efficiency:
 
 ```toml
 [plugin_config]
 url = "https://analytics.example.com/v1/events"
-batch_mode = "ndjson"
+batch_mode = "nd_json"
 include_metadata = true     # downstream can route by iggy_stream/iggy_topic
 
 [plugin_config.headers]
@@ -328,7 +330,7 @@ consumer_group = "log_forwarder"
 
 [plugin_config]
 url = "https://logs.example.com/api/v1/ingest"
-batch_mode = "ndjson"
+batch_mode = "nd_json"
 max_connections = 20
 timeout = "60s"
 max_payload_size_bytes = 52428800   # 50MB for large log batches
@@ -458,7 +460,7 @@ consumer_group = "http_sink_orders"
 
 [plugin_config]
 url = "https://api.example.com/ingest"
-batch_mode = "ndjson"
+batch_mode = "nd_json"
 include_metadata = true
 
 [plugin_config.headers]
@@ -520,7 +522,7 @@ consumer_group = "analytics_sink"
 
 [plugin_config]
 url = "https://analytics-api.example.com/v1/events"
-batch_mode = "ndjson"
+batch_mode = "nd_json"
 max_connections = 20
 
 [plugin_config.headers]
@@ -634,7 +636,7 @@ consumer_group = "analytics_sink"     # different consumer group = fan-out
 
 [plugin_config]
 url = "https://analytics.example.com/v1/events"
-batch_mode = "ndjson"
+batch_mode = "nd_json"
 ```
 
 ### Docker / Container Deployment
@@ -698,19 +700,19 @@ The connector runtime calls `consume()` **sequentially** — the next poll cycle
 | Mode | HTTP Requests per Poll | Latency per Poll | Best For |
 | ---- | ---------------------- | ----------------- | -------- |
 | `individual` | N (one per message) | N × round-trip | Low-volume webhooks, order-sensitive delivery |
-| `ndjson` | 1 | 1 × round-trip | High-throughput bulk ingestion |
+| `nd_json` | 1 | 1 × round-trip | High-throughput bulk ingestion |
 | `json_array` | 1 | 1 × round-trip | APIs expecting array payloads |
 | `raw` | N (one per message) | N × round-trip | Binary payloads (protobuf, avro) |
 
-With `batch_length=50` in `individual` mode, each poll cycle performs 50 sequential HTTP round trips. If each takes 100ms, the poll cycle takes 5 seconds — during which no new messages are consumed from that topic. Use `ndjson` or `json_array` to collapse this to a single round trip.
+With `batch_length=50` in `individual` mode, each poll cycle performs 50 sequential HTTP round trips. If each takes 100ms, the poll cycle takes 5 seconds — during which no new messages are consumed from that topic. Use `nd_json` or `json_array` to collapse this to a single round trip.
 
 ### Memory
 
-In `ndjson` and `json_array` modes, the entire batch is serialized into memory before sending. With `batch_length=1000` and 10KB messages, this allocates ~10MB per poll cycle. The `max_payload_size_bytes` check runs **after** serialization (the batch must be built to know its size). For very large batches, tune `batch_length` and `max_payload_size_bytes` together.
+In `nd_json` and `json_array` modes, the entire batch is serialized into memory before sending. With `batch_length=1000` and 10KB messages, this allocates ~10MB per poll cycle. The `max_payload_size_bytes` check runs **after** serialization (the batch must be built to know its size). For very large batches, tune `batch_length` and `max_payload_size_bytes` together.
 
 ### Connection Pooling and Keep-Alive
 
-The connector builds one `reqwest::Client` per plugin instance (in `open()`). Because the runtime calls `consume()` sequentially within each topic task, a single-topic connector uses at most **one connection at a time**. Multi-topic connectors may use up to N concurrent connections (one per topic task), since each task calls `consume()` independently.
+The connector builds one `ClientWithMiddleware` (wrapping `reqwest::Client` with retry and tracing middleware) per plugin instance in `open()`. Because the runtime calls `consume()` sequentially within each topic task, a single-topic connector uses at most **one connection at a time**. Multi-topic connectors may use up to N concurrent connections (one per topic task), since each task calls `consume()` independently.
 
 reqwest uses HTTP/1.1 persistent connections (keep-alive) by default. The connector configures:
 
@@ -762,7 +764,7 @@ x-api-key = "my-api-key"
 [plugin_config]
 url = "https://ingest.example.com/bulk"
 method = "POST"
-batch_mode = "ndjson"
+batch_mode = "nd_json"
 max_connections = 20
 timeout = "60s"
 max_payload_size_bytes = 52428800
@@ -797,7 +799,7 @@ The effective delivery guarantee is **at-most-once** at the runtime level. The s
 
 2. **Offsets committed before processing**: The `PollingMessages` auto-commit strategy commits consumer group offsets before `consume()` is called. Combined with limitation 1, at-least-once delivery is not achievable. ([#2928](https://github.com/apache/iggy/issues/2928))
 
-3. **`Retry-After` HTTP-date format not supported**: Only integer `Retry-After` values (delay-seconds) are parsed. HTTP-date format (RFC 7231 §7.1.3) falls back to exponential backoff.
+3. **`Retry-After` header not used for backoff**: The `reqwest-middleware` retry layer uses computed exponential backoff. `Retry-After` headers are logged as warnings but do not influence retry timing.
 
 4. **No dead letter queue**: Failed messages are logged at `error!` level but not persisted to a DLQ. DLQ support would be a runtime-level feature.
 
