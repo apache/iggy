@@ -25,6 +25,8 @@ use deltalake::writer::{DeltaWriter, JsonWriter};
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata};
 use tracing::{debug, error, info};
 
+// TODO: Expose metrics for observability purposes
+
 #[async_trait]
 impl Sink for DeltaSink {
     async fn open(&mut self) -> Result<(), Error> {
@@ -117,6 +119,9 @@ impl Sink for DeltaSink {
             return Ok(());
         }
 
+        // TODO: all partition consume() calls serialize on this single lock, holding it
+        // through flush_and_commit() I/O. fix: per-partition writers keyed by partition_id.
+        // Ref: https://github.com/apache/iggy/pull/2889/#discussion_r2936719763
         let mut state_guard = self.state.lock().await;
         let state = state_guard.as_mut().ok_or_else(|| {
             error!("Delta sink state not initialized — was open() called?");
@@ -129,6 +134,7 @@ impl Sink for DeltaSink {
         }
 
         // Write JSON values to internal Parquet buffers
+        // TODO: Add retry mechanism if write fails.
         if let Err(e) = state.writer.write(json_values).await {
             state.writer.reset();
             error!("Failed to write to Delta writer: {e}");
