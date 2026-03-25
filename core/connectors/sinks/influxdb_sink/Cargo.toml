@@ -43,6 +43,7 @@ futures = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 once_cell = { workspace = true }
 reqwest = { workspace = true }
+reqwest-middleware = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

@@ -5541,6 +5541,7 @@ dependencies = [
  "iggy_connector_sdk",
  "once_cell",
  "reqwest 0.13.2",
+ "reqwest-middleware",
  "serde",
  "serde_json",
  "tokio",
@@ -5561,6 +5562,7 @@ dependencies = [
  "once_cell",
  "regex",
  "reqwest 0.13.2",
+ "reqwest-middleware",
  "serde",
  "serde_json",
  "tokio",
@@ -5663,10 +5665,12 @@ dependencies = [
 name = "iggy_connector_sdk"
 version = "0.2.1-edge.1"
 dependencies = [
+ "anyhow",
  "async-trait",
  "base64 0.22.1",
  "dashmap",
  "flatbuffers",
+ "http 1.4.0",
  "humantime",
  "iggy",
  "iggy_common",
@@ -5678,6 +5682,8 @@ dependencies = [
  "protox-parse",
  "rand 0.10.0",
  "regex",
+ "reqwest 0.13.2",
+ "reqwest-middleware",
  "rmp-serde",
  "serde",
  "serde_json",

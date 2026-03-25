@@ -21,13 +21,14 @@ use base64::{Engine as _, engine::general_purpose};
 use csv::StringRecord;
 use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::retry::{
-    CircuitBreaker, exponential_backoff, jitter, parse_duration, parse_retry_after,
+    CircuitBreaker, build_retry_client, exponential_backoff, jitter, parse_duration,
 };
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
 use regex::Regex;
-use reqwest::{Client, StatusCode, Url};
+use reqwest::Url;
+use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -75,15 +76,14 @@ static CURSOR_RE: OnceLock<Regex> = OnceLock::new();
 pub struct InfluxDbSource {
     pub id: u32,
     config: InfluxDbSourceConfig,
-    client: Option<Client>,
+    /// `None` until `open()` is called. Wraps `reqwest::Client` with
+    /// [`InfluxDbRetryMiddleware`] so retry/back-off/jitter is handled
+    /// transparently by the middleware stack instead of a hand-rolled loop.
+    client: Option<ClientWithMiddleware>,
     state: Mutex<State>,
     verbose: bool,
     retry_delay: Duration,
     poll_interval: Duration,
-    /// Cached once in `open()` — parsed from `config.retry_max_delay`.
-    /// Controls the backoff cap for per-query retries only; startup retries
-    /// use `config.open_retry_max_delay` and are never affected by this field.
-    query_retry_max_delay: Duration,
     circuit_breaker: Arc<CircuitBreaker>,
 }
 
@@ -184,10 +184,6 @@ fn is_header_record(record: &StringRecord) -> bool {
     record.iter().any(|v| v == "_time") && record.iter().any(|v| v == "_value")
 }
 
-fn is_transient_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-}
-
 /// Compare two RFC 3339 timestamp strings chronologically.
 ///
 /// InfluxDB strips trailing fractional-second zeros, producing timestamps like
@@ -243,7 +239,6 @@ impl InfluxDbSource {
             verbose,
             retry_delay,
             poll_interval,
-            query_retry_max_delay: Duration::from_secs(0), // overwritten in open()
             circuit_breaker: Arc::new(CircuitBreaker::new(cb_threshold, cb_cool_down)),
         }
     }
@@ -267,15 +262,15 @@ impl InfluxDbSource {
             .max(1)
     }
 
-    fn build_client(&self) -> Result<Client, Error> {
+    fn build_raw_client(&self) -> Result<reqwest::Client, Error> {
         let timeout = parse_duration(self.config.timeout.as_deref(), DEFAULT_TIMEOUT);
-        Client::builder()
+        reqwest::Client::builder()
             .timeout(timeout)
             .build()
             .map_err(|e| Error::InitError(format!("Failed to create HTTP client: {e}")))
     }
 
-    fn get_client(&self) -> Result<&Client, Error> {
+    fn get_client(&self) -> Result<&ClientWithMiddleware, Error> {
         self.client
             .as_ref()
             .ok_or_else(|| Error::Connection("InfluxDB client is not initialized".to_string()))
@@ -295,8 +290,10 @@ impl InfluxDbSource {
         Ok(url)
     }
 
-    async fn check_connectivity(&self) -> Result<(), Error> {
-        let client = self.get_client()?;
+    /// Single connectivity probe using the provided raw client (no retry).
+    /// The caller (`check_connectivity_with_retry`) owns the outer retry loop,
+    /// which uses different delay bounds than per-query retries.
+    async fn check_connectivity(&self, client: &reqwest::Client) -> Result<(), Error> {
         let url = self.build_health_url()?;
         let response = client
             .get(url)
@@ -317,9 +314,13 @@ impl InfluxDbSource {
         Ok(())
     }
 
-    // Retry connectivity check with exponential backoff + jitter
-    // instead of failing hard on the first attempt.
-    async fn check_connectivity_with_retry(&self) -> Result<(), Error> {
+    /// Retry connectivity check with exponential backoff + jitter instead of
+    /// failing hard on the first attempt.
+    ///
+    /// Uses separate `max_open_retries` / `open_retry_max_delay` so startup
+    /// can wait patiently for InfluxDB without affecting the per-query retry
+    /// parameters used by the middleware during normal operation.
+    async fn check_connectivity_with_retry(&self, client: &reqwest::Client) -> Result<(), Error> {
         let max_open_retries = self
             .config
             .max_open_retries
@@ -333,7 +334,7 @@ impl InfluxDbSource {
 
         let mut attempt = 0u32;
         loop {
-            match self.check_connectivity().await {
+            match self.check_connectivity(client).await {
                 Ok(()) => {
                     if attempt > 0 {
                         info!(
@@ -385,7 +386,6 @@ impl InfluxDbSource {
 
     fn validate_cursor(cursor: &str) -> Result<(), Error> {
         if Self::cursor_re().is_match(cursor) {
-            // ← call on &Regex, not on OnceLock
             Ok(())
         } else {
             Err(Error::InvalidConfigValue(format!(
@@ -434,14 +434,13 @@ impl InfluxDbSource {
         Ok(query)
     }
 
-    async fn run_query_with_retry(&self, query: &str) -> Result<String, Error> {
+    /// Execute a Flux query against `/api/v2/query` and return the raw CSV
+    /// response body. Retry/back-off is handled transparently by the
+    /// `ClientWithMiddleware` stack (see `build_retry_client`).
+    async fn run_query(&self, query: &str) -> Result<String, Error> {
         let client = self.get_client()?;
         let url = self.build_query_url()?;
-        let max_retries = self.get_max_retries();
         let token = self.config.token.clone();
-
-        // Cap for per-query backoff — cached in open(), no re-parse needed.
-        let max_delay = self.query_retry_max_delay;
 
         let body = json!({
             "query": query,
@@ -453,82 +452,31 @@ impl InfluxDbSource {
             }
         });
 
-        let mut attempts = 0u32;
-        loop {
-            let response_result = client
-                .post(url.clone())
-                .header("Authorization", format!("Token {token}"))
-                .header("Content-Type", "application/json")
-                .header("Accept", "text/csv")
-                .json(&body)
-                .send()
-                .await;
+        let response = client
+            .post(url)
+            .header("Authorization", format!("Token {token}"))
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/csv")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::Storage(format!("InfluxDB query failed: {e}")))?;
 
-            match response_result {
-                Ok(response) => {
-                    let status = response.status();
-
-                    if status.is_success() {
-                        return response.text().await.map_err(|e| {
-                            Error::Storage(format!("Failed to read query response: {e}"))
-                        });
-                    }
-
-                    // Honour Retry-After on 429 before our own backoff
-                    let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
-                        response
-                            .headers()
-                            .get("Retry-After")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(parse_retry_after)
-                    } else {
-                        None
-                    };
-
-                    let body_text = response
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| "failed to read response body".to_string());
-
-                    attempts += 1;
-                    if is_transient_status(status) && attempts < max_retries {
-                        // Use server-supplied delay when available
-                        let delay = retry_after.unwrap_or_else(|| {
-                            // Exponential, with jitter
-                            jitter(exponential_backoff(self.retry_delay, attempts, max_delay))
-                        });
-                        warn!(
-                            "Transient InfluxDB query error (attempt {attempts}/{max_retries}): \
-                             {status}. Retrying in {delay:?}..."
-                        );
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-
-                    return Err(Error::Storage(format!(
-                        "InfluxDB query failed with status {status}: {body_text}"
-                    )));
-                }
-                Err(e) => {
-                    attempts += 1;
-                    if attempts < max_retries {
-                        // Exponential, with jitter
-                        let delay =
-                            jitter(exponential_backoff(self.retry_delay, attempts, max_delay));
-                        warn!(
-                            "Failed to query InfluxDB (attempt {attempts}/{max_retries}): \
-                             {e}. Retrying in {delay:?}..."
-                        );
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-
-                    return Err(Error::Storage(format!(
-                        "InfluxDB query failed after {attempts} attempts: {e}"
-                    )));
-                }
-            }
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .text()
+                .await
+                .map_err(|e| Error::Storage(format!("Failed to read query response: {e}")));
         }
+
+        let body_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "failed to read response body".to_string());
+        Err(Error::Storage(format!(
+            "InfluxDB query failed with status {status}: {body_text}"
+        )))
     }
 
     fn parse_csv_rows(&self, csv_text: &str) -> Result<Vec<HashMap<String, String>>, Error> {
@@ -644,7 +592,7 @@ impl InfluxDbSource {
             );
             e
         })?;
-        let csv_data = self.run_query_with_retry(&query).await?;
+        let csv_data = self.run_query(&query).await?;
 
         let rows = self.parse_csv_rows(&csv_data)?;
         let include_metadata = self.config.include_metadata.unwrap_or(true);
@@ -663,7 +611,6 @@ impl InfluxDbSource {
             }
 
             let payload = self.build_payload(&row, include_metadata)?;
-            // correct unit, single clock read
             // Capture once so timestamp and origin_timestamp are guaranteed identical
             // and we make exactly one syscall regardless of how many fields use it.
             let now_micros = Utc::now().timestamp_micros() as u64;
@@ -694,21 +641,32 @@ impl Source for InfluxDbSource {
             self.id, self.config.org
         );
 
-        self.client = Some(self.build_client()?);
-
-        // Cache once here — derived purely from a config field that never
-        // changes at runtime, so re-parsing on every poll is wasteful.
-        self.query_retry_max_delay = parse_duration(
-            self.config.retry_max_delay.as_deref(),
-            DEFAULT_RETRY_MAX_DELAY,
-        );
+        // Build the raw client first and use it for the startup connectivity
+        // check. The connectivity retry loop uses separate delay bounds
+        // (open_retry_max_delay) from the per-query middleware retries, so
+        // we keep them independent.
+        let raw_client = self.build_raw_client()?;
 
         // Validate cursor_field before touching the network: string comparison
         // is only safe for timestamp columns. See validate_cursor_field for details.
         Self::validate_cursor_field(self.cursor_field())?;
 
-        // Use retrying connectivity check instead of hard-fail
-        self.check_connectivity_with_retry().await?;
+        self.check_connectivity_with_retry(&raw_client).await?;
+
+        // Wrap in the retry middleware for all subsequent query operations.
+        // The middleware handles transient 429 / 5xx retries with
+        // exponential back-off, jitter, and Retry-After header support.
+        let max_retries = self.get_max_retries();
+        let query_retry_max_delay = parse_duration(
+            self.config.retry_max_delay.as_deref(),
+            DEFAULT_RETRY_MAX_DELAY,
+        );
+        self.client = Some(build_retry_client(
+            raw_client,
+            max_retries,
+            self.retry_delay,
+            query_retry_max_delay,
+        ));
 
         info!(
             "InfluxDB source connector with ID: {} opened successfully",
@@ -799,5 +757,410 @@ impl Source for InfluxDbSource {
             self.id, state.processed_rows
         );
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn make_config() -> InfluxDbSourceConfig {
+        InfluxDbSourceConfig {
+            url: "http://localhost:8086".to_string(),
+            org: "test_org".to_string(),
+            token: "test_token".to_string(),
+            query: r#"from(bucket:"b") |> range(start: $cursor) |> limit(n: $limit)"#.to_string(),
+            poll_interval: Some("1s".to_string()),
+            batch_size: Some(100),
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: Some(true),
+            verbose_logging: None,
+            max_retries: Some(3),
+            retry_delay: Some("100ms".to_string()),
+            timeout: Some("5s".to_string()),
+            max_open_retries: Some(3),
+            open_retry_max_delay: Some("5s".to_string()),
+            retry_max_delay: Some("1s".to_string()),
+            circuit_breaker_threshold: Some(5),
+            circuit_breaker_cool_down: Some("30s".to_string()),
+        }
+    }
+
+    fn make_source() -> InfluxDbSource {
+        InfluxDbSource::new(1, make_config(), None)
+    }
+
+    // ── validate_cursor ──────────────────────────────────────────────────
+
+    #[test]
+    fn validate_cursor_accepts_valid_rfc3339() {
+        assert!(InfluxDbSource::validate_cursor("2024-01-15T10:30:00Z").is_ok());
+        assert!(InfluxDbSource::validate_cursor("2024-01-15T10:30:00.123456789Z").is_ok());
+        assert!(InfluxDbSource::validate_cursor("2024-01-15T10:30:00+05:30").is_ok());
+        assert!(InfluxDbSource::validate_cursor("1970-01-01T00:00:00Z").is_ok());
+    }
+
+    #[test]
+    fn validate_cursor_rejects_flux_injection_characters() {
+        // pipe, quote, parenthesis, space, slash are Flux syntax characters
+        assert!(InfluxDbSource::validate_cursor(r#"") |> drop() //"#).is_err());
+        assert!(InfluxDbSource::validate_cursor("2024-01-15 10:30:00Z").is_err());
+        assert!(InfluxDbSource::validate_cursor("2024/01/15T10:30:00Z").is_err());
+        assert!(InfluxDbSource::validate_cursor("not-a-timestamp").is_err());
+    }
+
+    #[test]
+    fn validate_cursor_rejects_empty_string() {
+        assert!(InfluxDbSource::validate_cursor("").is_err());
+    }
+
+    #[test]
+    fn validate_cursor_rejects_date_only() {
+        // Missing time component
+        assert!(InfluxDbSource::validate_cursor("2024-01-15").is_err());
+    }
+
+    // ── validate_cursor_field ────────────────────────────────────────────
+
+    #[test]
+    fn validate_cursor_field_accepts_time_columns() {
+        assert!(InfluxDbSource::validate_cursor_field("_time").is_ok());
+        assert!(InfluxDbSource::validate_cursor_field("time").is_ok());
+    }
+
+    #[test]
+    fn validate_cursor_field_rejects_non_timestamp_columns() {
+        assert!(InfluxDbSource::validate_cursor_field("_value").is_err());
+        assert!(InfluxDbSource::validate_cursor_field("sensor_id").is_err());
+        assert!(InfluxDbSource::validate_cursor_field("temperature").is_err());
+        assert!(InfluxDbSource::validate_cursor_field("").is_err());
+    }
+
+    // ── parse_scalar ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_scalar_empty_is_null() {
+        assert_eq!(parse_scalar(""), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn parse_scalar_booleans() {
+        assert_eq!(parse_scalar("true"), serde_json::Value::Bool(true));
+        assert_eq!(parse_scalar("false"), serde_json::Value::Bool(false));
+    }
+
+    #[test]
+    fn parse_scalar_integers() {
+        assert_eq!(parse_scalar("42"), serde_json::Value::Number(42.into()));
+        assert_eq!(
+            parse_scalar("-7"),
+            serde_json::Value::Number((-7i64).into())
+        );
+    }
+
+    #[test]
+    fn parse_scalar_floats() {
+        match parse_scalar("1.5") {
+            serde_json::Value::Number(n) => {
+                let v = n.as_f64().unwrap();
+                assert!((v - 1.5).abs() < 1e-10);
+            }
+            other => panic!("expected Number, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_scalar_strings() {
+        assert_eq!(
+            parse_scalar("hello"),
+            serde_json::Value::String("hello".to_string())
+        );
+        // "True" is not a bool (case-sensitive)
+        assert_eq!(
+            parse_scalar("True"),
+            serde_json::Value::String("True".to_string())
+        );
+    }
+
+    // ── is_timestamp_after ───────────────────────────────────────────────
+
+    #[test]
+    fn is_timestamp_after_compares_chronologically_not_lexicographically() {
+        // "2026-03-18T12:00:00.60952Z" = 609520µs (chronologically earlier)
+        // "2026-03-18T12:00:00.609521Z" = 609521µs (chronologically later)
+        // A naive string compare would say the first is > second (Z > 1).
+        let earlier = "2026-03-18T12:00:00.60952Z";
+        let later = "2026-03-18T12:00:00.609521Z";
+        assert!(
+            is_timestamp_after(later, earlier),
+            "later timestamp should be after earlier"
+        );
+        assert!(
+            !is_timestamp_after(earlier, later),
+            "earlier should not be after later"
+        );
+    }
+
+    #[test]
+    fn is_timestamp_after_equal_timestamps() {
+        let ts = "2024-01-15T10:30:00Z";
+        assert!(!is_timestamp_after(ts, ts));
+    }
+
+    // ── parse_csv_rows ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_csv_rows_empty_string_returns_empty() {
+        let source = make_source();
+        let rows = source.parse_csv_rows("").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn parse_csv_rows_skips_annotation_rows() {
+        let source = make_source();
+        // Annotation rows must have the same field count as data rows for the CSV
+        // reader to accept them.  InfluxDB always emits uniformly-wide rows.
+        let csv = "#group,false\n#datatype,string\n_time,_value\n2024-01-01T00:00:00Z,42\n";
+        let rows = source.parse_csv_rows(csv).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("_value").map(String::as_str), Some("42"));
+    }
+
+    #[test]
+    fn parse_csv_rows_skips_blank_lines() {
+        let source = make_source();
+        // Two data records separated by a blank line (multi-table CSV format)
+        let csv = "_time,_value\n2024-01-01T00:00:00Z,1\n\n_time,_value\n2024-01-01T00:00:01Z,2\n";
+        let rows = source.parse_csv_rows(csv).unwrap();
+        // Both data rows should be parsed (second header line is skipped)
+        assert_eq!(rows.len(), 2, "expected 2 data rows, got {}", rows.len());
+    }
+
+    #[test]
+    fn parse_csv_rows_skips_repeated_header_rows() {
+        let source = make_source();
+        // Same header appears twice (InfluxDB multi-table result format)
+        let csv = "_time,_value\n2024-01-01T00:00:00Z,10\n_time,_value\n2024-01-01T00:00:01Z,20\n";
+        let rows = source.parse_csv_rows(csv).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn parse_csv_rows_handles_empty_value_columns() {
+        let source = make_source();
+        // Data row with an empty field value (column present but blank).
+        // The CSV reader requires uniform field counts, so we keep all 3 columns.
+        let csv = "_time,_value,_measurement\n2024-01-01T00:00:00Z,42,\n";
+        let rows = source.parse_csv_rows(csv).unwrap();
+        assert_eq!(rows.len(), 1);
+        // _measurement is present but empty
+        assert_eq!(
+            rows[0].get("_measurement").map(String::as_str),
+            Some(""),
+            "empty column value should be stored as empty string"
+        );
+    }
+
+    // ── build_payload ────────────────────────────────────────────────────
+
+    #[test]
+    fn build_payload_missing_column_returns_error() {
+        let mut config = make_config();
+        config.payload_column = Some("data".to_string());
+        let source = InfluxDbSource::new(1, config, None);
+
+        let row: HashMap<String, String> =
+            [("_time".to_string(), "2024-01-01T00:00:00Z".to_string())]
+                .into_iter()
+                .collect();
+
+        let result = source.build_payload(&row, true);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("data") || err.contains("Missing"),
+            "error should mention missing column: {err}"
+        );
+    }
+
+    #[test]
+    fn build_payload_invalid_base64_returns_error() {
+        let mut config = make_config();
+        config.payload_column = Some("data".to_string());
+        config.payload_format = Some("raw".to_string()); // raw = base64 decode
+        let source = InfluxDbSource::new(1, config, None);
+
+        let row: HashMap<String, String> =
+            [("data".to_string(), "not-valid-base64!!!".to_string())]
+                .into_iter()
+                .collect();
+
+        let result = source.build_payload(&row, true);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("base64") || err.contains("decode"),
+            "error should mention base64: {err}"
+        );
+    }
+
+    #[test]
+    fn build_payload_invalid_json_returns_error() {
+        let mut config = make_config();
+        config.payload_column = Some("data".to_string());
+        config.payload_format = Some("json".to_string());
+        let source = InfluxDbSource::new(1, config, None);
+
+        let row: HashMap<String, String> = [("data".to_string(), "{{not valid json}}".to_string())]
+            .into_iter()
+            .collect();
+
+        let result = source.build_payload(&row, true);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("JSON") || err.contains("json"),
+            "error should mention JSON: {err}"
+        );
+    }
+
+    #[test]
+    fn build_payload_valid_base64_decodes_correctly() {
+        let mut config = make_config();
+        config.payload_column = Some("data".to_string());
+        config.payload_format = Some("raw".to_string());
+        let source = InfluxDbSource::new(1, config, None);
+
+        // base64("hello") = "aGVsbG8="
+        let row: HashMap<String, String> = [("data".to_string(), "aGVsbG8=".to_string())]
+            .into_iter()
+            .collect();
+
+        let result = source.build_payload(&row, true).unwrap();
+        assert_eq!(result, b"hello");
+    }
+
+    #[test]
+    fn build_payload_text_column_returns_bytes() {
+        let mut config = make_config();
+        config.payload_column = Some("data".to_string());
+        config.payload_format = Some("text".to_string());
+        let source = InfluxDbSource::new(1, config, None);
+
+        let row: HashMap<String, String> = [("data".to_string(), "hello world".to_string())]
+            .into_iter()
+            .collect();
+
+        let result = source.build_payload(&row, true).unwrap();
+        assert_eq!(result, b"hello world");
+    }
+
+    #[test]
+    fn build_payload_whole_row_wraps_measurement_and_value() {
+        let source = make_source(); // no payload_column
+        let row: HashMap<String, String> = [
+            ("_measurement".to_string(), "temperature".to_string()),
+            ("_field".to_string(), "v".to_string()),
+            ("_time".to_string(), "2024-01-01T00:00:00Z".to_string()),
+            ("_value".to_string(), "21.5".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let bytes = source.build_payload(&row, true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["measurement"], "temperature");
+        assert_eq!(parsed["timestamp"], "2024-01-01T00:00:00Z");
+        // _value "21.5" → parsed as f64
+        assert!(parsed["value"].is_number());
+    }
+
+    #[test]
+    fn build_payload_include_metadata_false_filters_fields() {
+        let source = make_source();
+        let row: HashMap<String, String> = [
+            ("_measurement".to_string(), "temp".to_string()),
+            ("_field".to_string(), "v".to_string()),
+            ("_time".to_string(), "2024-01-01T00:00:00Z".to_string()),
+            ("_value".to_string(), "42".to_string()),
+            ("host".to_string(), "server1".to_string()), // extra annotation column
+        ]
+        .into_iter()
+        .collect();
+
+        let bytes = source.build_payload(&row, false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // With include_metadata=false, only _value/_time/_measurement go into row
+        let row_obj = parsed["row"].as_object().unwrap();
+        // "host" is an annotation column — should be excluded
+        assert!(
+            !row_obj.contains_key("host"),
+            "annotation columns should be excluded when include_metadata=false"
+        );
+        // Core columns should still be present
+        assert!(row_obj.contains_key("_value") || row_obj.contains_key("_time"));
+    }
+
+    // ── circuit breaker integration ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn poll_returns_empty_when_circuit_is_open() {
+        let mut config = make_config();
+        config.circuit_breaker_threshold = Some(1);
+        config.circuit_breaker_cool_down = Some("60s".to_string());
+        let source = InfluxDbSource::new(1, config, None);
+
+        // Force the circuit open
+        source.circuit_breaker.record_failure().await;
+        assert!(source.circuit_breaker.is_open().await);
+
+        let result = source.poll().await;
+        assert!(result.is_ok(), "poll should return Ok when circuit is open");
+        let produced = result.unwrap();
+        assert!(
+            produced.messages.is_empty(),
+            "no messages should be produced when circuit is open"
+        );
+    }
+
+    // ── close() ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn close_drops_client() {
+        let mut source = make_source();
+        let result = source.close().await;
+        assert!(result.is_ok());
+        assert!(source.client.is_none(), "client should be None after close");
+    }
+
+    // ── payload_format ───────────────────────────────────────────────────
+
+    #[test]
+    fn payload_format_aliases() {
+        assert_eq!(
+            PayloadFormat::from_config(Some("utf8")),
+            PayloadFormat::Text
+        );
+        assert_eq!(
+            PayloadFormat::from_config(Some("base64")),
+            PayloadFormat::Raw
+        );
+        assert_eq!(PayloadFormat::from_config(None), PayloadFormat::Json);
+    }
+
+    #[test]
+    fn payload_format_schema_mapping() {
+        assert_eq!(PayloadFormat::Json.schema(), Schema::Json);
+        assert_eq!(PayloadFormat::Text.schema(), Schema::Text);
+        assert_eq!(PayloadFormat::Raw.schema(), Schema::Raw);
     }
 }

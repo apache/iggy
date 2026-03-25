@@ -20,13 +20,20 @@
 //!
 //! Provides:
 //! - [`CircuitBreaker`] — consecutive-failure circuit breaker
+//! - [`InfluxDbRetryMiddleware`] — `reqwest-middleware` middleware with
+//!   exponential back-off, jitter, and `Retry-After` header support
+//! - [`build_retry_client`] — wraps a `reqwest::Client` with the middleware
+//! - [`is_transient_status`] — transient HTTP status predicate
 //! - [`parse_duration`] — humantime duration parsing with fallback
 //! - [`jitter`] — ±20 % random jitter for retry delays
 //! - [`exponential_backoff`] — capped exponential backoff
 //! - [`parse_retry_after`] — HTTP `Retry-After` header parsing
 
+use anyhow::anyhow;
+use http::Extensions;
 use humantime::Duration as HumanDuration;
 use rand::RngExt as _;
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, Middleware, Next};
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -156,4 +163,301 @@ pub fn parse_retry_after(value: &str) -> Option<Duration> {
         return Some(Duration::from_secs(secs));
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// reqwest-middleware retry implementation
+// ---------------------------------------------------------------------------
+
+/// Returns `true` for HTTP status codes that are worth retrying:
+/// `429 Too Many Requests` and all `5xx` server errors.
+pub fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Per-request retry middleware for InfluxDB connectors.
+///
+/// Wraps a `reqwest-middleware` stack and retries transient failures
+/// (HTTP 429, 5xx, network errors) with exponential back-off and ±20 % jitter.
+/// An `Retry-After` response header on a 429 overrides the calculated delay.
+///
+/// The `max_retries` parameter is the *total attempt count* (not the number
+/// of extra attempts), consistent with the rest of the connector retry config:
+/// - `max_retries = 1` → one attempt, no retries on failure
+/// - `max_retries = 3` → up to three attempts (two retries after a failure)
+///
+/// Non-transient error responses (4xx except 429) are returned as-is so
+/// callers can inspect the status and body to build a meaningful error.
+#[derive(Debug, Clone)]
+pub struct InfluxDbRetryMiddleware {
+    max_retries: u32,
+    retry_delay: Duration,
+    max_delay: Duration,
+}
+
+impl InfluxDbRetryMiddleware {
+    pub fn new(max_retries: u32, retry_delay: Duration, max_delay: Duration) -> Self {
+        Self {
+            max_retries,
+            retry_delay,
+            max_delay,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Middleware for InfluxDbRetryMiddleware {
+    async fn handle(
+        &self,
+        req: reqwest::Request,
+        extensions: &mut Extensions,
+        next: Next<'_>,
+    ) -> reqwest_middleware::Result<reqwest::Response> {
+        let mut current_req = req;
+        let mut attempts = 0u32;
+
+        loop {
+            // Clone before consuming — Bytes / JSON bodies are reference-counted
+            // so this is O(1), not a deep copy of the payload.
+            let next_req = current_req.try_clone();
+
+            match next.clone().run(current_req, extensions).await {
+                Ok(response) => {
+                    let status = response.status();
+
+                    if status.is_success() {
+                        return Ok(response);
+                    }
+
+                    // Parse Retry-After header on 429 before falling back to
+                    // our own calculated backoff.
+                    let retry_after = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        response
+                            .headers()
+                            .get("Retry-After")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(parse_retry_after)
+                    } else {
+                        None
+                    };
+
+                    attempts += 1;
+                    if is_transient_status(status) && attempts < self.max_retries {
+                        // Consume the error body for logging, then retry.
+                        let body_text = response.text().await.unwrap_or_default();
+                        let delay = retry_after.unwrap_or_else(|| {
+                            jitter(exponential_backoff(
+                                self.retry_delay,
+                                attempts,
+                                self.max_delay,
+                            ))
+                        });
+                        warn!(
+                            "Transient InfluxDB error {status} \
+                             (attempt {attempts}/{}): {body_text}. \
+                             Retrying in {delay:?}...",
+                            self.max_retries
+                        );
+                        tokio::time::sleep(delay).await;
+                        current_req = match next_req {
+                            Some(r) => r,
+                            None => {
+                                return Err(reqwest_middleware::Error::Middleware(anyhow!(
+                                    "request body is not cloneable — cannot retry"
+                                )));
+                            }
+                        };
+                        continue;
+                    }
+
+                    // Non-transient status or retries exhausted — pass the
+                    // response through so the caller can read the body and
+                    // build a meaningful error message.
+                    return Ok(response);
+                }
+                Err(e) => {
+                    attempts += 1;
+                    if attempts < self.max_retries {
+                        let delay = jitter(exponential_backoff(
+                            self.retry_delay,
+                            attempts,
+                            self.max_delay,
+                        ));
+                        warn!(
+                            "InfluxDB network error (attempt {attempts}/{}): {e}. \
+                             Retrying in {delay:?}...",
+                            self.max_retries
+                        );
+                        tokio::time::sleep(delay).await;
+                        current_req = match next_req {
+                            Some(r) => r,
+                            None => return Err(e),
+                        };
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// Wrap a raw [`reqwest::Client`] in a [`ClientWithMiddleware`] that
+/// automatically retries transient InfluxDB failures.
+///
+/// The middleware uses the same `max_retries` semantics as the rest of the
+/// connector retry config (total attempt count, not number of extra retries).
+pub fn build_retry_client(
+    client: reqwest::Client,
+    max_retries: u32,
+    retry_delay: Duration,
+    max_delay: Duration,
+) -> ClientWithMiddleware {
+    ClientBuilder::new(client)
+        .with(InfluxDbRetryMiddleware::new(
+            max_retries,
+            retry_delay,
+            max_delay,
+        ))
+        .build()
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    // ── CircuitBreaker ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn circuit_starts_closed() {
+        let cb = CircuitBreaker::new(3, Duration::from_secs(60));
+        assert!(!cb.is_open().await);
+    }
+
+    #[tokio::test]
+    async fn circuit_opens_at_threshold() {
+        let cb = CircuitBreaker::new(2, Duration::from_secs(60));
+        cb.record_failure().await;
+        assert!(
+            !cb.is_open().await,
+            "one failure should not open the circuit"
+        );
+        cb.record_failure().await;
+        assert!(
+            cb.is_open().await,
+            "threshold reached — circuit should be open"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_success_resets_and_closes_circuit() {
+        let cb = CircuitBreaker::new(1, Duration::from_secs(60));
+        cb.record_failure().await;
+        assert!(cb.is_open().await);
+        // record_success uses try_lock; sleep a tick to ensure it acquires
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        cb.record_success();
+        // After success the cool_down is cancelled; wait for the lock
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(!cb.is_open().await);
+    }
+
+    #[tokio::test]
+    async fn circuit_transitions_to_half_open_after_cooldown() {
+        let cb = CircuitBreaker::new(1, Duration::from_millis(10));
+        cb.record_failure().await;
+        assert!(cb.is_open().await);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Cool-down elapsed → half-open → returns false
+        assert!(!cb.is_open().await);
+    }
+
+    // ── parse_duration ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_duration_valid() {
+        assert_eq!(parse_duration(Some("5s"), "1s"), Duration::from_secs(5));
+        assert_eq!(
+            parse_duration(Some("200ms"), "1s"),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn parse_duration_falls_back_to_default() {
+        assert_eq!(parse_duration(None, "3s"), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn parse_duration_falls_back_to_one_second_on_invalid() {
+        assert_eq!(
+            parse_duration(Some("not-a-duration"), "3s"),
+            Duration::from_secs(1)
+        );
+    }
+
+    // ── exponential_backoff ──────────────────────────────────────────────
+
+    #[test]
+    fn exponential_backoff_doubles_each_attempt() {
+        let base = Duration::from_millis(100);
+        let max = Duration::from_secs(60);
+        assert_eq!(
+            exponential_backoff(base, 0, max),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            exponential_backoff(base, 1, max),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            exponential_backoff(base, 2, max),
+            Duration::from_millis(400)
+        );
+    }
+
+    #[test]
+    fn exponential_backoff_capped_at_max_delay() {
+        let base = Duration::from_millis(1000);
+        let max = Duration::from_millis(2500);
+        assert_eq!(exponential_backoff(base, 10, max), max);
+    }
+
+    // ── parse_retry_after ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_retry_after_integer_seconds() {
+        assert_eq!(parse_retry_after("30"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_retry_after("  5  "), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_returns_none() {
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
+            None,
+            "HTTP-date format should return None"
+        );
+    }
+
+    // ── is_transient_status ──────────────────────────────────────────────
+
+    #[test]
+    fn transient_status_429_and_5xx() {
+        assert!(is_transient_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_transient_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(is_transient_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!is_transient_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!is_transient_status(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(!is_transient_status(reqwest::StatusCode::NOT_FOUND));
+    }
 }
