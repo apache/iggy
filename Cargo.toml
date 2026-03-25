@@ -184,7 +184,7 @@ mime_guess = "2.0"
 mockall = "0.14.0"
 moka = { version = "0.12.14", features = ["future"] }
 mongodb = { version = "3.5.2", features = ["rustls-tls"] }
-nix = { version = "0.31.2", features = ["fs", "resource", "sched"] }
+nix = { version = "0.31.2", features = ["feature", "fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 notify = "8.2.0"
 octocrab = "0.49.5"

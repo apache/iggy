@@ -165,7 +165,10 @@ pub fn create_root_user() -> User {
     User::root(&username, &password)
 }
 
-pub fn create_shard_executor() -> Runtime {
+// Shard executors require IORING_SETUP_COOP_TASKRUN for predictable latency.
+// Falling back to default flags would silently degrade shard performance -
+// do not add a retry with reduced flags here.
+pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
     // TODO: The event interval tick, could be configured based on the fact
     // How many clients we expect to have connected.
     // This roughly estimates the number of tasks we will create.
@@ -186,7 +189,6 @@ pub fn create_shard_executor() -> Runtime {
         .with_proactor(proactor.to_owned())
         .event_interval(128)
         .build()
-        .unwrap()
 }
 
 pub fn resolve_persister(enforce_fsync: bool) -> Arc<PersisterKind> {
