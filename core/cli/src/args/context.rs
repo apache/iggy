@@ -82,40 +82,42 @@ pub(crate) struct ContextCreateArgs {
     #[arg(value_parser = clap::value_parser!(String))]
     pub(crate) context_name: String,
 
-    /// Transport protocol (tcp, quic, http, ws)
-    #[clap(long)]
+    /// The transport to use
+    ///
+    /// Valid values are "quic", "http", "tcp" and "ws".
+    #[clap(verbatim_doc_comment, long)]
     pub(crate) transport: Option<String>,
 
-    /// TCP server address (e.g., 127.0.0.1:8090)
+    /// The server address for the TCP transport
     #[clap(long)]
     pub(crate) tcp_server_address: Option<String>,
 
-    /// HTTP API URL (e.g., http://localhost:3000)
+    /// The API URL for the HTTP transport
     #[clap(long)]
     pub(crate) http_api_url: Option<String>,
 
-    /// QUIC server address (e.g., 127.0.0.1:8080)
+    /// The server address for the QUIC transport
     #[clap(long)]
     pub(crate) quic_server_address: Option<String>,
 
-    /// Enable TLS for TCP transport
+    /// Flag to enable TLS for the TCP transport
     #[clap(long)]
     pub(crate) tcp_tls_enabled: Option<bool>,
 
-    /// Username for authentication
-    #[clap(long)]
+    /// Iggy server username
+    #[clap(short, long)]
     pub(crate) username: Option<String>,
 
-    /// Password for authentication
-    #[clap(long)]
+    /// Iggy server password
+    #[clap(short, long)]
     pub(crate) password: Option<String>,
 
-    /// Personal access token
-    #[clap(long)]
+    /// Iggy server personal access token
+    #[clap(short, long)]
     pub(crate) token: Option<String>,
 
-    /// Personal access token name (for keyring lookup)
-    #[clap(long)]
+    /// Iggy server personal access token name
+    #[clap(short = 'n', long)]
     pub(crate) token_name: Option<String>,
 }
 

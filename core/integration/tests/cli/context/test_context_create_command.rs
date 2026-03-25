@@ -167,33 +167,35 @@ Arguments:
 
 Options:
       --transport <TRANSPORT>
-{CLAP_INDENT}Transport protocol (tcp, quic, http, ws)
+{CLAP_INDENT}The transport to use
+{CLAP_INDENT}
+{CLAP_INDENT}Valid values are "quic", "http", "tcp" and "ws".
 
       --tcp-server-address <TCP_SERVER_ADDRESS>
-{CLAP_INDENT}TCP server address (e.g., 127.0.0.1:8090)
+{CLAP_INDENT}The server address for the TCP transport
 
       --http-api-url <HTTP_API_URL>
-{CLAP_INDENT}HTTP API URL (e.g., http://localhost:3000)
+{CLAP_INDENT}The API URL for the HTTP transport
 
       --quic-server-address <QUIC_SERVER_ADDRESS>
-{CLAP_INDENT}QUIC server address (e.g., 127.0.0.1:8080)
+{CLAP_INDENT}The server address for the QUIC transport
 
       --tcp-tls-enabled <TCP_TLS_ENABLED>
-{CLAP_INDENT}Enable TLS for TCP transport
+{CLAP_INDENT}Flag to enable TLS for the TCP transport
 {CLAP_INDENT}
 {CLAP_INDENT}[possible values: true, false]
 
-      --username <USERNAME>
-{CLAP_INDENT}Username for authentication
+  -u, --username <USERNAME>
+{CLAP_INDENT}Iggy server username
 
-      --password <PASSWORD>
-{CLAP_INDENT}Password for authentication
+  -p, --password <PASSWORD>
+{CLAP_INDENT}Iggy server password
 
-      --token <TOKEN>
-{CLAP_INDENT}Personal access token
+  -t, --token <TOKEN>
+{CLAP_INDENT}Iggy server personal access token
 
-      --token-name <TOKEN_NAME>
-{CLAP_INDENT}Personal access token name (for keyring lookup)
+  -n, --token-name <TOKEN_NAME>
+{CLAP_INDENT}Iggy server personal access token name
 
   -h, --help
 {CLAP_INDENT}Print help (see a summary with '-h')
@@ -220,16 +222,26 @@ Arguments:
   <CONTEXT_NAME>  Name of the context to create
 
 Options:
-      --transport <TRANSPORT>                    Transport protocol (tcp, quic, http, ws)
-      --tcp-server-address <TCP_SERVER_ADDRESS>  TCP server address (e.g., 127.0.0.1:8090)
-      --http-api-url <HTTP_API_URL>              HTTP API URL (e.g., http://localhost:3000)
-      --quic-server-address <QUIC_SERVER_ADDRESS>  QUIC server address (e.g., 127.0.0.1:8080)
-      --tcp-tls-enabled <TCP_TLS_ENABLED>        Enable TLS for TCP transport [possible values: true, false]
-      --username <USERNAME>                      Username for authentication
-      --password <PASSWORD>                      Password for authentication
-      --token <TOKEN>                            Personal access token
-      --token-name <TOKEN_NAME>                  Personal access token name (for keyring lookup)
-  -h, --help                                     Print help (see more with '--help')
+      --transport <TRANSPORT>
+{CLAP_INDENT}The transport to use
+      --tcp-server-address <TCP_SERVER_ADDRESS>
+{CLAP_INDENT}The server address for the TCP transport
+      --http-api-url <HTTP_API_URL>
+{CLAP_INDENT}The API URL for the HTTP transport
+      --quic-server-address <QUIC_SERVER_ADDRESS>
+{CLAP_INDENT}The server address for the QUIC transport
+      --tcp-tls-enabled <TCP_TLS_ENABLED>
+{CLAP_INDENT}Flag to enable TLS for the TCP transport [possible values: true, false]
+  -u, --username <USERNAME>
+{CLAP_INDENT}Iggy server username
+  -p, --password <PASSWORD>
+{CLAP_INDENT}Iggy server password
+  -t, --token <TOKEN>
+{CLAP_INDENT}Iggy server personal access token
+  -n, --token-name <TOKEN_NAME>
+{CLAP_INDENT}Iggy server personal access token name
+  -h, --help
+{CLAP_INDENT}Print help (see more with '--help')
 "#,
             ),
         ))
