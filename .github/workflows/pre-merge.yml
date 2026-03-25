@@ -15,6 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# PR gate: detects changed components, builds test matrices, and runs
+# lint/test/build/compat/BDD/examples jobs only for affected languages.
+# All jobs must pass before merge.
+
 name: Pre-merge
 on:
   pull_request:

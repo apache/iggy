@@ -24,9 +24,9 @@ mod log;
 mod types;
 
 use bytes::{Bytes, BytesMut};
+use iggy_binary_protocol::{Message, PrepareHeader};
 use iggy_common::{
-    INDEX_SIZE, IggyError, IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet,
-    PooledBuffer, header::PrepareHeader, message::Message,
+    INDEX_SIZE, IggyError, IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, PooledBuffer,
 };
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;
@@ -54,8 +54,14 @@ pub(crate) fn decode_send_messages_batch(body: Bytes) -> Option<IggyMessagesBatc
     }
 
     let indexes_bytes = body.split_to(indexes_len);
-    let indexes = IggyIndexesMut::from_bytes(PooledBuffer::from(indexes_bytes), 0);
-    let messages = PooledBuffer::from(body);
+
+    let mut indexes_buf = PooledBuffer::with_capacity(indexes_len);
+    indexes_buf.put_slice(indexes_bytes.as_ref());
+    let indexes = IggyIndexesMut::from_bytes(indexes_buf, 0);
+
+    let messages_len = body.len();
+    let mut messages = PooledBuffer::with_capacity(messages_len);
+    messages.put_slice(body.as_ref());
 
     Some(IggyMessagesBatchMut::from_indexes_and_messages(
         indexes, messages,

@@ -66,8 +66,35 @@ flag_management:
       paths:
         - foreign/go/
 
+component_management:
+  individual_components:
+    - component_id: rust
+      name: Rust Core
+      paths:
+        - core/
+    - component_id: java
+      name: Java SDK
+      paths:
+        - foreign/java/
+    - component_id: csharp
+      name: "C# SDK"
+      paths:
+        - foreign/csharp/
+    - component_id: python
+      name: Python SDK
+      paths:
+        - foreign/python/
+    - component_id: node
+      name: Node SDK
+      paths:
+        - foreign/node/
+    - component_id: go
+      name: Go SDK
+      paths:
+        - foreign/go/
+
 comment:
-  layout: "header, diff, flags, files"
+  layout: "header, diff, components, files"
   behavior: default
   require_changes: true
   require_base: true

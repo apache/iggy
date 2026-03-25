@@ -165,7 +165,10 @@ pub fn create_root_user() -> User {
     User::root(&username, &password)
 }
 
-pub fn create_shard_executor() -> Runtime {
+// Shard executors require IORING_SETUP_COOP_TASKRUN for predictable latency.
+// Falling back to default flags would silently degrade shard performance -
+// do not add a retry with reduced flags here.
+pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
     // TODO: The event interval tick, could be configured based on the fact
     // How many clients we expect to have connected.
     // This roughly estimates the number of tasks we will create.
@@ -186,7 +189,6 @@ pub fn create_shard_executor() -> Runtime {
         .with_proactor(proactor.to_owned())
         .event_interval(128)
         .build()
-        .unwrap()
 }
 
 pub fn resolve_persister(enforce_fsync: bool) -> Arc<PersisterKind> {
@@ -237,7 +239,7 @@ pub async fn load_segments(
 ) -> Result<SegmentedLog<MemoryMessageJournal>, IggyError> {
     let mut log_files = collect_log_files(&partition_path).await?;
     log_files.sort_by(|a, b| a.path.file_name().cmp(&b.path.file_name()));
-    let mut log = SegmentedLog::<MemoryMessageJournal>::default();
+    let mut log = SegmentedLog::new(MemoryMessageJournal::empty());
     for entry in log_files {
         let log_file_name = entry
             .path
@@ -324,7 +326,7 @@ pub async fn load_segments(
         };
 
         let end_offset = if loaded_indexes.count() == 0 {
-            0
+            start_offset
         } else {
             let last_index_offset = loaded_indexes.last().unwrap().offset() as u64;
             start_offset + last_index_offset

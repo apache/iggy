@@ -22,14 +22,11 @@ build-backend = "maturin"
 [project]
 name = "apache-iggy"
 requires-python = ">=3.10"
-version = "0.7.3.dev1"
+version = "0.7.4.dev1"
 description = "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 readme = "README.md"
 license = { file = "LICENSE" }
-authors = [
-    { name = "Dario Lencina Talarico", email = "darioalessandrolencina@gmail.com" },
-    { name = "Albin Skott", email = "albin@mattsson.io" },
-]
+authors = [{ name = "Iggy Committers", email = "dev@iggy.apache.org" }]
 keywords = ["streaming", "messaging", "pubsub", "iggy", "rust", "performance"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -40,6 +37,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",

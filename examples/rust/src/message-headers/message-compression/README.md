@@ -41,7 +41,7 @@ pub const STREAM_NAME: &str = "compression-stream";
 pub const TOPIC_NAME: &str = "compression-topic";
 ```
 
-Additionally, set a constant that defines the number of messages to be send to the server via the producer.
+Additionally, set a constant that defines the number of messages to be sent to the server via the producer.
 
 ```rust
 pub const NUM_MESSAGES: u32 = 1000;
@@ -50,12 +50,12 @@ pub const NUM_MESSAGES: u32 = 1000;
 ### Spotlight: IggyMessage's
 
 In order to add functionality to compress and decompress messages during transit, we need to know what a message actually is and how it is implemented.
-Iggy implements two important types, that we need to know.
+Iggy implements two important types that we need to know.
 
 * [IggyMessage](https://github.com/apache/iggy/blob/e46f294b7af4f86b0d7e26d984205a019a8885f8/core/common/src/types/message/iggy_message.rs#L108)
 * [ReceivedMessage](https://github.com/apache/iggy/blob/b26246252502ba6f5d6cad2895e7c468d9f959e4/core/sdk/src/clients/consumer.rs#L905)
 
-A message send to the server needs to be of type `IggyMessage`.
+A message sent to the server needs to be of type `IggyMessage`.
 
 ```Rust
 pub struct IggyMessage {
@@ -71,17 +71,17 @@ pub struct IggyMessage {
 The important bits in context of this example are the *payload* and the *user_headers*.
 Payload is of type Bytes and corresponds to the actual message that we want to send to the server.
 
-Let's suppose our example is an abstraction over a real world scenario, where some application sends it's application logs to the iggy-server. This application is therefore the producer.
+Let's suppose our example is an abstraction over a real world scenario, where some application sends its application logs to the iggy-server. This application is therefore the producer.
 We also have a monitoring service, that inspects the logs of our application to check for any service disruptions. So this monitoring service needs to read the logs from the iggy-server and is therefore the consumer.
 
 Further suppose, the application logs are quite large and repetitive, since they follow a structured pattern (as logs usually do).
-It may be a good idea to reduce bandwidth by trading of some idle CPU time to compress the logs before sending them to the server.
+It may be a good idea to reduce bandwidth by trading off some idle CPU time to compress the logs before sending them to the server.
 We go straight ahead, implement some compression functionalities and send the compressed messages to the server.
 If the monitoring service now consumes these messages we have a problem. The logs are still compressed.
 Even if we know that the messages are compressed we do not know how to decompress them because the algorithm that was used for compression is unknown.
 
 This is where `user_headers` become handy.
-The definition above tells us, that user_headers are (optional) Bytes. But thats because finally everything is serialized before sending to the server.
+The definition above tells us that user_headers are (optional) Bytes. But that's because finally everything is serialized before sending to the server.
 Looking at the implementation of `IggyMessage` we see that user_headers are a serialized `HashMap` with Iggy specific types `HeaderKey` and `HeaderValue`.
 So the user_headers are basically a set of metadata defined by us, the user, using a key and a value.
 

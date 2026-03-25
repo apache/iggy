@@ -256,7 +256,7 @@ async fn validate_log_rotation_rules(
     // The delay in log writing in Iggy mainly depends on the processing speed
     // of background threads and the operating system's I/O scheduling,  which
     // means that the actual size of written logs may be slightly larger  than
-    // expected. So there ignores tiny minor overflow by comparing integer  KB
+    // expected. So this ignores tiny minor overflow by comparing integer  KB
     // values instead of exact bytes.
 
     let mut total_log_size = IggyByteSize::new(0);

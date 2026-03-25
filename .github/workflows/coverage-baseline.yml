@@ -1,0 +1,460 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Full coverage baseline for all 6 languages (Rust, Java, C#, Python,
+# Node, Go). Runs on every push to master so Codecov has complete data
+# for carryforward on PR builds where only a subset of SDKs is tested.
+
+name: Coverage baseline
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-baseline-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IGGY_CI_BUILD: true
+
+jobs:
+  rust-coverage:
+    name: Rust coverage baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cleanup disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update --yes
+          sudo apt-get install --yes gnome-keyring keyutils dbus-x11 libsecret-tools
+          rm -f $HOME/.local/share/keyrings/*
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          # Also warms the GitHub Actions build cache for subsequent PR builds
+          save-cache: "true"
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Build and test with coverage
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo build --locked
+          cargo test --locked --no-run
+
+          # Start D-Bus and unlock keyring right before test execution to avoid
+          # gnome-keyring auto-locking the collection during the build phase.
+          # Previously this ran before `cargo build`, leaving a 7+ minute idle
+          # window that triggered org.freedesktop.Secret.Error.IsLocked ~10% of runs.
+          eval $(dbus-launch --sh-syntax)
+          export DBUS_SESSION_BUS_ADDRESS
+          eval $(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)
+          echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
+
+          cargo test --locked --no-fail-fast
+        shell: bash
+
+      - name: Generate coverage report
+        run: |
+          source <(cargo llvm-cov show-env --export-prefix)
+          cargo llvm-cov report --codecov --output-path codecov.json
+        shell: bash
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: codecov.json
+          disable_search: true
+          flags: rust
+          fail_ci_if_error: false
+
+  java-coverage:
+    name: Java coverage baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java with cache
+        uses: ./.github/actions/utils/setup-java-with-cache
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "false"
+
+      - name: Start Iggy server
+        id: iggy
+        uses: ./.github/actions/utils/server-start
+
+      - name: Run tests and generate coverage
+        working-directory: foreign/java
+        env:
+          USE_EXTERNAL_SERVER: true
+        run: |
+          ./gradlew test
+          ./gradlew jacocoAggregatedReport
+
+      - name: Stop Iggy server
+        if: always()
+        uses: ./.github/actions/utils/server-stop
+        with:
+          pid-file: ${{ steps.iggy.outputs.pid_file }}
+          log-file: ${{ steps.iggy.outputs.log_file }}
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: foreign/java/build/reports/jacoco/aggregate/jacocoAggregated.xml
+          disable_search: true
+          flags: java
+          fail_ci_if_error: false
+
+  csharp-coverage:
+    name: C# coverage baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "false"
+
+      - name: Build Iggy server Docker image
+        id: docker_build
+        uses: ./.github/actions/utils/docker-build-test-server
+        with:
+          image-tag: "iggy-server:test"
+          libc: "glibc"
+          profile: "debug"
+
+      - name: Restore and build
+        working-directory: foreign/csharp
+        run: |
+          dotnet restore Iggy_SDK.sln
+          dotnet build Iggy_SDK.sln --no-restore
+
+      - name: Run unit tests with coverage
+        working-directory: foreign/csharp
+        run: |
+          dotnet test \
+            --project Iggy_SDK_Tests \
+            --no-build \
+            --verbosity normal \
+            --coverage \
+            --coverage-output-format cobertura \
+            --coverage-output coverage.cobertura.xml \
+            --results-directory ./reports/unit
+
+      - name: Run integration tests with coverage
+        working-directory: foreign/csharp
+        env:
+          IGGY_SERVER_DOCKER_IMAGE: ${{ steps.docker_build.outputs.docker_image }}
+        run: |
+          dotnet test \
+            --project Iggy_SDK.Tests.Integration \
+            --no-build \
+            --verbosity normal \
+            --coverage \
+            --coverage-output-format cobertura \
+            --coverage-output coverage.cobertura.xml \
+            --results-directory ./reports/integration
+
+      - name: Merge coverage reports
+        working-directory: foreign/csharp
+        run: |
+          dotnet tool install --global dotnet-coverage
+          dotnet-coverage merge ./reports/**/*.cobertura.xml -f cobertura -o ./reports/coverage.cobertura.xml
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: foreign/csharp/reports/coverage.cobertura.xml
+          disable_search: true
+          flags: csharp
+          fail_ci_if_error: false
+
+  python-coverage:
+    name: Python coverage baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "false"
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7.3.1
+
+      - name: Install dependencies
+        run: |
+          cd foreign/python
+          uv sync --frozen --extra dev --extra testing --extra testing-docker
+
+      - name: Build Python wheel with coverage instrumentation
+        run: |
+          cd foreign/python
+          source <(cargo llvm-cov show-env --sh)
+          export CARGO_TARGET_DIR=$CARGO_LLVM_COV_TARGET_DIR
+
+          # Propagate LLVM_PROFILE_FILE so the test step can write profraw data
+          echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> $GITHUB_ENV
+
+          cargo llvm-cov clean --workspace
+          echo "Building Python wheel with coverage instrumentation..."
+          uv run --no-sync maturin develop
+        shell: bash
+
+      - name: Start Iggy server
+        id: iggy
+        uses: ./.github/actions/utils/server-start
+
+      - name: Run tests
+        run: |
+          cd foreign/python
+          IGGY_SERVER_HOST=127.0.0.1 \
+          IGGY_SERVER_TCP_PORT=8090 \
+            uv run --no-sync pytest tests/ -v \
+              --junitxml=../../reports/python-junit.xml \
+              --tb=short \
+              --capture=no
+
+      - name: Stop Iggy server
+        if: always()
+        uses: ./.github/actions/utils/server-stop
+        with:
+          pid-file: ${{ steps.iggy.outputs.pid_file }}
+          log-file: ${{ steps.iggy.outputs.log_file }}
+
+      - name: Generate coverage report
+        run: |
+          mkdir -p reports
+          cd foreign/python
+          source <(cargo llvm-cov show-env --sh)
+          export CARGO_TARGET_DIR=$CARGO_LLVM_COV_TARGET_DIR
+
+          cargo llvm-cov report --lcov \
+            --ignore-filename-regex='(\.cargo/|/rustc/|/core/)' \
+            --output-path ../../reports/python-coverage.lcov
+
+          # Fix paths: cargo-llvm-cov outputs paths relative to the crate root (src/...)
+          # but Codecov expects paths relative to the repo root (foreign/python/src/...)
+          sed -i 's|^SF:src/|SF:foreign/python/src/|' ../../reports/python-coverage.lcov
+
+          echo "Coverage report generated: $(wc -l < ../../reports/python-coverage.lcov) lines"
+        shell: bash
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/python-coverage.lcov
+          disable_search: true
+          flags: python
+          fail_ci_if_error: false
+
+  node-coverage:
+    name: Node coverage baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "23"
+          cache: "npm"
+          cache-dependency-path: foreign/node/package-lock.json
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "false"
+
+      - name: Install netcat
+        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd
+
+      - name: Install dependencies
+        run: |
+          cd foreign/node
+          npm ci --ignore-scripts
+
+      - name: Start Iggy server
+        id: iggy
+        uses: ./.github/actions/utils/server-start
+        env:
+          IGGY_CLUSTER_ENABLED: true
+
+      - name: Run unit tests with coverage
+        run: |
+          cd foreign/node
+          mkdir -p ../../reports/node-coverage/unit
+          npx c8 --reporter=lcov --reports-dir=../../reports/node-coverage/unit npm run test:unit
+
+      - name: Run e2e tests with coverage
+        run: |
+          cd foreign/node
+          mkdir -p ../../reports/node-coverage/e2e
+          npx c8 --reporter=lcov --reports-dir=../../reports/node-coverage/e2e npm run test:e2e
+        env:
+          IGGY_SERVER_HOST: 127.0.0.1
+          IGGY_SERVER_TCP_PORT: 8090
+
+      - name: Stop Iggy server
+        if: always()
+        uses: ./.github/actions/utils/server-stop
+        with:
+          pid-file: ${{ steps.iggy.outputs.pid_file }}
+          log-file: ${{ steps.iggy.outputs.log_file }}
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/node-coverage/unit/lcov.info,reports/node-coverage/e2e/lcov.info
+          disable_search: true
+          flags: node
+          fail_ci_if_error: false
+
+  go-coverage:
+    name: Go coverage baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: ./.github/actions/utils/setup-go-with-cache
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "false"
+
+      - name: Start Iggy server
+        id: iggy
+        uses: ./.github/actions/utils/server-start
+
+      - name: Run unit tests with coverage
+        run: |
+          cd foreign/go
+          mkdir -p ../../reports
+          go test -v -race -coverprofile=../../reports/go-coverage-unit.out ./...
+
+      - name: Run BDD tests with coverage
+        run: |
+          cd bdd/go
+          mkdir -p ../../reports
+          # Run only tcp_test suite (ginkgo); godog leader_redirection
+          # tests require a multi-node cluster not available in CI.
+          go test -v -race \
+            -coverpkg=github.com/apache/iggy/foreign/go/... \
+            -coverprofile=../../reports/go-coverage-bdd.out \
+            ./tests/tcp_test/...
+
+      - name: Merge coverage profiles
+        run: |
+          mkdir -p reports
+          if [[ ! -s reports/go-coverage-unit.out ]]; then
+            echo "::warning::Unit coverage profile is empty or missing"
+            if [[ -s reports/go-coverage-bdd.out ]]; then
+              cp reports/go-coverage-bdd.out reports/go-coverage.out
+            else
+              echo "::warning::Both unit and BDD coverage profiles are empty or missing, no coverage will be uploaded"
+            fi
+            exit 0
+          fi
+          # Start with the mode line from the unit profile
+          head -1 reports/go-coverage-unit.out > reports/go-coverage.out
+          # Append data lines (skip mode line) from both profiles
+          tail -n +2 reports/go-coverage-unit.out >> reports/go-coverage.out
+          if [[ -s reports/go-coverage-bdd.out ]]; then
+            tail -n +2 reports/go-coverage-bdd.out >> reports/go-coverage.out
+          else
+            echo "::warning::BDD coverage profile is empty or missing, using unit coverage only"
+          fi
+
+      - name: Stop Iggy server
+        if: always()
+        uses: ./.github/actions/utils/server-stop
+        with:
+          pid-file: ${{ steps.iggy.outputs.pid_file }}
+          log-file: ${{ steps.iggy.outputs.log_file }}
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/go-coverage.out
+          disable_search: true
+          flags: go
+          fail_ci_if_error: false
+
+  warm-cache-macos:
+    name: Warm macOS cache
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          save-cache: "true"
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Compile tests
+        run: cargo test --no-run --locked

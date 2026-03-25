@@ -237,22 +237,30 @@ impl IggyMessagesBatchSet {
 
         let mut result = Self::with_capacity(self.containers_count());
         let mut remaining_count = count;
+        let mut current_offset = start_offset;
 
         for container in self.iter() {
             if remaining_count == 0 {
                 break;
             }
 
-            let first_offset = container.first_offset();
-            if first_offset.is_none()
-                || first_offset.unwrap() + container.count() as u64 <= start_offset
-            {
+            let Some(batch_first) = container.first_offset() else {
+                continue;
+            };
+            if batch_first + container.count() as u64 <= current_offset {
                 continue;
             }
 
-            if let Some(sliced) = container.slice_by_offset(start_offset, remaining_count)
+            // When current_offset is below this batch's range (cross-batch
+            // reads), start from the batch's first offset instead.
+            let effective_start = current_offset.max(batch_first);
+
+            if let Some(sliced) = container.slice_by_offset(effective_start, remaining_count)
                 && sliced.count() > 0
             {
+                if let Some(last) = sliced.last_offset() {
+                    current_offset = last + 1;
+                }
                 remaining_count -= sliced.count();
                 result.add_batch(sliced);
             }
