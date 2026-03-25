@@ -26,6 +26,7 @@ consensus = { path = "../consensus" }
 crossfire = { workspace = true }
 futures = { workspace = true }
 hash32 = { workspace = true }
+iggy_binary_protocol = { path = "../binary_protocol" }
 iggy_common = { path = "../common" }
 journal = { path = "../journal" }
 message_bus = { path = "../message_bus" }

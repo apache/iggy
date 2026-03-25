@@ -37,7 +37,6 @@ base64 = { workspace = true }
 blake3 = { workspace = true }
 bon = { workspace = true }
 byte-unit = { workspace = true }
-bytemuck = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
@@ -45,7 +44,6 @@ comfy-table = { workspace = true }
 compio = { workspace = true }
 crossbeam = { workspace = true }
 derive_more = { workspace = true }
-enumset = { workspace = true }
 err_trail = { workspace = true }
 human-repr = { workspace = true }
 humantime = { workspace = true }
