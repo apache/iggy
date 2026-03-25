@@ -172,7 +172,7 @@ pub struct HttpSinkConfig {
     pub max_retries: Option<u32>,
     /// Retry delay as a human-readable duration string, e.g. "1s" (default: 1s).
     pub retry_delay: Option<String>,
-    /// Backoff multiplier for exponential retry delay (default: 2.0).
+    /// Backoff multiplier for exponential retry delay (default: 2).
     pub retry_backoff_multiplier: Option<u32>,
     /// Maximum retry delay cap as a human-readable duration string (default: 30s).
     pub max_retry_delay: Option<String>,
@@ -219,7 +219,7 @@ pub struct HttpSink {
     request_headers: Option<reqwest::header::HeaderMap>,
     /// Initialized in `open()` with config-derived settings. `None` before `open()` is called.
     client: Option<ClientWithMiddleware>,
-    requests_sent: AtomicU64,
+    send_attempts: AtomicU64,
     messages_delivered: AtomicU64,
     errors_count: AtomicU64,
     /// Epoch seconds of last successful HTTP request.
@@ -242,12 +242,12 @@ impl HttpSink {
         let health_check_enabled = config.health_check_enabled.unwrap_or(false);
         let health_check_method = config.health_check_method.unwrap_or(HttpMethod::Head);
         let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
-        let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
+        let mut retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
         let retry_backoff_multiplier = config
             .retry_backoff_multiplier
             .unwrap_or(DEFAULT_BACKOFF_MULTIPLIER)
             .max(1);
-        let max_retry_delay =
+        let mut max_retry_delay =
             parse_duration(config.max_retry_delay.as_deref(), DEFAULT_MAX_RETRY_DELAY);
         let success_status_codes: HashSet<u16> = config
             .success_status_codes
@@ -262,9 +262,10 @@ impl HttpSink {
         if retry_delay > max_retry_delay {
             warn!(
                 "HTTP sink ID: {} — retry_delay ({:?}) exceeds max_retry_delay ({:?}). \
-                 All retry delays will be capped to max_retry_delay.",
+                 Swapping values to prevent ExponentialBackoff panic.",
                 id, retry_delay, max_retry_delay,
             );
+            std::mem::swap(&mut retry_delay, &mut max_retry_delay);
         }
 
         if tls_danger_accept_invalid_certs {
@@ -316,7 +317,7 @@ impl HttpSink {
             verbose,
             request_headers: None,
             client: None,
-            requests_sent: AtomicU64::new(0),
+            send_attempts: AtomicU64::new(0),
             messages_delivered: AtomicU64::new(0),
             errors_count: AtomicU64::new(0),
             last_success_timestamp: AtomicU64::new(0),
@@ -398,9 +399,9 @@ impl HttpSink {
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
         payload_json: serde_json::Value,
-    ) -> serde_json::Value {
+    ) -> Result<serde_json::Value, Error> {
         if !self.include_metadata {
-            return payload_json;
+            return Ok(payload_json);
         }
 
         let headers_map = if let Some(ref headers) = message.headers
@@ -416,13 +417,14 @@ impl HttpSink {
                             data: general_purpose::STANDARD.encode(raw),
                             iggy_header_encoding: ENCODING_BASE64,
                         };
-                        serde_json::to_value(encoded).unwrap_or(serde_json::Value::Null)
+                        serde_json::to_value(encoded)
+                            .map_err(|e| Error::Serialization(format!("EncodedHeader: {}", e)))?
                     } else {
                         serde_json::Value::String(v.to_string_value())
                     };
-                    (k.to_string_value(), value)
+                    Ok((k.to_string_value(), value))
                 })
-                .collect();
+                .collect::<Result<serde_json::Map<String, serde_json::Value>, Error>>()?;
             Some(map)
         } else {
             None
@@ -453,7 +455,8 @@ impl HttpSink {
             payload: payload_json,
         };
 
-        serde_json::to_value(envelope).unwrap_or(serde_json::Value::Null)
+        serde_json::to_value(envelope)
+            .map_err(|e| Error::Serialization(format!("MetadataEnvelope: {}", e)))
     }
 
     /// Record a successful request timestamp.
@@ -484,7 +487,7 @@ impl HttpSink {
             );
         }
 
-        self.requests_sent.fetch_add(1, Ordering::Relaxed);
+        self.send_attempts.fetch_add(1, Ordering::Relaxed);
 
         let response = build_request(self.method, client, &self.url)
             .headers(headers.clone())
@@ -494,10 +497,16 @@ impl HttpSink {
             .await
             .map_err(|e| {
                 self.errors_count.fetch_add(1, Ordering::Relaxed);
+                error!(
+                    "HTTP sink ID: {} — request to {} failed after middleware retries: {:#}",
+                    self.id, self.url, e
+                );
                 Error::HttpRequestFailed(format!("HTTP {} — {}", self.url, e))
             })?;
 
         let status = response.status();
+        // success_status_codes is checked in BOTH the retry strategy (to stop retrying)
+        // AND here (to classify the final response). Both must use the same set.
         if self.success_status_codes.contains(&status.as_u16()) {
             if self.verbose {
                 debug!(
@@ -653,7 +662,7 @@ impl HttpSink {
             let payload = std::mem::replace(&mut message.payload, Payload::Raw(vec![]));
             let payload_json = self.payload_to_json(payload)?;
             let envelope =
-                self.build_envelope(&message, topic_metadata, messages_metadata, payload_json);
+                self.build_envelope(&message, topic_metadata, messages_metadata, payload_json)?;
             serde_json::to_vec(&envelope)
                 .map_err(|e| Error::Serialization(format!("Envelope serialize: {}", e)))
         })
@@ -721,8 +730,23 @@ impl HttpSink {
                     continue;
                 }
             };
-            let envelope =
-                self.build_envelope(&message, topic_metadata, messages_metadata, payload_json);
+            let envelope = match self.build_envelope(
+                &message,
+                topic_metadata,
+                messages_metadata,
+                payload_json,
+            ) {
+                Ok(env) => env,
+                Err(e) => {
+                    error!(
+                        "HTTP sink ID: {} — skipping message at offset {} in NDJSON batch (envelope): {}",
+                        self.id, message.offset, e
+                    );
+                    self.errors_count.fetch_add(1, Ordering::Relaxed);
+                    skipped += 1;
+                    continue;
+                }
+            };
             match serde_json::to_string(&envelope) {
                 Ok(line) => lines.push(line),
                 Err(e) => {
@@ -793,8 +817,23 @@ impl HttpSink {
                     continue;
                 }
             };
-            let envelope =
-                self.build_envelope(&message, topic_metadata, messages_metadata, payload_json);
+            let envelope = match self.build_envelope(
+                &message,
+                topic_metadata,
+                messages_metadata,
+                payload_json,
+            ) {
+                Ok(env) => env,
+                Err(e) => {
+                    error!(
+                        "HTTP sink ID: {} — skipping message at offset {} in JSON array batch (envelope): {}",
+                        self.id, message.offset, e
+                    );
+                    self.errors_count.fetch_add(1, Ordering::Relaxed);
+                    skipped += 1;
+                    continue;
+                }
+            };
             envelopes.push(envelope);
         }
 
@@ -891,9 +930,9 @@ impl RetryableStrategy for HttpSinkRetryStrategy {
                 if let Some(retry_after) = response.headers().get(reqwest::header::RETRY_AFTER) {
                     let header_str = retry_after.to_str().unwrap_or("<non-ascii>");
                     warn!(
-                        "Server returned 429 with Retry-After: {} — middleware uses computed \
+                        "Server returned {} with Retry-After: {} — middleware uses computed \
                          backoff which may be insufficient",
-                        header_str,
+                        status, header_str,
                     );
                 }
                 match status {
@@ -1139,13 +1178,13 @@ impl Sink for HttpSink {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        let requests = self.requests_sent.load(Ordering::Relaxed);
+        let requests = self.send_attempts.load(Ordering::Relaxed);
         let delivered = self.messages_delivered.load(Ordering::Relaxed);
         let errors = self.errors_count.load(Ordering::Relaxed);
         let last_success = self.last_success_timestamp.load(Ordering::Relaxed);
 
         info!(
-            "HTTP sink connector ID: {} closed. Stats: {} requests sent, \
+            "HTTP sink connector ID: {} closed. Stats: {} send attempts, \
              {} messages delivered, {} errors, last success epoch: {}.",
             self.id, requests, delivered, errors, last_success,
         );
@@ -1469,7 +1508,9 @@ mod tests {
         let msg_meta = given_messages_metadata();
         let payload_json = sink.payload_to_json(message.payload.clone()).unwrap();
 
-        let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json);
+        let envelope = sink
+            .build_envelope(&message, &topic_meta, &msg_meta, payload_json)
+            .unwrap();
 
         assert!(envelope.get(FIELD_METADATA).is_some());
         assert!(envelope.get(FIELD_PAYLOAD).is_some());
@@ -1497,7 +1538,9 @@ mod tests {
         let msg_meta = given_messages_metadata();
         let payload_json = sink.payload_to_json(message.payload.clone()).unwrap();
 
-        let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json.clone());
+        let envelope = sink
+            .build_envelope(&message, &topic_meta, &msg_meta, payload_json.clone())
+            .unwrap();
 
         // Should be the payload itself, not wrapped
         assert_eq!(envelope, payload_json);
@@ -1515,7 +1558,9 @@ mod tests {
         let msg_meta = given_messages_metadata();
         let payload_json = sink.payload_to_json(message.payload.clone()).unwrap();
 
-        let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json);
+        let envelope = sink
+            .build_envelope(&message, &topic_meta, &msg_meta, payload_json)
+            .unwrap();
         assert_eq!(envelope[FIELD_METADATA][FIELD_CHECKSUM], 12345);
     }
 
@@ -1530,7 +1575,9 @@ mod tests {
         let msg_meta = given_messages_metadata();
         let payload_json = sink.payload_to_json(message.payload.clone()).unwrap();
 
-        let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json);
+        let envelope = sink
+            .build_envelope(&message, &topic_meta, &msg_meta, payload_json)
+            .unwrap();
         assert_eq!(
             envelope[FIELD_METADATA][FIELD_ORIGIN_TIMESTAMP],
             1710064799000000u64
@@ -1562,7 +1609,9 @@ mod tests {
         };
 
         let payload_json = sink.payload_to_json(message.payload.clone()).unwrap();
-        let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json);
+        let envelope = sink
+            .build_envelope(&message, &topic_meta, &msg_meta, payload_json)
+            .unwrap();
 
         let iggy_headers = &envelope[FIELD_METADATA][FIELD_HEADERS];
         assert!(
@@ -1583,7 +1632,9 @@ mod tests {
         let msg_meta = given_messages_metadata();
         let payload_json = sink.payload_to_json(message.payload.clone()).unwrap();
 
-        let envelope = sink.build_envelope(&message, &topic_meta, &msg_meta, payload_json);
+        let envelope = sink
+            .build_envelope(&message, &topic_meta, &msg_meta, payload_json)
+            .unwrap();
         assert!(
             envelope[FIELD_METADATA].get(FIELD_HEADERS).is_none(),
             "Expected no iggy_headers when message has no headers"
