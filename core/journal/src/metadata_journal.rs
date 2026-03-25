@@ -24,6 +24,7 @@ use iggy_binary_protocol::consensus::{Command2, PrepareHeader};
 use std::cell::{Cell, Ref, RefCell};
 use std::fmt;
 use std::io;
+use std::ops::RangeInclusive;
 use std::path::Path;
 
 const HEADER_SIZE: usize = size_of::<PrepareHeader>();
@@ -307,13 +308,15 @@ impl Journal<FileStorage> for MetadataJournal {
         Some(SLOT_COUNT.saturating_sub(used))
     }
 
-    /// Remove entries with ops in `[start_op, end_op]` from the journal,
+    /// Remove entries with ops in `ops` from the journal,
     /// returning the removed entries sorted by op.
     ///
     /// Internally advances the snapshot watermark to `end_op` so that
     /// future appends treat drained slots as safe to overwrite. Rewrites
     /// the WAL file keeping only entries outside the drained range.
-    async fn drain(&self, start_op: u64, end_op: u64) -> io::Result<Vec<Self::Entry>> {
+    async fn drain(&self, ops: RangeInclusive<u64>) -> io::Result<Vec<Self::Entry>> {
+        let end_op = *ops.end();
+
         // Advance the snapshot watermark so future appends treat
         // drained ops as safe to overwrite.
         if end_op > self.snapshot_op.get() {
@@ -328,7 +331,7 @@ impl Journal<FileStorage> for MetadataJournal {
             let offsets = self.offsets.borrow();
             for slot in 0..SLOT_COUNT {
                 if let (Some(h), Some(off)) = (&headers[slot], offsets[slot]) {
-                    if h.op >= start_op && h.op <= end_op {
+                    if ops.contains(&h.op) {
                         to_drain.push((*h, off));
                     } else {
                         live.push((*h, off));
@@ -389,8 +392,7 @@ impl Journal<FileStorage> for MetadataJournal {
         }
         for slot in 0..SLOT_COUNT {
             if let Some(h) = &headers[slot]
-                && h.op >= start_op
-                && h.op <= end_op
+                && ops.contains(&h.op)
             {
                 headers[slot] = None;
                 offsets[slot] = None;
@@ -656,7 +658,7 @@ mod tests {
         let size_before = journal.storage.file_len();
 
         // Drain entries 1-3
-        let drained = journal.drain(1, 3).await.unwrap();
+        let drained = journal.drain(1..=3).await.unwrap();
         assert_eq!(drained.len(), 3);
         assert_eq!(drained[0].header().op, 1);
         assert_eq!(drained[1].header().op, 2);

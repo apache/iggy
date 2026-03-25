@@ -194,7 +194,7 @@ impl<M> SnapshotCoordinator<M> {
 
         let _ = journal
             .handle()
-            .drain(0, last_op)
+            .drain(0..=last_op)
             .await
             .map_err(SnapshotError::Io)?;
 

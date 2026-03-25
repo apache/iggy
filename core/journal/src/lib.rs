@@ -16,7 +16,7 @@
 // under the License.
 
 use std::io;
-use std::ops::Deref;
+use std::ops::{Deref, RangeInclusive};
 
 pub mod file_storage;
 pub mod metadata_journal;
@@ -43,7 +43,7 @@ where
         None
     }
 
-    /// Remove entries with ops in `[start_op, end_op]` from the journal,
+    /// Remove entries with ops in `ops` from the journal,
     /// returning the removed entries sorted by op.
     ///
     /// Implementations that persist to disk should rewrite the underlying
@@ -54,8 +54,7 @@ where
     /// Returns an I/O error if the drain fails.
     fn drain(
         &self,
-        _start_op: u64,
-        _end_op: u64,
+        _ops: RangeInclusive<u64>,
     ) -> impl Future<Output = io::Result<Vec<Self::Entry>>> {
         async { Ok(Vec::new()) }
     }
