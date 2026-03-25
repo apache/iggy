@@ -68,6 +68,7 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: codecov.json
+          disable_search: true
           flags: rust
           fail_ci_if_error: false
           verbose: true

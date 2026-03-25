@@ -19,8 +19,9 @@ mod router;
 pub mod shards_table;
 
 use consensus::{MuxPlane, NamespacedPipeline, PartitionsHandle, Plane, VsrConsensus};
-use iggy_common::header::{GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader};
-use iggy_common::message::{Message, MessageBag};
+use iggy_binary_protocol::{
+    GenericHeader, Message, MessageBag, PrepareHeader, PrepareOkHeader, RequestHeader,
+};
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::variadic;
 use journal::{Journal, JournalHandle};
@@ -301,7 +302,7 @@ where
     where
         B: MessageBus<
                 Replica = u8,
-                Data = iggy_common::message::Message<iggy_common::header::GenericHeader>,
+                Data = iggy_binary_protocol::Message<iggy_binary_protocol::GenericHeader>,
                 Client = u128,
             >,
     {
