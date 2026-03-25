@@ -82,18 +82,24 @@ pub enum HttpMethod {
 }
 
 /// Payload formatting mode for HTTP requests.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum_macros::Display,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum BatchMode {
     /// One HTTP request per message (default). Note: with batch_length=50, this produces 50
     /// sequential HTTP round trips per poll cycle. Use ndjson or json_array for higher throughput.
     #[default]
+    #[strum(to_string = "individual")]
     Individual,
     /// All messages in one request, newline-delimited JSON.
+    #[strum(to_string = "NDJSON")]
     NdJson,
     /// All messages as a single JSON array.
+    #[strum(to_string = "JSON array")]
     JsonArray,
     /// Raw bytes, one request per message (for non-JSON payloads).
+    #[strum(to_string = "raw")]
     Raw,
 }
 
@@ -597,7 +603,6 @@ impl HttpSink {
         client: &reqwest::Client,
         messages: Vec<ConsumedMessage>,
         content_type: &str,
-        mode_name: &str,
         mut build_body: F,
     ) -> Result<(), Error>
     where
@@ -617,7 +622,7 @@ impl HttpSink {
                 Err(e) => {
                     error!(
                         "HTTP sink ID: {} — failed to build {} body at offset {}: {}",
-                        self.id, mode_name, offset, e
+                        self.id, self.batch_mode, offset, e
                     );
                     self.errors_count.fetch_add(1, Ordering::Relaxed);
                     serialization_failures += 1;
@@ -630,7 +635,7 @@ impl HttpSink {
                 error!(
                     "HTTP sink ID: {} — {} payload at offset {} exceeds max size ({} > {} bytes). Skipping.",
                     self.id,
-                    mode_name,
+                    self.batch_mode,
                     offset,
                     body.len(),
                     self.max_payload_size_bytes,
@@ -655,7 +660,7 @@ impl HttpSink {
                 Err(e) => {
                     error!(
                         "HTTP sink ID: {} — failed to deliver {} message at offset {} after retries: {}",
-                        self.id, mode_name, offset, e
+                        self.id, self.batch_mode, offset, e
                     );
                     http_failures += 1;
                     consecutive_failures += 1;
@@ -671,7 +676,7 @@ impl HttpSink {
                         error!(
                             "HTTP sink ID: {} — aborting {} batch after {} consecutive HTTP failures \
                              ({} remaining messages skipped)",
-                            self.id, mode_name, consecutive_failures, skipped,
+                            self.id, self.batch_mode, consecutive_failures, skipped,
                         );
                         self.errors_count.fetch_add(skipped, Ordering::Relaxed);
                         break;
@@ -688,7 +693,12 @@ impl HttpSink {
                 error!(
                     "HTTP sink ID: {} — partial {} delivery: {}/{} delivered, \
                      {} HTTP failures, {} serialization errors",
-                    self.id, mode_name, delivered, total, http_failures, serialization_failures,
+                    self.id,
+                    self.batch_mode,
+                    delivered,
+                    total,
+                    http_failures,
+                    serialization_failures,
                 );
                 Err(e)
             }
@@ -704,20 +714,14 @@ impl HttpSink {
         messages_metadata: &MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
-        self.send_per_message(
-            client,
-            messages,
-            self.content_type(),
-            "individual",
-            |mut message| {
-                let payload = std::mem::replace(&mut message.payload, Payload::Raw(vec![]));
-                let payload_json = self.payload_to_json(payload)?;
-                let envelope =
-                    self.build_envelope(&message, topic_metadata, messages_metadata, payload_json);
-                serde_json::to_vec(&envelope)
-                    .map_err(|e| Error::Serialization(format!("Envelope serialize: {}", e)))
-            },
-        )
+        self.send_per_message(client, messages, self.content_type(), |mut message| {
+            let payload = std::mem::replace(&mut message.payload, Payload::Raw(vec![]));
+            let payload_json = self.payload_to_json(payload)?;
+            let envelope =
+                self.build_envelope(&message, topic_metadata, messages_metadata, payload_json);
+            serde_json::to_vec(&envelope)
+                .map_err(|e| Error::Serialization(format!("Envelope serialize: {}", e)))
+        })
         .await
     }
 
@@ -731,7 +735,6 @@ impl HttpSink {
         body: Bytes,
         count: u64,
         skipped: u64,
-        batch_mode: &str,
     ) -> Result<(), Error> {
         debug_assert!(
             count > 0,
@@ -749,7 +752,7 @@ impl HttpSink {
             if skipped > 0 {
                 error!(
                     "HTTP sink ID: {} — {} batch failed with {} serialization skips",
-                    self.id, batch_mode, skipped,
+                    self.id, self.batch_mode, skipped,
                 );
             }
             return Err(e);
@@ -758,7 +761,7 @@ impl HttpSink {
         if skipped > 0 {
             warn!(
                 "HTTP sink ID: {} — {} batch: {} delivered, {} skipped (serialization errors)",
-                self.id, batch_mode, count, skipped,
+                self.id, self.batch_mode, count, skipped,
             );
         }
         Ok(())
@@ -833,7 +836,7 @@ impl HttpSink {
             )));
         }
 
-        self.send_batch_body(client, Bytes::from(body), count, skipped, "NDJSON")
+        self.send_batch_body(client, Bytes::from(body), count, skipped)
             .await
     }
 
@@ -912,7 +915,7 @@ impl HttpSink {
             )));
         }
 
-        self.send_batch_body(client, Bytes::from(body), count, skipped, "JSON array")
+        self.send_batch_body(client, Bytes::from(body), count, skipped)
             .await
     }
 
@@ -922,7 +925,7 @@ impl HttpSink {
         client: &reqwest::Client,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
-        self.send_per_message(client, messages, self.content_type(), "raw", |message| {
+        self.send_per_message(client, messages, self.content_type(), |message| {
             message
                 .payload
                 .try_into_vec()
@@ -1432,6 +1435,14 @@ mod tests {
             let json = serde_json::to_string(&mode).unwrap();
             assert_eq!(json, expected_json);
         }
+    }
+
+    #[test]
+    fn given_batch_mode_display_should_return_human_readable_name() {
+        assert_eq!(BatchMode::Individual.to_string(), "individual");
+        assert_eq!(BatchMode::NdJson.to_string(), "NDJSON");
+        assert_eq!(BatchMode::JsonArray.to_string(), "JSON array");
+        assert_eq!(BatchMode::Raw.to_string(), "raw");
     }
 
     // ── Content-type tests ───────────────────────────────────────────
