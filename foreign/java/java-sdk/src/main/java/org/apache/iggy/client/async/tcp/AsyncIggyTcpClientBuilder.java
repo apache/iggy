@@ -220,21 +220,12 @@ public final class AsyncIggyTcpClientBuilder {
      * @throws IggyInvalidArgumentException if the host is null or empty, or if the port is not positive
      */
     public AsyncIggyTcpClient build() {
-        if (host == null || host.isEmpty()) {
-            throw new IggyInvalidArgumentException("Host cannot be null or empty");
-        }
-        if (port == null || port <= 0) {
-            throw new IggyInvalidArgumentException("Port must be a positive integer");
-        }
-        if (connectionPoolSize != null && connectionPoolSize <= 0) {
-            throw new IggyInvalidArgumentException("Connection pool size cannot by 0 or negative");
-        }
-        if (connectionTimeout != null && (connectionTimeout.equals(Duration.ZERO) || connectionTimeout.isNegative())) {
-            throw new IggyInvalidArgumentException("ConnectionTimeout Cannot be 0 or Negative");
-        }
-        if (acquireTimeout != null && (acquireTimeout.equals(Duration.ZERO) || acquireTimeout.isNegative())) {
-            throw new IggyInvalidArgumentException("AcquireTimeout Cannot be 0 or Negative");
-        }
+        validateHost();
+        validatePort();
+        validateConnectionPoolSize();
+        validateConnectionTimeout();
+        validateAcquireTimeout();
+
         return new AsyncIggyTcpClient(
                 host,
                 port,
@@ -247,6 +238,36 @@ public final class AsyncIggyTcpClientBuilder {
                 retryPolicy,
                 enableTls,
                 Optional.ofNullable(tlsCertificate));
+    }
+
+    private void validateHost() {
+        if (host == null || host.isEmpty()) {
+            throw new IggyInvalidArgumentException("Host cannot be null or empty");
+        }
+    }
+
+    private void validatePort() {
+        if (port == null || port <= 0) {
+            throw new IggyInvalidArgumentException("Port must be a positive integer");
+        }
+    }
+
+    private void validateConnectionPoolSize() {
+        if (connectionPoolSize != null && connectionPoolSize <= 0) {
+            throw new IggyInvalidArgumentException("Connection pool size cannot by 0 or negative");
+        }
+    }
+
+    private void validateConnectionTimeout() {
+        if (connectionTimeout != null && (connectionTimeout.equals(Duration.ZERO) || connectionTimeout.isNegative())) {
+            throw new IggyInvalidArgumentException("ConnectionTimeout Cannot be 0 or Negative");
+        }
+    }
+
+    private void validateAcquireTimeout() {
+        if (acquireTimeout != null && (acquireTimeout.equals(Duration.ZERO) || acquireTimeout.isNegative())) {
+            throw new IggyInvalidArgumentException("AcquireTimeout Cannot be 0 or Negative");
+        }
     }
 
     /**
