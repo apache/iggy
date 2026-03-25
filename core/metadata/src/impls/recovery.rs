@@ -18,9 +18,9 @@
 use crate::impls::metadata::IggySnapshot;
 use crate::stm::StateMachine;
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
+use iggy_binary_protocol::consensus::PrepareHeader;
+use iggy_binary_protocol::consensus::message::Message;
 use iggy_common::IggyError;
-use iggy_common::header::PrepareHeader;
-use iggy_common::message::Message;
 use journal::metadata_journal::{JournalError, MetadataJournal};
 use std::fmt;
 use std::path::Path;
@@ -159,7 +159,7 @@ where
 mod tests {
     use super::*;
     use bytes::BytesMut;
-    use iggy_common::header::{Command2, Operation};
+    use iggy_binary_protocol::consensus::{Command2, Operation};
     use journal::Journal;
     use tempfile::tempdir;
 

@@ -6062,6 +6062,7 @@ dependencies = [
  "bytemuck",
  "bytes",
  "compio",
+ "iggy_binary_protocol",
  "iggy_common",
  "tempfile",
 ]

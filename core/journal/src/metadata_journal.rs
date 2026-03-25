@@ -19,8 +19,8 @@ use crate::file_storage::FileStorage;
 use crate::{Journal, JournalHandle};
 use bytes::Bytes;
 use compio::io::AsyncWriteAtExt;
-use iggy_common::header::{Command2, PrepareHeader};
-use iggy_common::message::Message;
+use iggy_binary_protocol::consensus::message::Message;
+use iggy_binary_protocol::consensus::{Command2, PrepareHeader};
 use std::cell::{Cell, Ref, RefCell};
 use std::fmt;
 use std::io;
@@ -466,7 +466,7 @@ impl JournalHandle for MetadataJournal {
 mod tests {
     use super::*;
     use bytes::BytesMut;
-    use iggy_common::header::Operation;
+    use iggy_binary_protocol::consensus::Operation;
     use tempfile::tempdir;
 
     fn make_prepare(op: u64, body_size: usize) -> Message<PrepareHeader> {
