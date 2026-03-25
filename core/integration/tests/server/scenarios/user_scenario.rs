@@ -24,7 +24,6 @@ use iggy::prelude::defaults::DEFAULT_ROOT_USERNAME;
 use iggy::prelude::{GlobalPermissions, Permissions};
 use iggy::prelude::{PersonalAccessTokenClient, SEC_IN_MICRO, SystemClient, UserClient};
 use integration::harness::{TestHarness, assert_clean_system, login_root};
-use secrecy::ExposeSecret;
 
 pub async fn run(harness: &TestHarness) {
     let client = create_client(harness).await;
@@ -147,14 +146,14 @@ pub async fn run(harness: &TestHarness) {
         .await
         .unwrap();
 
-    assert!(!raw_pat1.token.expose_secret().is_empty());
+    assert!(!raw_pat1.token.is_empty());
 
     let raw_pat2 = client
         .create_personal_access_token(pat_name2, PersonalAccessTokenExpiry::NeverExpire)
         .await
         .unwrap();
 
-    assert!(!raw_pat2.token.expose_secret().is_empty());
+    assert!(!raw_pat2.token.is_empty());
 
     // 14. Get personal access tokens and verify that the token is there
     let personal_access_tokens = client.get_personal_access_tokens().await.unwrap();
@@ -165,14 +164,14 @@ pub async fn run(harness: &TestHarness) {
 
     // 16. Login with the personal access tokens
     let identity_info = client
-        .login_with_personal_access_token(raw_pat1.token.expose_secret())
+        .login_with_personal_access_token(&raw_pat1.token)
         .await
         .unwrap();
 
     assert_eq!(identity_info.user_id, 1);
 
     let identity_info = client
-        .login_with_personal_access_token(raw_pat2.token.expose_secret())
+        .login_with_personal_access_token(&raw_pat2.token)
         .await
         .unwrap();
 
