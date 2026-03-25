@@ -158,7 +158,7 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
 
     @Test
     void shouldThrowExceptionForNegativeConnectionPoolSize() {
-        // Given: Builder with 0 connection pool size
+        // Given: Builder with negative connection pool size
         AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().connectionPoolSize(-1);
 
         // When/Then: Building should throw IggyInvalidArgumentException
