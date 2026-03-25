@@ -498,4 +498,77 @@ mod tests {
             Some("http://localhost:3000")
         );
     }
+
+    #[tokio::test]
+    async fn reader_writer_with_none_iggy_home_is_noop_for_paths() {
+        let rw = ContextReaderWriter::new(None);
+        assert!(rw.read_contexts().await.unwrap().is_none());
+        assert!(rw.read_active_context().await.unwrap().is_none());
+        rw.write_contexts(ContextsConfigMap::new()).await.unwrap();
+        rw.write_active_context("any").await.unwrap();
+        rw.ensure_iggy_home_exists().unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_contexts_returns_none_when_file_missing() {
+        let dir = tempdir().unwrap();
+        let rw = ContextReaderWriter::new(Some(dir.path().to_path_buf()));
+        assert!(rw.read_contexts().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_active_context_returns_none_when_file_missing() {
+        let dir = tempdir().unwrap();
+        let rw = ContextReaderWriter::new(Some(dir.path().to_path_buf()));
+        assert!(rw.read_active_context().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn ensure_iggy_home_exists_skips_when_directory_already_exists() {
+        let dir = tempdir().unwrap();
+        let rw = ContextReaderWriter::new(Some(dir.path().to_path_buf()));
+        assert!(dir.path().exists());
+        rw.ensure_iggy_home_exists().unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_fail_when_active_context_file_points_to_unknown_context() {
+        let dir = tempdir().unwrap();
+        let iggy_home = dir.path().to_path_buf();
+        tokio::fs::create_dir_all(&iggy_home).await.unwrap();
+        tokio::fs::write(iggy_home.join(ACTIVE_CONTEXT_FILE_NAME), "ghost")
+            .await
+            .unwrap();
+        let mut only_default = ContextsConfigMap::new();
+        only_default.insert(DEFAULT_CONTEXT_NAME.to_string(), ContextConfig::default());
+        let contents = toml::to_string(&only_default).unwrap();
+        tokio::fs::write(iggy_home.join(CONTEXTS_FILE_NAME), contents)
+            .await
+            .unwrap();
+
+        let mut mgr = test_manager(iggy_home);
+        let err = mgr.get_contexts().await.unwrap_err();
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[tokio::test]
+    async fn should_reject_set_active_for_unknown_context() {
+        let dir = tempdir().unwrap();
+        let mut mgr = test_manager(dir.path().to_path_buf());
+        let err = mgr.set_active_context_key("nonexistent").await.unwrap_err();
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[tokio::test]
+    async fn should_get_active_context_config() {
+        let dir = tempdir().unwrap();
+        let mut mgr = test_manager(dir.path().to_path_buf());
+        let ctx = mgr.get_active_context().await.unwrap();
+        assert!(ctx.username.is_none());
+        assert!(ctx.password.is_none());
+        assert_eq!(
+            mgr.get_active_context_key().await.unwrap(),
+            DEFAULT_CONTEXT_NAME
+        );
+    }
 }
