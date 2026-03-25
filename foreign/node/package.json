@@ -63,6 +63,9 @@
     "typescript": "5.9.3",
     "typescript-eslint": "^8.47.0"
   },
+  "overrides": {
+    "flatted": "^3.4.2"
+  },
   "optionalDependencies": {
     "@swc/core-darwin-arm64": "^1.15.3",
     "@swc/core-darwin-x64": "^1.15.3",

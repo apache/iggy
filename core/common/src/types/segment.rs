@@ -66,7 +66,7 @@ impl Segment {
     }
 
     pub fn is_expired(&self, now: IggyTimestamp, expiry: IggyExpiry) -> bool {
-        if !self.sealed {
+        if !self.sealed || self.end_timestamp == 0 {
             return false;
         }
 
@@ -77,5 +77,32 @@ impl Segment {
                 self.end_timestamp + duration.as_micros() <= now.as_micros()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{IggyDuration, IggyTimestamp};
+    use std::time::Duration;
+
+    #[test]
+    fn zero_timestamp_segment_should_not_appear_expired() {
+        // Reproduce Bug 3 from #2924: during bootstrap, segments with empty
+        // indexes get end_timestamp = 0. is_expired() then evaluates
+        // 0 + expiry <= now, which is always true, causing immediate deletion.
+        let mut seg = Segment::new(5000, IggyByteSize::from(128 * 1024 * 1024u64));
+        seg.sealed = true;
+        seg.end_timestamp = 0; // simulates bootstrap with empty indexes
+
+        let now = IggyTimestamp::now();
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_secs(600)));
+
+        // A segment with unknown timestamp (0) must NOT be considered expired.
+        // Currently this FAILS - is_expired returns true because 0 + 600s <= now.
+        assert!(
+            !seg.is_expired(now, expiry),
+            "BUG: segment with end_timestamp=0 appears instantly expired"
+        );
     }
 }

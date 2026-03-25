@@ -22,18 +22,17 @@ use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
 use crate::shard::system::messages::PollingArgs;
 use crate::shard::transmission::message::ResolvedPartition;
-use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
+use crate::streaming::segments::IggyMessagesBatchMut;
 use crate::streaming::session::Session;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Extension, Json, Router, debug_handler};
 use err_trail::ErrContext;
-use iggy_common::Identifier;
-use iggy_common::PooledBuffer;
-use iggy_common::Validatable;
 use iggy_common::{Consumer, PollMessages, SendMessages};
+use iggy_common::{Identifier, PooledBuffer};
 use iggy_common::{IggyError, IggyMessagesBatch, PolledMessages};
+use iggy_common::{IggyIndexesMut, Validatable};
 use send_wrapper::SendWrapper;
 use std::sync::Arc;
 use tracing::instrument;
@@ -152,9 +151,14 @@ async fn flush_unsaved_buffer(
 
 fn make_mutable(batch: IggyMessagesBatch) -> IggyMessagesBatchMut {
     let (_, indexes, messages) = batch.decompose();
-    let (_, indexes_buffer) = indexes.decompose();
-    let indexes_buffer_mut = PooledBuffer::from_existing(indexes_buffer.into());
-    let indexes_mut = IggyIndexesMut::from_bytes(indexes_buffer_mut, 0);
-    let messages_buffer_mut = PooledBuffer::from_existing(messages.into());
+    let (base_position, indexes_buffer) = indexes.decompose();
+
+    let mut indexes_buffer_mut = PooledBuffer::with_capacity(indexes_buffer.len());
+    indexes_buffer_mut.extend_from_slice(&indexes_buffer);
+    let indexes_mut = IggyIndexesMut::from_bytes(indexes_buffer_mut, base_position);
+
+    let mut messages_buffer_mut = PooledBuffer::with_capacity(messages.len());
+    messages_buffer_mut.extend_from_slice(&messages);
+
     IggyMessagesBatchMut::from_indexes_and_messages(indexes_mut, messages_buffer_mut)
 }

@@ -51,7 +51,12 @@ impl WireDecode for ConsumerGroupMemberResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let id = read_u32_le(buf, 0)?;
         let partitions_count = read_u32_le(buf, 4)?;
-        let mut partitions = Vec::with_capacity(partitions_count as usize);
+        let remaining = buf.len().saturating_sub(8);
+        let mut partitions = Vec::with_capacity(crate::codec::capped_capacity(
+            partitions_count as usize,
+            remaining,
+            4,
+        ));
         let mut offset = 8;
         for _ in 0..partitions_count {
             let partition_id = read_u32_le(buf, offset)?;
@@ -206,5 +211,13 @@ mod tests {
                 "expected error for truncation at byte {i}"
             );
         }
+    }
+
+    #[test]
+    fn bogus_partition_count_does_not_oom() {
+        let mut buf = BytesMut::new();
+        buf.put_u32_le(1); // id
+        buf.put_u32_le(u32::MAX); // partitions_count
+        assert!(ConsumerGroupMemberResponse::decode(&buf).is_err());
     }
 }

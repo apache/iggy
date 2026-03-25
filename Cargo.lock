@@ -2231,6 +2231,7 @@ dependencies = [
  "bytemuck",
  "bytes",
  "futures",
+ "iggy_binary_protocol",
  "iggy_common",
  "message_bus",
  "rand 0.10.0",
@@ -5409,13 +5410,13 @@ version = "0.9.4-edge.1"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
+ "aligned-vec",
  "async-broadcast",
  "async-trait",
  "base64 0.22.1",
  "blake3",
  "bon",
  "byte-unit",
- "bytemuck",
  "bytes",
  "chrono",
  "clap",
@@ -5423,7 +5424,6 @@ dependencies = [
  "compio",
  "crossbeam",
  "derive_more",
- "enumset",
  "err_trail",
  "human-repr",
  "humantime",
@@ -6659,6 +6659,7 @@ dependencies = [
 name = "message_bus"
 version = "0.1.0"
 dependencies = [
+ "iggy_binary_protocol",
  "iggy_common",
  "rand 0.10.0",
 ]
@@ -6670,6 +6671,7 @@ dependencies = [
  "ahash 0.8.12",
  "bytes",
  "consensus",
+ "iggy_binary_protocol",
  "iggy_common",
  "journal",
  "left-right",
@@ -7647,6 +7649,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "consensus",
+ "iggy_binary_protocol",
  "iggy_common",
  "journal",
  "message_bus",
@@ -9832,6 +9835,7 @@ dependencies = [
  "crossfire",
  "futures",
  "hash32 1.0.0",
+ "iggy_binary_protocol",
  "iggy_common",
  "journal",
  "message_bus",
@@ -9941,6 +9945,7 @@ dependencies = [
  "consensus",
  "enumset",
  "futures",
+ "iggy_binary_protocol",
  "iggy_common",
  "journal",
  "message_bus",
