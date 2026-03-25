@@ -25,6 +25,11 @@ use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
     convert::owned_value_to_serde_json, sink_connector,
 };
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_retry::{
+    RetryTransientMiddleware, Retryable, RetryableStrategy, policies::ExponentialBackoff,
+};
+use reqwest_tracing::TracingMiddleware;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -38,7 +43,7 @@ const DEFAULT_TIMEOUT: &str = "30s";
 const DEFAULT_RETRY_DELAY: &str = "1s";
 const DEFAULT_MAX_RETRY_DELAY: &str = "30s";
 const DEFAULT_MAX_RETRIES: u32 = 3;
-const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
+const DEFAULT_BACKOFF_MULTIPLIER: u32 = 2;
 const DEFAULT_MAX_PAYLOAD_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 const DEFAULT_MAX_CONNECTIONS: usize = 10;
 /// TCP keep-alive interval for detecting dead connections behind load balancers.
@@ -168,7 +173,7 @@ pub struct HttpSinkConfig {
     /// Retry delay as a human-readable duration string, e.g. "1s" (default: 1s).
     pub retry_delay: Option<String>,
     /// Backoff multiplier for exponential retry delay (default: 2.0).
-    pub retry_backoff_multiplier: Option<f64>,
+    pub retry_backoff_multiplier: Option<u32>,
     /// Maximum retry delay cap as a human-readable duration string (default: 30s).
     pub max_retry_delay: Option<String>,
     /// HTTP status codes considered successful (default: [200, 201, 202, 204]).
@@ -203,7 +208,7 @@ pub struct HttpSink {
     health_check_method: HttpMethod,
     max_retries: u32,
     retry_delay: Duration,
-    retry_backoff_multiplier: f64,
+    retry_backoff_multiplier: u32,
     max_retry_delay: Duration,
     success_status_codes: HashSet<u16>,
     tls_danger_accept_invalid_certs: bool,
@@ -213,11 +218,10 @@ pub struct HttpSink {
     /// `self.headers`, reused for every request. `None` before `open()` is called.
     request_headers: Option<reqwest::header::HeaderMap>,
     /// Initialized in `open()` with config-derived settings. `None` before `open()` is called.
-    client: Option<reqwest::Client>,
+    client: Option<ClientWithMiddleware>,
     requests_sent: AtomicU64,
     messages_delivered: AtomicU64,
     errors_count: AtomicU64,
-    retries_count: AtomicU64,
     /// Epoch seconds of last successful HTTP request.
     last_success_timestamp: AtomicU64,
 }
@@ -242,7 +246,7 @@ impl HttpSink {
         let retry_backoff_multiplier = config
             .retry_backoff_multiplier
             .unwrap_or(DEFAULT_BACKOFF_MULTIPLIER)
-            .max(1.0);
+            .max(1);
         let max_retry_delay =
             parse_duration(config.max_retry_delay.as_deref(), DEFAULT_MAX_RETRY_DELAY);
         let success_status_codes: HashSet<u16> = config
@@ -315,27 +319,41 @@ impl HttpSink {
             requests_sent: AtomicU64::new(0),
             messages_delivered: AtomicU64::new(0),
             errors_count: AtomicU64::new(0),
-            retries_count: AtomicU64::new(0),
             last_success_timestamp: AtomicU64::new(0),
         }
     }
 
-    /// Build the `reqwest::Client` from resolved config.
-    fn build_client(&self) -> Result<reqwest::Client, Error> {
-        let builder = reqwest::Client::builder()
+    /// Build the `reqwest::Client` wrapped with retry and tracing middleware.
+    fn build_client(&self) -> Result<ClientWithMiddleware, Error> {
+        let raw_client = reqwest::Client::builder()
             .timeout(self.timeout)
             .pool_max_idle_per_host(self.max_connections)
             .pool_idle_timeout(Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS))
             .tcp_keepalive(Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS))
-            .danger_accept_invalid_certs(self.tls_danger_accept_invalid_certs);
-
-        builder
+            .danger_accept_invalid_certs(self.tls_danger_accept_invalid_certs)
             .build()
-            .map_err(|e| Error::InitError(format!("Failed to build HTTP client: {}", e)))
+            .map_err(|e| Error::InitError(format!("Failed to build HTTP client: {}", e)))?;
+
+        let retry_policy = ExponentialBackoff::builder()
+            .retry_bounds(self.retry_delay, self.max_retry_delay)
+            .base(self.retry_backoff_multiplier)
+            .build_with_max_retries(self.max_retries);
+
+        let retry_strategy = HttpSinkRetryStrategy {
+            success_status_codes: self.success_status_codes.clone(),
+        };
+
+        let retry_middleware =
+            RetryTransientMiddleware::new_with_policy_and_strategy(retry_policy, retry_strategy);
+
+        Ok(ClientBuilder::new(raw_client)
+            .with(TracingMiddleware::default())
+            .with(retry_middleware)
+            .build())
     }
 
     /// Returns the initialized HTTP client, or an error if `open()` was not called.
-    fn client(&self) -> Result<&reqwest::Client, Error> {
+    fn client(&self) -> Result<&ClientWithMiddleware, Error> {
         self.client.as_ref().ok_or_else(|| {
             Error::InitError("HTTP client not initialized — was open() called?".to_string())
         })
@@ -438,51 +456,6 @@ impl HttpSink {
         serde_json::to_value(envelope).unwrap_or(serde_json::Value::Null)
     }
 
-    /// Classify whether an HTTP status code is transient (worth retrying).
-    fn is_transient_status(status: reqwest::StatusCode) -> bool {
-        matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
-    }
-
-    /// Extract `Retry-After` header value as a Duration (seconds), capped to `max_retry_delay`.
-    fn parse_retry_after(&self, response: &reqwest::Response) -> Option<Duration> {
-        let header_raw = response.headers().get(reqwest::header::RETRY_AFTER)?;
-        let header_value = match header_raw.to_str() {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    "HTTP sink ID: {} — Retry-After header contains non-ASCII bytes: {}. \
-                     Using computed backoff.",
-                    self.id, e,
-                );
-                return None;
-            }
-        };
-        match header_value.parse::<u64>() {
-            Ok(secs) => Some(Duration::from_secs(secs).min(self.max_retry_delay)),
-            Err(_) => {
-                warn!(
-                    "HTTP sink ID: {} — Retry-After header '{}' is not an integer delay; \
-                     HTTP-date format is not supported. Using computed backoff.",
-                    self.id, header_value,
-                );
-                None
-            }
-        }
-    }
-
-    /// Compute the retry delay for a given attempt, applying exponential backoff
-    /// capped at `max_retry_delay`. Clamps before `Duration::from_secs_f64` to avoid
-    /// panics when extreme backoff configs produce infinity (e.g., multiplier=1000, retries=200).
-    fn compute_retry_delay(&self, attempt: u32) -> Duration {
-        let delay_secs =
-            self.retry_delay.as_secs_f64() * self.retry_backoff_multiplier.powi(attempt as i32);
-        let capped_secs = delay_secs.min(self.max_retry_delay.as_secs_f64());
-        if !capped_secs.is_finite() || capped_secs < 0.0 {
-            return self.max_retry_delay;
-        }
-        Duration::from_secs_f64(capped_secs)
-    }
-
     /// Record a successful request timestamp.
     fn record_success(&self) {
         let now = SystemTime::now()
@@ -492,133 +465,69 @@ impl HttpSink {
         self.last_success_timestamp.store(now, Ordering::Relaxed);
     }
 
-    /// Send an HTTP request with retry logic. Returns Ok on success, Err after exhausting retries.
-    ///
-    /// Takes `Bytes` instead of `Vec<u8>` so retries clone via reference-count increment (O(1))
-    /// rather than copying the entire payload on each attempt.
+    /// Send an HTTP request with retry via reqwest-middleware. Returns Ok on success,
+    /// Err after exhausting retries. Retry logic (backoff, transient classification)
+    /// is handled by the middleware configured in `build_client()`.
     async fn send_with_retry(&self, body: Bytes, content_type: &str) -> Result<(), Error> {
         let client = self.client()?;
-        let mut attempt = 0u32;
+        let headers = self.request_headers.as_ref().ok_or_else(|| {
+            Error::InitError("HTTP headers not initialized — was open() called?".to_string())
+        })?;
 
-        loop {
-            let headers = self.request_headers.as_ref().ok_or_else(|| {
-                Error::InitError("HTTP headers not initialized — was open() called?".to_string())
+        if self.verbose {
+            debug!(
+                "HTTP sink ID: {} — sending {:?} {} ({} bytes)",
+                self.id,
+                self.method,
+                self.url,
+                body.len(),
+            );
+        }
+
+        self.requests_sent.fetch_add(1, Ordering::Relaxed);
+
+        let response = build_request(self.method, client, &self.url)
+            .headers(headers.clone())
+            .header("content-type", content_type)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| {
+                self.errors_count.fetch_add(1, Ordering::Relaxed);
+                Error::HttpRequestFailed(format!("HTTP {} — {}", self.url, e))
             })?;
-            let request = build_request(self.method, client, &self.url)
-                .headers(headers.clone())
-                .header("content-type", content_type)
-                .body(body.clone())
-                .build()
-                .map_err(|e| Error::HttpRequestFailed(format!("Request build error: {}", e)))?;
 
+        let status = response.status();
+        if self.success_status_codes.contains(&status.as_u16()) {
             if self.verbose {
                 debug!(
-                    "HTTP sink ID: {} — sending {} {} (attempt {}/{}, {} bytes)",
+                    "HTTP sink ID: {} — success (status {})",
                     self.id,
-                    request.method(),
-                    request.url(),
-                    attempt + 1,
-                    self.max_retries + 1,
-                    body.len(),
+                    status.as_u16()
                 );
             }
-
-            self.requests_sent.fetch_add(1, Ordering::Relaxed);
-
-            match client.execute(request).await {
-                Ok(response) => {
-                    let status = response.status();
-
-                    // Check for Retry-After before consuming the response
-                    let retry_after = self.parse_retry_after(&response);
-
-                    if self.success_status_codes.contains(&status.as_u16()) {
-                        if self.verbose {
-                            debug!(
-                                "HTTP sink ID: {} — success (status {})",
-                                self.id,
-                                status.as_u16()
-                            );
-                        }
-                        self.record_success();
-                        return Ok(());
-                    }
-
-                    // Non-success status — read body for diagnostics
-                    let response_body = match response.text().await {
-                        Ok(body) => body,
-                        Err(e) => format!("<body read error: {}>", e),
-                    };
-
-                    if Self::is_transient_status(status) && attempt < self.max_retries {
-                        let delay =
-                            retry_after.unwrap_or_else(|| self.compute_retry_delay(attempt));
-                        warn!(
-                            "HTTP sink ID: {} — transient error (status {}, attempt {}/{}). \
-                             Retrying in {:?}. Response: {}",
-                            self.id,
-                            status.as_u16(),
-                            attempt + 1,
-                            self.max_retries + 1,
-                            delay,
-                            truncate_response(&response_body, 200),
-                        );
-                        self.retries_count.fetch_add(1, Ordering::Relaxed);
-                        tokio::time::sleep(delay).await;
-                        attempt += 1;
-                        continue;
-                    }
-
-                    // Non-transient or retries exhausted
-                    error!(
-                        "HTTP sink ID: {} — request failed (status {}, attempt {}/{}). \
-                         Response: {}",
-                        self.id,
-                        status.as_u16(),
-                        attempt + 1,
-                        self.max_retries + 1,
-                        truncate_response(&response_body, 500),
-                    );
-                    self.errors_count.fetch_add(1, Ordering::Relaxed);
-                    return Err(Error::HttpRequestFailed(format!(
-                        "HTTP {} — status: {}",
-                        self.url,
-                        status.as_u16()
-                    )));
-                }
-                Err(network_err) => {
-                    if attempt < self.max_retries {
-                        let delay = self.compute_retry_delay(attempt);
-                        warn!(
-                            "HTTP sink ID: {} — network error (attempt {}/{}): {}. \
-                             Retrying in {:?}.",
-                            self.id,
-                            attempt + 1,
-                            self.max_retries + 1,
-                            network_err,
-                            delay,
-                        );
-                        self.retries_count.fetch_add(1, Ordering::Relaxed);
-                        tokio::time::sleep(delay).await;
-                        attempt += 1;
-                        continue;
-                    }
-
-                    error!(
-                        "HTTP sink ID: {} — network error after {} attempts: {}",
-                        self.id,
-                        attempt + 1,
-                        network_err,
-                    );
-                    self.errors_count.fetch_add(1, Ordering::Relaxed);
-                    return Err(Error::HttpRequestFailed(format!(
-                        "Network error after {} attempts: {}",
-                        attempt + 1,
-                        network_err
-                    )));
-                }
-            }
+            self.record_success();
+            return Ok(());
         }
+
+        // Non-success status after middleware exhausted retries — read body for diagnostics
+        let response_body = match response.text().await {
+            Ok(body) => body,
+            Err(e) => format!("<body read error: {}>", e),
+        };
+
+        error!(
+            "HTTP sink ID: {} — request failed (status {}). Response: {}",
+            self.id,
+            status.as_u16(),
+            truncate_response(&response_body, 500),
+        );
+        self.errors_count.fetch_add(1, Ordering::Relaxed);
+        Err(Error::HttpRequestFailed(format!(
+            "HTTP {} — status: {}",
+            self.url,
+            status.as_u16()
+        )))
     }
 
     /// Shared per-message send loop for `individual` and `raw` modes.
@@ -963,12 +872,46 @@ fn parse_duration(input: Option<&str>, default: &str) -> Duration {
         })
 }
 
-/// Map an `HttpMethod` to a `reqwest::RequestBuilder` for the given URL.
+/// Custom retry strategy that respects user-configured success_status_codes.
+///
+/// Codes in the success set are never retried (even if normally transient like 429).
+/// Remaining 429/5xx are classified as transient for retry.
+struct HttpSinkRetryStrategy {
+    success_status_codes: HashSet<u16>,
+}
+
+impl RetryableStrategy for HttpSinkRetryStrategy {
+    fn handle(&self, res: &reqwest_middleware::Result<reqwest::Response>) -> Option<Retryable> {
+        match res {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if self.success_status_codes.contains(&status) {
+                    return None;
+                }
+                if let Some(retry_after) = response.headers().get(reqwest::header::RETRY_AFTER) {
+                    let header_str = retry_after.to_str().unwrap_or("<non-ascii>");
+                    warn!(
+                        "Server returned 429 with Retry-After: {} — middleware uses computed \
+                         backoff which may be insufficient",
+                        header_str,
+                    );
+                }
+                match status {
+                    429 | 500 | 502 | 503 | 504 => Some(Retryable::Transient),
+                    _ => Some(Retryable::Fatal),
+                }
+            }
+            Err(_) => Some(Retryable::Transient),
+        }
+    }
+}
+
+/// Map an `HttpMethod` to a `reqwest_middleware::RequestBuilder` for the given URL.
 fn build_request(
     method: HttpMethod,
-    client: &reqwest::Client,
+    client: &ClientWithMiddleware,
     url: &str,
-) -> reqwest::RequestBuilder {
+) -> reqwest_middleware::RequestBuilder {
     match method {
         HttpMethod::Get => client.get(url),
         HttpMethod::Head => client.head(url),
@@ -1199,13 +1142,12 @@ impl Sink for HttpSink {
         let requests = self.requests_sent.load(Ordering::Relaxed);
         let delivered = self.messages_delivered.load(Ordering::Relaxed);
         let errors = self.errors_count.load(Ordering::Relaxed);
-        let retries = self.retries_count.load(Ordering::Relaxed);
         let last_success = self.last_success_timestamp.load(Ordering::Relaxed);
 
         info!(
             "HTTP sink connector ID: {} closed. Stats: {} requests sent, \
-             {} messages delivered, {} errors, {} retries, last success epoch: {}.",
-            self.id, requests, delivered, errors, retries, last_success,
+             {} messages delivered, {} errors, last success epoch: {}.",
+            self.id, requests, delivered, errors, last_success,
         );
 
         self.request_headers = None;
@@ -1277,7 +1219,7 @@ mod tests {
             health_check_method: Some(HttpMethod::Get),
             max_retries: Some(5),
             retry_delay: Some("500ms".to_string()),
-            retry_backoff_multiplier: Some(3.0),
+            retry_backoff_multiplier: Some(3),
             max_retry_delay: Some("60s".to_string()),
             success_status_codes: Some(vec![200, 202]),
             tls_danger_accept_invalid_certs: Some(true),
@@ -1298,7 +1240,7 @@ mod tests {
         assert_eq!(sink.health_check_method, HttpMethod::Get);
         assert_eq!(sink.max_retries, 5);
         assert_eq!(sink.retry_delay, Duration::from_millis(500));
-        assert_eq!(sink.retry_backoff_multiplier, 3.0);
+        assert_eq!(sink.retry_backoff_multiplier, 3);
         assert_eq!(sink.max_retry_delay, Duration::from_secs(60));
         assert_eq!(sink.success_status_codes, HashSet::from([200, 202]));
         assert!(sink.tls_danger_accept_invalid_certs);
@@ -1309,9 +1251,9 @@ mod tests {
     #[test]
     fn given_backoff_multiplier_below_one_should_clamp_to_one() {
         let mut config = given_default_config();
-        config.retry_backoff_multiplier = Some(0.5);
+        config.retry_backoff_multiplier = Some(0);
         let sink = HttpSink::new(1, config);
-        assert_eq!(sink.retry_backoff_multiplier, 1.0);
+        assert_eq!(sink.retry_backoff_multiplier, 1);
     }
 
     #[test]
@@ -1649,52 +1591,6 @@ mod tests {
     }
 
     #[test]
-    fn given_attempt_zero_should_return_base_delay() {
-        let sink = given_sink_with_defaults();
-        assert_eq!(sink.compute_retry_delay(0), Duration::from_secs(1));
-    }
-
-    #[test]
-    fn given_increasing_attempts_should_apply_exponential_backoff() {
-        let sink = given_sink_with_defaults();
-        // attempt 0: 1s * 2.0^0 = 1s
-        assert_eq!(sink.compute_retry_delay(0), Duration::from_secs(1));
-        // attempt 1: 1s * 2.0^1 = 2s
-        assert_eq!(sink.compute_retry_delay(1), Duration::from_secs(2));
-        // attempt 2: 1s * 2.0^2 = 4s
-        assert_eq!(sink.compute_retry_delay(2), Duration::from_secs(4));
-    }
-
-    #[test]
-    fn given_large_attempt_should_cap_at_max_retry_delay() {
-        let sink = given_sink_with_defaults();
-        // attempt 10: 1s * 2.0^10 = 1024s, capped to 30s
-        assert_eq!(sink.compute_retry_delay(10), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn given_transient_status_codes_should_return_true() {
-        for code in [429, 500, 502, 503, 504] {
-            assert!(
-                HttpSink::is_transient_status(reqwest::StatusCode::from_u16(code).unwrap()),
-                "Expected {} to be transient",
-                code
-            );
-        }
-    }
-
-    #[test]
-    fn given_non_transient_status_codes_should_return_false() {
-        for code in [200, 201, 400, 401, 403, 404, 405] {
-            assert!(
-                !HttpSink::is_transient_status(reqwest::StatusCode::from_u16(code).unwrap()),
-                "Expected {} to be non-transient",
-                code
-            );
-        }
-    }
-
-    #[test]
     fn given_null_value_should_convert_to_null() {
         let v = simd_json::OwnedValue::Static(simd_json::StaticNode::Null);
         assert_eq!(owned_value_to_serde_json(&v), serde_json::Value::Null);
@@ -1769,7 +1665,7 @@ mod tests {
             health_check_method = "GET"
             max_retries = 5
             retry_delay = "2s"
-            retry_backoff_multiplier = 3.0
+            retry_backoff_multiplier = 3
             max_retry_delay = "60s"
             success_status_codes = [200, 201]
             tls_danger_accept_invalid_certs = true
@@ -2005,17 +1901,6 @@ mod tests {
             "X-Custom should survive the filter, got: {:?}",
             surviving
         );
-    }
-
-    #[test]
-    fn given_extreme_backoff_config_should_not_panic() {
-        let mut config = given_default_config();
-        config.retry_backoff_multiplier = Some(1000.0);
-        config.max_retries = Some(200);
-        let sink = HttpSink::new(1, config);
-        // This would panic with Duration::from_secs_f64(Infinity) without the clamp
-        let delay = sink.compute_retry_delay(199);
-        assert_eq!(delay, sink.max_retry_delay);
     }
 
     #[tokio::test]
