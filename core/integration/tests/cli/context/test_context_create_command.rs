@@ -222,26 +222,16 @@ Arguments:
   <CONTEXT_NAME>  Name of the context to create
 
 Options:
-      --transport <TRANSPORT>
-{CLAP_INDENT}The transport to use
-      --tcp-server-address <TCP_SERVER_ADDRESS>
-{CLAP_INDENT}The server address for the TCP transport
-      --http-api-url <HTTP_API_URL>
-{CLAP_INDENT}The API URL for the HTTP transport
-      --quic-server-address <QUIC_SERVER_ADDRESS>
-{CLAP_INDENT}The server address for the QUIC transport
-      --tcp-tls-enabled <TCP_TLS_ENABLED>
-{CLAP_INDENT}Flag to enable TLS for the TCP transport [possible values: true, false]
-  -u, --username <USERNAME>
-{CLAP_INDENT}Iggy server username
-  -p, --password <PASSWORD>
-{CLAP_INDENT}Iggy server password
-  -t, --token <TOKEN>
-{CLAP_INDENT}Iggy server personal access token
-  -n, --token-name <TOKEN_NAME>
-{CLAP_INDENT}Iggy server personal access token name
-  -h, --help
-{CLAP_INDENT}Print help (see more with '--help')
+      --transport <TRANSPORT>                      The transport to use
+      --tcp-server-address <TCP_SERVER_ADDRESS>    The server address for the TCP transport
+      --http-api-url <HTTP_API_URL>                The API URL for the HTTP transport
+      --quic-server-address <QUIC_SERVER_ADDRESS>  The server address for the QUIC transport
+      --tcp-tls-enabled <TCP_TLS_ENABLED>          Flag to enable TLS for the TCP transport [possible values: true, false]
+  -u, --username <USERNAME>                        Iggy server username
+  -p, --password <PASSWORD>                        Iggy server password
+  -t, --token <TOKEN>                              Iggy server personal access token
+  -n, --token-name <TOKEN_NAME>                    Iggy server personal access token name
+  -h, --help                                       Print help (see more with '--help')
 "#,
             ),
         ))

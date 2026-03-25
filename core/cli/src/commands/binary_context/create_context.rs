@@ -65,3 +65,26 @@ impl CliCommand for CreateContextCmd {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_return_explain_message() {
+        let cmd = CreateContextCmd::new("production".to_string(), ContextConfig::default());
+        assert_eq!(cmd.explain(), "create context production");
+    }
+
+    #[test]
+    fn should_not_require_login() {
+        let cmd = CreateContextCmd::new("test".to_string(), ContextConfig::default());
+        assert!(!cmd.login_required());
+    }
+
+    #[test]
+    fn should_not_require_connection() {
+        let cmd = CreateContextCmd::new("test".to_string(), ContextConfig::default());
+        assert!(!cmd.connection_required());
+    }
+}

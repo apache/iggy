@@ -356,3 +356,146 @@ pub fn iggy_home() -> Option<PathBuf> {
         Err(_) => home_dir().map(|dir| dir.join(path::Path::new(DEFAULT_IGGY_HOME_VALUE))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn test_manager(iggy_home: PathBuf) -> ContextManager {
+        ContextManager::new(ContextReaderWriter::new(Some(iggy_home)))
+    }
+
+    #[tokio::test]
+    async fn should_create_context() {
+        let dir = tempdir().unwrap();
+        let mut mgr = test_manager(dir.path().to_path_buf());
+
+        let config = ContextConfig {
+            username: Some("admin".to_string()),
+            password: None,
+            token: None,
+            token_name: None,
+            iggy: ArgsOptional {
+                transport: Some("tcp".to_string()),
+                tcp_server_address: Some("10.0.0.1:8090".to_string()),
+                ..Default::default()
+            },
+        };
+
+        mgr.create_context("production", config).await.unwrap();
+
+        let contexts = mgr.get_contexts().await.unwrap();
+        assert!(contexts.contains_key("production"));
+        assert!(contexts.contains_key("default"));
+        assert_eq!(contexts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn should_reject_duplicate_context() {
+        let dir = tempdir().unwrap();
+        let mut mgr = test_manager(dir.path().to_path_buf());
+
+        mgr.create_context("test", ContextConfig::default())
+            .await
+            .unwrap();
+
+        let result = mgr.create_context("test", ContextConfig::default()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn should_delete_context() {
+        let dir = tempdir().unwrap();
+        let mut mgr = test_manager(dir.path().to_path_buf());
+
+        mgr.create_context("staging", ContextConfig::default())
+            .await
+            .unwrap();
+
+        mgr.delete_context("staging").await.unwrap();
+
+        let contexts = mgr.get_contexts().await.unwrap();
+        assert!(!contexts.contains_key("staging"));
+    }
+
+    #[tokio::test]
+    async fn should_reject_deleting_default_context() {
+        let dir = tempdir().unwrap();
+        let mut mgr = test_manager(dir.path().to_path_buf());
+
+        let result = mgr.delete_context("default").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot delete"));
+    }
+
+    #[tokio::test]
+    async fn should_reject_deleting_nonexistent_context() {
+        let dir = tempdir().unwrap();
+        let mut mgr = test_manager(dir.path().to_path_buf());
+
+        let result = mgr.delete_context("nope").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn should_reset_active_to_default_when_deleting_active_context() {
+        let dir = tempdir().unwrap();
+        let mut mgr = test_manager(dir.path().to_path_buf());
+
+        mgr.create_context("dev", ContextConfig::default())
+            .await
+            .unwrap();
+        mgr.set_active_context_key("dev").await.unwrap();
+        assert_eq!(mgr.get_active_context_key().await.unwrap(), "dev");
+
+        mgr.delete_context("dev").await.unwrap();
+        assert_eq!(mgr.get_active_context_key().await.unwrap(), "default");
+    }
+
+    #[tokio::test]
+    async fn should_create_iggy_home_if_missing() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("sub").join("dir");
+        let mut mgr = test_manager(nested.clone());
+
+        assert!(!nested.exists());
+        mgr.create_context("test", ContextConfig::default())
+            .await
+            .unwrap();
+        assert!(nested.exists());
+    }
+
+    #[tokio::test]
+    async fn should_persist_context_config_fields() {
+        let dir = tempdir().unwrap();
+        let mut mgr = test_manager(dir.path().to_path_buf());
+
+        let config = ContextConfig {
+            username: Some("user1".to_string()),
+            password: Some("pass1".to_string()),
+            token: None,
+            token_name: None,
+            iggy: ArgsOptional {
+                transport: Some("http".to_string()),
+                http_api_url: Some("http://localhost:3000".to_string()),
+                ..Default::default()
+            },
+        };
+
+        mgr.create_context("myctx", config).await.unwrap();
+
+        let rw = ContextReaderWriter::new(Some(dir.path().to_path_buf()));
+        let saved = rw.read_contexts().await.unwrap().unwrap();
+        let ctx = saved.get("myctx").unwrap();
+        assert_eq!(ctx.username.as_deref(), Some("user1"));
+        assert_eq!(ctx.password.as_deref(), Some("pass1"));
+        assert_eq!(ctx.iggy.transport.as_deref(), Some("http"));
+        assert_eq!(
+            ctx.iggy.http_api_url.as_deref(),
+            Some("http://localhost:3000")
+        );
+    }
+}

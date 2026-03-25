@@ -146,3 +146,63 @@ pub(crate) struct ContextDeleteArgs {
     #[arg(value_parser = clap::value_parser!(String))]
     pub(crate) context_name: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_convert_create_args_to_context_config() {
+        let args = ContextCreateArgs {
+            context_name: "production".to_string(),
+            transport: Some("tcp".to_string()),
+            tcp_server_address: Some("10.0.0.1:8090".to_string()),
+            http_api_url: None,
+            quic_server_address: None,
+            tcp_tls_enabled: Some(true),
+            username: Some("admin".to_string()),
+            password: Some("secret".to_string()),
+            token: Some("tok123".to_string()),
+            token_name: Some("my-token".to_string()),
+        };
+
+        let config: ContextConfig = args.into();
+
+        assert_eq!(config.username.as_deref(), Some("admin"));
+        assert_eq!(config.password.as_deref(), Some("secret"));
+        assert_eq!(config.token.as_deref(), Some("tok123"));
+        assert_eq!(config.token_name.as_deref(), Some("my-token"));
+        assert_eq!(config.iggy.transport.as_deref(), Some("tcp"));
+        assert_eq!(
+            config.iggy.tcp_server_address.as_deref(),
+            Some("10.0.0.1:8090")
+        );
+        assert!(config.iggy.http_api_url.is_none());
+        assert!(config.iggy.quic_server_address.is_none());
+        assert_eq!(config.iggy.tcp_tls_enabled, Some(true));
+    }
+
+    #[test]
+    fn should_convert_create_args_with_defaults() {
+        let args = ContextCreateArgs {
+            context_name: "minimal".to_string(),
+            transport: None,
+            tcp_server_address: None,
+            http_api_url: None,
+            quic_server_address: None,
+            tcp_tls_enabled: None,
+            username: None,
+            password: None,
+            token: None,
+            token_name: None,
+        };
+
+        let config: ContextConfig = args.into();
+
+        assert!(config.username.is_none());
+        assert!(config.password.is_none());
+        assert!(config.token.is_none());
+        assert!(config.token_name.is_none());
+        assert!(config.iggy.transport.is_none());
+    }
+}
