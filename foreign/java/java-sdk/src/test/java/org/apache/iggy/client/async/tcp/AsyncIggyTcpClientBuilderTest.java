@@ -184,6 +184,16 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
     }
 
     @Test
+    void shouldThrowExceptionForConnectionTimeoutInMillisecondsGreaterThanMaximumInteger() {
+        // Given: Builder with connection timeout in milliseconds greater than maximum integer
+        AsyncIggyTcpClientBuilder builder =
+                AsyncIggyTcpClient.builder().connectionTimeout(Duration.ofMillis(((long) Integer.MAX_VALUE) + 1));
+
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
     void shouldThrowExceptionForZeroAcquireTimeout() {
         // Given: Builder with 0 acquire timeout
         AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().acquireTimeout(Duration.ofMillis(0));

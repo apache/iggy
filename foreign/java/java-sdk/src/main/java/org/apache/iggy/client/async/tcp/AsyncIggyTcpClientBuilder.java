@@ -259,8 +259,15 @@ public final class AsyncIggyTcpClientBuilder {
     }
 
     private void validateConnectionTimeout() {
-        if (connectionTimeout != null && (connectionTimeout.equals(Duration.ZERO) || connectionTimeout.isNegative())) {
+        if (connectionTimeout == null) {
+            return;
+        }
+        if (connectionTimeout.equals(Duration.ZERO) || connectionTimeout.isNegative()) {
             throw new IggyInvalidArgumentException("ConnectionTimeout Cannot be 0 or Negative");
+        }
+        if (connectionTimeout.toMillis() > ((long) Integer.MAX_VALUE)) {
+            throw new IggyInvalidArgumentException(
+                    String.format("ConnectionTimeout Cannot be greater than %d", Integer.MAX_VALUE));
         }
     }
 
