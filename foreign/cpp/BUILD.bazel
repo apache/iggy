@@ -21,13 +21,13 @@ genrule(
     name = "cargo_build",
     srcs = glob(["src/**/*.rs"]) + [
         "Cargo.toml",
-        "Cargo.lock",
         "build.rs",
     ],
     outs = [
         "libiggy_cpp.a",
         "include/lib.rs.h",
         "cxxbridge/rust/cxx.h",
+        "cxxbridge/sources/lib.rs.cc",
     ],
     cmd = """
         set -euo pipefail
@@ -38,6 +38,7 @@ genrule(
         OUT_LIB="$$EXECROOT/$(location libiggy_cpp.a)"
         OUT_RS="$$EXECROOT/$(location include/lib.rs.h)"
         OUT_CXX="$$EXECROOT/$(location cxxbridge/rust/cxx.h)"
+        OUT_CC="$$EXECROOT/$(location cxxbridge/sources/lib.rs.cc)"
 
         PROJECT_ROOT="$$(dirname $$(readlink -f $(location Cargo.toml)))"
         cd "$$PROJECT_ROOT"
@@ -50,7 +51,7 @@ genrule(
         fi
 
         mkdir -p "$$CARGO_TARGET_DIR"
-        env -u PWD CARGO_TARGET_DIR="$$CARGO_TARGET_DIR" "$$CARGO" build $$FLAGS --locked
+        env -u PWD CARGO_TARGET_DIR="$$CARGO_TARGET_DIR" "$$CARGO" build $$FLAGS
 
         cp "$$CARGO_TARGET_DIR/$$PROFILE/libiggy_cpp.a" "$$OUT_LIB"
 
@@ -67,6 +68,13 @@ genrule(
             exit 1
         fi
         cp "$$CXX_HDR" "$$OUT_CXX"
+
+        CC_SRC="$$(find "$$CARGO_TARGET_DIR/$$PROFILE/build" -path '*/out/cxxbridge/sources/*/src/lib.rs.cc' -print -quit)"
+        if [ -z "$$CC_SRC" ]; then
+            echo "ERROR: Failed to locate generated lib.rs.cc under $$CARGO_TARGET_DIR/$$PROFILE/build" >&2
+            exit 1
+        fi
+        cp "$$CC_SRC" "$$OUT_CC"
     """,
     local = 1,
 )
@@ -80,7 +88,9 @@ cc_library(
     name = "iggy-cpp",
     srcs = glob([
         "src/*.cpp",
-    ], allow_empty = True),
+    ], allow_empty = True) + [
+        ":cxxbridge/sources/lib.rs.cc",
+    ],
     hdrs = [
         "include/iggy.hpp",
         ":include/lib.rs.h",
@@ -106,8 +116,26 @@ cc_library(
 )
 
 cc_test(
-    name = "iggy-cpp-test",
-    srcs = ["tests/test.cpp"],
+    name = "unit",
+    srcs = [
+        "tests/unit_tests.cpp",
+    ],
+    deps = [
+        ":iggy-cpp",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "low-level-e2e",
+    srcs = glob([
+        "tests/**/low_level_e2e.cpp",
+    ]) + [
+        "tests/common/test_helpers.hpp",
+    ],
+    tags = [
+        "e2e",
+    ],
     deps = [
         ":iggy-cpp",
         "@googletest//:gtest_main",

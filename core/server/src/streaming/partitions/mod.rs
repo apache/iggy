@@ -26,6 +26,8 @@ pub mod local_partition;
 pub mod local_partitions;
 pub mod log;
 pub mod ops;
+#[cfg(test)]
+mod ops_tests;
 pub mod segments;
 pub mod storage;
 

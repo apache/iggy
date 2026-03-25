@@ -22,31 +22,22 @@ package org.apache.iggy.client.blocking.tcp;
 import org.apache.iggy.client.blocking.PartitionsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.serde.CommandCode;
 
-import static org.apache.iggy.serde.BytesSerializer.toBytes;
+final class PartitionsTcpClient implements PartitionsClient {
 
-class PartitionsTcpClient implements PartitionsClient {
+    private final org.apache.iggy.client.async.PartitionsClient delegate;
 
-    private final InternalTcpClient tcpClient;
-
-    PartitionsTcpClient(InternalTcpClient tcpClient) {
-        this.tcpClient = tcpClient;
+    PartitionsTcpClient(org.apache.iggy.client.async.PartitionsClient delegate) {
+        this.delegate = delegate;
     }
 
     @Override
     public void createPartitions(StreamId streamId, TopicId topicId, Long partitionsCount) {
-        var payload = toBytes(streamId);
-        payload.writeBytes(toBytes(topicId));
-        payload.writeIntLE(partitionsCount.intValue());
-        tcpClient.send(CommandCode.Partition.CREATE, payload);
+        FutureUtil.resolve(delegate.createPartitions(streamId, topicId, partitionsCount));
     }
 
     @Override
     public void deletePartitions(StreamId streamId, TopicId topicId, Long partitionsCount) {
-        var payload = toBytes(streamId);
-        payload.writeBytes(toBytes(topicId));
-        payload.writeIntLE(partitionsCount.intValue());
-        tcpClient.send(CommandCode.Partition.DELETE, payload);
+        FutureUtil.resolve(delegate.deletePartitions(streamId, topicId, partitionsCount));
     }
 }

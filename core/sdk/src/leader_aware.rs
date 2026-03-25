@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy_binary_protocol::ClusterClient;
+use iggy_common::ClusterClient;
 use iggy_common::{
     ClusterMetadata, ClusterNodeRole, ClusterNodeStatus, IggyError, TransportProtocol,
 };

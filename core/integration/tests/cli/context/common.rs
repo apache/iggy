@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 
-use iggy_binary_protocol::cli::binary_context::common::{ContextReaderWriter, ContextsConfigMap};
+use iggy_cli::commands::binary_context::common::{ContextReaderWriter, ContextsConfigMap};
 use tempfile::{TempDir, tempdir};
 
 pub struct TestIggyContext {

@@ -51,7 +51,8 @@ pub struct Partition {
 }
 
 impl Partition {
-    pub fn new(id: usize, created_at: IggyTimestamp) -> Self {
+    #[must_use]
+    pub const fn new(id: usize, created_at: IggyTimestamp) -> Self {
         Self { id, created_at }
     }
 }
@@ -184,6 +185,7 @@ impl Clone for Stream {
 }
 
 impl Stream {
+    #[must_use]
     pub fn new(name: Arc<str>, created_at: IggyTimestamp) -> Self {
         Self {
             id: 0,
@@ -195,6 +197,7 @@ impl Stream {
         }
     }
 
+    #[must_use]
     pub fn with_stats(name: Arc<str>, created_at: IggyTimestamp, stats: Arc<StreamStats>) -> Self {
         Self {
             id: 0,

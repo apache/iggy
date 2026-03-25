@@ -15,7 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM golang:1.23.10-alpine
+FROM golang:1.25.0-alpine
+
+RUN apk add --no-cache gcc musl-dev
 
 WORKDIR /app
 
@@ -39,5 +41,5 @@ COPY bdd/scenarios ./bdd/scenarios
 # Change workdir to bdd/go
 WORKDIR /app/bdd/go
 
-# Default command
-CMD ["go", "test", "-v", "./..."]
+# Default command (GO_TEST_EXTRA_FLAGS can inject -race)
+CMD ["sh", "-c", "go test -v ${GO_TEST_EXTRA_FLAGS:-} ./..."]

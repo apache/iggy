@@ -259,8 +259,7 @@ jobs:
                 // Individual BDD tests should run separately with proper Docker setup
                 groups.bdd.push(...entries);
               }
-              else if (name === 'examples-suite') {
-                // Examples should run separately
+              else if (name.startsWith('examples-')) {
                 groups.examples.push(...entries);
               }
               else if (name === 'shell-scripts') groups.other.push(...entries);
@@ -317,7 +316,7 @@ jobs:
                 else if (name === 'sdk-csharp') groups.csharp.push(...entries);
                 else if (name === 'sdk-cpp') groups.cpp.push(...entries);
                 else if (name.startsWith('bdd-')) groups.bdd.push(...entries);
-                else if (name === 'examples-suite') groups.examples.push(...entries);
+                else if (name.startsWith('examples-')) groups.examples.push(...entries);
                 else groups.other.push(...entries);
               }
             }

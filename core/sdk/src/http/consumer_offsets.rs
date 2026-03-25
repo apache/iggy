@@ -21,7 +21,7 @@ use crate::http::http_transport::HttpTransport;
 use crate::prelude::Identifier;
 use crate::prelude::IggyError;
 use async_trait::async_trait;
-use iggy_binary_protocol::ConsumerOffsetClient;
+use iggy_common::ConsumerOffsetClient;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::{Consumer, ConsumerOffsetInfo};

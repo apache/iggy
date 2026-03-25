@@ -55,7 +55,7 @@ public class BasicMessagingOperationsSteps
     [Given(@"I am authenticated as the root user")]
     public async Task GivenIAmAuthenticatedAsTheRootUser()
     {
-        var loginResult = await _context.IggyClient.LoginUser("iggy", "iggy");
+        var loginResult = await _context.IggyClient.LoginUserAsync("iggy", "iggy");
 
         loginResult.ShouldNotBeNull();
         loginResult.UserId.ShouldBe(0);

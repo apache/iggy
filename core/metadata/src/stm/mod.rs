@@ -23,7 +23,7 @@ pub mod user;
 
 use bytes::Bytes;
 use iggy_common::Either;
-use left_right::*;
+use left_right::{Absorb, ReadHandle, WriteHandle};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
@@ -47,18 +47,21 @@ impl<T, O> WriteCell<T, O>
 where
     T: Absorb<O>,
 {
-    pub fn new(write: WriteHandle<T, O>) -> Self {
+    pub const fn new(write: WriteHandle<T, O>) -> Self {
         Self {
             inner: UnsafeCell::new(write),
         }
     }
 
+    /// # Panics
+    /// Panics if the inner `UnsafeCell` pointer is null (should never happen
+    /// unless the writer was not properly initialized).
     pub fn apply(&self, cmd: O) {
         let hdl = unsafe {
             self.inner
                 .get()
                 .as_mut()
-                .expect("[apply]: called on uninit writer, for cmd: {cmd}")
+                .expect("[apply]: called on uninit writer")
         };
         hdl.append(cmd).publish();
     }
@@ -69,6 +72,7 @@ where
 /// - `Ok(Either::Left(cmd))` if applicable
 /// - `Ok(Either::Right(input))` to pass ownership back
 /// - `Err(error)` for malformed payload/parse errors
+#[allow(clippy::missing_errors_doc)]
 pub trait Command {
     type Cmd;
     type Input;
@@ -99,6 +103,8 @@ impl<T, C> LeftRight<T, C>
 where
     T: Absorb<C>,
 {
+    /// # Panics
+    /// Panics if the read handle has been dropped (should never happen in normal operation).
     pub fn read<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&T) -> R,
@@ -125,6 +131,8 @@ impl<T> LeftRight<T, <T as Command>::Cmd>
 where
     T: Absorb<<T as Command>::Cmd> + Clone + Command,
 {
+    /// # Panics
+    /// Panics if this is not the owner shard (no write handle available).
     pub fn do_apply(&self, cmd: <T as Command>::Cmd) {
         self.write
             .as_ref()
@@ -134,6 +142,7 @@ where
 }
 
 /// Public interface for state handlers.
+#[allow(clippy::missing_errors_doc)]
 pub trait State {
     type Output;
     type Input;
@@ -142,6 +151,7 @@ pub trait State {
     fn apply(&self, input: Self::Input) -> Result<Either<Self::Output, Self::Input>, Self::Error>;
 }
 
+#[allow(clippy::missing_errors_doc)]
 pub trait StateMachine {
     type Input;
     type Output;
@@ -153,7 +163,7 @@ pub trait StateMachine {
 ///
 /// # Generated items
 /// - `{$state}Inner` struct with the specified fields (the data)
-/// - `$state` wrapper struct (contains LeftRight storage)
+/// - `$state` wrapper struct (contains `LeftRight` storage)
 /// - `From<LeftRight<...>>` impl for `$state`
 /// - `From<{$state}Inner>` impl for `$state`
 ///
@@ -231,14 +241,13 @@ macro_rules! collect_handlers {
 
             impl $crate::stm::Command for [<$state Inner>] {
                 type Cmd = [<$state Command>];
-                type Input = ::iggy_common::message::Message<::iggy_common::header::PrepareHeader>;
+                type Input = ::iggy_binary_protocol::Message<::iggy_binary_protocol::PrepareHeader>;
                 type Error = ::iggy_common::IggyError;
 
                 fn parse(input: Self::Input) -> Result<::iggy_common::Either<Self::Cmd, Self::Input>, Self::Error> {
                     use ::iggy_common::BytesSerializable;
                     use ::iggy_common::Either;
-                    use ::iggy_common::header::Operation;
-
+                    use ::iggy_binary_protocol::Operation;
                     match input.header().operation {
                         $(
                             Operation::$operation => {

@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::header::ConsensusHeader;
-use iggy_common::message::ConsensusMessage;
+use iggy_binary_protocol::{ConsensusHeader, ConsensusMessage};
 use message_bus::MessageBus;
 
 pub trait Project<T, C: Consensus> {
@@ -78,7 +77,7 @@ pub trait Consensus: Sized {
 /// This abstracts the VSR message flow:
 /// - request -> prepare
 /// - replicate (prepare)
-/// - ack (prepare_ok)
+/// - ack (`prepare_ok`)
 pub trait Plane<C>
 where
     C: Consensus,

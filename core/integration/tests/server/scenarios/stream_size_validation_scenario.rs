@@ -104,7 +104,7 @@ pub async fn run(harness: &TestHarness) {
     // 14. Delete first topic on the first stream
     delete_topic(&client, S1_NAME, T1_NAME).await;
 
-    // 15. Validate both streams, first should have it's message count and size should be reduced by 50%, second stream should be unchanged
+    // 15. Validate both streams, first should have its message count and size should be reduced by 50%, second stream should be unchanged
     validate_stream(&client, S1_NAME, MSGS_SIZE * 2, MSGS_COUNT * 2).await;
     validate_stream(&client, S2_NAME, MSGS_SIZE * 4, MSGS_COUNT * 4).await;
 
@@ -124,7 +124,7 @@ pub async fn run(harness: &TestHarness) {
     // 20. Purge second stream
     purge_stream(&client, S2_NAME).await;
 
-    // 21. Validate second stream and it's topics, should be empty
+    // 21. Validate second stream and its topics, should be empty
     validate_stream(&client, S2_NAME, 0, 0).await;
     validate_topic(&client, S2_NAME, T1_NAME, 0, 0).await;
     validate_topic(&client, S2_NAME, T2_NAME, 0, 0).await;

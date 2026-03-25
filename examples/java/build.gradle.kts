@@ -110,3 +110,12 @@ tasks.register<JavaExec>("runAsyncConsumer") {
     mainClass.set("org.apache.iggy.examples.async.AsyncConsumer")
 }
 
+tasks.register<JavaExec>("runTcpTlsProducer") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.examples.tcptls.producer.TcpTlsProducer")
+}
+
+tasks.register<JavaExec>("runTcpTlsConsumer") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.apache.iggy.examples.tcptls.consumer.TcpTlsConsumer")
+}

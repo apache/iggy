@@ -48,6 +48,12 @@ pub mod transforms;
 pub use log::LogCallback;
 pub use transforms::Transform;
 
+#[doc(hidden)]
+pub mod connector_macro_support {
+    pub use dashmap::DashMap;
+    pub use once_cell::sync::Lazy;
+}
+
 static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 
 pub fn get_runtime() -> &'static Runtime {

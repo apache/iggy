@@ -51,7 +51,7 @@ pub struct CreateConsumerGroupWithId {
     pub command: CreateConsumerGroup,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateUserWithId {
     pub user_id: u32,
     pub command: CreateUser,

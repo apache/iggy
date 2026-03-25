@@ -18,8 +18,9 @@
  */
 
 use crate::server::scenarios::{
-    message_size_scenario, segment_rotation_race_scenario, single_message_per_batch_scenario,
-    tcp_tls_scenario, websocket_tls_scenario,
+    message_size_scenario, reconnect_after_restart_scenario, restart_offset_skip_scenario,
+    segment_rotation_race_scenario, single_message_per_batch_scenario, tcp_tls_scenario,
+    websocket_tls_scenario,
 };
 use integration::iggy_harness;
 
@@ -58,6 +59,66 @@ async fn message_size_scenario(harness: &TestHarness) {
 #[iggy_harness(server(partition.messages_required_to_save = "10000"))]
 async fn should_handle_single_message_per_batch_with_delayed_persistence(harness: &TestHarness) {
     single_message_per_batch_scenario::run(harness, 5).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn producer_reconnect_after_server_restart(harness: &mut TestHarness) {
+    reconnect_after_restart_scenario::run_producer(harness).await;
+}
+
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(
+        tcp.socket.override_defaults = true,
+        tcp.socket.nodelay = true,
+        quic.max_idle_timeout = "500s",
+        quic.keep_alive_interval = "15s"
+    )
+)]
+async fn consumer_reconnect_after_server_restart(harness: &mut TestHarness) {
+    reconnect_after_restart_scenario::run_consumer(harness).await;
+}
+
+#[iggy_harness(server(
+    partition.messages_required_to_save = "1",
+    partition.enforce_fsync = true
+))]
+async fn single_message_restart_offset_zero(harness: &mut TestHarness) {
+    reconnect_after_restart_scenario::run_single_message_offset_zero_restart(harness).await;
+}
+
+#[iggy_harness(server(
+    partition.messages_required_to_save = "1",
+    partition.enforce_fsync = true
+))]
+async fn consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
+    reconnect_after_restart_scenario::run_consumer_offset_ahead_after_crash(harness).await;
+}
+
+/// Regression test: consumer offset skip after server restart during concurrent
+/// produce+consume. Reproduces the exact scenario from issue #2924/#2715:
+/// send messages, restart server, produce+consume concurrently, verify no offset
+/// gaps.
+///
+/// Config: high messages_required_to_save so post-restart messages accumulate in
+/// the journal (exposing the base_offset=0 bug). message_saver flushes pre-restart
+/// data before the restart.
+#[iggy_harness(server(
+    partition.messages_required_to_save = "10000",
+    partition.enforce_fsync = false,
+    message_saver.enabled = true,
+    message_saver.interval = "1s"
+))]
+async fn restart_offset_skip(harness: &mut TestHarness) {
+    restart_offset_skip_scenario::run(harness).await;
 }
 
 /// This test configures the server to trigger frequent segment rotations and runs

@@ -46,6 +46,7 @@ use iggy_common::{
     purge_stream::PurgeStream, purge_topic::PurgeTopic, update_permissions::UpdatePermissions,
     update_stream::UpdateStream, update_topic::UpdateTopic, update_user::UpdateUser,
 };
+use secrecy::{ExposeSecret, SecretString};
 pub struct DeleteStreamResult {
     pub stream_id: usize,
 }
@@ -558,7 +559,7 @@ pub async fn execute_create_user(
 
     let user = shard.create_user(
         &command.username,
-        &command.password,
+        command.password.expose_secret(),
         command.status,
         command.permissions.clone(),
     )?;
@@ -570,7 +571,9 @@ pub async fn execute_create_user(
             &EntryCommand::CreateUser(CreateUserWithId {
                 user_id: user.id,
                 command: iggy_common::create_user::CreateUser {
-                    password: crypto::hash_password(&command.password),
+                    password: SecretString::from(crypto::hash_password(
+                        command.password.expose_secret(),
+                    )),
                     ..command
                 },
             }),
@@ -626,8 +629,8 @@ pub async fn execute_change_password(
 
     shard.change_password(
         &command.user_id,
-        &command.current_password,
-        &command.new_password,
+        command.current_password.expose_secret(),
+        command.new_password.expose_secret(),
     )?;
 
     shard
@@ -635,8 +638,10 @@ pub async fn execute_change_password(
         .apply(
             user_id,
             &EntryCommand::ChangePassword(ChangePassword {
-                current_password: String::new(),
-                new_password: crypto::hash_password(&command.new_password),
+                current_password: SecretString::from(String::new()),
+                new_password: SecretString::from(crypto::hash_password(
+                    command.new_password.expose_secret(),
+                )),
                 ..command
             }),
         )

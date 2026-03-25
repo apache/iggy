@@ -37,7 +37,7 @@ use builder::IggyShardBuilder;
 use dashmap::DashMap;
 use iggy_common::SemanticVersion;
 use iggy_common::sharding::{IggyNamespace, PartitionLocation};
-use iggy_common::{EncryptorKind, IggyError};
+use iggy_common::{EncryptorKind, IggyByteSize, IggyError};
 use std::{
     cell::{Cell, RefCell},
     net::SocketAddr,
@@ -48,7 +48,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 use transmission::connector::{Receiver, ShardConnector, StopReceiver};
 
 pub mod builder;
@@ -302,13 +302,81 @@ impl IggyShard {
                             stats.increment_segments_count(1);
                         }
 
-                        let current_offset = loaded_log.active_segment().end_offset;
+                        // Use the max end_offset across segments that have data,
+                        // not just the active segment. Handles the edge case where
+                        // the active segment is empty (rotated right before shutdown).
+                        let current_offset = loaded_log
+                            .segments()
+                            .iter()
+                            .filter(|s| s.size > IggyByteSize::default())
+                            .map(|s| s.end_offset)
+                            .max()
+                            .unwrap_or(0);
                         stats.set_current_offset(current_offset);
 
-                        // Only increment offset if we have messages (current_offset > 0).
-                        // When current_offset is 0 and we have no messages, first message
-                        // should get offset 0.
-                        let should_increment_offset = current_offset > 0;
+                        // Check if ANY segment has data. Cannot use current_offset > 0
+                        // because a single message at offset 0 yields current_offset = 0
+                        // yet must still increment on the next append.
+                        let should_increment_offset = loaded_log
+                            .segments()
+                            .iter()
+                            .any(|s| s.size > IggyByteSize::default());
+
+                        // After a crash (OOM, SIGKILL), auto_commit may have persisted
+                        // a consumer offset beyond what was flushed to disk. Clamp to
+                        // the partition's actual offset to prevent permanent empty polls.
+                        {
+                            let guard = consumer_offsets.pin();
+                            for entry in guard.iter() {
+                                let stored = entry.1.offset.load(Ordering::Relaxed);
+                                if stored > current_offset {
+                                    warn!(
+                                        "Consumer {} offset {} ahead of partition offset {} \
+                                         for stream {}, topic {}, partition {} - clamping \
+                                         (crash recovery)",
+                                        entry.0,
+                                        stored,
+                                        current_offset,
+                                        stream_id,
+                                        topic_id,
+                                        partition_id
+                                    );
+                                    entry.1.offset.store(current_offset, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        {
+                            let guard = consumer_group_offsets.pin();
+                            for entry in guard.iter() {
+                                let stored = entry.1.offset.load(Ordering::Relaxed);
+                                if stored > current_offset {
+                                    warn!(
+                                        "Consumer group {:?} offset {} ahead of partition \
+                                         offset {} for stream {}, topic {}, partition {} - \
+                                         clamping (crash recovery)",
+                                        entry.0,
+                                        stored,
+                                        current_offset,
+                                        stream_id,
+                                        topic_id,
+                                        partition_id
+                                    );
+                                    entry.1.offset.store(current_offset, Ordering::Relaxed);
+                                }
+                            }
+                        }
+
+                        // Initialize journal base_offset so the three-tier
+                        // routing in ops.rs computes correct in_memory_floor.
+                        // Without this, journal defaults to base_offset=0 which
+                        // causes disk reads to be skipped after restart.
+                        if should_increment_offset {
+                            use crate::streaming::partitions::journal::{Inner, Journal};
+                            loaded_log.journal_mut().init(Inner {
+                                base_offset: current_offset + 1,
+                                ..Default::default()
+                            });
+                        }
 
                         let revision_id = init_info.revision_id;
 

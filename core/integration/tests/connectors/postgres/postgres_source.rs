@@ -24,7 +24,7 @@ use crate::connectors::fixtures::{
     PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
     PostgresSourceOps,
 };
-use iggy_binary_protocol::MessageClient;
+use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
 use integration::harness::seeds;
 use integration::iggy_harness;

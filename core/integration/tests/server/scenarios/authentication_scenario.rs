@@ -30,6 +30,7 @@ use crate::server::scenarios::create_client;
 use bytes::Bytes;
 use iggy::prelude::*;
 use integration::harness::{TestHarness, login_root};
+use secrecy::ExposeSecret;
 use server::binary::command::ServerCommand;
 use strum::IntoEnumIterator;
 
@@ -90,7 +91,7 @@ pub async fn run(harness: &TestHarness) {
     );
 
     let identity = client
-        .login_with_personal_access_token(&raw_pat.token)
+        .login_with_personal_access_token(raw_pat.token.expose_secret())
         .await
         .expect("PAT login should work");
     assert_eq!(identity.user_id, 0, "PAT should authenticate as root");

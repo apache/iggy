@@ -16,14 +16,21 @@
 // under the License.
 
 use crate::{Consensus, Pipeline, PipelineEntry, Sequencer, Status, VsrConsensus};
-use iggy_common::header::{Command2, GenericHeader, PrepareHeader, PrepareOkHeader, ReplyHeader};
-use iggy_common::message::Message;
+use iggy_binary_protocol::{
+    Command2, GenericHeader, Message, PrepareHeader, PrepareOkHeader, ReplyHeader,
+};
 use message_bus::MessageBus;
 use std::ops::AsyncFnOnce;
 
 // TODO: Rework all of those helpers, once the boundaries are more clear and we have a better picture of the commonalities between all of the planes.
 
 /// Shared pipeline-first request flow used by metadata and partitions.
+///
+/// # Panics
+/// - If the caller is not the primary.
+/// - If the consensus status is not normal.
+/// - If the consensus is syncing.
+#[allow(clippy::future_not_send)]
 pub async fn pipeline_prepare_common<C, F>(
     consensus: &C,
     prepare: C::Message<C::ReplicateHeader>,
@@ -43,7 +50,8 @@ pub async fn pipeline_prepare_common<C, F>(
 }
 
 /// Shared commit-based old-prepare fence.
-pub fn fence_old_prepare_by_commit<B, P>(
+#[must_use]
+pub const fn fence_old_prepare_by_commit<B, P>(
     consensus: &VsrConsensus<B, P>,
     header: &PrepareHeader,
 ) -> bool
@@ -55,6 +63,13 @@ where
 }
 
 /// Shared chain-replication forwarding to the next replica.
+///
+/// # Panics
+/// - If `header.command` is not `Command2::Prepare`.
+/// - If `header.op <= consensus.commit()`.
+/// - If the computed next replica equals self.
+/// - If the message bus send fails.
+#[allow(clippy::future_not_send)]
 pub async fn replicate_to_next_in_chain<B, P>(
     consensus: &VsrConsensus<B, P>,
     message: Message<PrepareHeader>,
@@ -87,6 +102,13 @@ pub async fn replicate_to_next_in_chain<B, P>(
 /// Shared preflight checks for `on_replicate`.
 ///
 /// Returns current op on success.
+///
+/// # Errors
+/// Returns a static error string if the replica is syncing, not in normal
+/// status, or the message has a newer view.
+///
+/// # Panics
+/// If `header.command` is not `Command2::Prepare`.
 pub fn replicate_preflight<B, P>(
     consensus: &VsrConsensus<B, P>,
     header: &PrepareHeader,
@@ -119,6 +141,10 @@ where
 }
 
 /// Shared preflight checks for `on_ack`.
+///
+/// # Errors
+/// Returns a static error string if the replica is not primary or not in
+/// normal status.
 pub fn ack_preflight<B, P>(consensus: &VsrConsensus<B, P>) -> Result<(), &'static str>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
@@ -171,6 +197,9 @@ where
 ///
 /// Entries are drained only from the head and only while their op is covered
 /// by the current commit frontier.
+///
+/// # Panics
+/// If `head()` returns `Some` but `pop_message()` returns `None` (unreachable).
 pub fn drain_committable_prefix<B, P>(consensus: &VsrConsensus<B, P>) -> Vec<PipelineEntry>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
@@ -195,6 +224,10 @@ where
 }
 
 /// Shared reply-message construction for committed prepare.
+///
+/// # Panics
+/// If the constructed message buffer is not valid.
+#[allow(clippy::needless_pass_by_value, clippy::cast_possible_truncation)]
 pub fn build_reply_message<B, P>(
     consensus: &VsrConsensus<B, P>,
     prepare_header: &PrepareHeader,
@@ -208,7 +241,8 @@ where
     let total_size = header_size + body.len();
     let mut buffer = bytes::BytesMut::zeroed(total_size);
 
-    let header = bytemuck::from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size]);
+    let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size])
+        .expect("zeroed bytes are valid");
     *header = ReplyHeader {
         checksum: 0,
         checksum_body: 0,
@@ -239,6 +273,9 @@ where
 }
 
 /// Verify hash chain would not break if we add this header.
+///
+/// # Panics
+/// If both headers share the same view and `current.parent != previous.checksum`.
 pub fn panic_if_hash_chain_would_break_in_same_view(
     previous: &PrepareHeader,
     current: &PrepareHeader,
@@ -254,6 +291,10 @@ pub fn panic_if_hash_chain_would_break_in_same_view(
 }
 
 // TODO: Figure out how to make this check the journal if it contains the prepare.
+/// # Panics
+/// - If `header.command` is not `Command2::Prepare`.
+/// - If `header.view > consensus.view()`.
+#[allow(clippy::cast_possible_truncation, clippy::future_not_send)]
 pub async fn send_prepare_ok<B, P>(
     consensus: &VsrConsensus<B, P>,
     header: &PrepareHeader,
@@ -272,7 +313,7 @@ pub async fn send_prepare_ok<B, P>(
         return;
     }
 
-    if let Some(false) = is_persisted {
+    if is_persisted == Some(false) {
         return;
     }
 
@@ -437,7 +478,7 @@ mod tests {
 
     #[test]
     fn loopback_cleared_on_complete_view_change_as_primary() {
-        use iggy_common::header::{DoViewChangeHeader, StartViewChangeHeader};
+        use iggy_binary_protocol::{DoViewChangeHeader, StartViewChangeHeader};
 
         // 3 replicas, replica 0 is primary for view 0 (and view 3: 3 % 3 = 0).
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
@@ -534,6 +575,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::future_not_send)]
     impl MessageBus for SpyBus {
         type Client = u128;
         type Replica = u8;

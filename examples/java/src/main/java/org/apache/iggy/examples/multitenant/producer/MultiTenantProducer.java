@@ -140,9 +140,16 @@ public final class MultiTenantProducer {
             }
         }
 
-        waitFor(tasks);
-        executor.shutdown();
-        log.info("Disconnecting clients");
+        try {
+            waitFor(tasks);
+        } finally {
+            executor.shutdown();
+            for (Tenant tenant : tenants) {
+                tenant.client().close();
+            }
+            rootClient.close();
+            log.info("Disconnected clients");
+        }
     }
 
     private static void sendBatches(

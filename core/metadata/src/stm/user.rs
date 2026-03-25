@@ -32,6 +32,7 @@ use iggy_common::{
     GlobalPermissions, IggyTimestamp, Permissions, PersonalAccessToken, StreamPermissions, UserId,
     UserStatus,
 };
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use slab::Slab;
 use std::sync::Arc;
@@ -64,7 +65,8 @@ impl Default for User {
 }
 
 impl User {
-    pub fn new(
+    #[must_use]
+    pub const fn new(
         username: Arc<str>,
         password_hash: Arc<str>,
         status: UserStatus,
@@ -126,6 +128,7 @@ impl UsersInner {
 // TODO(hubcio): Serialize proper reply (e.g. assigned user ID) instead of empty Bytes.
 impl StateHandler for CreateUser {
     type State = UsersInner;
+    #[allow(clippy::cast_possible_truncation)]
     fn apply(&self, state: &mut UsersInner) -> Bytes {
         let username_arc: Arc<str> = Arc::from(self.username.as_str());
         if state.index.contains_key(&username_arc) {
@@ -135,7 +138,7 @@ impl StateHandler for CreateUser {
         let user = User {
             id: 0,
             username: username_arc.clone(),
-            password_hash: Arc::from(self.password.as_str()),
+            password_hash: Arc::from(self.password.expose_secret()),
             status: self.status,
             created_at: iggy_common::IggyTimestamp::now(),
             permissions: self.permissions.as_ref().map(|p| Arc::new(p.clone())),
@@ -156,6 +159,7 @@ impl StateHandler for CreateUser {
 
 impl StateHandler for UpdateUser {
     type State = UsersInner;
+    #[allow(clippy::cast_possible_truncation)]
     fn apply(&self, state: &mut UsersInner) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return Bytes::new();
@@ -187,6 +191,7 @@ impl StateHandler for UpdateUser {
 
 impl StateHandler for DeleteUser {
     type State = UsersInner;
+    #[allow(clippy::cast_possible_truncation)]
     fn apply(&self, state: &mut UsersInner) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return Bytes::new();
@@ -210,7 +215,7 @@ impl StateHandler for ChangePassword {
         };
 
         if let Some(user) = state.items.get_mut(user_id) {
-            user.password_hash = Arc::from(self.new_password.as_str());
+            user.password_hash = Arc::from(self.new_password.expose_secret());
         }
         Bytes::new()
     }
@@ -406,6 +411,7 @@ impl Snapshotable for Users {
         })
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn from_snapshot(
         snapshot: Self::Snapshot,
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {

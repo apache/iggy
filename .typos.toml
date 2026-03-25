@@ -17,6 +17,8 @@
 
 # Whitelist valid technical terms to avoid typos false positives
 [default.extend-words]
+# French for coffee, used in UTF-8 test strings (cafe with accent)
+caf = "caf"
 # Valid bi-directional map data structure term
 bimap = "bimap"
 # Valid compression algorithm abbreviation

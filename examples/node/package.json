@@ -5,7 +5,7 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "test": "./test-examples.sh",
+    "test": "echo 'Use scripts/run-examples-from-readme.sh --language node from repo root'",
     "lint": "eslint src/**/*.ts",
     "lint:fix": "eslint src/**/*.ts --fix",
     "test:getting-started:producer": "tsx src/getting-started/producer.ts",
@@ -19,7 +19,9 @@
     "test:multi-tenant:producer": "tsx src/multi-tenant/producer.ts",
     "test:multi-tenant:consumer": "tsx src/multi-tenant/consumer.ts",
     "test:stream-builder": "tsx src/stream-builder/example.ts",
-    "test:sink-data-producer": "tsx src/sink-data-producer/producer.ts"
+    "test:sink-data-producer": "tsx src/sink-data-producer/producer.ts",
+    "test:tcp-tls:producer": "tsx src/tcp-tls/producer.ts",
+    "test:tcp-tls:consumer": "tsx src/tcp-tls/consumer.ts"
   },
   "keywords": [
     "iggy",
@@ -41,6 +43,9 @@
     "jiti": "^2.6.1",
     "tsx": "^4.7.0",
     "typescript-eslint": "^8.47.0"
+  },
+  "overrides": {
+    "flatted": "^3.4.2"
   },
   "eslintConfig": {
     "root": true,

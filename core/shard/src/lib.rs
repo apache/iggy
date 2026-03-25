@@ -19,8 +19,9 @@ mod router;
 pub mod shards_table;
 
 use consensus::{MuxPlane, NamespacedPipeline, PartitionsHandle, Plane, VsrConsensus};
-use iggy_common::header::{GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader};
-use iggy_common::message::{Message, MessageBag};
+use iggy_binary_protocol::{
+    GenericHeader, Message, MessageBag, PrepareHeader, PrepareOkHeader, RequestHeader,
+};
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::variadic;
 use journal::{Journal, JournalHandle};
@@ -44,6 +45,7 @@ pub type Sender<T> = crossfire::MTx<crossfire::mpsc::Array<T>>;
 pub type Receiver<T> = crossfire::AsyncRx<crossfire::mpsc::Array<T>>;
 
 /// Create a bounded mpsc channel with a blocking sender and async receiver.
+#[must_use]
 pub fn channel<T: Send + 'static>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     crossfire::mpsc::bounded_blocking_async(capacity)
 }
@@ -64,7 +66,8 @@ pub struct ShardFrame<R: Send + 'static = ()> {
 
 impl<R: Send + 'static> ShardFrame<R> {
     /// Create a fire-and-forget frame (no caller waiting for completion).
-    pub fn fire_and_forget(message: Message<GenericHeader>) -> Self {
+    #[must_use]
+    pub const fn fire_and_forget(message: Message<GenericHeader>) -> Self {
         Self {
             message,
             response_sender: None,
@@ -116,7 +119,8 @@ where
     /// * `senders` - one sender per shard in the cluster (indexed by shard id).
     /// * `inbox` - the receiver that this shard drains in its message pump.
     /// * `shards_table` - namespace -> shard routing table.
-    pub fn new(
+    #[must_use]
+    pub const fn new(
         id: u16,
         name: String,
         metadata: IggyMetadata<VsrConsensus<B>, J, S, M>,
@@ -136,7 +140,8 @@ where
         }
     }
 
-    pub fn shards_table(&self) -> &T {
+    #[must_use]
+    pub const fn shards_table(&self) -> &T {
         &self.shards_table
     }
 }
@@ -151,6 +156,7 @@ where
     ///
     /// Routes requests, replication messages, and acks to either the metadata
     /// plane or the partitions plane based on `PlaneIdentity::is_applicable`.
+    #[allow(clippy::future_not_send)]
     pub async fn on_message(&self, message: Message<GenericHeader>)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
@@ -166,13 +172,17 @@ where
                 Error = iggy_common::IggyError,
             >,
     {
-        match MessageBag::from(message) {
-            MessageBag::Request(request) => self.on_request(request).await,
-            MessageBag::Prepare(prepare) => self.on_replicate(prepare).await,
-            MessageBag::PrepareOk(prepare_ok) => self.on_ack(prepare_ok).await,
+        match MessageBag::try_from(message) {
+            Ok(MessageBag::Request(request)) => self.on_request(request).await,
+            Ok(MessageBag::Prepare(prepare)) => self.on_replicate(prepare).await,
+            Ok(MessageBag::PrepareOk(prepare_ok)) => self.on_ack(prepare_ok).await,
+            Err(e) => {
+                tracing::warn!(shard = self.id, error = %e, "dropping message with invalid command");
+            }
         }
     }
 
+    #[allow(clippy::future_not_send)]
     pub async fn on_request(&self, request: Message<RequestHeader>)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
@@ -191,6 +201,7 @@ where
         self.plane.on_request(request).await;
     }
 
+    #[allow(clippy::future_not_send)]
     pub async fn on_replicate(&self, prepare: Message<PrepareHeader>)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
@@ -209,6 +220,7 @@ where
         self.plane.on_replicate(prepare).await;
     }
 
+    #[allow(clippy::future_not_send)]
     pub async fn on_ack(&self, prepare_ok: Message<PrepareOkHeader>)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
@@ -235,6 +247,10 @@ where
     /// Invariant: planes do not produce loopback messages for each other.
     /// `on_ack` commits and applies but never calls `push_loopback`, so
     /// draining metadata before partitions is order-independent.
+    ///
+    /// # Panics
+    /// Panics if a loopback message is not a valid `PrepareOk` message.
+    #[allow(clippy::future_not_send)]
     pub async fn process_loopback(&self, buf: &mut Vec<Message<GenericHeader>>) -> usize
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
@@ -286,7 +302,7 @@ where
     where
         B: MessageBus<
                 Replica = u8,
-                Data = iggy_common::message::Message<iggy_common::header::GenericHeader>,
+                Data = iggy_binary_protocol::Message<iggy_binary_protocol::GenericHeader>,
                 Client = u128,
             >,
     {

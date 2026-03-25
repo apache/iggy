@@ -19,6 +19,7 @@
 use crate::permissioner::Permissioner;
 use iggy_common::IggyError;
 
+#[allow(clippy::missing_errors_doc)]
 impl Permissioner {
     pub fn get_stream(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
         if let Some(global_permissions) = self.users_permissions.get(&user_id)

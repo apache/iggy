@@ -26,10 +26,8 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Setup Go with cache
+    - name: Setup Go
       uses: ./.github/actions/utils/setup-go-with-cache
-      with:
-        enabled: "false"
 
     - name: Format Check
       shell: bash
@@ -74,38 +72,41 @@ runs:
         # Create reports directory
         mkdir -p ../../reports
 
-        # Run tests with coverage
-        go test -v -race -coverprofile=../../reports/go-coverage.out ./...
+        # Run unit tests with coverage (integration tests run in e2e task)
+        go test -v -race -coverprofile=../../reports/go-coverage.out $(go list ./... | grep -v /tests)
 
         # Generate coverage report
         go tool cover -html=../../reports/go-coverage.out -o ../../reports/go-coverage.html
 
         # Run tests with JSON output for better reporting
-        go test -v -json ./... > ../../reports/go-tests.json
+        go test -v -json $(go list ./... | grep -v /tests) > ../../reports/go-tests.json
 
     - name: Lint
       if: inputs.task == 'lint'
-      uses: golangci/golangci-lint-action@v6
+      uses: golangci/golangci-lint-action@v7
       with:
-        version: v1.64.8
+        version: v2.11.3
         working-directory: foreign/go
         args: --timeout=5m
+        skip-cache: true
 
     - name: Lint BDD
       if: inputs.task == 'lint' && hashFiles('bdd/go/go.mod') != ''
-      uses: golangci/golangci-lint-action@v6
+      uses: golangci/golangci-lint-action@v7
       with:
-        version: v1.64.8
+        version: v2.11.3
         working-directory: bdd/go
         args: --timeout=5m
+        skip-cache: true
 
     - name: Lint Examples
       if: inputs.task == 'lint' && hashFiles('examples/go/go.mod') != ''
-      uses: golangci/golangci-lint-action@v6
+      uses: golangci/golangci-lint-action@v7
       with:
-        version: v1.64.8
+        version: v2.11.3
         working-directory: examples/go
         args: --timeout=5m
+        skip-cache: true
 
     - name: Build
       shell: bash
@@ -120,6 +121,15 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/setup-rust-with-cache
 
+    - name: Build Iggy server Docker image for TLS tests
+      if: inputs.task == 'e2e'
+      id: docker_build
+      uses: ./.github/actions/utils/docker-build-test-server
+      with:
+        image-tag: "iggy-server:test"
+        libc: "glibc"
+        profile: "debug"
+
     - name: Setup server for e2e tests
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
@@ -127,6 +137,8 @@ runs:
     - name: Run e2e tests
       shell: bash
       if: inputs.task == 'e2e'
+      env:
+        IGGY_SERVER_DOCKER_IMAGE: ${{ steps.docker_build.outputs.docker_image }}
       run: |
         echo "🧪 Running Go e2e tests..."
 
@@ -137,10 +149,31 @@ runs:
         # Ensure ginkgo is in PATH
         export PATH="${PATH}:$(go env GOPATH)/bin"
 
-        # Run foreign/go e2e tests
-        echo "Running foreign/go e2e tests..."
+        # Create reports directory
+        mkdir -p reports
+
+        # Run foreign/go e2e tests with coverage
+        echo "Running foreign/go e2e tests (including TLS integration tests)..."
         cd foreign/go
-        go test -v -race ./...
+        go test -v -race \
+          -coverprofile=../../reports/go-coverage-e2e-sdk.out \
+          ./...
+
+        # Run BDD tests with coverage of foreign/go packages
+        # Only tcp_test suite (ginkgo); godog leader_redirection tests
+        # require a multi-node cluster not available in CI.
+        echo "Running BDD tests..."
+        cd ../../bdd/go
+        go test -v -race \
+          -coverpkg=github.com/apache/iggy/foreign/go/... \
+          -coverprofile=../../reports/go-coverage-e2e-bdd.out \
+          ./tests/tcp_test/...
+
+        # Merge e2e coverage profiles
+        cd ../..
+        head -1 reports/go-coverage-e2e-sdk.out > reports/go-coverage-e2e.out
+        tail -n +2 reports/go-coverage-e2e-sdk.out >> reports/go-coverage-e2e.out
+        tail -n +2 reports/go-coverage-e2e-bdd.out >> reports/go-coverage-e2e.out
 
     - name: Stop server after e2e tests
       if: always() && inputs.task == 'e2e'

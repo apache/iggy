@@ -31,6 +31,7 @@ use iggy_common::PersonalAccessToken;
 use iggy_common::create_user::CreateUser;
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{IdKind, Identifier, Permissions, UserStatus};
+use secrecy::{ExposeSecret, SecretString};
 use std::collections::BTreeMap;
 use std::fmt::Display;
 use tracing::{debug, error, info};
@@ -74,14 +75,26 @@ pub struct PartitionState {
     pub created_at: IggyTimestamp,
 }
 
-#[derive(Debug, Clone)]
+// TODO: consider converting token_hash to SecretString (requires updating the full hash flow across crates)
+#[derive(Clone)]
 pub struct PersonalAccessTokenState {
     pub name: String,
     pub token_hash: String,
     pub expiry_at: Option<IggyTimestamp>,
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for PersonalAccessTokenState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersonalAccessTokenState")
+            .field("name", &self.name)
+            .field("token_hash", &"[REDACTED]")
+            .field("expiry_at", &self.expiry_at)
+            .finish()
+    }
+}
+
+// TODO: consider converting password_hash to SecretString (requires updating the full hash flow across crates)
+#[derive(Clone)]
 pub struct UserState {
     pub id: u32,
     pub username: String,
@@ -90,6 +103,20 @@ pub struct UserState {
     pub created_at: IggyTimestamp,
     pub permissions: Option<Permissions>,
     pub personal_access_tokens: AHashMap<String, PersonalAccessTokenState>,
+}
+
+impl std::fmt::Debug for UserState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserState")
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .field("password_hash", &"[REDACTED]")
+            .field("status", &self.status)
+            .field("created_at", &self.created_at)
+            .field("permissions", &self.permissions)
+            .field("personal_access_tokens", &self.personal_access_tokens)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -122,7 +149,7 @@ impl SystemState {
             let root = create_root_user();
             let command = CreateUser {
                 username: root.username.clone(),
-                password: root.password.clone(),
+                password: SecretString::from(root.password.clone()),
                 status: root.status,
                 permissions: root.permissions.clone(),
             };
@@ -379,7 +406,7 @@ impl SystemState {
                     let user = UserState {
                         id: user_id,
                         username: command.username,
-                        password_hash: command.password, // This is already hashed
+                        password_hash: command.password.expose_secret().to_owned(), // This is already hashed
                         status: command.status,
                         created_at: entry.timestamp,
                         permissions: command.permissions,
@@ -408,7 +435,7 @@ impl SystemState {
                     let user = users
                         .get_mut(&user_id)
                         .unwrap_or_else(|| panic!("{}", format!("User: {user_id} not found")));
-                    user.password_hash = command.new_password // This is already hashed
+                    user.password_hash = command.new_password.expose_secret().to_owned() // This is already hashed
                 }
                 EntryCommand::UpdatePermissions(command) => {
                     let user_id = find_user_id(&users, &command.user_id);

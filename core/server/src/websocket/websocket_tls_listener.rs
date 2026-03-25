@@ -140,7 +140,7 @@ pub async fn start(
         "{} has started on: wss://{}",
         "WebSocket TLS Server", local_addr
     );
-    let ws_config = config.to_tungstenite_config();
+    let ws_config = super::build_compio_ws_config(&config);
     info!(
         "WebSocket TLS config: max_message_size: {:?}, max_frame_size: {:?}, accept_unmasked_frames: {}",
         config.max_message_size, config.max_frame_size, config.accept_unmasked_frames
@@ -159,7 +159,7 @@ pub async fn start(
 async fn accept_loop(
     listener: TcpListener,
     acceptor: TlsAcceptor,
-    ws_config: tungstenite::protocol::WebSocketConfig,
+    ws_config: compio::ws::tungstenite::protocol::WebSocketConfig,
     shard: Rc<IggyShard>,
     shutdown: ShutdownToken,
 ) -> Result<(), IggyError> {

@@ -31,12 +31,19 @@ readme = "../../../README.md"
 ahash = { workspace = true }
 bytes = { workspace = true }
 consensus = { workspace = true }
+iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 journal = { workspace = true }
 left-right = { workspace = true }
 message_bus = { workspace = true }
 paste = { workspace = true }
 rmp-serde = { workspace = true }
+secrecy = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 slab = { workspace = true }
 tracing = { workspace = true }
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "warn"

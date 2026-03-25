@@ -77,7 +77,7 @@ public abstract class ConsumerGroupsClientBaseTest extends IntegrationTest {
         String groupName = "consumes-group-42";
         createConsumerGroup(groupName);
         var consumerGroup = consumerGroupsClient.getConsumerGroup(STREAM_NAME, TOPIC_NAME, ConsumerId.of(groupName));
-        assert consumerGroup.isPresent();
+        assertThat(consumerGroup).isPresent();
 
         // when
         consumerGroupsClient.deleteConsumerGroup(STREAM_NAME, TOPIC_NAME, ConsumerId.of(groupName));

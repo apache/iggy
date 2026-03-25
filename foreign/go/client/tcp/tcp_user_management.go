@@ -21,10 +21,11 @@ import (
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
 func (c *IggyTcpClient) GetUser(identifier iggcon.Identifier) (*iggcon.UserInfoDetails, error) {
-	buffer, err := c.do(&iggcon.GetUser{Id: identifier})
+	buffer, err := c.do(&command.GetUser{Id: identifier})
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +37,7 @@ func (c *IggyTcpClient) GetUser(identifier iggcon.Identifier) (*iggcon.UserInfoD
 }
 
 func (c *IggyTcpClient) GetUsers() ([]iggcon.UserInfo, error) {
-	buffer, err := c.do(&iggcon.GetUsers{})
+	buffer, err := c.do(&command.GetUsers{})
 	if err != nil {
 		return nil, err
 	}
@@ -45,7 +46,7 @@ func (c *IggyTcpClient) GetUsers() ([]iggcon.UserInfo, error) {
 }
 
 func (c *IggyTcpClient) CreateUser(username string, password string, status iggcon.UserStatus, permissions *iggcon.Permissions) (*iggcon.UserInfoDetails, error) {
-	buffer, err := c.do(&iggcon.CreateUser{
+	buffer, err := c.do(&command.CreateUser{
 		Username:    username,
 		Password:    password,
 		Status:      status,
@@ -62,7 +63,7 @@ func (c *IggyTcpClient) CreateUser(username string, password string, status iggc
 }
 
 func (c *IggyTcpClient) UpdateUser(userID iggcon.Identifier, username *string, status *iggcon.UserStatus) error {
-	_, err := c.do(&iggcon.UpdateUser{
+	_, err := c.do(&command.UpdateUser{
 		UserID:   userID,
 		Username: username,
 		Status:   status,
@@ -71,14 +72,14 @@ func (c *IggyTcpClient) UpdateUser(userID iggcon.Identifier, username *string, s
 }
 
 func (c *IggyTcpClient) DeleteUser(identifier iggcon.Identifier) error {
-	_, err := c.do(&iggcon.DeleteUser{
+	_, err := c.do(&command.DeleteUser{
 		Id: identifier,
 	})
 	return err
 }
 
 func (c *IggyTcpClient) UpdatePermissions(userID iggcon.Identifier, permissions *iggcon.Permissions) error {
-	_, err := c.do(&iggcon.UpdatePermissions{
+	_, err := c.do(&command.UpdatePermissions{
 		UserID:      userID,
 		Permissions: permissions,
 	})
@@ -86,7 +87,7 @@ func (c *IggyTcpClient) UpdatePermissions(userID iggcon.Identifier, permissions 
 }
 
 func (c *IggyTcpClient) ChangePassword(userID iggcon.Identifier, currentPassword string, newPassword string) error {
-	_, err := c.do(&iggcon.ChangePassword{
+	_, err := c.do(&command.ChangePassword{
 		UserID:          userID,
 		CurrentPassword: currentPassword,
 		NewPassword:     newPassword,

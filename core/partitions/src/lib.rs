@@ -15,19 +15,58 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![allow(clippy::future_not_send)]
+
 mod iggy_partition;
 mod iggy_partitions;
 mod journal;
 mod log;
 mod types;
 
-use iggy_common::{IggyError, IggyMessagesBatchMut, IggyMessagesBatchSet};
+use bytes::{Bytes, BytesMut};
+use iggy_binary_protocol::{Message, PrepareHeader};
+use iggy_common::{
+    INDEX_SIZE, IggyError, IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, PooledBuffer,
+};
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;
 pub use types::{
     AppendResult, PartitionOffsets, PartitionsConfig, PollingArgs, PollingConsumer,
     SendMessagesResult,
 };
+
+pub(crate) fn decode_send_messages_batch(body: Bytes) -> Option<IggyMessagesBatchMut> {
+    // TODO: This very is bad, IGGY-114 Fixes this.
+    let mut body = body
+        .try_into_mut()
+        .unwrap_or_else(|body| BytesMut::from(body.as_ref()));
+
+    if body.len() < 4 {
+        return None;
+    }
+
+    let count_bytes = body.split_to(4);
+    let count = u32::from_le_bytes(count_bytes.as_ref().try_into().ok()?);
+    let indexes_len = (count as usize).checked_mul(INDEX_SIZE)?;
+
+    if body.len() < indexes_len {
+        return None;
+    }
+
+    let indexes_bytes = body.split_to(indexes_len);
+
+    let mut indexes_buf = PooledBuffer::with_capacity(indexes_len);
+    indexes_buf.put_slice(indexes_bytes.as_ref());
+    let indexes = IggyIndexesMut::from_bytes(indexes_buf, 0);
+
+    let messages_len = body.len();
+    let mut messages = PooledBuffer::with_capacity(messages_len);
+    messages.put_slice(body.as_ref());
+
+    Some(IggyMessagesBatchMut::from_indexes_and_messages(
+        indexes, messages,
+    ))
+}
 
 /// Partition-level data plane operations.
 ///
@@ -36,7 +75,7 @@ pub use types::{
 pub trait Partition {
     fn append_messages(
         &mut self,
-        batch: IggyMessagesBatchMut,
+        message: Message<PrepareHeader>,
     ) -> impl Future<Output = Result<AppendResult, IggyError>>;
 
     fn poll_messages(
@@ -48,6 +87,8 @@ pub trait Partition {
         async { Err(IggyError::FeatureUnavailable) }
     }
 
+    /// # Errors
+    /// Returns `IggyError::FeatureUnavailable` by default.
     fn store_consumer_offset(
         &self,
         consumer: PollingConsumer,

@@ -51,19 +51,19 @@ public sealed class GlobalPermissions
     ///     <para>Additionally, allowed methods:</para>
     ///     <list type="bullet">
     ///         <item>
-    ///             <see cref="Apache.Iggy.IggyClient.IIggyUsers.CreateUser" />
+    ///             <see cref="Apache.Iggy.IggyClient.IIggyUsers.CreateUserAsync" />
     ///         </item>
     ///         <item>
-    ///             <see cref="Apache.Iggy.IggyClient.IIggyUsers.DeleteUser" />
+    ///             <see cref="Apache.Iggy.IggyClient.IIggyUsers.DeleteUserAsync" />
     ///         </item>
     ///         <item>
-    ///             <see cref="Apache.Iggy.IggyClient.IIggyUsers.UpdateUser" />
+    ///             <see cref="Apache.Iggy.IggyClient.IIggyUsers.UpdateUserAsync" />
     ///         </item>
     ///         <item>
-    ///             <see cref="Apache.Iggy.IggyClient.IIggyUsers.UpdatePermissions" />
+    ///             <see cref="Apache.Iggy.IggyClient.IIggyUsers.UpdatePermissionsAsync" />
     ///         </item>
     ///         <item>
-    ///             <see cref="Apache.Iggy.IggyClient.IIggyUsers.ChangePassword" />
+    ///             <see cref="Apache.Iggy.IggyClient.IIggyUsers.ChangePasswordAsync" />
     ///         </item>
     ///     </list>
     /// </summary>
@@ -74,10 +74,10 @@ public sealed class GlobalPermissions
     ///     <para>Allowed methods:</para>
     ///     <list type="bullet">
     ///         <item>
-    ///             <see cref="Apache.Iggy.IggyClient.IIggyUsers.GetUser" />
+    ///             <see cref="Apache.Iggy.IggyClient.IIggyUsers.GetUserAsync" />
     ///         </item>
     ///         <item>
-    ///             <see cref="Apache.Iggy.IggyClient.IIggyUsers.GetUsers" />
+    ///             <see cref="Apache.Iggy.IggyClient.IIggyUsers.GetUsersAsync" />
     ///         </item>
     ///     </list>
     /// </summary>
