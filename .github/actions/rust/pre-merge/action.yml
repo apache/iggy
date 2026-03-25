@@ -146,6 +146,9 @@ runs:
         if command -v cargo-nextest &> /dev/null; then
           cargo nextest run --locked --no-fail-fast $PARTITION_FLAG
         else
+          if [[ -n "$PARTITION_FLAG" ]]; then
+            echo "::error::cargo-nextest not found, falling back to cargo test without partitioning (all tests will run on every partition)"
+          fi
           cargo test --locked --no-fail-fast
         fi
         test_end=$(date +%s)
