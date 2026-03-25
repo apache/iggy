@@ -74,7 +74,7 @@ pub enum BatchMode {
     #[default]
     Individual,
     /// All messages in one request, newline-delimited JSON.
-    Ndjson,
+    NdJson,
     /// All messages as a single JSON array.
     JsonArray,
     /// Raw bytes, one request per message (for non-JSON payloads).
@@ -295,7 +295,7 @@ impl HttpSink {
     fn content_type(&self) -> &'static str {
         match self.batch_mode {
             BatchMode::Individual | BatchMode::JsonArray => "application/json",
-            BatchMode::Ndjson => "application/x-ndjson",
+            BatchMode::NdJson => "application/x-ndjson",
             BatchMode::Raw => "application/octet-stream",
         }
     }
@@ -1136,7 +1136,7 @@ impl Sink for HttpSink {
                 self.send_individual(client, topic_metadata, &messages_metadata, messages)
                     .await
             }
-            BatchMode::Ndjson => {
+            BatchMode::NdJson => {
                 self.send_ndjson(client, topic_metadata, &messages_metadata, messages)
                     .await
             }
@@ -1281,7 +1281,7 @@ mod tests {
             timeout: Some("10s".to_string()),
             max_payload_size_bytes: Some(5000),
             headers: Some(HashMap::from([("X-Key".to_string(), "val".to_string())])),
-            batch_mode: Some(BatchMode::Ndjson),
+            batch_mode: Some(BatchMode::NdJson),
             include_metadata: Some(false),
             include_checksum: Some(true),
             include_origin_timestamp: Some(true),
@@ -1302,7 +1302,7 @@ mod tests {
         assert_eq!(sink.timeout, Duration::from_secs(10));
         assert_eq!(sink.max_payload_size_bytes, 5000);
         assert_eq!(sink.headers.len(), 1);
-        assert_eq!(sink.batch_mode, BatchMode::Ndjson);
+        assert_eq!(sink.batch_mode, BatchMode::NdJson);
         assert!(!sink.include_metadata);
         assert!(sink.include_checksum);
         assert!(sink.include_origin_timestamp);
@@ -1407,7 +1407,7 @@ mod tests {
     fn given_batch_mode_should_serialize_as_snake_case() {
         let cases = [
             (BatchMode::Individual, "\"individual\""),
-            (BatchMode::Ndjson, "\"ndjson\""),
+            (BatchMode::NdJson, "\"nd_json\""),
             (BatchMode::JsonArray, "\"json_array\""),
             (BatchMode::Raw, "\"raw\""),
         ];
@@ -1424,7 +1424,7 @@ mod tests {
     fn given_batch_mode_should_return_correct_content_type() {
         let cases = [
             (BatchMode::Individual, "application/json"),
-            (BatchMode::Ndjson, "application/x-ndjson"),
+            (BatchMode::NdJson, "application/x-ndjson"),
             (BatchMode::JsonArray, "application/json"),
             (BatchMode::Raw, "application/octet-stream"),
         ];
@@ -1792,7 +1792,7 @@ mod tests {
             method = "PUT"
             timeout = "10s"
             max_payload_size_bytes = 5000
-            batch_mode = "ndjson"
+            batch_mode = "nd_json"
             include_metadata = false
             include_checksum = true
             include_origin_timestamp = true
@@ -1815,7 +1815,7 @@ mod tests {
         let config: HttpSinkConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.url, "https://example.com/api");
         assert_eq!(config.method, Some(HttpMethod::Put));
-        assert_eq!(config.batch_mode, Some(BatchMode::Ndjson));
+        assert_eq!(config.batch_mode, Some(BatchMode::NdJson));
         assert_eq!(config.max_retries, Some(5));
         assert_eq!(config.success_status_codes, Some(vec![200, 201]));
         let headers = config.headers.unwrap();
