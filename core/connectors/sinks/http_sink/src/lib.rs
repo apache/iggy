@@ -222,20 +222,6 @@ pub struct HttpSink {
     last_success_timestamp: AtomicU64,
 }
 
-/// Parse a human-readable duration string, falling back to a default on failure.
-fn parse_duration(input: Option<&str>, default: &str) -> Duration {
-    let raw = input.unwrap_or(default);
-    HumanDuration::from_str(raw)
-        .map(|d| *d)
-        .unwrap_or_else(|e| {
-            warn!(
-                "Invalid duration '{}': {}, using default '{}'",
-                raw, e, default
-            );
-            *HumanDuration::from_str(default).expect("default duration must be valid")
-        })
-}
-
 impl HttpSink {
     pub fn new(id: u32, config: HttpSinkConfig) -> Self {
         let url = config.url;
@@ -987,6 +973,20 @@ impl HttpSink {
     }
 }
 
+/// Parse a human-readable duration string, falling back to a default on failure.
+fn parse_duration(input: Option<&str>, default: &str) -> Duration {
+    let raw = input.unwrap_or(default);
+    HumanDuration::from_str(raw)
+        .map(|d| *d)
+        .unwrap_or_else(|e| {
+            warn!(
+                "Invalid duration '{}': {}, using default '{}'",
+                raw, e, default
+            );
+            *HumanDuration::from_str(default).expect("default duration must be valid")
+        })
+}
+
 /// Map an `HttpMethod` to a `reqwest::RequestBuilder` for the given URL.
 fn build_request(
     method: HttpMethod,
@@ -1267,71 +1267,6 @@ mod tests {
     const FIELD_ORIGIN_TIMESTAMP: &str = "iggy_origin_timestamp";
     const FIELD_HEADERS: &str = "iggy_headers";
 
-    // ── Test helpers ──────────────────────────────────────────────────
-
-    /// Parse a JSON string into `simd_json::OwnedValue` for test construction.
-    fn simd_json_from_str(s: &str) -> simd_json::OwnedValue {
-        let mut bytes = s.as_bytes().to_vec();
-        simd_json::to_owned_value(&mut bytes).expect("valid JSON for test")
-    }
-
-    fn given_default_config() -> HttpSinkConfig {
-        HttpSinkConfig {
-            url: "https://api.example.com/ingest".to_string(),
-            method: None,
-            timeout: None,
-            max_payload_size_bytes: None,
-            headers: None,
-            batch_mode: None,
-            include_metadata: None,
-            include_checksum: None,
-            include_origin_timestamp: None,
-            health_check_enabled: None,
-            health_check_method: None,
-            max_retries: None,
-            retry_delay: None,
-            retry_backoff_multiplier: None,
-            max_retry_delay: None,
-            success_status_codes: None,
-            tls_danger_accept_invalid_certs: None,
-            max_connections: None,
-            verbose_logging: None,
-        }
-    }
-
-    fn given_sink_with_defaults() -> HttpSink {
-        HttpSink::new(1, given_default_config())
-    }
-
-    fn given_topic_metadata() -> TopicMetadata {
-        TopicMetadata {
-            stream: "test_stream".to_string(),
-            topic: "test_topic".to_string(),
-        }
-    }
-
-    fn given_messages_metadata() -> MessagesMetadata {
-        MessagesMetadata {
-            partition_id: 0,
-            current_offset: 0,
-            schema: Schema::Json,
-        }
-    }
-
-    fn given_json_message(id: u128, offset: u64) -> ConsumedMessage {
-        ConsumedMessage {
-            id,
-            offset,
-            checksum: 12345,
-            timestamp: 1710064800000000,
-            origin_timestamp: 1710064799000000,
-            headers: None,
-            payload: Payload::Json(simd_json_from_str(r#"{"key":"value"}"#)),
-        }
-    }
-
-    // ── Config resolution tests ──────────────────────────────────────
-
     #[test]
     fn given_all_none_config_should_apply_defaults() {
         let sink = given_sink_with_defaults();
@@ -1422,8 +1357,6 @@ mod tests {
         assert_eq!(sink.retry_delay, Duration::from_secs(1));
     }
 
-    // ── Duration parsing tests ───────────────────────────────────────
-
     #[test]
     fn given_valid_duration_strings_should_parse_correctly() {
         let cases = [
@@ -1447,8 +1380,6 @@ mod tests {
     fn given_none_duration_should_use_default() {
         assert_eq!(parse_duration(None, "5s"), Duration::from_secs(5));
     }
-
-    // ── HttpMethod serde tests ───────────────────────────────────────
 
     #[test]
     fn given_http_method_should_serialize_as_uppercase() {
@@ -1487,8 +1418,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── BatchMode serde tests ────────────────────────────────────────
-
     #[test]
     fn given_batch_mode_should_serialize_as_snake_case() {
         let cases = [
@@ -1512,8 +1441,6 @@ mod tests {
         assert_eq!(BatchMode::Raw.to_string(), "raw");
     }
 
-    // ── Content-type tests ───────────────────────────────────────────
-
     #[test]
     fn given_batch_mode_should_return_correct_content_type() {
         let cases = [
@@ -1527,8 +1454,6 @@ mod tests {
             assert_eq!(mode.content_type(), expected);
         }
     }
-
-    // ── UUID formatting tests ────────────────────────────────────────
 
     #[test]
     fn given_zero_id_should_format_as_valid_v8_uuid() {
@@ -1558,8 +1483,6 @@ mod tests {
         assert_eq!(result, "01234567-89ab-8def-8123-456789abcdef");
     }
 
-    // ── Truncation tests ─────────────────────────────────────────────
-
     #[test]
     fn given_short_string_should_return_unchanged() {
         assert_eq!(truncate_response("hello", 10), "hello");
@@ -1578,8 +1501,6 @@ mod tests {
         let result = truncate_response("héllo", 2);
         assert_eq!(result, "h");
     }
-
-    // ── Payload conversion tests ─────────────────────────────────────
 
     #[test]
     fn given_json_payload_should_convert_to_serde_json() {
@@ -1636,8 +1557,6 @@ mod tests {
             general_purpose::STANDARD.encode(b"proto_data")
         );
     }
-
-    // ── Metadata envelope tests ──────────────────────────────────────
 
     #[test]
     fn given_include_metadata_true_should_wrap_payload() {
@@ -1768,8 +1687,6 @@ mod tests {
         );
     }
 
-    // ── Retry delay computation tests ────────────────────────────────
-
     #[test]
     fn given_attempt_zero_should_return_base_delay() {
         let sink = given_sink_with_defaults();
@@ -1794,8 +1711,6 @@ mod tests {
         assert_eq!(sink.compute_retry_delay(10), Duration::from_secs(30));
     }
 
-    // ── Transient status classification tests ────────────────────────
-
     #[test]
     fn given_transient_status_codes_should_return_true() {
         for code in [429, 500, 502, 503, 504] {
@@ -1817,8 +1732,6 @@ mod tests {
             );
         }
     }
-
-    // ── owned_value_to_serde_json conversion tests ───────────────────
 
     #[test]
     fn given_null_value_should_convert_to_null() {
@@ -1869,8 +1782,6 @@ mod tests {
         assert_eq!(result["arr"][0], 1);
         assert_eq!(result["arr"][1], 2);
     }
-
-    // ── Config TOML deserialization tests ─────────────────────────────
 
     #[test]
     fn given_minimal_toml_config_should_deserialize() {
@@ -1940,8 +1851,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── open() validation tests ──────────────────────────────────────
-
     #[tokio::test]
     async fn given_empty_url_should_fail_open() {
         let mut config = given_default_config();
@@ -1997,8 +1906,6 @@ mod tests {
         assert!(sink.client.is_some());
     }
 
-    // ── Batch mode invariant tests ───────────────────────────────────
-
     #[test]
     fn given_raw_mode_with_include_metadata_should_still_use_raw_content_type() {
         let mut config = given_default_config();
@@ -2011,8 +1918,6 @@ mod tests {
         // include_metadata is set but irrelevant in raw mode (warned at construction)
         assert!(sink.include_metadata);
     }
-
-    // ── C1: URL scheme validation tests ─────────────────────────────
 
     #[tokio::test]
     async fn given_file_scheme_url_should_fail_open() {
@@ -2061,8 +1966,6 @@ mod tests {
         let result = sink.open().await;
         assert!(result.is_ok());
     }
-
-    // ── C2: Header validation tests ─────────────────────────────────
 
     #[tokio::test]
     async fn given_invalid_header_name_should_fail_open() {
@@ -2113,8 +2016,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── H1: Content-Type deduplication test ──────────────────────────
-
     #[test]
     fn given_user_content_type_header_should_be_filtered_in_open() {
         // Note: This test validates the Content-Type filter used when building
@@ -2145,8 +2046,6 @@ mod tests {
         );
     }
 
-    // ── M1: compute_retry_delay overflow safety ──────────────────────
-
     #[test]
     fn given_extreme_backoff_config_should_not_panic() {
         let mut config = given_default_config();
@@ -2157,8 +2056,6 @@ mod tests {
         let delay = sink.compute_retry_delay(199);
         assert_eq!(delay, sink.max_retry_delay);
     }
-
-    // ── M2: success_status_codes validation ────────────────────────────
 
     #[tokio::test]
     async fn given_invalid_status_code_should_fail_open() {
@@ -2196,8 +2093,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── T4: consume() before open() test ─────────────────────────────
-
     #[tokio::test]
     async fn given_consume_called_before_open_should_return_init_error() {
         let sink = given_sink_with_defaults();
@@ -2214,5 +2109,65 @@ mod tests {
             "Expected init error: {}",
             err
         );
+    }
+
+    fn simd_json_from_str(s: &str) -> simd_json::OwnedValue {
+        let mut bytes = s.as_bytes().to_vec();
+        simd_json::to_owned_value(&mut bytes).expect("valid JSON for test")
+    }
+
+    fn given_default_config() -> HttpSinkConfig {
+        HttpSinkConfig {
+            url: "https://api.example.com/ingest".to_string(),
+            method: None,
+            timeout: None,
+            max_payload_size_bytes: None,
+            headers: None,
+            batch_mode: None,
+            include_metadata: None,
+            include_checksum: None,
+            include_origin_timestamp: None,
+            health_check_enabled: None,
+            health_check_method: None,
+            max_retries: None,
+            retry_delay: None,
+            retry_backoff_multiplier: None,
+            max_retry_delay: None,
+            success_status_codes: None,
+            tls_danger_accept_invalid_certs: None,
+            max_connections: None,
+            verbose_logging: None,
+        }
+    }
+
+    fn given_sink_with_defaults() -> HttpSink {
+        HttpSink::new(1, given_default_config())
+    }
+
+    fn given_topic_metadata() -> TopicMetadata {
+        TopicMetadata {
+            stream: "test_stream".to_string(),
+            topic: "test_topic".to_string(),
+        }
+    }
+
+    fn given_messages_metadata() -> MessagesMetadata {
+        MessagesMetadata {
+            partition_id: 0,
+            current_offset: 0,
+            schema: Schema::Json,
+        }
+    }
+
+    fn given_json_message(id: u128, offset: u64) -> ConsumedMessage {
+        ConsumedMessage {
+            id,
+            offset,
+            checksum: 12345,
+            timestamp: 1710064800000000,
+            origin_timestamp: 1710064799000000,
+            headers: None,
+            payload: Payload::Json(simd_json_from_str(r#"{"key":"value"}"#)),
+        }
     }
 }
