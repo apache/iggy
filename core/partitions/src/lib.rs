@@ -24,9 +24,9 @@ mod log;
 mod types;
 
 use bytes::{Bytes, BytesMut};
+use iggy_binary_protocol::{Message, PrepareHeader};
 use iggy_common::{
-    INDEX_SIZE, IggyError, IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet,
-    PooledBuffer, header::PrepareHeader, message::Message,
+    INDEX_SIZE, IggyError, IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, PooledBuffer,
 };
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;

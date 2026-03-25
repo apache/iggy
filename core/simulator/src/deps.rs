@@ -16,8 +16,7 @@
 // under the License.
 
 use bytes::Bytes;
-use iggy_common::header::PrepareHeader;
-use iggy_common::message::Message;
+use iggy_binary_protocol::{Message, PrepareHeader};
 use iggy_common::variadic;
 use journal::{Journal, JournalHandle, Storage};
 use metadata::MuxStateMachine;

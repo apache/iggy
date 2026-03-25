@@ -23,12 +23,11 @@ use crate::{
     AppendResult, Partition, PartitionOffsets, PollingArgs, PollingConsumer,
     decode_send_messages_batch,
 };
+use iggy_binary_protocol::{Message, Operation, PrepareHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
     IggyByteSize, IggyError, IggyMessagesBatchMut, IggyMessagesBatchSet, IggyTimestamp,
     PartitionStats, PollingKind,
-    header::{Operation, PrepareHeader},
-    message::Message,
 };
 use journal::Journal as _;
 use std::sync::Arc;

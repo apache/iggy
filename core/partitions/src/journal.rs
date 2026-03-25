@@ -16,11 +16,8 @@
 // under the License.
 
 use bytes::Bytes;
-use iggy_common::{
-    IggyMessagesBatchMut, IggyMessagesBatchSet,
-    header::{Operation, PrepareHeader},
-    message::Message,
-};
+use iggy_binary_protocol::{Message, Operation, PrepareHeader};
+use iggy_common::{IggyMessagesBatchMut, IggyMessagesBatchSet};
 use journal::{Journal, Storage};
 use std::{
     cell::UnsafeCell,
