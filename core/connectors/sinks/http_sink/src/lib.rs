@@ -1202,7 +1202,6 @@ mod tests {
 
     const FIELD_DATA: &str = "data";
     const FIELD_PAYLOAD_ENCODING: &str = "iggy_payload_encoding";
-    const FIELD_HEADER_ENCODING: &str = "iggy_header_encoding";
     const FIELD_METADATA: &str = "metadata";
     const FIELD_PAYLOAD: &str = "payload";
     const FIELD_ID: &str = "iggy_id";
