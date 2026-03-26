@@ -114,8 +114,11 @@ where
     op_to_storage_offset: UnsafeCell<BTreeMap<u64, usize>>,
     /// Maps message offset -> op (for queryable entries)
     offset_to_op: UnsafeCell<BTreeMap<u64, u64>>,
-    /// Maps timestamp -> op (for queryable entries)
-    timestamp_to_op: UnsafeCell<BTreeMap<u64, u64>>,
+    /// Maps `(origin_timestamp, op)` -> op (for queryable entries).
+    ///
+    /// Keeping `op` in the key preserves duplicate timestamps while still
+    /// letting us seek to the closest batch for timestamp-based polling.
+    timestamp_to_op: UnsafeCell<BTreeMap<(u64, u64), u64>>,
     headers: UnsafeCell<Vec<PrepareHeader>>,
     inner: UnsafeCell<JournalInner<S>>,
 }
@@ -154,6 +157,11 @@ where
 }
 
 impl PartitionJournalMemStorage {
+    fn entries(&self) -> Vec<JournalBuffer> {
+        let entries = unsafe { &*self.entries.get() };
+        entries.clone()
+    }
+
     fn drain(&self) -> Vec<JournalBuffer> {
         let entries = unsafe { &mut *self.entries.get() };
         let offset_to_index = unsafe { &mut *self.offset_to_index.get() };
@@ -172,6 +180,11 @@ impl PartitionJournalMemStorage {
 }
 
 impl PartitionJournal<PartitionJournalMemStorage> {
+    pub fn entries(&self) -> Vec<JournalBuffer> {
+        let inner = unsafe { &*self.inner.get() };
+        inner.storage.entries()
+    }
+
     /// Drain all accumulated batches, matching the legacy `PartitionJournal` API.
     pub fn commit(&self) -> Vec<JournalBuffer> {
         let entries = {
@@ -214,11 +227,22 @@ where
             }
             MessageLookup::Timestamp { timestamp, .. } => {
                 let timestamp_to_op = unsafe { &*self.timestamp_to_op.get() };
+                let next_at_or_after = timestamp_to_op
+                    .range((*timestamp, 0)..)
+                    .next()
+                    .map(|(key, op)| (*key, *op));
+
+                if let Some(((candidate_timestamp, _), op)) = next_at_or_after
+                    && candidate_timestamp == *timestamp
+                {
+                    return Some(op);
+                }
+
                 timestamp_to_op
-                    .range(..=*timestamp)
+                    .range(..(*timestamp, 0))
                     .next_back()
-                    .or_else(|| timestamp_to_op.range(*timestamp..).next())
                     .map(|(_, op)| *op)
+                    .or_else(|| next_at_or_after.map(|(_, op)| op))
             }
         }
     }
@@ -344,10 +368,8 @@ where
             decode_prepare_slice(entry.as_slice())
                 .ok()
                 .and_then(|batch| {
-                    batch.message_count().ok().and_then(|count| {
-                        (count != 0)
-                            .then_some((batch.header.base_offset, batch.header.base_timestamp))
-                    })
+                    (batch.message_count() != 0)
+                        .then_some((batch.header.base_offset, batch.header.origin_timestamp))
                 })
         } else {
             None
@@ -373,7 +395,7 @@ where
             offset_to_op.insert(offset, op);
 
             let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
-            timestamp_to_op.insert(timestamp, op);
+            timestamp_to_op.insert((timestamp, op), op);
         }
     }
 
@@ -407,13 +429,8 @@ fn select_batch_slice(
     already_matched: u32,
 ) -> Option<SelectedBatchSlice> {
     let remaining = query.count().saturating_sub(already_matched);
-    let batch_message_count = batch.message_count().ok()?;
+    let batch_message_count = batch.message_count();
     if remaining == 0 || batch_message_count == 0 {
-        return None;
-    }
-
-    if matches!(query, MessageLookup::Timestamp { timestamp, .. } if batch.header.base_timestamp < timestamp)
-    {
         return None;
     }
 
@@ -430,7 +447,10 @@ fn select_batch_slice(
                 offset: query_offset,
                 ..
             } => offset >= query_offset,
-            MessageLookup::Timestamp { .. } => true,
+            MessageLookup::Timestamp { timestamp, .. } => {
+                batch.header.origin_timestamp + u64::from(record.message.header.timestamp_delta)
+                    >= timestamp
+            }
         };
         if !selected {
             continue;

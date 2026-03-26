@@ -27,12 +27,14 @@ pub struct IggyIndexWriter {
     file_path: String,
     file: File,
     index_size_bytes: Rc<AtomicU64>,
+    fsync: bool,
 }
 
 impl IggyIndexWriter {
     pub async fn new(
         file_path: &str,
         index_size_bytes: Rc<AtomicU64>,
+        fsync: bool,
         file_exists: bool,
     ) -> Result<Self, IggyError> {
         let mut opts = OpenOptions::new();
@@ -64,6 +66,7 @@ impl IggyIndexWriter {
             file_path: file_path.to_owned(),
             file,
             index_size_bytes,
+            fsync,
         })
     }
 
@@ -84,7 +87,9 @@ impl IggyIndexWriter {
         self.index_size_bytes
             .fetch_add(len as u64, Ordering::Release);
 
-        self.fsync().await?;
+        if self.fsync {
+            self.fsync().await?;
+        }
 
         trace!("Saved {len} sparse index bytes to file: {}", self.file_path);
         Ok(())

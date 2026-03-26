@@ -384,6 +384,10 @@ pub enum IggyError {
     InvalidMessagesSize(u32, u32) = 4036,
     #[error("Too small message: {0}B, expected: {1}B")]
     TooSmallMessage(u32, u32) = 4037,
+    #[error("Invalid message timestamp delta: {0} microseconds exceeds the per-batch limit")]
+    InvalidMessageTimestampDelta(u64) = 4038,
+    #[error("Invalid batch checksum: {0}, expected: {1}, for base offset: {2}")]
+    InvalidBatchChecksum(u64, u64, u64) = 4039,
     #[error("Cannot sed messages due to client disconnection")]
     CannotSendMessagesDueToClientDisconnection = 4050,
     #[error("Background send error")]

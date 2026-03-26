@@ -15,16 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{INDEX_SIZE, IggyError, calculate_checksum, random_id, sharding::IggyNamespace};
-use bytes::{BufMut, Bytes, BytesMut};
+use crate::{INDEX_SIZE, IggyError, random_id, sharding::IggyNamespace};
+use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::{Message, PrepareHeader, RequestHeader};
 use iobuf::Owned;
+use std::hash::Hasher;
+use twox_hash::XxHash3_64;
 
 const MESSAGE_ALIGN: usize = 4096;
 pub const COMMAND_HEADER_SIZE: usize = 256;
 pub const PREPARE_SPLIT_POINT: usize = 512;
 const MESSAGE_HEADER_SIZE: usize = 48;
 const LEGACY_MESSAGE_HEADER_SIZE: usize = 64;
+const BATCH_CHECKSUM_OFFSET: usize = 40;
+const MESSAGE_COUNT_OFFSET: usize = 48;
+const MAX_TIMESTAMP_DELTA_MICROS: u64 = u32::MAX as u64;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SendMessages2Header {
@@ -33,16 +38,25 @@ pub struct SendMessages2Header {
     pub base_timestamp: u64,
     pub origin_timestamp: u64,
     pub batch_length: u64,
+    pub batch_checksum: u64,
+    pub message_count: u32,
 }
 
 impl SendMessages2Header {
-    pub const fn new(partition_id: u64, origin_timestamp: u64, batch_length: u64) -> Self {
+    pub const fn new(
+        partition_id: u64,
+        origin_timestamp: u64,
+        batch_length: u64,
+        message_count: u32,
+    ) -> Self {
         Self {
             partition_id,
             base_offset: 0,
             base_timestamp: 0,
             origin_timestamp,
             batch_length,
+            batch_checksum: 0,
+            message_count,
         }
     }
 
@@ -62,6 +76,8 @@ impl SendMessages2Header {
             base_timestamp: read_u64(bytes, 16)?,
             origin_timestamp: read_u64(bytes, 24)?,
             batch_length,
+            batch_checksum: read_u64(bytes, BATCH_CHECKSUM_OFFSET)?,
+            message_count: read_u32(bytes, MESSAGE_COUNT_OFFSET)?,
         })
     }
 
@@ -73,6 +89,10 @@ impl SendMessages2Header {
         bytes[16..24].copy_from_slice(&self.base_timestamp.to_le_bytes());
         bytes[24..32].copy_from_slice(&self.origin_timestamp.to_le_bytes());
         bytes[32..40].copy_from_slice(&self.batch_length.to_le_bytes());
+        bytes[BATCH_CHECKSUM_OFFSET..BATCH_CHECKSUM_OFFSET + 8]
+            .copy_from_slice(&self.batch_checksum.to_le_bytes());
+        bytes[MESSAGE_COUNT_OFFSET..MESSAGE_COUNT_OFFSET + 4]
+            .copy_from_slice(&self.message_count.to_le_bytes());
     }
 
     pub fn total_size(&self) -> usize {
@@ -134,8 +154,12 @@ impl SendMessages2Owned {
             let timestamp_delta = legacy
                 .origin_timestamp
                 .checked_sub(origin_timestamp)
-                .and_then(|delta| u32::try_from(delta).ok())
                 .ok_or(IggyError::InvalidCommand)?;
+            if timestamp_delta > MAX_TIMESTAMP_DELTA_MICROS {
+                return Err(IggyError::InvalidMessageTimestampDelta(timestamp_delta));
+            }
+            let timestamp_delta =
+                u32::try_from(timestamp_delta).map_err(|_| IggyError::InvalidCommand)?;
             let user_headers_length =
                 u32::try_from(legacy.user_headers.len()).map_err(|_| IggyError::InvalidCommand)?;
             let payload_length =
@@ -158,12 +182,14 @@ impl SendMessages2Owned {
         }
 
         let blob = blob.freeze();
-        let header = SendMessages2Header::new(
+        let mut header = SendMessages2Header::new(
             namespace.partition_id() as u64,
             origin_timestamp,
             u64::try_from(COMMAND_HEADER_SIZE + blob.len())
                 .map_err(|_| IggyError::InvalidCommand)?,
+            message_count,
         );
+        header.batch_checksum = calculate_batch_checksum(&header, &blob);
 
         Ok(Self { header, blob })
     }
@@ -304,8 +330,8 @@ impl<'a> SendMessages2Ref<'a> {
         self.blob
     }
 
-    pub fn message_count(&self) -> Result<u32, IggyError> {
-        count_messages_blob(self.blob)
+    pub const fn message_count(&self) -> u32 {
+        self.header.message_count
     }
 }
 
@@ -315,6 +341,10 @@ pub struct SendMessages2MessageHeader {
     pub checksum: u64,
     pub id: u128,
     pub offset_delta: u32,
+    /// Microsecond delta from `SendMessages2Header::origin_timestamp`.
+    ///
+    /// This is stored in `u32`, which limits a single batch to roughly
+    /// 71.6 minutes of origin timestamp span.
     pub timestamp_delta: u32,
     pub user_headers_length: u32,
     pub payload_length: u32,
@@ -480,10 +510,17 @@ pub fn decode_prepare_slice(bytes: &[u8]) -> Result<SendMessages2Ref<'_>, IggyEr
         return Err(IggyError::InvalidCommand);
     }
 
-    Ok(SendMessages2Ref {
-        header,
-        blob: &blob[..blob_len],
-    })
+    let blob = &blob[..blob_len];
+    let expected_checksum = calculate_batch_checksum(&header, blob);
+    if header.batch_checksum != expected_checksum {
+        return Err(IggyError::InvalidBatchChecksum(
+            header.batch_checksum,
+            expected_checksum,
+            header.base_offset,
+        ));
+    }
+
+    Ok(SendMessages2Ref { header, blob })
 }
 
 pub fn stamp_prepare_for_persistence(
@@ -498,13 +535,14 @@ pub fn stamp_prepare_for_persistence(
     }
 
     let header_offset = std::mem::size_of::<PrepareHeader>();
-    let header_bytes = &mut bytes[header_offset..header_offset + COMMAND_HEADER_SIZE];
-    let mut command = SendMessages2Header::decode(header_bytes)?;
+    let mut command =
+        SendMessages2Header::decode(&bytes[header_offset..header_offset + COMMAND_HEADER_SIZE])?;
     command.base_offset = base_offset;
     command.base_timestamp = base_timestamp;
-    command.encode_into(header_bytes);
-    let message_count = count_messages_blob(&bytes[PREPARE_SPLIT_POINT..total_size])?;
-    Ok((message, command, message_count))
+    let blob = &bytes[PREPARE_SPLIT_POINT..total_size];
+    command.batch_checksum = calculate_batch_checksum(&command, blob);
+    command.encode_into(&mut bytes[header_offset..header_offset + COMMAND_HEADER_SIZE]);
+    Ok((message, command, command.message_count))
 }
 
 fn legacy_messages_slice(body: &[u8]) -> Result<(u32, &[u8]), IggyError> {
@@ -575,29 +613,23 @@ impl<'a> LegacyMessageRef<'a> {
 }
 
 fn calculate_checksum_parts(header_tail: &[u8], user_headers: &[u8], payload: &[u8]) -> u64 {
-    let mut bytes = BytesMut::with_capacity(header_tail.len() + user_headers.len() + payload.len());
-    bytes.put_slice(header_tail);
-    bytes.put_slice(user_headers);
-    bytes.put_slice(payload);
-    calculate_checksum(&bytes.freeze())
+    let mut hasher = XxHash3_64::new();
+    hasher.write(header_tail);
+    hasher.write(user_headers);
+    hasher.write(payload);
+    hasher.finish()
 }
 
-fn count_messages_blob(blob: &[u8]) -> Result<u32, IggyError> {
-    let mut count = 0u32;
-    let mut position = 0usize;
-
-    while position < blob.len() {
-        let header = SendMessages2MessageHeader::decode(&blob[position..])?;
-        position = position
-            .checked_add(header.total_size())
-            .ok_or(IggyError::InvalidCommand)?;
-        if position > blob.len() {
-            return Err(IggyError::InvalidCommand);
-        }
-        count = count.checked_add(1).ok_or(IggyError::InvalidCommand)?;
-    }
-
-    Ok(count)
+fn calculate_batch_checksum(header: &SendMessages2Header, blob: &[u8]) -> u64 {
+    let mut hasher = XxHash3_64::new();
+    hasher.write(&header.partition_id.to_le_bytes());
+    hasher.write(&header.base_offset.to_le_bytes());
+    hasher.write(&header.base_timestamp.to_le_bytes());
+    hasher.write(&header.origin_timestamp.to_le_bytes());
+    hasher.write(&header.batch_length.to_le_bytes());
+    hasher.write(&header.message_count.to_le_bytes());
+    hasher.write(blob);
+    hasher.finish()
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, IggyError> {

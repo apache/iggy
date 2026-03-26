@@ -100,11 +100,7 @@ impl Partition for IggyPartition {
         let batch_messages_size =
             u32::try_from(batch.total_size()).map_err(|_| IggyError::CannotAppendMessage)?;
 
-        let last_dirty_offset = if batch_messages_count == 0 {
-            dirty_offset
-        } else {
-            dirty_offset + u64::from(batch_messages_count) - 1
-        };
+        let last_dirty_offset = dirty_offset + u64::from(batch_messages_count) - 1;
 
         if !self.should_increment_offset {
             self.should_increment_offset = true;
@@ -142,7 +138,7 @@ impl Partition for IggyPartition {
             return Ok((PollFragments::new(), None));
         }
 
-        let write_offset = self.dirty_offset.load(Ordering::Relaxed);
+        let write_offset = self.offset.load(Ordering::Relaxed);
 
         let result = match args.strategy.kind {
             PollingKind::Timestamp => {
