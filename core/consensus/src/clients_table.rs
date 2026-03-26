@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::header::ReplyHeader;
-use iggy_common::message::Message;
+use iggy_binary_protocol::{Message, ReplyHeader};
 use std::collections::HashMap;
 
 /// Per-client entry in the clients table (VR paper Section 4, Figure 2).
@@ -148,7 +147,7 @@ impl ClientsTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_common::header::{Command2, Operation};
+    use iggy_binary_protocol::{Command2, Operation};
 
     fn make_reply(request: u64) -> Message<ReplyHeader> {
         let header_size = std::mem::size_of::<ReplyHeader>();
