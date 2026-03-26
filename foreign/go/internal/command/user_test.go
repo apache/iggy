@@ -108,6 +108,39 @@ func TestUpdatePermissions_MarshalBinary_NilPermissions(t *testing.T) {
 	}
 }
 
+func TestUpdatePermissions_MarshalBinary_WithPermissions(t *testing.T) {
+	userId, _ := iggcon.NewIdentifier(uint32(1))
+
+	perms := &iggcon.Permissions{
+		Global: iggcon.GlobalPermissions{
+			ManageServers: true,
+			ReadServers:   true,
+		},
+	}
+
+	request := UpdatePermissions{
+		UserID:      userId,
+		Permissions: perms,
+	}
+
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if serialized[len(serialized)-1] == 0 && len(serialized) <= 8 {
+		t.Fatalf("expected permission bytes in output, got only %d bytes", len(serialized))
+	}
+
+	// The userId (numeric 1) is 6 bytes, then 1 byte has_permissions=1,
+	// then 4 bytes permission length, then the permission bytes.
+	idBytes, _ := userId.MarshalBinary()
+	pos := len(idBytes)
+	if serialized[pos] != 1 {
+		t.Fatalf("expected has_permissions=1, got %d", serialized[pos])
+	}
+}
+
 func TestChangePassword_MarshalBinary(t *testing.T) {
 	userId, _ := iggcon.NewIdentifier(uint32(1))
 

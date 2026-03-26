@@ -67,8 +67,8 @@ func newTestClient(response []byte) (*IggyTcpClient, func()) {
 	}()
 
 	cleanup := func() {
-		clientConn.Close()
-		serverConn.Close()
+		_ = clientConn.Close()
+		_ = serverConn.Close()
 		<-done
 	}
 	return client, cleanup
@@ -620,17 +620,17 @@ func TestGetClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetClient() error: %v", err)
 	}
-	if info.ClientInfo.ID != 42 {
-		t.Fatalf("expected client id=42, got %d", info.ClientInfo.ID)
+	if info.ID != 42 {
+		t.Fatalf("expected client id=42, got %d", info.ID)
 	}
-	if info.ClientInfo.UserID != 7 {
-		t.Fatalf("expected userId=7, got %d", info.ClientInfo.UserID)
+	if info.UserID != 7 {
+		t.Fatalf("expected userId=7, got %d", info.UserID)
 	}
-	if info.ClientInfo.Address != "192.168.1.1:5000" {
-		t.Fatalf("expected address='192.168.1.1:5000', got '%s'", info.ClientInfo.Address)
+	if info.Address != "192.168.1.1:5000" {
+		t.Fatalf("expected address='192.168.1.1:5000', got '%s'", info.Address)
 	}
-	if info.ClientInfo.Transport != string(iggcon.Tcp) {
-		t.Fatalf("expected transport='tcp', got '%s'", info.ClientInfo.Transport)
+	if info.Transport != string(iggcon.Tcp) {
+		t.Fatalf("expected transport='tcp', got '%s'", info.Transport)
 	}
 }
 
@@ -804,8 +804,8 @@ func TestGetConsumerGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.ConsumerGroup.Name != "cg-1" {
-		t.Fatalf("expected name 'cg-1', got '%s'", result.ConsumerGroup.Name)
+	if result.Name != "cg-1" {
+		t.Fatalf("expected name 'cg-1', got '%s'", result.Name)
 	}
 }
 
@@ -919,8 +919,8 @@ func newMultiResponseTestClient(responses [][]byte) (*IggyTcpClient, func()) {
 	}()
 
 	cleanup := func() {
-		clientConn.Close()
-		serverConn.Close()
+		_ = clientConn.Close()
+		_ = serverConn.Close()
 		<-done
 	}
 	return client, cleanup
@@ -994,8 +994,8 @@ func TestGetUser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetUser() unexpected error: %v", err)
 	}
-	if result.UserInfo.Username != "admin" {
-		t.Fatalf("expected username 'admin', got '%s'", result.UserInfo.Username)
+	if result.Username != "admin" {
+		t.Fatalf("expected username 'admin', got '%s'", result.Username)
 	}
 }
 
@@ -1052,8 +1052,8 @@ func TestCreateUser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateUser() unexpected error: %v", err)
 	}
-	if result.UserInfo.Username != "newuser" {
-		t.Fatalf("expected 'newuser', got '%s'", result.UserInfo.Username)
+	if result.Username != "newuser" {
+		t.Fatalf("expected 'newuser', got '%s'", result.Username)
 	}
 }
 
@@ -1184,8 +1184,8 @@ func TestWriteError(t *testing.T) {
 		conn:  clientConn,
 		state: iggcon.StateConnected,
 	}
-	clientConn.Close()
-	serverConn.Close()
+	_ = clientConn.Close()
+	_ = serverConn.Close()
 
 	_, err := client.sendAndFetchResponse([]byte{0}, command.PingCode)
 	if err == nil {

@@ -71,20 +71,20 @@ func TestDeserializeStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Stream.Id != 1 {
-		t.Fatalf("expected stream id 1, got %d", result.Stream.Id)
+	if result.Id != 1 {
+		t.Fatalf("expected stream id 1, got %d", result.Id)
 	}
-	if result.Stream.Name != "stream" {
-		t.Fatalf("expected stream name 'stream', got '%s'", result.Stream.Name)
+	if result.Name != "stream" {
+		t.Fatalf("expected stream name 'stream', got '%s'", result.Name)
 	}
-	if result.Stream.CreatedAt != 100 {
-		t.Fatalf("expected createdAt 100, got %d", result.Stream.CreatedAt)
+	if result.CreatedAt != 100 {
+		t.Fatalf("expected createdAt 100, got %d", result.CreatedAt)
 	}
-	if result.Stream.SizeBytes != 2048 {
-		t.Fatalf("expected sizeBytes 2048, got %d", result.Stream.SizeBytes)
+	if result.SizeBytes != 2048 {
+		t.Fatalf("expected sizeBytes 2048, got %d", result.SizeBytes)
 	}
-	if result.Stream.MessagesCount != 10 {
-		t.Fatalf("expected messagesCount 10, got %d", result.Stream.MessagesCount)
+	if result.MessagesCount != 10 {
+		t.Fatalf("expected messagesCount 10, got %d", result.MessagesCount)
 	}
 	if len(result.Topics) != 1 {
 		t.Fatalf("expected 1 topic, got %d", len(result.Topics))
@@ -142,17 +142,17 @@ func TestDeserializeTopic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.Topic.Name != "mytopic" {
-		t.Fatalf("expected topic name 'mytopic', got '%s'", result.Topic.Name)
+	if result.Name != "mytopic" {
+		t.Fatalf("expected topic name 'mytopic', got '%s'", result.Name)
 	}
-	if result.Topic.Id != 1 {
-		t.Fatalf("expected topic id 1, got %d", result.Topic.Id)
+	if result.Id != 1 {
+		t.Fatalf("expected topic id 1, got %d", result.Id)
 	}
-	if result.Topic.Size != 1024 {
-		t.Fatalf("expected topic size 1024, got %d", result.Topic.Size)
+	if result.Size != 1024 {
+		t.Fatalf("expected topic size 1024, got %d", result.Size)
 	}
-	if result.Topic.MessagesCount != 5 {
-		t.Fatalf("expected messagesCount 5, got %d", result.Topic.MessagesCount)
+	if result.MessagesCount != 5 {
+		t.Fatalf("expected messagesCount 5, got %d", result.MessagesCount)
 	}
 	if len(result.Partitions) != 1 {
 		t.Fatalf("expected 1 partition, got %d", len(result.Partitions))
@@ -197,17 +197,17 @@ func TestDeserializeConsumerGroup_WithMembers(t *testing.T) {
 	binary.LittleEndian.PutUint32(payload[pos:], 2)
 
 	result := DeserializeConsumerGroup(payload)
-	if result.ConsumerGroup.Name != "grp-1" {
-		t.Fatalf("expected group name 'grp-1', got '%s'", result.ConsumerGroup.Name)
+	if result.Name != "grp-1" {
+		t.Fatalf("expected group name 'grp-1', got '%s'", result.Name)
 	}
-	if result.ConsumerGroup.Id != 1 {
-		t.Fatalf("expected group id 1, got %d", result.ConsumerGroup.Id)
+	if result.Id != 1 {
+		t.Fatalf("expected group id 1, got %d", result.Id)
 	}
-	if result.ConsumerGroup.PartitionsCount != 2 {
-		t.Fatalf("expected partitionsCount 2, got %d", result.ConsumerGroup.PartitionsCount)
+	if result.PartitionsCount != 2 {
+		t.Fatalf("expected partitionsCount 2, got %d", result.PartitionsCount)
 	}
-	if result.ConsumerGroup.MembersCount != 1 {
-		t.Fatalf("expected membersCount 1, got %d", result.ConsumerGroup.MembersCount)
+	if result.MembersCount != 1 {
+		t.Fatalf("expected membersCount 1, got %d", result.MembersCount)
 	}
 	if len(result.Members) != 1 {
 		t.Fatalf("expected 1 member, got %d", len(result.Members))
@@ -256,14 +256,14 @@ func TestDeserializeUser_WithPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.UserInfo.Username != "admin" {
-		t.Fatalf("expected username 'admin', got '%s'", result.UserInfo.Username)
+	if result.Username != "admin" {
+		t.Fatalf("expected username 'admin', got '%s'", result.Username)
 	}
-	if result.UserInfo.Id != 42 {
-		t.Fatalf("expected user id 42, got %d", result.UserInfo.Id)
+	if result.Id != 42 {
+		t.Fatalf("expected user id 42, got %d", result.Id)
 	}
-	if result.UserInfo.CreatedAt != 999 {
-		t.Fatalf("expected createdAt 999, got %d", result.UserInfo.CreatedAt)
+	if result.CreatedAt != 999 {
+		t.Fatalf("expected createdAt 999, got %d", result.CreatedAt)
 	}
 	if result.Permissions == nil {
 		t.Fatalf("expected permissions to be non-nil")
@@ -323,11 +323,11 @@ func TestDeserializeUser_WithoutPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result.UserInfo.Username != "admin" {
-		t.Fatalf("expected username 'admin', got '%s'", result.UserInfo.Username)
+	if result.Username != "admin" {
+		t.Fatalf("expected username 'admin', got '%s'", result.Username)
 	}
-	if result.UserInfo.Id != 42 {
-		t.Fatalf("expected user id 42, got %d", result.UserInfo.Id)
+	if result.Id != 42 {
+		t.Fatalf("expected user id 42, got %d", result.Id)
 	}
 	if result.Permissions != nil {
 		t.Fatalf("expected permissions to be nil, got %+v", result.Permissions)
@@ -363,20 +363,20 @@ func TestDeserializeClient_WithConsumerGroups(t *testing.T) {
 	binary.LittleEndian.PutUint32(payload[pos:], 3)
 
 	result := DeserializeClient(payload)
-	if result.ClientInfo.ID != 1 {
-		t.Fatalf("expected client id 1, got %d", result.ClientInfo.ID)
+	if result.ID != 1 {
+		t.Fatalf("expected client id 1, got %d", result.ID)
 	}
-	if result.ClientInfo.UserID != 2 {
-		t.Fatalf("expected user id 2, got %d", result.ClientInfo.UserID)
+	if result.UserID != 2 {
+		t.Fatalf("expected user id 2, got %d", result.UserID)
 	}
-	if result.ClientInfo.Transport != "tcp" {
-		t.Fatalf("expected transport 'tcp', got '%s'", result.ClientInfo.Transport)
+	if result.Transport != "tcp" {
+		t.Fatalf("expected transport 'tcp', got '%s'", result.Transport)
 	}
-	if result.ClientInfo.Address != "127.0.0.1:8090" {
-		t.Fatalf("expected address '127.0.0.1:8090', got '%s'", result.ClientInfo.Address)
+	if result.Address != "127.0.0.1:8090" {
+		t.Fatalf("expected address '127.0.0.1:8090', got '%s'", result.Address)
 	}
-	if result.ClientInfo.ConsumerGroupsCount != 1 {
-		t.Fatalf("expected consumerGroupsCount 1, got %d", result.ClientInfo.ConsumerGroupsCount)
+	if result.ConsumerGroupsCount != 1 {
+		t.Fatalf("expected consumerGroupsCount 1, got %d", result.ConsumerGroupsCount)
 	}
 	// make([]ConsumerGroupInfo, 1) pre-fills one zero entry, then append adds the real one
 	if len(result.ConsumerGroups) != 2 {
