@@ -77,7 +77,6 @@ wait_for_completed_job() {
 wait_for_ingress_validation() {
   local retries=30
   local sleep_seconds=4
-  local attempt
   local probe_file
 
   probe_file="$(mktemp "${TMPDIR:-/tmp}/ingress-nginx-probe.XXXXXX.yaml")"
@@ -103,7 +102,7 @@ spec:
                   number: 80
 EOF
 
-  for attempt in $(seq 1 "$retries"); do
+  for _ in $(seq 1 "$retries"); do
     if kubectl apply --dry-run=server -f "$probe_file" >/dev/null 2>&1; then
       rm -f "$probe_file"
       return 0
