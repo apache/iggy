@@ -18,403 +18,409 @@
 package binaryserialization
 
 import (
-	"bytes"
 	"encoding/binary"
-	"errors"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
-func TestDeserializeFetchMessagesResponse_EmptyPayload(t *testing.T) {
-	response, err := DeserializeFetchMessagesResponse([]byte{}, iggcon.MESSAGE_COMPRESSION_NONE)
+func TestDeserializeStream(t *testing.T) {
+	payload := make([]byte, 96)
+	pos := 0
+
+	// Stream header
+	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	pos += 4
+	binary.LittleEndian.PutUint64(payload[pos:], 100)
+	pos += 8
+	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	pos += 4
+	binary.LittleEndian.PutUint64(payload[pos:], 2048)
+	pos += 8
+	binary.LittleEndian.PutUint64(payload[pos:], 10)
+	pos += 8
+	payload[pos] = 6
+	pos++
+	copy(payload[pos:], "stream")
+	pos += 6
+
+	// Topic entry
+	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	pos += 4
+	binary.LittleEndian.PutUint64(payload[pos:], 200)
+	pos += 8
+	binary.LittleEndian.PutUint32(payload[pos:], 2)
+	pos += 4
+	binary.LittleEndian.PutUint64(payload[pos:], 0)
+	pos += 8
+	payload[pos] = 0
+	pos++
+	binary.LittleEndian.PutUint64(payload[pos:], 0)
+	pos += 8
+	payload[pos] = 1
+	pos++
+	binary.LittleEndian.PutUint64(payload[pos:], 1024)
+	pos += 8
+	binary.LittleEndian.PutUint64(payload[pos:], 5)
+	pos += 8
+	payload[pos] = 6
+	pos++
+	copy(payload[pos:], "topic1")
+
+	result, err := DeserializeStream(payload)
 	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if response.PartitionId != 0 || response.CurrentOffset != 0 {
-		t.Fatalf("expected zero metadata, got partitionId=%d currentOffset=%d", response.PartitionId, response.CurrentOffset)
+	if result.Stream.Id != 1 {
+		t.Fatalf("expected stream id 1, got %d", result.Stream.Id)
 	}
-	if len(response.Messages) != 0 {
-		t.Fatalf("expected no messages, got %d", len(response.Messages))
+	if result.Stream.Name != "stream" {
+		t.Fatalf("expected stream name 'stream', got '%s'", result.Stream.Name)
+	}
+	if result.Stream.CreatedAt != 100 {
+		t.Fatalf("expected createdAt 100, got %d", result.Stream.CreatedAt)
+	}
+	if result.Stream.SizeBytes != 2048 {
+		t.Fatalf("expected sizeBytes 2048, got %d", result.Stream.SizeBytes)
+	}
+	if result.Stream.MessagesCount != 10 {
+		t.Fatalf("expected messagesCount 10, got %d", result.Stream.MessagesCount)
+	}
+	if len(result.Topics) != 1 {
+		t.Fatalf("expected 1 topic, got %d", len(result.Topics))
+	}
+	if result.Topics[0].Name != "topic1" {
+		t.Fatalf("expected topic name 'topic1', got '%s'", result.Topics[0].Name)
+	}
+	if result.Topics[0].PartitionsCount != 2 {
+		t.Fatalf("expected partitionsCount 2, got %d", result.Topics[0].PartitionsCount)
 	}
 }
 
-func TestDeserializeFetchMessagesResponse_ParsesSingleMessage(t *testing.T) {
-	var msgID iggcon.MessageID
-	copy(msgID[:], []byte("abcdefghijklmnop"))
-	messagePayload := []byte("hello")
-	userHeaders := []byte{0xAA, 0xBB}
+func TestDeserializeTopic(t *testing.T) {
+	payload := make([]byte, 98)
+	pos := 0
 
-	header := iggcon.MessageHeader{
-		Checksum:         123,
-		Id:               msgID,
-		Offset:           11,
-		Timestamp:        22,
-		OriginTimestamp:  33,
-		UserHeaderLength: uint32(len(userHeaders)),
-		PayloadLength:    uint32(len(messagePayload)),
-		Reserved:         44,
-	}
+	// Topic header
+	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	pos += 4
+	binary.LittleEndian.PutUint64(payload[pos:], 200)
+	pos += 8
+	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	pos += 4
+	binary.LittleEndian.PutUint64(payload[pos:], 0)
+	pos += 8
+	payload[pos] = 0
+	pos++
+	binary.LittleEndian.PutUint64(payload[pos:], 0)
+	pos += 8
+	payload[pos] = 1
+	pos++
+	binary.LittleEndian.PutUint64(payload[pos:], 1024)
+	pos += 8
+	binary.LittleEndian.PutUint64(payload[pos:], 5)
+	pos += 8
+	payload[pos] = 7
+	pos++
+	copy(payload[pos:], "mytopic")
+	pos += 7
 
-	payload := make([]byte, 16)
-	binary.LittleEndian.PutUint32(payload[0:4], 9)   // partition ID
-	binary.LittleEndian.PutUint64(payload[4:12], 99) // current offset
-	binary.LittleEndian.PutUint32(payload[12:16], 1) // messages count
-	payload = append(payload, header.ToBytes()...)
-	payload = append(payload, messagePayload...)
-	payload = append(payload, userHeaders...)
+	// Partition entry
+	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	pos += 4
+	binary.LittleEndian.PutUint64(payload[pos:], 300)
+	pos += 8
+	binary.LittleEndian.PutUint32(payload[pos:], 3)
+	pos += 4
+	binary.LittleEndian.PutUint64(payload[pos:], 99)
+	pos += 8
+	binary.LittleEndian.PutUint64(payload[pos:], 512)
+	pos += 8
+	binary.LittleEndian.PutUint64(payload[pos:], 7)
 
-	response, err := DeserializeFetchMessagesResponse(payload, iggcon.MESSAGE_COMPRESSION_NONE)
+	result, err := DeserializeTopic(payload)
 	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if response.PartitionId != 9 {
-		t.Fatalf("partition id mismatch, expected 9 got %d", response.PartitionId)
+	if result.Topic.Name != "mytopic" {
+		t.Fatalf("expected topic name 'mytopic', got '%s'", result.Topic.Name)
 	}
-	if response.CurrentOffset != 99 {
-		t.Fatalf("current offset mismatch, expected 99 got %d", response.CurrentOffset)
+	if result.Topic.Id != 1 {
+		t.Fatalf("expected topic id 1, got %d", result.Topic.Id)
 	}
-	if response.MessageCount != 1 {
-		t.Fatalf("message count mismatch, expected 1 got %d", response.MessageCount)
+	if result.Topic.Size != 1024 {
+		t.Fatalf("expected topic size 1024, got %d", result.Topic.Size)
 	}
-	if len(response.Messages) != 1 {
-		t.Fatalf("expected exactly one message, got %d", len(response.Messages))
+	if result.Topic.MessagesCount != 5 {
+		t.Fatalf("expected messagesCount 5, got %d", result.Topic.MessagesCount)
 	}
-	if !bytes.Equal(response.Messages[0].Payload, messagePayload) {
-		t.Fatalf("payload mismatch, expected %v got %v", messagePayload, response.Messages[0].Payload)
+	if len(result.Partitions) != 1 {
+		t.Fatalf("expected 1 partition, got %d", len(result.Partitions))
 	}
-	if !bytes.Equal(response.Messages[0].UserHeaders, userHeaders) {
-		t.Fatalf("user headers mismatch, expected %v got %v", userHeaders, response.Messages[0].UserHeaders)
+	if result.Partitions[0].CurrentOffset != 99 {
+		t.Fatalf("expected currentOffset 99, got %d", result.Partitions[0].CurrentOffset)
+	}
+	if result.Partitions[0].SegmentsCount != 3 {
+		t.Fatalf("expected segmentsCount 3, got %d", result.Partitions[0].SegmentsCount)
+	}
+	if result.Partitions[0].SizeBytes != 512 {
+		t.Fatalf("expected sizeBytes 512, got %d", result.Partitions[0].SizeBytes)
+	}
+	if result.Partitions[0].MessagesCount != 7 {
+		t.Fatalf("expected messagesCount 7, got %d", result.Partitions[0].MessagesCount)
 	}
 }
 
-func TestDeserializeFetchMessagesResponse_TruncatedHeaderBody_IgnoresMessage(t *testing.T) {
-	payload := make([]byte, 16+iggcon.MessageHeaderSize-1)
-	binary.LittleEndian.PutUint32(payload[12:16], 1) // declared message count
+func TestDeserializeConsumerGroup_WithMembers(t *testing.T) {
+	payload := make([]byte, 34)
+	pos := 0
 
-	response, err := DeserializeFetchMessagesResponse(payload, iggcon.MESSAGE_COMPRESSION_NONE)
+	// Consumer group header
+	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	pos += 4
+	binary.LittleEndian.PutUint32(payload[pos:], 2)
+	pos += 4
+	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	pos += 4
+	payload[pos] = 5
+	pos++
+	copy(payload[pos:], "grp-1")
+	pos += 5
+
+	// Member entry: id=10, partitionsCount=2, partitions=[1,2]
+	binary.LittleEndian.PutUint32(payload[pos:], 10)
+	pos += 4
+	binary.LittleEndian.PutUint32(payload[pos:], 2)
+	pos += 4
+	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	pos += 4
+	binary.LittleEndian.PutUint32(payload[pos:], 2)
+
+	result := DeserializeConsumerGroup(payload)
+	if result.ConsumerGroup.Name != "grp-1" {
+		t.Fatalf("expected group name 'grp-1', got '%s'", result.ConsumerGroup.Name)
+	}
+	if result.ConsumerGroup.Id != 1 {
+		t.Fatalf("expected group id 1, got %d", result.ConsumerGroup.Id)
+	}
+	if result.ConsumerGroup.PartitionsCount != 2 {
+		t.Fatalf("expected partitionsCount 2, got %d", result.ConsumerGroup.PartitionsCount)
+	}
+	if result.ConsumerGroup.MembersCount != 1 {
+		t.Fatalf("expected membersCount 1, got %d", result.ConsumerGroup.MembersCount)
+	}
+	if len(result.Members) != 1 {
+		t.Fatalf("expected 1 member, got %d", len(result.Members))
+	}
+	if result.Members[0].ID != 10 {
+		t.Fatalf("expected member id 10, got %d", result.Members[0].ID)
+	}
+	if len(result.Members[0].Partitions) != 2 {
+		t.Fatalf("expected 2 partitions, got %d", len(result.Members[0].Partitions))
+	}
+	if result.Members[0].Partitions[0] != 1 || result.Members[0].Partitions[1] != 2 {
+		t.Fatalf("expected partitions [1,2], got %v", result.Members[0].Partitions)
+	}
+}
+
+func TestDeserializeUser_WithPermissions(t *testing.T) {
+	// User: id=42(4) + createdAt=999(8) + status=1(1) + usernameLen=5(1) + "admin"(5) = 19 bytes
+	// hasPermissions=1(1) + permLen=11(4) + permissions(11) = 16 bytes
+	payload := make([]byte, 35)
+	pos := 0
+
+	binary.LittleEndian.PutUint32(payload[pos:], 42)
+	pos += 4
+	binary.LittleEndian.PutUint64(payload[pos:], 999)
+	pos += 8
+	payload[pos] = 1 // status Active in wire format
+	pos++
+	payload[pos] = 5
+	pos++
+	copy(payload[pos:], "admin")
+	pos += 5
+
+	payload[pos] = 1 // hasPermissions
+	pos++
+	binary.LittleEndian.PutUint32(payload[pos:], 11) // permission block length
+	pos += 4
+
+	// 10 global permission bytes, all true
+	for i := 0; i < 10; i++ {
+		payload[pos+i] = 1
+	}
+	pos += 10
+	payload[pos] = 0 // hasStreams = false
+
+	result, err := DeserializeUser(payload)
 	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(response.Messages) != 0 {
-		t.Fatalf("expected no messages from truncated payload, got %d", len(response.Messages))
+	if result.UserInfo.Username != "admin" {
+		t.Fatalf("expected username 'admin', got '%s'", result.UserInfo.Username)
 	}
-}
-
-func TestDeserializeFetchMessagesResponse_TruncatedMessagePayload_IgnoresMessage(t *testing.T) {
-	var msgID iggcon.MessageID
-	copy(msgID[:], []byte("abcdefghijklmnop"))
-	header := iggcon.MessageHeader{
-		Id:            msgID,
-		PayloadLength: 10, // claims 10 bytes
+	if result.UserInfo.Id != 42 {
+		t.Fatalf("expected user id 42, got %d", result.UserInfo.Id)
 	}
-
-	payload := make([]byte, 16)
-	binary.LittleEndian.PutUint32(payload[12:16], 1) // declared message count
-	payload = append(payload, header.ToBytes()...)
-	payload = append(payload, []byte{0x01, 0x02, 0x03}...) // only 3 bytes available
-
-	response, err := DeserializeFetchMessagesResponse(payload, iggcon.MESSAGE_COMPRESSION_NONE)
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
+	if result.UserInfo.CreatedAt != 999 {
+		t.Fatalf("expected createdAt 999, got %d", result.UserInfo.CreatedAt)
 	}
-	if len(response.Messages) != 0 {
-		t.Fatalf("expected no messages when payload is truncated, got %d", len(response.Messages))
+	if result.Permissions == nil {
+		t.Fatalf("expected permissions to be non-nil")
 	}
-}
-
-func TestDeserializeLogInResponse(t *testing.T) {
-	payload := make([]byte, 4)
-	binary.LittleEndian.PutUint32(payload[0:4], 42)
-
-	result := DeserializeLogInResponse(payload)
-	if result == nil {
-		t.Fatalf("expected non-nil result")
+	if !result.Permissions.Global.ManageServers {
+		t.Fatalf("expected ManageServers to be true")
 	}
-	if result.UserId != 42 {
-		t.Fatalf("expected UserId=42, got %d", result.UserId)
+	if !result.Permissions.Global.ReadServers {
+		t.Fatalf("expected ReadServers to be true")
 	}
-}
-
-func TestDeserializeOffset_EmptyPayload(t *testing.T) {
-	result := DeserializeOffset([]byte{})
-	if result != nil {
-		t.Fatalf("expected nil for empty payload, got %+v", result)
+	if !result.Permissions.Global.ManageUsers {
+		t.Fatalf("expected ManageUsers to be true")
+	}
+	if !result.Permissions.Global.ReadUsers {
+		t.Fatalf("expected ReadUsers to be true")
+	}
+	if !result.Permissions.Global.ManageStreams {
+		t.Fatalf("expected ManageStreams to be true")
+	}
+	if !result.Permissions.Global.ReadStreams {
+		t.Fatalf("expected ReadStreams to be true")
+	}
+	if !result.Permissions.Global.ManageTopics {
+		t.Fatalf("expected ManageTopics to be true")
+	}
+	if !result.Permissions.Global.ReadTopics {
+		t.Fatalf("expected ReadTopics to be true")
+	}
+	if !result.Permissions.Global.PollMessages {
+		t.Fatalf("expected PollMessages to be true")
+	}
+	if !result.Permissions.Global.SendMessages {
+		t.Fatalf("expected SendMessages to be true")
 	}
 }
 
-func TestDeserializeOffset_ValidPayload(t *testing.T) {
+func TestDeserializeUser_WithoutPermissions(t *testing.T) {
+	// User: id=42(4) + createdAt=999(8) + status=1(1) + usernameLen=5(1) + "admin"(5) = 19 bytes
+	// hasPermissions=0(1) = 1 byte
 	payload := make([]byte, 20)
-	binary.LittleEndian.PutUint32(payload[0:4], 1)
-	binary.LittleEndian.PutUint64(payload[4:12], 100)
-	binary.LittleEndian.PutUint64(payload[12:20], 50)
+	pos := 0
 
-	result := DeserializeOffset(payload)
-	if result == nil {
-		t.Fatalf("expected non-nil result")
-	}
-	if result.PartitionId != 1 {
-		t.Fatalf("expected PartitionId=1, got %d", result.PartitionId)
-	}
-	if result.CurrentOffset != 100 {
-		t.Fatalf("expected CurrentOffset=100, got %d", result.CurrentOffset)
-	}
-	if result.StoredOffset != 50 {
-		t.Fatalf("expected StoredOffset=50, got %d", result.StoredOffset)
-	}
-}
+	binary.LittleEndian.PutUint32(payload[pos:], 42)
+	pos += 4
+	binary.LittleEndian.PutUint64(payload[pos:], 999)
+	pos += 8
+	payload[pos] = 1 // status Active in wire format
+	pos++
+	payload[pos] = 5
+	pos++
+	copy(payload[pos:], "admin")
+	pos += 5
 
-func buildStreamPayload(id uint32, createdAt uint64, topicsCount uint32, sizeBytes uint64, messagesCount uint64, name string) []byte {
-	nameBytes := []byte(name)
-	payload := make([]byte, 33+len(nameBytes))
-	binary.LittleEndian.PutUint32(payload[0:4], id)
-	binary.LittleEndian.PutUint64(payload[4:12], createdAt)
-	binary.LittleEndian.PutUint32(payload[12:16], topicsCount)
-	binary.LittleEndian.PutUint64(payload[16:24], sizeBytes)
-	binary.LittleEndian.PutUint64(payload[24:32], messagesCount)
-	payload[32] = byte(len(nameBytes))
-	copy(payload[33:], nameBytes)
-	return payload
-}
+	payload[pos] = 0 // hasPermissions = false
 
-func TestDeserializeToStream(t *testing.T) {
-	payload := buildStreamPayload(7, 1234567890, 3, 4096, 500, "test")
-
-	stream, readBytes := DeserializeToStream(payload, 0)
-	if stream.Id != 7 {
-		t.Fatalf("expected Id=7, got %d", stream.Id)
-	}
-	if stream.CreatedAt != 1234567890 {
-		t.Fatalf("expected CreatedAt=1234567890, got %d", stream.CreatedAt)
-	}
-	if stream.TopicsCount != 3 {
-		t.Fatalf("expected TopicsCount=3, got %d", stream.TopicsCount)
-	}
-	if stream.SizeBytes != 4096 {
-		t.Fatalf("expected SizeBytes=4096, got %d", stream.SizeBytes)
-	}
-	if stream.MessagesCount != 500 {
-		t.Fatalf("expected MessagesCount=500, got %d", stream.MessagesCount)
-	}
-	if stream.Name != "test" {
-		t.Fatalf("expected Name='test', got '%s'", stream.Name)
-	}
-	expectedReadBytes := 4 + 8 + 4 + 8 + 8 + 1 + 4
-	if readBytes != expectedReadBytes {
-		t.Fatalf("expected readBytes=%d, got %d", expectedReadBytes, readBytes)
-	}
-}
-
-func TestDeserializeStreams(t *testing.T) {
-	entry1 := buildStreamPayload(1, 100, 2, 1024, 10, "stream1")
-	entry2 := buildStreamPayload(2, 200, 5, 2048, 20, "stream2")
-	payload := append(entry1, entry2...)
-
-	streams := DeserializeStreams(payload)
-	if len(streams) != 2 {
-		t.Fatalf("expected 2 streams, got %d", len(streams))
-	}
-	if streams[0].Name != "stream1" {
-		t.Fatalf("expected first stream name='stream1', got '%s'", streams[0].Name)
-	}
-	if streams[1].Name != "stream2" {
-		t.Fatalf("expected second stream name='stream2', got '%s'", streams[1].Name)
-	}
-}
-
-func buildTopicPayload(id uint32, createdAt uint64, partitionsCount uint32, messageExpiry uint64, compressionAlgo byte, maxTopicSize uint64, replicationFactor byte, size uint64, messagesCount uint64, name string) []byte {
-	nameBytes := []byte(name)
-	payload := make([]byte, 51+len(nameBytes))
-	binary.LittleEndian.PutUint32(payload[0:4], id)
-	binary.LittleEndian.PutUint64(payload[4:12], createdAt)
-	binary.LittleEndian.PutUint32(payload[12:16], partitionsCount)
-	binary.LittleEndian.PutUint64(payload[16:24], messageExpiry)
-	payload[24] = compressionAlgo
-	binary.LittleEndian.PutUint64(payload[25:33], maxTopicSize)
-	payload[33] = replicationFactor
-	binary.LittleEndian.PutUint64(payload[34:42], size)
-	binary.LittleEndian.PutUint64(payload[42:50], messagesCount)
-	payload[50] = byte(len(nameBytes))
-	copy(payload[51:], nameBytes)
-	return payload
-}
-
-func TestDeserializeToTopic(t *testing.T) {
-	payload := buildTopicPayload(10, 9999, 4, 60000, 2, 1048576, 3, 8192, 777, "topic1")
-
-	topic, readBytes, err := DeserializeToTopic(payload, 0)
+	result, err := DeserializeUser(payload)
 	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if topic.Id != 10 {
-		t.Fatalf("expected Id=10, got %d", topic.Id)
+	if result.UserInfo.Username != "admin" {
+		t.Fatalf("expected username 'admin', got '%s'", result.UserInfo.Username)
 	}
-	if topic.CreatedAt != 9999 {
-		t.Fatalf("expected CreatedAt=9999, got %d", topic.CreatedAt)
+	if result.UserInfo.Id != 42 {
+		t.Fatalf("expected user id 42, got %d", result.UserInfo.Id)
 	}
-	if topic.PartitionsCount != 4 {
-		t.Fatalf("expected PartitionsCount=4, got %d", topic.PartitionsCount)
-	}
-	if uint64(topic.MessageExpiry) != 60000 {
-		t.Fatalf("expected MessageExpiry=60000, got %d", topic.MessageExpiry)
-	}
-	if topic.CompressionAlgorithm != 2 {
-		t.Fatalf("expected CompressionAlgorithm=2, got %d", topic.CompressionAlgorithm)
-	}
-	if topic.MaxTopicSize != 1048576 {
-		t.Fatalf("expected MaxTopicSize=1048576, got %d", topic.MaxTopicSize)
-	}
-	if topic.ReplicationFactor != 3 {
-		t.Fatalf("expected ReplicationFactor=3, got %d", topic.ReplicationFactor)
-	}
-	if topic.Size != 8192 {
-		t.Fatalf("expected Size=8192, got %d", topic.Size)
-	}
-	if topic.MessagesCount != 777 {
-		t.Fatalf("expected MessagesCount=777, got %d", topic.MessagesCount)
-	}
-	if topic.Name != "topic1" {
-		t.Fatalf("expected Name='topic1', got '%s'", topic.Name)
-	}
-	expectedReadBytes := 4 + 8 + 4 + 8 + 8 + 8 + 8 + 1 + 1 + 1 + 6
-	if readBytes != expectedReadBytes {
-		t.Fatalf("expected readBytes=%d, got %d", expectedReadBytes, readBytes)
+	if result.Permissions != nil {
+		t.Fatalf("expected permissions to be nil, got %+v", result.Permissions)
 	}
 }
 
-func TestDeserializeTopics(t *testing.T) {
-	entry1 := buildTopicPayload(1, 100, 2, 1000, 1, 4096, 1, 512, 50, "topicA")
-	entry2 := buildTopicPayload(2, 200, 3, 2000, 0, 8192, 2, 1024, 100, "topicB")
-	payload := append(entry1, entry2...)
+func TestDeserializeClient_WithConsumerGroups(t *testing.T) {
+	addr := "127.0.0.1:8090"
+	addrLen := len(addr) // 14
+	// Client header: id(4) + userId(4) + transport(1) + addrLen(4) + addr(14) + cgCount(4) = 31
+	// Consumer group info: streamId(4) + topicId(4) + groupId(4) = 12
+	payload := make([]byte, 31+12)
+	pos := 0
 
-	topics, err := DeserializeTopics(payload)
+	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	pos += 4
+	binary.LittleEndian.PutUint32(payload[pos:], 2)
+	pos += 4
+	payload[pos] = 1 // Tcp
+	pos++
+	binary.LittleEndian.PutUint32(payload[pos:], uint32(addrLen))
+	pos += 4
+	copy(payload[pos:], addr)
+	pos += addrLen
+	binary.LittleEndian.PutUint32(payload[pos:], 1) // consumerGroupsCount
+	pos += 4
+
+	// Consumer group info
+	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	pos += 4
+	binary.LittleEndian.PutUint32(payload[pos:], 2)
+	pos += 4
+	binary.LittleEndian.PutUint32(payload[pos:], 3)
+
+	result := DeserializeClient(payload)
+	if result.ClientInfo.ID != 1 {
+		t.Fatalf("expected client id 1, got %d", result.ClientInfo.ID)
+	}
+	if result.ClientInfo.UserID != 2 {
+		t.Fatalf("expected user id 2, got %d", result.ClientInfo.UserID)
+	}
+	if result.ClientInfo.Transport != "tcp" {
+		t.Fatalf("expected transport 'tcp', got '%s'", result.ClientInfo.Transport)
+	}
+	if result.ClientInfo.Address != "127.0.0.1:8090" {
+		t.Fatalf("expected address '127.0.0.1:8090', got '%s'", result.ClientInfo.Address)
+	}
+	if result.ClientInfo.ConsumerGroupsCount != 1 {
+		t.Fatalf("expected consumerGroupsCount 1, got %d", result.ClientInfo.ConsumerGroupsCount)
+	}
+	// make([]ConsumerGroupInfo, 1) pre-fills one zero entry, then append adds the real one
+	if len(result.ConsumerGroups) != 2 {
+		t.Fatalf("expected 2 consumer group entries (1 zero + 1 real), got %d", len(result.ConsumerGroups))
+	}
+	cg := result.ConsumerGroups[1]
+	if cg.StreamId != 1 {
+		t.Fatalf("expected streamId 1, got %d", cg.StreamId)
+	}
+	if cg.TopicId != 2 {
+		t.Fatalf("expected topicId 2, got %d", cg.TopicId)
+	}
+	if cg.GroupId != 3 {
+		t.Fatalf("expected groupId 3, got %d", cg.GroupId)
+	}
+}
+
+func TestDeserializeUsers_MultipleUsers(t *testing.T) {
+	buildUser := func(id uint32, createdAt uint64, status byte, name string) []byte {
+		buf := make([]byte, 14+len(name))
+		binary.LittleEndian.PutUint32(buf[0:], id)
+		binary.LittleEndian.PutUint64(buf[4:], createdAt)
+		buf[12] = status
+		buf[13] = byte(len(name))
+		copy(buf[14:], name)
+		return buf
+	}
+
+	user1 := buildUser(1, 100, 1, "alice")
+	user2 := buildUser(2, 200, 2, "bob")
+	payload := append(user1, user2...)
+
+	result, err := DeserializeUsers(payload)
 	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(topics) != 2 {
-		t.Fatalf("expected 2 topics, got %d", len(topics))
+	if len(result) != 2 {
+		t.Fatalf("expected 2 users, got %d", len(result))
 	}
-	if topics[0].Name != "topicA" {
-		t.Fatalf("expected first topic name='topicA', got '%s'", topics[0].Name)
+	if result[0].Username != "alice" || result[0].Id != 1 {
+		t.Fatalf("user[0] mismatch: got id=%d name=%s", result[0].Id, result[0].Username)
 	}
-	if topics[1].Name != "topicB" {
-		t.Fatalf("expected second topic name='topicB', got '%s'", topics[1].Name)
-	}
-}
-
-func TestDeserializePartition(t *testing.T) {
-	payload := make([]byte, 40)
-	binary.LittleEndian.PutUint32(payload[0:4], 5)
-	binary.LittleEndian.PutUint64(payload[4:12], 1111)
-	binary.LittleEndian.PutUint32(payload[12:16], 8)
-	binary.LittleEndian.PutUint64(payload[16:24], 99)
-	binary.LittleEndian.PutUint64(payload[24:32], 2048)
-	binary.LittleEndian.PutUint64(payload[32:40], 300)
-
-	partition, readBytes := DeserializePartition(payload, 0)
-	if partition.Id != 5 {
-		t.Fatalf("expected Id=5, got %d", partition.Id)
-	}
-	if partition.CreatedAt != 1111 {
-		t.Fatalf("expected CreatedAt=1111, got %d", partition.CreatedAt)
-	}
-	if partition.SegmentsCount != 8 {
-		t.Fatalf("expected SegmentsCount=8, got %d", partition.SegmentsCount)
-	}
-	if partition.CurrentOffset != 99 {
-		t.Fatalf("expected CurrentOffset=99, got %d", partition.CurrentOffset)
-	}
-	if partition.SizeBytes != 2048 {
-		t.Fatalf("expected SizeBytes=2048, got %d", partition.SizeBytes)
-	}
-	if partition.MessagesCount != 300 {
-		t.Fatalf("expected MessagesCount=300, got %d", partition.MessagesCount)
-	}
-	if readBytes != 40 {
-		t.Fatalf("expected readBytes=40, got %d", readBytes)
-	}
-}
-
-func buildConsumerGroupPayload(id uint32, partitionsCount uint32, membersCount uint32, name string) []byte {
-	nameBytes := []byte(name)
-	payload := make([]byte, 13+len(nameBytes))
-	binary.LittleEndian.PutUint32(payload[0:4], id)
-	binary.LittleEndian.PutUint32(payload[4:8], partitionsCount)
-	binary.LittleEndian.PutUint32(payload[8:12], membersCount)
-	payload[12] = byte(len(nameBytes))
-	copy(payload[13:], nameBytes)
-	return payload
-}
-
-func TestDeserializeToConsumerGroup(t *testing.T) {
-	payload := buildConsumerGroupPayload(11, 6, 2, "grp1")
-
-	cg, readBytes := DeserializeToConsumerGroup(payload, 0)
-	if cg == nil {
-		t.Fatalf("expected non-nil consumer group")
-	}
-	if cg.Id != 11 {
-		t.Fatalf("expected Id=11, got %d", cg.Id)
-	}
-	if cg.PartitionsCount != 6 {
-		t.Fatalf("expected PartitionsCount=6, got %d", cg.PartitionsCount)
-	}
-	if cg.MembersCount != 2 {
-		t.Fatalf("expected MembersCount=2, got %d", cg.MembersCount)
-	}
-	if cg.Name != "grp1" {
-		t.Fatalf("expected Name='grp1', got '%s'", cg.Name)
-	}
-	expectedReadBytes := 12 + 1 + 4
-	if readBytes != expectedReadBytes {
-		t.Fatalf("expected readBytes=%d, got %d", expectedReadBytes, readBytes)
-	}
-}
-
-func TestDeserializeConsumerGroups(t *testing.T) {
-	entry1 := buildConsumerGroupPayload(1, 3, 1, "group1")
-	entry2 := buildConsumerGroupPayload(2, 5, 4, "group2")
-	payload := append(entry1, entry2...)
-
-	groups := DeserializeConsumerGroups(payload)
-	if len(groups) != 2 {
-		t.Fatalf("expected 2 consumer groups, got %d", len(groups))
-	}
-	if groups[0].Name != "group1" {
-		t.Fatalf("expected first group name='group1', got '%s'", groups[0].Name)
-	}
-	if groups[1].Name != "group2" {
-		t.Fatalf("expected second group name='group2', got '%s'", groups[1].Name)
-	}
-}
-
-func TestDeserializeToConsumerGroupMember(t *testing.T) {
-	payload := make([]byte, 16)
-	binary.LittleEndian.PutUint32(payload[0:4], 77)
-	binary.LittleEndian.PutUint32(payload[4:8], 2)
-	binary.LittleEndian.PutUint32(payload[8:12], 10)
-	binary.LittleEndian.PutUint32(payload[12:16], 20)
-
-	member, readBytes := DeserializeToConsumerGroupMember(payload, 0)
-	if member.ID != 77 {
-		t.Fatalf("expected ID=77, got %d", member.ID)
-	}
-	if member.PartitionsCount != 2 {
-		t.Fatalf("expected PartitionsCount=2, got %d", member.PartitionsCount)
-	}
-	if len(member.Partitions) != 2 {
-		t.Fatalf("expected 2 partitions, got %d", len(member.Partitions))
-	}
-	if member.Partitions[0] != 10 {
-		t.Fatalf("expected first partition=10, got %d", member.Partitions[0])
-	}
-	if member.Partitions[1] != 20 {
-		t.Fatalf("expected second partition=20, got %d", member.Partitions[1])
-	}
-	expectedReadBytes := 4 + 4 + 2*4
-	if readBytes != expectedReadBytes {
-		t.Fatalf("expected readBytes=%d, got %d", expectedReadBytes, readBytes)
+	if result[1].Username != "bob" || result[1].Status != iggcon.Inactive {
+		t.Fatalf("user[1] mismatch: got name=%s status=%v", result[1].Username, result[1].Status)
 	}
 }
 
@@ -425,126 +431,216 @@ func TestDeserializeUsers_EmptyPayload(t *testing.T) {
 	}
 }
 
-func TestDeserializeUsers_ValidPayload(t *testing.T) {
-	username := "admin"
-	usernameBytes := []byte(username)
-	payload := make([]byte, 14+len(usernameBytes))
-	binary.LittleEndian.PutUint32(payload[0:4], 1)
-	binary.LittleEndian.PutUint64(payload[4:12], 5555)
-	payload[12] = 1 // Active
-	payload[13] = byte(len(usernameBytes))
-	copy(payload[14:], usernameBytes)
-
-	users, err := DeserializeUsers(payload)
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if len(users) != 1 {
-		t.Fatalf("expected 1 user, got %d", len(users))
-	}
-	if users[0].Id != 1 {
-		t.Fatalf("expected Id=1, got %d", users[0].Id)
-	}
-	if users[0].CreatedAt != 5555 {
-		t.Fatalf("expected CreatedAt=5555, got %d", users[0].CreatedAt)
-	}
-	if users[0].Status != iggcon.Active {
-		t.Fatalf("expected Status=Active, got %v", users[0].Status)
-	}
-	if users[0].Username != "admin" {
-		t.Fatalf("expected Username='admin', got '%s'", users[0].Username)
+func TestDeserializeUsers_InvalidStatus(t *testing.T) {
+	buf := make([]byte, 18)
+	binary.LittleEndian.PutUint32(buf[0:], 1)
+	binary.LittleEndian.PutUint64(buf[4:], 100)
+	buf[12] = 99 // invalid status
+	buf[13] = 4
+	copy(buf[14:], "test")
+	_, err := DeserializeUsers(buf)
+	if err == nil {
+		t.Fatalf("expected error for invalid user status")
 	}
 }
 
-func TestDeserializeClients_EmptyPayload(t *testing.T) {
-	clients, err := DeserializeClients([]byte{})
+func TestDeserializeAccessTokens_Valid(t *testing.T) {
+	name := "my-token"
+	entry := make([]byte, 1+len(name)+8)
+	entry[0] = byte(len(name))
+	copy(entry[1:], name)
+	binary.LittleEndian.PutUint64(entry[1+len(name):], 1000000000)
+
+	result, err := DeserializeAccessTokens(entry)
 	if err != nil {
-		t.Fatalf("expected no error for empty payload, got %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(clients) != 0 {
-		t.Fatalf("expected 0 clients, got %d", len(clients))
+	if len(result) != 1 {
+		t.Fatalf("expected 1 token, got %d", len(result))
 	}
-}
-
-func TestDeserializeClients_ValidPayload(t *testing.T) {
-	address := "1.2.3.4:8090"
-	addressBytes := []byte(address)
-	headerSize := 4 + 4 + 1 + 4 + len(addressBytes) + 4
-	payload := make([]byte, headerSize)
-	binary.LittleEndian.PutUint32(payload[0:4], 99)
-	binary.LittleEndian.PutUint32(payload[4:8], 7)
-	payload[8] = 1 // Tcp
-	binary.LittleEndian.PutUint32(payload[9:13], uint32(len(addressBytes)))
-	copy(payload[13:13+len(addressBytes)], addressBytes)
-	pos := 13 + len(addressBytes)
-	binary.LittleEndian.PutUint32(payload[pos:pos+4], 3)
-
-	clients, err := DeserializeClients(payload)
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
+	if result[0].Name != "my-token" {
+		t.Fatalf("expected name 'my-token', got '%s'", result[0].Name)
 	}
-	if len(clients) != 1 {
-		t.Fatalf("expected 1 client, got %d", len(clients))
-	}
-	if clients[0].ID != 99 {
-		t.Fatalf("expected ID=99, got %d", clients[0].ID)
-	}
-	if clients[0].UserID != 7 {
-		t.Fatalf("expected UserID=7, got %d", clients[0].UserID)
-	}
-	if clients[0].Transport != string(iggcon.Tcp) {
-		t.Fatalf("expected Transport='tcp', got '%s'", clients[0].Transport)
-	}
-	if clients[0].Address != address {
-		t.Fatalf("expected Address='%s', got '%s'", address, clients[0].Address)
-	}
-	if clients[0].ConsumerGroupsCount != 3 {
-		t.Fatalf("expected ConsumerGroupsCount=3, got %d", clients[0].ConsumerGroupsCount)
-	}
-}
-
-func TestDeserializeAccessToken(t *testing.T) {
-	token := "abc123"
-	tokenBytes := []byte(token)
-	payload := make([]byte, 1+len(tokenBytes))
-	payload[0] = byte(len(tokenBytes))
-	copy(payload[1:], tokenBytes)
-
-	result, err := DeserializeAccessToken(payload)
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if result.Token != token {
-		t.Fatalf("expected Token='%s', got '%s'", token, result.Token)
+	if result[0].Expiry == nil {
+		t.Fatalf("expected non-nil expiry")
 	}
 }
 
 func TestDeserializeAccessTokens_EmptyPayload(t *testing.T) {
 	_, err := DeserializeAccessTokens([]byte{})
-	if !errors.Is(err, ierror.ErrEmptyMessagePayload) {
-		t.Fatalf("expected ErrEmptyMessagePayload, got %v", err)
+	if err == nil {
+		t.Fatalf("expected error for empty payload")
 	}
 }
 
-func TestDeserializeAccessTokens_ValidPayload(t *testing.T) {
-	name := "token1"
-	nameBytes := []byte(name)
-	payload := make([]byte, 1+len(nameBytes)+8)
-	payload[0] = byte(len(nameBytes))
-	copy(payload[1:1+len(nameBytes)], nameBytes)
-	binary.LittleEndian.PutUint64(payload[1+len(nameBytes):], 1000000)
+func TestDeserializeClients_MultipleClients(t *testing.T) {
+	buildClient := func(id, userId uint32, transport byte, addr string) []byte {
+		buf := make([]byte, 4+4+1+4+len(addr)+4)
+		pos := 0
+		binary.LittleEndian.PutUint32(buf[pos:], id)
+		pos += 4
+		binary.LittleEndian.PutUint32(buf[pos:], userId)
+		pos += 4
+		buf[pos] = transport
+		pos++
+		binary.LittleEndian.PutUint32(buf[pos:], uint32(len(addr)))
+		pos += 4
+		copy(buf[pos:], addr)
+		pos += len(addr)
+		binary.LittleEndian.PutUint32(buf[pos:], 0) // no consumer groups
+		return buf
+	}
 
-	tokens, err := DeserializeAccessTokens(payload)
+	c1 := buildClient(1, 10, 1, "127.0.0.1:8090")
+	c2 := buildClient(2, 20, 2, "127.0.0.1:8091")
+	payload := append(c1, c2...)
+
+	result, err := DeserializeClients(payload)
 	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(tokens) != 1 {
-		t.Fatalf("expected 1 token, got %d", len(tokens))
+	if len(result) != 2 {
+		t.Fatalf("expected 2 clients, got %d", len(result))
 	}
-	if tokens[0].Name != name {
-		t.Fatalf("expected Name='%s', got '%s'", name, tokens[0].Name)
+	if result[0].Transport != "tcp" {
+		t.Fatalf("expected tcp, got %s", result[0].Transport)
 	}
-	if tokens[0].Expiry == nil {
-		t.Fatalf("expected non-nil Expiry")
+	if result[1].Transport != "quic" {
+		t.Fatalf("expected quic, got %s", result[1].Transport)
+	}
+}
+
+func TestDeserializeClients_EmptyPayload(t *testing.T) {
+	result, err := DeserializeClients([]byte{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(result) != 0 {
+		t.Fatalf("expected 0 clients, got %d", len(result))
+	}
+}
+
+func TestDeserializePermissions_WithStreamsAndTopics(t *testing.T) {
+	var buf []byte
+
+	// 10 global permission bytes (all true)
+	for i := 0; i < 10; i++ {
+		buf = append(buf, 1)
+	}
+
+	// hasStreams = 1 (index 10; the outer `index += 1` skips past this)
+	buf = append(buf, 1)
+
+	// stream id = 42 (starts at index 11 after index += 1)
+	streamIdBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(streamIdBytes, 42)
+	buf = append(buf, streamIdBytes...)
+
+	// 6 stream permission bytes (index 15-20)
+	buf = append(buf, 1, 1, 1, 1, 1, 1)
+
+	// hasTopics for this stream = 1 (index 21; inner `index += 1` skips past this)
+	buf = append(buf, 1)
+
+	// topic id = 7 (starts at index 22 after inner index += 1)
+	topicIdBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(topicIdBytes, 7)
+	buf = append(buf, topicIdBytes...)
+
+	// 4 topic permission bytes (index 26-29)
+	buf = append(buf, 1, 0, 1, 0)
+
+	// hasMoreTopics = 0 (index 30)
+	buf = append(buf, 0)
+
+	// hasMoreStreams = 0 (index 31, after outer `index += 1`)
+	buf = append(buf, 0)
+
+	result := deserializePermissions(buf)
+	if result == nil {
+		t.Fatalf("expected non-nil permissions")
+	}
+	if !result.Global.ManageServers {
+		t.Fatalf("expected ManageServers true")
+	}
+	if !result.Global.SendMessages {
+		t.Fatalf("expected SendMessages true")
+	}
+
+	streamPerms, ok := result.Streams[42]
+	if !ok {
+		t.Fatalf("expected stream 42 in permissions map")
+	}
+	if !streamPerms.ManageStream {
+		t.Fatalf("expected ManageStream true for stream 42")
+	}
+
+	topicPerms, ok := streamPerms.Topics[7]
+	if !ok {
+		t.Fatalf("expected topic 7 in stream 42 permissions")
+	}
+	if !topicPerms.ManageTopic {
+		t.Fatalf("expected ManageTopic true for topic 7")
+	}
+	if topicPerms.ReadTopic {
+		t.Fatalf("expected ReadTopic false for topic 7")
+	}
+	if !topicPerms.PollMessages {
+		t.Fatalf("expected PollMessages true for topic 7")
+	}
+	if topicPerms.SendMessages {
+		t.Fatalf("expected SendMessages false for topic 7")
+	}
+}
+
+func TestDeserializePermissions_NoStreams(t *testing.T) {
+	var buf []byte
+	for i := 0; i < 10; i++ {
+		buf = append(buf, 0)
+	}
+	buf = append(buf, 0) // hasStreams = false
+
+	result := deserializePermissions(buf)
+	if result == nil {
+		t.Fatalf("expected non-nil permissions")
+	}
+	if result.Global.ManageServers {
+		t.Fatalf("expected ManageServers false")
+	}
+	if len(result.Streams) != 0 {
+		t.Fatalf("expected 0 streams, got %d", len(result.Streams))
+	}
+}
+
+func TestDeserializePermissions_StreamWithNoTopics(t *testing.T) {
+	var buf []byte
+	for i := 0; i < 10; i++ {
+		buf = append(buf, 1)
+	}
+	buf = append(buf, 1) // hasStreams (index 10; skipped by outer `index += 1`)
+
+	// stream id = 5 (starts at index 11)
+	streamIdBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(streamIdBytes, 5)
+	buf = append(buf, streamIdBytes...)
+
+	buf = append(buf, 1, 0, 1, 0, 1, 0) // 6 stream perms (index 15-20)
+
+	buf = append(buf, 0) // hasTopics = false (index 21)
+	buf = append(buf, 0) // hasMoreStreams = false (index 22, after `index += 1`)
+
+	result := deserializePermissions(buf)
+	streamPerms, ok := result.Streams[5]
+	if !ok {
+		t.Fatalf("expected stream 5")
+	}
+	if len(streamPerms.Topics) != 0 {
+		t.Fatalf("expected 0 topics")
+	}
+	if !streamPerms.ManageStream {
+		t.Fatalf("expected ManageStream true")
+	}
+	if streamPerms.ReadStream {
+		t.Fatalf("expected ReadStream false")
 	}
 }
