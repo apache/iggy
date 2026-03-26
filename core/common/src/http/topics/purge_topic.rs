@@ -15,3 +15,28 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
+use crate::Identifier;
+use crate::Validatable;
+use crate::error::IggyError;
+use serde::{Deserialize, Serialize};
+
+/// `PurgeTopic` command is used to purge topic data (its messages in all the partitions) from a stream.
+/// It has additional payload:
+/// - `stream_id` - unique stream ID (numeric or name).
+/// - `topic_id` - unique topic ID (numeric or name).
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
+pub struct PurgeTopic {
+    /// Unique stream ID (numeric or name).
+    #[serde(skip)]
+    pub stream_id: Identifier,
+    /// Unique topic ID (numeric or name).
+    #[serde(skip)]
+    pub topic_id: Identifier,
+}
+
+impl Validatable<IggyError> for PurgeTopic {
+    fn validate(&self) -> Result<(), IggyError> {
+        Ok(())
+    }
+}

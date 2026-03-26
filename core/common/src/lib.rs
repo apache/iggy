@@ -19,9 +19,9 @@
 
 mod alloc;
 mod certificates;
-mod commands;
 mod deduplication;
 mod error;
+pub mod http;
 mod macros;
 mod sender;
 pub mod sharding;
@@ -38,15 +38,15 @@ pub use alloc::buffer::PooledBuffer;
 pub use alloc::memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_pool};
 pub use certificates::generate_self_signed_certificate;
 pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
-pub use commands::consumer_groups::*;
-pub use commands::messages::*;
-pub use commands::partitions::*;
-pub use commands::personal_access_tokens::*;
-pub use commands::segments::*;
-pub use commands::streams::*;
-pub use commands::topics::*;
-pub use commands::users::*;
 pub use deduplication::MessageDeduplicator;
+pub use http::consumer_groups::*;
+pub use http::messages::*;
+pub use http::partitions::*;
+pub use http::personal_access_tokens::*;
+pub use http::segments::*;
+pub use http::streams::*;
+pub use http::topics::*;
+pub use http::users::*;
 pub use sender::{
     QuicSender, Sender, SenderKind, TcpSender, TcpTlsSender, WebSocketSender, WebSocketTlsSender,
 };
@@ -72,7 +72,6 @@ pub use types::args::*;
 pub use types::client::client_info::*;
 pub use types::client_state::ClientState;
 pub use types::cluster::*;
-pub use types::command::*;
 pub use types::compression::compression_algorithm::*;
 pub use types::configuration::auth_config::auto_login::*;
 pub use types::configuration::auth_config::connection_string::*;

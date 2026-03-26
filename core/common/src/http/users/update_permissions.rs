@@ -15,3 +15,28 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
+use crate::Identifier;
+use crate::Permissions;
+use crate::Validatable;
+use crate::error::IggyError;
+use serde::{Deserialize, Serialize};
+
+/// `UpdatePermissions` command is used to update a user's permissions.
+/// It has additional payload:
+/// - `user_id` - unique user ID (numeric or name).
+/// - `permissions` - new permissions (optional)
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
+pub struct UpdatePermissions {
+    /// Unique user ID (numeric or name).
+    #[serde(skip)]
+    pub user_id: Identifier,
+    /// New permissions if `None` is provided, then the existing user's permissions will be removed.
+    pub permissions: Option<Permissions>,
+}
+
+impl Validatable<IggyError> for UpdatePermissions {
+    fn validate(&self) -> Result<(), IggyError> {
+        Ok(())
+    }
+}

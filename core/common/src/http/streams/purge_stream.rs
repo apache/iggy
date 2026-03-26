@@ -15,3 +15,24 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
+use crate::Identifier;
+use crate::Validatable;
+use crate::error::IggyError;
+use serde::{Deserialize, Serialize};
+
+/// `PurgeStream` command is used to purge stream data (all the messages from its topics).
+/// It has additional payload:
+/// - `stream_id` - unique stream ID (numeric or name).
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
+pub struct PurgeStream {
+    /// Unique stream ID (numeric or name).
+    #[serde(skip)]
+    pub stream_id: Identifier,
+}
+
+impl Validatable<IggyError> for PurgeStream {
+    fn validate(&self) -> Result<(), IggyError> {
+        Ok(())
+    }
+}

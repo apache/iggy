@@ -15,3 +15,28 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
+use crate::Identifier;
+use crate::Validatable;
+use crate::error::IggyError;
+use serde::{Deserialize, Serialize};
+
+/// `DeleteTopic` command is used to delete a topic from a stream.
+/// It has additional payload:
+/// - `stream_id` - unique stream ID (numeric or name).
+/// - `topic_id` - unique topic ID (numeric or name).
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
+pub struct DeleteTopic {
+    /// Unique stream ID (numeric or name).
+    #[serde(skip)]
+    pub stream_id: Identifier,
+    /// Unique topic ID (numeric or name).
+    #[serde(skip)]
+    pub topic_id: Identifier,
+}
+
+impl Validatable<IggyError> for DeleteTopic {
+    fn validate(&self) -> Result<(), IggyError> {
+        Ok(())
+    }
+}

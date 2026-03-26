@@ -15,3 +15,24 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
+use crate::Identifier;
+use crate::Validatable;
+use crate::error::IggyError;
+use serde::{Deserialize, Serialize};
+
+/// `DeleteUser` command is used to delete a user by unique ID.
+/// It has additional payload:
+/// - `user_id` - unique user ID (numeric or name).
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
+pub struct DeleteUser {
+    /// Unique user ID (numeric or name).
+    #[serde(skip)]
+    pub user_id: Identifier,
+}
+
+impl Validatable<IggyError> for DeleteUser {
+    fn validate(&self) -> Result<(), IggyError> {
+        Ok(())
+    }
+}

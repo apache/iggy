@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::binary::dispatch::identifier_to_wire_id;
 use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
@@ -27,6 +28,7 @@ use axum::http::StatusCode;
 use axum::routing::delete;
 use axum::{Extension, Router, debug_handler};
 use err_trail::ErrContext;
+use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_common::Identifier;
 use iggy_common::Validatable;
 use iggy_common::delete_segments::DeleteSegments;
@@ -96,13 +98,13 @@ async fn delete_segments(
         _ => unreachable!("Expected DeleteSegments"),
     }
 
-    let command = DeleteSegments {
-        stream_id: query.stream_id.clone(),
-        topic_id: query.topic_id.clone(),
+    let wire_command = DeleteSegmentsRequest {
+        stream_id: identifier_to_wire_id(&query.stream_id)?,
+        topic_id: identifier_to_wire_id(&query.topic_id)?,
         partition_id: query.partition_id,
         segments_count,
     };
-    let entry_command = crate::state::command::EntryCommand::DeleteSegments(command);
+    let entry_command = crate::state::command::EntryCommand::DeleteSegments(wire_command);
     let state_future = SendWrapper::new(
         state
             .shard
