@@ -61,6 +61,64 @@ require_command() {
   fi
 }
 
+wait_for_completed_job() {
+  local job_name="$1"
+
+  if ! kubectl -n ingress-nginx get "job/${job_name}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  kubectl -n ingress-nginx wait \
+    --for=condition=complete \
+    "job/${job_name}" \
+    --timeout="$HELM_SMOKE_INGRESS_NGINX_TIMEOUT"
+}
+
+wait_for_ingress_validation() {
+  local retries=30
+  local sleep_seconds=4
+  local attempt
+  local probe_file
+
+  probe_file="$(mktemp "${TMPDIR:-/tmp}/ingress-nginx-probe.XXXXXX.yaml")"
+
+  cat > "$probe_file" <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ingress-nginx-readiness-probe
+  namespace: ingress-nginx
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: readiness-probe.iggy.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ingress-nginx-controller
+                port:
+                  number: 80
+EOF
+
+  for attempt in $(seq 1 "$retries"); do
+    if kubectl apply --dry-run=server -f "$probe_file" >/dev/null 2>&1; then
+      rm -f "$probe_file"
+      return 0
+    fi
+    sleep "$sleep_seconds"
+  done
+
+  echo "Error: ingress-nginx admission webhook did not become ready in time" >&2
+  if ! kubectl apply --dry-run=server -f "$probe_file"; then
+    rm -f "$probe_file"
+    return 1
+  fi
+  rm -f "$probe_file"
+}
+
 require_command kind
 require_command kubectl
 
@@ -130,3 +188,11 @@ fi
 kubectl config use-context "$kind_context" >/dev/null
 kubectl apply -f "https://raw.githubusercontent.com/kubernetes/ingress-nginx/${HELM_SMOKE_INGRESS_NGINX_VERSION}/deploy/static/provider/kind/deploy.yaml"
 kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout="$HELM_SMOKE_INGRESS_NGINX_TIMEOUT"
+kubectl -n ingress-nginx wait \
+  --for=condition=ready \
+  pod \
+  --selector=app.kubernetes.io/component=controller \
+  --timeout="$HELM_SMOKE_INGRESS_NGINX_TIMEOUT"
+wait_for_completed_job ingress-nginx-admission-create
+wait_for_completed_job ingress-nginx-admission-patch
+wait_for_ingress_validation
