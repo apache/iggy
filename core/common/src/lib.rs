@@ -39,14 +39,11 @@ pub use alloc::memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, mem
 pub use certificates::generate_self_signed_certificate;
 pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
 pub use commands::consumer_groups::*;
-pub use commands::consumer_offsets::*;
 pub use commands::messages::*;
 pub use commands::partitions::*;
 pub use commands::personal_access_tokens::*;
 pub use commands::segments::*;
 pub use commands::streams::*;
-pub use commands::system::get_cluster_metadata::*;
-pub use commands::system::*;
 pub use commands::topics::*;
 pub use commands::users::*;
 pub use deduplication::MessageDeduplicator;

@@ -15,7 +15,3 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
-pub mod delete_consumer_offset;
-pub mod get_consumer_offset;
-pub mod store_consumer_offset;

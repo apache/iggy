@@ -46,10 +46,9 @@ use iggy_common::{
     create_stream::CreateStream, create_topic::CreateTopic, create_user::CreateUser,
     delete_consumer_group::DeleteConsumerGroup, delete_partitions::DeletePartitions,
     delete_personal_access_token::DeletePersonalAccessToken, delete_stream::DeleteStream,
-    delete_topic::DeleteTopic, delete_user::DeleteUser, join_consumer_group::JoinConsumerGroup,
-    leave_consumer_group::LeaveConsumerGroup, purge_stream::PurgeStream, purge_topic::PurgeTopic,
-    update_permissions::UpdatePermissions, update_stream::UpdateStream, update_topic::UpdateTopic,
-    update_user::UpdateUser,
+    delete_topic::DeleteTopic, delete_user::DeleteUser, purge_stream::PurgeStream,
+    purge_topic::PurgeTopic, update_permissions::UpdatePermissions, update_stream::UpdateStream,
+    update_topic::UpdateTopic, update_user::UpdateUser,
 };
 use secrecy::{ExposeSecret, SecretString};
 
@@ -571,13 +570,10 @@ pub fn execute_join_consumer_group(
     client_id: u32,
     wire: JoinConsumerGroupRequest,
 ) -> Result<(), IggyError> {
-    let command = JoinConsumerGroup {
-        stream_id: wire_id_to_identifier(&wire.stream_id)?,
-        topic_id: wire_id_to_identifier(&wire.topic_id)?,
-        group_id: wire_id_to_identifier(&wire.group_id)?,
-    };
-    let group =
-        shard.resolve_consumer_group(&command.stream_id, &command.topic_id, &command.group_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let topic_id = wire_id_to_identifier(&wire.topic_id)?;
+    let group_id = wire_id_to_identifier(&wire.group_id)?;
+    let group = shard.resolve_consumer_group(&stream_id, &topic_id, &group_id)?;
     shard
         .metadata
         .perm_join_consumer_group(user_id, group.stream_id, group.topic_id)?;
@@ -593,13 +589,10 @@ pub fn execute_leave_consumer_group(
     client_id: u32,
     wire: LeaveConsumerGroupRequest,
 ) -> Result<(), IggyError> {
-    let command = LeaveConsumerGroup {
-        stream_id: wire_id_to_identifier(&wire.stream_id)?,
-        topic_id: wire_id_to_identifier(&wire.topic_id)?,
-        group_id: wire_id_to_identifier(&wire.group_id)?,
-    };
-    let group =
-        shard.resolve_consumer_group(&command.stream_id, &command.topic_id, &command.group_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let topic_id = wire_id_to_identifier(&wire.topic_id)?;
+    let group_id = wire_id_to_identifier(&wire.group_id)?;
+    let group = shard.resolve_consumer_group(&stream_id, &topic_id, &group_id)?;
     shard
         .metadata
         .perm_leave_consumer_group(user_id, group.stream_id, group.topic_id)?;
