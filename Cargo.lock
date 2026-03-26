@@ -5443,6 +5443,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "serial_test",
+ "smallvec",
  "strum 0.28.0",
  "thiserror 2.0.18",
  "tokio",
@@ -5926,6 +5927,7 @@ version = "0.1.0"
 dependencies = [
  "aligned-vec",
  "compio-buf",
+ "smallvec",
 ]
 
 [[package]]
@@ -7660,6 +7662,7 @@ dependencies = [
  "journal",
  "message_bus",
  "ringbuffer",
+ "smallvec",
  "tokio",
  "tracing",
 ]

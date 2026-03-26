@@ -20,14 +20,15 @@ use crate::journal::{
 };
 use crate::log::SegmentedLog;
 use crate::{
-    AppendResult, Partition, PartitionOffsets, PolledBatches, PollingArgs, PollingConsumer,
-    send_messages2::stamp_prepare_for_persistence,
+    AppendResult, Partition, PartitionOffsets, PollFragments, PollQueryResult, PollingArgs,
+    PollingConsumer,
 };
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
     IggyByteSize, IggyError, IggyTimestamp, PartitionStats, PollingKind,
     header::{Operation, PrepareHeader},
     message::Message,
+    send_messages2::stamp_prepare_for_persistence,
 };
 use journal::Journal as _;
 use std::sync::Arc;
@@ -124,7 +125,7 @@ impl Partition for IggyPartition {
         }
         journal.info.end_timestamp = batch.base_timestamp;
         journal.info.max_timestamp = journal.info.max_timestamp.max(batch.base_timestamp);
-        journal.inner.append(message).await;
+        journal.inner.append(message.into_frozen()).await;
 
         Ok(AppendResult::new(
             dirty_offset,
@@ -137,9 +138,9 @@ impl Partition for IggyPartition {
         &self,
         consumer: PollingConsumer,
         args: PollingArgs,
-    ) -> Result<PolledBatches<4096>, IggyError> {
+    ) -> Result<PollQueryResult<4096>, IggyError> {
         if !self.should_increment_offset || args.count == 0 {
-            return Ok(PolledBatches::empty());
+            return Ok((PollFragments::new(), None));
         }
 
         let write_offset = self.dirty_offset.load(Ordering::Relaxed);
@@ -167,7 +168,7 @@ impl Partition for IggyPartition {
                 };
 
                 if start_offset > write_offset {
-                    return Ok(PolledBatches::empty());
+                    return Ok((PollFragments::new(), None));
                 }
 
                 self.log
@@ -181,12 +182,12 @@ impl Partition for IggyPartition {
             }
         };
 
-        let messages = result.unwrap_or_else(PolledBatches::empty);
+        let (fragments, last_matching_offset) =
+            result.unwrap_or_else(|| (PollFragments::new(), None));
 
-        if args.auto_commit && !messages.is_empty() {
-            let last_offset = messages
-                .last_matching_offset
-                .expect("non-empty poll result must have a last offset");
+        if args.auto_commit && !fragments.is_empty() {
+            let last_offset =
+                last_matching_offset.expect("non-empty poll result must have a last offset");
             if let Err(err) = self.store_consumer_offset(consumer, last_offset) {
                 // warning for now.
                 warn!(
@@ -198,7 +199,7 @@ impl Partition for IggyPartition {
             }
         }
 
-        Ok(messages)
+        Ok((fragments, last_matching_offset))
     }
 
     #[allow(clippy::cast_possible_truncation)]

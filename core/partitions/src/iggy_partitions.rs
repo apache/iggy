@@ -24,7 +24,6 @@ use crate::iggy_index_writer::IggyIndexWriter;
 use crate::log::JournalInfo;
 use crate::messages_writer::MessagesWriter;
 use crate::segment::Segment;
-use crate::send_messages2::convert_request_message;
 use crate::types::PartitionsConfig;
 use consensus::PlaneIdentity;
 use consensus::{
@@ -40,10 +39,11 @@ use iggy_common::{
         ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
     },
     message::Message,
+    send_messages2::{convert_request_message, decode_prepare_slice},
     sharding::{IggyNamespace, LocalIdx, ShardId},
 };
-use iobuf::{Frozen, TryMerge};
-use message_bus::{ClientBuffers, MessageBus};
+use iobuf::Frozen;
+use message_bus::MessageBus;
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -73,10 +73,8 @@ pub struct IggyPartitions<C> {
     consensus: Option<C>,
 }
 
-fn freeze_client_reply(message: Message<GenericHeader>) -> ClientBuffers {
-    let owned = unsafe { message.into_inner().try_merge() }
-        .expect("client reply expects a mergeable message buffer");
-    vec![owned.into()]
+const fn freeze_client_reply(message: Message<GenericHeader>) -> Message<GenericHeader> {
+    message
 }
 
 impl<C> IggyPartitions<C> {
@@ -384,12 +382,7 @@ impl<C> IggyPartitions<C> {
 
 impl<B> Plane<VsrConsensus<B>> for IggyPartitions<VsrConsensus<B, NamespacedPipeline>>
 where
-    B: MessageBus<
-            Replica = u8,
-            Data = Message<GenericHeader>,
-            Client = u128,
-            ClientData = ClientBuffers,
-        >,
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
 {
     async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let namespace = IggyNamespace::from_raw(message.header().namespace);
@@ -432,11 +425,12 @@ where
         };
 
         let is_old_prepare = fence_old_prepare_by_commit(consensus, &header);
-        if is_old_prepare {
+        let message = if is_old_prepare {
             warn!("received old prepare, not replicating");
+            message
         } else {
-            self.replicate(message.clone()).await;
-        }
+            self.replicate(message).await
+        };
 
         // TODO: Make those assertions be toggleable through an feature flag, so they can be used only by simulator/tests.
         debug_assert_eq!(header.op, current_op + 1);
@@ -467,7 +461,7 @@ where
         {
             let pipeline = consensus.pipeline().borrow();
             if pipeline
-                .message_by_op_and_checksum(header.op, header.prepare_checksum)
+                .entry_by_op_and_checksum(header.op, header.prepare_checksum)
                 .is_none()
             {
                 debug!("on_ack: prepare not in pipeline op={}", header.op);
@@ -624,9 +618,7 @@ where
             }
             Operation::StoreConsumerOffset => {
                 let total_size = header.size() as usize;
-                let owned = unsafe { message.into_inner().try_merge() }
-                    .expect("consumer offset prepare expects a unique message buffer");
-                let body = &owned.as_slice()[std::mem::size_of::<PrepareHeader>()..total_size];
+                let body = &message.as_slice()[std::mem::size_of::<PrepareHeader>()..total_size];
                 let consumer_kind = body[0];
                 let consumer_id = u32::from_le_bytes(body[1..5].try_into().unwrap()) as usize;
                 let offset = u64::from_le_bytes(body[5..13].try_into().unwrap());
@@ -692,11 +684,11 @@ where
     ///
     /// Chain replication: primary -> first backup -> ... -> last backup.
     /// Stops when the next replica would be the primary.
-    async fn replicate(&self, message: Message<PrepareHeader>) {
+    async fn replicate(&self, message: Message<PrepareHeader>) -> Message<PrepareHeader> {
         let consensus = self
             .consensus()
             .expect("replicate: consensus not initialized");
-        replicate_to_next_in_chain(consensus, message).await;
+        replicate_to_next_in_chain(consensus, message).await
     }
 
     #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
@@ -763,10 +755,7 @@ where
                 let mut batch_count = 0u32;
 
                 for entry in entries {
-                    let owned = unsafe { entry.into_inner().try_merge() }
-                        .expect("journal commit expects mergeable prepare buffers");
-                    let Ok(batch) = crate::send_messages2::decode_prepare_slice(owned.as_slice())
-                    else {
+                    let Ok(batch) = decode_prepare_slice(entry.as_slice()) else {
                         continue;
                     };
                     let Ok(message_count) = batch.message_count() else {
@@ -787,7 +776,7 @@ where
                     }
                     file_position += batch.header.total_size() as u64;
                     batch_count += message_count;
-                    frozen.push(owned.into());
+                    frozen.push(entry);
                 }
 
                 (

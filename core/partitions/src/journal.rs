@@ -17,29 +17,19 @@
 
 use iggy_common::{
     header::{Operation, PrepareHeader},
-    message::Message,
+    send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice},
 };
-use iobuf::{Frozen, Owned, TryMerge};
+use iobuf::{Frozen, Owned};
 use journal::{Journal, Storage};
 use std::{
     cell::UnsafeCell,
     collections::{BTreeMap, HashMap},
 };
 
-use crate::{
-    PolledBatches,
-    send_messages2::{COMMAND_HEADER_SIZE, PREPARE_SPLIT_POINT, decode_prepare_slice},
-};
+use crate::{Fragment, PollFragments, PollQueryResult};
 
 const ZERO_LEN: usize = 0;
 type JournalBuffer = Frozen<4096>;
-
-fn message_from_frozen(
-    inner: JournalBuffer,
-) -> Result<Message<PrepareHeader>, iggy_common::header::ConsensusError> {
-    let split_at = PREPARE_SPLIT_POINT.min(inner.len());
-    Message::try_from(inner.split_at(split_at))
-}
 
 /// Lookup key for querying messages from the journal.
 #[derive(Debug, Clone, Copy)]
@@ -73,7 +63,7 @@ where
 {
     type Query;
 
-    fn get(&self, query: &Self::Query) -> impl Future<Output = Option<PolledBatches<4096>>>;
+    fn get(&self, query: &Self::Query) -> impl Future<Output = Option<PollQueryResult<4096>>>;
 }
 
 #[derive(Debug, Default)]
@@ -185,7 +175,7 @@ impl PartitionJournalMemStorage {
 
 impl PartitionJournal<PartitionJournalMemStorage> {
     /// Drain all accumulated batches, matching the legacy `PartitionJournal` API.
-    pub fn commit(&self) -> Vec<Message<PrepareHeader>> {
+    pub fn commit(&self) -> Vec<JournalBuffer> {
         let entries = {
             let inner = unsafe { &*self.inner.get() };
             inner.storage.drain()
@@ -201,12 +191,6 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         timestamp_to_op.clear();
 
         entries
-            .into_iter()
-            .map(|entry| {
-                message_from_frozen(entry)
-                    .expect("partition journal storage must contain valid prepare batches")
-            })
-            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -241,7 +225,7 @@ where
         }
     }
 
-    async fn message_by_op(&self, op: u64) -> Option<Message<PrepareHeader>> {
+    async fn bytes_by_op(&self, op: u64) -> Option<JournalBuffer> {
         let storage_offset = {
             let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
             *op_to_storage_offset.get(&op)?
@@ -256,10 +240,7 @@ where
             return None;
         }
 
-        Some(
-            message_from_frozen(bytes)
-                .expect("partition journal storage must contain a valid prepare batch"),
-        )
+        Some(bytes)
     }
 
     #[allow(dead_code)]
@@ -267,11 +248,11 @@ where
         &self,
         start_op: u64,
         query: MessageLookup,
-    ) -> PolledBatches<4096> {
+    ) -> PollQueryResult<4096> {
         let count = query.count();
 
         if count == 0 {
-            return PolledBatches::empty();
+            return (PollFragments::new(), None);
         }
 
         // Get (op, storage_offset) pairs directly from the mapping
@@ -284,10 +265,12 @@ where
                 .collect()
         };
 
-        let mut polled = PolledBatches::empty();
+        let mut fragments = PollFragments::new();
+        let mut last_matching_offset = None;
+        let mut matched_messages = 0u32;
 
         for (_, storage_offset) in op_offsets {
-            if polled.matched_messages >= count {
+            if matched_messages >= count {
                 break;
             }
 
@@ -311,13 +294,21 @@ where
                 continue;
             };
 
-            let Some(selection) = select_batch_slice(&batch, query, polled.matched_messages) else {
+            let Some(selection) = select_batch_slice(&batch, query, matched_messages) else {
                 continue;
             };
-            push_selected_batch_fragments(&mut polled, &bytes, &header, &batch, selection);
+            push_selected_batch_fragments(
+                &mut fragments,
+                &mut last_matching_offset,
+                &mut matched_messages,
+                &bytes,
+                &header,
+                &batch,
+                selection,
+            );
         }
 
-        polled
+        (fragments, last_matching_offset)
     }
 }
 
@@ -326,7 +317,7 @@ where
     S: Storage<Buffer = JournalBuffer>,
 {
     type Header = PrepareHeader;
-    type Entry = Message<Self::Header>;
+    type Entry = JournalBuffer;
     #[rustfmt::skip] // Scuffed formatter.
     type HeaderRef<'a> = &'a Self::Header where S: 'a;
 
@@ -346,12 +337,13 @@ where
     }
 
     async fn append(&self, entry: Self::Entry) {
-        let header = *entry.header();
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        let header_bytes = &entry[..header_size];
+        let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
+            .expect("partition journal append expects a valid prepare header");
         let op = header.op;
-        let owned = unsafe { entry.into_inner().try_merge() }
-            .expect("partition journal append expects a unique message buffer");
         let first_offset_and_timestamp = if header.operation == Operation::SendMessages {
-            decode_prepare_slice(owned.as_slice())
+            decode_prepare_slice(entry.as_slice())
                 .ok()
                 .and_then(|batch| {
                     batch.message_count().ok().and_then(|count| {
@@ -368,10 +360,9 @@ where
             headers.push(header);
         };
 
-        let bytes: JournalBuffer = owned.into();
         let storage_offset = {
             let inner = unsafe { &*self.inner.get() };
-            inner.storage.write(bytes).await
+            inner.storage.write(entry).await
         };
 
         {
@@ -389,7 +380,7 @@ where
     }
 
     async fn entry(&self, header: &Self::Header) -> Option<Self::Entry> {
-        self.message_by_op(header.op).await
+        self.bytes_by_op(header.op).await
     }
 }
 
@@ -399,12 +390,12 @@ where
 {
     type Query = MessageLookup;
 
-    async fn get(&self, query: &Self::Query) -> Option<PolledBatches<4096>> {
+    async fn get(&self, query: &Self::Query) -> Option<PollQueryResult<4096>> {
         let query = *query;
         let start_op = self.candidate_start_op(&query)?;
         let result = self.load_polled_batches_from_storage(start_op, query).await;
 
-        if result.is_empty() {
+        if result.0.is_empty() {
             None
         } else {
             Some(result)
@@ -413,7 +404,7 @@ where
 }
 
 fn select_batch_slice(
-    batch: &crate::send_messages2::SendMessages2Ref<'_>,
+    batch: &SendMessages2Ref<'_>,
     query: MessageLookup,
     already_matched: u32,
 ) -> Option<SelectedBatchSlice> {
@@ -466,10 +457,12 @@ fn select_batch_slice(
 }
 
 fn push_selected_batch_fragments(
-    polled: &mut PolledBatches<4096>,
+    fragments: &mut PollFragments<4096>,
+    last_matching_offset: &mut Option<u64>,
+    matched_messages: &mut u32,
     prepare: &Frozen<4096>,
     prepare_header: &PrepareHeader,
-    batch: &crate::send_messages2::SendMessages2Ref<'_>,
+    batch: &SendMessages2Ref<'_>,
     selection: SelectedBatchSlice,
 ) {
     let prepare_header_size = std::mem::size_of::<PrepareHeader>();
@@ -477,19 +470,24 @@ fn push_selected_batch_fragments(
     let full_body_selected = selection.start == 0 && selection.end == batch.blob().len();
 
     if full_body_selected {
-        polled.push_fragment(prepare.slice(prepare_header_size..prepare_size));
+        fragments.push(Fragment::slice(
+            prepare.clone(),
+            prepare_header_size,
+            prepare_size,
+        ));
     } else {
         let mut rewritten = batch.header;
         rewritten.batch_length =
             u64::try_from(COMMAND_HEADER_SIZE + (selection.end - selection.start))
                 .expect("sliced batch length exceeds u64::MAX");
-        polled.push_fragment(rewritten.into_frozen());
-        polled.push_fragment(prepare.slice(
-            prepare_header_size + COMMAND_HEADER_SIZE + selection.start
-                ..prepare_header_size + COMMAND_HEADER_SIZE + selection.end,
+        fragments.push(Fragment::whole(rewritten.into_frozen()));
+        fragments.push(Fragment::slice(
+            prepare.clone(),
+            prepare_header_size + COMMAND_HEADER_SIZE + selection.start,
+            prepare_header_size + COMMAND_HEADER_SIZE + selection.end,
         ));
     }
 
-    polled.last_matching_offset = Some(selection.last_matching_offset);
-    polled.matched_messages += selection.matched_messages;
+    *last_matching_offset = Some(selection.last_matching_offset);
+    *matched_messages += selection.matched_messages;
 }

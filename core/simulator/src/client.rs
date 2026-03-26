@@ -158,7 +158,7 @@ impl SimClient {
         buffer.extend_from_slice(header_bytes);
         buffer.extend_from_slice(payload);
 
-        Message::try_from(Owned::<4096>::copy_from_slice(&buffer).split_at(header_size))
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
             .expect("request buffer must contain a valid request message")
     }
 
@@ -190,7 +190,7 @@ impl SimClient {
         buffer.extend_from_slice(header_bytes);
         buffer.extend_from_slice(payload);
 
-        Message::try_from(Owned::<4096>::copy_from_slice(&buffer).split_at(header_size))
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
             .expect("request buffer must contain a valid request message")
     }
 }

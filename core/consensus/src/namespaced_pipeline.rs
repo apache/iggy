@@ -17,8 +17,6 @@
 
 use crate::Pipeline;
 use crate::impls::{PIPELINE_PREPARE_QUEUE_MAX, PipelineEntry};
-use iggy_common::header::PrepareHeader;
-use iggy_common::message::Message;
 use std::collections::{HashMap, VecDeque};
 
 /// Pipeline that partitions entries by namespace for independent commit draining.
@@ -136,7 +134,7 @@ impl NamespacedPipeline {
                 break;
             }
             // Still in a queue means not yet drained
-            if self.message_by_op(next).is_some() {
+            if self.entry_by_op(next).is_some() {
                 break;
             }
             commit = next;
@@ -146,7 +144,6 @@ impl NamespacedPipeline {
 }
 
 impl Pipeline for NamespacedPipeline {
-    type Message = Message<PrepareHeader>;
     type Entry = PipelineEntry;
 
     /// # Panics
@@ -154,13 +151,13 @@ impl Pipeline for NamespacedPipeline {
     /// - If ops are not globally sequential.
     /// - If the hash chain is broken.
     /// - If the namespace is not registered.
-    fn push_message(&mut self, message: Self::Message) {
+    fn push(&mut self, entry: Self::Entry) {
         assert!(
             self.total_count < PIPELINE_PREPARE_QUEUE_MAX,
             "namespaced pipeline full"
         );
 
-        let header = *message.header();
+        let header = entry.header;
         let ns = header.namespace;
 
         if self.total_count > 0 {
@@ -190,13 +187,13 @@ impl Pipeline for NamespacedPipeline {
             );
         }
 
-        queue.push_back(PipelineEntry::new(header));
+        queue.push_back(entry);
         self.total_count += 1;
         self.last_push_checksum = header.checksum;
         self.last_push_op = header.op;
     }
 
-    fn pop_message(&mut self) -> Option<Self::Entry> {
+    fn pop(&mut self) -> Option<Self::Entry> {
         let min_ns = self
             .queues
             .iter()
@@ -220,7 +217,7 @@ impl Pipeline for NamespacedPipeline {
     }
 
     /// Linear scan all queues. Ops are globally unique; max 8 entries total.
-    fn message_by_op(&self, op: u64) -> Option<&Self::Entry> {
+    fn entry_by_op(&self, op: u64) -> Option<&Self::Entry> {
         for queue in self.queues.values() {
             for entry in queue {
                 if entry.header.op == op {
@@ -231,7 +228,7 @@ impl Pipeline for NamespacedPipeline {
         None
     }
 
-    fn message_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry> {
+    fn entry_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry> {
         for queue in self.queues.values_mut() {
             for entry in queue.iter_mut() {
                 if entry.header.op == op {
@@ -242,8 +239,8 @@ impl Pipeline for NamespacedPipeline {
         None
     }
 
-    fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&Self::Entry> {
-        let entry = self.message_by_op(op)?;
+    fn entry_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&Self::Entry> {
+        let entry = self.entry_by_op(op)?;
         if entry.header.checksum == checksum {
             Some(entry)
         } else {
@@ -310,10 +307,41 @@ impl Pipeline for NamespacedPipeline {
     }
 }
 
+impl NamespacedPipeline {
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn push_message(
+        &mut self,
+        message: iggy_common::message::Message<iggy_common::header::PrepareHeader>,
+    ) {
+        self.push(PipelineEntry::new(*message.header()));
+    }
+
+    pub fn pop_message(&mut self) -> Option<PipelineEntry> {
+        self.pop()
+    }
+
+    #[must_use]
+    pub fn message_by_op(&self, op: u64) -> Option<&PipelineEntry> {
+        self.entry_by_op(op)
+    }
+
+    pub fn message_by_op_mut(&mut self, op: u64) -> Option<&mut PipelineEntry> {
+        self.entry_by_op_mut(op)
+    }
+
+    #[must_use]
+    pub fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&PipelineEntry> {
+        self.entry_by_op_and_checksum(op, checksum)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_common::header::Command2;
+    use iggy_common::{
+        header::{Command2, PrepareHeader},
+        message::Message,
+    };
 
     fn make_prepare(
         op: u64,

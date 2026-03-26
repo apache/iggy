@@ -29,15 +29,12 @@ use iggy_common::{
     },
     message::Message,
 };
-use iobuf::TryMerge;
 use journal::{Journal, JournalHandle};
-use message_bus::{ClientBuffers, MessageBus};
+use message_bus::MessageBus;
 use tracing::{debug, warn};
 
-fn freeze_client_reply(message: Message<GenericHeader>) -> ClientBuffers {
-    let owned = unsafe { message.into_inner().try_merge() }
-        .expect("client reply expects a mergeable message buffer");
-    vec![owned.into()]
+const fn freeze_client_reply(message: Message<GenericHeader>) -> Message<GenericHeader> {
+    message
 }
 
 #[derive(Debug, Clone)]
@@ -111,12 +108,7 @@ pub struct IggyMetadata<C, J, S, M> {
 #[allow(clippy::future_not_send)]
 impl<B, J, S, M> Plane<VsrConsensus<B>> for IggyMetadata<VsrConsensus<B>, J, S, M>
 where
-    B: MessageBus<
-            Replica = u8,
-            Data = Message<GenericHeader>,
-            Client = u128,
-            ClientData = ClientBuffers,
-        >,
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StateMachine<
@@ -138,9 +130,9 @@ where
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
-        let header = message.header();
+        let header = *message.header();
 
-        let current_op = match replicate_preflight(consensus, header) {
+        let current_op = match replicate_preflight(consensus, &header) {
             Ok(current_op) => current_op,
             Err(reason) => {
                 warn!(
@@ -153,13 +145,14 @@ where
 
         // TODO: Handle idx calculation, for now using header.op, but since the journal may get compacted, this may not be correct.
         #[allow(clippy::cast_possible_truncation)]
-        let is_old_prepare = fence_old_prepare_by_commit(consensus, header)
+        let is_old_prepare = fence_old_prepare_by_commit(consensus, &header)
             || journal.handle().header(header.op as usize).is_some();
-        if is_old_prepare {
+        let message = if is_old_prepare {
             warn!("received old prepare, not replicating");
+            message
         } else {
-            self.replicate(message.clone()).await;
-        }
+            self.replicate(message).await
+        };
 
         // TODO add assertions for valid state here.
 
@@ -168,8 +161,8 @@ where
         // TODO handle gap in ops.
 
         // Verify hash chain integrity.
-        if let Some(previous) = journal.handle().previous_header(header) {
-            panic_if_hash_chain_would_break_in_same_view(&previous, header);
+        if let Some(previous) = journal.handle().previous_header(&header) {
+            panic_if_hash_chain_would_break_in_same_view(&previous, &header);
         }
 
         assert_eq!(header.op, current_op + 1);
@@ -178,10 +171,10 @@ where
         consensus.set_last_prepare_checksum(header.checksum);
 
         // Append to journal.
-        journal.handle().append(message.clone()).await;
+        journal.handle().append(message).await;
 
         // After successful journal write, send prepare_ok to primary.
-        self.send_prepare_ok(header).await;
+        self.send_prepare_ok(&header).await;
 
         // If follower, commit any newly committable entries.
         if consensus.is_follower() {
@@ -201,7 +194,7 @@ where
         {
             let pipeline = consensus.pipeline().borrow();
             if pipeline
-                .message_by_op_and_checksum(header.op, header.prepare_checksum)
+                .entry_by_op_and_checksum(header.op, header.prepare_checksum)
                 .is_none()
             {
                 debug!("on_ack: prepare not in pipeline op={}", header.op);
@@ -271,7 +264,7 @@ where
 impl<B, P, J, S, M> PlaneIdentity<VsrConsensus<B, P>> for IggyMetadata<VsrConsensus<B, P>, J, S, M>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StateMachine<Input = Message<PrepareHeader>>,
@@ -291,7 +284,7 @@ where
 impl<B, P, J, S, M> IggyMetadata<VsrConsensus<B, P>, J, S, M>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StateMachine<Input = Message<PrepareHeader>>,
@@ -303,11 +296,11 @@ where
     /// - Each backup forwards to the next
     /// - Stops when we would forward back to primary
     #[allow(clippy::future_not_send)]
-    async fn replicate(&self, message: Message<PrepareHeader>) {
+    async fn replicate(&self, message: Message<PrepareHeader>) -> Message<PrepareHeader> {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
-        let header = message.header();
+        let header = *message.header();
 
         // TODO: calculate the index;
         #[allow(clippy::cast_possible_truncation)]
@@ -317,7 +310,7 @@ where
             journal.handle().header(idx).is_none(),
             "replicate: must not already have prepare"
         );
-        replicate_to_next_in_chain(consensus, message).await;
+        replicate_to_next_in_chain(consensus, message).await
     }
 
     // TODO: Implement jump_to_newer_op

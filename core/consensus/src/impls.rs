@@ -182,17 +182,15 @@ impl LocalPipeline {
         self.prepare_queue.is_empty()
     }
 
-    /// Push a new message to the pipeline.
+    /// Push a new entry to the pipeline.
     ///
     /// # Panics
     /// - If message queue is full.
     /// - If the message doesn't chain correctly to the previous entry.
-    // Signature must match `Pipeline::push_message` trait definition.
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn push_message(&mut self, message: Message<PrepareHeader>) {
+    pub fn push(&mut self, entry: PipelineEntry) {
         assert!(!self.prepare_queue_full(), "prepare queue is full");
 
-        let header = *message.header();
+        let header = entry.header;
 
         if let Some(tail) = self.prepare_queue.back() {
             let tail_header = &tail.header;
@@ -210,7 +208,12 @@ impl LocalPipeline {
             assert!(header.view >= tail_header.view, "view cannot go backwards");
         }
 
-        self.prepare_queue.push_back(PipelineEntry::new(header));
+        self.prepare_queue.push_back(entry);
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn push_message(&mut self, message: Message<PrepareHeader>) {
+        self.push(PipelineEntry::new(*message.header()));
     }
 
     /// Pop the oldest message (after it's been committed).
@@ -344,14 +347,13 @@ impl LocalPipeline {
 }
 
 impl Pipeline for LocalPipeline {
-    type Message = Message<PrepareHeader>;
     type Entry = PipelineEntry;
 
-    fn push_message(&mut self, message: Self::Message) {
-        Self::push_message(self, message);
+    fn push(&mut self, entry: Self::Entry) {
+        Self::push(self, entry);
     }
 
-    fn pop_message(&mut self) -> Option<Self::Entry> {
+    fn pop(&mut self) -> Option<Self::Entry> {
         Self::pop_message(self)
     }
 
@@ -359,15 +361,15 @@ impl Pipeline for LocalPipeline {
         Self::clear(self);
     }
 
-    fn message_by_op(&self, op: u64) -> Option<&Self::Entry> {
+    fn entry_by_op(&self, op: u64) -> Option<&Self::Entry> {
         Self::message_by_op(self, op)
     }
 
-    fn message_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry> {
+    fn entry_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry> {
         Self::message_by_op_mut(self, op)
     }
 
-    fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&Self::Entry> {
+    fn entry_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&Self::Entry> {
         Self::message_by_op_and_checksum(self, op, checksum)
     }
 
@@ -1184,7 +1186,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // Find the prepare in our pipeline
         let mut pipeline = self.pipeline.borrow_mut();
 
-        let Some(entry) = pipeline.message_by_op_mut(header.op) else {
+        let Some(entry) = pipeline.entry_by_op_mut(header.op) else {
             // Not in pipeline - could be old/duplicate or already committed
             return false;
         };
@@ -1259,7 +1261,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 impl<B, P> Project<Message<PrepareHeader>, VsrConsensus<B, P>> for Message<RequestHeader>
 where
     B: MessageBus,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
 {
     type Consensus = VsrConsensus<B, P>;
 
@@ -1292,7 +1294,7 @@ where
 impl<B, P> Project<Message<PrepareOkHeader>, VsrConsensus<B, P>> for Message<PrepareHeader>
 where
     B: MessageBus,
-    P: Pipeline<Message = Self, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
 {
     type Consensus = VsrConsensus<B, P>;
 
@@ -1322,7 +1324,7 @@ where
 impl<B, P> Consensus for VsrConsensus<B, P>
 where
     B: MessageBus,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
 {
     type MessageBus = B;
     #[rustfmt::skip] // Scuffed formatter. TODO: Make the naming less ambiguous for `Message`.
@@ -1338,11 +1340,11 @@ where
     // (push_loopback / drain_loopback_into) rather than inline here,
     // so that WAL persistence can happen between pipeline insertion
     // and ack recording.
-    fn pipeline_message(&self, message: Self::Message<Self::ReplicateHeader>) {
+    fn pipeline_message(&self, message: &Self::Message<Self::ReplicateHeader>) {
         assert!(self.is_primary(), "only primary can pipeline messages");
 
         let mut pipeline = self.pipeline.borrow_mut();
-        pipeline.push_message(message);
+        pipeline.push(PipelineEntry::new(*message.header()));
     }
 
     fn verify_pipeline(&self) {

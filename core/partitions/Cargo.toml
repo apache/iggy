@@ -37,6 +37,7 @@ iggy_common = { workspace = true }
 journal = { workspace = true }
 message_bus = { workspace = true }
 ringbuffer = { workspace = true }
+smallvec = "1.13"
 tokio = { workspace = true }
 tracing = { workspace = true }
 

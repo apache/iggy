@@ -17,6 +17,45 @@
 
 use iggy_common::{IggyByteSize, PollingStrategy};
 use iobuf::Frozen;
+use smallvec::SmallVec;
+
+#[derive(Debug, Clone)]
+pub struct Fragment<const ALIGN: usize = 4096> {
+    source: Frozen<ALIGN>,
+    start: usize,
+    end: usize,
+}
+
+impl<const ALIGN: usize> Fragment<ALIGN> {
+    #[must_use]
+    pub fn whole(source: Frozen<ALIGN>) -> Self {
+        let end = source.len();
+        Self {
+            source,
+            start: 0,
+            end,
+        }
+    }
+
+    #[must_use]
+    /// # Panics
+    ///
+    /// Panics if `start > end` or if `end` is past the end of `source`.
+    pub fn slice(source: Frozen<ALIGN>, start: usize, end: usize) -> Self {
+        assert!(start <= end);
+        assert!(end <= source.len());
+        Self { source, start, end }
+    }
+
+    #[must_use]
+    pub fn into_frozen(self) -> Frozen<ALIGN> {
+        if self.start == 0 && self.end == self.source.len() {
+            self.source
+        } else {
+            self.source.slice(self.start..self.end)
+        }
+    }
+}
 
 /// Arguments for polling messages from a partition.
 #[derive(Debug, Clone)]
@@ -26,34 +65,8 @@ pub struct PollingArgs {
     pub auto_commit: bool,
 }
 
-/// Poll result returned as an ordered fragment stream plus message-space metadata.
-#[derive(Debug, Clone, Default)]
-pub struct PolledBatches<const ALIGN: usize = 4096> {
-    pub fragments: Vec<Frozen<ALIGN>>,
-    pub last_matching_offset: Option<u64>,
-    pub matched_messages: u32,
-}
-
-impl<const ALIGN: usize> PolledBatches<ALIGN> {
-    #[must_use]
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.fragments.is_empty()
-    }
-
-    #[must_use]
-    pub const fn count(&self) -> u32 {
-        self.matched_messages
-    }
-
-    pub fn push_fragment(&mut self, fragment: Frozen<ALIGN>) {
-        self.fragments.push(fragment);
-    }
-}
+pub type PollFragments<const ALIGN: usize = 4096> = SmallVec<[Fragment<ALIGN>; 4]>;
+pub type PollQueryResult<const ALIGN: usize = 4096> = (PollFragments<ALIGN>, Option<u64>);
 
 impl PollingArgs {
     #[must_use]

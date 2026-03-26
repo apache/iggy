@@ -30,7 +30,7 @@ use iggy_common::header::ReplyHeader;
 use iggy_common::message::Message;
 use iggy_common::sharding::IggyNamespace;
 use message_bus::MessageBus;
-use partitions::{Partition, PartitionOffsets, PolledBatches, PollingArgs, PollingConsumer};
+use partitions::{Partition, PartitionOffsets, PollQueryResult, PollingArgs, PollingConsumer};
 use replica::{Replica, new_replica};
 use std::sync::Arc;
 
@@ -108,17 +108,11 @@ impl Simulator {
     pub async fn step(&self) -> Option<Message<ReplyHeader>> {
         if let Some(envelope) = self.message_bus.receive() {
             if let Some(_client_id) = envelope.to_client {
-                let EnvelopePayload::Client(mut fragments) = envelope.payload else {
-                    panic!("client envelope must carry frozen fragments");
+                let EnvelopePayload::Client(message) = envelope.payload else {
+                    panic!("client envelope must carry a reply message");
                 };
-                assert_eq!(
-                    fragments.len(),
-                    1,
-                    "client fragment decoding for multi-fragment payloads is not implemented"
-                );
-                let frozen = fragments.pop().expect("client envelope must contain data");
-                let split_at = std::mem::size_of::<ReplyHeader>().min(frozen.len());
-                let reply: Message<ReplyHeader> = Message::try_from(frozen.split_at(split_at))
+                let reply: Message<ReplyHeader> = message
+                    .try_into_typed()
                     .expect("invalid message, wrong command type for a client response");
                 return Some(reply);
             }
@@ -166,7 +160,7 @@ impl Simulator {
         namespace: IggyNamespace,
         consumer: PollingConsumer,
         args: PollingArgs,
-    ) -> Result<PolledBatches<4096>, IggyError> {
+    ) -> Result<PollQueryResult<4096>, IggyError> {
         let replica = &self.replicas[replica_idx];
         let partition =
             replica

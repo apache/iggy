@@ -15,21 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytes::{BufMut, Bytes, BytesMut};
-use iggy_common::{
-    INDEX_SIZE, IggyError, calculate_checksum,
-    header::{PrepareHeader, RequestHeader},
-    message::Message,
-    random_id,
+use crate::{
+    INDEX_SIZE, IggyError, calculate_checksum, random_id,
     sharding::IggyNamespace,
+    types::consensus::{
+        header::{PrepareHeader, RequestHeader},
+        message::Message,
+    },
 };
-use iobuf::{Owned, TryMerge};
+use bytes::{BufMut, Bytes, BytesMut};
+use iobuf::Owned;
 
 const MESSAGE_ALIGN: usize = 4096;
 pub const COMMAND_HEADER_SIZE: usize = 256;
 pub const PREPARE_SPLIT_POINT: usize = 512;
 const MESSAGE_HEADER_SIZE: usize = 48;
 const LEGACY_MESSAGE_HEADER_SIZE: usize = 64;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SendMessages2Header {
     pub partition_id: u64,
@@ -188,8 +190,7 @@ impl SendMessages2Owned {
         bytes[PREPARE_SPLIT_POINT..PREPARE_SPLIT_POINT + self.blob.len()]
             .copy_from_slice(&self.blob);
 
-        Message::try_from(buffer.split_at(PREPARE_SPLIT_POINT))
-            .map_err(|_| IggyError::InvalidCommand)
+        Message::try_from(buffer).map_err(|_| IggyError::InvalidCommand)
     }
 }
 
@@ -456,9 +457,7 @@ pub fn convert_request_message(
 ) -> Result<Message<RequestHeader>, IggyError> {
     let request_header = *message.header();
     let total_size = request_header.size as usize;
-    let owned = unsafe { message.into_inner().try_merge() }
-        .expect("request conversion expects a unique message buffer");
-    let body = &owned.as_slice()[std::mem::size_of::<RequestHeader>()..total_size];
+    let body = &message.as_slice()[std::mem::size_of::<RequestHeader>()..total_size];
     SendMessages2Owned::from_legacy_request(namespace, body)?.encode_request(request_header)
 }
 
@@ -494,24 +493,23 @@ pub fn decode_prepare_slice(bytes: &[u8]) -> Result<SendMessages2Ref<'_>, IggyEr
 }
 
 pub fn stamp_prepare_for_persistence(
-    message: Message<PrepareHeader>,
+    mut message: Message<PrepareHeader>,
     base_offset: u64,
     base_timestamp: u64,
 ) -> Result<(Message<PrepareHeader>, SendMessages2Header, u32), IggyError> {
-    let (mut prefix, tail) = message.into_inner();
-    if prefix.len() < PREPARE_SPLIT_POINT {
+    let total_size = message.header().size as usize;
+    let bytes = message.as_mut_slice();
+    if bytes.len() < PREPARE_SPLIT_POINT || total_size < PREPARE_SPLIT_POINT {
         return Err(IggyError::InvalidCommand);
     }
 
     let header_offset = std::mem::size_of::<PrepareHeader>();
-    let header_bytes = &mut prefix[header_offset..header_offset + COMMAND_HEADER_SIZE];
+    let header_bytes = &mut bytes[header_offset..header_offset + COMMAND_HEADER_SIZE];
     let mut command = SendMessages2Header::decode(header_bytes)?;
     command.base_offset = base_offset;
     command.base_timestamp = base_timestamp;
     command.encode_into(header_bytes);
-    let message_count = count_messages_blob(&tail)?;
-
-    let message = Message::from_inner((prefix, tail)).map_err(|_| IggyError::InvalidCommand)?;
+    let message_count = count_messages_blob(&bytes[PREPARE_SPLIT_POINT..total_size])?;
     Ok((message, command, message_count))
 }
 

@@ -24,7 +24,7 @@ use iggy_common::message::{Message, MessageBag};
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::variadic;
 use journal::{Journal, JournalHandle};
-use message_bus::{ClientBuffers, MessageBus};
+use message_bus::MessageBus;
 use metadata::IggyMetadata;
 use metadata::stm::StateMachine;
 use partitions::IggyPartitions;
@@ -159,12 +159,7 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn on_message(&self, message: Message<GenericHeader>)
     where
-        B: MessageBus<
-                Replica = u8,
-                Data = Message<GenericHeader>,
-                Client = u128,
-                ClientData = ClientBuffers,
-            >,
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
         J: JournalHandle,
         <J as JournalHandle>::Target: Journal<
                 <J as JournalHandle>::Storage,
@@ -190,12 +185,7 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn on_request(&self, request: Message<RequestHeader>)
     where
-        B: MessageBus<
-                Replica = u8,
-                Data = Message<GenericHeader>,
-                Client = u128,
-                ClientData = ClientBuffers,
-            >,
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
         J: JournalHandle,
         <J as JournalHandle>::Target: Journal<
                 <J as JournalHandle>::Storage,
@@ -214,12 +204,7 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn on_replicate(&self, prepare: Message<PrepareHeader>)
     where
-        B: MessageBus<
-                Replica = u8,
-                Data = Message<GenericHeader>,
-                Client = u128,
-                ClientData = ClientBuffers,
-            >,
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
         J: JournalHandle,
         <J as JournalHandle>::Target: Journal<
                 <J as JournalHandle>::Storage,
@@ -238,12 +223,7 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn on_ack(&self, prepare_ok: Message<PrepareOkHeader>)
     where
-        B: MessageBus<
-                Replica = u8,
-                Data = Message<GenericHeader>,
-                Client = u128,
-                ClientData = ClientBuffers,
-            >,
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
         J: JournalHandle,
         <J as JournalHandle>::Target: Journal<
                 <J as JournalHandle>::Storage,
@@ -273,12 +253,7 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn process_loopback(&self, buf: &mut Vec<Message<GenericHeader>>) -> usize
     where
-        B: MessageBus<
-                Replica = u8,
-                Data = Message<GenericHeader>,
-                Client = u128,
-                ClientData = ClientBuffers,
-            >,
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
         J: JournalHandle,
         <J as JournalHandle>::Target: Journal<
                 <J as JournalHandle>::Storage,
@@ -329,7 +304,6 @@ where
                 Replica = u8,
                 Data = iggy_common::message::Message<iggy_common::header::GenericHeader>,
                 Client = u128,
-                ClientData = ClientBuffers,
             >,
     {
         let partitions = self.plane.partitions_mut();

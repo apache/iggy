@@ -251,11 +251,11 @@ macro_rules! collect_handlers {
                     match input.header().operation {
                         $(
                             Operation::$operation => {
-                                // TODO: FIXME, ideally, we want the `Operation` enum to be constructable only from the `tail` buffer,
-                                // We might consider using the remaining 256 bytes of the `prefix` to encode operation specific header, but that might be not worth the complexity
-                                // maintaining mental model, where tail = entire operation payload is better and `Prefix` is just the `ConsensusHeader`.
-                                let (_, tail) = input.into_inner();
-                                let body = ::bytes::Bytes::copy_from_slice(&tail);
+                                // TODO: FIXME, zero allocation operation construction.
+                                let header = *input.header();
+                                let body = ::bytes::Bytes::copy_from_slice(
+                                    &input.as_slice()[core::mem::size_of::<::iggy_common::header::PrepareHeader>()..header.size as usize]
+                                );
                                 let cmd = $operation::from_bytes(body)?;
                                 Ok(Either::Left([<$state Command>]::$operation(cmd)))
                             },

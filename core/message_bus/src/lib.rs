@@ -20,17 +20,13 @@ use crate::cache::connection::{
     ConnectionCache, Coordinator, LeastLoadedStrategy, ShardedConnections,
 };
 use iggy_common::{IggyError, SenderKind, TcpSender, header::GenericHeader, message::Message};
-use iobuf::Frozen;
 use std::{collections::HashMap, rc::Rc};
-
-pub type ClientBuffers = Vec<Frozen<4096>>;
 
 /// Message bus parameterized by allocation strategy and sharded state
 pub trait MessageBus {
     type Client;
     type Replica;
     type Data;
-    type ClientData;
     type Sender;
 
     fn add_client(&mut self, client: Self::Client, sender: Self::Sender) -> bool;
@@ -43,8 +39,8 @@ pub trait MessageBus {
     fn send_to_client(
         &self,
         client_id: Self::Client,
-        data: Self::ClientData,
-    ) -> impl Future<Output = Result<Self::ClientData, IggyError>>;
+        data: Self::Data,
+    ) -> impl Future<Output = Result<Self::Data, IggyError>>;
     fn send_to_replica(
         &self,
         replica: Self::Replica,
@@ -91,7 +87,6 @@ impl MessageBus for IggyMessageBus {
     type Client = u128;
     type Replica = u8;
     type Data = Message<GenericHeader>;
-    type ClientData = ClientBuffers;
     type Sender = SenderKind;
 
     fn add_client(&mut self, client: Self::Client, sender: Self::Sender) -> bool {
@@ -117,14 +112,14 @@ impl MessageBus for IggyMessageBus {
     async fn send_to_client(
         &self,
         client_id: Self::Client,
-        buffers: Self::ClientData,
-    ) -> Result<Self::ClientData, IggyError> {
+        message: Self::Data,
+    ) -> Result<Self::Data, IggyError> {
         #[allow(clippy::cast_possible_truncation)] // IggyError::ClientNotFound takes u32
         let _sender = self
             .clients
             .get(&client_id)
             .ok_or(IggyError::ClientNotFound(client_id as u32))?;
-        Ok(buffers)
+        Ok(message)
     }
 
     async fn send_to_replica(

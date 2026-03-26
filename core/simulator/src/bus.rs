@@ -16,19 +16,19 @@
 // under the License.
 
 use iggy_common::{IggyError, header::GenericHeader, message::Message};
-use message_bus::{ClientBuffers, MessageBus};
+use message_bus::MessageBus;
 use std::collections::{HashSet, VecDeque};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 /// Message envelope for tracking sender/recipient
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum EnvelopePayload {
     Replica(Message<GenericHeader>),
-    Client(ClientBuffers),
+    Client(Message<GenericHeader>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Envelope {
     pub from_replica: Option<u8>,
     pub to_replica: Option<u8>,
@@ -70,7 +70,6 @@ impl MessageBus for MemBus {
     type Client = u128;
     type Replica = u8;
     type Data = Message<GenericHeader>;
-    type ClientData = ClientBuffers;
     type Sender = ();
 
     fn add_client(&mut self, client: Self::Client, _sender: Self::Sender) -> bool {
@@ -100,8 +99,8 @@ impl MessageBus for MemBus {
     async fn send_to_client(
         &self,
         client_id: Self::Client,
-        buffers: Self::ClientData,
-    ) -> Result<Self::ClientData, IggyError> {
+        message: Self::Data,
+    ) -> Result<Self::Data, IggyError> {
         if !self.clients.lock().unwrap().contains(&client_id) {
             #[allow(clippy::cast_possible_truncation)]
             return Err(IggyError::ClientNotFound(client_id as u32));
@@ -111,10 +110,10 @@ impl MessageBus for MemBus {
             from_replica: None,
             to_replica: None,
             to_client: Some(client_id),
-            payload: EnvelopePayload::Client(buffers.clone()),
+            payload: EnvelopePayload::Client(message.deep_copy()),
         });
 
-        Ok(buffers)
+        Ok(message)
     }
 
     async fn send_to_replica(
@@ -130,7 +129,7 @@ impl MessageBus for MemBus {
             from_replica: None,
             to_replica: Some(replica),
             to_client: None,
-            payload: EnvelopePayload::Replica(message.clone()),
+            payload: EnvelopePayload::Replica(message.deep_copy()),
         });
 
         Ok(message)
@@ -152,7 +151,6 @@ impl MessageBus for SharedMemBus {
     type Client = u128;
     type Replica = u8;
     type Data = Message<GenericHeader>;
-    type ClientData = ClientBuffers;
     type Sender = ();
 
     fn add_client(&mut self, client: Self::Client, _sender: Self::Sender) -> bool {
@@ -174,9 +172,9 @@ impl MessageBus for SharedMemBus {
     async fn send_to_client(
         &self,
         client_id: Self::Client,
-        buffers: Self::ClientData,
-    ) -> Result<Self::ClientData, IggyError> {
-        self.0.send_to_client(client_id, buffers).await
+        message: Self::Data,
+    ) -> Result<Self::Data, IggyError> {
+        self.0.send_to_client(client_id, message).await
     }
 
     async fn send_to_replica(

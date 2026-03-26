@@ -25,16 +25,15 @@ mod journal;
 mod log;
 mod messages_writer;
 mod segment;
-mod send_messages2;
 mod types;
 
 use iggy_common::{IggyError, header::PrepareHeader, message::Message};
+pub use iggy_common::{IggyMessage2, IggyMessage2Header, IggyMessages2};
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;
-pub use send_messages2::{IggyMessage2, IggyMessage2Header, IggyMessages2};
 pub use types::{
-    AppendResult, PartitionOffsets, PartitionsConfig, PolledBatches, PollingArgs, PollingConsumer,
-    SendMessagesResult,
+    AppendResult, Fragment, PartitionOffsets, PartitionsConfig, PollFragments, PollQueryResult,
+    PollingArgs, PollingConsumer, SendMessagesResult,
 };
 
 /// Partition-level data plane operations.
@@ -51,7 +50,7 @@ pub trait Partition {
         &self,
         consumer: PollingConsumer,
         args: PollingArgs,
-    ) -> impl Future<Output = Result<PolledBatches<4096>, IggyError>> {
+    ) -> impl Future<Output = Result<PollQueryResult<4096>, IggyError>> {
         let _ = (consumer, args);
         async { Err(IggyError::FeatureUnavailable) }
     }

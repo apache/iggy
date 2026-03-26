@@ -22,7 +22,7 @@ use iggy_common::header::{ConsensusError, GenericHeader, PrepareHeader};
 use iggy_common::message::{Message, MessageBag};
 use iggy_common::sharding::IggyNamespace;
 use journal::{Journal, JournalHandle};
-use message_bus::{ClientBuffers, MessageBus};
+use message_bus::MessageBus;
 use metadata::stm::StateMachine;
 
 /// Inter-shard dispatch logic.
@@ -52,17 +52,17 @@ where
             }
         };
         let (operation, namespace, generic) = match bag {
-            MessageBag::Request(ref r) => {
-                let h = r.header();
-                (h.operation, h.namespace, r.as_generic().clone())
+            MessageBag::Request(r) => {
+                let h = *r.header();
+                (h.operation, h.namespace, r.into_generic())
             }
-            MessageBag::Prepare(ref p) => {
-                let h = p.header();
-                (h.operation, h.namespace, p.as_generic().clone())
+            MessageBag::Prepare(p) => {
+                let h = *p.header();
+                (h.operation, h.namespace, p.into_generic())
             }
-            MessageBag::PrepareOk(ref p) => {
-                let h = p.header();
-                (h.operation, h.namespace, p.as_generic().clone())
+            MessageBag::PrepareOk(p) => {
+                let h = *p.header();
+                (h.operation, h.namespace, p.into_generic())
             }
         };
         let namespace = IggyNamespace::from_raw(namespace);
@@ -96,17 +96,17 @@ where
     ) -> Result<Receiver<R>, ConsensusError> {
         let bag = MessageBag::try_from(message)?;
         let (operation, namespace, generic) = match bag {
-            MessageBag::Request(ref r) => {
-                let h = r.header();
-                (h.operation, h.namespace, r.as_generic().clone())
+            MessageBag::Request(r) => {
+                let h = *r.header();
+                (h.operation, h.namespace, r.into_generic())
             }
-            MessageBag::Prepare(ref p) => {
-                let h = p.header();
-                (h.operation, h.namespace, p.as_generic().clone())
+            MessageBag::Prepare(p) => {
+                let h = *p.header();
+                (h.operation, h.namespace, p.into_generic())
             }
-            MessageBag::PrepareOk(ref p) => {
-                let h = p.header();
-                (h.operation, h.namespace, p.as_generic().clone())
+            MessageBag::PrepareOk(p) => {
+                let h = *p.header();
+                (h.operation, h.namespace, p.into_generic())
             }
         };
         let namespace = IggyNamespace::from_raw(namespace);
@@ -144,12 +144,7 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn run_message_pump(&self, stop: Receiver<()>)
     where
-        B: MessageBus<
-                Replica = u8,
-                Data = Message<GenericHeader>,
-                Client = u128,
-                ClientData = ClientBuffers,
-            >,
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
         J: JournalHandle,
         <J as JournalHandle>::Target: Journal<
                 <J as JournalHandle>::Storage,
@@ -183,12 +178,7 @@ where
     #[allow(clippy::future_not_send)]
     async fn process_frame(&self, frame: ShardFrame<R>)
     where
-        B: MessageBus<
-                Replica = u8,
-                Data = Message<GenericHeader>,
-                Client = u128,
-                ClientData = ClientBuffers,
-            >,
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
         J: JournalHandle,
         <J as JournalHandle>::Target: Journal<
                 <J as JournalHandle>::Storage,
