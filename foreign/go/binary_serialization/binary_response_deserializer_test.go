@@ -28,44 +28,45 @@ func TestDeserializeStream(t *testing.T) {
 	payload := make([]byte, 96)
 	pos := 0
 
-	// Stream header
-	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	// Stream header: id(4) + createdAt(8) + topicsCount(4) + sizeBytes(8) + messagesCount(8) + nameLen(1) + name(N)
+	binary.LittleEndian.PutUint32(payload[pos:], 1) // id = 1
 	pos += 4
-	binary.LittleEndian.PutUint64(payload[pos:], 100)
+	binary.LittleEndian.PutUint64(payload[pos:], 100) // createdAt = 100
 	pos += 8
-	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	binary.LittleEndian.PutUint32(payload[pos:], 1) // topicsCount = 1
 	pos += 4
-	binary.LittleEndian.PutUint64(payload[pos:], 2048)
+	binary.LittleEndian.PutUint64(payload[pos:], 2048) // sizeBytes = 2048
 	pos += 8
-	binary.LittleEndian.PutUint64(payload[pos:], 10)
+	binary.LittleEndian.PutUint64(payload[pos:], 10) // messagesCount = 10
 	pos += 8
-	payload[pos] = 6
+	payload[pos] = 6 // nameLen = 6
 	pos++
-	copy(payload[pos:], "stream")
+	copy(payload[pos:], "stream") // name = "stream"
 	pos += 6
 
-	// Topic entry
-	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	// Embedded topic: id(4) + createdAt(8) + partitionsCount(4) + messageExpiry(8) +
+	//   compressionAlg(1) + maxTopicSize(8) + replicationFactor(1) + size(8) + messagesCount(8) + nameLen(1) + name(N)
+	binary.LittleEndian.PutUint32(payload[pos:], 1) // id = 1
 	pos += 4
-	binary.LittleEndian.PutUint64(payload[pos:], 200)
+	binary.LittleEndian.PutUint64(payload[pos:], 200) // createdAt = 200
 	pos += 8
-	binary.LittleEndian.PutUint32(payload[pos:], 2)
+	binary.LittleEndian.PutUint32(payload[pos:], 2) // partitionsCount = 2
 	pos += 4
-	binary.LittleEndian.PutUint64(payload[pos:], 0)
+	binary.LittleEndian.PutUint64(payload[pos:], 0) // messageExpiry = 0 (none)
 	pos += 8
-	payload[pos] = 0
+	payload[pos] = 0 // compressionAlgorithm = 0 (none)
 	pos++
-	binary.LittleEndian.PutUint64(payload[pos:], 0)
+	binary.LittleEndian.PutUint64(payload[pos:], 0) // maxTopicSize = 0 (unlimited)
 	pos += 8
-	payload[pos] = 1
+	payload[pos] = 1 // replicationFactor = 1
 	pos++
-	binary.LittleEndian.PutUint64(payload[pos:], 1024)
+	binary.LittleEndian.PutUint64(payload[pos:], 1024) // size = 1024
 	pos += 8
-	binary.LittleEndian.PutUint64(payload[pos:], 5)
+	binary.LittleEndian.PutUint64(payload[pos:], 5) // messagesCount = 5
 	pos += 8
-	payload[pos] = 6
+	payload[pos] = 6 // nameLen = 6
 	pos++
-	copy(payload[pos:], "topic1")
+	copy(payload[pos:], "topic1") // name = "topic1"
 
 	result, err := DeserializeStream(payload)
 	if err != nil {
@@ -101,42 +102,43 @@ func TestDeserializeTopic(t *testing.T) {
 	payload := make([]byte, 98)
 	pos := 0
 
-	// Topic header
-	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	// Topic header: id(4) + createdAt(8) + partitionsCount(4) + messageExpiry(8) +
+	//   compressionAlg(1) + maxTopicSize(8) + replicationFactor(1) + size(8) + messagesCount(8) + nameLen(1) + name(N)
+	binary.LittleEndian.PutUint32(payload[pos:], 1) // id = 1
 	pos += 4
-	binary.LittleEndian.PutUint64(payload[pos:], 200)
+	binary.LittleEndian.PutUint64(payload[pos:], 200) // createdAt = 200
 	pos += 8
-	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	binary.LittleEndian.PutUint32(payload[pos:], 1) // partitionsCount = 1
 	pos += 4
-	binary.LittleEndian.PutUint64(payload[pos:], 0)
+	binary.LittleEndian.PutUint64(payload[pos:], 0) // messageExpiry = 0 (none)
 	pos += 8
-	payload[pos] = 0
+	payload[pos] = 0 // compressionAlgorithm = 0 (none)
 	pos++
-	binary.LittleEndian.PutUint64(payload[pos:], 0)
+	binary.LittleEndian.PutUint64(payload[pos:], 0) // maxTopicSize = 0 (unlimited)
 	pos += 8
-	payload[pos] = 1
+	payload[pos] = 1 // replicationFactor = 1
 	pos++
-	binary.LittleEndian.PutUint64(payload[pos:], 1024)
+	binary.LittleEndian.PutUint64(payload[pos:], 1024) // size = 1024
 	pos += 8
-	binary.LittleEndian.PutUint64(payload[pos:], 5)
+	binary.LittleEndian.PutUint64(payload[pos:], 5) // messagesCount = 5
 	pos += 8
-	payload[pos] = 7
+	payload[pos] = 7 // nameLen = 7
 	pos++
-	copy(payload[pos:], "mytopic")
+	copy(payload[pos:], "mytopic") // name = "mytopic"
 	pos += 7
 
-	// Partition entry
-	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	// Partition entry: id(4) + createdAt(8) + segmentsCount(4) + currentOffset(8) + sizeBytes(8) + messagesCount(8)
+	binary.LittleEndian.PutUint32(payload[pos:], 1) // id = 1
 	pos += 4
-	binary.LittleEndian.PutUint64(payload[pos:], 300)
+	binary.LittleEndian.PutUint64(payload[pos:], 300) // createdAt = 300
 	pos += 8
-	binary.LittleEndian.PutUint32(payload[pos:], 3)
+	binary.LittleEndian.PutUint32(payload[pos:], 3) // segmentsCount = 3
 	pos += 4
-	binary.LittleEndian.PutUint64(payload[pos:], 99)
+	binary.LittleEndian.PutUint64(payload[pos:], 99) // currentOffset = 99
 	pos += 8
-	binary.LittleEndian.PutUint64(payload[pos:], 512)
+	binary.LittleEndian.PutUint64(payload[pos:], 512) // sizeBytes = 512
 	pos += 8
-	binary.LittleEndian.PutUint64(payload[pos:], 7)
+	binary.LittleEndian.PutUint64(payload[pos:], 7) // messagesCount = 7
 
 	result, err := DeserializeTopic(payload)
 	if err != nil {
@@ -175,26 +177,26 @@ func TestDeserializeConsumerGroup_WithMembers(t *testing.T) {
 	payload := make([]byte, 34)
 	pos := 0
 
-	// Consumer group header
-	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	// Consumer group header: id(4) + partitionsCount(4) + membersCount(4) + nameLen(1) + name(N)
+	binary.LittleEndian.PutUint32(payload[pos:], 1) // id = 1
 	pos += 4
-	binary.LittleEndian.PutUint32(payload[pos:], 2)
+	binary.LittleEndian.PutUint32(payload[pos:], 2) // partitionsCount = 2
 	pos += 4
-	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	binary.LittleEndian.PutUint32(payload[pos:], 1) // membersCount = 1
 	pos += 4
-	payload[pos] = 5
+	payload[pos] = 5 // nameLen = 5
 	pos++
-	copy(payload[pos:], "grp-1")
+	copy(payload[pos:], "grp-1") // name = "grp-1"
 	pos += 5
 
-	// Member entry: id=10, partitionsCount=2, partitions=[1,2]
-	binary.LittleEndian.PutUint32(payload[pos:], 10)
+	// Member entry: id(4) + partitionsCount(4) + partitions(4*N)
+	binary.LittleEndian.PutUint32(payload[pos:], 10) // memberId = 10
 	pos += 4
-	binary.LittleEndian.PutUint32(payload[pos:], 2)
+	binary.LittleEndian.PutUint32(payload[pos:], 2) // partitionsCount = 2
 	pos += 4
-	binary.LittleEndian.PutUint32(payload[pos:], 1)
+	binary.LittleEndian.PutUint32(payload[pos:], 1) // partition[0] = 1
 	pos += 4
-	binary.LittleEndian.PutUint32(payload[pos:], 2)
+	binary.LittleEndian.PutUint32(payload[pos:], 2) // partition[1] = 2
 
 	result := DeserializeConsumerGroup(payload)
 	if result.Name != "grp-1" {
