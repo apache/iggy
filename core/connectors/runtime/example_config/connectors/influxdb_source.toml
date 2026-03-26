@@ -51,4 +51,5 @@ payload_format = "json"
 max_retries = 3
 retry_delay = "1s"
 timeout = "10s"
-precision = "us"
+# Note: precision is a write-side setting (see influxdb_sink); it does not
+# apply to source queries and is not a field of InfluxDbSourceConfig.

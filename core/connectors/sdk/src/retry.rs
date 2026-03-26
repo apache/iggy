@@ -20,7 +20,7 @@
 //!
 //! Provides:
 //! - [`CircuitBreaker`] — consecutive-failure circuit breaker
-//! - [`InfluxDbRetryMiddleware`] — `reqwest-middleware` middleware with
+//! - [`HttpRetryMiddleware`] — `reqwest-middleware` middleware with
 //!   exponential back-off, jitter, and `Retry-After` header support
 //! - [`build_retry_client`] — wraps a `reqwest::Client` with the middleware
 //! - [`is_transient_status`] — transient HTTP status predicate
@@ -125,12 +125,26 @@ impl CircuitBreaker {
 // ---------------------------------------------------------------------------
 
 /// Parse a human-readable duration string (e.g. `"5s"`, `"1m30s"`) using
-/// [`humantime`]. Falls back to 1 second if parsing fails.
+/// [`humantime`]. Falls back to 1 second if parsing fails, and emits a
+/// `warn!` so misconfigured values (e.g. `"5sec"` instead of `"5s"`) are
+/// visible in logs rather than silently causing unexpected retry timing.
 pub fn parse_duration(value: Option<&str>, default_value: &str) -> Duration {
     let raw = value.unwrap_or(default_value);
     HumanDuration::from_str(raw)
         .map(|d| d.into())
-        .unwrap_or_else(|_| Duration::from_secs(1))
+        .unwrap_or_else(|e| {
+            // Only warn when the caller supplied a bad value; a bad
+            // default_value is a programming error caught in tests, not a
+            // runtime config issue worth alarming operators about.
+            if value.is_some() {
+                warn!(
+                    "Invalid duration {:?}: {e}. Falling back to 1s. \
+                     Use humantime format, e.g. \"5s\", \"1m30s\", \"200ms\".",
+                    raw
+                );
+            }
+            Duration::from_secs(1)
+        })
 }
 
 /// Apply ±20 % random jitter to `base` to spread retry storms.
@@ -175,11 +189,15 @@ pub fn is_transient_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
-/// Per-request retry middleware for InfluxDB connectors.
+/// Per-request retry middleware for HTTP connectors.
 ///
 /// Wraps a `reqwest-middleware` stack and retries transient failures
 /// (HTTP 429, 5xx, network errors) with exponential back-off and ±20 % jitter.
-/// An `Retry-After` response header on a 429 overrides the calculated delay.
+/// A `Retry-After` response header on a 429 overrides the calculated delay.
+///
+/// The `log_prefix` parameter identifies the connector in log messages
+/// (e.g. `"InfluxDB"`, `"Elasticsearch"`), allowing this middleware to be
+/// reused across connectors without misleading log output.
 ///
 /// The `max_retries` parameter is the *total attempt count* (not the number
 /// of extra attempts), consistent with the rest of the connector retry config:
@@ -189,24 +207,31 @@ pub fn is_transient_status(status: reqwest::StatusCode) -> bool {
 /// Non-transient error responses (4xx except 429) are returned as-is so
 /// callers can inspect the status and body to build a meaningful error.
 #[derive(Debug, Clone)]
-pub struct InfluxDbRetryMiddleware {
+pub struct HttpRetryMiddleware {
     max_retries: u32,
     retry_delay: Duration,
     max_delay: Duration,
+    log_prefix: &'static str,
 }
 
-impl InfluxDbRetryMiddleware {
-    pub fn new(max_retries: u32, retry_delay: Duration, max_delay: Duration) -> Self {
+impl HttpRetryMiddleware {
+    pub fn new(
+        max_retries: u32,
+        retry_delay: Duration,
+        max_delay: Duration,
+        log_prefix: &'static str,
+    ) -> Self {
         Self {
             max_retries,
             retry_delay,
             max_delay,
+            log_prefix,
         }
     }
 }
 
 #[async_trait::async_trait]
-impl Middleware for InfluxDbRetryMiddleware {
+impl Middleware for HttpRetryMiddleware {
     async fn handle(
         &self,
         req: reqwest::Request,
@@ -253,10 +278,10 @@ impl Middleware for InfluxDbRetryMiddleware {
                             ))
                         });
                         warn!(
-                            "Transient InfluxDB error {status} \
+                            "{} transient error {status} \
                              (attempt {attempts}/{}): {body_text}. \
                              Retrying in {delay:?}...",
-                            self.max_retries
+                            self.log_prefix, self.max_retries
                         );
                         tokio::time::sleep(delay).await;
                         current_req = match next_req {
@@ -284,9 +309,9 @@ impl Middleware for InfluxDbRetryMiddleware {
                             self.max_delay,
                         ));
                         warn!(
-                            "InfluxDB network error (attempt {attempts}/{}): {e}. \
+                            "{} network error (attempt {attempts}/{}): {e}. \
                              Retrying in {delay:?}...",
-                            self.max_retries
+                            self.log_prefix, self.max_retries
                         );
                         tokio::time::sleep(delay).await;
                         current_req = match next_req {
@@ -303,7 +328,10 @@ impl Middleware for InfluxDbRetryMiddleware {
 }
 
 /// Wrap a raw [`reqwest::Client`] in a [`ClientWithMiddleware`] that
-/// automatically retries transient InfluxDB failures.
+/// automatically retries transient HTTP failures.
+///
+/// The `log_prefix` parameter is included in all retry log messages to
+/// identify which connector is retrying (e.g. `"InfluxDB"`, `"Elasticsearch"`).
 ///
 /// The middleware uses the same `max_retries` semantics as the rest of the
 /// connector retry config (total attempt count, not number of extra retries).
@@ -312,12 +340,14 @@ pub fn build_retry_client(
     max_retries: u32,
     retry_delay: Duration,
     max_delay: Duration,
+    log_prefix: &'static str,
 ) -> ClientWithMiddleware {
     ClientBuilder::new(client)
-        .with(InfluxDbRetryMiddleware::new(
+        .with(HttpRetryMiddleware::new(
             max_retries,
             retry_delay,
             max_delay,
+            log_prefix,
         ))
         .build()
 }
@@ -395,10 +425,18 @@ mod tests {
 
     #[test]
     fn parse_duration_falls_back_to_one_second_on_invalid() {
+        // Invalid user-supplied value — falls back to 1s (and would emit warn! at runtime)
         assert_eq!(
             parse_duration(Some("not-a-duration"), "3s"),
             Duration::from_secs(1)
         );
+    }
+
+    #[test]
+    fn parse_duration_falls_back_silently_when_no_value_supplied() {
+        // None means "use the default"; the default itself is always valid
+        // so no warn! is emitted and the result is the parsed default.
+        assert_eq!(parse_duration(None, "3s"), Duration::from_secs(3));
     }
 
     // ── exponential_backoff ──────────────────────────────────────────────

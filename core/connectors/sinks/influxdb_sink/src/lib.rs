@@ -19,6 +19,7 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
+use iggy_common::serde_secret::serialize_secret;
 use iggy_connector_sdk::retry::{
     CircuitBreaker, build_retry_client, exponential_backoff, jitter, parse_duration,
 };
@@ -27,6 +28,7 @@ use iggy_connector_sdk::{
 };
 use reqwest::Url;
 use reqwest_middleware::ClientWithMiddleware;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,7 +63,7 @@ pub struct InfluxDbSink {
     pub id: u32,
     config: InfluxDbSinkConfig,
     /// `None` until `open()` is called. Wraps `reqwest::Client` with
-    /// [`InfluxDbRetryMiddleware`] so retry/back-off/jitter is handled
+    /// [`HttpRetryMiddleware`] so retry/back-off/jitter is handled
     /// transparently by the middleware stack instead of a hand-rolled loop.
     client: Option<ClientWithMiddleware>,
     /// Cached once in `open()` — config fields never change at runtime.
@@ -79,7 +81,8 @@ pub struct InfluxDbSinkConfig {
     pub url: String,
     pub org: String,
     pub bucket: String,
-    pub token: String,
+    #[serde(serialize_with = "serialize_secret")]
+    pub token: SecretString,
     pub measurement: Option<String>,
     pub precision: Option<String>,
     pub batch_size: Option<u32>,
@@ -569,7 +572,7 @@ impl InfluxDbSink {
         let url = self.write_url.clone().ok_or_else(|| {
             Error::Connection("write_url not initialised — was open() called?".to_string())
         })?;
-        let token = self.config.token.clone();
+        let token = self.config.token.expose_secret().to_owned();
 
         // Convert once before sending — Bytes is reference-counted so any
         // retry inside the middleware clones the pointer, not the payload data.
@@ -593,9 +596,19 @@ impl InfluxDbSink {
             .text()
             .await
             .unwrap_or_else(|_| "failed to read response body".to_string());
-        Err(Error::CannotStoreData(format!(
-            "InfluxDB write failed with status {status}: {body_text}"
-        )))
+
+        // Use PermanentHttpError for non-transient 4xx (400 Bad Request, 422
+        // schema conflict, etc.) so consume() can skip the circuit breaker for
+        // these — they indicate a data/schema issue, not an infrastructure one.
+        if iggy_connector_sdk::retry::is_transient_status(status) {
+            Err(Error::CannotStoreData(format!(
+                "InfluxDB write failed with status {status}: {body_text}"
+            )))
+        } else {
+            Err(Error::PermanentHttpError(format!(
+                "InfluxDB write failed with status {status}: {body_text}"
+            )))
+        }
     }
 }
 
@@ -632,6 +645,7 @@ impl Sink for InfluxDbSink {
             max_retries,
             self.retry_delay,
             write_retry_max_delay,
+            "InfluxDB",
         ));
 
         // Cache once — both are derived purely from config fields that
@@ -682,8 +696,13 @@ impl Sink for InfluxDbSink {
                         .fetch_add(batch.len() as u64, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    // Failed write — notify circuit breaker
-                    self.circuit_breaker.record_failure().await;
+                    // Only count transient/connectivity failures toward the
+                    // circuit breaker. PermanentHttpError (400, 422, etc.) are
+                    // data/schema issues that retrying will not fix; tripping
+                    // the circuit on them would block valid subsequent messages.
+                    if !matches!(e, Error::PermanentHttpError(_)) {
+                        self.circuit_breaker.record_failure().await;
+                    }
                     self.write_errors
                         .fetch_add(batch.len() as u64, Ordering::Relaxed);
                     error!(
@@ -765,7 +784,7 @@ mod tests {
             url: "http://localhost:8086".to_string(),
             org: "test_org".to_string(),
             bucket: "test_bucket".to_string(),
-            token: "test_token".to_string(),
+            token: SecretString::from("test_token"),
             measurement: Some("test_measurement".to_string()),
             precision: Some("us".to_string()),
             batch_size: None,

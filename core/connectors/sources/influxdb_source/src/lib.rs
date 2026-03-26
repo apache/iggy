@@ -19,6 +19,7 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use csv::StringRecord;
+use iggy_common::serde_secret::serialize_secret;
 use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::retry::{
     CircuitBreaker, build_retry_client, exponential_backoff, jitter, parse_duration,
@@ -29,6 +30,7 @@ use iggy_connector_sdk::{
 use regex::Regex;
 use reqwest::Url;
 use reqwest_middleware::ClientWithMiddleware;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -77,7 +79,7 @@ pub struct InfluxDbSource {
     pub id: u32,
     config: InfluxDbSourceConfig,
     /// `None` until `open()` is called. Wraps `reqwest::Client` with
-    /// [`InfluxDbRetryMiddleware`] so retry/back-off/jitter is handled
+    /// [`HttpRetryMiddleware`] so retry/back-off/jitter is handled
     /// transparently by the middleware stack instead of a hand-rolled loop.
     client: Option<ClientWithMiddleware>,
     state: Mutex<State>,
@@ -91,7 +93,8 @@ pub struct InfluxDbSource {
 pub struct InfluxDbSourceConfig {
     pub url: String,
     pub org: String,
-    pub token: String,
+    #[serde(serialize_with = "serialize_secret")]
+    pub token: SecretString,
     pub query: String,
     pub poll_interval: Option<String>,
     pub batch_size: Option<u32>,
@@ -192,8 +195,20 @@ fn parse_scalar(value: &str) -> serde_json::Value {
     serde_json::Value::String(value.to_string())
 }
 
+/// Recognise an InfluxDB CSV header row.
+///
+/// A header row must contain a `_time` column. The `_value` column is
+/// intentionally **not** required: Flux aggregation queries (`count()`,
+/// `mean()`, `group()`) produce result tables with columns like `_count` or
+/// `_mean` instead of `_value`. Requiring `_value` would cause those header
+/// rows to be missed, silently skipping all subsequent data rows until the
+/// next recognised header.
+///
+/// InfluxDB annotation rows (`#group`, `#datatype`, `#default`) are already
+/// filtered out earlier in `parse_csv_rows` by the leading-`#` check, so
+/// they will never reach this function.
 fn is_header_record(record: &StringRecord) -> bool {
-    record.iter().any(|v| v == "_time") && record.iter().any(|v| v == "_value")
+    record.iter().any(|v| v == "_time")
 }
 
 /// Compare two RFC 3339 timestamp strings chronologically.
@@ -448,7 +463,7 @@ impl InfluxDbSource {
     async fn run_query(&self, query: &str) -> Result<String, Error> {
         let client = self.get_client()?;
         let url = self.build_query_url()?;
-        let token = self.config.token.clone();
+        let token = self.config.token.expose_secret().to_owned();
 
         let body = json!({
             "query": query,
@@ -482,9 +497,19 @@ impl InfluxDbSource {
             .text()
             .await
             .unwrap_or_else(|_| "failed to read response body".to_string());
-        Err(Error::Storage(format!(
-            "InfluxDB query failed with status {status}: {body_text}"
-        )))
+
+        // Use PermanentHttpError for non-transient 4xx (400 Bad Request, 401
+        // Unauthorized, etc.) so poll() can skip the circuit breaker for these
+        // — they indicate a config/data issue, not an infrastructure failure.
+        if iggy_connector_sdk::retry::is_transient_status(status) {
+            Err(Error::Storage(format!(
+                "InfluxDB query failed with status {status}: {body_text}"
+            )))
+        } else {
+            Err(Error::PermanentHttpError(format!(
+                "InfluxDB query failed with status {status}: {body_text}"
+            )))
+        }
     }
 
     fn parse_csv_rows(&self, csv_text: &str) -> Result<Vec<HashMap<String, String>>, Error> {
@@ -715,6 +740,7 @@ impl Source for InfluxDbSource {
             max_retries,
             self.retry_delay,
             query_retry_max_delay,
+            "InfluxDB",
         ));
 
         info!(
@@ -802,8 +828,12 @@ impl Source for InfluxDbSource {
                 })
             }
             Err(e) => {
-                // Failed poll — notify circuit breaker
-                self.circuit_breaker.record_failure().await;
+                // Only count transient/connectivity failures toward the
+                // circuit breaker. PermanentHttpError (400, 401, etc.) are
+                // config/data issues that retrying will not fix.
+                if !matches!(e, Error::PermanentHttpError(_)) {
+                    self.circuit_breaker.record_failure().await;
+                }
                 error!(
                     "InfluxDB source ID: {} poll failed: {e}. \
                      Consecutive failures tracked by circuit breaker.",
@@ -839,7 +869,7 @@ mod tests {
         InfluxDbSourceConfig {
             url: "http://localhost:8086".to_string(),
             org: "test_org".to_string(),
-            token: "test_token".to_string(),
+            token: SecretString::from("test_token"),
             query: r#"from(bucket:"b") |> range(start: $cursor) |> limit(n: $limit)"#.to_string(),
             poll_interval: Some("1s".to_string()),
             batch_size: Some(100),

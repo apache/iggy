@@ -403,4 +403,10 @@ pub enum Error {
     Connection(String),
     #[error("Cannot store data: {0}")]
     CannotStoreData(String),
+    /// A non-transient HTTP error (e.g. 400 Bad Request, 422 Unprocessable
+    /// Entity) that retrying will not fix. Connectors use this variant to
+    /// distinguish permanent data/schema issues from transient connectivity
+    /// failures so that circuit breakers are not tripped by bad data.
+    #[error("Permanent HTTP error: {0}")]
+    PermanentHttpError(String),
 }
