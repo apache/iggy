@@ -28,6 +28,13 @@ repository = "https://github.com/apache/iggy"
 readme = "../../../README.md"
 
 [dependencies]
+bytemuck = { workspace = true }
+bytes = { workspace = true }
+compio = { workspace = true }
+iggy_binary_protocol = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints.clippy]
 enum_glob_use = "deny"

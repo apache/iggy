@@ -152,10 +152,8 @@ async fn handle_request(
                 "CreatePartitionsRequest should only be handled by shard0"
             );
 
-            let result = execution::execute_create_partitions(shard, user_id, command).await?;
-            Ok(ShardResponse::CreatePartitionsResponse(
-                result.partition_ids,
-            ))
+            execution::execute_create_partitions(shard, user_id, command).await?;
+            Ok(ShardResponse::CreatePartitionsResponse)
         }
         ShardRequestPayload::DeletePartitionsRequest { user_id, command } => {
             assert_eq!(
@@ -163,10 +161,8 @@ async fn handle_request(
                 "DeletePartitionsRequest should only be handled by shard0"
             );
 
-            let result = execution::execute_delete_partitions(shard, user_id, command).await?;
-            Ok(ShardResponse::DeletePartitionsResponse(
-                result.partition_ids,
-            ))
+            execution::execute_delete_partitions(shard, user_id, command).await?;
+            Ok(ShardResponse::DeletePartitionsResponse)
         }
         ShardRequestPayload::CreateStreamRequest { user_id, command } => {
             assert_eq!(
@@ -201,8 +197,8 @@ async fn handle_request(
                 "DeleteTopicRequest should only be handled by shard0"
             );
 
-            let result = execution::execute_delete_topic(shard, user_id, command).await?;
-            Ok(ShardResponse::DeleteTopicResponse(result.topic_id))
+            execution::execute_delete_topic(shard, user_id, command).await?;
+            Ok(ShardResponse::DeleteTopicResponse)
         }
         ShardRequestPayload::CreateUserRequest { user_id, command } => {
             assert_eq!(
@@ -240,8 +236,8 @@ async fn handle_request(
                 "DeleteStreamRequest should only be handled by shard0"
             );
 
-            let result = execution::execute_delete_stream(shard, user_id, command).await?;
-            Ok(ShardResponse::DeleteStreamResponse(result.stream_id))
+            execution::execute_delete_stream(shard, user_id, command).await?;
+            Ok(ShardResponse::DeleteStreamResponse)
         }
         ShardRequestPayload::UpdatePermissionsRequest { user_id, command } => {
             assert_eq!(
