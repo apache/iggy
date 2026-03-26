@@ -36,7 +36,7 @@ use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::{IggyError, RawPersonalAccessToken};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -93,9 +93,7 @@ async fn create_personal_access_token(
 
     match state.shard.send_to_control_plane(request).await? {
         ShardResponse::CreatePersonalAccessTokenResponse(_, token) => {
-            Ok(Json(RawPersonalAccessToken {
-                token: SecretString::from(token),
-            }))
+            Ok(Json(RawPersonalAccessToken { token }))
         }
         ShardResponse::ErrorResponse(err) => Err(err.into()),
         _ => unreachable!("Expected CreatePersonalAccessTokenResponse"),
