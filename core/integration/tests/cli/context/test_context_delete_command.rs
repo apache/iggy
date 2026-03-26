@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
@@ -86,7 +86,7 @@ pub async fn should_be_successful() {
     iggy_cmd_test
         .execute_test(TestContextDeleteCmd::new(
             TestIggyContext::new(
-                Some(HashMap::from([
+                Some(BTreeMap::from([
                     ("default".to_string(), ContextConfig::default()),
                     ("production".to_string(), ContextConfig::default()),
                 ])),
@@ -104,7 +104,7 @@ pub async fn should_reset_active_context_on_delete() {
     iggy_cmd_test.setup().await;
 
     let test_context = TestIggyContext::new(
-        Some(HashMap::from([
+        Some(BTreeMap::from([
             ("default".to_string(), ContextConfig::default()),
             ("staging".to_string(), ContextConfig::default()),
         ])),

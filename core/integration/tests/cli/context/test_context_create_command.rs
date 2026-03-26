@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
@@ -105,7 +105,7 @@ pub async fn should_be_successful() {
     iggy_cmd_test
         .execute_test(TestContextCreateCmd::new(
             TestIggyContext::new(
-                Some(HashMap::from([(
+                Some(BTreeMap::from([(
                     "default".to_string(),
                     ContextConfig::default(),
                 )])),
@@ -127,7 +127,7 @@ pub async fn should_create_minimal_context() {
     iggy_cmd_test
         .execute_test(TestContextCreateCmd::new(
             TestIggyContext::new(
-                Some(HashMap::from([(
+                Some(BTreeMap::from([(
                     "default".to_string(),
                     ContextConfig::default(),
                 )])),
