@@ -24,9 +24,15 @@ use iggy_common::IdentityInfo;
 use iggy_common::PersonalAccessTokenClient;
 use iggy_common::PersonalAccessTokenExpiry;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::{PersonalAccessTokenInfo, RawPersonalAccessToken};
 use secrecy::SecretString;
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct LoginWithPatRequest {
+    #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
+    token: SecretString,
+}
 
 const PATH: &str = "/personal-access-tokens";
 
@@ -74,7 +80,7 @@ impl PersonalAccessTokenClient for HttpClient {
         let response = self
             .post(
                 &format!("{PATH}/login"),
-                &LoginWithPersonalAccessToken {
+                &LoginWithPatRequest {
                     token: SecretString::from(token),
                 },
             )

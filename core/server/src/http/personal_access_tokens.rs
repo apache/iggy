@@ -38,11 +38,16 @@ use iggy_common::IdentityInfo;
 use iggy_common::PersonalAccessTokenInfo;
 use iggy_common::Validatable;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::{IggyError, RawPersonalAccessToken};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
+use serde::Deserialize;
 use std::sync::Arc;
 use tracing::instrument;
+
+#[derive(Debug, Deserialize)]
+struct LoginWithPatBody {
+    pub token: SecretString,
+}
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -135,9 +140,8 @@ async fn delete_personal_access_token(
 #[instrument(skip_all, name = "trace_login_with_personal_access_token")]
 async fn login_with_personal_access_token(
     State(state): State<Arc<AppState>>,
-    Json(command): Json<LoginWithPersonalAccessToken>,
+    Json(command): Json<LoginWithPatBody>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
-    command.validate()?;
     let user = state
         .shard
         .shard()

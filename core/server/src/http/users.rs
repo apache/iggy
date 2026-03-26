@@ -29,7 +29,6 @@ use crate::streaming::session::Session;
 use crate::streaming::users::user::User;
 use ::iggy_common::change_password::ChangePassword;
 use ::iggy_common::create_user::CreateUser;
-use ::iggy_common::login_user::LoginUser;
 use ::iggy_common::update_permissions::UpdatePermissions;
 use ::iggy_common::update_user::UpdateUser;
 use axum::extract::{Path, State};
@@ -47,11 +46,17 @@ use iggy_common::Identifier;
 use iggy_common::IdentityInfo;
 use iggy_common::Validatable;
 use iggy_common::{IggyError, UserInfo, UserInfoDetails};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::instrument;
+
+#[derive(Debug, Deserialize)]
+struct LoginUserBody {
+    pub username: String,
+    pub password: SecretString,
+}
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -257,9 +262,8 @@ async fn delete_user(
 #[instrument(skip_all, name = "trace_login_user")]
 async fn login_user(
     State(state): State<Arc<AppState>>,
-    Json(command): Json<LoginUser>,
+    Json(command): Json<LoginUserBody>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
-    command.validate()?;
     let user = state
         .shard
         .shard()

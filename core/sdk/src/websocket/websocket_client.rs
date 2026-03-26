@@ -27,7 +27,7 @@ use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_common::{
-    AutoLogin, ClientState, Command, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
+    AutoLogin, ClientState, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
     IggyError, IggyErrorDiscriminants, IggyTimestamp, WebSocketClientConfig,
     WebSocketConnectionStringOptions,
 };
@@ -99,12 +99,6 @@ impl BinaryTransport for WebSocketClient {
         if let Err(error) = self.events.0.broadcast(event).await {
             error!("Failed to send a {} diagnostic event: {error}", NAME);
         }
-    }
-
-    async fn send_with_response<T: Command>(&self, command: &T) -> Result<Bytes, IggyError> {
-        command.validate()?;
-        self.send_raw_with_response(command.code(), command.to_bytes())
-            .await
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {

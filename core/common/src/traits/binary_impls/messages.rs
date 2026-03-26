@@ -17,11 +17,16 @@
  */
 use crate::BinaryClient;
 use crate::traits::binary_auth::fail_if_not_authenticated;
+use crate::wire_conversions::identifier_to_wire;
 use crate::{
-    BytesSerializable, Consumer, FlushUnsavedBuffer, Identifier, IggyError, IggyMessage,
-    MessageClient, POLL_MESSAGES_CODE, Partitioning, PollMessages, PolledMessages, PollingStrategy,
-    SEND_MESSAGES_CODE, SendMessages,
+    BytesSerializable, Consumer, Identifier, IggyError, IggyMessage, MessageClient, Partitioning,
+    PollMessages, PolledMessages, PollingStrategy, SendMessages,
 };
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::codes::{
+    FLUSH_UNSAVED_BUFFER_CODE, POLL_MESSAGES_CODE, SEND_MESSAGES_CODE,
+};
+use iggy_binary_protocol::requests::messages::FlushUnsavedBufferRequest;
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> MessageClient for B {
@@ -77,13 +82,14 @@ impl<B: BinaryClient> MessageClient for B {
         fsync: bool,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&FlushUnsavedBuffer {
-            stream_id: stream_id.clone(),
-            topic_id: topic_id.clone(),
+        let req = FlushUnsavedBufferRequest {
+            stream_id: identifier_to_wire(stream_id)?,
+            topic_id: identifier_to_wire(topic_id)?,
             partition_id,
             fsync,
-        })
-        .await?;
+        };
+        self.send_raw_with_response(FLUSH_UNSAVED_BUFFER_CODE, req.to_bytes())
+            .await?;
         Ok(())
     }
 }

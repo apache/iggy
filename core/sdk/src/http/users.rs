@@ -23,11 +23,20 @@ use async_trait::async_trait;
 use iggy_common::UserClient;
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_user::CreateUser;
-use iggy_common::login_user::LoginUser;
 use iggy_common::update_permissions::UpdatePermissions;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::{IdentityInfo, Permissions, UserInfo, UserInfoDetails, UserStatus};
 use secrecy::SecretString;
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct LoginUserRequest {
+    username: String,
+    #[serde(serialize_with = "iggy_common::serde_secret::serialize_secret")]
+    password: SecretString,
+    version: Option<String>,
+    context: Option<String>,
+}
 
 const PATH: &str = "/users";
 
@@ -146,7 +155,7 @@ impl UserClient for HttpClient {
         let response = self
             .post(
                 &format!("{PATH}/login"),
-                &LoginUser {
+                &LoginUserRequest {
                     username: username.to_string(),
                     password: SecretString::from(password),
                     version: Some(env!("CARGO_PKG_VERSION").to_string()),

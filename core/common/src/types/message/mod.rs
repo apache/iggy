@@ -41,7 +41,6 @@ mod user_headers;
 
 pub const INDEX_SIZE: usize = 16;
 
-pub use crate::commands::messages::flush_unsaved_buffer::FlushUnsavedBuffer;
 pub use crate::commands::messages::poll_messages::PollMessages;
 pub use crate::commands::messages::send_messages::SendMessages;
 pub use iggy_message::{IggyMessage, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE};
