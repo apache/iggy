@@ -15,60 +15,44 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::shard::IggyShard;
-use std::rc::Rc;
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
+use crate::binary::dispatch::HandlerResult;
 use crate::binary::handlers::personal_access_tokens::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use err_trail::ErrContext;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::requests::personal_access_tokens::LoginWithPersonalAccessTokenRequest;
+use iggy_binary_protocol::responses::users::IdentityResponse;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
-use iggy_common::{IggyError, SenderKind};
-use secrecy::ExposeSecret;
+use iggy_common::{IggyError, SenderKind, Validatable};
+use secrecy::SecretString;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for LoginWithPersonalAccessToken {
-    fn code(&self) -> u32 {
-        iggy_common::LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE
-    }
+#[instrument(skip_all, name = "trace_login_with_personal_access_token", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+pub async fn handle_login_with_personal_access_token(
+    req: LoginWithPersonalAccessTokenRequest,
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    debug!("session: {session}, command: login_with_personal_access_token");
+    let token = req.token.as_str();
 
-    #[instrument(skip_all, name = "trace_login_with_personal_access_token", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        let token = self.token.expose_secret();
-        let user = shard
-            .login_with_personal_access_token(token, Some(session))
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to login with personal access token, session: {session}",
-                )
-            })?;
-        let identity_info = mapper::map_identity_info(user.id);
-        sender.send_ok_response(&identity_info).await?;
-        Ok(HandlerResult::Finished)
-    }
-}
+    let command = LoginWithPersonalAccessToken {
+        token: SecretString::from(token),
+    };
+    command.validate()?;
 
-impl BinaryServerCommand for LoginWithPersonalAccessToken {
-    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::LoginWithPersonalAccessToken(login_with_personal_access_token) => {
-                Ok(login_with_personal_access_token)
-            }
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+    let user = shard
+        .login_with_personal_access_token(token, Some(session))
+        .error(|e: &IggyError| {
+            format!(
+                "{COMPONENT} (error: {e}) - failed to login with personal access token, session: {session}",
+            )
+        })?;
+    let response = IdentityResponse { user_id: user.id };
+    sender.send_ok_response(&response.to_bytes()).await?;
+    Ok(HandlerResult::Finished)
 }

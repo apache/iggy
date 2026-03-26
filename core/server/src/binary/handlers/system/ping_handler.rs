@@ -16,49 +16,27 @@
  * under the License.
  */
 
-use crate::binary::command::{BinaryServerCommand, HandlerResult, ServerCommandHandler};
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
 use iggy_common::SenderKind;
-use iggy_common::ping::Ping;
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for Ping {
-    fn code(&self) -> u32 {
-        iggy_common::PING_CODE
+pub async fn handle_ping(
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    debug!("session: {session}, command: ping");
+    if let Some(mut client) = shard.client_manager.try_get_client_mut(session.client_id) {
+        let now = IggyTimestamp::now();
+        client.last_heartbeat = now;
+        debug!("Updated last heartbeat to: {now} for session: {session}");
     }
 
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        if let Some(mut client) = shard.client_manager.try_get_client_mut(session.client_id) {
-            let now = IggyTimestamp::now();
-            client.last_heartbeat = now;
-            debug!("Updated last heartbeat to: {now} for session: {session}");
-        }
-
-        sender.send_empty_ok_response().await?;
-        Ok(HandlerResult::Finished)
-    }
-}
-
-impl BinaryServerCommand for Ping {
-    async fn from_sender(
-        _sender: &mut SenderKind,
-        _length: u32,
-        _code: u32,
-    ) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        Ok(Ping {})
-    }
+    sender.send_empty_ok_response().await?;
+    Ok(HandlerResult::Finished)
 }

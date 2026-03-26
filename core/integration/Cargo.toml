@@ -42,6 +42,7 @@ harness_derive = { workspace = true }
 humantime = { workspace = true }
 iggy = { workspace = true }
 iggy-cli = { workspace = true }
+iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true, features = ["api"] }
 keyring = { workspace = true }
@@ -68,7 +69,6 @@ serial_test = { workspace = true }
 server = { workspace = true }
 socket2 = { workspace = true }
 sqlx = { workspace = true }
-strum = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
