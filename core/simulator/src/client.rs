@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_binary_protocol::{Message, Operation, RequestHeader};
-use iggy_common::{
-    BytesSerializable, IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, Identifier,
-    create_stream::CreateStream, delete_stream::DeleteStream, sharding::IggyNamespace,
+use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
+use iggy_binary_protocol::{
+    Message, Operation, RequestHeader, WireEncode, WireIdentifier, WireName,
 };
+use iggy_common::{IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, sharding::IggyNamespace};
 use std::cell::Cell;
 
 // TODO: Proper client which implements the full client SDK API
@@ -43,22 +43,24 @@ impl SimClient {
         current
     }
 
+    /// # Panics
+    /// Panics if the stream name is not a valid wire name.
     pub fn create_stream(&self, name: &str) -> Message<RequestHeader> {
-        let create_stream = CreateStream {
-            name: name.to_string(),
+        let wire = CreateStreamRequest {
+            name: WireName::new(name).expect("stream name must be valid"),
         };
-        let payload = create_stream.to_bytes();
+        let payload = wire.to_bytes();
 
         self.build_request(Operation::CreateStream, &payload)
     }
 
     /// # Panics
-    /// Panics if the stream name cannot be converted to an `Identifier`.
+    /// Panics if the stream name cannot be converted to a `WireIdentifier`.
     pub fn delete_stream(&self, name: &str) -> Message<RequestHeader> {
-        let delete_stream = DeleteStream {
-            stream_id: Identifier::named(name).unwrap(),
+        let wire = DeleteStreamRequest {
+            stream_id: WireIdentifier::named(name).expect("stream name must be valid"),
         };
-        let payload = delete_stream.to_bytes();
+        let payload = wire.to_bytes();
 
         self.build_request(Operation::DeleteStream, &payload)
     }

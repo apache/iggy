@@ -6663,7 +6663,6 @@ dependencies = [
  "message_bus",
  "paste",
  "rmp-serde",
- "secrecy",
  "serde",
  "slab",
  "tracing",

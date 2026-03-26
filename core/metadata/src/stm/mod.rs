@@ -223,7 +223,8 @@ macro_rules! define_state {
 /// - `Absorb<{$state}Command>` impl for `{$state}Inner`
 ///
 /// # Requirements
-/// Each listed operation type must implement `StateHandler<{$state}Inner>`.
+/// Each listed operation must have a corresponding `{Operation}Request` wire type
+/// that implements `WireDecode` and `StateHandler<State = {$state}Inner>`.
 #[macro_export]
 macro_rules! collect_handlers {
     (
@@ -235,7 +236,7 @@ macro_rules! collect_handlers {
             #[derive(Debug, Clone)]
             pub enum [<$state Command>] {
                 $(
-                    $operation($operation),
+                    $operation([<$operation Request>]),
                 )*
             }
 
@@ -245,14 +246,15 @@ macro_rules! collect_handlers {
                 type Error = ::iggy_common::IggyError;
 
                 fn parse(input: Self::Input) -> Result<::iggy_common::Either<Self::Cmd, Self::Input>, Self::Error> {
-                    use ::iggy_common::BytesSerializable;
+                    use ::iggy_binary_protocol::WireDecode;
                     use ::iggy_common::Either;
                     use ::iggy_binary_protocol::Operation;
                     match input.header().operation {
                         $(
                             Operation::$operation => {
                                 let body = input.body_bytes();
-                                let cmd = $operation::from_bytes(body)?;
+                                let cmd = [<$operation Request>]::decode_from(&body)
+                                    .map_err(|_| ::iggy_common::IggyError::InvalidCommand)?;
                                 Ok(Either::Left([<$state Command>]::$operation(cmd)))
                             },
                         )*

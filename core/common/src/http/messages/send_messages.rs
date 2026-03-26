@@ -25,7 +25,6 @@ use crate::Validatable;
 use crate::error::IggyError;
 use crate::types::message::HeaderEntry;
 use crate::types::message::partitioning::Partitioning;
-use crate::{Command, SEND_MESSAGES_CODE};
 use crate::{INDEX_SIZE, IggyMessage, IggyMessagesBatch};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -33,7 +32,7 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
+use std::fmt::Formatter;
 
 /// `SendMessages` command is used to send messages to a topic in a stream.
 /// It has additional payload:
@@ -140,12 +139,6 @@ impl Default for SendMessages {
     }
 }
 
-impl Command for SendMessages {
-    fn code(&self) -> u32 {
-        SEND_MESSAGES_CODE
-    }
-}
-
 impl Validatable<IggyError> for SendMessages {
     fn validate(&self) -> Result<(), IggyError> {
         if self.partitioning.value.len() > 255
@@ -158,28 +151,6 @@ impl Validatable<IggyError> for SendMessages {
         self.batch.validate()?;
 
         Ok(())
-    }
-}
-
-impl BytesSerializable for SendMessages {
-    fn to_bytes(&self) -> Bytes {
-        panic!("should not be used")
-    }
-
-    fn from_bytes(_bytes: Bytes) -> Result<SendMessages, IggyError> {
-        panic!("should not be used")
-    }
-}
-
-impl Display for SendMessages {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let messages_count = self.batch.count();
-        let messages_size = self.batch.size();
-        write!(
-            f,
-            "{}|{}|{}|messages_count:{}|messages_size:{}",
-            self.stream_id, self.topic_id, self.partitioning, messages_count, messages_size
-        )
     }
 }
 

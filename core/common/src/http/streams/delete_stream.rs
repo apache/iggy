@@ -15,3 +15,24 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
+use crate::Identifier;
+use crate::Validatable;
+use crate::error::IggyError;
+use serde::{Deserialize, Serialize};
+
+/// `DeleteStream` command is used to delete an existing stream.
+/// It has additional payload:
+/// - `stream_id` - unique stream ID (numeric or name).
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Clone)]
+pub struct DeleteStream {
+    /// Unique stream ID (numeric or name).
+    #[serde(skip)]
+    pub stream_id: Identifier,
+}
+
+impl Validatable<IggyError> for DeleteStream {
+    fn validate(&self) -> Result<(), IggyError> {
+        Ok(())
+    }
+}
