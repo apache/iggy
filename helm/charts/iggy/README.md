@@ -167,6 +167,12 @@ This runs `helm lint --strict` plus the CI render scenarios, including:
 
 The smoke path requires `helm`, `kind`, `kubectl`, and `curl`.
 
+Before running the local smoke path, keep these common gotchas in mind:
+
+* the Iggy server requires working `io_uring` support from the Kubernetes node/kernel/runtime
+* the server also needs enough available memory and locked-memory headroom during startup
+* `scripts/ci/test-helm.sh cleanup-smoke` removes the Helm release and smoke namespace, but it does not delete the reusable kind cluster created by `scripts/ci/setup-helm-smoke-cluster.sh`
+
 If `helm` and `kind` are already installed:
 
 ```bash
@@ -204,7 +210,7 @@ scripts/ci/test-helm.sh collect-smoke-diagnostics
 
 > **Note:** `scripts/ci/setup-helm-tools.sh` currently supports Linux `x86_64` only.
 > On other local platforms, install equivalent `helm` and `kind` binaries yourself and then use the same scripts above.
-> The runtime smoke test may still fail on some local/containerized clusters if the node/kernel does not provide the `io_uring` support required by the server runtime even after the local sharding override.
+> The runtime smoke test may still fail on some local/containerized clusters if the node/kernel does not provide the `io_uring` support required by the server runtime even after the local sharding override, or if the local environment does not provide enough memory for the server to initialize cleanly.
 
 ## Troubleshooting
 
