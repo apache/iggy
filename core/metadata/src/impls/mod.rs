@@ -15,3 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 pub mod metadata;
+pub mod recovery;
+
+/// Subdirectory under the data root where metadata state is stored.
+pub const METADATA_DIR: &str = "metadata";

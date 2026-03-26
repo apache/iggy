@@ -6046,6 +6046,13 @@ dependencies = [
 [[package]]
 name = "journal"
 version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "bytes",
+ "compio",
+ "iggy_binary_protocol",
+ "tempfile",
+]
 
 [[package]]
 name = "js-sys"
@@ -6657,7 +6664,9 @@ name = "metadata"
 version = "0.1.0"
 dependencies = [
  "ahash 0.8.12",
+ "bytemuck",
  "bytes",
+ "compio",
  "consensus",
  "iggy_binary_protocol",
  "iggy_common",
@@ -6669,6 +6678,7 @@ dependencies = [
  "secrecy",
  "serde",
  "slab",
+ "tempfile",
  "tracing",
 ]
 
