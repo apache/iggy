@@ -81,3 +81,143 @@ func TestLeaderRedirectionState(t *testing.T) {
 	assert.True(t, state.CanRedirect())
 	assert.Equal(t, uint8(0), state.RedirectCount)
 }
+
+func TestProcessClusterMetadata_SingleNode_NoRedirect(t *testing.T) {
+	metadata := &iggcon.ClusterMetadata{
+		Name: "single",
+		Nodes: []iggcon.ClusterNode{
+			{
+				Name:   "node1",
+				IP:     "127.0.0.1",
+				Role:   iggcon.RoleLeader,
+				Status: iggcon.Healthy,
+				Endpoints: iggcon.TransportEndpoints{
+					Tcp: 8090,
+				},
+			},
+		},
+	}
+
+	address, err := processClusterMetadata(metadata, "127.0.0.1:8090", iggcon.Tcp)
+	assert.NoError(t, err)
+	assert.Equal(t, "", address)
+}
+
+func TestProcessClusterMetadata_NoHealthyLeader_NoRedirect(t *testing.T) {
+	metadata := &iggcon.ClusterMetadata{
+		Name: "multi",
+		Nodes: []iggcon.ClusterNode{
+			{
+				Name:   "node1",
+				IP:     "127.0.0.1",
+				Role:   iggcon.RoleLeader,
+				Status: iggcon.Unreachable,
+				Endpoints: iggcon.TransportEndpoints{
+					Tcp: 8090,
+				},
+			},
+			{
+				Name:   "node2",
+				IP:     "127.0.0.2",
+				Role:   iggcon.RoleFollower,
+				Status: iggcon.Healthy,
+				Endpoints: iggcon.TransportEndpoints{
+					Tcp: 8091,
+				},
+			},
+		},
+	}
+
+	address, err := processClusterMetadata(metadata, "127.0.0.1:8090", iggcon.Tcp)
+	assert.NoError(t, err)
+	assert.Equal(t, "", address)
+}
+
+func TestProcessClusterMetadata_RedirectsToLeader(t *testing.T) {
+	metadata := &iggcon.ClusterMetadata{
+		Name: "multi",
+		Nodes: []iggcon.ClusterNode{
+			{
+				Name:   "node1",
+				IP:     "127.0.0.1",
+				Role:   iggcon.RoleFollower,
+				Status: iggcon.Healthy,
+				Endpoints: iggcon.TransportEndpoints{
+					Tcp: 8090,
+				},
+			},
+			{
+				Name:   "node2",
+				IP:     "127.0.0.2",
+				Role:   iggcon.RoleLeader,
+				Status: iggcon.Healthy,
+				Endpoints: iggcon.TransportEndpoints{
+					Tcp: 8092,
+				},
+			},
+		},
+	}
+
+	address, err := processClusterMetadata(metadata, "127.0.0.1:8090", iggcon.Tcp)
+	assert.NoError(t, err)
+	assert.Equal(t, "127.0.0.2:8092", address)
+}
+
+func TestProcessClusterMetadata_AlreadyConnectedToLeader_NoRedirect(t *testing.T) {
+	metadata := &iggcon.ClusterMetadata{
+		Name: "multi",
+		Nodes: []iggcon.ClusterNode{
+			{
+				Name:   "node1",
+				IP:     "127.0.0.1",
+				Role:   iggcon.RoleFollower,
+				Status: iggcon.Healthy,
+				Endpoints: iggcon.TransportEndpoints{
+					Tcp: 8090,
+				},
+			},
+			{
+				Name:   "node2",
+				IP:     "127.0.0.1",
+				Role:   iggcon.RoleLeader,
+				Status: iggcon.Healthy,
+				Endpoints: iggcon.TransportEndpoints{
+					Tcp: 8092,
+				},
+			},
+		},
+	}
+
+	address, err := processClusterMetadata(metadata, "127.0.0.1:8092", iggcon.Tcp)
+	assert.NoError(t, err)
+	assert.Equal(t, "", address)
+}
+
+func TestProcessClusterMetadata_UnsupportedTransport(t *testing.T) {
+	metadata := &iggcon.ClusterMetadata{
+		Name: "multi",
+		Nodes: []iggcon.ClusterNode{
+			{
+				Name:   "node1",
+				IP:     "127.0.0.1",
+				Role:   iggcon.RoleFollower,
+				Status: iggcon.Healthy,
+				Endpoints: iggcon.TransportEndpoints{
+					Tcp: 8090,
+				},
+			},
+			{
+				Name:   "node2",
+				IP:     "127.0.0.2",
+				Role:   iggcon.RoleLeader,
+				Status: iggcon.Healthy,
+				Endpoints: iggcon.TransportEndpoints{
+					Tcp: 8092,
+				},
+			},
+		},
+	}
+
+	_, err := processClusterMetadata(metadata, "127.0.0.1:8090", iggcon.Protocol("kafka"))
+	assert.Error(t, err)
+}

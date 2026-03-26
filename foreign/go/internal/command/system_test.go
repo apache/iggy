@@ -21,39 +21,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"testing"
-
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
-func TestSerialize_LoginUser_ContainsVersion(t *testing.T) {
-	request := LoginUser{
-		Username: "iggy",
-		Password: "iggy",
-	}
-
-	serialized, err := request.MarshalBinary()
-	if err != nil {
-		t.Fatalf("Failed to serialize LoginUser: %v", err)
-	}
-
-	// Skip past username (1-byte len + "iggy") and password (1-byte len + "iggy")
-	pos := 1 + len("iggy") + 1 + len("iggy")
-
-	// Read version length (u32 LE)
-	versionLen := binary.LittleEndian.Uint32(serialized[pos : pos+4])
-	pos += 4
-
-	// Read version string
-	version := string(serialized[pos : pos+int(versionLen)])
-
-	if version != iggcon.Version {
-		t.Errorf("Version mismatch. Expected: %q, Got: %q", iggcon.Version, version)
-	}
-}
-
-func TestLoginWithPersonalAccessToken_MarshalBinary(t *testing.T) {
-	request := LoginWithPersonalAccessToken{
-		Token: "mytoken",
+func TestGetClient_MarshalBinary(t *testing.T) {
+	request := GetClient{
+		ClientID: 42,
 	}
 
 	serialized, err := request.MarshalBinary()
@@ -61,18 +33,55 @@ func TestLoginWithPersonalAccessToken_MarshalBinary(t *testing.T) {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	expected := []byte{
-		0x07,                                     // token length = 7
-		0x6D, 0x79, 0x74, 0x6F, 0x6B, 0x65, 0x6E, // "mytoken"
-	}
+	expected := make([]byte, 4)
+	binary.LittleEndian.PutUint32(expected, 42)
 
 	if !bytes.Equal(serialized, expected) {
 		t.Fatalf("unexpected bytes.\nexpected:\t%v\ngot:\t\t%v", expected, serialized)
 	}
 }
 
-func TestLogoutUser_MarshalBinary(t *testing.T) {
-	request := LogoutUser{}
+func TestGetClients_MarshalBinary(t *testing.T) {
+	request := GetClients{}
+
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(serialized) != 0 {
+		t.Fatalf("expected empty bytes, got %v", serialized)
+	}
+}
+
+func TestGetClusterMetadata_MarshalBinary(t *testing.T) {
+	request := GetClusterMetadata{}
+
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(serialized) != 0 {
+		t.Fatalf("expected empty bytes, got %v", serialized)
+	}
+}
+
+func TestGetStats_MarshalBinary(t *testing.T) {
+	request := GetStats{}
+
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(serialized) != 0 {
+		t.Fatalf("expected empty bytes, got %v", serialized)
+	}
+}
+
+func TestPing_MarshalBinary(t *testing.T) {
+	request := Ping{}
 
 	serialized, err := request.MarshalBinary()
 	if err != nil {

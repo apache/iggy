@@ -114,3 +114,5 @@ ignore:
   - "**/build/**"
   - "**/target/**"
   - "**/e2e/**"
+  - "foreign/go/samples/**"
+  - "foreign/go/benchmarks/**"

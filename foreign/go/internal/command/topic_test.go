@@ -59,3 +59,97 @@ func TestSerialize_UpdateTopic(t *testing.T) {
 		t.Errorf("Test case 1 failed. \nExpected:\t%v\nGot:\t\t%v", expected, serialized1)
 	}
 }
+
+func TestCreateTopic_MarshalBinary(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier("stream")
+
+	request := CreateTopic{
+		StreamId:             streamId,
+		PartitionsCount:      3,
+		CompressionAlgorithm: 0,
+		MessageExpiry:        0,
+		MaxTopicSize:         0,
+		Name:                 "test-topic",
+	}
+
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	expected := []byte{
+		0x02, 0x06, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6D, // stream id = "stream"
+		0x03, 0x00, 0x00, 0x00, // partitions = 3
+		0x00,                                           // compression = 0
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // expiry = 0
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // max size = 0
+		0x00,                                                       // replication factor = 0
+		0x0A,                                                       // name length = 10
+		0x74, 0x65, 0x73, 0x74, 0x2D, 0x74, 0x6F, 0x70, 0x69, 0x63, // "test-topic"
+	}
+
+	if !bytes.Equal(serialized, expected) {
+		t.Fatalf("unexpected bytes.\nexpected:\t%v\ngot:\t\t%v", expected, serialized)
+	}
+}
+
+func TestGetTopic_MarshalBinary(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier("stream")
+	topicId, _ := iggcon.NewIdentifier(uint32(5))
+
+	request := GetTopic{
+		StreamId: streamId,
+		TopicId:  topicId,
+	}
+
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	expected, _ := iggcon.MarshalIdentifiers(streamId, topicId)
+
+	if !bytes.Equal(serialized, expected) {
+		t.Fatalf("unexpected bytes.\nexpected:\t%v\ngot:\t\t%v", expected, serialized)
+	}
+}
+
+func TestGetTopics_MarshalBinary(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier("stream")
+
+	request := GetTopics{
+		StreamId: streamId,
+	}
+
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	expected, _ := streamId.MarshalBinary()
+
+	if !bytes.Equal(serialized, expected) {
+		t.Fatalf("unexpected bytes.\nexpected:\t%v\ngot:\t\t%v", expected, serialized)
+	}
+}
+
+func TestDeleteTopic_MarshalBinary(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier("stream")
+	topicId, _ := iggcon.NewIdentifier(uint32(5))
+
+	request := DeleteTopic{
+		StreamId: streamId,
+		TopicId:  topicId,
+	}
+
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	expected, _ := iggcon.MarshalIdentifiers(streamId, topicId)
+
+	if !bytes.Equal(serialized, expected) {
+		t.Fatalf("unexpected bytes.\nexpected:\t%v\ngot:\t\t%v", expected, serialized)
+	}
+}

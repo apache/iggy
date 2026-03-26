@@ -80,3 +80,54 @@ func TestSerialize_UpdateStream(t *testing.T) {
 		t.Errorf("Test case 1 failed. \nExpected:\t%v\nGot:\t\t%v", expected, serialized1)
 	}
 }
+
+func TestGetStream_MarshalBinary(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier("stream")
+
+	request := GetStream{
+		StreamId: streamId,
+	}
+
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	expected, _ := streamId.MarshalBinary()
+
+	if !bytes.Equal(serialized, expected) {
+		t.Fatalf("unexpected bytes.\nexpected:\t%v\ngot:\t\t%v", expected, serialized)
+	}
+}
+
+func TestGetStreams_MarshalBinary(t *testing.T) {
+	request := GetStreams{}
+
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if len(serialized) != 0 {
+		t.Fatalf("expected empty bytes, got %v", serialized)
+	}
+}
+
+func TestDeleteStream_MarshalBinary(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier("stream")
+
+	request := DeleteStream{
+		StreamId: streamId,
+	}
+
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	expected, _ := streamId.MarshalBinary()
+
+	if !bytes.Equal(serialized, expected) {
+		t.Fatalf("unexpected bytes.\nexpected:\t%v\ngot:\t\t%v", expected, serialized)
+	}
+}

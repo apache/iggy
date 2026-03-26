@@ -116,10 +116,10 @@ func (u *UpdatePermissions) MarshalBinary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	length := len(userIdBytes)
+	length := len(userIdBytes) + 1 // +1 for has_permissions flag
 
 	if u.Permissions != nil {
-		length += 1 + 4 + u.Permissions.Size()
+		length += 4 + u.Permissions.Size()
 	}
 
 	bytes := make([]byte, length)

@@ -19,41 +19,19 @@ package command
 
 import (
 	"bytes"
-	"encoding/binary"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
-func TestSerialize_LoginUser_ContainsVersion(t *testing.T) {
-	request := LoginUser{
-		Username: "iggy",
-		Password: "iggy",
-	}
+func TestCreatePartitions_MarshalBinary(t *testing.T) {
+	streamID, _ := iggcon.NewIdentifier("stream")
+	topicID, _ := iggcon.NewIdentifier(uint32(7))
 
-	serialized, err := request.MarshalBinary()
-	if err != nil {
-		t.Fatalf("Failed to serialize LoginUser: %v", err)
-	}
-
-	// Skip past username (1-byte len + "iggy") and password (1-byte len + "iggy")
-	pos := 1 + len("iggy") + 1 + len("iggy")
-
-	// Read version length (u32 LE)
-	versionLen := binary.LittleEndian.Uint32(serialized[pos : pos+4])
-	pos += 4
-
-	// Read version string
-	version := string(serialized[pos : pos+int(versionLen)])
-
-	if version != iggcon.Version {
-		t.Errorf("Version mismatch. Expected: %q, Got: %q", iggcon.Version, version)
-	}
-}
-
-func TestLoginWithPersonalAccessToken_MarshalBinary(t *testing.T) {
-	request := LoginWithPersonalAccessToken{
-		Token: "mytoken",
+	request := CreatePartitions{
+		StreamId:        streamID,
+		TopicId:         topicID,
+		PartitionsCount: 2,
 	}
 
 	serialized, err := request.MarshalBinary()
@@ -62,8 +40,9 @@ func TestLoginWithPersonalAccessToken_MarshalBinary(t *testing.T) {
 	}
 
 	expected := []byte{
-		0x07,                                     // token length = 7
-		0x6D, 0x79, 0x74, 0x6F, 0x6B, 0x65, 0x6E, // "mytoken"
+		0x02, 0x06, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6D, // Stream id = "stream"
+		0x01, 0x04, 0x07, 0x00, 0x00, 0x00, // Topic id = 7
+		0x02, 0x00, 0x00, 0x00, // PartitionsCount = 2
 	}
 
 	if !bytes.Equal(serialized, expected) {
@@ -71,15 +50,28 @@ func TestLoginWithPersonalAccessToken_MarshalBinary(t *testing.T) {
 	}
 }
 
-func TestLogoutUser_MarshalBinary(t *testing.T) {
-	request := LogoutUser{}
+func TestDeletePartitions_MarshalBinary(t *testing.T) {
+	streamID, _ := iggcon.NewIdentifier("stream")
+	topicID, _ := iggcon.NewIdentifier(uint32(7))
+
+	request := DeletePartitions{
+		StreamId:        streamID,
+		TopicId:         topicID,
+		PartitionsCount: 1,
+	}
 
 	serialized, err := request.MarshalBinary()
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	if len(serialized) != 0 {
-		t.Fatalf("expected empty bytes, got %v", serialized)
+	expected := []byte{
+		0x02, 0x06, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6D, // Stream id = "stream"
+		0x01, 0x04, 0x07, 0x00, 0x00, 0x00, // Topic id = 7
+		0x01, 0x00, 0x00, 0x00, // PartitionsCount = 1
+	}
+
+	if !bytes.Equal(serialized, expected) {
+		t.Fatalf("unexpected bytes.\nexpected:\t%v\ngot:\t\t%v", expected, serialized)
 	}
 }
