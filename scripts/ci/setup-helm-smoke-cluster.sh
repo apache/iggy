@@ -61,6 +61,41 @@ require_command() {
   fi
 }
 
+duration_to_seconds() {
+  local duration="$1"
+  local total=0
+  local value
+  local unit
+  local multiplier
+
+  if [[ "$duration" =~ ^[0-9]+$ ]]; then
+    echo "$duration"
+    return 0
+  fi
+
+  while [ -n "$duration" ]; do
+    if [[ "$duration" =~ ^([0-9]+)([smhd])(.*)$ ]]; then
+      value="${BASH_REMATCH[1]}"
+      unit="${BASH_REMATCH[2]}"
+      duration="${BASH_REMATCH[3]}"
+      case "$unit" in
+        s) multiplier=1 ;;
+        m) multiplier=60 ;;
+        h) multiplier=3600 ;;
+        d) multiplier=86400 ;;
+      esac
+      total=$((total + (value * multiplier)))
+      continue
+    fi
+
+    echo "Error: unsupported timeout format '$1'" >&2
+    echo "Use plain seconds or a combination of s, m, h, or d units such as 300, 5m, or 1h30m." >&2
+    return 1
+  done
+
+  echo "$total"
+}
+
 wait_for_completed_job() {
   local job_name="$1"
 
@@ -75,10 +110,13 @@ wait_for_completed_job() {
 }
 
 wait_for_ingress_validation() {
-  local retries=30
   local sleep_seconds=4
+  local validation_timeout_seconds
+  local deadline
   local probe_file
 
+  validation_timeout_seconds="$(duration_to_seconds "$HELM_SMOKE_INGRESS_NGINX_TIMEOUT")"
+  deadline=$((SECONDS + validation_timeout_seconds))
   probe_file="$(mktemp "${TMPDIR:-/tmp}/ingress-nginx-probe.XXXXXX.yaml")"
 
   cat > "$probe_file" <<'EOF'
@@ -102,7 +140,7 @@ spec:
                   number: 80
 EOF
 
-  for _ in $(seq 1 "$retries"); do
+  while (( SECONDS < deadline )); do
     if kubectl apply --dry-run=server -f "$probe_file" >/dev/null 2>&1; then
       rm -f "$probe_file"
       return 0
@@ -110,7 +148,7 @@ EOF
     sleep "$sleep_seconds"
   done
 
-  echo "Error: ingress-nginx admission webhook did not become ready in time" >&2
+  echo "Error: ingress-nginx admission webhook did not become ready within ${HELM_SMOKE_INGRESS_NGINX_TIMEOUT}" >&2
   if ! kubectl apply --dry-run=server -f "$probe_file"; then
     rm -f "$probe_file"
     return 1

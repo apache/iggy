@@ -14,8 +14,6 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
-
 {{ if .Values.server.ingress.enabled -}}
 {{ $fullName := include "iggy.fullname" . -}}
 {{ $svcPort := .Values.server.service.port -}}
@@ -77,8 +75,6 @@ spec:
           {{- end }}
     {{- end }}
 {{- end }}
-
-
 {{ if .Values.ui.ingress.enabled -}}
 ---
 {{ $fullName := include "iggy.fullname" . -}}
