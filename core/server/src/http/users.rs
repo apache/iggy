@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::binary::dispatch::{domain_permissions_to_wire, identifier_to_wire_id};
 use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
@@ -28,7 +29,6 @@ use crate::streaming::session::Session;
 use crate::streaming::users::user::User;
 use ::iggy_common::change_password::ChangePassword;
 use ::iggy_common::create_user::CreateUser;
-use ::iggy_common::delete_user::DeleteUser;
 use ::iggy_common::login_user::LoginUser;
 use ::iggy_common::update_permissions::UpdatePermissions;
 use ::iggy_common::update_user::UpdateUser;
@@ -37,6 +37,12 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router, debug_handler};
 use err_trail::ErrContext;
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::requests::users::{
+    ChangePasswordRequest as WireChangePassword, CreateUserRequest as WireCreateUser,
+    DeleteUserRequest as WireDeleteUser, UpdatePermissionsRequest as WireUpdatePermissions,
+    UpdateUserRequest as WireUpdateUser,
+};
 use iggy_common::Identifier;
 use iggy_common::IdentityInfo;
 use iggy_common::Validatable;
@@ -114,9 +120,15 @@ async fn create_user(
 ) -> Result<Json<UserInfoDetails>, CustomError> {
     command.validate()?;
 
+    let wire_command = WireCreateUser {
+        username: WireName::new(&command.username).map_err(|_| IggyError::InvalidUsername)?,
+        password: command.password.expose_secret().to_string(),
+        status: command.status.as_code(),
+        permissions: command.permissions.as_ref().map(domain_permissions_to_wire),
+    };
     let request = ShardRequest::control_plane(ShardRequestPayload::CreateUserRequest {
         user_id: identity.user_id,
-        command,
+        command: wire_command,
     });
 
     match state.shard.send_to_control_plane(request).await? {
@@ -140,9 +152,19 @@ async fn update_user(
     command.user_id = Identifier::from_str_value(&user_id)?;
     command.validate()?;
 
+    let wire_command = WireUpdateUser {
+        user_id: identifier_to_wire_id(&command.user_id)?,
+        username: command
+            .username
+            .as_deref()
+            .map(WireName::new)
+            .transpose()
+            .map_err(|_| IggyError::InvalidUsername)?,
+        status: command.status.map(|s| s.as_code()),
+    };
     let request = ShardRequest::control_plane(ShardRequestPayload::UpdateUserRequest {
         user_id: identity.user_id,
-        command,
+        command: wire_command,
     });
 
     match state.shard.send_to_control_plane(request).await? {
@@ -163,9 +185,13 @@ async fn update_permissions(
     command.user_id = Identifier::from_str_value(&user_id)?;
     command.validate()?;
 
+    let wire_command = WireUpdatePermissions {
+        user_id: identifier_to_wire_id(&command.user_id)?,
+        permissions: command.permissions.as_ref().map(domain_permissions_to_wire),
+    };
     let request = ShardRequest::control_plane(ShardRequestPayload::UpdatePermissionsRequest {
         user_id: identity.user_id,
-        command,
+        command: wire_command,
     });
 
     match state.shard.send_to_control_plane(request).await? {
@@ -186,9 +212,14 @@ async fn change_password(
     command.user_id = Identifier::from_str_value(&user_id)?;
     command.validate()?;
 
+    let wire_command = WireChangePassword {
+        user_id: identifier_to_wire_id(&command.user_id)?,
+        current_password: command.current_password.expose_secret().to_string(),
+        new_password: command.new_password.expose_secret().to_string(),
+    };
     let request = ShardRequest::control_plane(ShardRequestPayload::ChangePasswordRequest {
         user_id: identity.user_id,
-        command,
+        command: wire_command,
     });
 
     match state.shard.send_to_control_plane(request).await? {
@@ -207,10 +238,12 @@ async fn delete_user(
 ) -> Result<StatusCode, CustomError> {
     let user_id = Identifier::from_str_value(&user_id)?;
 
-    let command = DeleteUser { user_id };
+    let wire_command = WireDeleteUser {
+        user_id: identifier_to_wire_id(&user_id)?,
+    };
     let request = ShardRequest::control_plane(ShardRequestPayload::DeleteUserRequest {
         user_id: identity.user_id,
-        command,
+        command: wire_command,
     });
 
     match state.shard.send_to_control_plane(request).await? {

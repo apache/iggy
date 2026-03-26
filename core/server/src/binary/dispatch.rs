@@ -19,7 +19,6 @@
 use crate::binary::handlers;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use ahash::AHashMap;
 use bytes::BytesMut;
 use iggy_binary_protocol::RequestFrame;
 use iggy_binary_protocol::codec::WireDecode;
@@ -41,6 +40,7 @@ use iggy_common::{
     Consumer, ConsumerKind, GlobalPermissions, Identifier, IggyError, Permissions, PollingKind,
     PollingStrategy, SenderKind, StreamPermissions, TopicPermissions,
 };
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use tracing::{error, warn};
 
@@ -102,6 +102,18 @@ pub fn wire_id_to_identifier(
     }
 }
 
+/// Convert a domain `Identifier` to `WireIdentifier`.
+pub fn identifier_to_wire_id(
+    id: &Identifier,
+) -> Result<iggy_binary_protocol::WireIdentifier, IggyError> {
+    if let Ok(value) = id.get_u32_value() {
+        Ok(iggy_binary_protocol::WireIdentifier::numeric(value))
+    } else {
+        let name = id.get_string_value()?;
+        iggy_binary_protocol::WireIdentifier::named(name).map_err(|_| IggyError::InvalidIdentifier)
+    }
+}
+
 /// Convert a `WireConsumer` to the domain `Consumer`.
 pub fn wire_consumer_to_consumer(
     wire: &iggy_binary_protocol::WireConsumer,
@@ -134,7 +146,7 @@ fn wire_stream_to_domain(ws: &WireStreamPermissions) -> StreamPermissions {
     let topics = if ws.topics.is_empty() {
         None
     } else {
-        let mut map = AHashMap::with_capacity(ws.topics.len());
+        let mut map = BTreeMap::new();
         for wt in &ws.topics {
             map.insert(wt.topic_id as usize, wire_topic_to_domain(wt));
         }
@@ -156,7 +168,7 @@ pub fn wire_permissions_to_permissions(wp: &WirePermissions) -> Permissions {
     let streams = if wp.streams.is_empty() {
         None
     } else {
-        let mut map = AHashMap::with_capacity(wp.streams.len());
+        let mut map = BTreeMap::new();
         for ws in &wp.streams {
             map.insert(ws.stream_id as usize, wire_stream_to_domain(ws));
         }
