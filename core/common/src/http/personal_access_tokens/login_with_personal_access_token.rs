@@ -15,3 +15,12 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
+use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LoginWithPersonalAccessToken {
+    #[serde(serialize_with = "crate::utils::serde_secret::serialize_secret")]
+    pub token: SecretString,
+}

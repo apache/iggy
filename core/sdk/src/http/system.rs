@@ -23,15 +23,9 @@ use async_trait::async_trait;
 use iggy_common::Snapshot;
 use iggy_common::Stats;
 use iggy_common::SystemClient;
+use iggy_common::get_snapshot::GetSnapshot;
 use iggy_common::{ClientInfo, ClientInfoDetails};
 use iggy_common::{SnapshotCompression, SystemSnapshotType};
-use serde::Serialize;
-
-#[derive(Serialize)]
-struct GetSnapshotRequest {
-    compression: SnapshotCompression,
-    snapshot_types: Vec<SystemSnapshotType>,
-}
 
 const PING: &str = "/ping";
 const CLIENTS: &str = "/clients";
@@ -96,7 +90,7 @@ impl SystemClient for HttpClient {
         let response = self
             .post(
                 SNAPSHOT,
-                &GetSnapshotRequest {
+                &GetSnapshot {
                     compression,
                     snapshot_types,
                 },

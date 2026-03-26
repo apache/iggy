@@ -25,13 +25,7 @@ use crate::prelude::{
 use async_trait::async_trait;
 use iggy_common::IggyMessagesBatch;
 use iggy_common::MessageClient;
-use serde::Serialize;
-
-#[derive(Serialize)]
-struct FlushUnsavedBufferQuery {
-    partition_id: u32,
-    fsync: bool,
-}
+use iggy_common::flush_unsaved_buffer::FlushUnsavedBuffer;
 
 #[async_trait]
 impl MessageClient for HttpClient {
@@ -103,7 +97,7 @@ impl MessageClient for HttpClient {
                     partition_id,
                     fsync,
                 ),
-                &FlushUnsavedBufferQuery {
+                &FlushUnsavedBuffer {
                     partition_id,
                     fsync,
                 },

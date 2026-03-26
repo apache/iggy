@@ -16,6 +16,12 @@
  * under the License.
  */
 
-pub mod delete_consumer_offset;
-pub mod get_consumer_offset;
-pub mod store_consumer_offset;
+use crate::SnapshotCompression;
+use crate::SystemSnapshotType;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetSnapshot {
+    pub compression: SnapshotCompression,
+    pub snapshot_types: Vec<SystemSnapshotType>,
+}
