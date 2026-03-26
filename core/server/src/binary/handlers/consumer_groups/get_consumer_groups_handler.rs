@@ -16,58 +16,54 @@
  * under the License.
  */
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
+use crate::binary::dispatch::{HandlerResult, wire_id_to_identifier};
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use bytes::Bytes;
-use iggy_common::get_consumer_groups::GetConsumerGroups;
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::requests::consumer_groups::GetConsumerGroupsRequest;
+use iggy_binary_protocol::responses::consumer_groups::{
+    ConsumerGroupResponse, GetConsumerGroupsResponse,
+};
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetConsumerGroups {
-    fn code(&self) -> u32 {
-        iggy_common::GET_CONSUMER_GROUPS_CODE
-    }
+pub async fn handle_get_consumer_groups(
+    req: GetConsumerGroupsRequest,
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    let stream_id = wire_id_to_identifier(&req.stream_id)?;
+    let topic_id = wire_id_to_identifier(&req.topic_id)?;
+    debug!(
+        "session: {session}, command: get_consumer_groups, stream_id: {stream_id}, topic_id: {topic_id}"
+    );
+    shard.ensure_authenticated(session)?;
 
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
+    let Some(consumer_groups) =
+        shard
+            .metadata
+            .query_consumer_groups(session.get_user_id(), &stream_id, &topic_id)?
+    else {
+        sender.send_ok_response(&Bytes::new()).await?;
+        return Ok(HandlerResult::Finished);
+    };
 
-        let Some(consumer_groups) = shard.metadata.query_consumer_groups(
-            session.get_user_id(),
-            &self.stream_id,
-            &self.topic_id,
-        )?
-        else {
-            sender.send_ok_response(&Bytes::new()).await?;
-            return Ok(HandlerResult::Finished);
-        };
-
-        let response = mapper::map_consumer_groups(&consumer_groups);
-        sender.send_ok_response(&response).await?;
-        Ok(HandlerResult::Finished)
-    }
-}
-
-impl BinaryServerCommand for GetConsumerGroups {
-    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::GetConsumerGroups(get_consumer_groups) => Ok(get_consumer_groups),
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+    let groups: Vec<ConsumerGroupResponse> = consumer_groups
+        .iter()
+        .map(|cg| {
+            Ok(ConsumerGroupResponse {
+                id: cg.id as u32,
+                partitions_count: cg.partitions.len() as u32,
+                members_count: cg.members.len() as u32,
+                name: WireName::new(cg.name.as_ref()).map_err(|_| IggyError::InvalidCommand)?,
+            })
+        })
+        .collect::<Result<_, IggyError>>()?;
+    let response = GetConsumerGroupsResponse { groups };
+    sender.send_ok_response(&response.to_bytes()).await?;
+    Ok(HandlerResult::Finished)
 }

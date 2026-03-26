@@ -47,21 +47,6 @@ use iggy_common::{
     update_stream::UpdateStream, update_topic::UpdateTopic, update_user::UpdateUser,
 };
 use secrecy::{ExposeSecret, SecretString};
-pub struct DeleteStreamResult {
-    pub stream_id: usize,
-}
-
-pub struct DeleteTopicResult {
-    pub topic_id: usize,
-}
-
-pub struct CreatePartitionsResult {
-    pub partition_ids: Vec<usize>,
-}
-
-pub struct DeletePartitionsResult {
-    pub partition_ids: Vec<usize>,
-}
 
 pub async fn execute_create_stream(
     shard: &IggyShard,
@@ -121,7 +106,7 @@ pub async fn execute_delete_stream(
     shard: &IggyShard,
     user_id: u32,
     command: DeleteStream,
-) -> Result<DeleteStreamResult, IggyError> {
+) -> Result<(), IggyError> {
     let stream = shard.resolve_stream(&command.stream_id)?;
     shard.metadata.perm_delete_stream(user_id, stream.id())?;
 
@@ -136,7 +121,7 @@ pub async fn execute_delete_stream(
         })
         .collect();
 
-    let stream_info = shard.delete_stream(stream).await?;
+    shard.delete_stream(stream).await?;
 
     shard
         .state
@@ -161,9 +146,7 @@ pub async fn execute_delete_stream(
         }
     }
 
-    Ok(DeleteStreamResult {
-        stream_id: stream_info.id,
-    })
+    Ok(())
 }
 
 pub async fn execute_purge_stream(
@@ -293,7 +276,7 @@ pub async fn execute_delete_topic(
     shard: &IggyShard,
     user_id: u32,
     command: DeleteTopic,
-) -> Result<DeleteTopicResult, IggyError> {
+) -> Result<(), IggyError> {
     let topic = shard.resolve_topic(&command.stream_id, &command.topic_id)?;
     shard
         .metadata
@@ -304,7 +287,7 @@ pub async fn execute_delete_topic(
         .metadata
         .get_partition_ids(topic.stream_id, topic.topic_id);
 
-    let topic_info = shard.delete_topic(topic).await?;
+    shard.delete_topic(topic).await?;
 
     shard
         .state
@@ -324,9 +307,7 @@ pub async fn execute_delete_topic(
         tracing::warn!("Broadcast failed: {e}. Shards will sync on restart.");
     }
 
-    Ok(DeleteTopicResult {
-        topic_id: topic_info.id,
-    })
+    Ok(())
 }
 
 pub async fn execute_purge_topic(
@@ -364,7 +345,7 @@ pub async fn execute_create_partitions(
     shard: &IggyShard,
     user_id: u32,
     command: CreatePartitions,
-) -> Result<CreatePartitionsResult, IggyError> {
+) -> Result<(), IggyError> {
     let topic = shard.resolve_topic(&command.stream_id, &command.topic_id)?;
     shard
         .metadata
@@ -373,8 +354,6 @@ pub async fn execute_create_partitions(
     let partition_infos = shard
         .create_partitions(topic, command.partitions_count)
         .await?;
-    let partition_ids = partition_infos.iter().map(|p| p.id).collect::<Vec<_>>();
-
     let total_partition_count = shard
         .metadata
         .partitions_count(topic.stream_id, topic.topic_id) as u32;
@@ -400,14 +379,14 @@ pub async fn execute_create_partitions(
         tracing::warn!("Broadcast failed: {e}. Shards will sync on restart.");
     }
 
-    Ok(CreatePartitionsResult { partition_ids })
+    Ok(())
 }
 
 pub async fn execute_delete_partitions(
     shard: &IggyShard,
     user_id: u32,
     command: DeletePartitions,
-) -> Result<DeletePartitionsResult, IggyError> {
+) -> Result<(), IggyError> {
     let topic = shard.resolve_topic(&command.stream_id, &command.topic_id)?;
     shard
         .metadata
@@ -444,9 +423,7 @@ pub async fn execute_delete_partitions(
         tracing::warn!("Broadcast failed: {e}. Shards will sync on restart.");
     }
 
-    Ok(DeletePartitionsResult {
-        partition_ids: deleted_partition_ids,
-    })
+    Ok(())
 }
 
 pub async fn execute_create_consumer_group(

@@ -16,51 +16,37 @@
  * under the License.
  */
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
-use crate::binary::handlers::utils::receive_and_validate;
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use bytes::Bytes;
-use iggy_common::IggyError;
-use iggy_common::SenderKind;
-use iggy_common::get_snapshot::GetSnapshot;
+use iggy_binary_protocol::requests::system::GetSnapshotRequest;
+use iggy_common::{IggyError, SenderKind, SnapshotCompression, SystemSnapshotType};
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetSnapshot {
-    fn code(&self) -> u32 {
-        iggy_common::GET_SNAPSHOT_FILE_CODE
+pub async fn handle_get_snapshot(
+    req: GetSnapshotRequest,
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    debug!("session: {session}, command: get_snapshot");
+    shard.ensure_authenticated(session)?;
+
+    let compression = SnapshotCompression::from_code(req.compression)?;
+    let snapshot_types: Vec<SystemSnapshotType> = req
+        .snapshot_types
+        .iter()
+        .map(|&code| SystemSnapshotType::from_code(code))
+        .collect::<Result<_, _>>()?;
+
+    if snapshot_types.contains(&SystemSnapshotType::All) && snapshot_types.len() > 1 {
+        return Err(IggyError::InvalidCommand);
     }
 
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
-
-        let snapshot = shard
-            .get_snapshot(self.compression, &self.snapshot_types)
-            .await?;
-        let bytes = Bytes::copy_from_slice(&snapshot.0);
-        sender.send_ok_response(&bytes).await?;
-        Ok(HandlerResult::Finished)
-    }
-}
-
-impl BinaryServerCommand for GetSnapshot {
-    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::GetSnapshot(get_snapshot) => Ok(get_snapshot),
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+    let snapshot = shard.get_snapshot(compression, &snapshot_types).await?;
+    let bytes = Bytes::copy_from_slice(&snapshot.0);
+    sender.send_ok_response(&bytes).await?;
+    Ok(HandlerResult::Finished)
 }

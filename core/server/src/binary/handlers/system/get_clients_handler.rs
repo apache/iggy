@@ -16,51 +16,30 @@
  * under the License.
  */
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
+use super::get_me_handler::build_client_response;
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::responses::clients::GetClientsResponse;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
-use iggy_common::get_clients::GetClients;
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetClients {
-    fn code(&self) -> u32 {
-        iggy_common::GET_CLIENTS_CODE
-    }
+pub async fn handle_get_clients(
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    debug!("session: {session}, command: get_clients");
+    shard.ensure_authenticated(session)?;
+    shard.metadata.perm_get_clients(session.get_user_id())?;
 
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
-        shard.metadata.perm_get_clients(session.get_user_id())?;
-
-        let clients = shard.get_clients();
-        let clients = mapper::map_clients(clients).await;
-        sender.send_ok_response(&clients).await?;
-        Ok(HandlerResult::Finished)
-    }
-}
-
-impl BinaryServerCommand for GetClients {
-    async fn from_sender(
-        sender: &mut SenderKind,
-        code: u32,
-        length: u32,
-    ) -> Result<Self, IggyError> {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::GetClients(get_clients) => Ok(get_clients),
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+    let clients = shard.get_clients();
+    let response = GetClientsResponse {
+        clients: clients.iter().map(build_client_response).collect(),
+    };
+    sender.send_ok_response(&response.to_bytes()).await?;
+    Ok(HandlerResult::Finished)
 }
