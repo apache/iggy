@@ -16,57 +16,61 @@
  * under the License.
  */
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
+use crate::binary::dispatch::{HandlerResult, wire_id_to_identifier};
+use crate::binary::handlers::streams::get_stream_handler::build_topic_header;
+use crate::metadata::TopicMeta;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use iggy_common::IggyError;
-use iggy_common::SenderKind;
-use iggy_common::get_topic::GetTopic;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::requests::topics::GetTopicRequest;
+use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetTopic {
-    fn code(&self) -> u32 {
-        iggy_common::GET_TOPIC_CODE
-    }
+pub async fn handle_get_topic(
+    req: GetTopicRequest,
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    let stream_id = wire_id_to_identifier(&req.stream_id)?;
+    let topic_id = wire_id_to_identifier(&req.topic_id)?;
+    debug!("session: {session}, command: get_topic, stream_id: {stream_id}, topic_id: {topic_id}");
+    shard.ensure_authenticated(session)?;
 
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
+    let Some(topic) = shard
+        .metadata
+        .query_topic(session.get_user_id(), &stream_id, &topic_id)?
+    else {
+        sender.send_empty_ok_response().await?;
+        return Ok(HandlerResult::Finished);
+    };
 
-        let Some(topic) =
-            shard
-                .metadata
-                .query_topic(session.get_user_id(), &self.stream_id, &self.topic_id)?
-        else {
-            sender.send_empty_ok_response().await?;
-            return Ok(HandlerResult::Finished);
-        };
-
-        let response = mapper::map_topic(&topic);
-        sender.send_ok_response(&response).await?;
-        Ok(HandlerResult::Finished)
-    }
+    let response = build_get_topic_response(&topic)?;
+    sender.send_ok_response(&response.to_bytes()).await?;
+    Ok(HandlerResult::Finished)
 }
 
-impl BinaryServerCommand for GetTopic {
-    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::GetTopic(get_topic) => Ok(get_topic),
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+fn build_get_topic_response(topic: &TopicMeta) -> Result<GetTopicResponse, IggyError> {
+    let header = build_topic_header(topic)?;
+
+    let partitions: Vec<PartitionResponse> = topic
+        .partitions
+        .iter()
+        .enumerate()
+        .map(|(partition_id, partition)| PartitionResponse {
+            id: partition_id as u32,
+            created_at: partition.created_at.into(),
+            segments_count: partition.stats.segments_count_inconsistent(),
+            current_offset: partition.stats.current_offset(),
+            size_bytes: partition.stats.size_bytes_inconsistent(),
+            messages_count: partition.stats.messages_count_inconsistent(),
+        })
+        .collect();
+
+    Ok(GetTopicResponse {
+        topic: header,
+        partitions,
+    })
 }

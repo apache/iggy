@@ -16,21 +16,19 @@
  * under the License.
  */
 
-use crate::binary::command;
-use crate::binary::command::ServerCommandHandler;
+use crate::binary::dispatch::{self, HandlerResult, MAX_CONTROL_FRAME_PAYLOAD};
 use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::tcp::connection_handler::command::ServerCommand;
 use async_channel::Receiver;
 use bytes::BytesMut;
 use futures::FutureExt;
+use iggy_binary_protocol::RequestFrame;
+use iggy_binary_protocol::codes::{SEND_MESSAGES_CODE, command_name};
 use iggy_common::{GET_CLUSTER_METADATA_CODE, IggyError, SenderKind};
 use std::io::ErrorKind;
 use std::rc::Rc;
 use tracing::{debug, error, info};
-
-const INITIAL_BYTES_LENGTH: usize = 4;
 
 /// Connection lifecycle action after command handling.
 pub enum ConnectionAction {
@@ -47,14 +45,13 @@ pub(crate) async fn handle_connection(
     shard: &Rc<IggyShard>,
     stop_receiver: Receiver<()>,
 ) -> Result<ConnectionAction, ConnectionError> {
-    let mut length_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
-    let mut code_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
+    let mut header_buffer = BytesMut::with_capacity(RequestFrame::HEADER_SIZE);
     loop {
-        let read_future = sender.read(length_buffer);
+        let read_future = sender.read(header_buffer);
         // TODO(hubcio): this futures::select! call is translated to epoll_wait syscall for every
         // message, which adds around 100 us median latency. We could instead just call sender.shutdown()
         // if some atomic bool is set, since this is all happenng within single thread.
-        let (_, mut initial_buffer) = futures::select! {
+        let (_, mut header_buf) = futures::select! {
             _ = stop_receiver.recv().fuse() => {
                 info!("Connection stop signal received for session: {}", session);
                 let _ = sender.send_error_response(IggyError::Disconnected).await;
@@ -62,9 +59,9 @@ pub(crate) async fn handle_connection(
             }
             result = read_future.fuse() => {
                 match result {
-                    (Ok(read_length), initial_buffer) => (read_length, initial_buffer),
-                    (Err(error), initial_buffer) => {
-                        length_buffer = initial_buffer;
+                    (Ok(_), buf) => (Ok::<(), IggyError>(()), buf),
+                    (Err(error), buf) => {
+                        header_buffer = buf;
                         if error.as_code() == IggyError::ConnectionClosed.as_code() {
                             return Err(ConnectionError::from(error));
                         } else {
@@ -77,38 +74,55 @@ pub(crate) async fn handle_connection(
             }
         };
 
-        let length =
-            u32::from_le_bytes(initial_buffer[0..INITIAL_BYTES_LENGTH].try_into().unwrap());
-        let (res, mut code_buffer_out) = sender.read(code_buffer).await;
-        res?;
-        let code: u32 =
-            u32::from_le_bytes(code_buffer_out[0..INITIAL_BYTES_LENGTH].try_into().unwrap());
-        initial_buffer.clear();
-        code_buffer_out.clear();
-        length_buffer = initial_buffer;
-        code_buffer = code_buffer_out;
-        debug!("Received a TCP request, length: {length}, code: {code}");
-        let command = ServerCommand::from_code_and_reader(code, sender, length - 4).await?;
-        debug!("Received a TCP command: {command}, payload size: {length}");
-        let cmd_code = command.code();
-        match command.handle(sender, length, session, shard).await {
+        let length = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+        let code = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+        header_buf.clear();
+        header_buffer = header_buf;
+
+        let cmd_name = command_name(code).unwrap_or("unknown");
+        debug!("Received a TCP request, length: {length}, code: {code} ({cmd_name})");
+
+        let payload_length = match RequestFrame::payload_length(length) {
+            Ok(len) => len,
+            Err(_) => {
+                sender
+                    .send_error_response(IggyError::InvalidCommand)
+                    .await?;
+                continue;
+            }
+        };
+
+        let result = if code == SEND_MESSAGES_CODE {
+            dispatch::dispatch_send_messages(sender, payload_length, session, shard).await
+        } else {
+            if payload_length > MAX_CONTROL_FRAME_PAYLOAD {
+                sender
+                    .send_error_response(IggyError::InvalidCommand)
+                    .await?;
+                continue;
+            }
+            let payload = dispatch::read_payload(sender, payload_length).await?;
+            let frame = RequestFrame::from_parts(code, &payload);
+            dispatch::dispatch(frame, sender, session, shard).await
+        };
+
+        match result {
             Ok(handler_result) => match handler_result {
-                command::HandlerResult::Finished => {
+                HandlerResult::Finished => {
                     debug!(
-                        "Command {cmd_code} was handled successfully, session: {session}. TCP response was sent."
+                        "Command {code} ({cmd_name}) was handled successfully, session: {session}. TCP response was sent."
                     );
                 }
-                command::HandlerResult::Migrated { to_shard } => {
+                HandlerResult::Migrated { to_shard } => {
                     info!(
-                        "Command {cmd_code} was transfer to shard {to_shard}, session: {session}. TCP response was sent."
+                        "Command {code} ({cmd_name}) was transferred to shard {to_shard}, session: {session}."
                     );
 
                     return Ok(ConnectionAction::Migrated { to_shard });
                 }
             },
             Err(error) => {
-                // Special handling for GetClusterMetadata when clustering is disabled
-                if cmd_code == GET_CLUSTER_METADATA_CODE
+                if code == GET_CLUSTER_METADATA_CODE
                     && matches!(error, IggyError::FeatureUnavailable)
                 {
                     debug!(
@@ -118,7 +132,7 @@ pub(crate) async fn handle_connection(
                     debug!("TCP error response was sent to: {session}.");
                 } else {
                     error!(
-                        "Command with code {cmd_code} was not handled successfully, session: {session}, error: {error}."
+                        "Command with code {code} ({cmd_name}) was not handled successfully, session: {session}, error: {error}."
                     );
 
                     if matches!(error, IggyError::ClientNotFound(_) | IggyError::StaleClient) {
