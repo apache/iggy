@@ -45,9 +45,9 @@ impl HttpClientConfigBuilder {
         self
     }
 
-    /// Sets the JWT token for A2A authentication.
-    pub fn with_jwt_token(mut self, token: String) -> Self {
-        self.config.jwt_token = Some(token);
+    /// Sets the JWT for A2A authentication.
+    pub fn with_jwt(mut self, token: String) -> Self {
+        self.config.jwt = Some(token);
         self
     }
 

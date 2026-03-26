@@ -308,9 +308,9 @@ impl HttpClientBuilder {
         self
     }
 
-    /// Sets the JWT token for A2A (Agent-to-Agent) authentication.
-    pub fn with_jwt_token(mut self, token: String) -> Self {
-        self.config = self.config.with_jwt_token(token);
+    /// Sets the JWT for A2A (Agent-to-Agent) authentication.
+    pub fn with_jwt(mut self, token: String) -> Self {
+        self.config = self.config.with_jwt(token);
         self
     }
 

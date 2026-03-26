@@ -277,7 +277,7 @@ impl HttpClient {
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
 
-        let access_token = config.jwt_token.clone().unwrap_or_default();
+        let access_token = config.jwt.clone().unwrap_or_default();
 
         Ok(Self {
             api_url,

@@ -176,7 +176,7 @@ async fn create_client_with_jwt(http_addr: &str, token: String) -> iggy::prelude
     IggyClientBuilder::new()
         .with_http()
         .with_api_url(format!("http://{}", http_addr))
-        .with_jwt_token(token)
+        .with_jwt(token)
         .build()
         .expect("failed to build client")
 }
