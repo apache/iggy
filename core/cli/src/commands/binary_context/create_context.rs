@@ -22,7 +22,7 @@ use tracing::{Level, event};
 use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use iggy_common::Client;
 
-use super::common::{ContextConfig, ContextManager};
+use super::common::{ContextConfig, ContextManager, validate_transport};
 
 pub struct CreateContextCmd {
     context_name: String,
@@ -54,6 +54,10 @@ impl CliCommand for CreateContextCmd {
     }
 
     async fn execute_cmd(&mut self, _client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
+        if let Some(ref transport) = self.context_config.iggy.transport {
+            validate_transport(transport)?;
+        }
+
         let mut context_mgr = ContextManager::default();
 
         context_mgr

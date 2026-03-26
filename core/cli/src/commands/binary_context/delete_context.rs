@@ -59,3 +59,26 @@ impl CliCommand for DeleteContextCmd {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_return_explain_message() {
+        let cmd = DeleteContextCmd::new("production".to_string());
+        assert_eq!(cmd.explain(), "delete context production");
+    }
+
+    #[test]
+    fn should_not_require_login() {
+        let cmd = DeleteContextCmd::new("test".to_string());
+        assert!(!cmd.login_required());
+    }
+
+    #[test]
+    fn should_not_require_connection() {
+        let cmd = DeleteContextCmd::new("test".to_string());
+        assert!(!cmd.connection_required());
+    }
+}

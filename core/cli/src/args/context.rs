@@ -136,6 +136,7 @@ impl From<ContextCreateArgs> for ContextConfig {
                 tcp_tls_enabled: args.tcp_tls_enabled,
                 ..Default::default()
             },
+            extra: Default::default(),
         }
     }
 }
