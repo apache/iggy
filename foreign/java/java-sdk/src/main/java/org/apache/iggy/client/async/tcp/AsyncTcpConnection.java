@@ -26,6 +26,7 @@ import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
+import io.netty.channel.ConnectTimeoutException;
 import io.netty.channel.IoEventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -38,6 +39,7 @@ import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.util.concurrent.FutureListener;
 import org.apache.iggy.exception.IggyClientException;
+import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyEmptyResponseException;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyNotConnectedException;
@@ -128,7 +130,12 @@ public class AsyncTcpConnection {
                 channelPool.release(f.getNow());
                 future.complete(null);
             } else {
-                future.completeExceptionally(f.cause());
+                Throwable cause = f.cause();
+                if (cause instanceof ConnectTimeoutException) {
+                    future.completeExceptionally(new IggyConnectionException("Connection timeout", cause));
+                } else {
+                    future.completeExceptionally(cause);
+                }
             }
         });
         return future;
