@@ -77,6 +77,7 @@ pub fn new_replica(id: u8, name: String, bus: &Arc<SimOutbox>, replica_count: u8
         size_of_messages_required_to_save: IggyByteSize::from(4 * 1024 * 1024),
         enforce_fsync: false, //Disable fsync for simulation
         segment_size: IggyByteSize::from(1024 * 1024 * 1024),
+        direct_io: false,
     };
 
     let mut partitions = IggyPartitions::new(ShardId::new(u16::from(id)), partitions_config);

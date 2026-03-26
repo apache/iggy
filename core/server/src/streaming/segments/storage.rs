@@ -35,6 +35,7 @@ pub async fn create_segment_storage(
     let index_path = config.get_index_path(stream_id, topic_id, partition_id, start_offset);
     let log_fsync = config.partition.enforce_fsync;
     let index_fsync = config.partition.enforce_fsync;
+    let direct_io = config.direct_io.enabled;
     let file_exists = false;
 
     Storage::new(
@@ -45,6 +46,7 @@ pub async fn create_segment_storage(
         log_fsync,
         index_fsync,
         file_exists,
+        direct_io,
     )
     .await
 }

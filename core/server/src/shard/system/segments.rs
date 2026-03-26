@@ -569,6 +569,13 @@ impl IggyShard {
             // Close writers for the sealed segment - they're never needed after sealing.
             // This releases file handles and associated kernel/io_uring resources.
             let old_storage = &mut partition.log.storages_mut()[old_segment_index];
+
+            // TODO(tungtose): this should be remove after MessageReader open with O_DIRECT
+            if let Some(ref messages_writer) = old_storage.messages_writer {
+                if messages_writer.try_get_direct_file().is_some() {
+                    messages_writer.flush_and_truncate().await?;
+                }
+            }
             let _ = old_storage.shutdown();
 
             partition.log.add_persisted_segment(segment, storage);

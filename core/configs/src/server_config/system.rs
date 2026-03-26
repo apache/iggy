@@ -49,6 +49,7 @@ pub struct SystemConfig {
     pub recovery: RecoveryConfig,
     pub memory_pool: MemoryPoolConfig,
     pub sharding: ShardingConfig,
+    pub direct_io: DirectIoConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
@@ -65,6 +66,11 @@ pub struct CompatibilityConfig {
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct DatabaseConfig {
     pub path: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, ConfigEnv)]
+pub struct DirectIoConfig {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]

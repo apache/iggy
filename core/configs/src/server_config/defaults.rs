@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use crate::system::DirectIoConfig;
+
 use super::cluster::CurrentNodeConfig;
 use super::cluster::{ClusterConfig, NodeConfig, OtherNodeConfig, TransportPorts};
 use super::http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig};
@@ -339,6 +341,7 @@ impl Default for SystemConfig {
             recovery: RecoveryConfig::default(),
             memory_pool: MemoryPoolConfig::default(),
             sharding: ShardingConfig::default(),
+            direct_io: DirectIoConfig::default(),
         }
     }
 }

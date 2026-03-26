@@ -115,7 +115,7 @@ async fn flush_and_fsync_all_partitions(shard: &Rc<IggyShard>) {
     let mut flushed = 0u32;
     for ns in &namespaces {
         match shard
-            .flush_unsaved_buffer_from_local_partitions(ns, false)
+            .flush_unsaved_buffer_from_local_partitions(ns, false, true)
             .await
         {
             Ok(saved) if saved > 0 => flushed += 1,
@@ -128,7 +128,10 @@ async fn flush_and_fsync_all_partitions(shard: &Rc<IggyShard>) {
     }
 
     for ns in &namespaces {
-        if let Err(e) = shard.fsync_all_messages_from_local_partitions(ns).await {
+        if let Err(e) = shard
+            .fsync_all_messages_from_local_partitions(ns, true)
+            .await
+        {
             error!("Shutdown fsync failed for partition {:?}: {}", ns, e);
         }
     }

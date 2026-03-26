@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::write_batch_frozen;
-use crate::{IggyByteSize, IggyError, IggyMessagesBatch};
+use crate::{IggyByteSize, IggyError, IggyMessagesBatch, write_batch_frozen};
 use compio::fs::{File, OpenOptions};
 use err_trail::ErrContext;
 use std::{
@@ -27,7 +26,7 @@ use tracing::trace;
 
 /// A dedicated struct for writing to the messages file.
 #[derive(Debug)]
-pub struct MessagesWriter {
+pub struct BufferedMessagesWriter {
     file_path: String,
     file: File,
     messages_size_bytes: Rc<AtomicU64>,
@@ -35,9 +34,9 @@ pub struct MessagesWriter {
 }
 
 // Safety: We are guaranteeing that MessagesWriter will never be used from multiple threads
-unsafe impl Send for MessagesWriter {}
+unsafe impl Send for BufferedMessagesWriter {}
 
-impl MessagesWriter {
+impl BufferedMessagesWriter {
     /// Opens the messages file in write mode.
     ///
     /// If the server confirmation is set to `NoWait`, the file handle is transferred to the
@@ -117,6 +116,7 @@ impl MessagesWriter {
 
         Ok(IggyByteSize::from(messages_size))
     }
+
     pub fn path(&self) -> String {
         self.file_path.clone()
     }

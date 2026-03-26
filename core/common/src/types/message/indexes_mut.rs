@@ -61,7 +61,7 @@ impl IggyIndexesMut {
     /// The returned `IggyIndexes` uses Arc-backed `Bytes`, allowing cheap clones.
     pub fn freeze(&mut self) -> IggyIndexes {
         let base_position = self.base_position;
-        let buffer = self.buffer.freeze();
+        let buffer = self.buffer.freeze_to_bytes();
         self.saved_count = 0;
         self.base_position = 0;
         IggyIndexes::new(buffer, base_position)

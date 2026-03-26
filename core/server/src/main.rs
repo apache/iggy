@@ -161,6 +161,7 @@ fn main() -> Result<(), ServerError> {
             }
         }
 
+
         // THIRD DISCRETE LOADING STEP.
         // Create directories.
         create_directories(&config.system).await?;
@@ -203,6 +204,8 @@ fn main() -> Result<(), ServerError> {
                 );
             }
         }
+
+        tracing::error!("=== DIRECT_IO CONFIG: {:?}", config.system.direct_io);
 
         // FIFTH DISCRETE LOADING STEP.
         MemoryPool::init_pool(&config.system.memory_pool.into_other());

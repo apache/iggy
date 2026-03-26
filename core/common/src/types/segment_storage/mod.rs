@@ -15,21 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod direct_file;
 mod index_reader;
 mod index_writer;
 mod messages_reader;
 mod messages_writer;
 
 use crate::{IggyError, IggyMessagesBatch};
+use std::rc::Rc;
+
 use bytes::Bytes;
 use compio::{fs::File, io::AsyncWriteAtExt};
-use std::rc::Rc;
-use tracing::error;
-
 pub use index_reader::IndexReader;
 pub use index_writer::IndexWriter;
 pub use messages_reader::MessagesReader;
 pub use messages_writer::MessagesWriter;
+use tracing::error;
 
 /// Maximum number of IO vectors for a single writev() call.
 /// Linux typically has IOV_MAX=1024, but we use a conservative value to ensure
@@ -97,12 +98,21 @@ impl SegmentStorage {
         log_fsync: bool,
         index_fsync: bool,
         file_exists: bool,
+        direct_io: bool,
     ) -> Result<Self, IggyError> {
         let size = Rc::new(std::sync::atomic::AtomicU64::new(messages_size));
         let indexes_size = Rc::new(std::sync::atomic::AtomicU64::new(indexes_size));
         let messages_writer = Rc::new(
-            MessagesWriter::new(messages_path, size.clone(), log_fsync, file_exists).await?,
+            MessagesWriter::new(
+                messages_path,
+                size.clone(),
+                log_fsync,
+                file_exists,
+                direct_io,
+            )
+            .await?,
         );
+        let writer_file_rc = messages_writer.try_get_direct_file();
 
         let index_writer = Rc::new(
             IndexWriter::new(index_path, indexes_size.clone(), index_fsync, file_exists).await?,
@@ -113,7 +123,8 @@ impl SegmentStorage {
             index_writer.fsync().await?;
         }
 
-        let messages_reader = Rc::new(MessagesReader::new(messages_path, size).await?);
+        let messages_reader =
+            Rc::new(MessagesReader::new(messages_path, size, writer_file_rc).await?);
         let index_reader = Rc::new(IndexReader::new(index_path, indexes_size).await?);
         Ok(Self {
             messages_writer: Some(messages_writer),

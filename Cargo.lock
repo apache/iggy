@@ -5719,6 +5719,7 @@ dependencies = [
  "serde_with",
  "serial_test",
  "strum 0.28.0",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

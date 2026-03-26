@@ -281,7 +281,7 @@ impl IggyMessagesBatchMut {
     pub fn freeze(&mut self) -> IggyMessagesBatch {
         let count = self.count();
         let indexes = self.indexes.freeze();
-        let messages = self.messages.freeze();
+        let messages = self.messages.freeze_to_bytes();
         IggyMessagesBatch::new(indexes, messages, count)
     }
 

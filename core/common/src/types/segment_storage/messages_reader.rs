@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::types::segment_storage::direct_file::DirectFile;
 use crate::{IggyError, IggyIndexesMut, IggyMessagesBatchMut, PooledBuffer};
 use compio::buf::{IntoInner, IoBuf};
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncReadAtExt;
 use err_trail::ErrContext;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::{
     io::ErrorKind,
@@ -33,6 +35,7 @@ pub struct MessagesReader {
     file_path: String,
     file: File,
     messages_size_bytes: Rc<AtomicU64>,
+    writer_file: Option<Rc<RefCell<DirectFile>>>,
 }
 
 // Safety: We are guaranteeing that MessagesReader will never be used from multiple threads
@@ -43,6 +46,7 @@ impl MessagesReader {
     pub async fn new(
         file_path: &str,
         messages_size_bytes: Rc<AtomicU64>,
+        writer_file: Option<Rc<RefCell<DirectFile>>>,
     ) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
             .read(true)
@@ -77,6 +81,7 @@ impl MessagesReader {
             file_path: file_path.to_string(),
             file,
             messages_size_bytes,
+            writer_file,
         })
     }
 
@@ -127,21 +132,80 @@ impl MessagesReader {
         self.messages_size_bytes.load(Ordering::Acquire) as u32
     }
 
-    /// Reads `len` bytes from the messages file at the specified `offset`.
     async fn read_at(
         &self,
         offset: u32,
         len: u32,
         _use_pool: bool,
     ) -> Result<PooledBuffer, std::io::Error> {
-        let buf = PooledBuffer::with_capacity(len as usize);
+        if let Some(ref writer) = self.writer_file {
+            let df = writer.borrow();
+            let tail_start = df.position() as u32;
+            let tail_len = df.tail_len() as u32;
 
+            if tail_len > 0 && offset + len > tail_start {
+                let mut result = PooledBuffer::with_capacity(len as usize);
+
+                if offset < tail_start {
+                    // Part from disk, part from tail
+                    let disk_len = tail_start - offset;
+                    let tail_read_len = (len - disk_len) as usize;
+                    let tail_len_usize = tail_len as usize;
+                    assert!(
+                        tail_read_len <= tail_len_usize,
+                        "tail read out of bounds: need {} but tail has {}",
+                        tail_read_len,
+                        tail_len_usize
+                    );
+
+                    // Copy tail data into an owned Vec before dropping the RefCell borrow.
+                    //
+                    // Safety of the data:
+                    // This is not atomic but the writer is append-only.
+                    // The tail bytes we copied and the disk region we're about to read are both historical data where content is fixed.
+                    // Even if the writer flushes or appends new data during our .await, this read range remains valid and unchanged
+                    //
+                    // TODO(tungtose): share mmap, ring buffer,...?
+                    let tail_data = df.tail_buffer()[..tail_read_len].to_vec();
+                    drop(df);
+
+                    let disk_buf = PooledBuffer::with_capacity(disk_len as usize);
+                    let (res, disk_buf) = self
+                        .file
+                        .read_exact_at(disk_buf.slice(..disk_len as usize), offset as u64)
+                        .await
+                        .into();
+                    let disk_buf = disk_buf.into_inner();
+                    res?;
+                    result.extend_from_slice(&disk_buf[..disk_len as usize]);
+                    result.extend_from_slice(&tail_data);
+                } else {
+                    // Read all from tail
+                    let tail_offset = (offset - tail_start) as usize;
+                    let tail_len_usize = tail_len as usize;
+                    assert!(
+                        tail_offset + len as usize <= tail_len_usize,
+                        "tail read out of bounds: offset {} + len {} exceeds tail {}",
+                        tail_offset,
+                        len,
+                        tail_len_usize
+                    );
+
+                    result.extend_from_slice(
+                        &df.tail_buffer()[tail_offset..tail_offset + len as usize],
+                    );
+                }
+                return Ok(result);
+            }
+        }
+
+        // Normal disk read
+        let buf = PooledBuffer::with_capacity(len as usize);
         let (result, buf) = self
             .file
             .read_exact_at(buf.slice(..len as usize), offset as u64)
             .await
             .into();
-
         let buf = buf.into_inner();
         result?;
         Ok(buf)

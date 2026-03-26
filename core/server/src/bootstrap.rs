@@ -311,6 +311,7 @@ pub async fn load_segments(
             config.partition.enforce_fsync,
             config.partition.enforce_fsync,
             true,
+            config.direct_io.enabled,
         )
         .await?;
 
