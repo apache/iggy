@@ -89,7 +89,7 @@ helm uninstall iggy
 | `server.enabled` | bool | `true` | Enable the Iggy server deployment |
 | `server.replicaCount` | int | `1` | Number of server replicas |
 | `server.image.repository` | string | `"apache/iggy"` | Server image repository |
-| `server.image.tag` | string | `""` | Server image tag (defaults to chart appVersion) |
+| `server.image.tag` | string | `"0.7.0"` | Server image tag |
 | `server.ports.http` | int | `3000` | HTTP API port |
 | `server.ports.tcp` | int | `8090` | TCP protocol port |
 | `server.ports.quic` | int | `8080` | QUIC protocol port |
