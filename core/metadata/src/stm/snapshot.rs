@@ -28,6 +28,36 @@ pub enum SnapshotError {
     Serialize(rmp_serde::encode::Error),
     /// Deserialization failed.
     Deserialize(rmp_serde::decode::Error),
+    /// I/O error during snapshot persist/load.
+    Io(std::io::Error),
+    /// I/O error during a specific stage of snapshot persistence.
+    /// The caller can inspect the stage to decide whether to retry
+    /// (e.g. `Rename`) or start from scratch (e.g. `Write`, `Sync`).
+    Persist {
+        stage: PersistStage,
+        source: std::io::Error,
+    },
+    /// Checksum mismatch on snapshot load.
+    ChecksumMismatch { expected: u32, actual: u32 },
+    /// Snapshot file is too short to contain a valid checksum.
+    Truncated { size: u64 },
+}
+
+/// Stage at which snapshot persistence failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistStage {
+    /// Creating or writing the temp file failed. The temp file may contain
+    /// partial data. Safe to delete and retry from scratch.
+    Write,
+    /// Fsync of the temp file failed. The data may not be durable.
+    /// Safe to delete the temp file and retry from scratch.
+    Sync,
+    /// Atomic rename of temp -> final path failed. The temp file contains
+    /// a complete, synced snapshot. Safe to retry just the rename.
+    Rename,
+    /// Fsync of the parent directory after rename failed. The rename
+    /// succeeded but may not be durable. Safe to retry just the dir sync.
+    DirSync,
 }
 
 impl fmt::Display for SnapshotError {
@@ -35,6 +65,22 @@ impl fmt::Display for SnapshotError {
         match self {
             Self::Serialize(e) => write!(f, "snapshot serialization failed: {e}"),
             Self::Deserialize(e) => write!(f, "snapshot deserialization failed: {e}"),
+            Self::Io(e) => write!(f, "snapshot I/O error: {e}"),
+            Self::Persist { stage, source } => {
+                write!(f, "snapshot persist failed at {stage:?} stage: {source}")
+            }
+            Self::ChecksumMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "snapshot checksum mismatch: expected {expected:#010x}, actual {actual:#010x}"
+                )
+            }
+            Self::Truncated { size } => {
+                write!(
+                    f,
+                    "snapshot file truncated: {size} bytes (too short for checksum)"
+                )
+            }
         }
     }
 }
@@ -44,7 +90,15 @@ impl std::error::Error for SnapshotError {
         match self {
             Self::Serialize(e) => Some(e),
             Self::Deserialize(e) => Some(e),
+            Self::Io(e) | Self::Persist { source: e, .. } => Some(e),
+            Self::ChecksumMismatch { .. } | Self::Truncated { .. } => None,
         }
+    }
+}
+
+impl From<std::io::Error> for SnapshotError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
     }
 }
 
