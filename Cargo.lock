@@ -5216,7 +5216,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.9.3-edge.1"
+version = "0.9.4-edge.1"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -5417,7 +5417,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.9.3-edge.1"
+version = "0.9.4-edge.1"
 dependencies = [
  "bytemuck",
  "bytes",
@@ -5427,7 +5427,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.9.3-edge.1"
+version = "0.9.4-edge.1"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
