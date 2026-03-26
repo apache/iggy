@@ -16,6 +16,13 @@
  * under the License.
  */
 
-pub mod delete_consumer_offset;
-pub mod get_consumer_offset;
-pub mod store_consumer_offset;
+use crate::Consumer;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetConsumerOffset {
+    #[serde(flatten)]
+    pub consumer: Consumer,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_id: Option<u32>,
+}

@@ -18,3 +18,4 @@
 
 pub mod create_personal_access_token;
 pub mod delete_personal_access_token;
+pub mod login_with_personal_access_token;

@@ -22,24 +22,9 @@ use crate::prelude::Identifier;
 use crate::prelude::IggyError;
 use async_trait::async_trait;
 use iggy_common::ConsumerOffsetClient;
+use iggy_common::get_consumer_offset::GetConsumerOffset;
+use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::{Consumer, ConsumerOffsetInfo};
-use serde::Serialize;
-
-#[derive(Serialize)]
-struct StoreOffsetRequest {
-    #[serde(flatten)]
-    consumer: Consumer,
-    partition_id: Option<u32>,
-    offset: u64,
-}
-
-#[derive(Serialize)]
-struct GetOffsetQuery {
-    #[serde(flatten)]
-    consumer: Consumer,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    partition_id: Option<u32>,
-}
 
 #[async_trait]
 impl ConsumerOffsetClient for HttpClient {
@@ -53,7 +38,7 @@ impl ConsumerOffsetClient for HttpClient {
     ) -> Result<(), IggyError> {
         self.put(
             &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
-            &StoreOffsetRequest {
+            &StoreConsumerOffset {
                 consumer: consumer.clone(),
                 partition_id,
                 offset,
@@ -73,7 +58,7 @@ impl ConsumerOffsetClient for HttpClient {
         let response = self
             .get_with_query(
                 &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
-                &GetOffsetQuery {
+                &GetConsumerOffset {
                     consumer: consumer.clone(),
                     partition_id,
                 },

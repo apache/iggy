@@ -19,7 +19,6 @@ pub(crate) mod args;
 pub(crate) mod client;
 pub(crate) mod client_state;
 pub(crate) mod cluster;
-pub(crate) mod command;
 pub(crate) mod compression;
 pub(crate) mod configuration;
 pub(crate) mod consumer;

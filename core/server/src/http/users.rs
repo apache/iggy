@@ -45,18 +45,13 @@ use iggy_binary_protocol::requests::users::{
 use iggy_common::Identifier;
 use iggy_common::IdentityInfo;
 use iggy_common::Validatable;
+use iggy_common::login_user::LoginUser;
 use iggy_common::{IggyError, UserInfo, UserInfoDetails};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::instrument;
-
-#[derive(Debug, Deserialize)]
-struct LoginUserBody {
-    pub username: String,
-    pub password: SecretString,
-}
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -262,7 +257,7 @@ async fn delete_user(
 #[instrument(skip_all, name = "trace_login_user")]
 async fn login_user(
     State(state): State<Arc<AppState>>,
-    Json(command): Json<LoginUserBody>,
+    Json(command): Json<LoginUser>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
     let user = state
         .shard

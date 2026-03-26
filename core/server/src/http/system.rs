@@ -32,20 +32,11 @@ use bytes::Bytes;
 use chrono::Local;
 use err_trail::ErrContext;
 use iggy_common::Stats;
-use iggy_common::{
-    ClientInfo, ClientInfoDetails, ClusterMetadata, IggyError, SnapshotCompression,
-    SystemSnapshotType,
-};
+use iggy_common::get_snapshot::GetSnapshot;
+use iggy_common::{ClientInfo, ClientInfoDetails, ClusterMetadata, IggyError, SystemSnapshotType};
 use send_wrapper::SendWrapper;
-use serde::Deserialize;
 use std::sync::Arc;
 use tracing::error;
-
-#[derive(Debug, Deserialize)]
-struct GetSnapshotBody {
-    pub snapshot_types: Vec<SystemSnapshotType>,
-    pub compression: SnapshotCompression,
-}
 
 const NAME: &str = "Iggy API";
 const PONG: &str = "pong";
@@ -138,7 +129,7 @@ async fn get_clients(
 async fn get_snapshot(
     State(state): State<Arc<AppState>>,
     Extension(_identity): Extension<Identity>,
-    Json(command): Json<GetSnapshotBody>,
+    Json(command): Json<GetSnapshot>,
 ) -> Result<impl IntoResponse, CustomError> {
     if command.snapshot_types.contains(&SystemSnapshotType::All) && command.snapshot_types.len() > 1
     {

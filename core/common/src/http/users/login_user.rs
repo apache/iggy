@@ -16,6 +16,16 @@
  * under the License.
  */
 
-pub mod delete_consumer_offset;
-pub mod get_consumer_offset;
-pub mod store_consumer_offset;
+use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LoginUser {
+    pub username: String,
+    #[serde(serialize_with = "crate::utils::serde_secret::serialize_secret")]
+    pub password: SecretString,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub context: Option<String>,
+}

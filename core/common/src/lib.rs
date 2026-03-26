@@ -40,11 +40,13 @@ pub use certificates::generate_self_signed_certificate;
 pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
 pub use deduplication::MessageDeduplicator;
 pub use http::consumer_groups::*;
+pub use http::consumer_offsets::*;
 pub use http::messages::*;
 pub use http::partitions::*;
 pub use http::personal_access_tokens::*;
 pub use http::segments::*;
 pub use http::streams::*;
+pub use http::system::*;
 pub use http::topics::*;
 pub use http::users::*;
 pub use sender::{

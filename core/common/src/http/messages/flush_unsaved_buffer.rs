@@ -16,6 +16,10 @@
  * under the License.
  */
 
-pub mod delete_consumer_offset;
-pub mod get_consumer_offset;
-pub mod store_consumer_offset;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FlushUnsavedBuffer {
+    pub partition_id: u32,
+    pub fsync: bool,
+}

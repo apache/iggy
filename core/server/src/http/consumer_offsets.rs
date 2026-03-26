@@ -30,30 +30,10 @@ use iggy_common::Consumer;
 use iggy_common::ConsumerOffsetInfo;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
-use serde::Deserialize;
+use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
+use iggy_common::get_consumer_offset::GetConsumerOffset;
+use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use std::sync::Arc;
-
-#[derive(Debug, Deserialize)]
-struct GetConsumerOffsetQuery {
-    #[serde(flatten)]
-    consumer: Consumer,
-    #[serde(default)]
-    partition_id: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StoreConsumerOffsetBody {
-    #[serde(flatten)]
-    consumer: Consumer,
-    partition_id: Option<u32>,
-    offset: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct DeleteConsumerOffsetQuery {
-    #[serde(default)]
-    partition_id: Option<u32>,
-}
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -73,7 +53,7 @@ async fn get_consumer_offset(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
     Path((stream_id, topic_id)): Path<(String, String)>,
-    query: Query<GetConsumerOffsetQuery>,
+    query: Query<GetConsumerOffset>,
 ) -> Result<Json<ConsumerOffsetInfo>, CustomError> {
     let stream_id = Identifier::from_str_value(&stream_id)?;
     let topic_id = Identifier::from_str_value(&topic_id)?;
@@ -111,7 +91,7 @@ async fn store_consumer_offset(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
     Path((stream_id, topic_id)): Path<(String, String)>,
-    Json(body): Json<StoreConsumerOffsetBody>,
+    Json(body): Json<StoreConsumerOffset>,
 ) -> Result<StatusCode, CustomError> {
     let stream_id = Identifier::from_str_value(&stream_id)?;
     let topic_id = Identifier::from_str_value(&topic_id)?;
@@ -142,7 +122,7 @@ async fn delete_consumer_offset(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
     Path((stream_id, topic_id, consumer_id)): Path<(String, String, String)>,
-    query: Query<DeleteConsumerOffsetQuery>,
+    query: Query<DeleteConsumerOffset>,
 ) -> Result<StatusCode, CustomError> {
     let stream_id_ident = Identifier::from_str_value(&stream_id)?;
     let topic_id_ident = Identifier::from_str_value(&topic_id)?;
