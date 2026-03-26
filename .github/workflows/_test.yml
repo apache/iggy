@@ -205,15 +205,15 @@ jobs:
 
       - name: Validate Helm chart
         if: inputs.component == 'helm' && inputs.task == 'validate'
-        run: scripts/ci/test_helm.sh validate
+        run: scripts/ci/test-helm.sh validate
 
       - name: Smoke test Helm chart runtime
         if: inputs.component == 'helm' && inputs.task == 'smoke'
-        run: scripts/ci/test_helm.sh smoke
+        run: scripts/ci/test-helm.sh smoke --cleanup
 
       - name: Collect Helm smoke diagnostics
         if: failure() && inputs.component == 'helm' && inputs.task == 'smoke'
-        run: scripts/ci/test_helm.sh collect-smoke-diagnostics
+        run: scripts/ci/test-helm.sh collect-smoke-diagnostics
 
       # CI workflow validation
       - name: Validate CI workflows

@@ -144,14 +144,14 @@ The chart CI paths are also available locally from the repository root.
 If `helm` is already installed locally:
 
 ```bash
-scripts/ci/test_helm.sh validate
+scripts/ci/test-helm.sh validate
 ```
 
 If you want the pinned Linux CI tool version instead:
 
 ```bash
 scripts/ci/setup-helm-tools.sh
-scripts/ci/test_helm.sh validate
+scripts/ci/test-helm.sh validate
 ```
 
 This runs `helm lint --strict` plus the CI render scenarios, including:
@@ -165,13 +165,13 @@ This runs `helm lint --strict` plus the CI render scenarios, including:
 
 ### Runtime Smoke Test
 
-The smoke path requires `helm`, `kind`, `kubectl`, `curl`, and `python3`.
+The smoke path requires `helm`, `kind`, `kubectl`, and `curl`.
 
 If `helm` and `kind` are already installed:
 
 ```bash
 scripts/ci/setup-helm-smoke-cluster.sh
-scripts/ci/test_helm.sh smoke
+scripts/ci/test-helm.sh smoke --cleanup
 ```
 
 If you want the pinned Linux CI tool versions:
@@ -179,13 +179,13 @@ If you want the pinned Linux CI tool versions:
 ```bash
 scripts/ci/setup-helm-tools.sh --install-kind
 scripts/ci/setup-helm-smoke-cluster.sh
-scripts/ci/test_helm.sh smoke
+scripts/ci/test-helm.sh smoke --cleanup
 ```
 
 If a previous local smoke install failed and left resources behind, reset the smoke namespace with:
 
 ```bash
-scripts/ci/test_helm.sh cleanup-smoke
+scripts/ci/test-helm.sh cleanup-smoke
 ```
 
 On Apple Silicon hosts, the released `apache/iggy:0.7.0` `arm64` image may still fail during the runtime smoke path in kind. If your Docker setup supports amd64 emulation well enough, you can try recreating the dedicated smoke cluster with:
@@ -194,12 +194,12 @@ On Apple Silicon hosts, the released `apache/iggy:0.7.0` `arm64` image may still
 HELM_SMOKE_KIND_PLATFORM=linux/amd64 scripts/ci/setup-helm-smoke-cluster.sh
 ```
 
-The smoke script defaults `IGGY_SYSTEM_SHARDING_CPU_ALLOCATION=1` for the server pod so the local kind path avoids the chart's `numa:auto` default and keeps the local runtime to a single shard, which has been more reliable on containerized local nodes. If you need a different local override, set `HELM_SMOKE_SERVER_CPU_ALLOCATION` before running `scripts/ci/test_helm.sh smoke`.
+The smoke script defaults `IGGY_SYSTEM_SHARDING_CPU_ALLOCATION=1` for the server pod so the local kind path avoids the chart's `numa:auto` default and keeps the local runtime to a single shard, which has been more reliable on containerized local nodes. If you need a different local override, set `HELM_SMOKE_SERVER_CPU_ALLOCATION` before running `scripts/ci/test-helm.sh smoke`. Pass `--cleanup` to remove the smoke namespace after a successful run; omit it if you want to inspect the deployed resources.
 
 On smoke-test failures you can collect the same diagnostics as CI with:
 
 ```bash
-scripts/ci/test_helm.sh collect-smoke-diagnostics
+scripts/ci/test-helm.sh collect-smoke-diagnostics
 ```
 
 > **Note:** `scripts/ci/setup-helm-tools.sh` currently supports Linux `x86_64` only.

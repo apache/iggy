@@ -22,7 +22,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/ci/test_helm.sh <validate|smoke|cleanup-smoke|collect-smoke-diagnostics>
+Usage: scripts/ci/test-helm.sh <validate|smoke|cleanup-smoke|collect-smoke-diagnostics> [--cleanup]
 
 Commands:
   validate                  Run Helm lint and render validation scenarios.
@@ -32,7 +32,8 @@ Commands:
 
 Notes:
   - validate requires helm.
-  - smoke requires helm, kubectl, curl, and python3, plus an existing cluster and ingress controller.
+  - smoke requires helm, kubectl, and curl, plus an existing cluster and ingress controller.
+  - pass --cleanup with smoke to remove the Helm smoke namespace after a successful run.
   - cleanup-smoke requires kubectl and optionally helm.
   - collect-smoke-diagnostics is best-effort and does not fail on missing resources.
 EOF
@@ -220,10 +221,10 @@ validate() {
 }
 
 smoke() {
+  local cleanup_after_success="$1"
   require_command helm
   require_command kubectl
   require_command curl
-  require_command python3
 
   local ui_image_tag
   local server_ping_status
@@ -243,21 +244,14 @@ smoke() {
     if [ -n "$leftover_resources" ]; then
       cat >&2 <<EOF
 Found leftover resources for a failed Helm smoke install in namespace '${HELM_SMOKE_NAMESPACE}'.
-Run 'scripts/ci/test_helm.sh cleanup-smoke' once, then rerun the smoke test.
+Run 'scripts/ci/test-helm.sh cleanup-smoke' once, then rerun the smoke test.
 EOF
       printf '%s\n' "$leftover_resources" >&2
       exit 1
     fi
   fi
 
-  ui_image_tag="$(
-    python3 - <<'PY'
-import json
-
-with open("web/package.json", "r", encoding="utf-8") as f:
-    print(json.load(f)["version"])
-PY
-  )"
+  ui_image_tag="$(extract_values_tag ui)"
 
   echo "$ui_image_tag" > "$HELM_SMOKE_REPORT_DIR/ui-image-tag.txt"
 
@@ -351,6 +345,10 @@ EOF
   done
 
   test "$ui_healthz_status" = "200"
+
+  if [ "$cleanup_after_success" = true ]; then
+    cleanup_smoke
+  fi
 }
 
 cleanup_smoke() {
@@ -386,29 +384,65 @@ collect_smoke_diagnostics() {
 }
 
 main() {
-  if [ $# -ne 1 ]; then
+  local command
+  local smoke_cleanup=false
+
+  if [ $# -lt 1 ]; then
     usage
     exit 1
   fi
 
-  case "$1" in
+  command="$1"
+  shift
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cleanup)
+        smoke_cleanup=true
+        ;;
+      --help|-h|help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Error: unknown option '$1'" >&2
+        usage
+        exit 1
+        ;;
+    esac
+    shift
+  done
+
+  case "$command" in
     validate)
+      if [ "$smoke_cleanup" = true ]; then
+        echo "Error: --cleanup is only supported with the smoke command" >&2
+        exit 1
+      fi
       validate
       ;;
     smoke)
-      smoke
+      smoke "$smoke_cleanup"
       ;;
     cleanup-smoke)
+      if [ "$smoke_cleanup" = true ]; then
+        echo "Error: --cleanup is only supported with the smoke command" >&2
+        exit 1
+      fi
       cleanup_smoke
       ;;
     collect-smoke-diagnostics)
+      if [ "$smoke_cleanup" = true ]; then
+        echo "Error: --cleanup is only supported with the smoke command" >&2
+        exit 1
+      fi
       collect_smoke_diagnostics
       ;;
     --help|-h|help)
       usage
       ;;
     *)
-      echo "Error: unknown command '$1'" >&2
+      echo "Error: unknown command '$command'" >&2
       usage
       exit 1
       ;;
