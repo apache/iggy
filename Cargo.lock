@@ -5515,13 +5515,16 @@ dependencies = [
  "humantime",
  "iggy_connector_sdk",
  "reqwest 0.13.2",
+ "reqwest-middleware",
+ "reqwest-retry",
+ "reqwest-tracing",
  "serde",
  "serde_json",
  "simd-json",
+ "strum_macros 0.28.0",
  "tokio",
  "toml 1.1.0+spec-1.1.0",
  "tracing",
- "uuid",
 ]
 
 [[package]]
