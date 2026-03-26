@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::{IggyError, header::GenericHeader, message::Message};
+use iggy_binary_protocol::{GenericHeader, Message};
+use iggy_common::IggyError;
 use message_bus::MessageBus;
 use std::collections::{HashSet, VecDeque};
 use std::ops::Deref;

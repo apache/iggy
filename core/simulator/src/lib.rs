@@ -131,11 +131,7 @@ impl Simulator {
     }
 
     #[allow(clippy::future_not_send)]
-    async fn dispatch_to_replica(
-        &self,
-        replica: &Replica,
-        message: Message<iggy_common::header::GenericHeader>,
-    ) {
+    async fn dispatch_to_replica(&self, replica: &Replica, message: Message<GenericHeader>) {
         replica.on_message(message).await;
 
         let mut buf = Vec::new();

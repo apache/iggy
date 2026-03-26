@@ -23,6 +23,7 @@ use crate::{
     AppendResult, Partition, PartitionOffsets, PollFragments, PollQueryResult, PollingArgs,
     PollingConsumer,
 };
+use iggy_binary_protocol::{Message, Operation, PrepareHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
     IggyByteSize, IggyError, IggyTimestamp, PartitionStats, PollingKind,

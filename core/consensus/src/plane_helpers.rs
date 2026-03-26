@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn loopback_cleared_on_complete_view_change_as_primary() {
-        use iggy_common::header::{DoViewChangeHeader, StartViewChangeHeader};
+        use iggy_binary_protocol::{DoViewChangeHeader, StartViewChangeHeader};
 
         // 3 replicas, replica 0 is primary for view 0 (and view 3: 3 % 3 = 0).
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());

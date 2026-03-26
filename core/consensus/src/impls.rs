@@ -21,11 +21,10 @@ use crate::{
     dvc_quorum_array_empty, dvc_record, dvc_reset, dvc_select_winner,
 };
 use bit_set::BitSet;
-use iggy_common::header::{
-    Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
-    RequestHeader, StartViewChangeHeader, StartViewHeader,
+use iggy_binary_protocol::{
+    Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, Message, PrepareHeader,
+    PrepareOkHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
-use iggy_common::message::Message;
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
 use std::cell::{Cell, RefCell};

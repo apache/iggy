@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::{Message, ReplyHeader};
 use iggy_common::PollingStrategy;
-use iggy_common::header::ReplyHeader;
-use iggy_common::message::Message;
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::{IggyByteSize, MemoryPool, MemoryPoolConfigOther};
 use message_bus::MessageBus;

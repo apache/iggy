@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_binary_protocol"
-version = "0.9.3-edge.1"
+version = "0.9.4-edge.1"
 description = "Wire protocol types and codec for the Iggy binary protocol. Shared between server and SDK."
 edition = "2024"
 license = "Apache-2.0"

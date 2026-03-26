@@ -40,8 +40,7 @@
 
 use crate::ready_queue::{Ready, ReadyQueue};
 use enumset::EnumSet;
-use iggy_common::header::{Command2, GenericHeader};
-use iggy_common::message::Message;
+use iggy_binary_protocol::{Command2, GenericHeader, Message};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::SeedableRng;

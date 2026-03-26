@@ -15,13 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::{Message, Operation, RequestHeader};
 use iggy_common::{
     BytesSerializable, IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, Identifier,
-    create_stream::CreateStream,
-    delete_stream::DeleteStream,
-    header::{Operation, RequestHeader},
-    message::Message,
-    sharding::IggyNamespace,
+    create_stream::CreateStream, delete_stream::DeleteStream, sharding::IggyNamespace,
 };
 use iobuf::Owned;
 use std::cell::Cell;
@@ -135,7 +132,7 @@ impl SimClient {
         let total_size = header_size + payload.len();
 
         let header = RequestHeader {
-            command: iggy_common::header::Command2::Request,
+            command: iggy_binary_protocol::Command2::Request,
             operation,
             size: total_size as u32,
             cluster: 0,
@@ -168,7 +165,7 @@ impl SimClient {
         let total_size = header_size + payload.len();
 
         let header = RequestHeader {
-            command: iggy_common::header::Command2::Request,
+            command: iggy_binary_protocol::Command2::Request,
             operation,
             size: total_size as u32,
             cluster: 0, // TODO: Get from config

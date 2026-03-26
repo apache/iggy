@@ -32,7 +32,10 @@ use consensus::{
     pipeline_prepare_common, replicate_preflight, replicate_to_next_in_chain,
     send_prepare_ok as send_prepare_ok_common,
 };
-use iggy_common::header::Command2;
+use iggy_binary_protocol::{
+    Command2, ConsensusHeader, GenericHeader, Message, Operation, PrepareHeader, PrepareOkHeader,
+    RequestHeader,
+};
 use iggy_common::{
     IggyByteSize, PartitionStats, SegmentStorage,
     header::{
