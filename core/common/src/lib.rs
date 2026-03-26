@@ -96,7 +96,6 @@ pub use types::configuration::websocket_config::websocket_client_config::*;
 pub use types::configuration::websocket_config::websocket_client_config_builder::*;
 pub use types::configuration::websocket_config::websocket_client_reconnection_config::*;
 pub use types::configuration::websocket_config::websocket_connection_string_options::*;
-pub use types::consensus::*;
 pub use types::consumer::consumer_group::*;
 pub use types::consumer::consumer_group_id::*;
 pub use types::consumer::consumer_group_offsets::*;

@@ -19,6 +19,7 @@ use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
 use crate::responses::streams::get_stream::TopicHeader;
 use bytes::{BufMut, BytesMut};
+use std::borrow::Cow;
 
 /// Partition details within a `GetTopic` response.
 ///
@@ -120,11 +121,11 @@ impl WireDecode for GetTopicResponse {
             partitions.push(partition);
         }
         if partitions.len() != topic.partitions_count as usize {
-            return Err(WireError::Validation(format!(
+            return Err(WireError::Validation(Cow::Owned(format!(
                 "topic.partitions_count={} but decoded {} partitions",
                 topic.partitions_count,
                 partitions.len()
-            )));
+            ))));
         }
         Ok((Self { topic, partitions }, pos))
     }

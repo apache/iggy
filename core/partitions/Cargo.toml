@@ -30,6 +30,7 @@ readme = "../../README.md"
 [dependencies]
 bytes = { workspace = true }
 consensus = { workspace = true }
+iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 journal = { workspace = true }
 message_bus = { workspace = true }

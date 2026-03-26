@@ -364,7 +364,7 @@ impl IggyShard {
 
             let segment = &mut partition.log.segments_mut()[segment_index];
 
-            if segment.end_offset == 0 {
+            if segment.start_timestamp == 0 {
                 segment.start_timestamp = batch.first_timestamp().unwrap();
             }
 

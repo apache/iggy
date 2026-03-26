@@ -24,7 +24,6 @@ use iggy_common::PersonalAccessToken;
 use iggy_common::{ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, IggyByteSize};
 use iggy_common::{IdentityInfo, PersonalAccessTokenInfo, TokenInfo, TopicDetails};
 use iggy_common::{UserInfo, UserInfoDetails};
-use secrecy::SecretString;
 
 pub fn map_user(user: &User) -> UserInfoDetails {
     UserInfoDetails {
@@ -106,7 +105,7 @@ pub fn map_generated_access_token_to_identity_info(token: GeneratedToken) -> Ide
     IdentityInfo {
         user_id: token.user_id,
         access_token: Some(TokenInfo {
-            token: SecretString::from(token.access_token),
+            token: token.access_token,
             expiry: token.access_token_expiry,
         }),
     }

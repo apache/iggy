@@ -20,6 +20,20 @@
 //!
 //! This module provides the core logic for polling and loading messages from partitions,
 //! avoiding code duplication between `IggyShard` and test harnesses.
+//!
+//! # Safety invariants
+//!
+//! The snapshot-then-read pattern in [`get_messages_by_offset`] and
+//! [`poll_messages_by_timestamp`] is safe only under **single-threaded shard
+//! execution** (compio runtime). Between the metadata snapshot and the actual
+//! reads, no other shard request can mutate the partition state because the
+//! message pump processes one request at a time.
+//!
+//! The poll + auto_commit sequence in the handler (`handlers.rs`) is likewise
+//! non-atomic but safe for the same reason.
+//!
+//! If the architecture ever moves to multi-threaded shard processing or adds
+//! compaction/message deletion, these invariants must be re-evaluated.
 
 use super::journal::Journal;
 use super::local_partitions::LocalPartitions;
@@ -131,100 +145,87 @@ pub async fn get_messages_by_offset(
         return Ok(IggyMessagesBatchSet::empty());
     }
 
-    // Get journal and in_flight metadata for routing
-    let (
-        is_journal_empty,
-        journal_first_offset,
-        journal_last_offset,
-        in_flight_empty,
-        in_flight_first,
-        in_flight_last,
-    ) = {
+    // Snapshot journal and in-flight metadata for routing decisions.
+    let (journal_first_offset, in_flight_empty, in_flight_first, in_flight_last) = {
         let store = local_partitions.borrow();
         let partition = store
             .get(namespace)
             .expect("local_partitions: partition must exist for poll");
 
         let journal = partition.log.journal();
-        let journal_inner = journal.inner();
         let in_flight = partition.log.in_flight();
         (
-            journal.is_empty(),
-            journal_inner.base_offset,
-            journal_inner.current_offset,
+            journal.first_offset(),
             in_flight.is_empty(),
             in_flight.first_offset(),
             in_flight.last_offset(),
         )
     };
 
-    let end_offset = start_offset + (count - 1).max(1) as u64;
+    // Lookup ordered by ascending offset: disk -> in-flight -> journal.
+    //
+    // Offsets are sequential: disk < in-flight < journal. A request may span
+    // multiple tiers, so we advance `current` through each sequentially.
+    // See issue #2715.
 
-    // Case 0: Journal is empty - check in_flight buffer or disk
-    if is_journal_empty {
-        if !in_flight_empty && start_offset >= in_flight_first && start_offset <= in_flight_last {
-            let in_flight_batches = {
-                let store = local_partitions.borrow();
-                let partition = store
-                    .get(namespace)
-                    .expect("local_partitions: partition must exist for poll");
-                partition
-                    .log
-                    .in_flight()
-                    .get_by_offset(start_offset, count)
-                    .to_vec()
-            };
-            if !in_flight_batches.is_empty() {
-                let mut result = IggyMessagesBatchSet::empty();
-                result.add_immutable_batches(&in_flight_batches);
-                return Ok(result.get_by_offset(start_offset, count));
-            }
+    let mut combined = IggyMessagesBatchSet::empty();
+    let mut remaining = count;
+    let mut current = start_offset;
+
+    // Lowest in-memory tier boundary (if any). Disk handles offsets below this.
+    let in_memory_floor = if !in_flight_empty {
+        in_flight_first
+    } else {
+        journal_first_offset.unwrap_or(u64::MAX)
+    };
+
+    // Disk (pre-tier): offsets below the lowest in-memory tier.
+    if remaining > 0 && current < in_memory_floor {
+        let disk_count =
+            ((in_memory_floor.min(current + remaining as u64) - current) as u32).min(remaining);
+        let disk_messages =
+            load_messages_from_disk(local_partitions, namespace, current, disk_count).await?;
+        let loaded = disk_messages.count();
+        if loaded > 0 {
+            current += loaded as u64;
+            remaining = remaining.saturating_sub(loaded);
+            combined.add_batch_set(disk_messages);
         }
-        return load_messages_from_disk(local_partitions, namespace, start_offset, count).await;
     }
 
-    // Case 1: All messages are in journal
-    if start_offset >= journal_first_offset && end_offset <= journal_last_offset {
-        let batches = {
+    // In-flight: committed data being persisted to disk.
+    if remaining > 0 && !in_flight_empty && current >= in_flight_first && current <= in_flight_last
+    {
+        let in_flight_count = ((in_flight_last - current + 1) as u32).min(remaining);
+        let in_flight_batches = {
             let store = local_partitions.borrow();
             let partition = store
                 .get(namespace)
                 .expect("local_partitions: partition must exist for poll");
             partition
                 .log
-                .journal()
-                .get(|batches| batches.get_by_offset(start_offset, count))
+                .in_flight()
+                .get_by_offset(current, in_flight_count)
+                .to_vec()
         };
-        return Ok(batches);
-    }
-
-    // Case 2: All messages on disk (end_offset < journal_first_offset)
-    if end_offset < journal_first_offset {
-        return load_messages_from_disk(local_partitions, namespace, start_offset, count).await;
-    }
-
-    // Case 3: Messages span disk and journal boundary
-    let disk_count = if start_offset < journal_first_offset {
-        ((journal_first_offset - start_offset) as u32).min(count)
-    } else {
-        0
-    };
-
-    let mut combined_batch_set = IggyMessagesBatchSet::empty();
-
-    // Load messages from disk if needed
-    if disk_count > 0 {
-        let disk_messages =
-            load_messages_from_disk(local_partitions, namespace, start_offset, disk_count).await?;
-        if !disk_messages.is_empty() {
-            combined_batch_set.add_batch_set(disk_messages);
+        if !in_flight_batches.is_empty() {
+            let mut result = IggyMessagesBatchSet::empty();
+            result.add_immutable_batches(&in_flight_batches);
+            let sliced = result.get_by_offset(current, in_flight_count);
+            let loaded = sliced.count();
+            if loaded > 0 {
+                current += loaded as u64;
+                remaining = remaining.saturating_sub(loaded);
+                combined.add_batch_set(sliced);
+            }
         }
     }
 
-    // Get remaining messages from journal
-    let remaining_count = count - combined_batch_set.count();
-    if remaining_count > 0 {
-        let journal_start_offset = std::cmp::max(start_offset, journal_first_offset);
+    // Journal: may hold data from recent appends.
+    if remaining > 0
+        && let Some(jfo) = journal_first_offset
+        && current >= jfo
+    {
         let journal_messages = {
             let store = local_partitions.borrow();
             let partition = store
@@ -233,14 +234,14 @@ pub async fn get_messages_by_offset(
             partition
                 .log
                 .journal()
-                .get(|batches| batches.get_by_offset(journal_start_offset, remaining_count))
+                .get(|batches| batches.get_by_offset(current, remaining))
         };
         if !journal_messages.is_empty() {
-            combined_batch_set.add_batch_set(journal_messages);
+            combined.add_batch_set(journal_messages);
         }
     }
 
-    Ok(combined_batch_set)
+    Ok(combined)
 }
 
 /// Poll messages by timestamp.
@@ -252,8 +253,15 @@ async fn poll_messages_by_timestamp(
 ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
     let partition_id = namespace.partition_id();
 
-    // Get metadata and journal info
-    let (metadata, is_journal_empty, journal_first_timestamp, journal_last_timestamp) = {
+    // Snapshot metadata from journal and in-flight for routing decisions.
+    let (
+        metadata,
+        journal_first_ts,
+        journal_last_ts,
+        in_flight_empty,
+        in_flight_first_ts,
+        in_flight_last_ts,
+    ) = {
         let store = local_partitions.borrow();
         let partition = store
             .get(namespace)
@@ -263,12 +271,31 @@ async fn poll_messages_by_timestamp(
         let metadata = IggyPollMetadata::new(partition_id as u32, current_offset);
 
         let journal = partition.log.journal();
-        let journal_inner = journal.inner();
+
+        let in_flight = partition.log.in_flight();
+        let (ife, ifts, ilts) = if in_flight.is_empty() {
+            (true, 0u64, 0u64)
+        } else {
+            let first_ts = in_flight
+                .batches()
+                .first()
+                .and_then(|b| b.first_timestamp())
+                .unwrap_or(0);
+            let last_ts = in_flight
+                .batches()
+                .last()
+                .and_then(|b| b.last_timestamp())
+                .unwrap_or(0);
+            (false, first_ts, last_ts)
+        };
+
         (
             metadata,
-            journal.is_empty(),
-            journal_inner.first_timestamp,
-            journal_inner.end_timestamp,
+            journal.first_timestamp(),
+            journal.last_timestamp(),
+            ife,
+            ifts,
+            ilts,
         )
     };
 
@@ -276,22 +303,57 @@ async fn poll_messages_by_timestamp(
         return Ok((metadata, IggyMessagesBatchSet::empty()));
     }
 
-    // Case 0: Journal is empty, all messages on disk
-    if is_journal_empty {
-        let batches =
-            load_messages_from_disk_by_timestamp(local_partitions, namespace, timestamp, count)
+    // Three-tier timestamp lookup: disk -> in-flight -> journal.
+    // Same structure as offset-based polling (see issue #2715).
+
+    let mut combined = IggyMessagesBatchSet::empty();
+    let mut remaining = count;
+
+    // Phase 1: Disk - timestamps before in-flight range.
+    let disk_upper_ts = if !in_flight_empty {
+        in_flight_first_ts
+    } else {
+        journal_first_ts.unwrap_or(u64::MAX)
+    };
+
+    if timestamp < disk_upper_ts && remaining > 0 {
+        let disk_messages =
+            load_messages_from_disk_by_timestamp(local_partitions, namespace, timestamp, remaining)
                 .await?;
-        return Ok((metadata, batches));
+        let loaded = disk_messages.count();
+        if loaded > 0 {
+            remaining = remaining.saturating_sub(loaded);
+            combined.add_batch_set(disk_messages);
+        }
     }
 
-    // Case 1: Timestamp is after journal's last timestamp - no messages
-    if timestamp > journal_last_timestamp {
-        return Ok((metadata, IggyMessagesBatchSet::empty()));
+    // Phase 2: In-flight - committed data being persisted.
+    if remaining > 0 && !in_flight_empty && timestamp <= in_flight_last_ts {
+        let in_flight_batches = {
+            let store = local_partitions.borrow();
+            let partition = store
+                .get(namespace)
+                .expect("local_partitions: partition must exist for poll");
+            partition.log.in_flight().batches().to_vec()
+        };
+        if !in_flight_batches.is_empty() {
+            let mut batch_set = IggyMessagesBatchSet::empty();
+            batch_set.add_immutable_batches(&in_flight_batches);
+            let filtered = batch_set.get_by_timestamp(timestamp, remaining);
+            let loaded = filtered.count();
+            if loaded > 0 {
+                remaining = remaining.saturating_sub(loaded);
+                combined.add_batch_set(filtered);
+            }
+        }
     }
 
-    // Case 2: Timestamp is within journal range - get from journal
-    if timestamp >= journal_first_timestamp {
-        let batches = {
+    // Phase 3: Journal - newest appends (post-commit).
+    if remaining > 0
+        && let Some(jlts) = journal_last_ts
+        && timestamp <= jlts
+    {
+        let journal_messages = {
             let store = local_partitions.borrow();
             let partition = store
                 .get(namespace)
@@ -299,37 +361,14 @@ async fn poll_messages_by_timestamp(
             partition
                 .log
                 .journal()
-                .get(|batches| batches.get_by_timestamp(timestamp, count))
+                .get(|batches| batches.get_by_timestamp(timestamp, remaining))
         };
-        return Ok((metadata, batches));
+        if !journal_messages.is_empty() {
+            combined.add_batch_set(journal_messages);
+        }
     }
 
-    // Case 3: Timestamp is before journal - need disk + possibly journal
-    let disk_messages =
-        load_messages_from_disk_by_timestamp(local_partitions, namespace, timestamp, count).await?;
-
-    if disk_messages.count() >= count {
-        return Ok((metadata, disk_messages));
-    }
-
-    // Case 4: Messages span disk and journal
-    let remaining_count = count - disk_messages.count();
-    let journal_messages = {
-        let store = local_partitions.borrow();
-        let partition = store
-            .get(namespace)
-            .expect("local_partitions: partition must exist for poll");
-        partition
-            .log
-            .journal()
-            .get(|batches| batches.get_by_timestamp(timestamp, remaining_count))
-    };
-
-    let mut combined_batch_set = disk_messages;
-    if !journal_messages.is_empty() {
-        combined_batch_set.add_batch_set(journal_messages);
-    }
-    Ok((metadata, combined_batch_set))
+    Ok((metadata, combined))
 }
 
 /// Load messages from disk by offset.
@@ -388,7 +427,7 @@ pub async fn load_messages_from_disk(
             current_offset
         };
 
-        let mut end_offset = offset + (remaining_count - 1).max(1) as u64;
+        let mut end_offset = offset + (remaining_count - 1) as u64;
         if end_offset > segment_end_offset {
             end_offset = segment_end_offset;
         }
@@ -429,7 +468,7 @@ async fn load_segment_messages(
 ) -> Result<IggyMessagesBatchSet, IggyError> {
     let relative_start_offset = (start_offset - segment_start_offset) as u32;
 
-    // Check journal first for this segment's data
+    // Check journal for this segment's data (handles callers outside get_messages_by_offset).
     let journal_data = {
         let store = local_partitions.borrow();
         let partition = store
@@ -437,14 +476,10 @@ async fn load_segment_messages(
             .expect("local_partitions: partition must exist");
 
         let journal = partition.log.journal();
-        let is_journal_empty = journal.is_empty();
-        let journal_inner = journal.inner();
-        let journal_first_offset = journal_inner.base_offset;
-        let journal_last_offset = journal_inner.current_offset;
 
-        if !is_journal_empty
-            && start_offset >= journal_first_offset
-            && end_offset <= journal_last_offset
+        if let (Some(jfo), Some(jlo)) = (journal.first_offset(), journal.last_offset())
+            && start_offset >= jfo
+            && end_offset <= jlo
         {
             Some(journal.get(|batches| batches.get_by_offset(start_offset, count)))
         } else {
@@ -617,14 +652,10 @@ async fn load_segment_messages_by_timestamp(
             .expect("local_partitions: partition must exist");
 
         let journal = partition.log.journal();
-        let is_journal_empty = journal.is_empty();
-        let journal_inner = journal.inner();
-        let journal_first_timestamp = journal_inner.first_timestamp;
-        let journal_last_timestamp = journal_inner.end_timestamp;
 
-        if !is_journal_empty
-            && timestamp >= journal_first_timestamp
-            && timestamp <= journal_last_timestamp
+        if let (Some(jfts), Some(jlts)) = (journal.first_timestamp(), journal.last_timestamp())
+            && timestamp >= jfts
+            && timestamp <= jlts
         {
             Some(journal.get(|batches| batches.get_by_timestamp(timestamp, count)))
         } else {

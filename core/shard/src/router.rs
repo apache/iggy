@@ -18,8 +18,7 @@
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, Receiver, ShardFrame};
 use futures::FutureExt;
-use iggy_common::header::{ConsensusError, GenericHeader, PrepareHeader};
-use iggy_common::message::{Message, MessageBag};
+use iggy_binary_protocol::{ConsensusError, GenericHeader, Message, MessageBag, PrepareHeader};
 use iggy_common::sharding::IggyNamespace;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;

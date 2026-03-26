@@ -64,6 +64,18 @@ impl<J> SegmentedLog<J>
 where
     J: Journal + Debug,
 {
+    pub fn new(journal: J) -> Self {
+        Self {
+            journal,
+            _access_map: AllocRingBuffer::with_capacity_power_of_2(ACCESS_MAP_CAPACITY),
+            _cache: (),
+            segments: Vec::with_capacity(SEGMENTS_CAPACITY),
+            storage: Vec::with_capacity(SEGMENTS_CAPACITY),
+            indexes: Vec::with_capacity(SEGMENTS_CAPACITY),
+            in_flight: IggyMessagesBatchSetInFlight::default(),
+        }
+    }
+
     pub fn has_segments(&self) -> bool {
         !self.segments.is_empty()
     }
