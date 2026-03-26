@@ -28,6 +28,7 @@ pub mod sharding;
 mod traits;
 mod types;
 mod utils;
+pub mod wire_conversions;
 
 pub use error::client_error::ClientError;
 pub use error::iggy_error::{IggyError, IggyErrorDiscriminants};

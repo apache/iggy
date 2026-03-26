@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::binary::dispatch::identifier_to_wire_id;
 use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
@@ -27,11 +28,14 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Extension, Json, Router, debug_handler};
 use err_trail::ErrContext;
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::requests::topics::{
+    CreateTopicRequest as WireCreateTopic, DeleteTopicRequest as WireDeleteTopic,
+    PurgeTopicRequest as WirePurgeTopic, UpdateTopicRequest as WireUpdateTopic,
+};
 use iggy_common::Identifier;
 use iggy_common::Validatable;
 use iggy_common::create_topic::CreateTopic;
-use iggy_common::delete_topic::DeleteTopic;
-use iggy_common::purge_topic::PurgeTopic;
 use iggy_common::update_topic::UpdateTopic;
 use iggy_common::{IggyError, Topic, TopicDetails};
 use std::sync::Arc;
@@ -146,9 +150,18 @@ async fn create_topic(
         .get_stream_id(&command.stream_id)
         .ok_or(CustomError::ResourceNotFound)?;
 
+    let wire_command = WireCreateTopic {
+        stream_id: identifier_to_wire_id(&command.stream_id)?,
+        partitions_count: command.partitions_count,
+        compression_algorithm: command.compression_algorithm.as_code(),
+        message_expiry: command.message_expiry.into(),
+        max_topic_size: command.max_topic_size.into(),
+        replication_factor: command.replication_factor.unwrap_or(0),
+        name: WireName::new(&command.name).map_err(|_| IggyError::InvalidTopicName)?,
+    };
     let request = ShardRequest::control_plane(ShardRequestPayload::CreateTopicRequest {
         user_id: identity.user_id,
-        command,
+        command: wire_command,
     });
 
     match state.shard.send_to_control_plane(request).await? {
@@ -179,9 +192,18 @@ async fn update_topic(
     command.topic_id = Identifier::from_str_value(&topic_id)?;
     command.validate()?;
 
+    let wire_command = WireUpdateTopic {
+        stream_id: identifier_to_wire_id(&command.stream_id)?,
+        topic_id: identifier_to_wire_id(&command.topic_id)?,
+        compression_algorithm: command.compression_algorithm.as_code(),
+        message_expiry: command.message_expiry.into(),
+        max_topic_size: command.max_topic_size.into(),
+        replication_factor: command.replication_factor.unwrap_or(0),
+        name: WireName::new(&command.name).map_err(|_| IggyError::InvalidTopicName)?,
+    };
     let request = ShardRequest::control_plane(ShardRequestPayload::UpdateTopicRequest {
         user_id: identity.user_id,
-        command,
+        command: wire_command,
     });
 
     match state.shard.send_to_control_plane(request).await? {
@@ -203,9 +225,9 @@ async fn delete_topic(
 
     let request = ShardRequest::control_plane(ShardRequestPayload::DeleteTopicRequest {
         user_id: identity.user_id,
-        command: DeleteTopic {
-            stream_id,
-            topic_id,
+        command: WireDeleteTopic {
+            stream_id: identifier_to_wire_id(&stream_id)?,
+            topic_id: identifier_to_wire_id(&topic_id)?,
         },
     });
 
@@ -228,9 +250,9 @@ async fn purge_topic(
 
     let request = ShardRequest::control_plane(ShardRequestPayload::PurgeTopicRequest {
         user_id: identity.user_id,
-        command: PurgeTopic {
-            stream_id,
-            topic_id,
+        command: WirePurgeTopic {
+            stream_id: identifier_to_wire_id(&stream_id)?,
+            topic_id: identifier_to_wire_id(&topic_id)?,
         },
     });
 

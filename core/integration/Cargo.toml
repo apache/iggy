@@ -27,7 +27,6 @@ license = "Apache-2.0"
 ci-qemu = []
 
 [dependencies]
-ahash = { workspace = true }
 assert_cmd = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }

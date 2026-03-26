@@ -19,17 +19,10 @@ use crate::{
     shard::{system::messages::PollingArgs, transmission::event::ShardEvent},
     streaming::{polling_consumer::PollingConsumer, segments::IggyMessagesBatchMut},
 };
-use iggy_common::{
-    change_password::ChangePassword, create_consumer_group::CreateConsumerGroup,
-    create_partitions::CreatePartitions, create_personal_access_token::CreatePersonalAccessToken,
-    create_stream::CreateStream, create_topic::CreateTopic, create_user::CreateUser,
-    delete_consumer_group::DeleteConsumerGroup, delete_partitions::DeletePartitions,
-    delete_personal_access_token::DeletePersonalAccessToken, delete_stream::DeleteStream,
-    delete_topic::DeleteTopic, delete_user::DeleteUser, join_consumer_group::JoinConsumerGroup,
-    leave_consumer_group::LeaveConsumerGroup, purge_stream::PurgeStream, purge_topic::PurgeTopic,
-    sharding::IggyNamespace, update_permissions::UpdatePermissions, update_stream::UpdateStream,
-    update_topic::UpdateTopic, update_user::UpdateUser,
+use iggy_binary_protocol::requests::{
+    consumer_groups::*, partitions::*, personal_access_tokens::*, streams::*, topics::*, users::*,
 };
+use iggy_common::sharding::IggyNamespace;
 
 use std::{net::SocketAddr, os::fd::OwnedFd};
 
@@ -132,89 +125,89 @@ pub enum ShardRequestPayload {
     // Control-plane: stream operations
     CreateStreamRequest {
         user_id: u32,
-        command: CreateStream,
+        command: CreateStreamRequest,
     },
     UpdateStreamRequest {
         user_id: u32,
-        command: UpdateStream,
+        command: UpdateStreamRequest,
     },
     DeleteStreamRequest {
         user_id: u32,
-        command: DeleteStream,
+        command: DeleteStreamRequest,
     },
     PurgeStreamRequest {
         user_id: u32,
-        command: PurgeStream,
+        command: PurgeStreamRequest,
     },
 
     // Control-plane: topic operations
     CreateTopicRequest {
         user_id: u32,
-        command: CreateTopic,
+        command: CreateTopicRequest,
     },
     UpdateTopicRequest {
         user_id: u32,
-        command: UpdateTopic,
+        command: UpdateTopicRequest,
     },
     DeleteTopicRequest {
         user_id: u32,
-        command: DeleteTopic,
+        command: DeleteTopicRequest,
     },
     PurgeTopicRequest {
         user_id: u32,
-        command: PurgeTopic,
+        command: PurgeTopicRequest,
     },
 
     // Control-plane: partition operations
     CreatePartitionsRequest {
         user_id: u32,
-        command: CreatePartitions,
+        command: CreatePartitionsRequest,
     },
     DeletePartitionsRequest {
         user_id: u32,
-        command: DeletePartitions,
+        command: DeletePartitionsRequest,
     },
 
     // Control-plane: user operations
     CreateUserRequest {
         user_id: u32,
-        command: CreateUser,
+        command: CreateUserRequest,
     },
     UpdateUserRequest {
         user_id: u32,
-        command: UpdateUser,
+        command: UpdateUserRequest,
     },
     DeleteUserRequest {
         user_id: u32,
-        command: DeleteUser,
+        command: DeleteUserRequest,
     },
     UpdatePermissionsRequest {
         user_id: u32,
-        command: UpdatePermissions,
+        command: UpdatePermissionsRequest,
     },
     ChangePasswordRequest {
         user_id: u32,
-        command: ChangePassword,
+        command: ChangePasswordRequest,
     },
 
     // Control-plane: consumer group operations
     CreateConsumerGroupRequest {
         user_id: u32,
-        command: CreateConsumerGroup,
+        command: CreateConsumerGroupRequest,
     },
     DeleteConsumerGroupRequest {
         user_id: u32,
-        command: DeleteConsumerGroup,
+        command: DeleteConsumerGroupRequest,
     },
     JoinConsumerGroupRequest {
         user_id: u32,
         client_id: u32,
-        command: JoinConsumerGroup,
+        command: JoinConsumerGroupRequest,
     },
     LeaveConsumerGroupRequest {
         user_id: u32,
         client_id: u32,
-        command: LeaveConsumerGroup,
+        command: LeaveConsumerGroupRequest,
     },
     LeaveConsumerGroupMetadataOnly {
         stream_id: usize,
@@ -235,11 +228,11 @@ pub enum ShardRequestPayload {
     // Control-plane: PAT operations
     CreatePersonalAccessTokenRequest {
         user_id: u32,
-        command: CreatePersonalAccessToken,
+        command: CreatePersonalAccessTokenRequest,
     },
     DeletePersonalAccessTokenRequest {
         user_id: u32,
-        command: DeletePersonalAccessToken,
+        command: DeletePersonalAccessTokenRequest,
     },
 
     // Control-plane: stats

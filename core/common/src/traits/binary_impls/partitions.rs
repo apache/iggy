@@ -16,11 +16,14 @@
  * under the License.
  */
 
-use crate::BinaryClient;
-use crate::create_partitions::CreatePartitions;
-use crate::delete_partitions::DeletePartitions;
 use crate::traits::binary_auth::fail_if_not_authenticated;
-use crate::{Identifier, IggyError, PartitionClient};
+use crate::wire_conversions::identifier_to_wire;
+use crate::{BinaryClient, Identifier, IggyError, PartitionClient};
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::codes::{CREATE_PARTITIONS_CODE, DELETE_PARTITIONS_CODE};
+use iggy_binary_protocol::requests::partitions::{
+    CreatePartitionsRequest, DeletePartitionsRequest,
+};
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> PartitionClient for B {
@@ -31,11 +34,17 @@ impl<B: BinaryClient> PartitionClient for B {
         partitions_count: u32,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&CreatePartitions {
-            stream_id: stream_id.clone(),
-            topic_id: topic_id.clone(),
-            partitions_count,
-        })
+        let wire_stream_id = identifier_to_wire(stream_id)?;
+        let wire_topic_id = identifier_to_wire(topic_id)?;
+        self.send_raw_with_response(
+            CREATE_PARTITIONS_CODE,
+            CreatePartitionsRequest {
+                stream_id: wire_stream_id,
+                topic_id: wire_topic_id,
+                partitions_count,
+            }
+            .to_bytes(),
+        )
         .await?;
         Ok(())
     }
@@ -47,11 +56,17 @@ impl<B: BinaryClient> PartitionClient for B {
         partitions_count: u32,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&DeletePartitions {
-            stream_id: stream_id.clone(),
-            topic_id: topic_id.clone(),
-            partitions_count,
-        })
+        let wire_stream_id = identifier_to_wire(stream_id)?;
+        let wire_topic_id = identifier_to_wire(topic_id)?;
+        self.send_raw_with_response(
+            DELETE_PARTITIONS_CODE,
+            DeletePartitionsRequest {
+                stream_id: wire_stream_id,
+                topic_id: wire_topic_id,
+                partitions_count,
+            }
+            .to_bytes(),
+        )
         .await?;
         Ok(())
     }

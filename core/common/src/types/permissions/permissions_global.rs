@@ -18,11 +18,11 @@
 
 use crate::BytesSerializable;
 use crate::error::IggyError;
-use ahash::AHashMap;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use comfy_table::Table;
 use comfy_table::presets::ASCII_NO_BORDERS;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt::Display;
 
 /// `Permissions` is used to define the permissions of a user.
@@ -35,7 +35,7 @@ pub struct Permissions {
     pub global: GlobalPermissions,
 
     /// Stream permissions are applied to a specific stream.
-    pub streams: Option<AHashMap<usize, StreamPermissions>>,
+    pub streams: Option<BTreeMap<usize, StreamPermissions>>,
 }
 
 /// `GlobalPermissions` are applied to all streams without a need to specify them one by one in the `streams` field.
@@ -142,7 +142,7 @@ pub struct StreamPermissions {
     pub send_messages: bool,
 
     /// The `topics` field allows to define the granular permissions for each topic of a stream.
-    pub topics: Option<AHashMap<usize, TopicPermissions>>,
+    pub topics: Option<BTreeMap<usize, TopicPermissions>>,
 }
 
 /// `TopicPermissions` are applied to a specific topic of a stream. This is the lowest level of permissions.
@@ -294,7 +294,7 @@ impl BytesSerializable for Permissions {
         let send_messages = bytes.get_u8() == 1;
         let mut streams = None;
         if bytes.get_u8() == 1 {
-            let mut streams_map = AHashMap::new();
+            let mut streams_map = BTreeMap::new();
             loop {
                 let stream_id = bytes.get_u32_le() as usize;
                 let manage_stream = bytes.get_u8() == 1;
@@ -305,7 +305,7 @@ impl BytesSerializable for Permissions {
                 let send_messages = bytes.get_u8() == 1;
                 let mut topics = None;
                 if bytes.get_u8() == 1 {
-                    let mut topics_map = AHashMap::new();
+                    let mut topics_map = BTreeMap::new();
                     loop {
                         let topic_id = bytes.get_u32_le() as usize;
                         let manage_topic = bytes.get_u8() == 1;
@@ -490,7 +490,7 @@ mod tests {
                 poll_messages: true,
                 send_messages: true,
             },
-            streams: Some(AHashMap::from([
+            streams: Some(BTreeMap::from([
                 (
                     1,
                     StreamPermissions {
@@ -500,7 +500,7 @@ mod tests {
                         read_topics: true,
                         poll_messages: true,
                         send_messages: true,
-                        topics: Some(AHashMap::from([
+                        topics: Some(BTreeMap::from([
                             (
                                 1,
                                 TopicPermissions {
@@ -547,7 +547,7 @@ mod tests {
     fn should_handle_empty_streams_map() {
         let permissions = Permissions {
             global: GlobalPermissions::default(),
-            streams: Some(AHashMap::new()),
+            streams: Some(BTreeMap::new()),
         };
 
         let bytes = permissions.to_bytes();
@@ -560,7 +560,7 @@ mod tests {
     fn should_handle_empty_topics_map() {
         let permissions = Permissions {
             global: GlobalPermissions::default(),
-            streams: Some(AHashMap::from([(
+            streams: Some(BTreeMap::from([(
                 1,
                 StreamPermissions {
                     manage_stream: true,
@@ -569,7 +569,7 @@ mod tests {
                     read_topics: false,
                     poll_messages: false,
                     send_messages: false,
-                    topics: Some(AHashMap::new()),
+                    topics: Some(BTreeMap::new()),
                 },
             )])),
         };
