@@ -30,7 +30,6 @@ readme = "../../../README.md"
 [dependencies]
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
-iobuf = { workspace = true }
 rand = { workspace = true }
 
 [lints.clippy]

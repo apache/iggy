@@ -5446,7 +5446,6 @@ dependencies = [
  "serde_json",
  "serde_with",
  "serial_test",
- "smallvec",
  "strum 0.28.0",
  "thiserror 2.0.18",
  "tokio",
@@ -5930,7 +5929,6 @@ version = "0.1.0"
 dependencies = [
  "aligned-vec",
  "compio-buf",
- "smallvec",
 ]
 
 [[package]]
@@ -6670,7 +6668,6 @@ version = "0.1.0"
 dependencies = [
  "iggy_binary_protocol",
  "iggy_common",
- "iobuf",
  "rand 0.10.0",
 ]
 
@@ -6683,7 +6680,6 @@ dependencies = [
  "consensus",
  "iggy_binary_protocol",
  "iggy_common",
- "iobuf",
  "journal",
  "left-right",
  "message_bus",
@@ -9956,7 +9952,6 @@ name = "simulator"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "bytes",
  "consensus",
  "enumset",
  "futures",
