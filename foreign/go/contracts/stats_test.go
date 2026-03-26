@@ -184,6 +184,35 @@ func TestUnmarshalBinary_noSemver(t *testing.T) {
 	assertStatsEqual(t, got, want)
 }
 
+func TestUnmarshalBinary_truncatedFixedFields(t *testing.T) {
+	// Payload too short to contain all fixed fields.
+	payload := make([]byte, 10) // far too small
+	var stats Stats
+	if err := stats.UnmarshalBinary(payload); err == nil {
+		t.Fatal("expected error for truncated payload, got nil")
+	}
+}
+
+func TestUnmarshalBinary_truncatedAfterStrings(t *testing.T) {
+	// Build a valid payload with no semver, then chop off the cache_metrics_count
+	// so that reading cache count fails.
+	s := Stats{
+		Hostname:          "h",
+		OsName:            "o",
+		OsVersion:         "v",
+		KernelVersion:     "k",
+		IggyServerVersion: "s",
+	}
+	payload := buildStatsPayload(t, s)
+	// The last 4 bytes are cache_metrics_count (0). Remove them.
+	payload = payload[:len(payload)-4]
+
+	var stats Stats
+	if err := stats.UnmarshalBinary(payload); err == nil {
+		t.Fatal("expected error for truncated cache count, got nil")
+	}
+}
+
 func TestUnmarshalBinary_emptyStrings(t *testing.T) {
 	want := sampleStats()
 	want.Hostname = ""
