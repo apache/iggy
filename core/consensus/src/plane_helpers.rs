@@ -16,8 +16,9 @@
 // under the License.
 
 use crate::{Consensus, Pipeline, PipelineEntry, Sequencer, Status, VsrConsensus};
-use iggy_common::header::{Command2, GenericHeader, PrepareHeader, PrepareOkHeader, ReplyHeader};
-use iggy_common::message::Message;
+use iggy_binary_protocol::{
+    Command2, GenericHeader, Message, PrepareHeader, PrepareOkHeader, ReplyHeader,
+};
 use iobuf::Owned;
 use message_bus::MessageBus;
 use std::ops::AsyncFnOnce;

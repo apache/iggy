@@ -5402,6 +5402,8 @@ dependencies = [
  "bytemuck",
  "bytes",
  "enumset",
+ "iobuf",
+ "smallvec",
  "thiserror 2.0.18",
 ]
 
@@ -5418,6 +5420,7 @@ dependencies = [
  "blake3",
  "bon",
  "byte-unit",
+ "bytemuck",
  "bytes",
  "chrono",
  "clap",
@@ -5428,6 +5431,7 @@ dependencies = [
  "err_trail",
  "human-repr",
  "humantime",
+ "iggy_binary_protocol",
  "iobuf",
  "lending-iterator",
  "moka",
@@ -7658,6 +7662,7 @@ dependencies = [
  "bytes",
  "compio",
  "consensus",
+ "iggy_binary_protocol",
  "iggy_common",
  "iobuf",
  "journal",

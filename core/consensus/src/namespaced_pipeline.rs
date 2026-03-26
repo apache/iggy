@@ -17,6 +17,7 @@
 
 use crate::Pipeline;
 use crate::impls::{PIPELINE_PREPARE_QUEUE_MAX, PipelineEntry};
+use iggy_binary_protocol::{Message, PrepareHeader};
 use std::collections::{HashMap, VecDeque};
 
 /// Pipeline that partitions entries by namespace for independent commit draining.
@@ -309,10 +310,7 @@ impl Pipeline for NamespacedPipeline {
 
 impl NamespacedPipeline {
     #[allow(clippy::needless_pass_by_value)]
-    pub fn push_message(
-        &mut self,
-        message: iggy_common::message::Message<iggy_common::header::PrepareHeader>,
-    ) {
+    pub fn push_message(&mut self, message: Message<PrepareHeader>) {
         self.push(PipelineEntry::new(*message.header()));
     }
 
@@ -338,10 +336,7 @@ impl NamespacedPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_common::{
-        header::{Command2, PrepareHeader},
-        message::Message,
-    };
+    use iggy_binary_protocol::{Command2, Message, PrepareHeader};
 
     fn make_prepare(
         op: u64,

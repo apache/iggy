@@ -33,6 +33,7 @@ bytes = { workspace = true }
 compio = { workspace = true }
 consensus = { workspace = true }
 iobuf = { workspace = true }
+iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 journal = { workspace = true }
 message_bus = { workspace = true }

@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::header::PrepareHeader;
-use iggy_common::message::Message;
+use iggy_binary_protocol::{Message, PrepareHeader};
 use iggy_common::variadic;
 use iobuf::Owned;
 use journal::{Journal, JournalHandle, Storage};

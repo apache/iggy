@@ -27,8 +27,6 @@ use iggy_binary_protocol::{Message, Operation, PrepareHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
     IggyByteSize, IggyError, IggyTimestamp, PartitionStats, PollingKind,
-    header::{Operation, PrepareHeader},
-    message::Message,
     send_messages2::stamp_prepare_for_persistence,
 };
 use journal::Journal as _;

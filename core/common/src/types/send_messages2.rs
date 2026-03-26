@@ -15,15 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{
-    INDEX_SIZE, IggyError, calculate_checksum, random_id,
-    sharding::IggyNamespace,
-    types::consensus::{
-        header::{PrepareHeader, RequestHeader},
-        message::Message,
-    },
-};
+use crate::{INDEX_SIZE, IggyError, calculate_checksum, random_id, sharding::IggyNamespace};
 use bytes::{BufMut, Bytes, BytesMut};
+use iggy_binary_protocol::{Message, PrepareHeader, RequestHeader};
 use iobuf::Owned;
 
 const MESSAGE_ALIGN: usize = 4096;

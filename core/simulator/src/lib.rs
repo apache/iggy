@@ -25,9 +25,8 @@ pub mod replica;
 
 use bus::{EnvelopePayload, MemBus};
 use consensus::PartitionsHandle;
+use iggy_binary_protocol::{GenericHeader, Message, ReplyHeader};
 use iggy_common::IggyError;
-use iggy_common::header::ReplyHeader;
-use iggy_common::message::Message;
 use iggy_common::sharding::IggyNamespace;
 use message_bus::MessageBus;
 use partitions::{Partition, PartitionOffsets, PollQueryResult, PollingArgs, PollingConsumer};

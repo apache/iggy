@@ -27,7 +27,8 @@ mod messages_writer;
 mod segment;
 mod types;
 
-use iggy_common::{IggyError, header::PrepareHeader, message::Message};
+use iggy_binary_protocol::{Message, PrepareHeader};
+use iggy_common::IggyError;
 pub use iggy_common::{IggyMessage2, IggyMessage2Header, IggyMessages2};
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;

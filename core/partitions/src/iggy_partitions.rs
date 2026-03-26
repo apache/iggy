@@ -38,10 +38,6 @@ use iggy_binary_protocol::{
 };
 use iggy_common::{
     IggyByteSize, PartitionStats, SegmentStorage,
-    header::{
-        ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
-    },
-    message::Message,
     send_messages2::{convert_request_message, decode_prepare_slice},
     sharding::{IggyNamespace, LocalIdx, ShardId},
 };
