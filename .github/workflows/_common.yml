@@ -83,6 +83,7 @@ jobs:
             cpp
             csharp
             deps
+            deps-dev
             docs
             example
             go
