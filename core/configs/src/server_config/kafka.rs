@@ -1,5 +1,4 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
+/* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -17,18 +16,15 @@
  * under the License.
  */
 
-pub mod cache_indexes;
-pub mod cluster;
-pub mod defaults;
-pub mod displays;
-pub mod http;
-pub mod kafka;
-pub mod quic;
-pub mod server;
-pub mod sharding;
-pub mod system;
-pub mod tcp;
-pub mod validators;
-pub mod websocket;
+use configs::ConfigEnv;
+use serde::{Deserialize, Serialize};
 
-pub const COMPONENT: &str = "CONFIG";
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+pub struct KafkaConfig {
+    pub enabled: bool,
+    pub address: String,
+    pub default_stream: String,
+    pub auto_create_topics: bool,
+    pub num_partitions: u32,
+    pub max_request_size: u32,
+}

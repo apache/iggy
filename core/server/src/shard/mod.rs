@@ -92,6 +92,7 @@ pub struct IggyShard {
     pub(crate) quic_bound_address: Cell<Option<SocketAddr>>,
     pub(crate) websocket_bound_address: Cell<Option<SocketAddr>>,
     pub(crate) http_bound_address: Cell<Option<SocketAddr>>,
+    pub(crate) kafka_bound_address: Cell<Option<SocketAddr>>,
     pub(crate) config_writer_notify: async_channel::Sender<()>,
     config_writer_receiver: async_channel::Receiver<()>,
     pub(crate) task_registry: Rc<TaskRegistry>,
@@ -123,7 +124,8 @@ impl IggyShard {
             && (self.config.tcp.enabled
                 || self.config.quic.enabled
                 || self.config.http.enabled
-                || self.config.websocket.enabled)
+                || self.config.websocket.enabled
+                || self.config.kafka.enabled)
         {
             tasks::oneshot::spawn_config_writer_task(self);
         }
@@ -146,6 +148,9 @@ impl IggyShard {
         }
         if self.config.websocket.enabled {
             continuous::spawn_websocket_server(self.clone());
+        }
+        if self.config.kafka.enabled && self.id == 0 {
+            continuous::spawn_kafka_server(self.clone());
         }
 
         if self.config.message_saver.enabled {

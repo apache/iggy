@@ -37,6 +37,7 @@ pub mod configs;
 pub mod diagnostics;
 pub mod http;
 pub mod io;
+pub mod kafka;
 pub mod log;
 pub mod metadata;
 pub mod quic;

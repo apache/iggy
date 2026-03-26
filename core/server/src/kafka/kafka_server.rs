@@ -16,16 +16,30 @@
  * under the License.
  */
 
-mod http_server;
-mod kafka_server;
-mod message_pump;
-mod quic_server;
-mod tcp_server;
-mod websocket_server;
+use crate::kafka::kafka_listener;
+use crate::shard::IggyShard;
+use crate::shard::task_registry::ShutdownToken;
+use iggy_common::IggyError;
+use std::rc::Rc;
+use tracing::{error, info};
 
-pub use http_server::spawn_http_server;
-pub use kafka_server::spawn_kafka_server;
-pub use message_pump::spawn_message_pump;
-pub use quic_server::spawn_quic_server;
-pub use tcp_server::spawn_tcp_server;
-pub use websocket_server::spawn_websocket_server;
+pub async fn start(shard: Rc<IggyShard>, shutdown: ShutdownToken) -> Result<(), IggyError> {
+    let config = &shard.config.kafka;
+
+    if !config.enabled {
+        info!("Kafka server is disabled.");
+        return Ok(());
+    }
+
+    info!(
+        "Starting Kafka server on: {} for shard: {}...",
+        config.address, shard.id
+    );
+
+    if let Err(e) = kafka_listener::start(shard, shutdown).await {
+        error!("Kafka server has failed, error: {e}");
+        return Err(e);
+    }
+
+    Ok(())
+}

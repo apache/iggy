@@ -588,3 +588,11 @@ enabled = false
 self_signed = true
 cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"
+
+[kafka]
+enabled = false
+address = "127.0.0.1:9092"
+default_stream = "kafka"
+auto_create_topics = true
+num_partitions = 1
+max_request_size = 67108864

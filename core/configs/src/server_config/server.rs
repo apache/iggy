@@ -19,6 +19,7 @@
 use super::COMPONENT;
 use super::cluster::ClusterConfig;
 use super::http::HttpConfig;
+use super::kafka::KafkaConfig;
 use super::quic::QuicConfig;
 use super::system::SystemConfig;
 use super::tcp::TcpConfig;
@@ -53,6 +54,7 @@ pub struct ServerConfig {
     pub tcp: TcpConfig,
     pub http: HttpConfig,
     pub websocket: WebSocketConfig,
+    pub kafka: KafkaConfig,
     pub telemetry: TelemetryConfig,
     pub cluster: ClusterConfig,
 }

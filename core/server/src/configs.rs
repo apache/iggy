@@ -18,6 +18,6 @@
  */
 
 pub use configs::{
-    COMPONENT, cache_indexes, cluster, defaults, displays, http, quic, server, sharding, system,
-    tcp, validators, websocket,
+    COMPONENT, cache_indexes, cluster, defaults, displays, http, kafka, quic, server, sharding,
+    system, tcp, validators, websocket,
 };

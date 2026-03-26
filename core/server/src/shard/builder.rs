@@ -180,6 +180,7 @@ impl IggyShardBuilder {
             quic_bound_address: Cell::new(None),
             websocket_bound_address: Cell::new(None),
             http_bound_address: Cell::new(None),
+            kafka_bound_address: Cell::new(None),
             config_writer_notify,
             config_writer_receiver,
             task_registry,

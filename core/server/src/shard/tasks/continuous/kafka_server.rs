@@ -1,5 +1,4 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
+/* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -17,18 +16,21 @@
  * under the License.
  */
 
-pub mod cache_indexes;
-pub mod cluster;
-pub mod defaults;
-pub mod displays;
-pub mod http;
-pub mod kafka;
-pub mod quic;
-pub mod server;
-pub mod sharding;
-pub mod system;
-pub mod tcp;
-pub mod validators;
-pub mod websocket;
+use crate::shard::IggyShard;
+use crate::shard::task_registry::ShutdownToken;
+use iggy_common::IggyError;
+use std::rc::Rc;
 
-pub const COMPONENT: &str = "CONFIG";
+pub fn spawn_kafka_server(shard: Rc<IggyShard>) {
+    let shard_clone = shard.clone();
+    shard
+        .task_registry
+        .continuous("kafka_server")
+        .critical(true)
+        .run(move |shutdown| kafka_server_task(shard_clone, shutdown))
+        .spawn();
+}
+
+async fn kafka_server_task(shard: Rc<IggyShard>, shutdown: ShutdownToken) -> Result<(), IggyError> {
+    crate::kafka::kafka_server::start(shard, shutdown).await
+}

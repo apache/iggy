@@ -27,6 +27,6 @@ pub use configs_impl::{
     FileConfigProvider, TypedEnvProvider, parse_env_value_to_json,
 };
 pub use server_config::{
-    COMPONENT, cache_indexes, cluster, defaults, displays, http, quic, server, sharding, system,
-    tcp, validators, websocket,
+    COMPONENT, cache_indexes, cluster, defaults, displays, http, kafka, quic, server, sharding,
+    system, tcp, validators, websocket,
 };

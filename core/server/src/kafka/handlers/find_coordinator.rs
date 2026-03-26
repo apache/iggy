@@ -1,5 +1,4 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
+/* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -17,18 +16,24 @@
  * under the License.
  */
 
-pub mod cache_indexes;
-pub mod cluster;
-pub mod defaults;
-pub mod displays;
-pub mod http;
-pub mod kafka;
-pub mod quic;
-pub mod server;
-pub mod sharding;
-pub mod system;
-pub mod tcp;
-pub mod validators;
-pub mod websocket;
+use crate::configs::kafka::KafkaConfig;
+use crate::kafka::protocol::types::FindCoordinatorResponse;
+use crate::shard::IggyShard;
+use std::rc::Rc;
 
-pub const COMPONENT: &str = "CONFIG";
+pub fn handle(shard: &Rc<IggyShard>, config: &KafkaConfig) -> Vec<u8> {
+    let bound_addr = shard.kafka_bound_address.get().unwrap_or_else(|| {
+        config
+            .address
+            .parse()
+            .unwrap_or_else(|_| "127.0.0.1:9092".parse().unwrap())
+    });
+
+    FindCoordinatorResponse {
+        error_code: 0,
+        node_id: 0,
+        host: bound_addr.ip().to_string(),
+        port: bound_addr.port() as i32,
+    }
+    .encode()
+}

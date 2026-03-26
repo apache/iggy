@@ -19,6 +19,7 @@
 use super::cluster::CurrentNodeConfig;
 use super::cluster::{ClusterConfig, NodeConfig, OtherNodeConfig, TransportPorts};
 use super::http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig};
+use super::kafka::KafkaConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use super::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig,
@@ -57,6 +58,7 @@ impl Default for ServerConfig {
             quic: QuicConfig::default(),
             tcp: TcpConfig::default(),
             websocket: WebSocketConfig::default(),
+            kafka: KafkaConfig::default(),
             http: HttpConfig::default(),
             telemetry: TelemetryConfig::default(),
             cluster: ClusterConfig::default(),
@@ -181,6 +183,19 @@ impl Default for WebSocketTlsConfig {
             self_signed: SERVER_CONFIG.websocket.tls.self_signed,
             cert_file: SERVER_CONFIG.websocket.tls.cert_file.parse().unwrap(),
             key_file: SERVER_CONFIG.websocket.tls.key_file.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for KafkaConfig {
+    fn default() -> KafkaConfig {
+        KafkaConfig {
+            enabled: SERVER_CONFIG.kafka.enabled,
+            address: SERVER_CONFIG.kafka.address.parse().unwrap(),
+            default_stream: SERVER_CONFIG.kafka.default_stream.parse().unwrap(),
+            auto_create_topics: SERVER_CONFIG.kafka.auto_create_topics,
+            num_partitions: SERVER_CONFIG.kafka.num_partitions as u32,
+            max_request_size: SERVER_CONFIG.kafka.max_request_size as u32,
         }
     }
 }
