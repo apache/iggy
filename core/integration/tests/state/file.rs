@@ -18,7 +18,7 @@
 
 use crate::state::StateSetup;
 use bytes::Bytes;
-use iggy::prelude::BytesSerializable;
+use iggy_binary_protocol::WireEncode;
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::requests::{streams::CreateStreamRequest, users::CreateUserRequest};
 use server::state::command::EntryCommand;
