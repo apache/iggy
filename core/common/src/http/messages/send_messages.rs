@@ -25,6 +25,7 @@ use crate::types::message::HeaderEntry;
 use crate::types::message::partitioning::Partitioning;
 use crate::{IggyMessage, IggyMessagesBatch};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use bytes::Bytes;
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -88,15 +89,14 @@ impl Serialize for SendMessages {
         // - messages as an array of {id, payload, headers}
         // We don't expose stream_id and topic_id via JSON as they're in URL path
 
-        let messages: Vec<HashMap<&str, serde_json::Value>> = self
+        let messages: Vec<serde_json::Value> = self
             .batch
             .iter()
             .map(|msg_view: IggyMessageView<'_>| {
-                let mut map = HashMap::with_capacity(self.batch.count() as usize);
-                map.insert("id", serde_json::to_value(msg_view.header().id()).unwrap());
-
-                let payload_base64 = BASE64.encode(msg_view.payload());
-                map.insert("payload", serde_json::to_value(payload_base64).unwrap());
+                let mut obj = serde_json::json!({
+                    "id": msg_view.header().id(),
+                    "payload": BASE64.encode(msg_view.payload()),
+                });
 
                 match msg_view.user_headers_map() {
                     Ok(Some(headers)) => {
@@ -104,16 +104,16 @@ impl Serialize for SendMessages {
                             .into_iter()
                             .map(|(k, v)| HeaderEntry { key: k, value: v })
                             .collect();
-                        map.insert("user_headers", serde_json::to_value(&entries).unwrap());
+                        obj["user_headers"] = serde_json::to_value(&entries).unwrap();
                     }
                     _ if msg_view.user_headers().is_some() => {
                         let raw_base64 = BASE64.encode(msg_view.user_headers().unwrap());
-                        map.insert("user_headers", serde_json::to_value(raw_base64).unwrap());
+                        obj["user_headers"] = serde_json::to_value(raw_base64).unwrap();
                     }
                     _ => {}
                 }
 
-                map
+                obj
             })
             .collect();
 

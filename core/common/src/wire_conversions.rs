@@ -262,6 +262,8 @@ impl From<ClientResponse> for ClientInfo {
         let transport = match w.transport {
             1 => "TCP",
             2 => "QUIC",
+            3 => "HTTP",
+            4 => "WebSocket",
             _ => "Unknown",
         }
         .to_string();
