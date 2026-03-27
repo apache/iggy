@@ -25,7 +25,7 @@ use crate::Sizeable;
 use crate::error::IggyError;
 use crate::utils::checksum;
 use crate::{HeaderKey, IggyMessageHeaderView};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
@@ -131,24 +131,6 @@ impl<'a> IggyMessageView<'a> {
         // Bounds guaranteed by new() which validates total message size
         let data = &self.buffer[checksum_field_size..end];
         checksum::calculate_checksum(data)
-    }
-}
-
-impl BytesSerializable for IggyMessageView<'_> {
-    fn to_bytes(&self) -> Bytes {
-        panic!("should not be used")
-    }
-
-    fn from_bytes(_bytes: Bytes) -> Result<Self, IggyError> {
-        panic!("should not be used")
-    }
-
-    fn write_to_buffer(&self, buf: &mut BytesMut) {
-        buf.extend_from_slice(self.buffer);
-    }
-
-    fn get_buffer_size(&self) -> usize {
-        self.buffer.len()
     }
 }
 
