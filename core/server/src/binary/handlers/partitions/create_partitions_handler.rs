@@ -21,6 +21,7 @@ use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
+use iggy_binary_protocol::MAX_PARTITIONS_PER_REQUEST;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest;
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
@@ -38,6 +39,10 @@ pub async fn handle_create_partitions(
         req.stream_id, req.topic_id
     );
     shard.ensure_authenticated(session)?;
+
+    if !(1..=MAX_PARTITIONS_PER_REQUEST).contains(&req.partitions_count) {
+        return Err(IggyError::TooManyPartitions);
+    }
 
     let request = ShardRequest::control_plane(ShardRequestPayload::CreatePartitionsRequest {
         user_id: session.get_user_id(),

@@ -22,6 +22,7 @@ use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
 use bytes::BytesMut;
+use iggy_binary_protocol::MAX_PARTITIONS_PER_REQUEST;
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::topics::CreateTopicRequest;
@@ -44,6 +45,10 @@ pub async fn handle_create_topic(
         req.name.as_str()
     );
     shard.ensure_authenticated(session)?;
+
+    if req.partitions_count > MAX_PARTITIONS_PER_REQUEST {
+        return Err(IggyError::TooManyPartitions);
+    }
 
     let request = ShardRequest::control_plane(ShardRequestPayload::CreateTopicRequest {
         user_id: session.get_user_id(),

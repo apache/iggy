@@ -87,3 +87,6 @@ pub use primitives::permissions::{
     WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
 };
 pub use primitives::polling_strategy::WirePollingStrategy;
+
+/// Maximum number of partitions allowed in a single create/delete request.
+pub const MAX_PARTITIONS_PER_REQUEST: u32 = 1000;
