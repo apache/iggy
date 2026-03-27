@@ -113,6 +113,11 @@ impl SendMessages2Header {
         self.encode_into(buffer.as_mut_slice());
         buffer.into()
     }
+
+    #[must_use]
+    pub fn checksum_for_blob(&self, blob: &[u8]) -> u64 {
+        calculate_batch_checksum(self, blob)
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -67,6 +67,11 @@ pub struct IggyPartitions<C> {
     /// Wrapped in `UnsafeCell` for interior mutability — matches the single-threaded
     /// per-shard execution model. Consensus trait methods take `&self` but need to
     /// mutate partition state (segments, offsets, journal).
+    ///
+    /// TODO: Move to more granular synchronization around partition substate and
+    /// stop exposing `&mut IggyPartition` from `&self`. The long-term shape here
+    /// should let append/commit paths coordinate on the exact mutable state they
+    /// need instead of relying on `UnsafeCell` aliasing for the whole partition.
     partitions: UnsafeCell<Vec<IggyPartition>>,
     namespace_to_local: HashMap<IggyNamespace, LocalIdx>,
     consensus: Option<C>,
@@ -722,79 +727,68 @@ where
             return Ok(());
         }
 
-        if is_full
-            || unsaved_messages_count_exceeded
-            || unsaved_messages_size_exceeded
-            || force_persist
-        {
-            // Freeze journal batches.
-            let (frozen_batches, index_bytes, batch_count) = {
-                let entries = partition.log.journal().inner.entries();
-                let segment = partition.log.active_segment();
-                let mut file_position = segment.size.as_bytes_u64();
-                partition.log.ensure_indexes();
-                let indexes = partition.log.active_indexes_mut().unwrap();
-                let mut flush_index = None;
-                let mut frozen = Vec::with_capacity(entries.len());
-                let mut batch_count = 0u32;
+        // Freeze journal batches.
+        let (frozen_batches, index_bytes, batch_count) = {
+            let entries = partition.log.journal().inner.entries();
+            let segment = partition.log.active_segment();
+            let mut file_position = segment.size.as_bytes_u64();
+            partition.log.ensure_indexes();
+            let indexes = partition.log.active_indexes_mut().unwrap();
+            let mut flush_index = None;
+            let mut frozen = Vec::with_capacity(entries.len());
+            let mut batch_count = 0u32;
 
-                for entry in entries {
-                    let Ok(batch) = decode_prepare_slice(entry.as_slice()) else {
-                        continue;
-                    };
-                    let message_count = batch.message_count();
-                    if message_count == 0 {
-                        continue;
-                    }
-
-                    let index = crate::iggy_index::IggyIndex::new(
-                        batch.header.base_offset,
-                        batch.header.base_timestamp,
-                        file_position,
-                    );
-                    if flush_index.is_none() {
-                        indexes.insert(index.offset, index.timestamp, index.position);
-                        flush_index = Some(index);
-                    }
-                    file_position += batch.header.total_size() as u64;
-                    batch_count += message_count;
-                    frozen.push(entry);
+            for entry in entries {
+                let Ok(batch) = decode_prepare_slice(entry.as_slice()) else {
+                    continue;
+                };
+                let message_count = batch.message_count();
+                if message_count == 0 {
+                    continue;
                 }
 
-                let index_bytes =
-                    flush_index.map(|index| crate::iggy_index::IggyIndexCache::serialize(&index));
-
-                (frozen, index_bytes, batch_count)
-            };
-
-            let Some(index_bytes) = index_bytes else {
-                warn!(
-                    ?namespace,
-                    "commit_messages: failed to build a sparse index entry from pending journal batches"
+                let index = crate::iggy_index::IggyIndex::new(
+                    batch.header.base_offset,
+                    batch.header.base_timestamp,
+                    file_position,
                 );
-                return Err(IggyError::InvalidCommand);
-            };
-
-            // Persist to disk.
-            self.persist_frozen_batches_to_disk(
-                namespace,
-                frozen_batches,
-                index_bytes,
-                batch_count,
-            )
-            .await?;
-
-            if is_full {
-                self.rotate_segment(namespace).await?;
+                if flush_index.is_none() {
+                    indexes.insert(index.offset, index.timestamp, index.position);
+                    flush_index = Some(index);
+                }
+                file_position += batch.header.total_size() as u64;
+                batch_count += message_count;
+                frozen.push(entry);
             }
 
-            // Reset journal info after drain.
-            let partition = self
-                .get_mut_by_ns(namespace)
-                .expect("commit_messages: partition not found");
-            let _ = partition.log.journal_mut().inner.commit();
-            partition.log.journal_mut().info = JournalInfo::default();
+            let index_bytes =
+                flush_index.map(|index| crate::iggy_index::IggyIndexCache::serialize(&index));
+
+            (frozen, index_bytes, batch_count)
+        };
+
+        let Some(index_bytes) = index_bytes else {
+            warn!(
+                ?namespace,
+                "commit_messages: failed to build a sparse index entry from pending journal batches"
+            );
+            return Err(IggyError::InvalidCommand);
+        };
+
+        // Persist to disk.
+        self.persist_frozen_batches_to_disk(namespace, frozen_batches, index_bytes, batch_count)
+            .await?;
+
+        if is_full {
+            self.rotate_segment(namespace).await?;
         }
+
+        // Reset journal info after drain.
+        let partition = self
+            .get_mut_by_ns(namespace)
+            .expect("commit_messages: partition not found");
+        let _ = partition.log.journal_mut().inner.commit();
+        partition.log.journal_mut().info = JournalInfo::default();
 
         // Update segment metadata from the just-persisted journal state.
         let partition = self

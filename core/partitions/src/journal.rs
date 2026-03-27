@@ -508,6 +508,13 @@ fn push_selected_batch_fragments(
         rewritten.batch_length =
             u64::try_from(COMMAND_HEADER_SIZE + (selection.end - selection.start))
                 .expect("sliced batch length exceeds u64::MAX");
+        rewritten.message_count = selection.matched_messages;
+        rewritten.batch_checksum = rewritten.checksum_for_blob(
+            batch
+                .blob()
+                .get(selection.start..selection.end)
+                .expect("selected batch slice must stay within blob bounds"),
+        );
         fragments.push(Fragment::whole(rewritten.into_frozen()));
         fragments.push(Fragment::slice(
             prepare.clone(),

@@ -6055,7 +6055,6 @@ name = "journal"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "bytes",
  "compio",
  "iggy_binary_protocol",
  "iobuf",
