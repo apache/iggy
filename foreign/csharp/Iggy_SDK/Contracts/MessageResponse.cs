@@ -42,5 +42,12 @@ public sealed class MessageResponse
     /// </summary>
     [JsonPropertyName("user_headers")]
     [JsonConverter(typeof(UserHeadersConverter))]
-    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
+    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; set; }
+
+    /// <summary>
+    ///     Raw user header bytes before deserialization.
+    ///     Used internally for decrypting encrypted headers.
+    /// </summary>
+    [JsonIgnore]
+    internal byte[]? RawUserHeaders { get; set; }
 }

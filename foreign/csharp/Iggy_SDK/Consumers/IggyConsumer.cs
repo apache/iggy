@@ -21,8 +21,10 @@ using System.Threading.Channels;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
+using Apache.Iggy.Mappers;
 using Apache.Iggy.Utils;
 using Microsoft.Extensions.Logging;
 
@@ -380,11 +382,19 @@ public partial class IggyConsumer : IAsyncDisposable
                     try
                     {
                         var decryptedPayload = _config.MessageEncryptor.Decrypt(message.Payload);
+
+                        Dictionary<HeaderKey, HeaderValue>? decryptedHeaders = message.UserHeaders;
+                        if (decryptedHeaders is null && message.RawUserHeaders is { Length: > 0 })
+                        {
+                            var decryptedHeaderBytes = _config.MessageEncryptor.Decrypt(message.RawUserHeaders);
+                            decryptedHeaders = BinaryMapper.MapHeaders(decryptedHeaderBytes);
+                        }
+
                         processedMessage = new MessageResponse
                         {
                             Header = message.Header,
                             Payload = decryptedPayload,
-                            UserHeaders = message.UserHeaders
+                            UserHeaders = decryptedHeaders
                         };
                     }
                     catch (Exception ex)

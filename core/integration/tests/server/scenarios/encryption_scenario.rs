@@ -21,32 +21,8 @@ use iggy::prelude::*;
 use integration::harness::{TestHarness, TestServerConfig};
 use serial_test::parallel;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use test_case::test_matrix;
-
-fn encryption_enabled() -> bool {
-    true
-}
-
-fn encryption_disabled() -> bool {
-    false
-}
-
-fn build_server_config(encryption: bool) -> TestServerConfig {
-    let mut extra_envs = HashMap::new();
-
-    if encryption {
-        extra_envs.insert(
-            "IGGY_SYSTEM_ENCRYPTION_ENABLED".to_string(),
-            "true".to_string(),
-        );
-        extra_envs.insert(
-            "IGGY_SYSTEM_ENCRYPTION_KEY".to_string(),
-            "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=".to_string(),
-        );
-    }
-
-    TestServerConfig::builder().extra_envs(extra_envs).build()
-}
 
 #[test_matrix(
     [encryption_enabled(), encryption_disabled()]
@@ -127,6 +103,43 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .unwrap();
 
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Verify on-disk encryption of headers and payload
+    let data_path = harness.server().data_path();
+    let log_files = find_log_files(&data_path);
+    assert!(
+        !log_files.is_empty(),
+        "Expected at least one .log segment file on disk"
+    );
+    let all_raw_bytes: Vec<u8> = log_files
+        .iter()
+        .flat_map(|p| std::fs::read(p).unwrap())
+        .collect();
+    let contains_plaintext_header = all_raw_bytes
+        .windows(b"test-message".len())
+        .any(|w| w == b"test-message");
+    let contains_plaintext_payload = all_raw_bytes
+        .windows(b"Message batch 1".len())
+        .any(|w| w == b"Message batch 1");
+    if encryption {
+        assert!(
+            !contains_plaintext_header,
+            "When encryption is enabled, header values must NOT appear as plaintext on disk"
+        );
+        assert!(
+            !contains_plaintext_payload,
+            "When encryption is enabled, payload must NOT appear as plaintext on disk"
+        );
+    } else {
+        assert!(
+            contains_plaintext_header,
+            "When encryption is disabled, header values should appear as plaintext on disk"
+        );
+        assert!(
+            contains_plaintext_payload,
+            "When encryption is disabled, payload should appear as plaintext on disk"
+        );
+    }
 
     let initial_stats = client.get_stats().await.unwrap();
     let initial_messages_count = initial_stats.messages_count;
@@ -316,4 +329,44 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         final_stats.messages_size_bytes.as_bytes_u64(),
         initial_messages_size.as_bytes_u64()
     );
+}
+
+fn encryption_enabled() -> bool {
+    true
+}
+
+fn encryption_disabled() -> bool {
+    false
+}
+
+fn build_server_config(encryption: bool) -> TestServerConfig {
+    let mut extra_envs = HashMap::new();
+
+    if encryption {
+        extra_envs.insert(
+            "IGGY_SYSTEM_ENCRYPTION_ENABLED".to_string(),
+            "true".to_string(),
+        );
+        extra_envs.insert(
+            "IGGY_SYSTEM_ENCRYPTION_KEY".to_string(),
+            "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=".to_string(),
+        );
+    }
+
+    TestServerConfig::builder().extra_envs(extra_envs).build()
+}
+
+fn find_log_files(dir: &Path) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                result.extend(find_log_files(&path));
+            } else if path.extension().and_then(|e| e.to_str()) == Some("log") {
+                result.push(path);
+            }
+        }
+    }
+    result
 }
