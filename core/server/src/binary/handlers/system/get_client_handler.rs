@@ -16,55 +16,40 @@
  * under the License.
  */
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
+use super::get_me_handler::build_client_details_response;
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::requests::system::GetClientRequest;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
-use iggy_common::get_client::GetClient;
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetClient {
-    fn code(&self) -> u32 {
-        iggy_common::GET_CLIENT_CODE
+pub async fn handle_get_client(
+    req: GetClientRequest,
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    debug!(
+        "session: {session}, command: get_client, client_id: {}",
+        req.client_id
+    );
+    shard.ensure_authenticated(session)?;
+    shard.metadata.perm_get_client(session.get_user_id())?;
+
+    if req.client_id == 0 {
+        return Err(IggyError::InvalidClientId);
     }
 
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
-        shard.metadata.perm_get_client(session.get_user_id())?;
+    let Some(client) = shard.get_client(req.client_id) else {
+        sender.send_empty_ok_response().await?;
+        return Ok(HandlerResult::Finished);
+    };
 
-        let Some(client) = shard.get_client(self.client_id) else {
-            sender.send_empty_ok_response().await?;
-            return Ok(HandlerResult::Finished);
-        };
-
-        let bytes = mapper::map_client(&client);
-
-        sender.send_ok_response(&bytes).await?;
-        Ok(HandlerResult::Finished)
-    }
-}
-
-impl BinaryServerCommand for GetClient {
-    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::GetClient(get_client) => Ok(get_client),
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+    let response = build_client_details_response(&client);
+    sender.send_ok_response(&response.to_bytes()).await?;
+    Ok(HandlerResult::Finished)
 }

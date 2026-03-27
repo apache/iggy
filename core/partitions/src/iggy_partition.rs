@@ -163,7 +163,11 @@ impl Partition for IggyPartition {
         }
 
         let message = Self::prepare_message_from_batch(header, &batch);
-        journal.inner.append(message).await;
+        journal
+            .inner
+            .append(message)
+            .await
+            .map_err(|e| IggyError::IoError(e.to_string()))?;
 
         Ok(AppendResult::new(
             dirty_offset,

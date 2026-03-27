@@ -55,7 +55,6 @@ cyper = { workspace = true }
 cyper-axum = { workspace = true }
 dashmap = { workspace = true }
 dotenvy = { workspace = true }
-enum_dispatch = { workspace = true }
 err_trail = { workspace = true }
 error_set = { workspace = true }
 figlet-rs = { workspace = true }
@@ -64,6 +63,7 @@ fs2 = { workspace = true }
 futures = { workspace = true }
 hash32 = { workspace = true }
 human-repr = { workspace = true }
+iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 jsonwebtoken = { workspace = true }
 left-right = { workspace = true }

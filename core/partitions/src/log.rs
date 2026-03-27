@@ -69,7 +69,7 @@ where
         self.inner.previous_header(header)
     }
 
-    fn append(&self, entry: Self::Entry) -> impl Future<Output = ()> {
+    fn append(&self, entry: Self::Entry) -> impl Future<Output = std::io::Result<()>> {
         self.inner.append(entry)
     }
 
