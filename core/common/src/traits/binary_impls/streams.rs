@@ -47,7 +47,7 @@ impl<B: BinaryClient> StreamClient for B {
             return Ok(None);
         }
         let wire_resp = super::decode_response::<GetStreamResponse>(&response)?;
-        Ok(Some(StreamDetails::from(wire_resp)))
+        Ok(Some(StreamDetails::try_from(wire_resp)?))
     }
 
     async fn get_streams(&self) -> Result<Vec<Stream>, IggyError> {
@@ -72,7 +72,7 @@ impl<B: BinaryClient> StreamClient for B {
             )
             .await?;
         let wire_resp = super::decode_response::<GetStreamResponse>(&response)?;
-        Ok(StreamDetails::from(wire_resp))
+        Ok(StreamDetails::try_from(wire_resp)?)
     }
 
     async fn update_stream(&self, stream_id: &Identifier, name: &str) -> Result<(), IggyError> {

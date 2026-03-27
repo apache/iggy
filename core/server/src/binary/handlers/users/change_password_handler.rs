@@ -22,6 +22,7 @@ use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
 use iggy_binary_protocol::requests::users::ChangePasswordRequest;
+use iggy_common::defaults::{MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH};
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
@@ -38,6 +39,15 @@ pub async fn handle_change_password(
         req.user_id
     );
     shard.ensure_authenticated(session)?;
+
+    let current_len = req.current_password.len();
+    if !(MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH).contains(&current_len) {
+        return Err(IggyError::InvalidPassword);
+    }
+    let new_len = req.new_password.len();
+    if !(MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH).contains(&new_len) {
+        return Err(IggyError::InvalidPassword);
+    }
 
     let request = ShardRequest::control_plane(ShardRequestPayload::ChangePasswordRequest {
         user_id: session.get_user_id(),

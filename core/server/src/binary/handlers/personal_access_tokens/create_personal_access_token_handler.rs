@@ -25,6 +25,9 @@ use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::personal_access_tokens::CreatePersonalAccessTokenRequest;
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
+use iggy_common::defaults::{
+    MAX_PERSONAL_ACCESS_TOKEN_NAME_LENGTH, MIN_PERSONAL_ACCESS_TOKEN_NAME_LENGTH,
+};
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
@@ -41,6 +44,13 @@ pub async fn handle_create_personal_access_token(
         req.name.as_str()
     );
     shard.ensure_authenticated(session)?;
+
+    let name_len = req.name.as_str().len();
+    if !(MIN_PERSONAL_ACCESS_TOKEN_NAME_LENGTH..=MAX_PERSONAL_ACCESS_TOKEN_NAME_LENGTH)
+        .contains(&name_len)
+    {
+        return Err(IggyError::InvalidPersonalAccessTokenName);
+    }
 
     let request =
         ShardRequest::control_plane(ShardRequestPayload::CreatePersonalAccessTokenRequest {

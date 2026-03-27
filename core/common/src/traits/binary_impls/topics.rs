@@ -59,7 +59,7 @@ impl<B: BinaryClient> TopicClient for B {
             return Ok(None);
         }
         let wire_resp = super::decode_response::<GetTopicResponse>(&response)?;
-        Ok(Some(TopicDetails::from(wire_resp)))
+        Ok(Some(TopicDetails::try_from(wire_resp)?))
     }
 
     async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
@@ -78,7 +78,7 @@ impl<B: BinaryClient> TopicClient for B {
             return Ok(Vec::new());
         }
         let wire_resp = super::decode_response::<GetTopicsResponse>(&response)?;
-        Ok(topics_from_wire(wire_resp))
+        Ok(topics_from_wire(wire_resp)?)
     }
 
     async fn create_topic(
@@ -110,7 +110,7 @@ impl<B: BinaryClient> TopicClient for B {
             )
             .await?;
         let wire_resp = super::decode_response::<GetTopicResponse>(&response)?;
-        Ok(TopicDetails::from(wire_resp))
+        Ok(TopicDetails::try_from(wire_resp)?)
     }
 
     async fn update_topic(

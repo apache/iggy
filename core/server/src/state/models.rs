@@ -131,8 +131,22 @@ impl WireDecode for CreateStreamWithId {
         }
         let stream_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let command_length = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-        let (command, _) = CreateStreamRequest::decode(&buf[8..8 + command_length])?;
-        Ok((Self { stream_id, command }, 8 + command_length))
+        let total = 8usize.checked_add(command_length).ok_or(
+            iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 4,
+                need: command_length,
+                have: buf.len() - 8,
+            },
+        )?;
+        if buf.len() < total {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 8,
+                need: command_length,
+                have: buf.len() - 8,
+            });
+        }
+        let (command, _) = CreateStreamRequest::decode(&buf[8..total])?;
+        Ok((Self { stream_id, command }, total))
     }
 }
 
@@ -159,8 +173,22 @@ impl WireDecode for CreateTopicWithId {
         }
         let topic_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let command_length = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-        let (command, _) = CreateTopicRequest::decode(&buf[8..8 + command_length])?;
-        Ok((Self { topic_id, command }, 8 + command_length))
+        let total = 8usize.checked_add(command_length).ok_or(
+            iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 4,
+                need: command_length,
+                have: buf.len() - 8,
+            },
+        )?;
+        if buf.len() < total {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 8,
+                need: command_length,
+                have: buf.len() - 8,
+            });
+        }
+        let (command, _) = CreateTopicRequest::decode(&buf[8..total])?;
+        Ok((Self { topic_id, command }, total))
     }
 }
 
@@ -187,8 +215,22 @@ impl WireDecode for CreateConsumerGroupWithId {
         }
         let group_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let command_length = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-        let (command, _) = CreateConsumerGroupRequest::decode(&buf[8..8 + command_length])?;
-        Ok((Self { group_id, command }, 8 + command_length))
+        let total = 8usize.checked_add(command_length).ok_or(
+            iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 4,
+                need: command_length,
+                have: buf.len() - 8,
+            },
+        )?;
+        if buf.len() < total {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 8,
+                need: command_length,
+                have: buf.len() - 8,
+            });
+        }
+        let (command, _) = CreateConsumerGroupRequest::decode(&buf[8..total])?;
+        Ok((Self { group_id, command }, total))
     }
 }
 
@@ -215,8 +257,22 @@ impl WireDecode for CreateUserWithId {
         }
         let user_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let command_length = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-        let (command, _) = CreateUserRequest::decode(&buf[8..8 + command_length])?;
-        Ok((Self { user_id, command }, 8 + command_length))
+        let total = 8usize.checked_add(command_length).ok_or(
+            iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 4,
+                need: command_length,
+                have: buf.len() - 8,
+            },
+        )?;
+        if buf.len() < total {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 8,
+                need: command_length,
+                have: buf.len() - 8,
+            });
+        }
+        let (command, _) = CreateUserRequest::decode(&buf[8..total])?;
+        Ok((Self { user_id, command }, total))
     }
 }
 
@@ -244,12 +300,33 @@ impl WireDecode for CreatePersonalAccessTokenWithHash {
         }
         let hash_length = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
         let mut pos = 4;
+        if buf.len() < pos + hash_length {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: pos,
+                need: hash_length,
+                have: buf.len() - pos,
+            });
+        }
         let hash = std::str::from_utf8(&buf[pos..pos + hash_length])
             .map_err(|_| iggy_binary_protocol::WireError::InvalidUtf8 { offset: pos })?
             .to_string();
         pos += hash_length;
+        if buf.len() < pos + 4 {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: pos,
+                need: 4,
+                have: buf.len() - pos,
+            });
+        }
         let command_length = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
+        if buf.len() < pos + command_length {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: pos,
+                need: command_length,
+                have: buf.len() - pos,
+            });
+        }
         let (command, _) =
             CreatePersonalAccessTokenRequest::decode(&buf[pos..pos + command_length])?;
         pos += command_length;

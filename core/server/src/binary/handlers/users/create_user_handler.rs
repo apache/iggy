@@ -25,6 +25,9 @@ use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::users::CreateUserRequest;
 use iggy_binary_protocol::responses::users::{UserDetailsResponse, UserResponse};
+use iggy_common::defaults::{
+    MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
+};
 use iggy_common::wire_conversions::permissions_to_wire;
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
@@ -43,6 +46,15 @@ pub async fn handle_create_user(
     );
     shard.ensure_authenticated(session)?;
     shard.metadata.perm_create_user(session.get_user_id())?;
+
+    let username_len = req.username.as_str().len();
+    if !(MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&username_len) {
+        return Err(IggyError::InvalidUsername);
+    }
+    let password_len = req.password.len();
+    if !(MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH).contains(&password_len) {
+        return Err(IggyError::InvalidPassword);
+    }
 
     let request = ShardRequest::control_plane(ShardRequestPayload::CreateUserRequest {
         user_id: session.get_user_id(),

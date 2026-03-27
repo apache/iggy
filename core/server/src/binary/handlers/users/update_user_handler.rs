@@ -22,6 +22,7 @@ use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
 use iggy_binary_protocol::requests::users::UpdateUserRequest;
+use iggy_common::defaults::{MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
@@ -39,6 +40,13 @@ pub async fn handle_update_user(
     );
     shard.ensure_authenticated(session)?;
     shard.metadata.perm_update_user(session.get_user_id())?;
+
+    if let Some(ref username) = req.username {
+        let username_len = username.as_str().len();
+        if !(MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&username_len) {
+            return Err(IggyError::InvalidUsername);
+        }
+    }
 
     let request = ShardRequest::control_plane(ShardRequestPayload::UpdateUserRequest {
         user_id: session.get_user_id(),

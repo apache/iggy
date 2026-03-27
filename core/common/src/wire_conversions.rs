@@ -84,11 +84,17 @@ impl From<StreamResponse> for Stream {
     }
 }
 
-impl From<GetStreamResponse> for StreamDetails {
-    fn from(w: GetStreamResponse) -> Self {
-        let mut topics: Vec<Topic> = w.topics.into_iter().map(Topic::from).collect();
+impl TryFrom<GetStreamResponse> for StreamDetails {
+    type Error = IggyError;
+
+    fn try_from(w: GetStreamResponse) -> Result<Self, Self::Error> {
+        let mut topics: Vec<Topic> = w
+            .topics
+            .into_iter()
+            .map(Topic::try_from)
+            .collect::<Result<_, _>>()?;
         topics.sort_by_key(|t| t.id);
-        Self {
+        Ok(Self {
             id: w.stream.id,
             created_at: w.stream.created_at.into(),
             name: w.stream.name.to_string(),
@@ -96,7 +102,7 @@ impl From<GetStreamResponse> for StreamDetails {
             messages_count: w.stream.messages_count,
             topics_count: w.stream.topics_count,
             topics,
-        }
+        })
     }
 }
 
@@ -110,14 +116,16 @@ pub fn streams_from_wire(w: GetStreamsResponse) -> Vec<Stream> {
 // Topics
 // ---------------------------------------------------------------------------
 
-impl From<TopicHeader> for Topic {
-    fn from(w: TopicHeader) -> Self {
+impl TryFrom<TopicHeader> for Topic {
+    type Error = IggyError;
+
+    fn try_from(w: TopicHeader) -> Result<Self, Self::Error> {
         let message_expiry = match w.message_expiry {
             0 => IggyExpiry::NeverExpire,
             v => v.into(),
         };
         let max_topic_size: MaxTopicSize = w.max_topic_size.into();
-        Self {
+        Ok(Self {
             id: w.id,
             created_at: w.created_at.into(),
             name: w.name.to_string(),
@@ -125,11 +133,10 @@ impl From<TopicHeader> for Topic {
             size: IggyByteSize::from(w.size_bytes),
             messages_count: w.messages_count,
             message_expiry,
-            compression_algorithm: CompressionAlgorithm::from_code(w.compression_algorithm)
-                .unwrap_or(CompressionAlgorithm::None),
+            compression_algorithm: CompressionAlgorithm::from_code(w.compression_algorithm)?,
             max_topic_size,
             replication_factor: w.replication_factor,
-        }
+        })
     }
 }
 
@@ -146,13 +153,15 @@ impl From<PartitionResponse> for Partition {
     }
 }
 
-impl From<GetTopicResponse> for TopicDetails {
-    fn from(w: GetTopicResponse) -> Self {
-        let topic = Topic::from(w.topic);
+impl TryFrom<GetTopicResponse> for TopicDetails {
+    type Error = IggyError;
+
+    fn try_from(w: GetTopicResponse) -> Result<Self, Self::Error> {
+        let topic = Topic::try_from(w.topic)?;
         let mut partitions: Vec<Partition> =
             w.partitions.into_iter().map(Partition::from).collect();
         partitions.sort_by_key(|p| p.id);
-        Self {
+        Ok(Self {
             id: topic.id,
             created_at: topic.created_at,
             name: topic.name,
@@ -164,14 +173,18 @@ impl From<GetTopicResponse> for TopicDetails {
             replication_factor: topic.replication_factor,
             partitions_count: topic.partitions_count,
             partitions,
-        }
+        })
     }
 }
 
-pub fn topics_from_wire(w: GetTopicsResponse) -> Vec<Topic> {
-    let mut topics: Vec<Topic> = w.topics.into_iter().map(Topic::from).collect();
+pub fn topics_from_wire(w: GetTopicsResponse) -> Result<Vec<Topic>, IggyError> {
+    let mut topics: Vec<Topic> = w
+        .topics
+        .into_iter()
+        .map(Topic::try_from)
+        .collect::<Result<_, _>>()?;
     topics.sort_by_key(|t| t.id);
-    topics
+    Ok(topics)
 }
 
 // ---------------------------------------------------------------------------
@@ -635,58 +648,7 @@ impl From<WirePermissions> for Permissions {
 
 /// Convert `&WirePermissions` to domain `Permissions` without consuming the input.
 pub fn wire_permissions_to_permissions(wp: &WirePermissions) -> Permissions {
-    let streams = if wp.streams.is_empty() {
-        None
-    } else {
-        let mut map = BTreeMap::new();
-        for ws in &wp.streams {
-            let topics = if ws.topics.is_empty() {
-                None
-            } else {
-                let mut tmap = BTreeMap::new();
-                for wt in &ws.topics {
-                    tmap.insert(
-                        wt.topic_id as usize,
-                        TopicPermissions {
-                            manage_topic: wt.manage_topic,
-                            read_topic: wt.read_topic,
-                            poll_messages: wt.poll_messages,
-                            send_messages: wt.send_messages,
-                        },
-                    );
-                }
-                Some(tmap)
-            };
-            map.insert(
-                ws.stream_id as usize,
-                StreamPermissions {
-                    manage_stream: ws.manage_stream,
-                    read_stream: ws.read_stream,
-                    manage_topics: ws.manage_topics,
-                    read_topics: ws.read_topics,
-                    poll_messages: ws.poll_messages,
-                    send_messages: ws.send_messages,
-                    topics,
-                },
-            );
-        }
-        Some(map)
-    };
-    Permissions {
-        global: GlobalPermissions {
-            manage_servers: wp.global.manage_servers,
-            read_servers: wp.global.read_servers,
-            manage_users: wp.global.manage_users,
-            read_users: wp.global.read_users,
-            manage_streams: wp.global.manage_streams,
-            read_streams: wp.global.read_streams,
-            manage_topics: wp.global.manage_topics,
-            read_topics: wp.global.read_topics,
-            poll_messages: wp.global.poll_messages,
-            send_messages: wp.global.send_messages,
-        },
-        streams,
-    }
+    Permissions::from(wp.clone())
 }
 
 // ---------------------------------------------------------------------------

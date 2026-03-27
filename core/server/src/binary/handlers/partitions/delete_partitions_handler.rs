@@ -39,6 +39,10 @@ pub async fn handle_delete_partitions(
     );
     shard.ensure_authenticated(session)?;
 
+    if req.partitions_count == 0 {
+        return Err(IggyError::TooManyPartitions);
+    }
+
     let request = ShardRequest::control_plane(ShardRequestPayload::DeletePartitionsRequest {
         user_id: session.get_user_id(),
         command: req,
