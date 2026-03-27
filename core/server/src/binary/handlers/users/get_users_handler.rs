@@ -16,50 +16,39 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::responses::users::{GetUsersResponse, UserResponse};
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
-use iggy_common::get_users::GetUsers;
+use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetUsers {
-    fn code(&self) -> u32 {
-        iggy_common::GET_USERS_CODE
-    }
+pub async fn handle_get_users(
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    debug!("session: {session}, command: get_users");
+    shard.ensure_authenticated(session)?;
 
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
-
-        let users = shard.metadata.query_users(session.get_user_id())?;
-        let response = mapper::map_users_meta(&users);
-        sender.send_ok_response(&response).await?;
-        Ok(HandlerResult::Finished)
-    }
-}
-
-impl BinaryServerCommand for GetUsers {
-    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::GetUsers(get_users) => Ok(get_users),
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+    let users = shard.metadata.query_users(session.get_user_id())?;
+    let wire_users: Vec<UserResponse> = users
+        .iter()
+        .map(|u| {
+            Ok(UserResponse {
+                id: u.id,
+                created_at: u.created_at.as_micros(),
+                status: u.status.as_code(),
+                username: WireName::new(u.username.as_ref())
+                    .map_err(|_| IggyError::InvalidCommand)?,
+            })
+        })
+        .collect::<Result<_, IggyError>>()?;
+    let response = GetUsersResponse { users: wire_users };
+    sender.send_ok_response(&response.to_bytes()).await?;
+    Ok(HandlerResult::Finished)
 }

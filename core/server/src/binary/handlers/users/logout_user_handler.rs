@@ -16,56 +16,29 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
+use crate::binary::dispatch::HandlerResult;
 use crate::binary::handlers::users::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use err_trail::ErrContext;
-use iggy_common::logout_user::LogoutUser;
 use iggy_common::{IggyError, SenderKind};
-use tracing::info;
-use tracing::{debug, instrument};
+use std::rc::Rc;
+use tracing::{debug, info, instrument};
 
-impl ServerCommandHandler for LogoutUser {
-    fn code(&self) -> u32 {
-        iggy_common::LOGOUT_USER_CODE
-    }
-
-    #[instrument(skip_all, name = "trace_logout_user", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
-        info!("Logging out user with ID: {}...", session.get_user_id());
-        shard.logout_user(session).error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to logout user, session: {session}")
-        })?;
-        info!("Logged out user with ID: {}.", session.get_user_id());
-        session.clear_user_id();
-        sender.send_empty_ok_response().await?;
-        Ok(HandlerResult::Finished)
-    }
-}
-
-impl BinaryServerCommand for LogoutUser {
-    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::LogoutUser(logout_user) => Ok(logout_user),
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+#[instrument(skip_all, name = "trace_logout_user", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+pub async fn handle_logout_user(
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    debug!("session: {session}, command: logout_user");
+    shard.ensure_authenticated(session)?;
+    info!("Logging out user with ID: {}...", session.get_user_id());
+    shard.logout_user(session).error(|e: &IggyError| {
+        format!("{COMPONENT} (error: {e}) - failed to logout user, session: {session}")
+    })?;
+    info!("Logged out user with ID: {}.", session.get_user_id());
+    session.clear_user_id();
+    sender.send_empty_ok_response().await?;
+    Ok(HandlerResult::Finished)
 }
