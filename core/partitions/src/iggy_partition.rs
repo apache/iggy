@@ -124,7 +124,11 @@ impl Partition for IggyPartition {
         }
         journal.info.end_timestamp = batch.base_timestamp;
         journal.info.max_timestamp = journal.info.max_timestamp.max(batch.base_timestamp);
-        journal.inner.append(message.into_frozen()).await;
+        journal
+            .inner
+            .append(message.into_frozen())
+            .await
+            .map_err(|_| IggyError::CannotAppendMessage)?;
 
         Ok(AppendResult::new(
             dirty_offset,

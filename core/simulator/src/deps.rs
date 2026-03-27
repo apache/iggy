@@ -30,28 +30,34 @@ use std::collections::HashMap;
 #[derive(Debug, Default)]
 pub struct MemStorage {
     data: RefCell<Vec<u8>>,
-    offset: Cell<u64>,
 }
 
 #[allow(clippy::future_not_send)]
 impl Storage for MemStorage {
     type Buffer = Vec<u8>;
 
-    async fn write(&self, buf: Self::Buffer) -> usize {
+    async fn write_at(&self, offset: usize, buf: Self::Buffer) -> std::io::Result<usize> {
         let len = buf.len();
-        self.data.borrow_mut().extend_from_slice(&buf);
-        self.offset.set(self.offset.get() + len as u64);
-        len
+        let mut data = self.data.borrow_mut();
+        let end = offset + len;
+        if end > data.len() {
+            data.resize(end, 0);
+        }
+        data[offset..end].copy_from_slice(&buf);
+        Ok(len)
     }
 
-    async fn read(&self, offset: usize, len: usize) -> Self::Buffer {
-        let mut buffer = vec![0; len];
+    async fn read_at(
+        &self,
+        offset: usize,
+        mut buffer: Self::Buffer,
+    ) -> std::io::Result<Self::Buffer> {
         let data = self.data.borrow();
         let end = offset + buffer.len();
         if offset < data.len() && end <= data.len() {
             buffer[..].copy_from_slice(&data[offset..end]);
         }
-        buffer
+        Ok(buffer)
     }
 }
 
@@ -106,7 +112,11 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
         let header = headers.get(&header.op)?;
         let offset = *offsets.get(&header.op)?;
 
-        let buffer = self.storage.read(offset, header.size as usize).await;
+        let buffer = self
+            .storage
+            .read_at(offset, vec![0; header.size as usize])
+            .await
+            .ok()?;
         let message = Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
             .expect("prepare buffer must contain a valid prepare message");
         Some(message)
@@ -119,16 +129,19 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
         unsafe { &*self.headers.get() }.get(&(header.op - 1))
     }
 
-    async fn append(&self, entry: Self::Entry) {
+    async fn append(&self, entry: Self::Entry) -> std::io::Result<()> {
         let header = *entry.header();
         let message_bytes = entry.into_frozen();
-
-        let bytes_written = self.storage.write(message_bytes.as_slice().to_vec()).await;
-
         let offset = self.write_offset.get();
+
+        let bytes_written = self
+            .storage
+            .write_at(offset, message_bytes.as_slice().to_vec())
+            .await?;
         unsafe { &mut *self.headers.get() }.insert(header.op, header);
         unsafe { &mut *self.offsets.get() }.insert(header.op, offset);
         self.write_offset.set(offset + bytes_written);
+        Ok(())
     }
 
     fn header(&self, idx: usize) -> Option<Self::HeaderRef<'_>> {

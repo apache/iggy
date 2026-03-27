@@ -16,50 +16,63 @@
  * under the License.
  */
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
+use crate::streaming::clients::client_manager::Client;
 use crate::streaming::session::Session;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::responses::clients::{
+    ClientDetailsResponse, ClientResponse, ConsumerGroupInfoResponse,
+};
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
-use iggy_common::get_me::GetMe;
 use std::rc::Rc;
 
-impl ServerCommandHandler for GetMe {
-    fn code(&self) -> u32 {
-        iggy_common::GET_ME_CODE
-    }
+pub async fn handle_get_me(
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    shard.ensure_authenticated(session)?;
+    let Some(client) = shard.get_client(session.client_id) else {
+        return Err(IggyError::ClientNotFound(session.client_id));
+    };
 
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        shard.ensure_authenticated(session)?;
-        let Some(client) = shard.get_client(session.client_id) else {
-            return Err(IggyError::ClientNotFound(session.client_id));
-        };
+    let response = build_client_details_response(&client);
+    sender.send_ok_response(&response.to_bytes()).await?;
+    Ok(HandlerResult::Finished)
+}
 
-        let bytes = mapper::map_client(&client);
-
-        sender.send_ok_response(&bytes).await?;
-        Ok(HandlerResult::Finished)
+pub(crate) fn build_client_details_response(client: &Client) -> ClientDetailsResponse {
+    ClientDetailsResponse {
+        client: build_client_response(client),
+        consumer_groups: client
+            .consumer_groups
+            .iter()
+            .map(|cg| ConsumerGroupInfoResponse {
+                stream_id: cg.stream_id,
+                topic_id: cg.topic_id,
+                group_id: cg.group_id,
+            })
+            .collect(),
     }
 }
 
-impl BinaryServerCommand for GetMe {
-    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::GetMe(get_me) => Ok(get_me),
-            _ => Err(IggyError::InvalidCommand),
-        }
+pub(crate) fn build_client_response(client: &Client) -> ClientResponse {
+    ClientResponse {
+        client_id: client.session.client_id,
+        user_id: client.user_id.unwrap_or(u32::MAX),
+        transport: transport_to_u8(&client.transport),
+        address: client.session.ip_address.to_string(),
+        consumer_groups_count: client.consumer_groups.len() as u32,
+    }
+}
+
+pub(crate) fn transport_to_u8(transport: &iggy_common::TransportProtocol) -> u8 {
+    match transport {
+        iggy_common::TransportProtocol::Tcp => 1,
+        iggy_common::TransportProtocol::Quic => 2,
+        iggy_common::TransportProtocol::Http => 3,
+        iggy_common::TransportProtocol::WebSocket => 4,
     }
 }

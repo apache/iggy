@@ -53,12 +53,13 @@ pub fn new_replica(id: u8, name: String, bus: &Arc<MemBus>, replica_count: u8) -
     );
     metadata_consensus.init();
 
-    let metadata = IggyMetadata {
-        consensus: Some(metadata_consensus),
-        journal: Some(SimJournal::<MemStorage>::default()),
-        snapshot: Some(SimSnapshot::default()),
-        mux_stm: mux,
-    };
+    let metadata = IggyMetadata::new(
+        Some(metadata_consensus),
+        Some(SimJournal::<MemStorage>::default()),
+        Some(SimSnapshot::default()),
+        mux,
+        None,
+    );
 
     let partitions_config = PartitionsConfig {
         messages_required_to_save: 1000,

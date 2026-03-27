@@ -19,6 +19,7 @@ use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice};
 use iobuf::{Frozen, Owned};
 use journal::{Journal, Storage};
+use std::io;
 use std::{
     cell::UnsafeCell,
     collections::{BTreeMap, HashMap},
@@ -76,7 +77,7 @@ pub struct PartitionJournalMemStorage {
 impl Storage for PartitionJournalMemStorage {
     type Buffer = JournalBuffer;
 
-    async fn write(&self, buf: Self::Buffer) -> usize {
+    async fn write_at(&self, _offset: usize, buf: Self::Buffer) -> io::Result<usize> {
         let len = buf.len();
         let entries = unsafe { &mut *self.entries.get() };
         let offset_to_index = unsafe { &mut *self.offset_to_index.get() };
@@ -85,24 +86,22 @@ impl Storage for PartitionJournalMemStorage {
         let index = entries.len();
         offset_to_index.insert(*current_offset, index);
         entries.push(buf);
-
-        let write_offset = *current_offset;
         *current_offset += len;
 
-        write_offset
+        Ok(len)
     }
 
-    async fn read(&self, offset: usize, _len: usize) -> Self::Buffer {
+    async fn read_at(&self, offset: usize, _buffer: Self::Buffer) -> io::Result<Self::Buffer> {
         let offset_to_index = unsafe { &*self.offset_to_index.get() };
         let Some(&index) = offset_to_index.get(&offset) else {
-            return Owned::<4096>::zeroed(0).into();
+            return Ok(Owned::<4096>::zeroed(0).into());
         };
 
         let entries = unsafe { &*self.entries.get() };
-        entries
+        Ok(entries
             .get(index)
             .cloned()
-            .unwrap_or_else(|| Owned::<4096>::zeroed(0).into())
+            .unwrap_or_else(|| Owned::<4096>::zeroed(0).into()))
     }
 }
 
@@ -176,6 +175,11 @@ impl PartitionJournalMemStorage {
     fn is_empty(&self) -> bool {
         let entries = unsafe { &*self.entries.get() };
         entries.is_empty()
+    }
+
+    fn current_offset(&self) -> usize {
+        let current_offset = unsafe { &*self.current_offset.get() };
+        *current_offset
     }
 }
 
@@ -255,7 +259,11 @@ where
 
         let bytes = {
             let inner = unsafe { &*self.inner.get() };
-            inner.storage.read(storage_offset, ZERO_LEN).await
+            inner
+                .storage
+                .read_at(storage_offset, Owned::<4096>::zeroed(ZERO_LEN).into())
+                .await
+                .unwrap_or_else(|_| Owned::<4096>::zeroed(ZERO_LEN).into())
         };
 
         if bytes.is_empty() {
@@ -298,7 +306,11 @@ where
 
             let bytes = {
                 let inner = unsafe { &*self.inner.get() };
-                inner.storage.read(storage_offset, ZERO_LEN).await
+                inner
+                    .storage
+                    .read_at(storage_offset, Owned::<4096>::zeroed(ZERO_LEN).into())
+                    .await
+                    .unwrap_or_else(|_| Owned::<4096>::zeroed(ZERO_LEN).into())
             };
 
             if bytes.is_empty() {
@@ -334,14 +346,11 @@ where
     }
 }
 
-impl<S> Journal<S> for PartitionJournal<S>
-where
-    S: Storage<Buffer = JournalBuffer>,
-{
+impl Journal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMemStorage> {
     type Header = PrepareHeader;
     type Entry = JournalBuffer;
-    #[rustfmt::skip] // Scuffed formatter.
-    type HeaderRef<'a> = &'a Self::Header where S: 'a;
+    #[rustfmt::skip]
+    type HeaderRef<'a> = &'a Self::Header;
 
     fn header(&self, idx: usize) -> Option<Self::HeaderRef<'_>> {
         let headers = unsafe { &mut *self.headers.get() };
@@ -358,7 +367,7 @@ where
         headers.iter().find(|candidate| candidate.op == prev_op)
     }
 
-    async fn append(&self, entry: Self::Entry) {
+    async fn append(&self, entry: Self::Entry) -> io::Result<()> {
         let header_size = std::mem::size_of::<PrepareHeader>();
         let header_bytes = &entry[..header_size];
         let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
@@ -382,7 +391,9 @@ where
 
         let storage_offset = {
             let inner = unsafe { &*self.inner.get() };
-            inner.storage.write(entry).await
+            let storage_offset = inner.storage.current_offset();
+            inner.storage.write_at(storage_offset, entry).await?;
+            storage_offset
         };
 
         {
@@ -397,6 +408,8 @@ where
             let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
             timestamp_to_op.insert((timestamp, op), op);
         }
+
+        Ok(())
     }
 
     async fn entry(&self, header: &Self::Header) -> Option<Self::Entry> {
@@ -404,10 +417,7 @@ where
     }
 }
 
-impl<S> QueryableJournal<S> for PartitionJournal<S>
-where
-    S: Storage<Buffer = JournalBuffer>,
-{
+impl QueryableJournal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMemStorage> {
     type Query = MessageLookup;
 
     async fn get(&self, query: &Self::Query) -> Option<PollQueryResult<4096>> {

@@ -89,7 +89,7 @@ helm uninstall iggy
 | `server.enabled` | bool | `true` | Enable the Iggy server deployment |
 | `server.replicaCount` | int | `1` | Number of server replicas |
 | `server.image.repository` | string | `"apache/iggy"` | Server image repository |
-| `server.image.tag` | string | `""` | Server image tag (defaults to chart appVersion) |
+| `server.image.tag` | string | `"0.7.0"` | Server image tag |
 | `server.ports.http` | int | `3000` | HTTP API port |
 | `server.ports.tcp` | int | `8090` | TCP protocol port |
 | `server.ports.quic` | int | `8080` | QUIC protocol port |
@@ -134,6 +134,83 @@ helm uninstall iggy
 | `ui.server.endpoint` | string | `""` | Iggy server endpoint (auto-detected if empty) |
 | `ui.securityContext` | object | `{}` | UI container security context |
 | `ui.podSecurityContext` | object | `{}` | UI pod security context |
+
+## Testing
+
+The chart CI paths are also available locally from the repository root.
+
+### Render Validation
+
+If `helm` is already installed locally:
+
+```bash
+scripts/ci/test-helm.sh validate
+```
+
+If you want the pinned Linux CI tool version instead:
+
+```bash
+scripts/ci/setup-helm-tools.sh
+scripts/ci/test-helm.sh validate
+```
+
+This runs `helm lint --strict` plus the CI render scenarios, including:
+
+* default chart output
+* all-features render
+* legacy Kubernetes 1.18 API coverage
+* server-only render
+* UI-only render
+* existing-secret render
+
+### Runtime Smoke Test
+
+The smoke path requires `helm`, `kind`, `kubectl`, and `curl`.
+
+Before running the local smoke path, keep these common gotchas in mind:
+
+* the Iggy server requires working `io_uring` support from the Kubernetes node/kernel/runtime
+* the server also needs enough available memory and locked-memory headroom during startup
+* `scripts/ci/test-helm.sh cleanup-smoke` removes the Helm release and smoke namespace, but it does not delete the reusable kind cluster created by `scripts/ci/setup-helm-smoke-cluster.sh`
+
+If `helm` and `kind` are already installed:
+
+```bash
+scripts/ci/setup-helm-smoke-cluster.sh
+scripts/ci/test-helm.sh smoke --cleanup
+```
+
+If you want the pinned Linux CI tool versions:
+
+```bash
+scripts/ci/setup-helm-tools.sh --install-kind
+scripts/ci/setup-helm-smoke-cluster.sh
+scripts/ci/test-helm.sh smoke --cleanup
+```
+
+If a previous local smoke install failed and left resources behind, reset the smoke namespace with:
+
+```bash
+scripts/ci/test-helm.sh cleanup-smoke
+```
+
+On Apple Silicon hosts, the released `apache/iggy:0.7.0` `arm64` image may still fail during the runtime smoke path in kind. If your Docker setup supports amd64 emulation well enough, you can try recreating the dedicated smoke cluster with:
+
+```bash
+HELM_SMOKE_KIND_PLATFORM=linux/amd64 scripts/ci/setup-helm-smoke-cluster.sh
+```
+
+The smoke script defaults `IGGY_SYSTEM_SHARDING_CPU_ALLOCATION=1` for the server pod so the local kind path avoids the chart's `numa:auto` default and keeps the local runtime to a single shard, which has been more reliable on containerized local nodes. If you need a different local override, set `HELM_SMOKE_SERVER_CPU_ALLOCATION` before running `scripts/ci/test-helm.sh smoke`. Pass `--cleanup` to remove the smoke namespace after a successful run; omit it if you want to inspect the deployed resources.
+
+On smoke-test failures you can collect the same diagnostics as CI with:
+
+```bash
+scripts/ci/test-helm.sh collect-smoke-diagnostics
+```
+
+> **Note:** `scripts/ci/setup-helm-tools.sh` currently supports Linux `x86_64` only.
+> On other local platforms, install equivalent `helm` and `kind` binaries yourself and then use the same scripts above.
+> The runtime smoke test may still fail on some local/containerized clusters if the node/kernel does not provide the `io_uring` support required by the server runtime even after the local sharding override, or if the local environment does not provide enough memory for the server to initialize cleanly.
 
 ## Troubleshooting
 
