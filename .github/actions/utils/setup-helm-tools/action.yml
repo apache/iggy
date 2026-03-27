@@ -1,0 +1,67 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: setup-helm-tools
+description: Install pinned Helm and optionally kind for Helm chart CI jobs
+inputs:
+  install-kind:
+    description: "Whether to install kind in addition to Helm"
+    required: false
+    default: "false"
+  helm-version:
+    description: "Helm release version"
+    required: false
+    default: "v4.1.3"
+  helm-checksum:
+    description: "SHA256 checksum for the Helm tarball"
+    required: false
+    default: "02ce9722d541238f81459938b84cf47df2fdf1187493b4bfb2346754d82a4700"
+  kind-version:
+    description: "kind release version"
+    required: false
+    default: "v0.31.0"
+  kind-checksum:
+    description: "SHA256 checksum for the kind binary"
+    required: false
+    default: "eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Verify supported runner
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ "${{ runner.os }}" != "Linux" || "${{ runner.arch }}" != "X64" ]]; then
+          echo "setup-helm-tools currently supports Linux X64 runners only" >&2
+          exit 1
+        fi
+
+    - name: Install Helm and optional kind
+      shell: bash
+      env:
+        HELM_VERSION: ${{ inputs.helm-version }}
+        HELM_CHECKSUM: ${{ inputs.helm-checksum }}
+        KIND_VERSION: ${{ inputs.kind-version }}
+        KIND_CHECKSUM: ${{ inputs.kind-checksum }}
+      run: |
+        set -euo pipefail
+        args=()
+        if [[ "${{ inputs.install-kind }}" == "true" ]]; then
+          args+=(--install-kind)
+        fi
+        scripts/ci/setup-helm-tools.sh "${args[@]}"

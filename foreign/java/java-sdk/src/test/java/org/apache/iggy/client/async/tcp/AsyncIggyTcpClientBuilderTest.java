@@ -138,6 +138,80 @@ class AsyncIggyTcpClientBuilderTest extends BaseIntegrationTest {
     }
 
     @Test
+    void shouldThrowExceptionForNullPort() {
+        // Given: Builder with null port
+        AsyncIggyTcpClientBuilder builder =
+                AsyncIggyTcpClient.builder().host(serverHost()).port(null);
+
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldThrowExceptionForZeroConnectionPoolSize() {
+        // Given: Builder with 0 connection pool size
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().connectionPoolSize(0);
+
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldThrowExceptionForNegativeConnectionPoolSize() {
+        // Given: Builder with negative connection pool size
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().connectionPoolSize(-1);
+
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldThrowExceptionForZeroConnectionTimeout() {
+        // Given: Builder with 0 connection timeout
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().connectionTimeout(Duration.ofMillis(0));
+
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldThrowExceptionForNegativeConnectionTimeout() {
+        // Given: Builder with negative connection timeout
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().connectionTimeout(Duration.ofMillis(-1));
+
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldThrowExceptionForConnectionTimeoutInMillisecondsGreaterThanMaximumInteger() {
+        // Given: Builder with connection timeout in milliseconds greater than maximum integer
+        AsyncIggyTcpClientBuilder builder =
+                AsyncIggyTcpClient.builder().connectionTimeout(Duration.ofMillis(((long) Integer.MAX_VALUE) + 1));
+
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldThrowExceptionForZeroAcquireTimeout() {
+        // Given: Builder with 0 acquire timeout
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().acquireTimeout(Duration.ofMillis(0));
+
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void shouldThrowExceptionForNegativeAcquireTimeout() {
+        // Given: Builder with negative acquire timeout
+        AsyncIggyTcpClientBuilder builder = AsyncIggyTcpClient.builder().acquireTimeout(Duration.ofMillis(-1000));
+
+        // When/Then: Building should throw IggyInvalidArgumentException
+        assertThatThrownBy(builder::build).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
     void shouldMaintainBackwardCompatibilityWithOldConstructor() throws Exception {
         // Given: Old constructor approach
         client = new AsyncIggyTcpClient(serverHost(), serverTcpPort());
