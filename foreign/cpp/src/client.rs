@@ -349,66 +349,6 @@ impl Client {
         })
     }
 
-    pub fn join_consumer_group(
-        &self,
-        stream_id: ffi::Identifier,
-        topic_id: ffi::Identifier,
-        group_id: ffi::Identifier,
-    ) -> Result<(), String> {
-        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
-            format!("Could not join consumer group: invalid stream identifier: {error}")
-        })?;
-        let rust_topic_id = RustIdentifier::try_from(topic_id).map_err(|error| {
-            format!("Could not join consumer group: invalid topic identifier: {error}")
-        })?;
-        let rust_group_id = RustIdentifier::try_from(group_id).map_err(|error| {
-            format!("Could not join consumer group: invalid group identifier: {error}")
-        })?;
-
-        RUNTIME.block_on(async {
-            self.inner
-                .join_consumer_group(&rust_stream_id, &rust_topic_id, &rust_group_id)
-                .await
-                .map_err(|error| {
-                    format!(
-                        "Could not join consumer group '{}' for topic '{}' on stream '{}': {error}",
-                        rust_group_id, rust_topic_id, rust_stream_id
-                    )
-                })?;
-            Ok(())
-        })
-    }
-
-    pub fn leave_consumer_group(
-        &self,
-        stream_id: ffi::Identifier,
-        topic_id: ffi::Identifier,
-        group_id: ffi::Identifier,
-    ) -> Result<(), String> {
-        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
-            format!("Could not leave consumer group: invalid stream identifier: {error}")
-        })?;
-        let rust_topic_id = RustIdentifier::try_from(topic_id).map_err(|error| {
-            format!("Could not leave consumer group: invalid topic identifier: {error}")
-        })?;
-        let rust_group_id = RustIdentifier::try_from(group_id).map_err(|error| {
-            format!("Could not leave consumer group: invalid group identifier: {error}")
-        })?;
-
-        RUNTIME.block_on(async {
-            self.inner
-                .leave_consumer_group(&rust_stream_id, &rust_topic_id, &rust_group_id)
-                .await
-                .map_err(|error| {
-                    format!(
-                        "Could not leave consumer group '{}' for topic '{}' on stream '{}': {error}",
-                        rust_group_id, rust_topic_id, rust_stream_id
-                    )
-                })?;
-            Ok(())
-        })
-    }
-
     pub fn delete_consumer_group(
         &self,
         stream_id: ffi::Identifier,

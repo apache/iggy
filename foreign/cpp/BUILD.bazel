@@ -124,7 +124,9 @@ cc_library(
 
 cc_test(
     name = "unit",
-    srcs = [
+    srcs = glob([
+        "tests/*/unit_tests.cpp",
+    ]) + [
         "tests/unit_tests.cpp",
     ],
     copts = select({
