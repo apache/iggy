@@ -21,7 +21,7 @@ use crate::wire_conversions::{consumer_to_wire, identifier_to_wire};
 use crate::{
     BinaryClient, Consumer, ConsumerOffsetClient, ConsumerOffsetInfo, Identifier, IggyError,
 };
-use iggy_binary_protocol::codec::{WireDecode, WireEncode};
+use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
     DELETE_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
@@ -85,8 +85,7 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
         if response.is_empty() {
             return Ok(None);
         }
-        let wire_resp =
-            ConsumerOffsetResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<ConsumerOffsetResponse>(&response)?;
         Ok(Some(ConsumerOffsetInfo::from(wire_resp)))
     }
 

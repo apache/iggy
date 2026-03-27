@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use crate::binary::dispatch::identifier_to_wire_id;
 use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
@@ -33,6 +32,7 @@ use iggy_common::Identifier;
 use iggy_common::Validatable;
 use iggy_common::delete_segments::DeleteSegments;
 use iggy_common::sharding::IggyNamespace;
+use iggy_common::wire_conversions::identifier_to_wire;
 use send_wrapper::SendWrapper;
 use std::sync::Arc;
 use tracing::instrument;
@@ -99,8 +99,8 @@ async fn delete_segments(
     }
 
     let wire_command = DeleteSegmentsRequest {
-        stream_id: identifier_to_wire_id(&query.stream_id)?,
-        topic_id: identifier_to_wire_id(&query.topic_id)?,
+        stream_id: identifier_to_wire(&query.stream_id)?,
+        topic_id: identifier_to_wire(&query.topic_id)?,
         partition_id: query.partition_id,
         segments_count,
     };

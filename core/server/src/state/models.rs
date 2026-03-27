@@ -107,7 +107,6 @@ impl Display for CreatePersonalAccessTokenWithHash {
 }
 
 // Wire format for WithId wrappers: id:u32_le | inner_length:u32_le | inner_bytes
-// Wire format for WithId wrappers: id:u32_le | inner_length:u32_le | inner_bytes
 
 impl WireEncode for CreateStreamWithId {
     fn encoded_size(&self) -> usize {

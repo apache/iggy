@@ -23,7 +23,7 @@ use crate::{
     TopicClient, TopicDetails,
 };
 use iggy_binary_protocol::WireName;
-use iggy_binary_protocol::codec::{WireDecode, WireEncode};
+use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
     CREATE_TOPIC_CODE, DELETE_TOPIC_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, PURGE_TOPIC_CODE,
     UPDATE_TOPIC_CODE,
@@ -58,8 +58,7 @@ impl<B: BinaryClient> TopicClient for B {
         if response.is_empty() {
             return Ok(None);
         }
-        let wire_resp =
-            GetTopicResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<GetTopicResponse>(&response)?;
         Ok(Some(TopicDetails::from(wire_resp)))
     }
 
@@ -78,8 +77,7 @@ impl<B: BinaryClient> TopicClient for B {
         if response.is_empty() {
             return Ok(Vec::new());
         }
-        let wire_resp =
-            GetTopicsResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<GetTopicsResponse>(&response)?;
         Ok(topics_from_wire(wire_resp))
     }
 
@@ -111,8 +109,7 @@ impl<B: BinaryClient> TopicClient for B {
                 .to_bytes(),
             )
             .await?;
-        let wire_resp =
-            GetTopicResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<GetTopicResponse>(&response)?;
         Ok(TopicDetails::from(wire_resp))
     }
 

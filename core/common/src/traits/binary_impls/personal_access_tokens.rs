@@ -24,7 +24,7 @@ use crate::{
     PersonalAccessTokenExpiry, PersonalAccessTokenInfo, RawPersonalAccessToken,
 };
 use iggy_binary_protocol::WireName;
-use iggy_binary_protocol::codec::{WireDecode, WireEncode};
+use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
     CREATE_PERSONAL_ACCESS_TOKEN_CODE, DELETE_PERSONAL_ACCESS_TOKEN_CODE,
     GET_PERSONAL_ACCESS_TOKENS_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
@@ -50,8 +50,7 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
         if response.is_empty() {
             return Ok(Vec::new());
         }
-        let wire_resp = GetPersonalAccessTokensResponse::decode_from(&response)
-            .map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<GetPersonalAccessTokensResponse>(&response)?;
         Ok(personal_access_tokens_from_wire(wire_resp))
     }
 
@@ -72,8 +71,7 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
                 .to_bytes(),
             )
             .await?;
-        let wire_resp = RawPersonalAccessTokenResponse::decode_from(&response)
-            .map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<RawPersonalAccessTokenResponse>(&response)?;
         Ok(RawPersonalAccessToken::from(wire_resp))
     }
 
@@ -101,8 +99,7 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
             .await?;
         self.set_state(ClientState::Authenticated).await;
         self.publish_event(DiagnosticEvent::SignedIn).await;
-        let wire_resp =
-            IdentityResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<IdentityResponse>(&response)?;
         Ok(IdentityInfo::from(wire_resp))
     }
 }

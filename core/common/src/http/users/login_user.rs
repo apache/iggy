@@ -16,7 +16,10 @@
  * under the License.
  */
 
-use secrecy::SecretString;
+use super::defaults::*;
+use crate::Validatable;
+use crate::error::IggyError;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -28,4 +31,25 @@ pub struct LoginUser {
     pub version: Option<String>,
     #[serde(default)]
     pub context: Option<String>,
+}
+
+impl Validatable<IggyError> for LoginUser {
+    fn validate(&self) -> Result<(), IggyError> {
+        if self.username.is_empty()
+            || self.username.len() > MAX_USERNAME_LENGTH
+            || self.username.len() < MIN_USERNAME_LENGTH
+        {
+            return Err(IggyError::InvalidUsername);
+        }
+
+        let password = self.password.expose_secret();
+        if password.is_empty()
+            || password.len() > MAX_PASSWORD_LENGTH
+            || password.len() < MIN_PASSWORD_LENGTH
+        {
+            return Err(IggyError::InvalidPassword);
+        }
+
+        Ok(())
+    }
 }

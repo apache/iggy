@@ -64,6 +64,9 @@ use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::responses::users::{GetUsersResponse, UserDetailsResponse};
 use std::collections::{BTreeMap, HashMap};
 
+/// Sentinel value in the wire protocol indicating no authenticated user.
+const WIRE_NO_USER_ID: u32 = u32::MAX;
+
 // ---------------------------------------------------------------------------
 // Streams
 // ---------------------------------------------------------------------------
@@ -240,7 +243,7 @@ impl From<ConsumerGroupInfoResponse> for ConsumerGroupInfo {
 impl From<ClientResponse> for ClientInfo {
     fn from(w: ClientResponse) -> Self {
         let user_id = match w.user_id {
-            u32::MAX => None,
+            WIRE_NO_USER_ID => None,
             id => Some(id),
         };
         let transport = match w.transport {
@@ -535,16 +538,20 @@ pub fn polling_strategy_to_wire(
 /// Convert a domain `Partitioning` to `WirePartitioning`.
 pub fn partitioning_to_wire(
     partitioning: &crate::Partitioning,
-) -> iggy_binary_protocol::primitives::partitioning::WirePartitioning {
+) -> Result<iggy_binary_protocol::primitives::partitioning::WirePartitioning, IggyError> {
     use iggy_binary_protocol::primitives::partitioning::WirePartitioning;
     match partitioning.kind {
-        crate::PartitioningKind::Balanced => WirePartitioning::Balanced,
+        crate::PartitioningKind::Balanced => Ok(WirePartitioning::Balanced),
         crate::PartitioningKind::PartitionId => {
-            let id = u32::from_le_bytes(partitioning.value[..4].try_into().unwrap());
-            WirePartitioning::PartitionId(id)
+            let bytes: [u8; 4] = partitioning
+                .value
+                .get(..4)
+                .and_then(|s| s.try_into().ok())
+                .ok_or(IggyError::InvalidCommand)?;
+            Ok(WirePartitioning::PartitionId(u32::from_le_bytes(bytes)))
         }
         crate::PartitioningKind::MessagesKey => {
-            WirePartitioning::MessagesKey(partitioning.value.clone())
+            Ok(WirePartitioning::MessagesKey(partitioning.value.clone()))
         }
     }
 }
@@ -623,6 +630,62 @@ impl From<WirePermissions> for Permissions {
             global: GlobalPermissions::from(w.global),
             streams,
         }
+    }
+}
+
+/// Convert `&WirePermissions` to domain `Permissions` without consuming the input.
+pub fn wire_permissions_to_permissions(wp: &WirePermissions) -> Permissions {
+    let streams = if wp.streams.is_empty() {
+        None
+    } else {
+        let mut map = BTreeMap::new();
+        for ws in &wp.streams {
+            let topics = if ws.topics.is_empty() {
+                None
+            } else {
+                let mut tmap = BTreeMap::new();
+                for wt in &ws.topics {
+                    tmap.insert(
+                        wt.topic_id as usize,
+                        TopicPermissions {
+                            manage_topic: wt.manage_topic,
+                            read_topic: wt.read_topic,
+                            poll_messages: wt.poll_messages,
+                            send_messages: wt.send_messages,
+                        },
+                    );
+                }
+                Some(tmap)
+            };
+            map.insert(
+                ws.stream_id as usize,
+                StreamPermissions {
+                    manage_stream: ws.manage_stream,
+                    read_stream: ws.read_stream,
+                    manage_topics: ws.manage_topics,
+                    read_topics: ws.read_topics,
+                    poll_messages: ws.poll_messages,
+                    send_messages: ws.send_messages,
+                    topics,
+                },
+            );
+        }
+        Some(map)
+    };
+    Permissions {
+        global: GlobalPermissions {
+            manage_servers: wp.global.manage_servers,
+            read_servers: wp.global.read_servers,
+            manage_users: wp.global.manage_users,
+            read_users: wp.global.read_users,
+            manage_streams: wp.global.manage_streams,
+            read_streams: wp.global.read_streams,
+            manage_topics: wp.global.manage_topics,
+            read_topics: wp.global.read_topics,
+            poll_messages: wp.global.poll_messages,
+            send_messages: wp.global.send_messages,
+        },
+        streams,
     }
 }
 

@@ -21,4 +21,4 @@ pub mod delete_stream;
 pub mod purge_stream;
 pub mod update_stream;
 
-const MAX_NAME_LENGTH: usize = 255;
+use crate::MAX_NAME_LENGTH;

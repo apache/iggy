@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use crate::binary::dispatch::{domain_permissions_to_wire, wire_permissions_to_permissions};
 use crate::bootstrap::create_root_user;
 use crate::state::file::FileState;
 use crate::state::models::CreateUserWithId;
@@ -32,6 +31,7 @@ use iggy_common::IggyTimestamp;
 use iggy_common::MaxTopicSize;
 use iggy_common::PersonalAccessToken;
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+use iggy_common::wire_conversions::{permissions_to_wire, wire_permissions_to_permissions};
 use iggy_common::{Permissions, UserStatus};
 use std::collections::BTreeMap;
 use std::fmt::Display;
@@ -153,7 +153,7 @@ impl SystemState {
                     .expect("root username must be valid"),
                 password: root.password.clone(),
                 status: root.status.as_code(),
-                permissions: root.permissions.as_ref().map(domain_permissions_to_wire),
+                permissions: root.permissions.as_ref().map(permissions_to_wire),
             };
             state
                 .apply(0, &EntryCommand::CreateUser(CreateUserWithId {

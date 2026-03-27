@@ -23,7 +23,7 @@ use crate::{
     UserClient, UserInfo, UserInfoDetails, UserStatus,
 };
 use iggy_binary_protocol::WireName;
-use iggy_binary_protocol::codec::{WireDecode, WireEncode};
+use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
     CHANGE_PASSWORD_CODE, CREATE_USER_CODE, DELETE_USER_CODE, GET_USER_CODE, GET_USERS_CODE,
     LOGIN_USER_CODE, LOGOUT_USER_CODE, UPDATE_PERMISSIONS_CODE, UPDATE_USER_CODE,
@@ -49,8 +49,7 @@ impl<B: BinaryClient> UserClient for B {
         if response.is_empty() {
             return Ok(None);
         }
-        let wire_resp =
-            UserDetailsResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<UserDetailsResponse>(&response)?;
         UserInfoDetails::try_from(wire_resp).map(Some)
     }
 
@@ -62,8 +61,7 @@ impl<B: BinaryClient> UserClient for B {
         if response.is_empty() {
             return Ok(Vec::new());
         }
-        let wire_resp =
-            GetUsersResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<GetUsersResponse>(&response)?;
         users_from_wire(wire_resp)
     }
 
@@ -89,8 +87,7 @@ impl<B: BinaryClient> UserClient for B {
                 .to_bytes(),
             )
             .await?;
-        let wire_resp =
-            UserDetailsResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<UserDetailsResponse>(&response)?;
         UserInfoDetails::try_from(wire_resp)
     }
 
@@ -187,8 +184,7 @@ impl<B: BinaryClient> UserClient for B {
             .await?;
         self.set_state(ClientState::Authenticated).await;
         self.publish_event(DiagnosticEvent::SignedIn).await;
-        let wire_resp =
-            IdentityResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<IdentityResponse>(&response)?;
         Ok(IdentityInfo::from(wire_resp))
     }
 

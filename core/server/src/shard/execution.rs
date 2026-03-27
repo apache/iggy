@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::binary::dispatch::{wire_id_to_identifier, wire_permissions_to_permissions};
+use crate::binary::dispatch::wire_id_to_identifier;
 use crate::streaming::users::user::User;
 use crate::streaming::utils::crypto;
 use crate::{
@@ -39,6 +39,7 @@ use crate::{
 use iggy_binary_protocol::requests::{
     consumer_groups::*, partitions::*, personal_access_tokens::*, streams::*, topics::*, users::*,
 };
+use iggy_common::wire_conversions::wire_permissions_to_permissions;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, PersonalAccessToken,
     UserStatus,

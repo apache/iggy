@@ -134,3 +134,6 @@ pub use utils::text;
 pub use utils::timestamp::*;
 pub use utils::topic_size::MaxTopicSize;
 pub use utils::versioning::SemanticVersion;
+
+pub const MAX_NAME_LENGTH: usize = 255;
+pub const MAX_PARTITIONS_COUNT: u32 = 1000;

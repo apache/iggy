@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use crate::binary::dispatch::identifier_to_wire_id;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::mapper;
@@ -36,6 +35,7 @@ use iggy_binary_protocol::requests::consumer_groups::{
 use iggy_common::Identifier;
 use iggy_common::Validatable;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
+use iggy_common::wire_conversions::identifier_to_wire;
 use iggy_common::{ConsumerGroup, ConsumerGroupDetails, IggyError};
 use std::sync::Arc;
 use tracing::instrument;
@@ -123,8 +123,8 @@ async fn create_consumer_group(
     let topic = shard.resolve_topic(&command.stream_id, &command.topic_id)?;
 
     let wire_command = WireCreateConsumerGroup {
-        stream_id: identifier_to_wire_id(&command.stream_id)?,
-        topic_id: identifier_to_wire_id(&command.topic_id)?,
+        stream_id: identifier_to_wire(&command.stream_id)?,
+        topic_id: identifier_to_wire(&command.topic_id)?,
         name: WireName::new(&command.name).map_err(|_| IggyError::InvalidConsumerGroupName)?,
     };
     let request = ShardRequest::control_plane(ShardRequestPayload::CreateConsumerGroupRequest {
@@ -160,9 +160,9 @@ async fn delete_consumer_group(
     let group_id = Identifier::from_str_value(&group_id)?;
 
     let wire_command = WireDeleteConsumerGroup {
-        stream_id: identifier_to_wire_id(&stream_id)?,
-        topic_id: identifier_to_wire_id(&topic_id)?,
-        group_id: identifier_to_wire_id(&group_id)?,
+        stream_id: identifier_to_wire(&stream_id)?,
+        topic_id: identifier_to_wire(&topic_id)?,
+        group_id: identifier_to_wire(&group_id)?,
     };
     let request = ShardRequest::control_plane(ShardRequestPayload::DeleteConsumerGroupRequest {
         user_id: identity.user_id,

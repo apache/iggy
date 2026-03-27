@@ -20,7 +20,7 @@ use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{identifier_to_wire, streams_from_wire};
 use crate::{BinaryClient, Identifier, IggyError, Stream, StreamClient, StreamDetails};
 use iggy_binary_protocol::WireName;
-use iggy_binary_protocol::codec::{WireDecode, WireEncode};
+use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
     CREATE_STREAM_CODE, DELETE_STREAM_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, PURGE_STREAM_CODE,
     UPDATE_STREAM_CODE,
@@ -46,8 +46,7 @@ impl<B: BinaryClient> StreamClient for B {
         if response.is_empty() {
             return Ok(None);
         }
-        let wire_resp =
-            GetStreamResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<GetStreamResponse>(&response)?;
         Ok(Some(StreamDetails::from(wire_resp)))
     }
 
@@ -59,8 +58,7 @@ impl<B: BinaryClient> StreamClient for B {
         if response.is_empty() {
             return Ok(Vec::new());
         }
-        let wire_resp =
-            GetStreamsResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<GetStreamsResponse>(&response)?;
         Ok(streams_from_wire(wire_resp))
     }
 
@@ -73,8 +71,7 @@ impl<B: BinaryClient> StreamClient for B {
                 CreateStreamRequest { name: wire_name }.to_bytes(),
             )
             .await?;
-        let wire_resp =
-            GetStreamResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<GetStreamResponse>(&response)?;
         Ok(StreamDetails::from(wire_resp))
     }
 

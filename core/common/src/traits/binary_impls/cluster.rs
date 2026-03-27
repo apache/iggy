@@ -19,7 +19,7 @@
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::cluster_metadata_from_wire;
 use crate::{BinaryClient, ClusterClient, ClusterMetadata, IggyError};
-use iggy_binary_protocol::codec::{WireDecode, WireEncode};
+use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::GET_CLUSTER_METADATA_CODE;
 use iggy_binary_protocol::requests::system::GetClusterMetadataRequest;
 use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterMetadataResponse;
@@ -34,8 +34,7 @@ impl<B: BinaryClient> ClusterClient for B {
                 GetClusterMetadataRequest.to_bytes(),
             )
             .await?;
-        let wire_resp = ClusterMetadataResponse::decode_from(&response)
-            .map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<ClusterMetadataResponse>(&response)?;
         cluster_metadata_from_wire(wire_resp)
     }
 }

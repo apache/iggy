@@ -71,7 +71,7 @@ impl<B: BinaryClient> MessageClient for B {
         fail_if_not_authenticated(self).await?;
         let wire_stream_id = identifier_to_wire(stream_id)?;
         let wire_topic_id = identifier_to_wire(topic_id)?;
-        let wire_partitioning = partitioning_to_wire(partitioning);
+        let wire_partitioning = partitioning_to_wire(partitioning)?;
         let raw_messages: Vec<RawMessage<'_>> = messages
             .iter()
             .map(|m| RawMessage {

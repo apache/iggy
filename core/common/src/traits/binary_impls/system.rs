@@ -22,7 +22,7 @@ use crate::{
     BinaryClient, ClientInfo, ClientInfoDetails, IggyDuration, IggyError, Snapshot,
     SnapshotCompression, Stats, SystemClient, SystemSnapshotType,
 };
-use iggy_binary_protocol::codec::{WireDecode, WireEncode};
+use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
     GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_ME_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE,
     PING_CODE,
@@ -41,8 +41,7 @@ impl<B: BinaryClient> SystemClient for B {
         let response = self
             .send_raw_with_response(GET_STATS_CODE, GetStatsRequest.to_bytes())
             .await?;
-        let wire_resp =
-            StatsResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<StatsResponse>(&response)?;
         Ok(Stats::from(wire_resp))
     }
 
@@ -51,8 +50,7 @@ impl<B: BinaryClient> SystemClient for B {
         let response = self
             .send_raw_with_response(GET_ME_CODE, GetMeRequest.to_bytes())
             .await?;
-        let wire_resp =
-            ClientDetailsResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<ClientDetailsResponse>(&response)?;
         Ok(ClientInfoDetails::from(wire_resp))
     }
 
@@ -64,8 +62,7 @@ impl<B: BinaryClient> SystemClient for B {
         if response.is_empty() {
             return Ok(None);
         }
-        let wire_resp =
-            ClientDetailsResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<ClientDetailsResponse>(&response)?;
         Ok(Some(ClientInfoDetails::from(wire_resp)))
     }
 
@@ -77,8 +74,7 @@ impl<B: BinaryClient> SystemClient for B {
         if response.is_empty() {
             return Ok(Vec::new());
         }
-        let wire_resp =
-            GetClientsResponse::decode_from(&response).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<GetClientsResponse>(&response)?;
         Ok(clients_from_wire(wire_resp))
     }
 

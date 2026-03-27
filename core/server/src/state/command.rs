@@ -163,6 +163,13 @@ impl WireDecode for EntryCommand {
         }
         let code = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let length = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        if buf.len() < 8 + length {
+            return Err(WireError::UnexpectedEof {
+                offset: 8,
+                need: length,
+                have: buf.len() - 8,
+            });
+        }
         let payload = &buf[8..8 + length];
         let consumed = 8 + length;
         let cmd = match code {

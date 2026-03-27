@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use crate::binary::dispatch::identifier_to_wire_id;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
@@ -34,6 +33,7 @@ use iggy_common::Identifier;
 use iggy_common::Validatable;
 use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::delete_partitions::DeletePartitions;
+use iggy_common::wire_conversions::identifier_to_wire;
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -59,8 +59,8 @@ async fn create_partitions(
     command.validate()?;
 
     let wire_command = WireCreatePartitions {
-        stream_id: identifier_to_wire_id(&command.stream_id)?,
-        topic_id: identifier_to_wire_id(&command.topic_id)?,
+        stream_id: identifier_to_wire(&command.stream_id)?,
+        topic_id: identifier_to_wire(&command.topic_id)?,
         partitions_count: command.partitions_count,
     };
     let request = ShardRequest::control_plane(ShardRequestPayload::CreatePartitionsRequest {
@@ -88,8 +88,8 @@ async fn delete_partitions(
     query.validate()?;
 
     let wire_command = WireDeletePartitions {
-        stream_id: identifier_to_wire_id(&query.stream_id)?,
-        topic_id: identifier_to_wire_id(&query.topic_id)?,
+        stream_id: identifier_to_wire(&query.stream_id)?,
+        topic_id: identifier_to_wire(&query.topic_id)?,
         partitions_count: query.partitions_count,
     };
     let request = ShardRequest::control_plane(ShardRequestPayload::DeletePartitionsRequest {

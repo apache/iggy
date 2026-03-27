@@ -22,7 +22,7 @@ use crate::{
     BinaryClient, ConsumerGroup, ConsumerGroupClient, ConsumerGroupDetails, Identifier, IggyError,
 };
 use iggy_binary_protocol::WireName;
-use iggy_binary_protocol::codec::{WireDecode, WireEncode};
+use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
     CREATE_CONSUMER_GROUP_CODE, DELETE_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUP_CODE,
     GET_CONSUMER_GROUPS_CODE, JOIN_CONSUMER_GROUP_CODE, LEAVE_CONSUMER_GROUP_CODE,
@@ -60,8 +60,7 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
         if response.is_empty() {
             return Ok(None);
         }
-        let wire_resp = ConsumerGroupDetailsResponse::decode_from(&response)
-            .map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<ConsumerGroupDetailsResponse>(&response)?;
         Ok(Some(ConsumerGroupDetails::from(wire_resp)))
     }
 
@@ -86,8 +85,7 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
         if response.is_empty() {
             return Ok(Vec::new());
         }
-        let wire_resp = GetConsumerGroupsResponse::decode_from(&response)
-            .map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<GetConsumerGroupsResponse>(&response)?;
         Ok(consumer_groups_from_wire(wire_resp))
     }
 
@@ -112,8 +110,7 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
                 .to_bytes(),
             )
             .await?;
-        let wire_resp = ConsumerGroupDetailsResponse::decode_from(&response)
-            .map_err(|_| IggyError::InvalidFormat)?;
+        let wire_resp = super::decode_response::<ConsumerGroupDetailsResponse>(&response)?;
         Ok(ConsumerGroupDetails::from(wire_resp))
     }
 
