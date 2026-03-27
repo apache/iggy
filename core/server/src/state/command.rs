@@ -20,7 +20,7 @@ use crate::state::models::{
     CreateConsumerGroupWithId, CreatePersonalAccessTokenWithHash, CreateStreamWithId,
     CreateTopicWithId, CreateUserWithId,
 };
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 use iggy_binary_protocol::codes::{
     CHANGE_PASSWORD_CODE, CREATE_CONSUMER_GROUP_CODE, CREATE_PARTITIONS_CODE,
     CREATE_PERSONAL_ACCESS_TOKEN_CODE, CREATE_STREAM_CODE, CREATE_TOPIC_CODE, CREATE_USER_CODE,
@@ -40,9 +40,7 @@ use iggy_binary_protocol::requests::{
         ChangePasswordRequest, DeleteUserRequest, UpdatePermissionsRequest, UpdateUserRequest,
     },
 };
-use iggy_binary_protocol::{WireDecode, WireEncode};
-use iggy_common::BytesSerializable;
-use iggy_common::IggyError;
+use iggy_binary_protocol::{WireDecode, WireEncode, WireError};
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug)]
@@ -69,119 +67,160 @@ pub enum EntryCommand {
     DeletePersonalAccessToken(DeletePersonalAccessTokenRequest),
 }
 
-fn wire_error_to_iggy(e: iggy_binary_protocol::WireError) -> IggyError {
-    tracing::warn!("wire decode error during WAL replay: {e}");
-    IggyError::InvalidCommand
-}
-
-impl BytesSerializable for EntryCommand {
-    fn to_bytes(&self) -> Bytes {
-        let (code, command) = match self {
-            EntryCommand::CreateStream(cmd) => (CREATE_STREAM_CODE, cmd.to_bytes()),
-            EntryCommand::UpdateStream(cmd) => (UPDATE_STREAM_CODE, cmd.to_bytes()),
-            EntryCommand::DeleteStream(cmd) => (DELETE_STREAM_CODE, cmd.to_bytes()),
-            EntryCommand::PurgeStream(cmd) => (PURGE_STREAM_CODE, cmd.to_bytes()),
-            EntryCommand::CreateTopic(cmd) => (CREATE_TOPIC_CODE, cmd.to_bytes()),
-            EntryCommand::UpdateTopic(cmd) => (UPDATE_TOPIC_CODE, cmd.to_bytes()),
-            EntryCommand::DeleteTopic(cmd) => (DELETE_TOPIC_CODE, cmd.to_bytes()),
-            EntryCommand::PurgeTopic(cmd) => (PURGE_TOPIC_CODE, cmd.to_bytes()),
-            EntryCommand::CreatePartitions(cmd) => (CREATE_PARTITIONS_CODE, cmd.to_bytes()),
-            EntryCommand::DeletePartitions(cmd) => (DELETE_PARTITIONS_CODE, cmd.to_bytes()),
-            EntryCommand::DeleteSegments(cmd) => (DELETE_SEGMENTS_CODE, cmd.to_bytes()),
-            EntryCommand::CreateConsumerGroup(cmd) => (CREATE_CONSUMER_GROUP_CODE, cmd.to_bytes()),
-            EntryCommand::DeleteConsumerGroup(cmd) => (DELETE_CONSUMER_GROUP_CODE, cmd.to_bytes()),
-            EntryCommand::CreateUser(cmd) => (CREATE_USER_CODE, cmd.to_bytes()),
-            EntryCommand::UpdateUser(cmd) => (UPDATE_USER_CODE, cmd.to_bytes()),
-            EntryCommand::DeleteUser(cmd) => (DELETE_USER_CODE, cmd.to_bytes()),
-            EntryCommand::ChangePassword(cmd) => (CHANGE_PASSWORD_CODE, cmd.to_bytes()),
-            EntryCommand::UpdatePermissions(cmd) => (UPDATE_PERMISSIONS_CODE, cmd.to_bytes()),
-            EntryCommand::CreatePersonalAccessToken(cmd) => {
-                (CREATE_PERSONAL_ACCESS_TOKEN_CODE, cmd.to_bytes())
-            }
-            EntryCommand::DeletePersonalAccessToken(cmd) => {
-                (DELETE_PERSONAL_ACCESS_TOKEN_CODE, cmd.to_bytes())
-            }
+impl WireEncode for EntryCommand {
+    fn encoded_size(&self) -> usize {
+        let inner_size = match self {
+            EntryCommand::CreateStream(cmd) => cmd.encoded_size(),
+            EntryCommand::UpdateStream(cmd) => cmd.encoded_size(),
+            EntryCommand::DeleteStream(cmd) => cmd.encoded_size(),
+            EntryCommand::PurgeStream(cmd) => cmd.encoded_size(),
+            EntryCommand::CreateTopic(cmd) => cmd.encoded_size(),
+            EntryCommand::UpdateTopic(cmd) => cmd.encoded_size(),
+            EntryCommand::DeleteTopic(cmd) => cmd.encoded_size(),
+            EntryCommand::PurgeTopic(cmd) => cmd.encoded_size(),
+            EntryCommand::CreatePartitions(cmd) => cmd.encoded_size(),
+            EntryCommand::DeletePartitions(cmd) => cmd.encoded_size(),
+            EntryCommand::DeleteSegments(cmd) => cmd.encoded_size(),
+            EntryCommand::CreateConsumerGroup(cmd) => cmd.encoded_size(),
+            EntryCommand::DeleteConsumerGroup(cmd) => cmd.encoded_size(),
+            EntryCommand::CreateUser(cmd) => cmd.encoded_size(),
+            EntryCommand::UpdateUser(cmd) => cmd.encoded_size(),
+            EntryCommand::DeleteUser(cmd) => cmd.encoded_size(),
+            EntryCommand::ChangePassword(cmd) => cmd.encoded_size(),
+            EntryCommand::UpdatePermissions(cmd) => cmd.encoded_size(),
+            EntryCommand::CreatePersonalAccessToken(cmd) => cmd.encoded_size(),
+            EntryCommand::DeletePersonalAccessToken(cmd) => cmd.encoded_size(),
         };
-
-        let mut bytes = BytesMut::with_capacity(4 + 4 + command.len());
-        bytes.put_u32_le(code);
-        bytes.put_u32_le(command.len() as u32);
-        bytes.extend(command);
-        bytes.freeze()
+        4 + 4 + inner_size
     }
 
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        let code = bytes.slice(0..4).get_u32_le();
-        let length = bytes.slice(4..8).get_u32_le();
-        let payload = &bytes[8..8 + length as usize];
-        match code {
-            CREATE_STREAM_CODE => Ok(EntryCommand::CreateStream(
-                CreateStreamWithId::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            UPDATE_STREAM_CODE => Ok(EntryCommand::UpdateStream(
-                UpdateStreamRequest::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            DELETE_STREAM_CODE => Ok(EntryCommand::DeleteStream(
-                DeleteStreamRequest::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            PURGE_STREAM_CODE => Ok(EntryCommand::PurgeStream(
-                PurgeStreamRequest::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            CREATE_TOPIC_CODE => Ok(EntryCommand::CreateTopic(
-                CreateTopicWithId::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            UPDATE_TOPIC_CODE => Ok(EntryCommand::UpdateTopic(
-                UpdateTopicRequest::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            DELETE_TOPIC_CODE => Ok(EntryCommand::DeleteTopic(
-                DeleteTopicRequest::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            PURGE_TOPIC_CODE => Ok(EntryCommand::PurgeTopic(
-                PurgeTopicRequest::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            CREATE_PARTITIONS_CODE => Ok(EntryCommand::CreatePartitions(
-                CreatePartitionsRequest::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            DELETE_PARTITIONS_CODE => Ok(EntryCommand::DeletePartitions(
-                DeletePartitionsRequest::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            DELETE_SEGMENTS_CODE => Ok(EntryCommand::DeleteSegments(
-                DeleteSegmentsRequest::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            CREATE_CONSUMER_GROUP_CODE => Ok(EntryCommand::CreateConsumerGroup(
-                CreateConsumerGroupWithId::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            DELETE_CONSUMER_GROUP_CODE => Ok(EntryCommand::DeleteConsumerGroup(
-                DeleteConsumerGroupRequest::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            CREATE_USER_CODE => Ok(EntryCommand::CreateUser(
-                CreateUserWithId::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            UPDATE_USER_CODE => Ok(EntryCommand::UpdateUser(
-                UpdateUserRequest::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            DELETE_USER_CODE => Ok(EntryCommand::DeleteUser(
-                DeleteUserRequest::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            CHANGE_PASSWORD_CODE => Ok(EntryCommand::ChangePassword(
-                ChangePasswordRequest::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            UPDATE_PERMISSIONS_CODE => Ok(EntryCommand::UpdatePermissions(
-                UpdatePermissionsRequest::decode_from(payload).map_err(wire_error_to_iggy)?,
-            )),
-            CREATE_PERSONAL_ACCESS_TOKEN_CODE => Ok(EntryCommand::CreatePersonalAccessToken(
-                CreatePersonalAccessTokenWithHash::decode_from(payload)
-                    .map_err(wire_error_to_iggy)?,
-            )),
-            DELETE_PERSONAL_ACCESS_TOKEN_CODE => Ok(EntryCommand::DeletePersonalAccessToken(
-                DeletePersonalAccessTokenRequest::decode_from(payload)
-                    .map_err(wire_error_to_iggy)?,
-            )),
-            _ => Err(IggyError::InvalidCommand),
+    fn encode(&self, buf: &mut BytesMut) {
+        let (code, inner_size) = match self {
+            EntryCommand::CreateStream(cmd) => (CREATE_STREAM_CODE, cmd.encoded_size()),
+            EntryCommand::UpdateStream(cmd) => (UPDATE_STREAM_CODE, cmd.encoded_size()),
+            EntryCommand::DeleteStream(cmd) => (DELETE_STREAM_CODE, cmd.encoded_size()),
+            EntryCommand::PurgeStream(cmd) => (PURGE_STREAM_CODE, cmd.encoded_size()),
+            EntryCommand::CreateTopic(cmd) => (CREATE_TOPIC_CODE, cmd.encoded_size()),
+            EntryCommand::UpdateTopic(cmd) => (UPDATE_TOPIC_CODE, cmd.encoded_size()),
+            EntryCommand::DeleteTopic(cmd) => (DELETE_TOPIC_CODE, cmd.encoded_size()),
+            EntryCommand::PurgeTopic(cmd) => (PURGE_TOPIC_CODE, cmd.encoded_size()),
+            EntryCommand::CreatePartitions(cmd) => (CREATE_PARTITIONS_CODE, cmd.encoded_size()),
+            EntryCommand::DeletePartitions(cmd) => (DELETE_PARTITIONS_CODE, cmd.encoded_size()),
+            EntryCommand::DeleteSegments(cmd) => (DELETE_SEGMENTS_CODE, cmd.encoded_size()),
+            EntryCommand::CreateConsumerGroup(cmd) => {
+                (CREATE_CONSUMER_GROUP_CODE, cmd.encoded_size())
+            }
+            EntryCommand::DeleteConsumerGroup(cmd) => {
+                (DELETE_CONSUMER_GROUP_CODE, cmd.encoded_size())
+            }
+            EntryCommand::CreateUser(cmd) => (CREATE_USER_CODE, cmd.encoded_size()),
+            EntryCommand::UpdateUser(cmd) => (UPDATE_USER_CODE, cmd.encoded_size()),
+            EntryCommand::DeleteUser(cmd) => (DELETE_USER_CODE, cmd.encoded_size()),
+            EntryCommand::ChangePassword(cmd) => (CHANGE_PASSWORD_CODE, cmd.encoded_size()),
+            EntryCommand::UpdatePermissions(cmd) => (UPDATE_PERMISSIONS_CODE, cmd.encoded_size()),
+            EntryCommand::CreatePersonalAccessToken(cmd) => {
+                (CREATE_PERSONAL_ACCESS_TOKEN_CODE, cmd.encoded_size())
+            }
+            EntryCommand::DeletePersonalAccessToken(cmd) => {
+                (DELETE_PERSONAL_ACCESS_TOKEN_CODE, cmd.encoded_size())
+            }
+        };
+        buf.put_u32_le(code);
+        buf.put_u32_le(inner_size as u32);
+        match self {
+            EntryCommand::CreateStream(cmd) => cmd.encode(buf),
+            EntryCommand::UpdateStream(cmd) => cmd.encode(buf),
+            EntryCommand::DeleteStream(cmd) => cmd.encode(buf),
+            EntryCommand::PurgeStream(cmd) => cmd.encode(buf),
+            EntryCommand::CreateTopic(cmd) => cmd.encode(buf),
+            EntryCommand::UpdateTopic(cmd) => cmd.encode(buf),
+            EntryCommand::DeleteTopic(cmd) => cmd.encode(buf),
+            EntryCommand::PurgeTopic(cmd) => cmd.encode(buf),
+            EntryCommand::CreatePartitions(cmd) => cmd.encode(buf),
+            EntryCommand::DeletePartitions(cmd) => cmd.encode(buf),
+            EntryCommand::DeleteSegments(cmd) => cmd.encode(buf),
+            EntryCommand::CreateConsumerGroup(cmd) => cmd.encode(buf),
+            EntryCommand::DeleteConsumerGroup(cmd) => cmd.encode(buf),
+            EntryCommand::CreateUser(cmd) => cmd.encode(buf),
+            EntryCommand::UpdateUser(cmd) => cmd.encode(buf),
+            EntryCommand::DeleteUser(cmd) => cmd.encode(buf),
+            EntryCommand::ChangePassword(cmd) => cmd.encode(buf),
+            EntryCommand::UpdatePermissions(cmd) => cmd.encode(buf),
+            EntryCommand::CreatePersonalAccessToken(cmd) => cmd.encode(buf),
+            EntryCommand::DeletePersonalAccessToken(cmd) => cmd.encode(buf),
         }
+    }
+}
+
+impl WireDecode for EntryCommand {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
+        if buf.len() < 8 {
+            return Err(WireError::UnexpectedEof {
+                offset: 0,
+                need: 8,
+                have: buf.len(),
+            });
+        }
+        let code = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let length = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        let payload = &buf[8..8 + length];
+        let consumed = 8 + length;
+        let cmd = match code {
+            CREATE_STREAM_CODE => {
+                EntryCommand::CreateStream(CreateStreamWithId::decode_from(payload)?)
+            }
+            UPDATE_STREAM_CODE => {
+                EntryCommand::UpdateStream(UpdateStreamRequest::decode_from(payload)?)
+            }
+            DELETE_STREAM_CODE => {
+                EntryCommand::DeleteStream(DeleteStreamRequest::decode_from(payload)?)
+            }
+            PURGE_STREAM_CODE => {
+                EntryCommand::PurgeStream(PurgeStreamRequest::decode_from(payload)?)
+            }
+            CREATE_TOPIC_CODE => {
+                EntryCommand::CreateTopic(CreateTopicWithId::decode_from(payload)?)
+            }
+            UPDATE_TOPIC_CODE => {
+                EntryCommand::UpdateTopic(UpdateTopicRequest::decode_from(payload)?)
+            }
+            DELETE_TOPIC_CODE => {
+                EntryCommand::DeleteTopic(DeleteTopicRequest::decode_from(payload)?)
+            }
+            PURGE_TOPIC_CODE => EntryCommand::PurgeTopic(PurgeTopicRequest::decode_from(payload)?),
+            CREATE_PARTITIONS_CODE => {
+                EntryCommand::CreatePartitions(CreatePartitionsRequest::decode_from(payload)?)
+            }
+            DELETE_PARTITIONS_CODE => {
+                EntryCommand::DeletePartitions(DeletePartitionsRequest::decode_from(payload)?)
+            }
+            DELETE_SEGMENTS_CODE => {
+                EntryCommand::DeleteSegments(DeleteSegmentsRequest::decode_from(payload)?)
+            }
+            CREATE_CONSUMER_GROUP_CODE => {
+                EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId::decode_from(payload)?)
+            }
+            DELETE_CONSUMER_GROUP_CODE => {
+                EntryCommand::DeleteConsumerGroup(DeleteConsumerGroupRequest::decode_from(payload)?)
+            }
+            CREATE_USER_CODE => EntryCommand::CreateUser(CreateUserWithId::decode_from(payload)?),
+            UPDATE_USER_CODE => EntryCommand::UpdateUser(UpdateUserRequest::decode_from(payload)?),
+            DELETE_USER_CODE => EntryCommand::DeleteUser(DeleteUserRequest::decode_from(payload)?),
+            CHANGE_PASSWORD_CODE => {
+                EntryCommand::ChangePassword(ChangePasswordRequest::decode_from(payload)?)
+            }
+            UPDATE_PERMISSIONS_CODE => {
+                EntryCommand::UpdatePermissions(UpdatePermissionsRequest::decode_from(payload)?)
+            }
+            CREATE_PERSONAL_ACCESS_TOKEN_CODE => EntryCommand::CreatePersonalAccessToken(
+                CreatePersonalAccessTokenWithHash::decode_from(payload)?,
+            ),
+            DELETE_PERSONAL_ACCESS_TOKEN_CODE => EntryCommand::DeletePersonalAccessToken(
+                DeletePersonalAccessTokenRequest::decode_from(payload)?,
+            ),
+            _ => return Err(WireError::UnknownCommand(code)),
+        };
+        Ok((cmd, consumed))
     }
 }
 
