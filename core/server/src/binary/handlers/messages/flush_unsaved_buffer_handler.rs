@@ -16,71 +16,50 @@
  * under the License.
  */
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
+use crate::binary::dispatch::{HandlerResult, wire_id_to_identifier};
 use crate::binary::handlers::messages::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
 use crate::shard::transmission::message::ResolvedPartition;
 use crate::streaming::session::Session;
 use err_trail::ErrContext;
-use iggy_common::{FlushUnsavedBuffer, IggyError, SenderKind};
+use iggy_binary_protocol::requests::messages::FlushUnsavedBufferRequest;
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for FlushUnsavedBuffer {
-    fn code(&self) -> u32 {
-        iggy_common::FLUSH_UNSAVED_BUFFER_CODE
-    }
+#[instrument(skip_all, name = "trace_flush_unsaved_buffer", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_partition_id = req.partition_id, iggy_fsync = req.fsync))]
+pub async fn handle_flush_unsaved_buffer(
+    req: FlushUnsavedBufferRequest,
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    let stream_id = wire_id_to_identifier(&req.stream_id)?;
+    let topic_id = wire_id_to_identifier(&req.topic_id)?;
+    let partition_id = req.partition_id;
+    let fsync = req.fsync;
+    debug!(
+        "session: {session}, command: flush_unsaved_buffer, stream_id: {stream_id}, topic_id: {topic_id}, partition_id: {partition_id}, fsync: {fsync}"
+    );
+    shard.ensure_authenticated(session)?;
 
-    #[instrument(skip_all, name = "trace_flush_unsaved_buffer", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string(), iggy_partition_id = self.partition_id, iggy_fsync = self.fsync))]
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
+    let user_id = session.get_user_id();
+    let topic = shard.resolve_topic(&stream_id, &topic_id)?;
+    let partition = ResolvedPartition {
+        stream_id: topic.stream_id,
+        topic_id: topic.topic_id,
+        partition_id: partition_id as usize,
+    };
 
-        let user_id = session.get_user_id();
-        let stream_id_log = self.stream_id.clone();
-        let topic_id_log = self.topic_id.clone();
-        let partition_id = self.partition_id;
-        let fsync = self.fsync;
-
-        let topic = shard.resolve_topic(&self.stream_id, &self.topic_id)?;
-        let partition = ResolvedPartition {
-            stream_id: topic.stream_id,
-            topic_id: topic.topic_id,
-            partition_id: partition_id as usize,
-        };
-
-        shard
-            .flush_unsaved_buffer(user_id, partition, fsync)
-            .await
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to flush unsaved buffer for stream_id: {}, topic_id: {}, partition_id: {}, session: {}",
-                    stream_id_log, topic_id_log, partition_id, session
-                )
-            })?;
-        sender.send_empty_ok_response().await?;
-        Ok(HandlerResult::Finished)
-    }
-}
-
-impl BinaryServerCommand for FlushUnsavedBuffer {
-    async fn from_sender(
-        sender: &mut SenderKind,
-        code: u32,
-        length: u32,
-    ) -> Result<Self, IggyError> {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::FlushUnsavedBuffer(flush_unsaved_buffer) => Ok(flush_unsaved_buffer),
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+    shard
+        .flush_unsaved_buffer(user_id, partition, fsync)
+        .await
+        .error(|e: &IggyError| {
+            format!(
+                "{COMPONENT} (error: {e}) - failed to flush unsaved buffer for stream_id: {}, topic_id: {}, partition_id: {}, session: {}",
+                stream_id, topic_id, partition_id, session
+            )
+        })?;
+    sender.send_empty_ok_response().await?;
+    Ok(HandlerResult::Finished)
 }
