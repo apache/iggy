@@ -199,17 +199,9 @@ impl WireDecode for StatsResponse {
         let (iggy_server_version, next) = decode_len_prefixed_str(buf, pos)?;
         pos = next;
 
-        // iggy_server_semver is optional - only present if enough bytes remain
-        // before the cache_metrics section. We need at least 8 bytes for
-        // semver(4) + cache_count(4), vs 4 bytes for just cache_count(4).
-        let remaining = buf.len().saturating_sub(pos);
-        let iggy_server_semver = if remaining >= 8 {
-            let v = read_u32_le(buf, pos)?;
-            pos += 4;
-            (v != 0).then_some(v)
-        } else {
-            None
-        };
+        let raw_semver = read_u32_le(buf, pos)?;
+        pos += 4;
+        let iggy_server_semver = (raw_semver != 0).then_some(raw_semver);
 
         let cache_count = read_u32_le(buf, pos)? as usize;
         pos += 4;
@@ -238,24 +230,14 @@ impl WireDecode for StatsResponse {
             });
         }
 
-        // Optional tail fields for backwards compatibility with older servers
-        let mut threads_count = 0u32;
-        if pos + 4 <= buf.len() {
-            threads_count = read_u32_le(buf, pos)?;
-            pos += 4;
-        }
+        let threads_count = read_u32_le(buf, pos)?;
+        pos += 4;
 
-        let mut free_disk_space = 0u64;
-        if pos + 8 <= buf.len() {
-            free_disk_space = read_u64_le(buf, pos)?;
-            pos += 8;
-        }
+        let free_disk_space = read_u64_le(buf, pos)?;
+        pos += 8;
 
-        let mut total_disk_space = 0u64;
-        if pos + 8 <= buf.len() {
-            total_disk_space = read_u64_le(buf, pos)?;
-            pos += 8;
-        }
+        let total_disk_space = read_u64_le(buf, pos)?;
+        pos += 8;
 
         Ok((
             Self {
