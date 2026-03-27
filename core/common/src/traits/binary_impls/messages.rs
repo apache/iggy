@@ -19,8 +19,8 @@ use crate::BinaryClient;
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::identifier_to_wire;
 use crate::{
-    BytesSerializable, Consumer, Identifier, IggyError, IggyMessage, MessageClient, Partitioning,
-    PollMessages, PolledMessages, PollingStrategy, SendMessages,
+    Consumer, Identifier, IggyError, IggyMessage, MessageClient, Partitioning, PollMessages,
+    PolledMessages, PollingStrategy, SendMessages,
 };
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{

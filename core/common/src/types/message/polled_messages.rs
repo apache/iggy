@@ -52,12 +52,8 @@ impl PolledMessages {
     }
 }
 
-impl BytesSerializable for PolledMessages {
-    fn to_bytes(&self) -> Bytes {
-        panic!("should not be used")
-    }
-
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
+impl PolledMessages {
+    pub fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
         let partition_id = u32::from_le_bytes(
             bytes[0..4]
                 .try_into()
