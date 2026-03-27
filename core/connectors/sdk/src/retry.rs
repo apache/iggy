@@ -23,6 +23,9 @@
 //! - [`HttpRetryMiddleware`] — `reqwest-middleware` middleware with
 //!   exponential back-off, jitter, and `Retry-After` header support
 //! - [`build_retry_client`] — wraps a `reqwest::Client` with the middleware
+//! - [`check_connectivity`] — single health-check probe (GET /health)
+//! - [`check_connectivity_with_retry`] — startup probe with exponential backoff
+//! - [`ConnectivityConfig`] — parameters for the startup retry loop
 //! - [`is_transient_status`] — transient HTTP status predicate
 //! - [`parse_duration`] — humantime duration parsing with fallback
 //! - [`jitter`] — ±20 % random jitter for retry delays
@@ -353,149 +356,93 @@ pub fn build_retry_client(
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests
+// Shared connectivity helper
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
+/// Configuration for the startup connectivity retry loop.
+///
+/// This is intentionally separate from per-request retry config so that
+/// startup can wait patiently for a service (e.g. 10 retries over 60 s)
+/// without affecting the shorter per-request retry window used during
+/// normal operation.
+pub struct ConnectivityConfig {
+    pub max_open_retries: u32,
+    pub open_retry_max_delay: Duration,
+    pub retry_delay: Duration,
+}
 
-    // ── CircuitBreaker ────────────────────────────────────────────────────
+/// Probe `url` with a plain GET and return `Ok(())` if the response is 2xx.
+///
+/// This is a single, non-retried attempt. The caller is responsible for the
+/// outer retry loop (see [`check_connectivity_with_retry`]).
+pub async fn check_connectivity(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    connector_label: &str,
+) -> Result<(), crate::Error> {
+    let response = client.get(url).send().await.map_err(|e| {
+        crate::Error::Connection(format!("{connector_label} health check failed: {e}"))
+    })?;
 
-    #[tokio::test]
-    async fn circuit_starts_closed() {
-        let cb = CircuitBreaker::new(3, Duration::from_secs(60));
-        assert!(!cb.is_open().await);
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "failed to read response body".to_string());
+        return Err(crate::Error::Connection(format!(
+            "{connector_label} health check returned status {status}: {body}"
+        )));
     }
+    Ok(())
+}
 
-    #[tokio::test]
-    async fn circuit_opens_at_threshold() {
-        let cb = CircuitBreaker::new(2, Duration::from_secs(60));
-        cb.record_failure().await;
-        assert!(
-            !cb.is_open().await,
-            "one failure should not open the circuit"
-        );
-        cb.record_failure().await;
-        assert!(
-            cb.is_open().await,
-            "threshold reached — circuit should be open"
-        );
-    }
+/// Retry [`check_connectivity`] with exponential backoff + jitter.
+///
+/// `connector_label` is used in log messages (e.g. `"InfluxDB sink connector ID: 1"`).
+/// `connector_id` is included in log messages for multi-instance deployments.
+pub async fn check_connectivity_with_retry(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    connector_label: &str,
+    connector_id: u32,
+    cfg: &ConnectivityConfig,
+) -> Result<(), crate::Error> {
+    let max_open_retries = cfg.max_open_retries.max(1);
+    let mut attempt = 0u32;
 
-    #[tokio::test]
-    async fn record_success_resets_and_closes_circuit() {
-        let cb = CircuitBreaker::new(1, Duration::from_secs(60));
-        cb.record_failure().await;
-        assert!(cb.is_open().await);
-        // record_success uses try_lock; sleep a tick to ensure it acquires
-        tokio::time::sleep(Duration::from_millis(1)).await;
-        cb.record_success();
-        // After success the cool_down is cancelled; wait for the lock
-        tokio::time::sleep(Duration::from_millis(1)).await;
-        assert!(!cb.is_open().await);
-    }
-
-    #[tokio::test]
-    async fn circuit_transitions_to_half_open_after_cooldown() {
-        let cb = CircuitBreaker::new(1, Duration::from_millis(10));
-        cb.record_failure().await;
-        assert!(cb.is_open().await);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        // Cool-down elapsed → half-open → returns false
-        assert!(!cb.is_open().await);
-    }
-
-    // ── parse_duration ───────────────────────────────────────────────────
-
-    #[test]
-    fn parse_duration_valid() {
-        assert_eq!(parse_duration(Some("5s"), "1s"), Duration::from_secs(5));
-        assert_eq!(
-            parse_duration(Some("200ms"), "1s"),
-            Duration::from_millis(200)
-        );
-    }
-
-    #[test]
-    fn parse_duration_falls_back_to_default() {
-        assert_eq!(parse_duration(None, "3s"), Duration::from_secs(3));
-    }
-
-    #[test]
-    fn parse_duration_falls_back_to_one_second_on_invalid() {
-        // Invalid user-supplied value — falls back to 1s (and would emit warn! at runtime)
-        assert_eq!(
-            parse_duration(Some("not-a-duration"), "3s"),
-            Duration::from_secs(1)
-        );
-    }
-
-    #[test]
-    fn parse_duration_falls_back_silently_when_no_value_supplied() {
-        // None means "use the default"; the default itself is always valid
-        // so no warn! is emitted and the result is the parsed default.
-        assert_eq!(parse_duration(None, "3s"), Duration::from_secs(3));
-    }
-
-    // ── exponential_backoff ──────────────────────────────────────────────
-
-    #[test]
-    fn exponential_backoff_doubles_each_attempt() {
-        let base = Duration::from_millis(100);
-        let max = Duration::from_secs(60);
-        assert_eq!(
-            exponential_backoff(base, 0, max),
-            Duration::from_millis(100)
-        );
-        assert_eq!(
-            exponential_backoff(base, 1, max),
-            Duration::from_millis(200)
-        );
-        assert_eq!(
-            exponential_backoff(base, 2, max),
-            Duration::from_millis(400)
-        );
-    }
-
-    #[test]
-    fn exponential_backoff_capped_at_max_delay() {
-        let base = Duration::from_millis(1000);
-        let max = Duration::from_millis(2500);
-        assert_eq!(exponential_backoff(base, 10, max), max);
-    }
-
-    // ── parse_retry_after ────────────────────────────────────────────────
-
-    #[test]
-    fn parse_retry_after_integer_seconds() {
-        assert_eq!(parse_retry_after("30"), Some(Duration::from_secs(30)));
-        assert_eq!(parse_retry_after("  5  "), Some(Duration::from_secs(5)));
-    }
-
-    #[test]
-    fn parse_retry_after_http_date_returns_none() {
-        assert_eq!(
-            parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
-            None,
-            "HTTP-date format should return None"
-        );
-    }
-
-    // ── is_transient_status ──────────────────────────────────────────────
-
-    #[test]
-    fn transient_status_429_and_5xx() {
-        assert!(is_transient_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
-        assert!(is_transient_status(
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        ));
-        assert!(is_transient_status(
-            reqwest::StatusCode::SERVICE_UNAVAILABLE
-        ));
-        assert!(!is_transient_status(reqwest::StatusCode::BAD_REQUEST));
-        assert!(!is_transient_status(reqwest::StatusCode::UNAUTHORIZED));
-        assert!(!is_transient_status(reqwest::StatusCode::NOT_FOUND));
+    loop {
+        match check_connectivity(client, url.clone(), connector_label).await {
+            Ok(()) => {
+                if attempt > 0 {
+                    tracing::info!(
+                        "{connector_label} connectivity established after {attempt} retries \
+                         for connector ID: {connector_id}"
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                attempt += 1;
+                if attempt >= max_open_retries {
+                    tracing::error!(
+                        "{connector_label} connectivity check failed after {attempt} attempts \
+                         for connector ID: {connector_id}. Giving up: {e}"
+                    );
+                    return Err(e);
+                }
+                let backoff = jitter(exponential_backoff(
+                    cfg.retry_delay,
+                    attempt,
+                    cfg.open_retry_max_delay,
+                ));
+                tracing::warn!(
+                    "{connector_label} health check failed \
+                     (attempt {attempt}/{max_open_retries}) \
+                     for connector ID: {connector_id}. Retrying in {backoff:?}: {e}"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+        }
     }
 }

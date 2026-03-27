@@ -22,7 +22,8 @@ use csv::StringRecord;
 use iggy_common::serde_secret::serialize_secret;
 use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::retry::{
-    CircuitBreaker, build_retry_client, exponential_backoff, jitter, parse_duration,
+    CircuitBreaker, ConnectivityConfig, build_retry_client, check_connectivity_with_retry,
+    parse_duration,
 };
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
@@ -86,6 +87,9 @@ pub struct InfluxDbSource {
     verbose: bool,
     retry_delay: Duration,
     poll_interval: Duration,
+    /// Resolved once in `new()` — avoids a `to_ascii_lowercase()` allocation
+    /// on every message in the hot path.
+    payload_format: PayloadFormat,
     circuit_breaker: Arc<CircuitBreaker>,
 }
 
@@ -234,6 +238,7 @@ impl InfluxDbSource {
         let verbose = config.verbose_logging.unwrap_or(false);
         let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
         let poll_interval = parse_duration(config.poll_interval.as_deref(), DEFAULT_POLL_INTERVAL);
+        let payload_format = PayloadFormat::from_config(config.payload_format.as_deref());
 
         // Build circuit breaker from config
         let cb_threshold = config
@@ -267,6 +272,7 @@ impl InfluxDbSource {
             verbose,
             retry_delay,
             poll_interval,
+            payload_format,
             circuit_breaker: Arc::new(CircuitBreaker::new(cb_threshold, cb_cool_down)),
         }
     }
@@ -276,7 +282,7 @@ impl InfluxDbSource {
     }
 
     fn payload_format(&self) -> PayloadFormat {
-        PayloadFormat::from_config(self.config.payload_format.as_deref())
+        self.payload_format
     }
 
     fn cursor_field(&self) -> &str {
@@ -316,84 +322,6 @@ impl InfluxDbSource {
             .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))?;
         url.query_pairs_mut().append_pair("org", &self.config.org);
         Ok(url)
-    }
-
-    /// Single connectivity probe using the provided raw client (no retry).
-    /// The caller (`check_connectivity_with_retry`) owns the outer retry loop,
-    /// which uses different delay bounds than per-query retries.
-    async fn check_connectivity(&self, client: &reqwest::Client) -> Result<(), Error> {
-        let url = self.build_health_url()?;
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| Error::Connection(format!("InfluxDB health check failed: {e}")))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "failed to read response body".to_string());
-            return Err(Error::Connection(format!(
-                "InfluxDB health check returned status {status}: {body}"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Retry connectivity check with exponential backoff + jitter instead of
-    /// failing hard on the first attempt.
-    ///
-    /// Uses separate `max_open_retries` / `open_retry_max_delay` so startup
-    /// can wait patiently for InfluxDB without affecting the per-query retry
-    /// parameters used by the middleware during normal operation.
-    async fn check_connectivity_with_retry(&self, client: &reqwest::Client) -> Result<(), Error> {
-        let max_open_retries = self
-            .config
-            .max_open_retries
-            .unwrap_or(DEFAULT_MAX_OPEN_RETRIES)
-            .max(1);
-
-        let max_delay = parse_duration(
-            self.config.open_retry_max_delay.as_deref(),
-            DEFAULT_OPEN_RETRY_MAX_DELAY,
-        );
-
-        let mut attempt = 0u32;
-        loop {
-            match self.check_connectivity(client).await {
-                Ok(()) => {
-                    if attempt > 0 {
-                        info!(
-                            "InfluxDB connectivity established after {attempt} retries \
-                             for connector ID: {}",
-                            self.id
-                        );
-                    }
-                    return Ok(());
-                }
-                Err(e) => {
-                    attempt += 1;
-                    if attempt >= max_open_retries {
-                        error!(
-                            "InfluxDB connectivity check failed after {attempt} attempts \
-                             for connector ID: {}. Giving up: {e}",
-                            self.id
-                        );
-                        return Err(e);
-                    }
-                    // Exponential backoff, with jitter
-                    let backoff = jitter(exponential_backoff(self.retry_delay, attempt, max_delay));
-                    warn!(
-                        "InfluxDB health check failed (attempt {attempt}/{max_open_retries}) \
-                         for connector ID: {}. Retrying in {backoff:?}: {e}",
-                        self.id
-                    );
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-        }
     }
 
     fn cursor_re() -> &'static Regex {
@@ -725,7 +653,25 @@ impl Source for InfluxDbSource {
         // is only safe for timestamp columns. See validate_cursor_field for details.
         Self::validate_cursor_field(self.cursor_field())?;
 
-        self.check_connectivity_with_retry(&raw_client).await?;
+        let health_url = self.build_health_url()?;
+        check_connectivity_with_retry(
+            &raw_client,
+            health_url,
+            "InfluxDB source",
+            self.id,
+            &ConnectivityConfig {
+                max_open_retries: self
+                    .config
+                    .max_open_retries
+                    .unwrap_or(DEFAULT_MAX_OPEN_RETRIES),
+                open_retry_max_delay: parse_duration(
+                    self.config.open_retry_max_delay.as_deref(),
+                    DEFAULT_OPEN_RETRY_MAX_DELAY,
+                ),
+                retry_delay: self.retry_delay,
+            },
+        )
+        .await?;
 
         // Wrap in the retry middleware for all subsequent query operations.
         // The middleware handles transient 429 / 5xx retries with

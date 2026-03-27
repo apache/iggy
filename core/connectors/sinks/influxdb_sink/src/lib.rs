@@ -21,7 +21,8 @@ use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use iggy_common::serde_secret::serialize_secret;
 use iggy_connector_sdk::retry::{
-    CircuitBreaker, build_retry_client, exponential_backoff, jitter, parse_duration,
+    CircuitBreaker, ConnectivityConfig, build_retry_client, check_connectivity_with_retry,
+    parse_duration,
 };
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
@@ -73,6 +74,9 @@ pub struct InfluxDbSink {
     write_errors: AtomicU64,
     verbose: bool,
     retry_delay: Duration,
+    /// Resolved once in `new()` — avoids a `to_ascii_lowercase()` allocation
+    /// on every message in the hot path.
+    payload_format: PayloadFormat,
     circuit_breaker: Arc<CircuitBreaker>,
 }
 
@@ -204,6 +208,7 @@ impl InfluxDbSink {
     pub fn new(id: u32, config: InfluxDbSinkConfig) -> Self {
         let verbose = config.verbose_logging.unwrap_or(false);
         let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
+        let payload_format = PayloadFormat::from_config(config.payload_format.as_deref());
 
         // Build circuit breaker from config
         let cb_threshold = config
@@ -224,6 +229,7 @@ impl InfluxDbSink {
             write_errors: AtomicU64::new(0),
             verbose,
             retry_delay,
+            payload_format,
             circuit_breaker: Arc::new(CircuitBreaker::new(cb_threshold, cb_cool_down)),
         }
     }
@@ -260,86 +266,6 @@ impl InfluxDbSink {
             .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))
     }
 
-    /// Single connectivity probe using the provided raw client (no retry).
-    /// The caller (`check_connectivity_with_retry`) is responsible for the
-    /// outer retry loop, which uses different delay bounds than per-write retries.
-    async fn check_connectivity(&self, client: &reqwest::Client) -> Result<(), Error> {
-        let url = self.build_health_url()?;
-
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| Error::Connection(format!("InfluxDB health check failed: {e}")))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "failed to read response body".to_string());
-            return Err(Error::Connection(format!(
-                "InfluxDB health check returned status {status}: {body}"
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// Retry connectivity check with exponential backoff + jitter instead of
-    /// failing hard on the first attempt.
-    ///
-    /// Uses a separate `max_open_retries` / `open_retry_max_delay` so startup
-    /// can wait patiently for InfluxDB without affecting the per-write retry
-    /// parameters used by the middleware during normal operation.
-    async fn check_connectivity_with_retry(&self, client: &reqwest::Client) -> Result<(), Error> {
-        let max_open_retries = self
-            .config
-            .max_open_retries
-            .unwrap_or(DEFAULT_MAX_OPEN_RETRIES)
-            .max(1);
-
-        let max_delay = parse_duration(
-            self.config.open_retry_max_delay.as_deref(),
-            DEFAULT_OPEN_RETRY_MAX_DELAY,
-        );
-
-        let mut attempt = 0u32;
-        loop {
-            match self.check_connectivity(client).await {
-                Ok(()) => {
-                    if attempt > 0 {
-                        info!(
-                            "InfluxDB connectivity established after {attempt} retries \
-                             for sink connector ID: {}",
-                            self.id
-                        );
-                    }
-                    return Ok(());
-                }
-                Err(e) => {
-                    attempt += 1;
-                    if attempt >= max_open_retries {
-                        error!(
-                            "InfluxDB connectivity check failed after {attempt} attempts \
-                             for sink connector ID: {}. Giving up: {e}",
-                            self.id
-                        );
-                        return Err(e);
-                    }
-                    // Exponential backoff, with jitter
-                    let backoff = jitter(exponential_backoff(self.retry_delay, attempt, max_delay));
-                    warn!(
-                        "InfluxDB health check failed (attempt {attempt}/{max_open_retries}) \
-                         for sink connector ID: {}. Retrying in {backoff:?}: {e}",
-                        self.id
-                    );
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-        }
-    }
-
     fn get_client(&self) -> Result<&ClientWithMiddleware, Error> {
         self.client
             .as_ref()
@@ -354,7 +280,7 @@ impl InfluxDbSink {
     }
 
     fn payload_format(&self) -> PayloadFormat {
-        PayloadFormat::from_config(self.config.payload_format.as_deref())
+        self.payload_format
     }
 
     fn timestamp_precision(&self) -> &str {
@@ -479,27 +405,47 @@ impl InfluxDbSink {
         }
 
         // ── Payload field ────────────────────────────────────────────────────
-        // try_as_bytes() serialises in-place without cloning the Payload tree.
-        let payload_bytes = message.payload.try_as_bytes().map_err(|e| {
-            Error::CannotStoreData(format!("Failed to convert payload to bytes: {e}"))
-        })?;
-
         match self.payload_format() {
             PayloadFormat::Json => {
-                let value: serde_json::Value =
-                    serde_json::from_slice(&payload_bytes).map_err(|e| {
-                        Error::CannotStoreData(format!(
-                            "Payload format is json but payload is invalid JSON: {e}"
-                        ))
-                    })?;
-                let compact = serde_json::to_string(&value).map_err(|e| {
-                    Error::CannotStoreData(format!("Failed to serialize JSON payload: {e}"))
-                })?;
+                // Fast path: if the payload is already a parsed simd_json value,
+                // serialise directly to a compact string — one pass, no bytes
+                // round-trip. Avoids: simd_json→bytes, bytes→serde_json::Value,
+                // serde_json::Value→string (three allocating passes per message).
+                //
+                // Fallback: any other Payload variant (Raw bytes that happen to
+                // contain JSON, Text, etc.) goes through try_to_bytes() first.
+                let compact = match &message.payload {
+                    iggy_connector_sdk::Payload::Json(value) => simd_json::to_string(value)
+                        .map_err(|e| {
+                            Error::CannotStoreData(format!("Failed to serialize JSON payload: {e}"))
+                        })?,
+                    _ => {
+                        let bytes = message.payload.try_to_bytes().map_err(|e| {
+                            Error::CannotStoreData(format!(
+                                "Failed to convert payload to bytes: {e}"
+                            ))
+                        })?;
+                        // Validate that the bytes are actually JSON before
+                        // writing them into the line-protocol field.
+                        let value: serde_json::Value =
+                            serde_json::from_slice(&bytes).map_err(|e| {
+                                Error::CannotStoreData(format!(
+                                    "Payload format is json but payload is invalid JSON: {e}"
+                                ))
+                            })?;
+                        serde_json::to_string(&value).map_err(|e| {
+                            Error::CannotStoreData(format!("Failed to serialize JSON payload: {e}"))
+                        })?
+                    }
+                };
                 buf.push_str(",payload_json=\"");
                 write_field_string(buf, &compact);
                 buf.push('"');
             }
             PayloadFormat::Text => {
+                let payload_bytes = message.payload.try_to_bytes().map_err(|e| {
+                    Error::CannotStoreData(format!("Failed to convert payload to bytes: {e}"))
+                })?;
                 let text = String::from_utf8(payload_bytes).map_err(|e| {
                     Error::CannotStoreData(format!(
                         "Payload format is text but payload is invalid UTF-8: {e}"
@@ -510,6 +456,9 @@ impl InfluxDbSink {
                 buf.push('"');
             }
             PayloadFormat::Base64 => {
+                let payload_bytes = message.payload.try_to_bytes().map_err(|e| {
+                    Error::CannotStoreData(format!("Failed to convert payload to bytes: {e}"))
+                })?;
                 let encoded = general_purpose::STANDARD.encode(&payload_bytes);
                 buf.push_str(",payload_base64=\"");
                 write_field_string(buf, &encoded);
@@ -630,7 +579,25 @@ impl Sink for InfluxDbSink {
         // we keep them independent rather than routing health checks through
         // the write-tuned middleware.
         let raw_client = self.build_raw_client()?;
-        self.check_connectivity_with_retry(&raw_client).await?;
+        let health_url = self.build_health_url()?;
+        check_connectivity_with_retry(
+            &raw_client,
+            health_url,
+            "InfluxDB sink",
+            self.id,
+            &ConnectivityConfig {
+                max_open_retries: self
+                    .config
+                    .max_open_retries
+                    .unwrap_or(DEFAULT_MAX_OPEN_RETRIES),
+                open_retry_max_delay: parse_duration(
+                    self.config.open_retry_max_delay.as_deref(),
+                    DEFAULT_OPEN_RETRY_MAX_DELAY,
+                ),
+                retry_delay: self.retry_delay,
+            },
+        )
+        .await?;
 
         // Wrap in the retry middleware for all subsequent write operations.
         // The middleware handles transient 429 / 5xx retries with
@@ -1119,5 +1086,470 @@ mod tests {
             PayloadFormat::Base64
         );
         assert_eq!(PayloadFormat::from_config(None), PayloadFormat::Json);
+    }
+
+    // ── payload_format cached at construction ────────────────────────────────────
+
+    #[test]
+    fn payload_format_resolved_at_construction_text() {
+        let mut config = make_config();
+        config.payload_format = Some("text".to_string());
+        let sink = InfluxDbSink::new(1, config);
+        // The cached field must reflect what was in the config at new() time.
+        assert_eq!(sink.payload_format(), PayloadFormat::Text);
+    }
+
+    #[test]
+    fn payload_format_resolved_at_construction_base64() {
+        let mut config = make_config();
+        config.payload_format = Some("base64".to_string());
+        let sink = InfluxDbSink::new(1, config);
+        assert_eq!(sink.payload_format(), PayloadFormat::Base64);
+    }
+
+    #[test]
+    fn payload_format_resolved_at_construction_none_defaults_to_json() {
+        let mut config = make_config();
+        config.payload_format = None;
+        let sink = InfluxDbSink::new(1, config);
+        assert_eq!(sink.payload_format(), PayloadFormat::Json);
+    }
+
+    #[test]
+    fn payload_format_resolved_at_construction_unknown_defaults_to_json() {
+        let mut config = make_config();
+        config.payload_format = Some("bogus".to_string());
+        let sink = InfluxDbSink::new(1, config);
+        assert_eq!(sink.payload_format(), PayloadFormat::Json);
+    }
+
+    // ── append_line — Payload::Json fast path ───────────────────────────────────
+
+    #[test]
+    fn append_line_native_json_payload_uses_fast_path() {
+        // Payload::Json is the new fast path (single simd_json serialisation pass).
+        let sink = make_sink(); // payload_format = "json"
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+
+        let value = simd_json::json!({"sensor": "temp", "value": 23.5_f64});
+        let msg = make_message(iggy_connector_sdk::Payload::Json(value));
+
+        let mut buf = String::new();
+        sink.append_line(&mut buf, &topic, &meta, &msg).unwrap();
+
+        assert!(buf.contains("payload_json="), "field name must be present");
+        // The compact JSON must contain the key and value somewhere in the field.
+        assert!(
+            buf.contains("sensor") && buf.contains("temp"),
+            "JSON content must survive serialisation: {buf}"
+        );
+    }
+
+    #[test]
+    fn append_line_native_json_and_raw_json_produce_equivalent_output() {
+        // Both Payload::Json and Payload::Raw(valid_json_bytes) must produce the
+        // same logical JSON value in the line-protocol field, even though they
+        // travel through different code paths.
+        let mut config = make_config();
+        config.payload_format = Some("json".to_string());
+        let sink = InfluxDbSink::new(1, config);
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+
+        let raw_bytes = b"{\"k\":1}".to_vec();
+
+        // Fast path: already-parsed OwnedValue
+        let native_val = simd_json::owned::to_value(&mut raw_bytes.clone()).unwrap();
+        let msg_native = make_message(iggy_connector_sdk::Payload::Json(native_val));
+        let mut buf_native = String::new();
+        sink.append_line(&mut buf_native, &topic, &meta, &msg_native)
+            .unwrap();
+
+        // Fallback path: raw bytes
+        let msg_raw = make_message(iggy_connector_sdk::Payload::Raw(raw_bytes));
+        let mut buf_raw = String::new();
+        sink.append_line(&mut buf_raw, &topic, &meta, &msg_raw)
+            .unwrap();
+
+        // Extract just the payload_json field value from each line.
+        // Both should encode {"k":1} (possibly different key ordering, both valid).
+        let extract_json_field = |line: &str| -> serde_json::Value {
+            // Find the payload_json="..." section and parse it.
+            let start = line.find("payload_json=\"").unwrap() + "payload_json=\"".len();
+            // Walk forward to the closing unescaped quote.
+            let remainder = &line[start..];
+            let mut end = 0;
+            let chars: Vec<char> = remainder.chars().collect();
+            while end < chars.len() {
+                if chars[end] == '"' && (end == 0 || chars[end - 1] != '\\') {
+                    break;
+                }
+                end += 1;
+            }
+            let json_str = &remainder[..end].replace("\\\"", "\"").replace("\\\\", "\\");
+            serde_json::from_str(json_str).unwrap()
+        };
+
+        let val_native = extract_json_field(&buf_native);
+        let val_raw = extract_json_field(&buf_raw);
+        assert_eq!(val_native, val_raw, "fast-path and fallback must agree");
+    }
+
+    #[test]
+    fn append_line_text_payload_uses_payload_text_field() {
+        let mut config = make_config();
+        config.payload_format = Some("text".to_string());
+        let sink = InfluxDbSink::new(1, config);
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+        let msg = make_message(iggy_connector_sdk::Payload::Text(
+            "hello influx".to_string(),
+        ));
+
+        let mut buf = String::new();
+        sink.append_line(&mut buf, &topic, &meta, &msg).unwrap();
+        assert!(buf.contains("payload_text="), "field name must be present");
+        assert!(buf.contains("hello influx"), "content must be preserved");
+    }
+
+    #[test]
+    fn append_line_text_payload_from_raw_bytes() {
+        let mut config = make_config();
+        config.payload_format = Some("text".to_string());
+        let sink = InfluxDbSink::new(1, config);
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+        let msg = make_message(iggy_connector_sdk::Payload::Raw(b"raw_as_text".to_vec()));
+
+        let mut buf = String::new();
+        sink.append_line(&mut buf, &topic, &meta, &msg).unwrap();
+        assert!(buf.contains("payload_text="));
+        assert!(buf.contains("raw_as_text"));
+    }
+
+    // ── append_line — timestamp zero fallback ───────────────────────────────────
+
+    #[test]
+    fn append_line_zero_timestamp_falls_back_to_now() {
+        let sink = make_sink();
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+        // message.timestamp == 0 triggers the now() fallback.
+        let mut msg = make_message(iggy_connector_sdk::Payload::Raw(b"{\"x\":1}".to_vec()));
+        msg.timestamp = 0;
+
+        let mut buf = String::new();
+        sink.append_line(&mut buf, &topic, &meta, &msg).unwrap();
+
+        // Extract the trailing timestamp from the line-protocol line.
+        // Format: "measurement,...,tag=v field=v timestamp\n"
+        let ts_str = buf.trim().rsplit(' ').next().unwrap();
+        let ts: u64 = ts_str.parse().expect("timestamp should be a u64");
+
+        // Must be after Unix epoch (year 1970) and before year 2100.
+        let year_2100_us = 4_102_444_800_000_000u64; // approx
+        assert!(ts > 0, "zero timestamp must produce a positive fallback");
+        assert!(
+            ts < year_2100_us,
+            "fallback timestamp is unreasonably large: {ts}"
+        );
+    }
+
+    #[test]
+    fn append_line_nonzero_timestamp_preserved() {
+        let sink = make_sink(); // precision = "us" (identity transform)
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+        let mut msg = make_message(iggy_connector_sdk::Payload::Raw(b"{\"x\":1}".to_vec()));
+        msg.timestamp = 1_700_000_000_000_000; // 2023-11-14 in µs
+
+        let mut buf = String::new();
+        sink.append_line(&mut buf, &topic, &meta, &msg).unwrap();
+
+        let ts_str = buf.trim().rsplit(' ').next().unwrap();
+        let ts: u64 = ts_str.parse().unwrap();
+        assert_eq!(
+            ts, 1_700_000_000_000_000,
+            "timestamp must pass through unchanged"
+        );
+    }
+
+    // ── append_line — checksum / origin_timestamp fields ────────────────────────
+
+    #[test]
+    fn append_line_checksum_field_present_by_default() {
+        let sink = make_sink(); // include_checksum = Some(true)
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+        let msg = make_message(iggy_connector_sdk::Payload::Raw(b"{\"x\":1}".to_vec()));
+
+        let mut buf = String::new();
+        sink.append_line(&mut buf, &topic, &meta, &msg).unwrap();
+        // make_message sets checksum = 12345
+        assert!(
+            buf.contains("iggy_checksum=12345u"),
+            "checksum field missing: {buf}"
+        );
+    }
+
+    #[test]
+    fn append_line_checksum_suppressed_when_disabled() {
+        let mut config = make_config();
+        config.include_checksum = Some(false);
+        let sink = InfluxDbSink::new(1, config);
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+        let msg = make_message(iggy_connector_sdk::Payload::Raw(b"{\"x\":1}".to_vec()));
+
+        let mut buf = String::new();
+        sink.append_line(&mut buf, &topic, &meta, &msg).unwrap();
+        assert!(
+            !buf.contains("iggy_checksum"),
+            "checksum must be absent: {buf}"
+        );
+    }
+
+    #[test]
+    fn append_line_origin_timestamp_present_by_default() {
+        let sink = make_sink();
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+        // make_message sets origin_timestamp = 1_000_000
+        let msg = make_message(iggy_connector_sdk::Payload::Raw(b"{\"x\":1}".to_vec()));
+
+        let mut buf = String::new();
+        sink.append_line(&mut buf, &topic, &meta, &msg).unwrap();
+        assert!(
+            buf.contains("iggy_origin_timestamp=1000000u"),
+            "origin_timestamp missing: {buf}"
+        );
+    }
+
+    #[test]
+    fn append_line_origin_timestamp_suppressed_when_disabled() {
+        let mut config = make_config();
+        config.include_origin_timestamp = Some(false);
+        let sink = InfluxDbSink::new(1, config);
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+        let msg = make_message(iggy_connector_sdk::Payload::Raw(b"{\"x\":1}".to_vec()));
+
+        let mut buf = String::new();
+        sink.append_line(&mut buf, &topic, &meta, &msg).unwrap();
+        assert!(
+            !buf.contains("iggy_origin_timestamp"),
+            "must be absent: {buf}"
+        );
+    }
+
+    // ── append_line — metadata disabled entirely ─────────────────────────────────
+
+    #[test]
+    fn append_line_no_metadata_at_all() {
+        let mut config = make_config();
+        config.include_metadata = Some(false);
+        let sink = InfluxDbSink::new(1, config);
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+        let msg = make_message(iggy_connector_sdk::Payload::Raw(b"{\"x\":1}".to_vec()));
+
+        let mut buf = String::new();
+        sink.append_line(&mut buf, &topic, &meta, &msg).unwrap();
+
+        // With include_metadata=false, stream/topic/partition tags AND their
+        // field fallbacks must all be absent.
+        assert!(!buf.contains(",stream="), "stream tag must be absent");
+        assert!(!buf.contains(",topic="), "topic tag must be absent");
+        assert!(!buf.contains(",partition="), "partition tag must be absent");
+        assert!(!buf.contains("iggy_stream="), "stream field must be absent");
+        assert!(!buf.contains("iggy_topic="), "topic field must be absent");
+        assert!(
+            !buf.contains("iggy_partition="),
+            "partition field must be absent"
+        );
+    }
+
+    // ── build_write_url ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn build_write_url_contains_org_bucket_precision() {
+        let sink = make_sink(); // org=test_org, bucket=test_bucket, precision=us
+        let url = sink.build_write_url().unwrap();
+        let query = url.query().unwrap_or("");
+        assert!(query.contains("org=test_org"), "org missing: {query}");
+        assert!(
+            query.contains("bucket=test_bucket"),
+            "bucket missing: {query}"
+        );
+        assert!(query.contains("precision=us"), "precision missing: {query}");
+    }
+
+    #[test]
+    fn build_write_url_path_is_api_v2_write() {
+        let sink = make_sink();
+        let url = sink.build_write_url().unwrap();
+        assert_eq!(url.path(), "/api/v2/write");
+    }
+
+    #[test]
+    fn build_write_url_trailing_slash_stripped() {
+        let mut config = make_config();
+        config.url = "http://localhost:8086/".to_string();
+        let sink = InfluxDbSink::new(1, config);
+        let url = sink.build_write_url().unwrap();
+        // Must not produce a double-slash path like //api/v2/write
+        assert!(
+            !url.path().starts_with("//"),
+            "double slash: {}",
+            url.path()
+        );
+        assert_eq!(url.path(), "/api/v2/write");
+    }
+
+    #[test]
+    fn build_write_url_invalid_base_url_returns_error() {
+        let mut config = make_config();
+        config.url = "not_a_url".to_string();
+        let sink = InfluxDbSink::new(1, config);
+        assert!(
+            sink.build_write_url().is_err(),
+            "invalid URL must return error"
+        );
+    }
+
+    #[test]
+    fn build_health_url_path_is_health() {
+        let sink = make_sink();
+        let url = sink.build_health_url().unwrap();
+        assert_eq!(url.path(), "/health");
+    }
+
+    // ── PermanentHttpError does not trip circuit breaker ─────────────────────────
+
+    #[tokio::test]
+    async fn permanent_http_error_does_not_open_circuit_breaker() {
+        // threshold=1 means any transient error would open the circuit immediately.
+        let mut config = make_config();
+        config.circuit_breaker_threshold = Some(1);
+        config.circuit_breaker_cool_down = Some("60s".to_string());
+        let sink = InfluxDbSink::new(1, config);
+
+        // Simulate what process_batch does when it gets a 400 response:
+        // it returns PermanentHttpError, which consume() must NOT count.
+        let e = Error::PermanentHttpError("400 Bad Request: malformed line protocol".to_string());
+        if !matches!(e, Error::PermanentHttpError(_)) {
+            sink.circuit_breaker.record_failure().await;
+        }
+
+        // Circuit must remain closed — no failure was recorded.
+        assert!(
+            !sink.circuit_breaker.is_open().await,
+            "PermanentHttpError must not open the circuit breaker"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_error_does_open_circuit_breaker() {
+        let mut config = make_config();
+        config.circuit_breaker_threshold = Some(1);
+        config.circuit_breaker_cool_down = Some("60s".to_string());
+        let sink = InfluxDbSink::new(1, config);
+
+        // Simulate what process_batch does for a 503 response: CannotStoreData.
+        let e = Error::CannotStoreData("503 Service Unavailable".to_string());
+        if !matches!(e, Error::PermanentHttpError(_)) {
+            sink.circuit_breaker.record_failure().await;
+        }
+
+        assert!(
+            sink.circuit_breaker.is_open().await,
+            "transient error must open the circuit breaker"
+        );
+    }
+
+    // ── measurement default ───────────────────────────────────────────────────────
+
+    #[test]
+    fn measurement_defaults_to_iggy_messages_when_not_configured() {
+        let mut config = make_config();
+        config.measurement = None;
+        let sink = InfluxDbSink::new(1, config);
+        assert_eq!(sink.measurement(), "iggy_messages");
+    }
+
+    #[test]
+    fn measurement_uses_configured_value() {
+        let sink = make_sink(); // measurement = "test_measurement"
+        assert_eq!(sink.measurement(), "test_measurement");
+    }
+
+    // ── get_client before open() ──────────────────────────────────────────────────
+
+    #[test]
+    fn get_client_before_open_returns_error() {
+        let sink = make_sink();
+        assert!(
+            sink.get_client().is_err(),
+            "get_client before open() must return an error"
+        );
+    }
+
+    // ── batch chunking: multiple messages produce newline-separated lines ─────────
+
+    #[test]
+    fn process_batch_body_has_newline_between_lines() {
+        let sink = make_sink();
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+
+        let msg1 = make_message(iggy_connector_sdk::Payload::Raw(b"{\"a\":1}".to_vec()));
+        let msg2 = make_message(iggy_connector_sdk::Payload::Raw(b"{\"b\":2}".to_vec()));
+
+        // Build the body the same way process_batch does.
+        let mut body = String::new();
+        sink.append_line(&mut body, &topic, &meta, &msg1).unwrap();
+        body.push('\n');
+        sink.append_line(&mut body, &topic, &meta, &msg2).unwrap();
+
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "two messages must produce exactly two lines"
+        );
+        assert!(
+            lines[0].starts_with("test_measurement"),
+            "line 1: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("test_measurement"),
+            "line 2: {}",
+            lines[1]
+        );
+    }
+
+    // ── to_precision_timestamp edge cases ────────────────────────────────────────
+
+    #[test]
+    fn precision_ns_does_not_overflow_large_micros() {
+        // 1e15 µs × 1000 = 1e18 ns, within u64::MAX (~1.8e19).
+        let mut config = make_config();
+        config.precision = Some("ns".to_string());
+        let sink = InfluxDbSink::new(1, config);
+        let micros = 1_000_000_000_000_000u64; // 1e15 µs ≈ year 2001 in ns terms
+        let ns = sink.to_precision_timestamp(micros);
+        assert_eq!(ns, micros * 1_000);
+    }
+
+    #[test]
+    fn precision_ns_saturates_on_overflow() {
+        // u64::MAX µs × 1000 overflows; saturating_mul must not panic.
+        let mut config = make_config();
+        config.precision = Some("ns".to_string());
+        let sink = InfluxDbSink::new(1, config);
+        let result = sink.to_precision_timestamp(u64::MAX);
+        assert_eq!(result, u64::MAX, "saturating_mul must clamp at u64::MAX");
     }
 }

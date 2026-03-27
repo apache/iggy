@@ -160,18 +160,23 @@ impl Payload {
 
     /// Borrowing serialisation — no clone, no ownership transfer.
     ///
-    ///Json: serialises the `OwnedValue` in place → one allocation
-    ///  for the output `Vec<u8>`, zero clone of the value tree.
-    ///Raw:  returns a copy of the inner bytes (unavoidable — caller
-    ///  needs owned bytes and we only have a reference).
-    ///Text/`Proto: copies the string bytes (same reasoning).
-    ///FlatBuffer:  copies the buffer bytes.
+    /// - Json: serialises the `OwnedValue` in place → one allocation
+    ///   for the output `Vec<u8>`, zero clone of the value tree.
+    /// - Raw: returns a copy of the inner bytes (unavoidable — caller
+    ///   needs owned bytes and we only have a reference).
+    /// - Text/Proto: copies the string bytes (same reasoning).
+    /// - FlatBuffer: copies the buffer bytes.
     ///
     /// For `Json` this replaces a deep clone of the entire `OwnedValue` tree
     /// with a single serialisation pass — O(n) work either way, but the clone
     /// path does O(n) allocation + O(n) serialisation, while this path does
     /// only O(n) serialisation.
-    pub fn try_as_bytes(&self) -> Result<Vec<u8>, Error> {
+    ///
+    /// Named `try_to_bytes` (not `try_as_bytes`) because it allocates and
+    /// returns an owned `Vec<u8>` — following the Rust API guideline that
+    /// `as_` implies a cheap borrowed view while `to_` implies an owned,
+    /// potentially-allocating conversion.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, Error> {
         match self {
             Payload::Json(value) => simd_json::to_vec(value).map_err(|_| Error::InvalidJsonPayload),
             Payload::Raw(value) => Ok(value.clone()),
