@@ -44,7 +44,6 @@ pub struct ClickHouseClient {
     inner: reqwest::Client,
     base_url: String,
     database: String,
-    auth_headers: HeaderMap,
 }
 
 impl ClickHouseClient {
@@ -56,11 +55,6 @@ impl ClickHouseClient {
         password: &str,
         timeout: Duration,
     ) -> Result<Self, Error> {
-        let inner = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| Error::InitError(format!("Failed to build HTTP client: {e}")))?;
-
         let mut auth_headers = HeaderMap::new();
         auth_headers.insert(
             USER_HEADER,
@@ -73,11 +67,16 @@ impl ClickHouseClient {
                 .map_err(|e| Error::InitError(format!("Invalid password header value: {e}")))?,
         );
 
+        let inner = reqwest::Client::builder()
+            .timeout(timeout)
+            .default_headers(auth_headers)
+            .build()
+            .map_err(|e| Error::InitError(format!("Failed to build HTTP client: {e}")))?;
+
         Ok(ClickHouseClient {
             inner,
             base_url,
             database,
-            auth_headers,
         })
     }
 
@@ -87,7 +86,6 @@ impl ClickHouseClient {
         let response = self
             .inner
             .get(&url)
-            .headers(self.auth_headers.clone())
             .send()
             .await
             .map_err(|e| Error::InitError(format!("Ping failed: {e}")))?;
@@ -194,7 +192,6 @@ impl ClickHouseClient {
             let result = self
                 .inner
                 .post(&url)
-                .headers(self.auth_headers.clone())
                 .header(CONTENT_TYPE, "application/octet-stream")
                 .query(&[("query", &query)])
                 .body(body.clone())
@@ -263,7 +260,6 @@ impl ClickHouseClient {
         let response = self
             .inner
             .post(&url)
-            .headers(self.auth_headers.clone())
             .body(query.to_owned())
             .send()
             .await
