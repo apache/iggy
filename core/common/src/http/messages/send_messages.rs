@@ -16,18 +16,15 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
 use crate::Identifier;
 use crate::IggyMessageView;
 use crate::PartitioningKind;
-use crate::Sizeable;
 use crate::Validatable;
 use crate::error::IggyError;
 use crate::types::message::HeaderEntry;
 use crate::types::message::partitioning::Partitioning;
-use crate::{INDEX_SIZE, IggyMessage, IggyMessagesBatch};
+use crate::{IggyMessage, IggyMessagesBatch};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use bytes::{BufMut, Bytes, BytesMut};
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -52,79 +49,6 @@ pub struct SendMessages {
     pub partitioning: Partitioning,
     /// Messages collection
     pub batch: IggyMessagesBatch,
-}
-
-impl SendMessages {
-    pub fn bytes(
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partitioning: &Partitioning,
-        messages: &[IggyMessage],
-    ) -> Bytes {
-        let stream_id_field_size = stream_id.get_buffer_size();
-        let topic_id_field_size = topic_id.get_buffer_size();
-        let partitioning_field_size = partitioning.get_buffer_size();
-        let metadata_length_field_size = size_of::<u32>();
-        let messages_count = messages.len();
-        let messages_count_field_size = size_of::<u32>();
-        let metadata_length = stream_id_field_size
-            + topic_id_field_size
-            + partitioning_field_size
-            + messages_count_field_size;
-        let indexes_size = messages_count * INDEX_SIZE;
-        let messages_size = messages
-            .iter()
-            .map(|m| m.get_size_bytes().as_bytes_usize())
-            .sum::<usize>();
-
-        let total_size = metadata_length_field_size
-            + stream_id_field_size
-            + topic_id_field_size
-            + partitioning_field_size
-            + messages_count_field_size
-            + indexes_size
-            + messages_size;
-
-        let mut bytes = BytesMut::with_capacity(total_size);
-
-        bytes.put_u32_le(metadata_length as u32);
-        stream_id.write_to_buffer(&mut bytes);
-        topic_id.write_to_buffer(&mut bytes);
-        partitioning.write_to_buffer(&mut bytes);
-        bytes.put_u32_le(messages_count as u32);
-
-        let mut current_position = bytes.len();
-
-        bytes.put_bytes(0, indexes_size);
-
-        let mut msg_size: u32 = 0;
-        for message in messages.iter() {
-            message.write_to_buffer(&mut bytes);
-            msg_size += message.get_size_bytes().as_bytes_u64() as u32;
-            write_value_at(&mut bytes, 0u64.to_le_bytes(), current_position);
-            write_value_at(&mut bytes, msg_size.to_le_bytes(), current_position + 4);
-            write_value_at(&mut bytes, 0u64.to_le_bytes(), current_position + 8);
-            current_position += INDEX_SIZE;
-        }
-
-        let out = bytes.freeze();
-
-        debug_assert_eq!(
-            total_size,
-            out.len(),
-            "Calculated SendMessages command byte size doesn't match actual command size",
-        );
-
-        out
-    }
-}
-
-fn write_value_at<const N: usize>(slice: &mut [u8], value: [u8; N], position: usize) {
-    let slice = &mut slice[position..position + N];
-    let ptr = slice.as_mut_ptr();
-    unsafe {
-        std::ptr::copy_nonoverlapping(value.as_ptr(), ptr, N);
-    }
 }
 
 impl Default for SendMessages {

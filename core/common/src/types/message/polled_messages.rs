@@ -16,9 +16,7 @@
  * under the License.
  */
 
-use crate::{
-    BytesSerializable, IGGY_MESSAGE_HEADER_SIZE, IggyMessage, IggyMessageHeader, error::IggyError,
-};
+use crate::{IGGY_MESSAGE_HEADER_SIZE, IggyMessage, IggyMessageHeader, error::IggyError};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tracing::error;

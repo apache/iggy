@@ -18,8 +18,7 @@
 
 use crate::Consumer;
 use crate::error::IggyError;
-use crate::{BytesSerializable, Identifier, PollingStrategy, Validatable};
-use bytes::{BufMut, Bytes, BytesMut};
+use crate::{Identifier, PollingStrategy, Validatable};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PARTITION_ID: u32 = 0;
@@ -60,47 +59,6 @@ pub struct PollMessages {
 }
 
 impl PollMessages {
-    pub fn bytes(
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: Option<u32>,
-        consumer: &Consumer,
-        strategy: &PollingStrategy,
-        count: u32,
-        auto_commit: bool,
-    ) -> Bytes {
-        let consumer_bytes = consumer.to_bytes();
-        let stream_id_bytes = stream_id.to_bytes();
-        let topic_id_bytes = topic_id.to_bytes();
-        let strategy_bytes = strategy.to_bytes();
-        let mut bytes = BytesMut::with_capacity(
-            10 + consumer_bytes.len()
-                + stream_id_bytes.len()
-                + topic_id_bytes.len()
-                + strategy_bytes.len(),
-        );
-        bytes.put_slice(&consumer_bytes);
-        bytes.put_slice(&stream_id_bytes);
-        bytes.put_slice(&topic_id_bytes);
-        // Encode partition_id with a flag byte: 1 = Some, 0 = None
-        if let Some(partition_id) = partition_id {
-            bytes.put_u8(1);
-            bytes.put_u32_le(partition_id);
-        } else {
-            bytes.put_u8(0);
-            bytes.put_u32_le(0); // Padding to keep structure consistent
-        }
-        bytes.put_slice(&strategy_bytes);
-        bytes.put_u32_le(count);
-        if auto_commit {
-            bytes.put_u8(1);
-        } else {
-            bytes.put_u8(0);
-        }
-
-        bytes.freeze()
-    }
-
     pub fn default_number_of_messages_to_poll() -> u32 {
         DEFAULT_NUMBER_OF_MESSAGES_TO_POLL
     }

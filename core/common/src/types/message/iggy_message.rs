@@ -17,8 +17,7 @@
  */
 
 use super::message_header::{IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeader};
-use super::user_headers::get_user_headers_size;
-use crate::BytesSerializable;
+use super::user_headers::{get_user_headers_size, user_headers_from_bytes, user_headers_to_bytes};
 use crate::Sizeable;
 use crate::error::IggyError;
 use crate::utils::byte_size::IggyByteSize;
@@ -193,7 +192,7 @@ impl IggyMessage {
             reserved: 0,
         };
 
-        let user_headers = user_headers.map(|h| h.to_bytes());
+        let user_headers = user_headers.map(|h| user_headers_to_bytes(&h));
 
         Ok(Self {
             header,
@@ -236,7 +235,7 @@ impl IggyMessage {
     /// ```
     pub fn user_headers_map(&self) -> Result<Option<HashMap<HeaderKey, HeaderValue>>, IggyError> {
         if let Some(user_headers) = &self.user_headers {
-            match HashMap::<HeaderKey, HeaderValue>::from_bytes(user_headers.clone()) {
+            match user_headers_from_bytes(user_headers.clone()) {
                 Ok(h) => Ok(Some(h)),
                 Err(e) => {
                     warn!(
@@ -354,6 +353,75 @@ impl IggyMessage {
     pub fn payload_as_string(&self) -> Result<String, IggyError> {
         String::from_utf8(self.payload.to_vec()).map_err(|_| IggyError::InvalidUtf8)
     }
+
+    pub fn to_bytes(&self) -> Bytes {
+        let mut bytes = BytesMut::with_capacity(self.get_size_bytes().as_bytes_usize());
+        let message_header = self.header.to_bytes();
+        bytes.put_slice(&message_header);
+        bytes.put_slice(&self.payload);
+        if let Some(user_headers) = &self.user_headers {
+            bytes.put_slice(user_headers);
+        }
+        bytes.freeze()
+    }
+
+    pub fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
+        if bytes.len() < IGGY_MESSAGE_HEADER_SIZE {
+            return Err(IggyError::InvalidCommand);
+        }
+
+        let mut position = 0;
+        let header = IggyMessageHeader::from_bytes(bytes.slice(0..IGGY_MESSAGE_HEADER_SIZE))?;
+
+        position += IGGY_MESSAGE_HEADER_SIZE;
+        let payload_end = position + header.payload_length as usize;
+
+        if payload_end > bytes.len() {
+            return Err(IggyError::InvalidMessagePayloadLength);
+        }
+
+        let payload = bytes.slice(position..payload_end);
+        position = payload_end;
+
+        let user_headers = if header.user_headers_length > 0 {
+            let headers_end = position + header.user_headers_length as usize;
+            if headers_end > bytes.len() {
+                return Err(IggyError::InvalidHeaderValue);
+            }
+            Some(bytes.slice(position..headers_end))
+        } else {
+            None
+        };
+
+        #[cfg(debug_assertions)]
+        {
+            assert_eq!(
+                user_headers.as_ref().map(|h| h.len()).unwrap_or(0),
+                header.user_headers_length as usize,
+                "user_headers.len() != header.user_headers_length"
+            );
+
+            assert_eq!(
+                payload.len(),
+                header.payload_length as usize,
+                "payload.len() != header.payload_length"
+            )
+        }
+
+        Ok(IggyMessage {
+            header,
+            payload,
+            user_headers,
+        })
+    }
+
+    pub fn write_to_buffer(&self, buf: &mut BytesMut) {
+        buf.put_slice(&self.header.to_bytes());
+        buf.put_slice(&self.payload);
+        if let Some(user_headers) = &self.user_headers {
+            buf.put_slice(user_headers);
+        }
+    }
 }
 
 impl FromStr for IggyMessage {
@@ -413,77 +481,6 @@ impl Sizeable for IggyMessage {
         }
 
         IggyByteSize::from((message_header_len + payload_len + user_headers_len) as u64)
-    }
-}
-
-impl BytesSerializable for IggyMessage {
-    fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::with_capacity(self.get_size_bytes().as_bytes_usize());
-        let message_header = self.header.to_bytes();
-        bytes.put_slice(&message_header);
-        bytes.put_slice(&self.payload);
-        if let Some(user_headers) = &self.user_headers {
-            bytes.put_slice(user_headers);
-        }
-        bytes.freeze()
-    }
-
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
-        if bytes.len() < IGGY_MESSAGE_HEADER_SIZE {
-            return Err(IggyError::InvalidCommand);
-        }
-
-        let mut position = 0;
-        let header = IggyMessageHeader::from_bytes(bytes.slice(0..IGGY_MESSAGE_HEADER_SIZE))?;
-
-        position += IGGY_MESSAGE_HEADER_SIZE;
-        let payload_end = position + header.payload_length as usize;
-
-        if payload_end > bytes.len() {
-            return Err(IggyError::InvalidMessagePayloadLength);
-        }
-
-        let payload = bytes.slice(position..payload_end);
-        position = payload_end;
-
-        let user_headers = if header.user_headers_length > 0 {
-            let headers_end = position + header.user_headers_length as usize;
-            if headers_end > bytes.len() {
-                return Err(IggyError::InvalidHeaderValue);
-            }
-            Some(bytes.slice(position..headers_end))
-        } else {
-            None
-        };
-
-        #[cfg(debug_assertions)]
-        {
-            assert_eq!(
-                user_headers.as_ref().map(|h| h.len()).unwrap_or(0),
-                header.user_headers_length as usize,
-                "user_headers.len() != header.user_headers_length"
-            );
-
-            assert_eq!(
-                payload.len(),
-                header.payload_length as usize,
-                "payload.len() != header.payload_length"
-            )
-        }
-
-        Ok(IggyMessage {
-            header,
-            payload,
-            user_headers,
-        })
-    }
-
-    fn write_to_buffer(&self, buf: &mut BytesMut) {
-        buf.put_slice(&self.header.to_bytes());
-        buf.put_slice(&self.payload);
-        if let Some(user_headers) = &self.user_headers {
-            buf.put_slice(user_headers);
-        }
     }
 }
 
@@ -626,7 +623,8 @@ impl<'de> Deserialize<'de> for IggyMessage {
                 let header = header.ok_or_else(|| de::Error::missing_field("header"))?;
                 let payload = payload.ok_or_else(|| de::Error::missing_field("payload"))?;
 
-                let user_headers_bytes = user_headers.map(|headers| headers.to_bytes());
+                let user_headers_bytes =
+                    user_headers.map(|headers| user_headers_to_bytes(&headers));
 
                 let user_headers_length = user_headers_bytes
                     .as_ref()

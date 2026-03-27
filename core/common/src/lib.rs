@@ -54,7 +54,6 @@ pub use sender::{
 };
 pub use traits::binary_client::BinaryClient;
 pub use traits::binary_transport::BinaryTransport;
-pub use traits::bytes_serializable::BytesSerializable;
 pub use traits::client::Client;
 pub use traits::cluster_client::ClusterClient;
 pub use traits::consumer_group_client::ConsumerGroupClient;

@@ -18,8 +18,8 @@
 
 use super::message_boundaries::IggyMessageBoundaries;
 use crate::{
-    BytesSerializable, INDEX_SIZE, IggyByteSize, IggyIndexes, IggyMessage, IggyMessageView,
-    IggyMessageViewIterator, MAX_PAYLOAD_SIZE, Sizeable, Validatable, error::IggyError,
+    INDEX_SIZE, IggyByteSize, IggyIndexes, IggyMessage, IggyMessageView, IggyMessageViewIterator,
+    MAX_PAYLOAD_SIZE, Sizeable, Validatable, error::IggyError,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use std::ops::{Deref, Index};

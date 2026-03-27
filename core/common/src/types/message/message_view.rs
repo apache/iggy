@@ -19,7 +19,7 @@
 use super::HeaderValue;
 use super::message_boundaries::IggyMessageBoundaries;
 use super::message_header::*;
-use crate::BytesSerializable;
+use super::user_headers::user_headers_from_bytes;
 use crate::IggyByteSize;
 use crate::Sizeable;
 use crate::error::IggyError;
@@ -90,7 +90,7 @@ impl<'a> IggyMessageView<'a> {
         if let Some(headers) = self.user_headers() {
             let headers_bytes = Bytes::copy_from_slice(headers);
 
-            match HashMap::<HeaderKey, HeaderValue>::from_bytes(headers_bytes) {
+            match user_headers_from_bytes(headers_bytes) {
                 Ok(h) => Ok(Some(h)),
                 Err(e) => {
                     tracing::error!(
