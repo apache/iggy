@@ -272,6 +272,8 @@ where
         buffer[header_size..].copy_from_slice(&body);
     }
 
+    // TODO: Remove this copy once replies stop round-tripping through `Bytes`
+    // and the binary protocol uses `Owned` end-to-end.
     Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
         .expect("reply buffer must contain a valid reply message")
 }

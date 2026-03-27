@@ -42,7 +42,6 @@ use iggy_common::{
     sharding::{IggyNamespace, LocalIdx, ShardId},
 };
 use iobuf::Frozen;
-use journal::Journal as _;
 use message_bus::MessageBus;
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
@@ -128,7 +127,7 @@ impl<C> IggyPartitions<C> {
 
     /// Get mutable partition by local index.
     #[allow(clippy::mut_from_ref)]
-    pub fn get_mut(&self, local_idx: LocalIdx) -> Option<&mut IggyPartition> {
+    fn get_mut(&self, local_idx: LocalIdx) -> Option<&mut IggyPartition> {
         // Safety: single-threaded per-shard model, no concurrent access.
         unsafe { (&mut *self.partitions.get()).get_mut(*local_idx) }
     }
@@ -160,7 +159,7 @@ impl<C> IggyPartitions<C> {
 
     /// Get mutable partition by namespace directly.
     #[allow(clippy::mut_from_ref)]
-    pub fn get_mut_by_ns(&self, namespace: &IggyNamespace) -> Option<&mut IggyPartition> {
+    fn get_mut_by_ns(&self, namespace: &IggyNamespace) -> Option<&mut IggyPartition> {
         let idx = self.namespace_to_local.get(namespace)?;
         // Safety: single-threaded per-shard model, no concurrent access.
         unsafe { (&mut *self.partitions.get()).get_mut(**idx) }
@@ -273,7 +272,7 @@ impl<C> IggyPartitions<C> {
         partition
             .log
             .add_persisted_segment(segment, storage, None, None);
-        partition.offset.store(start_offset, Ordering::Relaxed);
+        partition.offset.store(start_offset, Ordering::Release);
         partition
             .dirty_offset
             .store(start_offset, Ordering::Relaxed);
@@ -296,11 +295,15 @@ impl<C> IggyPartitions<C> {
     /// Idempotent: subsequent calls for the same namespace are no-ops.
     /// Consensus must be set separately via `set_consensus`.
     ///
-    /// # Panics
-    /// Panics if segment storage creation fails.
-    pub async fn init_partition(&mut self, namespace: IggyNamespace) -> LocalIdx {
+    /// # Errors
+    ///
+    /// Returns an `IggyError` if the backing segment storage or writers cannot be created.
+    pub async fn init_partition(
+        &mut self,
+        namespace: IggyNamespace,
+    ) -> Result<LocalIdx, IggyError> {
         if let Some(idx) = self.local_idx(&namespace) {
-            return idx;
+            return Ok(idx);
         }
 
         // Create initial segment with storage
@@ -332,11 +335,11 @@ impl<C> IggyPartitions<C> {
             false, // file_exists (new segment)
         )
         .await
-        .expect("Failed to create segment storage");
+        .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
         let messages_size_bytes = storage
             .messages_writer
             .as_ref()
-            .expect("Messages writer not initialized")
+            .ok_or_else(|| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?
             .size_counter();
         let messages_writer = Rc::new(
             MessagesWriter::new(
@@ -346,7 +349,7 @@ impl<C> IggyPartitions<C> {
                 false,
             )
             .await
-            .expect("Failed to create messages writer"),
+            .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
         );
         let index_writer = Rc::new(
             IggyIndexWriter::new(
@@ -356,7 +359,7 @@ impl<C> IggyPartitions<C> {
                 false,
             )
             .await
-            .expect("Failed to create sparse index writer"),
+            .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
         );
 
         // Create partition with initialized log
@@ -368,14 +371,14 @@ impl<C> IggyPartitions<C> {
             Some(messages_writer),
             Some(index_writer),
         );
-        partition.offset.store(start_offset, Ordering::Relaxed);
+        partition.offset.store(start_offset, Ordering::Release);
         partition
             .dirty_offset
             .store(start_offset, Ordering::Relaxed);
         partition.should_increment_offset = false;
         partition.stats.increment_segments_count(1);
 
-        self.insert(namespace, partition)
+        Ok(self.insert(namespace, partition))
     }
 }
 
@@ -429,16 +432,11 @@ where
             return;
         }
 
-        let message = self.replicate(message).await;
-
-        // TODO: Make those assertions be toggleable through an feature flag, so they can be used only by simulator/tests.
-        debug_assert_eq!(header.op, current_op + 1);
-        consensus.sequencer().set_sequence(header.op);
-        consensus.set_last_prepare_checksum(header.checksum);
-
         // TODO: Figure out the flow of the partition operations.
         // In metadata layer we assume that when an `on_request` or `on_replicate` is called, it's called from correct shard.
         // I think we need to do the same here, which means that the code from below is unfallable, the partition should always exist by now!
+        let message = self.replicate(message).await;
+
         if let Err(error) = self.apply_replicated_operation(&namespace, message).await {
             warn!(
                 replica = consensus.replica(),
@@ -450,11 +448,25 @@ where
             return;
         }
 
-        self.send_prepare_ok(&header).await;
-
-        if consensus.is_follower() {
-            self.commit_journal(namespace);
+        if header.operation == Operation::SendMessages
+            && let Err(error) = self.commit_messages(&namespace, true).await
+        {
+            warn!(
+                replica = consensus.replica(),
+                op = header.op,
+                ?namespace,
+                %error,
+                "on_replicate: failed to durably persist replicated operation"
+            );
+            return;
         }
+
+        // TODO: Make those assertions be toggleable through a feature flag, so they can be used only by simulator/tests.
+        debug_assert_eq!(header.op, current_op + 1);
+        consensus.sequencer().set_sequence(header.op);
+        consensus.set_last_prepare_checksum(header.checksum);
+
+        self.send_prepare_ok(&header).await;
     }
 
     async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareOkHeader>) {
@@ -505,12 +517,12 @@ where
             return;
         }
 
-        if self.handle_committed_entries(consensus, drained).await {
-            let pipeline = consensus.pipeline().borrow();
-            let new_commit = pipeline.global_commit_frontier(consensus.commit());
-            drop(pipeline);
-            consensus.advance_commit_number(new_commit);
-        }
+        self.handle_committed_entries(consensus, drained).await;
+
+        let pipeline = consensus.pipeline().borrow();
+        let new_commit = pipeline.global_commit_frontier(consensus.commit());
+        drop(pipeline);
+        consensus.advance_commit_number(new_commit);
     }
 }
 
@@ -571,9 +583,24 @@ where
             Operation::StoreConsumerOffset => {
                 let total_size = header.size() as usize;
                 let body = &message.as_slice()[std::mem::size_of::<PrepareHeader>()..total_size];
-                let consumer_kind = body[0];
-                let consumer_id = u32::from_le_bytes(body[1..5].try_into().unwrap()) as usize;
-                let offset = u64::from_le_bytes(body[5..13].try_into().unwrap());
+                let consumer_kind = *body.first().ok_or(IggyError::InvalidCommand)?;
+                let consumer_id =
+                    body.get(1..5)
+                        .ok_or(IggyError::InvalidCommand)
+                        .and_then(|bytes| {
+                            <[u8; 4]>::try_from(bytes)
+                                .map(u32::from_le_bytes)
+                                .map(|value| value as usize)
+                                .map_err(|_| IggyError::InvalidCommand)
+                        })?;
+                let offset =
+                    body.get(5..13)
+                        .ok_or(IggyError::InvalidCommand)
+                        .and_then(|bytes| {
+                            <[u8; 8]>::try_from(bytes)
+                                .map(u64::from_le_bytes)
+                                .map_err(|_| IggyError::InvalidCommand)
+                        })?;
                 let consumer = match consumer_kind {
                     1 => PollingConsumer::Consumer(consumer_id, 0),
                     2 => PollingConsumer::ConsumerGroup(consumer_id, 0),
@@ -628,6 +655,12 @@ where
         namespace: &IggyNamespace,
         message: Message<PrepareHeader>,
     ) -> Result<(), IggyError> {
+        let write_lock = self
+            .get_by_ns(namespace)
+            .expect("append_send_messages_to_journal: partition not found for namespace")
+            .write_lock
+            .clone();
+        let _guard = write_lock.lock().await;
         let partition = self
             .get_mut_by_ns(namespace)
             .expect("append_send_messages_to_journal: partition not found for namespace");
@@ -645,18 +678,23 @@ where
         replicate_to_next_in_chain(consensus, message).await
     }
 
-    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
-    fn commit_journal(&self, _namespace: IggyNamespace) {
-        // TODO: Implement commit logic for followers.
-        // Walk through journal from last committed to current commit number
-        // Apply each entry to the partition state
-    }
-
-    /// Commit messages after quorum ack.
+    /// Persist prepared messages to segment storage and advance the durable frontier.
     ///
     /// Updates segment metadata, stats, flushes journal to disk if thresholds
-    /// are exceeded, and advances the committed offset last.
-    async fn commit_messages(&self, namespace: &IggyNamespace) -> Result<(), IggyError> {
+    /// are exceeded, and advances the durable offset last.
+    #[allow(clippy::too_many_lines)]
+    async fn commit_messages(
+        &self,
+        namespace: &IggyNamespace,
+        force_persist: bool,
+    ) -> Result<(), IggyError> {
+        let write_lock = self
+            .get_by_ns(namespace)
+            .expect("commit_messages: partition not found for namespace")
+            .write_lock
+            .clone();
+        let _guard = write_lock.lock().await;
+
         let partition = self
             .get_mut_by_ns(namespace)
             .expect("commit_messages: partition not found for namespace");
@@ -675,8 +713,20 @@ where
             journal_info.messages_count >= self.config.messages_required_to_save;
         let unsaved_messages_size_exceeded = journal_info.size.as_bytes_u64()
             >= self.config.size_of_messages_required_to_save.as_bytes_u64();
+        let should_persist = force_persist
+            || is_full
+            || unsaved_messages_count_exceeded
+            || unsaved_messages_size_exceeded;
 
-        if is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded {
+        if !should_persist {
+            return Ok(());
+        }
+
+        if is_full
+            || unsaved_messages_count_exceeded
+            || unsaved_messages_size_exceeded
+            || force_persist
+        {
             // Freeze journal batches.
             let (frozen_batches, index_bytes, batch_count) = {
                 let entries = partition.log.journal().inner.entries();
@@ -746,8 +796,7 @@ where
             partition.log.journal_mut().info = JournalInfo::default();
         }
 
-        // 2. Update segment metadata from journal state.
-        // Note: segment.current_position is already updated in append_batch (prepare phase).
+        // Update segment metadata from the just-persisted journal state.
         let partition = self
             .get_mut_by_ns(namespace)
             .expect("commit_messages: partition not found");
@@ -761,7 +810,6 @@ where
         segment.max_timestamp = segment.max_timestamp.max(journal_info.max_timestamp);
         segment.end_offset = journal_info.current_offset;
 
-        // 3. Update stats.
         partition
             .stats
             .increment_size_bytes(journal_info.size.as_bytes_u64());
@@ -769,10 +817,9 @@ where
             .stats
             .increment_messages_count(u64::from(journal_info.messages_count));
 
-        // 4. Advance committed offset (last, so consumers only see offset after data is durable).
-        let committed_offset = journal_info.current_offset;
-        partition.offset.store(committed_offset, Ordering::Relaxed);
-        partition.stats.set_current_offset(committed_offset);
+        let durable_offset = journal_info.current_offset;
+        partition.offset.store(durable_offset, Ordering::Release);
+        partition.stats.set_current_offset(durable_offset);
         Ok(())
     }
 
@@ -780,7 +827,7 @@ where
         &self,
         consensus: &VsrConsensus<B, NamespacedPipeline>,
         drained: Vec<PipelineEntry>,
-    ) -> bool {
+    ) {
         if let (Some(first), Some(last)) = (drained.first(), drained.last()) {
             debug!(
                 "on_ack: draining committed ops=[{}..={}] count={}",
@@ -803,7 +850,7 @@ where
             match prepare_header.operation {
                 Operation::SendMessages => {
                     if committed_ns.insert(entry_namespace)
-                        && let Err(error) = self.commit_messages(&entry_namespace).await
+                        && let Err(error) = self.commit_messages(&entry_namespace, false).await
                     {
                         failed_ns.insert(entry_namespace);
                         warn!(
@@ -854,15 +901,11 @@ where
                 );
             }
         }
-
-        if failed_ns.is_empty() {
-            true
-        } else {
+        if !failed_ns.is_empty() {
             warn!(
                 failed_namespaces = failed_ns.len(),
-                "on_ack: skipping commit-number advancement after commit failure"
+                "on_ack: some namespaces failed local commit handling"
             );
-            false
         }
     }
 
@@ -1034,14 +1077,6 @@ where
         let consensus = self
             .consensus()
             .expect("send_prepare_ok: consensus not initialized");
-        let namespace = IggyNamespace::from_raw(header.namespace);
-        let persisted = match header.operation {
-            Operation::SendMessages => match self.get_by_ns(&namespace) {
-                Some(partition) => partition.log.journal().inner.entry(header).await.is_some(),
-                None => false,
-            },
-            _ => true,
-        };
-        send_prepare_ok_common(consensus, header, Some(persisted)).await;
+        send_prepare_ok_common(consensus, header, Some(true)).await;
     }
 }

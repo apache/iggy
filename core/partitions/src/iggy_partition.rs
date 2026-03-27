@@ -36,13 +36,14 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::warn;
 
 // This struct aliases in terms of the code contained the `LocalPartition from `core/server/src/streaming/partitions/local_partition.rs`.
+//
+// TODO: Fix op deduplication once we move to a consensus-per-partition design.
 #[derive(Debug)]
 pub struct IggyPartition {
     pub log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>, PartitionJournalMemStorage>,
-    /// Committed offset — advanced only after quorum ack.
+    /// Highest durably persisted offset.
     pub offset: Arc<AtomicU64>,
-    /// Dirty offset — advanced on every prepare (before commit).
-    /// Used to assign offsets during `prepare_for_persistence`.
+    /// Highest offset assigned to prepares that may still only live in the in-memory journal.
     pub dirty_offset: AtomicU64,
     pub consumer_offsets: Arc<ConsumerOffsets>,
     pub consumer_group_offsets: Arc<ConsumerGroupOffsets>,
@@ -98,7 +99,7 @@ impl Partition for IggyPartition {
         }
 
         let batch_messages_size =
-            u32::try_from(batch.total_size()).map_err(|_| IggyError::CannotAppendMessage)?;
+            u64::try_from(batch.total_size()).map_err(|_| IggyError::CannotAppendMessage)?;
 
         let last_dirty_offset = dirty_offset + u64::from(batch_messages_count) - 1;
 
@@ -109,11 +110,14 @@ impl Partition for IggyPartition {
             .store(last_dirty_offset, Ordering::Relaxed);
 
         let segment_index = self.log.segments().len() - 1;
-        self.log.segments_mut()[segment_index].current_position += batch_messages_size;
+        let current_position = self.log.segments()[segment_index].current_position;
+        self.log.segments_mut()[segment_index].current_position = current_position
+            .checked_add(batch_messages_size)
+            .ok_or(IggyError::CannotAppendMessage)?;
 
         let journal = self.log.journal_mut();
         journal.info.messages_count += batch_messages_count;
-        journal.info.size += IggyByteSize::from(u64::from(batch_messages_size));
+        journal.info.size += IggyByteSize::from(batch_messages_size);
         journal.info.current_offset = last_dirty_offset;
         if journal.info.first_timestamp == 0 {
             journal.info.first_timestamp = batch.base_timestamp;
@@ -138,7 +142,7 @@ impl Partition for IggyPartition {
             return Ok((PollFragments::new(), None));
         }
 
-        let write_offset = self.offset.load(Ordering::Relaxed);
+        let write_offset = self.offset.load(Ordering::Acquire);
 
         let result = match args.strategy.kind {
             PollingKind::Timestamp => {
@@ -258,7 +262,7 @@ impl Partition for IggyPartition {
 
     fn offsets(&self) -> PartitionOffsets {
         PartitionOffsets::new(
-            self.offset.load(Ordering::Relaxed),
+            self.offset.load(Ordering::Acquire),
             self.dirty_offset.load(Ordering::Relaxed),
         )
     }

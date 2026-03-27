@@ -24,7 +24,7 @@ pub struct Segment {
     pub start_timestamp: u64,
     pub end_timestamp: u64,
     pub max_timestamp: u64,
-    pub current_position: u32,
+    pub current_position: u64,
     pub start_offset: u64,
     pub end_offset: u64,
     pub size: IggyByteSize,
@@ -66,7 +66,7 @@ impl Segment {
 
     #[must_use]
     pub fn is_full(&self) -> bool {
-        self.size >= self.max_size
+        self.current_position >= self.max_size.as_bytes_u64() || self.size >= self.max_size
     }
 
     #[must_use]

@@ -128,32 +128,28 @@ impl AppendResult {
 
 /// Current offset state of a partition.
 ///
-/// Tracks both the commit offset (visibility boundary) and write offset
-/// (highest written message). These may differ when there are prepared
-/// but uncommitted messages.
+/// Tracks both the durable offset (highest persisted message) and write offset
+/// (highest assigned message offset). These may differ when there are prepared
+/// messages that still only live in the in-memory journal.
 ///
 /// ```text
 /// Segment: [msg0][msg1][msg2][msg3][msg4][msg5][msg6][msg7]
 ///                                     ▲              ▲
-///                               commit_offset   write_offset
+///                              durable_offset   write_offset
 ///                                   (4)             (7)
 ///
-/// - Messages 0-4: COMMITTED (visible to consumers)
-/// - Messages 5-7: PREPARED but not committed (invisible)
+/// - Messages 0-4: durably persisted
+/// - Messages 5-7: prepared, but still buffered in memory
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartitionOffsets {
-    /// Highest offset visible to consumers.
-    ///
-    /// All messages with `offset <= commit_offset` can be read via
-    /// `read_committed()` or `poll_messages()`.
+    /// Highest durably persisted offset.
     pub commit_offset: u64,
 
-    /// Highest offset written to storage.
+    /// Highest offset assigned to the partition.
     ///
     /// This may be greater than `commit_offset` when there are prepared
-    /// but uncommitted messages (during the window between prepare and
-    /// commit in VSR).
+    /// messages buffered in the in-memory journal.
     ///
     /// Invariant: `write_offset >= commit_offset`
     pub write_offset: u64,
