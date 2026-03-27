@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
 use crate::error::IggyError;
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -930,103 +929,98 @@ impl<T> TryFrom<&HeaderField<T>> for Vec<u8> {
     }
 }
 
-impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
-    fn to_bytes(&self) -> Bytes {
-        if self.is_empty() {
-            return Bytes::new();
-        }
-
-        let mut bytes = BytesMut::new();
-        for (key, value) in self {
-            bytes.put_u8(key.kind().as_code());
-            #[allow(clippy::cast_possible_truncation)]
-            bytes.put_u32_le(key.as_bytes().len() as u32);
-            bytes.put_slice(key.as_bytes());
-            bytes.put_u8(value.kind().as_code());
-            #[allow(clippy::cast_possible_truncation)]
-            bytes.put_u32_le(value.as_bytes().len() as u32);
-            bytes.put_slice(value.as_bytes());
-        }
-
-        bytes.freeze()
+pub fn user_headers_to_bytes(headers: &HashMap<HeaderKey, HeaderValue>) -> Bytes {
+    if headers.is_empty() {
+        return Bytes::new();
     }
 
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        if bytes.is_empty() {
-            return Ok(Self::new());
-        }
-
-        let mut headers = Self::new();
-        let mut position = 0;
-        while position < bytes.len() {
-            let key_kind = HeaderKind::from_code(bytes[position])?;
-            position += 1;
-
-            if position + 4 > bytes.len() {
-                return Err(IggyError::InvalidHeaderKey);
-            }
-            let key_length = u32::from_le_bytes(
-                bytes[position..position + 4]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            ) as usize;
-            if key_length == 0 || key_length > 255 {
-                return Err(IggyError::InvalidHeaderKey);
-            }
-            position += 4;
-
-            if position + key_length > bytes.len() {
-                return Err(IggyError::InvalidHeaderKey);
-            }
-            if let Some(expected) = key_kind.expected_size()
-                && key_length != expected
-            {
-                return Err(IggyError::InvalidHeaderKey);
-            }
-            let key_value = bytes[position..position + key_length].to_vec();
-            position += key_length;
-
-            if position >= bytes.len() {
-                return Err(IggyError::InvalidHeaderValue);
-            }
-            let value_kind = HeaderKind::from_code(bytes[position])?;
-            position += 1;
-
-            if position + 4 > bytes.len() {
-                return Err(IggyError::InvalidHeaderValue);
-            }
-            let value_length = u32::from_le_bytes(
-                bytes[position..position + 4]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            ) as usize;
-            if value_length == 0 || value_length > 255 {
-                return Err(IggyError::InvalidHeaderValue);
-            }
-            position += 4;
-
-            if position + value_length > bytes.len() {
-                return Err(IggyError::InvalidHeaderValue);
-            }
-            if let Some(expected) = value_kind.expected_size()
-                && value_length != expected
-            {
-                return Err(IggyError::InvalidHeaderValue);
-            }
-            let value_value = bytes[position..position + value_length].to_vec();
-            position += value_length;
-
-            headers.insert(
-                HeaderKey::new_unchecked(key_kind, &key_value),
-                HeaderValue::new_unchecked(value_kind, &value_value),
-            );
-        }
-
-        Ok(headers)
+    let mut bytes = BytesMut::new();
+    for (key, value) in headers {
+        bytes.put_u8(key.kind().as_code());
+        #[allow(clippy::cast_possible_truncation)]
+        bytes.put_u32_le(key.as_bytes().len() as u32);
+        bytes.put_slice(key.as_bytes());
+        bytes.put_u8(value.kind().as_code());
+        #[allow(clippy::cast_possible_truncation)]
+        bytes.put_u32_le(value.as_bytes().len() as u32);
+        bytes.put_slice(value.as_bytes());
     }
+
+    bytes.freeze()
+}
+
+pub fn user_headers_from_bytes(bytes: Bytes) -> Result<HashMap<HeaderKey, HeaderValue>, IggyError> {
+    if bytes.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut headers = HashMap::new();
+    let mut position = 0;
+    while position < bytes.len() {
+        let key_kind = HeaderKind::from_code(bytes[position])?;
+        position += 1;
+
+        if position + 4 > bytes.len() {
+            return Err(IggyError::InvalidHeaderKey);
+        }
+        let key_length = u32::from_le_bytes(
+            bytes[position..position + 4]
+                .try_into()
+                .map_err(|_| IggyError::InvalidNumberEncoding)?,
+        ) as usize;
+        if key_length == 0 || key_length > 255 {
+            return Err(IggyError::InvalidHeaderKey);
+        }
+        position += 4;
+
+        if position + key_length > bytes.len() {
+            return Err(IggyError::InvalidHeaderKey);
+        }
+        if let Some(expected) = key_kind.expected_size()
+            && key_length != expected
+        {
+            return Err(IggyError::InvalidHeaderKey);
+        }
+        let key_value = bytes[position..position + key_length].to_vec();
+        position += key_length;
+
+        if position >= bytes.len() {
+            return Err(IggyError::InvalidHeaderValue);
+        }
+        let value_kind = HeaderKind::from_code(bytes[position])?;
+        position += 1;
+
+        if position + 4 > bytes.len() {
+            return Err(IggyError::InvalidHeaderValue);
+        }
+        let value_length = u32::from_le_bytes(
+            bytes[position..position + 4]
+                .try_into()
+                .map_err(|_| IggyError::InvalidNumberEncoding)?,
+        ) as usize;
+        if value_length == 0 || value_length > 255 {
+            return Err(IggyError::InvalidHeaderValue);
+        }
+        position += 4;
+
+        if position + value_length > bytes.len() {
+            return Err(IggyError::InvalidHeaderValue);
+        }
+        if let Some(expected) = value_kind.expected_size()
+            && value_length != expected
+        {
+            return Err(IggyError::InvalidHeaderValue);
+        }
+        let value_value = bytes[position..position + value_length].to_vec();
+        position += value_length;
+
+        headers.insert(
+            HeaderKey::new_unchecked(key_kind, &key_value),
+            HeaderValue::new_unchecked(value_kind, &value_value),
+        );
+    }
+
+    Ok(headers)
 }
 
 pub fn get_user_headers_size(headers: &Option<HashMap<HeaderKey, HeaderValue>>) -> Option<u32> {
@@ -1370,7 +1364,7 @@ mod tests {
         headers.insert(HeaderKey::try_from("key 1").unwrap(), 12345u64.into());
         headers.insert(HeaderKey::try_from("key_3").unwrap(), true.into());
 
-        let bytes = headers.to_bytes();
+        let bytes = user_headers_to_bytes(&headers);
 
         let mut position = 0;
         let mut headers_count = 0;
@@ -1427,7 +1421,7 @@ mod tests {
             bytes.put_slice(&value.value);
         }
 
-        let deserialized_headers = HashMap::<HeaderKey, HeaderValue>::from_bytes(bytes.freeze());
+        let deserialized_headers = user_headers_from_bytes(bytes.freeze());
 
         assert!(deserialized_headers.is_ok());
         let deserialized_headers = deserialized_headers.unwrap();
@@ -1451,8 +1445,8 @@ mod tests {
         );
         headers.insert(999u64.into(), true.into());
 
-        let bytes = headers.to_bytes();
-        let deserialized = HashMap::<HeaderKey, HeaderValue>::from_bytes(bytes).unwrap();
+        let bytes = user_headers_to_bytes(&headers);
+        let deserialized = user_headers_from_bytes(bytes).unwrap();
 
         assert_eq!(deserialized.len(), headers.len());
         for (key, value) in &headers {
@@ -1661,7 +1655,7 @@ mod tests {
         bytes.put_u32_le(100); // key_len = 100 (lie!)
         bytes.put_slice(b"abc"); // only 3 bytes of key data
 
-        let result = HashMap::<HeaderKey, HeaderValue>::from_bytes(bytes.freeze());
+        let result = user_headers_from_bytes(bytes.freeze());
         assert!(result.is_err());
     }
 
@@ -1688,7 +1682,7 @@ mod tests {
         bytes.put_u32_le(4); // value_len = 4 (wrong, should be 2)
         bytes.put_slice(&[1, 2, 3, 4]);
 
-        let result = HashMap::<HeaderKey, HeaderValue>::from_bytes(bytes.freeze());
+        let result = user_headers_from_bytes(bytes.freeze());
         assert!(result.is_err());
     }
 
@@ -1703,7 +1697,7 @@ mod tests {
         bytes.put_u8(6); // value_kind = Int32
         // Missing value length bytes
 
-        let result = HashMap::<HeaderKey, HeaderValue>::from_bytes(bytes.freeze());
+        let result = user_headers_from_bytes(bytes.freeze());
         assert!(result.is_err());
     }
 

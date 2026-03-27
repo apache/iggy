@@ -522,6 +522,33 @@ pub fn consumer_to_wire(consumer: &Consumer) -> Result<WireConsumer, IggyError> 
     })
 }
 
+/// Convert a domain `PollingStrategy` to `WirePollingStrategy`.
+pub fn polling_strategy_to_wire(
+    strategy: &crate::PollingStrategy,
+) -> iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy {
+    iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy {
+        kind: strategy.kind.as_code(),
+        value: strategy.value,
+    }
+}
+
+/// Convert a domain `Partitioning` to `WirePartitioning`.
+pub fn partitioning_to_wire(
+    partitioning: &crate::Partitioning,
+) -> iggy_binary_protocol::primitives::partitioning::WirePartitioning {
+    use iggy_binary_protocol::primitives::partitioning::WirePartitioning;
+    match partitioning.kind {
+        crate::PartitioningKind::Balanced => WirePartitioning::Balanced,
+        crate::PartitioningKind::PartitionId => {
+            let id = u32::from_le_bytes(partitioning.value[..4].try_into().unwrap());
+            WirePartitioning::PartitionId(id)
+        }
+        crate::PartitioningKind::MessagesKey => {
+            WirePartitioning::MessagesKey(partitioning.value.clone())
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Permissions (wire -> domain)
 // ---------------------------------------------------------------------------

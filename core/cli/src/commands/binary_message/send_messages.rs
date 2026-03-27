@@ -21,9 +21,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_common::Client;
-use iggy_common::{
-    BytesSerializable, HeaderKey, HeaderValue, Identifier, IggyMessage, Partitioning, Sizeable,
-};
+use iggy_common::{HeaderKey, HeaderValue, Identifier, IggyMessage, Partitioning, Sizeable};
 use std::collections::HashMap;
 use std::io::{self, Read};
 use tokio::io::AsyncReadExt;

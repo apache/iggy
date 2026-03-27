@@ -71,5 +71,6 @@ pub use polling_kind::PollingKind;
 pub use polling_strategy::PollingStrategy;
 pub use user_headers::{
     HeaderEntry, HeaderField, HeaderKey, HeaderKind, HeaderValue, KeyMarker, UserHeaders,
-    ValueMarker, deserialize_headers, serialize_headers,
+    ValueMarker, deserialize_headers, serialize_headers, user_headers_from_bytes,
+    user_headers_to_bytes,
 };

@@ -16,11 +16,8 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::error::IggyError;
 use crate::types::message::polling_kind::PollingKind;
 use crate::utils::timestamp::IggyTimestamp;
-use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 use std::fmt::Display;
@@ -119,29 +116,5 @@ impl PollingStrategy {
     /// Returns default kind of the polling strategy.
     pub fn default_kind() -> PollingKind {
         PollingKind::default()
-    }
-}
-
-impl BytesSerializable for PollingStrategy {
-    fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::with_capacity(9);
-        bytes.put_u8(self.kind.as_code());
-        bytes.put_u64_le(self.value);
-        bytes.freeze()
-    }
-
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
-        if bytes.len() != 9 {
-            return Err(IggyError::InvalidCommand);
-        }
-
-        let kind = PollingKind::from_code(bytes[0])?;
-        let value = u64::from_le_bytes(
-            bytes[1..9]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        let strategy = PollingStrategy { kind, value };
-        Ok(strategy)
     }
 }

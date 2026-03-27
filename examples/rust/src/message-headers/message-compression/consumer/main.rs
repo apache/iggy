@@ -76,7 +76,7 @@ fn handle_payload_compression(msg: &mut ReceivedMessage) -> Result<(), IggyError
         // remove the compression header since payload is now decompressed
         if let Ok(Some(mut headers_map)) = msg.message.user_headers_map() {
             headers_map.remove(&Codec::header_key());
-            let headers_bytes = headers_map.to_bytes();
+            let headers_bytes = user_headers_to_bytes(&headers_map);
             msg.message.header.user_headers_length = headers_bytes.len() as u32;
             msg.message.user_headers = if headers_map.is_empty() {
                 None

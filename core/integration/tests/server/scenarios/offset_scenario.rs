@@ -19,6 +19,7 @@
 use super::PARTITION_ID;
 use bytes::BytesMut;
 use iggy::prelude::*;
+use iggy_common::user_headers_from_bytes;
 use integration::harness::TestHarness;
 use std::collections::HashMap;
 
@@ -403,8 +404,7 @@ async fn verify_message_content(
             );
 
             if let Some(headers) = &msg.user_headers {
-                let headers_map =
-                    HashMap::<HeaderKey, HeaderValue>::from_bytes(headers.clone()).unwrap();
+                let headers_map = user_headers_from_bytes(headers.clone()).unwrap();
                 assert_eq!(headers_map.len(), 3, "Expected 3 headers");
             }
         }
