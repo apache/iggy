@@ -280,22 +280,30 @@ pub(crate) fn serialize_value(
                         );
                         return Err(Error::InvalidRecord);
                     }
-                    for (elem, ft) in arr.iter().zip(field_types.iter()) {
+                    for (elem, (_, ft)) in arr.iter().zip(field_types.iter()) {
                         serialize_value(elem, ft, buf)?;
                     }
                 }
                 OwnedValue::Object(obj) => {
-                    // Named tuple: fields are matched by position (insertion order).
-                    let values: Vec<&OwnedValue> = obj.values().collect();
-                    if values.len() != field_types.len() {
+                    // Named tuple: look up each field by name to guarantee
+                    // correct ordering regardless of JSON key iteration order.
+                    if obj.len() != field_types.len() {
                         error!(
                             "Tuple length mismatch: expected {}, got {}",
                             field_types.len(),
-                            values.len()
+                            obj.len()
                         );
                         return Err(Error::InvalidRecord);
                     }
-                    for (v, ft) in values.iter().zip(field_types.iter()) {
+                    for (name_opt, ft) in field_types.iter() {
+                        let Some(name) = name_opt else {
+                            error!("Cannot serialise unnamed tuple fields from a JSON object");
+                            return Err(Error::InvalidRecord);
+                        };
+                        let Some(v) = obj.get(name.as_str()) else {
+                            error!("Tuple field '{name}' not found in JSON object");
+                            return Err(Error::InvalidRecord);
+                        };
                         serialize_value(v, ft, buf)?;
                     }
                 }
@@ -1011,7 +1019,7 @@ mod tests {
         let mut buf = vec![];
         serialize_value(
             &arr,
-            &ChType::Tuple(vec![ChType::String, ChType::Int32]),
+            &ChType::Tuple(vec![(None, ChType::String), (None, ChType::Int32)]),
             &mut buf,
         )
         .unwrap();
@@ -1021,18 +1029,24 @@ mod tests {
 
     #[test]
     fn serialize_tuple_from_json_object() {
-        // Tuple(String, Int32) as named object: {"a": "hi", "b": 7}
+        // Tuple(a String, b Int32) as named object: {"b": 7, "a": "hi"}
+        // Keys are inserted in reverse order to verify name-based (not positional) lookup.
         let mut obj = simd_json::owned::Object::new();
-        obj.insert("a".into(), json_str("hi"));
         obj.insert("b".into(), json_i64(7));
+        obj.insert("a".into(), json_str("hi"));
         let value = OwnedValue::Object(Box::new(obj));
         let mut buf = vec![];
         serialize_value(
             &value,
-            &ChType::Tuple(vec![ChType::String, ChType::Int32]),
+            &ChType::Tuple(vec![
+                (Some("a".into()), ChType::String),
+                (Some("b".into()), ChType::Int32),
+            ]),
             &mut buf,
         )
         .unwrap();
+        // Schema order is (a String, b Int32), so "hi" must come before 7
+        // regardless of object key insertion order.
         assert_eq!(&buf[..3], &[0x02, b'h', b'i']);
         assert_eq!(&buf[3..], 7i32.to_le_bytes());
     }
@@ -1044,7 +1058,7 @@ mod tests {
         let mut buf = vec![];
         let result = serialize_value(
             &arr,
-            &ChType::Tuple(vec![ChType::Int32, ChType::String]),
+            &ChType::Tuple(vec![(None, ChType::Int32), (None, ChType::String)]),
             &mut buf,
         );
         assert!(result.is_err());

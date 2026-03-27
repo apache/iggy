@@ -133,8 +133,8 @@ pub enum ChType {
     Array(Box<ChType>),
     /// Map(key_type, value_type)
     Map(Box<ChType>, Box<ChType>),
-    /// Tuple of ordered field types (named or unnamed).
-    Tuple(Vec<ChType>),
+    /// Tuple of ordered fields. Each field carries an optional name (named tuples).
+    Tuple(Vec<(Option<String>, ChType)>),
 }
 
 // ─── Public entry point ──────────────────────────────────────────────────────
@@ -172,21 +172,18 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
     // e.g. "Tuple(Int32, String)" or "Tuple(id Int32, name String)"
     if let Some(inner) = strip_wrapper(s, "Tuple") {
         let parts = split_args(inner)?;
-        // Named tuples look like `field_name Type, …`. Strip names if present.
-        let types: Result<Vec<ChType>, Error> = parts
+        let fields: Result<Vec<(Option<String>, ChType)>, Error> = parts
             .iter()
             .map(|p| {
                 let p = p.trim();
-                // If the first token is an identifier followed by a space and a
-                // valid type keyword, treat it as a named field.
-                if let Some(rest) = strip_named_tuple_field(p) {
-                    parse_type_inner(rest)
+                if let Some((name, rest)) = strip_named_tuple_field(p) {
+                    Ok((Some(name.to_string()), parse_type_inner(rest)?))
                 } else {
-                    parse_type_inner(p)
+                    Ok((None, parse_type_inner(p)?))
                 }
             })
             .collect();
-        return Ok(ChType::Tuple(types?));
+        return Ok(ChType::Tuple(fields?));
     }
     // e.g. "Enum8('a' = 1, 'b' = 2)"
     if let Some(inner) = strip_wrapper(s, "Enum8") {
@@ -373,9 +370,9 @@ fn split_two_args(s: &str) -> Result<(&str, &str), Error> {
 }
 
 /// If `s` starts with an identifier followed by a space and the rest looks
-/// like a type, return the type portion. This handles named Tuple fields like
+/// like a type, return `(name, type_str)`. This handles named Tuple fields like
 /// `id Int32`.
-fn strip_named_tuple_field(s: &str) -> Option<&str> {
+fn strip_named_tuple_field(s: &str) -> Option<(&str, &str)> {
     let mut chars = s.char_indices().peekable();
     // Consume identifier characters (letters, digits, underscore)
     while let Some((_, ch)) = chars.peek() {
@@ -387,10 +384,11 @@ fn strip_named_tuple_field(s: &str) -> Option<&str> {
     }
     // Expect a single space after the identifier
     if let Some((idx, ' ')) = chars.next() {
+        let name = &s[..idx];
         let rest = s[idx + 1..].trim();
         // Sanity: the rest should start with an uppercase letter (type name)
         if rest.starts_with(|c: char| c.is_uppercase()) {
-            return Some(rest);
+            return Some((name, rest));
         }
     }
     None
@@ -556,13 +554,27 @@ mod tests {
     #[test]
     fn parses_tuple_unnamed() {
         let t = parse_type("Tuple(String, Int32)").unwrap();
-        assert!(matches!(t, ChType::Tuple(fields) if fields.len() == 2));
+        let ChType::Tuple(fields) = t else {
+            panic!("expected Tuple")
+        };
+        assert_eq!(fields.len(), 2);
+        assert!(fields[0].0.is_none());
+        assert!(fields[1].0.is_none());
+        assert!(matches!(fields[0].1, ChType::String));
+        assert!(matches!(fields[1].1, ChType::Int32));
     }
 
     #[test]
     fn parses_tuple_named() {
         let t = parse_type("Tuple(id Int32, name String)").unwrap();
-        assert!(matches!(t, ChType::Tuple(fields) if fields.len() == 2));
+        let ChType::Tuple(fields) = t else {
+            panic!("expected Tuple")
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0.as_deref(), Some("id"));
+        assert_eq!(fields[1].0.as_deref(), Some("name"));
+        assert!(matches!(fields[0].1, ChType::Int32));
+        assert!(matches!(fields[1].1, ChType::String));
     }
 
     #[test]
@@ -636,8 +648,10 @@ mod tests {
             panic!("expected Tuple")
         };
         assert_eq!(fields.len(), 2);
-        assert!(matches!(fields[0], ChType::Int32));
-        assert!(matches!(fields[1], ChType::DateTime64(3)));
+        assert_eq!(fields[0].0.as_deref(), Some("id"));
+        assert_eq!(fields[1].0.as_deref(), Some("ts"));
+        assert!(matches!(fields[0].1, ChType::Int32));
+        assert!(matches!(fields[1].1, ChType::DateTime64(3)));
     }
 
     /// Nullable wrapping a composite type (not just a primitive).
@@ -659,8 +673,10 @@ mod tests {
             panic!("expected Tuple")
         };
         assert_eq!(fields.len(), 2);
-        assert!(matches!(fields[0], ChType::Array(_)));
-        assert!(matches!(fields[1], ChType::Map(_, _)));
+        assert_eq!(fields[0].0.as_deref(), Some("tags"));
+        assert_eq!(fields[1].0.as_deref(), Some("meta"));
+        assert!(matches!(fields[0].1, ChType::Array(_)));
+        assert!(matches!(fields[1].1, ChType::Map(_, _)));
     }
 
     /// Map whose value type is itself a Map — exercises that split_two_args
@@ -683,6 +699,6 @@ mod tests {
             panic!("expected Tuple")
         };
         assert_eq!(fields.len(), 3);
-        assert!(fields.iter().all(|f| matches!(f, ChType::Float32)));
+        assert!(fields.iter().all(|(_, ft)| matches!(ft, ChType::Float32)));
     }
 }
