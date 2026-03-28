@@ -373,6 +373,11 @@ components:
       - "web/**"
     tasks: ["lint", "build"]
 
+  helm:
+    paths:
+      - "helm/**"
+    tasks: ["validate", "smoke"]
+
   rust-bench-dashboard:
     paths:
       - "core/bench/dashboard/**"
