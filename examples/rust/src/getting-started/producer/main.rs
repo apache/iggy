@@ -167,13 +167,6 @@ fn get_tcp_server_addr() -> String {
             );
         }
         let tcp_server_addr = tcp_server_addr.unwrap();
-        if parse_server_address(tcp_server_addr.trim()).is_err() {
-            panic!(
-                "Invalid server address {}! Usage: {} --tcp-server-address <server-address>",
-                tcp_server_addr,
-                env::args().next().unwrap()
-            );
-        }
         info!("Using server address: {}", tcp_server_addr);
         tcp_server_addr
     }

@@ -32,14 +32,14 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// - Bare IPv6 without brackets (e.g. `::1:8080`) — ambiguous due to colons
 /// - Missing port (e.g. `localhost`)
 /// - Invalid port (e.g. `localhost:abc`, `localhost:65536`)
-pub fn parse_server_address(addr: &str) -> Result<(), IggyError> {
+pub fn validate_server_address(addr: &str) -> Result<(), IggyError> {
     if let Some(rest) = addr.strip_prefix('[') {
         // Bracketed IPv6: "[::1]:port"
         let close = rest.find(']').ok_or(IggyError::InvalidIpAddress(
             addr.to_string(),
             "".to_string(),
         ))?;
-        let ipv6_str = &rest[0..close];
+        let ipv6_str = &rest[..close];
         let port_str = rest[close + 1..]
             .strip_prefix(':')
             .ok_or(IggyError::InvalidIpAddress(
@@ -126,79 +126,79 @@ mod tests {
 
     #[test]
     fn valid_ipv4_with_port() {
-        assert!(parse_server_address("127.0.0.1:8090").is_ok());
-        assert!(parse_server_address("192.168.1.1:65535").is_ok());
+        assert!(validate_server_address("127.0.0.1:8090").is_ok());
+        assert!(validate_server_address("192.168.1.1:65535").is_ok());
     }
 
     #[test]
     fn valid_ipv6_with_brackets() {
-        assert!(parse_server_address("[::1]:8090").is_ok());
-        assert!(parse_server_address("[2001:db8::1]:65535").is_ok());
+        assert!(validate_server_address("[::1]:8090").is_ok());
+        assert!(validate_server_address("[2001:db8::1]:65535").is_ok());
     }
 
     #[test]
     fn valid_hostname_with_port() {
-        assert!(parse_server_address("localhost:8090").is_ok());
-        assert!(parse_server_address("iggy-server:8090").is_ok());
-        assert!(parse_server_address("iggy.default.svc.cluster.local:8090").is_ok());
-        assert!(parse_server_address("example.com:80").is_ok());
+        assert!(validate_server_address("localhost:8090").is_ok());
+        assert!(validate_server_address("iggy-server:8090").is_ok());
+        assert!(validate_server_address("iggy.default.svc.cluster.local:8090").is_ok());
+        assert!(validate_server_address("example.com:80").is_ok());
     }
 
     #[test]
     fn bare_ipv6_without_brackets_should_fail() {
         // Ambiguous format, not supported
-        assert!(parse_server_address("::1:8080").is_err());
+        assert!(validate_server_address("::1:8080").is_err());
     }
 
     #[test]
     fn unresolvable_hostname_should_succeed() {
         // Format is valid, DNS is not attempted
-        assert!(parse_server_address("invalid.ip:8080").is_ok());
+        assert!(validate_server_address("invalid.ip:8080").is_ok());
     }
 
     #[test]
     fn missing_port_should_fail() {
-        assert!(parse_server_address("localhost").is_err());
-        assert!(parse_server_address("127.0.0.1").is_err());
+        assert!(validate_server_address("localhost").is_err());
+        assert!(validate_server_address("127.0.0.1").is_err());
     }
 
     #[test]
     fn invalid_port_should_fail() {
-        assert!(parse_server_address("localhost:abc").is_err());
-        assert!(parse_server_address("127.0.0.1:invalid").is_err());
+        assert!(validate_server_address("localhost:abc").is_err());
+        assert!(validate_server_address("127.0.0.1:invalid").is_err());
     }
 
     #[test]
     fn port_out_of_range_should_fail() {
-        assert!(parse_server_address("localhost:65536").is_err());
-        assert!(parse_server_address("127.0.0.1:70000").is_err());
+        assert!(validate_server_address("localhost:65536").is_err());
+        assert!(validate_server_address("127.0.0.1:70000").is_err());
     }
 
     #[test]
     fn port_65535_should_succeed() {
-        assert!(parse_server_address("localhost:65535").is_ok());
+        assert!(validate_server_address("localhost:65535").is_ok());
     }
 
     #[test]
     fn port_0_should_fail() {
-        assert!(parse_server_address("localhost:0").is_err());
-        assert!(parse_server_address("127.0.0.1:0").is_err());
-        assert!(parse_server_address("[::1]:0").is_err());
+        assert!(validate_server_address("localhost:0").is_err());
+        assert!(validate_server_address("127.0.0.1:0").is_err());
+        assert!(validate_server_address("[::1]:0").is_err());
     }
 
     #[test]
     fn ipv6_missing_closing_bracket_should_fail() {
-        assert!(parse_server_address("[::1:8090").is_err());
+        assert!(validate_server_address("[::1:8090").is_err());
     }
 
     #[test]
     fn empty_host_should_fail() {
-        assert!(parse_server_address(":8090").is_err());
+        assert!(validate_server_address(":8090").is_err());
     }
 
     #[test]
     fn empty_string_should_fail() {
-        assert!(parse_server_address("").is_err());
+        assert!(validate_server_address("").is_err());
     }
 
     #[test]
@@ -263,29 +263,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_server_address_rejects_invalid_hostname() {
-        assert!(parse_server_address("example..com:8090").is_err());
-        assert!(parse_server_address("-invalid:8090").is_err());
-        assert!(parse_server_address("invalid-:8090").is_err());
-        assert!(parse_server_address("example_invalid:8090").is_err());
+    fn validate_server_address_rejects_invalid_hostname() {
+        assert!(validate_server_address("example..com:8090").is_err());
+        assert!(validate_server_address("-invalid:8090").is_err());
+        assert!(validate_server_address("invalid-:8090").is_err());
+        assert!(validate_server_address("example_invalid:8090").is_err());
     }
 
     #[test]
     fn invalid_ipv6_in_brackets_should_fail() {
-        assert!(parse_server_address("[invalid]:8090").is_err());
-        assert!(parse_server_address("[::gggg]:8090").is_err());
-        assert!(parse_server_address("[192.168.1.1]:8090").is_err());
+        assert!(validate_server_address("[invalid]:8090").is_err());
+        assert!(validate_server_address("[::gggg]:8090").is_err());
+        assert!(validate_server_address("[192.168.1.1]:8090").is_err());
     }
 
     #[test]
     fn valid_ipv4_address_should_succeed() {
-        assert!(parse_server_address("192.168.1.1:8090").is_ok());
-        assert!(parse_server_address("10.0.0.1:8090").is_ok());
+        assert!(validate_server_address("192.168.1.1:8090").is_ok());
+        assert!(validate_server_address("10.0.0.1:8090").is_ok());
     }
 
     #[test]
     fn invalid_ipv4_address_should_fail() {
-        assert!(parse_server_address("256.1.1.1:8090").is_err());
-        assert!(parse_server_address("192.168.1:8090").is_err());
+        assert!(validate_server_address("256.1.1.1:8090").is_err());
+        assert!(validate_server_address("192.168.1:8090").is_err());
     }
 }

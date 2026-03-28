@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{AutoLogin, IggyDuration, IggyError, TcpClientConfig, parse_server_address};
+use crate::{AutoLogin, IggyDuration, IggyError, TcpClientConfig, validate_server_address};
 
 /// Builder for the TCP client configuration.
 /// Allows configuring the TCP client with custom settings or using defaults:
@@ -102,9 +102,9 @@ impl TcpClientConfigBuilder {
     }
 
     /// Builds the TCP client configuration.
-    pub fn build(self) -> Result<TcpClientConfig, IggyError> {
-        let addr = self.config.server_address.trim();
-        parse_server_address(addr)?;
+    pub fn build(mut self) -> Result<TcpClientConfig, IggyError> {
+        self.config.server_address = self.config.server_address.trim().to_string();
+        validate_server_address(&self.config.server_address)?;
 
         Ok(self.config)
     }
