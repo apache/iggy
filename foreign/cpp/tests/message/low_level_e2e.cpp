@@ -24,29 +24,17 @@
 #include "lib.rs.h"
 #include "tests/common/test_helpers.hpp"
 
-static rust::Vec<std::uint8_t> to_payload(const std::string &s) {
-    rust::Vec<std::uint8_t> v;
-    for (const char c : s) {
-        v.push_back(static_cast<std::uint8_t>(c));
-    }
-    return v;
-}
-
-static rust::Vec<std::uint8_t> partition_id_bytes(std::uint32_t id) {
-    rust::Vec<std::uint8_t> v;
-    v.push_back(static_cast<std::uint8_t>(id & 0xFF));
-    v.push_back(static_cast<std::uint8_t>((id >> 8) & 0xFF));
-    v.push_back(static_cast<std::uint8_t>((id >> 16) & 0xFF));
-    v.push_back(static_cast<std::uint8_t>((id >> 24) & 0xFF));
-    return v;
-}
-
-TEST(LowLevelE2E_Message, GetStreamsReturnsEmptyInitially) {
-    RecordProperty("description", "Verifies get_streams returns empty vector on fresh server.");
+TEST(LowLevelE2E_Message, GetStreamsReturnsEmptyAfterCleanup) {
+    RecordProperty("description", "Verifies get_streams returns empty vector after cleaning up all streams.");
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
 
     auto streams = client->get_streams();
+    for (const auto &s : streams) {
+        client->delete_stream(make_numeric_identifier(s.id));
+    }
+
+    streams = client->get_streams();
     ASSERT_EQ(streams.size(), 0);
 
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));

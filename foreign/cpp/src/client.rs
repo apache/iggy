@@ -159,17 +159,18 @@ impl Client {
             "balanced" => Partitioning::balanced(),
             "partition_id" => {
                 if partitioning_value.len() < 4 {
-                    return Err("partition_id requires 4 bytes".to_string());
+                    return Err(
+                        "Could not send messages: partition_id requires 4 bytes".to_string()
+                    );
                 }
-                let id = u32::from_le_bytes(
-                    partitioning_value[..4]
-                        .try_into()
-                        .map_err(|_| "Invalid partition_id value".to_string())?,
-                );
+                let id = u32::from_le_bytes(partitioning_value[..4].try_into().map_err(|_| {
+                    "Could not send messages: invalid partition_id value".to_string()
+                })?);
                 Partitioning::partition_id(id)
             }
-            "messages_key" => Partitioning::messages_key(&partitioning_value)
-                .map_err(|error| format!("Invalid messages key: {error}"))?,
+            "messages_key" => Partitioning::messages_key(&partitioning_value).map_err(|error| {
+                format!("Could not send messages: invalid messages key: {error}")
+            })?,
             _ => return Err(format!("Invalid partitioning kind: {partitioning_kind}")),
         };
 
