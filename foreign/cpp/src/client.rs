@@ -19,10 +19,11 @@ use crate::{RUNTIME, ffi};
 use bytes::Bytes;
 use iggy::prelude::{
     Client as IggyConnectionClient, CompressionAlgorithm as RustCompressionAlgorithm,
-    ConsumerGroupClient, Identifier as RustIdentifier, IggyClient as RustIggyClient,
-    IggyClientBuilder as RustIggyClientBuilder, IggyError, IggyExpiry as RustIggyExpiry,
-    IggyMessage, MaxTopicSize as RustMaxTopicSize, MessageClient, Partitioning, PartitionClient,
-    StreamClient, TopicClient, UserClient,
+    Consumer, ConsumerGroupClient, ConsumerKind, Identifier as RustIdentifier,
+    IggyClient as RustIggyClient, IggyClientBuilder as RustIggyClientBuilder, IggyError,
+    IggyExpiry as RustIggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize as RustMaxTopicSize,
+    MessageClient, Partitioning, PartitionClient, PollingStrategy, StreamClient, TopicClient,
+    UserClient,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -197,6 +198,68 @@ impl Client {
                 .await
                 .map_err(|error| format!("Could not send messages: {error}"))?;
             Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn poll_messages(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partition_id: u32,
+        consumer_kind: String,
+        consumer_id: ffi::Identifier,
+        strategy_kind: String,
+        strategy_value: u64,
+        count: u32,
+        auto_commit: bool,
+    ) -> Result<ffi::PolledMessages, String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not poll messages: {error}"))?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not poll messages: {error}"))?;
+        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
+            .map_err(|error| format!("Could not poll messages: {error}"))?;
+
+        let consumer = Consumer {
+            kind: match consumer_kind.as_str() {
+                "consumer" => ConsumerKind::Consumer,
+                "consumer_group" => ConsumerKind::ConsumerGroup,
+                _ => return Err(format!("Invalid consumer kind: {consumer_kind}")),
+            },
+            id: rust_consumer_id,
+        };
+
+        let strategy = match strategy_kind.as_str() {
+            "offset" => PollingStrategy::offset(strategy_value),
+            "timestamp" => PollingStrategy::timestamp(IggyTimestamp::from(strategy_value)),
+            "first" => PollingStrategy::first(),
+            "last" => PollingStrategy::last(),
+            "next" => PollingStrategy::next(),
+            _ => return Err(format!("Invalid polling strategy: {strategy_kind}")),
+        };
+
+        let opt_partition = if partition_id == u32::MAX {
+            None
+        } else {
+            Some(partition_id)
+        };
+
+        RUNTIME.block_on(async {
+            let polled = self
+                .inner
+                .poll_messages(
+                    &rust_stream_id,
+                    &rust_topic_id,
+                    opt_partition,
+                    &consumer,
+                    &strategy,
+                    count,
+                    auto_commit,
+                )
+                .await
+                .map_err(|error| format!("Could not poll messages: {error}"))?;
+            Ok(ffi::PolledMessages::from(polled))
         })
     }
 

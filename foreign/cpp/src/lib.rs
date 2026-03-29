@@ -17,6 +17,7 @@
 mod client;
 mod consumer_group;
 mod identifier;
+mod messages;
 mod stream;
 mod topic;
 
@@ -64,6 +65,23 @@ mod ffi {
         id_lo: u64,
         id_hi: u64,
         payload: Vec<u8>,
+    }
+
+    struct IggyMessagePolled {
+        id_lo: u64,
+        id_hi: u64,
+        offset: u64,
+        timestamp: u64,
+        origin_timestamp: u64,
+        payload: Vec<u8>,
+        user_headers: Vec<u8>,
+    }
+
+    struct PolledMessages {
+        partition_id: u32,
+        current_offset: u64,
+        count: u32,
+        messages: Vec<IggyMessagePolled>,
     }
 
     struct StreamDetails {
@@ -145,6 +163,20 @@ mod ffi {
             topic_id: Identifier,
             group_id: Identifier,
         ) -> Result<()>;
+
+        #[allow(clippy::too_many_arguments)]
+        fn poll_messages(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partition_id: u32,
+            consumer_kind: String,
+            consumer_id: Identifier,
+            strategy_kind: String,
+            strategy_value: u64,
+            count: u32,
+            auto_commit: bool,
+        ) -> Result<PolledMessages>;
 
         #[allow(clippy::too_many_arguments)]
         fn send_messages(
