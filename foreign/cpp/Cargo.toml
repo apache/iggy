@@ -27,6 +27,7 @@ ignored = ["cxx-build"]
 crate-type = ["staticlib"]
 
 [dependencies]
+bytes = "1.11.1"
 cxx = "1.0.194"
 iggy = { path = "../../core/sdk" }
 iggy_common = { path = "../../core/common" }
