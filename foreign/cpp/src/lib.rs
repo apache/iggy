@@ -60,6 +60,12 @@ mod ffi {
         topics_count: u32,
     }
 
+    struct IggyMessageToSend {
+        id_lo: u64,
+        id_hi: u64,
+        payload: Vec<u8>,
+    }
+
     struct StreamDetails {
         id: u32,
         created_at: u64,
@@ -138,6 +144,16 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             group_id: Identifier,
+        ) -> Result<()>;
+
+        #[allow(clippy::too_many_arguments)]
+        fn send_messages(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partitioning_kind: String,
+            partitioning_value: Vec<u8>,
+            messages: Vec<IggyMessageToSend>,
         ) -> Result<()>;
 
         unsafe fn delete_connection(client: *mut Client) -> Result<()>;

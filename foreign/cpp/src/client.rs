@@ -16,11 +16,13 @@
 // under the License.
 
 use crate::{RUNTIME, ffi};
+use bytes::Bytes;
 use iggy::prelude::{
     Client as IggyConnectionClient, CompressionAlgorithm as RustCompressionAlgorithm,
     ConsumerGroupClient, Identifier as RustIdentifier, IggyClient as RustIggyClient,
     IggyClientBuilder as RustIggyClientBuilder, IggyError, IggyExpiry as RustIggyExpiry,
-    MaxTopicSize as RustMaxTopicSize, PartitionClient, StreamClient, TopicClient, UserClient,
+    IggyMessage, MaxTopicSize as RustMaxTopicSize, MessageClient, Partitioning, PartitionClient,
+    StreamClient, TopicClient, UserClient,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -137,6 +139,66 @@ impl Client {
     //         Ok(())
     //     })
     // }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_messages(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partitioning_kind: String,
+        partitioning_value: Vec<u8>,
+        messages: Vec<ffi::IggyMessageToSend>,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not send messages: {error}"))?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not send messages: {error}"))?;
+
+        let partitioning = match partitioning_kind.as_str() {
+            "balanced" => Partitioning::balanced(),
+            "partition_id" => {
+                if partitioning_value.len() < 4 {
+                    return Err("partition_id requires 4 bytes".to_string());
+                }
+                let id = u32::from_le_bytes(
+                    partitioning_value[..4]
+                        .try_into()
+                        .map_err(|_| "Invalid partition_id value".to_string())?,
+                );
+                Partitioning::partition_id(id)
+            }
+            "messages_key" => Partitioning::messages_key(&partitioning_value)
+                .map_err(|error| format!("Invalid messages key: {error}"))?,
+            _ => return Err(format!("Invalid partitioning kind: {partitioning_kind}")),
+        };
+
+        let mut iggy_messages: Vec<IggyMessage> = messages
+            .into_iter()
+            .map(|m| {
+                let id = ((m.id_hi as u128) << 64) | (m.id_lo as u128);
+                let payload = Bytes::from(m.payload);
+                let msg = if id > 0 {
+                    IggyMessage::builder().id(id).payload(payload).build()
+                } else {
+                    IggyMessage::builder().payload(payload).build()
+                };
+                msg.map_err(|error| format!("Could not build message: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .send_messages(
+                    &rust_stream_id,
+                    &rust_topic_id,
+                    &partitioning,
+                    &mut iggy_messages,
+                )
+                .await
+                .map_err(|error| format!("Could not send messages: {error}"))?;
+            Ok(())
+        })
+    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
