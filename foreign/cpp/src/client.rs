@@ -73,6 +73,17 @@ impl Client {
         })
     }
 
+    pub fn get_streams(&self) -> Result<Vec<ffi::Stream>, String> {
+        RUNTIME.block_on(async {
+            let streams = self
+                .inner
+                .get_streams()
+                .await
+                .map_err(|error| format!("Could not get streams: {error}"))?;
+            Ok(streams.into_iter().map(ffi::Stream::from).collect())
+        })
+    }
+
     pub fn create_stream(&self, stream_name: String) -> Result<(), String> {
         RUNTIME.block_on(async {
             self.inner

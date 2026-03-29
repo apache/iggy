@@ -51,6 +51,15 @@ mod ffi {
         partitions_count: u32,
     }
 
+    struct Stream {
+        id: u32,
+        created_at: u64,
+        name: String,
+        size_bytes: u64,
+        messages_count: u64,
+        topics_count: u32,
+    }
+
     struct StreamDetails {
         id: u32,
         created_at: u64,
@@ -83,6 +92,7 @@ mod ffi {
         fn login_user(self: &Client, username: String, password: String) -> Result<()>;
         fn connect(self: &Client) -> Result<()>;
         fn create_stream(self: &Client, stream_name: String) -> Result<()>;
+        fn get_streams(self: &Client) -> Result<Vec<Stream>>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(self: &Client, stream_id: Identifier) -> Result<()>;
         // fn purge_stream(&self, stream_id: Identifier) -> Result<()>;
