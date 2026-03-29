@@ -428,6 +428,16 @@ where
             RequestStatus::New => {}
         }
 
+        // Register for commit notification before entering the pipeline.
+        // TODO: Once the connection handler (SDK integration) owns the request lifecycle,
+        // the Notify handle should be returned to the caller so it can await the committed
+        // reply. At that point, `on_request` no longer calls `send_to_client` in `on_ack` —
+        // the connection handler reads `get_reply()` after `notify.notified().await`.
+        let _notify = consensus
+            .clients_table()
+            .borrow_mut()
+            .register_pending(client_id, request);
+
         emit_sim_event(
             SimEventKind::ClientRequestReceived,
             &RequestLogEvent {

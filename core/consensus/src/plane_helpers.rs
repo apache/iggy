@@ -273,6 +273,7 @@ where
         reserved_frame: [0; 66],
         request_checksum: prepare_header.request_checksum,
         context: 0,
+        client: prepare_header.client,
         op: prepare_header.op,
         commit: consensus.commit(),
         timestamp: prepare_header.timestamp,
