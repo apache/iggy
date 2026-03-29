@@ -466,6 +466,33 @@ impl PacketSimulator {
         &mut self.links[idx].drop_packet_fn
     }
 
+    /// Disable a process by blocking all links to and from it.
+    ///
+    /// Packets already queued on those links remain but will be dropped at
+    /// delivery time because the link filter is [`BLOCK_ALL`].
+    pub fn process_disable(&mut self, process: ProcessId) {
+        let all_processes: Vec<ProcessId> = self.process_indices.keys().copied().collect();
+        for other in all_processes {
+            if other == process {
+                continue;
+            }
+            *self.link_filter(process, other) = BLOCK_ALL;
+            *self.link_filter(other, process) = BLOCK_ALL;
+        }
+    }
+
+    /// Re-enable a process by allowing all links to and from it.
+    pub fn process_enable(&mut self, process: ProcessId) {
+        let all_processes: Vec<ProcessId> = self.process_indices.keys().copied().collect();
+        for other in all_processes {
+            if other == process {
+                continue;
+            }
+            *self.link_filter(process, other) = ALLOW_ALL;
+            *self.link_filter(other, process) = ALLOW_ALL;
+        }
+    }
+
     // TODO: implement record/replay_recorded for deterministic replay support.
 
     /// Deliver all packets that are ready at the current tick.
