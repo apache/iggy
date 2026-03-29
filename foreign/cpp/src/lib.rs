@@ -22,6 +22,7 @@ mod stream;
 mod topic;
 
 use client::{Client, delete_connection, new_connection};
+use messages::new_message;
 use std::sync::LazyLock;
 
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
@@ -61,18 +62,16 @@ mod ffi {
         topics_count: u32,
     }
 
-    struct IggyMessageToSend {
-        id_lo: u64,
-        id_hi: u64,
-        payload: Vec<u8>,
-    }
-
-    struct IggyMessagePolled {
+    struct Message {
+        checksum: u64,
         id_lo: u64,
         id_hi: u64,
         offset: u64,
         timestamp: u64,
         origin_timestamp: u64,
+        user_headers_length: u32,
+        payload_length: u32,
+        reserved: u64,
         payload: Vec<u8>,
         user_headers: Vec<u8>,
     }
@@ -81,7 +80,7 @@ mod ffi {
         partition_id: u32,
         current_offset: u64,
         count: u32,
-        messages: Vec<IggyMessagePolled>,
+        messages: Vec<Message>,
     }
 
     struct StreamDetails {
@@ -172,11 +171,13 @@ mod ffi {
             partition_id: u32,
             consumer_kind: String,
             consumer_id: Identifier,
-            strategy_kind: String,
-            strategy_value: u64,
+            polling_strategy_kind: String,
+            polling_strategy_value: u64,
             count: u32,
             auto_commit: bool,
         ) -> Result<PolledMessages>;
+
+        fn new_message(payload: Vec<u8>) -> Result<Message>;
 
         #[allow(clippy::too_many_arguments)]
         fn send_messages(
@@ -185,7 +186,7 @@ mod ffi {
             topic_id: Identifier,
             partitioning_kind: String,
             partitioning_value: Vec<u8>,
-            messages: Vec<IggyMessageToSend>,
+            messages: Vec<Message>,
         ) -> Result<()>;
 
         unsafe fn delete_connection(client: *mut Client) -> Result<()>;

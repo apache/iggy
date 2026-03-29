@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::{RUNTIME, ffi};
-use bytes::Bytes;
 use iggy::prelude::{
     Client as IggyConnectionClient, CompressionAlgorithm as RustCompressionAlgorithm, Consumer,
     ConsumerGroupClient, ConsumerKind, Identifier as RustIdentifier,
@@ -148,7 +147,7 @@ impl Client {
         topic_id: ffi::Identifier,
         partitioning_kind: String,
         partitioning_value: Vec<u8>,
-        messages: Vec<ffi::IggyMessageToSend>,
+        messages: Vec<ffi::Message>,
     ) -> Result<(), String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not send messages: {error}"))?;
@@ -171,21 +170,16 @@ impl Client {
             "messages_key" => Partitioning::messages_key(&partitioning_value).map_err(|error| {
                 format!("Could not send messages: invalid messages key: {error}")
             })?,
-            _ => return Err(format!("Invalid partitioning kind: {partitioning_kind}")),
+            _ => {
+                return Err(format!(
+                    "Could not send messages: invalid partitioning kind: {partitioning_kind}"
+                ));
+            }
         };
 
         let mut iggy_messages: Vec<IggyMessage> = messages
             .into_iter()
-            .map(|m| {
-                let id = ((m.id_hi as u128) << 64) | (m.id_lo as u128);
-                let payload = Bytes::from(m.payload);
-                let msg = if id > 0 {
-                    IggyMessage::builder().id(id).payload(payload).build()
-                } else {
-                    IggyMessage::builder().payload(payload).build()
-                };
-                msg.map_err(|error| format!("Could not build message: {error}"))
-            })
+            .map(IggyMessage::try_from)
             .collect::<Result<Vec<_>, _>>()?;
 
         RUNTIME.block_on(async {
@@ -210,8 +204,8 @@ impl Client {
         partition_id: u32,
         consumer_kind: String,
         consumer_id: ffi::Identifier,
-        strategy_kind: String,
-        strategy_value: u64,
+        polling_strategy_kind: String,
+        polling_strategy_value: u64,
         count: u32,
         auto_commit: bool,
     ) -> Result<ffi::PolledMessages, String> {
@@ -226,18 +220,26 @@ impl Client {
             kind: match consumer_kind.as_str() {
                 "consumer" => ConsumerKind::Consumer,
                 "consumer_group" => ConsumerKind::ConsumerGroup,
-                _ => return Err(format!("Invalid consumer kind: {consumer_kind}")),
+                _ => {
+                    return Err(format!(
+                        "Could not poll messages: invalid consumer kind: {consumer_kind}"
+                    ));
+                }
             },
             id: rust_consumer_id,
         };
 
-        let strategy = match strategy_kind.as_str() {
-            "offset" => PollingStrategy::offset(strategy_value),
-            "timestamp" => PollingStrategy::timestamp(IggyTimestamp::from(strategy_value)),
+        let strategy = match polling_strategy_kind.as_str() {
+            "offset" => PollingStrategy::offset(polling_strategy_value),
+            "timestamp" => PollingStrategy::timestamp(IggyTimestamp::from(polling_strategy_value)),
             "first" => PollingStrategy::first(),
             "last" => PollingStrategy::last(),
             "next" => PollingStrategy::next(),
-            _ => return Err(format!("Invalid polling strategy: {strategy_kind}")),
+            _ => {
+                return Err(format!(
+                    "Could not poll messages: invalid polling strategy: {polling_strategy_kind}"
+                ));
+            }
         };
 
         let opt_partition = if partition_id == u32::MAX {
