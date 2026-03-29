@@ -16,20 +16,60 @@
 // under the License.
 
 use crate::ffi;
+use bytes::Bytes;
 use iggy::prelude::{IggyMessage as RustIggyMessage, PolledMessages as RustPolledMessages};
 
-impl From<RustIggyMessage> for ffi::IggyMessagePolled {
+pub fn new_message(payload: Vec<u8>) -> Result<ffi::Message, String> {
+    if payload.is_empty() {
+        return Err("Could not create message: payload must not be empty".to_string());
+    }
+    let payload_length = payload.len() as u32;
+    Ok(ffi::Message {
+        checksum: 0,
+        id_lo: 0,
+        id_hi: 0,
+        offset: 0,
+        timestamp: 0,
+        origin_timestamp: 0,
+        user_headers_length: 0,
+        payload_length,
+        reserved: 0,
+        payload,
+        user_headers: Vec::new(),
+    })
+}
+
+impl From<RustIggyMessage> for ffi::Message {
     fn from(m: RustIggyMessage) -> Self {
         let id = m.header.id;
-        ffi::IggyMessagePolled {
+        ffi::Message {
+            checksum: m.header.checksum,
             id_lo: id as u64,
             id_hi: (id >> 64) as u64,
             offset: m.header.offset,
             timestamp: m.header.timestamp,
             origin_timestamp: m.header.origin_timestamp,
+            user_headers_length: m.header.user_headers_length,
+            payload_length: m.header.payload_length,
+            reserved: m.header.reserved,
             payload: m.payload.to_vec(),
             user_headers: m.user_headers.map(|h| h.to_vec()).unwrap_or_default(),
         }
+    }
+}
+
+impl TryFrom<ffi::Message> for RustIggyMessage {
+    type Error = String;
+
+    fn try_from(m: ffi::Message) -> Result<Self, Self::Error> {
+        let id = ((m.id_hi as u128) << 64) | (m.id_lo as u128);
+        let payload = Bytes::from(m.payload);
+        let msg = if id > 0 {
+            RustIggyMessage::builder().id(id).payload(payload).build()
+        } else {
+            RustIggyMessage::builder().payload(payload).build()
+        };
+        msg.map_err(|error| format!("Could not convert message: {error}"))
     }
 }
 
@@ -39,7 +79,7 @@ impl From<RustPolledMessages> for ffi::PolledMessages {
             partition_id: p.partition_id,
             current_offset: p.current_offset,
             count: p.count,
-            messages: p.messages.into_iter().map(Into::into).collect(),
+            messages: p.messages.into_iter().map(ffi::Message::from).collect(),
         }
     }
 }
