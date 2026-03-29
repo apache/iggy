@@ -111,9 +111,9 @@ TEST(LowLevelE2E_Message, PollMessagesVerifyMessageIds) {
                          "server_default");
 
     rust::Vec<iggy::ffi::Message> messages;
-    auto msg    = iggy::ffi::new_message(to_payload("id-test-message"));
-    msg.id_lo   = 42;
-    msg.id_hi   = 0;
+    auto msg  = iggy::ffi::new_message(to_payload("id-test-message"));
+    msg.id_lo = 42;
+    msg.id_hi = 0;
     messages.push_back(std::move(msg));
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
