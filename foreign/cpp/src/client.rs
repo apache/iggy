@@ -18,8 +18,8 @@
 use crate::{RUNTIME, ffi};
 use bytes::Bytes;
 use iggy::prelude::{
-    Client as IggyConnectionClient, CompressionAlgorithm as RustCompressionAlgorithm,
-    Consumer, ConsumerGroupClient, ConsumerKind, Identifier as RustIdentifier,
+    Client as IggyConnectionClient, CompressionAlgorithm as RustCompressionAlgorithm, Consumer,
+    ConsumerGroupClient, ConsumerKind, Identifier as RustIdentifier,
     IggyClient as RustIggyClient, IggyClientBuilder as RustIggyClientBuilder, IggyError,
     IggyExpiry as RustIggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize as RustMaxTopicSize,
     MessageClient, Partitioning, PartitionClient, PollingStrategy, StreamClient, TopicClient,
