@@ -100,6 +100,7 @@ public class AsyncIggyTcpClient {
     private final int port;
     private final Optional<String> username;
     private final Optional<String> password;
+    private final Optional<Duration> connectionTimeout;
     private final Optional<Duration> acquireTimeout;
     private final Optional<Duration> requestTimeout;
     private final Optional<Integer> connectionPoolSize;
@@ -126,7 +127,7 @@ public class AsyncIggyTcpClient {
      * @param port the server port
      */
     public AsyncIggyTcpClient(String host, int port) {
-        this(host, port, null, null, null, null, null, null, false, Optional.empty());
+        this(host, port, null, null, null, null, null, null, null, false, Optional.empty());
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
@@ -135,6 +136,7 @@ public class AsyncIggyTcpClient {
             int port,
             String username,
             String password,
+            Duration connectionTimeout,
             Duration acquireTimeout,
             Duration requestTimeout,
             Integer connectionPoolSize,
@@ -145,6 +147,7 @@ public class AsyncIggyTcpClient {
         this.port = port;
         this.username = Optional.ofNullable(username);
         this.password = Optional.ofNullable(password);
+        this.connectionTimeout = Optional.ofNullable(connectionTimeout);
         this.acquireTimeout = Optional.ofNullable(acquireTimeout);
         this.requestTimeout = Optional.ofNullable(requestTimeout);
         this.connectionPoolSize = Optional.ofNullable(connectionPoolSize);
@@ -176,7 +179,7 @@ public class AsyncIggyTcpClient {
         connectionPoolSize.ifPresent(poolConfigBuilder::setMaxConnections);
         acquireTimeout.ifPresent(timeout -> poolConfigBuilder.setAcquireTimeoutMillis(timeout.toMillis()));
         TCPConnectionPoolConfig poolConfig = poolConfigBuilder.build();
-        connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate, poolConfig);
+        connection = new AsyncTcpConnection(host, port, enableTls, tlsCertificate, poolConfig, connectionTimeout);
         return connection.connect().thenRun(() -> {
             log.debug("Connected to {}:{} | {}", host, port, IggyVersion.getInstance());
             messagesClient = new MessagesTcpClient(connection);

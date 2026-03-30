@@ -59,7 +59,7 @@ async fn create_partitions(
     });
 
     match state.shard.send_to_control_plane(request).await? {
-        ShardResponse::CreatePartitionsResponse(_) => Ok(StatusCode::CREATED),
+        ShardResponse::CreatePartitionsResponse => Ok(StatusCode::CREATED),
         ShardResponse::ErrorResponse(err) => Err(err.into()),
         _ => unreachable!("Expected CreatePartitionsResponse"),
     }
@@ -87,7 +87,7 @@ async fn delete_partitions(
     });
 
     match state.shard.send_to_control_plane(request).await? {
-        ShardResponse::DeletePartitionsResponse(_) => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::DeletePartitionsResponse => Ok(StatusCode::NO_CONTENT),
         ShardResponse::ErrorResponse(err) => Err(err.into()),
         _ => unreachable!("Expected DeletePartitionsResponse"),
     }

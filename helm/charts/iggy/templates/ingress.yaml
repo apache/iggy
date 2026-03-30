@@ -14,8 +14,6 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
-
 {{ if .Values.server.ingress.enabled -}}
 {{ $fullName := include "iggy.fullname" . -}}
 {{ $svcPort := .Values.server.service.port -}}
@@ -24,11 +22,11 @@
   {{- $_ := set .Values.server.ingress.annotations "kubernetes.io/ingress.class" .Values.server.ingress.className}}
   {{- end }}
 {{- end }}
-{{ if .Capabilities.APIVersions.Has "networking.k8s.io/v1" }}
+{{- if semverCompare ">=1.19-0" .Capabilities.KubeVersion.GitVersion -}}
 apiVersion: networking.k8s.io/v1
-{{- else if .Capabilities.APIVersions.Has "networking.k8s.io/v1beta1" }}
+{{- else if semverCompare ">=1.14-0" .Capabilities.KubeVersion.GitVersion -}}
 apiVersion: networking.k8s.io/v1beta1
-{{- else }}
+{{- else -}}
 apiVersion: extensions/v1beta1
 {{- end }}
 kind: Ingress
@@ -77,8 +75,6 @@ spec:
           {{- end }}
     {{- end }}
 {{- end }}
-
-
 {{ if .Values.ui.ingress.enabled -}}
 ---
 {{ $fullName := include "iggy.fullname" . -}}
@@ -97,7 +93,7 @@ apiVersion: extensions/v1beta1
 {{- end }}
 kind: Ingress
 metadata:
-  name: {{ $fullName }}
+  name: {{ $fullName }}-ui
   labels:
     {{- include "iggy.labels" . | nindent 4 }}
   {{- with .Values.ui.ingress.annotations }}
