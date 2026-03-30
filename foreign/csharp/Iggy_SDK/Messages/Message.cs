@@ -46,6 +46,12 @@ public class Message
     public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; set; }
 
     /// <summary>
+    ///     Pre-serialized (possibly encrypted) user headers bytes.
+    ///     When set, this takes precedence over <see cref="UserHeaders"/> during serialization.
+    /// </summary>
+    internal byte[]? RawUserHeaders { get; set; }
+
+    /// <summary>
     ///     Default constructor.
     /// </summary>
     public Message()
