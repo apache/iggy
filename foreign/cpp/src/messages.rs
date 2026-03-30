@@ -19,24 +19,23 @@ use crate::ffi;
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage as RustIggyMessage, PolledMessages as RustPolledMessages};
 
-pub fn new_message(payload: Vec<u8>) -> Result<ffi::Message, String> {
-    if payload.is_empty() {
-        return Err("Could not create message: payload must not be empty".to_string());
+impl ffi::Message {
+    pub fn new_message(&mut self, payload: Vec<u8>) {
+        let payload_length = payload.len() as u32;
+        *self = Self {
+            checksum: 0,
+            id_lo: 0,
+            id_hi: 0,
+            offset: 0,
+            timestamp: 0,
+            origin_timestamp: 0,
+            user_headers_length: 0,
+            payload_length,
+            reserved: 0,
+            payload,
+            user_headers: Vec::new(),
+        };
     }
-    let payload_length = payload.len() as u32;
-    Ok(ffi::Message {
-        checksum: 0,
-        id_lo: 0,
-        id_hi: 0,
-        offset: 0,
-        timestamp: 0,
-        origin_timestamp: 0,
-        user_headers_length: 0,
-        payload_length,
-        reserved: 0,
-        payload,
-        user_headers: Vec::new(),
-    })
 }
 
 impl From<RustIggyMessage> for ffi::Message {
