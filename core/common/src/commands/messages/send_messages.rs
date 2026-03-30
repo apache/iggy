@@ -330,14 +330,14 @@ impl<'de> Deserialize<'de> for SendMessages {
                                             })?;
                                             (None, Some(Bytes::from(raw)))
                                         } else {
-                                            let entries: Vec<HeaderEntry> =
-                                                serde_json::from_value(headers.clone()).map_err(
-                                                    |e| {
-                                                        de::Error::custom(format!(
-                                                            "Invalid headers format: {e}"
-                                                        ))
-                                                    },
-                                                )?;
+                                            let entries: Vec<HeaderEntry> = serde_json::from_value(
+                                                headers.clone(),
+                                            )
+                                            .map_err(|e| {
+                                                de::Error::custom(format!(
+                                                    "Invalid headers format: {e}"
+                                                ))
+                                            })?;
                                             let mut map = HashMap::new();
                                             for entry in entries {
                                                 map.insert(entry.key, entry.value);

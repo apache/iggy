@@ -629,11 +629,9 @@ impl<'de> Deserialize<'de> for IggyMessage {
                                     })?;
                                 raw_user_headers = Some(Bytes::from(decoded));
                             } else if value.is_array() {
-                                let entries: Vec<HeaderEntry> =
-                                    serde_json::from_value(value).map_err(|e| {
-                                        de::Error::custom(format!(
-                                            "Invalid headers format: {e}"
-                                        ))
+                                let entries: Vec<HeaderEntry> = serde_json::from_value(value)
+                                    .map_err(|e| {
+                                        de::Error::custom(format!("Invalid headers format: {e}"))
                                     })?;
                                 let mut headers_map = HashMap::new();
                                 for entry in entries {

@@ -402,7 +402,12 @@ async fn should_encrypt_and_decrypt_headers_with_client_side_encryption(
     }
 
     encrypting_client
-        .send_messages(&stream_id, &topic_id, &Partitioning::partition_id(0), &mut messages)
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
         .await
         .unwrap();
 
@@ -445,9 +450,8 @@ async fn should_encrypt_and_decrypt_headers_with_client_side_encryption(
         );
     }
 
-    // Poll with a plain client (no encryptor) — payload and headers should be unreadable
-    let plain_client = harness.root_client_for(transport).await.unwrap();
-    let polled_plain = plain_client
+    let client_without_encryptor = harness.root_client_for(transport).await.unwrap();
+    let polled_without_decryption = client_without_encryptor
         .poll_messages(
             &stream_id,
             &topic_id,
@@ -460,8 +464,8 @@ async fn should_encrypt_and_decrypt_headers_with_client_side_encryption(
         .await
         .unwrap();
 
-    assert_eq!(polled_plain.messages.len(), 10);
-    for msg in &polled_plain.messages {
+    assert_eq!(polled_without_decryption.messages.len(), 10);
+    for msg in &polled_without_decryption.messages {
         let payload_text = std::str::from_utf8(&msg.payload).unwrap_or("");
         assert!(
             !payload_text.starts_with("client encrypted msg"),
