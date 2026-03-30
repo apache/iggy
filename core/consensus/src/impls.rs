@@ -596,12 +596,6 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 
     #[must_use]
-    pub const fn is_syncing(&self) -> bool {
-        // TODO: for now return false. we have to add syncing related setup to VsrConsensus to make this work.
-        false
-    }
-
-    #[must_use]
     pub const fn replica(&self) -> u8 {
         self.replica
     }
@@ -1576,6 +1570,7 @@ where
     }
 
     fn is_syncing(&self) -> bool {
-        VsrConsensus::is_syncing(self)
+        // TODO: for now return false. we have to add syncing related setup to VsrConsensus to make this work.
+        false
     }
 }
