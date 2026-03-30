@@ -55,6 +55,7 @@ members = [
     "core/partitions",
     "core/sdk",
     "core/server",
+    "core/server-ng",
     "core/shard",
     "core/simulator",
     "core/tools",
@@ -253,6 +254,7 @@ serde_with = { version = "3.18.0", features = ["base64", "macros"] }
 serde_yaml_ng = "0.10.0"
 serial_test = "3.4.0"
 server = { path = "core/server" }
+server-ng = { path = "core/server-ng" }
 simd-json = { version = "0.17.0", features = ["serde_impl"] }
 slab = "0.4.12"
 socket2 = "0.6.3"
