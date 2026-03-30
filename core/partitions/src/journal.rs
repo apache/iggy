@@ -16,18 +16,31 @@
 // under the License.
 
 use bytes::Bytes;
-use iggy_common::{
-    IggyMessagesBatchMut, IggyMessagesBatchSet,
-    header::{Operation, PrepareHeader},
-    message::Message,
-};
+use iggy_binary_protocol::{Message, Operation, PrepareHeader};
+use iggy_common::{IggyMessagesBatchMut, IggyMessagesBatchSet};
 use journal::{Journal, Storage};
 use std::{
     cell::UnsafeCell,
     collections::{BTreeMap, HashMap},
 };
 
-const ZERO_LEN: usize = 0;
+// TODO: Fix that, we need to figure out how to store the `IggyMessagesBatchSet`.
+/// No-op storage backend for the in-memory partition journal.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct Noop;
+
+impl Storage for Noop {
+    type Buffer = ();
+
+    async fn write_at(&self, _offset: usize, _buf: ()) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
+    async fn read_at(&self, _offset: usize, _buffer: ()) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Lookup key for querying messages from the journal.
 #[derive(Debug, Clone, Copy)]
@@ -68,7 +81,7 @@ pub struct PartitionJournalMemStorage {
 impl Storage for PartitionJournalMemStorage {
     type Buffer = Bytes;
 
-    async fn write(&self, buf: Self::Buffer) -> usize {
+    async fn write_at(&self, _offset: usize, buf: Self::Buffer) -> std::io::Result<usize> {
         let len = buf.len();
         let entries = unsafe { &mut *self.entries.get() };
         let offset_to_index = unsafe { &mut *self.offset_to_index.get() };
@@ -81,17 +94,17 @@ impl Storage for PartitionJournalMemStorage {
         let write_offset = *current_offset;
         *current_offset += len;
 
-        write_offset
+        Ok(write_offset)
     }
 
-    async fn read(&self, offset: usize, _len: usize) -> Self::Buffer {
+    async fn read_at(&self, offset: usize, _buffer: Self::Buffer) -> std::io::Result<Self::Buffer> {
         let offset_to_index = unsafe { &*self.offset_to_index.get() };
         let Some(&index) = offset_to_index.get(&offset) else {
-            return Bytes::new();
+            return Ok(Bytes::new());
         };
 
         let entries = unsafe { &*self.entries.get() };
-        entries.get(index).cloned().unwrap_or_default()
+        Ok(entries.get(index).cloned().unwrap_or_default())
     }
 }
 
@@ -247,7 +260,11 @@ where
 
         let bytes = {
             let inner = unsafe { &*self.inner.get() };
-            inner.storage.read(storage_offset, ZERO_LEN).await
+            inner
+                .storage
+                .read_at(storage_offset, Bytes::new())
+                .await
+                .unwrap_or_default()
         };
 
         if bytes.is_empty() {
@@ -290,7 +307,11 @@ where
 
             let bytes = {
                 let inner = unsafe { &*self.inner.get() };
-                inner.storage.read(storage_offset, ZERO_LEN).await
+                inner
+                    .storage
+                    .read_at(storage_offset, Bytes::new())
+                    .await
+                    .unwrap_or_default()
             };
 
             if bytes.is_empty() {
@@ -334,7 +355,7 @@ where
         headers.iter().find(|candidate| candidate.op == prev_op)
     }
 
-    async fn append(&self, entry: Self::Entry) {
+    async fn append(&self, entry: Self::Entry) -> std::io::Result<()> {
         let first_offset_and_timestamp = Self::message_to_batch(&entry)
             .and_then(|batch| Some((batch.first_offset()?, batch.first_timestamp()?)));
 
@@ -349,7 +370,7 @@ where
         let bytes = entry.into_inner();
         let storage_offset = {
             let inner = unsafe { &*self.inner.get() };
-            inner.storage.write(bytes).await
+            inner.storage.write_at(0, bytes).await?
         };
 
         {
@@ -364,6 +385,8 @@ where
             let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
             timestamp_to_op.insert(timestamp, op);
         }
+
+        Ok(())
     }
 
     async fn entry(&self, header: &Self::Header) -> Option<Self::Entry> {

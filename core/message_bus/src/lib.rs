@@ -19,7 +19,8 @@ mod cache;
 use crate::cache::connection::{
     ConnectionCache, Coordinator, LeastLoadedStrategy, ShardedConnections,
 };
-use iggy_common::{IggyError, SenderKind, TcpSender, header::GenericHeader, message::Message};
+use iggy_binary_protocol::{GenericHeader, Message};
+use iggy_common::{IggyError, SenderKind, TcpSender};
 use std::{collections::HashMap, rc::Rc};
 
 /// Message bus parameterized by allocation strategy and sharded state

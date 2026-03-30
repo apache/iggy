@@ -68,6 +68,7 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: codecov.json
+          disable_search: true
           flags: rust
           fail_ci_if_error: false
           verbose: true
@@ -190,6 +191,29 @@ jobs:
           elif [ "${{ inputs.task }}" = "build" ]; then
             npm run build
           fi
+
+      # Helm chart testing
+      - name: Setup Helm test tools
+        if: inputs.component == 'helm' && (inputs.task == 'validate' || inputs.task == 'smoke')
+        uses: ./.github/actions/utils/setup-helm-tools
+        with:
+          install-kind: ${{ inputs.task == 'smoke' }}
+
+      - name: Setup Helm smoke cluster
+        if: inputs.component == 'helm' && inputs.task == 'smoke'
+        run: scripts/ci/setup-helm-smoke-cluster.sh
+
+      - name: Validate Helm chart
+        if: inputs.component == 'helm' && inputs.task == 'validate'
+        run: scripts/ci/test-helm.sh validate
+
+      - name: Smoke test Helm chart runtime
+        if: inputs.component == 'helm' && inputs.task == 'smoke'
+        run: scripts/ci/test-helm.sh smoke --cleanup
+
+      - name: Collect Helm smoke diagnostics
+        if: failure() && inputs.component == 'helm' && inputs.task == 'smoke'
+        run: scripts/ci/test-helm.sh collect-smoke-diagnostics
 
       # CI workflow validation
       - name: Validate CI workflows

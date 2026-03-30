@@ -2231,6 +2231,7 @@ dependencies = [
  "bytemuck",
  "bytes",
  "futures",
+ "iggy_binary_protocol",
  "iggy_common",
  "message_bus",
  "rand 0.10.0",
@@ -3422,18 +3423,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1e6a265c649f3f5979b601d26f1d05ada116434c87741c9493cb56218f76cbc"
 dependencies = [
  "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "enum_dispatch"
-version = "0.3.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa18ce2bc66555b3218614519ac839ddb759a7d6720732f979ef8d13be147ecd"
-dependencies = [
- "once_cell",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -5194,7 +5183,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.9.3-edge.1"
+version = "0.9.4-edge.1"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -5395,7 +5384,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.9.3-edge.1"
+version = "0.9.4-edge.1"
 dependencies = [
  "bytemuck",
  "bytes",
@@ -5405,17 +5394,17 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.9.3-edge.1"
+version = "0.9.4-edge.1"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.12",
+ "aligned-vec",
  "async-broadcast",
  "async-trait",
  "base64 0.22.1",
  "blake3",
  "bon",
  "byte-unit",
- "bytemuck",
  "bytes",
  "chrono",
  "clap",
@@ -5423,7 +5412,6 @@ dependencies = [
  "compio",
  "crossbeam",
  "derive_more",
- "enumset",
  "err_trail",
  "human-repr",
  "humantime",
@@ -5840,6 +5828,7 @@ dependencies = [
  "humantime",
  "iggy",
  "iggy-cli",
+ "iggy_binary_protocol",
  "iggy_common",
  "iggy_connector_sdk",
  "keyring",
@@ -5861,7 +5850,6 @@ dependencies = [
  "server",
  "socket2 0.6.3",
  "sqlx",
- "strum 0.28.0",
  "sysinfo 0.38.4",
  "tempfile",
  "test-case",
@@ -6058,6 +6046,13 @@ dependencies = [
 [[package]]
 name = "journal"
 version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "bytes",
+ "compio",
+ "iggy_binary_protocol",
+ "tempfile",
+]
 
 [[package]]
 name = "js-sys"
@@ -6659,6 +6654,7 @@ dependencies = [
 name = "message_bus"
 version = "0.1.0"
 dependencies = [
+ "iggy_binary_protocol",
  "iggy_common",
  "rand 0.10.0",
 ]
@@ -6668,8 +6664,11 @@ name = "metadata"
 version = "0.1.0"
 dependencies = [
  "ahash 0.8.12",
+ "bytemuck",
  "bytes",
+ "compio",
  "consensus",
+ "iggy_binary_protocol",
  "iggy_common",
  "journal",
  "left-right",
@@ -6679,6 +6678,7 @@ dependencies = [
  "secrecy",
  "serde",
  "slab",
+ "tempfile",
  "tracing",
 ]
 
@@ -7647,6 +7647,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "consensus",
+ "iggy_binary_protocol",
  "iggy_common",
  "journal",
  "message_bus",
@@ -9740,7 +9741,6 @@ dependencies = [
  "cyper-axum",
  "dashmap",
  "dotenvy",
- "enum_dispatch",
  "err_trail",
  "error_set",
  "figlet-rs",
@@ -9750,6 +9750,7 @@ dependencies = [
  "hash32 1.0.0",
  "human-repr",
  "hwlocality",
+ "iggy_binary_protocol",
  "iggy_common",
  "jsonwebtoken",
  "left-right",
@@ -9832,6 +9833,7 @@ dependencies = [
  "crossfire",
  "futures",
  "hash32 1.0.0",
+ "iggy_binary_protocol",
  "iggy_common",
  "journal",
  "message_bus",
@@ -9941,6 +9943,7 @@ dependencies = [
  "consensus",
  "enumset",
  "futures",
+ "iggy_binary_protocol",
  "iggy_common",
  "journal",
  "message_bus",

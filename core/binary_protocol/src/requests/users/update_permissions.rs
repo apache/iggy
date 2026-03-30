@@ -20,6 +20,7 @@ use crate::WireIdentifier;
 use crate::codec::{WireDecode, WireEncode, read_u8, read_u32_le};
 use crate::primitives::permissions::WirePermissions;
 use bytes::{BufMut, BytesMut};
+use std::borrow::Cow;
 
 /// `UpdatePermissions` request.
 ///
@@ -35,8 +36,10 @@ impl WireEncode for UpdatePermissionsRequest {
     fn encoded_size(&self) -> usize {
         self.user_id.encoded_size()
             + 1 // has_permissions
-            + 4 // permissions_len (always present)
-            + self.permissions.as_ref().map_or(0, WireEncode::encoded_size)
+            + self
+                .permissions
+                .as_ref()
+                .map_or(0, |p| 4 + p.encoded_size())
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -49,7 +52,6 @@ impl WireEncode for UpdatePermissionsRequest {
             buf.put_slice(&perm_bytes);
         } else {
             buf.put_u8(0);
-            buf.put_u32_le(0);
         }
     }
 }
@@ -61,15 +63,14 @@ impl WireDecode for UpdatePermissionsRequest {
         let has_permissions = read_u8(buf, pos)?;
         pos += 1;
 
-        let perm_len = read_u32_le(buf, pos)? as usize;
-        pos += 4;
-
-        let permissions = if has_permissions == 1 && perm_len > 0 {
+        let permissions = if has_permissions == 1 {
+            let perm_len = read_u32_le(buf, pos)? as usize;
+            pos += 4;
             let (perms, consumed) = WirePermissions::decode(&buf[pos..])?;
             if consumed != perm_len {
-                return Err(WireError::Validation(format!(
+                return Err(WireError::Validation(Cow::Owned(format!(
                     "permissions length mismatch: header says {perm_len}, decoded {consumed}"
-                )));
+                ))));
             }
             pos += consumed;
             Some(perms)

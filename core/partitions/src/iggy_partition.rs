@@ -23,12 +23,11 @@ use crate::{
     AppendResult, Partition, PartitionOffsets, PollingArgs, PollingConsumer,
     decode_send_messages_batch,
 };
+use iggy_binary_protocol::{Message, Operation, PrepareHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
     IggyByteSize, IggyError, IggyMessagesBatchMut, IggyMessagesBatchSet, IggyTimestamp,
     PartitionStats, PollingKind,
-    header::{Operation, PrepareHeader},
-    message::Message,
 };
 use journal::Journal as _;
 use std::sync::Arc;
@@ -79,7 +78,7 @@ impl IggyPartition {
         let mut position = header_size + 4;
         bytes[position..position + indexes.len()].copy_from_slice(indexes);
         position += indexes.len();
-        bytes[position..position + batch.len()].copy_from_slice(batch);
+        bytes[position..position + batch.len()].copy_from_slice(batch.as_bytes());
 
         Message::<PrepareHeader>::from_bytes(bytes.freeze())
             .expect("prepare_message_from_batch: invalid prepared message bytes")
@@ -164,7 +163,11 @@ impl Partition for IggyPartition {
         }
 
         let message = Self::prepare_message_from_batch(header, &batch);
-        journal.inner.append(message).await;
+        journal
+            .inner
+            .append(message)
+            .await
+            .map_err(|e| IggyError::IoError(e.to_string()))?;
 
         Ok(AppendResult::new(
             dirty_offset,

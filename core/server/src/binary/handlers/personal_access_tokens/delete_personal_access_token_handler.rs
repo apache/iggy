@@ -16,63 +16,48 @@
  * under the License.
  */
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
-use crate::binary::handlers::utils::receive_and_validate;
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
+use iggy_binary_protocol::requests::personal_access_tokens::DeletePersonalAccessTokenRequest;
 use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::{IggyError, SenderKind, Validatable};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for DeletePersonalAccessToken {
-    fn code(&self) -> u32 {
-        iggy_common::DELETE_PERSONAL_ACCESS_TOKEN_CODE
-    }
+#[instrument(skip_all, name = "trace_delete_personal_access_token", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+pub async fn handle_delete_personal_access_token(
+    req: DeletePersonalAccessTokenRequest,
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    debug!(
+        "session: {session}, command: delete_personal_access_token, name: {}",
+        req.name.as_str()
+    );
+    shard.ensure_authenticated(session)?;
 
-    #[instrument(skip_all, name = "trace_delete_personal_access_token", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
+    let command = DeletePersonalAccessToken {
+        name: req.name.to_string(),
+    };
+    command.validate()?;
 
-        let request =
-            ShardRequest::control_plane(ShardRequestPayload::DeletePersonalAccessTokenRequest {
-                user_id: session.get_user_id(),
-                command: self,
-            });
+    let request =
+        ShardRequest::control_plane(ShardRequestPayload::DeletePersonalAccessTokenRequest {
+            user_id: session.get_user_id(),
+            command,
+        });
 
-        match shard.send_to_control_plane(request).await? {
-            ShardResponse::DeletePersonalAccessTokenResponse => {
-                sender.send_empty_ok_response().await?;
-            }
-            ShardResponse::ErrorResponse(err) => return Err(err),
-            _ => unreachable!("Expected DeletePersonalAccessTokenResponse"),
+    match shard.send_to_control_plane(request).await? {
+        ShardResponse::DeletePersonalAccessTokenResponse => {
+            sender.send_empty_ok_response().await?;
         }
-
-        Ok(HandlerResult::Finished)
+        ShardResponse::ErrorResponse(err) => return Err(err),
+        _ => unreachable!("Expected DeletePersonalAccessTokenResponse"),
     }
-}
 
-impl BinaryServerCommand for DeletePersonalAccessToken {
-    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::DeletePersonalAccessToken(delete_personal_access_token) => {
-                Ok(delete_personal_access_token)
-            }
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+    Ok(HandlerResult::Finished)
 }

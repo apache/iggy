@@ -20,9 +20,25 @@
 //! `Message<H>` wraps a `Bytes` buffer and provides typed access to the
 //! header via `bytemuck` pointer cast (zero allocation, zero copy).
 
-use crate::consensus::{Command2, ConsensusError, ConsensusHeader, GenericHeader};
+use crate::consensus::{
+    Command2, ConsensusError, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
+    RequestHeader,
+};
 use bytes::Bytes;
 use std::marker::PhantomData;
+
+/// Trait for types that provide access to a consensus header.
+pub trait ConsensusMessage<H: ConsensusHeader> {
+    fn header(&self) -> &H;
+}
+
+impl<H: ConsensusHeader> ConsensusMessage<H> for Message<H> {
+    fn header(&self) -> &H {
+        let header_bytes = &self.buffer[..size_of::<H>()];
+        bytemuck::checked::try_from_bytes(header_bytes)
+            .expect("header validated at construction time")
+    }
+}
 
 /// Zero-copy message wrapping a `Bytes` buffer with a typed header.
 ///
@@ -197,6 +213,36 @@ impl<H: ConsensusHeader> Message<H> {
         Ok(unsafe { Message::<T>::from_buffer_unchecked(self.buffer) })
     }
 
+    /// Try to borrow as a different header type without consuming.
+    ///
+    /// # Errors
+    /// Returns `ConsensusError` if the header command doesn't match or validation fails.
+    pub fn try_as_typed<T: ConsensusHeader>(&self) -> Result<&Message<T>, ConsensusError> {
+        if self.buffer.len() < size_of::<T>() {
+            return Err(ConsensusError::InvalidCommand {
+                expected: T::COMMAND,
+                found: Command2::Reserved,
+            });
+        }
+
+        let generic = self.as_generic();
+        if generic.header().command != T::COMMAND {
+            return Err(ConsensusError::InvalidCommand {
+                expected: T::COMMAND,
+                found: generic.header().command,
+            });
+        }
+
+        let header_bytes = &self.buffer[..size_of::<T>()];
+        bytemuck::checked::try_from_bytes::<T>(header_bytes)
+            .map_err(|_| ConsensusError::InvalidBitPattern)?
+            .validate()?;
+
+        // SAFETY: Message<H> and Message<T> have identical layout (#[repr(C)],
+        // differ only in PhantomData). Header validated above.
+        Ok(unsafe { &*std::ptr::from_ref(self).cast::<Message<T>>() })
+    }
+
     /// Transmute the header to a different type, preserving the buffer.
     ///
     /// The callback receives the old header (by value) and a mutable reference
@@ -236,6 +282,71 @@ impl<H: ConsensusHeader> Message<H> {
         Self {
             buffer,
             _marker: PhantomData,
+        }
+    }
+}
+
+/// Type-erased message bag for dispatching incoming consensus messages.
+#[derive(Debug)]
+pub enum MessageBag {
+    Request(Message<RequestHeader>),
+    Prepare(Message<PrepareHeader>),
+    PrepareOk(Message<PrepareOkHeader>),
+}
+
+impl MessageBag {
+    #[must_use]
+    pub fn command(&self) -> Command2 {
+        match self {
+            Self::Request(m) => m.header().command,
+            Self::Prepare(m) => m.header().command,
+            Self::PrepareOk(m) => m.header().command,
+        }
+    }
+
+    #[must_use]
+    pub fn size(&self) -> u32 {
+        match self {
+            Self::Request(m) => m.header().size(),
+            Self::Prepare(m) => m.header().size(),
+            Self::PrepareOk(m) => m.header().size(),
+        }
+    }
+
+    #[must_use]
+    pub fn operation(&self) -> crate::consensus::Operation {
+        match self {
+            Self::Request(m) => m.header().operation,
+            Self::Prepare(m) => m.header().operation,
+            Self::PrepareOk(m) => m.header().operation,
+        }
+    }
+}
+
+impl<T: ConsensusHeader> TryFrom<Message<T>> for MessageBag {
+    type Error = ConsensusError;
+
+    fn try_from(value: Message<T>) -> Result<Self, Self::Error> {
+        let command = value.as_generic().header().command;
+        let buffer = value.into_inner();
+
+        match command {
+            Command2::Request => {
+                let msg = unsafe { Message::<RequestHeader>::from_buffer_unchecked(buffer) };
+                Ok(Self::Request(msg))
+            }
+            Command2::Prepare => {
+                let msg = unsafe { Message::<PrepareHeader>::from_buffer_unchecked(buffer) };
+                Ok(Self::Prepare(msg))
+            }
+            Command2::PrepareOk => {
+                let msg = unsafe { Message::<PrepareOkHeader>::from_buffer_unchecked(buffer) };
+                Ok(Self::PrepareOk(msg))
+            }
+            other => Err(ConsensusError::InvalidCommand {
+                expected: Command2::Reserved,
+                found: other,
+            }),
         }
     }
 }

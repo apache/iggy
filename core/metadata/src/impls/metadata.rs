@@ -23,15 +23,14 @@ use consensus::{
     pipeline_prepare_common, replicate_preflight, replicate_to_next_in_chain,
     send_prepare_ok as send_prepare_ok_common,
 };
-use iggy_common::{
-    header::{
-        Command2, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader,
-    },
-    message::Message,
+use iggy_binary_protocol::{
+    Command2, ConsensusHeader, GenericHeader, Message, PrepareHeader, PrepareOkHeader,
+    RequestHeader,
 };
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use tracing::{debug, warn};
+use std::path::Path;
+use tracing::{debug, error, warn};
 
 #[derive(Debug, Clone)]
 #[allow(unused)]
@@ -51,6 +50,67 @@ impl IggySnapshot {
     #[must_use]
     pub const fn snapshot(&self) -> &MetadataSnapshot {
         &self.snapshot
+    }
+
+    /// Persist the snapshot to disk.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError` if serialization or I/O fails.
+    pub fn persist(&self, path: &Path) -> Result<(), SnapshotError> {
+        use crate::stm::snapshot::PersistStage;
+        use std::fs;
+        use std::io::Write;
+
+        let encoded = self.encode()?;
+
+        let tmp_path = path.with_extension("bin.tmp");
+
+        let mut file = fs::File::create(&tmp_path).map_err(|e| SnapshotError::Persist {
+            stage: PersistStage::Write,
+            source: e,
+        })?;
+        file.write_all(&encoded)
+            .map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::Write,
+                source: e,
+            })?;
+        file.sync_all().map_err(|e| SnapshotError::Persist {
+            stage: PersistStage::Sync,
+            source: e,
+        })?;
+        drop(file);
+
+        fs::rename(&tmp_path, path).map_err(|e| SnapshotError::Persist {
+            stage: PersistStage::Rename,
+            source: e,
+        })?;
+
+        // Fsync the parent directory to ensure the rename is durable.
+        if let Some(parent) = path.parent() {
+            let dir = fs::File::open(parent).map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::DirSync,
+                source: e,
+            })?;
+            dir.sync_all().map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::DirSync,
+                source: e,
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Load a snapshot from disk.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError` if the file cannot be read or deserialization fails.
+    pub fn load(path: &Path) -> Result<Self, SnapshotError> {
+        let data = std::fs::read(path)?;
+
+        // TODO: when checksum is added we need to check
+        // if data.len() is atleast the size of checksum
+
+        Self::decode(data.as_slice())
     }
 }
 
@@ -89,7 +149,88 @@ impl Snapshot for IggySnapshot {
     }
 }
 
-#[derive(Debug)]
+/// Coordinates snapshot creation, persistence, and WAL compaction.
+///
+/// Owns the data directory path and the snapshot creation function.
+pub struct SnapshotCoordinator<M> {
+    data_dir: std::path::PathBuf,
+    create_snapshot: fn(&M, u64) -> Result<IggySnapshot, SnapshotError>,
+}
+
+impl<M> SnapshotCoordinator<M> {
+    /// Number of remaining journal slots at which a checkpoint is forced.
+    // TODO: tune this margin size
+    const CHECKPOINT_MARGIN: usize = 64;
+
+    #[must_use]
+    pub fn new(
+        data_dir: std::path::PathBuf,
+        create_snapshot: fn(&M, u64) -> Result<IggySnapshot, SnapshotError>,
+    ) -> Self {
+        Self {
+            data_dir,
+            create_snapshot,
+        }
+    }
+
+    /// Create a snapshot, persist it, and drain snapshotted entries from the
+    /// journal to reclaim WAL space.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError` if snapshotting, persistence, or drain fails.
+    #[allow(clippy::future_not_send)]
+    pub async fn checkpoint<J>(
+        &self,
+        stm: &M,
+        journal: &J,
+        last_op: u64,
+    ) -> Result<(), SnapshotError>
+    where
+        J: JournalHandle,
+    {
+        let snapshot = (self.create_snapshot)(stm, last_op)?;
+        let path = self.data_dir.join(super::METADATA_DIR).join("snapshot.bin");
+        snapshot.persist(&path)?;
+
+        let _ = journal
+            .handle()
+            .drain(0..=last_op)
+            .await
+            .map_err(SnapshotError::Io)?;
+
+        Ok(())
+    }
+
+    /// Force a checkpoint if the journal is running low on capacity.
+    ///
+    /// Returns `Ok(true)` if a checkpoint was taken, `Ok(false)` if not needed.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError` if the checkpoint fails.
+    #[allow(clippy::future_not_send)]
+    pub async fn checkpoint_if_needed<J>(
+        &self,
+        stm: &M,
+        journal: &J,
+        commit_op: u64,
+    ) -> Result<bool, SnapshotError>
+    where
+        J: JournalHandle,
+    {
+        let needs_checkpoint = journal
+            .handle()
+            .remaining_capacity()
+            .is_some_and(|c| c <= Self::CHECKPOINT_MARGIN);
+
+        if needs_checkpoint {
+            self.checkpoint(stm, journal, commit_op).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
 pub struct IggyMetadata<C, J, S, M> {
     /// Some on shard0, None on other shards
     pub consensus: Option<C>,
@@ -99,6 +240,36 @@ pub struct IggyMetadata<C, J, S, M> {
     pub snapshot: Option<S>,
     /// State machine - lives on all shards
     pub mux_stm: M,
+    /// Snapshot coordinator - present when persistent checkpointing is configured.
+    pub coordinator: Option<SnapshotCoordinator<M>>,
+}
+
+impl<C, J, S, M> IggyMetadata<C, J, S, M>
+where
+    M: FillSnapshot<MetadataSnapshot>,
+{
+    /// Create a new `IggyMetadata` instance.
+    ///
+    /// The `FillSnapshot<MetadataSnapshot>` bound is captured here via a
+    /// function pointer so that no downstream caller needs the bound.
+    #[must_use]
+    pub fn new(
+        consensus: Option<C>,
+        journal: Option<J>,
+        snapshot: Option<S>,
+        mux_stm: M,
+        data_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        let coordinator = data_dir
+            .map(|dir| SnapshotCoordinator::new(dir, |stm, seq| IggySnapshot::create(stm, seq)));
+        Self {
+            consensus,
+            journal,
+            snapshot,
+            mux_stm,
+            coordinator,
+        }
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -151,9 +322,31 @@ where
 
         // TODO add assertions for valid state here.
 
-        // TODO verify that the current prepare fits in the WAL.
-
         // TODO handle gap in ops.
+
+        // Force a checkpoint if the journal is running low on capacity.
+        if let Some(coordinator) = &self.coordinator {
+            let snap_op = consensus.commit();
+            match coordinator
+                .checkpoint_if_needed(&self.mux_stm, journal, snap_op)
+                .await
+            {
+                Ok(true) => {
+                    debug!(
+                        replica = consensus.replica(),
+                        "on_replicate: forced checkpoint at op={snap_op}"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    error!(
+                        replica = consensus.replica(),
+                        "on_replicate: forced checkpoint failed: {e}"
+                    );
+                    return;
+                }
+            }
+        }
 
         // Verify hash chain integrity.
         if let Some(previous) = journal.handle().previous_header(header) {
@@ -166,7 +359,13 @@ where
         consensus.set_last_prepare_checksum(header.checksum);
 
         // Append to journal.
-        journal.handle().append(message.clone()).await;
+        if let Err(e) = journal.handle().append(message.clone()).await {
+            error!(
+                replica = consensus.replica(),
+                "on_replicate: journal append failed: {e}"
+            );
+            return;
+        }
 
         // After successful journal write, send prepare_ok to primary.
         self.send_prepare_ok(header).await;

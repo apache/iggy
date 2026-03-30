@@ -66,6 +66,7 @@ actix-files = "0.6.10"
 actix-web = "4.13.0"
 aes-gcm = "0.10.3"
 ahash = { version = "0.8.12", features = ["serde"] }
+aligned-vec = "0.6.4"
 anyhow = "1.0.102"
 argon2 = "0.5.3"
 arrow = "57.3.0"
@@ -134,7 +135,6 @@ dirs = "6.0.0"
 dlopen2 = "0.8.2"
 dotenvy = "0.15.7"
 elasticsearch = { version = "9.1.0-alpha.1", features = ["rustls-tls"], default-features = false }
-enum_dispatch = "0.3.13"
 enumset = "1.1"
 env_logger = "0.11.9"
 err_trail = { version = "0.11.0", features = ["tracing"] }
@@ -160,10 +160,10 @@ hwlocality = "1.0.0-alpha.11"
 iceberg = "0.9.0"
 iceberg-catalog-rest = "0.9.0"
 iceberg-storage-opendal = "0.9.0"
-iggy = { path = "core/sdk", version = "0.9.3-edge.1" }
+iggy = { path = "core/sdk", version = "0.9.4-edge.1" }
 iggy-cli = { path = "core/cli", version = "0.11.3-edge.1" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.9.3-edge.1" }
-iggy_common = { path = "core/common", version = "0.9.3-edge.1" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.9.4-edge.1" }
+iggy_common = { path = "core/common", version = "0.9.4-edge.1" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.2.1-edge.1" }
 integration = { path = "core/integration" }
 journal = { path = "core/journal" }
@@ -183,7 +183,7 @@ mime_guess = "2.0"
 mockall = "0.14.0"
 moka = { version = "0.12.14", features = ["future"] }
 mongodb = { version = "3.5.2", features = ["rustls-tls"] }
-nix = { version = "0.31.2", features = ["fs", "resource", "sched"] }
+nix = { version = "0.31.2", features = ["feature", "fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 notify = "8.2.0"
 octocrab = "0.49.5"

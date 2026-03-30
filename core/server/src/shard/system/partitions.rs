@@ -260,7 +260,29 @@ impl IggyShard {
             stats.increment_segments_count(1);
         }
 
-        let current_offset = loaded_log.active_segment().end_offset;
+        // Use the max end_offset across segments that have data, not just
+        // the active segment. Mirrors the fix in shard/mod.rs bootstrap.
+        let current_offset = loaded_log
+            .segments()
+            .iter()
+            .filter(|s| s.size > iggy_common::IggyByteSize::default())
+            .map(|s| s.end_offset)
+            .max()
+            .unwrap_or(0);
+
+        let should_increment_offset = loaded_log
+            .segments()
+            .iter()
+            .any(|s| s.size > iggy_common::IggyByteSize::default());
+
+        // Initialize journal base_offset so three-tier routing works correctly.
+        if should_increment_offset {
+            use crate::streaming::partitions::journal::{Inner, Journal};
+            loaded_log.journal_mut().init(Inner {
+                base_offset: current_offset + 1,
+                ..Default::default()
+            });
+        }
 
         let (revision_id, consumer_offsets, consumer_group_offsets) = self
             .metadata
@@ -280,6 +302,54 @@ impl IggyShard {
                 )
             });
 
+        // Clamp consumer offsets that are ahead of partition offset (crash recovery).
+        {
+            let guard = consumer_offsets.pin();
+            for entry in guard.iter() {
+                let stored = entry.1.offset.load(std::sync::atomic::Ordering::Relaxed);
+                if stored > current_offset {
+                    tracing::warn!(
+                        "Consumer {} offset {} ahead of partition offset {} \
+                         for stream {}, topic {}, partition {} - clamping \
+                         (lazy init recovery)",
+                        entry.0,
+                        stored,
+                        current_offset,
+                        stream_id,
+                        topic_id,
+                        partition_id
+                    );
+                    entry
+                        .1
+                        .offset
+                        .store(current_offset, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        {
+            let guard = consumer_group_offsets.pin();
+            for entry in guard.iter() {
+                let stored = entry.1.offset.load(std::sync::atomic::Ordering::Relaxed);
+                if stored > current_offset {
+                    tracing::warn!(
+                        "Consumer group {:?} offset {} ahead of partition \
+                         offset {} for stream {}, topic {}, partition {} - \
+                         clamping (lazy init recovery)",
+                        entry.0,
+                        stored,
+                        current_offset,
+                        stream_id,
+                        topic_id,
+                        partition_id
+                    );
+                    entry
+                        .1
+                        .offset
+                        .store(current_offset, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
         let partition = LocalPartition::with_log(
             loaded_log,
             stats,
@@ -289,7 +359,7 @@ impl IggyShard {
             None,
             created_at,
             revision_id,
-            current_offset > 0,
+            should_increment_offset,
         );
 
         self.local_partitions.borrow_mut().insert(*ns, partition);
