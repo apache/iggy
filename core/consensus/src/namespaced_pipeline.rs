@@ -264,6 +264,10 @@ impl Pipeline for NamespacedPipeline {
         self.total_count == 0
     }
 
+    fn len(&self) -> usize {
+        self.total_count
+    }
+
     fn verify(&self) {
         assert!(self.total_count <= PIPELINE_PREPARE_QUEUE_MAX);
 

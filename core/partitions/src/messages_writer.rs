@@ -126,7 +126,9 @@ async fn write_frozen_chunked<const ALIGN: usize>(
             .into();
         result.map_err(|err| {
             error!(
+                target: "iggy.partitions.storage",
                 file = file_path,
+                write_position = position,
                 %err,
                 "failed to write frozen messages to segment file"
             );

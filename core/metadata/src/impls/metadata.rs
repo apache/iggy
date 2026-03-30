@@ -17,8 +17,9 @@
 use crate::stm::StateMachine;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
 use consensus::{
-    Consensus, Pipeline, PipelineEntry, Plane, PlaneIdentity, Project, Sequencer, VsrConsensus,
-    ack_preflight, ack_quorum_reached, build_reply_message, drain_committable_prefix,
+    CommitLogEvent, Consensus, Pipeline, PipelineEntry, Plane, PlaneIdentity, PlaneKind, Project,
+    ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
+    ack_quorum_reached, build_reply_message, drain_committable_prefix, emit_sim_event,
     fence_old_prepare_by_commit, panic_if_hash_chain_would_break_in_same_view,
     pipeline_prepare_common, replicate_preflight, replicate_to_next_in_chain,
     send_prepare_ok as send_prepare_ok_common,
@@ -291,10 +292,20 @@ where
     async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
 
-        // TODO: Bunch of asserts.
-        debug!("handling metadata request");
+        emit_sim_event(
+            SimEventKind::ClientRequestReceived,
+            &RequestLogEvent {
+                replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Metadata),
+                client_id: message.header().client,
+                request_id: message.header().request,
+                operation: message.header().operation,
+            },
+        );
         let prepare = message.project(consensus);
-        pipeline_prepare_common(consensus, prepare, |prepare| self.on_replicate(prepare)).await;
+        pipeline_prepare_common(consensus, PlaneKind::Metadata, prepare, |prepare| {
+            self.on_replicate(prepare)
+        })
+        .await;
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
@@ -307,8 +318,14 @@ where
             Ok(current_op) => current_op,
             Err(reason) => {
                 warn!(
-                    replica = consensus.replica(),
-                    "on_replicate: ignoring ({reason})"
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    view = consensus.view(),
+                    op = header.op,
+                    operation = ?header.operation,
+                    reason = reason.as_str(),
+                    "ignoring prepare during replicate preflight"
                 );
                 return;
             }
@@ -319,7 +336,16 @@ where
         let is_old_prepare = fence_old_prepare_by_commit(consensus, &header)
             || journal.handle().header(header.op as usize).is_some();
         let message = if is_old_prepare {
-            warn!("received old prepare, not replicating");
+            warn!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                view = consensus.view(),
+                op = header.op,
+                commit = consensus.commit(),
+                operation = ?header.operation,
+                "received old prepare, skipping replication"
+            );
             message
         } else {
             self.replicate(message).await
@@ -338,15 +364,22 @@ where
             {
                 Ok(true) => {
                     debug!(
-                        replica = consensus.replica(),
-                        "on_replicate: forced checkpoint at op={snap_op}"
+                        target: "iggy.metadata.diag",
+                        plane = "metadata",
+                        replica_id = consensus.replica(),
+                        checkpoint_op = snap_op,
+                        "forced checkpoint completed"
                     );
                 }
                 Ok(false) => {}
                 Err(e) => {
                     error!(
-                        replica = consensus.replica(),
-                        "on_replicate: forced checkpoint failed: {e}"
+                        target: "iggy.metadata.diag",
+                        plane = "metadata",
+                        replica_id = consensus.replica(),
+                        checkpoint_op = snap_op,
+                        error = %e,
+                        "forced checkpoint failed"
                     );
                     return;
                 }
@@ -366,8 +399,13 @@ where
         // Append to journal.
         if let Err(e) = journal.handle().append(message).await {
             error!(
-                replica = consensus.replica(),
-                "on_replicate: journal append failed: {e}"
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                op = header.op,
+                operation = ?header.operation,
+                error = %e,
+                "journal append failed"
             );
             return;
         }
@@ -386,7 +424,15 @@ where
         let header = message.header();
 
         if let Err(reason) = ack_preflight(consensus) {
-            warn!("on_ack: ignoring ({reason})");
+            warn!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                view = consensus.view(),
+                op = header.op,
+                reason = reason.as_str(),
+                "ignoring ack during preflight"
+            );
             return;
         }
 
@@ -396,23 +442,39 @@ where
                 .entry_by_op_and_checksum(header.op, header.prepare_checksum)
                 .is_none()
             {
-                debug!("on_ack: prepare not in pipeline op={}", header.op);
+                debug!(
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    op = header.op,
+                    prepare_checksum = header.prepare_checksum,
+                    "ack target prepare not in pipeline"
+                );
                 return;
             }
         }
 
-        if ack_quorum_reached(consensus, header) {
+        if ack_quorum_reached(consensus, PlaneKind::Metadata, header) {
             let journal = self.journal.as_ref().unwrap();
 
-            debug!("on_ack: quorum received for op={}", header.op);
+            debug!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                op = header.op,
+                "ack quorum received"
+            );
 
             let drained = drain_committable_prefix(consensus);
             if let (Some(first), Some(last)) = (drained.first(), drained.last()) {
                 debug!(
-                    "on_ack: draining committed prefix ops=[{}..={}] count={}",
-                    first.header.op,
-                    last.header.op,
-                    drained.len()
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    first_op = first.header.op,
+                    last_op = last.header.op,
+                    drained_count = drained.len(),
+                    "draining committed metadata prefix"
                 );
             }
 
@@ -434,20 +496,31 @@ where
 
                 let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
                     warn!(
-                        "on_ack: state machine error for op={}: {err}",
-                        prepare_header.op
+                        target: "iggy.metadata.diag",
+                        plane = "metadata",
+                        replica_id = consensus.replica(),
+                        op = prepare_header.op,
+                        operation = ?prepare_header.operation,
+                        error = %err,
+                        "state machine update failed for committed metadata entry"
                     );
                     bytes::Bytes::new()
                 });
-                debug!("on_ack: state applied for op={}", prepare_header.op);
+                let pipeline_depth = consensus.pipeline().borrow().len();
+                let event = CommitLogEvent {
+                    replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Metadata),
+                    op: prepare_header.op,
+                    client_id: prepare_header.client,
+                    request_id: prepare_header.request,
+                    operation: prepare_header.operation,
+                    pipeline_depth,
+                };
+                emit_sim_event(SimEventKind::OperationCommitted, &event);
 
                 let generic_reply =
                     build_reply_message(consensus, &prepare_header, response).into_generic();
                 let reply_buffers = freeze_client_reply(generic_reply);
-                debug!(
-                    "on_ack: sending reply to client={} for op={}",
-                    prepare_header.client, prepare_header.op
-                );
+                emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
 
                 // TODO: Propagate send error instead of panicking; requires bus error design.
                 consensus

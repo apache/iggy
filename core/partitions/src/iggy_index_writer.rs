@@ -58,8 +58,10 @@ impl IggyIndexWriter {
 
         let size = index_size_bytes.load(Ordering::Relaxed);
         trace!(
-            "Opened sparse index file for writing: {file_path}, size: {}",
-            size
+            target: "iggy.partitions.storage",
+            file = file_path,
+            size,
+            "opened sparse index file for writing"
         );
 
         Ok(Self {
@@ -91,7 +93,13 @@ impl IggyIndexWriter {
             self.fsync().await?;
         }
 
-        trace!("Saved {len} sparse index bytes to file: {}", self.file_path);
+        trace!(
+            target: "iggy.partitions.storage",
+            file = self.file_path.as_str(),
+            bytes = len,
+            position,
+            "saved sparse index bytes to file"
+        );
         Ok(())
     }
 

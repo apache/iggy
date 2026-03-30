@@ -17,8 +17,10 @@
 
 use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
 use crate::{
-    Consensus, DvcQuorumArray, Pipeline, Project, StoredDvc, dvc_count, dvc_max_commit,
-    dvc_quorum_array_empty, dvc_record, dvc_reset, dvc_select_winner,
+    AckLogEvent, Consensus, ControlActionLogEvent, DvcQuorumArray, IgnoreReason, Pipeline,
+    PlaneKind, PrepareLogEvent, Project, ReplicaLogContext, SimEventKind, StoredDvc,
+    ViewChangeLogEvent, ViewChangeReason, dvc_count, dvc_max_commit, dvc_quorum_array_empty,
+    dvc_record, dvc_reset, dvc_select_winner, emit_replica_event, emit_sim_event,
 };
 use bit_set::BitSet;
 use iggy_binary_protocol::{
@@ -384,6 +386,10 @@ impl Pipeline for LocalPipeline {
         Self::is_empty(self)
     }
 
+    fn len(&self) -> usize {
+        self.prepare_count()
+    }
+
     fn verify(&self) {
         Self::verify(self);
     }
@@ -424,6 +430,27 @@ pub enum VsrAction {
         target: u8,
         namespace: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareOkOutcome {
+    Accepted {
+        ack_count: usize,
+        quorum_reached: bool,
+    },
+    Ignored {
+        reason: IgnoreReason,
+    },
+}
+
+impl PrepareOkOutcome {
+    #[must_use]
+    pub const fn quorum_reached(self) -> bool {
+        match self {
+            Self::Accepted { quorum_reached, .. } => quorum_reached,
+            Self::Ignored { .. } => false,
+        }
+    }
 }
 
 #[allow(unused)]
@@ -691,7 +718,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// Returns a list of actions to take based on fired timeouts.
     /// Empty vec means no actions needed.
-    pub fn tick(&self, current_op: u64, current_commit: u64) -> Vec<VsrAction> {
+    pub fn tick(&self, plane: PlaneKind, current_op: u64, current_commit: u64) -> Vec<VsrAction> {
         let mut actions = Vec::new();
         let mut timeouts = self.timeouts.borrow_mut();
 
@@ -701,25 +728,29 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // Phase 2: Handle fired timeouts
         if timeouts.fired(TimeoutKind::NormalHeartbeat) {
             drop(timeouts);
-            actions.extend(self.handle_normal_heartbeat_timeout());
+            actions.extend(self.handle_normal_heartbeat_timeout(plane));
             timeouts = self.timeouts.borrow_mut();
         }
 
         if timeouts.fired(TimeoutKind::StartViewChangeMessage) {
             drop(timeouts);
-            actions.extend(self.handle_start_view_change_message_timeout());
+            actions.extend(self.handle_start_view_change_message_timeout(plane));
             timeouts = self.timeouts.borrow_mut();
         }
 
         if timeouts.fired(TimeoutKind::DoViewChangeMessage) {
             drop(timeouts);
-            actions.extend(self.handle_do_view_change_message_timeout(current_op, current_commit));
+            actions.extend(self.handle_do_view_change_message_timeout(
+                plane,
+                current_op,
+                current_commit,
+            ));
             timeouts = self.timeouts.borrow_mut();
         }
 
         if timeouts.fired(TimeoutKind::ViewChangeStatus) {
             drop(timeouts);
-            actions.extend(self.handle_view_change_status_timeout());
+            actions.extend(self.handle_view_change_status_timeout(plane));
             // timeouts = self.timeouts.borrow_mut(); // Not needed if last
         }
 
@@ -728,7 +759,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// Called when `normal_heartbeat` timeout fires.
     /// Backup hasn't heard from primary - start view change.
-    fn handle_normal_heartbeat_timeout(&self) -> Vec<VsrAction> {
+    fn handle_normal_heartbeat_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
         // Only backups trigger view change on heartbeat timeout
         if self.is_primary() {
             return Vec::new();
@@ -740,7 +771,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         // Advance to new view and transition to view change
-        let new_view = self.view.get() + 1;
+        let old_view = self.view.get();
+        let new_view = old_view + 1;
 
         self.view.set(new_view);
         self.status.set(Status::ViewChange);
@@ -758,14 +790,32 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts.start(TimeoutKind::ViewChangeStatus);
         }
 
-        vec![VsrAction::SendStartViewChange {
+        emit_sim_event(
+            SimEventKind::ViewChangeStarted,
+            &ViewChangeLogEvent {
+                replica: ReplicaLogContext::from_consensus(self, plane),
+                old_view,
+                new_view,
+                reason: ViewChangeReason::NormalHeartbeatTimeout,
+            },
+        );
+
+        let action = VsrAction::SendStartViewChange {
             view: new_view,
             namespace: self.namespace,
-        }]
+        };
+        emit_sim_event(
+            SimEventKind::ControlMessageScheduled,
+            &ControlActionLogEvent::from_vsr_action(
+                ReplicaLogContext::from_consensus(self, plane),
+                &action,
+            ),
+        );
+        vec![action]
     }
 
     /// Resend SVC message if we've started view change.
-    fn handle_start_view_change_message_timeout(&self) -> Vec<VsrAction> {
+    fn handle_start_view_change_message_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
         if !self.sent_own_start_view_change.get() {
             return Vec::new();
         }
@@ -774,15 +824,24 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .borrow_mut()
             .reset(TimeoutKind::StartViewChangeMessage);
 
-        vec![VsrAction::SendStartViewChange {
+        let action = VsrAction::SendStartViewChange {
             view: self.view.get(),
             namespace: self.namespace,
-        }]
+        };
+        emit_sim_event(
+            SimEventKind::ControlMessageScheduled,
+            &ControlActionLogEvent::from_vsr_action(
+                ReplicaLogContext::from_consensus(self, plane),
+                &action,
+            ),
+        );
+        vec![action]
     }
 
     /// Resend DVC message if we've sent one.
     fn handle_do_view_change_message_timeout(
         &self,
+        plane: PlaneKind,
         current_op: u64,
         current_commit: u64,
     ) -> Vec<VsrAction> {
@@ -803,24 +862,33 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .borrow_mut()
             .reset(TimeoutKind::DoViewChangeMessage);
 
-        vec![VsrAction::SendDoViewChange {
+        let action = VsrAction::SendDoViewChange {
             view: self.view.get(),
             target: self.primary_index(self.view.get()),
             log_view: self.log_view.get(),
             op: current_op,
             commit: current_commit,
             namespace: self.namespace,
-        }]
+        };
+        emit_sim_event(
+            SimEventKind::ControlMessageScheduled,
+            &ControlActionLogEvent::from_vsr_action(
+                ReplicaLogContext::from_consensus(self, plane),
+                &action,
+            ),
+        );
+        vec![action]
     }
 
     /// Escalate to next view if stuck in view change.
-    fn handle_view_change_status_timeout(&self) -> Vec<VsrAction> {
+    fn handle_view_change_status_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
         if self.status.get() != Status::ViewChange {
             return Vec::new();
         }
 
         // Escalate: try next view
-        let next_view = self.view.get() + 1;
+        let old_view = self.view.get();
+        let next_view = old_view + 1;
 
         self.view.set(next_view);
         self.reset_view_change_state();
@@ -833,10 +901,28 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .borrow_mut()
             .reset(TimeoutKind::ViewChangeStatus);
 
-        vec![VsrAction::SendStartViewChange {
+        emit_sim_event(
+            SimEventKind::ViewChangeStarted,
+            &ViewChangeLogEvent {
+                replica: ReplicaLogContext::from_consensus(self, plane),
+                old_view,
+                new_view: next_view,
+                reason: ViewChangeReason::ViewChangeStatusTimeout,
+            },
+        );
+
+        let action = VsrAction::SendStartViewChange {
             view: next_view,
             namespace: self.namespace,
-        }]
+        };
+        emit_sim_event(
+            SimEventKind::ControlMessageScheduled,
+            &ControlActionLogEvent::from_vsr_action(
+                ReplicaLogContext::from_consensus(self, plane),
+                &action,
+            ),
+        );
+        vec![action]
     }
 
     /// Handle a received `StartViewChange` message.
@@ -847,7 +933,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// # Panics
     /// If `header.namespace` does not match this replica's namespace.
-    pub fn handle_start_view_change(&self, header: &StartViewChangeHeader) -> Vec<VsrAction> {
+    pub fn handle_start_view_change(
+        &self,
+        plane: PlaneKind,
+        header: &StartViewChangeHeader,
+    ) -> Vec<VsrAction> {
         assert_eq!(
             header.namespace, self.namespace,
             "SVC routed to wrong group"
@@ -864,6 +954,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // If SVC is for a higher view, advance to that view
         if msg_view > self.view.get() {
+            let old_view = self.view.get();
             self.view.set(msg_view);
             self.status.set(Status::ViewChange);
             self.reset_view_change_state();
@@ -880,11 +971,29 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 timeouts.start(TimeoutKind::ViewChangeStatus);
             }
 
+            emit_sim_event(
+                SimEventKind::ViewChangeStarted,
+                &ViewChangeLogEvent {
+                    replica: ReplicaLogContext::from_consensus(self, plane),
+                    old_view,
+                    new_view: msg_view,
+                    reason: ViewChangeReason::ReceivedStartViewChange,
+                },
+            );
+
             // Send our own SVC
-            actions.push(VsrAction::SendStartViewChange {
+            let action = VsrAction::SendStartViewChange {
                 view: msg_view,
                 namespace: self.namespace,
-            });
+            };
+            emit_sim_event(
+                SimEventKind::ControlMessageScheduled,
+                &ControlActionLogEvent::from_vsr_action(
+                    ReplicaLogContext::from_consensus(self, plane),
+                    &action,
+                ),
+            );
+            actions.push(action);
         }
 
         // Record the SVC from sender
@@ -908,14 +1017,22 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 .borrow_mut()
                 .start(TimeoutKind::DoViewChangeMessage);
 
-            actions.push(VsrAction::SendDoViewChange {
+            let action = VsrAction::SendDoViewChange {
                 view: self.view.get(),
                 target: primary_candidate,
                 log_view: self.log_view.get(),
                 op: current_op,
                 commit: current_commit,
                 namespace: self.namespace,
-            });
+            };
+            emit_sim_event(
+                SimEventKind::ControlMessageScheduled,
+                &ControlActionLogEvent::from_vsr_action(
+                    ReplicaLogContext::from_consensus(self, plane),
+                    &action,
+                ),
+            );
+            actions.push(action);
 
             // If we are the primary candidate, record our own DVC
             if primary_candidate == self.replica {
@@ -933,7 +1050,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 // Check if we now have quorum
                 if dvc_count(&self.do_view_change_from_all_replicas.borrow()) >= self.quorum() {
                     self.do_view_change_quorum.set(true);
-                    actions.extend(self.complete_view_change_as_primary());
+                    actions.extend(self.complete_view_change_as_primary(plane));
                 }
             }
         }
@@ -949,7 +1066,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// # Panics
     /// If `header.namespace` does not match this replica's namespace.
-    pub fn handle_do_view_change(&self, header: &DoViewChangeHeader) -> Vec<VsrAction> {
+    pub fn handle_do_view_change(
+        &self,
+        plane: PlaneKind,
+        header: &DoViewChangeHeader,
+    ) -> Vec<VsrAction> {
         assert_eq!(
             header.namespace, self.namespace,
             "DVC routed to wrong group"
@@ -969,6 +1090,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // If DVC is for a higher view, advance to that view
         if msg_view > self.view.get() {
+            let old_view = self.view.get();
             self.view.set(msg_view);
             self.status.set(Status::ViewChange);
             self.reset_view_change_state();
@@ -985,11 +1107,29 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 timeouts.start(TimeoutKind::ViewChangeStatus);
             }
 
+            emit_sim_event(
+                SimEventKind::ViewChangeStarted,
+                &ViewChangeLogEvent {
+                    replica: ReplicaLogContext::from_consensus(self, plane),
+                    old_view,
+                    new_view: msg_view,
+                    reason: ViewChangeReason::ReceivedDoViewChange,
+                },
+            );
+
             // Send our own SVC
-            actions.push(VsrAction::SendStartViewChange {
+            let action = VsrAction::SendStartViewChange {
                 view: msg_view,
                 namespace: self.namespace,
-            });
+            };
+            emit_sim_event(
+                SimEventKind::ControlMessageScheduled,
+                &ControlActionLogEvent::from_vsr_action(
+                    ReplicaLogContext::from_consensus(self, plane),
+                    &action,
+                ),
+            );
+            actions.push(action);
         }
 
         // Only the primary candidate processes DVCs for quorum
@@ -1035,7 +1175,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             && dvc_count(&self.do_view_change_from_all_replicas.borrow()) >= self.quorum()
         {
             self.do_view_change_quorum.set(true);
-            actions.extend(self.complete_view_change_as_primary());
+            actions.extend(self.complete_view_change_as_primary(plane));
         }
 
         actions
@@ -1050,7 +1190,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// # Panics
     /// If `header.namespace` does not match this replica's namespace.
-    pub fn handle_start_view(&self, header: &StartViewHeader) -> Vec<VsrAction> {
+    pub fn handle_start_view(&self, plane: PlaneKind, header: &StartViewHeader) -> Vec<VsrAction> {
         assert_eq!(header.namespace, self.namespace, "SV routed to wrong group");
         let from_replica = header.replica;
         let msg_view = header.view;
@@ -1097,19 +1237,32 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // Send PrepareOK for uncommitted ops (commit+1 to op)
         let mut actions = Vec::new();
         for op_num in (msg_commit + 1)..=msg_op {
-            actions.push(VsrAction::SendPrepareOk {
+            let action = VsrAction::SendPrepareOk {
                 view: msg_view,
                 op: op_num,
                 target: from_replica,
                 namespace: self.namespace,
-            });
+            };
+            emit_sim_event(
+                SimEventKind::ControlMessageScheduled,
+                &ControlActionLogEvent::from_vsr_action(
+                    ReplicaLogContext::from_consensus(self, plane),
+                    &action,
+                ),
+            );
+            actions.push(action);
         }
+
+        emit_replica_event(
+            SimEventKind::ReplicaStateChanged,
+            &ReplicaLogContext::from_consensus(self, plane),
+        );
 
         actions
     }
 
     /// Complete view change as the new primary after collecting DVC quorum.
-    fn complete_view_change_as_primary(&self) -> Vec<VsrAction> {
+    fn complete_view_change_as_primary(&self, plane: PlaneKind) -> Vec<VsrAction> {
         let dvc_array = self.do_view_change_from_all_replicas.borrow();
 
         let Some(winner) = dvc_select_winner(&dvc_array) else {
@@ -1143,23 +1296,39 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts.start(TimeoutKind::CommitMessage);
         }
 
-        vec![VsrAction::SendStartView {
+        let state = ReplicaLogContext::from_consensus(self, plane);
+        emit_replica_event(SimEventKind::PrimaryElected, &state);
+        emit_replica_event(SimEventKind::ReplicaStateChanged, &state);
+
+        let action = VsrAction::SendStartView {
             view: self.view.get(),
             op: new_op,
             commit: max_commit,
             namespace: self.namespace,
-        }]
+        };
+        emit_sim_event(
+            SimEventKind::ControlMessageScheduled,
+            &ControlActionLogEvent::from_vsr_action(
+                ReplicaLogContext::from_consensus(self, plane),
+                &action,
+            ),
+        );
+        vec![action]
     }
 
     /// Handle a `PrepareOk` message from a replica.
     ///
-    /// Returns `true` if quorum was just reached for this op.
+    /// Returns rich ack-progress information for structured logging.
     /// Caller (`on_ack`) should validate `is_primary` and status before calling.
     ///
     /// # Panics
     /// - If `header.command` is not `Command2::PrepareOk`.
     /// - If `header.replica >= self.replica_count`.
-    pub fn handle_prepare_ok(&self, header: &PrepareOkHeader) -> bool {
+    pub fn handle_prepare_ok(
+        &self,
+        plane: PlaneKind,
+        header: &PrepareOkHeader,
+    ) -> PrepareOkOutcome {
         assert_eq!(header.command, Command2::PrepareOk);
         assert!(
             header.replica < self.replica_count,
@@ -1169,17 +1338,23 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // Ignore if from older view
         if header.view < self.view() {
-            return false;
+            return PrepareOkOutcome::Ignored {
+                reason: IgnoreReason::OlderView,
+            };
         }
 
         // Ignore if from newer view
         if header.view > self.view() {
-            return false;
+            return PrepareOkOutcome::Ignored {
+                reason: IgnoreReason::NewerView,
+            };
         }
 
         // Ignore if syncing
         if self.is_syncing() {
-            return false;
+            return PrepareOkOutcome::Ignored {
+                reason: IgnoreReason::Syncing,
+            };
         }
 
         // Find the prepare in our pipeline
@@ -1187,30 +1362,54 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         let Some(entry) = pipeline.entry_by_op_mut(header.op) else {
             // Not in pipeline - could be old/duplicate or already committed
-            return false;
+            return PrepareOkOutcome::Ignored {
+                reason: IgnoreReason::UnknownPrepare,
+            };
         };
 
         // Verify checksum matches
         if entry.header.checksum != header.prepare_checksum {
-            return false;
+            return PrepareOkOutcome::Ignored {
+                reason: IgnoreReason::ChecksumMismatch,
+            };
         }
 
         // Check for duplicate ack
         if entry.has_ack(header.replica) {
-            return false;
+            return PrepareOkOutcome::Ignored {
+                reason: IgnoreReason::DuplicateAck,
+            };
         }
 
         // Record the ack from this replica
         let ack_count = entry.add_ack(header.replica);
         let quorum = self.quorum();
+        let quorum_reached = ack_count >= quorum && !entry.ok_quorum_received;
 
         // Check if we've reached quorum
-        if ack_count >= quorum && !entry.ok_quorum_received {
+        if quorum_reached {
             entry.ok_quorum_received = true;
-            return true;
         }
 
-        false
+        drop(pipeline);
+
+        emit_sim_event(
+            SimEventKind::PrepareAcked,
+            &AckLogEvent {
+                replica: ReplicaLogContext::from_consensus(self, plane),
+                op: header.op,
+                prepare_checksum: header.prepare_checksum,
+                ack_from_replica: header.replica,
+                ack_count,
+                quorum,
+                quorum_reached,
+            },
+        );
+
+        PrepareOkOutcome::Accepted {
+            ack_count,
+            quorum_reached,
+        }
     }
 
     /// Enqueue a self-addressed message for processing in the next loopback drain.
@@ -1339,11 +1538,28 @@ where
     // (push_loopback / drain_loopback_into) rather than inline here,
     // so that WAL persistence can happen between pipeline insertion
     // and ack recording.
-    fn pipeline_message(&self, message: &Self::Message<Self::ReplicateHeader>) {
+    fn pipeline_message(&self, plane: PlaneKind, message: &Self::Message<Self::ReplicateHeader>) {
         assert!(self.is_primary(), "only primary can pipeline messages");
 
         let mut pipeline = self.pipeline.borrow_mut();
         pipeline.push(PipelineEntry::new(*message.header()));
+        let pipeline_depth = pipeline.len();
+        drop(pipeline);
+
+        let header = message.header();
+        emit_sim_event(
+            SimEventKind::PrepareQueued,
+            &PrepareLogEvent {
+                replica: ReplicaLogContext::from_consensus(self, plane),
+                op: header.op,
+                parent_checksum: header.parent,
+                prepare_checksum: header.checksum,
+                client_id: header.client,
+                request_id: header.request,
+                operation: header.operation,
+                pipeline_depth,
+            },
+        );
     }
 
     fn verify_pipeline(&self) {

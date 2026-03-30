@@ -27,10 +27,11 @@ use crate::segment::Segment;
 use crate::types::PartitionsConfig;
 use consensus::PlaneIdentity;
 use consensus::{
-    Consensus, NamespacedPipeline, Pipeline, PipelineEntry, Plane, Project, Sequencer,
-    VsrConsensus, ack_preflight, build_reply_message, fence_old_prepare_by_commit,
-    pipeline_prepare_common, replicate_preflight, replicate_to_next_in_chain,
-    send_prepare_ok as send_prepare_ok_common,
+    CommitLogEvent, Consensus, NamespacedPipeline, Pipeline, PipelineEntry, Plane, PlaneKind,
+    Project, ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus,
+    ack_preflight, build_reply_message, emit_namespace_progress_event, emit_sim_event,
+    fence_old_prepare_by_commit, pipeline_prepare_common, replicate_preflight,
+    replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, GenericHeader, Message, Operation, PrepareHeader, PrepareOkHeader,
@@ -397,12 +398,28 @@ where
             .consensus()
             .expect("on_request: consensus not initialized");
 
-        debug!(?namespace, "handling partition request");
+        emit_sim_event(
+            SimEventKind::ClientRequestReceived,
+            &RequestLogEvent {
+                replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                client_id: message.header().client,
+                request_id: message.header().request,
+                operation: message.header().operation,
+            },
+        );
         let message = if message.header().operation == Operation::SendMessages {
             match convert_request_message(namespace, message) {
                 Ok(message) => message,
                 Err(error) => {
-                    warn!(?namespace, %error, "on_request: failed to convert SendMessages");
+                    warn!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        replica_id = consensus.replica(),
+                        namespace_raw = namespace.inner(),
+                        operation = ?Operation::SendMessages,
+                        error = %error,
+                        "failed to convert send_messages request"
+                    );
                     return;
                 }
             }
@@ -410,7 +427,10 @@ where
             message
         };
         let prepare = message.project(consensus);
-        pipeline_prepare_common(consensus, prepare, |prepare| self.on_replicate(prepare)).await;
+        pipeline_prepare_common(consensus, PlaneKind::Partitions, prepare, |prepare| {
+            self.on_replicate(prepare)
+        })
+        .await;
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
@@ -424,8 +444,15 @@ where
             Ok(current_op) => current_op,
             Err(reason) => {
                 warn!(
-                    replica = consensus.replica(),
-                    "on_replicate: ignoring ({reason})"
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    replica_id = consensus.replica(),
+                    view = consensus.view(),
+                    op = header.op,
+                    namespace_raw = header.namespace,
+                    operation = ?header.operation,
+                    reason = reason.as_str(),
+                    "ignoring prepare during replicate preflight"
                 );
                 return;
             }
@@ -433,7 +460,17 @@ where
 
         let is_old_prepare = fence_old_prepare_by_commit(consensus, &header);
         if is_old_prepare {
-            warn!("received old prepare, not replicating");
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                replica_id = consensus.replica(),
+                view = consensus.view(),
+                op = header.op,
+                commit = consensus.commit(),
+                namespace_raw = header.namespace,
+                operation = ?header.operation,
+                "received old prepare, skipping replication"
+            );
             return;
         }
 
@@ -444,11 +481,14 @@ where
 
         if let Err(error) = self.apply_replicated_operation(&namespace, message).await {
             warn!(
-                replica = consensus.replica(),
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                replica_id = consensus.replica(),
                 op = header.op,
-                ?namespace,
+                namespace_raw = namespace.inner(),
+                operation = ?header.operation,
                 %error,
-                "on_replicate: failed to apply replicated operation"
+                "failed to apply replicated partition operation"
             );
             return;
         }
@@ -457,11 +497,14 @@ where
             && let Err(error) = self.commit_messages(&namespace, true).await
         {
             warn!(
-                replica = consensus.replica(),
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                replica_id = consensus.replica(),
                 op = header.op,
-                ?namespace,
+                namespace_raw = namespace.inner(),
+                operation = ?header.operation,
                 %error,
-                "on_replicate: failed to durably persist replicated operation"
+                "failed to durably persist replicated partition operation"
             );
             return;
         }
@@ -470,6 +513,12 @@ where
         debug_assert_eq!(header.op, current_op + 1);
         consensus.sequencer().set_sequence(header.op);
         consensus.set_last_prepare_checksum(header.checksum);
+        emit_namespace_progress_event(
+            SimEventKind::NamespaceProgressUpdated,
+            &ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+            header.op,
+            consensus.pipeline().borrow().len(),
+        );
 
         self.send_prepare_ok(&header).await;
     }
@@ -479,7 +528,15 @@ where
         let consensus = self.consensus().expect("on_ack: consensus not initialized");
 
         if let Err(reason) = ack_preflight(consensus) {
-            warn!("on_ack: ignoring ({reason})");
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                replica_id = consensus.replica(),
+                view = consensus.view(),
+                op = header.op,
+                reason = reason.as_str(),
+                "ignoring ack during preflight"
+            );
             return;
         }
 
@@ -489,12 +546,19 @@ where
                 .entry_by_op_and_checksum(header.op, header.prepare_checksum)
                 .is_none()
             {
-                debug!("on_ack: prepare not in pipeline op={}", header.op);
+                debug!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    replica_id = consensus.replica(),
+                    op = header.op,
+                    prepare_checksum = header.prepare_checksum,
+                    "ack target prepare not in pipeline"
+                );
                 return;
             }
         }
 
-        consensus.handle_prepare_ok(header);
+        consensus.handle_prepare_ok(PlaneKind::Partitions, header);
 
         // SAFETY(IGGY-66): Per-namespace drain independent of global commit.
         //
@@ -528,6 +592,12 @@ where
         let new_commit = pipeline.global_commit_frontier(consensus.commit());
         drop(pipeline);
         consensus.advance_commit_number(new_commit);
+        emit_namespace_progress_event(
+            SimEventKind::NamespaceProgressUpdated,
+            &ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+            new_commit,
+            consensus.pipeline().borrow().len(),
+        );
     }
 }
 
@@ -578,10 +648,13 @@ where
                 self.append_send_messages_to_journal(namespace, message)
                     .await?;
                 debug!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
                     replica = consensus.replica(),
                     op = header.op,
-                    ?namespace,
-                    "on_replicate: send_messages appended to partition journal"
+                    namespace_raw = namespace.inner(),
+                    operation = ?header.operation,
+                    "replicated send_messages appended to partition journal"
                 );
                 Ok(())
             }
@@ -611,10 +684,14 @@ where
                     2 => PollingConsumer::ConsumerGroup(consumer_id, 0),
                     _ => {
                         warn!(
+                            target: "iggy.partitions.diag",
+                            plane = "partitions",
                             replica = consensus.replica(),
                             op = header.op,
+                            namespace_raw = namespace.inner(),
+                            operation = ?header.operation,
                             consumer_kind,
-                            "on_replicate: unknown consumer kind"
+                            "unknown consumer kind while applying replicated offset update"
                         );
                         return Err(IggyError::InvalidCommand);
                     }
@@ -626,21 +703,28 @@ where
                 let _ = partition.store_consumer_offset(consumer, offset);
 
                 debug!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
                     replica = consensus.replica(),
                     op = header.op,
+                    namespace_raw = namespace.inner(),
+                    operation = ?header.operation,
                     consumer_kind,
                     consumer_id,
                     offset,
-                    "on_replicate: consumer offset stored"
+                    "replicated consumer offset stored"
                 );
                 Ok(())
             }
             _ => {
                 warn!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
                     replica = consensus.replica(),
+                    namespace_raw = namespace.inner(),
                     op = header.op,
-                    "on_replicate: unexpected operation {:?}",
-                    header.operation
+                    operation = ?header.operation,
+                    "unexpected replicated partition operation"
                 );
                 Ok(())
             }
@@ -769,8 +853,10 @@ where
 
         let Some(index_bytes) = index_bytes else {
             warn!(
-                ?namespace,
-                "commit_messages: failed to build a sparse index entry from pending journal batches"
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = namespace.inner(),
+                "failed to build sparse index entry from pending journal batches"
             );
             return Err(IggyError::InvalidCommand);
         };
@@ -824,10 +910,13 @@ where
     ) {
         if let (Some(first), Some(last)) = (drained.first(), drained.last()) {
             debug!(
-                "on_ack: draining committed ops=[{}..={}] count={}",
-                first.header.op,
-                last.header.op,
-                drained.len()
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                replica_id = consensus.replica(),
+                first_op = first.header.op,
+                last_op = last.header.op,
+                drained_count = drained.len(),
+                "draining committed partition ops"
             );
         }
 
@@ -840,47 +929,40 @@ where
         } in drained
         {
             let entry_namespace = IggyNamespace::from_raw(prepare_header.namespace);
-
-            match prepare_header.operation {
-                Operation::SendMessages => {
-                    if committed_ns.insert(entry_namespace)
-                        && let Err(error) = self.commit_messages(&entry_namespace, false).await
-                    {
-                        failed_ns.insert(entry_namespace);
-                        warn!(
-                            ?entry_namespace,
-                            op = prepare_header.op,
-                            %error,
-                            "on_ack: failed to commit partition messages"
-                        );
-                    }
-                    if failed_ns.contains(&entry_namespace) {
-                        continue;
-                    }
-                    debug!("on_ack: messages committed for op={}", prepare_header.op);
-                }
-                Operation::StoreConsumerOffset => {
-                    // TODO: Commit consumer offset update.
-                    debug!(
-                        "on_ack: consumer offset committed for op={}",
-                        prepare_header.op
-                    );
-                }
-                _ => {
-                    warn!(
-                        "on_ack: unexpected operation {:?} for op={}",
-                        prepare_header.operation, prepare_header.op
-                    );
-                }
+            if !self
+                .commit_partition_entry(
+                    consensus,
+                    prepare_header,
+                    entry_namespace,
+                    &mut committed_ns,
+                    &mut failed_ns,
+                )
+                .await
+            {
+                continue;
             }
+
+            let pipeline_depth = consensus.pipeline().borrow().len();
+            let event = CommitLogEvent {
+                replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                op: prepare_header.op,
+                client_id: prepare_header.client,
+                request_id: prepare_header.request,
+                operation: prepare_header.operation,
+                pipeline_depth,
+            };
+            emit_sim_event(SimEventKind::OperationCommitted, &event);
+            emit_namespace_progress_event(
+                SimEventKind::NamespaceProgressUpdated,
+                &event.replica,
+                prepare_header.op,
+                pipeline_depth,
+            );
 
             let generic_reply =
                 build_reply_message(consensus, &prepare_header, bytes::Bytes::new()).into_generic();
             let reply_buffers = freeze_client_reply(generic_reply);
-            debug!(
-                "on_ack: sending reply to client={} for op={}",
-                prepare_header.client, prepare_header.op
-            );
+            emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
 
             if let Err(error) = consensus
                 .message_bus()
@@ -888,18 +970,78 @@ where
                 .await
             {
                 warn!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
                     client = prepare_header.client,
                     op = prepare_header.op,
+                    namespace_raw = entry_namespace.inner(),
                     %error,
-                    "on_ack: failed to send reply to client"
+                    "failed to send reply to client"
                 );
             }
         }
         if !failed_ns.is_empty() {
             warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                replica_id = consensus.replica(),
                 failed_namespaces = failed_ns.len(),
-                "on_ack: some namespaces failed local commit handling"
+                "some namespaces failed local commit handling"
             );
+        }
+    }
+
+    async fn commit_partition_entry(
+        &self,
+        consensus: &VsrConsensus<B, NamespacedPipeline>,
+        prepare_header: PrepareHeader,
+        entry_namespace: IggyNamespace,
+        committed_ns: &mut HashSet<IggyNamespace>,
+        failed_ns: &mut HashSet<IggyNamespace>,
+    ) -> bool {
+        match prepare_header.operation {
+            Operation::SendMessages => {
+                if committed_ns.insert(entry_namespace)
+                    && let Err(error) = self.commit_messages(&entry_namespace, false).await
+                {
+                    failed_ns.insert(entry_namespace);
+                    warn!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        replica_id = consensus.replica(),
+                        namespace_raw = entry_namespace.inner(),
+                        op = prepare_header.op,
+                        operation = ?prepare_header.operation,
+                        %error,
+                        "failed to commit partition messages"
+                    );
+                }
+                !failed_ns.contains(&entry_namespace)
+            }
+            Operation::StoreConsumerOffset => {
+                // TODO: Commit consumer offset update.
+                debug!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    replica_id = consensus.replica(),
+                    op = prepare_header.op,
+                    namespace_raw = entry_namespace.inner(),
+                    "consumer offset committed"
+                );
+                true
+            }
+            _ => {
+                warn!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    replica_id = consensus.replica(),
+                    op = prepare_header.op,
+                    namespace_raw = entry_namespace.inner(),
+                    operation = ?prepare_header.operation,
+                    "unexpected committed partition operation"
+                );
+                true
+            }
         }
     }
 
@@ -947,10 +1089,12 @@ where
             .await
             .map_err(|error| {
                 warn!(
-                    ?namespace,
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    namespace_raw = namespace.inner(),
                     batch_count,
                     %error,
-                    "persist: failed to save frozen batches"
+                    "failed to save frozen batches"
                 );
                 error
             })?;
@@ -960,15 +1104,24 @@ where
             .await
             .map_err(|error| {
                 warn!(
-                    ?namespace,
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    namespace_raw = namespace.inner(),
                     batch_count,
                     %error,
-                    "persist: failed to save sparse indexes"
+                    "failed to save sparse indexes"
                 );
                 error
             })?;
 
-        debug!(?namespace, batch_count, ?saved, "persisted batches to disk");
+        debug!(
+            target: "iggy.partitions.diag",
+            plane = "partitions",
+            namespace_raw = namespace.inner(),
+            batch_count,
+            saved_bytes = saved.as_bytes_u64(),
+            "persisted batches to disk"
+        );
 
         let partition = self
             .get_mut_by_ns(namespace)
@@ -1063,7 +1216,13 @@ where
         );
         partition.stats.increment_segments_count(1);
 
-        debug!(?namespace, start_offset, "rotated to new segment");
+        debug!(
+            target: "iggy.partitions.diag",
+            plane = "partitions",
+            namespace_raw = namespace.inner(),
+            start_offset,
+            "rotated to new segment"
+        );
         Ok(())
     }
 

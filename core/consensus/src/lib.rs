@@ -44,6 +44,8 @@ pub trait Pipeline {
 
     fn is_empty(&self) -> bool;
 
+    fn len(&self) -> usize;
+
     fn verify(&self);
 }
 
@@ -63,7 +65,7 @@ pub trait Consensus: Sized {
     type Sequencer: Sequencer;
     type Pipeline: Pipeline;
 
-    fn pipeline_message(&self, message: &Self::Message<Self::ReplicateHeader>);
+    fn pipeline_message(&self, plane: PlaneKind, message: &Self::Message<Self::ReplicateHeader>);
     fn verify_pipeline(&self);
 
     fn is_follower(&self) -> bool;
@@ -109,6 +111,8 @@ mod namespaced_pipeline;
 pub use namespaced_pipeline::*;
 mod plane_helpers;
 pub use plane_helpers::*;
+mod observability;
+pub use observability::*;
 
 mod view_change_quorum;
 pub use view_change_quorum::*;

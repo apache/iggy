@@ -37,6 +37,7 @@ iobuf = { workspace = true }
 message_bus = { workspace = true }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }

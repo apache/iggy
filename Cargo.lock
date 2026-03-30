@@ -2237,6 +2237,7 @@ dependencies = [
  "message_bus",
  "rand 0.10.0",
  "rand_xoshiro",
+ "tracing",
 ]
 
 [[package]]

@@ -194,6 +194,7 @@ impl Partition for IggyPartition {
             if let Err(err) = self.store_consumer_offset(consumer, last_offset) {
                 // warning for now.
                 warn!(
+                    target: "iggy.partitions.diag",
                     consumer = ?consumer,
                     last_offset,
                     %err,
