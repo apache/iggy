@@ -76,7 +76,8 @@ TEST(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
 
     rust::Vec<iggy::ffi::Message> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        auto msg = iggy::ffi::new_message(to_payload("test message " + std::to_string(i)));
+        iggy::ffi::Message msg;
+        msg.new_message(to_payload("test message " + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
 
@@ -111,7 +112,8 @@ TEST(LowLevelE2E_Message, PollMessagesVerifyMessageIds) {
                          "server_default");
 
     rust::Vec<iggy::ffi::Message> messages;
-    auto msg  = iggy::ffi::new_message(to_payload("id-test-message"));
+    iggy::ffi::Message msg;
+    msg.new_message(to_payload("id-test-message"));
     msg.id_lo = 42;
     msg.id_hi = 0;
     messages.push_back(std::move(msg));
@@ -159,7 +161,8 @@ TEST(LowLevelE2E_Message, SendMessagesBeforeLoginThrows) {
     ASSERT_NO_THROW(client->connect());
 
     rust::Vec<iggy::ffi::Message> messages;
-    auto msg = iggy::ffi::new_message(to_payload("should-fail"));
+    iggy::ffi::Message msg;
+    msg.new_message(to_payload("should-fail"));
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(1), make_numeric_identifier(1), "partition_id",

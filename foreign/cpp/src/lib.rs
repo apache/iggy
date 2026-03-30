@@ -22,7 +22,6 @@ mod stream;
 mod topic;
 
 use client::{Client, delete_connection, new_connection};
-use messages::new_message;
 use std::sync::LazyLock;
 
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
@@ -177,7 +176,7 @@ mod ffi {
             auto_commit: bool,
         ) -> Result<PolledMessages>;
 
-        fn new_message(payload: Vec<u8>) -> Result<Message>;
+        fn new_message(self: &mut Message, payload: Vec<u8>);
 
         #[allow(clippy::too_many_arguments)]
         fn send_messages(
