@@ -18,6 +18,7 @@
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Microsoft.Extensions.Logging;
@@ -331,7 +332,13 @@ public partial class IggyPublisher : IAsyncDisposable
                 var headerBytes = TcpContracts.GetHeadersBytes(message.UserHeaders);
                 var encryptedHeaderBytes = _config.MessageEncryptor.Encrypt(headerBytes);
                 message.RawUserHeaders = encryptedHeaderBytes;
-                message.UserHeaders = null;
+                message.UserHeaders = new Dictionary<HeaderKey, HeaderValue>
+                {
+                    {
+                        HeaderKey.EncryptedHeadersSentinel,
+                        new HeaderValue { Kind = HeaderKind.Raw, Value = encryptedHeaderBytes }
+                    }
+                };
                 message.Header.UserHeadersLength = encryptedHeaderBytes.Length;
             }
         }

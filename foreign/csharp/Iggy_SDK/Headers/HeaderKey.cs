@@ -101,6 +101,15 @@ public readonly struct HeaderKey : IEquatable<HeaderKey>
     }
 
     /// <summary>
+    /// Sentinel key used to wrap encrypted user headers as a single raw header entry.
+    /// </summary>
+    internal static readonly HeaderKey EncryptedHeadersSentinel = new()
+    {
+        Kind = HeaderKind.Raw,
+        Value = "__encrypted_headers"u8.ToArray()
+    };
+
+    /// <summary>
     /// Determines whether two HeaderKey instances are equal.
     /// </summary>
     public static bool operator ==(HeaderKey left, HeaderKey right)
