@@ -203,12 +203,19 @@ impl Serialize for SendMessages {
                 let payload_base64 = BASE64.encode(msg_view.payload());
                 map.insert("payload", serde_json::to_value(payload_base64).unwrap());
 
-                if let Ok(Some(headers)) = msg_view.user_headers_map() {
-                    let entries: Vec<HeaderEntry> = headers
-                        .into_iter()
-                        .map(|(k, v)| HeaderEntry { key: k, value: v })
-                        .collect();
-                    map.insert("user_headers", serde_json::to_value(&entries).unwrap());
+                match msg_view.user_headers_map() {
+                    Ok(Some(headers)) => {
+                        let entries: Vec<HeaderEntry> = headers
+                            .into_iter()
+                            .map(|(k, v)| HeaderEntry { key: k, value: v })
+                            .collect();
+                        map.insert("user_headers", serde_json::to_value(&entries).unwrap());
+                    }
+                    _ if msg_view.user_headers().is_some() => {
+                        let raw_base64 = BASE64.encode(msg_view.user_headers().unwrap());
+                        map.insert("user_headers", serde_json::to_value(raw_base64).unwrap());
+                    }
+                    _ => {}
                 }
 
                 map
@@ -310,29 +317,38 @@ impl<'de> Deserialize<'de> for SendMessages {
                                     .decode(payload)
                                     .map_err(|_| de::Error::custom("Invalid base64 payload"))?;
 
-                                let headers_map = if let Some(headers) = msg.get("user_headers") {
-                                    if headers.is_null() {
-                                        None
-                                    } else {
-                                        let entries: Vec<HeaderEntry> = serde_json::from_value(
-                                            headers.clone(),
-                                        )
-                                        .map_err(|e| {
-                                            de::Error::custom(format!(
-                                                "Invalid headers format: {e}"
-                                            ))
-                                        })?;
-                                        let mut map = HashMap::new();
-                                        for entry in entries {
-                                            map.insert(entry.key, entry.value);
+                                let (headers_map, raw_headers) =
+                                    if let Some(headers) = msg.get("user_headers") {
+                                        if headers.is_null() {
+                                            (None, None)
+                                        } else if let Some(base64_str) = headers.as_str() {
+                                            // Raw base64-encoded header bytes (e.g. client-side encrypted)
+                                            let raw = BASE64.decode(base64_str).map_err(|e| {
+                                                de::Error::custom(format!(
+                                                    "Invalid base64 headers: {e}"
+                                                ))
+                                            })?;
+                                            (None, Some(Bytes::from(raw)))
+                                        } else {
+                                            let entries: Vec<HeaderEntry> =
+                                                serde_json::from_value(headers.clone()).map_err(
+                                                    |e| {
+                                                        de::Error::custom(format!(
+                                                            "Invalid headers format: {e}"
+                                                        ))
+                                                    },
+                                                )?;
+                                            let mut map = HashMap::new();
+                                            for entry in entries {
+                                                map.insert(entry.key, entry.value);
+                                            }
+                                            (Some(map), None)
                                         }
-                                        Some(map)
-                                    }
-                                } else {
-                                    None
-                                };
+                                    } else {
+                                        (None, None)
+                                    };
 
-                                let iggy_message = if let Some(headers) = headers_map {
+                                let mut iggy_message = if let Some(headers) = headers_map {
                                     IggyMessage::builder()
                                         .id(id)
                                         .payload(payload_bytes.into())
@@ -354,6 +370,11 @@ impl<'de> Deserialize<'de> for SendMessages {
                                             ))
                                         })?
                                 };
+
+                                if let Some(raw) = raw_headers {
+                                    iggy_message.header.user_headers_length = raw.len() as u32;
+                                    iggy_message.user_headers = Some(raw);
+                                }
 
                                 iggy_messages.push(iggy_message);
                             }

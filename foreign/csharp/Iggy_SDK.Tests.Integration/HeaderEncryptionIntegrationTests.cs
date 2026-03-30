@@ -80,26 +80,16 @@ public class HeaderEncryptionIntegrationTests
         // Payload should be encrypted (not readable as plaintext)
         Encoding.UTF8.GetString(msg.Payload).ShouldNotBe("encrypted payload");
 
-        // Extract encrypted header bytes:
-        // TCP path: RawUserHeaders is set, UserHeaders is null
-        // HTTP path: UserHeaders contains sentinel key with encrypted bytes
-        byte[]? encryptedHeaderBytes = msg.RawUserHeaders;
-        if (encryptedHeaderBytes is null
-            && msg.UserHeaders is { Count: 1 }
-            && msg.UserHeaders.TryGetValue(HeaderKey.EncryptedHeadersSentinel, out var sentinelValue))
-        {
-            encryptedHeaderBytes = sentinelValue.Value;
-        }
-
-        encryptedHeaderBytes.ShouldNotBeNull();
-        encryptedHeaderBytes!.Length.ShouldBeGreaterThan(0);
+        // RawUserHeaders should contain encrypted bytes (both TCP and HTTP)
+        msg.RawUserHeaders.ShouldNotBeNull();
+        msg.RawUserHeaders!.Length.ShouldBeGreaterThan(0);
 
         // Manually decrypt and verify payload
         var decryptedPayload = encryptor.Decrypt(msg.Payload);
         Encoding.UTF8.GetString(decryptedPayload).ShouldBe("encrypted payload");
 
         // Manually decrypt and verify headers
-        var decryptedHeaderBytesResult = encryptor.Decrypt(encryptedHeaderBytes);
+        var decryptedHeaderBytesResult = encryptor.Decrypt(msg.RawUserHeaders);
         var decryptedHeaders = BinaryMapper.MapHeaders(decryptedHeaderBytesResult);
         decryptedHeaders.Count.ShouldBe(3);
 

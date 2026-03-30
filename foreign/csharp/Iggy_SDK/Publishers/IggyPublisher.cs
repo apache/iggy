@@ -332,13 +332,7 @@ public partial class IggyPublisher : IAsyncDisposable
                 var headerBytes = TcpContracts.GetHeadersBytes(message.UserHeaders);
                 var encryptedHeaderBytes = _config.MessageEncryptor.Encrypt(headerBytes);
                 message.RawUserHeaders = encryptedHeaderBytes;
-                message.UserHeaders = new Dictionary<HeaderKey, HeaderValue>
-                {
-                    {
-                        HeaderKey.EncryptedHeadersSentinel,
-                        new HeaderValue { Kind = HeaderKind.Raw, Value = encryptedHeaderBytes }
-                    }
-                };
+                message.UserHeaders = null;
                 message.Header.UserHeadersLength = encryptedHeaderBytes.Length;
             }
         }

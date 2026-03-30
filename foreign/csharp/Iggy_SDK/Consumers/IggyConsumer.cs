@@ -383,18 +383,10 @@ public partial class IggyConsumer : IAsyncDisposable
                     {
                         var decryptedPayload = _config.MessageEncryptor.Decrypt(message.Payload);
 
-                        byte[]? encryptedHeaderBytes = message.RawUserHeaders;
-                        if (encryptedHeaderBytes is null
-                            && message.UserHeaders is { Count: 1 }
-                            && message.UserHeaders.TryGetValue(HeaderKey.EncryptedHeadersSentinel, out var sentinelValue))
-                        {
-                            encryptedHeaderBytes = sentinelValue.Value;
-                        }
-
                         Dictionary<HeaderKey, HeaderValue>? decryptedHeaders = null;
-                        if (encryptedHeaderBytes is { Length: > 0 })
+                        if (message.RawUserHeaders is { Length: > 0 })
                         {
-                            var decryptedHeaderBytes = _config.MessageEncryptor.Decrypt(encryptedHeaderBytes);
+                            var decryptedHeaderBytes = _config.MessageEncryptor.Decrypt(message.RawUserHeaders);
                             decryptedHeaders = BinaryMapper.MapHeaders(decryptedHeaderBytes);
                         }
 

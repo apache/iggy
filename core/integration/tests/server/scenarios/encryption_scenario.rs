@@ -18,10 +18,12 @@
 
 use bytes::Bytes;
 use iggy::prelude::*;
+use iggy_common::TransportProtocol;
 use integration::harness::{TestHarness, TestServerConfig};
 use serial_test::parallel;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use test_case::test_matrix;
 
 #[test_matrix(
@@ -329,6 +331,149 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         final_stats.messages_size_bytes.as_bytes_u64(),
         initial_messages_size.as_bytes_u64()
     );
+}
+
+#[test_matrix(
+    [TransportProtocol::Tcp, TransportProtocol::Http, TransportProtocol::Quic, TransportProtocol::WebSocket]
+)]
+#[tokio::test]
+#[parallel]
+async fn should_encrypt_and_decrypt_headers_with_client_side_encryption(
+    transport: TransportProtocol,
+) {
+    let mut harness = TestHarness::builder()
+        .server(TestServerConfig::default())
+        .build()
+        .unwrap();
+
+    harness.start().await.unwrap();
+
+    let setup_client = harness.tcp_root_client().await.unwrap();
+    let stream_name = format!("client-enc-{transport}");
+    let topic_name = "enc-topic";
+
+    setup_client.create_stream(&stream_name).await.unwrap();
+    setup_client
+        .create_topic(
+            &Identifier::named(&stream_name).unwrap(),
+            topic_name,
+            1,
+            CompressionAlgorithm::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+
+    let encryptor = Arc::new(EncryptorKind::Aes256Gcm(
+        Aes256GcmEncryptor::new(&[42u8; 32]).unwrap(),
+    ));
+
+    let encrypting_client = harness
+        .client_builder_for(transport)
+        .unwrap()
+        .with_encryptor(encryptor)
+        .with_root_login()
+        .connect()
+        .await
+        .unwrap();
+
+    let stream_id = Identifier::named(&stream_name).unwrap();
+    let topic_id = Identifier::named(topic_name).unwrap();
+
+    let mut messages = Vec::new();
+    for i in 0..10i64 {
+        let mut headers = HashMap::new();
+        headers.insert(HeaderKey::try_from("index").unwrap(), HeaderValue::from(i));
+        headers.insert(
+            HeaderKey::try_from("transport").unwrap(),
+            HeaderValue::try_from(transport.to_string().as_str()).unwrap(),
+        );
+
+        messages.push(
+            IggyMessage::builder()
+                .id((i + 1) as u128)
+                .payload(Bytes::from(format!("client encrypted msg {i}")))
+                .user_headers(headers)
+                .build()
+                .unwrap(),
+        );
+    }
+
+    encrypting_client
+        .send_messages(&stream_id, &topic_id, &Partitioning::partition_id(0), &mut messages)
+        .await
+        .unwrap();
+
+    let polled = encrypting_client
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            Some(0),
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(polled.messages.len(), 10);
+    for (i, msg) in polled.messages.iter().enumerate() {
+        assert_eq!(
+            std::str::from_utf8(&msg.payload).unwrap(),
+            format!("client encrypted msg {i}")
+        );
+
+        let headers = msg.user_headers_map().unwrap().unwrap();
+        assert_eq!(
+            headers
+                .get(&HeaderKey::try_from("index").unwrap())
+                .unwrap()
+                .as_int64()
+                .unwrap(),
+            i as i64
+        );
+        assert_eq!(
+            headers
+                .get(&HeaderKey::try_from("transport").unwrap())
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            transport.to_string().as_str()
+        );
+    }
+
+    // Poll with a plain client (no encryptor) — payload and headers should be unreadable
+    let plain_client = harness.root_client_for(transport).await.unwrap();
+    let polled_plain = plain_client
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            Some(0),
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(polled_plain.messages.len(), 10);
+    for msg in &polled_plain.messages {
+        let payload_text = std::str::from_utf8(&msg.payload).unwrap_or("");
+        assert!(
+            !payload_text.starts_with("client encrypted msg"),
+            "Payload must not be readable without the encryptor"
+        );
+
+        let headers = msg.user_headers_map().unwrap();
+        assert!(
+            headers.is_none(),
+            "Headers must not be parseable without the encryptor"
+        );
+    }
 }
 
 fn encryption_enabled() -> bool {
