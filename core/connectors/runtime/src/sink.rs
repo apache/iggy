@@ -582,7 +582,7 @@ async fn process_messages(
         RuntimeError::FailedToSerializeRawMessages
     })?;
 
-    (consume)(
+    let result = (consume)(
         plugin_id,
         topic_meta.as_ptr(),
         topic_meta.len(),
@@ -591,6 +591,11 @@ async fn process_messages(
         messages.as_ptr(),
         messages.len(),
     );
+
+    if result != 0 {
+        error!("Sink consume failed for plugin {plugin_id} with return code: {result}");
+        return Err(RuntimeError::SinkConsumeFailed(plugin_id, result));
+    }
 
     Ok(processed_count)
 }

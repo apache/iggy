@@ -63,6 +63,8 @@ pub enum RuntimeError {
     TokenFileReadError(String, String),
     #[error("Token file is empty: {0}")]
     TokenFileEmpty(String),
+    #[error("Sink consume failed for plugin {0} with return code: {1}")]
+    SinkConsumeFailed(u32, i32),
 }
 
 impl RuntimeError {
@@ -78,6 +80,7 @@ impl RuntimeError {
             RuntimeError::TokenFileNotFound(_) => "invalid_configuration",
             RuntimeError::TokenFileReadError(_, _) => "invalid_configuration",
             RuntimeError::TokenFileEmpty(_) => "invalid_configuration",
+            RuntimeError::SinkConsumeFailed(_, _) => "sink_consume_failed",
             _ => "error",
         }
     }
