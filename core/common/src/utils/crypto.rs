@@ -95,6 +95,7 @@ impl Encryptor for Aes256GcmEncryptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{HeaderKey, HeaderValue, IggyMessage};
 
     #[test]
     fn given_the_same_key_data_should_be_encrypted_and_decrypted_correctly() {
@@ -124,5 +125,74 @@ mod tests {
         assert!(decrypted_data.is_err());
         let error = decrypted_data.err().unwrap();
         assert_eq!(error.as_code(), IggyError::CannotDecryptData.as_code());
+    }
+
+    #[test]
+    fn message_payload_and_headers_should_encrypt_and_decrypt_correctly() {
+        use bytes::Bytes;
+        use std::collections::HashMap;
+
+        let key = [1; 32];
+        let encryptor = Aes256GcmEncryptor::new(&key).unwrap();
+
+        let mut headers = HashMap::new();
+        headers.insert(
+            HeaderKey::try_from("batch").unwrap(),
+            HeaderValue::from(1u64),
+        );
+        headers.insert(
+            HeaderKey::try_from("type").unwrap(),
+            HeaderValue::try_from("test-message").unwrap(),
+        );
+
+        let mut message = IggyMessage::builder()
+            .payload(Bytes::from("test payload data"))
+            .user_headers(headers)
+            .build()
+            .unwrap();
+
+        let original_payload = message.payload.clone();
+        let original_headers = message.user_headers.clone().unwrap();
+
+        message.payload = Bytes::from(encryptor.encrypt(&message.payload).unwrap());
+        message.header.payload_length = message.payload.len() as u32;
+
+        let encrypted_headers = encryptor.encrypt(&original_headers).unwrap();
+        message.header.user_headers_length = encrypted_headers.len() as u32;
+        message.user_headers = Some(Bytes::from(encrypted_headers));
+
+        assert_ne!(message.payload, original_payload);
+        assert_ne!(message.user_headers.as_ref().unwrap(), &original_headers);
+
+        let decrypted_payload = encryptor.decrypt(&message.payload).unwrap();
+        message.payload = Bytes::from(decrypted_payload);
+        message.header.payload_length = message.payload.len() as u32;
+
+        let decrypted_headers = encryptor
+            .decrypt(message.user_headers.as_ref().unwrap())
+            .unwrap();
+        message.header.user_headers_length = decrypted_headers.len() as u32;
+        message.user_headers = Some(Bytes::from(decrypted_headers));
+
+        assert_eq!(message.payload, original_payload);
+        assert_eq!(message.user_headers.as_ref().unwrap(), &original_headers);
+
+        let parsed = message.user_headers_map().unwrap().unwrap();
+        assert_eq!(
+            parsed
+                .get(&HeaderKey::try_from("batch").unwrap())
+                .unwrap()
+                .as_uint64()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            parsed
+                .get(&HeaderKey::try_from("type").unwrap())
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "test-message"
+        );
     }
 }

@@ -72,6 +72,7 @@ pub struct ClientBuilder {
     connection: ServerConnection,
     auto_login: Option<AutoLoginConfig>,
     tcp_nodelay: bool,
+    encryptor: Option<Arc<iggy_common::EncryptorKind>>,
 }
 
 impl ClientBuilder {
@@ -81,6 +82,7 @@ impl ClientBuilder {
             connection,
             auto_login: None,
             tcp_nodelay: false,
+            encryptor: None,
         }
     }
 
@@ -99,6 +101,12 @@ impl ClientBuilder {
     /// Enable TCP_NODELAY (only affects TCP transport).
     pub fn with_nodelay(mut self) -> Self {
         self.tcp_nodelay = true;
+        self
+    }
+
+    /// Set the client-side encryptor for encrypting/decrypting message payloads and headers.
+    pub fn with_encryptor(mut self, encryptor: Arc<iggy_common::EncryptorKind>) -> Self {
+        self.encryptor = Some(encryptor);
         self
     }
 
@@ -168,7 +176,7 @@ impl ClientBuilder {
         Ok(IggyClient::create(
             iggy::prelude::ClientWrapper::Tcp(client),
             None,
-            None,
+            self.encryptor.clone(),
         ))
     }
 
@@ -195,7 +203,7 @@ impl ClientBuilder {
         Ok(IggyClient::create(
             iggy::prelude::ClientWrapper::Http(client),
             None,
-            None,
+            self.encryptor.clone(),
         ))
     }
 
@@ -231,7 +239,7 @@ impl ClientBuilder {
         Ok(IggyClient::create(
             iggy::prelude::ClientWrapper::Quic(client),
             None,
-            None,
+            self.encryptor.clone(),
         ))
     }
 
@@ -282,7 +290,7 @@ impl ClientBuilder {
         Ok(IggyClient::create(
             iggy::prelude::ClientWrapper::WebSocket(client),
             None,
-            None,
+            self.encryptor.clone(),
         ))
     }
 

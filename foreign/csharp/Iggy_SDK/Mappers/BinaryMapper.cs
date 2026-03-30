@@ -336,8 +336,7 @@ internal static class BinaryMapper
         };
     }
 
-    internal static PolledMessages MapMessages(ReadOnlySpan<byte> payload,
-        Func<byte[], byte[]>? decryptor = null)
+    internal static PolledMessages MapMessages(ReadOnlySpan<byte> payload)
     {
         var length = payload.Length;
         var partitionId = BinaryPrimitives.ReadInt32LittleEndian(payload[..4]);
@@ -362,13 +361,22 @@ internal static class BinaryMapper
             var payloadLength = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 52)..(position + 56)]);
             var reserved = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 56)..(position + 64)]);
 
-            Dictionary<HeaderKey, HeaderValue>? headers = headersLength switch
+            var wireHeadersLength = headersLength;
+            byte[]? rawUserHeaders = null;
+            Dictionary<HeaderKey, HeaderValue>? headers;
+            if (headersLength == 0)
             {
-                0 => null,
-                > 0 => MapHeaders(
-                    payload[(position + 64 + payloadLength)..(position + 64 + payloadLength + headersLength)]),
-                < 0 => throw new ArgumentOutOfRangeException()
-            };
+                headers = null;
+            }
+            else if (headersLength < 0)
+            {
+                throw new ArgumentOutOfRangeException();
+            }
+            else
+            {
+                rawUserHeaders = payload[(position + 64 + payloadLength)..(position + 64 + payloadLength + headersLength)].ToArray();
+                headers = TryMapHeaders(rawUserHeaders);
+            }
 
             var payloadRangeStart = position + 64;
             var payloadRangeEnd = position + 64 + payloadLength;
@@ -399,9 +407,8 @@ internal static class BinaryMapper
                         Reserved = reserved
                     },
                     UserHeaders = headers,
-                    Payload = decryptor is not null
-                        ? decryptor(messagePayload[..payloadSliceLen])
-                        : messagePayload[..payloadSliceLen]
+                    RawUserHeaders = rawUserHeaders,
+                    Payload = messagePayload[..payloadSliceLen]
                 });
             }
             finally
@@ -409,7 +416,7 @@ internal static class BinaryMapper
                 ArrayPool<byte>.Shared.Return(messagePayload);
             }
 
-            position += 64 + payloadLength + headersLength;
+            position += 64 + payloadLength + wireHeadersLength;
             if (position + PropertiesSize >= length)
             {
                 break;
@@ -424,14 +431,14 @@ internal static class BinaryMapper
         };
     }
 
-    private static Dictionary<HeaderKey, HeaderValue> MapHeaders(ReadOnlySpan<byte> payload)
+    internal static Dictionary<HeaderKey, HeaderValue> MapHeaders(ReadOnlySpan<byte> payload)
     {
         var headers = new Dictionary<HeaderKey, HeaderValue>();
         var position = 0;
 
         while (position < payload.Length)
         {
-            var keyKind = MapHeaderKind(payload, position);
+            var keyKind = MapHeaderKind(payload[position]);
             position++;
 
             var keyLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
@@ -444,7 +451,7 @@ internal static class BinaryMapper
             var keyValue = payload[position..(position + keyLength)].ToArray();
             position += keyLength;
 
-            var valueKind = MapHeaderKind(payload, position);
+            var valueKind = MapHeaderKind(payload[position]);
             position++;
 
             var valueLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
@@ -464,9 +471,62 @@ internal static class BinaryMapper
         return headers;
     }
 
-    private static HeaderKind MapHeaderKind(ReadOnlySpan<byte> payload, int position)
+    internal static Dictionary<HeaderKey, HeaderValue>? TryMapHeaders(ReadOnlySpan<byte> payload)
     {
-        var headerKind = payload[position] switch
+        if (payload.Length == 0 || payload[0] is 0 or > 15)
+        {
+            return null;
+        }
+
+        var headers = new Dictionary<HeaderKey, HeaderValue>();
+        var position = 0;
+
+        while (position < payload.Length)
+        {
+            if (!TryMapHeaderKind(payload[position], out var keyKind))
+                return null;
+            position++;
+
+            if (position + 4 > payload.Length)
+                return null;
+            var keyLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
+            if (keyLength is <= 0 or > 255)
+                return null;
+
+            position += 4;
+            if (position + keyLength > payload.Length)
+                return null;
+            var keyValue = payload[position..(position + keyLength)].ToArray();
+            position += keyLength;
+
+            if (position >= payload.Length)
+                return null;
+            if (!TryMapHeaderKind(payload[position], out var valueKind))
+                return null;
+            position++;
+
+            if (position + 4 > payload.Length)
+                return null;
+            var valueLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
+            if (valueLength is <= 0 or > 255)
+                return null;
+
+            position += 4;
+            if (position + valueLength > payload.Length)
+                return null;
+            ReadOnlySpan<byte> value = payload[position..(position + valueLength)];
+            position += valueLength;
+
+            headers[new HeaderKey { Kind = keyKind, Value = keyValue }] =
+                new HeaderValue { Kind = valueKind, Value = value.ToArray() };
+        }
+
+        return headers;
+    }
+
+    private static HeaderKind MapHeaderKind(byte value)
+    {
+        return value switch
         {
             1 => HeaderKind.Raw,
             2 => HeaderKind.String,
@@ -483,9 +543,19 @@ internal static class BinaryMapper
             13 => HeaderKind.Uint128,
             14 => HeaderKind.Float,
             15 => HeaderKind.Double,
-            _ => throw new ArgumentOutOfRangeException()
+            _ => throw new ArgumentOutOfRangeException(nameof(value), value, null)
         };
-        return headerKind;
+    }
+
+    private static bool TryMapHeaderKind(byte value, out HeaderKind kind)
+    {
+        if (value is >= 1 and <= 15)
+        {
+            kind = MapHeaderKind(value);
+            return true;
+        }
+        kind = default;
+        return false;
     }
 
     internal static IReadOnlyList<StreamResponse> MapStreams(ReadOnlySpan<byte> payload)
