@@ -43,6 +43,7 @@ use iggy_common::{
     sharding::{IggyNamespace, LocalIdx, ShardId},
 };
 use iobuf::Frozen;
+use journal::Journal as _;
 use message_bus::MessageBus;
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
@@ -899,6 +900,9 @@ where
 
         let mut committed_ns: HashSet<IggyNamespace> = HashSet::new();
         let mut failed_ns: HashSet<IggyNamespace> = HashSet::new();
+        let committed_visible_offsets = self
+            .resolve_committed_visible_offsets(consensus, &drained, &mut failed_ns)
+            .await;
 
         for PipelineEntry {
             header: prepare_header,
@@ -912,6 +916,7 @@ where
                     prepare_header,
                     entry_namespace,
                     &mut committed_ns,
+                    &committed_visible_offsets,
                     &mut failed_ns,
                 )
                 .await
@@ -968,12 +973,54 @@ where
         }
     }
 
+    async fn resolve_committed_visible_offsets(
+        &self,
+        consensus: &VsrConsensus<B, NamespacedPipeline>,
+        drained: &[PipelineEntry],
+        failed_ns: &mut HashSet<IggyNamespace>,
+    ) -> HashMap<IggyNamespace, u64> {
+        let mut committed_visible_offsets = HashMap::new();
+
+        for entry in drained {
+            if entry.header.operation != Operation::SendMessages {
+                continue;
+            }
+
+            let entry_namespace = IggyNamespace::from_raw(entry.header.namespace);
+            match self
+                .committed_end_offset_for_prepare(&entry_namespace, &entry.header)
+                .await
+            {
+                Ok(Some(end_offset)) => {
+                    committed_visible_offsets.insert(entry_namespace, end_offset);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    failed_ns.insert(entry_namespace);
+                    warn!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        replica_id = consensus.replica(),
+                        namespace_raw = entry_namespace.inner(),
+                        op = entry.header.op,
+                        operation = ?entry.header.operation,
+                        %error,
+                        "failed to resolve committed visible offset for partition entry"
+                    );
+                }
+            }
+        }
+
+        committed_visible_offsets
+    }
+
     async fn commit_partition_entry(
         &self,
         consensus: &VsrConsensus<B, NamespacedPipeline>,
         prepare_header: PrepareHeader,
         entry_namespace: IggyNamespace,
         committed_ns: &mut HashSet<IggyNamespace>,
+        committed_visible_offsets: &HashMap<IggyNamespace, u64>,
         failed_ns: &mut HashSet<IggyNamespace>,
     ) -> bool {
         match prepare_header.operation {
@@ -993,6 +1040,19 @@ where
                         "failed to commit partition messages"
                     );
                 }
+
+                if committed_ns.contains(&entry_namespace)
+                    && !failed_ns.contains(&entry_namespace)
+                    && let Some(visible_offset) =
+                        committed_visible_offsets.get(&entry_namespace).copied()
+                {
+                    let partition = self
+                        .get_by_ns(&entry_namespace)
+                        .expect("commit_partition_entry: partition not found");
+                    partition.offset.store(visible_offset, Ordering::Release);
+                    partition.stats.set_current_offset(visible_offset);
+                }
+
                 !failed_ns.contains(&entry_namespace)
             }
             Operation::StoreConsumerOffset => {
@@ -1020,6 +1080,29 @@ where
                 true
             }
         }
+    }
+
+    async fn committed_end_offset_for_prepare(
+        &self,
+        namespace: &IggyNamespace,
+        prepare_header: &PrepareHeader,
+    ) -> Result<Option<u64>, IggyError> {
+        let partition = self
+            .get_by_ns(namespace)
+            .expect("committed_end_offset_for_prepare: partition not found");
+        let Some(entry) = partition.log.journal().inner.entry(prepare_header).await else {
+            return Err(IggyError::InvalidCommand);
+        };
+        let batch =
+            decode_prepare_slice(entry.as_slice()).map_err(|_| IggyError::InvalidCommand)?;
+        let message_count = batch.message_count();
+        if message_count == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            batch.header.base_offset + u64::from(message_count) - 1,
+        ))
     }
 
     /// Persist frozen batches to disk and update segment bookkeeping.

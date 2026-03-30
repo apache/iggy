@@ -219,7 +219,7 @@ where
     S: Storage<Buffer = JournalBuffer>,
 {
     #[must_use]
-    pub fn with_storage(storage: S) -> Self {
+    pub const fn with_storage(storage: S) -> Self {
         Self {
             op_to_storage_offset: UnsafeCell::new(BTreeMap::new()),
             offset_to_op: UnsafeCell::new(BTreeMap::new()),

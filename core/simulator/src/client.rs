@@ -69,6 +69,10 @@ impl SimClient {
     }
 
     #[allow(clippy::cast_possible_truncation)]
+    /// # Panics
+    ///
+    /// Panics if the simulator cannot encode the provided messages into a valid
+    /// `SendMessages2` request.
     pub fn send_messages(
         &self,
         namespace: IggyNamespace,
