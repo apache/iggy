@@ -657,8 +657,6 @@ impl Sink for InfluxDbSink {
                 .await
             {
                 Ok(()) => {
-                    // Successful write — reset circuit breaker
-                    self.circuit_breaker.record_success();
                     self.write_success
                         .fetch_add(batch.len() as u64, Ordering::Relaxed);
                 }
@@ -685,6 +683,15 @@ impl Sink for InfluxDbSink {
                     }
                 }
             }
+        }
+
+        // Only reset the circuit breaker if every batch in this consume() call
+        // succeeded.  Resetting inside the loop means a later successful batch
+        // would clear the failure counter accumulated by an earlier failed one,
+        // masking repeated partial failures and preventing the circuit from
+        // ever tripping.
+        if first_error.is_none() {
+            self.circuit_breaker.record_success();
         }
 
         let total_processed = self
@@ -1465,6 +1472,68 @@ mod tests {
         assert!(
             sink.circuit_breaker.is_open().await,
             "transient error must open the circuit breaker"
+        );
+    }
+
+    // ── partial-batch failure does not reset circuit breaker (fix) ────────
+
+    #[tokio::test]
+    async fn partial_batch_failure_does_not_reset_circuit_failure_counter() {
+        // With threshold=2, two consume() calls each containing one failed batch
+        // followed by one successful batch must still open the circuit.
+        //
+        // With the old code (record_success inside the loop), the successful
+        // second batch would reset the consecutive-failure counter after every
+        // call, so the circuit would never trip regardless of how many partial
+        // failures occurred.  The fix moves record_success after the loop,
+        // guarded by first_error.is_none(), so the counter accumulates across
+        // calls that had any failure.
+        let mut config = make_config();
+        config.circuit_breaker_threshold = Some(2);
+        config.circuit_breaker_cool_down = Some("60s".to_string());
+        let sink = InfluxDbSink::new(1, config);
+
+        // Simulate consume() call 1: batch 1 fails (record_failure), batch 2
+        // succeeds but first_error.is_some() → record_success NOT called.
+        sink.circuit_breaker.record_failure().await;
+        assert!(
+            !sink.circuit_breaker.is_open().await,
+            "circuit must still be closed after one failure at threshold 2"
+        );
+
+        // Simulate consume() call 2: same pattern.
+        sink.circuit_breaker.record_failure().await;
+
+        assert!(
+            sink.circuit_breaker.is_open().await,
+            "circuit must open after threshold failures – a later successful \
+             batch in the same call must not reset the consecutive-failure counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_batches_succeeding_resets_circuit_failure_counter() {
+        // Contrast: when ALL batches in a consume() succeed, first_error is None
+        // and record_success IS called after the loop.  The consecutive-failure
+        // counter must reset so a subsequent isolated failure does not
+        // immediately re-open the circuit.
+        let mut config = make_config();
+        config.circuit_breaker_threshold = Some(2);
+        config.circuit_breaker_cool_down = Some("60s".to_string());
+        let sink = InfluxDbSink::new(1, config);
+
+        // Accumulate one failure.
+        sink.circuit_breaker.record_failure().await;
+        assert!(!sink.circuit_breaker.is_open().await);
+
+        // A fully successful consume() → record_success resets the counter.
+        sink.circuit_breaker.record_success();
+
+        // A single subsequent failure should restart from 1 (threshold not reached).
+        sink.circuit_breaker.record_failure().await;
+        assert!(
+            !sink.circuit_breaker.is_open().await,
+            "failure counter must restart from zero after a fully successful consume() call"
         );
     }
 

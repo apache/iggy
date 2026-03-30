@@ -91,6 +91,11 @@ pub struct InfluxDbSource {
     /// on every message in the hot path.
     payload_format: PayloadFormat,
     circuit_breaker: Arc<CircuitBreaker>,
+    /// Set when a persisted `ConnectorState` was provided to `new()` but could
+    /// not be deserialized into `State` (e.g. schema changed after an upgrade).
+    /// `open()` refuses to start when this is `true` so operators are not
+    /// surprised by a silent cursor reset and full re-delivery.
+    state_restore_failed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,15 +254,35 @@ impl InfluxDbSource {
             DEFAULT_CIRCUIT_COOL_DOWN,
         );
 
-        let restored_state = state
-            .and_then(|s| s.deserialize::<State>(CONNECTOR_NAME, id))
-            .inspect(|s| {
-                info!(
-                    "Restored state for {CONNECTOR_NAME} connector with ID: {id}. \
-                     Last timestamp: {:?}, processed rows: {}",
-                    s.last_timestamp, s.processed_rows
-                );
-            });
+        // Distinguish "no prior state" (fresh start, expected) from "state
+        // existed but could not be deserialized" (schema mismatch after an
+        // upgrade, unexpected).  Collapsing both into None via and_then() would
+        // silently reset the cursor to the epoch and cause a full re-delivery.
+        let (restored_state, state_restore_failed) = match state {
+            None => (None, false),
+            Some(s) => match s.deserialize::<State>(CONNECTOR_NAME, id) {
+                Some(state) => {
+                    info!(
+                        "Restored state for {CONNECTOR_NAME} connector with ID: {id}. \
+                         Last timestamp: {:?}, processed rows: {}",
+                        state.last_timestamp, state.processed_rows
+                    );
+                    (Some(state), false)
+                }
+                None => {
+                    // ConnectorState::deserialize already logs at warn level;
+                    // escalate to error here so the operator sees the connector
+                    // ID and understands the cursor will NOT be silently reset.
+                    error!(
+                        "InfluxDB source ID: {id} — persisted state exists but could not \
+                         be deserialized (possible schema change after upgrade). \
+                         Refusing to start to prevent silent cursor reset and full \
+                         re-delivery. Clear or migrate the connector state to proceed."
+                    );
+                    (None, true)
+                }
+            },
+        };
 
         InfluxDbSource {
             id,
@@ -274,6 +299,7 @@ impl InfluxDbSource {
             poll_interval,
             payload_format,
             circuit_breaker: Arc::new(CircuitBreaker::new(cb_threshold, cb_cool_down)),
+            state_restore_failed,
         }
     }
 
@@ -544,13 +570,23 @@ impl InfluxDbSource {
             .map_err(|e| Error::Serialization(format!("JSON serialization failed: {e}")))
     }
 
-    /// Returns `(messages, max_cursor, rows_at_max_cursor)`.
+    /// Returns `(messages, max_cursor, rows_at_max_cursor, skipped)`.
     ///
     /// `rows_at_max_cursor` is the count of delivered messages whose cursor
     /// field value equals `max_cursor`.  The caller stores this in
     /// [`State::cursor_row_count`] so the next poll can skip those rows when
     /// the query uses `>= $cursor`.
-    async fn poll_messages(&self) -> Result<(Vec<ProducedMessage>, Option<String>, u64), Error> {
+    ///
+    /// `skipped` is the number of rows that were elided because they fell
+    /// within the already-seen window.  When the caller observes zero
+    /// delivered messages but `skipped > 0`, it means every row the query
+    /// returned was at the current cursor timestamp and had already been
+    /// delivered.  In that case `skipped` equals the true row count at that
+    /// timestamp, so the caller can correct any over-inflated
+    /// `cursor_row_count` rather than getting permanently stuck.
+    async fn poll_messages(
+        &self,
+    ) -> Result<(Vec<ProducedMessage>, Option<String>, u64, u64), Error> {
         // Read cursor and already_seen atomically from the same lock acquisition
         // so the two values are always consistent with each other.
         let (cursor, already_seen) = {
@@ -627,7 +663,7 @@ impl InfluxDbSource {
             });
         }
 
-        Ok((messages, max_cursor, rows_at_max_cursor))
+        Ok((messages, max_cursor, rows_at_max_cursor, skipped))
     }
 }
 
@@ -638,6 +674,10 @@ impl InfluxDbSource {
 #[async_trait]
 impl Source for InfluxDbSource {
     async fn open(&mut self) -> Result<(), Error> {
+        if self.state_restore_failed {
+            return Err(Error::InvalidState);
+        }
+
         info!(
             "Opening InfluxDB source connector with ID: {}. Org: {}",
             self.id, self.config.org
@@ -713,7 +753,7 @@ impl Source for InfluxDbSource {
         }
 
         match self.poll_messages().await {
-            Ok((messages, max_cursor, rows_at_max_cursor)) => {
+            Ok((messages, max_cursor, rows_at_max_cursor, skipped)) => {
                 // Successful poll — reset circuit breaker
                 self.circuit_breaker.record_success();
 
@@ -735,7 +775,18 @@ impl Source for InfluxDbSource {
                             state.cursor_row_count.saturating_add(rows_at_max_cursor);
                     }
                     None => {
-                        // No rows returned — leave cursor and count unchanged.
+                        // No rows delivered.  If we skipped some rows it means
+                        // every row in the result was at the current cursor
+                        // timestamp and had already been seen.  `skipped` is
+                        // therefore the true row count at that timestamp for
+                        // this query result, so we correct cursor_row_count to
+                        // that value.  This prevents a permanently-inflated
+                        // counter (e.g. after rows are deleted or compacted in
+                        // InfluxDB) from causing the skip logic to over-skip on
+                        // every subsequent poll and stall the connector.
+                        if skipped > 0 {
+                            state.cursor_row_count = skipped;
+                        }
                     }
                 }
 
@@ -1215,6 +1266,113 @@ mod tests {
         let result = source.close().await;
         assert!(result.is_ok());
         assert!(source.client.is_none(), "client should be None after close");
+    }
+
+    // ── cursor_row_count correction (fix: inflated counter reset) ────────
+
+    #[tokio::test]
+    async fn cursor_row_count_corrected_when_inflated_above_actual_row_count_at_cursor() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener as StdTcpListener;
+
+        // The server returns 3 rows, all at the cursor timestamp.
+        // The source starts with cursor_row_count = 5 (inflated – e.g. rows
+        // deleted from InfluxDB after delivery).  All 3 returned rows will be
+        // skipped (skipped=3 < already_seen=5).  The None branch must correct
+        // cursor_row_count to 3 instead of leaving it at the inflated 5.
+        let t = "2024-01-01T00:00:00Z";
+        let csv = format!("_time,_value\n{t},1\n{t},2\n{t},3\n");
+        let http_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            csv.len(),
+            csv
+        );
+
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(http_response.as_bytes());
+            }
+        });
+
+        let initial_state = State {
+            last_poll_time: Utc::now(),
+            last_timestamp: Some(t.to_string()),
+            processed_rows: 0,
+            cursor_row_count: 5, // inflated: actual rows at T are only 3
+        };
+        let persisted = ConnectorState::serialize(&initial_state, CONNECTOR_NAME, 1).unwrap();
+
+        let mut config = make_config();
+        config.url = format!("http://127.0.0.1:{port}");
+        config.batch_size = Some(10);
+        let mut source = InfluxDbSource::new(1, config, Some(persisted));
+
+        // Inject a real HTTP client directly, bypassing open()'s health check.
+        let raw = source.build_raw_client().unwrap();
+        source.client = Some(build_retry_client(
+            raw,
+            0,
+            Duration::from_millis(0),
+            Duration::from_millis(0),
+            "InfluxDB",
+        ));
+
+        assert_eq!(
+            source.state.lock().await.cursor_row_count,
+            5,
+            "pre-condition: cursor_row_count starts at inflated value"
+        );
+
+        // poll() → server returns 3 rows at T, all skipped (already_seen=5 > 3)
+        // → (messages=[], max_cursor=None, rows_at_max_cursor=0, skipped=3)
+        // → None branch corrects cursor_row_count to skipped (3).
+        let result = source.poll().await;
+        assert!(result.is_ok(), "poll should succeed: {:?}", result);
+        assert!(
+            result.unwrap().messages.is_empty(),
+            "all rows were already seen – no messages expected"
+        );
+
+        assert_eq!(
+            source.state.lock().await.cursor_row_count,
+            3,
+            "cursor_row_count must be corrected to actual row count (3), not left at inflated (5)"
+        );
+    }
+
+    // ── state restore failure (fix: deserialization failure fails open) ──
+
+    #[tokio::test]
+    async fn open_returns_invalid_state_when_persisted_state_cannot_be_deserialized() {
+        // Garbage bytes will cause ConnectorState::deserialize to fail.
+        // new() must set state_restore_failed=true, and open() must return
+        // Err(InvalidState) before attempting any network calls, so the
+        // operator sees a hard failure instead of a silent cursor reset.
+        let garbage = ConnectorState(vec![0xFF, 0xFE, 0xFD, 0xAA, 0xBB]);
+        let mut source = InfluxDbSource::new(1, make_config(), Some(garbage));
+
+        let result = source.open().await;
+        assert!(
+            matches!(result, Err(Error::InvalidState)),
+            "open() must return Err(InvalidState) on state deserialization failure, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn fresh_start_with_no_prior_state_does_not_set_restore_failed() {
+        // When no prior ConnectorState is supplied (first boot), state_restore_failed
+        // must be false so that open() is not blocked on a normal first run.
+        let source = InfluxDbSource::new(1, make_config(), None);
+        assert!(
+            !source.state_restore_failed,
+            "state_restore_failed must be false when no prior state exists"
+        );
     }
 
     // ── payload_format ───────────────────────────────────────────────────
