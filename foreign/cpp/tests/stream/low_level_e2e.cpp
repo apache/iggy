@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -292,4 +293,43 @@ TEST(LowLevelE2E_Stream, GetStreamByNumericIdentifierReturnsStreamDetails) {
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
     client = nullptr;
+}
+
+TEST(LowLevelE2E_Stream, GetStreamsReturnsEmptyAfterCleanup) {
+    RecordProperty("description", "Verifies get_streams returns empty vector after cleaning up all streams.");
+    iggy::ffi::Client *client = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    auto streams = client->get_streams();
+    for (const auto &s : streams) {
+        client->delete_stream(make_numeric_identifier(s.id));
+    }
+
+    streams = client->get_streams();
+    ASSERT_EQ(streams.size(), 0);
+
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+}
+
+TEST(LowLevelE2E_Stream, GetStreamsReturnsStreamAfterCreation) {
+    RecordProperty("description", "Verifies created stream appears in get_streams result.");
+    const std::string stream_name = "cpp-stream-get-streams";
+    iggy::ffi::Client *client     = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    client->create_stream(stream_name);
+    auto streams = client->get_streams();
+    ASSERT_GE(streams.size(), 1);
+
+    bool found = false;
+    for (const auto &s : streams) {
+        if (std::string(s.name) == stream_name) {
+            found = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found) << "Stream '" << stream_name << "' not found in get_streams result";
+
+    client->delete_stream(make_string_identifier(stream_name));
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
