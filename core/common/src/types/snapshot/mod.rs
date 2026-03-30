@@ -32,41 +32,52 @@ impl Snapshot {
 }
 
 /// Enum representing the different types of system snapshots that can be taken.
-#[serde(rename_all = "snake_case")]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum SystemSnapshotType {
     /// Overview of the filesystem.
+    #[serde(alias = "filesystem_overview")]
     FilesystemOverview,
     /// List of currently running processes.
+    #[serde(alias = "process_list")]
     ProcessList,
     /// Resource usage statistics of the system.
+    #[serde(alias = "resource_usage")]
     ResourceUsage,
     /// Test snapshot type for development purposes.
+    #[serde(alias = "test")]
     Test,
     /// Server logs
+    #[serde(alias = "server_logs")]
     ServerLogs,
     /// Server configuration
+    #[serde(alias = "server_config")]
     ServerConfig,
     /// Everything
+    #[serde(alias = "all")]
     All,
 }
 
 /// Enum representing the various compression methods available for snapshots.
-#[serde(rename_all = "snake_case")]
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Clone, Copy)]
 pub enum SnapshotCompression {
     /// Store the file as is
+    #[serde(alias = "stored")]
     Stored,
     /// Compress the file using Deflate
     #[default]
+    #[serde(alias = "deflated")]
     Deflated,
     /// Compress the file using BZIP2
+    #[serde(alias = "bzip2")]
     Bzip2,
     /// Compress the file using ZStandard
+    #[serde(alias = "zstd")]
     Zstd,
     /// Compress the file using LZMA
+    #[serde(alias = "lzma")]
     Lzma,
     /// Compress the file using XZ
+    #[serde(alias = "xz")]
     Xz,
 }
 
