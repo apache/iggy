@@ -9952,6 +9952,7 @@ name = "simulator"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "bytes",
  "consensus",
  "enumset",
  "futures",

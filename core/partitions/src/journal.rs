@@ -218,6 +218,17 @@ impl<S> PartitionJournal<S>
 where
     S: Storage<Buffer = JournalBuffer>,
 {
+    #[must_use]
+    pub fn with_storage(storage: S) -> Self {
+        Self {
+            op_to_storage_offset: UnsafeCell::new(BTreeMap::new()),
+            offset_to_op: UnsafeCell::new(BTreeMap::new()),
+            timestamp_to_op: UnsafeCell::new(BTreeMap::new()),
+            headers: UnsafeCell::new(Vec::new()),
+            inner: UnsafeCell::new(JournalInner { storage }),
+        }
+    }
+
     #[allow(dead_code)]
     fn candidate_start_op(&self, query: &MessageLookup) -> Option<u64> {
         match query {

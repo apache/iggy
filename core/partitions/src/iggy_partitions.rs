@@ -478,7 +478,6 @@ where
         // In metadata layer we assume that when an `on_request` or `on_replicate` is called, it's called from correct shard.
         // I think we need to do the same here, which means that the code from below is unfallable, the partition should always exist by now!
         let message = self.replicate(message).await;
-
         if let Err(error) = self.apply_replicated_operation(&namespace, message).await {
             warn!(
                 target: "iggy.partitions.diag",
@@ -489,22 +488,6 @@ where
                 operation = ?header.operation,
                 %error,
                 "failed to apply replicated partition operation"
-            );
-            return;
-        }
-
-        if header.operation == Operation::SendMessages
-            && let Err(error) = self.commit_messages(&namespace, true).await
-        {
-            warn!(
-                target: "iggy.partitions.diag",
-                plane = "partitions",
-                replica_id = consensus.replica(),
-                op = header.op,
-                namespace_raw = namespace.inner(),
-                operation = ?header.operation,
-                %error,
-                "failed to durably persist replicated partition operation"
             );
             return;
         }
@@ -772,11 +755,7 @@ where
     /// Updates segment metadata, stats, flushes journal to disk if thresholds
     /// are exceeded, and advances the durable offset last.
     #[allow(clippy::too_many_lines)]
-    async fn commit_messages(
-        &self,
-        namespace: &IggyNamespace,
-        force_persist: bool,
-    ) -> Result<(), IggyError> {
+    async fn commit_messages(&self, namespace: &IggyNamespace) -> Result<(), IggyError> {
         let write_lock = self
             .get_by_ns(namespace)
             .expect("commit_messages: partition not found for namespace")
@@ -802,10 +781,8 @@ where
             journal_info.messages_count >= self.config.messages_required_to_save;
         let unsaved_messages_size_exceeded = journal_info.size.as_bytes_u64()
             >= self.config.size_of_messages_required_to_save.as_bytes_u64();
-        let should_persist = force_persist
-            || is_full
-            || unsaved_messages_count_exceeded
-            || unsaved_messages_size_exceeded;
+        let should_persist =
+            is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded;
 
         if !should_persist {
             return Ok(());
@@ -1002,7 +979,7 @@ where
         match prepare_header.operation {
             Operation::SendMessages => {
                 if committed_ns.insert(entry_namespace)
-                    && let Err(error) = self.commit_messages(&entry_namespace, false).await
+                    && let Err(error) = self.commit_messages(&entry_namespace).await
                 {
                     failed_ns.insert(entry_namespace);
                     warn!(
@@ -1074,15 +1051,37 @@ where
             .messages_writers()
             .last()
             .and_then(|writer| writer.as_ref())
-            .cloned()
-            .ok_or(IggyError::CannotSaveMessagesToSegment)?;
+            .cloned();
         let index_writer = partition
             .log
             .index_writers()
             .last()
             .and_then(|writer| writer.as_ref())
-            .cloned()
-            .ok_or(IggyError::CannotSaveIndexToSegment)?;
+            .cloned();
+
+        if messages_writer.is_none() || index_writer.is_none() {
+            let saved_bytes = stripped_batches.iter().map(Frozen::len).sum::<usize>();
+            debug!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = namespace.inner(),
+                batch_count,
+                saved_bytes,
+                "simulated in-memory batch persistence"
+            );
+
+            let partition = self
+                .get_mut_by_ns(namespace)
+                .expect("persist: partition not found");
+            let segment_index = partition.log.segments().len() - 1;
+            let segment = &mut partition.log.segments_mut()[segment_index];
+            segment.size = IggyByteSize::from(segment.size.as_bytes_u64() + saved_bytes as u64);
+            partition.log.clear_in_flight();
+            return Ok(());
+        }
+
+        let messages_writer = messages_writer.expect("checked above");
+        let index_writer = index_writer.expect("checked above");
 
         let saved = messages_writer
             .save_frozen_batches(&stripped_batches)

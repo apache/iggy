@@ -1576,6 +1576,6 @@ where
     }
 
     fn is_syncing(&self) -> bool {
-        self.is_syncing()
+        VsrConsensus::is_syncing(self)
     }
 }

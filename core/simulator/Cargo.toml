@@ -22,6 +22,7 @@ edition = "2024"
 
 [dependencies]
 bytemuck = { workspace = true }
+bytes = { workspace = true }
 consensus = { path = "../consensus" }
 enumset = { workspace = true }
 futures = { workspace = true }

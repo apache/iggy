@@ -127,6 +127,72 @@ pub struct SendMessages2Owned {
 }
 
 impl SendMessages2Owned {
+    pub fn from_messages(
+        namespace: IggyNamespace,
+        messages: &IggyMessages2,
+    ) -> Result<Self, IggyError> {
+        let message_count = messages.count();
+        let mut origin_timestamp = u64::MAX;
+        for message in messages {
+            origin_timestamp = origin_timestamp.min(message.header.origin_timestamp);
+        }
+
+        if origin_timestamp == u64::MAX {
+            origin_timestamp = 0;
+        }
+
+        let mut blob = BytesMut::new();
+        for (index, message) in messages.iter().enumerate() {
+            let id = if message.header.id == 0 {
+                random_id::get_uuid()
+            } else {
+                message.header.id
+            };
+            let offset_delta = u32::try_from(index).map_err(|_| IggyError::InvalidCommand)?;
+            let timestamp_delta = message
+                .header
+                .origin_timestamp
+                .checked_sub(origin_timestamp)
+                .ok_or(IggyError::InvalidCommand)?;
+            if timestamp_delta > MAX_TIMESTAMP_DELTA_MICROS {
+                return Err(IggyError::InvalidMessageTimestampDelta(timestamp_delta));
+            }
+            let timestamp_delta =
+                u32::try_from(timestamp_delta).map_err(|_| IggyError::InvalidCommand)?;
+            let user_headers = message.user_headers.as_deref().unwrap_or_default();
+            let user_headers_length =
+                u32::try_from(user_headers.len()).map_err(|_| IggyError::InvalidCommand)?;
+            let payload_length =
+                u32::try_from(message.payload.len()).map_err(|_| IggyError::InvalidCommand)?;
+
+            let mut header = [0u8; MESSAGE_HEADER_SIZE];
+            header[8..24].copy_from_slice(&id.to_le_bytes());
+            header[24..28].copy_from_slice(&offset_delta.to_le_bytes());
+            header[28..32].copy_from_slice(&timestamp_delta.to_le_bytes());
+            header[32..36].copy_from_slice(&user_headers_length.to_le_bytes());
+            header[36..40].copy_from_slice(&payload_length.to_le_bytes());
+
+            let checksum = calculate_checksum_parts(&header[8..], user_headers, &message.payload);
+            header[0..8].copy_from_slice(&checksum.to_le_bytes());
+
+            blob.extend_from_slice(&header);
+            blob.extend_from_slice(user_headers);
+            blob.extend_from_slice(&message.payload);
+        }
+
+        let blob = blob.freeze();
+        let mut header = SendMessages2Header::new(
+            namespace.partition_id() as u64,
+            origin_timestamp,
+            u64::try_from(COMMAND_HEADER_SIZE + blob.len())
+                .map_err(|_| IggyError::InvalidCommand)?,
+            message_count,
+        );
+        header.batch_checksum = calculate_batch_checksum(&header, &blob);
+
+        Ok(Self { header, blob })
+    }
+
     pub fn from_legacy_request(namespace: IggyNamespace, body: &[u8]) -> Result<Self, IggyError> {
         let (message_count, messages) = legacy_messages_slice(body)?;
         let mut parsed = Vec::with_capacity(message_count as usize);
@@ -487,7 +553,34 @@ pub fn convert_request_message(
     let request_header = *message.header();
     let total_size = request_header.size as usize;
     let body = &message.as_slice()[std::mem::size_of::<RequestHeader>()..total_size];
+    if decode_request_slice(body).is_ok() {
+        return Ok(message);
+    }
     SendMessages2Owned::from_legacy_request(namespace, body)?.encode_request(request_header)
+}
+
+fn decode_request_slice(body: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> {
+    if body.len() < COMMAND_HEADER_SIZE {
+        return Err(IggyError::InvalidCommand);
+    }
+
+    let header = SendMessages2Header::decode(&body[..COMMAND_HEADER_SIZE])?;
+    let blob_len = header.blob_len()?;
+    if body.len() < header.total_size() {
+        return Err(IggyError::InvalidCommand);
+    }
+
+    let blob = &body[COMMAND_HEADER_SIZE..COMMAND_HEADER_SIZE + blob_len];
+    let expected_checksum = calculate_batch_checksum(&header, blob);
+    if header.batch_checksum != expected_checksum {
+        return Err(IggyError::InvalidBatchChecksum(
+            header.batch_checksum,
+            expected_checksum,
+            header.base_offset,
+        ));
+    }
+
+    Ok(SendMessages2Ref { header, blob })
 }
 
 pub fn decode_prepare_slice(bytes: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> {
