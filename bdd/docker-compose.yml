@@ -225,6 +225,7 @@ services:
       - GO_TEST_EXTRA_FLAGS=${GO_TEST_EXTRA_FLAGS:-}
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
+      - ./scenarios/stream_operations.feature:/app/features/stream_operations.feature
     command: [ "sh", "-c", "go test -v ${GO_TEST_EXTRA_FLAGS} ./..." ]
     networks:
       - iggy-bdd-network
