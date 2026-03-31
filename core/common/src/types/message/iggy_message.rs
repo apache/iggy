@@ -552,19 +552,25 @@ impl Serialize for IggyMessage {
         let base64_payload = STANDARD.encode(&self.payload);
         state.serialize_field("payload", &base64_payload)?;
 
-        let entries: Vec<HeaderEntry> = if self.user_headers.is_some() {
-            let headers_map = self.user_headers_map().map_err(serde::ser::Error::custom)?;
-            if let Some(map) = headers_map {
-                map.into_iter()
-                    .map(|(key, value)| HeaderEntry { key, value })
-                    .collect()
-            } else {
-                Vec::new()
+        match self.user_headers.as_ref() {
+            Some(raw_bytes) => match self.user_headers_map() {
+                Ok(Some(map)) => {
+                    let entries: Vec<HeaderEntry> = map
+                        .into_iter()
+                        .map(|(key, value)| HeaderEntry { key, value })
+                        .collect();
+                    state.serialize_field("user_headers", &entries)?;
+                }
+                _ => {
+                    let base64_headers = STANDARD.encode(raw_bytes);
+                    state.serialize_field("user_headers", &base64_headers)?;
+                }
+            },
+            None => {
+                let empty: Vec<HeaderEntry> = Vec::new();
+                state.serialize_field("user_headers", &empty)?;
             }
-        } else {
-            Vec::new()
-        };
-        state.serialize_field("user_headers", &entries)?;
+        }
 
         state.end()
     }
@@ -595,6 +601,7 @@ impl<'de> Deserialize<'de> for IggyMessage {
                 let mut header: Option<IggyMessageHeader> = None;
                 let mut payload: Option<Bytes> = None;
                 let mut user_headers: Option<HashMap<HeaderKey, HeaderValue>> = None;
+                let mut raw_user_headers: Option<Bytes> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -610,12 +617,28 @@ impl<'de> Deserialize<'de> for IggyMessage {
                             payload = Some(Bytes::from(decoded));
                         }
                         "user_headers" => {
-                            let entries: Vec<HeaderEntry> = map.next_value()?;
-                            let mut headers_map = HashMap::new();
-                            for entry in entries {
-                                headers_map.insert(entry.key, entry.value);
+                            // Try as array of HeaderEntry first, fall back to base64 string
+                            let value: serde_json::Value = map.next_value()?;
+                            if let Some(base64_str) = value.as_str() {
+                                use base64::{Engine as _, engine::general_purpose::STANDARD};
+                                let decoded =
+                                    STANDARD.decode(base64_str.as_bytes()).map_err(|e| {
+                                        de::Error::custom(format!(
+                                            "Failed to decode base64 headers: {e}"
+                                        ))
+                                    })?;
+                                raw_user_headers = Some(Bytes::from(decoded));
+                            } else if value.is_array() {
+                                let entries: Vec<HeaderEntry> = serde_json::from_value(value)
+                                    .map_err(|e| {
+                                        de::Error::custom(format!("Invalid headers format: {e}"))
+                                    })?;
+                                let mut headers_map = HashMap::new();
+                                for entry in entries {
+                                    headers_map.insert(entry.key, entry.value);
+                                }
+                                user_headers = Some(headers_map);
                             }
-                            user_headers = Some(headers_map);
                         }
                         _ => {
                             let _ = map.next_value::<de::IgnoredAny>()?;
@@ -626,7 +649,11 @@ impl<'de> Deserialize<'de> for IggyMessage {
                 let header = header.ok_or_else(|| de::Error::missing_field("header"))?;
                 let payload = payload.ok_or_else(|| de::Error::missing_field("payload"))?;
 
-                let user_headers_bytes = user_headers.map(|headers| headers.to_bytes());
+                let user_headers_bytes = if let Some(raw) = raw_user_headers {
+                    Some(raw)
+                } else {
+                    user_headers.map(|headers| headers.to_bytes())
+                };
 
                 let user_headers_length = user_headers_bytes
                     .as_ref()

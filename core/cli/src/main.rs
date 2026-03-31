@@ -41,6 +41,8 @@ use iggy::client_provider::{self, ClientProviderConfig};
 use iggy::clients::client::IggyClient;
 use iggy::prelude::{Aes256GcmEncryptor, Args, EncryptorKind, PersonalAccessTokenExpiry};
 use iggy_cli::commands::binary_context::common::ContextManager;
+use iggy_cli::commands::binary_context::create_context::CreateContextCmd;
+use iggy_cli::commands::binary_context::delete_context::DeleteContextCmd;
 use iggy_cli::commands::binary_context::use_context::UseContextCmd;
 use iggy_cli::commands::binary_segments::delete_segments::DeleteSegmentsCmd;
 use iggy_cli::commands::binary_system::snapshot::GetSnapshotCmd;
@@ -327,6 +329,13 @@ fn get_command(
             }
             ContextAction::Use(use_args) => {
                 Box::new(UseContextCmd::new(use_args.context_name.clone()))
+            }
+            ContextAction::Create(create_args) => {
+                let context_name = create_args.context_name.clone();
+                Box::new(CreateContextCmd::new(context_name, create_args.into()))
+            }
+            ContextAction::Delete(delete_args) => {
+                Box::new(DeleteContextCmd::new(delete_args.context_name.clone()))
             }
         },
         #[cfg(feature = "login-session")]

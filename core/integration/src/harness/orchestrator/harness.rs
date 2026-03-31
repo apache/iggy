@@ -22,7 +22,8 @@ use crate::harness::config::ClientConfig;
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::handle::{
-    ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle, ServerLogs,
+    ClientBuilder, ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle,
+    ServerLogs,
 };
 use crate::harness::traits::{Restartable, TestBinary};
 use futures::executor::block_on;
@@ -271,19 +272,28 @@ impl TestHarness {
         }
     }
 
-    /// Create a new client logged in as root for the specified transport.
     pub async fn root_client_for(
         &self,
         transport: TransportProtocol,
     ) -> Result<IggyClient, TestBinaryError> {
+        self.client_builder_for(transport)?
+            .with_root_login()
+            .connect()
+            .await
+    }
+
+    /// Create a new client logged in as root for the specified transport.
+    pub fn client_builder_for(
+        &self,
+        transport: TransportProtocol,
+    ) -> Result<ClientBuilder, TestBinaryError> {
         let server = self.servers.first().ok_or(TestBinaryError::MissingServer)?;
-        let builder = match transport {
-            TransportProtocol::Tcp => server.tcp_client()?,
-            TransportProtocol::Http => server.http_client()?,
-            TransportProtocol::Quic => server.quic_client()?,
-            TransportProtocol::WebSocket => server.websocket_client()?,
-        };
-        builder.with_root_login().connect().await
+        match transport {
+            TransportProtocol::Tcp => server.tcp_client(),
+            TransportProtocol::Http => server.http_client(),
+            TransportProtocol::Quic => server.quic_client(),
+            TransportProtocol::WebSocket => server.websocket_client(),
+        }
     }
 
     /// Create multiple root clients for the specified transport.
