@@ -2233,9 +2233,11 @@ dependencies = [
  "futures",
  "iggy_binary_protocol",
  "iggy_common",
+ "iobuf",
  "message_bus",
  "rand 0.10.0",
  "rand_xoshiro",
+ "tracing",
 ]
 
 [[package]]
@@ -5411,6 +5413,8 @@ dependencies = [
  "bytemuck",
  "bytes",
  "enumset",
+ "iobuf",
+ "smallvec",
  "thiserror 2.0.18",
 ]
 
@@ -5427,6 +5431,7 @@ dependencies = [
  "blake3",
  "bon",
  "byte-unit",
+ "bytemuck",
  "bytes",
  "chrono",
  "clap",
@@ -5437,6 +5442,8 @@ dependencies = [
  "err_trail",
  "human-repr",
  "humantime",
+ "iggy_binary_protocol",
+ "iobuf",
  "lending-iterator",
  "moka",
  "nix",
@@ -5984,6 +5991,7 @@ name = "iobuf"
 version = "0.1.0"
 dependencies = [
  "aligned-vec",
+ "compio-buf",
 ]
 
 [[package]]
@@ -6122,9 +6130,9 @@ name = "journal"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "bytes",
  "compio",
  "iggy_binary_protocol",
+ "iobuf",
  "tempfile",
 ]
 
@@ -6744,6 +6752,7 @@ dependencies = [
  "consensus",
  "iggy_binary_protocol",
  "iggy_common",
+ "iobuf",
  "journal",
  "left-right",
  "message_bus",
@@ -7719,13 +7728,17 @@ dependencies = [
 name = "partitions"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "bytes",
+ "compio",
  "consensus",
  "iggy_binary_protocol",
  "iggy_common",
+ "iobuf",
  "journal",
  "message_bus",
  "ringbuffer",
+ "smallvec",
  "tokio",
  "tracing",
 ]
@@ -10019,6 +10032,7 @@ dependencies = [
  "futures",
  "iggy_binary_protocol",
  "iggy_common",
+ "iobuf",
  "journal",
  "message_bus",
  "metadata",

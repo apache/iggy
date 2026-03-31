@@ -15,17 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::write_batch_frozen;
-use crate::{IggyByteSize, IggyError, IggyMessagesBatch};
-use compio::fs::{File, OpenOptions};
-use err_trail::ErrContext;
+use compio::{
+    fs::{File, OpenOptions},
+    io::AsyncWriteAtExt,
+};
+use iggy_common::{IggyByteSize, IggyError};
+use iobuf::Frozen;
 use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
 };
-use tracing::trace;
+use tracing::error;
 
-/// A dedicated struct for writing to the messages file.
+const MAX_IOV_COUNT: usize = 1024;
+
 #[derive(Debug)]
 pub struct MessagesWriter {
     file_path: String,
@@ -34,15 +37,7 @@ pub struct MessagesWriter {
     fsync: bool,
 }
 
-// Safety: We are guaranteeing that MessagesWriter will never be used from multiple threads
-unsafe impl Send for MessagesWriter {}
-
 impl MessagesWriter {
-    /// Opens the messages file in write mode.
-    ///
-    /// If the server confirmation is set to `NoWait`, the file handle is transferred to the
-    /// persister task (and stored in `persister_task`) so that writes are done asynchronously.
-    /// Otherwise, the file is retained in `self.file` for synchronous writes.
     pub async fn new(
         file_path: &str,
         messages_size_bytes: Rc<AtomicU64>,
@@ -54,32 +49,22 @@ impl MessagesWriter {
         let file = opts
             .open(file_path)
             .await
-            .error(|err: &std::io::Error| {
-                format!("Failed to open messages file: {file_path}, error: {err}")
-            })
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {
-            let _ = file.sync_all().await.error(|e: &std::io::Error| {
-                format!("Failed to fsync messages file after creation: {file_path}, error: {e}")
-            });
+            let _ = file
+                .sync_all()
+                .await
+                .map_err(|_| IggyError::CannotWriteToFile);
 
             let actual_messages_size = file
                 .metadata()
                 .await
-                .error(|e: &std::io::Error| {
-                    format!("Failed to get metadata of messages file: {file_path}, error: {e}")
-                })
                 .map_err(|_| IggyError::CannotReadFileMetadata)?
                 .len();
 
             messages_size_bytes.store(actual_messages_size, Ordering::Relaxed);
         }
-
-        trace!(
-            "Opened messages file for writing: {file_path}, size: {}",
-            messages_size_bytes.load(Ordering::Acquire)
-        );
 
         Ok(Self {
             file_path: file_path.to_string(),
@@ -89,27 +74,21 @@ impl MessagesWriter {
         })
     }
 
-    /// Append frozen (immutable) batches to the messages file.
-    /// The caller retains the batches (for use in in-flight buffer) while disk I/O proceeds.
-    pub async fn save_frozen_batches(
+    pub async fn save_frozen_batches<const ALIGN: usize>(
         &self,
-        batches: &[IggyMessagesBatch],
+        buffers: &[Frozen<ALIGN>],
     ) -> Result<IggyByteSize, IggyError> {
-        let messages_size: u64 = batches.iter().map(|b| b.size() as u64).sum();
+        let messages_size: u64 = buffers.iter().map(|buffer| buffer.len() as u64).sum();
+
+        if messages_size == 0 {
+            return Ok(IggyByteSize::from(0));
+        }
 
         let position = self.messages_size_bytes.load(Ordering::Relaxed);
-        let file = &self.file;
-        write_batch_frozen(file, position, batches)
-            .await
-            .error(|e: &IggyError| {
-                format!(
-                    "Failed to write frozen batch to messages file: {}. {e}",
-                    self.file_path
-                )
-            })?;
+        write_frozen_chunked(&self.file, &self.file_path, position, buffers).await?;
 
         if self.fsync {
-            let _ = self.fsync().await;
+            self.fsync().await?;
         }
 
         self.messages_size_bytes
@@ -117,22 +96,47 @@ impl MessagesWriter {
 
         Ok(IggyByteSize::from(messages_size))
     }
+
     pub fn path(&self) -> String {
         self.file_path.clone()
-    }
-
-    pub fn size_counter(&self) -> Rc<AtomicU64> {
-        self.messages_size_bytes.clone()
     }
 
     pub async fn fsync(&self) -> Result<(), IggyError> {
         self.file
             .sync_all()
             .await
-            .error(|e: &std::io::Error| {
-                format!("Failed to fsync messages file: {}. {e}", self.file_path)
-            })
             .map_err(|_| IggyError::CannotWriteToFile)?;
         Ok(())
     }
+}
+
+async fn write_frozen_chunked<const ALIGN: usize>(
+    file: &File,
+    file_path: &str,
+    mut position: u64,
+    buffers: &[Frozen<ALIGN>],
+) -> Result<(), IggyError> {
+    for chunk in buffers.chunks(MAX_IOV_COUNT) {
+        let chunk_size: usize = chunk.iter().map(Frozen::len).sum();
+        let chunk_vec: Vec<_> = chunk.to_vec();
+
+        let (result, _) = (&*file)
+            .write_vectored_all_at(chunk_vec, position)
+            .await
+            .into();
+        result.map_err(|err| {
+            error!(
+                target: "iggy.partitions.storage",
+                file = file_path,
+                write_position = position,
+                %err,
+                "failed to write frozen messages to segment file"
+            );
+            IggyError::CannotWriteToFile
+        })?;
+
+        position += chunk_size as u64;
+    }
+
+    Ok(())
 }
