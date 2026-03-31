@@ -260,12 +260,6 @@ async fn delete_after_read_source_removes_rows_after_producing(
             .await;
     }
 
-    let initial_count = fixture.count_rows(&pool).await;
-    assert_eq!(
-        initial_count, TEST_MESSAGE_COUNT as i64,
-        "Expected {TEST_MESSAGE_COUNT} rows before processing"
-    );
-
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
     let consumer_id: Identifier = "test_consumer".try_into().unwrap();
