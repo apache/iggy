@@ -26,7 +26,9 @@ bytes = { workspace = true }
 consensus = { path = "../consensus" }
 enumset = { workspace = true }
 futures = { workspace = true }
+iggy_binary_protocol = { path = "../binary_protocol" }
 iggy_common = { path = "../common" }
+iobuf = { workspace = true }
 journal = { path = "../journal" }
 message_bus = { path = "../message_bus" }
 metadata = { path = "../metadata" }

@@ -19,6 +19,8 @@ package command
 
 import (
 	"encoding/binary"
+
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 type LoginUser struct {
@@ -33,7 +35,7 @@ func (lu *LoginUser) Code() Code {
 func (lu *LoginUser) MarshalBinary() ([]byte, error) {
 	usernameBytes := []byte(lu.Username)
 	passwordBytes := []byte(lu.Password)
-	versionBytes := []byte("")
+	versionBytes := []byte(iggcon.Version)
 	contextBytes := []byte("")
 
 	// Calculate total length

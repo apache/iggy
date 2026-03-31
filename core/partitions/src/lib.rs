@@ -17,50 +17,25 @@
 
 #![allow(clippy::future_not_send)]
 
+mod iggy_index;
+mod iggy_index_writer;
 mod iggy_partition;
 mod iggy_partitions;
 mod journal;
 mod log;
+mod messages_writer;
+mod segment;
 mod types;
 
-use bytes::{Bytes, BytesMut};
-use iggy_common::{
-    INDEX_SIZE, IggyError, IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet,
-    PooledBuffer, header::PrepareHeader, message::Message,
-};
+use iggy_binary_protocol::{Message, PrepareHeader};
+use iggy_common::IggyError;
+pub use iggy_common::{IggyMessage2, IggyMessage2Header, IggyMessages2};
 pub use iggy_partition::IggyPartition;
 pub use iggy_partitions::IggyPartitions;
 pub use types::{
-    AppendResult, PartitionOffsets, PartitionsConfig, PollingArgs, PollingConsumer,
-    SendMessagesResult,
+    AppendResult, Fragment, PartitionOffsets, PartitionsConfig, PollFragments, PollQueryResult,
+    PollingArgs, PollingConsumer, SendMessagesResult,
 };
-
-pub(crate) fn decode_send_messages_batch(body: Bytes) -> Option<IggyMessagesBatchMut> {
-    // TODO: This very is bad, IGGY-114 Fixes this.
-    let mut body = body
-        .try_into_mut()
-        .unwrap_or_else(|body| BytesMut::from(body.as_ref()));
-
-    if body.len() < 4 {
-        return None;
-    }
-
-    let count_bytes = body.split_to(4);
-    let count = u32::from_le_bytes(count_bytes.as_ref().try_into().ok()?);
-    let indexes_len = (count as usize).checked_mul(INDEX_SIZE)?;
-
-    if body.len() < indexes_len {
-        return None;
-    }
-
-    let indexes_bytes = body.split_to(indexes_len);
-    let indexes = IggyIndexesMut::from_bytes(PooledBuffer::from(indexes_bytes), 0);
-    let messages = PooledBuffer::from(body);
-
-    Some(IggyMessagesBatchMut::from_indexes_and_messages(
-        indexes, messages,
-    ))
-}
 
 /// Partition-level data plane operations.
 ///
@@ -76,7 +51,7 @@ pub trait Partition {
         &self,
         consumer: PollingConsumer,
         args: PollingArgs,
-    ) -> impl Future<Output = Result<IggyMessagesBatchSet, IggyError>> {
+    ) -> impl Future<Output = Result<PollQueryResult<4096>, IggyError>> {
         let _ = (consumer, args);
         async { Err(IggyError::FeatureUnavailable) }
     }

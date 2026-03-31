@@ -364,7 +364,7 @@ impl IggyShard {
 
             let segment = &mut partition.log.segments_mut()[segment_index];
 
-            if segment.end_offset == 0 {
+            if segment.start_timestamp == 0 {
                 segment.start_timestamp = batch.first_timestamp().unwrap();
             }
 
@@ -559,25 +559,46 @@ impl IggyShard {
             let mut position = 0;
 
             for message in batch.iter() {
+                let mut header = message.header().to_header();
+                let offset = header.offset;
                 let payload = encryptor.decrypt(message.payload());
                 match payload {
                     Ok(payload) => {
                         // Update the header with the decrypted payload length
-                        let mut header = message.header().to_header();
                         header.payload_length = payload.len() as u32;
+
+                        // Decrypt user headers if present
+                        let decrypted_user_headers = if let Some(user_headers) =
+                            message.user_headers()
+                        {
+                            match encryptor.decrypt(user_headers) {
+                                Ok(decrypted) => {
+                                    header.user_headers_length = decrypted.len() as u32;
+                                    Some(decrypted)
+                                }
+                                Err(error) => {
+                                    error!(
+                                        "Cannot decrypt the message user headers at offset: {offset}. Error: {error}"
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
 
                         decrypted_messages.extend_from_slice(&header.to_bytes());
                         decrypted_messages.extend_from_slice(&payload);
-                        if let Some(user_headers) = message.user_headers() {
+                        if let Some(ref user_headers) = decrypted_user_headers {
                             decrypted_messages.extend_from_slice(user_headers);
                         }
                         position += IGGY_MESSAGE_HEADER_SIZE
                             + payload.len()
-                            + message.header().user_headers_length();
+                            + header.user_headers_length as usize;
                         indexes.insert(0, position as u32, 0);
                     }
                     Err(error) => {
-                        error!("Cannot decrypt the message. Error: {}", error);
+                        error!("Cannot decrypt the message at offset: {offset}. Error: {error}",);
                         continue;
                     }
                 }
@@ -604,7 +625,7 @@ impl IggyShard {
 
         for message in batch.iter() {
             let header = message.header().to_header();
-            let user_headers_length = header.user_headers_length;
+            let offset = header.offset;
             let payload_bytes = message.payload();
             let user_headers_bytes = message.user_headers();
 
@@ -614,18 +635,38 @@ impl IggyShard {
                     let mut updated_header = header;
                     updated_header.payload_length = encrypted_payload.len() as u32;
 
+                    // Encrypt user headers if present
+                    let encrypted_user_headers = if let Some(user_headers_bytes) =
+                        user_headers_bytes
+                    {
+                        match encryptor.encrypt(user_headers_bytes) {
+                            Ok(encrypted) => {
+                                updated_header.user_headers_length = encrypted.len() as u32;
+                                Some(encrypted)
+                            }
+                            Err(error) => {
+                                error!(
+                                    "Cannot encrypt the message user headers at offset: {offset}. Error: {error}"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     encrypted_messages.extend_from_slice(&updated_header.to_bytes());
                     encrypted_messages.extend_from_slice(&encrypted_payload);
-                    if let Some(user_headers_bytes) = user_headers_bytes {
-                        encrypted_messages.extend_from_slice(user_headers_bytes);
+                    if let Some(ref encrypted_user_headers) = encrypted_user_headers {
+                        encrypted_messages.extend_from_slice(encrypted_user_headers);
                     }
                     position += IGGY_MESSAGE_HEADER_SIZE
                         + encrypted_payload.len()
-                        + user_headers_length as usize;
+                        + updated_header.user_headers_length as usize;
                     indexes.insert(0, position as u32, 0);
                 }
                 Err(error) => {
-                    error!("Cannot encrypt the message. Error: {}", error);
+                    error!("Cannot encrypt the message at offset: {offset}. Error: {error}",);
                     continue;
                 }
             }

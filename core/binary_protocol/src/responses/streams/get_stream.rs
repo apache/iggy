@@ -20,6 +20,7 @@ use crate::codec::{WireDecode, WireEncode, read_u8, read_u32_le, read_u64_le};
 use crate::primitives::identifier::WireName;
 use crate::responses::streams::StreamResponse;
 use bytes::{BufMut, BytesMut};
+use std::borrow::Cow;
 
 /// Topic header within a `GetStream` response.
 ///
@@ -141,11 +142,11 @@ impl WireDecode for GetStreamResponse {
             topics.push(topic);
         }
         if topics.len() != stream.topics_count as usize {
-            return Err(WireError::Validation(format!(
+            return Err(WireError::Validation(Cow::Owned(format!(
                 "stream.topics_count={} but decoded {} topics",
                 stream.topics_count,
                 topics.len()
-            )));
+            ))));
         }
         Ok((Self { stream, topics }, pos))
     }

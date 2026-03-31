@@ -241,17 +241,21 @@ macro_rules! collect_handlers {
 
             impl $crate::stm::Command for [<$state Inner>] {
                 type Cmd = [<$state Command>];
-                type Input = ::iggy_common::message::Message<::iggy_common::header::PrepareHeader>;
+                type Input = ::iggy_binary_protocol::Message<::iggy_binary_protocol::PrepareHeader>;
                 type Error = ::iggy_common::IggyError;
 
                 fn parse(input: Self::Input) -> Result<::iggy_common::Either<Self::Cmd, Self::Input>, Self::Error> {
                     use ::iggy_common::BytesSerializable;
                     use ::iggy_common::Either;
-                    use ::iggy_common::header::Operation;
+                    use ::iggy_binary_protocol::{Operation, PrepareHeader};
                     match input.header().operation {
                         $(
                             Operation::$operation => {
-                                let body = input.body_bytes();
+                                // TODO: FIXME, zero allocation operation construction.
+                                let header = *input.header();
+                                let body = ::bytes::Bytes::copy_from_slice(
+                                    &input.as_slice()[core::mem::size_of::<PrepareHeader>()..header.size as usize]
+                                );
                                 let cmd = $operation::from_bytes(body)?;
                                 Ok(Either::Left([<$state Command>]::$operation(cmd)))
                             },

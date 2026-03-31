@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,28 +17,12 @@
  * under the License.
  */
 
-use crate::binary::command::ServerCommand;
-use bytes::BytesMut;
-use iggy_common::{IggyError, SenderKind};
+pub mod container;
+pub mod sink;
+pub mod source;
 
-pub async fn receive_and_validate(
-    sender: &mut SenderKind,
-    code: u32,
-    length: u32,
-) -> Result<ServerCommand, IggyError> {
-    let mut buffer = BytesMut::with_capacity(length as usize);
-    unsafe {
-        buffer.set_len(length as usize);
-    }
-    let buffer = if length == 0 {
-        buffer
-    } else {
-        let (result, buffer) = sender.read(buffer).await;
-        result?;
-        buffer
-    };
-
-    let command = ServerCommand::from_code_and_payload(code, buffer.freeze())?;
-    command.validate()?;
-    Ok(command)
-}
+pub use sink::{
+    InfluxDbSinkBase64Fixture, InfluxDbSinkFixture, InfluxDbSinkNoMetadataFixture,
+    InfluxDbSinkNsPrecisionFixture, InfluxDbSinkTextFixture,
+};
+pub use source::{InfluxDbSourceFixture, InfluxDbSourceRawFixture, InfluxDbSourceTextFixture};

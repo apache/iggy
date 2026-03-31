@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Microsoft.Extensions.Logging;
@@ -91,7 +93,7 @@ public partial class IggyPublisher : IAsyncDisposable
         {
             try
             {
-                await _client.LogoutUser();
+                await _client.LogoutUserAsync();
                 _client.Dispose();
             }
             catch (Exception e)
@@ -160,12 +162,12 @@ public partial class IggyPublisher : IAsyncDisposable
         LogInitializingPublisher(_config.StreamId, _config.TopicId);
         if (_config.CreateIggyClient)
         {
-            await _client.LoginUser(_config.Login, _config.Password, ct);
+            await _client.LoginUserAsync(_config.Login, _config.Password, ct);
             LogUserLoggedIn(_config.Login);
         }
 
-        await CreateStreamIfNeeded(ct);
-        await CreateTopicIfNeeded(ct);
+        await CreateStreamIfNeededAsync(ct);
+        await CreateTopicIfNeededAsync(ct);
 
         if (_config.EnableBackgroundSending)
         {
@@ -182,7 +184,7 @@ public partial class IggyPublisher : IAsyncDisposable
     /// </summary>
     /// <param name="ct">Cancellation token to cancel the operation.</param>
     /// <exception cref="StreamNotFoundException">Thrown when the stream doesn't exist and auto-creation is disabled.</exception>
-    private async Task CreateStreamIfNeeded(CancellationToken ct)
+    private async Task CreateStreamIfNeededAsync(CancellationToken ct)
     {
         if (await _client.GetStreamByIdAsync(_config.StreamId, ct) != null)
         {
@@ -215,7 +217,7 @@ public partial class IggyPublisher : IAsyncDisposable
     /// </summary>
     /// <param name="ct">Cancellation token to cancel the operation.</param>
     /// <exception cref="TopicNotFoundException">Thrown when the topic doesn't exist and auto-creation is disabled.</exception>
-    private async Task CreateTopicIfNeeded(CancellationToken ct)
+    private async Task CreateTopicIfNeededAsync(CancellationToken ct)
     {
         if (await _client.GetTopicByIdAsync(_config.StreamId, _config.TopicId, ct) != null)
         {
@@ -255,7 +257,7 @@ public partial class IggyPublisher : IAsyncDisposable
     /// <param name="messages">The messages to send.</param>
     /// <param name="ct">Cancellation token to cancel the send operation.</param>
     /// <exception cref="PublisherNotInitializedException">Thrown when attempting to send before initialization.</exception>
-    public async Task SendMessages(IList<Message> messages, CancellationToken ct = default)
+    public async Task SendMessagesAsync(IList<Message> messages, CancellationToken ct = default)
     {
         if (!_isInitialized)
         {
@@ -290,7 +292,7 @@ public partial class IggyPublisher : IAsyncDisposable
     ///     Only applicable when background sending is enabled. Returns immediately otherwise.
     /// </summary>
     /// <param name="ct">Cancellation token to cancel the wait operation.</param>
-    public async Task WaitUntilAllSends(CancellationToken ct = default)
+    public async Task WaitUntilAllSendsAsync(CancellationToken ct = default)
     {
         if (!_config.EnableBackgroundSending || _backgroundProcessor == null)
         {
@@ -310,7 +312,7 @@ public partial class IggyPublisher : IAsyncDisposable
 
     /// <summary>
     ///     Encrypts all messages in the list using the configured message encryptor, if available.
-    ///     Updates the payload length in the message header after encryption.
+    ///     Updates the payload and user headers lengths in the message header after encryption.
     /// </summary>
     /// <param name="messages">The messages to encrypt.</param>
     private void EncryptMessages(IList<Message> messages)
@@ -324,6 +326,15 @@ public partial class IggyPublisher : IAsyncDisposable
         {
             message.Payload = _config.MessageEncryptor.Encrypt(message.Payload);
             message.Header.PayloadLength = message.Payload.Length;
+
+            if (message.UserHeaders is { Count: > 0 })
+            {
+                var headerBytes = TcpContracts.GetHeadersBytes(message.UserHeaders);
+                var encryptedHeaderBytes = _config.MessageEncryptor.Encrypt(headerBytes);
+                message.RawUserHeaders = encryptedHeaderBytes;
+                message.UserHeaders = null;
+                message.Header.UserHeadersLength = encryptedHeaderBytes.Length;
+            }
         }
     }
 }

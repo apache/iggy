@@ -15,5 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod header;
-pub mod message;
+/// `GetMe` response: same wire format as `ClientDetailsResponse`.
+///
+/// The server returns the authenticated client's own info using the
+/// same `map_client` serialization as `GetClient`.
+pub type GetMeResponse = crate::responses::clients::get_client::ClientDetailsResponse;

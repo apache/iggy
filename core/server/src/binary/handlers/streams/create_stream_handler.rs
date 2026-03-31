@@ -16,64 +16,58 @@
  * under the License.
  */
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+use iggy_binary_protocol::responses::streams::StreamResponse;
 use iggy_common::create_stream::CreateStream;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::{IggyError, SenderKind, Validatable};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for CreateStream {
-    fn code(&self) -> u32 {
-        iggy_common::CREATE_STREAM_CODE
-    }
+#[instrument(skip_all, name = "trace_create_stream", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+pub async fn handle_create_stream(
+    req: CreateStreamRequest,
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    debug!(
+        "session: {session}, command: create_stream, name: {}",
+        req.name.as_str()
+    );
+    shard.ensure_authenticated(session)?;
 
-    #[instrument(skip_all, name = "trace_create_stream", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
+    let command = CreateStream {
+        name: req.name.to_string(),
+    };
+    command.validate()?;
 
-        let request = ShardRequest::control_plane(ShardRequestPayload::CreateStreamRequest {
-            user_id: session.get_user_id(),
-            command: self,
-        });
+    let request = ShardRequest::control_plane(ShardRequestPayload::CreateStreamRequest {
+        user_id: session.get_user_id(),
+        command,
+    });
 
-        match shard.send_to_control_plane(request).await? {
-            ShardResponse::CreateStreamResponse(data) => {
-                sender
-                    .send_ok_response(&mapper::map_stream_from_response(&data))
-                    .await?;
-            }
-            ShardResponse::ErrorResponse(err) => return Err(err),
-            _ => unreachable!("Expected CreateStreamResponse"),
+    match shard.send_to_control_plane(request).await? {
+        ShardResponse::CreateStreamResponse(data) => {
+            let response = StreamResponse {
+                id: data.id,
+                created_at: data.created_at.into(),
+                topics_count: 0,
+                size_bytes: 0,
+                messages_count: 0,
+                name: WireName::new(data.name.as_ref()).map_err(|_| IggyError::InvalidCommand)?,
+            };
+            sender.send_ok_response(&response.to_bytes()).await?;
         }
-
-        Ok(HandlerResult::Finished)
+        ShardResponse::ErrorResponse(err) => return Err(err),
+        _ => unreachable!("Expected CreateStreamResponse"),
     }
-}
 
-impl BinaryServerCommand for CreateStream {
-    async fn from_sender(
-        sender: &mut SenderKind,
-        code: u32,
-        length: u32,
-    ) -> Result<Self, IggyError> {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::CreateStream(create_stream) => Ok(create_stream),
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+    Ok(HandlerResult::Finished)
 }

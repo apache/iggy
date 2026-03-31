@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::binary::command::{ServerCommand, ServerCommandHandler};
+use crate::binary::dispatch::{self, HandlerResult, MAX_CONTROL_FRAME_PAYLOAD};
 use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
@@ -25,11 +25,11 @@ use anyhow::anyhow;
 use compio::io::AsyncReadExt;
 use compio::quic::{Connection, Endpoint, RecvStream, SendStream};
 use futures::FutureExt;
+use iggy_binary_protocol::RequestFrame;
+use iggy_binary_protocol::codes::{SEND_MESSAGES_CODE, command_name};
 use iggy_common::{GET_CLUSTER_METADATA_CODE, IggyError, SenderKind, TransportProtocol};
 use std::rc::Rc;
-use tracing::{debug, error, info, trace};
-
-const INITIAL_BYTES_LENGTH: usize = 4;
+use tracing::{debug, error, info, trace, warn};
 
 pub async fn start(
     endpoint: Endpoint,
@@ -165,37 +165,45 @@ async fn handle_stream(
 ) -> anyhow::Result<()> {
     let (send_stream, mut recv_stream) = stream;
 
-    let length_buffer = [0u8; INITIAL_BYTES_LENGTH];
-    let code_buffer = [0u8; INITIAL_BYTES_LENGTH];
-
-    let compio::BufResult(result, length_buffer) = recv_stream.read_exact(length_buffer).await;
-    result?;
-    let compio::BufResult(result, code_buffer) = recv_stream.read_exact(code_buffer).await;
+    let header_buf = [0u8; RequestFrame::HEADER_SIZE];
+    let compio::BufResult(result, header_buf) = recv_stream.read_exact(header_buf).await;
     result?;
 
-    let length = u32::from_le_bytes(length_buffer);
-    let code = u32::from_le_bytes(code_buffer);
+    let length = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+    let code = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
 
-    trace!("Received a QUIC request, length: {length}, code: {code}");
+    let cmd_name = command_name(code).unwrap_or("unknown");
+    trace!("Received a QUIC request, length: {length}, code: {code} ({cmd_name})");
+
+    let payload_length = RequestFrame::payload_length(length)
+        .map_err(|_| anyhow!("Invalid frame length: {length}"))?;
 
     let mut sender = SenderKind::get_quic_sender(send_stream, recv_stream);
 
-    let command = match ServerCommand::from_code_and_reader(code, &mut sender, length - 4).await {
-        Ok(cmd) => cmd,
-        Err(e) => {
-            sender.send_error_response(e.clone()).await?;
-            return Err(anyhow!("Failed to parse command: {e}"));
+    let result = if code == SEND_MESSAGES_CODE {
+        dispatch::dispatch_send_messages(&mut sender, payload_length, session, &shard).await
+    } else {
+        if payload_length > MAX_CONTROL_FRAME_PAYLOAD {
+            sender
+                .send_error_response(IggyError::InvalidCommand)
+                .await?;
+            return Ok(());
         }
+        let payload = dispatch::read_payload(&mut sender, payload_length).await?;
+        let frame = RequestFrame::from_parts(code, &payload);
+        dispatch::dispatch(frame, &mut sender, session, &shard).await
     };
 
-    trace!("Received a QUIC command: {command}, payload size: {length}");
-
-    match command.handle(&mut sender, length, session, &shard).await {
-        Ok(_) => {
+    match result {
+        Ok(HandlerResult::Finished) => {
             trace!(
                 "Command was handled successfully, session: {:?}. QUIC response was sent.",
                 session
             );
+            Ok(())
+        }
+        Ok(HandlerResult::Migrated { to_shard }) => {
+            warn!("Unexpected migration on QUIC: to_shard {to_shard}, session: {session:?}");
             Ok(())
         }
         Err(e) => {

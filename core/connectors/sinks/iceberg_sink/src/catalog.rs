@@ -16,14 +16,15 @@
  * under the License.
  */
 
-use super::{Error, IcebergSinkConfig, IcebergSinkTypes};
+use super::{Error, IcebergSinkConfig, IcebergSinkStoreClass, IcebergSinkTypes};
 use crate::props::init_props;
 use iceberg::{Catalog, CatalogBuilder};
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
 };
-
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub async fn init_catalog(config: &IcebergSinkConfig) -> Result<Box<dyn Catalog>, Error> {
     let props = init_props(config)?;
@@ -46,7 +47,20 @@ async fn get_rest_catalog(
     ]);
     new_props.extend(props);
 
+    let storage_factory: Arc<dyn iceberg::io::StorageFactory> = match &config.store_class {
+        IcebergSinkStoreClass::S3 => Arc::new(OpenDalStorageFactory::S3 {
+            configured_scheme: "s3".to_string(),
+            customized_credential_load: None,
+        }),
+        other => {
+            return Err(Error::InitError(format!(
+                "Unsupported store class: {other}"
+            )));
+        }
+    };
+
     let catalog = RestCatalogBuilder::default()
+        .with_storage_factory(storage_factory)
         .load("rest", new_props)
         .await
         .map_err(|err| {

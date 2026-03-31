@@ -41,6 +41,7 @@ pub mod api;
 pub mod decoders;
 pub mod encoders;
 pub mod log;
+pub mod retry;
 pub mod sink;
 pub mod source;
 pub mod transforms;
@@ -144,6 +145,7 @@ pub enum Payload {
 }
 
 impl Payload {
+    /// Consuming conversion — transfers ownership of inner buffers.
     pub fn try_into_vec(self) -> Result<Vec<u8>, Error> {
         match self {
             Payload::Json(value) => {
@@ -153,6 +155,34 @@ impl Payload {
             Payload::Text(text) => Ok(text.into_bytes()),
             Payload::Proto(text) => Ok(text.into_bytes()),
             Payload::FlatBuffer(value) => Ok(value),
+        }
+    }
+
+    /// Borrowing serialisation — no clone, no ownership transfer.
+    ///
+    /// - Json: serialises the `OwnedValue` in place → one allocation
+    ///   for the output `Vec<u8>`, zero clone of the value tree.
+    /// - Raw: returns a copy of the inner bytes (unavoidable — caller
+    ///   needs owned bytes and we only have a reference).
+    /// - Text/Proto: copies the string bytes (same reasoning).
+    /// - FlatBuffer: copies the buffer bytes.
+    ///
+    /// For `Json` this replaces a deep clone of the entire `OwnedValue` tree
+    /// with a single serialisation pass — O(n) work either way, but the clone
+    /// path does O(n) allocation + O(n) serialisation, while this path does
+    /// only O(n) serialisation.
+    ///
+    /// Named `try_to_bytes` (not `try_as_bytes`) because it allocates and
+    /// returns an owned `Vec<u8>` — following the Rust API guideline that
+    /// `as_` implies a cheap borrowed view while `to_` implies an owned,
+    /// potentially-allocating conversion.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, Error> {
+        match self {
+            Payload::Json(value) => simd_json::to_vec(value).map_err(|_| Error::InvalidJsonPayload),
+            Payload::Raw(value) => Ok(value.clone()),
+            Payload::Text(text) => Ok(text.as_bytes().to_vec()),
+            Payload::Proto(text) => Ok(text.as_bytes().to_vec()),
+            Payload::FlatBuffer(value) => Ok(value.clone()),
         }
     }
 }
@@ -340,8 +370,12 @@ pub trait StreamEncoder: Send + Sync {
 pub enum Error {
     #[error("Invalid config")]
     InvalidConfig,
+    #[error("Invalid config value: {0}")]
+    InvalidConfigValue(String),
     #[error("Invalid record")]
     InvalidRecord,
+    #[error("Invalid record value: {0}")]
+    InvalidRecordValue(String),
     #[error("Invalid transformer")]
     InvalidTransformer,
     #[error("HTTP request failed: {0}")]
@@ -374,4 +408,10 @@ pub enum Error {
     Connection(String),
     #[error("Cannot store data: {0}")]
     CannotStoreData(String),
+    /// A non-transient HTTP error (e.g. 400 Bad Request, 422 Unprocessable
+    /// Entity) that retrying will not fix. Connectors use this variant to
+    /// distinguish permanent data/schema issues from transient connectivity
+    /// failures so that circuit breakers are not tripped by bad data.
+    #[error("Permanent HTTP error: {0}")]
+    PermanentHttpError(String),
 }

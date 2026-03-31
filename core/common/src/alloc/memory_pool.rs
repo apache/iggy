@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use bytes::BytesMut;
+use aligned_vec::{AVec, ConstAlign};
 use crossbeam::queue::ArrayQueue;
 use human_repr::HumanCount;
 use once_cell::sync::OnceCell;
@@ -24,18 +24,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::{info, trace, warn};
 
+pub const ALIGNMENT: usize = 4096;
+pub type AlignedBuffer = AVec<u8, ConstAlign<4096>>;
+
 /// Global memory pool instance. Use `memory_pool()` to access it.
 pub static MEMORY_POOL: OnceCell<MemoryPool> = OnceCell::new();
 
 /// Total number of distinct bucket sizes.
-const NUM_BUCKETS: usize = 32;
+const NUM_BUCKETS: usize = 28;
 
 /// Array of bucket sizes in ascending order. Each entry is a distinct buffer size (in bytes).
 const BUCKET_SIZES: [usize; NUM_BUCKETS] = [
-    256,
-    512,
-    1024,
-    2 * 1024,
     4 * 1024,
     8 * 1024,
     16 * 1024,
@@ -87,7 +86,7 @@ pub struct MemoryPoolConfigOther {
     pub bucket_capacity: u32,
 }
 
-/// A memory pool that maintains fixed-size buckets for reusing `BytesMut` buffers.
+/// A memory pool that maintains fixed-size buckets for reusing `AlignedBuffer` buffers.
 ///
 /// Each bucket corresponds to a particular size in `BUCKET_SIZES`. The pool tracks:
 /// - Buffers currently in use (`in_use`)
@@ -109,7 +108,7 @@ pub struct MemoryPool {
     /// Array of queues for reusable buffers. Each queue can store up to `bucket_capacity` buffers.
     /// The length of each queue (`buckets[i].len()`) is how many **free** buffers are currently available.
     /// Free doesn't mean the buffer is allocated, it just means it's not in use.
-    buckets: [Arc<ArrayQueue<BytesMut>>; NUM_BUCKETS],
+    buckets: [Arc<ArrayQueue<AlignedBuffer>>; NUM_BUCKETS],
 
     /// Number of buffers **in use** for each bucket size (grow/shrink as they are acquired/released).
     in_use: [Arc<AtomicUsize>; NUM_BUCKETS],
@@ -175,29 +174,47 @@ impl MemoryPool {
             MEMORY_POOL.get_or_init(|| MemoryPool::new(is_enabled, memory_limit, bucket_capacity));
     }
 
-    /// Acquire a `BytesMut` buffer with at least `capacity` bytes.
+    /// Acquire a `AlignedBuffer` buffer with at least `capacity` bytes.
     ///
     /// - If a bucket can fit `capacity`, try to pop from its free buffer queue; otherwise create a new buffer.
     /// - If `memory_limit` would be exceeded, allocate outside the pool.
     ///
     /// Returns a tuple of (buffer, was_pool_allocated) where was_pool_allocated indicates if the buffer
     /// was allocated from the pool (true) or externally (false).
-    pub fn acquire_buffer(&self, capacity: usize) -> (BytesMut, bool) {
+    pub fn acquire_buffer(&self, capacity: usize) -> (AlignedBuffer, bool) {
         if !self.is_enabled {
-            return (BytesMut::with_capacity(capacity), false);
+            return (allocate_aligned_buffer(capacity), false);
         }
 
         let current = self.pool_current_size();
 
         match self.best_fit(capacity) {
             Some(idx) => {
+                let new_size = BUCKET_SIZES[idx];
+
                 if let Some(mut buf) = self.buckets[idx].pop() {
                     buf.clear();
+
+                    if buf.capacity() < capacity {
+                        warn!(
+                            "Pooled buffer too small! bucket[{}]={}, buf.capacity()={}, requested={}. Dropping and allocating new.",
+                            idx,
+                            new_size,
+                            buf.capacity(),
+                            capacity
+                        );
+                        drop(buf);
+
+                        let new_buf = allocate_aligned_buffer(new_size);
+                        self.inc_bucket_alloc(idx);
+                        self.inc_bucket_in_use(idx);
+                        return (new_buf, true);
+                    }
+
                     self.inc_bucket_in_use(idx);
                     return (buf, true);
                 }
 
-                let new_size = BUCKET_SIZES[idx];
                 if current + new_size > self.memory_limit {
                     self.set_capacity_warning(true);
                     trace!(
@@ -205,12 +222,12 @@ impl MemoryPool {
                         new_size, current, self.memory_limit
                     );
                     self.inc_external_allocations();
-                    return (BytesMut::with_capacity(new_size), false);
+                    return (allocate_aligned_buffer(new_size), false);
                 }
 
                 self.inc_bucket_alloc(idx);
                 self.inc_bucket_in_use(idx);
-                (BytesMut::with_capacity(new_size), true)
+                (allocate_aligned_buffer(new_size), true)
             }
             None => {
                 if current + capacity > self.memory_limit {
@@ -219,16 +236,16 @@ impl MemoryPool {
                         capacity, current, self.memory_limit
                     );
                     self.inc_external_allocations();
-                    return (BytesMut::with_capacity(capacity), false);
+                    return (allocate_aligned_buffer(capacity), false);
                 }
 
                 self.inc_external_allocations();
-                (BytesMut::with_capacity(capacity), false)
+                (allocate_aligned_buffer(capacity), false)
             }
         }
     }
 
-    /// Return a `BytesMut` buffer previously acquired from the pool.
+    /// Return a `AlignedBuffer` buffer previously acquired from the pool.
     ///
     /// - If `current_capacity` differs from `original_capacity`, increments `resize_events`.
     /// - If a matching bucket exists, place it back in that bucket's queue (if space is available).
@@ -236,7 +253,7 @@ impl MemoryPool {
     /// - The `was_pool_allocated` flag indicates if this buffer was originally allocated from the pool.
     pub fn release_buffer(
         &self,
-        buffer: BytesMut,
+        buffer: AlignedBuffer,
         original_capacity: usize,
         was_pool_allocated: bool,
     ) {
@@ -448,14 +465,19 @@ impl MemoryPool {
 
 /// Return a buffer to the pool by calling `release_buffer` with the original capacity.
 /// This extension trait makes it easy to do `some_bytes.return_to_pool(orig_cap, was_pool_allocated)`.
-pub trait BytesMutExt {
+pub trait AlignedBufferExt {
     fn return_to_pool(self, original_capacity: usize, was_pool_allocated: bool);
 }
 
-impl BytesMutExt for BytesMut {
+impl AlignedBufferExt for AlignedBuffer {
     fn return_to_pool(self, original_capacity: usize, was_pool_allocated: bool) {
         memory_pool().release_buffer(self, original_capacity, was_pool_allocated);
     }
+}
+
+fn allocate_aligned_buffer(capacity: usize) -> AlignedBuffer {
+    let aligned_capacity = capacity.next_multiple_of(ALIGNMENT).max(ALIGNMENT);
+    AlignedBuffer::with_capacity(ALIGNMENT, aligned_capacity)
 }
 
 /// Convert a size in bytes to a string like "8KiB" or "2MiB".

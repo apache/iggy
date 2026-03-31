@@ -19,7 +19,7 @@ use crate::configs::cache_indexes::CacheIndexesConfig;
 use crate::shard::IggyShard;
 use crate::streaming::segments::Segment;
 use iggy_common::sharding::IggyNamespace;
-use iggy_common::{IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize};
+use iggy_common::{ConsumerKind, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize};
 
 impl IggyShard {
     /// Performs all cleanup for a topic's partitions: time-based expiry then size-based trimming.
@@ -122,15 +122,36 @@ impl IggyShard {
             let Some(partition) = partitions.get(&ns) else {
                 return Ok((0, 0));
             };
+
+            let min_committed = Self::min_committed_offset(
+                &partition.consumer_offsets,
+                &partition.consumer_group_offsets,
+            );
+
             let segments = partition.log.segments();
             let last_idx = segments.len().saturating_sub(1);
+            let mut offsets = Vec::new();
 
-            segments
-                .iter()
-                .enumerate()
-                .filter(|(idx, seg)| *idx != last_idx && seg.is_expired(now, expiry))
-                .map(|(_, seg)| seg.start_offset)
-                .collect()
+            for (idx, seg) in segments.iter().enumerate() {
+                if idx == last_idx || !seg.is_expired(now, expiry) {
+                    continue;
+                }
+                if let Some((barrier, kind, id)) = &min_committed
+                    && seg.end_offset > *barrier
+                {
+                    tracing::warn!(
+                        "Segment [{}..{}] blocked from expiry-based deletion \
+                         by {kind} (ID: {id}) at offset {barrier} \
+                         in partition {partition_id} (stream: {stream_id}, topic: {topic_id})",
+                        seg.start_offset,
+                        seg.end_offset,
+                    );
+                    continue;
+                }
+                offsets.push(seg.start_offset);
+            }
+
+            offsets
         };
 
         let mut total_segments = 0u64;
@@ -169,6 +190,23 @@ impl IggyShard {
 
             let first = &segments[0];
             if !first.sealed {
+                continue;
+            }
+
+            let min_committed = Self::min_committed_offset(
+                &partition.consumer_offsets,
+                &partition.consumer_group_offsets,
+            );
+            if let Some((barrier, kind, id)) = &min_committed
+                && first.end_offset > *barrier
+            {
+                tracing::warn!(
+                    "Segment [{}..{}] blocked from size-based deletion \
+                     by {kind} (ID: {id}) at offset {barrier} \
+                     in partition {partition_id} (stream: {stream_id}, topic: {topic_id})",
+                    first.start_offset,
+                    first.end_offset,
+                );
                 continue;
             }
 
@@ -271,11 +309,11 @@ impl IggyShard {
     }
 
     /// Deletes the N oldest **sealed** segments from a partition, preserving the active segment
-    /// and partition offset. Reuses `remove_segment_by_offset` — same logic as the message cleaner.
+    /// and partition offset. Reuses `remove_segment_by_offset` - same logic as the message cleaner.
     ///
-    /// Segments containing unconsumed messages are protected: a segment is only eligible for
-    /// deletion if `end_offset <= min_committed_offset` across all consumers and consumer groups.
-    /// If no consumers exist, there is no barrier.
+    /// Segments containing unconsumed messages are protected by a barrier: deletion is skipped
+    /// when `end_offset > min_committed_offset` and a warning is logged identifying the
+    /// blocking consumer. If no consumers exist, there is no barrier.
     pub(crate) async fn delete_oldest_segments(
         &self,
         stream_id: usize,
@@ -298,18 +336,33 @@ impl IggyShard {
 
             let segments = partition.log.segments();
             let last_idx = segments.len().saturating_sub(1);
+            let mut offsets = Vec::new();
+            let mut collected = 0u32;
 
-            segments
-                .iter()
-                .enumerate()
-                .filter(|(idx, seg)| {
-                    *idx != last_idx
-                        && seg.sealed
-                        && min_committed.is_none_or(|barrier| seg.end_offset <= barrier)
-                })
-                .map(|(_, seg)| seg.start_offset)
-                .take(segments_count as usize)
-                .collect()
+            for (idx, seg) in segments.iter().enumerate() {
+                if collected >= segments_count {
+                    break;
+                }
+                if idx == last_idx || !seg.sealed {
+                    continue;
+                }
+                if let Some((barrier, kind, id)) = &min_committed
+                    && seg.end_offset > *barrier
+                {
+                    tracing::warn!(
+                        "Segment [{}..{}] blocked from size-based deletion \
+                         by {kind} (ID: {id}) at offset {barrier} \
+                         in partition {partition_id} (stream: {stream_id}, topic: {topic_id})",
+                        seg.start_offset,
+                        seg.end_offset,
+                    );
+                    continue;
+                }
+                offsets.push(seg.start_offset);
+                collected += 1;
+            }
+
+            offsets
         };
 
         let mut total_segments = 0u64;
@@ -325,20 +378,29 @@ impl IggyShard {
     }
 
     /// Returns the minimum committed offset across all consumers and consumer groups,
-    /// or `None` if no consumers exist (no barrier).
+    /// along with the identity of the consumer holding it. Returns `None` if no
+    /// consumers exist (no barrier).
     fn min_committed_offset(
         consumer_offsets: &crate::streaming::partitions::consumer_offsets::ConsumerOffsets,
         consumer_group_offsets: &crate::streaming::partitions::consumer_group_offsets::ConsumerGroupOffsets,
-    ) -> Option<u64> {
+    ) -> Option<(u64, ConsumerKind, u32)> {
         let co_guard = consumer_offsets.pin();
         let cg_guard = consumer_group_offsets.pin();
-        let consumers = co_guard
-            .iter()
-            .map(|(_, co)| co.offset.load(std::sync::atomic::Ordering::Relaxed));
-        let groups = cg_guard
-            .iter()
-            .map(|(_, co)| co.offset.load(std::sync::atomic::Ordering::Relaxed));
-        consumers.chain(groups).min()
+        let consumers = co_guard.iter().map(|(_, co)| {
+            (
+                co.offset.load(std::sync::atomic::Ordering::Relaxed),
+                co.kind,
+                co.consumer_id,
+            )
+        });
+        let groups = cg_guard.iter().map(|(_, co)| {
+            (
+                co.offset.load(std::sync::atomic::Ordering::Relaxed),
+                co.kind,
+                co.consumer_id,
+            )
+        });
+        consumers.chain(groups).min_by_key(|(offset, _, _)| *offset)
     }
 
     /// Drains all segments, deletes their files, and re-initializes the partition log at offset 0.

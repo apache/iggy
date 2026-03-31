@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use bytes::Bytes;
+use iggy_binary_protocol::{Message, Operation, RequestHeader};
+use iggy_common::send_messages2::{
+    IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned,
+};
 use iggy_common::{
-    BytesSerializable, INDEX_SIZE, Identifier,
-    create_stream::CreateStream,
-    delete_stream::DeleteStream,
-    header::{Operation, RequestHeader},
-    message::Message,
+    BytesSerializable, Identifier, create_stream::CreateStream, delete_stream::DeleteStream,
     sharding::IggyNamespace,
 };
+use iobuf::Owned;
 use std::cell::Cell;
 
 // TODO: Proper client which implements the full client SDK API
@@ -67,34 +69,49 @@ impl SimClient {
     }
 
     #[allow(clippy::cast_possible_truncation)]
+    /// # Panics
+    ///
+    /// Panics if the simulator cannot encode the provided messages into a valid
+    /// `SendMessages2` request.
     pub fn send_messages(
         &self,
         namespace: IggyNamespace,
         messages: &[&[u8]],
     ) -> Message<RequestHeader> {
-        // Build batch: count | indexes | messages
-        let count = messages.len() as u32;
-        let mut indexes = Vec::with_capacity(count as usize * INDEX_SIZE);
-        let mut messages_buf = Vec::new();
-
-        let mut current_position = 0u32;
-        for msg in messages {
-            // Write index: position (u32) + length (u32)
-            indexes.extend_from_slice(&current_position.to_le_bytes());
-            indexes.extend_from_slice(&(msg.len() as u32).to_le_bytes());
-
-            // Append message
-            messages_buf.extend_from_slice(msg);
-            current_position += msg.len() as u32;
+        let mut batch = IggyMessages2::with_capacity(messages.len());
+        for message in messages {
+            batch.push(IggyMessage2 {
+                header: IggyMessage2Header {
+                    payload_length: message.len() as u32,
+                    ..Default::default()
+                },
+                payload: Bytes::copy_from_slice(message),
+                user_headers: None,
+            });
         }
 
-        // Build payload: count | indexes | messages
-        let mut payload = Vec::with_capacity(4 + indexes.len() + messages_buf.len());
-        payload.extend_from_slice(&count.to_le_bytes());
-        payload.extend_from_slice(&indexes);
-        payload.extend_from_slice(&messages_buf);
+        let batch = SendMessages2Owned::from_messages(namespace, &batch)
+            .expect("simulator must build a valid send_messages2 batch");
+        let total_size = std::mem::size_of::<RequestHeader>() + batch.header.total_size();
+        let request_header = self.request_header(Operation::SendMessages, namespace, total_size);
+        batch
+            .encode_request(request_header)
+            .expect("simulator must build a valid send_messages2 request")
+    }
 
-        self.build_request_with_namespace(Operation::SendMessages, &payload, namespace)
+    pub fn store_consumer_offset(
+        &self,
+        namespace: IggyNamespace,
+        consumer_kind: u8,
+        consumer_id: u32,
+        offset: u64,
+    ) -> Message<RequestHeader> {
+        let mut payload = Vec::with_capacity(13);
+        payload.push(consumer_kind);
+        payload.extend_from_slice(&consumer_id.to_le_bytes());
+        payload.extend_from_slice(&offset.to_le_bytes());
+
+        self.build_request_with_namespace(Operation::StoreConsumerOffset, &payload, namespace)
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -104,48 +121,27 @@ impl SimClient {
         payload: &[u8],
         namespace: IggyNamespace,
     ) -> Message<RequestHeader> {
-        use bytes::Bytes;
-
         let header_size = std::mem::size_of::<RequestHeader>();
         let total_size = header_size + payload.len();
 
-        let header = RequestHeader {
-            command: iggy_common::header::Command2::Request,
-            operation,
-            size: total_size as u32,
-            cluster: 0,
-            checksum: 0,
-            checksum_body: 0,
-            view: 0,
-            release: 0,
-            replica: 0,
-            reserved_frame: [0; 66],
-            client: self.client_id,
-            request_checksum: 0,
-            timestamp: 0,
-            request: self.next_request_number(),
-            namespace: namespace.inner(),
-            ..Default::default()
-        };
+        let header = self.request_header(operation, namespace, total_size);
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
         buffer.extend_from_slice(header_bytes);
         buffer.extend_from_slice(payload);
 
-        Message::<RequestHeader>::from_bytes(Bytes::from(buffer))
-            .expect("failed to build request message")
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
+            .expect("request buffer must contain a valid request message")
     }
 
     #[allow(clippy::cast_possible_truncation)]
     fn build_request(&self, operation: Operation, payload: &[u8]) -> Message<RequestHeader> {
-        use bytes::Bytes;
-
         let header_size = std::mem::size_of::<RequestHeader>();
         let total_size = header_size + payload.len();
 
         let header = RequestHeader {
-            command: iggy_common::header::Command2::Request,
+            command: iggy_binary_protocol::Command2::Request,
             operation,
             size: total_size as u32,
             cluster: 0, // TODO: Get from config
@@ -167,7 +163,34 @@ impl SimClient {
         buffer.extend_from_slice(header_bytes);
         buffer.extend_from_slice(payload);
 
-        Message::<RequestHeader>::from_bytes(Bytes::from(buffer))
-            .expect("failed to build request message")
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
+            .expect("request buffer must contain a valid request message")
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn request_header(
+        &self,
+        operation: Operation,
+        namespace: IggyNamespace,
+        total_size: usize,
+    ) -> RequestHeader {
+        RequestHeader {
+            command: iggy_binary_protocol::Command2::Request,
+            operation,
+            size: total_size as u32,
+            cluster: 0,
+            checksum: 0,
+            checksum_body: 0,
+            view: 0,
+            release: 0,
+            replica: 0,
+            reserved_frame: [0; 66],
+            client: self.client_id,
+            request_checksum: 0,
+            timestamp: 0,
+            request: self.next_request_number(),
+            namespace: namespace.inner(),
+            ..Default::default()
+        }
     }
 }

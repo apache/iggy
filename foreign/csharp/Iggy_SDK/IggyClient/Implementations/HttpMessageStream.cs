@@ -592,7 +592,7 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<UserResponse?> GetUser(Identifier userId, CancellationToken token = default)
+    public async Task<UserResponse?> GetUserAsync(Identifier userId, CancellationToken token = default)
     {
         //TODO - this doesn't work prob needs a custom json serializer
         var response = await _httpClient.GetAsync($"/users/{userId}", token);
@@ -606,7 +606,7 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<UserResponse>> GetUsers(CancellationToken token = default)
+    public async Task<IReadOnlyList<UserResponse>> GetUsersAsync(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync("/users", token);
         if (response.IsSuccessStatusCode)
@@ -620,7 +620,7 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<UserResponse?> CreateUser(string userName, string password, UserStatus status,
+    public async Task<UserResponse?> CreateUserAsync(string userName, string password, UserStatus status,
         Permissions? permissions = null, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new CreateUserRequest(userName, password, status, permissions),
@@ -638,7 +638,7 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task DeleteUser(Identifier userId, CancellationToken token = default)
+    public async Task DeleteUserAsync(Identifier userId, CancellationToken token = default)
     {
         var response = await _httpClient.DeleteAsync($"/users/{userId}", token);
         if (!response.IsSuccessStatusCode)
@@ -648,7 +648,7 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task UpdateUser(Identifier userId, string? userName = null, UserStatus? status = null,
+    public async Task UpdateUserAsync(Identifier userId, string? userName = null, UserStatus? status = null,
         CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new UpdateUserRequest(userName, status), _jsonSerializerOptions);
@@ -661,7 +661,7 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task UpdatePermissions(Identifier userId, Permissions? permissions = null,
+    public async Task UpdatePermissionsAsync(Identifier userId, Permissions? permissions = null,
         CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new UpdateUserPermissionsRequest(permissions), _jsonSerializerOptions);
@@ -674,7 +674,7 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task ChangePassword(Identifier userId, string currentPassword, string newPassword,
+    public async Task ChangePasswordAsync(Identifier userId, string currentPassword, string newPassword,
         CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new ChangePasswordRequest(currentPassword, newPassword),
@@ -688,7 +688,7 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<AuthResponse?> LoginUser(string userName, string password, CancellationToken token = default)
+    public async Task<AuthResponse?> LoginUserAsync(string userName, string password, CancellationToken token = default)
     {
         // TODO: Add binary protocol version
         var json = JsonSerializer.Serialize(new LoginUserRequest(userName, password, SdkVersion.Value, Context),
@@ -719,7 +719,7 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task LogoutUser(CancellationToken token = default)
+    public async Task LogoutUserAsync(CancellationToken token = default)
     {
         var response = await _httpClient.DeleteAsync("users/logout", token);
         if (!response.IsSuccessStatusCode)
@@ -774,7 +774,7 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<AuthResponse?> LoginWithPersonalAccessToken(string token, CancellationToken ct = default)
+    public async Task<AuthResponse?> LoginWithPersonalAccessTokenAsync(string token, CancellationToken ct = default)
     {
         var json = JsonSerializer.Serialize(new LoginWithPersonalAccessTokenRequest(token), _jsonSerializerOptions);
 

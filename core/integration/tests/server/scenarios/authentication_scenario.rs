@@ -23,16 +23,14 @@
 //! - LoginUser (authenticate with username/password)
 //! - LoginWithPersonalAccessToken (authenticate with PAT)
 //!
-//! Uses exhaustive matching on `ServerCommand` to ensure no command is missed
-//! when new commands are added.
+//! Covers all command codes from the dispatch table to ensure no command
+//! is missed when new commands are added.
 
 use crate::server::scenarios::create_client;
 use bytes::Bytes;
 use iggy::prelude::*;
+use iggy_binary_protocol::dispatch::COMMAND_TABLE;
 use integration::harness::{TestHarness, login_root};
-use secrecy::ExposeSecret;
-use server::binary::command::ServerCommand;
-use strum::IntoEnumIterator;
 
 const STREAM_NAME: &str = "auth-test-stream";
 const TOPIC_NAME: &str = "auth-test-topic";
@@ -91,7 +89,7 @@ pub async fn run(harness: &TestHarness) {
     );
 
     let identity = client
-        .login_with_personal_access_token(raw_pat.token.expose_secret())
+        .login_with_personal_access_token(&raw_pat.token)
         .await
         .expect("PAT login should work");
     assert_eq!(identity.user_id, 0, "PAT should authenticate as root");
@@ -104,142 +102,101 @@ pub async fn run(harness: &TestHarness) {
     cleanup_test_resources(&client).await;
 }
 
-/// Tests all commands require authentication using exhaustive matching.
-/// If a new command is added to ServerCommand, this match becomes non-exhaustive.
+/// Tests all commands require authentication by iterating the dispatch table.
+/// New entries in `COMMAND_TABLE` will hit the wildcard arm and panic,
+/// forcing an explicit decision about each new command.
 async fn test_all_commands_require_auth(client: &IggyClient) {
+    use iggy_binary_protocol::codes::*;
+
     let ctx = TestContext::new();
 
-    for cmd in ServerCommand::iter() {
-        let (name, result): (&str, Result<(), IggyError>) = match cmd {
-            // ================================================================
-            // NO AUTH REQUIRED (3 commands)
-            // ================================================================
-            ServerCommand::Ping(_)
-            | ServerCommand::LoginUser(_)
-            | ServerCommand::LoginWithPersonalAccessToken(_) => continue,
+    for entry in COMMAND_TABLE {
+        let code = entry.code;
+        let name = entry.name;
 
-            // ================================================================
-            // STATEFUL - NOT SUPPORTED ON HTTP (2 commands)
-            // ================================================================
-            ServerCommand::JoinConsumerGroup(_) | ServerCommand::LeaveConsumerGroup(_) => continue,
+        // ================================================================
+        // SKIPPED COMMANDS (8 total)
+        // ================================================================
+        // No auth required
+        if matches!(
+            code,
+            PING_CODE | LOGIN_USER_CODE | LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE
+        ) {
+            continue;
+        }
+        // Stateful - not supported on HTTP
+        if matches!(code, JOIN_CONSUMER_GROUP_CODE | LEAVE_CONSUMER_GROUP_CODE) {
+            continue;
+        }
+        // Special setup required
+        if matches!(
+            code,
+            GET_SNAPSHOT_FILE_CODE | DELETE_SEGMENTS_CODE | LOGOUT_USER_CODE
+        ) {
+            continue;
+        }
 
-            // ================================================================
-            // SPECIAL SETUP REQUIRED (3 commands)
-            // ================================================================
-            ServerCommand::GetSnapshot(_)
-            | ServerCommand::DeleteSegments(_)
-            | ServerCommand::LogoutUser(_) => continue,
-
-            // ================================================================
-            // REQUIRES AUTH (39 commands)
-            // ================================================================
-
+        // ================================================================
+        // REQUIRES AUTH
+        // ================================================================
+        let result: Result<(), IggyError> = match code {
             // System
-            ServerCommand::GetStats(_) => ("GetStats", client.get_stats().await.map(|_| ())),
-            ServerCommand::GetMe(_) => ("GetMe", client.get_me().await.map(|_| ())),
-            ServerCommand::GetClient(_) => ("GetClient", client.get_client(1).await.map(|_| ())),
-            ServerCommand::GetClients(_) => ("GetClients", client.get_clients().await.map(|_| ())),
-            ServerCommand::GetClusterMetadata(_) => (
-                "GetClusterMetadata",
-                client.get_cluster_metadata().await.map(|_| ()),
-            ),
+            GET_STATS_CODE => client.get_stats().await.map(|_| ()),
+            GET_ME_CODE => client.get_me().await.map(|_| ()),
+            GET_CLIENT_CODE => client.get_client(1).await.map(|_| ()),
+            GET_CLIENTS_CODE => client.get_clients().await.map(|_| ()),
+            GET_CLUSTER_METADATA_CODE => client.get_cluster_metadata().await.map(|_| ()),
 
             // Users
-            ServerCommand::GetUser(_) => {
-                ("GetUser", client.get_user(&ctx.user_id).await.map(|_| ()))
-            }
-            ServerCommand::GetUsers(_) => ("GetUsers", client.get_users().await.map(|_| ())),
-            ServerCommand::CreateUser(_) => (
-                "CreateUser",
-                client
-                    .create_user("test", "test", UserStatus::Active, None)
-                    .await
-                    .map(|_| ()),
-            ),
-            ServerCommand::DeleteUser(_) => ("DeleteUser", client.delete_user(&ctx.user_id).await),
-            ServerCommand::UpdateUser(_) => (
-                "UpdateUser",
-                client.update_user(&ctx.user_id, Some("x"), None).await,
-            ),
-            ServerCommand::UpdatePermissions(_) => (
-                "UpdatePermissions",
-                client.update_permissions(&ctx.user_id, None).await,
-            ),
-            ServerCommand::ChangePassword(_) => (
-                "ChangePassword",
-                client.change_password(&ctx.user_id, "old", "new").await,
-            ),
+            GET_USER_CODE => client.get_user(&ctx.user_id).await.map(|_| ()),
+            GET_USERS_CODE => client.get_users().await.map(|_| ()),
+            CREATE_USER_CODE => client
+                .create_user("test", "test", UserStatus::Active, None)
+                .await
+                .map(|_| ()),
+            DELETE_USER_CODE => client.delete_user(&ctx.user_id).await,
+            UPDATE_USER_CODE => client.update_user(&ctx.user_id, Some("x"), None).await,
+            UPDATE_PERMISSIONS_CODE => client.update_permissions(&ctx.user_id, None).await,
+            CHANGE_PASSWORD_CODE => client.change_password(&ctx.user_id, "old", "new").await,
 
             // PAT
-            ServerCommand::GetPersonalAccessTokens(_) => (
-                "GetPersonalAccessTokens",
-                client.get_personal_access_tokens().await.map(|_| ()),
-            ),
-            ServerCommand::CreatePersonalAccessToken(_) => (
-                "CreatePersonalAccessToken",
-                client
-                    .create_personal_access_token("x", PersonalAccessTokenExpiry::NeverExpire)
-                    .await
-                    .map(|_| ()),
-            ),
-            ServerCommand::DeletePersonalAccessToken(_) => (
-                "DeletePersonalAccessToken",
-                client.delete_personal_access_token("x").await,
-            ),
+            GET_PERSONAL_ACCESS_TOKENS_CODE => {
+                client.get_personal_access_tokens().await.map(|_| ())
+            }
+            CREATE_PERSONAL_ACCESS_TOKEN_CODE => client
+                .create_personal_access_token("x", PersonalAccessTokenExpiry::NeverExpire)
+                .await
+                .map(|_| ()),
+            DELETE_PERSONAL_ACCESS_TOKEN_CODE => client.delete_personal_access_token("x").await,
 
             // Streams
-            ServerCommand::GetStream(_) => (
-                "GetStream",
-                client.get_stream(&ctx.stream_id).await.map(|_| ()),
-            ),
-            ServerCommand::GetStreams(_) => ("GetStreams", client.get_streams().await.map(|_| ())),
-            ServerCommand::CreateStream(_) => {
-                ("CreateStream", client.create_stream("x").await.map(|_| ()))
-            }
-            ServerCommand::DeleteStream(_) => {
-                ("DeleteStream", client.delete_stream(&ctx.stream_id).await)
-            }
-            ServerCommand::UpdateStream(_) => (
-                "UpdateStream",
-                client.update_stream(&ctx.stream_id, "x").await,
-            ),
-            ServerCommand::PurgeStream(_) => {
-                ("PurgeStream", client.purge_stream(&ctx.stream_id).await)
-            }
+            GET_STREAM_CODE => client.get_stream(&ctx.stream_id).await.map(|_| ()),
+            GET_STREAMS_CODE => client.get_streams().await.map(|_| ()),
+            CREATE_STREAM_CODE => client.create_stream("x").await.map(|_| ()),
+            DELETE_STREAM_CODE => client.delete_stream(&ctx.stream_id).await,
+            UPDATE_STREAM_CODE => client.update_stream(&ctx.stream_id, "x").await,
+            PURGE_STREAM_CODE => client.purge_stream(&ctx.stream_id).await,
 
             // Topics
-            ServerCommand::GetTopic(_) => (
-                "GetTopic",
-                client
-                    .get_topic(&ctx.stream_id, &ctx.topic_id)
-                    .await
-                    .map(|_| ()),
-            ),
-            ServerCommand::GetTopics(_) => (
-                "GetTopics",
-                client.get_topics(&ctx.stream_id).await.map(|_| ()),
-            ),
-            ServerCommand::CreateTopic(_) => (
-                "CreateTopic",
-                client
-                    .create_topic(
-                        &ctx.stream_id,
-                        "x",
-                        1,
-                        CompressionAlgorithm::None,
-                        None,
-                        IggyExpiry::NeverExpire,
-                        MaxTopicSize::ServerDefault,
-                    )
-                    .await
-                    .map(|_| ()),
-            ),
-            ServerCommand::DeleteTopic(_) => (
-                "DeleteTopic",
-                client.delete_topic(&ctx.stream_id, &ctx.topic_id).await,
-            ),
-            ServerCommand::UpdateTopic(_) => (
-                "UpdateTopic",
+            GET_TOPIC_CODE => client
+                .get_topic(&ctx.stream_id, &ctx.topic_id)
+                .await
+                .map(|_| ()),
+            GET_TOPICS_CODE => client.get_topics(&ctx.stream_id).await.map(|_| ()),
+            CREATE_TOPIC_CODE => client
+                .create_topic(
+                    &ctx.stream_id,
+                    "x",
+                    1,
+                    CompressionAlgorithm::None,
+                    None,
+                    IggyExpiry::NeverExpire,
+                    MaxTopicSize::ServerDefault,
+                )
+                .await
+                .map(|_| ()),
+            DELETE_TOPIC_CODE => client.delete_topic(&ctx.stream_id, &ctx.topic_id).await,
+            UPDATE_TOPIC_CODE => {
                 client
                     .update_topic(
                         &ctx.stream_id,
@@ -250,118 +207,93 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                         IggyExpiry::NeverExpire,
                         MaxTopicSize::ServerDefault,
                     )
-                    .await,
-            ),
-            ServerCommand::PurgeTopic(_) => (
-                "PurgeTopic",
-                client.purge_topic(&ctx.stream_id, &ctx.topic_id).await,
-            ),
+                    .await
+            }
+            PURGE_TOPIC_CODE => client.purge_topic(&ctx.stream_id, &ctx.topic_id).await,
 
             // Partitions
-            ServerCommand::CreatePartitions(_) => (
-                "CreatePartitions",
+            CREATE_PARTITIONS_CODE => {
                 client
                     .create_partitions(&ctx.stream_id, &ctx.topic_id, 1)
-                    .await,
-            ),
-            ServerCommand::DeletePartitions(_) => (
-                "DeletePartitions",
+                    .await
+            }
+            DELETE_PARTITIONS_CODE => {
                 client
                     .delete_partitions(&ctx.stream_id, &ctx.topic_id, 1)
-                    .await,
-            ),
+                    .await
+            }
 
             // Messages
-            ServerCommand::SendMessages(_) => {
+            SEND_MESSAGES_CODE => {
                 let mut msgs = vec![
                     IggyMessage::builder()
                         .payload(Bytes::from("x"))
                         .build()
                         .unwrap(),
                 ];
-                (
-                    "SendMessages",
-                    client
-                        .send_messages(
-                            &ctx.stream_id,
-                            &ctx.topic_id,
-                            &Partitioning::partition_id(0),
-                            &mut msgs,
-                        )
-                        .await,
-                )
-            }
-            ServerCommand::PollMessages(_) => (
-                "PollMessages",
                 client
-                    .poll_messages(
+                    .send_messages(
                         &ctx.stream_id,
                         &ctx.topic_id,
-                        Some(0),
-                        &ctx.consumer,
-                        &PollingStrategy::offset(0),
-                        1,
-                        false,
+                        &Partitioning::partition_id(0),
+                        &mut msgs,
                     )
                     .await
-                    .map(|_| ()),
-            ),
-            ServerCommand::FlushUnsavedBuffer(_) => (
-                "FlushUnsavedBuffer",
+            }
+            POLL_MESSAGES_CODE => client
+                .poll_messages(
+                    &ctx.stream_id,
+                    &ctx.topic_id,
+                    Some(0),
+                    &ctx.consumer,
+                    &PollingStrategy::offset(0),
+                    1,
+                    false,
+                )
+                .await
+                .map(|_| ()),
+            FLUSH_UNSAVED_BUFFER_CODE => {
                 client
                     .flush_unsaved_buffer(&ctx.stream_id, &ctx.topic_id, 0, false)
-                    .await,
-            ),
+                    .await
+            }
 
             // Consumer Offsets
-            ServerCommand::GetConsumerOffset(_) => (
-                "GetConsumerOffset",
-                client
-                    .get_consumer_offset(&ctx.consumer, &ctx.stream_id, &ctx.topic_id, Some(0))
-                    .await
-                    .map(|_| ()),
-            ),
-            ServerCommand::StoreConsumerOffset(_) => (
-                "StoreConsumerOffset",
+            GET_CONSUMER_OFFSET_CODE => client
+                .get_consumer_offset(&ctx.consumer, &ctx.stream_id, &ctx.topic_id, Some(0))
+                .await
+                .map(|_| ()),
+            STORE_CONSUMER_OFFSET_CODE => {
                 client
                     .store_consumer_offset(&ctx.consumer, &ctx.stream_id, &ctx.topic_id, Some(0), 0)
-                    .await,
-            ),
-            ServerCommand::DeleteConsumerOffset(_) => (
-                "DeleteConsumerOffset",
+                    .await
+            }
+            DELETE_CONSUMER_OFFSET_CODE => {
                 client
                     .delete_consumer_offset(&ctx.consumer, &ctx.stream_id, &ctx.topic_id, Some(0))
-                    .await,
-            ),
+                    .await
+            }
 
             // Consumer Groups
-            ServerCommand::GetConsumerGroup(_) => (
-                "GetConsumerGroup",
-                client
-                    .get_consumer_group(&ctx.stream_id, &ctx.topic_id, &ctx.group_id)
-                    .await
-                    .map(|_| ()),
-            ),
-            ServerCommand::GetConsumerGroups(_) => (
-                "GetConsumerGroups",
-                client
-                    .get_consumer_groups(&ctx.stream_id, &ctx.topic_id)
-                    .await
-                    .map(|_| ()),
-            ),
-            ServerCommand::CreateConsumerGroup(_) => (
-                "CreateConsumerGroup",
-                client
-                    .create_consumer_group(&ctx.stream_id, &ctx.topic_id, "x")
-                    .await
-                    .map(|_| ()),
-            ),
-            ServerCommand::DeleteConsumerGroup(_) => (
-                "DeleteConsumerGroup",
+            GET_CONSUMER_GROUP_CODE => client
+                .get_consumer_group(&ctx.stream_id, &ctx.topic_id, &ctx.group_id)
+                .await
+                .map(|_| ()),
+            GET_CONSUMER_GROUPS_CODE => client
+                .get_consumer_groups(&ctx.stream_id, &ctx.topic_id)
+                .await
+                .map(|_| ()),
+            CREATE_CONSUMER_GROUP_CODE => client
+                .create_consumer_group(&ctx.stream_id, &ctx.topic_id, "x")
+                .await
+                .map(|_| ()),
+            DELETE_CONSUMER_GROUP_CODE => {
                 client
                     .delete_consumer_group(&ctx.stream_id, &ctx.topic_id, &ctx.group_id)
-                    .await,
-            ),
+                    .await
+            }
+
+            _ => panic!("Unhandled command code {code} ({name}) in auth test"),
         };
 
         assert_unauthenticated(result, name);

@@ -73,12 +73,18 @@ fn fair_size_cleanup_multipartition() -> CleanupScenarioFn {
     }
 }
 
+fn expiry_respects_consumer_offset() -> CleanupScenarioFn {
+    |client, path| {
+        Box::pin(message_cleanup_scenario::run_expiry_respects_consumer_offset(client, path))
+    }
+}
+
 async fn run_cleanup_scenario(scenario: CleanupScenarioFn) {
     let mut harness = TestHarness::builder()
         .server(
             TestServerConfig::builder()
                 .extra_envs(HashMap::from([
-                    ("IGGY_SYSTEM_SEGMENT_SIZE".to_string(), "100KiB".to_string()),
+                    ("IGGY_SYSTEM_SEGMENT_SIZE".to_string(), "10KiB".to_string()),
                     (
                         "IGGY_DATA_MAINTENANCE_MESSAGES_CLEANER_ENABLED".to_string(),
                         "true".to_string(),
@@ -116,6 +122,7 @@ async fn run_cleanup_scenario(scenario: CleanupScenarioFn) {
     combined_retention(),
     expiry_multipartition(),
     fair_size_cleanup_multipartition(),
+    expiry_respects_consumer_offset(),
 ])]
 #[tokio::test]
 #[parallel]

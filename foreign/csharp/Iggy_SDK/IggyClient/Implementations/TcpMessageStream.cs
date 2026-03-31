@@ -626,7 +626,7 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<UserResponse?> GetUser(Identifier userId, CancellationToken token = default)
+    public async Task<UserResponse?> GetUserAsync(Identifier userId, CancellationToken token = default)
     {
         var message = TcpContracts.GetUser(userId);
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
@@ -643,7 +643,7 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<IReadOnlyList<UserResponse>> GetUsers(CancellationToken token = default)
+    public async Task<IReadOnlyList<UserResponse>> GetUsersAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
@@ -660,7 +660,7 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<UserResponse?> CreateUser(string userName, string password, UserStatus status,
+    public async Task<UserResponse?> CreateUserAsync(string userName, string password, UserStatus status,
         Permissions? permissions = null, CancellationToken token = default)
     {
         var message = TcpContracts.CreateUser(userName, password, status, permissions);
@@ -678,7 +678,7 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task DeleteUser(Identifier userId, CancellationToken token = default)
+    public async Task DeleteUserAsync(Identifier userId, CancellationToken token = default)
     {
         var message = TcpContracts.DeleteUser(userId);
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
@@ -688,7 +688,7 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task UpdateUser(Identifier userId, string? userName = null, UserStatus? status = null,
+    public async Task UpdateUserAsync(Identifier userId, string? userName = null, UserStatus? status = null,
         CancellationToken token = default)
     {
         var message = TcpContracts.UpdateUser(userId, userName, status);
@@ -699,7 +699,7 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task UpdatePermissions(Identifier userId, Permissions? permissions = null,
+    public async Task UpdatePermissionsAsync(Identifier userId, Permissions? permissions = null,
         CancellationToken token = default)
     {
         var message = TcpContracts.UpdatePermissions(userId, permissions);
@@ -710,7 +710,7 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task ChangePassword(Identifier userId, string currentPassword, string newPassword,
+    public async Task ChangePasswordAsync(Identifier userId, string currentPassword, string newPassword,
         CancellationToken token = default)
     {
         var message = TcpContracts.ChangePassword(userId, currentPassword, newPassword);
@@ -721,7 +721,7 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<AuthResponse?> LoginUser(string userName, string password, CancellationToken token = default)
+    public async Task<AuthResponse?> LoginUserAsync(string userName, string password, CancellationToken token = default)
     {
         if (_state == ConnectionState.Disconnected)
         {
@@ -747,7 +747,7 @@ public sealed class TcpMessageStream : IIggyClient
         if (await RedirectAsync(token))
         {
             await ConnectAsync(token);
-            return await LoginUser(userName, password, token);
+            return await LoginUserAsync(userName, password, token);
         }
 
         var authResponse = new AuthResponse(userId, null);
@@ -755,7 +755,7 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task LogoutUser(CancellationToken token = default)
+    public async Task LogoutUserAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
@@ -811,7 +811,7 @@ public sealed class TcpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
-    public async Task<AuthResponse?> LoginWithPersonalAccessToken(string token, CancellationToken ct = default)
+    public async Task<AuthResponse?> LoginWithPersonalAccessTokenAsync(string token, CancellationToken ct = default)
     {
         var message = TcpContracts.LoginWithPersonalAccessToken(token);
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
@@ -832,7 +832,7 @@ public sealed class TcpMessageStream : IIggyClient
         if (await RedirectAsync(ct))
         {
             await ConnectAsync(ct);
-            return await LoginWithPersonalAccessToken(token, ct);
+            return await LoginWithPersonalAccessTokenAsync(token, ct);
         }
 
         return new AuthResponse(userId, null);
@@ -883,7 +883,7 @@ public sealed class TcpMessageStream : IIggyClient
                 {
                     _logger.LogInformation("Auto login enabled. Trying to login with credentials: {Username}",
                         _configuration.AutoLoginSettings.Username);
-                    await LoginUser(_configuration.AutoLoginSettings.Username,
+                    await LoginUserAsync(_configuration.AutoLoginSettings.Username,
                         _configuration.AutoLoginSettings.Password, token);
                 }
 

@@ -17,21 +17,25 @@
 use crate::stm::StateMachine;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
 use consensus::{
-    Consensus, Pipeline, PipelineEntry, Plane, PlaneIdentity, Project, Sequencer, VsrConsensus,
-    ack_preflight, ack_quorum_reached, build_reply_message, drain_committable_prefix,
+    CommitLogEvent, Consensus, Pipeline, PipelineEntry, Plane, PlaneIdentity, PlaneKind, Project,
+    ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
+    ack_quorum_reached, build_reply_message, drain_committable_prefix, emit_sim_event,
     fence_old_prepare_by_commit, panic_if_hash_chain_would_break_in_same_view,
     pipeline_prepare_common, replicate_preflight, replicate_to_next_in_chain,
     send_prepare_ok as send_prepare_ok_common,
 };
-use iggy_common::{
-    header::{
-        Command2, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader,
-    },
-    message::Message,
+use iggy_binary_protocol::{
+    Command2, ConsensusHeader, GenericHeader, Message, PrepareHeader, PrepareOkHeader,
+    RequestHeader,
 };
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use tracing::{debug, warn};
+use std::path::Path;
+use tracing::{debug, error, warn};
+
+const fn freeze_client_reply(message: Message<GenericHeader>) -> Message<GenericHeader> {
+    message
+}
 
 #[derive(Debug, Clone)]
 #[allow(unused)]
@@ -51,6 +55,67 @@ impl IggySnapshot {
     #[must_use]
     pub const fn snapshot(&self) -> &MetadataSnapshot {
         &self.snapshot
+    }
+
+    /// Persist the snapshot to disk.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError` if serialization or I/O fails.
+    pub fn persist(&self, path: &Path) -> Result<(), SnapshotError> {
+        use crate::stm::snapshot::PersistStage;
+        use std::fs;
+        use std::io::Write;
+
+        let encoded = self.encode()?;
+
+        let tmp_path = path.with_extension("bin.tmp");
+
+        let mut file = fs::File::create(&tmp_path).map_err(|e| SnapshotError::Persist {
+            stage: PersistStage::Write,
+            source: e,
+        })?;
+        file.write_all(&encoded)
+            .map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::Write,
+                source: e,
+            })?;
+        file.sync_all().map_err(|e| SnapshotError::Persist {
+            stage: PersistStage::Sync,
+            source: e,
+        })?;
+        drop(file);
+
+        fs::rename(&tmp_path, path).map_err(|e| SnapshotError::Persist {
+            stage: PersistStage::Rename,
+            source: e,
+        })?;
+
+        // Fsync the parent directory to ensure the rename is durable.
+        if let Some(parent) = path.parent() {
+            let dir = fs::File::open(parent).map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::DirSync,
+                source: e,
+            })?;
+            dir.sync_all().map_err(|e| SnapshotError::Persist {
+                stage: PersistStage::DirSync,
+                source: e,
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Load a snapshot from disk.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError` if the file cannot be read or deserialization fails.
+    pub fn load(path: &Path) -> Result<Self, SnapshotError> {
+        let data = std::fs::read(path)?;
+
+        // TODO: when checksum is added we need to check
+        // if data.len() is atleast the size of checksum
+
+        Self::decode(data.as_slice())
     }
 }
 
@@ -89,7 +154,88 @@ impl Snapshot for IggySnapshot {
     }
 }
 
-#[derive(Debug)]
+/// Coordinates snapshot creation, persistence, and WAL compaction.
+///
+/// Owns the data directory path and the snapshot creation function.
+pub struct SnapshotCoordinator<M> {
+    data_dir: std::path::PathBuf,
+    create_snapshot: fn(&M, u64) -> Result<IggySnapshot, SnapshotError>,
+}
+
+impl<M> SnapshotCoordinator<M> {
+    /// Number of remaining journal slots at which a checkpoint is forced.
+    // TODO: tune this margin size
+    const CHECKPOINT_MARGIN: usize = 64;
+
+    #[must_use]
+    pub fn new(
+        data_dir: std::path::PathBuf,
+        create_snapshot: fn(&M, u64) -> Result<IggySnapshot, SnapshotError>,
+    ) -> Self {
+        Self {
+            data_dir,
+            create_snapshot,
+        }
+    }
+
+    /// Create a snapshot, persist it, and drain snapshotted entries from the
+    /// journal to reclaim WAL space.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError` if snapshotting, persistence, or drain fails.
+    #[allow(clippy::future_not_send)]
+    pub async fn checkpoint<J>(
+        &self,
+        stm: &M,
+        journal: &J,
+        last_op: u64,
+    ) -> Result<(), SnapshotError>
+    where
+        J: JournalHandle,
+    {
+        let snapshot = (self.create_snapshot)(stm, last_op)?;
+        let path = self.data_dir.join(super::METADATA_DIR).join("snapshot.bin");
+        snapshot.persist(&path)?;
+
+        let _ = journal
+            .handle()
+            .drain(0..=last_op)
+            .await
+            .map_err(SnapshotError::Io)?;
+
+        Ok(())
+    }
+
+    /// Force a checkpoint if the journal is running low on capacity.
+    ///
+    /// Returns `Ok(true)` if a checkpoint was taken, `Ok(false)` if not needed.
+    ///
+    /// # Errors
+    /// Returns `SnapshotError` if the checkpoint fails.
+    #[allow(clippy::future_not_send)]
+    pub async fn checkpoint_if_needed<J>(
+        &self,
+        stm: &M,
+        journal: &J,
+        commit_op: u64,
+    ) -> Result<bool, SnapshotError>
+    where
+        J: JournalHandle,
+    {
+        let needs_checkpoint = journal
+            .handle()
+            .remaining_capacity()
+            .is_some_and(|c| c <= Self::CHECKPOINT_MARGIN);
+
+        if needs_checkpoint {
+            self.checkpoint(stm, journal, commit_op).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
 pub struct IggyMetadata<C, J, S, M> {
     /// Some on shard0, None on other shards
     pub consensus: Option<C>,
@@ -99,6 +245,36 @@ pub struct IggyMetadata<C, J, S, M> {
     pub snapshot: Option<S>,
     /// State machine - lives on all shards
     pub mux_stm: M,
+    /// Snapshot coordinator - present when persistent checkpointing is configured.
+    pub coordinator: Option<SnapshotCoordinator<M>>,
+}
+
+impl<C, J, S, M> IggyMetadata<C, J, S, M>
+where
+    M: FillSnapshot<MetadataSnapshot>,
+{
+    /// Create a new `IggyMetadata` instance.
+    ///
+    /// The `FillSnapshot<MetadataSnapshot>` bound is captured here via a
+    /// function pointer so that no downstream caller needs the bound.
+    #[must_use]
+    pub fn new(
+        consensus: Option<C>,
+        journal: Option<J>,
+        snapshot: Option<S>,
+        mux_stm: M,
+        data_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        let coordinator = data_dir
+            .map(|dir| SnapshotCoordinator::new(dir, |stm, seq| IggySnapshot::create(stm, seq)));
+        Self {
+            consensus,
+            journal,
+            snapshot,
+            mux_stm,
+            coordinator,
+        }
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -116,24 +292,40 @@ where
     async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
 
-        // TODO: Bunch of asserts.
-        debug!("handling metadata request");
+        emit_sim_event(
+            SimEventKind::ClientRequestReceived,
+            &RequestLogEvent {
+                replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Metadata),
+                client_id: message.header().client,
+                request_id: message.header().request,
+                operation: message.header().operation,
+            },
+        );
         let prepare = message.project(consensus);
-        pipeline_prepare_common(consensus, prepare, |prepare| self.on_replicate(prepare)).await;
+        pipeline_prepare_common(consensus, PlaneKind::Metadata, prepare, |prepare| {
+            self.on_replicate(prepare)
+        })
+        .await;
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
-        let header = message.header();
+        let header = *message.header();
 
-        let current_op = match replicate_preflight(consensus, header) {
+        let current_op = match replicate_preflight(consensus, &header) {
             Ok(current_op) => current_op,
             Err(reason) => {
                 warn!(
-                    replica = consensus.replica(),
-                    "on_replicate: ignoring ({reason})"
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    view = consensus.view(),
+                    op = header.op,
+                    operation = ?header.operation,
+                    reason = reason.as_str(),
+                    "ignoring prepare during replicate preflight"
                 );
                 return;
             }
@@ -141,23 +333,62 @@ where
 
         // TODO: Handle idx calculation, for now using header.op, but since the journal may get compacted, this may not be correct.
         #[allow(clippy::cast_possible_truncation)]
-        let is_old_prepare = fence_old_prepare_by_commit(consensus, header)
+        let is_old_prepare = fence_old_prepare_by_commit(consensus, &header)
             || journal.handle().header(header.op as usize).is_some();
-        if is_old_prepare {
-            warn!("received old prepare, not replicating");
+        let message = if is_old_prepare {
+            warn!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                view = consensus.view(),
+                op = header.op,
+                commit = consensus.commit(),
+                operation = ?header.operation,
+                "received old prepare, skipping replication"
+            );
+            message
         } else {
-            self.replicate(message.clone()).await;
-        }
+            self.replicate(message).await
+        };
 
         // TODO add assertions for valid state here.
 
-        // TODO verify that the current prepare fits in the WAL.
-
         // TODO handle gap in ops.
 
+        // Force a checkpoint if the journal is running low on capacity.
+        if let Some(coordinator) = &self.coordinator {
+            let snap_op = consensus.commit();
+            match coordinator
+                .checkpoint_if_needed(&self.mux_stm, journal, snap_op)
+                .await
+            {
+                Ok(true) => {
+                    debug!(
+                        target: "iggy.metadata.diag",
+                        plane = "metadata",
+                        replica_id = consensus.replica(),
+                        checkpoint_op = snap_op,
+                        "forced checkpoint completed"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    error!(
+                        target: "iggy.metadata.diag",
+                        plane = "metadata",
+                        replica_id = consensus.replica(),
+                        checkpoint_op = snap_op,
+                        error = %e,
+                        "forced checkpoint failed"
+                    );
+                    return;
+                }
+            }
+        }
+
         // Verify hash chain integrity.
-        if let Some(previous) = journal.handle().previous_header(header) {
-            panic_if_hash_chain_would_break_in_same_view(&previous, header);
+        if let Some(previous) = journal.handle().previous_header(&header) {
+            panic_if_hash_chain_would_break_in_same_view(&previous, &header);
         }
 
         assert_eq!(header.op, current_op + 1);
@@ -166,10 +397,21 @@ where
         consensus.set_last_prepare_checksum(header.checksum);
 
         // Append to journal.
-        journal.handle().append(message.clone()).await;
+        if let Err(e) = journal.handle().append(message).await {
+            error!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                op = header.op,
+                operation = ?header.operation,
+                error = %e,
+                "journal append failed"
+            );
+            return;
+        }
 
         // After successful journal write, send prepare_ok to primary.
-        self.send_prepare_ok(header).await;
+        self.send_prepare_ok(&header).await;
 
         // If follower, commit any newly committable entries.
         if consensus.is_follower() {
@@ -182,33 +424,57 @@ where
         let header = message.header();
 
         if let Err(reason) = ack_preflight(consensus) {
-            warn!("on_ack: ignoring ({reason})");
+            warn!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                view = consensus.view(),
+                op = header.op,
+                reason = reason.as_str(),
+                "ignoring ack during preflight"
+            );
             return;
         }
 
         {
             let pipeline = consensus.pipeline().borrow();
             if pipeline
-                .message_by_op_and_checksum(header.op, header.prepare_checksum)
+                .entry_by_op_and_checksum(header.op, header.prepare_checksum)
                 .is_none()
             {
-                debug!("on_ack: prepare not in pipeline op={}", header.op);
+                debug!(
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    op = header.op,
+                    prepare_checksum = header.prepare_checksum,
+                    "ack target prepare not in pipeline"
+                );
                 return;
             }
         }
 
-        if ack_quorum_reached(consensus, header) {
+        if ack_quorum_reached(consensus, PlaneKind::Metadata, header) {
             let journal = self.journal.as_ref().unwrap();
 
-            debug!("on_ack: quorum received for op={}", header.op);
+            debug!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                op = header.op,
+                "ack quorum received"
+            );
 
             let drained = drain_committable_prefix(consensus);
             if let (Some(first), Some(last)) = (drained.first(), drained.last()) {
                 debug!(
-                    "on_ack: draining committed prefix ops=[{}..={}] count={}",
-                    first.header.op,
-                    last.header.op,
-                    drained.len()
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    first_op = first.header.op,
+                    last_op = last.header.op,
+                    drained_count = drained.len(),
+                    "draining committed metadata prefix"
                 );
             }
 
@@ -230,24 +496,36 @@ where
 
                 let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
                     warn!(
-                        "on_ack: state machine error for op={}: {err}",
-                        prepare_header.op
+                        target: "iggy.metadata.diag",
+                        plane = "metadata",
+                        replica_id = consensus.replica(),
+                        op = prepare_header.op,
+                        operation = ?prepare_header.operation,
+                        error = %err,
+                        "state machine update failed for committed metadata entry"
                     );
                     bytes::Bytes::new()
                 });
-                debug!("on_ack: state applied for op={}", prepare_header.op);
+                let pipeline_depth = consensus.pipeline().borrow().len();
+                let event = CommitLogEvent {
+                    replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Metadata),
+                    op: prepare_header.op,
+                    client_id: prepare_header.client,
+                    request_id: prepare_header.request,
+                    operation: prepare_header.operation,
+                    pipeline_depth,
+                };
+                emit_sim_event(SimEventKind::OperationCommitted, &event);
 
                 let generic_reply =
                     build_reply_message(consensus, &prepare_header, response).into_generic();
-                debug!(
-                    "on_ack: sending reply to client={} for op={}",
-                    prepare_header.client, prepare_header.op
-                );
+                let reply_buffers = freeze_client_reply(generic_reply);
+                emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
 
                 // TODO: Propagate send error instead of panicking; requires bus error design.
                 consensus
                     .message_bus()
-                    .send_to_client(prepare_header.client, generic_reply)
+                    .send_to_client(prepare_header.client, reply_buffers)
                     .await
                     .unwrap();
             }
@@ -258,7 +536,7 @@ where
 impl<B, P, J, S, M> PlaneIdentity<VsrConsensus<B, P>> for IggyMetadata<VsrConsensus<B, P>, J, S, M>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StateMachine<Input = Message<PrepareHeader>>,
@@ -278,7 +556,7 @@ where
 impl<B, P, J, S, M> IggyMetadata<VsrConsensus<B, P>, J, S, M>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StateMachine<Input = Message<PrepareHeader>>,
@@ -290,11 +568,11 @@ where
     /// - Each backup forwards to the next
     /// - Stops when we would forward back to primary
     #[allow(clippy::future_not_send)]
-    async fn replicate(&self, message: Message<PrepareHeader>) {
+    async fn replicate(&self, message: Message<PrepareHeader>) -> Message<PrepareHeader> {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
-        let header = message.header();
+        let header = *message.header();
 
         // TODO: calculate the index;
         #[allow(clippy::cast_possible_truncation)]
@@ -304,7 +582,7 @@ where
             journal.handle().header(idx).is_none(),
             "replicate: must not already have prepare"
         );
-        replicate_to_next_in_chain(consensus, message).await;
+        replicate_to_next_in_chain(consensus, message).await
     }
 
     // TODO: Implement jump_to_newer_op

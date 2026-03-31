@@ -109,7 +109,8 @@ components:
       - "sort"
       - "doctest"
       - "machete"
-      - "test"
+      - "test-1"
+      - "test-2"
       - "compat"
       - "build-aarch64-gnu"
       - "build-aarch64-musl"
@@ -371,6 +372,11 @@ components:
     paths:
       - "web/**"
     tasks: ["lint", "build"]
+
+  helm:
+    paths:
+      - "helm/**"
+    tasks: ["validate", "smoke"]
 
   rust-bench-dashboard:
     paths:

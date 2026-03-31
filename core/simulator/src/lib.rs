@@ -23,10 +23,13 @@ pub mod packet;
 pub mod ready_queue;
 pub mod replica;
 
-use bus::MemBus;
-use iggy_common::header::ReplyHeader;
-use iggy_common::message::Message;
+use bus::{EnvelopePayload, MemBus};
+use consensus::PartitionsHandle;
+use iggy_binary_protocol::{GenericHeader, Message, ReplyHeader};
+use iggy_common::IggyError;
+use iggy_common::sharding::IggyNamespace;
 use message_bus::MessageBus;
+use partitions::{Partition, PartitionOffsets, PollQueryResult, PollingArgs, PollingConsumer};
 use replica::{Replica, new_replica};
 use std::sync::Arc;
 
@@ -104,17 +107,22 @@ impl Simulator {
     pub async fn step(&self) -> Option<Message<ReplyHeader>> {
         if let Some(envelope) = self.message_bus.receive() {
             if let Some(_client_id) = envelope.to_client {
-                let reply: Message<ReplyHeader> = envelope
-                    .message
+                let EnvelopePayload::Client(message) = envelope.payload else {
+                    panic!("client envelope must carry a reply message");
+                };
+                let reply: Message<ReplyHeader> = message
                     .try_into_typed()
-                    .expect("invalid message, wrong command type for an client response");
+                    .expect("invalid message, wrong command type for a client response");
                 return Some(reply);
             }
 
             if let Some(replica_id) = envelope.to_replica
                 && let Some(replica) = self.replicas.get(replica_id as usize)
             {
-                self.dispatch_to_replica(replica, envelope.message).await;
+                let EnvelopePayload::Replica(message) = envelope.payload else {
+                    panic!("replica envelope must carry a replica message");
+                };
+                self.dispatch_to_replica(replica, message).await;
             }
         }
 
@@ -122,11 +130,7 @@ impl Simulator {
     }
 
     #[allow(clippy::future_not_send)]
-    async fn dispatch_to_replica(
-        &self,
-        replica: &Replica,
-        message: Message<iggy_common::header::GenericHeader>,
-    ) {
+    async fn dispatch_to_replica(&self, replica: &Replica, message: Message<GenericHeader>) {
         replica.on_message(message).await;
 
         let mut buf = Vec::new();
@@ -136,6 +140,44 @@ impl Simulator {
             0,
             "on_ack must not re-enqueue loopback messages"
         );
+    }
+}
+
+impl Simulator {
+    /// Poll messages directly from a replica's partition.
+    ///
+    /// # Errors
+    /// Returns `IggyError::ResourceNotFound` if the namespace does not exist on this replica.
+    #[allow(clippy::future_not_send)]
+    pub async fn poll_messages(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+        consumer: PollingConsumer,
+        args: PollingArgs,
+    ) -> Result<PollQueryResult<4096>, IggyError> {
+        let replica = &self.replicas[replica_idx];
+        let partition =
+            replica
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .ok_or(IggyError::ResourceNotFound(format!(
+                    "partition not found for namespace {namespace:?} on replica {replica_idx}"
+                )))?;
+        partition.poll_messages(consumer, args).await
+    }
+
+    /// Get partition offsets from a replica.
+    #[must_use]
+    pub fn offsets(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+    ) -> Option<PartitionOffsets> {
+        let replica = &self.replicas[replica_idx];
+        let partition = replica.plane.partitions().get_by_ns(&namespace)?;
+        Some(partition.offsets())
     }
 }
 

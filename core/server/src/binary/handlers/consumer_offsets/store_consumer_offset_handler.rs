@@ -18,63 +18,47 @@
 
 use std::rc::Rc;
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
+use crate::binary::dispatch::{HandlerResult, wire_consumer_to_consumer, wire_id_to_identifier};
 use crate::binary::handlers::consumer_offsets::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use err_trail::ErrContext;
+use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
-use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use tracing::debug;
 
-impl ServerCommandHandler for StoreConsumerOffset {
-    fn code(&self) -> u32 {
-        iggy_common::STORE_CONSUMER_OFFSET_CODE
-    }
-
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
-        let topic = shard.resolve_topic_for_store_consumer_offset(
-            session.get_user_id(),
-            &self.stream_id,
-            &self.topic_id,
-        )?;
-        shard
-            .store_consumer_offset(
-                session.client_id,
-                self.consumer,
-                topic,
-                self.partition_id,
-                self.offset,
-            )
-            .await
-            .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to store consumer offset for stream_id: {}, topic_id: {}, partition_id: {:?}, offset: {}, session: {}",
-                self.stream_id, self.topic_id, self.partition_id, self.offset, session
-            ))?;
-        sender.send_empty_ok_response().await?;
-        Ok(HandlerResult::Finished)
-    }
-}
-
-impl BinaryServerCommand for StoreConsumerOffset {
-    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::StoreConsumerOffset(store_consumer_offset) => Ok(store_consumer_offset),
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+pub async fn handle_store_consumer_offset(
+    req: StoreConsumerOffsetRequest,
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    let consumer = wire_consumer_to_consumer(&req.consumer)?;
+    let stream_id = wire_id_to_identifier(&req.stream_id)?;
+    let topic_id = wire_id_to_identifier(&req.topic_id)?;
+    debug!(
+        "session: {session}, command: store_consumer_offset, stream_id: {stream_id}, topic_id: {topic_id}, partition_id: {:?}, offset: {}",
+        req.partition_id, req.offset
+    );
+    shard.ensure_authenticated(session)?;
+    let topic = shard.resolve_topic_for_store_consumer_offset(
+        session.get_user_id(),
+        &stream_id,
+        &topic_id,
+    )?;
+    shard
+        .store_consumer_offset(
+            session.client_id,
+            consumer,
+            topic,
+            req.partition_id,
+            req.offset,
+        )
+        .await
+        .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to store consumer offset for stream_id: {}, topic_id: {}, partition_id: {:?}, offset: {}, session: {}",
+            stream_id, topic_id, req.partition_id, req.offset, session
+        ))?;
+    sender.send_empty_ok_response().await?;
+    Ok(HandlerResult::Finished)
 }

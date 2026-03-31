@@ -52,7 +52,7 @@ public class IggyTlsConnectionTests
         });
 
         await client.ConnectAsync();
-        var loginResult = await client.LoginUser("iggy", "iggy");
+        var loginResult = await client.LoginUserAsync("iggy", "iggy");
 
         loginResult.ShouldNotBeNull();
     }
@@ -68,7 +68,7 @@ public class IggyTlsConnectionTests
         });
 
         await client.ConnectAsync();
-        await Should.ThrowAsync<IggyZeroBytesException>(client.LoginUser("iggy", "iggy"));
+        await Should.ThrowAsync<IggyZeroBytesException>(client.LoginUserAsync("iggy", "iggy"));
     }
 
     [Test]
@@ -94,7 +94,7 @@ public class IggyTlsConnectionTests
         });
 
         await client.ConnectAsync();
-        var loginResult = await client.LoginUser("iggy", "iggy");
+        var loginResult = await client.LoginUserAsync("iggy", "iggy");
 
         loginResult.ShouldNotBeNull();
     }

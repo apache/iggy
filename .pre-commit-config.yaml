@@ -87,6 +87,14 @@ repos:
         files: ^foreign/python/(Cargo\.toml|pyproject\.toml)$
         pass_filenames: false
 
+      - id: uv-lock-check
+        name: uv lock check
+        entry: ./scripts/ci/uv-lock-check.sh
+        args: ["--fix"]
+        language: system
+        files: ^(foreign|bdd|examples)/python/(pyproject\.toml|uv\.lock)$
+        pass_filenames: false
+
       - id: trailing-whitespace
         name: trailing whitespace
         entry: ./scripts/ci/trailing-whitespace.sh

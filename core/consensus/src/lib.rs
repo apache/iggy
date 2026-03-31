@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_common::header::ConsensusHeader;
-use iggy_common::message::ConsensusMessage;
+use iggy_binary_protocol::{ConsensusHeader, ConsensusMessage};
 use message_bus::MessageBus;
 
 pub trait Project<T, C: Consensus> {
@@ -25,26 +24,27 @@ pub trait Project<T, C: Consensus> {
 }
 
 pub trait Pipeline {
-    type Message;
     type Entry;
 
-    fn push_message(&mut self, message: Self::Message);
+    fn push(&mut self, entry: Self::Entry);
 
-    fn pop_message(&mut self) -> Option<Self::Entry>;
+    fn pop(&mut self) -> Option<Self::Entry>;
 
     fn clear(&mut self);
 
-    fn message_by_op(&self, op: u64) -> Option<&Self::Entry>;
+    fn entry_by_op(&self, op: u64) -> Option<&Self::Entry>;
 
-    fn message_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry>;
+    fn entry_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry>;
 
-    fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&Self::Entry>;
+    fn entry_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&Self::Entry>;
 
     fn head(&self) -> Option<&Self::Entry>;
 
     fn is_full(&self) -> bool;
 
     fn is_empty(&self) -> bool;
+
+    fn len(&self) -> usize;
 
     fn verify(&self);
 }
@@ -63,9 +63,9 @@ pub trait Consensus: Sized {
     type AckHeader: ConsensusHeader;
 
     type Sequencer: Sequencer;
-    type Pipeline: Pipeline<Message = Self::Message<Self::ReplicateHeader>>;
+    type Pipeline: Pipeline;
 
-    fn pipeline_message(&self, message: Self::Message<Self::ReplicateHeader>);
+    fn pipeline_message(&self, plane: PlaneKind, message: &Self::Message<Self::ReplicateHeader>);
     fn verify_pipeline(&self);
 
     fn is_follower(&self) -> bool;
@@ -85,11 +85,11 @@ where
 {
     fn on_request(&self, message: RequestMessage<C>) -> impl Future<Output = ()>
     where
-        RequestMessage<C>: Project<ReplicateMessage<C>, C, Consensus = C> + Clone;
+        RequestMessage<C>: Project<ReplicateMessage<C>, C, Consensus = C>;
 
     fn on_replicate(&self, message: ReplicateMessage<C>) -> impl Future<Output = ()>
     where
-        ReplicateMessage<C>: Project<AckMessage<C>, C, Consensus = C> + Clone;
+        ReplicateMessage<C>: Project<AckMessage<C>, C, Consensus = C>;
 
     fn on_ack(&self, message: AckMessage<C>) -> impl Future<Output = ()>;
 }
@@ -111,6 +111,8 @@ mod namespaced_pipeline;
 pub use namespaced_pipeline::*;
 mod plane_helpers;
 pub use plane_helpers::*;
+mod observability;
+pub use observability::*;
 
 mod view_change_quorum;
 pub use view_change_quorum::*;

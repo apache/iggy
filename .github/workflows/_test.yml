@@ -63,11 +63,12 @@ jobs:
           component: ${{ inputs.component }}
 
       - name: Upload coverage to Codecov
-        if: startsWith(inputs.component, 'rust') && inputs.task == 'test'
+        if: startsWith(inputs.component, 'rust') && startsWith(inputs.task, 'test-')
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: codecov.json
+          disable_search: true
           flags: rust
           fail_ci_if_error: false
           verbose: true
@@ -76,7 +77,7 @@ jobs:
       # Python SDK
       - name: Set up Docker Buildx for Python
         if: inputs.component == 'sdk-python' && inputs.task == 'test'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Run Python SDK task
         if: inputs.component == 'sdk-python'
@@ -190,6 +191,29 @@ jobs:
           elif [ "${{ inputs.task }}" = "build" ]; then
             npm run build
           fi
+
+      # Helm chart testing
+      - name: Setup Helm test tools
+        if: inputs.component == 'helm' && (inputs.task == 'validate' || inputs.task == 'smoke')
+        uses: ./.github/actions/utils/setup-helm-tools
+        with:
+          install-kind: ${{ inputs.task == 'smoke' }}
+
+      - name: Setup Helm smoke cluster
+        if: inputs.component == 'helm' && inputs.task == 'smoke'
+        run: scripts/ci/setup-helm-smoke-cluster.sh
+
+      - name: Validate Helm chart
+        if: inputs.component == 'helm' && inputs.task == 'validate'
+        run: scripts/ci/test-helm.sh validate
+
+      - name: Smoke test Helm chart runtime
+        if: inputs.component == 'helm' && inputs.task == 'smoke'
+        run: scripts/ci/test-helm.sh smoke --cleanup
+
+      - name: Collect Helm smoke diagnostics
+        if: failure() && inputs.component == 'helm' && inputs.task == 'smoke'
+        run: scripts/ci/test-helm.sh collect-smoke-diagnostics
 
       # CI workflow validation
       - name: Validate CI workflows

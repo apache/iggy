@@ -18,8 +18,7 @@
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, Receiver, ShardFrame};
 use futures::FutureExt;
-use iggy_common::header::{ConsensusError, GenericHeader, PrepareHeader};
-use iggy_common::message::{Message, MessageBag};
+use iggy_binary_protocol::{ConsensusError, GenericHeader, Message, MessageBag, PrepareHeader};
 use iggy_common::sharding::IggyNamespace;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
@@ -52,17 +51,17 @@ where
             }
         };
         let (operation, namespace, generic) = match bag {
-            MessageBag::Request(ref r) => {
-                let h = r.header();
-                (h.operation, h.namespace, r.as_generic().clone())
+            MessageBag::Request(r) => {
+                let h = *r.header();
+                (h.operation, h.namespace, r.into_generic())
             }
-            MessageBag::Prepare(ref p) => {
-                let h = p.header();
-                (h.operation, h.namespace, p.as_generic().clone())
+            MessageBag::Prepare(p) => {
+                let h = *p.header();
+                (h.operation, h.namespace, p.into_generic())
             }
-            MessageBag::PrepareOk(ref p) => {
-                let h = p.header();
-                (h.operation, h.namespace, p.as_generic().clone())
+            MessageBag::PrepareOk(p) => {
+                let h = *p.header();
+                (h.operation, h.namespace, p.into_generic())
             }
         };
         let namespace = IggyNamespace::from_raw(namespace);
@@ -96,17 +95,17 @@ where
     ) -> Result<Receiver<R>, ConsensusError> {
         let bag = MessageBag::try_from(message)?;
         let (operation, namespace, generic) = match bag {
-            MessageBag::Request(ref r) => {
-                let h = r.header();
-                (h.operation, h.namespace, r.as_generic().clone())
+            MessageBag::Request(r) => {
+                let h = *r.header();
+                (h.operation, h.namespace, r.into_generic())
             }
-            MessageBag::Prepare(ref p) => {
-                let h = p.header();
-                (h.operation, h.namespace, p.as_generic().clone())
+            MessageBag::Prepare(p) => {
+                let h = *p.header();
+                (h.operation, h.namespace, p.into_generic())
             }
-            MessageBag::PrepareOk(ref p) => {
-                let h = p.header();
-                (h.operation, h.namespace, p.as_generic().clone())
+            MessageBag::PrepareOk(p) => {
+                let h = *p.header();
+                (h.operation, h.namespace, p.into_generic())
             }
         };
         let namespace = IggyNamespace::from_raw(namespace);

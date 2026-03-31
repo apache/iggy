@@ -19,8 +19,9 @@ mod router;
 pub mod shards_table;
 
 use consensus::{MuxPlane, NamespacedPipeline, PartitionsHandle, Plane, VsrConsensus};
-use iggy_common::header::{GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader};
-use iggy_common::message::{Message, MessageBag};
+use iggy_binary_protocol::{
+    GenericHeader, Message, MessageBag, PrepareHeader, PrepareOkHeader, RequestHeader,
+};
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::variadic;
 use journal::{Journal, JournalHandle};
@@ -75,6 +76,7 @@ impl<R: Send + 'static> ShardFrame<R> {
 
     /// Create a request-response frame.  Returns the frame and a receiver
     /// that the caller can await for completion notification.
+    #[must_use]
     pub fn with_response(message: Message<GenericHeader>) -> (Self, Receiver<R>) {
         let (tx, rx) = channel(1);
         (
@@ -301,7 +303,7 @@ where
     where
         B: MessageBus<
                 Replica = u8,
-                Data = iggy_common::message::Message<iggy_common::header::GenericHeader>,
+                Data = iggy_binary_protocol::Message<iggy_binary_protocol::GenericHeader>,
                 Client = u128,
             >,
     {

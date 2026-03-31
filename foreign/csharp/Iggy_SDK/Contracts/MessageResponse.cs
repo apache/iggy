@@ -25,6 +25,7 @@ namespace Apache.Iggy.Contracts;
 /// <summary>
 ///     Response from the server containing a message payload.
 /// </summary>
+[JsonConverter(typeof(MessageResponseConverter))]
 public sealed class MessageResponse
 {
     /// <summary>
@@ -40,7 +41,12 @@ public sealed class MessageResponse
     /// <summary>
     ///     Headers defined by the user.
     /// </summary>
-    [JsonPropertyName("user_headers")]
-    [JsonConverter(typeof(UserHeadersConverter))]
-    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
+    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; set; }
+
+    /// <summary>
+    ///     Raw user header bytes before deserialization.
+    ///     Used internally for decrypting encrypted headers.
+    /// </summary>
+    [JsonIgnore]
+    internal byte[]? RawUserHeaders { get; set; }
 }

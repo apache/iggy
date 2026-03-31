@@ -21,8 +21,10 @@ using System.Threading.Channels;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
+using Apache.Iggy.Mappers;
 using Apache.Iggy.Utils;
 using Microsoft.Extensions.Logging;
 
@@ -76,7 +78,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
         if (_isInitialized)
         {
-            _client.UnsubscribeConnectionEvents(OnClientConnectionStateChanged);
+            _client.UnsubscribeConnectionEvents(OnClientConnectionStateChangedAsync);
         }
 
         if (!string.IsNullOrEmpty(_consumerGroupName) && _isInitialized)
@@ -98,7 +100,7 @@ public partial class IggyConsumer : IAsyncDisposable
         {
             try
             {
-                await _client.LogoutUser();
+                await _client.LogoutUserAsync();
                 _client.Dispose();
             }
             catch (Exception e)
@@ -144,12 +146,12 @@ public partial class IggyConsumer : IAsyncDisposable
 
             if (_config.CreateIggyClient)
             {
-                await _client.LoginUser(_config.Login, _config.Password, ct);
+                await _client.LoginUserAsync(_config.Login, _config.Password, ct);
             }
 
             await InitializeConsumerGroupAsync(ct);
 
-            _client.SubscribeConnectionEvents(OnClientConnectionStateChanged);
+            _client.SubscribeConnectionEvents(OnClientConnectionStateChangedAsync);
 
             _isInitialized = true;
         }
@@ -380,11 +382,19 @@ public partial class IggyConsumer : IAsyncDisposable
                     try
                     {
                         var decryptedPayload = _config.MessageEncryptor.Decrypt(message.Payload);
+
+                        Dictionary<HeaderKey, HeaderValue>? decryptedHeaders = null;
+                        if (message.RawUserHeaders is { Length: > 0 })
+                        {
+                            var decryptedHeaderBytes = _config.MessageEncryptor.Decrypt(message.RawUserHeaders);
+                            decryptedHeaders = BinaryMapper.MapHeaders(decryptedHeaderBytes);
+                        }
+
                         processedMessage = new MessageResponse
                         {
                             Header = message.Header,
                             Payload = decryptedPayload,
-                            UserHeaders = message.UserHeaders
+                            UserHeaders = decryptedHeaders
                         };
                     }
                     catch (Exception ex)
@@ -473,7 +483,7 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     Handles connection state changes from the client.
     /// </summary>
     /// <param name="e">Event object</param>
-    private async Task OnClientConnectionStateChanged(ConnectionStateChangedEventArgs e)
+    private async Task OnClientConnectionStateChangedAsync(ConnectionStateChangedEventArgs e)
     {
         LogConnectionStateChanged(e.PreviousState, e.CurrentState);
 

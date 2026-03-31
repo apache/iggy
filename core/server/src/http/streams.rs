@@ -158,7 +158,7 @@ async fn delete_stream(
     });
 
     match state.shard.send_to_control_plane(request).await? {
-        ShardResponse::DeleteStreamResponse(_) => Ok(StatusCode::NO_CONTENT),
+        ShardResponse::DeleteStreamResponse => Ok(StatusCode::NO_CONTENT),
         ShardResponse::ErrorResponse(err) => Err(err.into()),
         _ => unreachable!("Expected DeleteStreamResponse"),
     }
