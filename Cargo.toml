@@ -40,6 +40,7 @@ members = [
     "core/connectors/sinks/quickwit_sink",
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sources/elasticsearch_source",
+    "core/connectors/sources/mongodb_source",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
     "core/consensus",
