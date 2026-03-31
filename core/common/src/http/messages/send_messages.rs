@@ -29,7 +29,7 @@ use bytes::Bytes;
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt::Formatter;
 
 /// `SendMessages` command is used to send messages to a topic in a stream.
@@ -233,7 +233,7 @@ impl<'de> Deserialize<'de> for SendMessages {
                                                     "Invalid headers format: {e}"
                                                 ))
                                             })?;
-                                            let mut map = HashMap::new();
+                                            let mut map = BTreeMap::new();
                                             for entry in entries {
                                                 map.insert(entry.key, entry.value);
                                             }

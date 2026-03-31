@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_common::Client;
 use iggy_common::{HeaderKey, HeaderValue, Identifier, IggyMessage, Partitioning, Sizeable};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::{self, Read};
 use tokio::io::AsyncReadExt;
 use tracing::{Level, event};
@@ -73,7 +73,7 @@ impl SendMessagesCmd {
         Ok(buffer)
     }
 
-    fn get_headers(&self) -> Option<HashMap<HeaderKey, HeaderValue>> {
+    fn get_headers(&self) -> Option<BTreeMap<HeaderKey, HeaderValue>> {
         match self.headers.len() {
             0 => None,
             _ => Some(self.headers.iter().cloned().collect()),

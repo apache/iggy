@@ -17,19 +17,19 @@
  */
 
 use super::message_header::{IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeader};
-use super::user_headers::{get_user_headers_size, user_headers_from_bytes, user_headers_to_bytes};
 use crate::Sizeable;
 use crate::error::IggyError;
 use crate::utils::byte_size::IggyByteSize;
 use crate::utils::timestamp::IggyTimestamp;
+use crate::wire_conversions::{user_headers_from_wire, user_headers_to_wire};
 use crate::{HeaderKey, HeaderValue};
 use bon::bon;
 use bytes::{BufMut, Bytes, BytesMut};
+use iggy_binary_protocol::WireUserHeaders;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::str::FromStr;
-use tracing::warn;
 
 /// Maximum allowed size in bytes for a message payload.
 ///
@@ -71,7 +71,7 @@ pub const MAX_USER_HEADERS_SIZE: u32 = 100 * 1000;
 /// ```
 /// use iggy_common::*;
 /// use std::str::FromStr;
-/// use std::collections::HashMap;
+/// use std::collections::BTreeMap;
 /// use bytes::Bytes;
 ///
 /// // Create a simple text message
@@ -96,7 +96,7 @@ pub const MAX_USER_HEADERS_SIZE: u32 = 100 * 1000;
 /// // Create a message with headers
 /// let key = HeaderKey::from_str("content-type").unwrap();
 /// let value = HeaderValue::from_str("text/plain").unwrap();
-/// let user_headers = HashMap::from([(key, value)]);
+/// let user_headers = BTreeMap::from([(key, value)]);
 ///
 /// let message = IggyMessage::builder()
 ///     .payload("Message with metadata".into())
@@ -135,7 +135,7 @@ impl IggyMessage {
     /// ```
     /// use iggy_common::*;
     /// use bytes::Bytes;
-    /// use std::collections::HashMap;
+    /// use std::collections::BTreeMap;
     /// use std::str::FromStr;
     ///
     /// // Simple message with just payload
@@ -154,7 +154,7 @@ impl IggyMessage {
     /// // Message with headers
     /// let key = HeaderKey::from_str("content-type").unwrap();
     /// let value = HeaderValue::from_str("text/plain").unwrap();
-    /// let user_headers = HashMap::from([(key, value)]);
+    /// let user_headers = BTreeMap::from([(key, value)]);
     /// let msg = IggyMessage::builder()
     ///     .payload("Hello".into())
     ///     .user_headers(user_headers)
@@ -165,7 +165,7 @@ impl IggyMessage {
     pub fn new(
         id: Option<u128>,
         payload: Bytes,
-        user_headers: Option<HashMap<HeaderKey, HeaderValue>>,
+        user_headers: Option<BTreeMap<HeaderKey, HeaderValue>>,
     ) -> Result<Self, IggyError> {
         if payload.is_empty() {
             return Err(IggyError::InvalidMessagePayloadLength);
@@ -175,7 +175,10 @@ impl IggyMessage {
             return Err(IggyError::TooBigMessagePayload);
         }
 
-        let user_headers_length = get_user_headers_size(&user_headers).unwrap_or(0);
+        let wire_headers = user_headers.as_ref().map(user_headers_to_wire);
+        let user_headers_length = wire_headers
+            .as_ref()
+            .map_or(0, |w| w.as_bytes().len() as u32);
 
         if user_headers_length > MAX_USER_HEADERS_SIZE {
             return Err(IggyError::TooBigUserHeaders);
@@ -192,7 +195,7 @@ impl IggyMessage {
             reserved: 0,
         };
 
-        let user_headers = user_headers.map(|h| user_headers_to_bytes(&h));
+        let user_headers = wire_headers.map(|w| w.into_bytes());
 
         Ok(Self {
             header,
@@ -203,13 +206,13 @@ impl IggyMessage {
 }
 
 impl IggyMessage {
-    /// Gets the user headers as a typed HashMap.
+    /// Gets the user headers as a typed BTreeMap.
     ///
-    /// This method parses the binary header data into a typed HashMap for easy access.
+    /// This method parses the binary header data into a typed BTreeMap for easy access.
     ///
     /// # Returns
     ///
-    /// * `Ok(Some(HashMap))` - Successfully parsed headers
+    /// * `Ok(Some(BTreeMap))` - Successfully parsed headers
     /// * `Ok(None)` - No headers present
     /// * `Err(IggyError)` - Error parsing headers
     ///
@@ -218,11 +221,11 @@ impl IggyMessage {
     /// ```
     /// use iggy_common::*;
     /// use std::str::FromStr;
-    /// use std::collections::HashMap;
+    /// use std::collections::BTreeMap;
     ///
     /// let key = HeaderKey::from_str("content-type").unwrap();
     /// let value = HeaderValue::from_str("text/plain").unwrap();
-    /// let user_headers_map = HashMap::from([(key.clone(), value)]);
+    /// let user_headers_map = BTreeMap::from([(key.clone(), value)]);
     ///
     /// let message = IggyMessage::builder()
     ///     .payload("Hello".into())
@@ -233,21 +236,22 @@ impl IggyMessage {
     /// let headers = message.user_headers_map().unwrap().unwrap();
     /// assert!(headers.contains_key(&key));
     /// ```
-    pub fn user_headers_map(&self) -> Result<Option<HashMap<HeaderKey, HeaderValue>>, IggyError> {
+    pub fn user_headers_map(&self) -> Result<Option<BTreeMap<HeaderKey, HeaderValue>>, IggyError> {
         if let Some(user_headers) = &self.user_headers {
-            match user_headers_from_bytes(user_headers.clone()) {
-                Ok(h) => Ok(Some(h)),
+            let wire = match WireUserHeaders::from_bytes(user_headers.clone()) {
+                Ok(w) => w,
                 Err(e) => {
-                    warn!(
-                        "Failed to deserialize user headers: {e} for message at offset {}, sent at: {} ({}), user_headers_length: {}, skipping field...",
+                    tracing::warn!(
+                        "Failed to parse user headers for message at offset {}, \
+                         user_headers_length: {}: {e}",
                         self.header.offset,
-                        IggyTimestamp::from(self.header.origin_timestamp).to_rfc3339_string(),
-                        self.header.origin_timestamp,
                         self.header.user_headers_length
                     );
-                    Ok(None)
+                    return Ok(None);
                 }
-            }
+            };
+            let map = user_headers_from_wire(&wire)?;
+            Ok(Some(map))
         } else {
             Ok(None)
         }
@@ -264,7 +268,7 @@ impl IggyMessage {
     /// # Returns
     ///
     /// * `Ok(Some(HeaderValue))` - User header found with its value
-    /// * `Ok(None)` - User header not found or user headers couldn't be parsed
+    /// * `Ok(None)` - User header not found or no user headers present
     /// * `Err(IggyError)` - Error accessing user headers
     ///
     /// # Examples
@@ -272,11 +276,11 @@ impl IggyMessage {
     /// ```
     /// use iggy_common::*;
     /// use std::str::FromStr;
-    /// use std::collections::HashMap;
+    /// use std::collections::BTreeMap;
     ///
     /// let key = HeaderKey::from_str("content-type").unwrap();
     /// let value = HeaderValue::from_str("text/plain").unwrap();
-    /// let user_headers_map = HashMap::from([(key.clone(), value.clone())]);
+    /// let user_headers_map = BTreeMap::from([(key.clone(), value.clone())]);
     ///
     /// let message = IggyMessage::builder()
     ///     .payload("Hello".into())
@@ -310,11 +314,11 @@ impl IggyMessage {
     /// ```
     /// use iggy_common::*;
     /// use std::str::FromStr;
-    /// use std::collections::HashMap;
+    /// use std::collections::BTreeMap;
     ///
     /// let key = HeaderKey::from_str("content-type").unwrap();
     /// let value = HeaderValue::from_str("text/plain").unwrap();
-    /// let user_headers_map = HashMap::from([(key.clone(), value)]);
+    /// let user_headers_map = BTreeMap::from([(key.clone(), value)]);
     ///
     /// let message = IggyMessage::builder()
     ///     .payload("Hello".into())
@@ -597,7 +601,7 @@ impl<'de> Deserialize<'de> for IggyMessage {
             {
                 let mut header: Option<IggyMessageHeader> = None;
                 let mut payload: Option<Bytes> = None;
-                let mut user_headers: Option<HashMap<HeaderKey, HeaderValue>> = None;
+                let mut user_headers: Option<BTreeMap<HeaderKey, HeaderValue>> = None;
                 let mut raw_user_headers: Option<Bytes> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
@@ -630,7 +634,7 @@ impl<'de> Deserialize<'de> for IggyMessage {
                                     .map_err(|e| {
                                         de::Error::custom(format!("Invalid headers format: {e}"))
                                     })?;
-                                let mut headers_map = HashMap::new();
+                                let mut headers_map = BTreeMap::new();
                                 for entry in entries {
                                     headers_map.insert(entry.key, entry.value);
                                 }
@@ -649,7 +653,7 @@ impl<'de> Deserialize<'de> for IggyMessage {
                 let user_headers_bytes = if let Some(raw) = raw_user_headers {
                     Some(raw)
                 } else {
-                    user_headers.map(|headers| user_headers_to_bytes(&headers))
+                    user_headers.map(|headers| user_headers_to_wire(&headers).into_bytes())
                 };
 
                 let user_headers_length = user_headers_bytes
@@ -704,7 +708,7 @@ mod tests {
 
     #[test]
     fn test_create_with_headers() {
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert(
             HeaderKey::try_from("content-type").unwrap(),
             HeaderValue::try_from("text/plain").unwrap(),
@@ -782,7 +786,7 @@ mod tests {
 
     #[test]
     fn test_json_serialization_with_headers() {
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert(
             HeaderKey::try_from("content-type").unwrap(),
             HeaderValue::try_from("text/plain").unwrap(),

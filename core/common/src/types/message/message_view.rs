@@ -19,14 +19,14 @@
 use super::HeaderValue;
 use super::message_boundaries::IggyMessageBoundaries;
 use super::message_header::*;
-use super::user_headers::user_headers_from_bytes;
 use crate::IggyByteSize;
 use crate::Sizeable;
 use crate::error::IggyError;
 use crate::utils::checksum;
+use crate::wire_conversions::user_headers_from_wire;
 use crate::{HeaderKey, IggyMessageHeaderView};
-use bytes::Bytes;
-use std::collections::HashMap;
+use iggy_binary_protocol::WireUserHeaders;
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
 /// A immutable view of a message.
@@ -86,22 +86,20 @@ impl<'a> IggyMessageView<'a> {
     }
 
     /// Return instantiated user headers map
-    pub fn user_headers_map(&self) -> Result<Option<HashMap<HeaderKey, HeaderValue>>, IggyError> {
+    pub fn user_headers_map(&self) -> Result<Option<BTreeMap<HeaderKey, HeaderValue>>, IggyError> {
         if let Some(headers) = self.user_headers() {
-            let headers_bytes = Bytes::copy_from_slice(headers);
-
-            match user_headers_from_bytes(headers_bytes) {
-                Ok(h) => Ok(Some(h)),
+            let wire = match WireUserHeaders::from_slice(headers) {
+                Ok(w) => w,
                 Err(e) => {
-                    tracing::error!(
-                        "Error parsing headers: {}, header_length={}",
-                        e,
+                    tracing::warn!(
+                        "Failed to parse user headers: {e}, header_length={}",
                         self.header().user_headers_length()
                     );
-
-                    Ok(None)
+                    return Ok(None);
                 }
-            }
+            };
+            let map = user_headers_from_wire(&wire)?;
+            Ok(Some(map))
         } else {
             Ok(None)
         }

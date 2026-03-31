@@ -63,7 +63,6 @@ pub use iggy_common::{
     TcpClientReconnectionConfig, Topic, TopicDetails, TopicPermissions, TransportEndpoints,
     TransportProtocol, UserId, UserStatus, Validatable, WebSocketClientConfig,
     WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, defaults, locking,
-    user_headers_from_bytes, user_headers_to_bytes,
 };
 pub use iggy_common::{
     Client, ClusterClient, ConsumerGroupClient, ConsumerOffsetClient, MessageClient,

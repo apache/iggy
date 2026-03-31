@@ -26,10 +26,10 @@ use crate::{
     CacheMetrics, CacheMetricsKey, ClientInfo, ClientInfoDetails, ClusterMetadata, ClusterNode,
     ClusterNodeRole, ClusterNodeStatus, CompressionAlgorithm, Consumer, ConsumerGroup,
     ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, ConsumerOffsetInfo,
-    GlobalPermissions, IdKind, IdentityInfo, IggyByteSize, IggyError, IggyExpiry, MaxTopicSize,
-    Partition, Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, Stats, Stream,
-    StreamDetails, StreamPermissions, Topic, TopicDetails, TopicPermissions, TransportEndpoints,
-    UserInfo, UserInfoDetails, UserStatus,
+    GlobalPermissions, HeaderKey, HeaderKind, HeaderValue, IdKind, IdentityInfo, IggyByteSize,
+    IggyError, IggyExpiry, MaxTopicSize, Partition, Permissions, PersonalAccessTokenInfo,
+    RawPersonalAccessToken, Stats, Stream, StreamDetails, StreamPermissions, Topic, TopicDetails,
+    TopicPermissions, TransportEndpoints, UserInfo, UserInfoDetails, UserStatus,
 };
 use iggy_binary_protocol::WireConsumer;
 use iggy_binary_protocol::primitives::permissions::{
@@ -715,4 +715,71 @@ fn topic_permissions_to_wire(topic_id: usize, tp: &TopicPermissions) -> WireTopi
         poll_messages: tp.poll_messages,
         send_messages: tp.send_messages,
     }
+}
+
+// -- User Headers conversions --
+
+/// Encode domain user headers into a [`WireUserHeaders`] wrapper.
+pub fn user_headers_to_wire(
+    headers: &BTreeMap<HeaderKey, HeaderValue>,
+) -> iggy_binary_protocol::WireUserHeaders {
+    use bytes::{BufMut, BytesMut};
+    use iggy_binary_protocol::WireUserHeaders;
+
+    if headers.is_empty() {
+        return WireUserHeaders::empty();
+    }
+    let size: usize = headers
+        .iter()
+        .map(|(k, v)| 1 + 4 + k.as_bytes().len() + 1 + 4 + v.as_bytes().len())
+        .sum();
+    let mut buf = BytesMut::with_capacity(size);
+    for (key, value) in headers {
+        buf.put_u8(key.kind().as_code());
+        #[allow(clippy::cast_possible_truncation)]
+        buf.put_u32_le(key.as_bytes().len() as u32);
+        buf.put_slice(key.as_bytes());
+        buf.put_u8(value.kind().as_code());
+        #[allow(clippy::cast_possible_truncation)]
+        buf.put_u32_le(value.as_bytes().len() as u32);
+        buf.put_slice(value.as_bytes());
+    }
+    // Buffer was just encoded from valid HeaderKey/HeaderValue entries,
+    // so structural TLV validity is guaranteed by construction.
+    WireUserHeaders::from_validated(buf.freeze())
+}
+
+/// Decode a [`WireUserHeaders`] wrapper into domain user headers.
+///
+/// Wire-level validation accepts unknown kind codes for forward compatibility
+/// (VSR rolling upgrades). Domain-level `from_code()` rejects them - the wire
+/// layer stores structurally valid data, the domain layer requires known semantics.
+pub fn user_headers_from_wire(
+    wire: &iggy_binary_protocol::WireUserHeaders,
+) -> Result<BTreeMap<HeaderKey, HeaderValue>, IggyError> {
+    if wire.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut headers = BTreeMap::new();
+    for entry in wire.iter() {
+        let key_kind = HeaderKind::from_code(entry.key_kind.0)?;
+        if let Some(expected) = key_kind.expected_size()
+            && entry.key.len() != expected
+        {
+            return Err(IggyError::InvalidHeaderKey);
+        }
+
+        let value_kind = HeaderKind::from_code(entry.value_kind.0)?;
+        if let Some(expected) = value_kind.expected_size()
+            && entry.value.len() != expected
+        {
+            return Err(IggyError::InvalidHeaderValue);
+        }
+
+        headers.insert(
+            HeaderKey::new_unchecked(key_kind, entry.key),
+            HeaderValue::new_unchecked(value_kind, entry.value),
+        );
+    }
+    Ok(headers)
 }
