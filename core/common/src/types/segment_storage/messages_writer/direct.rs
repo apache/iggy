@@ -115,8 +115,7 @@ impl DirectMessagesWriter {
         Rc::clone(&self.file)
     }
 
-    /// Append frozen (immutable) batches to the messages file.
-    /// The caller retains the batches (for use in in-flight buffer) while disk I/O proceeds.
+    #[allow(clippy::await_holding_refcell_ref)]
     pub async fn save_frozen_batches(
         &self,
         batches: &[IggyMessagesBatch],
@@ -167,6 +166,7 @@ impl DirectMessagesWriter {
         self.messages_size_bytes.clone()
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
     pub async fn flush(&self) -> Result<(), IggyError> {
         let logical_tail = self.file.borrow().tail_len();
         if logical_tail == 0 {
@@ -180,6 +180,7 @@ impl DirectMessagesWriter {
         Ok(())
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
     pub async fn flush_and_truncate(&self) -> Result<(), IggyError> {
         let logical_tail = self.file.borrow().tail_len();
 

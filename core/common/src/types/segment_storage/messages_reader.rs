@@ -132,6 +132,7 @@ impl MessagesReader {
         self.messages_size_bytes.load(Ordering::Acquire) as u32
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn read_at(
         &self,
         offset: u32,

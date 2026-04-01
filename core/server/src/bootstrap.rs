@@ -52,7 +52,6 @@ use crate::{
 };
 use compio::{fs::create_dir_all, runtime::Runtime};
 use err_trail::ErrContext;
-use iggy_common::SemanticVersion;
 use iggy_common::{
     IggyByteSize, IggyError, PersonalAccessToken,
     defaults::{
@@ -60,6 +59,7 @@ use iggy_common::{
         MIN_USERNAME_LENGTH,
     },
 };
+use iggy_common::{SemanticVersion, StorageOpenOptions};
 use slab::Slab;
 use std::{env, path::Path, sync::Arc};
 use tracing::{info, warn};
@@ -303,17 +303,17 @@ pub async fn load_segments(
             Err(_) => 0, // Default to 0 if index file doesn't exist
         };
 
-        let storage = Storage::new(
-            &messages_file_path,
-            &index_file_path,
-            messages_size as u64,
-            index_size as u64,
-            config.partition.enforce_fsync,
-            config.partition.enforce_fsync,
-            true,
-            config.direct_io.enabled,
-        )
-        .await?;
+        let storage_open_opts = StorageOpenOptions {
+            messages_size: messages_size as u64,
+            indexes_size: index_size as u64,
+            log_fsync: config.partition.enforce_fsync,
+            index_fsync: config.partition.enforce_fsync,
+            file_exists: true,
+            direct_io: config.direct_io.enabled,
+        };
+
+        let storage =
+            Storage::new(&messages_file_path, &index_file_path, storage_open_opts).await?;
 
         let loaded_indexes = {
             storage.

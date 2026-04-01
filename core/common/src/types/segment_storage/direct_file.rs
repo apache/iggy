@@ -24,9 +24,15 @@ use tracing::{error, trace};
 
 use crate::{IggyError, PooledBuffer, alloc::memory_pool::ALIGNMENT};
 
+#[cfg(target_os = "linux")]
 const O_DIRECT: i32 = 0x4000;
-
+#[cfg(target_os = "linux")]
 const O_DSYNC: i32 = 0x1000;
+
+#[cfg(not(target_os = "linux"))]
+const O_DIRECT: u32 = 0;
+#[cfg(not(target_os = "linux"))]
+const O_DSYNC: u32 = 0;
 
 /// Cache line padding to prevent false sharing
 #[repr(align(64))]

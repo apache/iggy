@@ -18,7 +18,7 @@
 pub use iggy_common::SegmentStorage as Storage;
 
 use crate::configs::system::SystemConfig;
-use iggy_common::IggyError;
+use iggy_common::{IggyError, StorageOpenOptions};
 
 /// Creates a new storage for the specified partition with the given start offset
 pub async fn create_segment_storage(
@@ -33,20 +33,15 @@ pub async fn create_segment_storage(
     let messages_path =
         config.get_messages_file_path(stream_id, topic_id, partition_id, start_offset);
     let index_path = config.get_index_path(stream_id, topic_id, partition_id, start_offset);
-    let log_fsync = config.partition.enforce_fsync;
-    let index_fsync = config.partition.enforce_fsync;
-    let direct_io = config.direct_io.enabled;
-    let file_exists = false;
 
-    Storage::new(
-        &messages_path,
-        &index_path,
+    let storage_open_opts = StorageOpenOptions {
         messages_size,
         indexes_size,
-        log_fsync,
-        index_fsync,
-        file_exists,
-        direct_io,
-    )
-    .await
+        log_fsync: config.partition.enforce_fsync,
+        index_fsync: config.partition.enforce_fsync,
+        file_exists: false,
+        direct_io: config.direct_io.enabled,
+    };
+
+    Storage::new(&messages_path, &index_path, storage_open_opts).await
 }

@@ -38,6 +38,7 @@ use iggy_binary_protocol::{
     Command2, ConsensusHeader, GenericHeader, Message, Operation, PrepareHeader, PrepareOkHeader,
     RequestHeader,
 };
+use iggy_common::StorageOpenOptions;
 use iggy_common::{
     IggyByteSize, IggyError, PartitionStats, SegmentStorage,
     send_messages2::{convert_request_message, decode_prepare_slice},
@@ -349,18 +350,18 @@ impl<C, J> IggyPartitions<C, J> {
             start_offset,
         );
 
-        let storage = SegmentStorage::new(
-            &messages_path,
-            &index_path,
-            0, // messages_size (new segment)
-            0, // indexes_size (new segment)
-            self.config.enforce_fsync,
-            self.config.enforce_fsync,
-            false, // file_exists (new segment)
-            self.config.direct_io,
-        )
-        .await
-        .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
+        let storage_open_opts = StorageOpenOptions {
+            messages_size: 0,
+            indexes_size: 0,
+            log_fsync: self.config.enforce_fsync,
+            index_fsync: self.config.enforce_fsync,
+            file_exists: false,
+            direct_io: self.config.direct_io,
+        };
+
+        let storage = SegmentStorage::new(&messages_path, &index_path, storage_open_opts)
+            .await
+            .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
         let messages_size_bytes = storage
             .messages_writer
             .as_ref()
@@ -1429,18 +1430,18 @@ where
             start_offset,
         );
 
-        let storage = SegmentStorage::new(
-            &messages_path,
-            &index_path,
-            0, // messages_size (new segment)
-            0, // indexes_size (new segment)
-            self.config.enforce_fsync,
-            self.config.enforce_fsync,
-            false, // file_exists (new segment)
-            self.config.direct_io,
-        )
-        .await
-        .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
+        let storage_open_opts = StorageOpenOptions {
+            messages_size: 0,
+            indexes_size: 0,
+            log_fsync: self.config.enforce_fsync,
+            index_fsync: self.config.enforce_fsync,
+            file_exists: false,
+            direct_io: self.config.direct_io,
+        };
+
+        let storage = SegmentStorage::new(&messages_path, &index_path, storage_open_opts)
+            .await
+            .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
         let messages_size_bytes = storage
             .messages_writer
             .as_ref()
@@ -1471,10 +1472,10 @@ where
         let old_storage = &mut partition.log.storages_mut()[old_segment_index];
 
         // TODO(tungtose): this should be remove after MessageReader open with O_DIRECT
-        if let Some(ref messages_writer) = old_storage.messages_writer {
-            if messages_writer.try_get_direct_file().is_some() {
-                messages_writer.flush_and_truncate().await?;
-            }
+        if let Some(ref messages_writer) = old_storage.messages_writer
+            && messages_writer.try_get_direct_file().is_some()
+        {
+            messages_writer.flush_and_truncate().await?;
         }
 
         let _ = old_storage.shutdown();

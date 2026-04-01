@@ -89,17 +89,31 @@ pub struct SegmentStorage {
     pub index_reader: Option<Rc<IndexReader>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StorageOpenOptions {
+    pub messages_size: u64,
+    pub indexes_size: u64,
+    pub log_fsync: bool,
+    pub index_fsync: bool,
+    pub file_exists: bool,
+    pub direct_io: bool,
+}
+
 impl SegmentStorage {
     pub async fn new(
         messages_path: &str,
         index_path: &str,
-        messages_size: u64,
-        indexes_size: u64,
-        log_fsync: bool,
-        index_fsync: bool,
-        file_exists: bool,
-        direct_io: bool,
+        opts: StorageOpenOptions,
     ) -> Result<Self, IggyError> {
+        let StorageOpenOptions {
+            messages_size,
+            indexes_size,
+            log_fsync,
+            index_fsync,
+            file_exists,
+            direct_io,
+        } = opts;
+
         let size = Rc::new(std::sync::atomic::AtomicU64::new(messages_size));
         let indexes_size = Rc::new(std::sync::atomic::AtomicU64::new(indexes_size));
         let messages_writer = Rc::new(
