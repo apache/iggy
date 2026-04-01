@@ -57,6 +57,7 @@ members = [
     "core/server",
     "core/shard",
     "core/simulator",
+    "core/simulator_ui",
     "core/tools",
     "examples/rust",
 ]
