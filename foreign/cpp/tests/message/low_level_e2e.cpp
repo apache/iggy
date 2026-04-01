@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <chrono>
 #include <cstdint>
 #include <string>
+#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -904,5 +906,179 @@ TEST(LowLevelE2E_Message, PollMessagesAfterStreamDeleted) {
                                        "consumer", make_numeric_identifier(1), "offset", 0, 10, false),
                  std::exception);
 
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+}
+
+TEST(LowLevelE2E_Message, PollMessagesWithInvalidPartitionId) {
+    RecordProperty("description", "Throws when polling with a non-existent partition ID.");
+    const std::string stream_name = "cpp-msg-invalid-partition";
+    iggy::ffi::Client *client     = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 9999, "consumer",
+                                       make_numeric_identifier(1), "offset", 0, 10, false),
+                 std::exception);
+
+    client->delete_stream(make_numeric_identifier(stream.id));
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+}
+
+TEST(LowLevelE2E_Message, PollMessagesWithCountZero) {
+    RecordProperty("description", "Verifies polling with count=0 returns zero messages successfully.");
+    const std::string stream_name = "cpp-msg-count-zero";
+    iggy::ffi::Client *client     = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    rust::Vec<iggy::ffi::Message> messages;
+    for (std::uint32_t i = 0; i < 5; i++) {
+        iggy::ffi::Message msg;
+        msg.new_message(to_payload("msg-" + std::to_string(i)));
+        messages.push_back(std::move(msg));
+    }
+    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                          partition_id_bytes(0), std::move(messages));
+
+    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                        make_numeric_identifier(1), "offset", 0, 0, false);
+
+    ASSERT_EQ(polled.count, 0u);
+    ASSERT_EQ(polled.messages.size(), 0u);
+
+    client->delete_stream(make_numeric_identifier(stream.id));
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+}
+
+TEST(LowLevelE2E_Message, PollMessagesWithoutSpecifyingPartition) {
+    RecordProperty("description",
+                   "Verifies polling with partition_id=u32::MAX defaults to partition 0 and returns messages.");
+    const std::string stream_name = "cpp-msg-no-partition";
+    iggy::ffi::Client *client     = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    rust::Vec<iggy::ffi::Message> messages;
+    for (std::uint32_t i = 0; i < 5; i++) {
+        iggy::ffi::Message msg;
+        msg.new_message(to_payload("msg-" + std::to_string(i)));
+        messages.push_back(std::move(msg));
+    }
+    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                          partition_id_bytes(0), std::move(messages));
+
+    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), UINT32_MAX,
+                                        "consumer", make_numeric_identifier(1), "offset", 0, 100, false);
+
+    ASSERT_EQ(polled.count, 5u);
+    ASSERT_EQ(polled.messages.size(), 5u);
+
+    client->delete_stream(make_numeric_identifier(stream.id));
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+}
+
+TEST(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
+    RecordProperty("description",
+                   "Verifies timestamp polling strategy returns messages with timestamp >= the specified value.");
+    const std::string stream_name = "cpp-msg-timestamp-strategy";
+    iggy::ffi::Client *client     = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    rust::Vec<iggy::ffi::Message> batch1;
+    for (std::uint32_t i = 0; i < 5; i++) {
+        iggy::ffi::Message msg;
+        msg.new_message(to_payload("batch1-" + std::to_string(i)));
+        batch1.push_back(std::move(msg));
+    }
+    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                          partition_id_bytes(0), std::move(batch1));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    rust::Vec<iggy::ffi::Message> batch2;
+    for (std::uint32_t i = 0; i < 5; i++) {
+        iggy::ffi::Message msg;
+        msg.new_message(to_payload("batch2-" + std::to_string(i)));
+        batch2.push_back(std::move(msg));
+    }
+    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                          partition_id_bytes(0), std::move(batch2));
+
+    auto all = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                     make_numeric_identifier(1), "offset", 0, 100, false);
+    ASSERT_EQ(all.count, 10u);
+
+    std::uint64_t batch2_timestamp = all.messages[5].timestamp;
+    ASSERT_GT(batch2_timestamp, all.messages[0].timestamp);
+
+    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                        make_numeric_identifier(2), "timestamp", batch2_timestamp, 100, false);
+
+    ASSERT_GE(polled.count, 5u);
+    for (std::size_t i = 0; i < polled.messages.size(); i++) {
+        EXPECT_GE(polled.messages[i].timestamp, batch2_timestamp)
+            << "Message at index " << i << " has earlier timestamp";
+    }
+
+    client->delete_stream(make_numeric_identifier(stream.id));
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+}
+
+TEST(LowLevelE2E_Message, PollMessagesMonotonicOffsets) {
+    RecordProperty("description",
+                   "Verifies offsets are monotonically increasing and continuous across multiple polls.");
+    const std::string stream_name = "cpp-msg-monotonic-offsets";
+    iggy::ffi::Client *client     = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    rust::Vec<iggy::ffi::Message> messages;
+    for (std::uint32_t i = 0; i < 20; i++) {
+        iggy::ffi::Message msg;
+        msg.new_message(to_payload("mono-" + std::to_string(i)));
+        messages.push_back(std::move(msg));
+    }
+    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                          partition_id_bytes(0), std::move(messages));
+
+    std::uint64_t expected_offset = 0;
+    for (int chunk = 0; chunk < 4; chunk++) {
+        auto polled =
+            client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                  make_numeric_identifier(1), "offset", expected_offset, 5, false);
+
+        ASSERT_EQ(polled.count, 5u) << "Chunk " << chunk;
+        ASSERT_EQ(polled.messages.size(), 5u) << "Chunk " << chunk;
+
+        for (std::size_t i = 0; i < polled.messages.size(); i++) {
+            EXPECT_EQ(polled.messages[i].offset, expected_offset) << "Chunk " << chunk << " index " << i;
+            expected_offset++;
+        }
+    }
+
+    ASSERT_EQ(expected_offset, 20u);
+
+    client->delete_stream(make_numeric_identifier(stream.id));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
