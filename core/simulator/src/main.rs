@@ -131,10 +131,10 @@ fn main() {
         consumer,
         args,
     )) {
-        Ok(batch_set) => {
+        Ok((fragments, _last_matching_offset)) => {
             println!(
-                "[sim] Poll returned {} messages (expected 4)",
-                batch_set.count()
+                "[sim] Poll returned {} fragments (expected 4)",
+                fragments.len()
             );
         }
         Err(e) => {

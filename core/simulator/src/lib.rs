@@ -134,14 +134,14 @@ impl Simulator {
                     if !self.crashed.contains(&id)
                         && let Some(replica) = self.replicas.get(id as usize)
                     {
-                        Self::dispatch_to_replica(replica, packet.message.clone()).await;
+                        Self::dispatch_to_replica(replica, packet.message.deep_copy()).await;
                     }
                     // Crashed or missing: packet silently dropped.
                 }
                 ProcessId::Client(_) => {
                     let reply: Message<ReplyHeader> = packet
                         .message
-                        .clone()
+                        .deep_copy()
                         .try_into_typed()
                         .expect("invalid message, wrong command type for a client response");
                     client_replies.push(reply);
@@ -166,7 +166,10 @@ impl Simulator {
                 } else {
                     continue;
                 };
-                self.network.submit(from, to, envelope.message);
+                let message = match envelope.payload {
+                    bus::EnvelopePayload::Replica(m) | bus::EnvelopePayload::Client(m) => m,
+                };
+                self.network.submit(from, to, message);
             }
         }
 
