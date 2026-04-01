@@ -84,6 +84,7 @@ pub enum BatchMode {
     #[strum(to_string = "individual")]
     Individual,
     /// All messages in one request, newline-delimited JSON.
+    #[serde(rename = "ndjson")]
     #[strum(to_string = "NDJSON")]
     NdJson,
     /// All messages as a single JSON array.
@@ -1369,7 +1370,7 @@ mod tests {
     fn given_batch_mode_should_serialize_as_snake_case() {
         let cases = [
             (BatchMode::Individual, "\"individual\""),
-            (BatchMode::NdJson, "\"nd_json\""),
+            (BatchMode::NdJson, "\"ndjson\""),
             (BatchMode::JsonArray, "\"json_array\""),
             (BatchMode::Raw, "\"raw\""),
         ];
@@ -1707,7 +1708,7 @@ mod tests {
             method = "PUT"
             timeout = "10s"
             max_payload_size_bytes = 5000
-            batch_mode = "nd_json"
+            batch_mode = "ndjson"
             include_metadata = false
             include_checksum = true
             include_origin_timestamp = true

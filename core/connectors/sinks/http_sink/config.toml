@@ -46,10 +46,10 @@ max_payload_size_bytes = 10485760
 
 # Payload formatting mode (default: individual).
 # - "individual": one HTTP request per message
-# - "nd_json": newline-delimited JSON, all messages in one request
+# - "ndjson": newline-delimited JSON, all messages in one request
 # - "json_array": JSON array of messages in one request
 # - "raw": raw bytes, individual requests only
-batch_mode = "nd_json"
+batch_mode = "ndjson"
 
 # Include Iggy metadata envelope (default: true).
 include_metadata = true

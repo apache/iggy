@@ -99,7 +99,7 @@ consumer_group = "http_sink"
 
 [plugin_config]
 url = "https://api.example.com/ingest"
-batch_mode = "nd_json"
+batch_mode = "ndjson"
 ```
 
 ## Configuration
@@ -110,7 +110,7 @@ batch_mode = "nd_json"
 | `method` | string | `POST` | HTTP method: `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` |
 | `timeout` | string | `30s` | Request timeout (e.g., `10s`, `500ms`) |
 | `max_payload_size_bytes` | u64 | `10485760` | Max body size in bytes (10MB). `0` to disable |
-| `batch_mode` | string | `individual` | `individual`, `nd_json`, `json_array`, or `raw` |
+| `batch_mode` | string | `individual` | `individual`, `ndjson`, `json_array`, or `raw` |
 | `include_metadata` | bool | `true` | Wrap payload in metadata envelope |
 | `include_checksum` | bool | `false` | Add message checksum to metadata |
 | `include_origin_timestamp` | bool | `false` | Add origin timestamp to metadata |
@@ -133,14 +133,14 @@ batch_mode = "nd_json"
 One HTTP request per message. Best for webhooks and endpoints that accept single events.
 
 > With `batch_length = 50`, this produces 50 sequential HTTP round trips per poll cycle.
-> For production throughput, use `nd_json` or `json_array`.
+> For production throughput, use `ndjson` or `json_array`.
 
 ```text
 POST /ingest  Content-Type: application/json
 {"metadata": {"iggy_offset": 1, ...}, "payload": {"key": "value"}}
 ```
 
-### `nd_json`
+### `ndjson`
 
 All messages in one request, [newline-delimited JSON](https://github.com/ndjson/ndjson-spec). Best for bulk ingestion endpoints.
 
@@ -265,12 +265,12 @@ include_metadata = false    # Slack expects bare JSON payload
 
 ### REST API Ingestion
 
-Push data into downstream REST APIs (analytics, CRM, data warehouse loaders). Use `nd_json` or `json_array` for bulk efficiency:
+Push data into downstream REST APIs (analytics, CRM, data warehouse loaders). Use `ndjson` or `json_array` for bulk efficiency:
 
 ```toml
 [plugin_config]
 url = "https://analytics.example.com/v1/events"
-batch_mode = "nd_json"
+batch_mode = "ndjson"
 include_metadata = true     # downstream can route by iggy_stream/iggy_topic
 
 [plugin_config.headers]
@@ -330,7 +330,7 @@ consumer_group = "log_forwarder"
 
 [plugin_config]
 url = "https://logs.example.com/api/v1/ingest"
-batch_mode = "nd_json"
+batch_mode = "ndjson"
 max_connections = 20
 timeout = "60s"
 max_payload_size_bytes = 52428800   # 50MB for large log batches
@@ -460,7 +460,7 @@ consumer_group = "http_sink_orders"
 
 [plugin_config]
 url = "https://api.example.com/ingest"
-batch_mode = "nd_json"
+batch_mode = "ndjson"
 include_metadata = true
 
 [plugin_config.headers]
@@ -522,7 +522,7 @@ consumer_group = "analytics_sink"
 
 [plugin_config]
 url = "https://analytics-api.example.com/v1/events"
-batch_mode = "nd_json"
+batch_mode = "ndjson"
 max_connections = 20
 
 [plugin_config.headers]
@@ -636,7 +636,7 @@ consumer_group = "analytics_sink"     # different consumer group = fan-out
 
 [plugin_config]
 url = "https://analytics.example.com/v1/events"
-batch_mode = "nd_json"
+batch_mode = "ndjson"
 ```
 
 ### Docker / Container Deployment
@@ -700,15 +700,15 @@ The connector runtime calls `consume()` **sequentially** — the next poll cycle
 | Mode | HTTP Requests per Poll | Latency per Poll | Best For |
 | ---- | ---------------------- | ----------------- | -------- |
 | `individual` | N (one per message) | N × round-trip | Low-volume webhooks, order-sensitive delivery |
-| `nd_json` | 1 | 1 × round-trip | High-throughput bulk ingestion |
+| `ndjson` | 1 | 1 × round-trip | High-throughput bulk ingestion |
 | `json_array` | 1 | 1 × round-trip | APIs expecting array payloads |
 | `raw` | N (one per message) | N × round-trip | Binary payloads (protobuf, avro) |
 
-With `batch_length=50` in `individual` mode, each poll cycle performs 50 sequential HTTP round trips. If each takes 100ms, the poll cycle takes 5 seconds — during which no new messages are consumed from that topic. Use `nd_json` or `json_array` to collapse this to a single round trip.
+With `batch_length=50` in `individual` mode, each poll cycle performs 50 sequential HTTP round trips. If each takes 100ms, the poll cycle takes 5 seconds — during which no new messages are consumed from that topic. Use `ndjson` or `json_array` to collapse this to a single round trip.
 
 ### Memory
 
-In `nd_json` and `json_array` modes, the entire batch is serialized into memory before sending. With `batch_length=1000` and 10KB messages, this allocates ~10MB per poll cycle. The `max_payload_size_bytes` check runs **after** serialization (the batch must be built to know its size). For very large batches, tune `batch_length` and `max_payload_size_bytes` together.
+In `ndjson` and `json_array` modes, the entire batch is serialized into memory before sending. With `batch_length=1000` and 10KB messages, this allocates ~10MB per poll cycle. The `max_payload_size_bytes` check runs **after** serialization (the batch must be built to know its size). For very large batches, tune `batch_length` and `max_payload_size_bytes` together.
 
 ### Connection Pooling and Keep-Alive
 
@@ -764,7 +764,7 @@ x-api-key = "my-api-key"
 [plugin_config]
 url = "https://ingest.example.com/bulk"
 method = "POST"
-batch_mode = "nd_json"
+batch_mode = "ndjson"
 max_connections = 20
 timeout = "60s"
 max_payload_size_bytes = 52428800

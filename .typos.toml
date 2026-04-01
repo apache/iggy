@@ -19,7 +19,6 @@
 [default.extend-identifiers]
 # NDJSON = Newline Delimited JSON — "NdJson" is valid Rust CamelCase
 NdJson = "NdJson"
-nd_json = "nd_json"
 
 # Whitelist valid technical terms to avoid typos false positives
 [default.extend-words]
