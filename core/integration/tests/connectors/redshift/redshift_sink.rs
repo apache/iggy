@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,9 +17,11 @@
  * under the License.
  */
 
-use crate::connectors::redshift::setup;
+use integration::harness::seeds;
+use integration::iggy_harness;
 
-#[tokio::test]
-async fn given_valid_configuration_redshift_sink_connector_should_start() {
-    let _setup = setup().await;
-}
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/redshift/config.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_valid_configuration_redshift_sink_connector_should_start(_harness: &TestHarness) {}

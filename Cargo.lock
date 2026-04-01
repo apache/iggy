@@ -922,9 +922,9 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "attohttpc"
-version = "0.30.1"
+version = "0.29.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16e2cdb6d5ed835199484bb92bb8b3edd526effe995c61732580439c1a67e2e9"
+checksum = "48404d931ab11b3a7a5267291b3b8f3590f09b86181381f8e82a7e562ed832c0"
 dependencies = [
  "base64 0.22.1",
  "http 1.4.0",
@@ -933,7 +933,7 @@ dependencies = [
  "serde",
  "serde_json",
  "url",
- "webpki-roots 1.0.6",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -995,23 +995,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aws-creds"
-version = "0.39.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca3b85155d265df828f84e53886ed9e427aed979dd8a39f5b8b2162c77e142d7"
-dependencies = [
- "attohttpc",
- "home",
- "log",
- "quick-xml 0.38.4",
- "rust-ini",
- "serde",
- "thiserror 2.0.18",
- "time",
- "url",
-]
-
-[[package]]
 name = "aws-lc-rs"
 version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1035,11 +1018,11 @@ dependencies = [
 
 [[package]]
 name = "aws-region"
-version = "0.28.1"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "838b36c8dc927b6db1b6c6b8f5d05865f2213550b9e83bf92fa99ed6525472c0"
+checksum = "8369408b4c9287bbaa8f5030814167b29a4999920ae45670d531d10511c3843e"
 dependencies = [
- "thiserror 2.0.18",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3781,6 +3764,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "femlol-aws-creds"
+version = "0.39.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71f5dd65481537447ca0a2433af1d67a705e430ec27307c70bbb2b727075687b"
+dependencies = [
+ "attohttpc",
+ "home",
+ "log",
+ "quick-xml 0.38.4",
+ "rust-ini",
+ "serde",
+ "thiserror 2.0.18",
+ "time",
+ "url",
+]
+
+[[package]]
 name = "ferroid"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5734,7 +5734,8 @@ dependencies = [
  "futures",
  "iggy_connector_sdk",
  "once_cell",
- "rust-s3",
+ "rustls",
+ "s3-tokio",
  "serde",
  "simd-json",
  "sqlx",
@@ -5803,7 +5804,7 @@ dependencies = [
  "clap",
  "futures-util",
  "iggy",
- "lz4_flex 0.13.0",
+ "lz4_flex",
  "rand 0.10.0",
  "serde",
  "serde_json",
@@ -6717,15 +6718,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lz4_flex"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db9a0d582c2874f68138a16ce1867e0ffde6c0bb0a0df85e1f36d04146db488a"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
 name = "macro_magic"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6803,17 +6795,6 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
-
-[[package]]
-name = "maybe-async"
-version = "0.2.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cf92c10c7e361d6b99666ec1c6f9805b0bea2c3bd8c78dc6fe98ac5bd78db11"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
 
 [[package]]
 name = "maybe-rayon"
@@ -7818,7 +7799,7 @@ dependencies = [
  "futures",
  "half",
  "hashbrown 0.16.1",
- "lz4_flex 0.12.1",
+ "lz4_flex",
  "num-bigint",
  "num-integer",
  "num-traits",
@@ -9346,41 +9327,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-s3"
-version = "0.37.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4af74047374528b627109d579ce86b23ccf6ffba7ff363c807126c1aff69e1bb"
-dependencies = [
- "async-trait",
- "aws-creds",
- "aws-region",
- "base64 0.22.1",
- "bytes",
- "cfg-if",
- "futures-util",
- "hex",
- "hmac",
- "http 1.4.0",
- "log",
- "maybe-async",
- "md5",
- "minidom",
- "percent-encoding",
- "quick-xml 0.38.4",
- "reqwest 0.12.28",
- "serde",
- "serde_derive",
- "serde_json",
- "sha2",
- "sysinfo 0.37.2",
- "thiserror 2.0.18",
- "time",
- "tokio",
- "tokio-stream",
- "url",
-]
-
-[[package]]
 name = "rust_decimal"
 version = "1.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9591,6 +9537,41 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "s3-tokio"
+version = "0.39.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fd8d44de9045104205a93dcfe3525889df62af2d2db6d95ccb44663733b8832"
+dependencies = [
+ "aws-region",
+ "base64 0.22.1",
+ "bytes",
+ "femlol-aws-creds",
+ "futures",
+ "hex",
+ "hmac",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-timeout",
+ "hyper-util",
+ "md5",
+ "minidom",
+ "percent-encoding",
+ "quick-xml 0.38.4",
+ "rustls",
+ "serde",
+ "sha2",
+ "strum_macros 0.27.2",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "url",
+]
 
 [[package]]
 name = "same-file"

@@ -41,14 +41,13 @@ dashmap = { workspace = true }
 futures = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 once_cell = { workspace = true }
-rust-s3 = { workspace = true }
+s3-tokio = { workspace = true }
 serde = { workspace = true }
 simd-json = { workspace = true }
-sqlx = { version = "0.8", features = [
-    "runtime-tokio-rustls",
-    "postgres",
-    "chrono",
-] }
+sqlx = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+rustls = { workspace = true }

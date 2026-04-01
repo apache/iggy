@@ -26,7 +26,7 @@ use uuid::Uuid;
 /// S3 uploader for staging CSV files before Redshift COPY.
 #[derive(Debug)]
 pub struct S3Uploader {
-    bucket: Box<Bucket>,
+    bucket: Bucket,
     prefix: String,
 }
 
@@ -154,9 +154,18 @@ impl S3Uploader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+
+    fn install_crypto_provider() {
+        static PROVIDER: OnceLock<()> = OnceLock::new();
+        PROVIDER.get_or_init(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
 
     #[test]
     fn test_s3_uploader_creation_with_credentials() {
+        install_crypto_provider();
         let result = S3Uploader::new(
             "test-bucket",
             "prefix/",
@@ -170,6 +179,7 @@ mod tests {
 
     #[test]
     fn test_prefix_normalization() {
+        install_crypto_provider();
         let uploader = S3Uploader::new(
             "test-bucket",
             "staging/redshift/",
@@ -185,6 +195,7 @@ mod tests {
 
     #[test]
     fn test_empty_prefix() {
+        install_crypto_provider();
         let uploader = S3Uploader::new(
             "test-bucket",
             "",
