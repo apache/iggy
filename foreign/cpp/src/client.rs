@@ -18,11 +18,10 @@
 use crate::{RUNTIME, ffi};
 use iggy::prelude::{
     Client as IggyConnectionClient, CompressionAlgorithm as RustCompressionAlgorithm, Consumer,
-    ConsumerGroupClient, ConsumerKind, Identifier as RustIdentifier,
-    IggyClient as RustIggyClient, IggyClientBuilder as RustIggyClientBuilder, IggyError,
-    IggyExpiry as RustIggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize as RustMaxTopicSize,
-    MessageClient, Partitioning, PartitionClient, PollingStrategy, StreamClient, TopicClient,
-    UserClient,
+    ConsumerGroupClient, ConsumerKind, Identifier as RustIdentifier, IggyClient as RustIggyClient,
+    IggyClientBuilder as RustIggyClientBuilder, IggyError, IggyExpiry as RustIggyExpiry,
+    IggyMessage, IggyTimestamp, MaxTopicSize as RustMaxTopicSize, MessageClient, PartitionClient,
+    Partitioning, PollingStrategy, StreamClient, TopicClient, UserClient,
 };
 use std::str::FromStr;
 use std::sync::Arc;
