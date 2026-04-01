@@ -929,7 +929,7 @@ TEST(LowLevelE2E_Message, PollMessagesWithInvalidPartitionId) {
 }
 
 TEST(LowLevelE2E_Message, PollMessagesWithCountZero) {
-    RecordProperty("description", "Verifies polling with count=0 returns zero messages successfully.");
+    RecordProperty("description", "Throws when polling with count=0.");
     const std::string stream_name = "cpp-msg-count-zero";
     iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -939,20 +939,9 @@ TEST(LowLevelE2E_Message, PollMessagesWithCountZero) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
-    for (std::uint32_t i = 0; i < 5; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("msg-" + std::to_string(i)));
-        messages.push_back(std::move(msg));
-    }
-    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
-
-    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, 0, false);
-
-    ASSERT_EQ(polled.count, 0u);
-    ASSERT_EQ(polled.messages.size(), 0u);
+    ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                       make_numeric_identifier(1), "offset", 0, 0, false),
+                 std::exception);
 
     client->delete_stream(make_numeric_identifier(stream.id));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
