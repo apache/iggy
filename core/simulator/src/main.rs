@@ -65,9 +65,7 @@ fn main() {
     println!("[sim] Initializing test partition: {test_namespace:?}");
     sim.init_partition(test_namespace);
 
-    // -----------------------------------------------------------------------
     // 1. Send messages to a partition
-    // -----------------------------------------------------------------------
     println!("[sim] Sending messages to partition");
     let test_messages = vec![
         b"Hello, partition!".as_slice(),
@@ -81,9 +79,7 @@ fn main() {
     assert!(!replies.is_empty(), "expected send_messages reply");
     println!("[sim] Got send_messages reply: {:?}", replies[0].header());
 
-    // -----------------------------------------------------------------------
     // 2. Metadata operations (create + delete stream)
-    // -----------------------------------------------------------------------
     let create_msg = client.create_stream("test-stream");
     sim.submit_request(client_id, leader, create_msg.into_generic());
 
@@ -98,9 +94,7 @@ fn main() {
     assert!(!replies.is_empty(), "expected delete_stream reply");
     println!("[sim] Got delete_stream reply: {:?}", replies[0].header());
 
-    // -----------------------------------------------------------------------
     // 3. Crash a follower and verify the cluster still commits
-    // -----------------------------------------------------------------------
     println!("\n[sim] === Crash demo ===");
     println!("[sim] Crashing replica 2 (follower)");
     sim.replica_crash(2);
@@ -119,9 +113,7 @@ fn main() {
         replies[0].header()
     );
 
-    // -----------------------------------------------------------------------
     // 4. Poll messages and check offsets on the leader
-    // -----------------------------------------------------------------------
     let consumer = PollingConsumer::Consumer(1, 0);
     let args = PollingArgs::new(PollingStrategy::first(), 10, false);
     match sim.poll_messages(leader as usize, test_namespace, consumer, args) {
