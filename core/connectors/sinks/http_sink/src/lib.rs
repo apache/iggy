@@ -114,6 +114,11 @@ struct MetadataEnvelope {
 }
 
 /// Iggy message metadata fields.
+///
+/// Field naming convention: `iggy_*` without leading underscore. The Elasticsearch sink
+/// uses `_iggy_*` (leading underscore, ES convention for internal fields). This divergence
+/// is intentional — HTTP endpoints follow standard JSON conventions, not ES-specific ones.
+/// A follow-up to unify the convention across sinks may be worthwhile.
 #[derive(Debug, Serialize)]
 struct IggyMetadata {
     iggy_id: String,
@@ -197,6 +202,8 @@ pub struct HttpSinkConfig {
 pub struct HttpSink {
     id: u32,
     url: String,
+    /// URL with userinfo (user:password) stripped for safe logging.
+    log_url: String,
     method: HttpMethod,
     timeout: Duration,
     max_payload_size_bytes: u64,
@@ -230,6 +237,7 @@ pub struct HttpSink {
 impl HttpSink {
     pub fn new(id: u32, config: HttpSinkConfig) -> Self {
         let url = config.url;
+        let log_url = sanitize_url_for_log(&url);
         let method = config.method.unwrap_or_default();
         let timeout = parse_duration(config.timeout.as_deref(), DEFAULT_TIMEOUT);
         let max_payload_size_bytes = config
@@ -298,6 +306,7 @@ impl HttpSink {
         HttpSink {
             id,
             url,
+            log_url,
             method,
             timeout,
             max_payload_size_bytes,
@@ -393,26 +402,20 @@ impl HttpSink {
         }
     }
 
-    /// Build a message envelope with optional metadata wrapping.
-    fn build_envelope(
+    /// Build the `IggyMetadata` struct from message and topic context.
+    /// Shared by `build_envelope`, `build_envelope_vec`, and `build_envelope_to_writer`.
+    fn build_iggy_metadata(
         &self,
         message: &ConsumedMessage,
         topic_metadata: &TopicMetadata,
         messages_metadata: &MessagesMetadata,
-        payload_json: serde_json::Value,
-    ) -> Result<serde_json::Value, Error> {
-        if !self.include_metadata {
-            return Ok(payload_json);
-        }
-
+    ) -> Result<IggyMetadata, Error> {
         let headers_map = if let Some(ref headers) = message.headers
             && !headers.is_empty()
         {
             let map: serde_json::Map<String, serde_json::Value> = headers
                 .iter()
                 .map(|(k, v)| {
-                    // Raw bytes: base64-encode to avoid Rust debug format in JSON output.
-                    // as_raw() returns Ok only for HeaderKind::Raw.
                     let value = if let Ok(raw) = v.as_raw() {
                         let encoded = EncodedHeader {
                             data: general_purpose::STANDARD.encode(raw),
@@ -431,7 +434,7 @@ impl HttpSink {
             None
         };
 
-        let metadata = IggyMetadata {
+        Ok(IggyMetadata {
             iggy_id: format_u128_as_hex(message.id),
             iggy_offset: message.offset,
             iggy_timestamp: message.timestamp,
@@ -449,8 +452,24 @@ impl HttpSink {
                 None
             },
             iggy_headers: headers_map,
-        };
+        })
+    }
 
+    /// Build a message envelope as `serde_json::Value` (used by `json_array` mode).
+    /// Note: For `individual` and `ndjson` modes, prefer `build_envelope_vec` or
+    /// `build_envelope_to_writer` which serialize directly without the intermediate `Value`.
+    fn build_envelope(
+        &self,
+        message: &ConsumedMessage,
+        topic_metadata: &TopicMetadata,
+        messages_metadata: &MessagesMetadata,
+        payload_json: serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
+        if !self.include_metadata {
+            return Ok(payload_json);
+        }
+
+        let metadata = self.build_iggy_metadata(message, topic_metadata, messages_metadata)?;
         let envelope = MetadataEnvelope {
             metadata,
             payload: payload_json,
@@ -458,6 +477,55 @@ impl HttpSink {
 
         serde_json::to_value(envelope)
             .map_err(|e| Error::Serialization(format!("MetadataEnvelope: {}", e)))
+    }
+
+    /// Serialize a message envelope directly to bytes, avoiding the intermediate `Value`.
+    /// Used by `individual` mode where the final output is always bytes.
+    fn build_envelope_vec(
+        &self,
+        message: &ConsumedMessage,
+        topic_metadata: &TopicMetadata,
+        messages_metadata: &MessagesMetadata,
+        payload_json: serde_json::Value,
+    ) -> Result<Vec<u8>, Error> {
+        if !self.include_metadata {
+            return serde_json::to_vec(&payload_json)
+                .map_err(|e| Error::Serialization(format!("Payload serialize: {}", e)));
+        }
+
+        let metadata = self.build_iggy_metadata(message, topic_metadata, messages_metadata)?;
+        let envelope = MetadataEnvelope {
+            metadata,
+            payload: payload_json,
+        };
+
+        serde_json::to_vec(&envelope)
+            .map_err(|e| Error::Serialization(format!("MetadataEnvelope serialize: {}", e)))
+    }
+
+    /// Serialize a message envelope directly to a writer, avoiding the intermediate `Value`.
+    /// Used by `ndjson` mode where the final output is a byte stream.
+    fn build_envelope_to_writer<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        message: &ConsumedMessage,
+        topic_metadata: &TopicMetadata,
+        messages_metadata: &MessagesMetadata,
+        payload_json: serde_json::Value,
+    ) -> Result<(), Error> {
+        if !self.include_metadata {
+            return serde_json::to_writer(writer, &payload_json)
+                .map_err(|e| Error::Serialization(format!("Payload serialize: {}", e)));
+        }
+
+        let metadata = self.build_iggy_metadata(message, topic_metadata, messages_metadata)?;
+        let envelope = MetadataEnvelope {
+            metadata,
+            payload: payload_json,
+        };
+
+        serde_json::to_writer(writer, &envelope)
+            .map_err(|e| Error::Serialization(format!("MetadataEnvelope serialize: {}", e)))
     }
 
     /// Record a successful request timestamp.
@@ -483,7 +551,7 @@ impl HttpSink {
                 "HTTP sink ID: {} — sending {:?} {} ({} bytes)",
                 self.id,
                 self.method,
-                self.url,
+                self.log_url,
                 body.len(),
             );
         }
@@ -500,9 +568,9 @@ impl HttpSink {
                 self.errors_count.fetch_add(1, Ordering::Relaxed);
                 error!(
                     "HTTP sink ID: {} — request to {} failed after middleware retries: {:#}",
-                    self.id, self.url, e
+                    self.id, self.log_url, e
                 );
-                Error::HttpRequestFailed(format!("HTTP {} — {}", self.url, e))
+                Error::HttpRequestFailed(format!("HTTP {} — {}", self.log_url, e))
             })?;
 
         let status = response.status();
@@ -535,7 +603,7 @@ impl HttpSink {
         self.errors_count.fetch_add(1, Ordering::Relaxed);
         Err(Error::HttpRequestFailed(format!(
             "HTTP {} — status: {}",
-            self.url,
+            self.log_url,
             status.as_u16()
         )))
     }
@@ -662,10 +730,7 @@ impl HttpSink {
         self.send_per_message(messages, self.batch_mode.content_type(), |mut message| {
             let payload = std::mem::replace(&mut message.payload, Payload::Raw(vec![]));
             let payload_json = self.payload_to_json(payload)?;
-            let envelope =
-                self.build_envelope(&message, topic_metadata, messages_metadata, payload_json)?;
-            serde_json::to_vec(&envelope)
-                .map_err(|e| Error::Serialization(format!("Envelope serialize: {}", e)))
+            self.build_envelope_vec(&message, topic_metadata, messages_metadata, payload_json)
         })
         .await
     }
@@ -683,11 +748,11 @@ impl HttpSink {
             .send_with_retry(body, self.batch_mode.content_type())
             .await
         {
-            // send_with_retry already added 1 to errors_count for the HTTP failure.
-            // Add the remaining messages that were serialized but not delivered.
-            if count > 1 {
-                self.errors_count.fetch_add(count - 1, Ordering::Relaxed);
-            }
+            // Count all serialized-but-undelivered messages as errors.
+            // send_with_retry already incremented errors_count by 1 for the HTTP failure;
+            // add the rest here. Total = count (all messages in the batch that were serialized).
+            self.errors_count
+                .fetch_add(count.saturating_sub(1), Ordering::Relaxed);
             if skipped > 0 {
                 error!(
                     "HTTP sink ID: {} — {} batch failed with {} serialization skips",
@@ -714,7 +779,10 @@ impl HttpSink {
         messages_metadata: &MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
-        let mut lines = Vec::with_capacity(messages.len());
+        // Write directly to a single Vec<u8> — avoids the intermediate Vec<String>
+        // and the join("\n") copy that doubles memory usage.
+        let mut body = Vec::with_capacity(messages.len() * 256);
+        let mut count = 0u64;
         let mut skipped = 0u64;
 
         for mut message in messages {
@@ -731,48 +799,32 @@ impl HttpSink {
                     continue;
                 }
             };
-            let envelope = match self.build_envelope(
+            let pos = body.len();
+            if let Err(e) = self.build_envelope_to_writer(
+                &mut body,
                 &message,
                 topic_metadata,
                 messages_metadata,
                 payload_json,
             ) {
-                Ok(env) => env,
-                Err(e) => {
-                    error!(
-                        "HTTP sink ID: {} — skipping message at offset {} in NDJSON batch (envelope): {}",
-                        self.id, message.offset, e
-                    );
-                    self.errors_count.fetch_add(1, Ordering::Relaxed);
-                    skipped += 1;
-                    continue;
-                }
-            };
-            match serde_json::to_string(&envelope) {
-                Ok(line) => lines.push(line),
-                Err(e) => {
-                    error!(
-                        "HTTP sink ID: {} — skipping message at offset {} in NDJSON batch (serialize): {}",
-                        self.id, message.offset, e
-                    );
-                    self.errors_count.fetch_add(1, Ordering::Relaxed);
-                    skipped += 1;
-                    continue;
-                }
+                body.truncate(pos); // Rollback partial write
+                error!(
+                    "HTTP sink ID: {} — skipping message at offset {} in NDJSON batch (serialize): {}",
+                    self.id, message.offset, e
+                );
+                self.errors_count.fetch_add(1, Ordering::Relaxed);
+                skipped += 1;
+                continue;
             }
+            body.push(b'\n');
+            count += 1;
         }
 
-        if lines.is_empty() {
+        if count == 0 {
             return Err(Error::Serialization(
                 "All messages in NDJSON batch failed serialization".to_string(),
             ));
         }
-
-        let count = lines.len() as u64;
-
-        let mut body_str = lines.join("\n");
-        body_str.push('\n'); // NDJSON spec requires trailing newline
-        let body = body_str.into_bytes();
 
         if self.max_payload_size_bytes > 0 && body.len() as u64 > self.max_payload_size_bytes {
             error!(
@@ -978,6 +1030,21 @@ fn truncate_response(body: &str, max_len: usize) -> &str {
     }
 }
 
+/// Strip userinfo (user:password) from a URL for safe logging.
+/// Returns the original string unchanged if parsing fails.
+fn sanitize_url_for_log(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                let _ = parsed.set_username("");
+                let _ = parsed.set_password(None);
+            }
+            parsed.to_string()
+        }
+        Err(_) => url.to_string(),
+    }
+}
+
 #[async_trait]
 impl Sink for HttpSink {
     async fn open(&mut self) -> Result<(), Error> {
@@ -1025,14 +1092,14 @@ impl Sink for HttpSink {
                 if scheme != "http" && scheme != "https" {
                     return Err(Error::InitError(format!(
                         "HTTP sink URL scheme '{}' is not allowed — only 'http' and 'https' are supported (url: '{}')",
-                        scheme, self.url,
+                        scheme, self.log_url,
                     )));
                 }
             }
             Err(e) => {
                 return Err(Error::InitError(format!(
                     "HTTP sink URL '{}' is not a valid URL: {}",
-                    self.url, e,
+                    self.log_url, e,
                 )));
             }
         }
@@ -1091,7 +1158,10 @@ impl Sink for HttpSink {
                 build_request(self.health_check_method, client, &self.url).headers(headers.clone());
 
             let response = health_request.send().await.map_err(|e| {
-                Error::Connection(format!("Health check failed for URL '{}': {}", self.url, e))
+                Error::Connection(format!(
+                    "Health check failed for URL '{}': {}",
+                    self.log_url, e
+                ))
             })?;
 
             let status = response.status();
@@ -1100,7 +1170,7 @@ impl Sink for HttpSink {
                     "Health check returned status {} (not in success_status_codes {:?}) for URL '{}'",
                     status.as_u16(),
                     self.success_status_codes,
-                    self.url,
+                    self.log_url,
                 )));
             }
 
@@ -1114,7 +1184,7 @@ impl Sink for HttpSink {
         info!(
             "Opened HTTP sink connector with ID: {} for URL: {} (method: {:?}, \
              batch_mode: {:?}, timeout: {:?}, max_retries: {})",
-            self.id, self.url, self.method, self.batch_mode, self.timeout, self.max_retries,
+            self.id, self.log_url, self.method, self.batch_mode, self.timeout, self.max_retries,
         );
         Ok(())
     }
