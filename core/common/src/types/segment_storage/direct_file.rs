@@ -30,9 +30,9 @@ const O_DIRECT: i32 = 0x4000;
 const O_DSYNC: i32 = 0x1000;
 
 #[cfg(not(target_os = "linux"))]
-const O_DIRECT: u32 = 0;
+const O_DIRECT: i32 = 0;
 #[cfg(not(target_os = "linux"))]
-const O_DSYNC: u32 = 0;
+const O_DSYNC: i32 = 0;
 
 /// Cache line padding to prevent false sharing
 #[repr(align(64))]
@@ -54,8 +54,6 @@ pub struct DirectFile {
     spare: PooledBuffer,
 }
 
-/// Hold a frozen view or owned mutable buffer
-/// Used internally by `write_vectored` to defer the thaw/copy decision until submission time
 enum WriteChunk {
     Frozen(Bytes),
     Owned(PooledBuffer),
@@ -85,23 +83,13 @@ impl DirectFile {
         let file = OpenOptions::new()
             .create(true)
             .write(true)
-            .custom_flags(O_DSYNC | O_DIRECT)
+            .custom_flags((O_DSYNC | O_DIRECT) as _)
             .open(file_path)
             .await
             .map_err(|err| {
                 error!("Failed to open file with O_DIRECT: {file_path}, error: {err}");
                 IggyError::CannotReadFile
             })?;
-
-        // if !file_exists {
-        //     let init_buffer = PooledBuffer::with_capacity(ALIGNMENT);
-        //     let (result, _) = file.write_all_at(init_buffer, 0).await.into();
-        //
-        //     result.map_err(|err| {
-        //         error!("Failed to init file with dummy block: {file_path}, error: {err}");
-        //         IggyError::CannotWriteToFile
-        //     })?;
-        // }
 
         trace!(
             "Successfully opened DirectIO File: {}, pos: {}, exists: {}",
