@@ -41,12 +41,12 @@ pub trait MessageBus {
         &self,
         client_id: Self::Client,
         data: Self::Data,
-    ) -> impl Future<Output = Result<(), IggyError>>;
+    ) -> impl Future<Output = Result<Self::Data, IggyError>>;
     fn send_to_replica(
         &self,
         replica: Self::Replica,
         data: Self::Data,
-    ) -> impl Future<Output = Result<(), IggyError>>;
+    ) -> impl Future<Output = Result<Self::Data, IggyError>>;
 }
 
 // TODO: explore generics for Strategy
@@ -113,25 +113,25 @@ impl MessageBus for IggyMessageBus {
     async fn send_to_client(
         &self,
         client_id: Self::Client,
-        _message: Self::Data,
-    ) -> Result<(), IggyError> {
+        message: Self::Data,
+    ) -> Result<Self::Data, IggyError> {
         #[allow(clippy::cast_possible_truncation)] // IggyError::ClientNotFound takes u32
         let _sender = self
             .clients
             .get(&client_id)
             .ok_or(IggyError::ClientNotFound(client_id as u32))?;
-        Ok(())
+        Ok(message)
     }
 
     async fn send_to_replica(
         &self,
         replica: Self::Replica,
-        _message: Self::Data,
-    ) -> Result<(), IggyError> {
+        message: Self::Data,
+    ) -> Result<Self::Data, IggyError> {
         // TODO: Handle lazily creating the connection.
         let _connection = self
             .get_replica_connection(replica)
             .ok_or(IggyError::ResourceNotFound(format!("Replica {replica}")))?;
-        Ok(())
+        Ok(message)
     }
 }

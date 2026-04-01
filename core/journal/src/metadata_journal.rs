@@ -17,10 +17,10 @@
 
 use crate::file_storage::FileStorage;
 use crate::{Journal, JournalHandle};
-use bytes::Bytes;
 use compio::io::AsyncWriteAtExt;
 use iggy_binary_protocol::consensus::message::Message;
 use iggy_binary_protocol::consensus::{Command2, PrepareHeader};
+use iobuf::Owned;
 use std::cell::{Cell, Ref, RefCell};
 use std::fmt;
 use std::io;
@@ -259,8 +259,11 @@ impl MetadataJournal {
         };
         let buf = vec![0u8; size];
         let buf = self.storage.read_at(offset, buf).await?;
-        let msg = Message::from_bytes(Bytes::from(buf))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let msg = Message::try_from(Owned::<4096>::copy_from_slice(&buf)).map_err(
+            |e: iggy_binary_protocol::consensus::ConsensusError| {
+                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+            },
+        )?;
         Ok(Some(msg))
     }
 }
@@ -347,8 +350,11 @@ impl Journal<FileStorage> for MetadataJournal {
         for (header, offset) in &to_drain {
             let buf = vec![0u8; header.size as usize];
             let buf = self.storage.read_at(*offset, buf).await?;
-            let msg = Message::from_bytes(Bytes::from(buf))
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let msg = Message::try_from(Owned::<4096>::copy_from_slice(&buf)).map_err(
+                |e: iggy_binary_protocol::consensus::ConsensusError| {
+                    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                },
+            )?;
             drained.push(msg);
         }
 
@@ -406,7 +412,7 @@ impl Journal<FileStorage> for MetadataJournal {
         let header = *entry.header();
         let offset = self.storage.file_len();
 
-        self.storage.write_append(entry.into_inner()).await?;
+        self.storage.write_append(entry.as_slice().to_vec()).await?;
         self.storage.fsync().await?;
 
         let slot = slot_for_op(header.op);
@@ -450,7 +456,7 @@ impl Journal<FileStorage> for MetadataJournal {
 
         let buffer = vec![0u8; size];
         let buffer = self.storage.read_at(offset, buffer).await.ok()?;
-        Message::from_bytes(Bytes::from(buffer)).ok()
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer)).ok()
     }
 }
 
@@ -467,26 +473,27 @@ impl JournalHandle for MetadataJournal {
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 mod tests {
     use super::*;
-    use bytes::BytesMut;
     use iggy_binary_protocol::consensus::Operation;
     use tempfile::tempdir;
 
     fn make_prepare(op: u64, body_size: usize) -> Message<PrepareHeader> {
         let total_size = HEADER_SIZE + body_size;
-        let mut buffer = BytesMut::zeroed(total_size);
+        let mut buffer = Owned::<4096>::zeroed(total_size);
 
-        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(&mut buffer[..HEADER_SIZE]);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut buffer.as_mut_slice()[..HEADER_SIZE],
+        );
         header.size = total_size as u32;
         header.command = Command2::Prepare;
         header.op = op;
         header.operation = Operation::CreateStream;
 
         // Fill body with recognizable pattern
-        for (i, byte) in buffer[HEADER_SIZE..].iter_mut().enumerate() {
+        for (i, byte) in buffer.as_mut_slice()[HEADER_SIZE..].iter_mut().enumerate() {
             *byte = (op as u8).wrapping_add(i as u8);
         }
 
-        Message::from_bytes(buffer.freeze()).unwrap()
+        Message::try_from(buffer).unwrap()
     }
 
     #[compio::test]
@@ -508,8 +515,8 @@ mod tests {
         let msg1 = make_prepare(1, 64);
         let msg2 = make_prepare(2, 32);
 
-        journal.append(msg1.clone()).await.unwrap();
-        journal.append(msg2.clone()).await.unwrap();
+        journal.append(msg1.deep_copy()).await.unwrap();
+        journal.append(msg2.deep_copy()).await.unwrap();
 
         assert_eq!(journal.last_op(), Some(2));
         assert!(journal.header(1).is_some());
@@ -518,11 +525,11 @@ mod tests {
 
         let entry1 = journal.entry(msg1.header()).await.unwrap();
         assert_eq!(entry1.header().op, 1);
-        assert_eq!(entry1.body().len(), 64);
+        assert_eq!(entry1.as_slice()[HEADER_SIZE..].len(), 64);
 
         let entry2 = journal.entry(msg2.header()).await.unwrap();
         assert_eq!(entry2.header().op, 2);
-        assert_eq!(entry2.body().len(), 32);
+        assert_eq!(entry2.as_slice()[HEADER_SIZE..].len(), 32);
     }
 
     #[compio::test]
@@ -684,7 +691,7 @@ mod tests {
             assert_eq!(h.op, op);
             let entry = journal.entry_at(&h).await.unwrap().unwrap();
             assert_eq!(entry.header().op, op);
-            assert_eq!(entry.body().len(), 64);
+            assert_eq!(entry.as_slice()[HEADER_SIZE..].len(), 64);
         }
 
         // Reopen and verify the drained WAL is valid
@@ -695,7 +702,7 @@ mod tests {
             let h = *journal.header(op as usize).unwrap();
             let entry = journal.entry_at(&h).await.unwrap().unwrap();
             assert_eq!(entry.header().op, op);
-            assert_eq!(entry.body().len(), 64);
+            assert_eq!(entry.as_slice()[HEADER_SIZE..].len(), 64);
         }
     }
 

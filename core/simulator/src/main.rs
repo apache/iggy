@@ -145,11 +145,8 @@ fn main() {
             .poll_messages(leader as usize, test_namespace, consumer, args)
             .await
         {
-            Ok(batch_set) => {
-                println!(
-                    "[sim] Poll returned {} messages (expected 3)",
-                    batch_set.count()
-                );
+            Ok((fragments, _last_matching_offset)) => {
+                println!("[sim] Poll returned {} fragments", fragments.len());
             }
             Err(e) => {
                 println!("[sim] Poll failed: {e}");
@@ -161,7 +158,10 @@ fn main() {
             .poll_messages(leader as usize, test_namespace, consumer, args_auto)
             .await
         {
-            println!("[sim] Auto-commit poll returned {} messages", batch.count());
+            println!(
+                "[sim] Auto-commit poll returned {} fragments",
+                batch.0.len()
+            );
         }
 
         // Next poll should start from offset 2 (after auto-commit of 0,1)
@@ -170,10 +170,7 @@ fn main() {
             .poll_messages(leader as usize, test_namespace, consumer, args_next)
             .await
         {
-            println!(
-                "[sim] Next poll returned {} messages (expected 1)",
-                batch.count()
-            );
+            println!("[sim] Next poll returned {} fragments", batch.0.len());
         }
 
         // Check offsets

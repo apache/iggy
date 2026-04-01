@@ -247,11 +247,15 @@ macro_rules! collect_handlers {
                 fn parse(input: Self::Input) -> Result<::iggy_common::Either<Self::Cmd, Self::Input>, Self::Error> {
                     use ::iggy_common::BytesSerializable;
                     use ::iggy_common::Either;
-                    use ::iggy_binary_protocol::Operation;
+                    use ::iggy_binary_protocol::{Operation, PrepareHeader};
                     match input.header().operation {
                         $(
                             Operation::$operation => {
-                                let body = input.body_bytes();
+                                // TODO: FIXME, zero allocation operation construction.
+                                let header = *input.header();
+                                let body = ::bytes::Bytes::copy_from_slice(
+                                    &input.as_slice()[core::mem::size_of::<PrepareHeader>()..header.size as usize]
+                                );
                                 let cmd = $operation::from_bytes(body)?;
                                 Ok(Either::Left([<$state Command>]::$operation(cmd)))
                             },

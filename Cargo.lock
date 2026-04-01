@@ -2233,9 +2233,11 @@ dependencies = [
  "futures",
  "iggy_binary_protocol",
  "iggy_common",
+ "iobuf",
  "message_bus",
  "rand 0.10.0",
  "rand_xoshiro",
+ "tracing",
 ]
 
 [[package]]
@@ -2547,6 +2549,27 @@ dependencies = [
  "generic-array",
  "rand_core 0.6.4",
  "typenum",
+]
+
+[[package]]
+name = "csv"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52cd9d68cf7efc6ddfaaee42e7288d3a99d613d4b50f76ce9827ae0c6e14f938"
+dependencies = [
+ "csv-core",
+ "itoa",
+ "ryu",
+ "serde_core",
+]
+
+[[package]]
+name = "csv-core"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704a3c26996a80471189265814dbc2c257598b96b8a7feae2d31ace646bb9782"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -5390,6 +5413,8 @@ dependencies = [
  "bytemuck",
  "bytes",
  "enumset",
+ "iobuf",
+ "smallvec",
  "thiserror 2.0.18",
 ]
 
@@ -5406,6 +5431,7 @@ dependencies = [
  "blake3",
  "bon",
  "byte-unit",
+ "bytemuck",
  "bytes",
  "chrono",
  "clap",
@@ -5416,6 +5442,8 @@ dependencies = [
  "err_trail",
  "human-repr",
  "humantime",
+ "iggy_binary_protocol",
+ "iobuf",
  "lending-iterator",
  "moka",
  "nix",
@@ -5493,6 +5521,51 @@ dependencies = [
  "serde",
  "simd-json",
  "strum 0.28.0",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "iggy_connector_influxdb_sink"
+version = "0.1.0-edge.1"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "dashmap",
+ "futures",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "once_cell",
+ "reqwest 0.13.2",
+ "reqwest-middleware",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "simd-json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "iggy_connector_influxdb_source"
+version = "0.1.0-edge.1"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "csv",
+ "dashmap",
+ "futures",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "once_cell",
+ "regex",
+ "reqwest 0.13.2",
+ "reqwest-middleware",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -5592,10 +5665,13 @@ dependencies = [
 name = "iggy_connector_sdk"
 version = "0.2.2-edge.1"
 dependencies = [
+ "anyhow",
  "async-trait",
  "base64 0.22.1",
  "dashmap",
  "flatbuffers",
+ "http 1.4.0",
+ "humantime",
  "iggy",
  "iggy_common",
  "once_cell",
@@ -5604,7 +5680,10 @@ dependencies = [
  "prost-types",
  "protox",
  "protox-parse",
+ "rand 0.10.0",
  "regex",
+ "reqwest 0.13.2",
+ "reqwest-middleware",
  "rmp-serde",
  "serde",
  "serde_json",
@@ -5817,6 +5896,7 @@ dependencies = [
  "ahash 0.8.12",
  "assert_cmd",
  "async-trait",
+ "base64 0.22.1",
  "bon",
  "bytes",
  "compio",
@@ -5911,6 +5991,7 @@ name = "iobuf"
 version = "0.1.0"
 dependencies = [
  "aligned-vec",
+ "compio-buf",
 ]
 
 [[package]]
@@ -6049,9 +6130,9 @@ name = "journal"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "bytes",
  "compio",
  "iggy_binary_protocol",
+ "iobuf",
  "tempfile",
 ]
 
@@ -6671,6 +6752,7 @@ dependencies = [
  "consensus",
  "iggy_binary_protocol",
  "iggy_common",
+ "iobuf",
  "journal",
  "left-right",
  "message_bus",
@@ -7646,13 +7728,17 @@ dependencies = [
 name = "partitions"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "bytes",
+ "compio",
  "consensus",
  "iggy_binary_protocol",
  "iggy_common",
+ "iobuf",
  "journal",
  "message_bus",
  "ringbuffer",
+ "smallvec",
  "tokio",
  "tracing",
 ]
@@ -9946,6 +10032,7 @@ dependencies = [
  "futures",
  "iggy_binary_protocol",
  "iggy_common",
+ "iobuf",
  "journal",
  "message_bus",
  "metadata",

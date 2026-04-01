@@ -76,6 +76,7 @@ impl<R: Send + 'static> ShardFrame<R> {
 
     /// Create a request-response frame.  Returns the frame and a receiver
     /// that the caller can await for completion notification.
+    #[must_use]
     pub fn with_response(message: Message<GenericHeader>) -> (Self, Receiver<R>) {
         let (tx, rx) = channel(1);
         (

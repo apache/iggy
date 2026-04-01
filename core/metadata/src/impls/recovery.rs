@@ -158,8 +158,8 @@ where
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use bytes::BytesMut;
     use iggy_binary_protocol::consensus::{Command2, Operation};
+    use iobuf::Owned;
     use journal::Journal;
     use tempfile::tempdir;
 
@@ -171,13 +171,15 @@ mod tests {
 
     fn make_prepare(op: u64, body_size: usize) -> Message<PrepareHeader> {
         let total_size = HEADER_SIZE + body_size;
-        let mut buffer = BytesMut::zeroed(total_size);
-        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(&mut buffer[..HEADER_SIZE]);
+        let mut buffer = Owned::<4096>::zeroed(total_size);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut buffer.as_mut_slice()[..HEADER_SIZE],
+        );
         header.size = total_size as u32;
         header.command = Command2::Prepare;
         header.op = op;
         header.operation = Operation::CreateStream;
-        Message::from_bytes(buffer.freeze()).unwrap()
+        Message::try_from(buffer).unwrap()
     }
 
     #[compio::test]
