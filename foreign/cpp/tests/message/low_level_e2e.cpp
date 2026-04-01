@@ -1082,3 +1082,67 @@ TEST(LowLevelE2E_Message, PollMessagesMonotonicOffsets) {
     client->delete_stream(make_numeric_identifier(stream.id));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
+
+TEST(LowLevelE2E_Message, SendMessagesLargeBatch) {
+    RecordProperty("description", "Verifies sending a large batch of 1000 messages succeeds and all are retrievable.");
+    const std::string stream_name = "cpp-msg-large-batch";
+    iggy::ffi::Client *client     = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    rust::Vec<iggy::ffi::Message> messages;
+    for (std::uint32_t i = 0; i < 1000; i++) {
+        iggy::ffi::Message msg;
+        msg.new_message(to_payload("batch-msg-" + std::to_string(i)));
+        messages.push_back(std::move(msg));
+    }
+
+    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                          "partition_id", partition_id_bytes(0), std::move(messages)));
+
+    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                        make_numeric_identifier(1), "offset", 0, 1000, false);
+
+    ASSERT_EQ(polled.count, 1000u);
+    ASSERT_EQ(polled.messages.size(), 1000u);
+    EXPECT_EQ(polled.messages[0].offset, 0u);
+    EXPECT_EQ(polled.messages[999].offset, 999u);
+
+    client->delete_stream(make_numeric_identifier(stream.id));
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+}
+
+TEST(LowLevelE2E_Message, PollMessagesLargeCount) {
+    RecordProperty("description",
+                   "Verifies polling with a very large count returns only the available messages without error.");
+    const std::string stream_name = "cpp-msg-large-count";
+    iggy::ffi::Client *client     = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    rust::Vec<iggy::ffi::Message> messages;
+    for (std::uint32_t i = 0; i < 10; i++) {
+        iggy::ffi::Message msg;
+        msg.new_message(to_payload("msg-" + std::to_string(i)));
+        messages.push_back(std::move(msg));
+    }
+    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                          partition_id_bytes(0), std::move(messages));
+
+    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                        make_numeric_identifier(1), "offset", 0, UINT32_MAX, false);
+
+    ASSERT_EQ(polled.count, 10u);
+    ASSERT_EQ(polled.messages.size(), 10u);
+
+    client->delete_stream(make_numeric_identifier(stream.id));
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+}
