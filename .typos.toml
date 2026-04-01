@@ -30,6 +30,8 @@ bimap = "bimap"
 flate = "flate"
 # Valid Rust compression crate name
 flate2 = "flate2"
+# valid rust crate name
+writeable = "writeable"
 # Valid project-specific technical acronym
 bais = "bais"
 # Legitimate abbreviation for "Strategy" (e.g. pollingStrat)
