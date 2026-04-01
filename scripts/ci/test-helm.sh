@@ -145,6 +145,25 @@ extract_kind_names() {
   ' "$file"
 }
 
+validate_helm_docs() {
+  if ! command -v helm-docs >/dev/null 2>&1; then
+    echo "Warning: helm-docs not found, skipping README drift check" >&2
+    return 0
+  fi
+
+  local readme_before
+  local readme_after
+
+  readme_before="$(cat "$CHART_DIR/README.md")"
+  helm-docs --chart-search-root "$CHART_DIR" --template-files README.md.gotmpl
+  readme_after="$(cat "$CHART_DIR/README.md")"
+
+  if [ "$readme_before" != "$readme_after" ]; then
+    echo "Error: README.md is out of sync with values.yaml. Run 'helm-docs' locally and commit the updated README." >&2
+    exit 1
+  fi
+}
+
 validate() {
   require_command helm
 
@@ -218,6 +237,8 @@ validate() {
     exit 1
   fi
   grep -q 'name: supersecret' "$HELM_RENDER_DIR/existing-secret.yaml"
+
+  validate_helm_docs
 }
 
 smoke() {

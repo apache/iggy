@@ -1,0 +1,142 @@
+{{- /*
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
+*/ -}}
+# {{ template "chart.name" . }}
+
+{{ template "chart.description" . }}
+
+{{ template "chart.versionBadge" . }}{{ template "chart.typeBadge" . }}{{ template "chart.appVersionBadge" . }}
+
+## Prerequisites
+
+* Kubernetes 1.19+
+* Helm 3.2.0+
+* PV provisioner support in the underlying infrastructure (if persistence is enabled)
+* Prometheus Operator CRDs if `server.serviceMonitor.enabled=true`
+
+### io_uring Requirements
+
+Iggy server uses `io_uring` for high-performance async I/O. This requires:
+
+1. **IPC_LOCK capability** - For locking memory required by io_uring
+2. **Unconfined seccomp profile** - To allow io_uring syscalls
+
+These are configured by default for the Iggy server via the chart's root-level
+`securityContext` and `podSecurityContext`. The web UI uses `ui.securityContext`
+and `ui.podSecurityContext`, which default to empty.
+
+Some local or container-based Kubernetes environments may still fail during Iggy runtime
+initialization if the node/kernel does not provide the `io_uring` support required by the
+server runtime.
+
+## Quick Start
+
+```bash
+# Clone the repository
+git clone https://github.com/apache/iggy.git
+cd iggy
+
+# Install with persistence enabled
+helm install iggy ./helm/charts/iggy \
+  --set server.persistence.enabled=true
+
+# Install with custom root credentials
+helm install iggy ./helm/charts/iggy \
+  --set server.persistence.enabled=true \
+  --set server.users.root.username=admin \
+  --set server.users.root.password=secretpassword
+```
+
+> **Note:** `server.serviceMonitor.enabled` defaults to `false`.
+> Enable it only if Prometheus Operator is installed and you want a `ServiceMonitor` resource.
+> The server still requires node/kernel support for `io_uring`, including on clean local clusters such as `kind` or `minikube`.
+
+## Installation
+
+### From Git Repository
+
+```bash
+git clone https://github.com/apache/iggy.git
+cd iggy
+helm install iggy ./helm/charts/iggy
+```
+
+### With Persistence
+
+```bash
+helm install iggy ./helm/charts/iggy \
+  --set server.persistence.enabled=true \
+  --set server.persistence.size=50Gi
+```
+
+### With Custom Values File
+
+```bash
+helm install iggy ./helm/charts/iggy -f custom-values.yaml
+```
+
+If Prometheus Operator is installed and you want monitoring, set
+`server.serviceMonitor.enabled=true` in `custom-values.yaml` or pass it on the
+command line with `--set server.serviceMonitor.enabled=true`.
+
+## Uninstallation
+
+```bash
+helm uninstall iggy
+```
+
+## Using Ingress
+
+Enable ingress in values. Set `className` and any controller-specific annotations to match your
+ingress implementation:
+
+```yaml
+server:
+  ingress:
+    enabled: true
+    className: "<your-ingress-class>"
+    annotations: {}
+    hosts:
+      - host: iggy.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+
+ui:
+  ingress:
+    enabled: true
+    className: "<your-ingress-class>"
+    annotations: {}
+    hosts:
+      - host: iggy-ui.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+```
+
+The chart is controller-neutral and works with any Ingress controller (nginx, Traefik, HAProxy, Contour, etc.).
+
+{{ template "chart.requirementsSection" . }}
+
+## Values
+
+{{ template "chart.valuesTable" . }}
+
+{{ template "helm-docs.versionFooter" . }}

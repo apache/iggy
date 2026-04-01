@@ -198,6 +198,7 @@ jobs:
         uses: ./.github/actions/utils/setup-helm-tools
         with:
           install-kind: ${{ inputs.task == 'smoke' }}
+          install-helm-docs: ${{ inputs.task == 'validate' }}
 
       - name: Setup Helm smoke cluster
         if: inputs.component == 'helm' && inputs.task == 'smoke'
