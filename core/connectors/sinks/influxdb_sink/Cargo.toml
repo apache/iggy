@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_influxdb_sink"
-version = "0.1.0-edge.1"
+version = "0.3.3-edge.1"
 description = "Iggy InfluxDB sink connector for storing stream messages as line protocol"
 edition = "2024"
 license = "Apache-2.0"
