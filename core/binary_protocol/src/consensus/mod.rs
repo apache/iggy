@@ -37,7 +37,7 @@
 //! - [`StartViewHeader`] - new primary -> all replicas (header-only)
 //!
 //! ## Message wrapper
-//! - [`message::Message`] - zero-copy `Bytes` wrapper with typed header access
+//! - [`message::Message`] - typed consensus message wrapper over request or response backing
 
 mod command;
 mod error;
@@ -51,5 +51,8 @@ pub use header::{
     CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader, HEADER_SIZE, PrepareHeader,
     PrepareOkHeader, ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
-pub use message::{ConsensusMessage, MessageBag};
+pub use message::{
+    ConsensusMessage, FragmentedBacking, Message, MessageBacking, MessageBag, MutableBacking,
+    RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
+};
 pub use operation::Operation;

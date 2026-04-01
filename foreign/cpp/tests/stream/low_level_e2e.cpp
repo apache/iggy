@@ -25,6 +25,8 @@
 #include "lib.rs.h"
 #include "tests/common/test_helpers.hpp"
 
+// TODO(slbotbm): Add tests for purge_stream after implementing send_messages(...).
+
 TEST(LowLevelE2E_Stream, CreateStreamAfterLogin) {
     RecordProperty("description", "Creates a stream successfully after authenticating.");
     const std::string stream_name = "cpp-create-stream-after-login";
@@ -79,6 +81,27 @@ TEST(LowLevelE2E_Stream, CreateStreamValidatesNameConstraintsAndUniqueness) {
     const std::string max_length_name(255, 'a');
     ASSERT_NO_THROW(client->create_stream(max_length_name));
 
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    client = nullptr;
+}
+
+TEST(LowLevelE2E_Stream, CreateStreamWithEmojiName) {
+    RecordProperty("description", "Creates a stream with a UTF-8 emoji name.");
+    const std::string stream_name = "🚀🚀🚀🚀Apache Iggy🚀🚀🚀🚀";
+    iggy::ffi::Client *client     = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW({
+        const auto stream_details              = client->get_stream(make_string_identifier(stream_name));
+        const std::string returned_stream_name = static_cast<std::string>(stream_details.name);
+        EXPECT_NE(stream_details.id, 0u);
+        EXPECT_EQ(returned_stream_name, stream_name);
+        EXPECT_EQ(stream_details.topics_count, 0u);
+        EXPECT_EQ(stream_details.topics.size(), 0u);
+    });
+
+    ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
     client = nullptr;
 }

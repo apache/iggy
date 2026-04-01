@@ -15,88 +15,277 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Zero-copy consensus message wrapper.
-//!
-//! `Message<H>` wraps a `Bytes` buffer and provides typed access to the
-//! header via `bytemuck` pointer cast (zero allocation, zero copy).
-
 use crate::consensus::{
-    Command2, ConsensusError, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
+    self, Command2, ConsensusError, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
     RequestHeader,
 };
-use bytes::Bytes;
-use std::marker::PhantomData;
+use iobuf::{Frozen, Owned};
+use smallvec::SmallVec;
+use std::{marker::PhantomData, mem::size_of};
 
-/// Trait for types that provide access to a consensus header.
-pub trait ConsensusMessage<H: ConsensusHeader> {
+const MESSAGE_ALIGN: usize = 4096;
+
+pub trait MessageBacking<H>
+where
+    H: ConsensusHeader,
+{
     fn header(&self) -> &H;
+    fn header_storage(&self) -> &[u8];
+    fn total_len(&self) -> usize;
 }
 
-impl<H: ConsensusHeader> ConsensusMessage<H> for Message<H> {
-    fn header(&self) -> &H {
-        let header_bytes = &self.buffer[..size_of::<H>()];
-        bytemuck::checked::try_from_bytes(header_bytes)
-            .expect("header validated at construction time")
+pub trait RequestBackingKind {}
+pub trait ResponseBackingKind {}
+
+pub trait MutableBacking<H>: MessageBacking<H> + RequestBackingKind
+where
+    H: ConsensusHeader,
+{
+    fn as_slice(&self) -> &[u8];
+    fn as_mut_slice(&mut self) -> &mut [u8];
+}
+
+pub trait FragmentedBacking<H>: MessageBacking<H> + ResponseBackingKind
+where
+    H: ConsensusHeader,
+{
+    fn fragments(&self) -> &[Frozen<MESSAGE_ALIGN>];
+}
+
+#[derive(Debug)]
+pub struct RequestBacking {
+    owned: Owned<MESSAGE_ALIGN>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResponseBacking {
+    fragments: SmallVec<[Frozen<MESSAGE_ALIGN>; 4]>,
+}
+
+impl RequestBackingKind for RequestBacking {}
+impl ResponseBackingKind for ResponseBacking {}
+
+impl RequestBacking {
+    fn into_owned(self) -> Owned<MESSAGE_ALIGN> {
+        self.owned
+    }
+
+    fn into_frozen(self) -> Frozen<MESSAGE_ALIGN> {
+        self.owned.into()
     }
 }
 
-/// Zero-copy message wrapping a `Bytes` buffer with a typed header.
-///
-/// The header is accessed via `bytemuck::try_from_bytes` - a pointer cast,
-/// not a deserialization step. The body is the slice after the header,
-/// sized according to `header.size()`.
+impl<H> MessageBacking<H> for RequestBacking
+where
+    H: ConsensusHeader,
+{
+    fn header(&self) -> &H {
+        let bytes = &self.owned.as_slice()[..size_of::<H>()];
+        bytemuck::checked::try_from_bytes(bytes)
+            .expect("header bytes must match the requested header type")
+    }
+
+    fn header_storage(&self) -> &[u8] {
+        self.owned.as_slice()
+    }
+
+    fn total_len(&self) -> usize {
+        self.owned.as_slice().len()
+    }
+}
+
+impl<H> MutableBacking<H> for RequestBacking
+where
+    H: ConsensusHeader,
+{
+    fn as_slice(&self) -> &[u8] {
+        self.owned.as_slice()
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.owned.as_mut_slice()
+    }
+}
+
+impl<H> MessageBacking<H> for ResponseBacking
+where
+    H: ConsensusHeader,
+{
+    fn header(&self) -> &H {
+        let first = self
+            .fragments
+            .first()
+            .expect("response backing validated at construction time");
+        let bytes = &first.as_slice()[..size_of::<H>()];
+        bytemuck::checked::try_from_bytes(bytes)
+            .expect("response header bytes must match the requested header type")
+    }
+
+    fn header_storage(&self) -> &[u8] {
+        self.fragments
+            .first()
+            .expect("response backing validated at construction time")
+            .as_slice()
+    }
+
+    fn total_len(&self) -> usize {
+        self.fragments.iter().map(Frozen::len).sum()
+    }
+}
+
+impl<H> FragmentedBacking<H> for ResponseBacking
+where
+    H: ConsensusHeader,
+{
+    fn fragments(&self) -> &[Frozen<MESSAGE_ALIGN>] {
+        &self.fragments
+    }
+}
+
+pub trait ConsensusMessage<H>
+where
+    H: ConsensusHeader,
+{
+    fn header(&self) -> &H;
+}
+
+impl<H, B> ConsensusMessage<H> for Message<H, B>
+where
+    H: ConsensusHeader,
+    B: MessageBacking<H>,
+{
+    fn header(&self) -> &H {
+        self.backing.header()
+    }
+}
+
+#[derive(Debug)]
 #[repr(C)]
-#[derive(Debug, Clone)]
-pub struct Message<H: ConsensusHeader> {
-    buffer: Bytes,
+pub struct Message<H, B = RequestBacking> {
+    backing: B,
     _marker: PhantomData<H>,
 }
 
-impl<H: ConsensusHeader> Message<H> {
-    /// Create a message from a buffer, validating the header.
-    ///
+impl<H, B> Message<H, B>
+where
+    H: ConsensusHeader,
+    B: MessageBacking<H>,
+{
+    pub fn header(&self) -> &H {
+        self.backing.header()
+    }
+
+    pub fn total_len(&self) -> usize {
+        self.backing.total_len()
+    }
+
+    pub fn into_inner(self) -> B {
+        self.backing
+    }
+
+    pub fn into_generic(self) -> Message<GenericHeader, B>
+    where
+        B: MessageBacking<GenericHeader>,
+    {
+        Message {
+            backing: self.backing,
+            _marker: PhantomData,
+        }
+    }
+
+    pub const fn as_generic(&self) -> &Message<GenericHeader, B>
+    where
+        B: MessageBacking<GenericHeader>,
+    {
+        unsafe { &*std::ptr::from_ref(self).cast::<Message<GenericHeader, B>>() }
+    }
+
     /// # Errors
-    /// Returns `ConsensusError` if the buffer is too small or the header is invalid.
-    pub fn from_bytes(buffer: Bytes) -> Result<Self, ConsensusError> {
-        if buffer.len() < size_of::<H>() {
+    ///
+    /// Returns [`ConsensusError`] if the backing is too short for `T`, the
+    /// command encoded in the generic header does not match `T::COMMAND`, or
+    /// the typed header fails validation.
+    pub fn try_into_typed<T>(self) -> Result<Message<T, B>, ConsensusError>
+    where
+        T: ConsensusHeader,
+        B: MessageBacking<GenericHeader> + MessageBacking<T>,
+    {
+        if self.total_len() < size_of::<T>() {
             return Err(ConsensusError::InvalidCommand {
-                expected: H::COMMAND,
+                expected: T::COMMAND,
                 found: Command2::Reserved,
             });
         }
 
-        // TODO(hubcio): bytemuck::checked::try_from_bytes requires the buffer to be aligned
-        // to the target type's alignment. Consensus headers contain u128 fields (16-byte
-        // alignment), but Bytes from Vec<u8> only guarantees 8-byte alignment. The checked
-        // variant returns Err on misalignment (no UB), but production code can fail on
-        // misaligned buffers. The original iggy_common code has the same limitation.
-        // Fix by either using pod_read_unaligned (copies header) or ensuring aligned
-        // allocation at the network receive layer.
-        let header_bytes = &buffer[..size_of::<H>()];
-        let header = bytemuck::checked::try_from_bytes::<H>(header_bytes)
+        let generic = self.as_generic();
+        if generic.header().command != T::COMMAND {
+            return Err(ConsensusError::InvalidCommand {
+                expected: T::COMMAND,
+                found: generic.header().command,
+            });
+        }
+
+        let bytes = <B as MessageBacking<T>>::header_storage(&self.backing);
+        let typed = bytemuck::checked::try_from_bytes::<T>(&bytes[..size_of::<T>()])
             .map_err(|_| ConsensusError::InvalidBitPattern)?;
+        typed.validate()?;
 
-        header.validate()?;
-
-        let header_size = header.size() as usize;
-        if buffer.len() < header_size {
-            return Err(ConsensusError::InvalidCommand {
-                expected: H::COMMAND,
-                found: Command2::Reserved,
-            });
-        }
-
-        Ok(Self {
-            buffer,
+        Ok(Message {
+            backing: self.backing,
             _marker: PhantomData,
         })
     }
 
-    /// Create a zero-initialized message of the given size.
-    /// The caller must initialize the header fields.
+    /// # Errors
     ///
+    /// Returns [`ConsensusError`] if the backing is too short for `T`, the
+    /// command encoded in the generic header does not match `T::COMMAND`, or
+    /// the typed header fails validation.
+    pub fn try_as_typed<T>(&self) -> Result<&Message<T, B>, ConsensusError>
+    where
+        T: ConsensusHeader,
+        B: MessageBacking<GenericHeader> + MessageBacking<T>,
+    {
+        if self.total_len() < size_of::<T>() {
+            return Err(ConsensusError::InvalidCommand {
+                expected: T::COMMAND,
+                found: Command2::Reserved,
+            });
+        }
+
+        let generic = self.as_generic();
+        if generic.header().command != T::COMMAND {
+            return Err(ConsensusError::InvalidCommand {
+                expected: T::COMMAND,
+                found: generic.header().command,
+            });
+        }
+
+        let bytes = <B as MessageBacking<T>>::header_storage(&self.backing);
+        let typed = bytemuck::checked::try_from_bytes::<T>(&bytes[..size_of::<T>()])
+            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+        typed.validate()?;
+
+        let typed_message = unsafe { &*std::ptr::from_ref(self).cast::<Message<T, B>>() };
+        let _ = typed;
+        Ok(typed_message)
+    }
+
+    const unsafe fn from_backing_unchecked(backing: B) -> Self {
+        Self {
+            backing,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<H> Message<H>
+where
+    H: ConsensusHeader,
+{
     /// # Panics
-    /// Panics if `size` is smaller than the header size.
+    ///
+    /// Panics if `size` is smaller than `size_of::<H>()`.
     #[must_use]
     pub fn new(size: usize) -> Self {
         assert!(
@@ -104,189 +293,154 @@ impl<H: ConsensusHeader> Message<H> {
             "size must be at least header size ({})",
             size_of::<H>()
         );
-        Self {
-            buffer: Bytes::from(vec![0u8; size]),
-            _marker: PhantomData,
+
+        unsafe {
+            Self::from_backing_unchecked(RequestBacking {
+                owned: Owned::<MESSAGE_ALIGN>::zeroed(size),
+            })
         }
     }
 
-    /// Access the typed header (zero-copy pointer cast).
-    ///
-    /// Re-validates the bit pattern on each call because headers contain
-    /// `CheckedBitPattern` enums (`Command2`, `Operation`) which prevent
-    /// using the unchecked `bytemuck::try_from_bytes` (requires `Pod`).
-    /// The cost is a few enum discriminant range checks per access.
-    /// The buffer is immutable (`Bytes`) so validation cannot fail after
-    /// successful construction.
     #[must_use]
-    #[allow(clippy::missing_panics_doc)]
-    #[inline]
-    pub fn header(&self) -> &H {
-        let header_bytes = &self.buffer[..size_of::<H>()];
-        bytemuck::checked::try_from_bytes(header_bytes)
-            .expect("header validated at construction time")
+    pub fn as_slice(&self) -> &[u8] {
+        <RequestBacking as MutableBacking<H>>::as_slice(&self.backing)
     }
 
-    /// Message body (everything after the header).
-    #[must_use]
-    #[inline]
-    pub fn body(&self) -> &[u8] {
-        let header_size = size_of::<H>();
-        let total_size = self.header().size() as usize;
-        if total_size > header_size {
-            &self.buffer[header_size..total_size]
-        } else {
-            &[]
-        }
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        <RequestBacking as MutableBacking<H>>::as_mut_slice(&mut self.backing)
     }
 
-    /// Message body as zero-copy [`Bytes`].
-    #[must_use]
-    #[inline]
-    pub fn body_bytes(&self) -> Bytes {
-        let header_size = size_of::<H>();
-        let total_size = self.header().size() as usize;
-        if total_size > header_size {
-            self.buffer.slice(header_size..total_size)
-        } else {
-            Bytes::new()
-        }
+    pub fn prefix_mut(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
     }
 
-    /// Complete message bytes (header + body).
-    #[must_use]
-    #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
-        let total_size = self.header().size() as usize;
-        &self.buffer[..total_size]
-    }
-
-    /// Consume into the underlying buffer.
-    #[must_use]
-    #[inline]
-    pub fn into_inner(self) -> Bytes {
-        self.buffer
-    }
-
-    /// Convert to a generic message (type-erase the header).
-    #[must_use]
-    pub fn into_generic(self) -> Message<GenericHeader> {
-        // SAFETY: Message<H> and Message<GenericHeader> have identical layout
-        // (only PhantomData differs). GenericHeader accepts any command.
-        unsafe { Message::from_buffer_unchecked(self.buffer) }
-    }
-
-    /// View as a generic message without consuming.
-    #[must_use]
-    #[allow(clippy::missing_const_for_fn)]
-    pub fn as_generic(&self) -> &Message<GenericHeader> {
-        // SAFETY: #[repr(C)] guarantees field layout. Message<H> and
-        // Message<GenericHeader> differ only in PhantomData (ZST).
-        unsafe { &*std::ptr::from_ref(self).cast::<Message<GenericHeader>>() }
-    }
-
-    /// Try to reinterpret as a different header type.
-    ///
-    /// # Errors
-    /// Returns `ConsensusError` if the header command doesn't match or validation fails.
-    pub fn try_into_typed<T: ConsensusHeader>(self) -> Result<Message<T>, ConsensusError> {
-        if self.buffer.len() < size_of::<T>() {
-            return Err(ConsensusError::InvalidCommand {
-                expected: T::COMMAND,
-                found: Command2::Reserved,
-            });
-        }
-
-        let generic = self.as_generic();
-        if generic.header().command != T::COMMAND {
-            return Err(ConsensusError::InvalidCommand {
-                expected: T::COMMAND,
-                found: generic.header().command,
-            });
-        }
-
-        let header_bytes = &self.buffer[..size_of::<T>()];
-        let header = bytemuck::checked::try_from_bytes::<T>(header_bytes)
-            .map_err(|_| ConsensusError::InvalidBitPattern)?;
-        header.validate()?;
-
-        Ok(unsafe { Message::<T>::from_buffer_unchecked(self.buffer) })
-    }
-
-    /// Try to borrow as a different header type without consuming.
-    ///
-    /// # Errors
-    /// Returns `ConsensusError` if the header command doesn't match or validation fails.
-    pub fn try_as_typed<T: ConsensusHeader>(&self) -> Result<&Message<T>, ConsensusError> {
-        if self.buffer.len() < size_of::<T>() {
-            return Err(ConsensusError::InvalidCommand {
-                expected: T::COMMAND,
-                found: Command2::Reserved,
-            });
-        }
-
-        let generic = self.as_generic();
-        if generic.header().command != T::COMMAND {
-            return Err(ConsensusError::InvalidCommand {
-                expected: T::COMMAND,
-                found: generic.header().command,
-            });
-        }
-
-        let header_bytes = &self.buffer[..size_of::<T>()];
-        bytemuck::checked::try_from_bytes::<T>(header_bytes)
-            .map_err(|_| ConsensusError::InvalidBitPattern)?
-            .validate()?;
-
-        // SAFETY: Message<H> and Message<T> have identical layout (#[repr(C)],
-        // differ only in PhantomData). Header validated above.
-        Ok(unsafe { &*std::ptr::from_ref(self).cast::<Message<T>>() })
-    }
-
-    /// Transmute the header to a different type, preserving the buffer.
-    ///
-    /// The callback receives the old header (by value) and a mutable reference
-    /// to the new (zeroed) header, allowing field-by-field initialization.
-    ///
     /// # Panics
-    /// Panics if `size_of::<H>() != size_of::<T>()`.
+    ///
+    /// Panics if re-validating the copied message unexpectedly fails.
     #[must_use]
+    pub fn deep_copy(&self) -> Self {
+        Self::try_from(Owned::<MESSAGE_ALIGN>::copy_from_slice(self.as_slice()))
+            .expect("deep copied request message must stay valid")
+    }
+
+    #[must_use]
+    pub fn into_owned(self) -> Owned<MESSAGE_ALIGN> {
+        self.backing.into_owned()
+    }
+
+    #[must_use]
+    pub fn into_frozen(self) -> Frozen<MESSAGE_ALIGN> {
+        self.backing.into_frozen()
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `H` and `T` have different sizes, or if the rewritten header
+    /// does not validate as `T`.
     pub fn transmute_header<T: ConsensusHeader>(self, f: impl FnOnce(H, &mut T)) -> Message<T> {
         assert_eq!(size_of::<H>(), size_of::<T>());
-        let old_header = *self.header();
-        let buffer = self.into_inner();
-        // TODO: This mutates through Bytes via cast_mut(), which violates aliasing rules.
-        // The original iggy_common code has the same pattern. Once iggy_common is migrated
-        // to use iggy_binary_protocol types, fix both by using Bytes::try_into_mut() ->
-        // mutate BytesMut -> freeze(). Tracked as part of the consensus migration.
-        unsafe {
-            let ptr = buffer.as_ptr().cast_mut();
-            let slice = std::slice::from_raw_parts_mut(ptr, size_of::<T>());
-            slice.fill(0);
-            let new_header =
-                bytemuck::checked::try_from_bytes_mut(slice).expect("zeroed bytes are valid");
-            f(old_header, new_header);
-        }
-        Message {
-            buffer,
-            _marker: PhantomData,
-        }
-    }
 
-    /// Create without validation. Private.
-    ///
-    /// # Safety
-    /// Buffer must already be validated for the target header type.
-    #[inline]
-    const unsafe fn from_buffer_unchecked(buffer: Bytes) -> Self {
+        let old_header = *self.header();
+        let mut owned = self.into_owned();
+        let slice = &mut owned.as_mut_slice()[..size_of::<T>()];
+        slice.fill(0);
+        let new_header =
+            bytemuck::checked::try_from_bytes_mut(slice).expect("zeroed bytes are valid");
+        f(old_header, new_header);
+
+        Message::try_from(owned).expect("transmuted request message must stay valid")
+    }
+}
+
+impl<H> Message<H, ResponseBacking>
+where
+    H: ConsensusHeader,
+{
+    #[must_use]
+    pub fn fragments(&self) -> &[Frozen<MESSAGE_ALIGN>] {
+        <ResponseBacking as FragmentedBacking<H>>::fragments(&self.backing)
+    }
+}
+
+impl<H> Clone for Message<H, ResponseBacking>
+where
+    H: ConsensusHeader,
+{
+    fn clone(&self) -> Self {
         Self {
-            buffer,
+            backing: self.backing.clone(),
             _marker: PhantomData,
         }
     }
 }
 
-/// Type-erased message bag for dispatching incoming consensus messages.
+impl<H> TryFrom<Owned<MESSAGE_ALIGN>> for Message<H>
+where
+    H: ConsensusHeader,
+{
+    type Error = ConsensusError;
+
+    fn try_from(owned: Owned<MESSAGE_ALIGN>) -> Result<Self, Self::Error> {
+        let bytes = owned.as_slice();
+        if bytes.len() < size_of::<H>() {
+            return Err(ConsensusError::InvalidCommand {
+                expected: H::COMMAND,
+                found: Command2::Reserved,
+            });
+        }
+
+        let header = bytemuck::checked::try_from_bytes::<H>(&bytes[..size_of::<H>()])
+            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+        header.validate()?;
+
+        if bytes.len() < header.size() as usize {
+            return Err(ConsensusError::InvalidCommand {
+                expected: H::COMMAND,
+                found: Command2::Reserved,
+            });
+        }
+
+        Ok(unsafe { Self::from_backing_unchecked(RequestBacking { owned }) })
+    }
+}
+
+impl<H> TryFrom<SmallVec<[Frozen<MESSAGE_ALIGN>; 4]>> for Message<H, ResponseBacking>
+where
+    H: ConsensusHeader,
+{
+    type Error = ConsensusError;
+
+    fn try_from(fragments: SmallVec<[Frozen<MESSAGE_ALIGN>; 4]>) -> Result<Self, Self::Error> {
+        let Some(first) = fragments.first() else {
+            return Err(ConsensusError::InvalidCommand {
+                expected: H::COMMAND,
+                found: Command2::Reserved,
+            });
+        };
+
+        if first.len() < size_of::<H>() {
+            return Err(ConsensusError::InvalidCommand {
+                expected: H::COMMAND,
+                found: Command2::Reserved,
+            });
+        }
+
+        let header = bytemuck::checked::try_from_bytes::<H>(&first.as_slice()[..size_of::<H>()])
+            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+        header.validate()?;
+
+        let total_len = fragments.iter().map(Frozen::len).sum::<usize>();
+        if total_len < header.size() as usize {
+            return Err(ConsensusError::InvalidCommand {
+                expected: H::COMMAND,
+                found: Command2::Reserved,
+            });
+        }
+
+        Ok(unsafe { Self::from_backing_unchecked(ResponseBacking { fragments }) })
+    }
+}
+
 #[derive(Debug)]
 pub enum MessageBag {
     Request(Message<RequestHeader>),
@@ -298,49 +452,52 @@ impl MessageBag {
     #[must_use]
     pub fn command(&self) -> Command2 {
         match self {
-            Self::Request(m) => m.header().command,
-            Self::Prepare(m) => m.header().command,
-            Self::PrepareOk(m) => m.header().command,
+            Self::Request(message) => message.header().command,
+            Self::Prepare(message) => message.header().command,
+            Self::PrepareOk(message) => message.header().command,
         }
     }
 
     #[must_use]
     pub fn size(&self) -> u32 {
         match self {
-            Self::Request(m) => m.header().size(),
-            Self::Prepare(m) => m.header().size(),
-            Self::PrepareOk(m) => m.header().size(),
+            Self::Request(message) => message.header().size(),
+            Self::Prepare(message) => message.header().size(),
+            Self::PrepareOk(message) => message.header().size(),
         }
     }
 
     #[must_use]
-    pub fn operation(&self) -> crate::consensus::Operation {
+    pub fn operation(&self) -> consensus::Operation {
         match self {
-            Self::Request(m) => m.header().operation,
-            Self::Prepare(m) => m.header().operation,
-            Self::PrepareOk(m) => m.header().operation,
+            Self::Request(message) => message.header().operation,
+            Self::Prepare(message) => message.header().operation,
+            Self::PrepareOk(message) => message.header().operation,
         }
     }
 }
 
-impl<T: ConsensusHeader> TryFrom<Message<T>> for MessageBag {
+impl<T> TryFrom<Message<T>> for MessageBag
+where
+    T: ConsensusHeader,
+{
     type Error = ConsensusError;
 
     fn try_from(value: Message<T>) -> Result<Self, Self::Error> {
         let command = value.as_generic().header().command;
-        let buffer = value.into_inner();
+        let backing = value.into_inner();
 
         match command {
-            Command2::Request => {
-                let msg = unsafe { Message::<RequestHeader>::from_buffer_unchecked(buffer) };
-                Ok(Self::Request(msg))
-            }
             Command2::Prepare => {
-                let msg = unsafe { Message::<PrepareHeader>::from_buffer_unchecked(buffer) };
+                let msg = unsafe { Message::<PrepareHeader>::from_backing_unchecked(backing) };
                 Ok(Self::Prepare(msg))
             }
+            Command2::Request => {
+                let msg = unsafe { Message::<RequestHeader>::from_backing_unchecked(backing) };
+                Ok(Self::Request(msg))
+            }
             Command2::PrepareOk => {
-                let msg = unsafe { Message::<PrepareOkHeader>::from_buffer_unchecked(buffer) };
+                let msg = unsafe { Message::<PrepareOkHeader>::from_backing_unchecked(backing) };
                 Ok(Self::PrepareOk(msg))
             }
             other => Err(ConsensusError::InvalidCommand {
@@ -348,102 +505,5 @@ impl<T: ConsensusHeader> TryFrom<Message<T>> for MessageBag {
                 found: other,
             }),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Message;
-    use crate::consensus::{Command2, GenericHeader, RequestHeader};
-    use bytes::{Bytes, BytesMut};
-
-    #[test]
-    fn generic_message_from_zeroed_buffer() {
-        let mut buf = BytesMut::zeroed(384);
-        let header =
-            bytemuck::checked::try_from_bytes_mut::<GenericHeader>(&mut buf[..256]).unwrap();
-        header.size = 384;
-        header.cluster = 42;
-
-        let msg = Message::<GenericHeader>::from_bytes(buf.freeze()).unwrap();
-        assert_eq!(msg.header().cluster, 42);
-        assert_eq!(msg.header().size, 384);
-        assert_eq!(msg.body().len(), 128);
-    }
-
-    #[test]
-    fn request_message_roundtrip() {
-        let mut buf = BytesMut::zeroed(320);
-        let header =
-            bytemuck::checked::try_from_bytes_mut::<RequestHeader>(&mut buf[..256]).unwrap();
-        header.size = 320;
-        header.command = Command2::Request;
-        header.client = 12345;
-        header.operation = crate::consensus::Operation::CreateStream;
-
-        let msg = Message::<RequestHeader>::from_bytes(buf.freeze()).unwrap();
-        assert_eq!(msg.header().client, 12345);
-        assert_eq!(
-            msg.header().operation,
-            crate::consensus::Operation::CreateStream
-        );
-        assert_eq!(msg.body().len(), 64);
-    }
-
-    #[test]
-    fn too_small_buffer_rejected() {
-        let buf = Bytes::from(vec![0u8; 100]); // < 256
-        assert!(Message::<GenericHeader>::from_bytes(buf).is_err());
-    }
-
-    #[test]
-    fn into_generic_and_back() {
-        let mut buf = BytesMut::zeroed(256);
-        let header =
-            bytemuck::checked::try_from_bytes_mut::<RequestHeader>(&mut buf[..256]).unwrap();
-        header.size = 256;
-        header.command = Command2::Request;
-
-        let msg = Message::<RequestHeader>::from_bytes(buf.freeze()).unwrap();
-        let generic = msg.into_generic();
-        assert_eq!(generic.header().command, Command2::Request);
-
-        let back = generic.try_into_typed::<RequestHeader>().unwrap();
-        assert_eq!(back.header().command, Command2::Request);
-    }
-
-    #[test]
-    fn transmute_header_generic_to_request() {
-        let mut buf = BytesMut::zeroed(320);
-        let header =
-            bytemuck::checked::try_from_bytes_mut::<GenericHeader>(&mut buf[..256]).unwrap();
-        header.size = 320;
-        header.cluster = 99;
-
-        let generic = Message::<GenericHeader>::from_bytes(buf.freeze()).unwrap();
-        let request = generic.transmute_header(|old, new: &mut RequestHeader| {
-            new.size = old.size;
-            new.command = Command2::Request;
-            new.cluster = old.cluster;
-            new.client = 42;
-            new.operation = crate::consensus::Operation::CreateStream;
-        });
-        assert_eq!(request.header().command, Command2::Request);
-        assert_eq!(request.header().client, 42);
-        assert_eq!(request.header().cluster, 99);
-        assert_eq!(request.header().size, 320);
-        assert_eq!(request.body().len(), 64);
-    }
-
-    #[test]
-    fn wrong_type_conversion_fails() {
-        let mut buf = BytesMut::zeroed(256);
-        let header =
-            bytemuck::checked::try_from_bytes_mut::<GenericHeader>(&mut buf[..256]).unwrap();
-        header.size = 256;
-        header.command = Command2::Reserved; // not Request
-
-        let msg = Message::<GenericHeader>::from_bytes(buf.freeze()).unwrap();
-        assert!(msg.try_into_typed::<RequestHeader>().is_err());
     }
 }

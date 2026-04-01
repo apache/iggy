@@ -32,6 +32,7 @@ pub(crate) mod permissions;
 pub(crate) mod personal_access_tokens;
 pub(crate) mod segment;
 pub(crate) mod segment_storage;
+pub mod send_messages2;
 pub(crate) mod snapshot;
 pub(crate) mod stats;
 pub(crate) mod stream;

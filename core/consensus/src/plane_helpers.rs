@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{Consensus, Pipeline, PipelineEntry, Sequencer, Status, VsrConsensus};
+use crate::{
+    Consensus, IgnoreReason, Pipeline, PipelineEntry, PlaneKind, PrepareOkOutcome, Sequencer,
+    Status, VsrConsensus,
+};
 use iggy_binary_protocol::{
     Command2, GenericHeader, Message, PrepareHeader, PrepareOkHeader, ReplyHeader,
 };
+use iobuf::Owned;
 use message_bus::MessageBus;
 use std::ops::AsyncFnOnce;
 
@@ -33,11 +37,11 @@ use std::ops::AsyncFnOnce;
 #[allow(clippy::future_not_send)]
 pub async fn pipeline_prepare_common<C, F>(
     consensus: &C,
+    plane: PlaneKind,
     prepare: C::Message<C::ReplicateHeader>,
     on_replicate: F,
 ) where
     C: Consensus,
-    C::Message<C::ReplicateHeader>: Clone,
     F: AsyncFnOnce(C::Message<C::ReplicateHeader>) -> (),
 {
     assert!(!consensus.is_follower(), "on_request: primary only");
@@ -45,8 +49,8 @@ pub async fn pipeline_prepare_common<C, F>(
     assert!(!consensus.is_syncing(), "on_request: must not be syncing");
 
     consensus.verify_pipeline();
-    consensus.pipeline_message(prepare.clone());
-    on_replicate(prepare.clone()).await;
+    consensus.pipeline_message(plane, &prepare);
+    on_replicate(prepare).await;
 }
 
 /// Shared commit-based old-prepare fence.
@@ -57,7 +61,7 @@ pub const fn fence_old_prepare_by_commit<B, P>(
 ) -> bool
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
 {
     header.op <= consensus.commit()
 }
@@ -73,11 +77,12 @@ where
 pub async fn replicate_to_next_in_chain<B, P>(
     consensus: &VsrConsensus<B, P>,
     message: Message<PrepareHeader>,
-) where
+) -> Message<PrepareHeader>
+where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
 {
-    let header = message.header();
+    let header = *message.header();
 
     assert_eq!(header.command, Command2::Prepare);
     assert!(header.op > consensus.commit());
@@ -86,17 +91,20 @@ pub async fn replicate_to_next_in_chain<B, P>(
     let primary = consensus.primary_index(header.view);
 
     if next == primary {
-        return;
+        return message;
     }
 
     assert_ne!(next, consensus.replica());
 
     // TODO: Propagate send error instead of panicking; requires bus error design.
-    consensus
+    let returned = consensus
         .message_bus()
         .send_to_replica(next, message.into_generic())
         .await
         .unwrap();
+    returned
+        .try_into_typed()
+        .expect("replica send must return the same prepare message")
 }
 
 /// Shared preflight checks for `on_replicate`.
@@ -112,25 +120,25 @@ pub async fn replicate_to_next_in_chain<B, P>(
 pub fn replicate_preflight<B, P>(
     consensus: &VsrConsensus<B, P>,
     header: &PrepareHeader,
-) -> Result<u64, &'static str>
+) -> Result<u64, IgnoreReason>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
 {
     assert_eq!(header.command, Command2::Prepare);
 
     if consensus.is_syncing() {
-        return Err("sync");
+        return Err(IgnoreReason::Syncing);
     }
 
     let current_op = consensus.sequencer().current_sequence();
 
     if consensus.status() != Status::Normal {
-        return Err("not normal state");
+        return Err(IgnoreReason::NotNormal);
     }
 
     if header.view > consensus.view() {
-        return Err("newer view");
+        return Err(IgnoreReason::NewerView);
     }
 
     if consensus.is_follower() {
@@ -145,17 +153,17 @@ where
 /// # Errors
 /// Returns a static error string if the replica is not primary or not in
 /// normal status.
-pub fn ack_preflight<B, P>(consensus: &VsrConsensus<B, P>) -> Result<(), &'static str>
+pub fn ack_preflight<B, P>(consensus: &VsrConsensus<B, P>) -> Result<(), IgnoreReason>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
 {
     if !consensus.is_primary() {
-        return Err("not primary");
+        return Err(IgnoreReason::NotPrimary);
     }
 
     if consensus.status() != Status::Normal {
-        return Err("not normal");
+        return Err(IgnoreReason::NotNormal);
     }
 
     Ok(())
@@ -166,18 +174,28 @@ where
 /// After recording the ack, walks forward from `current_commit + 1` advancing
 /// the commit number only while consecutive ops have achieved quorum. This
 /// prevents committing ops that have gaps in quorum acknowledgment.
-pub fn ack_quorum_reached<B, P>(consensus: &VsrConsensus<B, P>, ack: &PrepareOkHeader) -> bool
+pub fn ack_quorum_reached<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    plane: PlaneKind,
+    ack: &PrepareOkHeader,
+) -> bool
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
 {
-    if !consensus.handle_prepare_ok(ack) {
+    if !matches!(
+        consensus.handle_prepare_ok(plane, ack),
+        PrepareOkOutcome::Accepted {
+            quorum_reached: true,
+            ..
+        }
+    ) {
         return false;
     }
 
     let pipeline = consensus.pipeline().borrow();
     let mut new_commit = consensus.commit();
-    while let Some(entry) = pipeline.message_by_op(new_commit + 1) {
+    while let Some(entry) = pipeline.entry_by_op(new_commit + 1) {
         if !entry.ok_quorum_received {
             break;
         }
@@ -199,11 +217,11 @@ where
 /// by the current commit frontier.
 ///
 /// # Panics
-/// If `head()` returns `Some` but `pop_message()` returns `None` (unreachable).
+/// If `head()` returns `Some` but `pop()` returns `None` (unreachable).
 pub fn drain_committable_prefix<B, P>(consensus: &VsrConsensus<B, P>) -> Vec<PipelineEntry>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
 {
     let commit = consensus.commit();
     let mut drained = Vec::new();
@@ -215,7 +233,7 @@ where
         }
 
         let entry = pipeline
-            .pop_message()
+            .pop()
             .expect("drain_committable_prefix: head exists");
         drained.push(entry);
     }
@@ -235,7 +253,7 @@ pub fn build_reply_message<B, P>(
 ) -> Message<ReplyHeader>
 where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
 {
     let header_size = std::mem::size_of::<ReplyHeader>();
     let total_size = header_size + body.len();
@@ -268,8 +286,10 @@ where
         buffer[header_size..].copy_from_slice(&body);
     }
 
-    Message::<ReplyHeader>::from_bytes(buffer.freeze())
-        .expect("build_reply_message: constructed header must be valid")
+    // TODO: Remove this copy once replies stop round-tripping through `Bytes`
+    // and the binary protocol uses `Owned` end-to-end.
+    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
+        .expect("reply buffer must contain a valid reply message")
 }
 
 /// Verify hash chain would not break if we add this header.
@@ -301,7 +321,7 @@ pub async fn send_prepare_ok<B, P>(
     is_persisted: Option<bool>,
 ) where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
 {
     assert_eq!(header.command, Command2::Prepare);
 
@@ -389,17 +409,17 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: Self::Client,
-            _data: Self::Data,
-        ) -> Result<(), IggyError> {
-            Ok(())
+            data: Self::Data,
+        ) -> Result<Self::Data, IggyError> {
+            Ok(data)
         }
 
         async fn send_to_replica(
             &self,
             _replica: Self::Replica,
-            _data: Self::Data,
-        ) -> Result<(), IggyError> {
-            Ok(())
+            data: Self::Data,
+        ) -> Result<Self::Data, IggyError> {
+            Ok(data)
         }
     }
 
@@ -500,7 +520,7 @@ mod tests {
             namespace: 0,
             reserved: [0; 120],
         };
-        let _ = consensus.handle_start_view_change(&svc);
+        let _ = consensus.handle_start_view_change(PlaneKind::Metadata, &svc);
 
         // Simulate an in-flight loopback message queued between SVC and DVC quorum.
         let stale_msg = Message::<PrepareOkHeader>::new(std::mem::size_of::<PrepareOkHeader>());
@@ -523,7 +543,7 @@ mod tests {
             log_view: 0,
             reserved: [0; 100],
         };
-        let actions = consensus.handle_do_view_change(&dvc);
+        let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &dvc);
 
         // View change completed: should have SendStartView action.
         assert!(
@@ -597,17 +617,19 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: Self::Client,
-            _data: Self::Data,
-        ) -> Result<(), IggyError> {
-            Ok(())
+            data: Self::Data,
+        ) -> Result<Self::Data, IggyError> {
+            Ok(data)
         }
         async fn send_to_replica(
             &self,
             replica: Self::Replica,
             data: Self::Data,
-        ) -> Result<(), IggyError> {
-            self.sent.borrow_mut().push((replica, data));
-            Ok(())
+        ) -> Result<Self::Data, IggyError> {
+            let stored = data.deep_copy();
+            let returned = data.deep_copy();
+            self.sent.borrow_mut().push((replica, stored));
+            Ok(returned)
         }
     }
 
@@ -647,9 +669,9 @@ mod tests {
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
         consensus.init();
 
-        consensus.pipeline_message(prepare_message(1, 0, 10));
-        consensus.pipeline_message(prepare_message(2, 10, 20));
-        consensus.pipeline_message(prepare_message(3, 20, 30));
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(1, 0, 10));
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(2, 10, 20));
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(3, 20, 30));
 
         consensus.advance_commit_number(3);
 
@@ -664,9 +686,9 @@ mod tests {
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
         consensus.init();
 
-        consensus.pipeline_message(prepare_message(5, 0, 50));
-        consensus.pipeline_message(prepare_message(6, 50, 60));
-        consensus.pipeline_message(prepare_message(7, 60, 70));
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(5, 0, 50));
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(6, 50, 60));
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(7, 60, 70));
 
         consensus.advance_commit_number(6);
         let drained = drain_committable_prefix(&consensus);

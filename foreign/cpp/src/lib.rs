@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 mod client;
+mod consumer_group;
 mod identifier;
 mod stream;
 mod topic;
@@ -60,18 +61,34 @@ mod ffi {
         topics: Vec<Topic>,
     }
 
+    struct ConsumerGroupMember {
+        id: u32,
+        partitions_count: u32,
+        partitions: Vec<u32>,
+    }
+
+    struct ConsumerGroupDetails {
+        id: u32,
+        name: String,
+        partitions_count: u32,
+        members_count: u32,
+        members: Vec<ConsumerGroupMember>,
+    }
+
     extern "Rust" {
         type Client;
 
+        // Client functions
         fn new_connection(connection_string: String) -> Result<*mut Client>;
         fn login_user(self: &Client, username: String, password: String) -> Result<()>;
         fn connect(self: &Client) -> Result<()>;
-        fn create_stream(&self, stream_name: String) -> Result<()>;
+        fn create_stream(self: &Client, stream_name: String) -> Result<()>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
-        fn delete_stream(&self, stream_id: Identifier) -> Result<()>;
+        fn delete_stream(self: &Client, stream_id: Identifier) -> Result<()>;
+        // fn purge_stream(&self, stream_id: Identifier) -> Result<()>;
         #[allow(clippy::too_many_arguments)]
         fn create_topic(
-            &self,
+            self: &Client,
             stream_id: Identifier,
             topic_name: String,
             partitions_count: u32,
@@ -81,7 +98,42 @@ mod ffi {
             message_expiry_value: u64,
             max_topic_size: String,
         ) -> Result<()>;
+        // fn purge_topic(&self, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
+        fn create_partitions(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partitions_count: u32,
+        ) -> Result<()>;
+        fn delete_partitions(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partitions_count: u32,
+        ) -> Result<()>;
+        fn create_consumer_group(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            name: String,
+        ) -> Result<ConsumerGroupDetails>;
+        fn get_consumer_group(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            group_id: Identifier,
+        ) -> Result<ConsumerGroupDetails>;
+        fn delete_consumer_group(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            group_id: Identifier,
+        ) -> Result<()>;
 
         unsafe fn delete_connection(client: *mut Client) -> Result<()>;
+
+        // Identifier functions
+        fn from_string(self: &mut Identifier, id: String) -> Result<()>;
+        fn from_numeric(self: &mut Identifier, id: u32) -> Result<()>;
     }
 }
