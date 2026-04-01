@@ -142,6 +142,12 @@ impl SenderKind {
         }
     }
 
+    #[cfg(not(unix))]
+    pub fn take_and_migrate_tcp(&mut self) -> Option<()> {
+        // Socket migration is not supported on non-Unix platforms
+        None
+    }
+
     forward_async_methods! {
         async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<(), IggyError>, B);
         async fn send_empty_ok_response(&mut self) -> Result<(), IggyError>;

@@ -39,6 +39,7 @@ members = [
     "core/connectors/sinks/mongodb_sink",
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
+    "core/connectors/sinks/redshift_sink",
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sources/elasticsearch_source",
     "core/connectors/sources/influxdb_source",
@@ -275,7 +276,7 @@ tokio = { version = "1.50.0", features = ["full"] }
 tokio-rustls = "0.26.4"
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7.18", features = ["compat"] }
-toml = "1.0.7"
+toml = "1.1.1+spec-1.1.0"
 tower-http = { version = "0.6.8", features = ["add-extension", "cors", "trace"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.4"
