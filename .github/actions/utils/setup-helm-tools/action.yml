@@ -49,7 +49,7 @@ inputs:
   helm-docs-checksum:
     description: "SHA256 checksum for the helm-docs tarball"
     required: false
-    default: "f3c755c2b9d319ba993e0b4cc80e77ae16c8533b1bb24048d3d013c73e10211b"
+    default: "a8cf72ada34fad93285ba2a452b38bdc5bd52cc9a571236244ec31022928d6cc"
 
 runs:
   using: "composite"
