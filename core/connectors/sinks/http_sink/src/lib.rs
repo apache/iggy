@@ -84,6 +84,8 @@ pub enum BatchMode {
     #[strum(to_string = "individual")]
     Individual,
     /// All messages in one request, newline-delimited JSON.
+    /// Note: `rename = "ndjson"` overrides the enum-level `rename_all = "snake_case"` which
+    /// would produce "and_json". Industry standard is "ndjson" (one word, per ndjson.org).
     #[serde(rename = "ndjson")]
     #[strum(to_string = "NDJSON")]
     NdJson,
@@ -403,7 +405,7 @@ impl HttpSink {
     }
 
     /// Build the `IggyMetadata` struct from message and topic context.
-    /// Shared by `build_envelope`, `build_envelope_vec`, and `build_envelope_to_writer`.
+    /// Shared by `build_envelope` (all batch modes call through this single entry point).
     fn build_iggy_metadata(
         &self,
         message: &ConsumedMessage,
@@ -455,9 +457,11 @@ impl HttpSink {
         })
     }
 
-    /// Build a message envelope as `serde_json::Value` (used by `json_array` mode).
-    /// Note: For `individual` and `ndjson` modes, prefer `build_envelope_vec` or
-    /// `build_envelope_to_writer` which serialize directly without the intermediate `Value`.
+    /// Build a message envelope as `serde_json::Value`.
+    /// Single entry point for all batch modes — callers choose serialization format:
+    /// - `json_array`: uses the `Value` directly in `Vec<Value>`
+    /// - `individual`: `serde_json::to_vec(&envelope)`
+    /// - `ndjson`: `serde_json::to_writer(&mut body, &envelope)`
     fn build_envelope(
         &self,
         message: &ConsumedMessage,
@@ -477,55 +481,6 @@ impl HttpSink {
 
         serde_json::to_value(envelope)
             .map_err(|e| Error::Serialization(format!("MetadataEnvelope: {}", e)))
-    }
-
-    /// Serialize a message envelope directly to bytes, avoiding the intermediate `Value`.
-    /// Used by `individual` mode where the final output is always bytes.
-    fn build_envelope_vec(
-        &self,
-        message: &ConsumedMessage,
-        topic_metadata: &TopicMetadata,
-        messages_metadata: &MessagesMetadata,
-        payload_json: serde_json::Value,
-    ) -> Result<Vec<u8>, Error> {
-        if !self.include_metadata {
-            return serde_json::to_vec(&payload_json)
-                .map_err(|e| Error::Serialization(format!("Payload serialize: {}", e)));
-        }
-
-        let metadata = self.build_iggy_metadata(message, topic_metadata, messages_metadata)?;
-        let envelope = MetadataEnvelope {
-            metadata,
-            payload: payload_json,
-        };
-
-        serde_json::to_vec(&envelope)
-            .map_err(|e| Error::Serialization(format!("MetadataEnvelope serialize: {}", e)))
-    }
-
-    /// Serialize a message envelope directly to a writer, avoiding the intermediate `Value`.
-    /// Used by `ndjson` mode where the final output is a byte stream.
-    fn build_envelope_to_writer<W: std::io::Write>(
-        &self,
-        writer: &mut W,
-        message: &ConsumedMessage,
-        topic_metadata: &TopicMetadata,
-        messages_metadata: &MessagesMetadata,
-        payload_json: serde_json::Value,
-    ) -> Result<(), Error> {
-        if !self.include_metadata {
-            return serde_json::to_writer(writer, &payload_json)
-                .map_err(|e| Error::Serialization(format!("Payload serialize: {}", e)));
-        }
-
-        let metadata = self.build_iggy_metadata(message, topic_metadata, messages_metadata)?;
-        let envelope = MetadataEnvelope {
-            metadata,
-            payload: payload_json,
-        };
-
-        serde_json::to_writer(writer, &envelope)
-            .map_err(|e| Error::Serialization(format!("MetadataEnvelope serialize: {}", e)))
     }
 
     /// Record a successful request timestamp.
@@ -730,7 +685,10 @@ impl HttpSink {
         self.send_per_message(messages, self.batch_mode.content_type(), |mut message| {
             let payload = std::mem::replace(&mut message.payload, Payload::Raw(vec![]));
             let payload_json = self.payload_to_json(payload)?;
-            self.build_envelope_vec(&message, topic_metadata, messages_metadata, payload_json)
+            let envelope =
+                self.build_envelope(&message, topic_metadata, messages_metadata, payload_json)?;
+            serde_json::to_vec(&envelope)
+                .map_err(|e| Error::Serialization(format!("Envelope serialize: {}", e)))
         })
         .await
     }
@@ -748,9 +706,10 @@ impl HttpSink {
             .send_with_retry(body, self.batch_mode.content_type())
             .await
         {
-            // Count all serialized-but-undelivered messages as errors.
-            // send_with_retry already incremented errors_count by 1 for the HTTP failure;
-            // add the rest here. Total = count (all messages in the batch that were serialized).
+            // INVARIANT: send_with_retry increments self.errors_count exactly once before
+            // returning Err (at line ~568 for middleware errors, or ~603 for non-success status).
+            // We add the remaining (count - 1) messages that were serialized but not delivered.
+            // If this invariant changes, error accounting will silently miscount.
             self.errors_count
                 .fetch_add(count.saturating_sub(1), Ordering::Relaxed);
             if skipped > 0 {
@@ -799,15 +758,26 @@ impl HttpSink {
                     continue;
                 }
             };
-            let pos = body.len();
-            if let Err(e) = self.build_envelope_to_writer(
-                &mut body,
+            let envelope = match self.build_envelope(
                 &message,
                 topic_metadata,
                 messages_metadata,
                 payload_json,
             ) {
-                body.truncate(pos); // Rollback partial write
+                Ok(env) => env,
+                Err(e) => {
+                    error!(
+                        "HTTP sink ID: {} — skipping message at offset {} in NDJSON batch (envelope): {}",
+                        self.id, message.offset, e
+                    );
+                    self.errors_count.fetch_add(1, Ordering::Relaxed);
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let pos = body.len();
+            if let Err(e) = serde_json::to_writer(&mut body, &envelope) {
+                body.truncate(pos);
                 error!(
                     "HTTP sink ID: {} — skipping message at offset {} in NDJSON batch (serialize): {}",
                     self.id, message.offset, e
@@ -1031,17 +1001,36 @@ fn truncate_response(body: &str, max_len: usize) -> &str {
 }
 
 /// Strip userinfo (user:password) from a URL for safe logging.
-/// Returns the original string unchanged if parsing fails.
+/// Preserves the original string exactly when no userinfo is present (avoids URL normalization).
+/// Falls back to stripping `://user:pass@` patterns when URL parsing fails.
 fn sanitize_url_for_log(url: &str) -> String {
     match reqwest::Url::parse(url) {
+        Ok(parsed) if parsed.username().is_empty() && parsed.password().is_none() => {
+            url.to_string()
+        }
         Ok(mut parsed) => {
-            if !parsed.username().is_empty() || parsed.password().is_some() {
-                let _ = parsed.set_username("");
-                let _ = parsed.set_password(None);
-            }
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
             parsed.to_string()
         }
-        Err(_) => url.to_string(),
+        Err(_) => {
+            // Fallback for unparsable URLs: strip userinfo to prevent credential leak.
+            if let Some(scheme_end) = url.find("://") {
+                let after_scheme = &url[scheme_end + 3..];
+                if let Some(at_pos) = after_scheme.find('@') {
+                    // Only strip if '@' comes before the first '/' (it's userinfo, not a path segment)
+                    let slash_pos = after_scheme.find('/').unwrap_or(after_scheme.len());
+                    if at_pos < slash_pos {
+                        return format!(
+                            "{}{}",
+                            &url[..scheme_end + 3],
+                            &after_scheme[at_pos + 1..]
+                        );
+                    }
+                }
+            }
+            url.to_string()
+        }
     }
 }
 
