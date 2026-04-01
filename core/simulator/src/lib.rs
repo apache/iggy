@@ -122,8 +122,8 @@ impl Simulator {
     /// # Panics
     /// Panics if a packet addressed to a client cannot be converted to a
     /// `ReplyHeader` message.
-    #[allow(clippy::future_not_send, clippy::cast_possible_truncation)]
-    pub async fn step(&mut self) -> Vec<Message<ReplyHeader>> {
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn step(&mut self) -> Vec<Message<ReplyHeader>> {
         let mut client_replies = Vec::new();
 
         // Phase 1: Deliver ready packets from the network.
@@ -134,7 +134,7 @@ impl Simulator {
                     if !self.crashed.contains(&id)
                         && let Some(replica) = self.replicas.get(id as usize)
                     {
-                        Self::dispatch_to_replica(replica, packet.message.deep_copy()).await;
+                        Self::dispatch_to_replica(replica, packet.message.deep_copy());
                     }
                     // Crashed or missing: packet silently dropped.
                 }
@@ -230,8 +230,7 @@ impl Simulator {
     ///
     /// # Errors
     /// Returns `IggyError::ResourceNotFound` if the namespace does not exist on this replica.
-    #[allow(clippy::future_not_send)]
-    pub async fn poll_messages(
+    pub fn poll_messages(
         &self,
         replica_idx: usize,
         namespace: IggyNamespace,
@@ -247,7 +246,7 @@ impl Simulator {
                 .ok_or(IggyError::ResourceNotFound(format!(
                     "partition not found for namespace {namespace:?} on replica {replica_idx}"
                 )))?;
-        partition.poll_messages(consumer, args).await
+        futures::executor::block_on(partition.poll_messages(consumer, args))
     }
 
     /// Get partition offsets from a replica.
@@ -262,15 +261,14 @@ impl Simulator {
         Some(partition.offsets())
     }
 
-    #[allow(clippy::future_not_send)]
-    async fn dispatch_to_replica(replica: &Replica, message: Message<GenericHeader>) {
-        replica.on_message(message).await;
+    fn dispatch_to_replica(replica: &Replica, message: Message<GenericHeader>) {
+        futures::executor::block_on(replica.on_message(message));
 
         let mut buf = Vec::new();
-        replica.process_loopback(&mut buf).await;
+        futures::executor::block_on(replica.process_loopback(&mut buf));
+        let loopback_count = futures::executor::block_on(replica.process_loopback(&mut buf));
         debug_assert_eq!(
-            replica.process_loopback(&mut buf).await,
-            0,
+            loopback_count, 0,
             "on_ack must not re-enqueue loopback messages"
         );
     }

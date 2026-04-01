@@ -28,8 +28,7 @@ use simulator::packet::PacketSimulatorOptions;
 fn step_until_reply(sim: &mut Simulator, max_ticks: u64) -> Vec<Message<ReplyHeader>> {
     let mut all_replies = Vec::new();
     for _ in 0..max_ticks {
-        let replies = futures::executor::block_on(sim.step());
-        all_replies.extend(replies);
+        all_replies.extend(sim.step());
         if !all_replies.is_empty() {
             return all_replies;
         }
@@ -125,12 +124,7 @@ fn main() {
     // -----------------------------------------------------------------------
     let consumer = PollingConsumer::Consumer(1, 0);
     let args = PollingArgs::new(PollingStrategy::first(), 10, false);
-    match futures::executor::block_on(sim.poll_messages(
-        leader as usize,
-        test_namespace,
-        consumer,
-        args,
-    )) {
+    match sim.poll_messages(leader as usize, test_namespace, consumer, args) {
         Ok((fragments, _last_matching_offset)) => {
             println!(
                 "[sim] Poll returned {} fragments (expected 4)",
