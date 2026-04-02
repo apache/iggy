@@ -171,6 +171,48 @@ impl IggyClient {
         })
     }
 
+    /// Updates a stream's name.
+    ///
+    /// Returns Ok(()) on successful stream update or a PyRuntimeError on failure.
+    #[pyo3(signature = (stream_id, name))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn update_stream<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        name: String,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::from(stream_id);
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .update_stream(&stream_id, &name)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+            Ok(())
+        })
+    }
+
+    /// Deletes a stream by id.
+    ///
+    /// Returns Ok(()) on successful stream deletion or a PyRuntimeError on failure.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_stream<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::from(stream_id);
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .delete_stream(&stream_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+            Ok(())
+        })
+    }
+
     /// Creates a new topic with the given parameters.
     ///
     /// Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.

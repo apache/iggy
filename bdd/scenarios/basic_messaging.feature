@@ -43,3 +43,9 @@ Feature: Basic Messaging Operations
     And the messages should have sequential offsets from 0 to 9
     And each message should have the expected payload content
     And the last polled message should match the last sent message
+
+    When I update the stream name to "test-stream-updated"
+    Then the stream name should be updated to "test-stream-updated"
+
+    When I delete the stream
+    Then the stream should be deleted successfully
