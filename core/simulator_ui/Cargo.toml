@@ -21,6 +21,10 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[[bin]]
+name = "simulator-ui"
+path = "src/main.rs"
+
 [dependencies]
 bevy = { version = "0.18" }
 bevy_prototype_lyon = "0.16"
@@ -31,7 +35,3 @@ iggy_common = { path = "../common" }
 simulator = { path = "../simulator" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-
-[[bin]]
-name = "simulator-ui"
-path = "src/main.rs"
