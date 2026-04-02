@@ -53,17 +53,25 @@ pub enum MessageType {
 }
 
 impl MessageType {
-    pub fn color(self) -> egui::Color32 {
+    /// Brand color for this message type as (r, g, b).
+    pub fn color_rgb(self) -> (u8, u8, u8) {
         match self {
-            Self::ClientRequest => egui::Color32::from_rgb(0xff, 0xfa, 0xeb), // cream #fffaeb
-            Self::Prepare => egui::Color32::from_rgb(0x5f, 0x87, 0xfd),       // blue #5f87fd
-            Self::PrepareOk => egui::Color32::from_rgb(0x14, 0xb8, 0xa6),     // teal #14b8a6
-            Self::Commit => egui::Color32::from_rgb(0xff, 0x91, 0x03),        // orange #ff9103
-            Self::StartViewChange => egui::Color32::from_rgb(0xfa, 0x5e, 0x8a), // pink #fa5e8a
-            Self::DoViewChange => egui::Color32::from_rgb(0xa8, 0x55, 0xf7),  // purple #a855f7
-            Self::StartView => egui::Color32::from_rgb(0x63, 0x66, 0xf1),     // indigo #6366f1
-            Self::ClientReply => egui::Color32::from_rgb(0xff, 0xa7, 0x03),   // orange #ffa703
+            Self::ClientRequest => (0xff, 0xfa, 0xeb),   // cream
+            Self::Prepare => (0x5f, 0x87, 0xfd),         // blue
+            Self::PrepareOk => (0x14, 0xb8, 0xa6),       // teal
+            Self::Commit => (0xff, 0x91, 0x03),           // orange
+            Self::StartViewChange => (0xfa, 0x5e, 0x8a),  // pink
+            Self::DoViewChange => (0xa8, 0x55, 0xf7),     // purple
+            Self::StartView => (0x63, 0x66, 0xf1),        // indigo
+            Self::ClientReply => (0xff, 0xa7, 0x03),      // orange
         }
+    }
+
+    /// Bevy Color for this message type.
+    #[allow(dead_code)]
+    pub fn color(self) -> bevy::color::Color {
+        let (r, g, b) = self.color_rgb();
+        bevy::color::Color::srgb_u8(r, g, b)
     }
 }
 

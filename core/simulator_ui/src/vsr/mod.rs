@@ -28,6 +28,5 @@ mod simulator;
 mod types;
 
 pub use events::*;
-pub use network::*;
 pub use simulator::*;
 pub use types::*;

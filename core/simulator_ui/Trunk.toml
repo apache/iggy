@@ -3,7 +3,7 @@ target = "index.html"
 dist = "dist"
 
 [watch]
-watch = ["src", "assets"]
+watch = ["src", "assets/style.css", "../../assets"]
 
 [serve]
 port = 8070

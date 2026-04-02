@@ -98,6 +98,7 @@ pub enum SimEvent {
     Tick { tick: u64 },
 }
 
+#[allow(dead_code)]
 impl SimEvent {
     pub fn tick(&self) -> u64 {
         match self {

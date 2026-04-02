@@ -22,18 +22,16 @@ edition = "2024"
 publish = false
 
 [dependencies]
-eframe = { version = "0.31", default-features = false, features = ["glow"] }
-egui = "0.31"
-image = { version = "0.25", default-features = false, features = ["png"] }
+bevy = { version = "0.18", features = ["webgl2"] }
+bevy_prototype_lyon = "0.16"
 rand = "0.9"
 rand_xoshiro = "0.7"
 strum = { workspace = true }
 strum_macros = { workspace = true }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Window", "Performance"] }
-getrandom = { version = "0.3", features = ["wasm_js"] }
+[[bin]]
+name = "simulator-ui"
+path = "src/main.rs"
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-env_logger = "0.11"
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
