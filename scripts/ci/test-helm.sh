@@ -145,6 +145,16 @@ extract_kind_names() {
   ' "$file"
 }
 
+validate_yamllint() {
+  if ! command -v yamllint >/dev/null 2>&1; then
+    echo "Warning: yamllint not found, skipping YAML lint check" >&2
+    return 0
+  fi
+
+  echo "Running yamllint on Helm chart..."
+  yamllint -c "$CHART_DIR/.yamllint.yml" "$CHART_DIR"
+}
+
 validate_helm_docs() {
   if ! command -v helm-docs >/dev/null 2>&1; then
     echo "Warning: helm-docs not found, skipping README drift check" >&2
@@ -238,6 +248,7 @@ validate() {
   fi
   grep -q 'name: supersecret' "$HELM_RENDER_DIR/existing-secret.yaml"
 
+  validate_yamllint
   validate_helm_docs
 }
 

@@ -16,7 +16,7 @@
 # under the License.
 
 name: setup-helm-tools
-description: Install pinned Helm and optionally kind and helm-docs for Helm chart CI jobs
+description: Install pinned Helm and optionally kind, helm-docs, and yamllint for Helm chart CI jobs
 inputs:
   install-kind:
     description: "Whether to install kind in addition to Helm"
@@ -24,6 +24,10 @@ inputs:
     default: "false"
   install-helm-docs:
     description: "Whether to install helm-docs for README generation"
+    required: false
+    default: "false"
+  install-yamllint:
+    description: "Whether to install yamllint for YAML linting"
     required: false
     default: "false"
   helm-version:
@@ -82,3 +86,8 @@ runs:
           args+=(--install-helm-docs)
         fi
         scripts/ci/setup-helm-tools.sh "${args[@]}"
+
+    - name: Install yamllint
+      if: inputs.install-yamllint == 'true'
+      shell: bash
+      run: pip install yamllint
