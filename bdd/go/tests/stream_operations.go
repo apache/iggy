@@ -19,14 +19,14 @@ package tests
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
-	"testing"
 
+	"github.com/apache/iggy/foreign/go/client"
+	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	"github.com/apache/iggy/foreign/go/iggycli"
-	"github.com/apache/iggy/foreign/go/tcp"
 	"github.com/cucumber/godog"
 )
 
@@ -34,7 +34,7 @@ type streamOpsCtxKey struct{}
 
 type streamOpsCtx struct {
 	serverAddr *string
-	client     iggycli.Client
+	client     iggcon.Client
 	streamID   *uint32
 	streamName *string
 }
@@ -43,7 +43,9 @@ func getStreamOpsCtx(ctx context.Context) *streamOpsCtx {
 	return ctx.Value(streamOpsCtxKey{}).(*streamOpsCtx)
 }
 
-func streamGivenRunningServer(ctx context.Context) error {
+type streamOpsSteps struct{}
+
+func (s streamOpsSteps) givenRunningServer(ctx context.Context) error {
 	c := getStreamOpsCtx(ctx)
 	addr := os.Getenv("IGGY_TCP_ADDRESS")
 	if addr == "" {
@@ -53,12 +55,12 @@ func streamGivenRunningServer(ctx context.Context) error {
 	return nil
 }
 
-func streamGivenAuthenticationAsRoot(ctx context.Context) error {
+func (s streamOpsSteps) givenAuthenticationAsRoot(ctx context.Context) error {
 	c := getStreamOpsCtx(ctx)
 	serverAddr := *c.serverAddr
 
-	client, err := iggycli.NewIggyClient(
-		iggycli.WithTcp(
+	cli, err := client.NewIggyClient(
+		client.WithTcp(
 			tcp.WithServerAddress(serverAddr),
 		),
 	)
@@ -66,19 +68,19 @@ func streamGivenAuthenticationAsRoot(ctx context.Context) error {
 		return fmt.Errorf("error creating client: %w", err)
 	}
 
-	if err = client.Ping(); err != nil {
+	if err = cli.Ping(); err != nil {
 		return fmt.Errorf("error pinging client: %w", err)
 	}
 
-	if _, err = client.LoginUser("iggy", "iggy"); err != nil {
+	if _, err = cli.LoginUser("iggy", "iggy"); err != nil {
 		return fmt.Errorf("error logging in: %v", err)
 	}
 
-	c.client = client
+	c.client = cli
 	return nil
 }
 
-func whenCreateStreamWithUniqueName(ctx context.Context) error {
+func (s streamOpsSteps) whenCreateStreamWithUniqueName(ctx context.Context) error {
 	c := getStreamOpsCtx(ctx)
 
 	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -98,7 +100,7 @@ func whenCreateStreamWithUniqueName(ctx context.Context) error {
 	return nil
 }
 
-func thenStreamCreatedSuccessfullyOps(ctx context.Context) error {
+func (s streamOpsSteps) thenStreamCreatedSuccessfully(ctx context.Context) error {
 	c := getStreamOpsCtx(ctx)
 	if c.streamID == nil {
 		return fmt.Errorf("stream should have been created")
@@ -106,7 +108,7 @@ func thenStreamCreatedSuccessfullyOps(ctx context.Context) error {
 	return nil
 }
 
-func thenStreamRetrievableByID(ctx context.Context) error {
+func (s streamOpsSteps) thenStreamRetrievableByID(ctx context.Context) error {
 	c := getStreamOpsCtx(ctx)
 	streamIdentifier, _ := iggcon.NewIdentifier(*c.streamID)
 	stream, err := c.client.GetStream(streamIdentifier)
@@ -119,7 +121,7 @@ func thenStreamRetrievableByID(ctx context.Context) error {
 	return nil
 }
 
-func thenStreamNameMatchesCreated(ctx context.Context) error {
+func (s streamOpsSteps) thenStreamNameMatchesCreated(ctx context.Context) error {
 	c := getStreamOpsCtx(ctx)
 	streamIdentifier, _ := iggcon.NewIdentifier(*c.streamID)
 	stream, err := c.client.GetStream(streamIdentifier)
@@ -132,41 +134,30 @@ func thenStreamNameMatchesCreated(ctx context.Context) error {
 	return nil
 }
 
-func initStreamScenarios(sc *godog.ScenarioContext) {
+func initStreamOpsScenario(sc *godog.ScenarioContext) {
 	sc.Before(func(ctx context.Context, sc *godog.Scenario) (context.Context, error) {
 		return context.WithValue(context.Background(), streamOpsCtxKey{}, &streamOpsCtx{}), nil
 	})
 
-	sc.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+	s := &streamOpsSteps{}
+	sc.Step(`I have a running Iggy server`, s.givenRunningServer)
+	sc.Step(`I am authenticated as the root user`, s.givenAuthenticationAsRoot)
+	sc.Step(`I create a stream with a unique name`, s.whenCreateStreamWithUniqueName)
+	sc.Step(`the stream should be created successfully`, s.thenStreamCreatedSuccessfully)
+	sc.Step(`the stream should be retrievable by its ID`, s.thenStreamRetrievableByID)
+	sc.Step(`the stream name should match the created name`, s.thenStreamNameMatchesCreated)
+
+	sc.After(func(ctx context.Context, sc *godog.Scenario, scErr error) (context.Context, error) {
 		c := getStreamOpsCtx(ctx)
 		if c.client != nil && c.streamID != nil {
 			streamIdentifier, _ := iggcon.NewIdentifier(*c.streamID)
 			_ = c.client.DeleteStream(streamIdentifier)
 		}
-		return ctx, nil
+		if c.client != nil {
+			if err := c.client.Close(); err != nil {
+				scErr = errors.Join(scErr, fmt.Errorf("error closing client: %w", err))
+			}
+		}
+		return ctx, scErr
 	})
-
-	// Background steps
-	sc.Step(`I have a running Iggy server`, streamGivenRunningServer)
-	sc.Step(`I am authenticated as the root user`, streamGivenAuthenticationAsRoot)
-
-	// Stream operation steps
-	sc.Step(`I create a stream with a unique name`, whenCreateStreamWithUniqueName)
-	sc.Step(`the stream should be created successfully`, thenStreamCreatedSuccessfullyOps)
-	sc.Step(`the stream should be retrievable by its ID`, thenStreamRetrievableByID)
-	sc.Step(`the stream name should match the created name`, thenStreamNameMatchesCreated)
-}
-
-func TestStreamFeatures(t *testing.T) {
-	suite := godog.TestSuite{
-		ScenarioInitializer: initStreamScenarios,
-		Options: &godog.Options{
-			Format:   "pretty",
-			Paths:    []string{"../../scenarios/stream_operations.feature"},
-			TestingT: t,
-		},
-	}
-	if suite.Run() != 0 {
-		t.Fatal("failing stream feature tests")
-	}
 }

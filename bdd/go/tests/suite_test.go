@@ -38,6 +38,13 @@ func TestFeatures(t *testing.T) {
 			Paths:    []string{"../../scenarios/leader_redirection.feature"},
 			TestingT: t,
 		},
+	}, {
+		ScenarioInitializer: initStreamOpsScenario,
+		Options: &godog.Options{
+			Format:   "pretty",
+			Paths:    []string{"../../scenarios/stream_operations.feature"},
+			TestingT: t,
+		},
 	}}
 	for _, s := range suites {
 		if s.Run() != 0 {
