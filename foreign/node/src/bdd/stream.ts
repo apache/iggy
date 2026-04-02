@@ -45,6 +45,40 @@ Then(
   }
 );
 
+When(
+  'I update the stream name to {string}',
+  async function (this: TestWorld, newName: string) {
+    assert.ok(await this.client.stream.update({
+      streamId: this.stream.id,
+      name: newName
+    }));
+    this.stream = { ...this.stream, name: newName };
+  }
+);
+
+Then(
+  'the stream name should be updated to {string}',
+  async function (this: TestWorld, expectedName: string) {
+    const stream = await this.client.stream.get({ streamId: this.stream.id });
+    assert.equal(stream.name, expectedName);
+  }
+);
+
+When(
+  'I delete the stream',
+  async function (this: TestWorld) {
+    assert.ok(await this.client.stream.delete({ streamId: this.stream.id }));
+  }
+);
+
+Then(
+  'the stream should be deleted successfully',
+  async function (this: TestWorld) {
+    // If we reached here without error, the stream was deleted successfully
+    assert.ok(true);
+  }
+);
+
 // Cleanup: delete stream after test
 Then(
   'I can delete stream with ID {int}',

@@ -196,6 +196,38 @@ public class BasicMessagingOperationsSteps
         lastPolled.Header.Id.ShouldBe(_context.LastSendMessage.Header.Id);
         lastPolled.Payload.ShouldBe(_context.LastSendMessage.Payload);
     }
+
+    [When("I update the stream name to {string}")]
+    public async Task WhenIUpdateTheStreamNameTo(string newName)
+    {
+        _context.CreatedStream.ShouldNotBeNull();
+        await _context.IggyClient.UpdateStreamAsync(
+            Identifier.Numeric(_context.CreatedStream!.Id), newName);
+        _context.CreatedStream = await _context.IggyClient.GetStreamByIdAsync(
+            Identifier.Numeric(_context.CreatedStream.Id));
+    }
+
+    [Then("the stream name should be updated to {string}")]
+    public void ThenTheStreamNameShouldBeUpdatedTo(string expectedName)
+    {
+        _context.CreatedStream.ShouldNotBeNull();
+        _context.CreatedStream!.Name.ShouldBe(expectedName);
+    }
+
+    [When(@"I delete the stream")]
+    public async Task WhenIDeleteTheStream()
+    {
+        _context.CreatedStream.ShouldNotBeNull();
+        await _context.IggyClient.DeleteStreamAsync(
+            Identifier.Numeric(_context.CreatedStream!.Id));
+        _context.CreatedStream = null;
+    }
+
+    [Then(@"the stream should be deleted successfully")]
+    public void ThenTheStreamShouldBeDeletedSuccessfully()
+    {
+        _context.CreatedStream.ShouldBeNull();
+    }
 }
 
 // Test context for sharing data between steps
