@@ -22,16 +22,17 @@ use crate::state::models::CreateUserWithId;
 use crate::state::{COMPONENT, EntryCommand, StateEntry};
 use ahash::AHashMap;
 use err_trail::ErrContext;
+use iggy_binary_protocol::requests::users::CreateUserRequest;
+use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::CompressionAlgorithm;
 use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
 use iggy_common::MaxTopicSize;
 use iggy_common::PersonalAccessToken;
-use iggy_common::create_user::CreateUser;
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
-use iggy_common::{IdKind, Identifier, Permissions, UserStatus};
-use secrecy::{ExposeSecret, SecretString};
+use iggy_common::wire_conversions::{permissions_to_wire, wire_permissions_to_permissions};
+use iggy_common::{Permissions, UserStatus};
 use std::collections::BTreeMap;
 use std::fmt::Display;
 use tracing::{debug, error, info};
@@ -147,11 +148,12 @@ impl SystemState {
         if !root_exists {
             info!("No users found, creating the root user...");
             let root = create_root_user();
-            let command = CreateUser {
-                username: root.username.clone(),
-                password: SecretString::from(root.password.clone()),
-                status: root.status,
-                permissions: root.permissions.clone(),
+            let command = CreateUserRequest {
+                username: WireName::new(root.username.clone())
+                    .expect("root username must be valid"),
+                password: root.password.clone(),
+                status: root.status.as_code(),
+                permissions: root.permissions.as_ref().map(permissions_to_wire),
             };
             state
                 .apply(0, &EntryCommand::CreateUser(CreateUserWithId {
@@ -189,10 +191,9 @@ impl SystemState {
                 EntryCommand::CreateStream(command) => {
                     info!("Creating stream: {command:?}");
                     let stream_id = command.stream_id;
-                    let command = command.command;
                     let stream = StreamState {
                         id: stream_id,
-                        name: command.name.clone(),
+                        name: command.command.name.to_string(),
                         topics: BTreeMap::new(),
                         created_at: entry.timestamp,
                     };
@@ -203,7 +204,7 @@ impl SystemState {
                     let stream = streams
                         .get_mut(&stream_id)
                         .unwrap_or_else(|| panic!("{}", format!("Stream: {stream_id} not found")));
-                    stream.name = command.name;
+                    stream.name = command.name.to_string();
                 }
                 EntryCommand::DeleteStream(command) => {
                     let stream_id = find_stream_id(&streams, &command.stream_id);
@@ -214,7 +215,6 @@ impl SystemState {
                     streams
                         .get(&stream_id)
                         .unwrap_or_else(|| panic!("{}", format!("Stream: {stream_id} not found")));
-                    // It only affects the segments which are not part of the state
                 }
                 EntryCommand::CreateTopic(command) => {
                     let stream_id = find_stream_id(&streams, &command.command.stream_id);
@@ -222,19 +222,25 @@ impl SystemState {
                         .get_mut(&stream_id)
                         .unwrap_or_else(|| panic!("{}", format!("Stream: {stream_id} not found")));
                     let topic_id = command.topic_id;
-                    let command = command.command;
+                    let wire = command.command;
                     let topic = TopicState {
                         id: topic_id,
-                        name: command.name,
+                        name: wire.name.to_string(),
                         consumer_groups: BTreeMap::new(),
-                        compression_algorithm: command.compression_algorithm,
-                        message_expiry: command.message_expiry,
-                        max_topic_size: command.max_topic_size,
-                        replication_factor: command.replication_factor,
+                        compression_algorithm: CompressionAlgorithm::from_code(
+                            wire.compression_algorithm,
+                        )?,
+                        message_expiry: IggyExpiry::from(wire.message_expiry),
+                        max_topic_size: MaxTopicSize::from(wire.max_topic_size),
+                        replication_factor: if wire.replication_factor == 0 {
+                            None
+                        } else {
+                            Some(wire.replication_factor)
+                        },
                         created_at: entry.timestamp,
-                        partitions: if command.partitions_count > 0 {
+                        partitions: if wire.partitions_count > 0 {
                             let mut partitions = BTreeMap::new();
-                            for i in 0..command.partitions_count {
+                            for i in 0..wire.partitions_count {
                                 partitions.insert(
                                     i,
                                     PartitionState {
@@ -260,11 +266,16 @@ impl SystemState {
                         .topics
                         .get_mut(&topic_id)
                         .unwrap_or_else(|| panic!("{}", format!("Topic: {topic_id} not found")));
-                    topic.name = command.name;
-                    topic.compression_algorithm = command.compression_algorithm;
-                    topic.message_expiry = command.message_expiry;
-                    topic.max_topic_size = command.max_topic_size;
-                    topic.replication_factor = command.replication_factor;
+                    topic.name = command.name.to_string();
+                    topic.compression_algorithm =
+                        CompressionAlgorithm::from_code(command.compression_algorithm)?;
+                    topic.message_expiry = IggyExpiry::from(command.message_expiry);
+                    topic.max_topic_size = MaxTopicSize::from(command.max_topic_size);
+                    topic.replication_factor = if command.replication_factor == 0 {
+                        None
+                    } else {
+                        Some(command.replication_factor)
+                    };
                 }
                 EntryCommand::DeleteTopic(command) => {
                     let stream_id = find_stream_id(&streams, &command.stream_id);
@@ -284,7 +295,6 @@ impl SystemState {
                         .topics
                         .get(&topic_id)
                         .unwrap_or_else(|| panic!("{}", format!("Topic: {topic_id} not found")));
-                    // It only affects the segments which are not part of the state
                 }
                 EntryCommand::CreatePartitions(command) => {
                     let stream_id = find_stream_id(&streams, &command.stream_id);
@@ -363,24 +373,22 @@ impl SystemState {
                             .unwrap_or_else(|| {
                                 panic!("{}", format!("Partition {partition_id} not found."))
                             });
-
-                    // State is not affected by the delete segments
                 }
                 EntryCommand::CreateConsumerGroup(command) => {
                     let consumer_group_id = command.group_id;
-                    let command = command.command;
-                    let stream_id = find_stream_id(&streams, &command.stream_id);
+                    let wire = command.command;
+                    let stream_id = find_stream_id(&streams, &wire.stream_id);
                     let stream = streams
                         .get_mut(&stream_id)
                         .unwrap_or_else(|| panic!("{}", format!("Stream: {stream_id} not found")));
-                    let topic_id = find_topic_id(&stream.topics, &command.topic_id);
+                    let topic_id = find_topic_id(&stream.topics, &wire.topic_id);
                     let topic = stream
                         .topics
                         .get_mut(&topic_id)
                         .unwrap_or_else(|| panic!("{}", format!("Topic: {topic_id} not found")));
                     let consumer_group = ConsumerGroupState {
                         id: consumer_group_id,
-                        name: command.name,
+                        name: wire.name.to_string(),
                     };
                     topic
                         .consumer_groups
@@ -402,14 +410,17 @@ impl SystemState {
                 }
                 EntryCommand::CreateUser(command) => {
                     let user_id = command.user_id;
-                    let command = command.command;
+                    let wire = command.command;
                     let user = UserState {
                         id: user_id,
-                        username: command.username,
-                        password_hash: command.password.expose_secret().to_owned(), // This is already hashed
-                        status: command.status,
+                        username: wire.username.to_string(),
+                        password_hash: wire.password, // already hashed at write time
+                        status: UserStatus::from_code(wire.status)?,
                         created_at: entry.timestamp,
-                        permissions: command.permissions,
+                        permissions: wire
+                            .permissions
+                            .as_ref()
+                            .map(wire_permissions_to_permissions),
                         personal_access_tokens: AHashMap::new(),
                     };
                     users.insert(user.id, user);
@@ -420,10 +431,10 @@ impl SystemState {
                         .get_mut(&user_id)
                         .unwrap_or_else(|| panic!("{}", format!("User: {user_id} not found")));
                     if let Some(username) = &command.username {
-                        user.username.clone_from(username);
+                        user.username = username.to_string();
                     }
-                    if let Some(status) = &command.status {
-                        user.status = *status;
+                    if let Some(status) = command.status {
+                        user.status = UserStatus::from_code(status)?;
                     }
                 }
                 EntryCommand::DeleteUser(command) => {
@@ -435,32 +446,27 @@ impl SystemState {
                     let user = users
                         .get_mut(&user_id)
                         .unwrap_or_else(|| panic!("{}", format!("User: {user_id} not found")));
-                    user.password_hash = command.new_password.expose_secret().to_owned() // This is already hashed
+                    user.password_hash = command.new_password; // already hashed at write time
                 }
                 EntryCommand::UpdatePermissions(command) => {
                     let user_id = find_user_id(&users, &command.user_id);
                     let user = users
                         .get_mut(&user_id)
                         .unwrap_or_else(|| panic!("{}", format!("User: {user_id} not found")));
-                    user.permissions = command.permissions;
+                    user.permissions = command
+                        .permissions
+                        .as_ref()
+                        .map(wire_permissions_to_permissions);
                 }
                 EntryCommand::CreatePersonalAccessToken(command) => {
                     let token_hash = command.hash;
-                    let user_id = find_user_id(
-                        &users,
-                        &entry.user_id.try_into().error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to find user, user ID: {}",
-                                entry.user_id
-                            )
-                        })?,
-                    );
+                    let user_id = find_user_id(&users, &WireIdentifier::numeric(entry.user_id));
                     let user = users
                         .get_mut(&user_id)
                         .unwrap_or_else(|| panic!("{}", format!("User: {user_id} not found")));
                     let expiry_at = PersonalAccessToken::calculate_expiry_at(
                         entry.timestamp,
-                        command.command.expiry,
+                        IggyExpiry::from(command.command.expiry),
                     );
                     if let Some(expiry_at) = expiry_at
                         && expiry_at.as_micros() <= IggyTimestamp::now().as_micros()
@@ -469,29 +475,22 @@ impl SystemState {
                         continue;
                     }
 
+                    let name = command.command.name.to_string();
                     user.personal_access_tokens.insert(
-                        command.command.name.clone(),
+                        name.clone(),
                         PersonalAccessTokenState {
-                            name: command.command.name,
+                            name,
                             token_hash,
                             expiry_at,
                         },
                     );
                 }
                 EntryCommand::DeletePersonalAccessToken(command) => {
-                    let user_id = find_user_id(
-                        &users,
-                        &entry.user_id.try_into().error(|e: &IggyError| {
-                            format!(
-                                "{COMPONENT} (error: {e}) - failed to find user, user ID: {}",
-                                entry.user_id
-                            )
-                        })?,
-                    );
+                    let user_id = find_user_id(&users, &WireIdentifier::numeric(entry.user_id));
                     let user = users
                         .get_mut(&user_id)
                         .unwrap_or_else(|| panic!("{}", format!("User: {user_id} not found")));
-                    user.personal_access_tokens.remove(&command.name);
+                    user.personal_access_tokens.remove(command.name.as_str());
                 }
             }
         }
@@ -504,37 +503,29 @@ impl SystemState {
     }
 }
 
-fn find_stream_id(streams: &BTreeMap<u32, StreamState>, stream_id: &Identifier) -> u32 {
-    match stream_id.kind {
-        IdKind::Numeric => stream_id
-            .get_u32_value()
-            .unwrap_or_else(|_| panic!("{}", format!("Invalid stream ID: {stream_id}"))),
-        IdKind::String => {
-            let name = stream_id
-                .get_cow_str_value()
-                .unwrap_or_else(|_| panic!("{}", format!("Invalid stream name: {stream_id}")));
+fn find_stream_id(streams: &BTreeMap<u32, StreamState>, stream_id: &WireIdentifier) -> u32 {
+    match stream_id {
+        WireIdentifier::Numeric(id) => *id,
+        WireIdentifier::String(name) => {
+            let name = name.as_str();
             let stream = streams
                 .values()
                 .find(|s| s.name == name)
-                .unwrap_or_else(|| panic!("{}", format!("Stream: {name} not found")));
+                .unwrap_or_else(|| panic!("Stream: {name} not found"));
             stream.id
         }
     }
 }
 
-fn find_topic_id(topics: &BTreeMap<u32, TopicState>, topic_id: &Identifier) -> u32 {
-    match topic_id.kind {
-        IdKind::Numeric => topic_id
-            .get_u32_value()
-            .unwrap_or_else(|_| panic!("{}", format!("Invalid topic ID: {topic_id}"))),
-        IdKind::String => {
-            let name = topic_id
-                .get_cow_str_value()
-                .unwrap_or_else(|_| panic!("{}", format!("Invalid topic name: {topic_id}")));
+fn find_topic_id(topics: &BTreeMap<u32, TopicState>, topic_id: &WireIdentifier) -> u32 {
+    match topic_id {
+        WireIdentifier::Numeric(id) => *id,
+        WireIdentifier::String(name) => {
+            let name = name.as_str();
             let topic = topics
                 .values()
                 .find(|s| s.name == name)
-                .unwrap_or_else(|| panic!("{}", format!("Topic: {name} not found")));
+                .unwrap_or_else(|| panic!("Topic: {name} not found"));
             topic.id
         }
     }
@@ -542,38 +533,30 @@ fn find_topic_id(topics: &BTreeMap<u32, TopicState>, topic_id: &Identifier) -> u
 
 fn find_consumer_group_id(
     groups: &BTreeMap<u32, ConsumerGroupState>,
-    group_id: &Identifier,
+    group_id: &WireIdentifier,
 ) -> u32 {
-    match group_id.kind {
-        IdKind::Numeric => group_id
-            .get_u32_value()
-            .unwrap_or_else(|_| panic!("{}", format!("Invalid group ID: {group_id}"))),
-        IdKind::String => {
-            let name = group_id
-                .get_cow_str_value()
-                .unwrap_or_else(|_| panic!("{}", format!("Invalid group name: {group_id}")));
+    match group_id {
+        WireIdentifier::Numeric(id) => *id,
+        WireIdentifier::String(name) => {
+            let name = name.as_str();
             let group = groups
                 .values()
                 .find(|s| s.name == name)
-                .unwrap_or_else(|| panic!("{}", format!("Consumer group: {name} not found")));
+                .unwrap_or_else(|| panic!("Consumer group: {name} not found"));
             group.id
         }
     }
 }
 
-fn find_user_id(users: &AHashMap<u32, UserState>, user_id: &Identifier) -> u32 {
-    match user_id.kind {
-        IdKind::Numeric => user_id
-            .get_u32_value()
-            .unwrap_or_else(|_| panic!("{}", format!("Invalid user ID: {user_id}"))),
-        IdKind::String => {
-            let username = user_id
-                .get_cow_str_value()
-                .unwrap_or_else(|_| panic!("{}", format!("Invalid username: {user_id}")));
+fn find_user_id(users: &AHashMap<u32, UserState>, user_id: &WireIdentifier) -> u32 {
+    match user_id {
+        WireIdentifier::Numeric(id) => *id,
+        WireIdentifier::String(name) => {
+            let name = name.as_str();
             let user = users
                 .values()
-                .find(|s| s.username == username)
-                .unwrap_or_else(|| panic!("{}", format!("User: {username} not found")));
+                .find(|s| s.username == name)
+                .unwrap_or_else(|| panic!("User: {name} not found"));
             user.id
         }
     }

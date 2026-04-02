@@ -20,23 +20,18 @@ use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use iggy_common::Client;
-use iggy_common::ping::Ping;
 use std::fmt::{Display, Formatter, Result};
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
 use tracing::{Level, event};
 
 pub struct PingCmd {
-    _ping: Ping,
     count: u32,
 }
 
 impl PingCmd {
     pub fn new(count: u32) -> Self {
-        Self {
-            _ping: Ping {},
-            count,
-        }
+        Self { count }
     }
 }
 

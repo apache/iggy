@@ -16,32 +16,26 @@
 // under the License.
 
 use iggy_binary_protocol::{Message, ReplyHeader};
-use iggy_common::PollingStrategy;
 use iggy_common::sharding::IggyNamespace;
-use iggy_common::{IggyByteSize, MemoryPool, MemoryPoolConfigOther};
-use message_bus::MessageBus;
+use iggy_common::{IggyByteSize, MemoryPool, MemoryPoolConfigOther, PollingStrategy};
 use partitions::{PollingArgs, PollingConsumer};
-use simulator::{Simulator, client::SimClient};
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use simulator::Simulator;
+use simulator::client::SimClient;
+use simulator::packet::PacketSimulatorOptions;
 
-/// Shared response queue for client replies
-#[derive(Default)]
-pub struct Responses {
-    queue: VecDeque<Message<ReplyHeader>>,
+/// Step the simulator until at least one client reply is received,
+/// or `max_ticks` is reached. Returns all collected replies.
+fn step_until_reply(sim: &mut Simulator, max_ticks: u64) -> Vec<Message<ReplyHeader>> {
+    let mut all_replies = Vec::new();
+    for _ in 0..max_ticks {
+        all_replies.extend(sim.step());
+        if !all_replies.is_empty() {
+            return all_replies;
+        }
+    }
+    all_replies
 }
 
-impl Responses {
-    pub fn push(&mut self, msg: Message<ReplyHeader>) {
-        self.queue.push_back(msg);
-    }
-
-    pub fn pop(&mut self) -> Option<Message<ReplyHeader>> {
-        self.queue.pop_front()
-    }
-}
-
-#[allow(clippy::too_many_lines)]
 fn main() {
     // PooledBuffer::from (used by poll_messages) panics if the global pool is uninitialized.
     // Disabled pooling just falls through to the system allocator.
@@ -53,8 +47,16 @@ fn main() {
 
     let client_id: u128 = 1;
     let leader: u8 = 0;
-    let mut sim = Simulator::new(3, std::iter::once(client_id));
-    let bus = sim.message_bus.clone();
+
+    // Deterministic network: minimum delay, no loss, no partitions.
+    let network_opts = PacketSimulatorOptions {
+        node_count: 3,
+        client_count: 1,
+        ..PacketSimulatorOptions::default()
+    };
+
+    let mut sim = Simulator::new(3, std::iter::once(client_id), network_opts);
+    let client = SimClient::new(client_id);
 
     // Hardcoded partition for testing: stream_id=1, topic_id=1, partition_id=0
     let test_namespace = IggyNamespace::new(1, 1, 0);
@@ -63,125 +65,75 @@ fn main() {
     println!("[sim] Initializing test partition: {test_namespace:?}");
     sim.init_partition(test_namespace);
 
-    // Responses queue
-    let responses = Arc::new(Mutex::new(Responses::default()));
-    let responses_clone = responses.clone();
+    // 1. Send messages to a partition
+    println!("[sim] Sending messages to partition");
+    let test_messages = vec![
+        b"Hello, partition!".as_slice(),
+        b"Message 2".as_slice(),
+        b"Message 3".as_slice(),
+    ];
+    let send_msg = client.send_messages(test_namespace, &test_messages);
+    sim.submit_request(client_id, leader, send_msg.into_generic());
 
-    // TODO: Scuffed client/simulator setup.
-    // We need a better interface on simulator
-    let client_handle = std::thread::spawn(move || {
-        futures::executor::block_on(async {
-            let client = SimClient::new(client_id);
+    let replies = step_until_reply(&mut sim, 100);
+    assert!(!replies.is_empty(), "expected send_messages reply");
+    println!("[sim] Got send_messages reply: {:?}", replies[0].header());
 
-            // Send some test messages to the partition
-            println!("[client] Sending messages to partition");
-            let test_messages = vec![
-                b"Hello, partition!".as_slice(),
-                b"Message 2".as_slice(),
-                b"Message 3".as_slice(),
-            ];
+    // 2. Metadata operations (create + delete stream)
+    let create_msg = client.create_stream("test-stream");
+    sim.submit_request(client_id, leader, create_msg.into_generic());
 
-            let send_msg = client.send_messages(test_namespace, &test_messages);
-            bus.send_to_replica(leader, send_msg.into_generic())
-                .await
-                .expect("failed to send messages");
+    let replies = step_until_reply(&mut sim, 100);
+    assert!(!replies.is_empty(), "expected create_stream reply");
+    println!("[sim] Got create_stream reply: {:?}", replies[0].header());
 
-            loop {
-                let reply = responses_clone.lock().unwrap().pop();
-                if let Some(reply) = reply {
-                    println!("[client] Got send_messages reply: {:?}", reply.header());
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+    let delete_msg = client.delete_stream("test-stream");
+    sim.submit_request(client_id, leader, delete_msg.into_generic());
 
-            // Send metadata operations
-            let create_msg = client.create_stream("test-stream");
-            bus.send_to_replica(leader, create_msg.into_generic())
-                .await
-                .expect("failed to send create_stream");
+    let replies = step_until_reply(&mut sim, 100);
+    assert!(!replies.is_empty(), "expected delete_stream reply");
+    println!("[sim] Got delete_stream reply: {:?}", replies[0].header());
 
-            loop {
-                let reply = responses_clone.lock().unwrap().pop();
-                if let Some(reply) = reply {
-                    println!("[client] Got create_stream reply: {:?}", reply.header());
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+    // 3. Crash a follower and verify the cluster still commits
+    println!("\n[sim] === Crash demo ===");
+    println!("[sim] Crashing replica 2 (follower)");
+    sim.replica_crash(2);
+    assert!(sim.is_crashed(2));
 
-            let delete_msg = client.delete_stream("test-stream");
-            bus.send_to_replica(leader, delete_msg.into_generic())
-                .await
-                .expect("failed to send delete_stream");
+    let send_msg2 = client.send_messages(test_namespace, &[b"After crash".as_slice()]);
+    sim.submit_request(client_id, leader, send_msg2.into_generic());
 
-            loop {
-                let reply = responses_clone.lock().unwrap().pop();
-                if let Some(reply) = reply {
-                    println!("[client] Got delete_stream reply: {:?}", reply.header());
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        });
-    });
+    let replies = step_until_reply(&mut sim, 100);
+    assert!(
+        !replies.is_empty(),
+        "expected reply even with one follower crashed"
+    );
+    println!(
+        "[sim] Got send_messages reply with replica 2 down: {:?}",
+        replies[0].header()
+    );
 
-    println!("[sim] Starting simulator loop");
-    futures::executor::block_on(async {
-        loop {
-            if let Some(reply) = sim.step().await {
-                responses.lock().unwrap().push(reply);
-            }
-
-            if client_handle.is_finished() {
-                break;
-            }
-        }
-
-        // Poll messages directly from the leader's partition (bypassing consensus)
-        let consumer = PollingConsumer::Consumer(1, 0);
-        let args = PollingArgs::new(PollingStrategy::first(), 10, false);
-        match sim
-            .poll_messages(leader as usize, test_namespace, consumer, args)
-            .await
-        {
-            Ok((fragments, _last_matching_offset)) => {
-                println!("[sim] Poll returned {} fragments", fragments.len());
-            }
-            Err(e) => {
-                println!("[sim] Poll failed: {e}");
-            }
-        }
-
-        let args_auto = PollingArgs::new(PollingStrategy::first(), 2, true);
-        if let Ok(batch) = sim
-            .poll_messages(leader as usize, test_namespace, consumer, args_auto)
-            .await
-        {
+    // 4. Poll messages and check offsets on the leader
+    let consumer = PollingConsumer::Consumer(1, 0);
+    let args = PollingArgs::new(PollingStrategy::first(), 10, false);
+    match sim.poll_messages(leader as usize, test_namespace, consumer, args) {
+        Ok((fragments, _last_matching_offset)) => {
             println!(
-                "[sim] Auto-commit poll returned {} fragments",
-                batch.0.len()
+                "[sim] Poll returned {} fragments (expected 4)",
+                fragments.len()
             );
         }
-
-        // Next poll should start from offset 2 (after auto-commit of 0,1)
-        let args_next = PollingArgs::new(PollingStrategy::next(), 10, false);
-        if let Ok(batch) = sim
-            .poll_messages(leader as usize, test_namespace, consumer, args_next)
-            .await
-        {
-            println!("[sim] Next poll returned {} fragments", batch.0.len());
+        Err(e) => {
+            println!("[sim] Poll failed: {e}");
         }
+    }
 
-        // Check offsets
-        if let Some(offsets) = sim.offsets(leader as usize, test_namespace) {
-            println!(
-                "[sim] Partition offsets: commit={}, write={}",
-                offsets.commit_offset, offsets.write_offset
-            );
-        }
-    });
+    if let Some(offsets) = sim.offsets(leader as usize, test_namespace) {
+        println!(
+            "[sim] Partition offsets: commit={}, write={}",
+            offsets.commit_offset, offsets.write_offset
+        );
+    }
 
-    client_handle.join().expect("client thread panicked");
-    println!("[sim] Simulator loop ended");
+    println!("[sim] Simulator finished successfully");
 }

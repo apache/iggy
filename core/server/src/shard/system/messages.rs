@@ -30,8 +30,7 @@ use iggy_common::IggyPollMetadata;
 use iggy_common::PooledBuffer;
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::{
-    BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError,
-    PollingStrategy,
+    Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError, PollingStrategy,
 };
 use std::sync::atomic::Ordering;
 use tracing::error;

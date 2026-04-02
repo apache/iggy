@@ -16,119 +16,52 @@
  * under the License.
  */
 
-use crate::state::COMPONENT;
-use bytes::{BufMut, Bytes, BytesMut};
-use err_trail::ErrContext;
-use iggy_common::BytesSerializable;
-use iggy_common::Command;
-use iggy_common::IggyError;
-use iggy_common::Validatable;
-use iggy_common::create_consumer_group::CreateConsumerGroup;
-use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-use iggy_common::create_stream::CreateStream;
-use iggy_common::create_topic::CreateTopic;
-use iggy_common::create_user::CreateUser;
-use serde::{Deserialize, Serialize};
+use bytes::{BufMut, BytesMut};
+use iggy_binary_protocol::requests::{
+    consumer_groups::CreateConsumerGroupRequest,
+    personal_access_tokens::CreatePersonalAccessTokenRequest, streams::CreateStreamRequest,
+    topics::CreateTopicRequest, users::CreateUserRequest,
+};
+use iggy_binary_protocol::{WireDecode, WireEncode};
 use std::fmt;
 use std::fmt::{Display, Formatter};
-use std::str::from_utf8;
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateStreamWithId {
     pub stream_id: u32,
-    pub command: CreateStream,
+    pub command: CreateStreamRequest,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTopicWithId {
     pub topic_id: u32,
-    pub command: CreateTopic,
+    pub command: CreateTopicRequest,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateConsumerGroupWithId {
     pub group_id: u32,
-    pub command: CreateConsumerGroup,
+    pub command: CreateConsumerGroupRequest,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateUserWithId {
     pub user_id: u32,
-    pub command: CreateUser,
+    pub command: CreateUserRequest,
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatePersonalAccessTokenWithHash {
     pub hash: String,
-    pub command: CreatePersonalAccessToken,
-}
-
-impl Validatable<IggyError> for CreateStreamWithId {
-    fn validate(&self) -> Result<(), IggyError> {
-        self.command.validate()
-    }
-}
-
-impl Command for CreateStreamWithId {
-    fn code(&self) -> u32 {
-        self.command.code()
-    }
-}
-
-impl Validatable<IggyError> for CreateTopicWithId {
-    fn validate(&self) -> Result<(), IggyError> {
-        self.command.validate()
-    }
-}
-
-impl Command for CreateTopicWithId {
-    fn code(&self) -> u32 {
-        self.command.code()
-    }
-}
-
-impl Validatable<IggyError> for CreateConsumerGroupWithId {
-    fn validate(&self) -> Result<(), IggyError> {
-        self.command.validate()
-    }
-}
-
-impl Command for CreateConsumerGroupWithId {
-    fn code(&self) -> u32 {
-        self.command.code()
-    }
-}
-
-impl Validatable<IggyError> for CreateUserWithId {
-    fn validate(&self) -> Result<(), IggyError> {
-        self.command.validate()
-    }
-}
-
-impl Command for CreateUserWithId {
-    fn code(&self) -> u32 {
-        self.command.code()
-    }
-}
-
-impl Validatable<IggyError> for CreatePersonalAccessTokenWithHash {
-    fn validate(&self) -> Result<(), IggyError> {
-        self.command.validate()
-    }
-}
-
-impl Command for CreatePersonalAccessTokenWithHash {
-    fn code(&self) -> u32 {
-        self.command.code()
-    }
+    pub command: CreatePersonalAccessTokenRequest,
 }
 
 impl Display for CreateStreamWithId {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "CreateStreamWithId {{ command: {}, stream ID: {} }}",
-            self.command, self.stream_id
+            "CreateStreamWithId {{ name: {}, stream_id: {} }}",
+            self.command.name, self.stream_id
         )
     }
 }
@@ -137,8 +70,8 @@ impl Display for CreateTopicWithId {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "CreateTopicWithId {{ command: {}, topic ID: {} }}",
-            self.command, self.topic_id
+            "CreateTopicWithId {{ name: {}, topic_id: {} }}",
+            self.command.name, self.topic_id
         )
     }
 }
@@ -147,8 +80,8 @@ impl Display for CreateConsumerGroupWithId {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "CreateConsumerGroupWithId {{ command: {}, group_id: {} }}",
-            self.command, self.group_id
+            "CreateConsumerGroupWithId {{ name: {}, group_id: {} }}",
+            self.command.name, self.group_id
         )
     }
 }
@@ -157,8 +90,8 @@ impl Display for CreateUserWithId {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "CreateUserWithId {{ command: {}, user_id: {} }}",
-            self.command, self.user_id
+            "CreateUserWithId {{ username: {}, user_id: {} }}",
+            self.command.username, self.user_id
         )
     }
 }
@@ -167,222 +100,236 @@ impl Display for CreatePersonalAccessTokenWithHash {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "CreatePersonalAccessTokenWithHash {{ command: {}, hash: {} }}",
-            self.command, self.hash
+            "CreatePersonalAccessTokenWithHash {{ name: {}, hash: [REDACTED] }}",
+            self.command.name,
         )
     }
 }
 
-impl BytesSerializable for CreateStreamWithId {
-    fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::new();
-        bytes.put_u32_le(self.stream_id);
-        let command_bytes = self.command.to_bytes();
-        bytes.put_u32_le(command_bytes.len() as u32);
-        bytes.put_slice(&command_bytes);
-        bytes.freeze()
+// Wire format for WithId wrappers: id:u32_le | inner_length:u32_le | inner_bytes
+
+impl WireEncode for CreateStreamWithId {
+    fn encoded_size(&self) -> usize {
+        4 + 4 + self.command.encoded_size()
     }
 
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        let mut position = 0;
-        let stream_id = u32::from_le_bytes(
-            bytes[position..4]
-                .try_into()
-                .error(|e: &std::array::TryFromSliceError| {
-                    format!("{COMPONENT} (error: {e}) - failed to parse stream ID")
-                })
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        position += 4;
-        let command_length = u32::from_le_bytes(
-            bytes[position..position + 4]
-                .try_into()
-                .error(|e: &std::array::TryFromSliceError| {
-                    format!("{COMPONENT} (error: {e}) - failed to parse stream command length")
-                })
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        position += 4;
-        let command_bytes = bytes.slice(position..position + command_length as usize);
-        let command = CreateStream::from_bytes(command_bytes).error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to parse stream command")
-        })?;
-        Ok(Self { stream_id, command })
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u32_le(self.stream_id);
+        buf.put_u32_le(self.command.encoded_size() as u32);
+        self.command.encode(buf);
     }
 }
 
-impl BytesSerializable for CreateTopicWithId {
-    fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::new();
-        bytes.put_u32_le(self.topic_id);
-        let command_bytes = self.command.to_bytes();
-        bytes.put_u32_le(command_bytes.len() as u32);
-        bytes.put_slice(&command_bytes);
-        bytes.freeze()
-    }
-
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        let mut position = 0;
-        let topic_id = u32::from_le_bytes(
-            bytes[position..4]
-                .try_into()
-                .error(|e: &std::array::TryFromSliceError| {
-                    format!("{COMPONENT} (error: {e}) - failed to parse topic ID")
-                })
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        position += 4;
-        let command_length = u32::from_le_bytes(
-            bytes[position..position + 4]
-                .try_into()
-                .error(|e: &std::array::TryFromSliceError| {
-                    format!("{COMPONENT} (error: {e}) - failed to parse topic command length")
-                })
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        position += 4;
-        let command_bytes = bytes.slice(position..position + command_length as usize);
-        let command = CreateTopic::from_bytes(command_bytes).error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to parse topic command")
-        })?;
-        Ok(Self { topic_id, command })
+impl WireDecode for CreateStreamWithId {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), iggy_binary_protocol::WireError> {
+        if buf.len() < 8 {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 0,
+                need: 8,
+                have: buf.len(),
+            });
+        }
+        let stream_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let command_length = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        let total = 8usize.checked_add(command_length).ok_or(
+            iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 4,
+                need: command_length,
+                have: buf.len() - 8,
+            },
+        )?;
+        if buf.len() < total {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 8,
+                need: command_length,
+                have: buf.len() - 8,
+            });
+        }
+        let (command, _) = CreateStreamRequest::decode(&buf[8..total])?;
+        Ok((Self { stream_id, command }, total))
     }
 }
 
-impl BytesSerializable for CreateConsumerGroupWithId {
-    fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::new();
-        bytes.put_u32_le(self.group_id);
-        let command_bytes = self.command.to_bytes();
-        bytes.put_u32_le(command_bytes.len() as u32);
-        bytes.put_slice(&command_bytes);
-        bytes.freeze()
+impl WireEncode for CreateTopicWithId {
+    fn encoded_size(&self) -> usize {
+        4 + 4 + self.command.encoded_size()
     }
 
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        let mut position = 0;
-        let group_id = u32::from_le_bytes(
-            bytes[position..4]
-                .try_into()
-                .error(|e: &std::array::TryFromSliceError| {
-                    format!("{COMPONENT} (error: {e}) - failed to parse consumer group ID")
-                })
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        position += 4;
-        let command_length = u32::from_le_bytes(
-            bytes[position..position + 4]
-                .try_into()
-                .error(|e: &std::array::TryFromSliceError| {
-                    format!(
-                        "{COMPONENT} (error: {e}) - failed to parse consumer group command length"
-                    )
-                })
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        position += 4;
-        let command_bytes = bytes.slice(position..position + command_length as usize);
-        let command = CreateConsumerGroup::from_bytes(command_bytes).error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to parse consumer group command")
-        })?;
-        Ok(Self { group_id, command })
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u32_le(self.topic_id);
+        buf.put_u32_le(self.command.encoded_size() as u32);
+        self.command.encode(buf);
     }
 }
 
-impl BytesSerializable for CreateUserWithId {
-    fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::new();
-        bytes.put_u32_le(self.user_id);
-        let command_bytes = self.command.to_bytes();
-        bytes.put_u32_le(command_bytes.len() as u32);
-        bytes.put_slice(&command_bytes);
-        bytes.freeze()
-    }
-
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        let mut position = 0;
-        let user_id = u32::from_le_bytes(
-            bytes[position..4]
-                .try_into()
-                .error(|e: &std::array::TryFromSliceError| {
-                    format!("{COMPONENT} (error: {e}) - failed to parse user ID")
-                })
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        position += 4;
-        let command_length = u32::from_le_bytes(
-            bytes[position..position + 4]
-                .try_into()
-                .error(|e: &std::array::TryFromSliceError| {
-                    format!("{COMPONENT} (error: {e}) - failed to parse user command length")
-                })
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        position += 4;
-        let command_bytes = bytes.slice(position..position + command_length as usize);
-        let command = CreateUser::from_bytes(command_bytes).error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to parse user command")
-        })?;
-        Ok(Self { user_id, command })
+impl WireDecode for CreateTopicWithId {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), iggy_binary_protocol::WireError> {
+        if buf.len() < 8 {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 0,
+                need: 8,
+                have: buf.len(),
+            });
+        }
+        let topic_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let command_length = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        let total = 8usize.checked_add(command_length).ok_or(
+            iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 4,
+                need: command_length,
+                have: buf.len() - 8,
+            },
+        )?;
+        if buf.len() < total {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 8,
+                need: command_length,
+                have: buf.len() - 8,
+            });
+        }
+        let (command, _) = CreateTopicRequest::decode(&buf[8..total])?;
+        Ok((Self { topic_id, command }, total))
     }
 }
 
-impl BytesSerializable for CreatePersonalAccessTokenWithHash {
-    fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::new();
-        bytes.put_u32_le(self.hash.len() as u32);
-        bytes.put_slice(self.hash.as_bytes());
-        let command_bytes = self.command.to_bytes();
-        bytes.put_u32_le(command_bytes.len() as u32);
-        bytes.put_slice(&command_bytes);
-        bytes.freeze()
+impl WireEncode for CreateConsumerGroupWithId {
+    fn encoded_size(&self) -> usize {
+        4 + 4 + self.command.encoded_size()
     }
 
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        let mut position = 0;
-        let hash_length = u32::from_le_bytes(
-            bytes[position..4]
-                .try_into()
-                .error(|e: &std::array::TryFromSliceError| {
-                    format!("{COMPONENT} (error: {e}) - failed to parse hash length")
-                })
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        position += 4;
-        let hash = from_utf8(&bytes[position..position + hash_length as usize])
-            .map_err(|_| IggyError::InvalidUtf8)?
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u32_le(self.group_id);
+        buf.put_u32_le(self.command.encoded_size() as u32);
+        self.command.encode(buf);
+    }
+}
+
+impl WireDecode for CreateConsumerGroupWithId {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), iggy_binary_protocol::WireError> {
+        if buf.len() < 8 {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 0,
+                need: 8,
+                have: buf.len(),
+            });
+        }
+        let group_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let command_length = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        let total = 8usize.checked_add(command_length).ok_or(
+            iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 4,
+                need: command_length,
+                have: buf.len() - 8,
+            },
+        )?;
+        if buf.len() < total {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 8,
+                need: command_length,
+                have: buf.len() - 8,
+            });
+        }
+        let (command, _) = CreateConsumerGroupRequest::decode(&buf[8..total])?;
+        Ok((Self { group_id, command }, total))
+    }
+}
+
+impl WireEncode for CreateUserWithId {
+    fn encoded_size(&self) -> usize {
+        4 + 4 + self.command.encoded_size()
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u32_le(self.user_id);
+        buf.put_u32_le(self.command.encoded_size() as u32);
+        self.command.encode(buf);
+    }
+}
+
+impl WireDecode for CreateUserWithId {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), iggy_binary_protocol::WireError> {
+        if buf.len() < 8 {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 0,
+                need: 8,
+                have: buf.len(),
+            });
+        }
+        let user_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let command_length = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        let total = 8usize.checked_add(command_length).ok_or(
+            iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 4,
+                need: command_length,
+                have: buf.len() - 8,
+            },
+        )?;
+        if buf.len() < total {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 8,
+                need: command_length,
+                have: buf.len() - 8,
+            });
+        }
+        let (command, _) = CreateUserRequest::decode(&buf[8..total])?;
+        Ok((Self { user_id, command }, total))
+    }
+}
+
+impl WireEncode for CreatePersonalAccessTokenWithHash {
+    fn encoded_size(&self) -> usize {
+        4 + self.hash.len() + 4 + self.command.encoded_size()
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u32_le(self.hash.len() as u32);
+        buf.put_slice(self.hash.as_bytes());
+        buf.put_u32_le(self.command.encoded_size() as u32);
+        self.command.encode(buf);
+    }
+}
+
+impl WireDecode for CreatePersonalAccessTokenWithHash {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), iggy_binary_protocol::WireError> {
+        if buf.len() < 4 {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: 0,
+                need: 4,
+                have: buf.len(),
+            });
+        }
+        let hash_length = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        let mut pos = 4;
+        if buf.len() < pos + hash_length {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: pos,
+                need: hash_length,
+                have: buf.len() - pos,
+            });
+        }
+        let hash = std::str::from_utf8(&buf[pos..pos + hash_length])
+            .map_err(|_| iggy_binary_protocol::WireError::InvalidUtf8 { offset: pos })?
             .to_string();
-
-        position += hash_length as usize;
-        let command_length = u32::from_le_bytes(
-            bytes[position..position + 4]
-                .try_into()
-                .error(|e: &std::array::TryFromSliceError| {
-                    format!("{COMPONENT} (error: {e}) - failed to parse personal access token command length")
-                })
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        position += 4;
-        let command_bytes = bytes.slice(position..position + command_length as usize);
-        let command =
-            CreatePersonalAccessToken::from_bytes(command_bytes).error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - failed to parse personal access token command")
-            })?;
-        Ok(Self { hash, command })
+        pos += hash_length;
+        if buf.len() < pos + 4 {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: pos,
+                need: 4,
+                have: buf.len() - pos,
+            });
+        }
+        let command_length = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if buf.len() < pos + command_length {
+            return Err(iggy_binary_protocol::WireError::UnexpectedEof {
+                offset: pos,
+                need: command_length,
+                have: buf.len() - pos,
+            });
+        }
+        let (command, _) =
+            CreatePersonalAccessTokenRequest::decode(&buf[pos..pos + command_length])?;
+        pos += command_length;
+        Ok((Self { hash, command }, pos))
     }
 }
