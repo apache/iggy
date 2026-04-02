@@ -19,10 +19,13 @@
 
 use crate::IggyPartition;
 use crate::Partition;
-use crate::PollingConsumer;
 use crate::iggy_index_writer::IggyIndexWriter;
+use crate::iggy_partition::{PendingConsumerOffsetCommit, PendingConsumerOffsetOwner};
 use crate::log::JournalInfo;
 use crate::messages_writer::MessagesWriter;
+use crate::offset_storage::{
+    create_offset_file_hierarchy, load_consumer_group_offsets, load_consumer_offsets,
+};
 use crate::segment::Segment;
 use crate::types::PartitionsConfig;
 use consensus::PlaneIdentity;
@@ -38,7 +41,8 @@ use iggy_binary_protocol::{
     RequestHeader,
 };
 use iggy_common::{
-    IggyByteSize, IggyError, PartitionStats, SegmentStorage,
+    ConsumerGroupOffsets, ConsumerOffset, ConsumerOffsets, IggyByteSize, IggyError, PartitionStats,
+    SegmentStorage,
     send_messages2::{convert_request_message, decode_prepare_slice},
     sharding::{IggyNamespace, LocalIdx, ShardId},
 };
@@ -316,6 +320,25 @@ impl<C> IggyPartitions<C> {
         // Create initial segment with storage
         let start_offset = 0;
         let segment = Segment::new(start_offset, self.config.segment_size);
+        create_offset_file_hierarchy(&self.config, namespace).await?;
+
+        let consumer_offsets_path = self.config.get_consumer_offsets_path(
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+        );
+        let consumer_group_offsets_path = self.config.get_consumer_group_offsets_path(
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+        );
+        let consumer_offsets =
+            Self::load_partition_consumer_offsets(&consumer_offsets_path, start_offset, namespace)?;
+        let consumer_group_offsets = Self::load_partition_consumer_group_offsets(
+            &consumer_group_offsets_path,
+            start_offset,
+            namespace,
+        )?;
 
         // TODO: Waiting for issue to move server config to shared module.
         // Once complete, paths will come from proper base_path/streams_path/etc config fields.
@@ -372,6 +395,12 @@ impl<C> IggyPartitions<C> {
         // Create partition with initialized log
         let stats = Arc::new(PartitionStats::default());
         let mut partition = IggyPartition::new(stats);
+        partition.configure_consumer_offset_storage(
+            consumer_offsets_path,
+            consumer_group_offsets_path,
+            consumer_offsets,
+            consumer_group_offsets,
+        );
         partition.log.add_persisted_segment(
             segment,
             storage,
@@ -386,6 +415,62 @@ impl<C> IggyPartitions<C> {
         partition.stats.increment_segments_count(1);
 
         Ok(self.insert(namespace, partition))
+    }
+
+    fn load_partition_consumer_offsets(
+        path: &str,
+        current_offset: u64,
+        namespace: IggyNamespace,
+    ) -> Result<ConsumerOffsets, IggyError> {
+        let offsets = load_consumer_offsets(path)?
+            .into_iter()
+            .map(|offset| {
+                let offset = Self::clamp_loaded_offset(namespace, current_offset, offset);
+                (
+                    usize::try_from(offset.consumer_id).expect("u32 consumer id must fit usize"),
+                    offset,
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(ConsumerOffsets::from(offsets))
+    }
+
+    fn load_partition_consumer_group_offsets(
+        path: &str,
+        current_offset: u64,
+        namespace: IggyNamespace,
+    ) -> Result<ConsumerGroupOffsets, IggyError> {
+        let offsets = load_consumer_group_offsets(path)?
+            .into_iter()
+            .map(|(group_id, offset)| {
+                let offset = Self::clamp_loaded_offset(namespace, current_offset, offset);
+                (group_id, offset)
+            })
+            .collect::<Vec<_>>();
+        Ok(ConsumerGroupOffsets::from(offsets))
+    }
+
+    fn clamp_loaded_offset(
+        namespace: IggyNamespace,
+        current_offset: u64,
+        offset: ConsumerOffset,
+    ) -> ConsumerOffset {
+        let persisted_offset = offset.offset.load(Ordering::Relaxed);
+        if persisted_offset <= current_offset {
+            return offset;
+        }
+
+        warn!(
+            target: "iggy.partitions.diag",
+            namespace_raw = namespace.inner(),
+            consumer_id = offset.consumer_id,
+            persisted_offset,
+            current_offset,
+            path = %offset.path,
+            "clamping recovered consumer offset to current partition offset"
+        );
+        offset.offset.store(current_offset, Ordering::Relaxed);
+        offset
     }
 }
 
@@ -642,49 +727,23 @@ where
                 );
                 Ok(())
             }
-            Operation::StoreConsumerOffset => {
-                let total_size = header.size() as usize;
-                let body = &message.as_slice()[std::mem::size_of::<PrepareHeader>()..total_size];
-                let consumer_kind = *body.first().ok_or(IggyError::InvalidCommand)?;
-                let consumer_id =
-                    body.get(1..5)
-                        .ok_or(IggyError::InvalidCommand)
-                        .and_then(|bytes| {
-                            <[u8; 4]>::try_from(bytes)
-                                .map(u32::from_le_bytes)
-                                .map(|value| value as usize)
-                                .map_err(|_| IggyError::InvalidCommand)
-                        })?;
-                let offset =
-                    body.get(5..13)
-                        .ok_or(IggyError::InvalidCommand)
-                        .and_then(|bytes| {
-                            <[u8; 8]>::try_from(bytes)
-                                .map(u64::from_le_bytes)
-                                .map_err(|_| IggyError::InvalidCommand)
-                        })?;
-                let consumer = match consumer_kind {
-                    1 => PollingConsumer::Consumer(consumer_id, 0),
-                    2 => PollingConsumer::ConsumerGroup(consumer_id, 0),
-                    _ => {
-                        warn!(
-                            target: "iggy.partitions.diag",
-                            plane = "partitions",
-                            replica = consensus.replica(),
-                            op = header.op,
-                            namespace_raw = namespace.inner(),
-                            operation = ?header.operation,
-                            consumer_kind,
-                            "unknown consumer kind while applying replicated offset update"
-                        );
-                        return Err(IggyError::InvalidCommand);
-                    }
-                };
-
+            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
+                let pending =
+                    Self::parse_staged_consumer_offset_commit(header.operation, &message)?;
+                let write_lock = self
+                    .get_by_ns(namespace)
+                    .expect("store_consumer_offset: partition not found for namespace")
+                    .write_lock
+                    .clone();
+                let _guard = write_lock.lock().await;
                 let partition = self
                     .get_by_ns(namespace)
                     .expect("store_consumer_offset: partition not found for namespace");
-                let _ = partition.store_consumer_offset(consumer, offset);
+                partition.persist_consumer_offset_commit(pending).await?;
+                let partition = self
+                    .get_mut_by_ns(namespace)
+                    .expect("store_consumer_offset: partition not found for namespace");
+                partition.stage_consumer_offset_commit(header.op, pending);
 
                 debug!(
                     target: "iggy.partitions.diag",
@@ -693,10 +752,9 @@ where
                     op = header.op,
                     namespace_raw = namespace.inner(),
                     operation = ?header.operation,
-                    consumer_kind,
-                    consumer_id,
-                    offset,
-                    "replicated consumer offset stored"
+                    consumer = ?pending.owner(),
+                    pending = ?pending.mutation,
+                    "replicated consumer offset persisted and staged"
                 );
                 Ok(())
             }
@@ -1055,17 +1113,14 @@ where
 
                 !failed_ns.contains(&entry_namespace)
             }
-            Operation::StoreConsumerOffset => {
-                // TODO: Commit consumer offset update.
-                debug!(
-                    target: "iggy.partitions.diag",
-                    plane = "partitions",
-                    replica_id = consensus.replica(),
-                    op = prepare_header.op,
-                    namespace_raw = entry_namespace.inner(),
-                    "consumer offset committed"
-                );
-                true
+            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
+                self.commit_consumer_offset_entry(
+                    consensus,
+                    prepare_header,
+                    entry_namespace,
+                    failed_ns,
+                )
+                .await
             }
             _ => {
                 warn!(
@@ -1103,6 +1158,93 @@ where
         Ok(Some(
             batch.header.base_offset + u64::from(message_count) - 1,
         ))
+    }
+
+    fn parse_staged_consumer_offset_commit(
+        operation: Operation,
+        message: &Message<PrepareHeader>,
+    ) -> Result<PendingConsumerOffsetCommit, IggyError> {
+        let total_size = message.header().size() as usize;
+        let body = &message.as_slice()[std::mem::size_of::<PrepareHeader>()..total_size];
+        let consumer_kind = *body.first().ok_or(IggyError::InvalidCommand)?;
+        let consumer_id = body
+            .get(1..5)
+            .ok_or(IggyError::InvalidCommand)
+            .and_then(|bytes| {
+                <[u8; 4]>::try_from(bytes)
+                    .map(u32::from_le_bytes)
+                    .map_err(|_| IggyError::InvalidCommand)
+            })?;
+        let owner = match consumer_kind {
+            1 => PendingConsumerOffsetOwner::Consumer(consumer_id),
+            2 => PendingConsumerOffsetOwner::ConsumerGroup(consumer_id),
+            _ => return Err(IggyError::InvalidCommand),
+        };
+        match operation {
+            Operation::StoreConsumerOffset => {
+                let offset =
+                    body.get(5..13)
+                        .ok_or(IggyError::InvalidCommand)
+                        .and_then(|bytes| {
+                            <[u8; 8]>::try_from(bytes)
+                                .map(u64::from_le_bytes)
+                                .map_err(|_| IggyError::InvalidCommand)
+                        })?;
+                Ok(PendingConsumerOffsetCommit::upsert(owner, offset))
+            }
+            Operation::DeleteConsumerOffset => Ok(PendingConsumerOffsetCommit::delete(owner)),
+            _ => Err(IggyError::InvalidCommand),
+        }
+    }
+
+    async fn commit_consumer_offset_entry(
+        &self,
+        consensus: &VsrConsensus<B, NamespacedPipeline>,
+        prepare_header: PrepareHeader,
+        entry_namespace: IggyNamespace,
+        failed_ns: &mut HashSet<IggyNamespace>,
+    ) -> bool {
+        let write_lock = self
+            .get_by_ns(&entry_namespace)
+            .expect("commit_partition_entry: partition not found")
+            .write_lock
+            .clone();
+        let _guard = write_lock.lock().await;
+
+        let pending = {
+            let partition = self
+                .get_mut_by_ns(&entry_namespace)
+                .expect("commit_partition_entry: partition not found");
+            partition.take_staged_consumer_offset_commit(prepare_header.op)
+        };
+        let Some(pending) = pending else {
+            failed_ns.insert(entry_namespace);
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                replica_id = consensus.replica(),
+                op = prepare_header.op,
+                namespace_raw = entry_namespace.inner(),
+                "missing staged consumer offset commit for committed prepare"
+            );
+            return false;
+        };
+
+        let partition = self
+            .get_by_ns(&entry_namespace)
+            .expect("commit_partition_entry: partition not found");
+        partition.apply_consumer_offset_commit(pending);
+        debug!(
+            target: "iggy.partitions.diag",
+            plane = "partitions",
+            replica_id = consensus.replica(),
+            op = prepare_header.op,
+            namespace_raw = entry_namespace.inner(),
+            consumer = ?pending.owner(),
+            mutation = ?pending.mutation,
+            "consumer offset committed"
+        );
+        true
     }
 
     /// Persist frozen batches to disk and update segment bookkeeping.

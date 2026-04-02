@@ -19,6 +19,7 @@ use crate::journal::{
     MessageLookup, PartitionJournal, PartitionJournalMemStorage, QueryableJournal,
 };
 use crate::log::SegmentedLog;
+use crate::offset_storage::{delete_persisted_offset, persist_offset};
 use crate::{
     AppendResult, Partition, PartitionOffsets, PollFragments, PollQueryResult, PollingArgs,
     PollingConsumer,
@@ -30,6 +31,7 @@ use iggy_common::{
     send_messages2::stamp_prepare_for_persistence,
 };
 use journal::Journal as _;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as TokioMutex;
@@ -52,6 +54,72 @@ pub struct IggyPartition {
     pub revision_id: u64,
     pub should_increment_offset: bool,
     pub write_lock: Arc<TokioMutex<()>>,
+    consumer_offsets_path: Option<String>,
+    consumer_group_offsets_path: Option<String>,
+    pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
+}
+
+#[allow(clippy::redundant_pub_crate)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingConsumerOffsetOwner {
+    Consumer(u32),
+    ConsumerGroup(u32),
+}
+
+#[allow(clippy::redundant_pub_crate)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingConsumerOffsetCommit {
+    pub(crate) mutation: PendingConsumerOffsetMutation,
+}
+
+#[allow(clippy::redundant_pub_crate)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingConsumerOffsetMutation {
+    Upsert {
+        owner: PendingConsumerOffsetOwner,
+        offset: u64,
+    },
+    Delete {
+        owner: PendingConsumerOffsetOwner,
+    },
+}
+
+impl PendingConsumerOffsetCommit {
+    pub(crate) const fn upsert(owner: PendingConsumerOffsetOwner, offset: u64) -> Self {
+        Self {
+            mutation: PendingConsumerOffsetMutation::Upsert { owner, offset },
+        }
+    }
+
+    pub(crate) const fn delete(owner: PendingConsumerOffsetOwner) -> Self {
+        Self {
+            mutation: PendingConsumerOffsetMutation::Delete { owner },
+        }
+    }
+
+    pub(crate) fn try_from_polling_consumer(
+        consumer: PollingConsumer,
+        offset: u64,
+    ) -> Result<Self, IggyError> {
+        let owner = match consumer {
+            PollingConsumer::Consumer(id, _) => PendingConsumerOffsetOwner::Consumer(
+                u32::try_from(id).map_err(|_| IggyError::InvalidCommand)?,
+            ),
+            PollingConsumer::ConsumerGroup(group_id, _) => {
+                PendingConsumerOffsetOwner::ConsumerGroup(
+                    u32::try_from(group_id).map_err(|_| IggyError::InvalidCommand)?,
+                )
+            }
+        };
+        Ok(Self::upsert(owner, offset))
+    }
+
+    pub(crate) const fn owner(self) -> PendingConsumerOffsetOwner {
+        match self.mutation {
+            PendingConsumerOffsetMutation::Upsert { owner, .. }
+            | PendingConsumerOffsetMutation::Delete { owner } => owner,
+        }
+    }
 }
 
 impl IggyPartition {
@@ -67,6 +135,141 @@ impl IggyPartition {
             revision_id: 0,
             should_increment_offset: false,
             write_lock: Arc::new(TokioMutex::new(())),
+            consumer_offsets_path: None,
+            consumer_group_offsets_path: None,
+            pending_consumer_offset_commits: HashMap::new(),
+        }
+    }
+
+    pub fn configure_consumer_offset_storage(
+        &mut self,
+        consumer_offsets_path: String,
+        consumer_group_offsets_path: String,
+        consumer_offsets: ConsumerOffsets,
+        consumer_group_offsets: ConsumerGroupOffsets,
+    ) {
+        self.consumer_offsets = Arc::new(consumer_offsets);
+        self.consumer_group_offsets = Arc::new(consumer_group_offsets);
+        self.consumer_offsets_path = Some(consumer_offsets_path);
+        self.consumer_group_offsets_path = Some(consumer_group_offsets_path);
+    }
+
+    pub(crate) fn stage_consumer_offset_commit(
+        &mut self,
+        op: u64,
+        pending: PendingConsumerOffsetCommit,
+    ) {
+        self.pending_consumer_offset_commits.insert(op, pending);
+    }
+
+    #[must_use]
+    pub(crate) fn take_staged_consumer_offset_commit(
+        &mut self,
+        op: u64,
+    ) -> Option<PendingConsumerOffsetCommit> {
+        self.pending_consumer_offset_commits.remove(&op)
+    }
+
+    pub(crate) async fn persist_consumer_offset_commit(
+        &self,
+        pending: PendingConsumerOffsetCommit,
+    ) -> Result<(), IggyError> {
+        let Some(path) = self.persisted_offset_path(pending.owner()) else {
+            return Ok(());
+        };
+        match pending.mutation {
+            PendingConsumerOffsetMutation::Upsert { offset, .. } => {
+                persist_offset(&path, offset).await
+            }
+            PendingConsumerOffsetMutation::Delete { .. } => delete_persisted_offset(&path).await,
+        }
+    }
+
+    pub(crate) fn apply_consumer_offset_commit(&self, pending: PendingConsumerOffsetCommit) {
+        match pending.mutation {
+            PendingConsumerOffsetMutation::Upsert {
+                owner: PendingConsumerOffsetOwner::Consumer(id),
+                offset,
+            } => {
+                let guard = self.consumer_offsets.pin();
+                let key = usize::try_from(id).expect("u32 consumer id must fit usize");
+                if let Some(existing) = guard.get(&key) {
+                    existing.offset.store(offset, Ordering::Relaxed);
+                } else {
+                    let created = self.consumer_offsets_path.as_deref().map_or_else(
+                        || ConsumerOffset::new(ConsumerKind::Consumer, id, 0, String::new()),
+                        |path| ConsumerOffset::default_for_consumer(id, path),
+                    );
+                    created.offset.store(offset, Ordering::Relaxed);
+                    guard.insert(key, created);
+                }
+            }
+            PendingConsumerOffsetMutation::Upsert {
+                owner: PendingConsumerOffsetOwner::ConsumerGroup(group_id),
+                offset,
+            } => {
+                let guard = self.consumer_group_offsets.pin();
+                let key = ConsumerGroupId(
+                    usize::try_from(group_id).expect("u32 group id must fit usize"),
+                );
+                if let Some(existing) = guard.get(&key) {
+                    existing.offset.store(offset, Ordering::Relaxed);
+                } else {
+                    let created = self.consumer_group_offsets_path.as_deref().map_or_else(
+                        || {
+                            ConsumerOffset::new(
+                                ConsumerKind::ConsumerGroup,
+                                group_id,
+                                0,
+                                String::new(),
+                            )
+                        },
+                        |path| ConsumerOffset::default_for_consumer_group(key, path),
+                    );
+                    created.offset.store(offset, Ordering::Relaxed);
+                    guard.insert(key, created);
+                }
+            }
+            PendingConsumerOffsetMutation::Delete {
+                owner: PendingConsumerOffsetOwner::Consumer(id),
+            } => {
+                let guard = self.consumer_offsets.pin();
+                let key = usize::try_from(id).expect("u32 consumer id must fit usize");
+                let _ = guard.remove(&key);
+            }
+            PendingConsumerOffsetMutation::Delete {
+                owner: PendingConsumerOffsetOwner::ConsumerGroup(group_id),
+            } => {
+                let guard = self.consumer_group_offsets.pin();
+                let key = ConsumerGroupId(
+                    usize::try_from(group_id).expect("u32 group id must fit usize"),
+                );
+                let _ = guard.remove(&key);
+            }
+        }
+    }
+
+    async fn store_consumer_offset_and_persist(
+        &self,
+        consumer: PollingConsumer,
+        offset: u64,
+    ) -> Result<(), IggyError> {
+        let pending = PendingConsumerOffsetCommit::try_from_polling_consumer(consumer, offset)?;
+        self.persist_consumer_offset_commit(pending).await?;
+        self.apply_consumer_offset_commit(pending);
+        Ok(())
+    }
+
+    fn persisted_offset_path(&self, owner: PendingConsumerOffsetOwner) -> Option<String> {
+        match owner {
+            PendingConsumerOffsetOwner::Consumer(id) => self
+                .consumer_offsets_path
+                .as_ref()
+                .map(|path| format!("{path}/{id}")),
+            PendingConsumerOffsetOwner::ConsumerGroup(group_id) => self
+                .consumer_group_offsets_path
+                .as_ref()
+                .map(|path| format!("{path}/{group_id}")),
         }
     }
 }
@@ -191,7 +394,10 @@ impl Partition for IggyPartition {
         if args.auto_commit && !fragments.is_empty() {
             let last_offset =
                 last_matching_offset.expect("non-empty poll result must have a last offset");
-            if let Err(err) = self.store_consumer_offset(consumer, last_offset) {
+            if let Err(err) = self
+                .store_consumer_offset_and_persist(consumer, last_offset)
+                .await
+            {
                 // warning for now.
                 warn!(
                     target: "iggy.partitions.diag",
@@ -212,41 +418,8 @@ impl Partition for IggyPartition {
         consumer: PollingConsumer,
         offset: u64,
     ) -> Result<(), IggyError> {
-        match consumer {
-            PollingConsumer::Consumer(id, _) => {
-                let guard = self.consumer_offsets.pin();
-                if let Some(existing) = guard.get(&id) {
-                    existing.offset.store(offset, Ordering::Relaxed);
-                } else {
-                    guard.insert(
-                        id,
-                        ConsumerOffset::new(
-                            ConsumerKind::Consumer,
-                            id as u32,
-                            offset,
-                            String::new(),
-                        ),
-                    );
-                }
-            }
-            PollingConsumer::ConsumerGroup(group_id, _) => {
-                let guard = self.consumer_group_offsets.pin();
-                let key = ConsumerGroupId(group_id);
-                if let Some(existing) = guard.get(&key) {
-                    existing.offset.store(offset, Ordering::Relaxed);
-                } else {
-                    guard.insert(
-                        key,
-                        ConsumerOffset::new(
-                            ConsumerKind::ConsumerGroup,
-                            group_id as u32,
-                            offset,
-                            String::new(),
-                        ),
-                    );
-                }
-            }
-        }
+        let pending = PendingConsumerOffsetCommit::try_from_polling_consumer(consumer, offset)?;
+        self.apply_consumer_offset_commit(pending);
         Ok(())
     }
 

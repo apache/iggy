@@ -372,6 +372,7 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::DeletePersonalAccessToken => "delete_personal_access_token",
         Operation::SendMessages => "send_messages",
         Operation::StoreConsumerOffset => "store_consumer_offset",
+        Operation::DeleteConsumerOffset => "delete_consumer_offset",
     }
 }
 

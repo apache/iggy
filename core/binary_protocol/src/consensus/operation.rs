@@ -37,7 +37,7 @@ pub enum Operation {
     CreatePartitions = 136,
     DeletePartitions = 137,
     // TODO: DeleteSegments is a partition operation (is_partition() == true) but its
-    // discriminant sits in the metadata range (128-147). Should be moved to 162 once
+    // discriminant sits in the metadata range (128-147). Should be moved to 163 once
     // iggy_common's Operation enum is removed and wire compat is no longer a concern.
     DeleteSegments = 138,
     CreateConsumerGroup = 139,
@@ -53,6 +53,7 @@ pub enum Operation {
     // Partition operations (routed by namespace)
     SendMessages = 160,
     StoreConsumerOffset = 161,
+    DeleteConsumerOffset = 162,
 }
 
 impl Operation {
@@ -90,7 +91,10 @@ impl Operation {
     pub const fn is_partition(&self) -> bool {
         matches!(
             self,
-            Self::SendMessages | Self::StoreConsumerOffset | Self::DeleteSegments
+            Self::SendMessages
+                | Self::StoreConsumerOffset
+                | Self::DeleteConsumerOffset
+                | Self::DeleteSegments
         )
     }
 
@@ -122,7 +126,8 @@ impl Operation {
             | Self::CreatePersonalAccessToken
             | Self::DeletePersonalAccessToken
             | Self::SendMessages
-            | Self::StoreConsumerOffset => match crate::dispatch::lookup_by_operation(*self) {
+            | Self::StoreConsumerOffset
+            | Self::DeleteConsumerOffset => match crate::dispatch::lookup_by_operation(*self) {
                 Some(meta) => Some(meta.code),
                 None => None,
             },
@@ -170,6 +175,7 @@ mod tests {
             Operation::DeletePersonalAccessToken,
             Operation::SendMessages,
             Operation::StoreConsumerOffset,
+            Operation::DeleteConsumerOffset,
         ];
         for op in ops {
             let code = op
@@ -202,5 +208,6 @@ mod tests {
         assert!(Operation::SendMessages.is_partition());
         assert!(!Operation::SendMessages.is_metadata());
         assert!(Operation::DeleteSegments.is_partition());
+        assert!(Operation::DeleteConsumerOffset.is_partition());
     }
 }
