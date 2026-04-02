@@ -115,6 +115,47 @@ ui:
 
 The chart is controller-neutral and works with any Ingress controller (nginx, Traefik, HAProxy, Contour, etc.).
 
+## Development
+
+### Formatting and Linting
+
+This chart uses automated tools to maintain code quality:
+
+| Tool | Purpose | Files |
+|------|---------|-------|
+| [helm-docs](https://github.com/norwoodj/helm-docs) | Auto-generate this README | `values.yaml` → `README.md` |
+| [yamllint](https://github.com/adrienverge/yamllint) | YAML formatting | `values.yaml`, `Chart.yaml` |
+| [helmfmt](https://github.com/digitalstudium/helmfmt) | Helm template formatting | `templates/*.yaml`, `*.tpl` |
+
+### Local Development
+
+```bash
+# Install tools (macOS)
+brew install norwoodj/tap/helm-docs
+pip install yamllint
+go install github.com/digitalstudium/helmfmt@latest
+
+# Format templates
+helmfmt helm/charts/iggy/
+
+# Lint YAML files
+yamllint -c helm/charts/iggy/.yamllint.yml helm/charts/iggy/
+
+# Regenerate README after changing values.yaml
+cd helm/charts/iggy && helm-docs
+
+# Run all validations
+scripts/ci/test-helm.sh validate
+```
+
+### Pre-commit Hooks
+
+These tools are integrated with pre-commit. Install hooks with:
+
+```bash
+pre-commit install
+```
+
 ## Values
 
 | Key | Type | Default | Description |
