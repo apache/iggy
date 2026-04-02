@@ -102,6 +102,6 @@ runs:
       run: |
         set -euo pipefail
         HELMFMT_VERSION="v0.5.0"
-        wget -qO /tmp/helmfmt.tar.gz "https://github.com/digitalstudium/helmfmt/releases/download/${HELMFMT_VERSION}/helmfmt_${HELMFMT_VERSION#v}_linux_amd64.tar.gz"
+        wget -qO /tmp/helmfmt.tar.gz "https://github.com/digitalstudium/helmfmt/releases/download/${HELMFMT_VERSION}/helmfmt_Linux_x86_64.tar.gz"
         tar -xzf /tmp/helmfmt.tar.gz -C /tmp helmfmt
         sudo install -m 0755 /tmp/helmfmt /usr/local/bin/helmfmt
