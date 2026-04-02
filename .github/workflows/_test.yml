@@ -200,6 +200,7 @@ jobs:
           install-kind: ${{ inputs.task == 'smoke' }}
           install-helm-docs: ${{ inputs.task == 'validate' }}
           install-yamllint: ${{ inputs.task == 'validate' }}
+          install-helmfmt: ${{ inputs.task == 'validate' }}
 
       - name: Setup Helm smoke cluster
         if: inputs.component == 'helm' && inputs.task == 'smoke'

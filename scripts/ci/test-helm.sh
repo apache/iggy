@@ -155,6 +155,19 @@ validate_yamllint() {
   yamllint -c "$CHART_DIR/.yamllint.yml" "$CHART_DIR"
 }
 
+validate_helmfmt() {
+  if ! command -v helmfmt >/dev/null 2>&1; then
+    echo "Warning: helmfmt not found, skipping Helm template format check" >&2
+    return 0
+  fi
+
+  echo "Checking Helm template formatting..."
+  if ! helmfmt --check "$CHART_DIR"; then
+    echo "Error: Helm templates are not formatted. Run 'helmfmt $CHART_DIR' locally and commit the changes." >&2
+    exit 1
+  fi
+}
+
 validate_helm_docs() {
   if ! command -v helm-docs >/dev/null 2>&1; then
     echo "Warning: helm-docs not found, skipping README drift check" >&2
@@ -249,6 +262,7 @@ validate() {
   grep -q 'name: supersecret' "$HELM_RENDER_DIR/existing-secret.yaml"
 
   validate_yamllint
+  validate_helmfmt
   validate_helm_docs
 }
 

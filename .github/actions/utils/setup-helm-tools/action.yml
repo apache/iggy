@@ -30,6 +30,10 @@ inputs:
     description: "Whether to install yamllint for YAML linting"
     required: false
     default: "false"
+  install-helmfmt:
+    description: "Whether to install helmfmt for Helm template formatting"
+    required: false
+    default: "false"
   helm-version:
     description: "Helm release version"
     required: false
@@ -91,3 +95,13 @@ runs:
       if: inputs.install-yamllint == 'true'
       shell: bash
       run: pip install yamllint
+
+    - name: Install helmfmt
+      if: inputs.install-helmfmt == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        HELMFMT_VERSION="v0.5.0"
+        wget -qO /tmp/helmfmt.tar.gz "https://github.com/digitalstudium/helmfmt/releases/download/${HELMFMT_VERSION}/helmfmt_${HELMFMT_VERSION#v}_linux_amd64.tar.gz"
+        tar -xzf /tmp/helmfmt.tar.gz -C /tmp helmfmt
+        sudo install -m 0755 /tmp/helmfmt /usr/local/bin/helmfmt
