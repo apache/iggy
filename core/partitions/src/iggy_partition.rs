@@ -59,66 +59,51 @@ pub struct IggyPartition {
     pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
 }
 
-#[allow(clippy::redundant_pub_crate)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PendingConsumerOffsetOwner {
-    Consumer(u32),
-    ConsumerGroup(u32),
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PendingConsumerOffsetCommit {
+    kind: ConsumerKind,
+    consumer_id: u32,
+    mutation: PendingConsumerOffsetMutation,
 }
 
-#[allow(clippy::redundant_pub_crate)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PendingConsumerOffsetCommit {
-    pub(crate) mutation: PendingConsumerOffsetMutation,
-}
-
-#[allow(clippy::redundant_pub_crate)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PendingConsumerOffsetMutation {
-    Upsert {
-        owner: PendingConsumerOffsetOwner,
-        offset: u64,
-    },
-    Delete {
-        owner: PendingConsumerOffsetOwner,
-    },
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PendingConsumerOffsetMutation {
+    Upsert(u64),
+    Delete,
 }
 
 impl PendingConsumerOffsetCommit {
-    pub(crate) const fn upsert(owner: PendingConsumerOffsetOwner, offset: u64) -> Self {
+    const fn upsert(kind: ConsumerKind, consumer_id: u32, offset: u64) -> Self {
         Self {
-            mutation: PendingConsumerOffsetMutation::Upsert { owner, offset },
+            kind,
+            consumer_id,
+            mutation: PendingConsumerOffsetMutation::Upsert(offset),
         }
     }
 
-    pub(crate) const fn delete(owner: PendingConsumerOffsetOwner) -> Self {
+    const fn delete(kind: ConsumerKind, consumer_id: u32) -> Self {
         Self {
-            mutation: PendingConsumerOffsetMutation::Delete { owner },
+            kind,
+            consumer_id,
+            mutation: PendingConsumerOffsetMutation::Delete,
         }
     }
 
-    pub(crate) fn try_from_polling_consumer(
+    fn try_from_polling_consumer(
         consumer: PollingConsumer,
         offset: u64,
     ) -> Result<Self, IggyError> {
-        let owner = match consumer {
-            PollingConsumer::Consumer(id, _) => PendingConsumerOffsetOwner::Consumer(
+        let (kind, consumer_id) = match consumer {
+            PollingConsumer::Consumer(id, _) => (
+                ConsumerKind::Consumer,
                 u32::try_from(id).map_err(|_| IggyError::InvalidCommand)?,
             ),
-            PollingConsumer::ConsumerGroup(group_id, _) => {
-                PendingConsumerOffsetOwner::ConsumerGroup(
-                    u32::try_from(group_id).map_err(|_| IggyError::InvalidCommand)?,
-                )
-            }
+            PollingConsumer::ConsumerGroup(group_id, _) => (
+                ConsumerKind::ConsumerGroup,
+                u32::try_from(group_id).map_err(|_| IggyError::InvalidCommand)?,
+            ),
         };
-        Ok(Self::upsert(owner, offset))
-    }
-
-    pub(crate) const fn owner(self) -> PendingConsumerOffsetOwner {
-        match self.mutation {
-            PendingConsumerOffsetMutation::Upsert { owner, .. }
-            | PendingConsumerOffsetMutation::Delete { owner } => owner,
-        }
+        Ok(Self::upsert(kind, consumer_id, offset))
     }
 }
 
@@ -154,43 +139,59 @@ impl IggyPartition {
         self.consumer_group_offsets_path = Some(consumer_group_offsets_path);
     }
 
-    pub(crate) fn stage_consumer_offset_commit(
+    pub(crate) async fn persist_and_stage_consumer_offset_upsert(
         &mut self,
         op: u64,
-        pending: PendingConsumerOffsetCommit,
-    ) {
+        kind: ConsumerKind,
+        consumer_id: u32,
+        offset: u64,
+    ) -> Result<(), IggyError> {
+        let pending = PendingConsumerOffsetCommit::upsert(kind, consumer_id, offset);
+        self.persist_consumer_offset_commit(pending).await?;
         self.pending_consumer_offset_commits.insert(op, pending);
+        Ok(())
     }
 
-    #[must_use]
-    pub(crate) fn take_staged_consumer_offset_commit(
+    pub(crate) async fn persist_and_stage_consumer_offset_delete(
         &mut self,
         op: u64,
-    ) -> Option<PendingConsumerOffsetCommit> {
-        self.pending_consumer_offset_commits.remove(&op)
+        kind: ConsumerKind,
+        consumer_id: u32,
+    ) -> Result<(), IggyError> {
+        let pending = PendingConsumerOffsetCommit::delete(kind, consumer_id);
+        self.persist_consumer_offset_commit(pending).await?;
+        self.pending_consumer_offset_commits.insert(op, pending);
+        Ok(())
     }
 
-    pub(crate) async fn persist_consumer_offset_commit(
+    pub(crate) fn apply_staged_consumer_offset_commit(&mut self, op: u64) -> Result<(), IggyError> {
+        let pending = self
+            .pending_consumer_offset_commits
+            .remove(&op)
+            .ok_or(IggyError::InvalidCommand)?;
+        self.apply_consumer_offset_commit(pending);
+        Ok(())
+    }
+
+    async fn persist_consumer_offset_commit(
         &self,
         pending: PendingConsumerOffsetCommit,
     ) -> Result<(), IggyError> {
-        let Some(path) = self.persisted_offset_path(pending.owner()) else {
+        let Some(path) = self.persisted_offset_path(pending.kind, pending.consumer_id) else {
             return Ok(());
         };
         match pending.mutation {
-            PendingConsumerOffsetMutation::Upsert { offset, .. } => {
-                persist_offset(&path, offset).await
-            }
-            PendingConsumerOffsetMutation::Delete { .. } => delete_persisted_offset(&path).await,
+            PendingConsumerOffsetMutation::Upsert(offset) => persist_offset(&path, offset).await,
+            PendingConsumerOffsetMutation::Delete => delete_persisted_offset(&path).await,
         }
     }
 
-    pub(crate) fn apply_consumer_offset_commit(&self, pending: PendingConsumerOffsetCommit) {
+    fn apply_consumer_offset_commit(&self, pending: PendingConsumerOffsetCommit) {
         match pending.mutation {
-            PendingConsumerOffsetMutation::Upsert {
-                owner: PendingConsumerOffsetOwner::Consumer(id),
-                offset,
-            } => {
+            PendingConsumerOffsetMutation::Upsert(offset)
+                if pending.kind == ConsumerKind::Consumer =>
+            {
+                let id = pending.consumer_id;
                 let guard = self.consumer_offsets.pin();
                 let key = usize::try_from(id).expect("u32 consumer id must fit usize");
                 if let Some(existing) = guard.get(&key) {
@@ -204,10 +205,10 @@ impl IggyPartition {
                     guard.insert(key, created);
                 }
             }
-            PendingConsumerOffsetMutation::Upsert {
-                owner: PendingConsumerOffsetOwner::ConsumerGroup(group_id),
-                offset,
-            } => {
+            PendingConsumerOffsetMutation::Upsert(offset)
+                if pending.kind == ConsumerKind::ConsumerGroup =>
+            {
+                let group_id = pending.consumer_id;
                 let guard = self.consumer_group_offsets.pin();
                 let key = ConsumerGroupId(
                     usize::try_from(group_id).expect("u32 group id must fit usize"),
@@ -230,22 +231,23 @@ impl IggyPartition {
                     guard.insert(key, created);
                 }
             }
-            PendingConsumerOffsetMutation::Delete {
-                owner: PendingConsumerOffsetOwner::Consumer(id),
-            } => {
+            PendingConsumerOffsetMutation::Delete if pending.kind == ConsumerKind::Consumer => {
+                let id = pending.consumer_id;
                 let guard = self.consumer_offsets.pin();
                 let key = usize::try_from(id).expect("u32 consumer id must fit usize");
                 let _ = guard.remove(&key);
             }
-            PendingConsumerOffsetMutation::Delete {
-                owner: PendingConsumerOffsetOwner::ConsumerGroup(group_id),
-            } => {
+            PendingConsumerOffsetMutation::Delete
+                if pending.kind == ConsumerKind::ConsumerGroup =>
+            {
+                let group_id = pending.consumer_id;
                 let guard = self.consumer_group_offsets.pin();
                 let key = ConsumerGroupId(
                     usize::try_from(group_id).expect("u32 group id must fit usize"),
                 );
                 let _ = guard.remove(&key);
             }
+            _ => {}
         }
     }
 
@@ -260,16 +262,16 @@ impl IggyPartition {
         Ok(())
     }
 
-    fn persisted_offset_path(&self, owner: PendingConsumerOffsetOwner) -> Option<String> {
-        match owner {
-            PendingConsumerOffsetOwner::Consumer(id) => self
+    fn persisted_offset_path(&self, kind: ConsumerKind, consumer_id: u32) -> Option<String> {
+        match kind {
+            ConsumerKind::Consumer => self
                 .consumer_offsets_path
                 .as_ref()
-                .map(|path| format!("{path}/{id}")),
-            PendingConsumerOffsetOwner::ConsumerGroup(group_id) => self
+                .map(|path| format!("{path}/{consumer_id}")),
+            ConsumerKind::ConsumerGroup => self
                 .consumer_group_offsets_path
                 .as_ref()
-                .map(|path| format!("{path}/{group_id}")),
+                .map(|path| format!("{path}/{consumer_id}")),
         }
     }
 }
