@@ -1259,6 +1259,7 @@ impl Sink for HttpSink {
 mod tests {
     use super::*;
     use iggy_connector_sdk::Schema;
+    use std::collections::BTreeMap;
 
     const FIELD_DATA: &str = "data";
     const FIELD_PAYLOAD_ENCODING: &str = "iggy_payload_encoding";
@@ -1651,7 +1652,7 @@ mod tests {
         let topic_meta = given_topic_metadata();
         let msg_meta = given_messages_metadata();
 
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert(
             "x-correlation-id".parse().unwrap(),
             "abc-123".parse().unwrap(),

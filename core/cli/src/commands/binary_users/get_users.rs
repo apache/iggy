@@ -21,7 +21,6 @@ use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::Client;
-use iggy_common::get_users::GetUsers;
 use tracing::{Level, event};
 
 pub enum GetUsersOutput {
@@ -30,23 +29,18 @@ pub enum GetUsersOutput {
 }
 
 pub struct GetUsersCmd {
-    _get_users: GetUsers,
     output: GetUsersOutput,
 }
 
 impl GetUsersCmd {
     pub fn new(output: GetUsersOutput) -> Self {
-        GetUsersCmd {
-            _get_users: GetUsers {},
-            output,
-        }
+        GetUsersCmd { output }
     }
 }
 
 impl Default for GetUsersCmd {
     fn default() -> Self {
         GetUsersCmd {
-            _get_users: GetUsers {},
             output: GetUsersOutput::Table,
         }
     }

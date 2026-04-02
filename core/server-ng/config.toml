@@ -1,0 +1,590 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Configuration for consumer group cooperative partition rebalancing.
+[consumer_group]
+# Maximum time a partition can remain in pending revocation before being force-transferred to the target member.
+rebalancing_timeout = "30s"
+# How often the periodic checker scans for timed-out pending revocations.
+rebalancing_check_interval = "5s"
+
+[data_maintenance.messages]
+# Enables or disables the expired message cleaner process.
+cleaner_enabled = false
+
+# Interval for running the message cleaner.
+interval = "1 m"
+
+# HTTP server configuration
+[http]
+# Determines if the HTTP server is active.
+# `true` enables the server, allowing it to handle HTTP requests.
+# `false` disables the server, preventing it from handling HTTP requests.
+enabled = true
+
+# Specifies the network address and port for the HTTP server.
+# The format is "HOST:PORT". For example, "127.0.0.1:3000" listens on localhost only on port 3000.
+address = "127.0.0.1:3000"
+
+# Maximum size of the request body in bytes. For security reasons, the default limit is 2 MB.
+max_request_size = "2 MB"
+
+# Enables the embedded Web UI dashboard at '/ui'.
+# When set to `true` and the server is compiled with the 'iggy-web' feature,
+# the Svelte dashboard will be served at the '/ui' endpoint, providing a
+# browser-based interface for managing streams, topics, and viewing messages.
+# If the server is compiled without 'iggy-web' feature and this is set to `true`,
+# a warning will be logged at startup but the server will continue to run.
+# `true` enables the embedded Web UI (requires server built with 'iggy-web' feature).
+# `false` disables the embedded Web UI (default).
+web_ui = false
+
+# Configuration for Cross-Origin Resource Sharing (CORS).
+[http.cors]
+# Controls whether CORS is enabled for the HTTP server.
+# `true` allows handling cross-origin requests with specified rules.
+# `false` blocks cross-origin requests, enhancing security.
+enabled = true
+
+# Specifies which HTTP methods are allowed when CORS is enabled.
+# For example, ["GET", "POST"] would allow only GET and POST requests.
+allowed_methods = ["GET", "POST", "PUT", "DELETE"]
+
+# Defines which origins are permitted to make cross-origin requests.
+# An asterisk "*" allows all origins. Specific domains can be listed to restrict access.
+allowed_origins = ["*"]
+
+# Lists allowed headers that can be used in CORS requests.
+# For example, ["content-type"] permits only the content-type header.
+allowed_headers = ["content-type", "authorization"]
+
+# Headers that browsers are allowed to access in CORS responses.
+# An empty array means no additional headers are exposed to browsers.
+exposed_headers = [""]
+
+# Determines if credentials like cookies or HTTP auth can be included in CORS requests.
+# `true` allows credentials to be included, useful for authenticated sessions.
+# `false` prevents credentials, enhancing privacy and security.
+allow_credentials = false
+
+# Allows or blocks requests from private networks in CORS.
+# `true` permits requests from private networks.
+# `false` disallows such requests, providing additional security.
+allow_private_network = false
+
+# JWT (JSON Web Token) configuration for HTTP.
+[http.jwt]
+# Specifies the algorithm used for signing JWTs.
+# For example, "HS256" indicates HMAC with SHA-256.
+algorithm = "HS256"
+
+# The issuer of the JWT, typically a URL or an identifier of the issuing entity.
+issuer = "iggy.apache.org"
+
+# Intended audience for the JWT, usually the recipient or system intended to process the token.
+audience = "iggy.apache.org"
+
+# Lists valid issuers for JWT validation to ensure tokens are from trusted sources.
+valid_issuers = ["iggy.apache.org"]
+
+# Lists valid audiences for JWT validation to confirm tokens are for the intended recipient.
+valid_audiences = ["iggy.apache.org"]
+
+# Expiry time for access tokens.
+access_token_expiry = "1 h"
+
+# Tolerance for timing discrepancies during token validation.
+clock_skew = "5 s"
+
+# Time before which the token should not be considered valid.
+not_before = "0 s"
+
+# Secret key for encoding JWTs.
+# If left empty, a secure random secret will be generated on each server start.
+encoding_secret = ""
+
+# Secret key for decoding JWTs.
+# If left empty, a secure random secret will be generated on each server start.
+decoding_secret = ""
+
+# Indicates if the secret key is base64 encoded.
+# `true` means the secret is base64 encoded.
+# `false` means the secret is in plain text.
+use_base64_secret = false
+
+# Metrics configuration for HTTP.
+[http.metrics]
+# Enable or disable the metrics endpoint.
+# `true` makes metrics available at the specified endpoint.
+# `false` disables metrics collection.
+enabled = true
+
+# Specifies the endpoint for accessing metrics, e.g., "/metrics".
+endpoint = "/metrics"
+
+# TLS (Transport Layer Security) configuration for HTTP.
+[http.tls]
+# Controls the use of TLS for encrypted HTTP connections.
+# `true` enables TLS, enhancing security.
+# `false` disables TLS, which may be appropriate in secure internal networks.
+enabled = false
+
+# Path to the TLS certificate file.
+cert_file = "core/certs/iggy_cert.pem"
+
+# Path to the TLS key file.
+key_file = "core/certs/iggy_key.pem"
+
+# TCP server configuration.
+[tcp]
+# Determines if the TCP server is active.
+# `true` enables the TCP server for handling TCP connections.
+# `false` disables it, preventing any TCP communication.
+enabled = true
+
+# Defines the network address and port for the TCP server.
+# For example, "127.0.0.1:8090" listens on localhost only on port 8090.
+address = "127.0.0.1:8090"
+
+# Enable TCP socket migration across shards.
+socket_migration = true
+
+# Whether to use ipv4 or ipv6
+ipv6 = false
+
+# TLS configuration for the TCP server.
+[tcp.tls]
+# Enables or disables TLS for TCP connections.
+# `true` secures TCP connections with TLS.
+# `false` leaves TCP connections unencrypted.
+enabled = false
+
+# Enables or disables self-signed certificate generation.
+# `true` generates a self-signed certificate if cert files don't exist.
+# `false` requires certificate files to exist at the specified paths.
+self_signed = true
+
+# Path to the TLS certificate file.
+cert_file = "core/certs/iggy_cert.pem"
+
+# Path to the TLS key file.
+key_file = "core/certs/iggy_key.pem"
+
+# Configuration for the TCP socket
+[tcp.socket]
+# Whether to overwrite the OS-default socket parameters
+override_defaults = false
+
+# SO_RCVBUF: maximum size of the receive buffer, can be clamped by the OS
+recv_buffer_size = "100 KB"
+
+# SO_SNDBUF: maximum size of the send buffer, can be clamped by the OS
+send_buffer_size = "100 KB"
+
+# SO_KEEPALIVE: whether to regularly send a keepalive packet maintaining the connection
+keepalive = false
+
+# TCP_NODELAY: enable/disable the Nagle algorithm which buffers data before sending segments
+nodelay = false
+
+# SO_LINGER: delay to wait for while data is being transmitted before closing the socket after a
+# close or shutdown call has been received
+linger = "0 s"
+
+# QUIC protocol configuration.
+[quic]
+# Controls whether the QUIC server is enabled.
+# `true` enables QUIC for fast, secure connections.
+# `false` disables QUIC, possibly for compatibility or simplicity.
+enabled = true
+
+# Network address and port for the QUIC server.
+# For example, "127.0.0.1:8080" binds to localhost on port 8080.
+address = "127.0.0.1:8080"
+
+# Maximum number of simultaneous bidirectional streams in QUIC.
+max_concurrent_bidi_streams = 10_000
+
+# Size of the buffer for sending datagrams in QUIC.
+datagram_send_buffer_size = "100 KB"
+
+# Initial Maximum Transmission Unit (MTU) for QUIC connections.
+initial_mtu = "8 KB"
+
+# Size of the sending window in QUIC, controlling data flow.
+send_window = "100 KB"
+
+# Size of the receiving window in QUIC, controlling data flow.
+receive_window = "100 KB"
+
+# Interval for sending keep-alive messages in QUIC.
+keep_alive_interval = "5 s"
+
+# Maximum idle time before a QUIC connection is closed.
+max_idle_timeout = "10 s"
+
+# QUIC certificate configuration.
+[quic.certificate]
+# Indicates whether the QUIC certificate is self-signed.
+# `true` for self-signed certificates, often used in internal or testing environments.
+# `false` for certificates issued by a certificate authority, common in production.
+self_signed = true
+
+# Path to the QUIC TLS certificate file.
+cert_file = "core/certs/iggy_cert.pem"
+
+# Path to the QUIC TLS key file.
+key_file = "core/certs/iggy_key.pem"
+
+# Configuration for the QUIC socket
+[quic.socket]
+# Whether to override the OS-default socket parameters
+override_defaults = false
+
+# SO_RCVBUF: maximum size of the receive buffer, can be clamped by the OS
+recv_buffer_size = "64 KB"
+
+# SO_SNDBUF: maximum size of the send buffer, can be clamped by the OS
+send_buffer_size = "64 KB"
+
+# SO_KEEPALIVE: whether to regularly send a keepalive packet maintaining the connection
+keepalive = false
+
+# Message saver configuration.
+[message_saver]
+# Enables or disables the background process for saving buffered data to disk.
+# `true` ensures data is periodically written to disk.
+# `false` turns off automatic saving, relying on other triggers for data persistence.
+enabled = true
+
+# Controls whether data saving is synchronous (enforce fsync) or asynchronous.
+# `true` for synchronous saving, ensuring data integrity at the cost of performance.
+# `false` for asynchronous saving, improving performance but with delayed data writing.
+enforce_fsync = true
+
+# Interval for running the message saver.
+interval = "30 s"
+
+# Personal access token configuration.
+[personal_access_token]
+# Sets the maximum number of active tokens allowed per user.
+max_tokens_per_user = 100
+
+# Personal access token cleaner configuration.
+[personal_access_token.cleaner]
+# Enables or disables the token cleaner process.
+# `true` activates periodic token cleaning.
+# `false` disables it, tokens remain active until manually revoked or expired.
+enabled = true
+
+# Interval for running the token cleaner.
+interval = "1 m"
+
+# Heartbeat configuration
+[heartbeat]
+# Enables or disables the client heartbeat verification process.
+enabled = false
+# Interval for expected client heartbeats
+interval = "5 s"
+
+# OpenTelemetry configuration
+[telemetry]
+# Enables or disables telemetry.
+enabled = false
+# Service name for telemetry.
+service_name = "iggy"
+
+# OpenTelemetry logs configuration
+[telemetry.logs]
+# Transport for sending logs. Options: "grpc", "http".
+transport = "grpc"
+# Endpoint for sending logs.
+endpoint = "http://localhost:7281/v1/logs"
+
+# OpenTelemetry traces configuration
+[telemetry.traces]
+# Transport for sending traces. Options: "grpc", "http".
+transport = "grpc"
+# Endpoint for sending traces.
+endpoint = "http://localhost:7281/v1/traces"
+
+# System configuration.
+[system]
+# Base path for system data storage.
+path = "local_data"
+
+# Backup configuration
+[system.backup]
+# Path for storing backup.
+path = "backup"
+
+# Compatibility conversion configuration
+[system.backup.compatibility]
+# Subpath of the backup directory where converted segment data is stored after compatibility conversion.
+path = "compatibility"
+
+[system.state]
+# Determines whether to enforce file synchronization on state updates (boolean).
+# `true` ensures immediate writing of data to disk for durability.
+# `false` allows the OS to manage write operations, which can improve performance.
+enforce_fsync = false
+
+# Maximum number of retries for a failed file operation (e.g., append, overwrite).
+# This defines how many times the system will attempt the operation before failing.
+max_file_operation_retries = 1
+
+# Delay between retries in case of a failed file operation.
+# This helps to avoid immediate repeated attempts and can reduce load.
+retry_delay = "1 s"
+
+# Runtime configuration.
+[system.runtime]
+# Path for storing runtime data.
+# Specifies the directory where any runtime data is stored, relative to `system.path`.
+path = "runtime"
+
+# Logging configuration.
+[system.logging]
+# Path for storing log files.
+path = "logs"
+
+# Log filtering directive using the same syntax as the RUST_LOG environment variable.
+# Supports simple levels ("trace", "debug", "info", "warn", "error", "off" or "none")
+# as well as complex directives like "warn,server=debug,iggy=trace".
+# Note: RUST_LOG environment variable always takes precedence over this setting.
+level = "info"
+
+# Whether to write logs to file. When false, logs are only written to stdout.
+# When enabled, logs are stored in {system.path}/{system.logging.path} (default: local_data/logs).
+file_enabled = true
+
+# Maximum size of a single log file before rotation occurs. When a log
+# file reaches this size,  it will be rotated   (closed and a new file
+# created). This setting works together with max_total_size to control
+# log storage.  You can set it to 0 to enable unlimited size of single
+# log,  but all logs will be written to a single file,  thus disabling
+# log rotation. Please configure 0 with caution, esp. RUST_LOG > debug
+max_file_size = "500 MB"
+
+# Maximum total size of all log files.  When this size is reached,
+# the oldest log files will be deleted first. Set it to 0 to allow
+# an unlimited number of archived logs. This does not disable time
+# based log rotation or per-log-file size limits.
+max_total_size = "4 GB"
+
+# Time interval for checking log rotation status. Avoid less than 1s.
+rotation_check_interval = "1 h"
+
+# Time to retain log files before deletion. Avoid less than 1s, too.
+retention = "7 days"
+
+# Interval for printing system information to the log.
+sysinfo_print_interval = "10 s"
+
+# Encryption configuration
+[system.encryption]
+# Determines whether server-side data encryption for the messages payloads and state commands is enabled (boolean).
+# `true` enables encryption for stored data using AES-256-GCM.
+# `false` means data is stored without encryption.
+enabled = false
+
+# The encryption key used when encryption is enabled (string).
+# Should be a 32 bytes length key, provided as a base64 encoded string.
+# This key is required and used only if encryption is enabled.
+key = ""
+
+# Compression configuration
+[system.compression]
+# Allows overriding the default compression algorithm per data segment (boolean).
+# `true` permits different compression algorithms for individual segments.
+# `false` means all data segments use the default compression algorithm.
+allow_override = false
+
+# The default compression algorithm used for data storage (string).
+# "none" indicates no compression, other values can specify different algorithms.
+default_algorithm = "none"
+
+# Stream configuration
+[system.stream]
+# Path for storing stream-related data (string).
+# Specifies the directory where stream data is stored, relative to `system.path`.
+path = "streams"
+
+# Topic configuration - default settings for new topics
+[system.topic]
+# Path for storing topic-related data, relative to `stream.path`.
+path = "topics"
+
+# Messages can be deleted based on two independent policies:
+# 1. Size-based: delete oldest segments when topic exceeds max_size
+# 2. Time-based: delete segments older than message_expiry
+# Both can be active simultaneously. Per-topic overrides via CreateTopic/UpdateTopic.
+
+# Maximum topic size before oldest segments are deleted.
+# "unlimited" or "0" = no size limit (messages kept indefinitely).
+# When 90% of this limit is reached, oldest segments are removed to make room.
+# Applies to sealed segments only (active segment is protected).
+# Example: "10 GiB"
+max_size = "unlimited"
+
+# Maximum age of messages before segments are deleted.
+# "none" = no time limit (messages kept indefinitely).
+# Applies to sealed segments only (active segment is protected).
+# Example: "7 days", "2 days 4 hours 15 minutes"
+message_expiry = "none"
+
+# Partition configuration
+[system.partition]
+# Path for storing partition-related data (string).
+# Specifies the directory where partition data is stored, relative to `topic.path`.
+path = "partitions"
+
+# Determines whether to enforce file synchronization on partition updates (boolean).
+# `true` ensures immediate writing of data to disk for durability.
+# `false` allows the OS to manage write operations, which can improve performance.
+enforce_fsync = false
+
+# Enables checksum validation for data integrity (boolean).
+# `true` activates CRC checks when loading data, guarding against corruption.
+# `false` skips these checks for faster loading at the risk of undetected corruption.
+validate_checksum = false
+
+# The count threshold of buffered messages before triggering a save to disk.
+# Together with `size_of_messages_required_to_save` it defines the threshold.
+# This is a soft limit - actual count may be higher depending on last batch size.
+# Minimum value is 1.
+messages_required_to_save = 1024
+
+# The size threshold of buffered messages before triggering a save to disk.
+# Together with `messages_required_to_save` it defines the threshold.
+# This is a soft limit - actual size may be higher depending on last batch size.
+size_of_messages_required_to_save = "1 MiB"
+
+# Segment configuration
+[system.segment]
+# Defines the soft limit for the size of a storage segment.
+# When a segment reaches this size, a new segment is created for subsequent data.
+# Example: if `size` is set "1GiB", the actual segment size may be 1GiB + the size of remaining messages in received batch.
+# Maximum size is 1 GiB. Size has to be a multiple of 512 B.
+size = "1 GiB"
+
+# Configures whether expired segments are archived (boolean) or just deleted without archiving.
+archive_expired = false
+
+# Controls whether to cache indexes (time and positional) for segment access.
+# Possible values:
+# - "true" or "all": keeps indexes in memory, speeding up data retrieval at the cost of memory
+# - "open_segment": keeps indexes in memory only for the currently open segment
+# - "false" or "none": reads indexes from disk, which can conserve memory at the cost of access speed
+cache_indexes = "open_segment"
+
+# Message deduplication configuration
+[system.message_deduplication]
+# Controls whether message deduplication is enabled (boolean).
+# `true` activates deduplication, ignoring messages with duplicate IDs.
+# `false` treats each message as unique, even if IDs are duplicated.
+enabled = false
+# Maximum number of ID entries in the deduplication cache (u64).
+max_entries = 10000
+# Maximum age of ID entries in the deduplication cache in human-readable format.
+expiry = "1 m"
+
+# Recovery configuration in case of lost data
+[system.recovery]
+# Controls whether streams/topics/partitions should be recreated if the expected data for existing state is missing (boolean).
+recreate_missing_state = false
+
+# Memory pool configuration
+[system.memory_pool]
+# Enables or disables the memory pool (boolean).
+# `true` enables the memory pool.
+# `false` disables the memory pool.
+enabled = true
+
+# Size of the memory pool (string).
+# Example: "512 MiB" or "1 GiB".
+# This defines the maximum, total memory allocated for the memory pool.
+# Note: This number has to be multiplication of 4096 (default linux page size).
+# Minimum size is 512 MiB due to internal implementation details.
+size = "4 GiB"
+
+# Maximum number of buffers in each bucket (u32).
+# There are 32 buckets in the memory pool. Each bucket can hold up to this number of buffers
+# and holds different buffer sizes, from 256 B to 512 MiB.
+# Note: This number has to be a power of 2. Minimum value is 128 due to internal implementation details.
+bucket_capacity = 8192
+
+# Cluster configuration
+[cluster]
+# Enables or disables cluster mode (boolean).
+# When enabled, this node will participate in the cluster and coordinate with other nodes.
+enabled = false
+
+# Unique cluster name (string).
+# All nodes in the same cluster must share the same name.
+# This prevents accidental cross-cluster communication.
+name = "iggy-cluster"
+
+# Current node configuration
+[cluster.node.current]
+# Name of this node - must be unique across all nodes in the cluster
+# The node will use its configured transport addresses (tcp.address, quic.address, etc.)
+name = "iggy-node-1"
+# IP address that other nodes should use to connect to this node
+ip = "127.0.0.1"
+
+# Other nodes in the cluster
+# Each field in 'ports' is optional. If omitted, the current node's configured port will be used.
+# This is useful when all nodes use the same ports but different IPs, or when only some ports differ.
+[[cluster.node.others]]
+name = "iggy-node-2"
+ip = "127.0.0.1"
+ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093 }
+
+# [[cluster.node.others]]
+# name = "iggy-node-3"
+# ip = "192.168.1.100"
+# # Only some ports specified, others will use defaults from current node
+# ports = { tcp = 8092, http = 3002 }
+
+# Example with all default ports (uses current node's configured ports):
+# [[cluster.node.others]]
+# name = "iggy-node-4"
+# ip = "192.168.1.101"
+# ports = {}  # Empty ports - all will use current node's defaults
+
+# Sharding configuration
+[system.sharding]
+# CPU allocation - controls the number of shards and their CPU affinity.
+# Possible values:
+# - "all": Use all available CPU cores (default)
+# - numeric value (e.g. 4): Use 4 shards (4 threads pinned to cores 0, 1, 2, 3)
+# - range (e.g. "5..8"): Use 3 shards with affinity to cores 5, 6, 7
+# - numa settings:
+#     + "numa:auto": Use all available numa node, cores
+#     + "numa:nodes=0,1;cores=4;no_ht=true": Use NUMA node 0 and 1, each nodes use 4 cores, and no hyperthreads
+cpu_allocation = "numa:auto"
+
+[websocket]
+enabled = true
+address = "127.0.0.1:8092"
+
+[websocket.tls]
+enabled = false
+self_signed = true
+cert_file = "core/certs/iggy_cert.pem"
+key_file = "core/certs/iggy_key.pem"

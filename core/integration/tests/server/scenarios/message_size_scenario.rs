@@ -19,7 +19,7 @@
 use bytes::Bytes;
 use iggy::prelude::*;
 use integration::harness::{TestHarness, assert_clean_system};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 const STREAM_NAME: &str = "test-stream";
 const TOPIC_NAME: &str = "test-topic";
@@ -199,8 +199,8 @@ fn create_string_of_size(size: usize) -> String {
     "x".repeat(size)
 }
 
-fn create_message_header_of_size(target_size: usize) -> HashMap<HeaderKey, HeaderValue> {
-    let mut headers = HashMap::new();
+fn create_message_header_of_size(target_size: usize) -> BTreeMap<HeaderKey, HeaderValue> {
+    let mut headers = BTreeMap::new();
     let mut current_size = 0;
     let mut header_id: u32 = 0;
 

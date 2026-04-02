@@ -122,6 +122,7 @@ jobs:
             sdk
             security
             server
+            server-ng
             shard
             test
             web

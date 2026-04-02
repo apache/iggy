@@ -23,7 +23,7 @@ use bytes::Bytes;
 use iggy::prelude::*;
 use predicates::str::{contains, is_match, starts_with};
 use serial_test::parallel;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -33,7 +33,7 @@ pub(super) struct TestMessagePollToFileCmd<'a> {
     messages: Vec<&'a str>,
     message_count: usize,
     strategy: PollingStrategy,
-    headers: HashMap<HeaderKey, HeaderValue>,
+    headers: BTreeMap<HeaderKey, HeaderValue>,
     output_file: String,
     cleanup: bool,
     // These will be populated after creating the resources
@@ -49,7 +49,7 @@ impl<'a> TestMessagePollToFileCmd<'a> {
         messages: &[&'a str],
         message_count: usize,
         strategy: PollingStrategy,
-        headers: HashMap<HeaderKey, HeaderValue>,
+        headers: BTreeMap<HeaderKey, HeaderValue>,
         output_file: &str,
         cleanup: bool,
     ) -> Self {
@@ -240,7 +240,7 @@ pub async fn should_be_successful() {
         "accusantium doloremque laudantium, totam rem aperiam, eaque ipsa",
     ];
 
-    let test_headers = HashMap::from([
+    let test_headers = BTreeMap::from([
         (
             HeaderKey::from_str("HeaderKey1").unwrap(),
             HeaderValue::from_str("HeaderValue1").unwrap(),

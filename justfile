@@ -51,6 +51,9 @@ nextests TEST: build
 server *ARGS:
   cargo run --bin iggy-server {{ARGS}}
 
+server-ng *ARGS:
+  cargo run --bin iggy-server-ng {{ARGS}}
+
 run-benches:
   ./scripts/run-benches.sh
 

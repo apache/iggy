@@ -16,16 +16,13 @@
  * under the License.
  */
 
-use crate::binary::dispatch::{HandlerResult, wire_id_to_identifier};
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
 use iggy_binary_protocol::requests::topics::UpdateTopicRequest;
-use iggy_common::update_topic::UpdateTopic;
-use iggy_common::{
-    CompressionAlgorithm, IggyError, IggyExpiry, MaxTopicSize, SenderKind, Validatable,
-};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -36,31 +33,15 @@ pub async fn handle_update_topic(
     session: &Session,
     shard: &Rc<IggyShard>,
 ) -> Result<HandlerResult, IggyError> {
-    let stream_id = wire_id_to_identifier(&req.stream_id)?;
-    let topic_id = wire_id_to_identifier(&req.topic_id)?;
     debug!(
-        "session: {session}, command: update_topic, stream_id: {stream_id}, topic_id: {topic_id}"
+        "session: {session}, command: update_topic, stream_id: {:?}, topic_id: {:?}",
+        req.stream_id, req.topic_id
     );
     shard.ensure_authenticated(session)?;
 
-    let command = UpdateTopic {
-        stream_id,
-        topic_id,
-        compression_algorithm: CompressionAlgorithm::from_code(req.compression_algorithm)?,
-        message_expiry: IggyExpiry::from(req.message_expiry),
-        max_topic_size: MaxTopicSize::from(req.max_topic_size),
-        replication_factor: if req.replication_factor == 0 {
-            None
-        } else {
-            Some(req.replication_factor)
-        },
-        name: req.name.to_string(),
-    };
-    command.validate()?;
-
     let request = ShardRequest::control_plane(ShardRequestPayload::UpdateTopicRequest {
         user_id: session.get_user_id(),
-        command,
+        command: req,
     });
 
     match shard.send_to_control_plane(request).await? {
