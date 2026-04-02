@@ -46,7 +46,7 @@ kind: Service
 metadata:
   name: {{ include "iggy.fullname" . }}-ui
   labels:
-    {{ include "iggy-ui.labels" . | nindent 4 }}
+    {{- include "iggy-ui.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.ui.service.type }}
   ports:
@@ -55,5 +55,5 @@ spec:
       targetPort: http
       protocol: TCP
   selector:
-    {{ include "iggy-ui.selectorLabels" . | nindent 4 }}
+    {{- include "iggy-ui.selectorLabels" . | nindent 4 }}
 {{- end }}
