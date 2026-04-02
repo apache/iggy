@@ -15,18 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Standalone VSR (Viewstamped Replication) consensus simulation engine.
-//!
-//! This is a self-contained, WASM-compatible implementation of the VSR protocol
-//! that mirrors the real consensus code in `core/consensus/`. It produces
-//! structured events for visualization.
+use std::sync::{Mutex, MutexGuard};
 
-mod events;
-mod network;
-mod protocol;
-mod simulator;
-mod types;
-
-pub use events::*;
-pub use simulator::*;
-pub use types::*;
+pub(crate) fn recover_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}

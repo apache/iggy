@@ -22,14 +22,16 @@ edition = "2024"
 publish = false
 
 [dependencies]
-bevy = { version = "0.18", features = ["webgl2"] }
+bevy = { version = "0.18" }
 bevy_prototype_lyon = "0.16"
-rand = "0.9"
-rand_xoshiro = "0.7"
-strum_macros = { workspace = true }
+consensus = { path = "../consensus" }
+futures = { workspace = true }
+iggy_binary_protocol = { path = "../binary_protocol" }
+iggy_common = { path = "../common" }
+simulator = { path = "../simulator" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[bin]]
 name = "simulator-ui"
 path = "src/main.rs"
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
