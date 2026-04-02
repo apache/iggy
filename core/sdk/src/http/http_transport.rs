@@ -20,7 +20,8 @@ use iggy_common::{IdentityInfo, IggyError};
 use reqwest::{Response, Url};
 use serde::Serialize;
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait HttpTransport {
     /// Get full URL for the provided path.
     fn get_url(&self, path: &str) -> Result<Url, IggyError>;

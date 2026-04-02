@@ -16,8 +16,9 @@
  * under the License.
  */
 
+use std::io;
+
 use thiserror::Error;
-use tokio::io;
 
 use crate::IggyError;
 

@@ -30,6 +30,7 @@ pub(crate) mod partition;
 pub(crate) mod permissions;
 pub(crate) mod personal_access_tokens;
 pub(crate) mod segment;
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod segment_storage;
 pub mod send_messages2;
 pub(crate) mod snapshot;

@@ -26,8 +26,11 @@ use iggy_common::{
     IdentityInfo, TransportProtocol,
 };
 use reqwest::{Response, StatusCode, Url};
+#[cfg(not(target_arch = "wasm32"))]
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+#[cfg(not(target_arch = "wasm32"))]
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
+#[cfg(not(target_arch = "wasm32"))]
 use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
 use serde::Serialize;
 use std::ops::Deref;
@@ -50,12 +53,16 @@ pub struct HttpClient {
     /// The URL of the Iggy API.
     pub api_url: Url,
     pub(crate) heartbeat_interval: IggyDuration,
+    #[cfg(not(target_arch = "wasm32"))]
     client: ClientWithMiddleware,
+    #[cfg(target_arch = "wasm32")]
+    client: reqwest::Client,
     access_token: IggyRwLock<String>,
     events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl Client for HttpClient {
     async fn connect(&self) -> Result<(), IggyError> {
         HttpClient::connect(self).await
@@ -83,7 +90,8 @@ impl Default for HttpClient {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl HttpTransport for HttpClient {
     /// Get full URL for the provided path.
     fn get_url(&self, path: &str) -> Result<Url, IggyError> {
@@ -265,6 +273,7 @@ impl HttpClient {
     }
 
     /// Create a new HTTP client for interacting with the Iggy API using the provided configuration.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn create(config: Arc<HttpClientConfig>) -> Result<Self, IggyError> {
         let api_url = Url::parse(&config.api_url);
         if api_url.is_err() {
@@ -276,6 +285,21 @@ impl HttpClient {
             .with(TracingMiddleware::<SpanBackendWithUrl>::new())
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
+
+        Ok(Self {
+            api_url,
+            client,
+            heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            access_token: IggyRwLock::new("".to_string()),
+            events: broadcast(1000),
+        })
+    }
+
+    /// Create a new HTTP client for WASM (no middleware, uses browser fetch).
+    #[cfg(target_arch = "wasm32")]
+    pub fn create(config: Arc<HttpClientConfig>) -> Result<Self, IggyError> {
+        let api_url = Url::parse(&config.api_url).map_err(|_| IggyError::CannotParseUrl)?;
+        let client = reqwest::Client::new();
 
         Ok(Self {
             api_url,

@@ -20,7 +20,8 @@ use crate::{ConsumerGroup, ConsumerGroupDetails, Identifier, IggyError};
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the consumer group module.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait ConsumerGroupClient {
     /// Get the info about a specific consumer group by unique ID or name for the given stream and topic by unique IDs or names.
     ///

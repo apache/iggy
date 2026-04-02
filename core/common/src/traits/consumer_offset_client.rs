@@ -20,7 +20,8 @@ use crate::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the consumer offset module.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait ConsumerOffsetClient {
     /// Store the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
     ///

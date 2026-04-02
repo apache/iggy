@@ -27,27 +27,36 @@
 //! use iggy::prelude::*;
 //! ```
 
-pub use crate::client_provider;
-pub use crate::client_provider::ClientProviderConfig;
-pub use crate::client_wrappers::client_wrapper::ClientWrapper;
-pub use crate::client_wrappers::connection_info::ConnectionInfo;
-pub use crate::clients::client::IggyClient;
-pub use crate::clients::client_builder::IggyClientBuilder;
-pub use crate::clients::consumer::{
-    AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, ReceivedMessage,
-};
-pub use crate::clients::consumer_builder::IggyConsumerBuilder;
-pub use crate::clients::producer::IggyProducer;
-pub use crate::clients::producer_builder::IggyProducerBuilder;
-pub use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
-pub use crate::clients::producer_sharding::{BalancedSharding, OrderedSharding, Sharding};
-pub use crate::consumer_ext::IggyConsumerMessageExt;
-pub use crate::stream_builder::IggyConsumerConfig;
-pub use crate::stream_builder::IggyStreamConsumer;
-pub use crate::stream_builder::{IggyProducerConfig, IggyStreamProducer};
-pub use crate::stream_builder::{IggyStream, IggyStreamConfig};
-pub use crate::tcp::tcp_client::TcpClient;
-pub use crate::websocket::websocket_client::WebSocketClient;
+// Native-only re-exports (transports, high-level client, producer/consumer).
+#[cfg(not(target_arch = "wasm32"))]
+mod native {
+    pub use crate::client_provider;
+    pub use crate::client_provider::ClientProviderConfig;
+    pub use crate::client_wrappers::client_wrapper::ClientWrapper;
+    pub use crate::client_wrappers::connection_info::ConnectionInfo;
+    pub use crate::clients::client::IggyClient;
+    pub use crate::clients::client_builder::IggyClientBuilder;
+    pub use crate::clients::consumer::{
+        AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, ReceivedMessage,
+    };
+    pub use crate::clients::consumer_builder::IggyConsumerBuilder;
+    pub use crate::clients::producer::IggyProducer;
+    pub use crate::clients::producer_builder::IggyProducerBuilder;
+    pub use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
+    pub use crate::clients::producer_sharding::{BalancedSharding, OrderedSharding, Sharding};
+    pub use crate::consumer_ext::IggyConsumerMessageExt;
+    pub use crate::stream_builder::IggyConsumerConfig;
+    pub use crate::stream_builder::IggyStreamConsumer;
+    pub use crate::stream_builder::{IggyProducerConfig, IggyStreamProducer};
+    pub use crate::stream_builder::{IggyStream, IggyStreamConfig};
+    pub use crate::tcp::tcp_client::TcpClient;
+    pub use crate::websocket::websocket_client::WebSocketClient;
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub use native::*;
+
+// Cross-platform re-exports (HTTP client, common types, traits, constants).
+pub use crate::http::http_client::HttpClient;
 pub use iggy_common::{
     Aes256GcmEncryptor, Args, ArgsOptional, AutoLogin, CacheMetrics, CacheMetricsKey, ClientError,
     ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus,

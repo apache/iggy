@@ -21,7 +21,8 @@ use crate::{
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the messaging module.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait MessageClient {
     /// Poll given amount of messages using the specified consumer and strategy from the specified stream and topic by unique IDs or names.
     ///

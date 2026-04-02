@@ -32,7 +32,8 @@ const CLIENTS: &str = "/clients";
 const STATS: &str = "/stats";
 const SNAPSHOT: &str = "/snapshot";
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl SystemClient for HttpClient {
     async fn get_stats(&self) -> Result<Stats, IggyError> {
         let response = self.get(STATS).await?;

@@ -18,11 +18,14 @@
  */
 
 mod alloc;
+#[cfg(not(target_arch = "wasm32"))]
 mod certificates;
+#[cfg(not(target_arch = "wasm32"))]
 mod deduplication;
 mod error;
 pub mod http;
 mod macros;
+#[cfg(not(target_arch = "wasm32"))]
 mod sender;
 pub mod sharding;
 mod traits;
@@ -35,9 +38,12 @@ pub use error::iggy_error::{IggyError, IggyErrorDiscriminants};
 // Locking is feature gated, thus only mod level re-export.
 pub mod locking;
 pub use alloc::buffer::PooledBuffer;
+#[cfg(not(target_arch = "wasm32"))]
 pub use alloc::memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_pool};
+#[cfg(not(target_arch = "wasm32"))]
 pub use certificates::generate_self_signed_certificate;
 pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
+#[cfg(not(target_arch = "wasm32"))]
 pub use deduplication::MessageDeduplicator;
 pub use http::consumer_groups::*;
 pub use http::consumer_offsets::*;
@@ -49,6 +55,7 @@ pub use http::streams::*;
 pub use http::system::*;
 pub use http::topics::*;
 pub use http::users::*;
+#[cfg(not(target_arch = "wasm32"))]
 pub use sender::{
     QuicSender, Sender, SenderKind, TcpSender, TcpTlsSender, WebSocketSender, WebSocketTlsSender,
 };
@@ -110,6 +117,7 @@ pub use types::permissions::permissions_global::*;
 pub use types::permissions::personal_access_token::*;
 pub use types::personal_access_tokens::*;
 pub use types::segment::Segment;
+#[cfg(not(target_arch = "wasm32"))]
 pub use types::segment_storage::*;
 pub use types::send_messages2;
 pub use types::send_messages2::*;

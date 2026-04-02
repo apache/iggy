@@ -24,7 +24,8 @@ use iggy_common::PartitionClient;
 use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::delete_partitions::DeletePartitions;
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl PartitionClient for HttpClient {
     async fn create_partitions(
         &self,

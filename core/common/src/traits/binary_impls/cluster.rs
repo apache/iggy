@@ -24,7 +24,8 @@ use iggy_binary_protocol::codes::GET_CLUSTER_METADATA_CODE;
 use iggy_binary_protocol::requests::system::GetClusterMetadataRequest;
 use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterMetadataResponse;
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl<B: BinaryClient> ClusterClient for B {
     async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError> {
         fail_if_not_authenticated(self).await?;

@@ -40,9 +40,6 @@ bytemuck = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
-comfy-table = { workspace = true }
-compio = { workspace = true }
-crossbeam = { workspace = true }
 derive_more = { workspace = true }
 err_trail = { workspace = true }
 human-repr = { workspace = true }
@@ -50,24 +47,34 @@ humantime = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iobuf = { workspace = true }
 lending-iterator = { workspace = true }
-moka = { workspace = true }
 once_cell = { workspace = true }
 papaya = { workspace = true }
-rcgen = { workspace = true }
-ring = { workspace = true }
-rustls = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true, features = ["base64"] }
 strum = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
-tungstenite = { workspace = true }
 twox-hash = { workspace = true }
 ulid = { workspace = true }
 uuid = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+comfy-table = { workspace = true }
+compio = { workspace = true }
+crossbeam = { workspace = true }
+moka = { workspace = true }
+rcgen = { workspace = true }
+ring = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true }
+tungstenite = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+uuid = { workspace = true, features = ["js"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }

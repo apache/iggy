@@ -16,7 +16,9 @@
  * under the License.
  */
 
+#[cfg(not(target_arch = "wasm32"))]
 use comfy_table::Table;
+#[cfg(not(target_arch = "wasm32"))]
 use comfy_table::presets::ASCII_NO_BORDERS;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -216,6 +218,7 @@ impl Display for Permissions {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl From<GlobalPermissions> for Table {
     fn from(value: GlobalPermissions) -> Self {
         let mut table = Self::new();
@@ -261,6 +264,7 @@ impl From<GlobalPermissions> for Table {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl From<&TopicPermissions> for Table {
     fn from(value: &TopicPermissions) -> Self {
         let mut table = Self::new();
@@ -285,6 +289,7 @@ impl From<&TopicPermissions> for Table {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl From<&StreamPermissions> for Table {
     fn from(value: &StreamPermissions) -> Self {
         let mut table = Self::new();

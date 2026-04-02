@@ -20,7 +20,8 @@ use crate::{Identifier, IggyError, Stream, StreamDetails};
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the stream module.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait StreamClient {
     /// Get the info about a specific stream by unique ID or name.
     ///

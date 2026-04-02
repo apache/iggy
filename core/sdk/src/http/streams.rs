@@ -28,7 +28,8 @@ use iggy_common::{Stream, StreamDetails};
 
 const PATH: &str = "/streams";
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl StreamClient for HttpClient {
     async fn get_stream(&self, stream_id: &Identifier) -> Result<Option<StreamDetails>, IggyError> {
         let response = self.get(&get_details_path(&stream_id.as_cow_str())).await;

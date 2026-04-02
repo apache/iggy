@@ -23,7 +23,8 @@ use crate::{
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the system module.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait SystemClient {
     /// Get the stats of the system such as PID, memory usage, streams count etc.
     ///

@@ -25,7 +25,8 @@ use iggy_common::create_topic::CreateTopic;
 use iggy_common::update_topic::UpdateTopic;
 use iggy_common::{Topic, TopicDetails};
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl TopicClient for HttpClient {
     async fn get_topic(
         &self,

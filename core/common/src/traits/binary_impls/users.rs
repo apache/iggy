@@ -35,7 +35,8 @@ use iggy_binary_protocol::requests::users::{
 use iggy_binary_protocol::responses::users::login_user::IdentityResponse;
 use iggy_binary_protocol::responses::users::{GetUsersResponse, UserDetailsResponse};
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl<B: BinaryClient> UserClient for B {
     async fn get_user(&self, user_id: &Identifier) -> Result<Option<UserInfoDetails>, IggyError> {
         fail_if_not_authenticated(self).await?;

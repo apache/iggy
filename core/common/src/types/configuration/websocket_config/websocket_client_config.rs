@@ -21,6 +21,7 @@ use crate::types::configuration::websocket_config::websocket_connection_string_o
 use crate::{AutoLogin, IggyDuration, WebSocketClientReconnectionConfig};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
+#[cfg(not(target_arch = "wasm32"))]
 use tungstenite::protocol::WebSocketConfig as TungsteniteConfig;
 
 /// Configuration for the WebSocket client.
@@ -80,6 +81,7 @@ impl Default for WebSocketClientConfig {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Default for WebSocketConfig {
     fn default() -> Self {
         // Use tungstenite defaults
@@ -95,8 +97,23 @@ impl Default for WebSocketConfig {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        WebSocketConfig {
+            read_buffer_size: Some(8192),
+            write_buffer_size: Some(8192),
+            max_write_buffer_size: Some(usize::MAX),
+            max_message_size: Some(64 << 20),
+            max_frame_size: Some(16 << 20),
+            accept_unmasked_frames: false,
+        }
+    }
+}
+
 impl WebSocketConfig {
     /// Convert to tungstenite WebSocketConfig so we can use tungstenite defaults
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn to_tungstenite_config(&self) -> TungsteniteConfig {
         let mut config = TungsteniteConfig::default();
 

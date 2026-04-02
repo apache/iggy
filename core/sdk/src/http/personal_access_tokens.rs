@@ -30,7 +30,8 @@ use secrecy::SecretString;
 
 const PATH: &str = "/personal-access-tokens";
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl PersonalAccessTokenClient for HttpClient {
     async fn get_personal_access_tokens(&self) -> Result<Vec<PersonalAccessTokenInfo>, IggyError> {
         let response = self.get(PATH).await?;

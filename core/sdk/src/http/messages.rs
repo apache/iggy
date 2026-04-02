@@ -27,7 +27,8 @@ use iggy_common::IggyMessagesBatch;
 use iggy_common::MessageClient;
 use iggy_common::flush_unsaved_buffer::FlushUnsavedBuffer;
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl MessageClient for HttpClient {
     async fn poll_messages(
         &self,

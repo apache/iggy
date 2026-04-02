@@ -25,7 +25,8 @@ use iggy_common::Identifier;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
 use iggy_common::{ConsumerGroup, ConsumerGroupDetails};
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl ConsumerGroupClient for HttpClient {
     async fn get_consumer_group(
         &self,

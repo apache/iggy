@@ -233,7 +233,7 @@ rand_xoshiro = "0.8.0"
 rayon = "1.11.0"
 rcgen = "0.14.7"
 regex = "1.12.3"
-reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "query", "rustls"] }
 reqwest-middleware = { version = "0.5.1", features = ["json", "query"] }
 reqwest-retry = "0.9.1"
 reqwest-tracing = "0.7.0"

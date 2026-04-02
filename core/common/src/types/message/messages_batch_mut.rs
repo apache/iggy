@@ -19,16 +19,24 @@
 use super::indexes_mut::IggyIndexesMut;
 use super::message_boundaries::IggyMessageBoundaries;
 use super::message_view_mut::IggyMessageViewMutIterator;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::MessageDeduplicator;
+use crate::PooledBuffer;
 use crate::{
     IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, IggyByteSize, IggyError, IggyIndexView, IggyMessage,
-    IggyMessageView, IggyMessageViewIterator, IggyMessagesBatch, IggyTimestamp, MAX_PAYLOAD_SIZE,
+    IggyMessageView, IggyMessageViewIterator, IggyMessagesBatch, MAX_PAYLOAD_SIZE,
     MAX_USER_HEADERS_SIZE, Sizeable, Validatable,
 };
-use crate::{MessageDeduplicator, PooledBuffer, random_id};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{IggyTimestamp, random_id};
+#[cfg(not(target_arch = "wasm32"))]
 use lending_iterator::prelude::*;
 use std::ops::Index;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::error;
+#[cfg(not(target_arch = "wasm32"))]
+use tracing::warn;
 
 /// A container for mutable messages that are being prepared for persistence.
 ///
@@ -135,6 +143,7 @@ impl IggyMessagesBatchMut {
     /// # Returns
     ///
     /// An immutable `IggyMessagesBatch` ready for persistence
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn prepare_for_persistence(
         &mut self,
         start_offset: u64,

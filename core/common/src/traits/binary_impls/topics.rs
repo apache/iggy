@@ -35,7 +35,8 @@ use iggy_binary_protocol::requests::topics::{
 use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl<B: BinaryClient> TopicClient for B {
     async fn get_topic(
         &self,

@@ -17,4 +17,13 @@
  */
 
 pub(crate) mod buffer;
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod memory_pool;
+
+// On WASM, provide the core alloc types that buffer.rs needs without the pool.
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod wasm_alloc_types {
+    use aligned_vec::{AVec, ConstAlign};
+    pub const ALIGNMENT: usize = 4096;
+    pub type AlignedBuffer = AVec<u8, ConstAlign<4096>>;
+}

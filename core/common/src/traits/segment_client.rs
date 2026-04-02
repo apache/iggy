@@ -20,7 +20,8 @@ use crate::{Identifier, IggyError};
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the partition module.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait SegmentClient {
     /// Delete last N segments for a partition by unique ID or name.
     ///

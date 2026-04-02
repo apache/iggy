@@ -26,7 +26,8 @@ use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::{Consumer, ConsumerOffsetInfo};
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl ConsumerOffsetClient for HttpClient {
     async fn store_consumer_offset(
         &self,

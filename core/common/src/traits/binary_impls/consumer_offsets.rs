@@ -30,7 +30,8 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 };
 use iggy_binary_protocol::responses::consumer_offsets::get_consumer_offset::ConsumerOffsetResponse;
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl<B: BinaryClient> ConsumerOffsetClient for B {
     async fn store_consumer_offset(
         &self,

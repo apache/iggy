@@ -16,15 +16,31 @@
  * under the License.
  */
 
+/// Declares modules that are only available on non-WASM targets.
+macro_rules! native_modules {
+    ($($(#[$meta:meta])* $vis:vis mod $name:ident;)*) => {
+        $(
+            #[cfg(not(target_arch = "wasm32"))]
+            $(#[$meta])*
+            $vis mod $name;
+        )*
+    };
+}
+
+// Cross-platform modules.
 pub mod binary;
-pub mod client_provider;
-pub mod client_wrappers;
-pub mod clients;
-pub mod consumer_ext;
 pub mod http;
-mod leader_aware;
 pub mod prelude;
-pub mod quic;
-pub mod stream_builder;
-pub mod tcp;
-pub mod websocket;
+
+// Native-only modules (require tokio, native networking, etc.).
+native_modules! {
+    pub mod client_provider;
+    pub mod client_wrappers;
+    pub mod clients;
+    pub mod consumer_ext;
+    mod leader_aware;
+    pub mod quic;
+    pub mod stream_builder;
+    pub mod tcp;
+    pub mod websocket;
+}

@@ -37,7 +37,8 @@ use iggy_binary_protocol::responses::personal_access_tokens::create_personal_acc
 use iggy_binary_protocol::responses::personal_access_tokens::get_personal_access_tokens::GetPersonalAccessTokensResponse;
 use iggy_binary_protocol::responses::users::login_user::IdentityResponse;
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl<B: BinaryClient> PersonalAccessTokenClient for B {
     async fn get_personal_access_tokens(&self) -> Result<Vec<PersonalAccessTokenInfo>, IggyError> {
         fail_if_not_authenticated(self).await?;

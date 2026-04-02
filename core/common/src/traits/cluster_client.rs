@@ -20,7 +20,8 @@ use crate::{ClusterMetadata, IggyError};
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the cluster module.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait ClusterClient {
     /// Get the metadata of the cluster including node information, roles, and status.
     ///

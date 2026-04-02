@@ -16,15 +16,15 @@
  * under the License.
  */
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::alloc::memory_pool::{ALIGNMENT, AlignedBuffer};
+#[cfg(target_arch = "wasm32")]
+use crate::alloc::wasm_alloc_types::{ALIGNMENT, AlignedBuffer};
 
+#[cfg(not(target_arch = "wasm32"))]
 use super::memory_pool::{AlignedBufferExt, memory_pool};
 use bytes::Bytes;
-use compio::buf::{IoBuf, IoBufMut, SetLen};
-use std::{
-    mem::MaybeUninit,
-    ops::{Deref, DerefMut},
-};
+use std::ops::{Deref, DerefMut};
 
 /// A buffer wrapper that participates in memory pooling.
 ///
@@ -51,6 +51,7 @@ impl PooledBuffer {
     /// # Arguments
     ///
     /// * `capacity` - The capacity of the buffer
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn with_capacity(capacity: usize) -> Self {
         let (buffer, was_pool_allocated) = memory_pool().acquire_buffer(capacity.max(ALIGNMENT));
         let original_capacity = buffer.capacity();
@@ -71,6 +72,20 @@ impl PooledBuffer {
             from_pool: was_pool_allocated,
             original_capacity,
             original_bucket_idx,
+            inner: buffer,
+        }
+    }
+
+    /// Creates a new buffer with the specified capacity (no pooling on WASM).
+    #[cfg(target_arch = "wasm32")]
+    pub fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.max(ALIGNMENT);
+        let aligned_capacity = capacity.next_multiple_of(ALIGNMENT).max(ALIGNMENT);
+        let buffer = AlignedBuffer::with_capacity(ALIGNMENT, aligned_capacity);
+        Self {
+            from_pool: false,
+            original_capacity: buffer.capacity(),
+            original_bucket_idx: None,
             inner: buffer,
         }
     }
@@ -101,6 +116,7 @@ impl PooledBuffer {
 
     /// Checks if the buffer needs to be resized and updates the memory pool accordingly.
     /// This shall be called after operations that might cause a resize.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn check_for_resize(&mut self) {
         if !self.from_pool {
             return;
@@ -128,6 +144,10 @@ impl PooledBuffer {
             self.original_capacity = current_capacity;
         }
     }
+
+    /// No-op on WASM (no memory pool).
+    #[cfg(target_arch = "wasm32")]
+    pub fn check_for_resize(&mut self) {}
 
     /// Wrapper for reserve which might cause resize
     pub fn reserve(&mut self, additional: usize) {
@@ -269,6 +289,7 @@ impl PooledBuffer {
         let buf = std::mem::replace(&mut self.inner, AlignedBuffer::new(ALIGNMENT));
 
         // Update pool accounting
+        #[cfg(not(target_arch = "wasm32"))]
         if self.from_pool
             && let Some(bucket_idx) = self.original_bucket_idx
         {
@@ -298,6 +319,7 @@ impl DerefMut for PooledBuffer {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
         if self.from_pool {
@@ -327,22 +349,29 @@ impl From<AlignedBuffer> for PooledBuffer {
     }
 }
 
-impl SetLen for PooledBuffer {
-    unsafe fn set_len(&mut self, len: usize) {
-        unsafe { self.inner.set_len(len) };
-    }
-}
+#[cfg(not(target_arch = "wasm32"))]
+mod compio_impls {
+    use super::PooledBuffer;
+    use compio::buf::{IoBuf, IoBufMut, SetLen};
+    use std::mem::MaybeUninit;
 
-impl IoBuf for PooledBuffer {
-    fn as_init(&self) -> &[u8] {
-        &self.inner[..]
+    impl SetLen for PooledBuffer {
+        unsafe fn set_len(&mut self, len: usize) {
+            unsafe { self.inner.set_len(len) };
+        }
     }
-}
 
-impl IoBufMut for PooledBuffer {
-    fn as_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        let ptr = self.inner.as_mut_ptr().cast::<MaybeUninit<u8>>();
-        let cap = self.inner.capacity();
-        unsafe { std::slice::from_raw_parts_mut(ptr, cap) }
+    impl IoBuf for PooledBuffer {
+        fn as_init(&self) -> &[u8] {
+            &self.inner[..]
+        }
+    }
+
+    impl IoBufMut for PooledBuffer {
+        fn as_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
+            let ptr = self.inner.as_mut_ptr().cast::<MaybeUninit<u8>>();
+            let cap = self.inner.capacity();
+            unsafe { std::slice::from_raw_parts_mut(ptr, cap) }
+        }
     }
 }

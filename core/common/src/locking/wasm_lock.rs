@@ -16,38 +16,43 @@
  * under the License.
  */
 
-use std::ops::{Deref, DerefMut};
+use crate::locking::IggyRwLockFn;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-#[cfg(not(target_arch = "wasm32"))]
-mod tokio_lock;
-#[cfg(target_arch = "wasm32")]
-mod wasm_lock;
+#[derive(Debug)]
+pub struct IggyWasmRwLock<T>(Arc<RwLock<T>>);
 
-#[cfg(not(target_arch = "wasm32"))]
-pub type IggyRwLock<T> = tokio_lock::IggyTokioRwLock<T>;
-#[cfg(target_arch = "wasm32")]
-pub type IggyRwLock<T> = wasm_lock::IggyWasmRwLock<T>;
-
-#[allow(async_fn_in_trait)]
-pub trait IggyRwLockFn<T> {
-    type ReadGuard<'a>: Deref<Target = T>
+impl<T> IggyRwLockFn<T> for IggyWasmRwLock<T> {
+    type ReadGuard<'a>
+        = RwLockReadGuard<'a, T>
     where
-        T: 'a,
-        Self: 'a;
-    type WriteGuard<'a>: DerefMut<Target = T>
+        T: 'a;
+    type WriteGuard<'a>
+        = RwLockWriteGuard<'a, T>
     where
-        T: 'a,
-        Self: 'a;
+        T: 'a;
 
-    fn new(data: T) -> Self
-    where
-        Self: Sized;
+    fn new(data: T) -> Self {
+        IggyWasmRwLock(Arc::new(RwLock::new(data)))
+    }
 
     async fn read<'a>(&'a self) -> Self::ReadGuard<'a>
     where
-        T: 'a;
+        T: 'a,
+    {
+        self.0.read().expect("RwLock poisoned")
+    }
 
     async fn write<'a>(&'a self) -> Self::WriteGuard<'a>
     where
-        T: 'a;
+        T: 'a,
+    {
+        self.0.write().expect("RwLock poisoned")
+    }
+}
+
+impl<T> Clone for IggyWasmRwLock<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
 }

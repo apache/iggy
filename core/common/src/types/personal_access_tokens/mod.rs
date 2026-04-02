@@ -18,11 +18,15 @@
 use crate::IggyExpiry;
 use crate::IggyTimestamp;
 use crate::UserId;
-use crate::text::as_base64;
 use crate::utils::hash;
-use ring::rand::SecureRandom;
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::text::as_base64;
+#[cfg(not(target_arch = "wasm32"))]
+use ring::rand::SecureRandom;
+
+#[cfg(not(target_arch = "wasm32"))]
 const SIZE: usize = 50;
 
 #[derive(Clone, Debug)]
@@ -35,6 +39,7 @@ pub struct PersonalAccessToken {
 
 impl PersonalAccessToken {
     // Raw token is generated and returned only once
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(
         user_id: UserId,
         name: &str,
