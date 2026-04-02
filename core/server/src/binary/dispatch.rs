@@ -19,14 +19,10 @@
 use crate::binary::handlers;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use ahash::AHashMap;
 use bytes::BytesMut;
 use iggy_binary_protocol::RequestFrame;
 use iggy_binary_protocol::codec::WireDecode;
 use iggy_binary_protocol::codes::*;
-use iggy_binary_protocol::primitives::permissions::{
-    WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
-};
 use iggy_binary_protocol::requests::consumer_groups::*;
 use iggy_binary_protocol::requests::consumer_offsets::*;
 use iggy_binary_protocol::requests::messages::*;
@@ -38,8 +34,7 @@ use iggy_binary_protocol::requests::system::*;
 use iggy_binary_protocol::requests::topics::*;
 use iggy_binary_protocol::requests::users::*;
 use iggy_common::{
-    Consumer, ConsumerKind, GlobalPermissions, Identifier, IggyError, Permissions, PollingKind,
-    PollingStrategy, SenderKind, StreamPermissions, TopicPermissions,
+    Consumer, ConsumerKind, Identifier, IggyError, PollingKind, PollingStrategy, SenderKind,
 };
 use std::rc::Rc;
 use tracing::{error, warn};
@@ -119,124 +114,6 @@ pub fn wire_polling_to_strategy(
         kind: PollingKind::from_code(wire.kind)?,
         value: wire.value,
     })
-}
-
-fn wire_topic_to_domain(wt: &WireTopicPermissions) -> TopicPermissions {
-    TopicPermissions {
-        manage_topic: wt.manage_topic,
-        read_topic: wt.read_topic,
-        poll_messages: wt.poll_messages,
-        send_messages: wt.send_messages,
-    }
-}
-
-fn wire_stream_to_domain(ws: &WireStreamPermissions) -> StreamPermissions {
-    let topics = if ws.topics.is_empty() {
-        None
-    } else {
-        let mut map = AHashMap::with_capacity(ws.topics.len());
-        for wt in &ws.topics {
-            map.insert(wt.topic_id as usize, wire_topic_to_domain(wt));
-        }
-        Some(map)
-    };
-    StreamPermissions {
-        manage_stream: ws.manage_stream,
-        read_stream: ws.read_stream,
-        manage_topics: ws.manage_topics,
-        read_topics: ws.read_topics,
-        poll_messages: ws.poll_messages,
-        send_messages: ws.send_messages,
-        topics,
-    }
-}
-
-/// Convert `WirePermissions` to the domain `Permissions`.
-pub fn wire_permissions_to_permissions(wp: &WirePermissions) -> Permissions {
-    let streams = if wp.streams.is_empty() {
-        None
-    } else {
-        let mut map = AHashMap::with_capacity(wp.streams.len());
-        for ws in &wp.streams {
-            map.insert(ws.stream_id as usize, wire_stream_to_domain(ws));
-        }
-        Some(map)
-    };
-    Permissions {
-        global: GlobalPermissions {
-            manage_servers: wp.global.manage_servers,
-            read_servers: wp.global.read_servers,
-            manage_users: wp.global.manage_users,
-            read_users: wp.global.read_users,
-            manage_streams: wp.global.manage_streams,
-            read_streams: wp.global.read_streams,
-            manage_topics: wp.global.manage_topics,
-            read_topics: wp.global.read_topics,
-            poll_messages: wp.global.poll_messages,
-            send_messages: wp.global.send_messages,
-        },
-        streams,
-    }
-}
-
-fn domain_topic_to_wire(topic_id: usize, tp: &TopicPermissions) -> WireTopicPermissions {
-    WireTopicPermissions {
-        topic_id: topic_id as u32,
-        manage_topic: tp.manage_topic,
-        read_topic: tp.read_topic,
-        poll_messages: tp.poll_messages,
-        send_messages: tp.send_messages,
-    }
-}
-
-fn domain_stream_to_wire(stream_id: usize, sp: &StreamPermissions) -> WireStreamPermissions {
-    let topics: Vec<WireTopicPermissions> = sp
-        .topics
-        .as_ref()
-        .map(|map| {
-            map.iter()
-                .map(|(&tid, tp)| domain_topic_to_wire(tid, tp))
-                .collect()
-        })
-        .unwrap_or_default();
-    WireStreamPermissions {
-        stream_id: stream_id as u32,
-        manage_stream: sp.manage_stream,
-        read_stream: sp.read_stream,
-        manage_topics: sp.manage_topics,
-        read_topics: sp.read_topics,
-        poll_messages: sp.poll_messages,
-        send_messages: sp.send_messages,
-        topics,
-    }
-}
-
-/// Convert domain `Permissions` to `WirePermissions`.
-pub fn domain_permissions_to_wire(perms: &Permissions) -> WirePermissions {
-    let streams: Vec<WireStreamPermissions> = perms
-        .streams
-        .as_ref()
-        .map(|map| {
-            map.iter()
-                .map(|(&sid, sp)| domain_stream_to_wire(sid, sp))
-                .collect()
-        })
-        .unwrap_or_default();
-    WirePermissions {
-        global: WireGlobalPermissions {
-            manage_servers: perms.global.manage_servers,
-            read_servers: perms.global.read_servers,
-            manage_users: perms.global.manage_users,
-            read_users: perms.global.read_users,
-            manage_streams: perms.global.manage_streams,
-            read_streams: perms.global.read_streams,
-            manage_topics: perms.global.manage_topics,
-            read_topics: perms.global.read_topics,
-            poll_messages: perms.global.poll_messages,
-            send_messages: perms.global.send_messages,
-        },
-        streams,
-    }
 }
 
 /// Maximum payload size for control-plane commands (non-SendMessages).

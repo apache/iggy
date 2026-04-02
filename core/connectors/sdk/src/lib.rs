@@ -31,7 +31,7 @@ use iggy::prelude::{HeaderKey, HeaderValue};
 use once_cell::sync::OnceCell;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 use strum_macros::{Display, IntoStaticStr};
 use thiserror::Error;
 use tokio::runtime::Runtime;
@@ -292,7 +292,7 @@ pub struct ReceivedMessage {
     pub checksum: u64,
     pub timestamp: u64,
     pub origin_timestamp: u64,
-    pub headers: Option<HashMap<HeaderKey, HeaderValue>>,
+    pub headers: Option<BTreeMap<HeaderKey, HeaderValue>>,
     pub payload: Vec<u8>,
 }
 
@@ -311,7 +311,7 @@ pub struct ProducedMessage {
     pub checksum: Option<u64>,
     pub timestamp: Option<u64>,
     pub origin_timestamp: Option<u64>,
-    pub headers: Option<HashMap<HeaderKey, HeaderValue>>,
+    pub headers: Option<BTreeMap<HeaderKey, HeaderValue>>,
     pub payload: Vec<u8>,
 }
 
@@ -323,7 +323,7 @@ pub struct DecodedMessage {
     pub checksum: Option<u64>,
     pub timestamp: Option<u64>,
     pub origin_timestamp: Option<u64>,
-    pub headers: Option<HashMap<HeaderKey, HeaderValue>>,
+    pub headers: Option<BTreeMap<HeaderKey, HeaderValue>>,
     pub payload: Payload,
 }
 
@@ -354,7 +354,7 @@ pub struct ConsumedMessage {
     pub checksum: u64,
     pub timestamp: u64,
     pub origin_timestamp: u64,
-    pub headers: Option<HashMap<HeaderKey, HeaderValue>>,
+    pub headers: Option<BTreeMap<HeaderKey, HeaderValue>>,
     pub payload: Payload,
 }
 

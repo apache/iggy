@@ -16,51 +16,71 @@
  * under the License.
  */
 
-use crate::BinaryClient;
-use crate::get_client::GetClient;
-use crate::get_clients::GetClients;
-use crate::get_me::GetMe;
-use crate::get_snapshot::GetSnapshot;
-use crate::get_stats::GetStats;
-use crate::ping::Ping;
 use crate::traits::binary_auth::fail_if_not_authenticated;
-use crate::traits::binary_mapper;
+use crate::wire_conversions::clients_from_wire;
 use crate::{
-    ClientInfo, ClientInfoDetails, IggyDuration, IggyError, Snapshot, SnapshotCompression, Stats,
-    SystemClient, SystemSnapshotType,
+    BinaryClient, ClientInfo, ClientInfoDetails, IggyDuration, IggyError, Snapshot,
+    SnapshotCompression, Stats, SystemClient, SystemSnapshotType,
 };
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::codes::{
+    GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_ME_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE,
+    PING_CODE,
+};
+use iggy_binary_protocol::requests::system::{
+    GetClientRequest, GetClientsRequest, GetMeRequest, GetSnapshotRequest, GetStatsRequest,
+    PingRequest,
+};
+use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
+use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
+use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> SystemClient for B {
     async fn get_stats(&self) -> Result<Stats, IggyError> {
-        let response = self.send_with_response(&GetStats {}).await?;
-        binary_mapper::map_stats(response)
+        let response = self
+            .send_raw_with_response(GET_STATS_CODE, GetStatsRequest.to_bytes())
+            .await?;
+        let wire_resp = super::decode_response::<StatsResponse>(&response)?;
+        Ok(Stats::from(wire_resp))
     }
 
     async fn get_me(&self) -> Result<ClientInfoDetails, IggyError> {
         fail_if_not_authenticated(self).await?;
-        let response = self.send_with_response(&GetMe {}).await?;
-        binary_mapper::map_client(response)
+        let response = self
+            .send_raw_with_response(GET_ME_CODE, GetMeRequest.to_bytes())
+            .await?;
+        let wire_resp = super::decode_response::<ClientDetailsResponse>(&response)?;
+        Ok(ClientInfoDetails::from(wire_resp))
     }
 
     async fn get_client(&self, client_id: u32) -> Result<Option<ClientInfoDetails>, IggyError> {
         fail_if_not_authenticated(self).await?;
-        let response = self.send_with_response(&GetClient { client_id }).await?;
+        let response = self
+            .send_raw_with_response(GET_CLIENT_CODE, GetClientRequest { client_id }.to_bytes())
+            .await?;
         if response.is_empty() {
             return Ok(None);
         }
-
-        binary_mapper::map_client(response).map(Some)
+        let wire_resp = super::decode_response::<ClientDetailsResponse>(&response)?;
+        Ok(Some(ClientInfoDetails::from(wire_resp)))
     }
 
     async fn get_clients(&self) -> Result<Vec<ClientInfo>, IggyError> {
         fail_if_not_authenticated(self).await?;
-        let response = self.send_with_response(&GetClients {}).await?;
-        binary_mapper::map_clients(response)
+        let response = self
+            .send_raw_with_response(GET_CLIENTS_CODE, GetClientsRequest.to_bytes())
+            .await?;
+        if response.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wire_resp = super::decode_response::<GetClientsResponse>(&response)?;
+        Ok(clients_from_wire(wire_resp))
     }
 
     async fn ping(&self) -> Result<(), IggyError> {
-        self.send_with_response(&Ping {}).await?;
+        self.send_raw_with_response(PING_CODE, PingRequest.to_bytes())
+            .await?;
         Ok(())
     }
 
@@ -75,10 +95,17 @@ impl<B: BinaryClient> SystemClient for B {
     ) -> Result<Snapshot, IggyError> {
         fail_if_not_authenticated(self).await?;
         let response = self
-            .send_with_response(&GetSnapshot {
-                compression,
-                snapshot_types,
-            })
+            .send_raw_with_response(
+                GET_SNAPSHOT_FILE_CODE,
+                GetSnapshotRequest {
+                    compression: compression.as_code(),
+                    snapshot_types: snapshot_types
+                        .iter()
+                        .map(SystemSnapshotType::as_code)
+                        .collect(),
+                }
+                .to_bytes(),
+            )
             .await?;
         let snapshot = Snapshot::new(response.to_vec());
         Ok(snapshot)

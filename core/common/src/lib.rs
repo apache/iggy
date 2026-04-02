@@ -19,15 +19,16 @@
 
 mod alloc;
 mod certificates;
-mod commands;
 mod deduplication;
 mod error;
+pub mod http;
 mod macros;
 mod sender;
 pub mod sharding;
 mod traits;
 mod types;
 mod utils;
+pub mod wire_conversions;
 
 pub use error::client_error::ClientError;
 pub use error::iggy_error::{IggyError, IggyErrorDiscriminants};
@@ -37,24 +38,22 @@ pub use alloc::buffer::PooledBuffer;
 pub use alloc::memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_pool};
 pub use certificates::generate_self_signed_certificate;
 pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
-pub use commands::consumer_groups::*;
-pub use commands::consumer_offsets::*;
-pub use commands::messages::*;
-pub use commands::partitions::*;
-pub use commands::personal_access_tokens::*;
-pub use commands::segments::*;
-pub use commands::streams::*;
-pub use commands::system::get_cluster_metadata::*;
-pub use commands::system::*;
-pub use commands::topics::*;
-pub use commands::users::*;
 pub use deduplication::MessageDeduplicator;
+pub use http::consumer_groups::*;
+pub use http::consumer_offsets::*;
+pub use http::messages::*;
+pub use http::partitions::*;
+pub use http::personal_access_tokens::*;
+pub use http::segments::*;
+pub use http::streams::*;
+pub use http::system::*;
+pub use http::topics::*;
+pub use http::users::*;
 pub use sender::{
     QuicSender, Sender, SenderKind, TcpSender, TcpTlsSender, WebSocketSender, WebSocketTlsSender,
 };
 pub use traits::binary_client::BinaryClient;
 pub use traits::binary_transport::BinaryTransport;
-pub use traits::bytes_serializable::BytesSerializable;
 pub use traits::client::Client;
 pub use traits::cluster_client::ClusterClient;
 pub use traits::consumer_group_client::ConsumerGroupClient;
@@ -74,7 +73,6 @@ pub use types::args::*;
 pub use types::client::client_info::*;
 pub use types::client_state::ClientState;
 pub use types::cluster::*;
-pub use types::command::*;
 pub use types::compression::compression_algorithm::*;
 pub use types::configuration::auth_config::auto_login::*;
 pub use types::configuration::auth_config::connection_string::*;
@@ -136,3 +134,6 @@ pub use utils::text;
 pub use utils::timestamp::*;
 pub use utils::topic_size::MaxTopicSize;
 pub use utils::versioning::SemanticVersion;
+
+pub const MAX_NAME_LENGTH: usize = 255;
+pub const MAX_PARTITIONS_COUNT: u32 = 1000;

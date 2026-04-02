@@ -24,17 +24,17 @@ use std::f32::consts::PI;
 
 // -- Apache Iggy brand palette (matches iggy.apache.org dark theme) ---------
 
-const BG_DARK: Color = Color::srgb_u8(0x07, 0x0c, 0x17);       // website main bg
-const BG_PANEL: Color = Color::srgb_u8(0x0c, 0x12, 0x20);      // card/panel bg
-const NEON_CYAN: Color = Color::srgb_u8(0x67, 0xe8, 0xf9);     // entity cyan
-const NEON_MAGENTA: Color = Color::srgb_u8(0xfa, 0x5e, 0x8a);   // gradient pink
-const NEON_YELLOW: Color = Color::srgb_u8(0xfe, 0xbc, 0x2e);    // macOS yellow
-const IGGY_ORANGE: Color = Color::srgb_u8(0xff, 0x91, 0x03);    // brand primary #ff9103
-const COOL_WHITE: Color = Color::srgb_u8(0xff, 0xfa, 0xeb);     // website cream text
-const DIM_GRAY: Color = Color::srgb_u8(0xaa, 0xaf, 0xb6);       // website muted text
-const GRID_LINE: Color = Color::srgb_u8(0x11, 0x1d, 0x35);      // dark overlay blue
-const HUD_EDGE: Color = Color::srgb_u8(0x3d, 0x44, 0x50);       // border/line color
-const HUD_ALERT: Color = Color::srgb_u8(0xff, 0x5f, 0x57);      // macOS red
+const BG_DARK: Color = Color::srgb_u8(0x07, 0x0c, 0x17); // website main bg
+const BG_PANEL: Color = Color::srgb_u8(0x0c, 0x12, 0x20); // card/panel bg
+const NEON_CYAN: Color = Color::srgb_u8(0x67, 0xe8, 0xf9); // entity cyan
+const NEON_MAGENTA: Color = Color::srgb_u8(0xfa, 0x5e, 0x8a); // gradient pink
+const NEON_YELLOW: Color = Color::srgb_u8(0xfe, 0xbc, 0x2e); // macOS yellow
+const IGGY_ORANGE: Color = Color::srgb_u8(0xff, 0x91, 0x03); // brand primary #ff9103
+const COOL_WHITE: Color = Color::srgb_u8(0xff, 0xfa, 0xeb); // website cream text
+const DIM_GRAY: Color = Color::srgb_u8(0xaa, 0xaf, 0xb6); // website muted text
+const GRID_LINE: Color = Color::srgb_u8(0x11, 0x1d, 0x35); // dark overlay blue
+const HUD_EDGE: Color = Color::srgb_u8(0x3d, 0x44, 0x50); // border/line color
+const HUD_ALERT: Color = Color::srgb_u8(0xff, 0x5f, 0x57); // macOS red
 
 // -- Layout constants -------------------------------------------------------
 
@@ -187,7 +187,9 @@ fn dog_name(id: u8) -> &'static str {
 
 fn narrate_event(event: &vsr::SimEvent) -> Option<EventLogEntry> {
     match event {
-        vsr::SimEvent::ClientRequest { tick, replica_id, .. } => {
+        vsr::SimEvent::ClientRequest {
+            tick, replica_id, ..
+        } => {
             let name = dog_name(*replica_id);
             Some(EventLogEntry {
                 tick: *tick,
@@ -200,7 +202,13 @@ fn narrate_event(event: &vsr::SimEvent) -> Option<EventLogEntry> {
                 color: IGGY_ORANGE,
             })
         }
-        vsr::SimEvent::PrepareQueued { tick, replica_id, op, pipeline_depth, .. } => {
+        vsr::SimEvent::PrepareQueued {
+            tick,
+            replica_id,
+            op,
+            pipeline_depth,
+            ..
+        } => {
             let name = dog_name(*replica_id);
             Some(EventLogEntry {
                 tick: *tick,
@@ -213,25 +221,49 @@ fn narrate_event(event: &vsr::SimEvent) -> Option<EventLogEntry> {
                 color: Color::srgb_u8(95, 135, 253),
             })
         }
-        vsr::SimEvent::PrepareAcked { tick, replica_id, op, ack_from, ack_count, quorum, quorum_reached, .. } => {
+        vsr::SimEvent::PrepareAcked {
+            tick,
+            replica_id,
+            op,
+            ack_from,
+            ack_count,
+            quorum,
+            quorum_reached,
+            ..
+        } => {
             let lead = dog_name(*replica_id);
             let acker = dog_name(*ack_from);
             let status = if *quorum_reached {
                 format!("That's {ack_count}/{quorum} -- quorum reached! {lead} can now commit.")
             } else {
-                format!("That's {ack_count}/{quorum} acks. Need {} more for quorum.", quorum - ack_count)
+                format!(
+                    "That's {ack_count}/{quorum} acks. Need {} more for quorum.",
+                    quorum - ack_count
+                )
             };
             Some(EventLogEntry {
                 tick: *tick,
                 icon: if *quorum_reached { "[OK!]" } else { "[ACK]" },
-                headline: format!("{acker} acked op #{op}{}", if *quorum_reached { " -- QUORUM!" } else { "" }),
+                headline: format!(
+                    "{acker} acked op #{op}{}",
+                    if *quorum_reached { " -- QUORUM!" } else { "" }
+                ),
                 detail: format!(
                     "{acker} (R{ack_from}) confirmed it logged operation #{op}. {status}"
                 ),
-                color: if *quorum_reached { IGGY_ORANGE } else { Color::srgb_u8(20, 184, 166) },
+                color: if *quorum_reached {
+                    IGGY_ORANGE
+                } else {
+                    Color::srgb_u8(20, 184, 166)
+                },
             })
         }
-        vsr::SimEvent::OperationCommitted { tick, replica_id, op, .. } => {
+        vsr::SimEvent::OperationCommitted {
+            tick,
+            replica_id,
+            op,
+            ..
+        } => {
             let name = dog_name(*replica_id);
             Some(EventLogEntry {
                 tick: *tick,
@@ -321,28 +353,41 @@ fn narrate_event(event: &vsr::SimEvent) -> Option<EventLogEntry> {
                 color: message.msg_type.color(),
             })
         }
-        vsr::SimEvent::MessageDropped { tick, message_id, .. } => {
-            Some(EventLogEntry {
-                tick: *tick,
-                icon: "[DRP]",
-                headline: format!("Message #{message_id} lost in the wind!"),
-                detail: "A message was dropped by the network -- it never arrived. \
+        vsr::SimEvent::MessageDropped {
+            tick, message_id, ..
+        } => Some(EventLogEntry {
+            tick: *tick,
+            icon: "[DRP]",
+            headline: format!("Message #{message_id} lost in the wind!"),
+            detail: "A message was dropped by the network -- it never arrived. \
                          This can happen due to partitions or packet loss. The sender won't \
-                         know until a timeout fires.".to_string(),
-                color: NEON_MAGENTA,
-            })
-        }
-        vsr::SimEvent::ViewChangeStarted { tick, replica_id, old_view, new_view, reason, .. } => {
+                         know until a timeout fires."
+                .to_string(),
+            color: NEON_MAGENTA,
+        }),
+        vsr::SimEvent::ViewChangeStarted {
+            tick,
+            replica_id,
+            old_view,
+            new_view,
+            reason,
+            ..
+        } => {
             let name = dog_name(*replica_id);
             let reason_text = match reason {
-                vsr::ViewChangeReason::HeartbeatTimeout =>
-                    format!("{name} hasn't heard from the lead dog in too long (heartbeat timeout)."),
-                vsr::ViewChangeReason::ViewChangeTimeout =>
-                    "The view change itself timed out -- the pack couldn't agree fast enough.".to_string(),
-                vsr::ViewChangeReason::ReceivedStartViewChange =>
-                    format!("{name} heard another dog howling for a view change and joined in."),
-                vsr::ViewChangeReason::ReceivedDoViewChange =>
-                    format!("{name} received a DoViewChange vote, triggering its own view change."),
+                vsr::ViewChangeReason::HeartbeatTimeout => format!(
+                    "{name} hasn't heard from the lead dog in too long (heartbeat timeout)."
+                ),
+                vsr::ViewChangeReason::ViewChangeTimeout => {
+                    "The view change itself timed out -- the pack couldn't agree fast enough."
+                        .to_string()
+                }
+                vsr::ViewChangeReason::ReceivedStartViewChange => {
+                    format!("{name} heard another dog howling for a view change and joined in.")
+                }
+                vsr::ViewChangeReason::ReceivedDoViewChange => {
+                    format!("{name} received a DoViewChange vote, triggering its own view change.")
+                }
             };
             Some(EventLogEntry {
                 tick: *tick,
@@ -357,7 +402,12 @@ fn narrate_event(event: &vsr::SimEvent) -> Option<EventLogEntry> {
                 color: NEON_MAGENTA,
             })
         }
-        vsr::SimEvent::PrimaryElected { tick, replica_id, view, .. } => {
+        vsr::SimEvent::PrimaryElected {
+            tick,
+            replica_id,
+            view,
+            ..
+        } => {
             let name = dog_name(*replica_id);
             Some(EventLogEntry {
                 tick: *tick,
@@ -371,23 +421,33 @@ fn narrate_event(event: &vsr::SimEvent) -> Option<EventLogEntry> {
                 color: NEON_YELLOW,
             })
         }
-        vsr::SimEvent::ReplicaStateChanged { tick, replica_id, old_status, new_status, role, .. } => {
+        vsr::SimEvent::ReplicaStateChanged {
+            tick,
+            replica_id,
+            old_status,
+            new_status,
+            role,
+            ..
+        } => {
             let name = dog_name(*replica_id);
             let role_str = match role {
                 vsr::Role::Primary => "lead dog",
                 vsr::Role::Backup => "pack dog",
             };
             let transition = match (old_status, new_status) {
-                (vsr::Status::Normal, vsr::Status::ViewChange) =>
-                    format!("{name} was running fine but now senses trouble -- howling for a new leader!"),
-                (vsr::Status::ViewChange, vsr::Status::Normal) =>
-                    format!("{name} finished the view change and is back to running! The pack is stable again."),
-                (vsr::Status::Recovering, vsr::Status::Normal) =>
-                    format!("{name} finished recovering and rejoined the race! Back on all four paws."),
-                (vsr::Status::Normal, vsr::Status::Recovering) =>
-                    format!("{name} stumbled and is now recovering -- needs to catch up with the pack."),
-                _ =>
-                    format!("{name} changed from {old_status:?} to {new_status:?}."),
+                (vsr::Status::Normal, vsr::Status::ViewChange) => format!(
+                    "{name} was running fine but now senses trouble -- howling for a new leader!"
+                ),
+                (vsr::Status::ViewChange, vsr::Status::Normal) => format!(
+                    "{name} finished the view change and is back to running! The pack is stable again."
+                ),
+                (vsr::Status::Recovering, vsr::Status::Normal) => format!(
+                    "{name} finished recovering and rejoined the race! Back on all four paws."
+                ),
+                (vsr::Status::Normal, vsr::Status::Recovering) => format!(
+                    "{name} stumbled and is now recovering -- needs to catch up with the pack."
+                ),
+                _ => format!("{name} changed from {old_status:?} to {new_status:?}."),
             };
             Some(EventLogEntry {
                 tick: *tick,
@@ -848,20 +908,21 @@ fn trigger_replica_callout(
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins
-            .set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "VSR Simulator".to_string(),
-                    resolution: (1400, 900).into(),
-                    canvas: Some("#bevy-canvas".to_string()),
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "VSR Simulator".to_string(),
+                        resolution: (1400, 900).into(),
+                        canvas: Some("#bevy-canvas".to_string()),
+                        ..default()
+                    }),
+                    ..default()
+                })
+                .set(AssetPlugin {
+                    file_path: "../../assets".to_string(),
                     ..default()
                 }),
-                ..default()
-            })
-            .set(AssetPlugin {
-                file_path: "../../assets".to_string(),
-                ..default()
-            })
         )
         .add_plugins(ShapePlugin)
         .insert_resource(ClearColor(BG_DARK))
@@ -938,7 +999,11 @@ fn setup_world(
     // Framing diamonds
     for (size, alpha, z) in [(640.0, 0.10, -0.14), (760.0, 0.04, -0.13)] {
         commands.spawn((
-            build_stroke(&rectangle_shape(size, size), GRID_LINE.with_alpha(alpha), 1.0),
+            build_stroke(
+                &rectangle_shape(size, size),
+                GRID_LINE.with_alpha(alpha),
+                1.0,
+            ),
             Transform {
                 translation: Vec3::new(0.0, WORLD_CENTER_Y, z),
                 rotation: Quat::from_rotation_z(PI / 4.0),
@@ -952,7 +1017,9 @@ fn setup_world(
         let y = -500.0 + (i as f32) * (1000.0 / SCAN_LINE_COUNT as f32);
         let line = shapes::Line(Vec2::new(-700.0, 0.0), Vec2::new(700.0, 0.0));
         commands.spawn((
-            ScanLine { speed: 30.0 + (i as f32) * 15.0 },
+            ScanLine {
+                speed: 30.0 + (i as f32) * 15.0,
+            },
             build_stroke(&line, NEON_CYAN.with_alpha(0.03), 1.0),
             Transform::from_xyz(0.0, y, -0.05),
         ));
@@ -961,15 +1028,27 @@ fn setup_world(
     // Track ring
     commands.spawn((
         TrackRing,
-        build_stroke(&circle_shape(CIRCLE_RADIUS), GRID_LINE.with_alpha(0.35), 0.9),
+        build_stroke(
+            &circle_shape(CIRCLE_RADIUS),
+            GRID_LINE.with_alpha(0.35),
+            0.9,
+        ),
         Transform::from_xyz(0.0, WORLD_CENTER_Y, 0.0),
     ));
     commands.spawn((
-        build_stroke(&circle_shape(CIRCLE_RADIUS - 18.0), GRID_LINE.with_alpha(0.12), 0.5),
+        build_stroke(
+            &circle_shape(CIRCLE_RADIUS - 18.0),
+            GRID_LINE.with_alpha(0.12),
+            0.5,
+        ),
         Transform::from_xyz(0.0, WORLD_CENTER_Y, -0.01),
     ));
     commands.spawn((
-        build_stroke(&circle_shape(CIRCLE_RADIUS + 18.0), GRID_LINE.with_alpha(0.12), 0.5),
+        build_stroke(
+            &circle_shape(CIRCLE_RADIUS + 18.0),
+            GRID_LINE.with_alpha(0.12),
+            0.5,
+        ),
         Transform::from_xyz(0.0, WORLD_CENTER_Y, -0.01),
     ));
 
@@ -1230,8 +1309,10 @@ fn setup_world(
 // -- Startup: HUD overlay ---------------------------------------------------
 
 fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
-    let sygnet_handle: Handle<Image> = asset_server.load("logo/4x/iggy-apache-sygnet-color-darkbg@4x.png");
-    let wordmark_handle: Handle<Image> = asset_server.load("logo/4x/iggy-apache-logo-wo-sygnet-light@4x.png");
+    let sygnet_handle: Handle<Image> =
+        asset_server.load("logo/4x/iggy-apache-sygnet-color-darkbg@4x.png");
+    let wordmark_handle: Handle<Image> =
+        asset_server.load("logo/4x/iggy-apache-logo-wo-sygnet-light@4x.png");
 
     commands
         .spawn(Node {
@@ -1266,7 +1347,10 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
                 .with_children(|left| {
                     left.spawn((
                         Text::new("iggy::pack"),
-                        TextFont { font_size: 16.0, ..default() },
+                        TextFont {
+                            font_size: 16.0,
+                            ..default()
+                        },
                         TextColor(IGGY_ORANGE),
                     ));
                     // Treats
@@ -1279,13 +1363,19 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
                     .with_children(|stat| {
                         stat.spawn((
                             Text::new("TREATS"),
-                            TextFont { font_size: 9.0, ..default() },
+                            TextFont {
+                                font_size: 9.0,
+                                ..default()
+                            },
                             TextColor(DIM_GRAY),
                         ));
                         stat.spawn((
                             HudCommitsText,
                             Text::new("0"),
-                            TextFont { font_size: 20.0, ..default() },
+                            TextFont {
+                                font_size: 20.0,
+                                ..default()
+                            },
                             TextColor(NEON_CYAN),
                         ));
                     });
@@ -1299,13 +1389,19 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
                     .with_children(|stat| {
                         stat.spawn((
                             Text::new("LAPS/S"),
-                            TextFont { font_size: 9.0, ..default() },
+                            TextFont {
+                                font_size: 9.0,
+                                ..default()
+                            },
                             TextColor(DIM_GRAY),
                         ));
                         stat.spawn((
                             HudOpsText,
                             Text::new("0"),
-                            TextFont { font_size: 20.0, ..default() },
+                            TextFont {
+                                font_size: 20.0,
+                                ..default()
+                            },
                             TextColor(IGGY_ORANGE),
                         ));
                     });
@@ -1348,28 +1444,38 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
                     right.spawn((
                         HudTickText,
                         Text::new("T 0"),
-                        TextFont { font_size: 18.0, ..default() },
+                        TextFont {
+                            font_size: 18.0,
+                            ..default()
+                        },
                         TextColor(COOL_WHITE),
                     ));
-                    right.spawn(Node {
-                        flex_direction: FlexDirection::Column,
-                        align_items: AlignItems::End,
-                        ..default()
-                    })
-                    .with_children(|col| {
-                        col.spawn((
-                            HudStateText,
-                            Text::new("RACING"),
-                            TextFont { font_size: 13.0, ..default() },
-                            TextColor(NEON_CYAN),
-                        ));
-                        col.spawn((
-                            HudSpeedText,
-                            Text::new("x1.0"),
-                            TextFont { font_size: 10.0, ..default() },
-                            TextColor(DIM_GRAY),
-                        ));
-                    });
+                    right
+                        .spawn(Node {
+                            flex_direction: FlexDirection::Column,
+                            align_items: AlignItems::End,
+                            ..default()
+                        })
+                        .with_children(|col| {
+                            col.spawn((
+                                HudStateText,
+                                Text::new("RACING"),
+                                TextFont {
+                                    font_size: 13.0,
+                                    ..default()
+                                },
+                                TextColor(NEON_CYAN),
+                            ));
+                            col.spawn((
+                                HudSpeedText,
+                                Text::new("x1.0"),
+                                TextFont {
+                                    font_size: 10.0,
+                                    ..default()
+                                },
+                                TextColor(DIM_GRAY),
+                            ));
+                        });
                 });
             });
 
@@ -1399,12 +1505,18 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
                 .with_children(|col| {
                     col.spawn((
                         Text::new("APACHE IGGY SIMULATOR"),
-                        TextFont { font_size: 14.0, ..default() },
+                        TextFont {
+                            font_size: 14.0,
+                            ..default()
+                        },
                         TextColor(COOL_WHITE),
                     ));
                     col.spawn((
                         Text::new("Italian greyhounds racing to consensus"),
-                        TextFont { font_size: 10.0, ..default() },
+                        TextFont {
+                            font_size: 10.0,
+                            ..default()
+                        },
                         TextColor(DIM_GRAY),
                     ));
                 });
@@ -1443,13 +1555,19 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
                             .with_children(|badge| {
                                 badge.spawn((
                                     Text::new(key),
-                                    TextFont { font_size: 10.0, ..default() },
+                                    TextFont {
+                                        font_size: 10.0,
+                                        ..default()
+                                    },
                                     TextColor(color),
                                 ));
                             });
                             pair.spawn((
                                 Text::new(action),
-                                TextFont { font_size: 9.0, ..default() },
+                                TextFont {
+                                    font_size: 9.0,
+                                    ..default()
+                                },
                                 TextColor(DIM_GRAY),
                             ));
                         });
@@ -1463,26 +1581,29 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
                     ..default()
                 })
                 .with_children(|chips| {
-                    for (label, color) in [
-                        ("3 GREYHOUNDS", IGGY_ORANGE),
-                        ("FAULT READY", HUD_ALERT),
-                    ] {
-                        chips.spawn((
-                            Node {
-                                padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
-                                border: UiRect::all(Val::Px(1.0)),
-                                ..default()
-                            },
-                            BackgroundColor(BG_PANEL.with_alpha(0.9)),
-                            BorderColor::all(color.with_alpha(0.4)),
-                        ))
-                        .with_children(|chip| {
-                            chip.spawn((
-                                Text::new(label),
-                                TextFont { font_size: 10.0, ..default() },
-                                TextColor(color),
-                            ));
-                        });
+                    for (label, color) in
+                        [("3 GREYHOUNDS", IGGY_ORANGE), ("FAULT READY", HUD_ALERT)]
+                    {
+                        chips
+                            .spawn((
+                                Node {
+                                    padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                                    border: UiRect::all(Val::Px(1.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(BG_PANEL.with_alpha(0.9)),
+                                BorderColor::all(color.with_alpha(0.4)),
+                            ))
+                            .with_children(|chip| {
+                                chip.spawn((
+                                    Text::new(label),
+                                    TextFont {
+                                        font_size: 10.0,
+                                        ..default()
+                                    },
+                                    TextColor(color),
+                                ));
+                            });
                     }
                 });
             });
@@ -1506,13 +1627,19 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
                 col.spawn((
                     PauseMainText,
                     Text::new("RESTING"),
-                    TextFont { font_size: 52.0, ..default() },
+                    TextFont {
+                        font_size: 52.0,
+                        ..default()
+                    },
                     TextColor(NEON_YELLOW),
                 ));
                 col.spawn((
                     PauseSubtext,
                     Text::new("press SPACE to unleash"),
-                    TextFont { font_size: 16.0, ..default() },
+                    TextFont {
+                        font_size: 16.0,
+                        ..default()
+                    },
                     TextColor(DIM_GRAY),
                 ));
             });
@@ -1540,15 +1667,27 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
             .with_children(|panel| {
                 panel.spawn((
                     Text::new("PACK ACTIVITY LOG"),
-                    TextFont { font_size: 13.0, ..default() },
+                    TextFont {
+                        font_size: 13.0,
+                        ..default()
+                    },
                     TextColor(IGGY_ORANGE),
-                    Node { margin: UiRect::bottom(Val::Px(4.0)), ..default() },
+                    Node {
+                        margin: UiRect::bottom(Val::Px(4.0)),
+                        ..default()
+                    },
                 ));
                 panel.spawn((
                     Text::new("[D] toggle details  [E] close"),
-                    TextFont { font_size: 9.0, ..default() },
+                    TextFont {
+                        font_size: 9.0,
+                        ..default()
+                    },
                     TextColor(DIM_GRAY),
-                    Node { margin: UiRect::bottom(Val::Px(8.0)), ..default() },
+                    Node {
+                        margin: UiRect::bottom(Val::Px(8.0)),
+                        ..default()
+                    },
                 ));
                 panel.spawn((
                     Node {
@@ -1584,7 +1723,10 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
             .with_children(|hint| {
                 hint.spawn((
                     Text::new("[E] event log"),
-                    TextFont { font_size: 10.0, ..default() },
+                    TextFont {
+                        font_size: 10.0,
+                        ..default()
+                    },
                     TextColor(DIM_GRAY),
                 ));
             });
@@ -1593,7 +1735,11 @@ fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
 
 // -- Update: keyboard input -------------------------------------------------
 
-fn keyboard_input_system(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<SimState>, mut event_log: ResMut<EventLog>) {
+fn keyboard_input_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut sim: ResMut<SimState>,
+    mut event_log: ResMut<EventLog>,
+) {
     if keys.just_pressed(KeyCode::Space) {
         sim.playing = !sim.playing;
     }
@@ -1762,11 +1908,7 @@ fn simulation_tick_system(
                                 center,
                                 lifetime: COMMIT_RING_LIFETIME + delay_factor,
                                 max_lifetime: COMMIT_RING_LIFETIME + delay_factor,
-                                color: if ring_i == 0 {
-                                    IGGY_ORANGE
-                                } else {
-                                    NEON_CYAN
-                                },
+                                color: if ring_i == 0 { IGGY_ORANGE } else { NEON_CYAN },
                                 max_radius: 120.0 + ring_i as f32 * 40.0,
                             },
                             build_stroke(
@@ -1808,11 +1950,7 @@ fn simulation_tick_system(
                                     color: NEON_MAGENTA,
                                     max_radius: 200.0,
                                 },
-                                build_stroke(
-                                    &circle_shape(1.0),
-                                    NEON_MAGENTA.with_alpha(0.5),
-                                    3.0,
-                                ),
+                                build_stroke(&circle_shape(1.0), NEON_MAGENTA.with_alpha(0.5), 3.0),
                                 Transform::from_xyz(center.x, center.y, 4.5),
                             ));
                         }
@@ -1845,11 +1983,7 @@ fn simulation_tick_system(
                                 color: NEON_YELLOW,
                                 max_radius: 150.0 + ring_i as f32 * 50.0,
                             },
-                            build_stroke(
-                                &circle_shape(1.0),
-                                NEON_YELLOW.with_alpha(0.45),
-                                2.5,
-                            ),
+                            build_stroke(&circle_shape(1.0), NEON_YELLOW.with_alpha(0.45), 2.5),
                             Transform::from_xyz(center.x, center.y, 4.4),
                         ));
                     }
@@ -1971,7 +2105,8 @@ fn update_replica_visuals(
         let busy = state.pipeline_depth as f32 / 8.0; // 0..1 how loaded
         let hover = (t * (1.3 + busy * 0.8) + id as f32 * 1.7).sin() * (7.0 + busy * 4.0);
         let sway = (t * (0.9 + busy * 1.2) + id as f32 * 0.8).sin() * (0.06 + busy * 0.04);
-        let breathe = 1.0 + (t * (1.8 + busy * 1.5) + id as f32 * 0.9).sin() * (0.035 + busy * 0.025);
+        let breathe =
+            1.0 + (t * (1.8 + busy * 1.5) + id as f32 * 0.9).sin() * (0.035 + busy * 0.025);
         // Running lean: greyhound tilts forward when busy
         let run_lean = busy * 0.08 * dir;
         // Stretch horizontally when running (greyhound elongation)
@@ -2069,9 +2204,12 @@ fn update_replica_visuals(
                     sway + run_lean + flash_energy * 0.04 * dir - kill_energy * 0.24 * dir,
                 );
                 transform.scale = Vec3::new(
-                    dir * breathe * impact_scale * run_stretch_x
+                    dir * breathe
+                        * impact_scale
+                        * run_stretch_x
                         * (1.0 + revive_energy * 0.1 - kill_energy * 0.16),
-                    (breathe / impact_scale) * run_squash_y
+                    (breathe / impact_scale)
+                        * run_squash_y
                         * (1.0 - kill_energy * 0.34 + healthy_energy * 0.08),
                     1.0,
                 );
@@ -2773,10 +2911,7 @@ fn update_track_ring(
     };
 
     for mut shape in query.iter_mut() {
-        shape.stroke = Some(Stroke::new(
-            color.with_alpha(base_alpha + breathe),
-            width,
-        ));
+        shape.stroke = Some(Stroke::new(color.with_alpha(base_alpha + breathe), width));
     }
 }
 
@@ -2840,17 +2975,20 @@ fn update_event_log_panel(
                     ))
                     .with_children(|card| {
                         card.spawn((
-                            Text::new(format!(
-                                "T{} {} {}",
-                                entry.tick, entry.icon, entry.headline
-                            )),
-                            TextFont { font_size: 12.0, ..default() },
+                            Text::new(format!("T{} {} {}", entry.tick, entry.icon, entry.headline)),
+                            TextFont {
+                                font_size: 12.0,
+                                ..default()
+                            },
                             TextColor(entry.color),
                         ));
                         if event_log.show_details {
                             card.spawn((
                                 Text::new(&entry.detail),
-                                TextFont { font_size: 10.0, ..default() },
+                                TextFont {
+                                    font_size: 10.0,
+                                    ..default()
+                                },
                                 TextColor(DIM_GRAY),
                                 Node {
                                     margin: UiRect::top(Val::Px(2.0)),

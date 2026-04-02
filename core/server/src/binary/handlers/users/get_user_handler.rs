@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::binary::dispatch::{HandlerResult, domain_permissions_to_wire, wire_id_to_identifier};
+use crate::binary::dispatch::{HandlerResult, wire_id_to_identifier};
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use iggy_binary_protocol::WireName;
@@ -25,6 +25,7 @@ use iggy_binary_protocol::requests::users::GetUserRequest;
 use iggy_binary_protocol::responses::users::{UserDetailsResponse, UserResponse};
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
+use iggy_common::wire_conversions::permissions_to_wire;
 use std::rc::Rc;
 use tracing::debug;
 
@@ -55,7 +56,7 @@ pub async fn handle_get_user(
             username: WireName::new(user.username.as_ref())
                 .map_err(|_| IggyError::InvalidCommand)?,
         },
-        permissions: user.permissions.as_deref().map(domain_permissions_to_wire),
+        permissions: user.permissions.as_deref().map(permissions_to_wire),
     };
     sender.send_ok_response(&response.to_bytes()).await?;
     Ok(HandlerResult::Finished)

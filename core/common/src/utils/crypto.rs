@@ -130,12 +130,12 @@ mod tests {
     #[test]
     fn message_payload_and_headers_should_encrypt_and_decrypt_correctly() {
         use bytes::Bytes;
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         let key = [1; 32];
         let encryptor = Aes256GcmEncryptor::new(&key).unwrap();
 
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert(
             HeaderKey::try_from("batch").unwrap(),
             HeaderValue::from(1u64),

@@ -21,16 +21,16 @@ use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
 use bytes::Bytes;
-use iggy_common::create_partitions::CreatePartitions;
-use iggy_common::create_stream::CreateStream;
-use iggy_common::create_topic::CreateTopic;
-use iggy_common::delete_partitions::DeletePartitions;
-use iggy_common::delete_stream::DeleteStream;
-use iggy_common::delete_topic::DeleteTopic;
-use iggy_common::purge_stream::PurgeStream;
-use iggy_common::purge_topic::PurgeTopic;
-use iggy_common::update_stream::UpdateStream;
-use iggy_common::update_topic::UpdateTopic;
+use iggy_binary_protocol::WireIdentifier;
+use iggy_binary_protocol::requests::partitions::{
+    CreatePartitionsRequest, DeletePartitionsRequest,
+};
+use iggy_binary_protocol::requests::streams::{
+    CreateStreamRequest, DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
+};
+use iggy_binary_protocol::requests::topics::{
+    CreateTopicRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
+};
 use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use serde::{Deserialize, Serialize};
 use slab::Slab;
@@ -233,51 +233,38 @@ collect_handlers! {
 }
 
 impl StreamsInner {
-    fn resolve_stream_id(&self, identifier: &iggy_common::Identifier) -> Option<usize> {
-        use iggy_common::IdKind;
-        match identifier.kind {
-            IdKind::Numeric => {
-                let id = identifier.get_u32_value().ok()? as usize;
+    fn resolve_stream_id(&self, identifier: &WireIdentifier) -> Option<usize> {
+        match identifier {
+            WireIdentifier::Numeric(id) => {
+                let id = *id as usize;
                 if self.items.contains(id) {
                     Some(id)
                 } else {
                     None
                 }
             }
-            IdKind::String => {
-                let name = identifier.get_string_value().ok()?;
-                self.index.get(name.as_str()).copied()
-            }
+            WireIdentifier::String(name) => self.index.get(name.as_str()).copied(),
         }
     }
 
-    fn resolve_topic_id(
-        &self,
-        stream_id: usize,
-        identifier: &iggy_common::Identifier,
-    ) -> Option<usize> {
-        use iggy_common::IdKind;
+    fn resolve_topic_id(&self, stream_id: usize, identifier: &WireIdentifier) -> Option<usize> {
         let stream = self.items.get(stream_id)?;
-
-        match identifier.kind {
-            IdKind::Numeric => {
-                let id = identifier.get_u32_value().ok()? as usize;
+        match identifier {
+            WireIdentifier::Numeric(id) => {
+                let id = *id as usize;
                 if stream.topics.contains(id) {
                     Some(id)
                 } else {
                     None
                 }
             }
-            IdKind::String => {
-                let name = identifier.get_string_value().ok()?;
-                stream.topic_index.get(name.as_str()).copied()
-            }
+            WireIdentifier::String(name) => stream.topic_index.get(name.as_str()).copied(),
         }
     }
 }
 
 // TODO(hubcio): Serialize proper reply (e.g. assigned stream ID) instead of empty Bytes.
-impl StateHandler for CreateStream {
+impl StateHandler for CreateStreamRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let name_arc: Arc<str> = Arc::from(self.name.as_str());
@@ -288,7 +275,7 @@ impl StateHandler for CreateStream {
         let stream = Stream {
             id: 0,
             name: name_arc.clone(),
-            created_at: iggy_common::IggyTimestamp::now(),
+            created_at: IggyTimestamp::now(),
             stats: Arc::new(StreamStats::default()),
             topics: Slab::new(),
             topic_index: AHashMap::default(),
@@ -303,7 +290,7 @@ impl StateHandler for CreateStream {
     }
 }
 
-impl StateHandler for UpdateStream {
+impl StateHandler for UpdateStreamRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
@@ -327,7 +314,7 @@ impl StateHandler for UpdateStream {
     }
 }
 
-impl StateHandler for DeleteStream {
+impl StateHandler for DeleteStreamRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
@@ -344,7 +331,7 @@ impl StateHandler for DeleteStream {
     }
 }
 
-impl StateHandler for PurgeStream {
+impl StateHandler for PurgeStreamRequest {
     type State = StreamsInner;
     fn apply(&self, _state: &mut StreamsInner) -> Bytes {
         // TODO
@@ -353,7 +340,7 @@ impl StateHandler for PurgeStream {
 }
 
 // TODO(hubcio): Serialize proper reply (e.g. assigned topic ID) instead of empty Bytes.
-impl StateHandler for CreateTopic {
+impl StateHandler for CreateTopicRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
@@ -368,14 +355,21 @@ impl StateHandler for CreateTopic {
             return Bytes::new();
         }
 
+        let replication_factor = if self.replication_factor == 0 {
+            1
+        } else {
+            self.replication_factor
+        };
+
         let topic = Topic {
             id: 0,
             name: name_arc.clone(),
-            created_at: iggy_common::IggyTimestamp::now(),
-            replication_factor: self.replication_factor.unwrap_or(1),
-            message_expiry: self.message_expiry,
-            compression_algorithm: self.compression_algorithm,
-            max_topic_size: self.max_topic_size,
+            created_at: IggyTimestamp::now(),
+            replication_factor,
+            message_expiry: IggyExpiry::from(self.message_expiry),
+            compression_algorithm: CompressionAlgorithm::from_code(self.compression_algorithm)
+                .unwrap_or_default(),
+            max_topic_size: MaxTopicSize::from(self.max_topic_size),
             stats: Arc::new(TopicStats::new(stream.stats.clone())),
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
@@ -388,7 +382,7 @@ impl StateHandler for CreateTopic {
             for partition_id in 0..self.partitions_count as usize {
                 let partition = Partition {
                     id: partition_id,
-                    created_at: iggy_common::IggyTimestamp::now(),
+                    created_at: IggyTimestamp::now(),
                 };
                 topic.partitions.push(partition);
             }
@@ -399,7 +393,7 @@ impl StateHandler for CreateTopic {
     }
 }
 
-impl StateHandler for UpdateTopic {
+impl StateHandler for UpdateTopicRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
@@ -425,18 +419,19 @@ impl StateHandler for UpdateTopic {
 
         stream.topic_index.remove(&topic.name);
         topic.name = new_name_arc.clone();
-        topic.compression_algorithm = self.compression_algorithm;
-        topic.message_expiry = self.message_expiry;
-        topic.max_topic_size = self.max_topic_size;
-        if let Some(rf) = self.replication_factor {
-            topic.replication_factor = rf;
+        topic.compression_algorithm =
+            CompressionAlgorithm::from_code(self.compression_algorithm).unwrap_or_default();
+        topic.message_expiry = IggyExpiry::from(self.message_expiry);
+        topic.max_topic_size = MaxTopicSize::from(self.max_topic_size);
+        if self.replication_factor != 0 {
+            topic.replication_factor = self.replication_factor;
         }
         stream.topic_index.insert(new_name_arc, topic_id);
         Bytes::new()
     }
 }
 
-impl StateHandler for DeleteTopic {
+impl StateHandler for DeleteTopicRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
@@ -458,7 +453,7 @@ impl StateHandler for DeleteTopic {
     }
 }
 
-impl StateHandler for PurgeTopic {
+impl StateHandler for PurgeTopicRequest {
     type State = StreamsInner;
     fn apply(&self, _state: &mut StreamsInner) -> Bytes {
         // TODO
@@ -467,7 +462,7 @@ impl StateHandler for PurgeTopic {
 }
 
 // TODO(hubcio): Serialize proper reply (e.g. assigned partition IDs) instead of empty Bytes.
-impl StateHandler for CreatePartitions {
+impl StateHandler for CreatePartitionsRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
@@ -489,7 +484,7 @@ impl StateHandler for CreatePartitions {
             let partition_id = current_partition_count + i;
             let partition = Partition {
                 id: partition_id,
-                created_at: iggy_common::IggyTimestamp::now(),
+                created_at: IggyTimestamp::now(),
             };
             topic.partitions.push(partition);
         }
@@ -497,7 +492,7 @@ impl StateHandler for CreatePartitions {
     }
 }
 
-impl StateHandler for DeletePartitions {
+impl StateHandler for DeletePartitionsRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {

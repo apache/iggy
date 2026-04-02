@@ -26,7 +26,6 @@ bevy = { version = "0.18", features = ["webgl2"] }
 bevy_prototype_lyon = "0.16"
 rand = "0.9"
 rand_xoshiro = "0.7"
-strum = { workspace = true }
 strum_macros = { workspace = true }
 
 [[bin]]
@@ -34,4 +33,3 @@ name = "simulator-ui"
 path = "src/main.rs"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.3", features = ["wasm_js"] }

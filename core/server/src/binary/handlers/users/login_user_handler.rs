@@ -24,9 +24,11 @@ use err_trail::ErrContext;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::users::LoginUserRequest;
 use iggy_binary_protocol::responses::users::IdentityResponse;
-use iggy_common::login_user::LoginUser;
-use iggy_common::{IggyError, SenderKind, Validatable};
-use secrecy::SecretString;
+use iggy_common::IggyError;
+use iggy_common::SenderKind;
+use iggy_common::defaults::{
+    MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
+};
 use std::rc::Rc;
 use tracing::{debug, info, instrument, warn};
 
@@ -43,15 +45,16 @@ pub async fn handle_login_user(
     }
 
     let username = req.username.as_str();
-    debug!("session: {session}, command: login_user, username: {username}");
+    let username_len = username.len();
+    if !(MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&username_len) {
+        return Err(IggyError::InvalidUsername);
+    }
+    let password_len = req.password.len();
+    if !(MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH).contains(&password_len) {
+        return Err(IggyError::InvalidPassword);
+    }
 
-    let command = LoginUser {
-        username: username.to_string(),
-        password: SecretString::from(req.password.as_str()),
-        version: req.version.clone(),
-        context: req.context.clone(),
-    };
-    command.validate()?;
+    debug!("session: {session}, command: login_user, username: {username}");
 
     info!("Logging in user: {username} ...");
     let user = shard

@@ -29,7 +29,6 @@ readme = "../../README.md"
 
 [dependencies]
 aes-gcm = { workspace = true }
-ahash = { workspace = true }
 aligned-vec = { workspace = true }
 async-broadcast = { workspace = true }
 async-trait = { workspace = true }

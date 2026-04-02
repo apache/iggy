@@ -59,11 +59,11 @@ impl MessageType {
             Self::ClientRequest => (0xff, 0xfa, 0xeb),   // cream
             Self::Prepare => (0x5f, 0x87, 0xfd),         // blue
             Self::PrepareOk => (0x14, 0xb8, 0xa6),       // teal
-            Self::Commit => (0xff, 0x91, 0x03),           // orange
-            Self::StartViewChange => (0xfa, 0x5e, 0x8a),  // pink
-            Self::DoViewChange => (0xa8, 0x55, 0xf7),     // purple
-            Self::StartView => (0x63, 0x66, 0xf1),        // indigo
-            Self::ClientReply => (0xff, 0xa7, 0x03),      // orange
+            Self::Commit => (0xff, 0x91, 0x03),          // orange
+            Self::StartViewChange => (0xfa, 0x5e, 0x8a), // pink
+            Self::DoViewChange => (0xa8, 0x55, 0xf7),    // purple
+            Self::StartView => (0x63, 0x66, 0xf1),       // indigo
+            Self::ClientReply => (0xff, 0xa7, 0x03),     // orange
         }
     }
 
