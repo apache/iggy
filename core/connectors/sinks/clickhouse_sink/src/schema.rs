@@ -612,7 +612,10 @@ mod tests {
 
     #[test]
     fn parses_low_cardinality() {
-        assert_eq!(parse_type("LowCardinality(String)").unwrap(), ChType::String);
+        assert_eq!(
+            parse_type("LowCardinality(String)").unwrap(),
+            ChType::String
+        );
         assert_eq!(
             parse_type("LowCardinality(FixedString(16))").unwrap(),
             ChType::FixedString(16)
