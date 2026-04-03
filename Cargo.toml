@@ -166,11 +166,11 @@ hwlocality = "1.0.0-alpha.11"
 iceberg = "0.9.0"
 iceberg-catalog-rest = "0.9.0"
 iceberg-storage-opendal = "0.9.0"
-iggy = { path = "core/sdk", version = "0.9.5-edge.1" }
-iggy-cli = { path = "core/cli", version = "0.12.1-edge.1" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.9.5-edge.1" }
-iggy_common = { path = "core/common", version = "0.9.5-edge.1" }
-iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.2.2-edge.1" }
+iggy = { path = "core/sdk", version = "0.10.0" }
+iggy-cli = { path = "core/cli", version = "0.13.0" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.0" }
+iggy_common = { path = "core/common", version = "0.10.0" }
+iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.3.0" }
 integration = { path = "core/integration" }
 iobuf = { path = "core/iobuf" }
 journal = { path = "core/journal" }

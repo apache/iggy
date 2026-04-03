@@ -5390,7 +5390,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.9.5-edge.1"
+version = "0.10.0"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -5478,7 +5478,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.12.1-edge.1"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5592,7 +5592,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.9.5-edge.1"
+version = "0.10.0"
 dependencies = [
  "bytemuck",
  "bytes",
@@ -5604,7 +5604,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.9.5-edge.1"
+version = "0.10.0"
 dependencies = [
  "aes-gcm",
  "aligned-vec",
@@ -5868,7 +5868,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_sdk"
-version = "0.2.2-edge.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10038,7 +10038,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.7.4-edge.1"
+version = "0.8.0"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
