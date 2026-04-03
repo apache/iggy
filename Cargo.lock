@@ -1155,7 +1155,7 @@ checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 
 [[package]]
 name = "bench-dashboard-frontend"
-version = "0.5.3-edge.1"
+version = "0.6.0"
 dependencies = [
  "bench-dashboard-shared",
  "bench-report",
@@ -1185,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "bench-report"
-version = "0.2.3-edge.1"
+version = "0.3.0"
 dependencies = [
  "charming",
  "colored",
@@ -5422,7 +5422,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench"
-version = "0.4.1-edge.1"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "bench-report",
@@ -5450,7 +5450,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench-dashboard-server"
-version = "0.6.3-edge.1"
+version = "0.7.0"
 dependencies = [
  "actix-cors",
  "actix-files",
@@ -5508,7 +5508,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -5560,7 +5560,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-mcp"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -5652,7 +5652,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_elasticsearch_sink"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5671,7 +5671,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_elasticsearch_source"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -5690,7 +5690,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_http_sink"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5712,7 +5712,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_iceberg_sink"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 dependencies = [
  "arrow-json",
  "async-trait",
@@ -5732,7 +5732,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_influxdb_sink"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5754,7 +5754,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_influxdb_source"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5777,7 +5777,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_mongodb_sink"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "humantime",
@@ -5793,7 +5793,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_postgres_sink"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -5813,7 +5813,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_postgres_source"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5835,7 +5835,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_quickwit_sink"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -5850,7 +5850,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_random_source"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -5904,7 +5904,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_stdout_sink"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -10110,7 +10110,7 @@ dependencies = [
 
 [[package]]
 name = "server-ng"
-version = "0.7.3-edge.1"
+version = "0.8.0"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
