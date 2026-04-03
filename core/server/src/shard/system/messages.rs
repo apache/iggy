@@ -173,9 +173,17 @@ impl IggyShard {
             frozen
         };
 
+        let persist_start = std::time::Instant::now();
+
         let saved_count = self
             .persist_frozen_batches_to_disk(namespace, frozen_batches)
             .await?;
+
+        tracing::error!(
+            "flush_unsaved_buffer: persist took {}ms, namespace={:?}",
+            persist_start.elapsed().as_millis(),
+            namespace
+        );
 
         // {
         //     let partitions = self.local_partitions.borrow();

@@ -18,13 +18,18 @@
 pub mod buffered;
 pub mod direct;
 
-use std::{cell::RefCell, rc::Rc, sync::atomic::AtomicU64};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 pub use buffered::BufferedMessagesWriter;
 pub use direct::DirectMessagesWriter;
 
 use crate::{
-    IggyByteSize, IggyError, IggyMessagesBatch, types::segment_storage::direct_file::DirectFile,
+    IggyByteSize, IggyError, IggyMessagesBatch,
+    types::segment_storage::direct_file::{DirectFile, SharedTail, TailBoundary},
 };
 
 #[derive(Debug)]
@@ -84,9 +89,9 @@ impl MessagesWriter {
         }
     }
 
-    pub fn try_get_direct_file(&self) -> Option<Rc<RefCell<DirectFile>>> {
+    pub fn try_get_shared_tail(&self) -> Option<Arc<SharedTail>> {
         match &self.backend {
-            MessagesWriterBackend::Direct(w) => Some(w.direct_file_rc()),
+            MessagesWriterBackend::Direct(w) => Some(w.shared_tail()),
             MessagesWriterBackend::Buffered(_) => None,
         }
     }

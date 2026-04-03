@@ -126,7 +126,7 @@ impl SegmentStorage {
             )
             .await?,
         );
-        let writer_file_rc = messages_writer.try_get_direct_file();
+        let shared_tail = messages_writer.try_get_shared_tail();
 
         let index_writer = Rc::new(
             IndexWriter::new(index_path, indexes_size.clone(), index_fsync, file_exists).await?,
@@ -137,8 +137,7 @@ impl SegmentStorage {
             index_writer.fsync().await?;
         }
 
-        let messages_reader =
-            Rc::new(MessagesReader::new(messages_path, size, writer_file_rc).await?);
+        let messages_reader = Rc::new(MessagesReader::new(messages_path, size, shared_tail).await?);
         let index_reader = Rc::new(IndexReader::new(index_path, indexes_size).await?);
         Ok(Self {
             messages_writer: Some(messages_writer),

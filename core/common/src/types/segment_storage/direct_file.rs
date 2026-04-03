@@ -15,6 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
 use bytes::Bytes;
 use compio::{
     fs::{File, OpenOptions},
@@ -38,6 +43,67 @@ const O_DSYNC: i32 = 0;
 #[repr(align(64))]
 #[derive(Debug)]
 struct Padded<T>(T);
+
+#[derive(Debug)]
+pub struct TailBoundary {
+    /// file_position — start of the tail region
+    pub start: AtomicU64,
+    /// file_position + tail_len — end of valid data
+    pub end: AtomicU64,
+}
+
+impl TailBoundary {
+    pub fn new(start: u64, end: u64) -> Self {
+        Self {
+            start: AtomicU64::new(start),
+            end: AtomicU64::new(end),
+        }
+    }
+
+    pub fn update(&self, file_position: u64, tail_len: usize) {
+        // Store end first so readers never see end < start
+        self.end
+            .store(file_position + tail_len as u64, Ordering::Release);
+        self.start.store(file_position, Ordering::Release);
+    }
+
+    pub fn load(&self) -> (u64, u64) {
+        let start = self.start.load(Ordering::Acquire);
+        let end = self.end.load(Ordering::Acquire);
+        (start, end)
+    }
+}
+
+use std::sync::Mutex;
+
+#[derive(Debug)]
+pub struct SharedTail {
+    pub boundary: TailBoundary,
+    data: Mutex<Vec<u8>>,
+}
+
+impl SharedTail {
+    pub fn new() -> Self {
+        Self {
+            boundary: TailBoundary::new(0, 0),
+            data: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn update(&self, position: u64, tail_buf: &[u8], tail_len: usize) {
+        self.boundary.update(position, tail_len);
+        if tail_len > 0 {
+            let mut data = self.data.lock().unwrap();
+            data.clear();
+            data.extend_from_slice(&tail_buf[..tail_len]);
+        }
+    }
+
+    pub fn read(&self, offset: usize, len: usize) -> Vec<u8> {
+        let data = self.data.lock().unwrap();
+        data[offset..offset + len].to_vec()
+    }
+}
 
 #[derive(Debug)]
 pub struct DirectFile {
@@ -84,6 +150,7 @@ impl DirectFile {
             .create(true)
             .write(true)
             .custom_flags((O_DSYNC | O_DIRECT) as _)
+            // .custom_flags(O_DIRECT as _)
             .open(file_path)
             .await
             .map_err(|err| {
@@ -458,6 +525,7 @@ impl DirectFile {
 
         self.file_position += ALIGNMENT as u64;
         self.tail_len.0 = 0;
+
         // reclaim that alloc for later reuse
         self.tail = returned_buf;
         self.tail.clear();

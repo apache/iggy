@@ -533,6 +533,8 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         use crate::streaming::segments::storage::create_segment_storage;
 
+        tracing::error!("===append_messages: ROTATING segment for {:?}", namespace);
+
         let (start_offset, old_segment_index) = {
             let mut partitions = self.local_partitions.borrow_mut();
             let partition = partitions
@@ -573,9 +575,7 @@ impl IggyShard {
             let old_storage = &mut partition.log.storages_mut()[old_segment_index];
 
             // TODO(tungtose): this should be remove after MessageReader open with O_DIRECT
-            if let Some(ref messages_writer) = old_storage.messages_writer
-                && messages_writer.try_get_direct_file().is_some()
-            {
+            if let Some(ref messages_writer) = old_storage.messages_writer {
                 messages_writer.flush_and_truncate().await?;
             }
             let _ = old_storage.shutdown();
