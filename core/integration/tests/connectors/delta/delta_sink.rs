@@ -21,7 +21,7 @@ use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{DeltaFixture, DeltaS3Fixture};
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
-use iggy_binary_protocol::MessageClient;
+use iggy_common::MessageClient;
 use iggy_common::Identifier;
 use iggy_connector_sdk::api::SinkInfoResponse;
 use integration::harness::seeds;
