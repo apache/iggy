@@ -16,11 +16,7 @@
  * under the License.
  */
 
-pub mod command;
+pub mod dispatch;
 pub mod handlers;
-pub mod mapper;
-
-#[macro_use]
-mod macros;
 
 pub const COMPONENT: &str = "BINARY";

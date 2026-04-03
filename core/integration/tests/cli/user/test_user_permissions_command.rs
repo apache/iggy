@@ -21,7 +21,6 @@ use crate::cli::common::{
     USAGE_PREFIX,
 };
 use crate::cli::user::common::PermissionsTestArgs;
-use ahash::AHashMap;
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
@@ -31,6 +30,7 @@ use iggy::prelude::UserStatus;
 use iggy::prelude::{GlobalPermissions, StreamPermissions, TopicPermissions};
 use predicates::str::diff;
 use serial_test::parallel;
+use std::collections::BTreeMap;
 
 struct TestUserPermissionsCmd {
     username: String,
@@ -159,7 +159,7 @@ pub async fn should_be_successful() {
                 vec![String::from("3")],
                 Some(Permissions {
                     global: GlobalPermissions::default(),
-                    streams: Some(AHashMap::from([(3usize, StreamPermissions::default())])),
+                    streams: Some(BTreeMap::from([(3usize, StreamPermissions::default())])),
                 }),
             ),
             TestUserId::Numeric,
@@ -173,10 +173,10 @@ pub async fn should_be_successful() {
                 vec![String::from("1#2:m_top,r_top,p_msg,s_msg")],
                 Some(Permissions {
                     global: GlobalPermissions::default(),
-                    streams: Some(AHashMap::from([(
+                    streams: Some(BTreeMap::from([(
                         1usize,
                         StreamPermissions {
-                            topics: Some(AHashMap::from([(
+                            topics: Some(BTreeMap::from([(
                                 2,
                                 TopicPermissions {
                                     manage_topic: true,
@@ -212,10 +212,10 @@ pub async fn should_be_successful() {
                         poll_messages: false,
                         send_messages: false,
                     },
-                    streams: Some(AHashMap::from([(
+                    streams: Some(BTreeMap::from([(
                         2usize,
                         StreamPermissions {
-                            topics: Some(AHashMap::from([(
+                            topics: Some(BTreeMap::from([(
                                 2usize,
                                 TopicPermissions {
                                     manage_topic: false,

@@ -16,68 +16,57 @@
  * under the License.
  */
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
+use crate::binary::dispatch::HandlerResult;
 use crate::binary::handlers::users::COMPONENT;
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use err_trail::ErrContext;
-use iggy_common::login_user::LoginUser;
-use iggy_common::{IggyError, SenderKind};
-use secrecy::ExposeSecret;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::requests::users::LoginUserRequest;
+use iggy_binary_protocol::responses::users::IdentityResponse;
+use iggy_common::IggyError;
+use iggy_common::SenderKind;
+use iggy_common::defaults::{
+    MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
+};
 use std::rc::Rc;
 use tracing::{debug, info, instrument, warn};
 
-impl ServerCommandHandler for LoginUser {
-    fn code(&self) -> u32 {
-        iggy_common::LOGIN_USER_CODE
+#[instrument(skip_all, name = "trace_login_user", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+pub async fn handle_login_user(
+    req: LoginUserRequest,
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    if shard.is_shutting_down() {
+        warn!("Rejecting login request during shutdown");
+        return Err(IggyError::Disconnected);
     }
 
-    #[instrument(skip_all, name = "trace_login_user", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        if shard.is_shutting_down() {
-            warn!("Rejecting login request during shutdown");
-            return Err(IggyError::Disconnected);
-        }
-
-        debug!("session: {session}, command: {self}");
-        let LoginUser {
-            username, password, ..
-        } = self;
-        info!("Logging in user: {} ...", &username);
-        let user = shard
-            .login_user(&username, password.expose_secret(), Some(session))
-            .error(|e: &IggyError| {
-                format!(
-                    "{COMPONENT} (error: {e}) - failed to login user with name: {}, session: {session}",
-                    username
-                )
-            })?;
-        info!("Logged in user: {} with ID: {}.", username, user.id);
-
-        let identity_info = mapper::map_identity_info(user.id);
-        sender.send_ok_response(&identity_info).await?;
-        Ok(HandlerResult::Finished)
+    let username = req.username.as_str();
+    let username_len = username.len();
+    if !(MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&username_len) {
+        return Err(IggyError::InvalidUsername);
     }
-}
-
-impl BinaryServerCommand for LoginUser {
-    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::LoginUser(login_user) => Ok(login_user),
-            _ => Err(IggyError::InvalidCommand),
-        }
+    let password_len = req.password.len();
+    if !(MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH).contains(&password_len) {
+        return Err(IggyError::InvalidPassword);
     }
+
+    debug!("session: {session}, command: login_user, username: {username}");
+
+    info!("Logging in user: {username} ...");
+    let user = shard
+        .login_user(username, &req.password, Some(session))
+        .error(|e: &IggyError| {
+            format!(
+                "{COMPONENT} (error: {e}) - failed to login user with name: {username}, session: {session}",
+            )
+        })?;
+    info!("Logged in user: {username} with ID: {}.", user.id);
+
+    let response = IdentityResponse { user_id: user.id };
+    sender.send_ok_response(&response.to_bytes()).await?;
+    Ok(HandlerResult::Finished)
 }

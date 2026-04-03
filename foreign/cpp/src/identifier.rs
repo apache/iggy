@@ -61,3 +61,19 @@ impl TryFrom<ffi::Identifier> for RustIdentifier {
         Ok(rust_identifier)
     }
 }
+
+impl ffi::Identifier {
+    pub fn from_string(&mut self, id: String) -> Result<(), String> {
+        *self = RustIdentifier::named(&id)
+            .map(ffi::Identifier::from)
+            .map_err(|error| format!("Could not create string identifier: {error}"))?;
+        Ok(())
+    }
+
+    pub fn from_numeric(&mut self, id: u32) -> Result<(), String> {
+        *self = RustIdentifier::numeric(id)
+            .map(ffi::Identifier::from)
+            .map_err(|error| format!("Could not create numeric identifier: {error}"))?;
+        Ok(())
+    }
+}

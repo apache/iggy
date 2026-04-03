@@ -27,7 +27,7 @@ impl From<RustStreamDetails> for ffi::StreamDetails {
             size_bytes: stream.size.as_bytes_u64(),
             messages_count: stream.messages_count,
             topics_count: stream.topics_count,
-            topics: stream.topics.into_iter().map(Into::into).collect(),
+            topics: stream.topics.into_iter().map(ffi::Topic::from).collect(),
         }
     }
 }

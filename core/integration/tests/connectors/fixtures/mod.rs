@@ -19,7 +19,9 @@
 
 mod delta;
 mod elasticsearch;
+mod http;
 mod iceberg;
+mod influxdb;
 mod mongodb;
 mod postgres;
 mod quickwit;
@@ -27,7 +29,16 @@ mod wiremock;
 
 pub use delta::{DeltaFixture, DeltaS3Fixture};
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
+pub use http::{
+    HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture,
+    HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture, HttpSinkRawFixture,
+};
 pub use iceberg::{DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergOps, IcebergPreCreatedFixture};
+pub use influxdb::{
+    InfluxDbSinkBase64Fixture, InfluxDbSinkFixture, InfluxDbSinkNoMetadataFixture,
+    InfluxDbSinkNsPrecisionFixture, InfluxDbSinkTextFixture, InfluxDbSourceFixture,
+    InfluxDbSourceRawFixture, InfluxDbSourceTextFixture,
+};
 pub use mongodb::{
     MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,

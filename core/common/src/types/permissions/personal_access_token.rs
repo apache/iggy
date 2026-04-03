@@ -16,28 +16,16 @@
  * under the License.
  */
 
-use crate::utils::serde_secret::serialize_secret;
 use crate::utils::timestamp::IggyTimestamp;
-use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
 /// `RawPersonalAccessToken` represents the raw personal access token - the secured token which is returned only once during the creation.
 /// It consists of the following fields:
 /// - `token`: the unique token that should be securely stored by the user and can be used for authentication.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RawPersonalAccessToken {
     /// The unique token that should be securely stored by the user and can be used for authentication.
-    #[serde(serialize_with = "serialize_secret")]
-    pub token: SecretString,
-}
-
-impl fmt::Debug for RawPersonalAccessToken {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RawPersonalAccessToken")
-            .field("token", &"[REDACTED]")
-            .finish()
-    }
+    pub token: String,
 }
 
 /// `PersonalAccessToken` represents the personal access token. It does not contain the token itself, but the information about the token.

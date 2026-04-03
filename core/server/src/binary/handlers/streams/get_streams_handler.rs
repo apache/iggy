@@ -16,50 +16,48 @@
  * under the License.
  */
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
+use super::get_stream_handler::compute_stream_stats;
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::responses::streams::StreamResponse;
+use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
 use iggy_common::IggyError;
 use iggy_common::SenderKind;
-use iggy_common::get_streams::GetStreams;
 use std::rc::Rc;
 use tracing::debug;
 
-impl ServerCommandHandler for GetStreams {
-    fn code(&self) -> u32 {
-        iggy_common::GET_STREAMS_CODE
+pub async fn handle_get_streams(
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    debug!("session: {session}, command: get_streams");
+    shard.ensure_authenticated(session)?;
+
+    let streams = shard.metadata.query_streams(session.get_user_id())?;
+
+    let mut sorted: Vec<_> = streams.iter().collect();
+    sorted.sort_by_key(|s| s.id);
+
+    let mut wire_streams = Vec::with_capacity(sorted.len());
+    for stream in sorted {
+        let (total_size, total_messages) = compute_stream_stats(stream);
+        wire_streams.push(StreamResponse {
+            id: stream.id as u32,
+            created_at: stream.created_at.into(),
+            topics_count: stream.topics.len() as u32,
+            size_bytes: total_size,
+            messages_count: total_messages,
+            name: WireName::new(stream.name.as_ref()).map_err(|_| IggyError::InvalidCommand)?,
+        });
     }
 
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
-
-        let streams = shard.metadata.query_streams(session.get_user_id())?;
-        let response = mapper::map_streams(&streams);
-        sender.send_ok_response(&response).await?;
-        Ok(HandlerResult::Finished)
-    }
-}
-
-impl BinaryServerCommand for GetStreams {
-    async fn from_sender(
-        sender: &mut SenderKind,
-        code: u32,
-        length: u32,
-    ) -> Result<Self, IggyError> {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::GetStreams(get_streams) => Ok(get_streams),
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+    let response = GetStreamsResponse {
+        streams: wire_streams,
+    };
+    sender.send_ok_response(&response.to_bytes()).await?;
+    Ok(HandlerResult::Finished)
 }

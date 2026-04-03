@@ -16,8 +16,7 @@
  * under the License.
  */
 
-use crate::{BytesSerializable, IggyError};
-use bytes::{BufMut, Bytes, BytesMut};
+use crate::IggyError;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumString};
 
@@ -33,30 +32,6 @@ pub enum ClusterNodeRole {
     Leader,
     /// Follower/Secondary node - read replica
     Follower,
-}
-
-impl BytesSerializable for ClusterNodeRole {
-    fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::with_capacity(1);
-        self.write_to_buffer(&mut bytes);
-        bytes.freeze()
-    }
-
-    fn from_bytes(bytes: Bytes) -> Result<ClusterNodeRole, IggyError> {
-        if bytes.is_empty() {
-            return Err(IggyError::InvalidCommand);
-        }
-
-        ClusterNodeRole::try_from(bytes[0])
-    }
-
-    fn write_to_buffer(&self, buf: &mut BytesMut) {
-        buf.put_u8(*self as u8);
-    }
-
-    fn get_buffer_size(&self) -> usize {
-        1
-    }
 }
 
 impl TryFrom<u8> for ClusterNodeRole {

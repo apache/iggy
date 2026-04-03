@@ -15,6 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Whitelist valid identifiers to avoid typos false positives
+[default.extend-identifiers]
+# NDJSON = Newline Delimited JSON — "NdJson" is valid Rust CamelCase
+NdJson = "NdJson"
+
 # Whitelist valid technical terms to avoid typos false positives
 [default.extend-words]
 # French for coffee, used in UTF-8 test strings (cafe with accent)
@@ -31,6 +36,8 @@ bais = "bais"
 Strat = "Strat"
 # Same as above
 strin = "strin"
+# Valid Rust crate name (part of ICU4X)
+writeable = "writeable"
 
 # Exclude auto-generated/non-editable files from typos check
 [files]
