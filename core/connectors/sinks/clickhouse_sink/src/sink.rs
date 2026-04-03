@@ -143,8 +143,8 @@ impl Sink for ClickHouseSink {
     async fn close(&mut self) -> Result<(), Error> {
         let state = self.state.lock().await;
         info!(
-            "ClickHouse sink ID: {} closed. Processed {} messages, {} errors.",
-            self.id, state.messages_processed, state.errors_count,
+            "ClickHouse sink ID: {} closed. Processed {} messages.",
+            self.id, state.messages_processed,
         );
         self.client = None;
         self.table_schema = None;

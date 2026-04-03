@@ -27,6 +27,7 @@
 //!   Body: row data in the chosen format
 
 use crate::schema::{Column, parse_type};
+use bytes::Bytes;
 use iggy_connector_sdk::Error;
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -187,6 +188,7 @@ impl ClickHouseClient {
             urlencoded(&self.database),
         );
 
+        let body = Bytes::from(body);
         let mut attempts = 0u32;
         loop {
             let result = self
@@ -216,7 +218,7 @@ impl ClickHouseClient {
 
                     if is_retryable_status(status) {
                         attempts += 1;
-                        if attempts >= max_retries {
+                        if attempts > max_retries {
                             error!(
                                 "Insert failed after {attempts} attempts (HTTP {status}): {body_text}"
                             );

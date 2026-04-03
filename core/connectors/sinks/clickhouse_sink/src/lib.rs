@@ -115,7 +115,6 @@ impl StringFormat {
 #[derive(Debug)]
 struct State {
     messages_processed: u64,
-    errors_count: u64,
 }
 
 #[derive(Debug)]
@@ -149,7 +148,6 @@ impl ClickHouseSink {
             retry_delay,
             state: Mutex::new(State {
                 messages_processed: 0,
-                errors_count: 0,
             }),
         }
     }

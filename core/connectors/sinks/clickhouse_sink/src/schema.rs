@@ -210,6 +210,11 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
         let precision: u8 = precision_str
             .parse()
             .map_err(|_| init_err(format!("Invalid DateTime64 precision: {precision_str}")))?;
+        if precision > 9 {
+            return Err(init_err(format!(
+                "DateTime64 precision must be 0-9, got {precision}"
+            )));
+        }
         return Ok(ChType::DateTime64(precision));
     }
     // e.g. "DateTime('UTC')"
@@ -495,6 +500,12 @@ mod tests {
     fn parses_datetime64_with_timezone() {
         let t = parse_type("DateTime64(6, 'UTC')").unwrap();
         assert!(matches!(t, ChType::DateTime64(6)));
+    }
+
+    #[test]
+    fn rejects_datetime64_precision_out_of_range() {
+        assert!(parse_type("DateTime64(10)").is_err());
+        assert!(parse_type("DateTime64(255)").is_err());
     }
 
     #[test]

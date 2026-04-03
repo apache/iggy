@@ -5455,6 +5455,7 @@ name = "iggy_connector_clickhouse_sink"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "dashmap",
  "humantime",
  "iggy_connector_sdk",

@@ -103,20 +103,53 @@ pub(crate) fn serialize_value(
             let s = coerce_to_string(value)?;
             let bytes = s.as_bytes();
             // Pad or truncate to exactly n bytes
-            let mut fixed = vec![0u8; *n];
             let copy_len = bytes.len().min(*n);
-            fixed[..copy_len].copy_from_slice(&bytes[..copy_len]);
-            buf.extend_from_slice(&fixed);
+            buf.extend_from_slice(&bytes[..copy_len]);
+            buf.resize(buf.len() + (n - copy_len), 0u8);
         }
 
         // ── Integers ─────────────────────────────────────────────────────────
-        ChType::Int8 => buf.push(coerce_i64(value)? as i8 as u8),
-        ChType::Int16 => buf.extend_from_slice(&(coerce_i64(value)? as i16).to_le_bytes()),
-        ChType::Int32 => buf.extend_from_slice(&(coerce_i64(value)? as i32).to_le_bytes()),
+        ChType::Int8 => buf.push(i8::try_from(coerce_i64(value)?).map_err(|_| {
+            error!("Value out of range for Int8");
+            Error::InvalidRecord
+        })? as u8),
+        ChType::Int16 => buf.extend_from_slice(
+            &i16::try_from(coerce_i64(value)?)
+                .map_err(|_| {
+                    error!("Value out of range for Int16");
+                    Error::InvalidRecord
+                })?
+                .to_le_bytes(),
+        ),
+        ChType::Int32 => buf.extend_from_slice(
+            &i32::try_from(coerce_i64(value)?)
+                .map_err(|_| {
+                    error!("Value out of range for Int32");
+                    Error::InvalidRecord
+                })?
+                .to_le_bytes(),
+        ),
         ChType::Int64 => buf.extend_from_slice(&coerce_i64(value)?.to_le_bytes()),
-        ChType::UInt8 => buf.push(coerce_u64(value)? as u8),
-        ChType::UInt16 => buf.extend_from_slice(&(coerce_u64(value)? as u16).to_le_bytes()),
-        ChType::UInt32 => buf.extend_from_slice(&(coerce_u64(value)? as u32).to_le_bytes()),
+        ChType::UInt8 => buf.push(u8::try_from(coerce_u64(value)?).map_err(|_| {
+            error!("Value out of range for UInt8");
+            Error::InvalidRecord
+        })?),
+        ChType::UInt16 => buf.extend_from_slice(
+            &u16::try_from(coerce_u64(value)?)
+                .map_err(|_| {
+                    error!("Value out of range for UInt16");
+                    Error::InvalidRecord
+                })?
+                .to_le_bytes(),
+        ),
+        ChType::UInt32 => buf.extend_from_slice(
+            &u32::try_from(coerce_u64(value)?)
+                .map_err(|_| {
+                    error!("Value out of range for UInt32");
+                    Error::InvalidRecord
+                })?
+                .to_le_bytes(),
+        ),
         ChType::UInt64 => buf.extend_from_slice(&coerce_u64(value)?.to_le_bytes()),
 
         // ── Floats ───────────────────────────────────────────────────────────
@@ -183,6 +216,8 @@ pub(crate) fn serialize_value(
         }
         ChType::DateTime64(precision) => {
             // Unix time scaled by 10^precision as Int64.
+            // precision is validated to be 0-9 by the schema parser, so
+            // 10i64.pow(*precision as u32) cannot overflow i64::MAX.
             let secs_f64 = coerce_to_unix_seconds_f64(value)?;
             let scale = 10i64.pow(*precision as u32) as f64;
             let scaled = (secs_f64 * scale).round() as i64;
@@ -195,15 +230,25 @@ pub(crate) fn serialize_value(
             let scale_factor = 10f64.powi(*scale as i32);
             let int_val = (f * scale_factor).round() as i128;
             if *precision <= 9 {
-                buf.extend_from_slice(&(int_val as i32).to_le_bytes());
+                buf.extend_from_slice(
+                    &i32::try_from(int_val)
+                        .map_err(|_| {
+                            error!("Decimal value out of range for precision {precision}");
+                            Error::InvalidRecord
+                        })?
+                        .to_le_bytes(),
+                );
             } else if *precision <= 18 {
-                buf.extend_from_slice(&(int_val as i64).to_le_bytes());
+                buf.extend_from_slice(
+                    &i64::try_from(int_val)
+                        .map_err(|_| {
+                            error!("Decimal value out of range for precision {precision}");
+                            Error::InvalidRecord
+                        })?
+                        .to_le_bytes(),
+                );
             } else {
-                // Int128: two little-endian 64-bit words, low word first
-                let lo = int_val as i64;
-                let hi = (int_val >> 64) as i64;
-                buf.extend_from_slice(&lo.to_le_bytes());
-                buf.extend_from_slice(&hi.to_le_bytes());
+                buf.extend_from_slice(&int_val.to_le_bytes());
             }
         }
 
@@ -377,7 +422,10 @@ fn coerce_i64(value: &OwnedValue) -> Result<i64, Error> {
 fn coerce_u64(value: &OwnedValue) -> Result<u64, Error> {
     match value {
         OwnedValue::Static(simd_json::StaticNode::U64(n)) => Ok(*n),
-        OwnedValue::Static(simd_json::StaticNode::I64(n)) => Ok(*n as u64),
+        OwnedValue::Static(simd_json::StaticNode::I64(n)) => u64::try_from(*n).map_err(|_| {
+            error!("Cannot coerce negative integer {n} to unsigned integer");
+            Error::InvalidRecord
+        }),
         OwnedValue::Static(simd_json::StaticNode::F64(f)) => Ok(*f as u64),
         OwnedValue::String(s) => s.parse::<u64>().map_err(|_| {
             error!("Cannot parse '{s}' as unsigned integer");
@@ -633,6 +681,59 @@ mod tests {
         let mut buf = vec![];
         serialize_value(&json_i64(1000), &ChType::Int32, &mut buf).unwrap();
         assert_eq!(buf, 1000i32.to_le_bytes());
+    }
+
+    #[test]
+    fn serialize_int8_rejects_out_of_range() {
+        let mut buf = vec![];
+        assert!(serialize_value(&json_i64(300), &ChType::Int8, &mut buf).is_err());
+        assert!(serialize_value(&json_i64(-129), &ChType::Int8, &mut buf).is_err());
+    }
+
+    #[test]
+    fn serialize_int16_rejects_out_of_range() {
+        let mut buf = vec![];
+        assert!(serialize_value(&json_i64(32768), &ChType::Int16, &mut buf).is_err());
+        assert!(serialize_value(&json_i64(-32769), &ChType::Int16, &mut buf).is_err());
+    }
+
+    #[test]
+    fn serialize_int32_rejects_out_of_range() {
+        let mut buf = vec![];
+        assert!(
+            serialize_value(&json_i64(i64::from(i32::MAX) + 1), &ChType::Int32, &mut buf).is_err()
+        );
+        assert!(
+            serialize_value(&json_i64(i64::from(i32::MIN) - 1), &ChType::Int32, &mut buf).is_err()
+        );
+    }
+
+    #[test]
+    fn serialize_uint8_rejects_out_of_range() {
+        let mut buf = vec![];
+        assert!(serialize_value(&json_i64(256), &ChType::UInt8, &mut buf).is_err());
+        assert!(serialize_value(&json_i64(-1), &ChType::UInt8, &mut buf).is_err());
+    }
+
+    #[test]
+    fn serialize_uint16_rejects_out_of_range() {
+        let mut buf = vec![];
+        assert!(serialize_value(&json_i64(65536), &ChType::UInt16, &mut buf).is_err());
+        assert!(serialize_value(&json_i64(-1), &ChType::UInt16, &mut buf).is_err());
+    }
+
+    #[test]
+    fn serialize_uint32_rejects_out_of_range() {
+        let mut buf = vec![];
+        assert!(
+            serialize_value(
+                &json_u64(u64::from(u32::MAX) + 1),
+                &ChType::UInt32,
+                &mut buf
+            )
+            .is_err()
+        );
+        assert!(serialize_value(&json_i64(-1), &ChType::UInt32, &mut buf).is_err());
     }
 
     #[test]
@@ -953,10 +1054,25 @@ mod tests {
     }
 
     #[test]
+    fn serialize_decimal32_rejects_out_of_range() {
+        let mut buf = vec![];
+        // i32::MAX = 2_147_483_647; value 1e9 * 100 (scale=2) = 1e11 > i32::MAX
+        assert!(
+            serialize_value(&json_f64(1_000_000_000.0), &ChType::Decimal(9, 2), &mut buf).is_err()
+        );
+    }
+
+    #[test]
+    fn serialize_decimal64_rejects_out_of_range() {
+        let mut buf = vec![];
+        // i64::MAX ~ 9.2e18; value 1e16 * 10^4 (scale=4) = 1e20 > i64::MAX
+        assert!(serialize_value(&json_f64(1e16), &ChType::Decimal(18, 4), &mut buf).is_err());
+    }
+
+    #[test]
     fn serialize_decimal128_two_word_layout() {
         let mut buf = vec![];
-        // Decimal(38, 2): 1.0 → int_val = 100 → fits in i128
-        // Written as two little-endian i64 words: lo=100, hi=0
+        // Decimal(38, 2): 1.0 → int_val = 100 → written as i128::to_le_bytes()
         serialize_value(&json_f64(1.0), &ChType::Decimal(38, 2), &mut buf).unwrap();
         let mut expected = 100i64.to_le_bytes().to_vec();
         expected.extend_from_slice(&0i64.to_le_bytes());

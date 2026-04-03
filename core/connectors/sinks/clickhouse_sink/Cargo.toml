@@ -36,6 +36,7 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 async-trait = { workspace = true }
+bytes = { workspace = true }
 dashmap = { workspace = true }
 humantime = { workspace = true }
 iggy_connector_sdk = { workspace = true }
