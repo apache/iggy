@@ -60,7 +60,8 @@ Then(
   'the stream name should be updated to {string}',
   async function (this: TestWorld, expectedName: string) {
     const stream = await this.client.stream.get({ streamId: this.stream.id });
-    assert.equal(stream.name, expectedName);
+    assert.ok(stream, 'Stream should exist after update');
+    assert.equal(stream!.name, expectedName);
   }
 );
 
