@@ -20,12 +20,12 @@ use crate::cli::common::{
     CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestUserId,
     USAGE_PREFIX,
 };
-use ahash::AHashMap;
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::{Client, Permissions, StreamPermissions, TopicPermissions, UserId, UserStatus};
 use predicates::str::{is_match, starts_with};
 use serial_test::parallel;
+use std::collections::BTreeMap;
 
 enum TestUser<'a> {
     Existing(&'a str),
@@ -89,10 +89,10 @@ impl TestUserGetCmd {
 
                 if let Some(topic_id) = self.check_topic_perms {
                     stream_perms.topics =
-                        Some(AHashMap::from([(topic_id, TopicPermissions::default())]));
+                        Some(BTreeMap::from([(topic_id, TopicPermissions::default())]));
                 };
 
-                permissions.streams = Some(AHashMap::from([(stream_id, stream_perms)]));
+                permissions.streams = Some(BTreeMap::from([(stream_id, stream_perms)]));
             }
 
             Some(permissions)

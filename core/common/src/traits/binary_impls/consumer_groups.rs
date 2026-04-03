@@ -16,17 +16,23 @@
  * under the License.
  */
 
-use crate::BinaryClient;
-
-use crate::create_consumer_group::CreateConsumerGroup;
-use crate::delete_consumer_group::DeleteConsumerGroup;
-use crate::get_consumer_group::GetConsumerGroup;
-use crate::get_consumer_groups::GetConsumerGroups;
-use crate::join_consumer_group::JoinConsumerGroup;
-use crate::leave_consumer_group::LeaveConsumerGroup;
 use crate::traits::binary_auth::fail_if_not_authenticated;
-use crate::traits::binary_mapper;
-use crate::{ConsumerGroup, ConsumerGroupClient, ConsumerGroupDetails, Identifier, IggyError};
+use crate::wire_conversions::{consumer_groups_from_wire, identifier_to_wire};
+use crate::{
+    BinaryClient, ConsumerGroup, ConsumerGroupClient, ConsumerGroupDetails, Identifier, IggyError,
+};
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::codes::{
+    CREATE_CONSUMER_GROUP_CODE, DELETE_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUP_CODE,
+    GET_CONSUMER_GROUPS_CODE, JOIN_CONSUMER_GROUP_CODE, LEAVE_CONSUMER_GROUP_CODE,
+};
+use iggy_binary_protocol::requests::consumer_groups::{
+    CreateConsumerGroupRequest, DeleteConsumerGroupRequest, GetConsumerGroupRequest,
+    GetConsumerGroupsRequest, JoinConsumerGroupRequest, LeaveConsumerGroupRequest,
+};
+use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
+use iggy_binary_protocol::responses::consumer_groups::get_consumer_groups::GetConsumerGroupsResponse;
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> ConsumerGroupClient for B {
@@ -37,18 +43,25 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
         group_id: &Identifier,
     ) -> Result<Option<ConsumerGroupDetails>, IggyError> {
         fail_if_not_authenticated(self).await?;
+        let wire_stream_id = identifier_to_wire(stream_id)?;
+        let wire_topic_id = identifier_to_wire(topic_id)?;
+        let wire_group_id = identifier_to_wire(group_id)?;
         let response = self
-            .send_with_response(&GetConsumerGroup {
-                stream_id: stream_id.clone(),
-                topic_id: topic_id.clone(),
-                group_id: group_id.clone(),
-            })
+            .send_raw_with_response(
+                GET_CONSUMER_GROUP_CODE,
+                GetConsumerGroupRequest {
+                    stream_id: wire_stream_id,
+                    topic_id: wire_topic_id,
+                    group_id: wire_group_id,
+                }
+                .to_bytes(),
+            )
             .await?;
         if response.is_empty() {
             return Ok(None);
         }
-
-        binary_mapper::map_consumer_group(response).map(Some)
+        let wire_resp = super::decode_response::<ConsumerGroupDetailsResponse>(&response)?;
+        Ok(Some(ConsumerGroupDetails::from(wire_resp)))
     }
 
     async fn get_consumer_groups(
@@ -57,13 +70,23 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
         topic_id: &Identifier,
     ) -> Result<Vec<ConsumerGroup>, IggyError> {
         fail_if_not_authenticated(self).await?;
+        let wire_stream_id = identifier_to_wire(stream_id)?;
+        let wire_topic_id = identifier_to_wire(topic_id)?;
         let response = self
-            .send_with_response(&GetConsumerGroups {
-                stream_id: stream_id.clone(),
-                topic_id: topic_id.clone(),
-            })
+            .send_raw_with_response(
+                GET_CONSUMER_GROUPS_CODE,
+                GetConsumerGroupsRequest {
+                    stream_id: wire_stream_id,
+                    topic_id: wire_topic_id,
+                }
+                .to_bytes(),
+            )
             .await?;
-        binary_mapper::map_consumer_groups(response)
+        if response.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wire_resp = super::decode_response::<GetConsumerGroupsResponse>(&response)?;
+        Ok(consumer_groups_from_wire(wire_resp))
     }
 
     async fn create_consumer_group(
@@ -73,14 +96,22 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
         name: &str,
     ) -> Result<ConsumerGroupDetails, IggyError> {
         fail_if_not_authenticated(self).await?;
+        let wire_stream_id = identifier_to_wire(stream_id)?;
+        let wire_topic_id = identifier_to_wire(topic_id)?;
+        let wire_name = WireName::new(name).map_err(|_| IggyError::InvalidFormat)?;
         let response = self
-            .send_with_response(&CreateConsumerGroup {
-                stream_id: stream_id.clone(),
-                topic_id: topic_id.clone(),
-                name: name.to_string(),
-            })
+            .send_raw_with_response(
+                CREATE_CONSUMER_GROUP_CODE,
+                CreateConsumerGroupRequest {
+                    stream_id: wire_stream_id,
+                    topic_id: wire_topic_id,
+                    name: wire_name,
+                }
+                .to_bytes(),
+            )
             .await?;
-        binary_mapper::map_consumer_group(response)
+        let wire_resp = super::decode_response::<ConsumerGroupDetailsResponse>(&response)?;
+        Ok(ConsumerGroupDetails::from(wire_resp))
     }
 
     async fn delete_consumer_group(
@@ -90,11 +121,18 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&DeleteConsumerGroup {
-            stream_id: stream_id.clone(),
-            topic_id: topic_id.clone(),
-            group_id: group_id.clone(),
-        })
+        let wire_stream_id = identifier_to_wire(stream_id)?;
+        let wire_topic_id = identifier_to_wire(topic_id)?;
+        let wire_group_id = identifier_to_wire(group_id)?;
+        self.send_raw_with_response(
+            DELETE_CONSUMER_GROUP_CODE,
+            DeleteConsumerGroupRequest {
+                stream_id: wire_stream_id,
+                topic_id: wire_topic_id,
+                group_id: wire_group_id,
+            }
+            .to_bytes(),
+        )
         .await?;
         Ok(())
     }
@@ -106,11 +144,18 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&JoinConsumerGroup {
-            stream_id: stream_id.clone(),
-            topic_id: topic_id.clone(),
-            group_id: group_id.clone(),
-        })
+        let wire_stream_id = identifier_to_wire(stream_id)?;
+        let wire_topic_id = identifier_to_wire(topic_id)?;
+        let wire_group_id = identifier_to_wire(group_id)?;
+        self.send_raw_with_response(
+            JOIN_CONSUMER_GROUP_CODE,
+            JoinConsumerGroupRequest {
+                stream_id: wire_stream_id,
+                topic_id: wire_topic_id,
+                group_id: wire_group_id,
+            }
+            .to_bytes(),
+        )
         .await?;
         Ok(())
     }
@@ -122,11 +167,18 @@ impl<B: BinaryClient> ConsumerGroupClient for B {
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&LeaveConsumerGroup {
-            stream_id: stream_id.clone(),
-            topic_id: topic_id.clone(),
-            group_id: group_id.clone(),
-        })
+        let wire_stream_id = identifier_to_wire(stream_id)?;
+        let wire_topic_id = identifier_to_wire(topic_id)?;
+        let wire_group_id = identifier_to_wire(group_id)?;
+        self.send_raw_with_response(
+            LEAVE_CONSUMER_GROUP_CODE,
+            LeaveConsumerGroupRequest {
+                stream_id: wire_stream_id,
+                topic_id: wire_topic_id,
+                group_id: wire_group_id,
+            }
+            .to_bytes(),
+        )
         .await?;
         Ok(())
     }

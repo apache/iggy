@@ -22,3 +22,4 @@ pub mod identifier;
 pub mod partitioning;
 pub mod permissions;
 pub mod polling_strategy;
+pub mod user_headers;

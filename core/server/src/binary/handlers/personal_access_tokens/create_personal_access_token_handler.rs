@@ -25,8 +25,10 @@ use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::personal_access_tokens::CreatePersonalAccessTokenRequest;
 use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
-use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-use iggy_common::{IggyError, IggyExpiry, SenderKind, Validatable};
+use iggy_common::defaults::{
+    MAX_PERSONAL_ACCESS_TOKEN_NAME_LENGTH, MIN_PERSONAL_ACCESS_TOKEN_NAME_LENGTH,
+};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -43,16 +45,17 @@ pub async fn handle_create_personal_access_token(
     );
     shard.ensure_authenticated(session)?;
 
-    let command = CreatePersonalAccessToken {
-        name: req.name.to_string(),
-        expiry: IggyExpiry::from(req.expiry),
-    };
-    command.validate()?;
+    let name_len = req.name.as_str().len();
+    if !(MIN_PERSONAL_ACCESS_TOKEN_NAME_LENGTH..=MAX_PERSONAL_ACCESS_TOKEN_NAME_LENGTH)
+        .contains(&name_len)
+    {
+        return Err(IggyError::InvalidPersonalAccessTokenName);
+    }
 
     let request =
         ShardRequest::control_plane(ShardRequestPayload::CreatePersonalAccessTokenRequest {
             user_id: session.get_user_id(),
-            command,
+            command: req,
         });
 
     match shard.send_to_control_plane(request).await? {

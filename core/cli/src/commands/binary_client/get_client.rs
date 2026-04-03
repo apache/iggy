@@ -21,40 +21,32 @@ use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::{Table, presets::ASCII_NO_BORDERS};
 use iggy_common::Client;
-use iggy_common::get_client::GetClient;
 use tracing::{Level, event};
 
 pub struct GetClientCmd {
-    get_client: GetClient,
+    client_id: u32,
 }
 
 impl GetClientCmd {
     pub fn new(client_id: u32) -> Self {
-        Self {
-            get_client: GetClient { client_id },
-        }
+        Self { client_id }
     }
 }
 
 #[async_trait]
 impl CliCommand for GetClientCmd {
     fn explain(&self) -> String {
-        format!("get client with ID: {}", self.get_client.client_id)
+        format!("get client with ID: {}", self.client_id)
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let client_details = client
-            .get_client(self.get_client.client_id)
+            .get_client(self.client_id)
             .await
-            .with_context(|| {
-                format!(
-                    "Problem getting client with ID: {}",
-                    self.get_client.client_id
-                )
-            })?;
+            .with_context(|| format!("Problem getting client with ID: {}", self.client_id))?;
 
         if client_details.is_none() {
-            event!(target: PRINT_TARGET, Level::INFO, "Client with ID: {} was not found", self.get_client.client_id);
+            event!(target: PRINT_TARGET, Level::INFO, "Client with ID: {} was not found", self.client_id);
             return Ok(());
         }
 

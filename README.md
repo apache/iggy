@@ -91,15 +91,15 @@ This is the high-level architecture of the Iggy message streaming server, where 
 
 ## Version
 
-The official releases follow the regular semver (`0.5.0`) or have `latest` tag applied (`apache/iggy:latest`).
+The official releases follow the regular semver (`0.7.0`) or have `latest` tag applied (`apache/iggy:latest`).
 
-We do also publish edge/dev/nightly releases (e.g. `0.6.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
+We do also publish edge/dev/nightly releases (e.g. `0.7.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
 
 ---
 
 ## Roadmap
 
-- **Clustering** & data replication based on **[VSR](http://pmg.csail.mit.edu/papers/vr-revisited.pdf)** (on sandbox project using Raft, will be implemented after shared-nothing design is completed)
+- **Clustering** & data replication based on **[VSR](https://github.com/apache/iggy/blob/master/assets/vsr.pdf)** (coming soon)
 
 ---
 
@@ -112,7 +112,7 @@ We do also publish edge/dev/nightly releases (e.g. `0.6.0-edge.1` or `apache/igg
 - [Node.js (TypeScript)](https://www.npmjs.com/package/apache-iggy)
 - [Go](https://pkg.go.dev/github.com/apache/iggy/foreign/go)
 
-C++ and Elixir are work in progress.
+[C++](https://github.com/apache/iggy/tree/master/foreign/cpp) is work in progress.
 
 ---
 

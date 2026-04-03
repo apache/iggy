@@ -29,6 +29,7 @@ crate-type = ["staticlib"]
 [dependencies]
 cxx = "1.0.194"
 iggy = { path = "../../core/sdk" }
+iggy_common = { path = "../../core/common" }
 tokio = { version = "1.49.0", features = ["rt-multi-thread"] }
 
 [build-dependencies]

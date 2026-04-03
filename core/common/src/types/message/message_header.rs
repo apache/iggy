@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::{BytesSerializable, Sizeable, error::IggyError, utils::byte_size::IggyByteSize};
+use crate::{Sizeable, error::IggyError, utils::byte_size::IggyByteSize};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
@@ -107,10 +107,8 @@ impl IggyMessageHeader {
             },
         })
     }
-}
 
-impl BytesSerializable for IggyMessageHeader {
-    fn to_bytes(&self) -> Bytes {
+    pub fn to_bytes(&self) -> Bytes {
         let mut bytes = BytesMut::with_capacity(self.get_size_bytes().as_bytes_usize());
         bytes.put_u64_le(self.checksum);
         bytes.put_u128_le(self.id);
@@ -123,7 +121,7 @@ impl BytesSerializable for IggyMessageHeader {
         bytes.freeze()
     }
 
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
+    pub fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
         if bytes.len() != IGGY_MESSAGE_HEADER_SIZE {
             return Err(IggyError::InvalidCommand);
         }

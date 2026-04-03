@@ -32,11 +32,11 @@ use bytes::Bytes;
 use chrono::Local;
 use err_trail::ErrContext;
 use iggy_common::Stats;
-use iggy_common::Validatable;
 use iggy_common::get_snapshot::GetSnapshot;
-use iggy_common::{ClientInfo, ClientInfoDetails, ClusterMetadata, IggyError};
+use iggy_common::{ClientInfo, ClientInfoDetails, ClusterMetadata, IggyError, SystemSnapshotType};
 use send_wrapper::SendWrapper;
 use std::sync::Arc;
+use tracing::error;
 
 const NAME: &str = "Iggy API";
 const PONG: &str = "pong";
@@ -131,7 +131,11 @@ async fn get_snapshot(
     Extension(_identity): Extension<Identity>,
     Json(command): Json<GetSnapshot>,
 ) -> Result<impl IntoResponse, CustomError> {
-    command.validate()?;
+    if command.snapshot_types.contains(&SystemSnapshotType::All) && command.snapshot_types.len() > 1
+    {
+        error!("When using 'All' snapshot type, no other types can be specified");
+        return Err(IggyError::InvalidCommand.into());
+    }
 
     let snapshot_future = SendWrapper::new(
         state

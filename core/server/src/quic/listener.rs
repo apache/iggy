@@ -26,8 +26,8 @@ use compio::io::AsyncReadExt;
 use compio::quic::{Connection, Endpoint, RecvStream, SendStream};
 use futures::FutureExt;
 use iggy_binary_protocol::RequestFrame;
-use iggy_binary_protocol::codes::{SEND_MESSAGES_CODE, command_name};
-use iggy_common::{GET_CLUSTER_METADATA_CODE, IggyError, SenderKind, TransportProtocol};
+use iggy_binary_protocol::codes::{GET_CLUSTER_METADATA_CODE, SEND_MESSAGES_CODE, command_name};
+use iggy_common::{IggyError, SenderKind, TransportProtocol};
 use std::rc::Rc;
 use tracing::{debug, error, info, trace, warn};
 

@@ -22,6 +22,7 @@
 #include <gtest/gtest.h>
 
 #include "lib.rs.h"
+#include "tests/common/test_helpers.hpp"
 
 TEST(LowLevelE2E_Client, ConnectAndLogin) {
     RecordProperty("description", "Connects and logs in successfully using each supported connection string format.");
