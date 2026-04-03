@@ -87,9 +87,10 @@ pub struct Column {
 
 /// Supported ClickHouse column types.
 ///
-/// Unsupported types (LowCardinality, Variant, the new JSON column type, geo
-/// types) cause `parse_type` to return an error, which in turn makes `open()`
-/// fail rather than silently producing corrupt data.
+/// Unsupported types (Variant, the new JSON column type, geo types) cause
+/// `parse_type` to return an error, which in turn makes `open()` fail rather
+/// than silently producing corrupt data. `LowCardinality(T)` is transparently
+/// unwrapped to `T` since RowBinary serialises it identically.
 #[derive(Debug, Clone)]
 pub enum ChType {
     // ── Primitives ──────────────────────────────────────────────────────────
@@ -156,6 +157,11 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
     // e.g. "Nullable(Int32)"
     if let Some(inner) = strip_wrapper(s, "Nullable") {
         return Ok(ChType::Nullable(Box::new(parse_type_inner(inner)?)));
+    }
+    // e.g. "LowCardinality(String)" — serialised identically to the inner type
+    // in RowBinary format, so just unwrap it.
+    if let Some(inner) = strip_wrapper(s, "LowCardinality") {
+        return parse_type_inner(inner);
     }
     // e.g. "Array(String)"
     if let Some(inner) = strip_wrapper(s, "Array") {
@@ -283,12 +289,6 @@ fn parse_type_inner(s: &str) -> Result<ChType, Error> {
         "IPv6" => Ok(ChType::IPv6),
 
         // ── Explicitly unsupported ─────────────────────────────────────────
-        s if s.starts_with("LowCardinality") => {
-            error!(
-                "Unsupported ClickHouse type: {s}. LowCardinality uses dictionary encoding that is not supported in RowBinary mode."
-            );
-            Err(init_err(format!("Unsupported type: {s}")))
-        }
         s if s.starts_with("Variant") => {
             error!("Unsupported ClickHouse type: {s}. Variant is not supported in RowBinary mode.");
             Err(init_err(format!("Unsupported type: {s}")))
@@ -611,8 +611,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_low_cardinality() {
-        assert!(parse_type("LowCardinality(String)").is_err());
+    fn parses_low_cardinality() {
+        assert_eq!(parse_type("LowCardinality(String)").unwrap(), ChType::String);
+        assert_eq!(
+            parse_type("LowCardinality(FixedString(16))").unwrap(),
+            ChType::FixedString(16)
+        );
+        assert_eq!(
+            parse_type("Nullable(LowCardinality(String))").unwrap(),
+            ChType::Nullable(Box::new(ChType::String))
+        );
     }
 
     #[test]

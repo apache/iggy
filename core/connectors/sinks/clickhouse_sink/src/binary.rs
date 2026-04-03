@@ -181,13 +181,26 @@ pub(crate) fn serialize_value(
         // Input: standard hyphenated UUID string "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
         ChType::Uuid => {
             let s = coerce_to_string(value)?;
-            let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-            if hex.len() != 32 {
-                error!("Invalid UUID string: {s}");
+            let b = s.as_bytes();
+            // Validate hyphenated UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+            if b.len() != 36 || b[8] != b'-' || b[13] != b'-' || b[18] != b'-' || b[23] != b'-' {
+                error!("Invalid UUID string (expected xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx): {s}");
                 return Err(Error::InvalidRecord);
             }
-            let bytes = hex::decode(&hex).map_err(|_| {
-                error!("Cannot decode UUID hex: {hex}");
+            // Copy hex segments into a stack buffer, skipping the 4 dashes
+            let mut hex = [0u8; 32];
+            let segments: [&[u8]; 5] = [&b[0..8], &b[9..13], &b[14..18], &b[19..23], &b[24..36]];
+            let mut i = 0;
+            for seg in segments {
+                hex[i..i + seg.len()].copy_from_slice(seg);
+                i += seg.len();
+            }
+            let hex_str = std::str::from_utf8(&hex).map_err(|_| {
+                error!("Cannot decode UUID hex: {s}");
+                Error::InvalidRecord
+            })?;
+            let bytes = hex::decode(hex_str).map_err(|_| {
+                error!("Cannot decode UUID hex: {s}");
                 Error::InvalidRecord
             })?;
             // ClickHouse UUID layout: first 8 bytes reversed, second 8 bytes reversed
