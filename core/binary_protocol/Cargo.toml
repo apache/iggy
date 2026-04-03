@@ -33,7 +33,7 @@ bytemuck = { workspace = true }
 bytes = { workspace = true }
 enumset = { workspace = true }
 iobuf = { workspace = true }
-smallvec = "1.13"
+smallvec = { workspace = true }
 thiserror = { workspace = true }
 
 [lints.clippy]
