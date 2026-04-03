@@ -16,44 +16,53 @@
  * under the License.
  */
 
-use crate::BinaryClient;
-use crate::change_password::ChangePassword;
-use crate::create_user::CreateUser;
-use crate::delete_user::DeleteUser;
-use crate::get_user::GetUser;
-use crate::get_users::GetUsers;
-use crate::login_user::LoginUser;
-use crate::logout_user::LogoutUser;
 use crate::traits::binary_auth::fail_if_not_authenticated;
-use crate::traits::binary_mapper;
-use crate::update_permissions::UpdatePermissions;
-use crate::update_user::UpdateUser;
+use crate::wire_conversions::{identifier_to_wire, permissions_to_wire, users_from_wire};
 use crate::{
-    ClientState, DiagnosticEvent, Identifier, IdentityInfo, IggyError, Permissions, UserClient,
-    UserInfo, UserInfoDetails, UserStatus,
+    BinaryClient, ClientState, DiagnosticEvent, Identifier, IdentityInfo, IggyError, Permissions,
+    UserClient, UserInfo, UserInfoDetails, UserStatus,
 };
-use secrecy::SecretString;
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::codes::{
+    CHANGE_PASSWORD_CODE, CREATE_USER_CODE, DELETE_USER_CODE, GET_USER_CODE, GET_USERS_CODE,
+    LOGIN_USER_CODE, LOGOUT_USER_CODE, UPDATE_PERMISSIONS_CODE, UPDATE_USER_CODE,
+};
+use iggy_binary_protocol::requests::users::{
+    ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, GetUserRequest, GetUsersRequest,
+    LoginUserRequest, LogoutUserRequest, UpdatePermissionsRequest, UpdateUserRequest,
+};
+use iggy_binary_protocol::responses::users::login_user::IdentityResponse;
+use iggy_binary_protocol::responses::users::{GetUsersResponse, UserDetailsResponse};
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> UserClient for B {
     async fn get_user(&self, user_id: &Identifier) -> Result<Option<UserInfoDetails>, IggyError> {
         fail_if_not_authenticated(self).await?;
+        let wire_id = identifier_to_wire(user_id)?;
         let response = self
-            .send_with_response(&GetUser {
-                user_id: user_id.clone(),
-            })
+            .send_raw_with_response(
+                GET_USER_CODE,
+                GetUserRequest { user_id: wire_id }.to_bytes(),
+            )
             .await?;
         if response.is_empty() {
             return Ok(None);
         }
-
-        binary_mapper::map_user(response).map(Some)
+        let wire_resp = super::decode_response::<UserDetailsResponse>(&response)?;
+        UserInfoDetails::try_from(wire_resp).map(Some)
     }
 
     async fn get_users(&self) -> Result<Vec<UserInfo>, IggyError> {
         fail_if_not_authenticated(self).await?;
-        let response = self.send_with_response(&GetUsers {}).await?;
-        binary_mapper::map_users(response)
+        let response = self
+            .send_raw_with_response(GET_USERS_CODE, GetUsersRequest.to_bytes())
+            .await?;
+        if response.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wire_resp = super::decode_response::<GetUsersResponse>(&response)?;
+        users_from_wire(wire_resp)
     }
 
     async fn create_user(
@@ -64,22 +73,31 @@ impl<B: BinaryClient> UserClient for B {
         permissions: Option<Permissions>,
     ) -> Result<UserInfoDetails, IggyError> {
         fail_if_not_authenticated(self).await?;
+        let wire_name = WireName::new(username).map_err(|_| IggyError::InvalidFormat)?;
+        let wire_perms = permissions.as_ref().map(permissions_to_wire);
         let response = self
-            .send_with_response(&CreateUser {
-                username: username.to_string(),
-                password: SecretString::from(password),
-                status,
-                permissions,
-            })
+            .send_raw_with_response(
+                CREATE_USER_CODE,
+                CreateUserRequest {
+                    username: wire_name,
+                    password: password.to_string(),
+                    status: status.as_code(),
+                    permissions: wire_perms,
+                }
+                .to_bytes(),
+            )
             .await?;
-        binary_mapper::map_user(response)
+        let wire_resp = super::decode_response::<UserDetailsResponse>(&response)?;
+        UserInfoDetails::try_from(wire_resp)
     }
 
     async fn delete_user(&self, user_id: &Identifier) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&DeleteUser {
-            user_id: user_id.clone(),
-        })
+        let wire_id = identifier_to_wire(user_id)?;
+        self.send_raw_with_response(
+            DELETE_USER_CODE,
+            DeleteUserRequest { user_id: wire_id }.to_bytes(),
+        )
         .await?;
         Ok(())
     }
@@ -91,11 +109,20 @@ impl<B: BinaryClient> UserClient for B {
         status: Option<UserStatus>,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&UpdateUser {
-            user_id: user_id.clone(),
-            username: username.map(|s| s.to_string()),
-            status,
-        })
+        let wire_id = identifier_to_wire(user_id)?;
+        let wire_username = username
+            .map(WireName::new)
+            .transpose()
+            .map_err(|_| IggyError::InvalidFormat)?;
+        self.send_raw_with_response(
+            UPDATE_USER_CODE,
+            UpdateUserRequest {
+                user_id: wire_id,
+                username: wire_username,
+                status: status.map(|s| s.as_code()),
+            }
+            .to_bytes(),
+        )
         .await?;
         Ok(())
     }
@@ -106,10 +133,16 @@ impl<B: BinaryClient> UserClient for B {
         permissions: Option<Permissions>,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&UpdatePermissions {
-            user_id: user_id.clone(),
-            permissions,
-        })
+        let wire_id = identifier_to_wire(user_id)?;
+        let wire_perms = permissions.as_ref().map(permissions_to_wire);
+        self.send_raw_with_response(
+            UPDATE_PERMISSIONS_CODE,
+            UpdatePermissionsRequest {
+                user_id: wire_id,
+                permissions: wire_perms,
+            }
+            .to_bytes(),
+        )
         .await?;
         Ok(())
     }
@@ -121,32 +154,44 @@ impl<B: BinaryClient> UserClient for B {
         new_password: &str,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&ChangePassword {
-            user_id: user_id.clone(),
-            current_password: SecretString::from(current_password),
-            new_password: SecretString::from(new_password),
-        })
+        let wire_id = identifier_to_wire(user_id)?;
+        self.send_raw_with_response(
+            CHANGE_PASSWORD_CODE,
+            ChangePasswordRequest {
+                user_id: wire_id,
+                current_password: current_password.to_string(),
+                new_password: new_password.to_string(),
+            }
+            .to_bytes(),
+        )
         .await?;
         Ok(())
     }
 
     async fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
+        let wire_name = WireName::new(username).map_err(|_| IggyError::InvalidFormat)?;
         let response = self
-            .send_with_response(&LoginUser {
-                username: username.to_string(),
-                password: SecretString::from(password),
-                version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                context: Some("".to_string()),
-            })
+            .send_raw_with_response(
+                LOGIN_USER_CODE,
+                LoginUserRequest {
+                    username: wire_name,
+                    password: password.to_string(),
+                    version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    context: Some(String::new()),
+                }
+                .to_bytes(),
+            )
             .await?;
         self.set_state(ClientState::Authenticated).await;
         self.publish_event(DiagnosticEvent::SignedIn).await;
-        binary_mapper::map_identity_info(response)
+        let wire_resp = super::decode_response::<IdentityResponse>(&response)?;
+        Ok(IdentityInfo::from(wire_resp))
     }
 
     async fn logout_user(&self) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&LogoutUser {}).await?;
+        self.send_raw_with_response(LOGOUT_USER_CODE, LogoutUserRequest.to_bytes())
+            .await?;
         self.set_state(ClientState::Connected).await;
         self.publish_event(DiagnosticEvent::SignedOut).await;
         Ok(())

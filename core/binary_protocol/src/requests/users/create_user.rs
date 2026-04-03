@@ -42,8 +42,10 @@ impl WireEncode for CreateUserRequest {
             + self.password.len()
             + 1 // status
             + 1 // has_permissions
-            + 4 // permissions_len (always present)
-            + self.permissions.as_ref().map_or(0, WireEncode::encoded_size)
+            + self
+                .permissions
+                .as_ref()
+                .map_or(0, |p| 4 + p.encoded_size())
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -60,7 +62,6 @@ impl WireEncode for CreateUserRequest {
             buf.put_slice(&perm_bytes);
         } else {
             buf.put_u8(0);
-            buf.put_u32_le(0);
         }
     }
 }
@@ -80,10 +81,9 @@ impl WireDecode for CreateUserRequest {
         let has_permissions = read_u8(buf, pos)?;
         pos += 1;
 
-        let perm_len = read_u32_le(buf, pos)? as usize;
-        pos += 4;
-
-        let permissions = if has_permissions == 1 && perm_len > 0 {
+        let permissions = if has_permissions == 1 {
+            let perm_len = read_u32_le(buf, pos)? as usize;
+            pos += 4;
             let (perms, consumed) = WirePermissions::decode(&buf[pos..])?;
             if consumed != perm_len {
                 return Err(WireError::Validation(Cow::Owned(format!(
@@ -197,8 +197,8 @@ mod tests {
         };
         let bytes = req.to_bytes();
         // username: [1, b'u'] + password: [1, b'p'] + status: [0]
-        // + has_perm: [0] + perm_len: [0,0,0,0]
-        let expected: &[u8] = &[1, b'u', 1, b'p', 0, 0, 0, 0, 0, 0];
+        // + has_perm: [0]
+        let expected: &[u8] = &[1, b'u', 1, b'p', 0, 0];
         assert_eq!(&bytes[..], expected);
     }
 }

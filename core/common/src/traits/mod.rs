@@ -18,9 +18,7 @@
 pub(crate) mod binary_auth;
 pub(crate) mod binary_client;
 mod binary_impls;
-pub(crate) mod binary_mapper;
 pub(crate) mod binary_transport;
-pub(crate) mod bytes_serializable;
 pub(crate) mod client;
 pub(crate) mod cluster_client;
 pub(crate) mod consumer_group_client;

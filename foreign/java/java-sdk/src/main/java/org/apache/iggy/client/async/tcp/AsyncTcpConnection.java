@@ -26,6 +26,7 @@ import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
+import io.netty.channel.ConnectTimeoutException;
 import io.netty.channel.IoEventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -38,6 +39,7 @@ import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.util.concurrent.FutureListener;
 import org.apache.iggy.exception.IggyClientException;
+import org.apache.iggy.exception.IggyConnectionException;
 import org.apache.iggy.exception.IggyEmptyResponseException;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.exception.IggyNotConnectedException;
@@ -49,6 +51,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.net.ssl.SSLException;
 import java.io.File;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -65,6 +68,7 @@ import java.util.function.Function;
  */
 public class AsyncTcpConnection {
     private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
+    private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
 
     private final IoEventLoopGroup eventLoopGroup;
     private final FixedChannelPool channelPool;
@@ -80,7 +84,8 @@ public class AsyncTcpConnection {
             int port,
             boolean enableTls,
             Optional<File> tlsCertificate,
-            TCPConnectionPoolConfig poolConfig) {
+            TCPConnectionPoolConfig poolConfig,
+            Optional<Duration> connectionTimeout) {
         this.eventLoopGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
 
         SslContext sslContext = null;
@@ -98,7 +103,8 @@ public class AsyncTcpConnection {
                 .group(eventLoopGroup)
                 .channel(NioSocketChannel.class)
                 .option(ChannelOption.TCP_NODELAY, true)
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 3000)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int)
+                        connectionTimeout.orElse(DEFAULT_CONNECTION_TIMEOUT).toMillis())
                 .option(ChannelOption.SO_KEEPALIVE, true)
                 .remoteAddress(host, port);
 
@@ -124,7 +130,12 @@ public class AsyncTcpConnection {
                 channelPool.release(f.getNow());
                 future.complete(null);
             } else {
-                future.completeExceptionally(f.cause());
+                Throwable cause = f.cause();
+                if (cause instanceof ConnectTimeoutException) {
+                    future.completeExceptionally(new IggyConnectionException("Connection timeout", cause));
+                } else {
+                    future.completeExceptionally(cause);
+                }
             }
         });
         return future;

@@ -18,35 +18,13 @@
 
 use bytes::Bytes;
 use iggy::prelude::*;
+use iggy_common::TransportProtocol;
 use integration::harness::{TestHarness, TestServerConfig};
 use serial_test::parallel;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use test_case::test_matrix;
-
-fn encryption_enabled() -> bool {
-    true
-}
-
-fn encryption_disabled() -> bool {
-    false
-}
-
-fn build_server_config(encryption: bool) -> TestServerConfig {
-    let mut extra_envs = HashMap::new();
-
-    if encryption {
-        extra_envs.insert(
-            "IGGY_SYSTEM_ENCRYPTION_ENABLED".to_string(),
-            "true".to_string(),
-        );
-        extra_envs.insert(
-            "IGGY_SYSTEM_ENCRYPTION_KEY".to_string(),
-            "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=".to_string(),
-        );
-    }
-
-    TestServerConfig::builder().extra_envs(extra_envs).build()
-}
 
 #[test_matrix(
     [encryption_enabled(), encryption_disabled()]
@@ -85,7 +63,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
     let mut messages_batch_1 = Vec::new();
 
     for i in 0..messages_per_batch {
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert(HeaderKey::try_from("batch").unwrap(), 1u64.into());
         headers.insert(HeaderKey::try_from("index").unwrap(), i.into());
         headers.insert(
@@ -127,6 +105,43 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .unwrap();
 
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Verify on-disk encryption of headers and payload
+    let data_path = harness.server().data_path();
+    let log_files = find_log_files(&data_path);
+    assert!(
+        !log_files.is_empty(),
+        "Expected at least one .log segment file on disk"
+    );
+    let all_raw_bytes: Vec<u8> = log_files
+        .iter()
+        .flat_map(|p| std::fs::read(p).unwrap())
+        .collect();
+    let contains_plaintext_header = all_raw_bytes
+        .windows(b"test-message".len())
+        .any(|w| w == b"test-message");
+    let contains_plaintext_payload = all_raw_bytes
+        .windows(b"Message batch 1".len())
+        .any(|w| w == b"Message batch 1");
+    if encryption {
+        assert!(
+            !contains_plaintext_header,
+            "When encryption is enabled, header values must NOT appear as plaintext on disk"
+        );
+        assert!(
+            !contains_plaintext_payload,
+            "When encryption is enabled, payload must NOT appear as plaintext on disk"
+        );
+    } else {
+        assert!(
+            contains_plaintext_header,
+            "When encryption is disabled, header values should appear as plaintext on disk"
+        );
+        assert!(
+            contains_plaintext_payload,
+            "When encryption is disabled, payload should appear as plaintext on disk"
+        );
+    }
 
     let initial_stats = client.get_stats().await.unwrap();
     let initial_messages_count = initial_stats.messages_count;
@@ -202,7 +217,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
     let mut messages_batch_2 = Vec::new();
 
     for i in 0..messages_per_batch {
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert(HeaderKey::try_from("batch").unwrap(), 2u64.into());
         headers.insert(HeaderKey::try_from("index").unwrap(), i.into());
         headers.insert(
@@ -316,4 +331,191 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         final_stats.messages_size_bytes.as_bytes_u64(),
         initial_messages_size.as_bytes_u64()
     );
+}
+
+#[test_matrix(
+    [TransportProtocol::Tcp, TransportProtocol::Http, TransportProtocol::Quic, TransportProtocol::WebSocket]
+)]
+#[tokio::test]
+#[parallel]
+async fn should_encrypt_and_decrypt_headers_with_client_side_encryption(
+    transport: TransportProtocol,
+) {
+    let mut harness = TestHarness::builder()
+        .server(TestServerConfig::default())
+        .build()
+        .unwrap();
+
+    harness.start().await.unwrap();
+
+    let setup_client = harness.tcp_root_client().await.unwrap();
+    let stream_name = format!("client-enc-{transport}");
+    let topic_name = "enc-topic";
+
+    setup_client.create_stream(&stream_name).await.unwrap();
+    setup_client
+        .create_topic(
+            &Identifier::named(&stream_name).unwrap(),
+            topic_name,
+            1,
+            CompressionAlgorithm::default(),
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+        .unwrap();
+
+    let encryptor = Arc::new(EncryptorKind::Aes256Gcm(
+        Aes256GcmEncryptor::new(&[42u8; 32]).unwrap(),
+    ));
+
+    let encrypting_client = harness
+        .client_builder_for(transport)
+        .unwrap()
+        .with_encryptor(encryptor)
+        .with_root_login()
+        .connect()
+        .await
+        .unwrap();
+
+    let stream_id = Identifier::named(&stream_name).unwrap();
+    let topic_id = Identifier::named(topic_name).unwrap();
+
+    let mut messages = Vec::new();
+    for i in 0..10i64 {
+        let mut headers = BTreeMap::new();
+        headers.insert(HeaderKey::try_from("index").unwrap(), HeaderValue::from(i));
+        headers.insert(
+            HeaderKey::try_from("transport").unwrap(),
+            HeaderValue::try_from(transport.to_string().as_str()).unwrap(),
+        );
+
+        messages.push(
+            IggyMessage::builder()
+                .id((i + 1) as u128)
+                .payload(Bytes::from(format!("client encrypted msg {i}")))
+                .user_headers(headers)
+                .build()
+                .unwrap(),
+        );
+    }
+
+    encrypting_client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+
+    let polled = encrypting_client
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            Some(0),
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(polled.messages.len(), 10);
+    for (i, msg) in polled.messages.iter().enumerate() {
+        assert_eq!(
+            std::str::from_utf8(&msg.payload).unwrap(),
+            format!("client encrypted msg {i}")
+        );
+
+        let headers = msg.user_headers_map().unwrap().unwrap();
+        assert_eq!(
+            headers
+                .get(&HeaderKey::try_from("index").unwrap())
+                .unwrap()
+                .as_int64()
+                .unwrap(),
+            i as i64
+        );
+        assert_eq!(
+            headers
+                .get(&HeaderKey::try_from("transport").unwrap())
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            transport.to_string().as_str()
+        );
+    }
+
+    let client_without_encryptor = harness.root_client_for(transport).await.unwrap();
+    let polled_without_decryption = client_without_encryptor
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            Some(0),
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(polled_without_decryption.messages.len(), 10);
+    for msg in &polled_without_decryption.messages {
+        let payload_text = std::str::from_utf8(&msg.payload).unwrap_or("");
+        assert!(
+            !payload_text.starts_with("client encrypted msg"),
+            "Payload must not be readable without the encryptor"
+        );
+
+        let headers = msg.user_headers_map().unwrap();
+        assert!(
+            headers.is_none(),
+            "Headers must not be parseable without the encryptor"
+        );
+    }
+}
+
+fn encryption_enabled() -> bool {
+    true
+}
+
+fn encryption_disabled() -> bool {
+    false
+}
+
+fn build_server_config(encryption: bool) -> TestServerConfig {
+    let mut extra_envs = HashMap::new();
+
+    if encryption {
+        extra_envs.insert(
+            "IGGY_SYSTEM_ENCRYPTION_ENABLED".to_string(),
+            "true".to_string(),
+        );
+        extra_envs.insert(
+            "IGGY_SYSTEM_ENCRYPTION_KEY".to_string(),
+            "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=".to_string(),
+        );
+    }
+
+    TestServerConfig::builder().extra_envs(extra_envs).build()
+}
+
+fn find_log_files(dir: &Path) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                result.extend(find_log_files(&path));
+            } else if path.extension().and_then(|e| e.to_str()) == Some("log") {
+                result.push(path);
+            }
+        }
+    }
+    result
 }

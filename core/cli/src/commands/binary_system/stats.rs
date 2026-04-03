@@ -21,7 +21,6 @@ use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::Client;
-use iggy_common::get_stats::GetStats;
 use std::fmt::Display;
 use std::time::SystemTime;
 use tracing::{Level, event};
@@ -48,16 +47,11 @@ impl Display for GetStatsOutput {
 pub struct GetStatsCmd {
     quiet_mode: bool,
     output: GetStatsOutput,
-    _get_stats: GetStats,
 }
 
 impl GetStatsCmd {
     pub fn new(quiet_mode: bool, output: GetStatsOutput) -> Self {
-        Self {
-            quiet_mode,
-            output,
-            _get_stats: GetStats {},
-        }
+        Self { quiet_mode, output }
     }
 }
 

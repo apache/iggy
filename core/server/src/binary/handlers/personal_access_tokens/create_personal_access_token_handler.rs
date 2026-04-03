@@ -16,66 +16,58 @@
  * under the License.
  */
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
-use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::requests::personal_access_tokens::CreatePersonalAccessTokenRequest;
+use iggy_binary_protocol::responses::personal_access_tokens::RawPersonalAccessTokenResponse;
+use iggy_common::defaults::{
+    MAX_PERSONAL_ACCESS_TOKEN_NAME_LENGTH, MIN_PERSONAL_ACCESS_TOKEN_NAME_LENGTH,
+};
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
-impl ServerCommandHandler for CreatePersonalAccessToken {
-    fn code(&self) -> u32 {
-        iggy_common::CREATE_PERSONAL_ACCESS_TOKEN_CODE
-    }
+#[instrument(skip_all, name = "trace_create_personal_access_token", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+pub async fn handle_create_personal_access_token(
+    req: CreatePersonalAccessTokenRequest,
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    debug!(
+        "session: {session}, command: create_personal_access_token, name: {}",
+        req.name.as_str()
+    );
+    shard.ensure_authenticated(session)?;
 
-    #[instrument(skip_all, name = "trace_create_personal_access_token", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
-
-        let request =
-            ShardRequest::control_plane(ShardRequestPayload::CreatePersonalAccessTokenRequest {
-                user_id: session.get_user_id(),
-                command: self,
-            });
-
-        match shard.send_to_control_plane(request).await? {
-            ShardResponse::CreatePersonalAccessTokenResponse(_, token) => {
-                sender
-                    .send_ok_response(&mapper::map_raw_pat(&token))
-                    .await?;
-            }
-            ShardResponse::ErrorResponse(err) => return Err(err),
-            _ => unreachable!("Expected CreatePersonalAccessTokenResponse"),
-        }
-
-        Ok(HandlerResult::Finished)
-    }
-}
-
-impl BinaryServerCommand for CreatePersonalAccessToken {
-    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
-    where
-        Self: Sized,
+    let name_len = req.name.as_str().len();
+    if !(MIN_PERSONAL_ACCESS_TOKEN_NAME_LENGTH..=MAX_PERSONAL_ACCESS_TOKEN_NAME_LENGTH)
+        .contains(&name_len)
     {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::CreatePersonalAccessToken(create_personal_access_token) => {
-                Ok(create_personal_access_token)
-            }
-            _ => Err(IggyError::InvalidCommand),
-        }
+        return Err(IggyError::InvalidPersonalAccessTokenName);
     }
+
+    let request =
+        ShardRequest::control_plane(ShardRequestPayload::CreatePersonalAccessTokenRequest {
+            user_id: session.get_user_id(),
+            command: req,
+        });
+
+    match shard.send_to_control_plane(request).await? {
+        ShardResponse::CreatePersonalAccessTokenResponse(_, token) => {
+            let response = RawPersonalAccessTokenResponse {
+                token: WireName::new(token).map_err(|_| IggyError::InvalidCommand)?,
+            };
+            sender.send_ok_response(&response.to_bytes()).await?;
+        }
+        ShardResponse::ErrorResponse(err) => return Err(err),
+        _ => unreachable!("Expected CreatePersonalAccessTokenResponse"),
+    }
+
+    Ok(HandlerResult::Finished)
 }

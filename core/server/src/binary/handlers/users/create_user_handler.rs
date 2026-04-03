@@ -16,63 +16,68 @@
  * under the License.
  */
 
-use crate::binary::command::{
-    BinaryServerCommand, HandlerResult, ServerCommand, ServerCommandHandler,
-};
-use crate::binary::handlers::utils::receive_and_validate;
-use crate::binary::mapper;
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
-use iggy_common::create_user::CreateUser;
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::requests::users::CreateUserRequest;
+use iggy_binary_protocol::responses::users::{UserDetailsResponse, UserResponse};
+use iggy_common::defaults::{
+    MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
+};
+use iggy_common::wire_conversions::permissions_to_wire;
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
-use tracing::debug;
-use tracing::instrument;
+use tracing::{debug, instrument};
 
-impl ServerCommandHandler for CreateUser {
-    fn code(&self) -> u32 {
-        iggy_common::CREATE_USER_CODE
+#[instrument(skip_all, name = "trace_create_user", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+pub async fn handle_create_user(
+    req: CreateUserRequest,
+    sender: &mut SenderKind,
+    session: &Session,
+    shard: &Rc<IggyShard>,
+) -> Result<HandlerResult, IggyError> {
+    debug!(
+        "session: {session}, command: create_user, username: {}",
+        req.username.as_str()
+    );
+    shard.ensure_authenticated(session)?;
+    shard.metadata.perm_create_user(session.get_user_id())?;
+
+    let username_len = req.username.as_str().len();
+    if !(MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&username_len) {
+        return Err(IggyError::InvalidUsername);
+    }
+    let password_len = req.password.len();
+    if !(MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH).contains(&password_len) {
+        return Err(IggyError::InvalidPassword);
     }
 
-    #[instrument(skip_all, name = "trace_create_user", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
-    async fn handle(
-        self,
-        sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        shard: &Rc<IggyShard>,
-    ) -> Result<HandlerResult, IggyError> {
-        debug!("session: {session}, command: {self}");
-        shard.ensure_authenticated(session)?;
-        shard.metadata.perm_create_user(session.get_user_id())?;
+    let request = ShardRequest::control_plane(ShardRequestPayload::CreateUserRequest {
+        user_id: session.get_user_id(),
+        command: req,
+    });
 
-        let request = ShardRequest::control_plane(ShardRequestPayload::CreateUserRequest {
-            user_id: session.get_user_id(),
-            command: self,
-        });
-
-        match shard.send_to_control_plane(request).await? {
-            ShardResponse::CreateUserResponse(user) => {
-                sender.send_ok_response(&mapper::map_user(&user)).await?;
-            }
-            ShardResponse::ErrorResponse(err) => return Err(err),
-            _ => unreachable!("Expected CreateUserResponse"),
+    match shard.send_to_control_plane(request).await? {
+        ShardResponse::CreateUserResponse(user) => {
+            let response = UserDetailsResponse {
+                user: UserResponse {
+                    id: user.id,
+                    created_at: user.created_at.as_micros(),
+                    status: user.status.as_code(),
+                    username: WireName::new(&user.username)
+                        .map_err(|_| IggyError::InvalidCommand)?,
+                },
+                permissions: user.permissions.as_ref().map(permissions_to_wire),
+            };
+            sender.send_ok_response(&response.to_bytes()).await?;
         }
-
-        Ok(HandlerResult::Finished)
+        ShardResponse::ErrorResponse(err) => return Err(err),
+        _ => unreachable!("Expected CreateUserResponse"),
     }
-}
 
-impl BinaryServerCommand for CreateUser {
-    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        match receive_and_validate(sender, code, length).await? {
-            ServerCommand::CreateUser(create_user) => Ok(create_user),
-            _ => Err(IggyError::InvalidCommand),
-        }
-    }
+    Ok(HandlerResult::Finished)
 }

@@ -15,4 +15,4 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-mod delete_segments_handler;
+pub mod delete_segments_handler;
