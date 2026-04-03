@@ -91,7 +91,7 @@ pub struct Column {
 /// `parse_type` to return an error, which in turn makes `open()` fail rather
 /// than silently producing corrupt data. `LowCardinality(T)` is transparently
 /// unwrapped to `T` since RowBinary serialises it identically.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChType {
     // ── Primitives ──────────────────────────────────────────────────────────
     String,
