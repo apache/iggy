@@ -35,7 +35,14 @@ internal sealed class MessageConverter : JsonConverter<Message>
 
         WriteMessageId(writer, value.Header.Id);
         WritePayload(writer, value.Payload);
-        WriteHeaders(writer, value.UserHeaders);
+        if (value.RawUserHeaders is not null)
+        {
+            writer.WriteBase64String("user_headers", value.RawUserHeaders);
+        }
+        else
+        {
+            WriteHeaders(writer, value.UserHeaders);
+        }
 
         writer.WriteEndObject();
     }

@@ -1,0 +1,90 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "http"
+enabled = true
+version = 0
+name = "HTTP sink"
+path = "../../target/release/libiggy_connector_http_sink"
+verbose = false
+
+[[streams]]
+stream = "my_stream"
+topics = ["my_topic"]
+schema = "json"
+batch_length = 50
+poll_interval = "100ms"
+consumer_group = "http_sink_group"
+
+[plugin_config]
+# Required — target URL for HTTP requests.
+url = "https://api.example.com/ingest"
+
+# HTTP method (default: POST). Valid: GET, HEAD, POST, PUT, PATCH, DELETE.
+method = "POST"
+
+# Request timeout (default: 30s).
+timeout = "30s"
+
+# Maximum HTTP body size in bytes (default: 10MB). Set to 0 to disable.
+max_payload_size_bytes = 10485760
+
+# Payload formatting mode (default: individual).
+# - "individual": one HTTP request per message
+# - "ndjson": newline-delimited JSON, all messages in one request
+# - "json_array": JSON array of messages in one request
+# - "raw": raw bytes, individual requests only
+batch_mode = "ndjson"
+
+# Include Iggy metadata envelope (default: true).
+include_metadata = true
+
+# Include message checksum in metadata (default: false).
+include_checksum = false
+
+# Include origin timestamp in metadata (default: false).
+include_origin_timestamp = false
+
+# Health check — opt-in, disabled by default.
+# Many endpoints (Lambda, API Gateway) don't support HEAD/OPTIONS.
+health_check_enabled = false
+health_check_method = "HEAD"
+
+# Retry configuration.
+max_retries = 3
+retry_delay = "1s"
+retry_backoff_multiplier = 2
+max_retry_delay = "30s"
+
+# HTTP status codes considered successful (default: [200, 201, 202, 204]).
+success_status_codes = [200, 201, 202, 204]
+
+# TLS — accept invalid certs (default: false). Use only for development.
+tls_danger_accept_invalid_certs = false
+
+# Connection pool — max idle connections per host (default: 10).
+max_connections = 10
+
+# Verbose request/response logging (default: false).
+verbose_logging = false
+
+# Custom HTTP headers. Replace placeholder values with real credentials.
+# Do not commit actual secrets — use environment variable overrides for production.
+[plugin_config.headers]
+Authorization = "Bearer <YOUR_TOKEN_HERE>"
+X-Custom-Header = "custom-value"

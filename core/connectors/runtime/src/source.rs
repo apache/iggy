@@ -30,7 +30,7 @@ use iggy_connector_sdk::{
 };
 use once_cell::sync::Lazy;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     str::FromStr,
     sync::{Arc, atomic::Ordering},
 };
@@ -567,7 +567,7 @@ pub(crate) extern "C" fn handle_produced_messages(
 fn build_iggy_message(
     payload: Vec<u8>,
     id: Option<u128>,
-    headers: Option<HashMap<HeaderKey, HeaderValue>>,
+    headers: Option<BTreeMap<HeaderKey, HeaderValue>>,
 ) -> Result<IggyMessage, IggyError> {
     match (id, headers) {
         (Some(id), Some(h)) => IggyMessage::builder()

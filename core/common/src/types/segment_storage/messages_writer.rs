@@ -117,9 +117,12 @@ impl MessagesWriter {
 
         Ok(IggyByteSize::from(messages_size))
     }
-
     pub fn path(&self) -> String {
         self.file_path.clone()
+    }
+
+    pub fn size_counter(&self) -> Rc<AtomicU64> {
+        self.messages_size_bytes.clone()
     }
 
     pub async fn fsync(&self) -> Result<(), IggyError> {

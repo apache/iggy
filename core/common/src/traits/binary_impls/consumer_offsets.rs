@@ -15,13 +15,20 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::BinaryClient;
-use crate::delete_consumer_offset::DeleteConsumerOffset;
-use crate::get_consumer_offset::GetConsumerOffset;
-use crate::store_consumer_offset::StoreConsumerOffset;
+
 use crate::traits::binary_auth::fail_if_not_authenticated;
-use crate::traits::binary_mapper;
-use crate::{Consumer, ConsumerOffsetClient, ConsumerOffsetInfo, Identifier, IggyError};
+use crate::wire_conversions::{consumer_to_wire, identifier_to_wire};
+use crate::{
+    BinaryClient, Consumer, ConsumerOffsetClient, ConsumerOffsetInfo, Identifier, IggyError,
+};
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::codes::{
+    DELETE_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_CODE, STORE_CONSUMER_OFFSET_CODE,
+};
+use iggy_binary_protocol::requests::consumer_offsets::{
+    DeleteConsumerOffsetRequest, GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
+};
+use iggy_binary_protocol::responses::consumer_offsets::get_consumer_offset::ConsumerOffsetResponse;
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> ConsumerOffsetClient for B {
@@ -34,13 +41,20 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
         offset: u64,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&StoreConsumerOffset {
-            consumer: consumer.clone(),
-            stream_id: stream_id.clone(),
-            topic_id: topic_id.clone(),
-            partition_id,
-            offset,
-        })
+        let wire_consumer = consumer_to_wire(consumer)?;
+        let wire_stream_id = identifier_to_wire(stream_id)?;
+        let wire_topic_id = identifier_to_wire(topic_id)?;
+        self.send_raw_with_response(
+            STORE_CONSUMER_OFFSET_CODE,
+            StoreConsumerOffsetRequest {
+                consumer: wire_consumer,
+                stream_id: wire_stream_id,
+                topic_id: wire_topic_id,
+                partition_id,
+                offset,
+            }
+            .to_bytes(),
+        )
         .await?;
         Ok(())
     }
@@ -53,19 +67,26 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
         partition_id: Option<u32>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
         fail_if_not_authenticated(self).await?;
+        let wire_consumer = consumer_to_wire(consumer)?;
+        let wire_stream_id = identifier_to_wire(stream_id)?;
+        let wire_topic_id = identifier_to_wire(topic_id)?;
         let response = self
-            .send_with_response(&GetConsumerOffset {
-                consumer: consumer.clone(),
-                stream_id: stream_id.clone(),
-                topic_id: topic_id.clone(),
-                partition_id,
-            })
+            .send_raw_with_response(
+                GET_CONSUMER_OFFSET_CODE,
+                GetConsumerOffsetRequest {
+                    consumer: wire_consumer,
+                    stream_id: wire_stream_id,
+                    topic_id: wire_topic_id,
+                    partition_id,
+                }
+                .to_bytes(),
+            )
             .await?;
         if response.is_empty() {
             return Ok(None);
         }
-
-        binary_mapper::map_consumer_offset(response).map(Some)
+        let wire_resp = super::decode_response::<ConsumerOffsetResponse>(&response)?;
+        Ok(Some(ConsumerOffsetInfo::from(wire_resp)))
     }
 
     async fn delete_consumer_offset(
@@ -76,12 +97,19 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&DeleteConsumerOffset {
-            consumer: consumer.clone(),
-            stream_id: stream_id.clone(),
-            topic_id: topic_id.clone(),
-            partition_id,
-        })
+        let wire_consumer = consumer_to_wire(consumer)?;
+        let wire_stream_id = identifier_to_wire(stream_id)?;
+        let wire_topic_id = identifier_to_wire(topic_id)?;
+        self.send_raw_with_response(
+            DELETE_CONSUMER_OFFSET_CODE,
+            DeleteConsumerOffsetRequest {
+                consumer: wire_consumer,
+                stream_id: wire_stream_id,
+                topic_id: wire_topic_id,
+                partition_id,
+            }
+            .to_bytes(),
+        )
         .await?;
         Ok(())
     }

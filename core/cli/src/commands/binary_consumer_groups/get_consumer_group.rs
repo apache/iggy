@@ -22,21 +22,20 @@ use async_trait::async_trait;
 use comfy_table::{Table, presets::ASCII_NO_BORDERS};
 use iggy_common::Client;
 use iggy_common::Identifier;
-use iggy_common::get_consumer_group::GetConsumerGroup;
 use tracing::{Level, event};
 
 pub struct GetConsumerGroupCmd {
-    get_consumer_group: GetConsumerGroup,
+    stream_id: Identifier,
+    topic_id: Identifier,
+    group_id: Identifier,
 }
 
 impl GetConsumerGroupCmd {
     pub fn new(stream_id: Identifier, topic_id: Identifier, consumer_group_id: Identifier) -> Self {
         Self {
-            get_consumer_group: GetConsumerGroup {
-                stream_id,
-                topic_id,
-                group_id: consumer_group_id,
-            },
+            stream_id,
+            topic_id,
+            group_id: consumer_group_id,
         }
     }
 }
@@ -46,25 +45,23 @@ impl CliCommand for GetConsumerGroupCmd {
     fn explain(&self) -> String {
         format!(
             "get consumer group with ID: {} for topic with ID: {} and stream with ID: {}",
-            self.get_consumer_group.group_id,
-            self.get_consumer_group.topic_id,
-            self.get_consumer_group.stream_id,
+            self.group_id, self.topic_id, self.stream_id,
         )
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let consumer_group = client
-            .get_consumer_group(&self.get_consumer_group.stream_id, &self.get_consumer_group.topic_id, &self.get_consumer_group.group_id)
+            .get_consumer_group(&self.stream_id, &self.topic_id, &self.group_id)
             .await
             .with_context(|| {
                 format!(
                     "Problem getting consumer group with ID: {} for topic with ID: {} and stream with ID: {}",
-                    self.get_consumer_group.group_id, self.get_consumer_group.topic_id, self.get_consumer_group.stream_id
+                    self.group_id, self.topic_id, self.stream_id
                 )
             })?;
 
         if consumer_group.is_none() {
-            event!(target: PRINT_TARGET, Level::INFO, "Consumer group with ID: {} was not found", self.get_consumer_group.group_id);
+            event!(target: PRINT_TARGET, Level::INFO, "Consumer group with ID: {} was not found", self.group_id);
             return Ok(());
         }
 

@@ -66,13 +66,24 @@ pub enum ProcessId {
 }
 
 /// A packet in flight through the simulated network.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Packet {
     pub from: ProcessId,
     pub to: ProcessId,
     pub message: Message<GenericHeader>,
     /// Tick at which this packet becomes deliverable.
     pub ready_at: u64,
+}
+
+impl Clone for Packet {
+    fn clone(&self) -> Self {
+        Self {
+            from: self.from,
+            to: self.to,
+            message: self.message.deep_copy(),
+            ready_at: self.ready_at,
+        }
+    }
 }
 
 impl Ready for Packet {
@@ -455,6 +466,33 @@ impl PacketSimulator {
         &mut self.links[idx].drop_packet_fn
     }
 
+    /// Disable a process by blocking all links to and from it.
+    ///
+    /// Packets already queued on those links remain but will be dropped at
+    /// delivery time because the link filter is [`BLOCK_ALL`].
+    pub fn process_disable(&mut self, process: ProcessId) {
+        let all_processes: Vec<ProcessId> = self.process_indices.keys().copied().collect();
+        for other in all_processes {
+            if other == process {
+                continue;
+            }
+            *self.link_filter(process, other) = BLOCK_ALL;
+            *self.link_filter(other, process) = BLOCK_ALL;
+        }
+    }
+
+    /// Re-enable a process by allowing all links to and from it.
+    pub fn process_enable(&mut self, process: ProcessId) {
+        let all_processes: Vec<ProcessId> = self.process_indices.keys().copied().collect();
+        for other in all_processes {
+            if other == process {
+                continue;
+            }
+            *self.link_filter(process, other) = ALLOW_ALL;
+            *self.link_filter(other, process) = ALLOW_ALL;
+        }
+    }
+
     // TODO: implement record/replay_recorded for deterministic replay support.
 
     /// Deliver all packets that are ready at the current tick.
@@ -743,7 +781,8 @@ mod tests {
         let header: &mut GenericHeader =
             bytemuck::checked::try_from_bytes_mut(&mut buf).expect("zeroed bytes are valid");
         header.command = command;
-        Message::<GenericHeader>::from_bytes(bytes::Bytes::from(buf)).unwrap()
+        Message::try_from(iobuf::Owned::<4096>::copy_from_slice(&buf))
+            .expect("generic test buffer must contain a valid generic message")
     }
 
     /// Helper: disable all links to/from a given replica (isolate it).
@@ -807,7 +846,11 @@ mod tests {
         let msg = create_test_message();
 
         // Send packet during partition
-        sim.submit(ProcessId::Replica(0), ProcessId::Replica(1), msg.clone());
+        sim.submit(
+            ProcessId::Replica(0),
+            ProcessId::Replica(1),
+            msg.deep_copy(),
+        );
         for _ in 0..20 {
             sim.tick();
             sim.step(); // drain and drop

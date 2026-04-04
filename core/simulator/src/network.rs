@@ -93,6 +93,18 @@ impl Network {
         self.simulator.register_client(client_id);
     }
 
+    /// Disable all links to and from a process (crash simulation).
+    ///
+    /// Packets already in flight remain queued but are dropped at delivery time.
+    pub fn process_disable(&mut self, process: ProcessId) {
+        self.simulator.process_disable(process);
+    }
+
+    /// Re-enable all links to and from a process (restart simulation).
+    pub fn process_enable(&mut self, process: ProcessId) {
+        self.simulator.process_enable(process);
+    }
+
     /// Set the enabled/disabled state of a specific link.
     /// Maps `enabled = true` to [`ALLOW_ALL`] and `enabled = false` to [`BLOCK_ALL`].
     pub fn set_link_filter(&mut self, from: ProcessId, to: ProcessId, enabled: bool) {

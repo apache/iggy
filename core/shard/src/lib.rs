@@ -76,6 +76,7 @@ impl<R: Send + 'static> ShardFrame<R> {
 
     /// Create a request-response frame.  Returns the frame and a receiver
     /// that the caller can await for completion notification.
+    #[must_use]
     pub fn with_response(message: Message<GenericHeader>) -> (Self, Receiver<R>) {
         let (tx, rx) = channel(1);
         (
@@ -135,6 +136,33 @@ where
             name,
             plane,
             senders,
+            inbox,
+            shards_table,
+        }
+    }
+
+    /// Create a shard without inter-shard channels.
+    ///
+    /// Useful for the simulator where inbound messages are delivered directly
+    /// via [`on_message`](Self::on_message) instead of through an inbox channel.
+    #[must_use]
+    pub fn without_inbox(
+        id: u16,
+        name: String,
+        metadata: IggyMetadata<VsrConsensus<B>, J, S, M>,
+        partitions: IggyPartitions<VsrConsensus<B, NamespacedPipeline>>,
+        shards_table: T,
+    ) -> Self {
+        // TODO: previously we used unbounded channel with flume,
+        // but this is not possible with crossfire without mangling types due to Flavor trait in crossfire.
+        // This needs to be revisited in the future.
+        let (_tx, inbox) = channel(1);
+        let plane = MuxPlane::new(variadic!(metadata, partitions));
+        Self {
+            id,
+            name,
+            plane,
+            senders: Vec::new(),
             inbox,
             shards_table,
         }

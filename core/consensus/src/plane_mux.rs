@@ -50,14 +50,14 @@ where
 {
     async fn on_request(&self, message: RequestMessage<C>)
     where
-        RequestMessage<C>: Project<ReplicateMessage<C>, C, Consensus = C> + Clone,
+        RequestMessage<C>: Project<ReplicateMessage<C>, C, Consensus = C>,
     {
         self.inner.on_request(message).await;
     }
 
     async fn on_replicate(&self, message: ReplicateMessage<C>)
     where
-        ReplicateMessage<C>: Project<AckMessage<C>, C, Consensus = C> + Clone,
+        ReplicateMessage<C>: Project<AckMessage<C>, C, Consensus = C>,
     {
         self.inner.on_replicate(message).await;
     }
@@ -75,13 +75,13 @@ where
 {
     async fn on_request(&self, _message: RequestMessage<C>)
     where
-        RequestMessage<C>: Project<ReplicateMessage<C>, C, Consensus = C> + Clone,
+        RequestMessage<C>: Project<ReplicateMessage<C>, C, Consensus = C>,
     {
     }
 
     async fn on_replicate(&self, _message: ReplicateMessage<C>)
     where
-        ReplicateMessage<C>: Project<AckMessage<C>, C, Consensus = C> + Clone,
+        ReplicateMessage<C>: Project<AckMessage<C>, C, Consensus = C>,
     {
     }
 
@@ -150,7 +150,7 @@ where
 {
     async fn on_request(&self, message: RequestMessage<C>)
     where
-        RequestMessage<C>: Project<ReplicateMessage<C>, C, Consensus = C> + Clone,
+        RequestMessage<C>: Project<ReplicateMessage<C>, C, Consensus = C>,
     {
         if self.0.is_applicable(&message) {
             self.0.on_request(message).await;
@@ -161,7 +161,7 @@ where
 
     async fn on_replicate(&self, message: ReplicateMessage<C>)
     where
-        ReplicateMessage<C>: Project<AckMessage<C>, C, Consensus = C> + Clone,
+        ReplicateMessage<C>: Project<AckMessage<C>, C, Consensus = C>,
     {
         if self.0.is_applicable(&message) {
             self.0.on_replicate(message).await;

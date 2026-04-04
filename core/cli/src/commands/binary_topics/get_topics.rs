@@ -21,7 +21,6 @@ use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::Client;
-use iggy_common::get_topics::GetTopics;
 use iggy_common::{Identifier, IggyExpiry};
 use std::fmt::{self, Display, Formatter};
 use tracing::{Level, event};
@@ -43,16 +42,13 @@ impl Display for GetTopicsOutput {
 }
 
 pub struct GetTopicsCmd {
-    get_topics: GetTopics,
+    stream_id: Identifier,
     output: GetTopicsOutput,
 }
 
 impl GetTopicsCmd {
     pub fn new(stream_id: Identifier, output: GetTopicsOutput) -> Self {
-        Self {
-            get_topics: GetTopics { stream_id },
-            output,
-        }
+        Self { stream_id, output }
     }
 }
 
@@ -61,20 +57,15 @@ impl CliCommand for GetTopicsCmd {
     fn explain(&self) -> String {
         format!(
             "list topics from stream with ID: {} in {} mode",
-            self.get_topics.stream_id, self.output
+            self.stream_id, self.output
         )
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let topics = client
-            .get_topics(&self.get_topics.stream_id)
+            .get_topics(&self.stream_id)
             .await
-            .with_context(|| {
-                format!(
-                    "Problem getting topics from stream {}",
-                    self.get_topics.stream_id
-                )
-            })?;
+            .with_context(|| format!("Problem getting topics from stream {}", self.stream_id))?;
 
         match self.output {
             GetTopicsOutput::Table => {

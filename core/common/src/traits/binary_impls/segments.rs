@@ -16,10 +16,12 @@
  * under the License.
  */
 
-use crate::BinaryClient;
-use crate::delete_segments::DeleteSegments;
 use crate::traits::binary_auth::fail_if_not_authenticated;
-use crate::{Identifier, IggyError, SegmentClient};
+use crate::wire_conversions::identifier_to_wire;
+use crate::{BinaryClient, Identifier, IggyError, SegmentClient};
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::codes::DELETE_SEGMENTS_CODE;
+use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> SegmentClient for B {
@@ -31,12 +33,18 @@ impl<B: BinaryClient> SegmentClient for B {
         segments_count: u32,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&DeleteSegments {
-            stream_id: stream_id.clone(),
-            topic_id: topic_id.clone(),
-            partition_id,
-            segments_count,
-        })
+        let wire_stream_id = identifier_to_wire(stream_id)?;
+        let wire_topic_id = identifier_to_wire(topic_id)?;
+        self.send_raw_with_response(
+            DELETE_SEGMENTS_CODE,
+            DeleteSegmentsRequest {
+                stream_id: wire_stream_id,
+                topic_id: wire_topic_id,
+                partition_id,
+                segments_count,
+            }
+            .to_bytes(),
+        )
         .await?;
         Ok(())
     }

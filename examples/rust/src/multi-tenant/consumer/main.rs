@@ -16,11 +16,11 @@
  * under the License.
  */
 
-use ahash::AHashMap;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
@@ -192,7 +192,7 @@ async fn create_user(
         .get_stream(&stream_name.try_into()?)
         .await?
         .expect("Stream does not exist");
-    let mut topic_permissions = AHashMap::new();
+    let mut topic_permissions = BTreeMap::new();
     for topic in topics {
         let topic_id = Identifier::named(topic)?;
         let topic = client
@@ -210,7 +210,7 @@ async fn create_user(
         );
     }
 
-    let mut streams_permissions = AHashMap::new();
+    let mut streams_permissions = BTreeMap::new();
     streams_permissions.insert(
         stream.id as usize,
         StreamPermissions {

@@ -22,39 +22,36 @@ use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::Client;
 use iggy_common::Identifier;
-use iggy_common::get_user::GetUser;
 use tracing::{Level, event};
 
 pub struct GetUserCmd {
-    get_user: GetUser,
+    user_id: Identifier,
 }
 
 impl GetUserCmd {
     pub fn new(user_id: Identifier) -> Self {
-        Self {
-            get_user: GetUser { user_id },
-        }
+        Self { user_id }
     }
 }
 
 #[async_trait]
 impl CliCommand for GetUserCmd {
     fn explain(&self) -> String {
-        format!("get user with ID: {}", self.get_user.user_id)
+        format!("get user with ID: {}", self.user_id)
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let user = client
-            .get_user(&self.get_user.user_id)
+            .get_user(&self.user_id)
             .await
-            .with_context(|| format!("Problem getting user with ID: {}", self.get_user.user_id))?;
+            .with_context(|| format!("Problem getting user with ID: {}", self.user_id))?;
 
         if user.is_none() {
             event!(
                 target: PRINT_TARGET,
                 Level::INFO,
                 "User with ID: {} was not found",
-                self.get_user.user_id
+                self.user_id
             );
             return Ok(());
         }

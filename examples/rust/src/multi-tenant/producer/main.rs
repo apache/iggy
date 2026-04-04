@@ -16,10 +16,10 @@
  * under the License.
  */
 
-use ahash::AHashMap;
 use futures_util::future::join_all;
 use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
@@ -332,7 +332,7 @@ async fn create_stream_and_user(
 ) -> Result<(), IggyError> {
     let stream = client.create_stream(stream_name).await?;
     info!("Created stream: {stream_name} with ID: {}", stream.id);
-    let mut streams_permissions = AHashMap::new();
+    let mut streams_permissions = BTreeMap::new();
     streams_permissions.insert(
         stream.id as usize,
         StreamPermissions {
