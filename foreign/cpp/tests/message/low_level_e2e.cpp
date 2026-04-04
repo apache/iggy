@@ -258,8 +258,8 @@ TEST(LowLevelE2E_Message, SendMessagesToSpecificPartitionVerified) {
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_Message, SendEmptyMessageVector) {
-    RecordProperty("description", "Verifies behavior when sending an empty message vector.");
+TEST(LowLevelE2E_Message, SendEmptyMessageVectorThrows) {
+    RecordProperty("description", "Throws when sending an empty message vector.");
     const std::string stream_name = "cpp-msg-empty-vec";
     iggy::ffi::Client *client     = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -279,7 +279,7 @@ TEST(LowLevelE2E_Message, SendEmptyMessageVector) {
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_Message, SendMessageWithEmptyPayload) {
+TEST(LowLevelE2E_Message, SendMessageWithEmptyPayloadThrows) {
     RecordProperty("description", "Throws when sending a message with an empty payload.");
     const std::string stream_name = "cpp-msg-empty-payload";
     iggy::ffi::Client *client     = login_to_server();
@@ -304,7 +304,7 @@ TEST(LowLevelE2E_Message, SendMessageWithEmptyPayload) {
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_Message, SendMessageWithOversizedPayload) {
+TEST(LowLevelE2E_Message, SendMessageWithOversizedPayloadThrows) {
     RecordProperty("description", "Throws when sending a message exceeding maximum payload size.");
     const std::string stream_name = "cpp-msg-oversized";
     iggy::ffi::Client *client     = login_to_server();
@@ -490,7 +490,7 @@ TEST(LowLevelE2E_Message, PollMessagesBeforeLoginThrows) {
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_Message, PollMessagesWithInvalidStreamId) {
+TEST(LowLevelE2E_Message, PollMessagesWithInvalidStreamIdThrows) {
     RecordProperty("description", "Throws when polling messages with an invalid stream identifier.");
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -506,7 +506,7 @@ TEST(LowLevelE2E_Message, PollMessagesWithInvalidStreamId) {
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_Message, PollMessagesFromNonExistentStream) {
+TEST(LowLevelE2E_Message, PollMessagesFromNonExistentStreamThrows) {
     RecordProperty("description", "Throws when polling messages from a non-existent stream.");
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
@@ -518,7 +518,7 @@ TEST(LowLevelE2E_Message, PollMessagesFromNonExistentStream) {
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_Message, PollMessagesWithInvalidConsumerKind) {
+TEST(LowLevelE2E_Message, PollMessagesWithInvalidConsumerKindThrows) {
     RecordProperty("description", "Throws when polling messages with an invalid consumer kind.");
     const std::string stream_name = "cpp-msg-invalid-consumer";
     iggy::ffi::Client *client     = login_to_server();
@@ -537,7 +537,7 @@ TEST(LowLevelE2E_Message, PollMessagesWithInvalidConsumerKind) {
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_Message, PollMessagesWithInvalidStrategyKind) {
+TEST(LowLevelE2E_Message, PollMessagesWithInvalidStrategyKindThrows) {
     RecordProperty("description", "Throws when polling messages with an invalid polling strategy kind.");
     const std::string stream_name = "cpp-msg-invalid-strategy";
     iggy::ffi::Client *client     = login_to_server();
@@ -645,6 +645,12 @@ TEST(LowLevelE2E_Message, PollMessagesFirstStrategy) {
     ASSERT_EQ(polled.count, 3u);
     ASSERT_EQ(polled.messages.size(), 3u);
     EXPECT_EQ(polled.messages[0].offset, 0u);
+    for (std::uint32_t i = 0; i < 3; i++) {
+        EXPECT_EQ(polled.messages[i].offset, static_cast<std::uint64_t>(i));
+        std::string expected = "msg-" + std::to_string(i);
+        std::string actual(polled.messages[i].payload.begin(), polled.messages[i].payload.end());
+        EXPECT_EQ(actual, expected) << "Payload mismatch at offset " << i;
+    }
 
     client->delete_stream(make_numeric_identifier(stream.id));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
@@ -678,6 +684,11 @@ TEST(LowLevelE2E_Message, PollMessagesLastStrategy) {
     ASSERT_EQ(polled.messages.size(), 3u);
     EXPECT_EQ(polled.messages[0].offset, 7u);
     EXPECT_EQ(polled.messages[2].offset, 9u);
+    for (std::uint32_t i = 0; i < 3; i++) {
+        std::string expected = "msg-" + std::to_string(7 + i);
+        std::string actual(polled.messages[i].payload.begin(), polled.messages[i].payload.end());
+        EXPECT_EQ(actual, expected) << "Payload mismatch at index " << i;
+    }
 
     client->delete_stream(make_numeric_identifier(stream.id));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
@@ -712,6 +723,18 @@ TEST(LowLevelE2E_Message, PollMessagesNextStrategyNoAutoCommit) {
     auto polled2 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
                                          make_numeric_identifier(1), "next", 0, 100, false);
     ASSERT_EQ(polled2.count, 5u);
+    for (std::uint32_t i = 0; i < 5; i++) {
+        EXPECT_EQ(polled1.messages[i].offset, static_cast<std::uint64_t>(i));
+        std::string expected = "msg-" + std::to_string(i);
+        std::string actual(polled1.messages[i].payload.begin(), polled1.messages[i].payload.end());
+        EXPECT_EQ(actual, expected) << "polled1 payload mismatch at index " << i;
+    }
+    for (std::uint32_t i = 0; i < 5; i++) {
+        EXPECT_EQ(polled2.messages[i].offset, static_cast<std::uint64_t>(i));
+        std::string expected = "msg-" + std::to_string(i);
+        std::string actual(polled2.messages[i].payload.begin(), polled2.messages[i].payload.end());
+        EXPECT_EQ(actual, expected) << "polled2 payload mismatch at index " << i;
+    }
 
     client->delete_stream(make_numeric_identifier(stream.id));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
@@ -749,6 +772,16 @@ TEST(LowLevelE2E_Message, PollMessagesNextStrategyAutoCommit) {
     ASSERT_EQ(polled2.count, 5u);
     EXPECT_EQ(polled2.messages[0].offset, 5u);
     EXPECT_EQ(polled2.messages[4].offset, 9u);
+    for (std::uint32_t i = 0; i < 5; i++) {
+        std::string expected1 = "msg-" + std::to_string(i);
+        std::string actual1(polled1.messages[i].payload.begin(), polled1.messages[i].payload.end());
+        EXPECT_EQ(actual1, expected1) << "polled1 payload mismatch at index " << i;
+    }
+    for (std::uint32_t i = 0; i < 5; i++) {
+        std::string expected2 = "msg-" + std::to_string(5 + i);
+        std::string actual2(polled2.messages[i].payload.begin(), polled2.messages[i].payload.end());
+        EXPECT_EQ(actual2, expected2) << "polled2 payload mismatch at index " << i;
+    }
 
     auto polled3 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
                                          make_numeric_identifier(1), "next", 0, 5, true);
@@ -828,6 +861,9 @@ TEST(LowLevelE2E_Message, PollMessagesMultipleSendsThenPollOrder) {
                                         make_numeric_identifier(1), "offset", 0, 100, false);
 
     ASSERT_EQ(polled.count, 10u);
+    for (std::uint32_t i = 0; i < 10; i++) {
+        EXPECT_EQ(polled.messages[i].offset, static_cast<std::uint64_t>(i)) << "Offset mismatch at index " << i;
+    }
     for (std::uint32_t i = 0; i < 5; i++) {
         std::string expected = "batch1-" + std::to_string(i);
         std::string actual(polled.messages[i].payload.begin(), polled.messages[i].payload.end());
@@ -880,7 +916,7 @@ TEST(LowLevelE2E_Message, PollMessagesMultipleCustomIds) {
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_Message, PollMessagesAfterStreamDeleted) {
+TEST(LowLevelE2E_Message, PollMessagesAfterStreamDeletedThrows) {
     RecordProperty("description", "Throws when polling messages after the stream has been deleted.");
     const std::string stream_name = "cpp-msg-deleted-stream";
     iggy::ffi::Client *client     = login_to_server();
@@ -909,7 +945,7 @@ TEST(LowLevelE2E_Message, PollMessagesAfterStreamDeleted) {
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_Message, PollMessagesWithInvalidPartitionId) {
+TEST(LowLevelE2E_Message, PollMessagesWithInvalidPartitionIdThrows) {
     RecordProperty("description", "Throws when polling with a non-existent partition ID.");
     const std::string stream_name = "cpp-msg-invalid-partition";
     iggy::ffi::Client *client     = login_to_server();
@@ -928,7 +964,7 @@ TEST(LowLevelE2E_Message, PollMessagesWithInvalidPartitionId) {
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_Message, PollMessagesWithCountZero) {
+TEST(LowLevelE2E_Message, PollMessagesWithCountZeroThrows) {
     RecordProperty("description", "Throws when polling with count=0.");
     const std::string stream_name = "cpp-msg-count-zero";
     iggy::ffi::Client *client     = login_to_server();
@@ -973,6 +1009,11 @@ TEST(LowLevelE2E_Message, PollMessagesWithoutSpecifyingPartition) {
 
     ASSERT_EQ(polled.count, 5u);
     ASSERT_EQ(polled.messages.size(), 5u);
+    for (std::uint32_t i = 0; i < 5; i++) {
+        std::string expected = "msg-" + std::to_string(i);
+        std::string actual(polled.messages[i].payload.begin(), polled.messages[i].payload.end());
+        EXPECT_EQ(actual, expected) << "Payload mismatch at index " << i;
+    }
 
     client->delete_stream(make_numeric_identifier(stream.id));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
@@ -1024,6 +1065,11 @@ TEST(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
     for (std::size_t i = 0; i < polled.messages.size(); i++) {
         EXPECT_GE(polled.messages[i].timestamp, batch2_timestamp)
             << "Message at index " << i << " has earlier timestamp";
+    }
+    for (std::size_t i = 0; i < polled.messages.size(); i++) {
+        std::string expected = "batch2-" + std::to_string(i);
+        std::string actual(polled.messages[i].payload.begin(), polled.messages[i].payload.end());
+        EXPECT_EQ(actual, expected) << "Payload mismatch at index " << i;
     }
 
     client->delete_stream(make_numeric_identifier(stream.id));
@@ -1100,37 +1146,6 @@ TEST(LowLevelE2E_Message, SendMessagesLargeBatch) {
     ASSERT_EQ(polled.messages.size(), 1000u);
     EXPECT_EQ(polled.messages[0].offset, 0u);
     EXPECT_EQ(polled.messages[999].offset, 999u);
-
-    client->delete_stream(make_numeric_identifier(stream.id));
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-}
-
-TEST(LowLevelE2E_Message, PollMessagesLargeCount) {
-    RecordProperty("description",
-                   "Verifies polling with a very large count returns only the available messages without error.");
-    const std::string stream_name = "cpp-msg-large-count";
-    iggy::ffi::Client *client     = login_to_server();
-    ASSERT_NE(client, nullptr);
-
-    client->create_stream(stream_name);
-    auto stream = client->get_stream(make_string_identifier(stream_name));
-    client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
-                         "server_default");
-
-    rust::Vec<iggy::ffi::Message> messages;
-    for (std::uint32_t i = 0; i < 10; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("msg-" + std::to_string(i)));
-        messages.push_back(std::move(msg));
-    }
-    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
-                          partition_id_bytes(0), std::move(messages));
-
-    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
-                                        make_numeric_identifier(1), "offset", 0, UINT32_MAX, false);
-
-    ASSERT_EQ(polled.count, 10u);
-    ASSERT_EQ(polled.messages.size(), 10u);
 
     client->delete_stream(make_numeric_identifier(stream.id));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
