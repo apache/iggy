@@ -479,8 +479,8 @@ mod tests {
         // coerce() must return Err so callers can reject the batch before Arrow sees the value.
         for bad in &[
             "This definitely is not a timestamp",
-            "20211111T22115800Z",  // compact ISO 8601, rejected by both chrono and Arrow
-            "1636668718000000",    // numeric string, not a timestamp format
+            "20211111T22115800Z", // compact ISO 8601, rejected by both chrono and Arrow
+            "1636668718000000",   // numeric string, not a timestamp format
         ] {
             let mut value = json!({ "level1_timestamp": bad });
             assert!(
