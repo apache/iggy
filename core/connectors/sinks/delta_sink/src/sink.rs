@@ -133,7 +133,7 @@ impl Sink for DeltaSink {
         // Apply coercions to match Delta table schema
         for value in &mut json_values {
             coerce(value, &state.coercion_tree)
-                .map_err(|e| Error::InvalidRecordValue(e))?;
+                .map_err(Error::InvalidRecordValue)?;
         }
 
         // Write JSON values to internal Parquet buffers

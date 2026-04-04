@@ -90,7 +90,7 @@ fn build_coercion_node(data_type: &DataType) -> Option<CoercionNode> {
 ///
 /// Returns an error if a string value in a timestamp field cannot be parsed as a timestamp.
 /// The caller should reject the record (or batch) on error rather than forwarding an
-/// unparseable string to Arrow, which would produce an opaque `ArrowError::JsonError`.
+/// unparsable string to Arrow, which would produce an opaque `ArrowError::JsonError`.
 pub(crate) fn coerce(value: &mut Value, coercion_tree: &CoercionTree) -> Result<(), String> {
     if let Some(context) = value.as_object_mut() {
         for (field_name, coercion) in coercion_tree.root.iter() {
@@ -363,7 +363,7 @@ mod tests {
 
         let coercion_tree = create_coercion_tree(&delta_schema);
 
-        let mut messages = vec![
+        let mut messages = [
             json!({
                 "level1_string": "a",
                 "level1_integer": 0,
@@ -416,7 +416,7 @@ mod tests {
             coerce(message, &coercion_tree).unwrap();
         }
 
-        let expected = vec![
+        let expected = [
             json!({
                 "level1_string": "a",
                 "level1_integer": 0,
