@@ -62,7 +62,6 @@ impl TryFrom<ffi::Identifier> for RustIdentifier {
     }
 }
 
-#[allow(clippy::wrong_self_convention)]
 impl ffi::Identifier {
     pub fn from_string(&mut self, id: String) -> Result<(), String> {
         *self = RustIdentifier::named(&id)
