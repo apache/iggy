@@ -30,21 +30,31 @@ use tracing::{debug, error, info};
 #[async_trait]
 impl Sink for IcebergSink {
     async fn open(&mut self) -> Result<(), Error> {
-        if let (Some(store_access_key_id), Some(store_secret_access_key)) = (
+        match (
             &self.config.store_access_key_id,
             &self.config.store_secret_access_key,
         ) {
-            let redacted_store_key = store_access_key_id.chars().take(3).collect::<String>();
-            let redacted_store_secret = store_secret_access_key.chars().take(3).collect::<String>();
-            info!(
-                "Opened Iceberg sink connector with ID: {} for URL: {}, store access key ID: {redacted_store_key}***  store secret: {redacted_store_secret}***",
-                self.id, self.config.uri
-            );
-        } else {
-            info!(
-                "Opened Iceberg sink connector with ID: {} for URL: {}. No explicit credentials provided, falling back to default credential provider chain",
-                self.id, self.config.uri
-            );
+            (Some(store_access_key_id), Some(store_secret_access_key)) => {
+                let redacted_store_key = store_access_key_id.chars().take(3).collect::<String>();
+                let redacted_store_secret =
+                    store_secret_access_key.chars().take(3).collect::<String>();
+                info!(
+                    "Opened Iceberg sink connector with ID: {} for URL: {}, store access key ID: {redacted_store_key}***  store secret: {redacted_store_secret}***",
+                    self.id, self.config.uri
+                );
+            }
+            (None, None) => {
+                info!(
+                    "Opened Iceberg sink connector with ID: {} for URL: {}. No explicit credentials provided, falling back to default credential provider chain",
+                    self.id, self.config.uri
+                );
+            }
+            _ => {
+                error!(
+                    "Partially configured Iceberg credentials. You must provide both store_access_key_id and store_secret_access_key, or omit both."
+                );
+                return Err(Error::InvalidConfig);
+            }
         }
 
         info!(
