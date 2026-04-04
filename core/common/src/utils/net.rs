@@ -33,18 +33,18 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// - Missing port (e.g. `localhost`)
 /// - Invalid port (e.g. `localhost:abc`, `localhost:65536`)
 pub fn validate_server_address(addr: &str) -> Result<(), IggyError> {
-    if let Some(rest) = addr.strip_prefix('[') {
+    if addr.starts_with('[') {
         // Bracketed IPv6: "[::1]:port"
-        let close = rest.find(']').ok_or(IggyError::InvalidIpAddress(
+        let close = addr.find(']').ok_or(IggyError::InvalidIpAddress(
             addr.to_string(),
-            "".to_string(),
+            "<missing>".to_string(),
         ))?;
-        let ipv6_str = &rest[..close];
-        let port_str = rest[close + 1..]
+        let ipv6_str = &addr[1..close];
+        let port_str = addr[close + 1..]
             .strip_prefix(':')
             .ok_or(IggyError::InvalidIpAddress(
-                ipv6_str.to_string(),
-                "".to_string(),
+                addr.to_string(),
+                "<missing>".to_string(),
             ))?;
 
         // Validate IPv6 address
@@ -64,7 +64,7 @@ pub fn validate_server_address(addr: &str) -> Result<(), IggyError> {
     // hostname:port or IPv4:port — rsplit_once to split at last colon
     let (host, port_str) = addr.rsplit_once(':').ok_or(IggyError::InvalidIpAddress(
         addr.to_string(),
-        "".to_string(),
+        "<missing>".to_string(),
     ))?;
 
     // Validate host (IPv4 or hostname with RFC 1123 compliance)
@@ -96,12 +96,14 @@ fn is_valid_hostname(host: &str) -> bool {
             && label
                 .chars()
                 .next()
-                .is_some_and(|c| c.is_ascii_alphanumeric())
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
             && label
                 .chars()
                 .last()
-                .is_some_and(|c| c.is_ascii_alphanumeric())
-            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     })
 }
 
@@ -219,6 +221,23 @@ mod tests {
     }
 
     #[test]
+    fn valid_hostname_with_underscores() {
+        // Docker Compose style names
+        assert!(is_valid_hostname("my_project_redis"));
+        assert!(is_valid_hostname("docker_compose_service"));
+        // SRV records
+        assert!(is_valid_hostname("_svc._tcp.example.com"));
+        // Mixed
+        assert!(is_valid_hostname("my_server-01.prod.example.com"));
+    }
+
+    #[test]
+    fn valid_underscore_hostname_with_port() {
+        assert!(validate_server_address("my_project_redis:6379").is_ok());
+        assert!(validate_server_address("_svc._tcp.example.com:8090").is_ok());
+    }
+
+    #[test]
     fn invalid_hostname_empty() {
         assert!(!is_valid_hostname(""));
     }
@@ -256,7 +275,7 @@ mod tests {
 
     #[test]
     fn invalid_hostname_invalid_characters() {
-        assert!(!is_valid_hostname("example_com"));
+        assert!(is_valid_hostname("example_com"));
         assert!(!is_valid_hostname("example@com"));
         assert!(!is_valid_hostname("example com"));
         assert!(!is_valid_hostname("example.c0m!"));
@@ -267,7 +286,7 @@ mod tests {
         assert!(validate_server_address("example..com:8090").is_err());
         assert!(validate_server_address("-invalid:8090").is_err());
         assert!(validate_server_address("invalid-:8090").is_err());
-        assert!(validate_server_address("example_invalid:8090").is_err());
+        assert!(validate_server_address("example_invalid:8090").is_ok());
     }
 
     #[test]
