@@ -87,17 +87,22 @@ fn build_coercion_node(data_type: &DataType) -> Option<CoercionNode> {
 }
 
 /// Applies all data coercions specified by the [`CoercionTree`] to the [`Value`].
-pub(crate) fn coerce(value: &mut Value, coercion_tree: &CoercionTree) {
+///
+/// Returns an error if a string value in a timestamp field cannot be parsed as a timestamp.
+/// The caller should reject the record (or batch) on error rather than forwarding an
+/// unparseable string to Arrow, which would produce an opaque `ArrowError::JsonError`.
+pub(crate) fn coerce(value: &mut Value, coercion_tree: &CoercionTree) -> Result<(), String> {
     if let Some(context) = value.as_object_mut() {
         for (field_name, coercion) in coercion_tree.root.iter() {
             if let Some(value) = context.get_mut(field_name) {
-                apply_coercion(value, coercion);
+                apply_coercion(value, coercion)?;
             }
         }
     }
+    Ok(())
 }
 
-fn apply_coercion(value: &mut Value, node: &CoercionNode) {
+fn apply_coercion(value: &mut Value, node: &CoercionNode) -> Result<(), String> {
     match node {
         CoercionNode::Coercion(Coercion::ToString) => {
             if !value.is_null() && !value.is_string() {
@@ -106,9 +111,7 @@ fn apply_coercion(value: &mut Value, node: &CoercionNode) {
         }
         CoercionNode::Coercion(Coercion::ToTimestamp) => {
             if let Some(as_str) = value.as_str() {
-                if let Some(parsed) = string_to_timestamp(as_str) {
-                    *value = parsed
-                }
+                *value = string_to_timestamp(as_str)?;
             } else if value.is_i64() || value.is_u64() {
                 // Already epoch microseconds — valid timestamp representation, pass through.
             }
@@ -119,7 +122,7 @@ fn apply_coercion(value: &mut Value, node: &CoercionNode) {
                 if let Some(fields) = fields
                     && let Some(value) = fields.get_mut(name)
                 {
-                    apply_coercion(value, node);
+                    apply_coercion(value, node)?;
                 }
             }
         }
@@ -128,7 +131,7 @@ fn apply_coercion(value: &mut Value, node: &CoercionNode) {
             if let Some(values) = values {
                 let node = CoercionNode::Coercion(coercion.clone());
                 for value in values {
-                    apply_coercion(value, &node);
+                    apply_coercion(value, &node)?;
                 }
             }
         }
@@ -139,27 +142,32 @@ fn apply_coercion(value: &mut Value, node: &CoercionNode) {
                         if let Some(fields) = value.as_object_mut()
                             && let Some(field_value) = fields.get_mut(name)
                         {
-                            apply_coercion(field_value, node);
+                            apply_coercion(field_value, node)?;
                         }
                     }
                 }
             }
         }
     }
+    Ok(())
 }
 
-fn string_to_timestamp(string: &str) -> Option<Value> {
-    let parsed = DateTime::from_str(string);
-    if let Err(e) = parsed {
-        tracing::warn!(
-            "Error coercing timestamp from string. String: {}. Error: {}",
-            string,
-            e
-        )
+fn string_to_timestamp(string: &str) -> Result<Value, String> {
+    // Try strict RFC 3339 / ISO 8601 with T separator first.
+    if let Ok(dt) = DateTime::<Utc>::from_str(string) {
+        return Ok(Value::Number(dt.timestamp_micros().into()));
     }
-    parsed
-        .ok()
-        .map(|dt: DateTime<Utc>| Value::Number(dt.timestamp_micros().into()))
+
+    // Arrow's parser also accepts ' ' as a date/time separator (e.g. "2021-11-11 22:11:58").
+    // Handle that here so the value is normalised to epoch microseconds rather than left as a
+    // raw string that Arrow would silently accept without going through this coercion layer.
+    let ndt = NaiveDateTime::parse_from_str(string, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(string, "%Y-%m-%d %H:%M:%S"));
+    if let Ok(ndt) = ndt {
+        return Ok(Value::Number(ndt.and_utc().timestamp_micros().into()));
+    }
+
+    Err(format!("cannot parse \"{string}\" as a timestamp"))
 }
 
 #[cfg(test)]
@@ -170,19 +178,20 @@ mod tests {
 
     #[test]
     fn test_string_to_timestamp_valid() {
-        let result = string_to_timestamp("2010-01-01T22:11:58Z");
-        assert!(result.is_some());
+        assert!(string_to_timestamp("2010-01-01T22:11:58Z").is_ok());
         // exceeds nanos size
-        let result = string_to_timestamp("2400-01-01T22:11:58Z");
-        assert!(result.is_some());
+        assert!(string_to_timestamp("2400-01-01T22:11:58Z").is_ok());
+        // Arrow also accepts ' ' as date/time separator
+        assert!(string_to_timestamp("2021-11-11 22:11:58").is_ok());
+        assert!(string_to_timestamp("2021-11-11 22:11:58.123456").is_ok());
     }
 
     #[test]
     fn test_string_to_timestamp_invalid() {
-        assert!(string_to_timestamp("not a date").is_none());
-        assert!(string_to_timestamp("").is_none());
-        assert!(string_to_timestamp("2021-13-01T00:00:00Z").is_none());
-        assert!(string_to_timestamp("1636668718000000").is_none());
+        assert!(string_to_timestamp("not a date").is_err());
+        assert!(string_to_timestamp("").is_err());
+        assert!(string_to_timestamp("2021-13-01T00:00:00Z").is_err());
+        assert!(string_to_timestamp("1636668718000000").is_err());
     }
 
     static SCHEMA: LazyLock<Value> = LazyLock::new(|| {
@@ -398,24 +407,13 @@ mod tests {
                 "level1_timestamp": "2021-11-11T22:11:58-00:00",
             }),
             json!({
-                // ISO 8601 but not RFC 3339. We WON'T coerce it.
-                "level1_timestamp": "20211111T22115800Z",
-            }),
-            json!({
-                // This is a Java date style timestamp. We WON'T coerce it.
+                // Space-separated (SQL/Java style) — Arrow accepts this format, so we coerce it.
                 "level1_timestamp": "2021-11-11 22:11:58",
-            }),
-            json!({
-                "level1_timestamp": "This definitely is not a timestamp",
-            }),
-            json!({
-                // This is valid epoch micros, but typed as a string on the way in. We WON'T coerce it.
-                "level1_timestamp": "1636668718000000",
             }),
         ];
 
         for message in messages.iter_mut() {
-            coerce(message, &coercion_tree);
+            coerce(message, &coercion_tree).unwrap();
         }
 
         let expected = vec![
@@ -462,24 +460,33 @@ mod tests {
                 "level1_timestamp": 1636668718000000i64
             }),
             json!({
-                // ISO 8601 but not RFC 3339. We WON'T coerce it.
-                "level1_timestamp": "20211111T22115800Z",
-            }),
-            json!({
-                // This is a Java date style timestamp. We WON'T coerce it.
-                "level1_timestamp": "2021-11-11 22:11:58",
-            }),
-            json!({
-                "level1_timestamp": "This definitely is not a timestamp",
-            }),
-            json!({
-                // This is valid epoch micros, but typed as a string on the way in. We WON'T coerce it.
-                "level1_timestamp": "1636668718000000",
+                // Space-separated (SQL/Java style) — coerced to epoch microseconds.
+                "level1_timestamp": 1636668718000000i64,
             }),
         ];
 
         for i in 0..messages.len() {
             assert_eq!(messages[i], expected[i]);
+        }
+    }
+
+    #[test]
+    fn test_timestamp_coercion_invalid_strings() {
+        let delta_schema: DeltaSchema = serde_json::from_value(SCHEMA.clone()).unwrap();
+        let coercion_tree = create_coercion_tree(&delta_schema);
+
+        // These strings are not parseable as timestamps by any format Arrow accepts.
+        // coerce() must return Err so callers can reject the batch before Arrow sees the value.
+        for bad in &[
+            "This definitely is not a timestamp",
+            "20211111T22115800Z",  // compact ISO 8601, rejected by both chrono and Arrow
+            "1636668718000000",    // numeric string, not a timestamp format
+        ] {
+            let mut value = json!({ "level1_timestamp": bad });
+            assert!(
+                coerce(&mut value, &coercion_tree).is_err(),
+                "expected error for: {bad}"
+            );
         }
     }
 
@@ -499,7 +506,7 @@ mod tests {
         let delta_schema: DeltaSchema = serde_json::from_value(SCHEMA.clone()).unwrap();
         let tree = create_coercion_tree(&delta_schema);
         let mut value = json!({});
-        coerce(&mut value, &tree);
+        coerce(&mut value, &tree).unwrap();
         assert_eq!(value, json!({}));
     }
 
@@ -515,7 +522,7 @@ mod tests {
             "array_struct": null,
         });
         let expected = value.clone();
-        coerce(&mut value, &tree);
+        coerce(&mut value, &tree).unwrap();
         // Null values should pass through unchanged — null on a string field stays null.
         assert_eq!(value, expected);
     }
@@ -531,7 +538,7 @@ mod tests {
             }
         });
         let expected = value.clone();
-        coerce(&mut value, &tree);
+        coerce(&mut value, &tree).unwrap();
         assert_eq!(value, expected);
     }
 
@@ -545,7 +552,7 @@ mod tests {
             "array_struct": [],
         });
         let expected = value.clone();
-        coerce(&mut value, &tree);
+        coerce(&mut value, &tree).unwrap();
         assert_eq!(value, expected);
     }
 
@@ -557,19 +564,19 @@ mod tests {
         // Array at top level
         let mut value = json!([1, 2, 3]);
         let expected = value.clone();
-        coerce(&mut value, &tree);
+        coerce(&mut value, &tree).unwrap();
         assert_eq!(value, expected);
 
         // Primitive at top level
         let mut value = json!("hello");
         let expected = value.clone();
-        coerce(&mut value, &tree);
+        coerce(&mut value, &tree).unwrap();
         assert_eq!(value, expected);
 
         // Null at top level
         let mut value = json!(null);
         let expected = value.clone();
-        coerce(&mut value, &tree);
+        coerce(&mut value, &tree).unwrap();
         assert_eq!(value, expected);
     }
 
@@ -586,7 +593,7 @@ mod tests {
             },
             "array_string": ["a", null, 42, true, 3.15, [1, 2, 3], {"x": 1}],
         });
-        coerce(&mut value, &tree);
+        coerce(&mut value, &tree).unwrap();
 
         assert_eq!(value["level1_string"], json!(null));
         assert_eq!(value["level2"]["level2_string"], json!(null));
@@ -606,7 +613,7 @@ mod tests {
 
         let epoch_micros = 1636668718000000i64;
         let mut value = json!({ "level1_timestamp": epoch_micros });
-        coerce(&mut value, &tree);
+        coerce(&mut value, &tree).unwrap();
 
         assert_eq!(value["level1_timestamp"], json!(epoch_micros));
     }

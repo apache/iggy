@@ -46,4 +46,4 @@ serde_json = { workspace = true }
 simd-json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-url = "2"
+url = { workspace = true }
