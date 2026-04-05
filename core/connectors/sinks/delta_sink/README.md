@@ -89,6 +89,6 @@ Required when `storage_backend_type = "gcs"`.
 
 The connector automatically coerces JSON values to match the Delta table schema:
 
-- **Timestamp fields**: ISO 8601 / RFC 3339 formatted strings (e.g. `"2021-11-11T22:11:58Z"`) are converted to microsecond timestamps. Numeric timestamps pass through unchanged.
+- **Timestamp fields**: ISO 8601 / RFC 3339 formatted strings (e.g. `"2021-11-11T22:11:58Z", "2021-11-11 22:11:58"`) are converted to microsecond timestamps. Numeric timestamps pass through unchanged.
 - **String fields**: Non-string values (numbers, booleans, objects, arrays) are converted to their string representation.
 - **Nested fields**: Coercions are applied recursively to nested structs and arrays.
