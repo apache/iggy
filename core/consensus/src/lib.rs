@@ -103,8 +103,8 @@ where
         H: ConsensusHeader;
 }
 
-pub mod clients_table;
-pub use clients_table::ClientsTable;
+pub mod client_table;
+pub use client_table::ClientTable;
 
 mod impls;
 pub use impls::*;

@@ -19,10 +19,10 @@ use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotErr
 use consensus::{
     CommitLogEvent, Consensus, Pipeline, PipelineEntry, Plane, PlaneIdentity, PlaneKind, Project,
     ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
-    ack_quorum_reached, build_reply_message, clients_table::RequestStatus,
-    drain_committable_prefix, emit_sim_event, fence_old_prepare_by_commit,
-    panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, replicate_preflight,
-    replicate_to_next_in_chain, send_prepare_ok as send_prepare_ok_common,
+    ack_quorum_reached, build_reply_message, drain_committable_prefix, emit_sim_event,
+    fence_old_prepare_by_commit, panic_if_hash_chain_would_break_in_same_view,
+    pipeline_prepare_common, replicate_preflight, replicate_to_next_in_chain, request_preflight,
+    send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, GenericHeader, Message, PrepareHeader, PrepareOkHeader,
@@ -294,41 +294,9 @@ where
         let client_id = message.header().client;
         let request = message.header().request;
 
-        // Duplicate detection via client-table
-        let status = consensus
-            .clients_table()
-            .borrow()
-            .check_request(client_id, request);
-        match status {
-            RequestStatus::Duplicate(cached_reply) => {
-                debug!(
-                    "on_request: duplicate request={request} for client={client_id}, re-sending cached reply"
-                );
-                consensus
-                    .message_bus()
-                    .send_to_client(client_id, cached_reply.into_generic())
-                    .await
-                    .unwrap();
-                return;
-            }
-            RequestStatus::InProgress => {
-                debug!(
-                    "on_request: request={request} for client={client_id} already in progress, dropping"
-                );
-                return;
-            }
-            RequestStatus::New => {}
-        }
-
-        // Register for commit notification before entering the pipeline.
-        // TODO: Once the connection handler (SDK integration) owns the request lifecycle,
-        // the Notify handle should be returned to the caller so it can await the committed
-        // reply. At that point, `on_request` no longer calls `send_to_client` in `on_ack` —
-        // the connection handler reads `get_reply()` after `notify.notified().await`.
-        let _notify = consensus
-            .clients_table()
-            .borrow_mut()
-            .register_pending(client_id, request);
+        let Some(_notify) = request_preflight(consensus, client_id, request).await else {
+            return;
+        };
 
         emit_sim_event(
             SimEventKind::ClientRequestReceived,
@@ -380,7 +348,7 @@ where
                 replica_id = consensus.replica(),
                 view = consensus.view(),
                 op = header.op,
-                commit = consensus.commit(),
+                commit = consensus.commit_max(),
                 operation = ?header.operation,
                 "received old prepare, skipping replication"
             );
@@ -395,7 +363,10 @@ where
 
         // Force a checkpoint if the journal is running low on capacity.
         if let Some(coordinator) = &self.coordinator {
-            let snap_op = consensus.commit();
+            // Use commit_min (locally executed), not commit_max. WAL entries
+            // between commit_min+1 and commit_max haven't been applied to the
+            // state machine yet, draining them would lose data on crash.
+            let snap_op = consensus.commit_min();
             match coordinator
                 .checkpoint_if_needed(&self.mux_stm, journal, snap_op)
                 .await
@@ -431,11 +402,10 @@ where
 
         assert_eq!(header.op, current_op + 1);
 
-        consensus.sequencer().set_sequence(header.op);
-        consensus.set_last_prepare_checksum(header.checksum);
-
-        // Append to journal.
-        if let Err(e) = journal.handle().append(message).await {
+        // Append to journal first. Sequencer and checksum are updated AFTER
+        // successful append so a failed write doesn't leave consensus state
+        // pointing at a phantom entry.
+        if let Err(e) = journal.handle().append(message.clone()).await {
             error!(
                 target: "iggy.metadata.diag",
                 plane = "metadata",
@@ -448,15 +418,19 @@ where
             return;
         }
 
+        consensus.sequencer().set_sequence(header.op);
+        consensus.set_last_prepare_checksum(header.checksum);
+
         // After successful journal write, send prepare_ok to primary.
         self.send_prepare_ok(&header).await;
 
         // If follower, commit any newly committable entries.
         if consensus.is_follower() {
-            self.commit_journal();
+            self.commit_journal().await;
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareOkHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
         let header = message.header();
@@ -544,6 +518,7 @@ where
                     );
                     bytes::Bytes::new()
                 });
+                consensus.advance_commit_min(prepare_header.op);
                 let pipeline_depth = consensus.pipeline().borrow().len();
                 let event = CommitLogEvent {
                     replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Metadata),
@@ -558,7 +533,7 @@ where
                 let reply = build_reply_message(consensus, &prepare_header, response);
                 // Cache reply for duplicate detection:
                 consensus
-                    .clients_table()
+                    .client_table()
                     .borrow_mut()
                     .commit_reply(prepare_header.client, reply.clone());
 
@@ -566,13 +541,16 @@ where
                 let reply_buffers = freeze_client_reply(generic_reply);
                 emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
 
-                // Wire delivery to the client socket:
-                // TODO: Propagate send error instead of panicking; requires bus error design.
-                consensus
+                if let Err(e) = consensus
                     .message_bus()
                     .send_to_client(prepare_header.client, reply_buffers)
                     .await
-                    .unwrap();
+                {
+                    warn!(
+                        "on_ack: failed to send reply to client={}: {e}",
+                        prepare_header.client
+                    );
+                }
             }
         }
     }
@@ -604,7 +582,11 @@ where
     P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    M: StateMachine<Input = Message<PrepareHeader>>,
+    M: StateMachine<
+            Input = Message<PrepareHeader>,
+            Output = bytes::Bytes,
+            Error = iggy_common::IggyError,
+        >,
 {
     /// Replicate a prepare message to the next replica in the chain.
     ///
@@ -633,11 +615,46 @@ where
     // TODO: Implement jump_to_newer_op
     // fn jump_to_newer_op(&self, header: &PrepareHeader) {}
 
-    #[allow(clippy::unused_self)]
-    const fn commit_journal(&self) {
-        // TODO: Implement commit logic
-        // Walk through journal from last committed to current commit number
-        // Apply each entry to the state machine
+    /// Walk ops from `commit_min+1` to `commit_max`, applying the state machine
+    /// and updating the client table for each.
+    ///
+    /// The backup does NOT send replies to clients, only the primary does that.
+    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::future_not_send)]
+    async fn commit_journal(&self) {
+        let consensus = self.consensus.as_ref().unwrap();
+        let journal = self.journal.as_ref().unwrap();
+
+        while consensus.commit_min() < consensus.commit_max() {
+            let op = consensus.commit_min() + 1;
+
+            let Some(header) = journal.handle().header(op as usize) else {
+                // TODO: Implement message repair: request missing prepare from
+                // primary or other replicas. Until then, the backup stalls here.
+                break;
+            };
+            let header = *header;
+
+            let Some(prepare) = journal.handle().entry(&header).await else {
+                warn!("commit_journal: prepare body missing for op={op}, stopping");
+                break;
+            };
+
+            let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                warn!("commit_journal: state machine error for op={op}: {err}");
+                bytes::Bytes::new()
+            });
+
+            consensus.advance_commit_min(op);
+
+            let reply = build_reply_message(consensus, &header, response);
+            consensus
+                .client_table()
+                .borrow_mut()
+                .commit_reply(header.client, reply);
+
+            debug!("commit_journal: committed op={op}");
+        }
     }
 
     #[allow(clippy::future_not_send, clippy::cast_possible_truncation)]

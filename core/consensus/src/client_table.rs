@@ -111,14 +111,17 @@ pub struct ClientEntry {
     pub reply: Message<ReplyHeader>,
 }
 
-/// Result of checking a request against the clients table.
+/// Result of checking a request against the client table.
 pub enum RequestStatus {
-    /// Request not seen before — proceed with consensus.
+    /// Request not seen before, proceed with consensus.
     New,
-    /// Request already committed — re-send cached reply.
+    /// Exact request already committed, re-send cached reply.
     Duplicate(Message<ReplyHeader>),
-    /// Request is in the pipeline awaiting commit — drop (client should wait).
+    /// Request is in the pipeline awaiting commit, drop (client should wait).
     InProgress,
+    /// Request number is older than the client's latest committed request.
+    /// Already handled in a prior commit cycle, drop silently.
+    Stale,
 }
 
 /// VSR client-table: tracks per-client request state for duplicate detection,
@@ -142,11 +145,17 @@ pub enum RequestStatus {
 /// The `pending` map is local notification state not replicated, not
 /// serialized, not part of the deterministic committed state.
 ///
-/// ## TODO
-///   Checkpoint serialization: the slot array is laid out for deterministic
-///   encode/decode to disk.
+/// ## Known gaps
+///
+/// - **Message repair**: If a backup never received a prepare (lost message),
+///   `commit_journal` stops at the gap. The client table will be missing
+///   entries for ops beyond the gap until the message repair protocol is
+///   implemented and the missing prepare is retransmitted.
+///
+/// - **Checkpoint serialization**: The slot array is laid out for deterministic
+///   encode/decode to disk, but serialization is not yet implemented.
 #[derive(Debug)]
-pub struct ClientsTable {
+pub struct ClientTable {
     /// `None` means the slot is free.
     /// Deterministic iteration order for eviction and serialization.
     slots: Vec<Option<ClientEntry>>,
@@ -158,7 +167,7 @@ pub struct ClientsTable {
     pending: HashMap<ClientRequest, Notify>,
 }
 
-impl ClientsTable {
+impl ClientTable {
     #[must_use]
     pub fn new(max_clients: usize) -> Self {
         let mut slots = Vec::with_capacity(max_clients);
@@ -173,14 +182,17 @@ impl ClientsTable {
     /// Check a request against the table.
     ///
     /// Returns:
-    /// - [`RequestStatus::New`] — not seen before, proceed with consensus
-    /// - [`RequestStatus::Duplicate`] — already committed, re-send cached reply
-    /// - [`RequestStatus::InProgress`] — stale, already pending, or already committed
+    /// - [`RequestStatus::New`]: not seen before, proceed with consensus
+    /// - [`RequestStatus::Duplicate`]: already committed, re-send cached reply
+    /// - [`RequestStatus::InProgress`]: in the pipeline awaiting commit
+    /// - [`RequestStatus::Stale`]: older than the client's latest committed request
     ///
     /// # Panics
     /// Panics if the internal index points to an empty slot (invariant violation).
     #[must_use]
     pub fn check_request(&self, client_id: u128, request: u64) -> RequestStatus {
+        assert!(client_id != 0, "client_id 0 is reserved for internal use");
+
         // Check if already pending in the pipeline.
         let key = ClientRequest { client_id, request };
         if self.pending.contains_key(&key) {
@@ -194,7 +206,7 @@ impl ClientsTable {
         let committed_request = entry.reply.header().request;
 
         if request < committed_request {
-            return RequestStatus::InProgress;
+            return RequestStatus::Stale;
         }
         if request == committed_request {
             return RequestStatus::Duplicate(entry.reply.clone());
@@ -207,7 +219,7 @@ impl ClientsTable {
     ///
     /// Returns a [`Notify`] the caller can `.notified().await` on. The `Notify`
     /// is cloned via `Rc`, so the caller can hold it across `.await` points
-    /// without borrowing the `ClientsTable`.
+    /// without borrowing the `ClientTable`.
     ///
     /// Called after `check_request` returns `New`, before submitting the request
     /// to the consensus pipeline.
@@ -238,11 +250,30 @@ impl ClientsTable {
     /// # Panics
     /// Panics if the internal index points to an empty slot (invariant violation).
     pub fn commit_reply(&mut self, client_id: u128, reply: Message<ReplyHeader>) {
+        assert!(client_id != 0, "client_id 0 is reserved for internal use");
+        assert_eq!(
+            client_id,
+            reply.header().client,
+            "commit_reply: client_id mismatch (arg={client_id}, header={})",
+            reply.header().client
+        );
         let request = reply.header().request;
 
         if let Some(&slot_idx) = self.index.get(&client_id) {
-            // Update existing slot in place.
             let slot = self.slots[slot_idx].as_mut().expect("index/slot mismatch");
+            // Monotonicity: both commit (op) and request must not regress.
+            assert!(
+                reply.header().commit >= slot.reply.header().commit,
+                "commit_reply: commit regression for client {client_id}: {} -> {}",
+                slot.reply.header().commit,
+                reply.header().commit
+            );
+            assert!(
+                reply.header().request >= slot.reply.header().request,
+                "commit_reply: request regression for client {client_id}: {} -> {}",
+                slot.reply.header().request,
+                reply.header().request
+            );
             slot.reply = reply;
         } else {
             // Need a free slot. Evict if full.
@@ -267,6 +298,10 @@ impl ClientsTable {
     /// Iterates the fixed-size slot array (deterministic order), so all replicas
     /// with the same committed state evict the same client. Ties on commit number
     /// are broken by slot index (lowest index wins), which is also deterministic.
+    ///
+    /// **Dedup caveat**: until checkpoint serialization is implemented, eviction
+    /// breaks at-most-once semantics for the evicted client — a retransmission
+    /// after eviction will be treated as `New` and re-executed.
     fn evict_oldest(&mut self) {
         let mut evictee: Option<(usize, u64)> = None; // (slot_idx, commit)
 
@@ -312,6 +347,21 @@ impl ClientsTable {
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
+
+    /// Wake and clear all pending waiters (e.g. during view change).
+    ///
+    /// Stale pending entries from a previous view must not survive into the
+    /// new view - `check_request` would return `InProgress` for the orphaned
+    /// keys, silently dropping valid client retries.
+    ///
+    /// Waiters are notified before removal so that any `.notified().await`
+    /// callers unblock and can detect the view change (e.g. retry or error).
+    pub fn clear_pending(&mut self) {
+        for notify in self.pending.values() {
+            notify.notify();
+        }
+        self.pending.clear();
+    }
 }
 
 #[cfg(test)]
@@ -321,10 +371,11 @@ mod tests {
 
     fn make_reply_for(client: u128, request: u64, commit: u64) -> Message<ReplyHeader> {
         let header_size = std::mem::size_of::<ReplyHeader>();
-        let mut buffer = bytes::BytesMut::zeroed(header_size);
-        let header =
-            bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size])
-                .expect("zeroed bytes are valid");
+        let mut msg = Message::<ReplyHeader>::new(header_size);
+        let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
+            &mut msg.as_mut_slice()[..header_size],
+        )
+        .expect("zeroed bytes are valid");
         *header = ReplyHeader {
             client,
             request,
@@ -333,11 +384,11 @@ mod tests {
             operation: Operation::SendMessages,
             ..ReplyHeader::default()
         };
-        Message::<ReplyHeader>::from_bytes(buffer.freeze()).expect("test reply must be valid")
+        msg
     }
 
     fn make_reply(request: u64, commit: u64) -> Message<ReplyHeader> {
-        make_reply_for(0, request, commit)
+        make_reply_for(1, request, commit)
     }
 
     // Notify tests
@@ -392,17 +443,17 @@ mod tests {
         assert!(fut2.as_mut().poll(&mut cx).is_pending());
     }
 
-    // ClientsTable tests
+    // ClientTable tests
 
     #[test]
     fn check_request_new() {
-        let table = ClientsTable::new(10);
+        let table = ClientTable::new(10);
         assert!(matches!(table.check_request(1, 1), RequestStatus::New));
     }
 
     #[test]
     fn check_request_duplicate_after_commit() {
-        let mut table = ClientsTable::new(10);
+        let mut table = ClientTable::new(10);
         table.commit_reply(1, make_reply(1, 10));
 
         match table.check_request(1, 1) {
@@ -415,18 +466,15 @@ mod tests {
 
     #[test]
     fn check_request_stale() {
-        let mut table = ClientsTable::new(10);
+        let mut table = ClientTable::new(10);
         table.commit_reply(1, make_reply(5, 10));
 
-        assert!(matches!(
-            table.check_request(1, 3),
-            RequestStatus::InProgress
-        ));
+        assert!(matches!(table.check_request(1, 3), RequestStatus::Stale));
     }
 
     #[test]
     fn check_request_in_progress_while_pending() {
-        let mut table = ClientsTable::new(10);
+        let mut table = ClientTable::new(10);
         let _notify = table.register_pending(1, 1);
 
         assert!(matches!(
@@ -437,7 +485,7 @@ mod tests {
 
     #[test]
     fn commit_caches_reply() {
-        let mut table = ClientsTable::new(10);
+        let mut table = ClientTable::new(10);
         table.commit_reply(1, make_reply(1, 10));
 
         let cached = table.get_reply(1).expect("should have cached reply");
@@ -446,7 +494,7 @@ mod tests {
 
     #[test]
     fn commit_updates_existing_entry() {
-        let mut table = ClientsTable::new(10);
+        let mut table = ClientTable::new(10);
         table.commit_reply(1, make_reply(1, 10));
         table.commit_reply(1, make_reply(2, 20));
 
@@ -457,7 +505,7 @@ mod tests {
 
     #[test]
     fn register_and_commit_notifies() {
-        let mut table = ClientsTable::new(10);
+        let mut table = ClientTable::new(10);
         let notify = table.register_pending(1, 1);
 
         assert_eq!(table.pending_count(), 1);
@@ -475,7 +523,7 @@ mod tests {
 
     #[test]
     fn eviction_removes_oldest_commit() {
-        let mut table = ClientsTable::new(2);
+        let mut table = ClientTable::new(2);
 
         table.commit_reply(100, make_reply_for(100, 1, 10));
         table.commit_reply(200, make_reply_for(200, 1, 20));
@@ -489,7 +537,7 @@ mod tests {
 
     #[test]
     fn eviction_is_deterministic_by_slot_index() {
-        let mut table = ClientsTable::new(2);
+        let mut table = ClientTable::new(2);
 
         table.commit_reply(100, make_reply_for(100, 1, 10));
         table.commit_reply(200, make_reply_for(200, 1, 10));
@@ -502,7 +550,7 @@ mod tests {
 
     #[test]
     fn new_request_after_commit_is_new() {
-        let mut table = ClientsTable::new(10);
+        let mut table = ClientTable::new(10);
         table.commit_reply(1, make_reply(1, 10));
 
         assert!(matches!(table.check_request(1, 2), RequestStatus::New));
@@ -510,7 +558,7 @@ mod tests {
 
     #[test]
     fn slot_reuse_after_eviction() {
-        let mut table = ClientsTable::new(1);
+        let mut table = ClientTable::new(1);
 
         table.commit_reply(100, make_reply_for(100, 1, 10));
         table.commit_reply(200, make_reply_for(200, 1, 20));
@@ -523,7 +571,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "already has a pending waiter")]
     fn register_pending_twice_panics() {
-        let mut table = ClientsTable::new(10);
+        let mut table = ClientTable::new(10);
         let _n1 = table.register_pending(1, 1);
         let _n2 = table.register_pending(1, 1);
     }
