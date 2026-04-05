@@ -23,6 +23,7 @@ use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 use std::collections::HashMap;
+use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -120,7 +121,11 @@ impl IcebergRestContainer {
 
         let container = GenericImage::new(ICEBERG_REST_IMAGE, ICEBERG_REST_TAG)
             .with_exposed_port(ICEBERG_REST_PORT.tcp())
-            .with_wait_for(WaitFor::message_on_stderr("Started Server@"))
+            .with_wait_for(WaitFor::http(
+                HttpWaitStrategy::new("/v1/config")
+                    .with_port(ICEBERG_REST_PORT.tcp())
+                    .with_expected_status_code(200u16),
+            ))
             .with_startup_timeout(std::time::Duration::from_secs(30))
             .with_network(network)
             .with_env_var(
