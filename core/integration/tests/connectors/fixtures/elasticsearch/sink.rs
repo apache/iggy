@@ -21,8 +21,7 @@ use super::container::{
     DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_INDEX, ENV_SINK_PATH,
     ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM,
     ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_URL, ElasticsearchContainer, ElasticsearchOps,
-    ElasticsearchSearchResponse, HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS,
-    create_http_client,
+    ElasticsearchSearchResponse, create_http_client,
 };
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
@@ -95,28 +94,11 @@ impl TestFixture for ElasticsearchSinkFixture {
         let container = ElasticsearchContainer::start().await?;
         let http_client = create_http_client();
 
-        let fixture = Self {
+        // Container startup already waits for /_cluster/health to return 200
+        // via HttpWaitStrategy, so no additional health check is needed.
+        Ok(Self {
             container,
             http_client,
-        };
-
-        for _ in 0..HEALTH_CHECK_ATTEMPTS {
-            let url = format!("{}/_cluster/health", fixture.container.base_url);
-            if let Ok(response) = fixture.http_client.get(&url).send().await
-                && response.status().is_success()
-            {
-                info!("Elasticsearch cluster is healthy");
-                return Ok(fixture);
-            }
-            sleep(Duration::from_millis(HEALTH_CHECK_INTERVAL_MS)).await;
-        }
-
-        Err(TestBinaryError::FixtureSetup {
-            fixture_type: "ElasticsearchSink".to_string(),
-            message: format!(
-                "Failed to confirm Elasticsearch cluster health after {} attempts",
-                HEALTH_CHECK_ATTEMPTS
-            ),
         })
     }
 
