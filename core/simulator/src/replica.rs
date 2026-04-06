@@ -17,7 +17,7 @@
 
 use crate::bus::{SharedSimOutbox, SimOutbox};
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
-use consensus::{LocalPipeline, NamespacedPipeline, VsrConsensus};
+use consensus::{LocalPipeline, VsrConsensus};
 use iggy_common::IggyByteSize;
 use iggy_common::sharding::ShardId;
 use iggy_common::variadic;
@@ -68,20 +68,17 @@ pub fn new_replica(id: u8, name: String, bus: &Arc<SimOutbox>, replica_count: u8
         segment_size: IggyByteSize::from(1024 * 1024 * 1024),
     };
 
-    let mut partitions = IggyPartitions::new(ShardId::new(u16::from(id)), partitions_config);
+    let partitions = IggyPartitions::new(ShardId::new(u16::from(id)), partitions_config);
 
-    // TODO: namespace=0 collides with metadata consensus. Safe for now because the simulator
-    // routes by Operation type, but a shared view change bus would produce namespace collisions.
-    let partition_consensus = VsrConsensus::new(
-        CLUSTER_ID,
-        id,
-        replica_count,
-        0,
-        SharedSimOutbox(Arc::clone(bus)),
-        NamespacedPipeline::new(),
-    );
-    partition_consensus.init();
-    partitions.set_consensus(partition_consensus);
-
-    shard::IggyShard::without_inbox(u16::from(id), name, metadata, partitions, ())
+    shard::IggyShard::without_inbox(
+        shard::ShardIdentity::new(u16::from(id), name),
+        metadata,
+        partitions,
+        (),
+        shard::PartitionConsensusConfig::new(
+            CLUSTER_ID,
+            replica_count,
+            SharedSimOutbox(Arc::clone(bus)),
+        ),
+    )
 }

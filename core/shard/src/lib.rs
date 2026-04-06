@@ -18,25 +18,57 @@
 mod router;
 pub mod shards_table;
 
-use consensus::{MuxPlane, NamespacedPipeline, PartitionsHandle, Plane, VsrConsensus};
+use consensus::{LocalPipeline, MuxPlane, PartitionsHandle, Plane, VsrConsensus};
 use iggy_binary_protocol::{
     GenericHeader, Message, MessageBag, PrepareHeader, PrepareOkHeader, RequestHeader,
 };
-use iggy_common::sharding::IggyNamespace;
 use iggy_common::variadic;
+use iggy_common::{PartitionStats, sharding::IggyNamespace};
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use metadata::IggyMetadata;
 use metadata::stm::StateMachine;
-use partitions::IggyPartitions;
+use partitions::{IggyPartition, IggyPartitions};
 use shards_table::ShardsTable;
+use std::sync::Arc;
 
-pub type ShardPlane<B, J, S, M> = MuxPlane<
-    variadic!(
-        IggyMetadata<VsrConsensus<B>, J, S, M>,
-        IggyPartitions<VsrConsensus<B, NamespacedPipeline>>
-    ),
->;
+pub type ShardPlane<B, J, S, M> =
+    MuxPlane<variadic!(IggyMetadata<VsrConsensus<B>, J, S, M>, IggyPartitions<B>)>;
+
+pub struct ShardIdentity {
+    pub id: u16,
+    pub name: String,
+}
+
+impl ShardIdentity {
+    #[must_use]
+    pub const fn new(id: u16, name: String) -> Self {
+        Self { id, name }
+    }
+}
+
+pub struct PartitionConsensusConfig<B>
+where
+    B: MessageBus,
+{
+    pub cluster_id: u128,
+    pub replica_count: u8,
+    pub bus: B,
+}
+
+impl<B> PartitionConsensusConfig<B>
+where
+    B: MessageBus,
+{
+    #[must_use]
+    pub const fn new(cluster_id: u128, replica_count: u8, bus: B) -> Self {
+        Self {
+            cluster_id,
+            replica_count,
+            bus,
+        }
+    }
+}
 
 /// Bounded mpsc channel sender (blocking send).
 pub type Sender<T> = crossfire::MTx<crossfire::mpsc::Array<T>>;
@@ -108,6 +140,8 @@ where
 
     /// Partition namespace -> owning shard lookup.
     shards_table: T,
+
+    partition_consensus: PartitionConsensusConfig<B>,
 }
 
 impl<B, J, S, M, T, R: Send + 'static> IggyShard<B, J, S, M, T, R>
@@ -121,16 +155,17 @@ where
     /// * `inbox` - the receiver that this shard drains in its message pump.
     /// * `shards_table` - namespace -> shard routing table.
     #[must_use]
-    pub const fn new(
-        id: u16,
-        name: String,
+    pub fn new(
+        identity: ShardIdentity,
         metadata: IggyMetadata<VsrConsensus<B>, J, S, M>,
-        partitions: IggyPartitions<VsrConsensus<B, NamespacedPipeline>>,
+        partitions: IggyPartitions<B>,
         senders: Vec<Sender<ShardFrame<R>>>,
         inbox: Receiver<ShardFrame<R>>,
         shards_table: T,
+        partition_consensus: PartitionConsensusConfig<B>,
     ) -> Self {
         let plane = MuxPlane::new(variadic!(metadata, partitions));
+        let ShardIdentity { id, name } = identity;
         Self {
             id,
             name,
@@ -138,6 +173,7 @@ where
             senders,
             inbox,
             shards_table,
+            partition_consensus,
         }
     }
 
@@ -147,17 +183,18 @@ where
     /// via [`on_message`](Self::on_message) instead of through an inbox channel.
     #[must_use]
     pub fn without_inbox(
-        id: u16,
-        name: String,
+        identity: ShardIdentity,
         metadata: IggyMetadata<VsrConsensus<B>, J, S, M>,
-        partitions: IggyPartitions<VsrConsensus<B, NamespacedPipeline>>,
+        partitions: IggyPartitions<B>,
         shards_table: T,
+        partition_consensus: PartitionConsensusConfig<B>,
     ) -> Self {
         // TODO: previously we used unbounded channel with flume,
         // but this is not possible with crossfire without mangling types due to Flavor trait in crossfire.
         // This needs to be revisited in the future.
         let (_tx, inbox) = channel(1);
         let plane = MuxPlane::new(variadic!(metadata, partitions));
+        let ShardIdentity { id, name } = identity;
         Self {
             id,
             name,
@@ -165,6 +202,7 @@ where
             senders: Vec::new(),
             inbox,
             shards_table,
+            partition_consensus,
         }
     }
 
@@ -311,31 +349,63 @@ where
             }
         }
 
-        if let Some(consensus) = planes.1.0.consensus() {
-            consensus.drain_loopback_into(buf);
-            let count = buf.len();
-            total += count;
-            for msg in buf.drain(..) {
-                let typed: Message<PrepareOkHeader> = msg
-                    .try_into_typed()
-                    .expect("loopback queue must only contain PrepareOk messages");
-                planes.1.0.on_ack(typed).await;
-            }
+        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
+        for namespace in namespaces {
+            let partition = planes
+                .1
+                .0
+                .get_by_ns(&namespace)
+                .expect("partition namespace must resolve during loopback drain");
+            partition.consensus().drain_loopback_into(buf);
+        }
+        let count = buf.len();
+        total += count;
+        for msg in buf.drain(..) {
+            let typed: Message<PrepareOkHeader> = msg
+                .try_into_typed()
+                .expect("loopback queue must only contain PrepareOk messages");
+            planes.1.0.on_ack(typed).await;
         }
 
         total
     }
 
+    /// Initializes a partition and its dedicated consensus instance on this shard.
+    ///
+    /// # Panics
+    /// Panics if the shard id does not fit in `u8`, which is currently required
+    /// by the partition consensus replica id.
     pub fn init_partition(&mut self, namespace: IggyNamespace)
     where
         B: MessageBus<
                 Replica = u8,
                 Data = iggy_binary_protocol::Message<iggy_binary_protocol::GenericHeader>,
                 Client = u128,
-            >,
+            > + Clone,
     {
         let partitions = self.plane.partitions_mut();
-        partitions.init_partition_in_memory(namespace);
-        partitions.register_namespace_in_pipeline(namespace.inner());
+        if partitions.contains(&namespace) {
+            return;
+        }
+
+        let replica_id =
+            u8::try_from(self.id).expect("shard id must fit in u8 for partition consensus");
+        let consensus = VsrConsensus::new(
+            self.partition_consensus.cluster_id,
+            replica_id,
+            self.partition_consensus.replica_count,
+            namespace.inner(),
+            self.partition_consensus.bus.clone(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+
+        let stats = Arc::new(PartitionStats::default());
+        let partition = IggyPartition::with_in_memory_storage(
+            stats,
+            consensus,
+            partitions.config().segment_size,
+        );
+        partitions.insert(namespace, partition);
     }
 }
