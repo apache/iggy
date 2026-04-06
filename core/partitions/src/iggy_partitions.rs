@@ -963,14 +963,6 @@ where
         let should_persist =
             is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded;
 
-        tracing::error!(
-            "commit_messages ENTER: namespace={:?}, journal_msgs={}, should_persist={}, is_full={}",
-            namespace,
-            journal_info.messages_count,
-            should_persist,
-            is_full
-        );
-
         if !should_persist {
             return Ok(());
         }
@@ -1025,19 +1017,9 @@ where
             return Err(IggyError::InvalidCommand);
         };
 
-        let persist_start = std::time::Instant::now();
-
         // Persist to disk.
         self.persist_frozen_batches_to_disk(namespace, frozen_batches, index_bytes, batch_count)
             .await?;
-
-        let persist_nano = persist_start.elapsed().as_nanos();
-        tracing::error!(
-            "commit_messages: persist took {}nano, batch_count={}, journal_msgs={}",
-            persist_nano,
-            batch_count,
-            journal_info.messages_count
-        );
 
         if is_full {
             self.rotate_segment(namespace).await?;
@@ -1072,12 +1054,6 @@ where
             .increment_messages_count(u64::from(journal_info.messages_count));
 
         let durable_offset = journal_info.current_offset;
-        tracing::error!(
-            "commit_messages: updating offset to {}, journal_msgs={}, journal_size={}",
-            durable_offset,
-            journal_info.messages_count,
-            journal_info.size
-        );
         partition.offset.store(durable_offset, Ordering::Release);
         partition.stats.set_current_offset(durable_offset);
         Ok(())
@@ -1257,11 +1233,6 @@ where
                         .get_by_ns(&entry_namespace)
                         .expect("commit_partition_entry: partition not found");
 
-                    tracing::error!(
-                        "commit_partition_entry: offset updated to {} for {:?}",
-                        visible_offset,
-                        entry_namespace
-                    );
                     partition.offset.store(visible_offset, Ordering::Release);
                     partition.stats.set_current_offset(visible_offset);
                 }

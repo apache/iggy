@@ -76,7 +76,6 @@ impl IggyIndexWriter {
         if indexes.is_empty() {
             return Ok(());
         }
-        let start = std::time::Instant::now();
 
         let len = indexes.len();
         let position = self.index_size_bytes.load(Ordering::Relaxed);
@@ -91,20 +90,9 @@ impl IggyIndexWriter {
             .fetch_add(len as u64, Ordering::Release);
 
         if self.fsync {
-            let fsync_start = std::time::Instant::now();
+            let _fsync_start = std::time::Instant::now();
             let _ = self.fsync().await;
-            tracing::warn!(
-                "IndexWriter: fsync took {}ms, file={}",
-                fsync_start.elapsed().as_millis(),
-                self.file_path
-            );
         }
-
-        tracing::warn!(
-            "IndexWriter: save_indexes took {}ms, file={}",
-            start.elapsed().as_millis(),
-            self.file_path
-        );
 
         trace!(
             target: "iggy.partitions.storage",

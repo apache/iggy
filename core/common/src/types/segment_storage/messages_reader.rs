@@ -15,15 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::types::segment_storage::direct_file::{DirectFile, SharedTail, TailBoundary};
+use crate::types::segment_storage::direct_file::SharedTail;
 use crate::{IggyError, IggyIndexesMut, IggyMessagesBatchMut, PooledBuffer};
 use compio::buf::{IntoInner, IoBuf};
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncReadAtExt;
 use err_trail::ErrContext;
-use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::{
     io::ErrorKind,
     sync::atomic::{AtomicU64, Ordering},
@@ -36,7 +34,7 @@ pub struct MessagesReader {
     file_path: String,
     file: File,
     messages_size_bytes: Rc<AtomicU64>,
-    shared_tail: Option<Arc<SharedTail>>,
+    shared_tail: Option<Rc<SharedTail>>,
 }
 
 // Safety: We are guaranteeing that MessagesReader will never be used from multiple threads
@@ -47,7 +45,7 @@ impl MessagesReader {
     pub async fn new(
         file_path: &str,
         messages_size_bytes: Rc<AtomicU64>,
-        shared_tail: Option<Arc<SharedTail>>,
+        shared_tail: Option<Rc<SharedTail>>,
     ) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
             .read(true)
@@ -141,41 +139,63 @@ impl MessagesReader {
         _use_pool: bool,
     ) -> Result<PooledBuffer, std::io::Error> {
         if let Some(ref tail) = self.shared_tail {
-            let (tail_start, tail_end) = tail.boundary.load();
-            let read_end = offset as u64 + len as u64;
+            let (tail_start, tail_end, tail_data) = tail.snapshot();
+            let read_start = offset as u64;
+            let read_end = read_start + len as u64;
 
-            if read_end <= tail_start {
+            // Entirely before tail — normal disk read
+            if read_end <= tail_start || tail_data.is_empty() {
                 return self.read_from_disk(offset, len).await;
             }
 
-            if offset as u64 >= tail_start && read_end <= tail_end {
-                // Entirely in tail
-                let tail_offset = (offset as u64 - tail_start) as usize;
-                let data = tail.read(tail_offset, len as usize);
+            // Entirely within tail
+            if read_start >= tail_start && read_end <= tail_end {
+                let tail_offset = (read_start - tail_start) as usize;
+                let end = tail_offset + len as usize;
+                if end > tail_data.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "tail read out of bounds: offset {} + len {} > tail {}",
+                            tail_offset,
+                            len,
+                            tail_data.len()
+                        ),
+                    ));
+                }
                 let mut result = PooledBuffer::with_capacity(len as usize);
-                result.extend_from_slice(&data);
+                result.extend_from_slice(&tail_data[tail_offset..end]);
                 return Ok(result);
             }
 
-            if (offset as u64) < tail_start && read_end > tail_start {
-                // Split: part disk, part tail
-                let disk_len = (tail_start - offset as u64) as u32;
-                let tail_read_len = (len - disk_len) as usize;
-                let tail_data = tail.read(0, tail_read_len);
+            // Split: part disk, part tail
+            if read_start < tail_start && read_end > tail_start {
+                let disk_len = (tail_start - read_start) as u32;
+                let tail_read_len = (read_end - tail_start) as usize;
+                if tail_read_len > tail_data.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "tail split read out of bounds: need {} but tail has {}",
+                            tail_read_len,
+                            tail_data.len()
+                        ),
+                    ));
+                }
 
-                let mut result = PooledBuffer::with_capacity(len as usize);
-                result.resize(len as usize, 0);
-                result[disk_len as usize..].copy_from_slice(&tail_data);
-
+                // Read disk portion
                 let disk_buf = PooledBuffer::with_capacity(disk_len as usize);
                 let (res, disk_buf) = self
                     .file
-                    .read_exact_at(disk_buf.slice(..disk_len as usize), offset as u64)
+                    .read_exact_at(disk_buf.slice(..disk_len as usize), read_start)
                     .await
                     .into();
                 let disk_buf = disk_buf.into_inner();
                 res?;
-                result[..disk_len as usize].copy_from_slice(&disk_buf[..disk_len as usize]);
+
+                let mut result = PooledBuffer::with_capacity(len as usize);
+                result.extend_from_slice(&disk_buf[..disk_len as usize]);
+                result.extend_from_slice(&tail_data[..tail_read_len]);
                 return Ok(result);
             }
         }

@@ -18,23 +18,18 @@
 pub mod buffered;
 pub mod direct;
 
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::{Arc, atomic::AtomicU64},
-};
+use std::{rc::Rc, sync::atomic::AtomicU64};
 
 pub use buffered::BufferedMessagesWriter;
 pub use direct::DirectMessagesWriter;
 
 use crate::{
-    IggyByteSize, IggyError, IggyMessagesBatch,
-    types::segment_storage::direct_file::{DirectFile, SharedTail, TailBoundary},
+    IggyByteSize, IggyError, IggyMessagesBatch, types::segment_storage::direct_file::SharedTail,
 };
 
 #[derive(Debug)]
 pub enum MessagesWriterBackend {
-    Direct(DirectMessagesWriter),
+    Direct(Box<DirectMessagesWriter>),
     Buffered(BufferedMessagesWriter),
 }
 
@@ -52,9 +47,9 @@ impl MessagesWriter {
         direct_io_enabled: bool,
     ) -> Result<Self, IggyError> {
         let backend = if direct_io_enabled {
-            MessagesWriterBackend::Direct(
+            MessagesWriterBackend::Direct(Box::new(
                 DirectMessagesWriter::new(file_path, messages_size_bytes, file_exists).await?,
-            )
+            ))
         } else {
             MessagesWriterBackend::Buffered(
                 BufferedMessagesWriter::new(file_path, messages_size_bytes, fsync, file_exists)
@@ -89,7 +84,7 @@ impl MessagesWriter {
         }
     }
 
-    pub fn try_get_shared_tail(&self) -> Option<Arc<SharedTail>> {
+    pub fn try_get_shared_tail(&self) -> Option<Rc<SharedTail>> {
         match &self.backend {
             MessagesWriterBackend::Direct(w) => Some(w.shared_tail()),
             MessagesWriterBackend::Buffered(_) => None,

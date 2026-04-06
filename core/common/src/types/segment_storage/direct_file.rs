@@ -15,10 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::cell::RefCell;
 
 use bytes::Bytes;
 use compio::{
@@ -45,69 +42,59 @@ const O_DSYNC: i32 = 0;
 struct Padded<T>(T);
 
 #[derive(Debug)]
-pub struct TailBoundary {
-    /// file_position — start of the tail region
-    pub start: AtomicU64,
-    /// file_position + tail_len — end of valid data
-    pub end: AtomicU64,
-}
-
-impl TailBoundary {
-    pub fn new(start: u64, end: u64) -> Self {
-        Self {
-            start: AtomicU64::new(start),
-            end: AtomicU64::new(end),
-        }
-    }
-
-    pub fn update(&self, file_position: u64, tail_len: usize) {
-        // Store end first so readers never see end < start
-        self.end
-            .store(file_position + tail_len as u64, Ordering::Release);
-        self.start.store(file_position, Ordering::Release);
-    }
-
-    pub fn load(&self) -> (u64, u64) {
-        let start = self.start.load(Ordering::Acquire);
-        let end = self.end.load(Ordering::Acquire);
-        (start, end)
-    }
-}
-
-use std::sync::Mutex;
-
-#[derive(Debug)]
 pub struct SharedTail {
-    pub boundary: TailBoundary,
-    data: Mutex<Vec<u8>>,
+    inner: RefCell<TailSnapshot>,
 }
 
+#[derive(Debug, Clone)]
+struct TailSnapshot {
+    start: u64,
+    end: u64,
+    data: Vec<u8>,
+}
+
+/// A shared view of the writer's uncommitted tail buffer.
+///
+/// The writer updates this after every write so that readers can
+/// serve reads that fall into the not-yet-flushed region without
+/// touching `DirectFile`.
 impl SharedTail {
     pub fn new() -> Self {
         Self {
-            boundary: TailBoundary::new(0, 0),
-            data: Mutex::new(Vec::new()),
+            inner: RefCell::new(TailSnapshot {
+                start: 0,
+                end: 0,
+                data: Vec::new(),
+            }),
         }
     }
 
     pub fn update(&self, position: u64, tail_buf: &[u8], tail_len: usize) {
-        self.boundary.update(position, tail_len);
+        let mut snap = self.inner.borrow_mut();
+        snap.data.clear();
         if tail_len > 0 {
-            let mut data = self.data.lock().unwrap();
-            data.clear();
-            data.extend_from_slice(&tail_buf[..tail_len]);
+            snap.data.extend_from_slice(&tail_buf[..tail_len]);
         }
+        snap.start = position;
+        snap.end = position + tail_len as u64;
     }
 
-    pub fn read(&self, offset: usize, len: usize) -> Vec<u8> {
-        let data = self.data.lock().unwrap();
-        data[offset..offset + len].to_vec()
+    pub fn snapshot(&self) -> (u64, u64, Vec<u8>) {
+        let snap = self.inner.borrow();
+        (snap.start, snap.end, snap.data.clone())
     }
 }
 
+/// Low-level O_DIRECT file writer.
+///
+/// All I/O is aligned to `ALIGNMENT` (typically 4096). Data smaller than
+/// one alignment block is buffered in `tail` until a full block can be
+/// flushed
 #[derive(Debug)]
 pub struct DirectFile {
+    /// Filesystem path
     file_path: String,
+    /// O_DIRECT + O_DSYNC file handle
     file: File,
     /// Current write pos in the file. Always a multiple of `ALIGNMENT`
     file_position: u64,
@@ -118,20 +105,6 @@ pub struct DirectFile {
     tail_len: Padded<usize>,
     /// Reusable carry-over buffer for `write_vectored`
     spare: PooledBuffer,
-}
-
-enum WriteChunk {
-    Frozen(Bytes),
-    Owned(PooledBuffer),
-}
-
-impl WriteChunk {
-    fn len(&self) -> usize {
-        match self {
-            WriteChunk::Frozen(f) => f.len(),
-            WriteChunk::Owned(p) => p.len(),
-        }
-    }
 }
 
 impl DirectFile {
@@ -150,7 +123,6 @@ impl DirectFile {
             .create(true)
             .write(true)
             .custom_flags((O_DSYNC | O_DIRECT) as _)
-            // .custom_flags(O_DIRECT as _)
             .open(file_path)
             .await
             .map_err(|err| {
@@ -173,6 +145,7 @@ impl DirectFile {
         })
     }
 
+    #[allow(dead_code)]
     pub async fn get_file_size(&self) -> Result<u64, IggyError> {
         self.file
             .metadata()
@@ -274,6 +247,7 @@ impl DirectFile {
         Ok(initial_len)
     }
 
+    #[allow(dead_code)]
     pub async fn write_from_slice(&mut self, data: &[u8]) -> Result<usize, IggyError> {
         let mut buffer = PooledBuffer::with_capacity(data.len());
         buffer.extend_from_slice(data);
@@ -305,19 +279,8 @@ impl DirectFile {
         self.tail_len.0
     }
 
-    pub fn file_path(&self) -> &str {
-        &self.file_path
-    }
-
     pub fn tail_buffer(&self) -> &PooledBuffer {
         &self.tail
-    }
-
-    pub fn take_tail(&mut self) -> (PooledBuffer, usize) {
-        let tail = std::mem::replace(&mut self.tail, PooledBuffer::with_capacity(ALIGNMENT));
-        let tail_len = self.tail_len.0;
-        self.tail_len.0 = 0;
-        (tail, tail_len)
     }
 
     /// Write multiple owned buffers using vectored I/O
@@ -330,8 +293,7 @@ impl DirectFile {
         }
 
         let mut total_logical_size: usize = 0;
-        // Handle worst case: every buffer boundary requires a split, so double th count
-        let mut write_buffers: Vec<WriteChunk> = Vec::with_capacity(buffers.len() * 2);
+        let mut write_buffers: Vec<Bytes> = Vec::with_capacity(buffers.len() * 2);
 
         // Seed carry over from any existing tail data
         let mut carry_over_len: usize = 0;
@@ -361,11 +323,11 @@ impl DirectFile {
                     self.spare.extend_from_slice(&buffer[..need]);
 
                     // Promote spare to write_buffers
-                    let completed = std::mem::replace(
+                    let mut completed = std::mem::replace(
                         &mut self.spare,
                         PooledBuffer::with_capacity(ALIGNMENT * 2),
                     );
-                    write_buffers.push(WriteChunk::Owned(completed));
+                    write_buffers.push(completed.freeze_to_bytes());
 
                     self.spare.clear();
                     carry_over_len = 0;
@@ -385,10 +347,7 @@ impl DirectFile {
                         let mut aligned_buffer = PooledBuffer::with_capacity(aligned_size);
                         aligned_buffer
                             .extend_from_slice(&buffer.as_ref()[need..need + aligned_size]);
-                        write_buffers.push(WriteChunk::Owned(aligned_buffer));
-
-                        // let aligned_view = buffer.slice(need..need + aligned_size);
-                        // write_buffers.push(WriteChunk::Frozen(aligned_view));
+                        write_buffers.push(aligned_buffer.freeze_to_bytes());
                     } else if after_fill > 0 {
                         // All remainder is sub ALIGNMENT, move to spare
                         self.spare.extend_from_slice(&buffer[need..]);
@@ -406,7 +365,7 @@ impl DirectFile {
                 if aligned_size > 0 {
                     if aligned_size == buffer_len {
                         // Perfect aligned, use all buffer
-                        write_buffers.push(WriteChunk::Frozen(buffer.clone()));
+                        write_buffers.push(buffer);
                     } else {
                         // sub ALIGNMENT tail stays in spare
                         self.spare.clear();
@@ -414,7 +373,7 @@ impl DirectFile {
                         carry_over_len = buffer_len - aligned_size;
 
                         let aligned_view = buffer.slice(0..aligned_size);
-                        write_buffers.push(WriteChunk::Frozen(aligned_view));
+                        write_buffers.push(aligned_view);
                     }
                 } else {
                     // All buffer  is sub ALIGNMENT
@@ -442,17 +401,9 @@ impl DirectFile {
                 self.file_position
             );
 
-            let final_buffers: Vec<Bytes> = write_buffers
-                .into_iter()
-                .map(|chunk| match chunk {
-                    WriteChunk::Frozen(bytes) => bytes,
-                    WriteChunk::Owned(mut buf) => buf.freeze_to_bytes(),
-                })
-                .collect();
-
             let (result, _) = self
                 .file
-                .write_vectored_all_at(final_buffers, self.file_position)
+                .write_vectored_all_at(write_buffers, self.file_position)
                 .await
                 .into();
 
@@ -578,7 +529,6 @@ mod tests {
         assert!(path.exists());
         assert_eq!(df.position(), 0);
         assert_eq!(df.tail_len(), 0);
-        assert_eq!(df.file_path(), path_str);
     }
 
     #[compio::test]
@@ -782,42 +732,6 @@ mod tests {
         assert!(on_disk.len() >= ALIGNMENT);
         assert!(on_disk[..small].iter().all(|&b| b == 0x55));
         assert!(on_disk[small..ALIGNMENT].iter().all(|&b| b == 0x00));
-    }
-
-    #[compio::test]
-    async fn test_take_tail_returns_buffered_data_and_resets() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("take_tail.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let small = 200;
-        df.write_all(make_buffer(small, 0x77)).await.unwrap();
-        assert_eq!(df.tail_len(), small);
-
-        let (tail_buf, tail_len) = df.take_tail();
-        assert_eq!(tail_len, small);
-        assert!(tail_buf[..small].iter().all(|&b| b == 0x77));
-
-        assert_eq!(df.tail_len(), 0);
-    }
-
-    #[compio::test]
-    async fn test_take_tail_when_empty() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("take_empty.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let (_, tail_len) = df.take_tail();
-        assert_eq!(tail_len, 0);
-        assert_eq!(df.tail_len(), 0);
     }
 
     #[compio::test]
@@ -1066,29 +980,6 @@ mod tests {
         let written = df.write_vectored(bufs).await.unwrap();
 
         assert_eq!(written, ALIGNMENT);
-        assert_eq!(df.position(), ALIGNMENT as u64);
-        assert_eq!(df.tail_len(), 0);
-    }
-
-    #[compio::test]
-    async fn test_write_all_after_take_tail() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("after_take.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        df.write_all(make_buffer(100, 0x11)).await.unwrap();
-        assert_eq!(df.tail_len(), 100);
-
-        let (_, len) = df.take_tail();
-        assert_eq!(len, 100);
-        assert_eq!(df.tail_len(), 0);
-
-        // Fresh writes work cleanly after take
-        df.write_all(make_buffer(ALIGNMENT, 0x22)).await.unwrap();
         assert_eq!(df.position(), ALIGNMENT as u64);
         assert_eq!(df.tail_len(), 0);
     }

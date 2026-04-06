@@ -18,17 +18,14 @@
 use crate::{
     IggyByteSize, IggyError, IggyMessagesBatch,
     alloc::memory_pool::ALIGNMENT,
-    types::segment_storage::direct_file::{DirectFile, SharedTail, TailBoundary},
+    types::segment_storage::direct_file::{DirectFile, SharedTail},
 };
 use bytes::Bytes;
 use compio::io::AsyncReadAtExt;
 use std::{
-    cell::{RefCell, UnsafeCell},
+    cell::RefCell,
     rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 use tracing::{error, trace};
 
@@ -36,9 +33,9 @@ use tracing::{error, trace};
 #[derive(Debug)]
 pub struct DirectMessagesWriter {
     file_path: String,
-    file: UnsafeCell<DirectFile>,
+    file: RefCell<DirectFile>,
     messages_size_bytes: Rc<AtomicU64>,
-    shared_tail: Arc<SharedTail>,
+    shared_tail: Rc<SharedTail>,
 }
 
 // Safety: We are guaranteeing that MessagesWriter will never be used from multiple threads
@@ -111,28 +108,25 @@ impl DirectMessagesWriter {
 
         Ok(Self {
             file_path: file_path.to_string(),
-            file: UnsafeCell::new(direct_file),
+            file: RefCell::new(direct_file),
             messages_size_bytes,
-            shared_tail: Arc::new(SharedTail::new()),
+            shared_tail: Rc::new(SharedTail::new()),
         })
     }
 
-    pub fn shared_tail(&self) -> Arc<SharedTail> {
-        Arc::clone(&self.shared_tail)
+    pub fn shared_tail(&self) -> Rc<SharedTail> {
+        Rc::clone(&self.shared_tail)
     }
 
     fn update_shared_tail(&self) {
-        let df = self.file_mut();
+        let df = self.file.borrow_mut();
         self.shared_tail
             .update(df.position(), &df.tail_buffer()[..], df.tail_len());
     }
 
-    // Safety: single-threaded compio runtime, only one caller at a time
-    fn file_mut(&self) -> &mut DirectFile {
-        unsafe { &mut *self.file.get() }
-    }
-
     #[allow(clippy::await_holding_refcell_ref)]
+    // SAFETY: compio is a single-threaded runtime — no other task runs on
+    // this thread during .await, so the RefCell borrow cannot conflict
     pub async fn save_frozen_batches(
         &self,
         batches: &[IggyMessagesBatch],
@@ -153,19 +147,18 @@ impl DirectMessagesWriter {
             return Ok(IggyByteSize::from(0u64));
         }
 
-        let mut df = self.file_mut();
-
         let written = if write_buffers.len() == 1 {
-            df.write_all(write_buffers.into_iter().next().unwrap())
+            self.file
+                .borrow_mut()
+                .write_all(write_buffers.into_iter().next().unwrap())
                 .await?
         } else {
-            df.write_vectored(write_buffers).await?
+            self.file.borrow_mut().write_vectored(write_buffers).await?
         };
 
         self.update_shared_tail();
 
-        // df.flush().await?;
-        let readable = df.position() + df.tail_len() as u64;
+        let readable = self.file.borrow().position() + self.file.borrow().tail_len() as u64;
         self.messages_size_bytes.store(readable, Ordering::Release);
 
         trace!(
@@ -185,14 +178,16 @@ impl DirectMessagesWriter {
         self.messages_size_bytes.clone()
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
+    // SAFETY: compio is a single-threaded runtime — no other task runs on
+    // this thread during .await, so the RefCell borrow cannot conflict
     pub async fn flush(&self) -> Result<(), IggyError> {
-        let df = self.file_mut();
-        let logical_tail = df.tail_len();
+        let logical_tail = self.file.borrow().tail_len();
         if logical_tail == 0 {
             return Ok(());
         }
-        df.flush().await?;
-        let on_disk = df.position();
+        self.file.borrow_mut().flush().await?;
+        let on_disk = self.file.borrow().position();
         let logical_size = on_disk - ALIGNMENT as u64 + logical_tail as u64;
         self.update_shared_tail();
         self.messages_size_bytes
@@ -201,21 +196,23 @@ impl DirectMessagesWriter {
         Ok(())
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
+    // SAFETY: compio is a single-threaded runtime — no other task runs on
+    // this thread during .await, so the RefCell borrow cannot conflict
     pub async fn flush_and_truncate(&self) -> Result<(), IggyError> {
-        let df = self.file_mut();
-        let logical_tail = df.tail_len();
+        let logical_tail = self.file.borrow().tail_len();
 
         if logical_tail > 0 {
-            df.flush().await?;
-            let on_disk = df.position();
+            self.file.borrow_mut().flush().await?;
+            let on_disk = self.file.borrow().position();
             let logical_size = on_disk - ALIGNMENT as u64 + logical_tail as u64;
             self.update_shared_tail();
             self.messages_size_bytes
                 .store(logical_size, Ordering::Release);
-            df.truncate(logical_size).await?;
+            self.file.borrow_mut().truncate(logical_size).await?;
         } else {
             let logical_size = self.messages_size_bytes.load(Ordering::Acquire);
-            df.truncate(logical_size).await?;
+            self.file.borrow_mut().truncate(logical_size).await?;
         }
 
         Ok(())
