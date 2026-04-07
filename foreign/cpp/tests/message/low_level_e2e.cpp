@@ -1150,3 +1150,117 @@ TEST(LowLevelE2E_Message, SendMessagesLargeBatch) {
     client->delete_stream(make_numeric_identifier(stream.id));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
+
+TEST(LowLevelE2E_Message, SendMessagesWithInvalidTopicIdThrows) {
+    RecordProperty("description", "Throws when sending messages with an invalid topic identifier.");
+    iggy::ffi::Client *client = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    rust::Vec<iggy::ffi::Message> messages;
+    iggy::ffi::Message msg;
+    msg.new_message(to_payload("test"));
+    messages.push_back(std::move(msg));
+
+    iggy::ffi::Identifier invalid_id;
+    invalid_id.kind   = "invalid";
+    invalid_id.length = 0;
+
+    ASSERT_THROW(client->send_messages(make_numeric_identifier(1), invalid_id, "partition_id", partition_id_bytes(0),
+                                       std::move(messages)),
+                 std::exception);
+
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+}
+
+TEST(LowLevelE2E_Message, PollMessagesWithInvalidTopicIdThrows) {
+    RecordProperty("description", "Throws when polling messages with an invalid topic identifier.");
+    iggy::ffi::Client *client = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    iggy::ffi::Identifier invalid_id;
+    invalid_id.kind   = "invalid";
+    invalid_id.length = 0;
+
+    ASSERT_THROW(client->poll_messages(make_numeric_identifier(1), invalid_id, 0, "consumer",
+                                       make_numeric_identifier(1), "offset", 0, 10, false),
+                 std::exception);
+
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+}
+
+TEST(LowLevelE2E_Message, PollMessagesWithInvalidConsumerIdThrows) {
+    RecordProperty("description", "Throws when polling messages with an invalid consumer identifier.");
+    const std::string stream_name = "cpp-msg-invalid-consumer-id";
+    iggy::ffi::Client *client     = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    iggy::ffi::Identifier invalid_id;
+    invalid_id.kind   = "invalid";
+    invalid_id.length = 0;
+
+    ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
+                                       invalid_id, "offset", 0, 10, false),
+                 std::exception);
+
+    client->delete_stream(make_numeric_identifier(stream.id));
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+}
+
+TEST(LowLevelE2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
+    RecordProperty("description",
+                   "Creates a consumer group, joins it, sends messages, and polls them using consumer_group kind.");
+    const std::string stream_name = "cpp-msg-consumer-group";
+    iggy::ffi::Client *client     = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
+                         "server_default");
+
+    auto group =
+        client->create_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0), "test-group");
+    ASSERT_EQ(group.members_count, 0u);
+
+    ASSERT_NO_THROW(client->join_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                                make_numeric_identifier(group.id)));
+
+    auto group_after_join = client->get_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                                       make_numeric_identifier(group.id));
+    ASSERT_EQ(group_after_join.members_count, 1u);
+
+    rust::Vec<iggy::ffi::Message> messages;
+    for (std::uint32_t i = 0; i < 10; i++) {
+        iggy::ffi::Message msg;
+        msg.new_message(to_payload("cg-msg-" + std::to_string(i)));
+        messages.push_back(std::move(msg));
+    }
+    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                          partition_id_bytes(0), std::move(messages));
+
+    auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
+                                        "consumer_group", make_numeric_identifier(group.id), "offset", 0, 100, false);
+
+    ASSERT_EQ(polled.count, 10u);
+    ASSERT_EQ(polled.messages.size(), 10u);
+    for (std::uint32_t i = 0; i < 10; i++) {
+        std::string expected = "cg-msg-" + std::to_string(i);
+        std::string actual(polled.messages[i].payload.begin(), polled.messages[i].payload.end());
+        EXPECT_EQ(actual, expected) << "Payload mismatch at offset " << i;
+    }
+
+    ASSERT_NO_THROW(client->leave_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                                 make_numeric_identifier(group.id)));
+
+    auto group_after_leave = client->get_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                                        make_numeric_identifier(group.id));
+    ASSERT_EQ(group_after_leave.members_count, 0u);
+
+    client->delete_stream(make_numeric_identifier(stream.id));
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+}
