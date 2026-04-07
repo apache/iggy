@@ -28,8 +28,9 @@ use integration::harness::seeds;
 use integration::iggy_harness;
 
 #[iggy_harness(
+    shared_server = "elasticsearch_sink",
     server(connectors_runtime(config_path = "tests/connectors/elasticsearch/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn elasticsearch_sink_stores_json_messages(
     harness: &TestHarness,
@@ -86,8 +87,9 @@ async fn elasticsearch_sink_stores_json_messages(
 }
 
 #[iggy_harness(
+    shared_server = "elasticsearch_sink",
     server(connectors_runtime(config_path = "tests/connectors/elasticsearch/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn elasticsearch_sink_handles_bulk_messages(
     harness: &TestHarness,
@@ -140,8 +142,9 @@ async fn elasticsearch_sink_handles_bulk_messages(
 }
 
 #[iggy_harness(
+    shared_server = "elasticsearch_sink",
     server(connectors_runtime(config_path = "tests/connectors/elasticsearch/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn elasticsearch_sink_preserves_json_structure(
     harness: &TestHarness,

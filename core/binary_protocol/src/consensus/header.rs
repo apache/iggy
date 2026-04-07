@@ -181,6 +181,7 @@ pub struct ReplyHeader {
 
     pub request_checksum: u128,
     pub context: u128,
+    pub client: u128,
     pub op: u64,
     pub commit: u64,
     pub timestamp: u64,
@@ -188,7 +189,7 @@ pub struct ReplyHeader {
     pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
-    pub reserved: [u8; 48],
+    pub reserved: [u8; 32],
 }
 const _: () = {
     assert!(size_of::<ReplyHeader>() == HEADER_SIZE);
@@ -196,7 +197,7 @@ const _: () = {
         offset_of!(ReplyHeader, request_checksum)
             == offset_of!(ReplyHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 48]>() == HEADER_SIZE);
+    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 32]>() == HEADER_SIZE);
 };
 
 impl Default for ReplyHeader {
@@ -213,6 +214,7 @@ impl Default for ReplyHeader {
             reserved_frame: [0; 66],
             request_checksum: 0,
             context: 0,
+            client: 0,
             op: 0,
             commit: 0,
             timestamp: 0,
@@ -220,7 +222,7 @@ impl Default for ReplyHeader {
             operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
-            reserved: [0; 48],
+            reserved: [0; 32],
         }
     }
 }

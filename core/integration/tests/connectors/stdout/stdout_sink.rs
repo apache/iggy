@@ -32,8 +32,9 @@ use tokio::time::sleep;
 const API_KEY: &str = "test-api-key";
 
 #[iggy_harness(
+    shared_server = "stdout_sink",
     server(connectors_runtime(config_path = "tests/connectors/stdout/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn stdout_sink_consumes_messages(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();
@@ -90,8 +91,9 @@ async fn stdout_sink_consumes_messages(harness: &TestHarness) {
 }
 
 #[iggy_harness(
+    shared_server = "stdout_sink",
     server(connectors_runtime(config_path = "tests/connectors/stdout/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn stdout_sink_reports_metrics(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();
@@ -150,8 +152,9 @@ async fn stdout_sink_reports_metrics(harness: &TestHarness) {
 }
 
 #[iggy_harness(
+    shared_server = "stdout_sink",
     server(connectors_runtime(config_path = "tests/connectors/stdout/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn stdout_sink_handles_bulk_messages(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();

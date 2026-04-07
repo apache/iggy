@@ -32,8 +32,9 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 #[iggy_harness(
+    shared_server = "postgres_source",
     server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn json_rows_source_produces_messages_to_iggy(
     harness: &TestHarness,
@@ -113,8 +114,9 @@ async fn json_rows_source_produces_messages_to_iggy(
 }
 
 #[iggy_harness(
+    shared_server = "postgres_source",
     server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn bytea_rows_source_produces_raw_messages_to_iggy(
     harness: &TestHarness,
@@ -176,8 +178,9 @@ async fn bytea_rows_source_produces_raw_messages_to_iggy(
 }
 
 #[iggy_harness(
+    shared_server = "postgres_source",
     server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn jsonb_rows_source_produces_json_messages_to_iggy(
     harness: &TestHarness,
@@ -243,8 +246,9 @@ async fn jsonb_rows_source_produces_json_messages_to_iggy(
 }
 
 #[iggy_harness(
+    shared_server = "postgres_source",
     server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn delete_after_read_source_removes_rows_after_producing(
     harness: &TestHarness,
@@ -313,8 +317,9 @@ async fn delete_after_read_source_removes_rows_after_producing(
 }
 
 #[iggy_harness(
+    shared_server = "postgres_source",
     server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn processed_column_source_marks_rows_after_producing(
     harness: &TestHarness,
