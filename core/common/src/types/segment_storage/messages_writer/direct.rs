@@ -51,6 +51,7 @@ impl DirectMessagesWriter {
         file_path: &str,
         messages_size_bytes: Rc<AtomicU64>,
         file_exists: bool,
+        dsync: bool,
     ) -> Result<Self, IggyError> {
         let initial_position = if file_exists {
             let metadata = compio::fs::metadata(file_path).await.map_err(|err| {
@@ -68,7 +69,8 @@ impl DirectMessagesWriter {
             0
         };
 
-        let mut direct_file = DirectFile::open(file_path, initial_position, file_exists).await?;
+        let mut direct_file =
+            DirectFile::open(file_path, initial_position, file_exists, dsync).await?;
 
         if file_exists {
             let actual_size = messages_size_bytes.load(Ordering::Relaxed);

@@ -41,6 +41,7 @@ pub async fn create_segment_storage(
         index_fsync: config.partition.enforce_fsync,
         file_exists: false,
         direct_io: config.direct_io.enabled,
+        direct_io_dsync: config.direct_io.dsync,
     };
 
     Storage::new(&messages_path, &index_path, storage_open_opts).await

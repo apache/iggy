@@ -362,6 +362,9 @@ retry_delay = "1 s"
 # Enables O_DIRECT for disk operations.
 # When enabled, bypasses the OS page cache for more predictable latency.
 enabled = true
+# Use O_DSYNC alongside O_DIRECT. When false, only O_DIRECT is used
+# and durability depends on explicit flush calls
+dsync = true
 
 # Runtime configuration.
 [system.runtime]

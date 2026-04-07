@@ -45,10 +45,17 @@ impl MessagesWriter {
         fsync: bool,
         file_exists: bool,
         direct_io_enabled: bool,
+        direct_io_dsync: bool,
     ) -> Result<Self, IggyError> {
         let backend = if direct_io_enabled {
             MessagesWriterBackend::Direct(Box::new(
-                DirectMessagesWriter::new(file_path, messages_size_bytes, file_exists).await?,
+                DirectMessagesWriter::new(
+                    file_path,
+                    messages_size_bytes,
+                    file_exists,
+                    direct_io_dsync,
+                )
+                .await?,
             ))
         } else {
             MessagesWriterBackend::Buffered(

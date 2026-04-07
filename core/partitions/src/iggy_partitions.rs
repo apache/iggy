@@ -357,6 +357,7 @@ impl<C, J> IggyPartitions<C, J> {
             index_fsync: self.config.enforce_fsync,
             file_exists: false,
             direct_io: self.config.direct_io,
+            direct_io_dsync: self.config.direct_io_dsync,
         };
 
         let storage = SegmentStorage::new(&messages_path, &index_path, storage_open_opts)
@@ -1438,6 +1439,7 @@ where
             index_fsync: self.config.enforce_fsync,
             file_exists: false,
             direct_io: self.config.direct_io,
+            direct_io_dsync: self.config.direct_io_dsync,
         };
 
         let storage = SegmentStorage::new(&messages_path, &index_path, storage_open_opts)

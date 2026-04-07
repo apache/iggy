@@ -97,6 +97,7 @@ pub struct StorageOpenOptions {
     pub index_fsync: bool,
     pub file_exists: bool,
     pub direct_io: bool,
+    pub direct_io_dsync: bool,
 }
 
 impl SegmentStorage {
@@ -112,6 +113,7 @@ impl SegmentStorage {
             index_fsync,
             file_exists,
             direct_io,
+            direct_io_dsync,
         } = opts;
 
         let size = Rc::new(std::sync::atomic::AtomicU64::new(messages_size));
@@ -123,6 +125,7 @@ impl SegmentStorage {
                 log_fsync,
                 file_exists,
                 direct_io,
+                direct_io_dsync,
             )
             .await?,
         );

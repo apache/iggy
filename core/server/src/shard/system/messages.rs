@@ -173,30 +173,9 @@ impl IggyShard {
             frozen
         };
 
-        let persist_start = std::time::Instant::now();
-
         let saved_count = self
             .persist_frozen_batches_to_disk(namespace, frozen_batches)
             .await?;
-
-        tracing::error!(
-            "flush_unsaved_buffer: persist took {}ms, namespace={:?}",
-            persist_start.elapsed().as_millis(),
-            namespace
-        );
-
-        // {
-        //     let partitions = self.local_partitions.borrow();
-        //     let partition = partitions.get(namespace).expect("namespace must be exist");
-        //     let message_writer = partition
-        //         .log
-        //         .active_storage()
-        //         .messages_writer
-        //         .as_ref()
-        //         .expect("messages_writer not initialized");
-        //
-        //     message_writer.as_ref().flush().await?;
-        // }
 
         if fsync {
             self.fsync_all_messages_from_local_partitions(namespace, shutdown)

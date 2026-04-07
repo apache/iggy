@@ -112,6 +112,7 @@ impl DirectFile {
         file_path: &str,
         initial_position: u64,
         file_exists: bool,
+        dsync: bool,
     ) -> Result<Self, IggyError> {
         debug_assert_eq!(
             initial_position % ALIGNMENT as u64,
@@ -119,10 +120,16 @@ impl DirectFile {
             "initial_position must be aligned, got {initial_position}"
         );
 
+        let mut flags = O_DIRECT;
+
+        if dsync {
+            flags |= O_DSYNC;
+        }
+
         let file = OpenOptions::new()
             .create(true)
             .write(true)
-            .custom_flags((O_DSYNC | O_DIRECT) as _)
+            .custom_flags(flags as _)
             .open(file_path)
             .await
             .map_err(|err| {

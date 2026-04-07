@@ -310,6 +310,7 @@ pub async fn load_segments(
             index_fsync: config.partition.enforce_fsync,
             file_exists: true,
             direct_io: config.direct_io.enabled,
+            direct_io_dsync: config.direct_io.dsync,
         };
 
         let storage =

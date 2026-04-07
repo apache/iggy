@@ -71,6 +71,7 @@ pub struct DatabaseConfig {
 #[derive(Debug, Deserialize, Serialize, Default, ConfigEnv)]
 pub struct DirectIoConfig {
     pub enabled: bool,
+    pub dsync: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
