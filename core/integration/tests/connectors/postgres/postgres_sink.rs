@@ -35,8 +35,9 @@ type SinkRow = (i64, String, String, Vec<u8>);
 type SinkJsonRow = (i64, serde_json::Value);
 
 #[iggy_harness(
+    shared_server = "postgres_sink",
     server(connectors_runtime(config_path = "tests/connectors/postgres/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn json_messages_sink_stores_as_bytea(harness: &TestHarness, fixture: PostgresSinkFixture) {
     let client = harness.root_client().await.unwrap();
@@ -97,8 +98,9 @@ async fn json_messages_sink_stores_as_bytea(harness: &TestHarness, fixture: Post
 }
 
 #[iggy_harness(
+    shared_server = "postgres_sink",
     server(connectors_runtime(config_path = "tests/connectors/postgres/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn binary_messages_sink_stores_as_bytea(
     harness: &TestHarness,
@@ -161,8 +163,9 @@ async fn binary_messages_sink_stores_as_bytea(
 }
 
 #[iggy_harness(
+    shared_server = "postgres_sink",
     server(connectors_runtime(config_path = "tests/connectors/postgres/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn json_messages_sink_stores_as_jsonb(
     harness: &TestHarness,

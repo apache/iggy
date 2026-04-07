@@ -19,7 +19,7 @@
 
 use iggy::prelude::{IggyClient, StreamClient, TopicClient};
 use iggy_common::{
-    CompressionAlgorithm, Consumer, Identifier, IggyExpiry, IggyMessage, MaxTopicSize,
+    CompressionAlgorithm, Consumer, Identifier, IggyError, IggyExpiry, IggyMessage, MaxTopicSize,
     Partitioning, PersonalAccessTokenExpiry, UserStatus,
 };
 use iggy_common::{
@@ -119,6 +119,75 @@ pub async fn connector_multi_topic_stream(client: &IggyClient) -> Result<(), See
             MaxTopicSize::ServerDefault,
         )
         .await?;
+
+    Ok(())
+}
+
+/// Idempotent seed for serial shared_server tests: creates stream and topic,
+/// silently skipping if they already exist from a previous test in the group.
+pub async fn connector_stream_idempotent(client: &IggyClient) -> Result<(), SeedError> {
+    let stream_id: Identifier = names::STREAM.try_into()?;
+
+    match client.create_stream(names::STREAM).await {
+        Ok(_) => {}
+        Err(e) if e.as_code() == IggyError::StreamNameAlreadyExists(String::new()).as_code() => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    match client
+        .create_topic(
+            &stream_id,
+            names::TOPIC,
+            1,
+            CompressionAlgorithm::None,
+            None,
+            IggyExpiry::ServerDefault,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(e)
+            if e.as_code()
+                == IggyError::TopicNameAlreadyExists(String::new(), Identifier::default())
+                    .as_code() => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    Ok(())
+}
+
+/// Idempotent multi-topic seed for serial shared_server tests.
+pub async fn connector_multi_topic_stream_idempotent(client: &IggyClient) -> Result<(), SeedError> {
+    let stream_id: Identifier = names::STREAM.try_into()?;
+
+    match client.create_stream(names::STREAM).await {
+        Ok(_) => {}
+        Err(e) if e.as_code() == IggyError::StreamNameAlreadyExists(String::new()).as_code() => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    for topic_name in [names::TOPIC, names::TOPIC_2] {
+        match client
+            .create_topic(
+                &stream_id,
+                topic_name,
+                1,
+                CompressionAlgorithm::None,
+                None,
+                IggyExpiry::ServerDefault,
+                MaxTopicSize::ServerDefault,
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(e)
+                if e.as_code()
+                    == IggyError::TopicNameAlreadyExists(String::new(), Identifier::default())
+                        .as_code() => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     Ok(())
 }

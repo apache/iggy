@@ -24,7 +24,8 @@ pub use harness_derive::iggy_harness;
 #[doc(hidden)]
 pub mod __macro_support {
     pub use crate::harness::{
-        ClientConfig, McpClient, McpConfig, TestHarness, TestServerConfig, TlsConfig,
+        ClientConfig, ConnectorsRuntimeConfig, McpClient, McpConfig, SharedServerRegistry,
+        TestHarness, TestServerConfig, TlsConfig,
     };
     pub use iggy::prelude::ClientWrapper;
     pub use iggy_common::TransportProtocol;

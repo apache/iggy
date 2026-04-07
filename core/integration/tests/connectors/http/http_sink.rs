@@ -196,8 +196,9 @@ use integration::iggy_harness;
 /// Validates `batch_mode=individual`: one HTTP POST per message, each with metadata envelope.
 /// Checks request count = message count, envelope structure, and `application/json` content type.
 #[iggy_harness(
+    shared_server = "http_sink",
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn individual_json_messages_delivered_as_separate_posts(
     harness: &TestHarness,
@@ -303,8 +304,9 @@ async fn individual_json_messages_delivered_as_separate_posts(
 /// Validates `batch_mode=ndjson`: all messages in one request as newline-delimited JSON.
 /// Checks single request, line count = message count, per-line envelope, `application/x-ndjson`.
 #[iggy_harness(
+    shared_server = "http_sink",
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn ndjson_messages_delivered_as_single_request(
     harness: &TestHarness,
@@ -395,8 +397,9 @@ async fn ndjson_messages_delivered_as_single_request(
 /// Validates `batch_mode=json_array`: all messages as a single JSON array in one request.
 /// Checks single request, array length = message count, per-item envelope, `application/json`.
 #[iggy_harness(
+    shared_server = "http_sink",
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn json_array_messages_delivered_as_single_request(
     harness: &TestHarness,
@@ -488,8 +491,9 @@ async fn json_array_messages_delivered_as_single_request(
 /// Validates `batch_mode=raw`: each message as raw bytes without metadata envelope.
 /// Checks request count = message count, no envelope wrapper, `application/octet-stream`.
 #[iggy_harness(
+    shared_server = "http_sink",
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn raw_binary_messages_delivered_without_envelope(
     harness: &TestHarness,
@@ -575,8 +579,9 @@ async fn raw_binary_messages_delivered_without_envelope(
 /// Validates `include_metadata=false`: bare payload without `{metadata, payload}` envelope.
 /// Checks no metadata field in body, original payload fields at top level.
 #[iggy_harness(
+    shared_server = "http_sink",
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn metadata_disabled_sends_bare_payload(
     harness: &TestHarness,
@@ -651,8 +656,9 @@ async fn metadata_disabled_sends_bare_payload(
 /// Validates sequential offset integrity: `iggy_offset` values are contiguous across
 /// 5 delivered messages. Sorts by offset and checks each = previous + 1.
 #[iggy_harness(
+    shared_server = "http_sink",
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn individual_messages_have_sequential_offsets(
     harness: &TestHarness,
@@ -738,8 +744,9 @@ async fn individual_messages_have_sequential_offsets(
 /// Validates multi-topic delivery: one connector consuming two topics on the same stream.
 /// Sends 2 messages to topic 1, 1 to topic 2, verifies `iggy_topic` metadata matches source.
 #[iggy_harness(
+    shared_server = "http_sink",
     server(connectors_runtime(config_path = "tests/connectors/http/sink.toml")),
-    seed = seeds::connector_multi_topic_stream
+    seed = seeds::connector_multi_topic_stream_idempotent
 )]
 async fn multi_topic_messages_delivered_with_correct_topic_metadata(
     harness: &TestHarness,
@@ -749,8 +756,8 @@ async fn multi_topic_messages_delivered_with_correct_topic_metadata(
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_1_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
-    // Step 1: Both topics created by connector_multi_topic_stream seed (runs before
-    // connector runtime starts — runtime health check requires all configured topics).
+    // Both topics created by connector_multi_topic_stream_idempotent seed (runs before
+    // connector runtime starts - runtime health check requires all configured topics).
     let topic_2_id: Identifier = seeds::names::TOPIC_2.try_into().unwrap();
 
     // Step 2: Send 2 messages to topic 1 with source identifier in payload
@@ -822,7 +829,6 @@ async fn multi_topic_messages_delivered_with_correct_topic_metadata(
             )
         });
 
-        // Match against constants — not magic strings (code review M9)
         match iggy_topic {
             t if t == seeds::names::TOPIC => {
                 topic_1_count += 1;

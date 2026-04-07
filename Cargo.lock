@@ -6151,6 +6151,7 @@ dependencies = [
  "configs",
  "configs_derive",
  "ctor",
+ "dashmap",
  "figment",
  "futures",
  "harness_derive",
