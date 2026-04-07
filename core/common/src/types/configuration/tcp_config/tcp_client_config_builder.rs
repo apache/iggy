@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{AutoLogin, IggyDuration, IggyError, TcpClientConfig};
-use std::net::SocketAddr;
+use crate::{AutoLogin, IggyDuration, IggyError, TcpClientConfig, validate_server_address};
 
 /// Builder for the TCP client configuration.
 /// Allows configuring the TCP client with custom settings or using defaults:
@@ -103,13 +102,9 @@ impl TcpClientConfigBuilder {
     }
 
     /// Builds the TCP client configuration.
-    pub fn build(self) -> Result<TcpClientConfig, IggyError> {
-        let addr = self.config.server_address.trim();
-
-        if addr.parse::<SocketAddr>().is_err() {
-            let (ip, port) = addr.rsplit_once(':').unwrap_or((addr, ""));
-            return Err(IggyError::InvalidIpAddress(ip.to_owned(), port.to_owned()));
-        }
+    pub fn build(mut self) -> Result<TcpClientConfig, IggyError> {
+        self.config.server_address = self.config.server_address.trim().to_string();
+        validate_server_address(&self.config.server_address)?;
 
         Ok(self.config)
     }
@@ -148,12 +143,16 @@ mod tests {
     }
 
     #[test]
-    fn invalid_ip_should_fail() {
+    fn valid_dns_name_should_succeed() {
+        let builder = builder_with_address("localhost:8080");
+        assert!(builder.build().is_ok());
+    }
+
+    #[test]
+    fn unresolvable_hostname_should_succeed() {
+        // Format is valid; DNS resolution is not attempted
         let builder = builder_with_address("invalid.ip:8080");
-        assert!(matches!(
-            builder.build(),
-            Err(IggyError::InvalidIpAddress(_, _))
-        ));
+        assert!(builder.build().is_ok());
     }
 
     #[test]
@@ -181,5 +180,11 @@ mod tests {
             builder.build(),
             Err(IggyError::InvalidIpAddress(_, _))
         ));
+    }
+
+    #[test]
+    fn docker_compose_service_name_should_succeed() {
+        let builder = builder_with_address("iggy-server:8090");
+        assert!(builder.build().is_ok());
     }
 }

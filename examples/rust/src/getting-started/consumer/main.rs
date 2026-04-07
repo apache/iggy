@@ -128,13 +128,6 @@ fn get_tcp_server_addr() -> String {
             );
         }
         let tcp_server_addr = tcp_server_addr.unwrap();
-        if tcp_server_addr.parse::<std::net::SocketAddr>().is_err() {
-            panic!(
-                "Invalid server address {}! Usage: {} --tcp-server-address <server-address>",
-                tcp_server_addr,
-                env::args().next().unwrap()
-            );
-        }
         info!("Using server address: {}", tcp_server_addr);
         tcp_server_addr
     }
