@@ -48,6 +48,12 @@ impl ClusterNodesValue {
     }
 }
 
+/// Shared server configuration.
+#[derive(Debug, Clone)]
+pub struct SharedServerAttrs {
+    pub key: String,
+}
+
 /// Parsed `#[iggy_harness(...)]` attributes.
 #[derive(Debug, Default)]
 pub struct IggyTestAttrs {
@@ -57,6 +63,7 @@ pub struct IggyTestAttrs {
     pub server: ServerAttrs,
     pub seed_fn: Option<syn::Path>,
     pub cluster_nodes: ClusterNodesValue,
+    pub shared_server: Option<SharedServerAttrs>,
 }
 
 /// MCP configuration attributes.
@@ -82,6 +89,7 @@ impl IggyTestAttrs {
             server: ServerAttrs::default(),
             seed_fn: None,
             cluster_nodes: ClusterNodesValue::None,
+            shared_server: None,
         }
     }
 }
@@ -248,6 +256,9 @@ impl Parse for IggyTestAttrs {
                 AttrItem::ClusterNodes(cluster) => {
                     attrs.cluster_nodes = cluster;
                 }
+                AttrItem::SharedServer(shared) => {
+                    attrs.shared_server = Some(shared);
+                }
             }
         }
 
@@ -264,6 +275,7 @@ enum AttrItem {
     Server(Box<ServerAttrs>),
     Seed(syn::Path),
     ClusterNodes(ClusterNodesValue),
+    SharedServer(SharedServerAttrs),
 }
 
 impl Parse for AttrItem {
@@ -292,6 +304,10 @@ impl Parse for AttrItem {
                 input.parse::<Token![=]>()?;
                 let path: syn::Path = input.parse()?;
                 Ok(AttrItem::Seed(path))
+            }
+            "shared_server" => {
+                let shared = parse_shared_server_attrs(input)?;
+                Ok(AttrItem::SharedServer(shared))
             }
             _ => Err(syn::Error::new(
                 ident.span(),
@@ -471,6 +487,13 @@ fn parse_mcp_attrs(input: ParseStream) -> syn::Result<McpAttrs> {
     }
 
     Ok(mcp)
+}
+
+/// Parse `shared_server = "key"`.
+fn parse_shared_server_attrs(input: ParseStream) -> syn::Result<SharedServerAttrs> {
+    input.parse::<Token![=]>()?;
+    let lit: LitStr = input.parse()?;
+    Ok(SharedServerAttrs { key: lit.value() })
 }
 
 fn parse_connectors_runtime_attrs(input: ParseStream) -> syn::Result<ConnectorsRuntimeAttrs> {

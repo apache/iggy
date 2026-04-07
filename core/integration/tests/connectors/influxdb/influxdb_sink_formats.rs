@@ -52,7 +52,8 @@ use integration::iggy_harness;
 /// with printable ASCII.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink_text.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_text_writes_points(harness: &TestHarness, fixture: InfluxDbSinkTextFixture) {
     let client = harness.root_client().await.unwrap();
@@ -91,7 +92,8 @@ async fn influxdb_sink_text_writes_points(harness: &TestHarness, fixture: Influx
 /// Covers: `write_field_string` quote-escape branch.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink_text.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_text_with_quote_characters(
     harness: &TestHarness,
@@ -131,7 +133,8 @@ async fn influxdb_sink_text_with_quote_characters(
 /// Covers: `write_field_string` backslash-escape branch.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink_text.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_text_with_backslash(
     harness: &TestHarness,
@@ -170,7 +173,8 @@ async fn influxdb_sink_text_with_backslash(
 /// path under the Text format.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink_text.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_text_bulk(harness: &TestHarness, fixture: InfluxDbSinkTextFixture) {
     let client = harness.root_client().await.unwrap();
@@ -212,7 +216,8 @@ async fn influxdb_sink_text_bulk(harness: &TestHarness, fixture: InfluxDbSinkTex
 /// `general_purpose::STANDARD.encode`.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink_base64.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_base64_writes_points(
     harness: &TestHarness,
@@ -257,7 +262,8 @@ async fn influxdb_sink_base64_writes_points(
 /// needed for base64 output, but exercises the full field-write path).
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink_base64.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_base64_roundtrip(harness: &TestHarness, fixture: InfluxDbSinkBase64Fixture) {
     let client = harness.root_client().await.unwrap();
@@ -302,7 +308,8 @@ async fn influxdb_sink_base64_roundtrip(harness: &TestHarness, fixture: InfluxDb
 /// test covers the next-closest case (1-byte payload → 4-char base64 string).
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink_base64.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_base64_single_byte_payload(
     harness: &TestHarness,
@@ -346,7 +353,8 @@ async fn influxdb_sink_base64_single_byte_payload(
 /// branches inside `append_line`.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink_no_metadata.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_no_metadata_writes_points(
     harness: &TestHarness,
@@ -387,7 +395,8 @@ async fn influxdb_sink_no_metadata_writes_points(
 /// with the no-metadata tag configuration.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink_no_metadata.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_no_metadata_bulk(
     harness: &TestHarness,
@@ -432,7 +441,8 @@ async fn influxdb_sink_no_metadata_bulk(
 /// Covers: `"ns"` arm of `to_precision_timestamp`.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_ns_precision_writes_points(
     harness: &TestHarness,
@@ -475,7 +485,8 @@ async fn influxdb_sink_ns_precision_writes_points(
 /// in `PayloadFormat::Json` and `write_field_string` with `{`, `}`, `:`, `"`.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_json_nested_payload(harness: &TestHarness, fixture: InfluxDbSinkFixture) {
     let client = harness.root_client().await.unwrap();
@@ -523,7 +534,8 @@ async fn influxdb_sink_json_nested_payload(harness: &TestHarness, fixture: Influ
 /// Covers: `'\n' => buf.push_str("\\n")` branch in `write_field_string`.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink_text.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_text_with_newline(harness: &TestHarness, fixture: InfluxDbSinkTextFixture) {
     let client = harness.root_client().await.unwrap();

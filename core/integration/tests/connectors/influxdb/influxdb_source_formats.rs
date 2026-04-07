@@ -51,7 +51,8 @@ use tracing::info;
 /// path), `schema()` → `Schema::Text`.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source_text.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_source",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_source_text_payload_column(
     harness: &TestHarness,
@@ -110,7 +111,8 @@ async fn influxdb_source_text_payload_column(
 /// Covers: `PayloadFormat::Text` → `Ok(raw_value.into_bytes())`.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source_text.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_source",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_source_text_whitespace_value(
     harness: &TestHarness,
@@ -172,7 +174,8 @@ async fn influxdb_source_text_whitespace_value(
 /// STANDARD.decode`.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source_raw.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_source",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_source_raw_payload_column(
     harness: &TestHarness,
@@ -229,7 +232,8 @@ async fn influxdb_source_raw_payload_column(
 /// Covers: the loop in `poll_messages` with `PayloadFormat::Raw`.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source_raw.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_source",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_source_raw_multiple_rows(
     harness: &TestHarness,
@@ -290,7 +294,8 @@ async fn influxdb_source_raw_multiple_rows(
 /// Covers: `parse_scalar` for `i64`, `f64`, `bool`, and string branches.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_source",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_source_scalar_type_integer(
     harness: &TestHarness,
@@ -350,7 +355,8 @@ async fn influxdb_source_scalar_type_integer(
 /// Covers `parse_scalar` for `f64` values.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_source",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_source_scalar_type_float(harness: &TestHarness, fixture: InfluxDbSourceFixture) {
     let base_ts: u64 = Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
@@ -401,7 +407,8 @@ async fn influxdb_source_scalar_type_float(harness: &TestHarness, fixture: Influ
 /// Covers `parse_scalar` for boolean values (`true`/`false`).
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_source",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_source_scalar_type_bool(harness: &TestHarness, fixture: InfluxDbSourceFixture) {
     let base_ts: u64 = Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
@@ -474,7 +481,8 @@ async fn influxdb_source_scalar_type_bool(harness: &TestHarness, fixture: Influx
 /// cursor state persisted via `state.last_timestamp`.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_source",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_source_cursor_advances_between_batches(
     harness: &TestHarness,
@@ -565,7 +573,8 @@ async fn influxdb_source_cursor_advances_between_batches(
 /// `build_payload` (whole-row path).
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_source",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_source_no_metadata_core_fields_present(
     harness: &TestHarness,

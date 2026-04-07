@@ -48,8 +48,9 @@ fn build_expected_document_id_for_topic(topic_name: &str, message_id: u128) -> S
 }
 
 #[iggy_harness(
+    shared_server = "mongodb_sink",
     server(connectors_runtime(config_path = "tests/connectors/mongodb/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn json_messages_sink_to_mongodb(harness: &TestHarness, fixture: MongoDbSinkJsonFixture) {
     let client = harness.root_client().await.unwrap();
@@ -136,8 +137,9 @@ async fn json_messages_sink_to_mongodb(harness: &TestHarness, fixture: MongoDbSi
 }
 
 #[iggy_harness(
+    shared_server = "mongodb_sink",
     server(connectors_runtime(config_path = "tests/connectors/mongodb/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn binary_messages_sink_as_bson_binary(harness: &TestHarness, fixture: MongoDbSinkFixture) {
     let client = harness.root_client().await.unwrap();
@@ -204,8 +206,9 @@ async fn binary_messages_sink_as_bson_binary(harness: &TestHarness, fixture: Mon
 }
 
 #[iggy_harness(
+    shared_server = "mongodb_sink",
     server(connectors_runtime(config_path = "tests/connectors/mongodb/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn large_batch_processed_correctly(harness: &TestHarness, fixture: MongoDbSinkBatchFixture) {
     let client = harness.root_client().await.unwrap();
@@ -258,8 +261,9 @@ async fn large_batch_processed_correctly(harness: &TestHarness, fixture: MongoDb
 }
 
 #[iggy_harness(
+    shared_server = "mongodb_sink",
     server(connectors_runtime(config_path = "tests/connectors/mongodb/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn duplicate_key_is_idempotent_replay_not_sink_error(
     harness: &TestHarness,
@@ -441,8 +445,9 @@ async fn duplicate_key_is_idempotent_replay_not_sink_error(
 }
 
 #[iggy_harness(
+    shared_server = "mongodb_sink",
     server(connectors_runtime(config_path = "tests/connectors/mongodb/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn ordered_duplicate_partial_insert_has_exact_accounting(
     harness: &TestHarness,
@@ -617,8 +622,9 @@ async fn ordered_duplicate_partial_insert_has_exact_accounting(
 }
 
 #[iggy_harness(
+    shared_server = "mongodb_sink",
     server(connectors_runtime(config_path = "tests/connectors/mongodb/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn schema_validation_mid_batch_surfaces_hard_error_and_partial_prefix(
     harness: &TestHarness,
@@ -729,8 +735,9 @@ async fn schema_validation_mid_batch_surfaces_hard_error_and_partial_prefix(
 }
 
 #[iggy_harness(
+    shared_server = "mongodb_sink",
     server(connectors_runtime(config_path = "tests/connectors/mongodb/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn write_concern_timeout_does_not_report_full_success(
     harness: &TestHarness,
@@ -820,8 +827,9 @@ async fn write_concern_timeout_does_not_report_full_success(
 }
 
 #[iggy_harness(
+    shared_server = "mongodb_sink",
     server(connectors_runtime(config_path = "tests/connectors/mongodb/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn retryable_write_failover_keeps_single_doc_per_id(
     harness: &TestHarness,
@@ -967,8 +975,9 @@ async fn retryable_write_failover_keeps_single_doc_per_id(
 }
 
 #[iggy_harness(
+    shared_server = "mongodb_sink",
     server(connectors_runtime(config_path = "tests/connectors/mongodb/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn no_writes_performed_label_path_preserves_state_accuracy(
     harness: &TestHarness,
@@ -1115,8 +1124,9 @@ async fn no_writes_performed_label_path_preserves_state_accuracy(
 }
 
 #[iggy_harness(
+    shared_server = "mongodb_sink",
     server(connectors_runtime(config_path = "tests/connectors/mongodb/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn auto_create_collection_on_open(
     harness: &TestHarness,
@@ -1157,6 +1167,5 @@ async fn auto_create_collection_on_open(
         "Collection should be empty after open() with no messages"
     );
 
-    // Suppress unused harness warning.
     let _ = harness;
 }

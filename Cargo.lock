@@ -8297,6 +8297,7 @@ dependencies = [
  "configs",
  "configs_derive",
  "ctor",
+ "dashmap",
  "figment",
  "futures",
  "harness_derive",
@@ -10736,12 +10737,12 @@ dependencies = [
 
 [[package]]
 name = "passterm"
-version = "2.0.1"
+version = "2.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6421520445baa36401ded73e4820ad3a3e04316a0eb1bdb13b94987739de5fa2"
+checksum = "9510c76e37ee20be1edfce1819a3169a7c1c67fab98bd35a33684f8886f5cf4d"
 dependencies = [
  "libc",
- "windows-sys 0.48.0",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
