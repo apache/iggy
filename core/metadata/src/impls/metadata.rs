@@ -294,6 +294,23 @@ where
         let client_id = message.header().client;
         let request = message.header().request;
 
+        // TODO: Add a bounded request queue instead of dropping here.
+        // When the prepare queue (8 max) is full, buffer
+        // incoming requests in a request queue. On commit, pop the next request
+        // from the request queue and begin preparing it. Only drop when both
+        // queues are full.
+        if consensus.pipeline().borrow().is_full() {
+            warn!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                client = client_id,
+                request = request,
+                "on_request: pipeline full, dropping request"
+            );
+            return;
+        }
+
         let Some(_notify) = request_preflight(consensus, client_id, request).await else {
             return;
         };
@@ -400,7 +417,20 @@ where
             panic_if_hash_chain_would_break_in_same_view(&previous, &header);
         }
 
-        assert_eq!(header.op, current_op + 1);
+        // TODO: Restore hard assert_eq!(header.op, current_op + 1) once message repair
+        // is implemented. Without repair, the network can deliver prepares out of order
+        // and the replica has no way to request the missing ones.
+        if header.op != current_op + 1 {
+            warn!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                op = header.op,
+                expected = current_op + 1,
+                "on_replicate: dropping out-of-order prepare (gap)"
+            );
+            return;
+        }
 
         // Append to journal first. Sequencer and checksum are updated AFTER
         // successful append so a failed write doesn't leave consensus state

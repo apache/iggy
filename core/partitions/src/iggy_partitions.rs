@@ -420,6 +420,23 @@ where
         let client_id = message.header().client;
         let request = message.header().request;
 
+        // TODO: Add a bounded request queue instead of dropping here.
+        // When the prepare queue (8 max) is full, buffer
+        // incoming requests in a request queue. On commit, pop the next request
+        // from the request queue and begin preparing it. Only drop when both
+        // queues are full.
+        if consensus.pipeline().borrow().is_full() {
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                replica_id = consensus.replica(),
+                client = client_id,
+                request = request,
+                "on_request: pipeline full, dropping request"
+            );
+            return;
+        }
+
         let Some(_notify) = request_preflight(consensus, client_id, request).await else {
             return;
         };
@@ -499,6 +516,9 @@ where
             return;
         }
 
+        // TODO: Restore hard assert_eq!(header.op, current_op + 1) once message repair
+        // is implemented. Without repair, the network can deliver prepares out of order
+        // and the replica has no way to request the missing ones.
         if header.op != current_op + 1 {
             // Out-of-order prepare: the network delivered a future op before
             // we received the preceding ones. Drop it and rely on primary
