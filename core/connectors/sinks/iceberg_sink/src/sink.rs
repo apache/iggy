@@ -50,10 +50,9 @@ impl Sink for IcebergSink {
                 );
             }
             _ => {
-                error!(
-                    "Partially configured Iceberg credentials. You must provide both store_access_key_id and store_secret_access_key, or omit both."
-                );
-                return Err(Error::InvalidConfig);
+                return Err(Error::InvalidConfigValue(
+                    "Partially configured credentials. You must provide both store_access_key_id and store_secret_access_key, or omit both.".to_owned(),
+                ));
             }
         }
 

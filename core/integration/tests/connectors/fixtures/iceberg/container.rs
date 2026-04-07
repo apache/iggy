@@ -554,11 +554,6 @@ impl IcebergOps for IcebergEnvAuthFixture {
 impl TestFixture for IcebergEnvAuthFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let inner = IcebergPreCreatedFixture::setup().await?;
-        // Set credentials before test server initialization.
-        unsafe {
-            std::env::set_var(ENV_AWS_ACCESS_KEY_ID, MINIO_ACCESS_KEY);
-            std::env::set_var(ENV_AWS_SECRET_ACCESS_KEY, MINIO_SECRET_KEY);
-        }
         Ok(Self { inner })
     }
 
@@ -568,6 +563,15 @@ impl TestFixture for IcebergEnvAuthFixture {
         // This forces the Iceberg Sink to use the default credential provider chain instead of explicit config.
         envs.remove(ENV_SINK_STORE_ACCESS_KEY);
         envs.remove(ENV_SINK_STORE_SECRET);
+        // Inject standard AWS env vars to test the default credential provider chain.
+        envs.insert(
+            ENV_AWS_ACCESS_KEY_ID.to_string(),
+            MINIO_ACCESS_KEY.to_string(),
+        );
+        envs.insert(
+            ENV_AWS_SECRET_ACCESS_KEY.to_string(),
+            MINIO_SECRET_KEY.to_string(),
+        );
         envs
     }
 }
