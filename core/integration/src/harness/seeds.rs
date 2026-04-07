@@ -19,7 +19,7 @@
 
 use iggy::prelude::{IggyClient, StreamClient, TopicClient};
 use iggy_common::{
-    CompressionAlgorithm, Consumer, Identifier, IggyExpiry, IggyMessage, MaxTopicSize,
+    CompressionAlgorithm, Consumer, Identifier, IggyError, IggyExpiry, IggyMessage, MaxTopicSize,
     Partitioning, PersonalAccessTokenExpiry, UserStatus,
 };
 use iggy_common::{
@@ -130,7 +130,7 @@ pub async fn connector_stream_idempotent(client: &IggyClient) -> Result<(), Seed
 
     match client.create_stream(names::STREAM).await {
         Ok(_) => {}
-        Err(e) if e.as_code() == 1012 => {}
+        Err(e) if e.as_code() == IggyError::StreamNameAlreadyExists(String::new()).as_code() => {}
         Err(e) => return Err(e.into()),
     }
 
@@ -147,7 +147,10 @@ pub async fn connector_stream_idempotent(client: &IggyClient) -> Result<(), Seed
         .await
     {
         Ok(_) => {}
-        Err(e) if e.as_code() == 2013 => {}
+        Err(e)
+            if e.as_code()
+                == IggyError::TopicNameAlreadyExists(String::new(), Identifier::default())
+                    .as_code() => {}
         Err(e) => return Err(e.into()),
     }
 
@@ -160,7 +163,7 @@ pub async fn connector_multi_topic_stream_idempotent(client: &IggyClient) -> Res
 
     match client.create_stream(names::STREAM).await {
         Ok(_) => {}
-        Err(e) if e.as_code() == 1012 => {}
+        Err(e) if e.as_code() == IggyError::StreamNameAlreadyExists(String::new()).as_code() => {}
         Err(e) => return Err(e.into()),
     }
 
@@ -178,7 +181,10 @@ pub async fn connector_multi_topic_stream_idempotent(client: &IggyClient) -> Res
             .await
         {
             Ok(_) => {}
-            Err(e) if e.as_code() == 2013 => {}
+            Err(e)
+                if e.as_code()
+                    == IggyError::TopicNameAlreadyExists(String::new(), Identifier::default())
+                        .as_code() => {}
             Err(e) => return Err(e.into()),
         }
     }

@@ -83,11 +83,18 @@ impl SharedServerInfo {
     pub fn release(&self) {
         let prev = self.active_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
-            if let Ok(mut guard) = self.handle.lock() {
-                if let Some(ref mut server) = *guard {
-                    let _ = server.stop();
+            match self.handle.lock() {
+                Ok(mut guard) => {
+                    if let Some(ref mut server) = *guard
+                        && let Err(e) = server.stop()
+                    {
+                        eprintln!("[SharedServer] failed to stop server: {e}");
+                    }
+                    *guard = None;
                 }
-                *guard = None;
+                Err(e) => {
+                    eprintln!("[SharedServer] mutex poisoned, server process may leak: {e}");
+                }
             }
             if !self.any_test_failed.load(Ordering::Acquire) {
                 self.context.cleanup();

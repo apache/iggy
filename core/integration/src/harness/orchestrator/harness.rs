@@ -84,8 +84,6 @@ impl TestHarness {
         connectors_runtime_config: Option<ConnectorsRuntimeConfig>,
         primary_client_config: Option<ClientConfig>,
     ) -> Result<Self, TestBinaryError> {
-        shared.acquire();
-
         let mut context = TestContext::new(None, true)?;
         context.ensure_created()?;
         let context = Arc::new(context);
@@ -94,6 +92,8 @@ impl TestHarness {
             .map(|cfg| ConnectorsRuntimeHandle::with_server_id(cfg, context.clone(), 0));
 
         let primary_transport = primary_client_config.as_ref().map(|c| c.transport);
+
+        shared.acquire();
 
         Ok(TestHarness {
             context,
@@ -250,7 +250,7 @@ impl TestHarness {
         }
 
         // Release shared server ref - last test stops the server and cleans up
-        if let Some(ref shared) = self.shared_server {
+        if let Some(shared) = self.shared_server.take() {
             if std::thread::panicking() {
                 shared.mark_failed();
             }
@@ -288,12 +288,24 @@ impl TestHarness {
     }
 
     /// Get reference to the first (primary) server handle.
+    ///
+    /// Not available in `shared_server` mode - the server is managed by `SharedServerRegistry`.
     pub fn server(&self) -> &ServerHandle {
+        assert!(
+            self.shared_server.is_none(),
+            "server() is not available in shared_server mode"
+        );
         self.servers.first().expect("No servers configured")
     }
 
     /// Get mutable reference to the first (primary) server handle.
+    ///
+    /// Not available in `shared_server` mode - the server is managed by `SharedServerRegistry`.
     pub fn server_mut(&mut self) -> &mut ServerHandle {
+        assert!(
+            self.shared_server.is_none(),
+            "server_mut() is not available in shared_server mode"
+        );
         self.servers.first_mut().expect("No servers configured")
     }
 
@@ -452,14 +464,7 @@ impl TestHarness {
         &self,
         transport: TransportProtocol,
     ) -> Result<IggyClient, TestBinaryError> {
-        let server = self.servers.first().ok_or(TestBinaryError::MissingServer)?;
-        let builder = match transport {
-            TransportProtocol::Tcp => server.tcp_client()?,
-            TransportProtocol::Http => server.http_client()?,
-            TransportProtocol::Quic => server.quic_client()?,
-            TransportProtocol::WebSocket => server.websocket_client()?,
-        };
-        builder.connect().await
+        self.client_builder_for(transport)?.connect().await
     }
 
     pub async fn tcp_root_client(&self) -> Result<IggyClient, TestBinaryError> {

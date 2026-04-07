@@ -214,6 +214,13 @@ fn validate_shared_server(
         ));
     }
 
+    if attrs.transports.iter().any(|t| t.tls_mode().is_some()) {
+        return Err(syn::Error::new(
+            fn_name.span(),
+            "shared_server is incompatible with TLS transports",
+        ));
+    }
+
     Ok(())
 }
 
