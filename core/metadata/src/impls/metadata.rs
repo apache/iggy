@@ -378,6 +378,12 @@ where
 
         // TODO handle gap in ops.
 
+        // Verify hash chain integrity BEFORE checkpoint. `checkpoint_if_needed`
+        // can drain WAL entries, making previous_header return None.
+        if let Some(previous) = journal.handle().previous_header(&header) {
+            panic_if_hash_chain_would_break_in_same_view(&previous, &header);
+        }
+
         // Force a checkpoint if the journal is running low on capacity.
         if let Some(coordinator) = &self.coordinator {
             // Use commit_min (locally executed), not commit_max. WAL entries
@@ -410,11 +416,6 @@ where
                     return;
                 }
             }
-        }
-
-        // Verify hash chain integrity.
-        if let Some(previous) = journal.handle().previous_header(&header) {
-            panic_if_hash_chain_would_break_in_same_view(&previous, &header);
         }
 
         // TODO: Restore hard assert_eq!(header.op, current_op + 1) once message repair

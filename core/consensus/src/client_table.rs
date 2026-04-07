@@ -112,6 +112,7 @@ pub struct ClientEntry {
 }
 
 /// Result of checking a request against the client table.
+#[derive(Debug)]
 pub enum RequestStatus {
     /// Request not seen before, proceed with consensus.
     New,

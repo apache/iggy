@@ -437,10 +437,6 @@ where
             return;
         }
 
-        let Some(_notify) = request_preflight(consensus, client_id, request).await else {
-            return;
-        };
-
         emit_sim_event(
             SimEventKind::ClientRequestReceived,
             &RequestLogEvent {
@@ -450,6 +446,7 @@ where
                 operation: message.header().operation,
             },
         );
+
         let message = if message.header().operation == Operation::SendMessages {
             match convert_request_message(namespace, message) {
                 Ok(message) => message,
@@ -469,6 +466,11 @@ where
         } else {
             message
         };
+
+        let Some(_notify) = request_preflight(consensus, client_id, request).await else {
+            return;
+        };
+
         let prepare = message.project(consensus);
         pipeline_prepare_common(consensus, PlaneKind::Partitions, prepare, |prepare| {
             self.on_replicate(prepare)

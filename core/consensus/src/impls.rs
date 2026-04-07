@@ -408,7 +408,7 @@ pub enum Status {
 }
 
 /// Actions to be taken by the caller after processing a VSR event.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum VsrAction {
     /// Send `StartViewChange` to all replicas.
     SendStartViewChange { view: u32, namespace: u64 },
