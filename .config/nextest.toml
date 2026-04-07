@@ -23,3 +23,6 @@ threads-required = "num-cpus"
 
 [profile.default]
 slow-timeout = { period = "30s", terminate-after = 4 }
+
+[profile.ci]
+retries = 3
