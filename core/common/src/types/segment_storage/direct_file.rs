@@ -524,533 +524,490 @@ mod tests {
         });
     }
 
-    #[compio::test]
-    async fn test_open_creates_new_file() {
-        initialize_pool_for_tests();
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("new_file.dat");
-        let path_str = path.to_str().unwrap();
+    /// Generate all DirectFile tests for a given dsync setting.
+    /// show up as e.g. `dsync_on::test_open_creates_new_file`.
+    macro_rules! direct_file_tests {
+        ($mod_name:ident, dsync = $dsync:expr) => {
+            mod $mod_name {
+                use super::*;
 
-        let df = DirectFile::open(path_str, 0, false).await.unwrap();
+                // Helper that opens with the fixed dsync flag for this module
+                async fn open_df(path: &str, pos: u64, exists: bool) -> DirectFile {
+                    DirectFile::open(path, pos, exists, $dsync).await.unwrap()
+                }
 
-        assert!(path.exists());
-        assert_eq!(df.position(), 0);
-        assert_eq!(df.tail_len(), 0);
+                #[compio::test]
+                async fn test_open_creates_new_file() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("new_file.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let df = open_df(path_str, 0, false).await;
+
+                    assert!(path.exists());
+                    assert_eq!(df.position(), 0);
+                    assert_eq!(df.tail_len(), 0);
+                }
+
+                #[compio::test]
+                async fn test_open_existing_file() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("existing.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let _df1 = open_df(path_str, 0, false).await;
+                    drop(_df1);
+
+                    let df2 = DirectFile::open(path_str, ALIGNMENT as u64, true, $dsync)
+                        .await
+                        .unwrap();
+                    assert_eq!(df2.position(), ALIGNMENT as u64);
+                }
+
+                #[compio::test]
+                #[should_panic(expected = "initial_position must be aligned")]
+                async fn test_open_unaligned_position_panics() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("unaligned.dat");
+                    let _df = DirectFile::open(path.to_str().unwrap(), 1, false, $dsync).await;
+                }
+
+                #[compio::test]
+                async fn test_write_all_fast_path_single_block() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("fast_path.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let written = df.write_all(make_buffer(ALIGNMENT, 0xAB)).await.unwrap();
+
+                    assert_eq!(written, ALIGNMENT);
+                    assert_eq!(df.position(), ALIGNMENT as u64);
+                    assert_eq!(df.tail_len(), 0);
+                }
+
+                #[compio::test]
+                async fn test_write_all_sub_alignment_goes_to_tail() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("sub_align.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let small_size = ALIGNMENT / 2;
+                    let written = df.write_all(make_buffer(small_size, 0x11)).await.unwrap();
+
+                    assert_eq!(written, small_size);
+                    assert_eq!(df.tail_len(), small_size);
+                    assert_eq!(df.position(), 0);
+                }
+
+                #[compio::test]
+                async fn test_write_all_two_sub_alignment_writes_complete_block() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("two_sub.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let half = ALIGNMENT / 2;
+
+                    df.write_all(make_buffer(half, 0xAA)).await.unwrap();
+                    assert_eq!(df.tail_len(), half);
+                    assert_eq!(df.position(), 0);
+
+                    df.write_all(make_buffer(half, 0xBB)).await.unwrap();
+                    assert_eq!(df.tail_len(), 0);
+                    assert_eq!(df.position(), ALIGNMENT as u64);
+                }
+
+                #[compio::test]
+                async fn test_write_all_unaligned_length_splits_correctly() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("unaligned_len.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let size = ALIGNMENT + ALIGNMENT / 2;
+                    let written = df.write_all(make_buffer(size, 0xEE)).await.unwrap();
+
+                    assert_eq!(written, size);
+                    assert_eq!(df.position(), ALIGNMENT as u64);
+                    assert_eq!(df.tail_len(), ALIGNMENT / 2);
+                }
+
+                #[compio::test]
+                async fn test_write_all_fills_existing_tail_then_writes_aligned() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("fill_tail.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let quarter = ALIGNMENT / 4;
+                    df.write_all(make_buffer(quarter, 0x11)).await.unwrap();
+                    assert_eq!(df.tail_len(), quarter);
+
+                    let next_size = (ALIGNMENT - quarter) + ALIGNMENT * 2;
+                    df.write_all(make_buffer(next_size, 0x22)).await.unwrap();
+
+                    assert_eq!(df.position(), (ALIGNMENT * 3) as u64);
+                    assert_eq!(df.tail_len(), 0);
+                }
+
+                #[compio::test]
+                async fn test_write_all_fills_tail_with_leftover_remainder() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("tail_leftover.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let quarter = ALIGNMENT / 4;
+                    df.write_all(make_buffer(quarter, 0x11)).await.unwrap();
+
+                    let remainder = 100;
+                    let next_size = (ALIGNMENT - quarter) + ALIGNMENT + remainder;
+                    df.write_all(make_buffer(next_size, 0x22)).await.unwrap();
+
+                    assert_eq!(df.position(), (ALIGNMENT * 2) as u64);
+                    assert_eq!(df.tail_len(), remainder);
+                }
+
+                #[compio::test]
+                async fn test_write_from_slice() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("from_slice.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let data = vec![0xFFu8; ALIGNMENT];
+                    let written = df.write_from_slice(&data).await.unwrap();
+
+                    assert_eq!(written, ALIGNMENT);
+                    assert_eq!(df.position(), ALIGNMENT as u64);
+                }
+
+                #[compio::test]
+                async fn test_flush_empty_tail_is_noop() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("flush_noop.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    df.flush().await.unwrap();
+
+                    assert_eq!(df.position(), 0);
+                    assert_eq!(df.tail_len(), 0);
+                }
+
+                #[compio::test]
+                async fn test_flush_pads_and_writes_tail() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("flush_pad.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let small = 100;
+                    df.write_all(make_buffer(small, 0x55)).await.unwrap();
+                    assert_eq!(df.tail_len(), small);
+
+                    df.flush().await.unwrap();
+
+                    assert_eq!(df.tail_len(), 0);
+                    assert_eq!(df.position(), ALIGNMENT as u64);
+
+                    let on_disk = read_file_bytes(path_str);
+                    assert!(on_disk.len() >= ALIGNMENT);
+                    assert!(on_disk[..small].iter().all(|&b| b == 0x55));
+                    assert!(on_disk[small..ALIGNMENT].iter().all(|&b| b == 0x00));
+                }
+
+                #[compio::test]
+                async fn test_write_vectored_empty_vec() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("vec_empty.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let written = df.write_vectored(vec![]).await.unwrap();
+
+                    assert_eq!(written, 0);
+                    assert_eq!(df.position(), 0);
+                }
+
+                #[compio::test]
+                async fn test_write_vectored_all_aligned_buffers() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("vec_aligned.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let bufs = vec![
+                        make_buffer(ALIGNMENT, 0xAA),
+                        make_buffer(ALIGNMENT * 2, 0xBB),
+                        make_buffer(ALIGNMENT, 0xCC),
+                        make_buffer(ALIGNMENT, 0xDD),
+                    ];
+                    let total = ALIGNMENT * 5;
+                    let written = df.write_vectored(bufs).await.unwrap();
+
+                    assert_eq!(written, total);
+                    assert_eq!(df.position(), total as u64);
+                    assert_eq!(df.tail_len(), 0);
+                }
+
+                #[compio::test]
+                async fn test_write_vectored_single_sub_alignment_buffer() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("vec_sub.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let small = 500;
+                    let written = df
+                        .write_vectored(vec![make_buffer(small, 0xDD)])
+                        .await
+                        .unwrap();
+
+                    assert_eq!(written, small);
+                    assert_eq!(df.position(), 0);
+                    assert_eq!(df.tail_len(), small);
+                }
+
+                #[compio::test]
+                async fn test_write_vectored_multiple_sub_alignment_buffers_form_block() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("vec_multi_sub.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let quarter = ALIGNMENT / 4;
+                    let bufs = vec![
+                        make_buffer(quarter, 0x11),
+                        make_buffer(quarter, 0x22),
+                        make_buffer(quarter, 0x33),
+                        make_buffer(quarter, 0x44),
+                    ];
+                    let written = df.write_vectored(bufs).await.unwrap();
+
+                    assert_eq!(written, ALIGNMENT);
+                    assert_eq!(df.position(), ALIGNMENT as u64);
+                    assert_eq!(df.tail_len(), 0);
+                }
+
+                #[compio::test]
+                async fn test_write_vectored_mixed_aligned_and_unaligned() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("vec_mixed.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let remainder = 300;
+                    let bufs = vec![
+                        make_buffer(ALIGNMENT, 0xAA),
+                        make_buffer(ALIGNMENT + remainder, 0xBB),
+                    ];
+                    let total = ALIGNMENT * 2 + remainder;
+                    let written = df.write_vectored(bufs).await.unwrap();
+
+                    assert_eq!(written, total);
+                    assert_eq!(df.position(), (ALIGNMENT * 2) as u64);
+                    assert_eq!(df.tail_len(), remainder);
+                }
+
+                #[compio::test]
+                async fn test_write_vectored_with_existing_tail() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("vec_tail.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let seed = 100;
+                    df.write_all(make_buffer(seed, 0x11)).await.unwrap();
+                    assert_eq!(df.tail_len(), seed);
+
+                    let fill = ALIGNMENT - seed;
+                    let bufs = vec![make_buffer(fill, 0x22), make_buffer(ALIGNMENT, 0x33)];
+                    let written = df.write_vectored(bufs).await.unwrap();
+
+                    assert_eq!(written, fill + ALIGNMENT);
+                    assert_eq!(df.position(), (ALIGNMENT * 2) as u64);
+                    assert_eq!(df.tail_len(), 0);
+                }
+
+                #[compio::test]
+                async fn test_data_integrity_simple_write_and_flush() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("integrity.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let pattern: Vec<u8> = (0..200u8).collect();
+                    df.write_from_slice(&pattern).await.unwrap();
+                    df.flush().await.unwrap();
+
+                    let on_disk = read_file_bytes(path_str);
+                    assert_eq!(&on_disk[..pattern.len()], &pattern[..]);
+                }
+
+                #[compio::test]
+                async fn test_data_integrity_multiple_sequential_writes() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("seq_integrity.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    df.write_all(make_buffer(ALIGNMENT, 0xAA)).await.unwrap();
+                    df.write_all(make_buffer(ALIGNMENT, 0xBB)).await.unwrap();
+                    df.write_all(make_buffer(ALIGNMENT, 0xCC)).await.unwrap();
+
+                    let on_disk = read_file_bytes(path_str);
+                    assert!(on_disk[..ALIGNMENT].iter().all(|&b| b == 0xAA));
+                    assert!(on_disk[ALIGNMENT..ALIGNMENT * 2].iter().all(|&b| b == 0xBB));
+                    assert!(
+                        on_disk[ALIGNMENT * 2..ALIGNMENT * 3]
+                            .iter()
+                            .all(|&b| b == 0xCC)
+                    );
+                }
+
+                #[compio::test]
+                async fn test_position_tracking_mixed_operations() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("pos_track.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    assert_eq!(df.position(), 0);
+
+                    df.write_all(make_buffer(ALIGNMENT, 0xAA)).await.unwrap();
+                    assert_eq!(df.position(), ALIGNMENT as u64);
+
+                    let small = 200;
+                    df.write_all(make_buffer(small, 0xBB)).await.unwrap();
+                    assert_eq!(df.position(), ALIGNMENT as u64);
+
+                    df.flush().await.unwrap();
+                    assert_eq!(df.position(), (ALIGNMENT * 2) as u64);
+
+                    let bufs = vec![
+                        make_buffer(ALIGNMENT, 0xCC),
+                        make_buffer(ALIGNMENT, 0xDD),
+                        make_buffer(ALIGNMENT, 0xEE),
+                    ];
+                    df.write_vectored(bufs).await.unwrap();
+                    assert_eq!(df.position(), (ALIGNMENT * 5) as u64);
+                }
+
+                #[compio::test]
+                async fn test_write_exactly_one_byte() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("one_byte.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let written = df.write_all(make_buffer(1, 0xFF)).await.unwrap();
+                    assert_eq!(written, 1);
+                    assert_eq!(df.tail_len(), 1);
+                    assert_eq!(df.position(), 0);
+                }
+
+                #[compio::test]
+                async fn test_write_vectored_many_tiny_buffers() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("many_tiny.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let bufs: Vec<Bytes> = (0..ALIGNMENT)
+                        .map(|i| make_buffer(1, (i % 256) as u8))
+                        .collect();
+                    let written = df.write_vectored(bufs).await.unwrap();
+
+                    assert_eq!(written, ALIGNMENT);
+                    assert_eq!(df.position(), ALIGNMENT as u64);
+                    assert_eq!(df.tail_len(), 0);
+                }
+
+                #[compio::test]
+                async fn test_flush_then_continue_writing() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("flush_continue.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    df.write_all(make_buffer(100, 0xAA)).await.unwrap();
+                    df.flush().await.unwrap();
+                    assert_eq!(df.position(), ALIGNMENT as u64);
+
+                    df.write_all(make_buffer(ALIGNMENT, 0xBB)).await.unwrap();
+                    assert_eq!(df.position(), (ALIGNMENT * 2) as u64);
+
+                    let on_disk = read_file_bytes(path_str);
+                    assert!(on_disk[ALIGNMENT..ALIGNMENT * 2].iter().all(|&b| b == 0xBB));
+                }
+
+                #[compio::test]
+                async fn test_write_vectored_data_integrity() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("vec_integrity.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let bufs = vec![make_buffer(ALIGNMENT, 0xAA), make_buffer(ALIGNMENT, 0xBB)];
+                    df.write_vectored(bufs).await.unwrap();
+
+                    let on_disk = read_file_bytes(path_str);
+                    assert!(on_disk[..ALIGNMENT].iter().all(|&b| b == 0xAA));
+                    assert!(on_disk[ALIGNMENT..ALIGNMENT * 2].iter().all(|&b| b == 0xBB));
+                }
+
+                #[compio::test]
+                async fn test_large_unaligned_write_all() {
+                    initialize_pool_for_tests();
+                    let dir = tempdir().unwrap();
+                    let path = dir.path().join("large_unaligned.dat");
+                    let path_str = path.to_str().unwrap();
+
+                    let mut df = open_df(path_str, 0, false).await;
+                    let size = ALIGNMENT * 10 + 137;
+                    let written = df.write_all(make_buffer(size, 0xDD)).await.unwrap();
+
+                    assert_eq!(written, size);
+                    assert_eq!(df.position(), (ALIGNMENT * 10) as u64);
+                    assert_eq!(df.tail_len(), 137);
+
+                    df.flush().await.unwrap();
+
+                    let on_disk = read_file_bytes(path_str);
+                    assert!(on_disk[..size].iter().all(|&b| b == 0xDD));
+                }
+            }
+        };
     }
 
-    #[compio::test]
-    async fn test_open_existing_file() {
-        initialize_pool_for_tests();
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("existing.dat");
-        let path_str = path.to_str().unwrap();
-
-        let _df1 = DirectFile::open(path_str, 0, false).await.unwrap();
-        drop(_df1);
-
-        // re-open as existing
-        let df2 = DirectFile::open(path_str, ALIGNMENT as u64, true)
-            .await
-            .unwrap();
-
-        assert_eq!(df2.position(), ALIGNMENT as u64);
-    }
-
-    #[compio::test]
-    #[should_panic(expected = "initial_position must be aligned")]
-    async fn test_open_unaligned_position_panics() {
-        initialize_pool_for_tests();
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("unaligned.dat");
-        let _df = DirectFile::open(path.to_str().unwrap(), 1, false).await;
-    }
-
-    #[compio::test]
-    async fn test_write_all_fast_path_single_block() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("unaligned.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let written = df.write_all(make_buffer(ALIGNMENT, 0xAB)).await.unwrap();
-
-        assert_eq!(written, ALIGNMENT);
-        assert_eq!(df.position(), ALIGNMENT as u64);
-        assert_eq!(df.tail_len(), 0);
-    }
-
-    // write_all: slow path (sub-alignment / tail buffering)
-    #[compio::test]
-    async fn test_write_all_sub_alignment_goes_to_tail() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("sub_align.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let small_size = ALIGNMENT / 2;
-        let written = df.write_all(make_buffer(small_size, 0x11)).await.unwrap();
-
-        assert_eq!(written, small_size);
-        assert_eq!(df.tail_len(), small_size);
-        assert_eq!(df.position(), 0);
-    }
-
-    #[compio::test]
-    async fn test_write_all_two_sub_alignment_writes_complete_block() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("two_sub.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let half = ALIGNMENT / 2;
-
-        df.write_all(make_buffer(half, 0xAA)).await.unwrap();
-        assert_eq!(df.tail_len(), half);
-        assert_eq!(df.position(), 0);
-
-        df.write_all(make_buffer(half, 0xBB)).await.unwrap();
-        assert_eq!(df.tail_len(), 0);
-        assert_eq!(df.position(), ALIGNMENT as u64);
-    }
-
-    #[compio::test]
-    async fn test_write_all_unaligned_length_splits_correctly() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("unaligned_len.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        // 1.5 * ALIGNMENT: one full block written, half-block in tail
-        let size = ALIGNMENT + ALIGNMENT / 2;
-        let written = df.write_all(make_buffer(size, 0xEE)).await.unwrap();
-
-        assert_eq!(written, size);
-        assert_eq!(df.position(), ALIGNMENT as u64);
-        assert_eq!(df.tail_len(), ALIGNMENT / 2);
-    }
-
-    #[compio::test]
-    async fn test_write_all_fills_existing_tail_then_writes_aligned() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("fill_tail.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let quarter = ALIGNMENT / 4;
-        df.write_all(make_buffer(quarter, 0x11)).await.unwrap();
-        assert_eq!(df.tail_len(), quarter);
-
-        // Fill the tail + two more full blocks
-        let next_size = (ALIGNMENT - quarter) + ALIGNMENT * 2;
-        df.write_all(make_buffer(next_size, 0x22)).await.unwrap();
-
-        assert_eq!(df.position(), (ALIGNMENT * 3) as u64);
-        assert_eq!(df.tail_len(), 0);
-    }
-
-    #[compio::test]
-    async fn test_write_all_fills_tail_with_leftover_remainder() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("tail_leftover.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let quarter = ALIGNMENT / 4;
-        df.write_all(make_buffer(quarter, 0x11)).await.unwrap();
-
-        let remainder = 100;
-        let next_size = (ALIGNMENT - quarter) + ALIGNMENT + remainder;
-        df.write_all(make_buffer(next_size, 0x22)).await.unwrap();
-
-        assert_eq!(df.position(), (ALIGNMENT * 2) as u64);
-        assert_eq!(df.tail_len(), remainder);
-    }
-
-    #[compio::test]
-    async fn test_write_from_slice() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("from_slice.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let data = vec![0xFFu8; ALIGNMENT];
-        let written = df.write_from_slice(&data).await.unwrap();
-
-        assert_eq!(written, ALIGNMENT);
-        assert_eq!(df.position(), ALIGNMENT as u64);
-    }
-
-    #[compio::test]
-    async fn test_flush_empty_tail_is_noop() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("flush_noop.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-        df.flush().await.unwrap();
-
-        assert_eq!(df.position(), 0);
-        assert_eq!(df.tail_len(), 0);
-    }
-
-    #[compio::test]
-    async fn test_flush_pads_and_writes_tail() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("flush_pad.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let small = 100;
-        df.write_all(make_buffer(small, 0x55)).await.unwrap();
-        assert_eq!(df.tail_len(), small);
-
-        df.flush().await.unwrap();
-
-        assert_eq!(df.tail_len(), 0);
-        assert_eq!(df.position(), ALIGNMENT as u64);
-
-        let on_disk = read_file_bytes(path_str);
-        assert!(on_disk.len() >= ALIGNMENT);
-        assert!(on_disk[..small].iter().all(|&b| b == 0x55));
-        assert!(on_disk[small..ALIGNMENT].iter().all(|&b| b == 0x00));
-    }
-
-    #[compio::test]
-    async fn test_write_vectored_empty_vec() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("vec_empty.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-        let written = df.write_vectored(vec![]).await.unwrap();
-
-        assert_eq!(written, 0);
-        assert_eq!(df.position(), 0);
-    }
-
-    #[compio::test]
-    async fn test_write_vectored_all_aligned_buffers() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("vec_aligned.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let bufs = vec![
-            make_buffer(ALIGNMENT, 0xAA),
-            make_buffer(ALIGNMENT * 2, 0xBB),
-            make_buffer(ALIGNMENT, 0xCC),
-            make_buffer(ALIGNMENT, 0xDD),
-        ];
-        let total = ALIGNMENT * 5;
-
-        let written = df.write_vectored(bufs).await.unwrap();
-
-        assert_eq!(written, total);
-        assert_eq!(df.position(), total as u64);
-        assert_eq!(df.tail_len(), 0);
-    }
-
-    #[compio::test]
-    async fn test_write_vectored_single_sub_alignment_buffer() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("vec_sub.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let small = 500;
-        let written = df
-            .write_vectored(vec![make_buffer(small, 0xDD)])
-            .await
-            .unwrap();
-
-        assert_eq!(written, small);
-        assert_eq!(df.position(), 0);
-        assert_eq!(df.tail_len(), small);
-    }
-
-    #[compio::test]
-    async fn test_write_vectored_multiple_sub_alignment_buffers_form_block() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("vec_multi_sub.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let quarter = ALIGNMENT / 4;
-        let bufs = vec![
-            make_buffer(quarter, 0x11),
-            make_buffer(quarter, 0x22),
-            make_buffer(quarter, 0x33),
-            make_buffer(quarter, 0x44),
-        ];
-
-        let written = df.write_vectored(bufs).await.unwrap();
-
-        assert_eq!(written, ALIGNMENT);
-        assert_eq!(df.position(), ALIGNMENT as u64);
-        assert_eq!(df.tail_len(), 0);
-    }
-
-    #[compio::test]
-    async fn test_write_vectored_mixed_aligned_and_unaligned() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("vec_mixed.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let remainder = 300;
-        let bufs = vec![
-            make_buffer(ALIGNMENT, 0xAA),
-            make_buffer(ALIGNMENT + remainder, 0xBB),
-        ];
-        let total = ALIGNMENT * 2 + remainder;
-
-        let written = df.write_vectored(bufs).await.unwrap();
-
-        assert_eq!(written, total);
-        assert_eq!(df.position(), (ALIGNMENT * 2) as u64);
-        assert_eq!(df.tail_len(), remainder);
-    }
-
-    #[compio::test]
-    async fn test_write_vectored_with_existing_tail() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("vec_tail.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let seed = 100;
-        df.write_all(make_buffer(seed, 0x11)).await.unwrap();
-        assert_eq!(df.tail_len(), seed);
-
-        let fill = ALIGNMENT - seed;
-        let bufs = vec![make_buffer(fill, 0x22), make_buffer(ALIGNMENT, 0x33)];
-
-        let written = df.write_vectored(bufs).await.unwrap();
-
-        assert_eq!(written, fill + ALIGNMENT);
-        assert_eq!(df.position(), (ALIGNMENT * 2) as u64);
-        assert_eq!(df.tail_len(), 0);
-    }
-
-    #[compio::test]
-    async fn test_data_integrity_simple_write_and_flush() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("integrity.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let pattern: Vec<u8> = (0..200u8).collect();
-        df.write_from_slice(&pattern).await.unwrap();
-        df.flush().await.unwrap();
-
-        let on_disk = read_file_bytes(path_str);
-        assert_eq!(&on_disk[..pattern.len()], &pattern[..]);
-    }
-
-    #[compio::test]
-    async fn test_data_integrity_multiple_sequential_writes() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("seq_integrity.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        df.write_all(make_buffer(ALIGNMENT, 0xAA)).await.unwrap();
-        df.write_all(make_buffer(ALIGNMENT, 0xBB)).await.unwrap();
-        df.write_all(make_buffer(ALIGNMENT, 0xCC)).await.unwrap();
-
-        let on_disk = read_file_bytes(path_str);
-
-        assert!(on_disk[..ALIGNMENT].iter().all(|&b| b == 0xAA));
-        assert!(on_disk[ALIGNMENT..ALIGNMENT * 2].iter().all(|&b| b == 0xBB));
-        assert!(
-            on_disk[ALIGNMENT * 2..ALIGNMENT * 3]
-                .iter()
-                .all(|&b| b == 0xCC)
-        );
-    }
-
-    #[compio::test]
-    async fn test_position_tracking_mixed_operations() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("pos_track.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-        assert_eq!(df.position(), 0);
-
-        // Aligned write
-        df.write_all(make_buffer(ALIGNMENT, 0xAA)).await.unwrap();
-        assert_eq!(df.position(), ALIGNMENT as u64);
-
-        // Sub-alignment write
-        let small = 200;
-        df.write_all(make_buffer(small, 0xBB)).await.unwrap();
-        assert_eq!(df.position(), ALIGNMENT as u64);
-
-        // Flush advances position by one block
-        df.flush().await.unwrap();
-        assert_eq!(df.position(), (ALIGNMENT * 2) as u64);
-
-        // Vectored write of 3 aligned blocks
-        let bufs = vec![
-            make_buffer(ALIGNMENT, 0xCC),
-            make_buffer(ALIGNMENT, 0xDD),
-            make_buffer(ALIGNMENT, 0xEE),
-        ];
-        df.write_vectored(bufs).await.unwrap();
-        assert_eq!(df.position(), (ALIGNMENT * 5) as u64);
-    }
-
-    // Some edge cases
-
-    #[compio::test]
-    async fn test_write_exactly_one_byte() {
-        initialize_pool_for_tests();
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("one_byte.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let written = df.write_all(make_buffer(1, 0xFF)).await.unwrap();
-        assert_eq!(written, 1);
-        assert_eq!(df.tail_len(), 1);
-        assert_eq!(df.position(), 0);
-    }
-
-    #[compio::test]
-    async fn test_write_vectored_many_tiny_buffers() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("many_tiny.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        // ALIGNMENT single-byte buffers → one aligned block
-        let bufs: Vec<Bytes> = (0..ALIGNMENT)
-            .map(|i| make_buffer(1, (i % 256) as u8))
-            .collect();
-
-        let written = df.write_vectored(bufs).await.unwrap();
-
-        assert_eq!(written, ALIGNMENT);
-        assert_eq!(df.position(), ALIGNMENT as u64);
-        assert_eq!(df.tail_len(), 0);
-    }
-
-    #[compio::test]
-    async fn test_flush_then_continue_writing() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("flush_continue.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        df.write_all(make_buffer(100, 0xAA)).await.unwrap();
-        df.flush().await.unwrap();
-        assert_eq!(df.position(), ALIGNMENT as u64);
-
-        df.write_all(make_buffer(ALIGNMENT, 0xBB)).await.unwrap();
-        assert_eq!(df.position(), (ALIGNMENT * 2) as u64);
-
-        let on_disk = read_file_bytes(path_str);
-        assert!(on_disk[ALIGNMENT..ALIGNMENT * 2].iter().all(|&b| b == 0xBB));
-    }
-
-    #[compio::test]
-    async fn test_write_vectored_data_integrity() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("vec_integrity.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let bufs = vec![make_buffer(ALIGNMENT, 0xAA), make_buffer(ALIGNMENT, 0xBB)];
-
-        df.write_vectored(bufs).await.unwrap();
-
-        let on_disk = read_file_bytes(path_str);
-        assert!(on_disk[..ALIGNMENT].iter().all(|&b| b == 0xAA));
-        assert!(on_disk[ALIGNMENT..ALIGNMENT * 2].iter().all(|&b| b == 0xBB));
-    }
-
-    #[compio::test]
-    async fn test_large_unaligned_write_all() {
-        initialize_pool_for_tests();
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("large_unaligned.dat");
-        let path_str = path.to_str().unwrap();
-
-        let mut df = DirectFile::open(path_str, 0, false).await.unwrap();
-
-        let size = ALIGNMENT * 10 + 137;
-        let written = df.write_all(make_buffer(size, 0xDD)).await.unwrap();
-
-        assert_eq!(written, size);
-        assert_eq!(df.position(), (ALIGNMENT * 10) as u64);
-        assert_eq!(df.tail_len(), 137);
-
-        df.flush().await.unwrap();
-
-        let on_disk = read_file_bytes(path_str);
-        assert!(on_disk[..size].iter().all(|&b| b == 0xDD));
-    }
+    direct_file_tests!(dsync_on, dsync = true);
+    direct_file_tests!(dsync_off, dsync = false);
 }
