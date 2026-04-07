@@ -1351,7 +1351,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // Stale pipeline entries from the old view must be discarded
         self.pipeline.borrow_mut().clear();
 
-        // Update our op to match the new primary's log
+        // TODO: TigerBeetle's StartView message carries uncommitted op headers,
+        // allowing the backup to install them into the WAL and set op to a
+        // WAL-verified value. We don't carry headers yet, so we blindly trust
+        // msg_op. This is correct for truncation (sequencer > msg_op) but wrong
+        // when the backup is behind (sequencer < msg_op) — the gap between the
+        // WAL and msg_op becomes unreachable without message repair. Fix by
+        // either carrying headers in StartView or implementing message repair.
         self.sequencer.set_sequence(msg_op);
 
         // Update timeouts for normal backup operation

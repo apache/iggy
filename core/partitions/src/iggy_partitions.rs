@@ -647,13 +647,26 @@ where
                         prepare_header.op
                     )
                 });
-            let _ = self
+            // Committed ops must be infallible — if the state machine cannot
+            // apply a committed op, replicas will diverge.
+            if let Err(e) = self
                 .apply_replicated_operation(&entry_namespace, prepare)
-                .await;
+                .await
+            {
+                panic!(
+                    "on_ack: committed op={} failed to apply: {e}",
+                    prepare_header.op
+                );
+            }
 
             // Flush after every op, each apply appends new data to the
             // partition journal that must be durable before advancing commit_min.
-            let _ = self.commit_messages(&entry_namespace).await;
+            if let Err(e) = self.commit_messages(&entry_namespace).await {
+                panic!(
+                    "on_ack: committed op={} failed to flush: {e}",
+                    prepare_header.op
+                );
+            }
 
             consensus.advance_commit_min(prepare_header.op);
 
@@ -893,9 +906,13 @@ where
 
             let ns = IggyNamespace::from_raw(header.namespace);
 
-            // Apply, flush, advance commit_min, update client table per-op.
-            let _ = self.apply_replicated_operation(&ns, prepare).await;
-            let _ = self.commit_messages(&ns).await;
+            // Committed ops must be infallible (see on_ack comment).
+            if let Err(e) = self.apply_replicated_operation(&ns, prepare).await {
+                panic!("commit_journal: committed op={op} failed to apply: {e}");
+            }
+            if let Err(e) = self.commit_messages(&ns).await {
+                panic!("commit_journal: committed op={op} failed to flush: {e}");
+            }
 
             consensus.advance_commit_min(op);
 

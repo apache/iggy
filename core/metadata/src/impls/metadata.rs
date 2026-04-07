@@ -536,17 +536,13 @@ where
                         )
                     });
 
+                // Committed ops must be infallible — if the state machine cannot
+                // apply a committed op, replicas will diverge.
                 let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
-                    warn!(
-                        target: "iggy.metadata.diag",
-                        plane = "metadata",
-                        replica_id = consensus.replica(),
-                        op = prepare_header.op,
-                        operation = ?prepare_header.operation,
-                        error = %err,
-                        "state machine update failed for committed metadata entry"
+                    panic!(
+                        "on_ack: committed metadata op={} failed to apply: {err}",
+                        prepare_header.op
                     );
-                    bytes::Bytes::new()
                 });
                 consensus.advance_commit_min(prepare_header.op);
                 let pipeline_depth = consensus.pipeline().borrow().len();
@@ -670,9 +666,9 @@ where
                 break;
             };
 
+            // Committed ops must be infallible (see on_ack comment).
             let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
-                warn!("commit_journal: state machine error for op={op}: {err}");
-                bytes::Bytes::new()
+                panic!("commit_journal: committed metadata op={op} failed to apply: {err}");
             });
 
             consensus.advance_commit_min(op);

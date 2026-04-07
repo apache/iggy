@@ -191,6 +191,10 @@ impl ClientTable {
     /// Panics if the internal index points to an empty slot (invariant violation).
     #[must_use]
     pub fn check_request(&self, client_id: u128, request: u64) -> RequestStatus {
+        // TODO: Once client sessions are added (register/evict protocol like
+        // validate client_id at the session layer instead of
+        // panicking here. Unregistered or invalid clients should be rejected
+        // gracefully at ingress, not inside the client table.
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
 
         // Check if already pending in the pipeline.
@@ -348,18 +352,12 @@ impl ClientTable {
         self.pending.len()
     }
 
-    /// Wake and clear all pending waiters (e.g. during view change).
+    /// Clear all pending entries (e.g. during view change).
     ///
     /// Stale pending entries from a previous view must not survive into the
     /// new view - `check_request` would return `InProgress` for the orphaned
     /// keys, silently dropping valid client retries.
-    ///
-    /// Waiters are notified before removal so that any `.notified().await`
-    /// callers unblock and can detect the view change (e.g. retry or error).
     pub fn clear_pending(&mut self) {
-        for notify in self.pending.values() {
-            notify.notify();
-        }
         self.pending.clear();
     }
 }

@@ -114,6 +114,7 @@ pub enum ControlActionKind {
     SendDoViewChange,
     SendStartView,
     SendPrepareOk,
+    SendPrepare,
 }
 
 impl ControlActionKind {
@@ -124,6 +125,7 @@ impl ControlActionKind {
             Self::SendDoViewChange => "send_do_view_change",
             Self::SendStartView => "send_start_view",
             Self::SendPrepareOk => "send_prepare_ok",
+            Self::SendPrepare => "send_prepare",
         }
     }
 }
@@ -333,7 +335,7 @@ impl ControlActionLogEvent {
             },
             VsrAction::RetransmitPrepares { .. } => Self {
                 replica,
-                action: ControlActionKind::SendPrepareOk, // TODO: add dedicated kind
+                action: ControlActionKind::SendPrepare,
                 target_replica: None,
                 op: None,
                 commit: None,
