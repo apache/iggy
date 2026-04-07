@@ -514,6 +514,9 @@ where
             return;
         }
 
+        // Chain-replicate to the next replica before local journal append.
+        let message = self.replicate(message).await;
+
         let journal = self
             .journal
             .as_ref()
