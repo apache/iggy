@@ -33,7 +33,8 @@ use serde_json::json;
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_writes_messages_to_bucket(
     harness: &TestHarness,
@@ -74,7 +75,8 @@ async fn influxdb_sink_writes_messages_to_bucket(
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_handles_bulk_messages(harness: &TestHarness, fixture: InfluxDbSinkFixture) {
     let client = harness.root_client().await.unwrap();
@@ -112,7 +114,8 @@ async fn influxdb_sink_handles_bulk_messages(harness: &TestHarness, fixture: Inf
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_payload_fields_stored_correctly(
     harness: &TestHarness,
@@ -150,7 +153,8 @@ async fn influxdb_sink_payload_fields_stored_correctly(
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_large_batch(harness: &TestHarness, fixture: InfluxDbSinkFixture) {
     let client = harness.root_client().await.unwrap();
@@ -184,7 +188,8 @@ async fn influxdb_sink_large_batch(harness: &TestHarness, fixture: InfluxDbSinkF
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_recovers_backlogged_messages(
     harness: &TestHarness,
@@ -224,7 +229,8 @@ async fn influxdb_sink_recovers_backlogged_messages(
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/sink.toml")),
-    seed = seeds::connector_stream
+    shared_server = "influxdb_sink",
+    seed = seeds::connector_stream_idempotent
 )]
 async fn influxdb_sink_multiple_partitions(harness: &TestHarness, fixture: InfluxDbSinkFixture) {
     let client = harness.root_client().await.unwrap();

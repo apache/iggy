@@ -28,8 +28,9 @@ use integration::iggy_harness;
 use serde::{Deserialize, Serialize};
 
 #[iggy_harness(
+    shared_server = "quickwit_sink",
     server(connectors_runtime(config_path = "tests/connectors/quickwit/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn given_existent_quickwit_index_should_store(
     harness: &TestHarness,
@@ -83,8 +84,9 @@ async fn given_existent_quickwit_index_should_store(
 }
 
 #[iggy_harness(
+    shared_server = "quickwit_sink",
     server(connectors_runtime(config_path = "tests/connectors/quickwit/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn given_nonexistent_quickwit_index_should_create_and_store(
     harness: &TestHarness,
@@ -138,8 +140,9 @@ async fn given_nonexistent_quickwit_index_should_create_and_store(
 }
 
 #[iggy_harness(
+    shared_server = "quickwit_sink",
     server(connectors_runtime(config_path = "tests/connectors/quickwit/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn given_bulk_message_send_should_store(
     harness: &TestHarness,
@@ -193,8 +196,9 @@ async fn given_bulk_message_send_should_store(
 }
 
 #[iggy_harness(
+    shared_server = "quickwit_sink",
     server(connectors_runtime(config_path = "tests/connectors/quickwit/sink.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn given_invalid_messages_should_not_store(harness: &TestHarness, fixture: QuickwitFixture) {
     let client = harness.root_client().await.unwrap();

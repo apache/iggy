@@ -123,6 +123,69 @@ pub async fn connector_multi_topic_stream(client: &IggyClient) -> Result<(), See
     Ok(())
 }
 
+/// Idempotent seed for serial shared_server tests: creates stream and topic,
+/// silently skipping if they already exist from a previous test in the group.
+pub async fn connector_stream_idempotent(client: &IggyClient) -> Result<(), SeedError> {
+    let stream_id: Identifier = names::STREAM.try_into()?;
+
+    match client.create_stream(names::STREAM).await {
+        Ok(_) => {}
+        Err(e) if e.as_code() == 1012 => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    match client
+        .create_topic(
+            &stream_id,
+            names::TOPIC,
+            1,
+            CompressionAlgorithm::None,
+            None,
+            IggyExpiry::ServerDefault,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(e) if e.as_code() == 2013 => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    Ok(())
+}
+
+/// Idempotent multi-topic seed for serial shared_server tests.
+pub async fn connector_multi_topic_stream_idempotent(client: &IggyClient) -> Result<(), SeedError> {
+    let stream_id: Identifier = names::STREAM.try_into()?;
+
+    match client.create_stream(names::STREAM).await {
+        Ok(_) => {}
+        Err(e) if e.as_code() == 1012 => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    for topic_name in [names::TOPIC, names::TOPIC_2] {
+        match client
+            .create_topic(
+                &stream_id,
+                topic_name,
+                1,
+                CompressionAlgorithm::None,
+                None,
+                IggyExpiry::ServerDefault,
+                MaxTopicSize::ServerDefault,
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(e) if e.as_code() == 2013 => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(())
+}
+
 /// Standard MCP test data: stream, topic, message, consumer group, consumer offset, user, PAT.
 pub async fn mcp_standard(client: &IggyClient) -> Result<(), SeedError> {
     let stream_id: Identifier = names::STREAM.try_into()?;

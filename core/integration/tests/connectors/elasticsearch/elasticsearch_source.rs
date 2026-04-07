@@ -27,8 +27,9 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 #[iggy_harness(
+    shared_server = "elasticsearch_source",
     server(connectors_runtime(config_path = "tests/connectors/elasticsearch/source.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn elasticsearch_source_produces_messages_to_iggy(
     harness: &TestHarness,
@@ -104,8 +105,9 @@ async fn elasticsearch_source_produces_messages_to_iggy(
 }
 
 #[iggy_harness(
+    shared_server = "elasticsearch_source",
     server(connectors_runtime(config_path = "tests/connectors/elasticsearch/source.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn elasticsearch_source_handles_empty_index(
     harness: &TestHarness,
@@ -144,8 +146,9 @@ async fn elasticsearch_source_handles_empty_index(
 }
 
 #[iggy_harness(
+    shared_server = "elasticsearch_source",
     server(connectors_runtime(config_path = "tests/connectors/elasticsearch/source.toml")),
-    seed = seeds::connector_stream
+    seed = seeds::connector_stream_idempotent
 )]
 async fn elasticsearch_source_produces_bulk_messages(
     harness: &TestHarness,
