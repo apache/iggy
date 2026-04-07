@@ -273,7 +273,7 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 sysinfo = "0.38.4"
 tempfile = "3.27.0"
 test-case = "3.3.1"
-testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
+testcontainers-modules = { version = "0.15.0", features = ["postgres", "http_wait"] }
 thiserror = "2.0.18"
 tokio = { version = "1.51.0", features = ["full"] }
 tokio-rustls = "0.26.4"
