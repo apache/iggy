@@ -187,8 +187,8 @@ handle_check() {
     while IFS= read -r line; do
         local pkg_name dep_version
         # Extract package name (left of '=') and version from the dep spec
-        pkg_name=$(echo "$line" | sed -E 's/^([a-z_-]+)\s*=.*/\1/')
-        dep_version=$(echo "$line" | sed -E 's/.*version\s*=\s*"([^"]+)".*/\1/')
+        pkg_name=$(echo "$line" | sed -E 's/^([a-z_-]+)[[:space:]]*=.*/\1/')
+        dep_version=$(echo "$line" | sed -E 's/.*version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
 
         if [[ -z "$pkg_name" ]] || [[ -z "$dep_version" ]]; then
             continue
