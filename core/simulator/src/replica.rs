@@ -33,8 +33,13 @@ const CLUSTER_ID: u128 = 1;
 
 // For now there is only one shard per replica,
 // we will add support for multiple shards per replica in the future.
-pub type Replica =
-    shard::IggyShard<SharedSimOutbox, SimJournal<MemStorage>, SimSnapshot, SimMuxStateMachine>;
+pub type Replica = shard::IggyShard<
+    SharedSimOutbox,
+    SimJournal<MemStorage>, // MJ: metadata journal
+    SimSnapshot,
+    SimMuxStateMachine,
+    SimJournal<MemStorage>, // PJ: partitions journal
+>;
 
 pub fn new_replica(id: u8, name: String, bus: &Arc<SimOutbox>, replica_count: u8) -> Replica {
     let users: Users = UsersInner::new().into();
@@ -69,6 +74,7 @@ pub fn new_replica(id: u8, name: String, bus: &Arc<SimOutbox>, replica_count: u8
     };
 
     let mut partitions = IggyPartitions::new(ShardId::new(u16::from(id)), partitions_config);
+    partitions.set_journal(SimJournal::<MemStorage>::default());
 
     // TODO: namespace=0 collides with metadata consensus. Safe for now because the simulator
     // routes by Operation type, but a shared view change bus would produce namespace collisions.

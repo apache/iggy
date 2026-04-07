@@ -226,6 +226,17 @@ impl Simulator {
         self.crashed.contains(&replica_index)
     }
 
+    /// Advance consensus timeouts and dispatch actions on every replica.
+    ///
+    /// Call this once per simulation tick. Handles prepare retransmission
+    /// (and eventually view-change messages) via the timeout system.
+    #[allow(clippy::future_not_send)]
+    pub async fn tick(&self) {
+        for replica in &self.replicas {
+            replica.tick_partitions().await;
+        }
+    }
+
     /// Poll messages directly from a replica's partition.
     ///
     /// # Errors
