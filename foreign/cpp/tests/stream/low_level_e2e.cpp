@@ -325,6 +325,10 @@ TEST(LowLevelE2E_Stream, GetStreamsReturnsStreamAfterCreation) {
     for (const auto &s : streams) {
         if (std::string(s.name) == stream_name) {
             found = true;
+            EXPECT_GT(s.created_at, static_cast<std::uint64_t>(0));
+            EXPECT_EQ(s.size_bytes, static_cast<std::uint64_t>(0));
+            EXPECT_EQ(s.messages_count, static_cast<std::uint64_t>(0));
+            EXPECT_EQ(s.topics_count, 0u);
             break;
         }
     }
@@ -397,11 +401,15 @@ TEST(LowLevelE2E_Stream, GetStreamsConsistentWithGetStream) {
 
     std::string list_name;
     std::uint32_t list_topics_count = 0;
+    std::uint64_t list_created_at   = 0;
+    std::uint64_t list_size_bytes   = 0;
     auto streams                    = client->get_streams();
     for (const auto &s : streams) {
         if (std::string(s.name) == stream_name) {
             list_name         = std::string(s.name);
             list_topics_count = s.topics_count;
+            list_created_at   = s.created_at;
+            list_size_bytes   = s.size_bytes;
             break;
         }
     }
@@ -413,6 +421,8 @@ TEST(LowLevelE2E_Stream, GetStreamsConsistentWithGetStream) {
 
     EXPECT_EQ(list_name, single_name);
     EXPECT_EQ(list_topics_count, single_topics);
+    EXPECT_EQ(list_created_at, single.created_at);
+    EXPECT_EQ(list_size_bytes, single.size_bytes);
 
     client->delete_stream(make_string_identifier(stream_name));
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));

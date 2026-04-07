@@ -161,6 +161,18 @@ mod ffi {
             topic_id: Identifier,
             group_id: Identifier,
         ) -> Result<()>;
+        fn join_consumer_group(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            group_id: Identifier,
+        ) -> Result<()>;
+        fn leave_consumer_group(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            group_id: Identifier,
+        ) -> Result<()>;
 
         #[allow(clippy::too_many_arguments)]
         fn poll_messages(
