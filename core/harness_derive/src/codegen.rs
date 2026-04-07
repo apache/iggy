@@ -244,12 +244,13 @@ fn generate_single_test(
         let shared_harness_setup = generate_shared_harness_setup(variant, has_fixtures, attrs);
         let shared_start_and_seed = generate_shared_start_and_seed(attrs, fixture_seed);
         let key_ident = Ident::new(&shared.key, Span::call_site());
+        let shared_fn_name = format_ident!("shared_server_{}", fn_name);
 
         return Ok(quote! {
             #(#other_attrs)*
             #[::tokio::test]
             #[::serial_test::serial(#key_ident)]
-            #fn_vis async fn #fn_name() {
+            #fn_vis async fn #shared_fn_name() {
                 #fixture_setup
                 #fixture_envs
                 #fixture_param_bindings
