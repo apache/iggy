@@ -27,9 +27,8 @@ use reqwest::Client;
 const API_KEY: &str = "test-api-key";
 
 #[iggy_harness(
-    shared_server = "connector_api",
     server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn root_endpoint_returns_welcome_message(harness: &TestHarness) {
     let api_address = harness
@@ -50,9 +49,8 @@ async fn root_endpoint_returns_welcome_message(harness: &TestHarness) {
 }
 
 #[iggy_harness(
-    shared_server = "connector_api",
     server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn health_endpoint_returns_healthy(harness: &TestHarness) {
     let api_address = harness
@@ -73,9 +71,8 @@ async fn health_endpoint_returns_healthy(harness: &TestHarness) {
 }
 
 #[iggy_harness(
-    shared_server = "connector_api",
     server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn stats_endpoint_returns_runtime_stats(harness: &TestHarness) {
     let api_address = harness
@@ -103,9 +100,8 @@ async fn stats_endpoint_returns_runtime_stats(harness: &TestHarness) {
 }
 
 #[iggy_harness(
-    shared_server = "connector_api",
     server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn metrics_endpoint_returns_prometheus_format(harness: &TestHarness) {
     let api_address = harness
@@ -131,9 +127,8 @@ async fn metrics_endpoint_returns_prometheus_format(harness: &TestHarness) {
 }
 
 #[iggy_harness(
-    shared_server = "connector_api",
     server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn sources_endpoint_returns_list(harness: &TestHarness) {
     let api_address = harness
@@ -155,9 +150,8 @@ async fn sources_endpoint_returns_list(harness: &TestHarness) {
 }
 
 #[iggy_harness(
-    shared_server = "connector_api",
     server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn sinks_endpoint_returns_list(harness: &TestHarness) {
     let api_address = harness
@@ -179,9 +173,8 @@ async fn sinks_endpoint_returns_list(harness: &TestHarness) {
 }
 
 #[iggy_harness(
-    shared_server = "connector_api",
     server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn api_key_authentication_required(harness: &TestHarness) {
     let api_address = harness
@@ -224,9 +217,8 @@ async fn api_key_authentication_required(harness: &TestHarness) {
 }
 
 #[iggy_harness(
-    shared_server = "connector_api",
     server(connectors_runtime(config_path = "tests/connectors/api/config.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn api_key_authentication_rejected_with_invalid_key(harness: &TestHarness) {
     let api_address = harness

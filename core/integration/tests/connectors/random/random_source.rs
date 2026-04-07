@@ -25,9 +25,8 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 #[iggy_harness(
-    shared_server = "random_source",
     server(connectors_runtime(config_path = "tests/connectors/random/source.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn random_source_produces_messages(harness: &TestHarness) {
     sleep(Duration::from_secs(1)).await;

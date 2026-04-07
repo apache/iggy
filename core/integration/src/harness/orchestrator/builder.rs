@@ -226,8 +226,6 @@ impl TestHarnessBuilder {
             primary_transport,
             primary_client_config: self.primary_client_config,
             started: false,
-            shared_server: None,
-            shared_connectors_runtime: None,
         })
     }
 }

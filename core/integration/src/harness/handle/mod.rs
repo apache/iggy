@@ -25,7 +25,7 @@ mod mcp;
 mod server;
 
 pub use client::ClientHandle;
-pub use client_builder::{ClientBuilder, ServerConnection};
+pub use client_builder::ClientBuilder;
 pub use connectors_runtime::ConnectorsRuntimeHandle;
 pub use mcp::{McpClient, McpHandle};
 pub use server::{ServerHandle, ServerLogs};

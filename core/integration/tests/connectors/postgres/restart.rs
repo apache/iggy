@@ -38,9 +38,8 @@ const SINK_KEY: &str = "postgres";
 type SinkRow = (i64, String, String, Vec<u8>);
 
 #[iggy_harness(
-    shared_server = "postgres_sink",
     server(connectors_runtime(config_path = "tests/connectors/postgres/sink.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn restart_sink_connector_continues_processing(
     harness: &TestHarness,
@@ -128,9 +127,8 @@ async fn restart_sink_connector_continues_processing(
 }
 
 #[iggy_harness(
-    shared_server = "postgres_sink",
     server(connectors_runtime(config_path = "tests/connectors/postgres/sink.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn parallel_restart_requests_should_not_break_connector(
     harness: &TestHarness,

@@ -51,7 +51,6 @@ mod helpers;
 mod orchestrator;
 mod port_reserver;
 pub mod seeds;
-mod shared;
 mod traits;
 
 pub use config::{
@@ -72,4 +71,3 @@ pub use helpers::{
 };
 
 pub use fixture::TestFixture;
-pub use shared::{SharedServerInfo, SharedServerRegistry};
