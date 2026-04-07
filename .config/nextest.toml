@@ -15,11 +15,125 @@
 # specific language governing permissions and limitations
 # under the License.
 
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 4 }
+
 [[profile.default.overrides]]
 # This is a solution (or actually a workaround) for the problem that nextest does not support
 # #[serial] macro which shall enforce sequential execution of the test case.
 filter = 'package(integration) and test(cli::system::test_cli_session_scenario::should_be_successful)'
 threads-required = "num-cpus"
 
-[profile.default]
-slow-timeout = { period = "30s", terminate-after = 4 }
+# shared_server groups: nextest runs each test in a separate process, so
+# #[serial_test::serial(key)] has no cross-process effect. These test-groups
+# serialize tests that share the same iggy-server key, matching the behavior
+# that serial_test provides under `cargo test`.
+
+[test-groups.shared-connector-api]
+max-threads = 1
+
+[test-groups.shared-elasticsearch-sink]
+max-threads = 1
+
+[test-groups.shared-elasticsearch-source]
+max-threads = 1
+
+[test-groups.shared-http-config-direct]
+max-threads = 1
+
+[test-groups.shared-http-config-wrapped]
+max-threads = 1
+
+[test-groups.shared-http-sink]
+max-threads = 1
+
+[test-groups.shared-iceberg-sink]
+max-threads = 1
+
+[test-groups.shared-influxdb-sink]
+max-threads = 1
+
+[test-groups.shared-influxdb-source]
+max-threads = 1
+
+[test-groups.shared-mongodb-sink]
+max-threads = 1
+
+[test-groups.shared-postgres-sink]
+max-threads = 1
+
+[test-groups.shared-postgres-source]
+max-threads = 1
+
+[test-groups.shared-quickwit-sink]
+max-threads = 1
+
+[test-groups.shared-random-source]
+max-threads = 1
+
+[test-groups.shared-stdout-sink]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::api::endpoints::)'
+test-group = 'shared-connector-api'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::elasticsearch::elasticsearch_sink::)'
+test-group = 'shared-elasticsearch-sink'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::elasticsearch::elasticsearch_source::)'
+test-group = 'shared-elasticsearch-source'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::http_config_provider::direct_responses::)'
+test-group = 'shared-http-config-direct'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::http_config_provider::wrapped_responses::)'
+test-group = 'shared-http-config-wrapped'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::http::http_sink::)'
+test-group = 'shared-http-sink'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::iceberg::iceberg_sink::)'
+test-group = 'shared-iceberg-sink'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::influxdb::influxdb_sink)' # matches influxdb_sink and influxdb_sink_formats
+test-group = 'shared-influxdb-sink'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::influxdb::influxdb_source)' # matches influxdb_source and influxdb_source_formats
+test-group = 'shared-influxdb-source'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::mongodb::mongodb_sink::)'
+test-group = 'shared-mongodb-sink'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::postgres::postgres_sink::)' # postgres_sink tests
+test-group = 'shared-postgres-sink'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::postgres::restart::)' # restart tests also use postgres_sink key
+test-group = 'shared-postgres-sink'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::postgres::postgres_source::)'
+test-group = 'shared-postgres-source'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::quickwit::quickwit_sink::)'
+test-group = 'shared-quickwit-sink'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::random::random_source::)'
+test-group = 'shared-random-source'
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(connectors::stdout::stdout_sink::)'
+test-group = 'shared-stdout-sink'
