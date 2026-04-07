@@ -15,21 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[profile.default]
-slow-timeout = { period = "30s", terminate-after = 4 }
-
 [[profile.default.overrides]]
 # This is a solution (or actually a workaround) for the problem that nextest does not support
 # #[serial] macro which shall enforce sequential execution of the test case.
 filter = 'package(integration) and test(cli::system::test_cli_session_scenario::should_be_successful)'
 threads-required = "num-cpus"
 
-# shared_server tests: the iggy_harness macro prefixes test names with
-# shared_server_ enabling a single generic nextest filter. Bounded to limit
-# resource contention from parallel fixture containers without fully serializing.
-[test-groups.shared-server]
-max-threads = 8
-
-[[profile.default.overrides]]
-filter = 'package(integration) and test(/shared_server_/)'
-test-group = 'shared-server'
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 4 }

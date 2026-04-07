@@ -37,9 +37,8 @@ const SNAPSHOT_POLL_INTERVAL_MS: u64 = 500;
 const BULK_SNAPSHOT_POLL_ATTEMPTS: usize = 60;
 
 #[iggy_harness(
-    shared_server = "iceberg_sink",
     server(connectors_runtime(config_path = "tests/connectors/iceberg/sink.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn iceberg_sink_initializes_and_runs(
     harness: &TestHarness,
@@ -69,9 +68,8 @@ async fn iceberg_sink_initializes_and_runs(
 }
 
 #[iggy_harness(
-    shared_server = "iceberg_sink",
     server(connectors_runtime(config_path = "tests/connectors/iceberg/sink.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn iceberg_sink_consumes_json_messages(
     harness: &TestHarness,
@@ -141,9 +139,8 @@ async fn iceberg_sink_consumes_json_messages(
 }
 
 #[iggy_harness(
-    shared_server = "iceberg_sink",
     server(connectors_runtime(config_path = "tests/connectors/iceberg/sink.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn iceberg_sink_handles_bulk_messages(
     harness: &TestHarness,

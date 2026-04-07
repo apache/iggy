@@ -26,8 +26,7 @@ use tracing::info;
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
-    shared_server = "influxdb_source",
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn influxdb_source_polls_and_produces_messages(
     harness: &TestHarness,
@@ -85,8 +84,7 @@ async fn influxdb_source_polls_and_produces_messages(
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
-    shared_server = "influxdb_source",
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn influxdb_source_message_payload_structure(
     harness: &TestHarness,
@@ -142,8 +140,7 @@ async fn influxdb_source_message_payload_structure(
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
-    shared_server = "influxdb_source",
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn influxdb_source_empty_bucket_produces_no_messages(
     harness: &TestHarness,
@@ -182,8 +179,7 @@ async fn influxdb_source_empty_bucket_produces_no_messages(
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/influxdb/source.toml")),
-    shared_server = "influxdb_source",
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn influxdb_source_multiple_measurements(
     harness: &TestHarness,
