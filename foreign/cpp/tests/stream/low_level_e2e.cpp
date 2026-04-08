@@ -400,6 +400,7 @@ TEST(LowLevelE2E_Stream, GetStreamsConsistentWithGetStream) {
     client->create_stream(stream_name);
 
     std::string list_name;
+    std::uint32_t list_id           = 0;
     std::uint32_t list_topics_count = 0;
     std::uint64_t list_created_at   = 0;
     std::uint64_t list_size_bytes   = 0;
@@ -407,6 +408,7 @@ TEST(LowLevelE2E_Stream, GetStreamsConsistentWithGetStream) {
     for (const auto &s : streams) {
         if (std::string(s.name) == stream_name) {
             list_name         = std::string(s.name);
+            list_id           = s.id;
             list_topics_count = s.topics_count;
             list_created_at   = s.created_at;
             list_size_bytes   = s.size_bytes;
@@ -420,6 +422,7 @@ TEST(LowLevelE2E_Stream, GetStreamsConsistentWithGetStream) {
     auto single_topics = single.topics_count;
 
     EXPECT_EQ(list_name, single_name);
+    EXPECT_EQ(list_id, single.id);
     EXPECT_EQ(list_topics_count, single_topics);
     EXPECT_EQ(list_created_at, single.created_at);
     EXPECT_EQ(list_size_bytes, single.size_bytes);
