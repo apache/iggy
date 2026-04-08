@@ -21,6 +21,7 @@ fn main() {
         .compile("iggy-cpp-bridge");
 
     println!("cargo:rerun-if-changed=src/client.rs");
+    println!("cargo:rerun-if-changed=src/consumer_group.rs");
     println!("cargo:rerun-if-changed=src/identifier.rs");
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=src/stream.rs");

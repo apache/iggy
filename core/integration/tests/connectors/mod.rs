@@ -20,8 +20,10 @@
 mod api;
 mod elasticsearch;
 mod fixtures;
+mod http;
 mod http_config_provider;
 mod iceberg;
+mod influxdb;
 mod mongodb;
 mod postgres;
 mod quickwit;

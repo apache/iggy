@@ -17,10 +17,20 @@
  */
 use crate::BinaryClient;
 use crate::traits::binary_auth::fail_if_not_authenticated;
+use crate::wire_conversions::{
+    consumer_to_wire, identifier_to_wire, partitioning_to_wire, polling_strategy_to_wire,
+};
 use crate::{
-    BytesSerializable, Consumer, FlushUnsavedBuffer, Identifier, IggyError, IggyMessage,
-    MessageClient, POLL_MESSAGES_CODE, Partitioning, PollMessages, PolledMessages, PollingStrategy,
-    SEND_MESSAGES_CODE, SendMessages,
+    Consumer, Identifier, IggyError, IggyMessage, MessageClient, Partitioning, PolledMessages,
+    PollingStrategy,
+};
+use bytes::BytesMut;
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::codes::{
+    FLUSH_UNSAVED_BUFFER_CODE, POLL_MESSAGES_CODE, SEND_MESSAGES_CODE,
+};
+use iggy_binary_protocol::requests::messages::{
+    FlushUnsavedBufferRequest, PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
 
 #[async_trait::async_trait]
@@ -36,19 +46,17 @@ impl<B: BinaryClient> MessageClient for B {
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
         fail_if_not_authenticated(self).await?;
+        let req = PollMessagesRequest {
+            consumer: consumer_to_wire(consumer)?,
+            stream_id: identifier_to_wire(stream_id)?,
+            topic_id: identifier_to_wire(topic_id)?,
+            partition_id,
+            strategy: polling_strategy_to_wire(strategy),
+            count,
+            auto_commit,
+        };
         let response = self
-            .send_raw_with_response(
-                POLL_MESSAGES_CODE,
-                PollMessages::bytes(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    consumer,
-                    strategy,
-                    count,
-                    auto_commit,
-                ),
-            )
+            .send_raw_with_response(POLL_MESSAGES_CODE, req.to_bytes())
             .await?;
         PolledMessages::from_bytes(response)
     }
@@ -61,11 +69,34 @@ impl<B: BinaryClient> MessageClient for B {
         messages: &mut [IggyMessage],
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_raw_with_response(
-            SEND_MESSAGES_CODE,
-            SendMessages::bytes(stream_id, topic_id, partitioning, messages),
-        )
-        .await?;
+        let wire_stream_id = identifier_to_wire(stream_id)?;
+        let wire_topic_id = identifier_to_wire(topic_id)?;
+        let wire_partitioning = partitioning_to_wire(partitioning)?;
+        let raw_messages: Vec<RawMessage<'_>> = messages
+            .iter()
+            .map(|m| RawMessage {
+                id: m.header.id,
+                origin_timestamp: m.header.origin_timestamp,
+                headers: m.user_headers.as_deref(),
+                payload: &m.payload,
+            })
+            .collect();
+        let size = SendMessagesEncoder::encoded_size(
+            &wire_stream_id,
+            &wire_topic_id,
+            &wire_partitioning,
+            &raw_messages,
+        );
+        let mut buf = BytesMut::with_capacity(size);
+        SendMessagesEncoder::encode(
+            &mut buf,
+            &wire_stream_id,
+            &wire_topic_id,
+            &wire_partitioning,
+            &raw_messages,
+        );
+        self.send_raw_with_response(SEND_MESSAGES_CODE, buf.freeze())
+            .await?;
         Ok(())
     }
 
@@ -77,13 +108,14 @@ impl<B: BinaryClient> MessageClient for B {
         fsync: bool,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
-        self.send_with_response(&FlushUnsavedBuffer {
-            stream_id: stream_id.clone(),
-            topic_id: topic_id.clone(),
+        let req = FlushUnsavedBufferRequest {
+            stream_id: identifier_to_wire(stream_id)?,
+            topic_id: identifier_to_wire(topic_id)?,
             partition_id,
             fsync,
-        })
-        .await?;
+        };
+        self.send_raw_with_response(FLUSH_UNSAVED_BUFFER_CODE, req.to_bytes())
+            .await?;
         Ok(())
     }
 }

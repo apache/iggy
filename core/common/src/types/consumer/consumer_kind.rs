@@ -16,11 +16,9 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
 use crate::Identifier;
 use crate::Validatable;
 use crate::error::IggyError;
-use bytes::{BufMut, Bytes, BytesMut};
 use clap::ValueEnum;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt::Display;
@@ -90,31 +88,6 @@ impl Consumer {
             kind: ConsumerKind::ConsumerGroup,
             id,
         }
-    }
-}
-
-impl BytesSerializable for Consumer {
-    fn to_bytes(&self) -> Bytes {
-        let id_bytes = self.id.to_bytes();
-        let mut bytes = BytesMut::with_capacity(1 + id_bytes.len());
-        bytes.put_u8(self.kind.as_code());
-        bytes.put_slice(&id_bytes);
-        bytes.freeze()
-    }
-
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        if bytes.len() < 4 {
-            return Err(IggyError::InvalidCommand);
-        }
-
-        let kind = ConsumerKind::from_code(bytes[0])?;
-        let id = Identifier::from_bytes(bytes.slice(1..))?;
-        let consumer = Consumer { kind, id };
-        consumer.validate()?;
-        Ok(consumer)
     }
 }
 

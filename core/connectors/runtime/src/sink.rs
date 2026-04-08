@@ -452,7 +452,7 @@ async fn process_messages(
         checksum: message.header.checksum,
         timestamp: message.header.timestamp,
         origin_timestamp: message.header.origin_timestamp,
-        headers: message.user_headers_map().unwrap_or_default(),
+        headers: message.user_headers_map().unwrap_or(None),
         payload: message.payload.into(),
     });
 

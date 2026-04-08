@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_mongodb_sink"
-version = "0.3.3-edge.1"
+version = "0.4.0"
 description = "Iggy MongoDB sink connector for storing stream messages into MongoDB database"
 edition = "2024"
 license = "Apache-2.0"

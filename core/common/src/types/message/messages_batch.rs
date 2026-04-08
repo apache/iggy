@@ -18,8 +18,8 @@
 
 use super::message_boundaries::IggyMessageBoundaries;
 use crate::{
-    BytesSerializable, INDEX_SIZE, IggyByteSize, IggyIndexes, IggyMessage, IggyMessageView,
-    IggyMessageViewIterator, MAX_PAYLOAD_SIZE, Sizeable, Validatable, error::IggyError,
+    INDEX_SIZE, IggyByteSize, IggyIndexes, IggyMessage, IggyMessageView, IggyMessageViewIterator,
+    MAX_PAYLOAD_SIZE, Sizeable, Validatable, error::IggyError,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use std::ops::{Deref, Index};
@@ -164,26 +164,6 @@ impl Index<usize> for IggyMessagesBatch {
             .expect("Invalid message boundaries");
 
         &self.messages[start..end]
-    }
-}
-
-impl BytesSerializable for IggyMessagesBatch {
-    fn to_bytes(&self) -> Bytes {
-        panic!("should not be used");
-    }
-
-    fn from_bytes(_bytes: Bytes) -> Result<Self, IggyError> {
-        panic!("don't use");
-    }
-
-    fn write_to_buffer(&self, buf: &mut BytesMut) {
-        buf.put_u32_le(self.count);
-        buf.put_slice(&self.indexes);
-        buf.put_slice(&self.messages);
-    }
-
-    fn get_buffer_size(&self) -> usize {
-        4 + self.indexes.len() + self.messages.len()
     }
 }
 

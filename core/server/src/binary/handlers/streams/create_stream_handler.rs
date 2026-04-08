@@ -25,8 +25,7 @@ use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::responses::streams::StreamResponse;
-use iggy_common::create_stream::CreateStream;
-use iggy_common::{IggyError, SenderKind, Validatable};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -43,14 +42,9 @@ pub async fn handle_create_stream(
     );
     shard.ensure_authenticated(session)?;
 
-    let command = CreateStream {
-        name: req.name.to_string(),
-    };
-    command.validate()?;
-
     let request = ShardRequest::control_plane(ShardRequestPayload::CreateStreamRequest {
         user_id: session.get_user_id(),
-        command,
+        command: req,
     });
 
     match shard.send_to_control_plane(request).await? {

@@ -15,10 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::client_table::ClientTable;
 use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
 use crate::{
-    Consensus, DvcQuorumArray, Pipeline, Project, StoredDvc, dvc_count, dvc_max_commit,
-    dvc_quorum_array_empty, dvc_record, dvc_reset, dvc_select_winner,
+    AckLogEvent, Consensus, ControlActionLogEvent, DvcQuorumArray, IgnoreReason, Pipeline,
+    PlaneKind, PrepareLogEvent, Project, ReplicaLogContext, SimEventKind, StoredDvc,
+    ViewChangeLogEvent, ViewChangeReason, dvc_count, dvc_max_commit, dvc_quorum_array_empty,
+    dvc_record, dvc_reset, dvc_select_winner, emit_replica_event, emit_sim_event,
 };
 use bit_set::BitSet;
 use iggy_binary_protocol::{
@@ -84,6 +87,10 @@ pub const PIPELINE_PREPARE_QUEUE_MAX: usize = 8;
 /// Maximum number of replicas in a cluster.
 pub const REPLICAS_MAX: usize = 32;
 
+/// Maximum number of clients tracked in the clients table.
+/// When exceeded, the client with the oldest committed request is evicted.
+pub const CLIENTS_TABLE_MAX: usize = 8192;
+
 #[derive(Debug)]
 pub struct PipelineEntry {
     pub header: PrepareHeader,
@@ -131,6 +138,7 @@ pub struct RequestEntry {
 }
 
 impl RequestEntry {
+    #[must_use]
     pub const fn new(message: Message<RequestHeader>) -> Self {
         Self {
             message,
@@ -180,17 +188,15 @@ impl LocalPipeline {
         self.prepare_queue.is_empty()
     }
 
-    /// Push a new message to the pipeline.
+    /// Push a new entry to the pipeline.
     ///
     /// # Panics
     /// - If message queue is full.
     /// - If the message doesn't chain correctly to the previous entry.
-    // Signature must match `Pipeline::push_message` trait definition.
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn push_message(&mut self, message: Message<PrepareHeader>) {
+    pub fn push(&mut self, entry: PipelineEntry) {
         assert!(!self.prepare_queue_full(), "prepare queue is full");
 
-        let header = *message.header();
+        let header = entry.header;
 
         if let Some(tail) = self.prepare_queue.back() {
             let tail_header = &tail.header;
@@ -208,7 +214,12 @@ impl LocalPipeline {
             assert!(header.view >= tail_header.view, "view cannot go backwards");
         }
 
-        self.prepare_queue.push_back(PipelineEntry::new(header));
+        self.prepare_queue.push_back(entry);
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn push_message(&mut self, message: Message<PrepareHeader>) {
+        self.push(PipelineEntry::new(*message.header()));
     }
 
     /// Pop the oldest message (after it's been committed).
@@ -342,14 +353,13 @@ impl LocalPipeline {
 }
 
 impl Pipeline for LocalPipeline {
-    type Message = Message<PrepareHeader>;
     type Entry = PipelineEntry;
 
-    fn push_message(&mut self, message: Self::Message) {
-        Self::push_message(self, message);
+    fn push(&mut self, entry: Self::Entry) {
+        Self::push(self, entry);
     }
 
-    fn pop_message(&mut self) -> Option<Self::Entry> {
+    fn pop(&mut self) -> Option<Self::Entry> {
         Self::pop_message(self)
     }
 
@@ -357,15 +367,15 @@ impl Pipeline for LocalPipeline {
         Self::clear(self);
     }
 
-    fn message_by_op(&self, op: u64) -> Option<&Self::Entry> {
+    fn entry_by_op(&self, op: u64) -> Option<&Self::Entry> {
         Self::message_by_op(self, op)
     }
 
-    fn message_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry> {
+    fn entry_by_op_mut(&mut self, op: u64) -> Option<&mut Self::Entry> {
         Self::message_by_op_mut(self, op)
     }
 
-    fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&Self::Entry> {
+    fn entry_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&Self::Entry> {
         Self::message_by_op_and_checksum(self, op, checksum)
     }
 
@@ -381,6 +391,10 @@ impl Pipeline for LocalPipeline {
         Self::is_empty(self)
     }
 
+    fn len(&self) -> usize {
+        self.prepare_count()
+    }
+
     fn verify(&self) {
         Self::verify(self);
     }
@@ -394,7 +408,7 @@ pub enum Status {
 }
 
 /// Actions to be taken by the caller after processing a VSR event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum VsrAction {
     /// Send `StartViewChange` to all replicas.
     SendStartViewChange { view: u32, namespace: u64 },
@@ -414,13 +428,47 @@ pub enum VsrAction {
         commit: u64,
         namespace: u64,
     },
-    /// Send `PrepareOK` to primary.
+    /// Send `PrepareOK` for each op in `[from_op, to_op]` that is present in the WAL.
+    ///
+    /// The caller MUST verify each op exists in the journal before sending.
+    /// Sending `PrepareOk` for a missing op is a safety violation, it can
+    /// cause the primary to commit an op without enough replicas holding the data.
     SendPrepareOk {
         view: u32,
-        op: u64,
+        from_op: u64,
+        to_op: u64,
         target: u8,
         namespace: u64,
     },
+    /// Retransmit uncommitted prepares from the WAL to replicas that haven't acked.
+    ///
+    /// Emitted when the primary's prepare timeout fires and there are
+    /// uncommitted entries in the pipeline. Each entry is a prepare header
+    /// (for journal lookup) and the list of replica IDs that need it.
+    RetransmitPrepares {
+        targets: Vec<(PrepareHeader, Vec<u8>)>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareOkOutcome {
+    Accepted {
+        ack_count: usize,
+        quorum_reached: bool,
+    },
+    Ignored {
+        reason: IgnoreReason,
+    },
+}
+
+impl PrepareOkOutcome {
+    #[must_use]
+    pub const fn quorum_reached(self) -> bool {
+        match self {
+            Self::Accepted { quorum_reached, .. } => quorum_reached,
+            Self::Ignored { .. } => false,
+        }
+    }
 }
 
 #[allow(unused)]
@@ -447,7 +495,16 @@ where
     // * `replica.log_view = 0` when replica_count=1.
     log_view: Cell<u32>,
     status: Cell<Status>,
-    commit: Cell<u64>,
+
+    /// Highest op number that has been locally executed (state machine applied,
+    /// client table updated). Advances one-by-one in `commit_journal` (backup)
+    /// and `on_ack` (primary). On a normal primary, `commit_min == commit_max`.
+    commit_min: Cell<u64>,
+
+    /// Highest op number known to be committed by the cluster. Advances
+    /// immediately when the replica learns about commits (from prepare
+    /// messages, commit heartbeats, or view change messages).
+    commit_max: Cell<u64>,
 
     sequencer: LocalSequencer,
 
@@ -472,6 +529,9 @@ where
     sent_own_do_view_change: Cell<bool>,
 
     timeouts: RefCell<TimeoutManager>,
+
+    /// VSR client-table for duplicate detection and reply caching.
+    client_table: RefCell<ClientTable>,
 }
 
 impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
@@ -504,7 +564,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             log_view: Cell::new(0),
             status: Cell::new(Status::Recovering),
             sequencer: LocalSequencer::new(0),
-            commit: Cell::new(0),
+            commit_min: Cell::new(0),
+            commit_max: Cell::new(0),
             last_timestamp: Cell::new(0),
             last_prepare_checksum: Cell::new(0),
             pipeline: RefCell::new(pipeline),
@@ -516,6 +577,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             sent_own_start_view_change: Cell::new(false),
             sent_own_do_view_change: Cell::new(false),
             timeouts: RefCell::new(TimeoutManager::new(timeout_seed)),
+            client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
         }
     }
 
@@ -537,14 +599,38 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.primary_index(self.view.get()) == self.replica
     }
 
+    /// Advance `commit_max` - the highest op known to be committed by the cluster.
+    ///
+    /// Called when the replica learns about new commits from the primary
+    /// (via prepare messages, commit heartbeats, or view change messages).
+    ///
     /// # Panics
-    /// If the stored commit number somehow exceeds the given `commit` after update.
-    pub fn advance_commit_number(&self, commit: u64) {
-        if commit > self.commit.get() {
-            self.commit.set(commit);
+    /// If `commit_max` would be less than `commit_min` after the update
+    /// (invariant violation).
+    pub fn advance_commit_max(&self, commit: u64) {
+        if commit > self.commit_max.get() {
+            self.commit_max.set(commit);
         }
+        assert!(self.commit_max.get() >= self.commit_min.get());
+    }
 
-        assert!(self.commit.get() >= commit);
+    /// Advance `commit_min` - the highest op locally executed.
+    ///
+    /// Called after each op is applied through `commit_journal` (backup)
+    /// or `on_ack` (primary). Must advance sequentially (by 1).
+    ///
+    /// # Panics
+    /// - If `op` is not exactly `commit_min + 1` (must advance sequentially).
+    /// - If `commit_min` would exceed `commit_max` after the update.
+    pub fn advance_commit_min(&self, op: u64) {
+        assert_eq!(
+            op,
+            self.commit_min.get() + 1,
+            "commit_min must advance sequentially: expected {}, got {op}",
+            self.commit_min.get() + 1
+        );
+        self.commit_min.set(op);
+        assert!(self.commit_max.get() >= self.commit_min.get());
     }
 
     /// Maximum number of faulty replicas that can be tolerated.
@@ -560,15 +646,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.max_faulty() + 1
     }
 
+    /// Highest op locally executed (state machine applied, client table updated).
     #[must_use]
-    pub const fn commit(&self) -> u64 {
-        self.commit.get()
+    pub const fn commit_min(&self) -> u64 {
+        self.commit_min.get()
     }
 
+    /// Highest op known to be committed by the cluster.
     #[must_use]
-    pub const fn is_syncing(&self) -> bool {
-        // TODO: for now return false. we have to add syncing related setup to VsrConsensus to make this work.
-        false
+    pub const fn commit_max(&self) -> u64 {
+        self.commit_max.get()
     }
 
     #[must_use]
@@ -606,6 +693,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub const fn pipeline_mut(&mut self) -> &mut RefCell<P> {
         &mut self.pipeline
+    }
+
+    #[must_use]
+    pub const fn client_table(&self) -> &RefCell<ClientTable> {
+        &self.client_table
     }
 
     #[must_use]
@@ -682,13 +774,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.sent_own_start_view_change.set(false);
         self.sent_own_do_view_change.set(false);
         self.loopback_queue.borrow_mut().clear();
+        self.client_table.borrow_mut().clear_pending();
     }
 
     /// Process one tick. Call this periodically (e.g., every 10ms).
     ///
     /// Returns a list of actions to take based on fired timeouts.
     /// Empty vec means no actions needed.
-    pub fn tick(&self, current_op: u64, current_commit: u64) -> Vec<VsrAction> {
+    pub fn tick(&self, plane: PlaneKind, current_op: u64, current_commit: u64) -> Vec<VsrAction> {
         let mut actions = Vec::new();
         let mut timeouts = self.timeouts.borrow_mut();
 
@@ -698,25 +791,35 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // Phase 2: Handle fired timeouts
         if timeouts.fired(TimeoutKind::NormalHeartbeat) {
             drop(timeouts);
-            actions.extend(self.handle_normal_heartbeat_timeout());
+            actions.extend(self.handle_normal_heartbeat_timeout(plane));
             timeouts = self.timeouts.borrow_mut();
         }
 
         if timeouts.fired(TimeoutKind::StartViewChangeMessage) {
             drop(timeouts);
-            actions.extend(self.handle_start_view_change_message_timeout());
+            actions.extend(self.handle_start_view_change_message_timeout(plane));
             timeouts = self.timeouts.borrow_mut();
         }
 
         if timeouts.fired(TimeoutKind::DoViewChangeMessage) {
             drop(timeouts);
-            actions.extend(self.handle_do_view_change_message_timeout(current_op, current_commit));
+            actions.extend(self.handle_do_view_change_message_timeout(
+                plane,
+                current_op,
+                current_commit,
+            ));
+            timeouts = self.timeouts.borrow_mut();
+        }
+
+        if timeouts.fired(TimeoutKind::Prepare) {
+            drop(timeouts);
+            actions.extend(self.handle_prepare_timeout());
             timeouts = self.timeouts.borrow_mut();
         }
 
         if timeouts.fired(TimeoutKind::ViewChangeStatus) {
             drop(timeouts);
-            actions.extend(self.handle_view_change_status_timeout());
+            actions.extend(self.handle_view_change_status_timeout(plane));
             // timeouts = self.timeouts.borrow_mut(); // Not needed if last
         }
 
@@ -725,7 +828,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// Called when `normal_heartbeat` timeout fires.
     /// Backup hasn't heard from primary - start view change.
-    fn handle_normal_heartbeat_timeout(&self) -> Vec<VsrAction> {
+    fn handle_normal_heartbeat_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
         // Only backups trigger view change on heartbeat timeout
         if self.is_primary() {
             return Vec::new();
@@ -737,7 +840,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         // Advance to new view and transition to view change
-        let new_view = self.view.get() + 1;
+        let old_view = self.view.get();
+        let new_view = old_view + 1;
 
         self.view.set(new_view);
         self.status.set(Status::ViewChange);
@@ -755,14 +859,32 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts.start(TimeoutKind::ViewChangeStatus);
         }
 
-        vec![VsrAction::SendStartViewChange {
+        emit_sim_event(
+            SimEventKind::ViewChangeStarted,
+            &ViewChangeLogEvent {
+                replica: ReplicaLogContext::from_consensus(self, plane),
+                old_view,
+                new_view,
+                reason: ViewChangeReason::NormalHeartbeatTimeout,
+            },
+        );
+
+        let action = VsrAction::SendStartViewChange {
             view: new_view,
             namespace: self.namespace,
-        }]
+        };
+        emit_sim_event(
+            SimEventKind::ControlMessageScheduled,
+            &ControlActionLogEvent::from_vsr_action(
+                ReplicaLogContext::from_consensus(self, plane),
+                &action,
+            ),
+        );
+        vec![action]
     }
 
     /// Resend SVC message if we've started view change.
-    fn handle_start_view_change_message_timeout(&self) -> Vec<VsrAction> {
+    fn handle_start_view_change_message_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
         if !self.sent_own_start_view_change.get() {
             return Vec::new();
         }
@@ -771,15 +893,24 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .borrow_mut()
             .reset(TimeoutKind::StartViewChangeMessage);
 
-        vec![VsrAction::SendStartViewChange {
+        let action = VsrAction::SendStartViewChange {
             view: self.view.get(),
             namespace: self.namespace,
-        }]
+        };
+        emit_sim_event(
+            SimEventKind::ControlMessageScheduled,
+            &ControlActionLogEvent::from_vsr_action(
+                ReplicaLogContext::from_consensus(self, plane),
+                &action,
+            ),
+        );
+        vec![action]
     }
 
     /// Resend DVC message if we've sent one.
     fn handle_do_view_change_message_timeout(
         &self,
+        plane: PlaneKind,
         current_op: u64,
         current_commit: u64,
     ) -> Vec<VsrAction> {
@@ -800,24 +931,33 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .borrow_mut()
             .reset(TimeoutKind::DoViewChangeMessage);
 
-        vec![VsrAction::SendDoViewChange {
+        let action = VsrAction::SendDoViewChange {
             view: self.view.get(),
             target: self.primary_index(self.view.get()),
             log_view: self.log_view.get(),
             op: current_op,
             commit: current_commit,
             namespace: self.namespace,
-        }]
+        };
+        emit_sim_event(
+            SimEventKind::ControlMessageScheduled,
+            &ControlActionLogEvent::from_vsr_action(
+                ReplicaLogContext::from_consensus(self, plane),
+                &action,
+            ),
+        );
+        vec![action]
     }
 
     /// Escalate to next view if stuck in view change.
-    fn handle_view_change_status_timeout(&self) -> Vec<VsrAction> {
+    fn handle_view_change_status_timeout(&self, plane: PlaneKind) -> Vec<VsrAction> {
         if self.status.get() != Status::ViewChange {
             return Vec::new();
         }
 
         // Escalate: try next view
-        let next_view = self.view.get() + 1;
+        let old_view = self.view.get();
+        let next_view = old_view + 1;
 
         self.view.set(next_view);
         self.reset_view_change_state();
@@ -830,10 +970,77 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .borrow_mut()
             .reset(TimeoutKind::ViewChangeStatus);
 
-        vec![VsrAction::SendStartViewChange {
+        emit_sim_event(
+            SimEventKind::ViewChangeStarted,
+            &ViewChangeLogEvent {
+                replica: ReplicaLogContext::from_consensus(self, plane),
+                old_view,
+                new_view: next_view,
+                reason: ViewChangeReason::ViewChangeStatusTimeout,
+            },
+        );
+
+        let action = VsrAction::SendStartViewChange {
             view: next_view,
             namespace: self.namespace,
-        }]
+        };
+        emit_sim_event(
+            SimEventKind::ControlMessageScheduled,
+            &ControlActionLogEvent::from_vsr_action(
+                ReplicaLogContext::from_consensus(self, plane),
+                &action,
+            ),
+        );
+        vec![action]
+    }
+
+    /// Collect uncommitted pipeline entries that should be retransmitted.
+    ///
+    /// Returns `(PrepareHeader, Vec<u8>)` pairs: each op that hasn't reached
+    /// quorum paired with the replica IDs that haven't acked it.
+    fn retransmit_targets(&self) -> Vec<(PrepareHeader, Vec<u8>)> {
+        let pipeline = self.pipeline.borrow();
+        let current_op = self.sequencer.current_sequence();
+        let replica_count = self.replica_count;
+        let mut targets = Vec::new();
+
+        let mut op = self.commit_max() + 1;
+        while op <= current_op {
+            if let Some(entry) = pipeline.entry_by_op(op)
+                && !entry.ok_quorum_received
+            {
+                let missing: Vec<u8> = (0..replica_count).filter(|&r| !entry.has_ack(r)).collect();
+                if !missing.is_empty() {
+                    targets.push((entry.header, missing));
+                }
+            }
+            op += 1;
+        }
+
+        targets
+    }
+
+    /// Retransmit uncommitted prepares when the prepare timeout fires.
+    ///
+    /// Only acts on the primary in normal status with a non-empty pipeline.
+    /// Resets the timeout with backoff on each firing.
+    fn handle_prepare_timeout(&self) -> Vec<VsrAction> {
+        if !self.is_primary() || self.status.get() != Status::Normal {
+            return Vec::new();
+        }
+
+        if self.pipeline.borrow().is_empty() {
+            return Vec::new();
+        }
+
+        let targets = self.retransmit_targets();
+        if targets.is_empty() {
+            return Vec::new();
+        }
+
+        self.timeouts.borrow_mut().backoff(TimeoutKind::Prepare);
+
+        vec![VsrAction::RetransmitPrepares { targets }]
     }
 
     /// Handle a received `StartViewChange` message.
@@ -844,7 +1051,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// # Panics
     /// If `header.namespace` does not match this replica's namespace.
-    pub fn handle_start_view_change(&self, header: &StartViewChangeHeader) -> Vec<VsrAction> {
+    pub fn handle_start_view_change(
+        &self,
+        plane: PlaneKind,
+        header: &StartViewChangeHeader,
+    ) -> Vec<VsrAction> {
         assert_eq!(
             header.namespace, self.namespace,
             "SVC routed to wrong group"
@@ -861,6 +1072,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // If SVC is for a higher view, advance to that view
         if msg_view > self.view.get() {
+            let old_view = self.view.get();
             self.view.set(msg_view);
             self.status.set(Status::ViewChange);
             self.reset_view_change_state();
@@ -877,11 +1089,29 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 timeouts.start(TimeoutKind::ViewChangeStatus);
             }
 
+            emit_sim_event(
+                SimEventKind::ViewChangeStarted,
+                &ViewChangeLogEvent {
+                    replica: ReplicaLogContext::from_consensus(self, plane),
+                    old_view,
+                    new_view: msg_view,
+                    reason: ViewChangeReason::ReceivedStartViewChange,
+                },
+            );
+
             // Send our own SVC
-            actions.push(VsrAction::SendStartViewChange {
+            let action = VsrAction::SendStartViewChange {
                 view: msg_view,
                 namespace: self.namespace,
-            });
+            };
+            emit_sim_event(
+                SimEventKind::ControlMessageScheduled,
+                &ControlActionLogEvent::from_vsr_action(
+                    ReplicaLogContext::from_consensus(self, plane),
+                    &action,
+                ),
+            );
+            actions.push(action);
         }
 
         // Record the SVC from sender
@@ -898,21 +1128,30 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
             let primary_candidate = self.primary_index(self.view.get());
             let current_op = self.sequencer.current_sequence();
-            let current_commit = self.commit.get();
+            // DVC uses commit_min: the replica's actual execution progress.
+            let current_commit = self.commit_min.get();
 
             // Start DVC timeout
             self.timeouts
                 .borrow_mut()
                 .start(TimeoutKind::DoViewChangeMessage);
 
-            actions.push(VsrAction::SendDoViewChange {
+            let action = VsrAction::SendDoViewChange {
                 view: self.view.get(),
                 target: primary_candidate,
                 log_view: self.log_view.get(),
                 op: current_op,
                 commit: current_commit,
                 namespace: self.namespace,
-            });
+            };
+            emit_sim_event(
+                SimEventKind::ControlMessageScheduled,
+                &ControlActionLogEvent::from_vsr_action(
+                    ReplicaLogContext::from_consensus(self, plane),
+                    &action,
+                ),
+            );
+            actions.push(action);
 
             // If we are the primary candidate, record our own DVC
             if primary_candidate == self.replica {
@@ -930,7 +1169,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 // Check if we now have quorum
                 if dvc_count(&self.do_view_change_from_all_replicas.borrow()) >= self.quorum() {
                     self.do_view_change_quorum.set(true);
-                    actions.extend(self.complete_view_change_as_primary());
+                    actions.extend(self.complete_view_change_as_primary(plane));
                 }
             }
         }
@@ -946,7 +1185,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// # Panics
     /// If `header.namespace` does not match this replica's namespace.
-    pub fn handle_do_view_change(&self, header: &DoViewChangeHeader) -> Vec<VsrAction> {
+    pub fn handle_do_view_change(
+        &self,
+        plane: PlaneKind,
+        header: &DoViewChangeHeader,
+    ) -> Vec<VsrAction> {
         assert_eq!(
             header.namespace, self.namespace,
             "DVC routed to wrong group"
@@ -966,6 +1209,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // If DVC is for a higher view, advance to that view
         if msg_view > self.view.get() {
+            let old_view = self.view.get();
             self.view.set(msg_view);
             self.status.set(Status::ViewChange);
             self.reset_view_change_state();
@@ -982,11 +1226,29 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 timeouts.start(TimeoutKind::ViewChangeStatus);
             }
 
+            emit_sim_event(
+                SimEventKind::ViewChangeStarted,
+                &ViewChangeLogEvent {
+                    replica: ReplicaLogContext::from_consensus(self, plane),
+                    old_view,
+                    new_view: msg_view,
+                    reason: ViewChangeReason::ReceivedDoViewChange,
+                },
+            );
+
             // Send our own SVC
-            actions.push(VsrAction::SendStartViewChange {
+            let action = VsrAction::SendStartViewChange {
                 view: msg_view,
                 namespace: self.namespace,
-            });
+            };
+            emit_sim_event(
+                SimEventKind::ControlMessageScheduled,
+                &ControlActionLogEvent::from_vsr_action(
+                    ReplicaLogContext::from_consensus(self, plane),
+                    &action,
+                ),
+            );
+            actions.push(action);
         }
 
         // Only the primary candidate processes DVCs for quorum
@@ -1000,7 +1262,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         let current_op = self.sequencer.current_sequence();
-        let current_commit = self.commit.get();
+        // Use commit_min: the replica's actual execution progress.
+        let current_commit = self.commit_min.get();
 
         // If we haven't sent our own DVC yet, record it
         if !self.sent_own_do_view_change.get() {
@@ -1032,7 +1295,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             && dvc_count(&self.do_view_change_from_all_replicas.borrow()) >= self.quorum()
         {
             self.do_view_change_quorum.set(true);
-            actions.extend(self.complete_view_change_as_primary());
+            actions.extend(self.complete_view_change_as_primary(plane));
         }
 
         actions
@@ -1047,7 +1310,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// # Panics
     /// If `header.namespace` does not match this replica's namespace.
-    pub fn handle_start_view(&self, header: &StartViewHeader) -> Vec<VsrAction> {
+    /// # Client-table maintenance
+    ///
+    /// Backups maintain the client-table during normal operation via
+    /// `commit_journal` in `on_replicate`, which walks the WAL and updates
+    /// the client table for each committed op. The WAL survives view changes,
+    /// so the new primary can process any committed op it received.
+    ///
+    /// Gap: if a backup never received a prepare (lost message),
+    /// `commit_journal` stops at the gap. Requires message repair.
+    pub fn handle_start_view(&self, plane: PlaneKind, header: &StartViewHeader) -> Vec<VsrAction> {
         assert_eq!(header.namespace, self.namespace, "SV routed to wrong group");
         let from_replica = header.replica;
         let msg_view = header.view;
@@ -1073,13 +1345,19 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.view.set(msg_view);
         self.log_view.set(msg_view);
         self.status.set(Status::Normal);
-        self.advance_commit_number(msg_commit);
+        self.advance_commit_max(msg_commit);
         self.reset_view_change_state();
 
         // Stale pipeline entries from the old view must be discarded
         self.pipeline.borrow_mut().clear();
 
-        // Update our op to match the new primary's log
+        // TODO: TigerBeetle's StartView message carries uncommitted op headers,
+        // allowing the backup to install them into the WAL and set op to a
+        // WAL-verified value. We don't carry headers yet, so we blindly trust
+        // msg_op. This is correct for truncation (sequencer > msg_op) but wrong
+        // when the backup is behind (sequencer < msg_op) — the gap between the
+        // WAL and msg_op becomes unreachable without message repair. Fix by
+        // either carrying headers in StartView or implementing message repair.
         self.sequencer.set_sequence(msg_op);
 
         // Update timeouts for normal backup operation
@@ -1091,22 +1369,45 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts.start(TimeoutKind::NormalHeartbeat);
         }
 
-        // Send PrepareOK for uncommitted ops (commit+1 to op)
-        let mut actions = Vec::new();
-        for op_num in (msg_commit + 1)..=msg_op {
-            actions.push(VsrAction::SendPrepareOk {
+        // Send PrepareOK for uncommitted ops that we actually have in the WAL.
+        // The caller must verify each op exists before sending.
+        emit_replica_event(
+            SimEventKind::ReplicaStateChanged,
+            &ReplicaLogContext::from_consensus(self, plane),
+        );
+
+        if msg_commit < msg_op {
+            let action = VsrAction::SendPrepareOk {
                 view: msg_view,
-                op: op_num,
+                from_op: msg_commit + 1,
+                to_op: msg_op,
                 target: from_replica,
                 namespace: self.namespace,
-            });
+            };
+            emit_sim_event(
+                SimEventKind::ControlMessageScheduled,
+                &ControlActionLogEvent::from_vsr_action(
+                    ReplicaLogContext::from_consensus(self, plane),
+                    &action,
+                ),
+            );
+            vec![action]
+        } else {
+            Vec::new()
         }
-
-        actions
     }
 
     /// Complete view change as the new primary after collecting DVC quorum.
-    fn complete_view_change_as_primary(&self) -> Vec<VsrAction> {
+    ///
+    /// # Client-table maintenance
+    ///
+    /// Backups populate the client-table during normal operation via
+    /// `commit_journal` in `on_replicate`. The WAL survives view changes, so
+    /// when this replica transitions from backup to primary, its table
+    /// contains entries for all committed ops it received.
+    ///
+    /// Gap: missing prepares (lost messages) require message repair.
+    fn complete_view_change_as_primary(&self, plane: PlaneKind) -> Vec<VsrAction> {
         let dvc_array = self.do_view_change_from_all_replicas.borrow();
 
         let Some(winner) = dvc_select_winner(&dvc_array) else {
@@ -1119,7 +1420,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // Update state
         self.log_view.set(self.view.get());
         self.status.set(Status::Normal);
-        self.advance_commit_number(max_commit);
+        self.advance_commit_max(max_commit);
         self.sequencer.set_sequence(new_op);
 
         // Stale pipeline entries from the old view are invalid in the new view.
@@ -1140,23 +1441,39 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts.start(TimeoutKind::CommitMessage);
         }
 
-        vec![VsrAction::SendStartView {
+        let state = ReplicaLogContext::from_consensus(self, plane);
+        emit_replica_event(SimEventKind::PrimaryElected, &state);
+        emit_replica_event(SimEventKind::ReplicaStateChanged, &state);
+
+        let action = VsrAction::SendStartView {
             view: self.view.get(),
             op: new_op,
             commit: max_commit,
             namespace: self.namespace,
-        }]
+        };
+        emit_sim_event(
+            SimEventKind::ControlMessageScheduled,
+            &ControlActionLogEvent::from_vsr_action(
+                ReplicaLogContext::from_consensus(self, plane),
+                &action,
+            ),
+        );
+        vec![action]
     }
 
     /// Handle a `PrepareOk` message from a replica.
     ///
-    /// Returns `true` if quorum was just reached for this op.
+    /// Returns rich ack-progress information for structured logging.
     /// Caller (`on_ack`) should validate `is_primary` and status before calling.
     ///
     /// # Panics
     /// - If `header.command` is not `Command2::PrepareOk`.
     /// - If `header.replica >= self.replica_count`.
-    pub fn handle_prepare_ok(&self, header: &PrepareOkHeader) -> bool {
+    pub fn handle_prepare_ok(
+        &self,
+        plane: PlaneKind,
+        header: &PrepareOkHeader,
+    ) -> PrepareOkOutcome {
         assert_eq!(header.command, Command2::PrepareOk);
         assert!(
             header.replica < self.replica_count,
@@ -1166,48 +1483,78 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // Ignore if from older view
         if header.view < self.view() {
-            return false;
+            return PrepareOkOutcome::Ignored {
+                reason: IgnoreReason::OlderView,
+            };
         }
 
         // Ignore if from newer view
         if header.view > self.view() {
-            return false;
+            return PrepareOkOutcome::Ignored {
+                reason: IgnoreReason::NewerView,
+            };
         }
 
         // Ignore if syncing
         if self.is_syncing() {
-            return false;
+            return PrepareOkOutcome::Ignored {
+                reason: IgnoreReason::Syncing,
+            };
         }
 
         // Find the prepare in our pipeline
         let mut pipeline = self.pipeline.borrow_mut();
 
-        let Some(entry) = pipeline.message_by_op_mut(header.op) else {
+        let Some(entry) = pipeline.entry_by_op_mut(header.op) else {
             // Not in pipeline - could be old/duplicate or already committed
-            return false;
+            return PrepareOkOutcome::Ignored {
+                reason: IgnoreReason::UnknownPrepare,
+            };
         };
 
         // Verify checksum matches
         if entry.header.checksum != header.prepare_checksum {
-            return false;
+            return PrepareOkOutcome::Ignored {
+                reason: IgnoreReason::ChecksumMismatch,
+            };
         }
 
         // Check for duplicate ack
         if entry.has_ack(header.replica) {
-            return false;
+            return PrepareOkOutcome::Ignored {
+                reason: IgnoreReason::DuplicateAck,
+            };
         }
 
         // Record the ack from this replica
         let ack_count = entry.add_ack(header.replica);
         let quorum = self.quorum();
+        let quorum_reached = ack_count >= quorum && !entry.ok_quorum_received;
 
         // Check if we've reached quorum
-        if ack_count >= quorum && !entry.ok_quorum_received {
+        if quorum_reached {
             entry.ok_quorum_received = true;
-            return true;
         }
 
-        false
+        drop(pipeline);
+
+        emit_sim_event(
+            SimEventKind::PrepareAcked,
+            &AckLogEvent {
+                replica: ReplicaLogContext::from_consensus(self, plane),
+                op: header.op,
+                prepare_checksum: header.prepare_checksum,
+                ack_from_replica: header.replica,
+                ack_count,
+                quorum,
+                quorum_reached,
+            },
+        );
+
+        PrepareOkOutcome::Accepted {
+            ack_count,
+            quorum_reached,
+        }
     }
 
     /// Enqueue a self-addressed message for processing in the next loopback drain.
@@ -1257,7 +1604,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 impl<B, P> Project<Message<PrepareHeader>, VsrConsensus<B, P>> for Message<RequestHeader>
 where
     B: MessageBus,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
 {
     type Consensus = VsrConsensus<B, P>;
 
@@ -1276,7 +1623,7 @@ where
                 parent: consensus.last_prepare_checksum(),
                 request_checksum: old.request_checksum,
                 request: old.request,
-                commit: consensus.commit.get(),
+                commit: consensus.commit_max.get(),
                 op,
                 timestamp: 0, // 0 for now. Implement correct way to get timestamp later
                 operation: old.operation,
@@ -1290,7 +1637,7 @@ where
 impl<B, P> Project<Message<PrepareOkHeader>, VsrConsensus<B, P>> for Message<PrepareHeader>
 where
     B: MessageBus,
-    P: Pipeline<Message = Self, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
 {
     type Consensus = VsrConsensus<B, P>;
 
@@ -1306,7 +1653,7 @@ where
                 // It's important to use the view of the replica, not the received prepare!
                 view: consensus.view.get(),
                 op: old.op,
-                commit: consensus.commit.get(),
+                commit: consensus.commit_max.get(),
                 timestamp: old.timestamp,
                 operation: old.operation,
                 namespace: old.namespace,
@@ -1320,7 +1667,7 @@ where
 impl<B, P> Consensus for VsrConsensus<B, P>
 where
     B: MessageBus,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    P: Pipeline<Entry = PipelineEntry>,
 {
     type MessageBus = B;
     #[rustfmt::skip] // Scuffed formatter. TODO: Make the naming less ambiguous for `Message`.
@@ -1336,11 +1683,36 @@ where
     // (push_loopback / drain_loopback_into) rather than inline here,
     // so that WAL persistence can happen between pipeline insertion
     // and ack recording.
-    fn pipeline_message(&self, message: Self::Message<Self::ReplicateHeader>) {
+    fn pipeline_message(&self, plane: PlaneKind, message: &Self::Message<Self::ReplicateHeader>) {
         assert!(self.is_primary(), "only primary can pipeline messages");
 
         let mut pipeline = self.pipeline.borrow_mut();
-        pipeline.push_message(message);
+        pipeline.push(PipelineEntry::new(*message.header()));
+        let pipeline_depth = pipeline.len();
+        drop(pipeline);
+
+        let header = message.header();
+        emit_sim_event(
+            SimEventKind::PrepareQueued,
+            &PrepareLogEvent {
+                replica: ReplicaLogContext::from_consensus(self, plane),
+                op: header.op,
+                parent_checksum: header.parent,
+                prepare_checksum: header.checksum,
+                client_id: header.client,
+                request_id: header.request,
+                operation: header.operation,
+                pipeline_depth,
+            },
+        );
+
+        // Start the prepare timeout so the primary retransmits if backups
+        // don't ack in time. It is only started (not reset) so that an
+        // already-ticking timeout is not pushed out by every new request.
+        let mut timeouts = self.timeouts.borrow_mut();
+        if !timeouts.is_ticking(TimeoutKind::Prepare) {
+            timeouts.start(TimeoutKind::Prepare);
+        }
     }
 
     fn verify_pipeline(&self) {
@@ -1357,6 +1729,7 @@ where
     }
 
     fn is_syncing(&self) -> bool {
-        self.is_syncing()
+        // TODO: for now return false. we have to add syncing related setup to VsrConsensus to make this work.
+        false
     }
 }

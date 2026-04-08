@@ -21,7 +21,7 @@ use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, Snapshot
 use iggy_binary_protocol::consensus::PrepareHeader;
 use iggy_binary_protocol::consensus::message::Message;
 use iggy_common::IggyError;
-use journal::metadata_journal::{JournalError, MetadataJournal};
+use journal::prepare_journal::{JournalError, PrepareJournal};
 use std::fmt;
 use std::path::Path;
 
@@ -82,7 +82,7 @@ impl From<std::io::Error> for RecoveryError {
 
 /// Result of a successful metadata recovery.
 pub struct RecoveredMetadata<M> {
-    pub journal: MetadataJournal,
+    pub journal: PrepareJournal,
     pub snapshot: IggySnapshot,
     pub mux_stm: M,
     /// `None` means no snapshot existed and no journal entries were replayed.
@@ -125,7 +125,7 @@ where
 
     // 3. Open journal, scan the WAL and build index
     let journal_path = metadata_dir.join("journal.wal");
-    let journal = MetadataJournal::open(&journal_path, snapshot.sequence_number()).await?;
+    let journal = PrepareJournal::open(&journal_path, snapshot.sequence_number()).await?;
 
     // 4. Replay journal entries after snapshot
     let headers_to_replay = journal.iter_headers_from(replay_from);
@@ -158,8 +158,8 @@ where
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use bytes::BytesMut;
     use iggy_binary_protocol::consensus::{Command2, Operation};
+    use iobuf::Owned;
     use journal::Journal;
     use tempfile::tempdir;
 
@@ -171,13 +171,15 @@ mod tests {
 
     fn make_prepare(op: u64, body_size: usize) -> Message<PrepareHeader> {
         let total_size = HEADER_SIZE + body_size;
-        let mut buffer = BytesMut::zeroed(total_size);
-        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(&mut buffer[..HEADER_SIZE]);
+        let mut buffer = Owned::<4096>::zeroed(total_size);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut buffer.as_mut_slice()[..HEADER_SIZE],
+        );
         header.size = total_size as u32;
         header.command = Command2::Prepare;
         header.op = op;
         header.operation = Operation::CreateStream;
-        Message::from_bytes(buffer.freeze()).unwrap()
+        Message::try_from(buffer).unwrap()
     }
 
     #[compio::test]
@@ -212,7 +214,7 @@ mod tests {
         std::fs::create_dir_all(&metadata_dir).unwrap();
 
         {
-            let journal = MetadataJournal::open(&metadata_dir.join("journal.wal"), 0)
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
                 .await
                 .unwrap();
             journal.append(make_prepare(1, 32)).await.unwrap();
@@ -240,7 +242,7 @@ mod tests {
 
         // WAL has ops 1-10
         {
-            let journal = MetadataJournal::open(&metadata_dir.join("journal.wal"), 0)
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
                 .await
                 .unwrap();
             for op in 1..=10 {

@@ -16,21 +16,19 @@
  * under the License.
  */
 
-use crate::binary::dispatch::{HandlerResult, wire_id_to_identifier};
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
 use bytes::BytesMut;
+use iggy_binary_protocol::MAX_PARTITIONS_PER_REQUEST;
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::responses::streams::get_stream::TopicHeader;
 use iggy_binary_protocol::responses::topics::get_topic::PartitionResponse;
-use iggy_common::create_topic::CreateTopic;
-use iggy_common::{
-    CompressionAlgorithm, IggyError, IggyExpiry, MaxTopicSize, SenderKind, Validatable,
-};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -41,31 +39,20 @@ pub async fn handle_create_topic(
     session: &Session,
     shard: &Rc<IggyShard>,
 ) -> Result<HandlerResult, IggyError> {
-    let stream_id = wire_id_to_identifier(&req.stream_id)?;
     debug!(
-        "session: {session}, command: create_topic, stream_id: {stream_id}, name: {}",
+        "session: {session}, command: create_topic, stream_id: {:?}, name: {}",
+        req.stream_id,
         req.name.as_str()
     );
     shard.ensure_authenticated(session)?;
 
-    let command = CreateTopic {
-        stream_id,
-        partitions_count: req.partitions_count,
-        compression_algorithm: CompressionAlgorithm::from_code(req.compression_algorithm)?,
-        message_expiry: IggyExpiry::from(req.message_expiry),
-        max_topic_size: MaxTopicSize::from(req.max_topic_size),
-        replication_factor: if req.replication_factor == 0 {
-            None
-        } else {
-            Some(req.replication_factor)
-        },
-        name: req.name.to_string(),
-    };
-    command.validate()?;
+    if req.partitions_count > MAX_PARTITIONS_PER_REQUEST {
+        return Err(IggyError::TooManyPartitions);
+    }
 
     let request = ShardRequest::control_plane(ShardRequestPayload::CreateTopicRequest {
         user_id: session.get_user_id(),
-        command,
+        command: req,
     });
 
     match shard.send_to_control_plane(request).await? {

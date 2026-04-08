@@ -46,7 +46,26 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check Python SDK versions are synchronized
-        run: ./scripts/ci/python-version-sync.sh --check
+        run: ./scripts/ci/python-sdk-version-sync.sh --check
+
+  version-consistency:
+    name: Check version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup yq
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
+            chmod +x /usr/local/bin/yq
+          fi
+
+      - name: Check version consistency
+        run: ./scripts/extract-version.sh --check
 
   pr-title:
     name: Check PR Title
@@ -103,6 +122,7 @@ jobs:
             sdk
             security
             server
+            server-ng
             shard
             test
             web
@@ -255,6 +275,7 @@ jobs:
       [
         rust-versions,
         python-versions,
+        version-consistency,
         pr-title,
         license-headers,
         license-list,
@@ -295,6 +316,7 @@ jobs:
           # Always-run checks
           RUST_VERSIONS="${{ needs.rust-versions.result }}"
           PYTHON_VERSIONS="${{ needs.python-versions.result }}"
+          VERSION_CONSISTENCY="${{ needs.version-consistency.result }}"
           LICENSE_HEADERS="${{ needs.license-headers.result }}"
           LICENSE_LIST="${{ needs.license-list.result }}"
           MARKDOWN="${{ needs.markdown.result }}"
@@ -313,6 +335,14 @@ jobs:
             echo "| ❌ Python SDK Versions | failure | Version mismatch between Cargo.toml and pyproject.toml |" >> $GITHUB_STEP_SUMMARY
           else
             echo "| ⏭️ Python SDK Versions | $PYTHON_VERSIONS | Check skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$VERSION_CONSISTENCY" = "success" ]; then
+            echo "| ✅ Version Consistency | success | Group and workspace dep versions match |" >> $GITHUB_STEP_SUMMARY
+          elif [ "$VERSION_CONSISTENCY" = "failure" ]; then
+            echo "| ❌ Version Consistency | failure | Version mismatch detected |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| ⏭️ Version Consistency | $VERSION_CONSISTENCY | Check skipped |" >> $GITHUB_STEP_SUMMARY
           fi
 
           if [ "$LICENSE_HEADERS" = "success" ]; then

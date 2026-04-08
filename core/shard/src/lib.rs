@@ -18,7 +18,9 @@
 mod router;
 pub mod shards_table;
 
-use consensus::{MuxPlane, NamespacedPipeline, PartitionsHandle, Plane, VsrConsensus};
+use consensus::{
+    MuxPlane, NamespacedPipeline, PartitionsHandle, Plane, PlaneKind, Sequencer, VsrConsensus,
+};
 use iggy_binary_protocol::{
     GenericHeader, Message, MessageBag, PrepareHeader, PrepareOkHeader, RequestHeader,
 };
@@ -31,10 +33,12 @@ use metadata::stm::StateMachine;
 use partitions::IggyPartitions;
 use shards_table::ShardsTable;
 
-pub type ShardPlane<B, J, S, M> = MuxPlane<
+// MJ - Metadata Journal
+// PJ - Partitions Journal
+pub type ShardPlane<B, MJ, S, M, PJ> = MuxPlane<
     variadic!(
-        IggyMetadata<VsrConsensus<B>, J, S, M>,
-        IggyPartitions<VsrConsensus<B, NamespacedPipeline>>
+        IggyMetadata<VsrConsensus<B>, MJ, S, M>,
+        IggyPartitions<VsrConsensus<B, NamespacedPipeline>, PJ>
     ),
 >;
 
@@ -76,6 +80,7 @@ impl<R: Send + 'static> ShardFrame<R> {
 
     /// Create a request-response frame.  Returns the frame and a receiver
     /// that the caller can await for completion notification.
+    #[must_use]
     pub fn with_response(message: Message<GenericHeader>) -> (Self, Receiver<R>) {
         let (tx, rx) = channel(1);
         (
@@ -88,13 +93,13 @@ impl<R: Send + 'static> ShardFrame<R> {
     }
 }
 
-pub struct IggyShard<B, J, S, M, T = (), R: Send + 'static = ()>
+pub struct IggyShard<B, MJ, S, M, PJ = (), T = (), R: Send + 'static = ()>
 where
     B: MessageBus,
 {
     pub id: u16,
     pub name: String,
-    pub plane: ShardPlane<B, J, S, M>,
+    pub plane: ShardPlane<B, MJ, S, M, PJ>,
 
     /// Channel senders to every shard, indexed by shard id.
     /// Includes a sender to self so that local routing goes through the
@@ -109,7 +114,7 @@ where
     shards_table: T,
 }
 
-impl<B, J, S, M, T, R: Send + 'static> IggyShard<B, J, S, M, T, R>
+impl<B, MJ, S, M, PJ, T, R: Send + 'static> IggyShard<B, MJ, S, M, PJ, T, R>
 where
     B: MessageBus,
     T: ShardsTable,
@@ -123,8 +128,8 @@ where
     pub const fn new(
         id: u16,
         name: String,
-        metadata: IggyMetadata<VsrConsensus<B>, J, S, M>,
-        partitions: IggyPartitions<VsrConsensus<B, NamespacedPipeline>>,
+        metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
+        partitions: IggyPartitions<VsrConsensus<B, NamespacedPipeline>, PJ>,
         senders: Vec<Sender<ShardFrame<R>>>,
         inbox: Receiver<ShardFrame<R>>,
         shards_table: T,
@@ -140,6 +145,33 @@ where
         }
     }
 
+    /// Create a shard without inter-shard channels.
+    ///
+    /// Useful for the simulator where inbound messages are delivered directly
+    /// via [`on_message`](Self::on_message) instead of through an inbox channel.
+    #[must_use]
+    pub fn without_inbox(
+        id: u16,
+        name: String,
+        metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
+        partitions: IggyPartitions<VsrConsensus<B, NamespacedPipeline>, PJ>,
+        shards_table: T,
+    ) -> Self {
+        // TODO: previously we used unbounded channel with flume,
+        // but this is not possible with crossfire without mangling types due to Flavor trait in crossfire.
+        // This needs to be revisited in the future.
+        let (_tx, inbox) = channel(1);
+        let plane = MuxPlane::new(variadic!(metadata, partitions));
+        Self {
+            id,
+            name,
+            plane,
+            senders: Vec::new(),
+            inbox,
+            shards_table,
+        }
+    }
+
     #[must_use]
     pub const fn shards_table(&self) -> &T {
         &self.shards_table
@@ -148,7 +180,7 @@ where
 
 /// Local message processing — these methods handle messages that have been
 /// routed to this shard via the message pump.
-impl<B, J, S, M, T, R: Send + 'static> IggyShard<B, J, S, M, T, R>
+impl<B, MJ, S, M, PJ, T, R: Send + 'static> IggyShard<B, MJ, S, M, PJ, T, R>
 where
     B: MessageBus,
 {
@@ -160,9 +192,15 @@ where
     pub async fn on_message(&self, message: Message<GenericHeader>)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-        J: JournalHandle,
-        <J as JournalHandle>::Target: Journal<
-                <J as JournalHandle>::Storage,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        PJ: JournalHandle,
+        <PJ as JournalHandle>::Target: Journal<
+                <PJ as JournalHandle>::Storage,
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
@@ -186,9 +224,15 @@ where
     pub async fn on_request(&self, request: Message<RequestHeader>)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-        J: JournalHandle,
-        <J as JournalHandle>::Target: Journal<
-                <J as JournalHandle>::Storage,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        PJ: JournalHandle,
+        <PJ as JournalHandle>::Target: Journal<
+                <PJ as JournalHandle>::Storage,
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
@@ -205,9 +249,15 @@ where
     pub async fn on_replicate(&self, prepare: Message<PrepareHeader>)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-        J: JournalHandle,
-        <J as JournalHandle>::Target: Journal<
-                <J as JournalHandle>::Storage,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        PJ: JournalHandle,
+        <PJ as JournalHandle>::Target: Journal<
+                <PJ as JournalHandle>::Storage,
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
@@ -224,9 +274,15 @@ where
     pub async fn on_ack(&self, prepare_ok: Message<PrepareOkHeader>)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-        J: JournalHandle,
-        <J as JournalHandle>::Target: Journal<
-                <J as JournalHandle>::Storage,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        PJ: JournalHandle,
+        <PJ as JournalHandle>::Target: Journal<
+                <PJ as JournalHandle>::Storage,
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
@@ -254,9 +310,15 @@ where
     pub async fn process_loopback(&self, buf: &mut Vec<Message<GenericHeader>>) -> usize
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-        J: JournalHandle,
-        <J as JournalHandle>::Target: Journal<
-                <J as JournalHandle>::Storage,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        PJ: JournalHandle,
+        <PJ as JournalHandle>::Target: Journal<
+                <PJ as JournalHandle>::Storage,
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
@@ -305,9 +367,60 @@ where
                 Data = iggy_binary_protocol::Message<iggy_binary_protocol::GenericHeader>,
                 Client = u128,
             >,
+        PJ: JournalHandle,
+        <PJ as JournalHandle>::Target: Journal<
+                <PJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
     {
         let partitions = self.plane.partitions_mut();
         partitions.init_partition_in_memory(namespace);
         partitions.register_namespace_in_pipeline(namespace.inner());
+    }
+
+    /// Tick the partitions consensus and dispatch any resulting actions.
+    ///
+    /// Currently handles `RetransmitPrepares` (primary retransmits
+    /// uncommitted prepares when the prepare timeout fires).
+    #[allow(clippy::future_not_send)]
+    pub async fn tick_partitions(&self)
+    where
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        PJ: JournalHandle,
+        <PJ as JournalHandle>::Target: Journal<
+                <PJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+    {
+        let partitions = self.plane.partitions();
+        let Some(consensus) = partitions.consensus() else {
+            return;
+        };
+        let Some(journal) = partitions.journal() else {
+            return;
+        };
+
+        let current_op = consensus.sequencer().current_sequence();
+        let current_commit = consensus.commit_min();
+        let actions = consensus.tick(PlaneKind::Partitions, current_op, current_commit);
+
+        for action in actions {
+            if let consensus::VsrAction::RetransmitPrepares { targets } = action {
+                for (header, replicas) in targets {
+                    let Some(prepare) = journal.handle().entry(&header).await else {
+                        continue;
+                    };
+                    for replica in replicas {
+                        let _ = consensus
+                            .message_bus()
+                            .send_to_replica(replica, prepare.clone().into_generic())
+                            .await;
+                    }
+                }
+            }
+            // TODO: Dispatch other VsrActions (view change messages, etc.)
+        }
     }
 }

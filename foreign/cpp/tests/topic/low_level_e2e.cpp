@@ -29,6 +29,8 @@
 #include "lib.rs.h"
 #include "tests/common/test_helpers.hpp"
 
+// TODO(slbotbm): Add tests for purge_topic after implementing send_messages(...).
+
 TEST(LowLevelE2E_Topic, CreateTopicWithAllOptionCombinations) {
     RecordProperty("description",
                    "Creates topics across supported option combinations and verifies they are all returned.");
