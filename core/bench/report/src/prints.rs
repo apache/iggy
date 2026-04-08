@@ -16,13 +16,18 @@
  * under the License.
  */
 
-use colored::{Color, ColoredString, Colorize};
+use colored::Colorize;
+use comfy_table::{Cell, Color as TableColor, ContentArrangement, Table, presets::UTF8_FULL};
 use human_repr::HumanCount;
 use tracing::info;
 
 use crate::{
-    actor_kind::ActorKind, benchmark_kind::BenchmarkKind, group_metrics::BenchmarkGroupMetrics,
-    group_metrics_kind::GroupMetricsKind, report::BenchmarkReport,
+    actor_kind::ActorKind,
+    benchmark_kind::BenchmarkKind,
+    group_metrics::BenchmarkGroupMetrics,
+    group_metrics_kind::GroupMetricsKind,
+    report::BenchmarkReport,
+    utils::{WIDE_LAYOUT_THRESHOLD, get_terminal_width},
 };
 
 impl BenchmarkReport {
@@ -71,7 +76,7 @@ impl BenchmarkReport {
 
         self.group_metrics
             .iter()
-            .for_each(|s| info!("{}\n", s.formatted_string()));
+            .for_each(|s| println!("\n{}", s.formatted_string()));
     }
 
     pub fn total_messages(&self) -> u64 {
@@ -136,45 +141,170 @@ impl BenchmarkReport {
 }
 
 impl BenchmarkGroupMetrics {
-    pub fn formatted_string(&self) -> ColoredString {
-        let (prefix, color) = match self.summary.kind {
-            GroupMetricsKind::Producers => ("Producers Results", Color::Green),
-            GroupMetricsKind::Consumers => ("Consumers Results", Color::Green),
-            GroupMetricsKind::ProducersAndConsumers => ("Aggregate Results", Color::Red),
-            GroupMetricsKind::ProducingConsumers => ("Producing Consumer Results", Color::Red),
-        };
+    pub fn formatted_string(&self) -> String {
+        let width = get_terminal_width();
 
+        if width >= WIDE_LAYOUT_THRESHOLD {
+            self.format_wide_layout()
+        } else {
+            self.format_narrow_layout()
+        }
+    }
+
+    fn format_wide_layout(&self) -> String {
+        let (prefix, color) = match self.summary.kind {
+            GroupMetricsKind::Producers => ("Producers Results", TableColor::Green),
+            GroupMetricsKind::Consumers => ("Consumers Results", TableColor::Green),
+            GroupMetricsKind::ProducersAndConsumers => ("Aggregate Results", TableColor::Red),
+            GroupMetricsKind::ProducingConsumers => ("Producing Consumer Results", TableColor::Red),
+        };
         let actor = self.summary.kind.actor();
 
-        let total_mb = format!("{:.2}", self.summary.total_throughput_megabytes_per_second);
-        let total_msg = format!("{:.0}", self.summary.total_throughput_messages_per_second);
-        let avg_mb = format!(
-            "{:.2}",
-            self.summary.average_throughput_megabytes_per_second
-        );
+        let mut summary_table = Table::new();
+        summary_table
+            .load_preset(UTF8_FULL)
+            .set_content_arrangement(ContentArrangement::Dynamic);
 
-        let p50 = format!("{:.2}", self.summary.average_p50_latency_ms);
-        let p90 = format!("{:.2}", self.summary.average_p90_latency_ms);
-        let p95 = format!("{:.2}", self.summary.average_p95_latency_ms);
-        let p99 = format!("{:.2}", self.summary.average_p99_latency_ms);
-        let p999 = format!("{:.2}", self.summary.average_p999_latency_ms);
-        let p9999 = format!("{:.2}", self.summary.average_p9999_latency_ms);
-        let avg = format!("{:.2}", self.summary.average_latency_ms);
-        let median = format!("{:.2}", self.summary.average_median_latency_ms);
-        let min = format!("{:.2}", self.summary.min_latency_ms);
-        let max = format!("{:.2}", self.summary.max_latency_ms);
-        let std_dev = format!("{:.2}", self.summary.std_dev_latency_ms);
-        let total_test_time = format!(
-            "{:.2}",
-            self.avg_throughput_mb_ts.points.last().unwrap().time_s
-        );
+        summary_table.add_row(vec![
+            Cell::new(prefix).fg(color),
+            Cell::new(format!(
+                "{:.2} s",
+                self.avg_throughput_mb_ts.points.last().unwrap().time_s
+            ))
+            .fg(color),
+            Cell::new(format!(
+                "{:.2} MB/s",
+                self.summary.total_throughput_megabytes_per_second
+            ))
+            .fg(color),
+            Cell::new(format!(
+                "{:.0} msg/s",
+                self.summary.total_throughput_messages_per_second
+            ))
+            .fg(color),
+            Cell::new(format!(
+                "{:.2} MB/s per {}",
+                self.summary.average_throughput_megabytes_per_second, actor
+            ))
+            .fg(color),
+        ]);
 
-        format!(
-            "{prefix}: Total throughput: {total_mb} MB/s, {total_msg} messages/s, average throughput per {actor}: {avg_mb} MB/s, \
-            p50 latency: {p50} ms, p90 latency: {p90} ms, p95 latency: {p95} ms, \
-            p99 latency: {p99} ms, p999 latency: {p999} ms, p9999 latency: {p9999} ms, average latency: {avg} ms, \
-            median latency: {median} ms, min: {min} ms, max: {max} ms, std dev: {std_dev} ms, total time: {total_test_time} s"
-        )
-        .color(color)
+        let mut latency_table = Table::new();
+        latency_table
+            .load_preset(UTF8_FULL)
+            .set_content_arrangement(ContentArrangement::Dynamic);
+
+        latency_table.add_row(vec![
+            "Latency", "p50", "p90", "p95", "p99", "p999", "p9999", "avg", "median", "min", "max",
+            "std dev",
+        ]);
+        latency_table.add_row(vec![
+            "(ms)".to_string(),
+            format!("{:.2}", self.summary.average_p50_latency_ms),
+            format!("{:.2}", self.summary.average_p90_latency_ms),
+            format!("{:.2}", self.summary.average_p95_latency_ms),
+            format!("{:.2}", self.summary.average_p99_latency_ms),
+            format!("{:.2}", self.summary.average_p999_latency_ms),
+            format!("{:.2}", self.summary.average_p9999_latency_ms),
+            format!("{:.2}", self.summary.average_latency_ms),
+            format!("{:.2}", self.summary.average_median_latency_ms),
+            format!("{:.2}", self.summary.min_latency_ms),
+            format!("{:.2}", self.summary.max_latency_ms),
+            format!("{:.2}", self.summary.std_dev_latency_ms),
+        ]);
+
+        format!("\n{}\n{}", summary_table, latency_table)
+    }
+
+    fn format_narrow_layout(&self) -> String {
+        let (prefix, color) = match self.summary.kind {
+            GroupMetricsKind::Producers => ("Producers Results", TableColor::Green),
+            GroupMetricsKind::Consumers => ("Consumers Results", TableColor::Green),
+            GroupMetricsKind::ProducersAndConsumers => ("Aggregate Results", TableColor::Red),
+            GroupMetricsKind::ProducingConsumers => ("Producing Consumer Results", TableColor::Red),
+        };
+        let actor = self.summary.kind.actor();
+
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL)
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_width(60);
+
+        table.add_row(vec![Cell::new(prefix).fg(color), Cell::new("").fg(color)]);
+
+        table.add_row(vec!["Summary", ""]);
+        table.add_row(vec![
+            "Total Time".to_string(),
+            format!(
+                "{:.2} s",
+                self.avg_throughput_mb_ts.points.last().unwrap().time_s
+            ),
+        ]);
+
+        table.add_row(vec!["Throughput", ""]);
+        table.add_row(vec![
+            "Total (MB/s)".to_string(),
+            format!("{:.2}", self.summary.total_throughput_megabytes_per_second),
+        ]);
+        table.add_row(vec![
+            "Total (msg/s)".to_string(),
+            format!("{:.0}", self.summary.total_throughput_messages_per_second),
+        ]);
+        table.add_row(vec![
+            format!("Avg per {} (MB/s)", actor),
+            format!(
+                "{:.2}",
+                self.summary.average_throughput_megabytes_per_second
+            ),
+        ]);
+
+        table.add_row(vec!["Latency", ""]);
+        table.add_row(vec![
+            "p50".to_string(),
+            format!("{:.2} ms", self.summary.average_p50_latency_ms),
+        ]);
+        table.add_row(vec![
+            "p90".to_string(),
+            format!("{:.2} ms", self.summary.average_p90_latency_ms),
+        ]);
+        table.add_row(vec![
+            "p95".to_string(),
+            format!("{:.2} ms", self.summary.average_p95_latency_ms),
+        ]);
+        table.add_row(vec![
+            "p99".to_string(),
+            format!("{:.2} ms", self.summary.average_p99_latency_ms),
+        ]);
+        table.add_row(vec![
+            "p999".to_string(),
+            format!("{:.2} ms", self.summary.average_p999_latency_ms),
+        ]);
+        table.add_row(vec![
+            "p9999".to_string(),
+            format!("{:.2} ms", self.summary.average_p9999_latency_ms),
+        ]);
+        table.add_row(vec![
+            "avg".to_string(),
+            format!("{:.2} ms", self.summary.average_latency_ms),
+        ]);
+        table.add_row(vec![
+            "median".to_string(),
+            format!("{:.2} ms", self.summary.average_median_latency_ms),
+        ]);
+        table.add_row(vec![
+            "min".to_string(),
+            format!("{:.2} ms", self.summary.min_latency_ms),
+        ]);
+        table.add_row(vec![
+            "max".to_string(),
+            format!("{:.2} ms", self.summary.max_latency_ms),
+        ]);
+        table.add_row(vec![
+            "std dev".to_string(),
+            format!("{:.2} ms", self.summary.std_dev_latency_ms),
+        ]);
+
+        format!("\n{}", table)
     }
 }

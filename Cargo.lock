@@ -1199,6 +1199,7 @@ version = "0.3.0"
 dependencies = [
  "charming",
  "colored",
+ "comfy-table",
  "derive-new",
  "derive_more",
  "human-repr",
@@ -1206,6 +1207,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo 0.38.4",
+ "terminal_size",
  "tracing",
  "uuid",
 ]
@@ -5508,6 +5510,7 @@ dependencies = [
  "charming",
  "chrono",
  "clap",
+ "comfy-table",
  "figlet-rs",
  "futures-util",
  "governor",

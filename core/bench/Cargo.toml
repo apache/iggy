@@ -37,6 +37,7 @@ bytes = { workspace = true }
 charming = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+comfy-table = { workspace = true }
 figlet-rs = { workspace = true }
 futures-util = { workspace = true }
 governor = { workspace = true }
