@@ -138,12 +138,6 @@ pub fn generate_tests(attrs: &IggyTestAttrs, input: &ItemFn) -> syn::Result<Toke
         .collect();
 
     let params = analyze_signature(&input.sig)?;
-
-    // Validate shared_server constraints
-    if attrs.shared_server.is_some() {
-        validate_shared_server(attrs, &params, fn_name)?;
-    }
-
     let matrix_params_list = matrix_params(&params);
     let has_matrix_params = !matrix_params_list.is_empty();
 
@@ -178,52 +172,6 @@ pub fn generate_tests(attrs: &IggyTestAttrs, input: &ItemFn) -> syn::Result<Toke
     )
 }
 
-fn validate_shared_server(
-    attrs: &IggyTestAttrs,
-    params: &[DetectedParam],
-    fn_name: &Ident,
-) -> syn::Result<()> {
-    let has_mut_harness = params
-        .iter()
-        .any(|p| matches!(p, DetectedParam::HarnessMut { .. }));
-    if has_mut_harness {
-        return Err(syn::Error::new(
-            fn_name.span(),
-            "shared_server is incompatible with &mut TestHarness",
-        ));
-    }
-
-    if !attrs.server.config_overrides.is_empty() {
-        return Err(syn::Error::new(
-            fn_name.span(),
-            "shared_server is incompatible with server config overrides",
-        ));
-    }
-
-    if !matches!(attrs.cluster_nodes, crate::attrs::ClusterNodesValue::None) {
-        return Err(syn::Error::new(
-            fn_name.span(),
-            "shared_server is incompatible with cluster_nodes",
-        ));
-    }
-
-    if attrs.server.tls.is_some() || attrs.server.websocket_tls.is_some() {
-        return Err(syn::Error::new(
-            fn_name.span(),
-            "shared_server is incompatible with TLS configuration",
-        ));
-    }
-
-    if attrs.transports.iter().any(|t| t.tls_mode().is_some()) {
-        return Err(syn::Error::new(
-            fn_name.span(),
-            "shared_server is incompatible with TLS transports",
-        ));
-    }
-
-    Ok(())
-}
-
 fn generate_single_test(
     fn_name: &Ident,
     fn_vis: &syn::Visibility,
@@ -237,33 +185,10 @@ fn generate_single_test(
     let fixture_setup = generate_fixture_setup(params);
     let fixture_envs = generate_fixture_envs_collection(params);
     let fixture_param_bindings = generate_fixture_param_bindings(params);
-    let fixture_seed = generate_fixture_seed(params);
-    let harness_param_bindings = generate_harness_param_bindings(params);
-
-    if let Some(ref shared) = attrs.shared_server {
-        let shared_harness_setup = generate_shared_harness_setup(variant, has_fixtures, attrs);
-        let shared_start_and_seed = generate_shared_start_and_seed(attrs, fixture_seed);
-        let key_ident = Ident::new(&shared.key, Span::call_site());
-        let shared_fn_name = format_ident!("shared_server_{}", fn_name);
-
-        return Ok(quote! {
-            #(#other_attrs)*
-            #[::tokio::test]
-            #[::serial_test::serial(#key_ident)]
-            #fn_vis async fn #shared_fn_name() {
-                #fixture_setup
-                #fixture_envs
-                #fixture_param_bindings
-                #shared_harness_setup
-                #shared_start_and_seed
-                #harness_param_bindings
-                #fn_body
-            }
-        });
-    }
-
     let harness_setup = generate_harness_setup(variant, has_fixtures, attrs);
+    let fixture_seed = generate_fixture_seed(params);
     let start_and_seed = generate_start_and_seed(attrs, fixture_seed);
+    let harness_param_bindings = generate_harness_param_bindings(params);
 
     Ok(quote! {
         #(#other_attrs)*
@@ -620,99 +545,6 @@ fn generate_start_and_seed(attrs: &IggyTestAttrs, fixture_seed: TokenStream) -> 
     }
 }
 
-// ============================================================================
-// Shared server code generation helpers
-// ============================================================================
-
-fn generate_shared_harness_setup(
-    variant: &TestVariant,
-    has_fixtures: bool,
-    attrs: &IggyTestAttrs,
-) -> TokenStream {
-    let shared = attrs
-        .shared_server
-        .as_ref()
-        .expect("shared_server required");
-    let key = &shared.key;
-    let transport = variant.transport.variant_ident();
-    let client_config_method =
-        Ident::new(variant.transport.client_config_method(), Span::call_site());
-
-    let cr_config = if let Some(ref cr) = attrs.server.connectors_runtime {
-        let config_path = cr.config_path.as_deref().unwrap_or("");
-        if has_fixtures {
-            quote! {
-                Some(::integration::__macro_support::ConnectorsRuntimeConfig::builder()
-                    .config_path(::std::path::PathBuf::from(#config_path))
-                    .extra_envs(__fixture_envs.clone())
-                    .build())
-            }
-        } else {
-            quote! {
-                Some(::integration::__macro_support::ConnectorsRuntimeConfig::builder()
-                    .config_path(::std::path::PathBuf::from(#config_path))
-                    .build())
-            }
-        }
-    } else {
-        quote! { None }
-    };
-
-    quote! {
-        let __shared = ::integration::__macro_support::SharedServerRegistry::get_or_start(
-            #key,
-            ::integration::__macro_support::TestServerConfig::default(),
-        ).await.unwrap_or_else(|e| panic!("failed to get shared server: {e}"));
-
-        let mut __harness = ::integration::__macro_support::TestHarness::from_shared(
-            __shared,
-            #cr_config,
-            Some(::integration::__macro_support::ClientConfig::#client_config_method()),
-        ).await.unwrap_or_else(|e| panic!("failed to build shared harness: {e}"));
-        let _ = ::integration::__macro_support::TransportProtocol::#transport;
-    }
-}
-
-fn generate_shared_start_and_seed(attrs: &IggyTestAttrs, fixture_seed: TokenStream) -> TokenStream {
-    let has_fixture_seed = !fixture_seed.is_empty();
-
-    match (&attrs.seed_fn, has_fixture_seed) {
-        (Some(seed_fn), true) => {
-            quote! {
-                __harness.start_shared_with_seed(|__seed_client| async move {
-                    #seed_fn(&__seed_client).await?;
-                    #fixture_seed
-                    Ok(())
-                }).await.unwrap_or_else(|e| panic!("failed to start shared harness: {e}"));
-            }
-        }
-        (Some(seed_fn), false) => {
-            quote! {
-                __harness.start_shared_with_seed(|__seed_client| async move {
-                    #seed_fn(&__seed_client).await
-                }).await.unwrap_or_else(|e| panic!("failed to start shared harness: {e}"));
-            }
-        }
-        (None, true) => {
-            quote! {
-                __harness.start_shared_with_seed(|__seed_client| async move {
-                    #fixture_seed
-                    Ok(())
-                }).await.unwrap_or_else(|e| panic!("failed to start shared harness: {e}"));
-            }
-        }
-        (None, false) => {
-            quote! {
-                __harness.start_shared().await.unwrap_or_else(|e| panic!("failed to start shared harness: {e}"));
-            }
-        }
-    }
-}
-
-// ============================================================================
-// Standard (non-shared) code generation helpers
-// ============================================================================
-
 fn fixture_var_ident(name: &syn::Ident) -> syn::Ident {
     let name_str = name.to_string();
     let clean_name = name_str.trim_start_matches('_');
@@ -963,7 +795,6 @@ mod tests {
             },
             seed_fn: None,
             cluster_nodes: crate::attrs::ClusterNodesValue::None,
-            shared_server: None,
         };
         let variants = generate_variants(&attrs);
         // 2 transports * 2 segment sizes * 2 cache modes = 8 variants
