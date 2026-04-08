@@ -78,14 +78,14 @@ impl From<io::Error> for JournalError {
     }
 }
 
-/// Persistent metadata journal backed by an append-only WAL file.
+/// Persistent prepare journal backed by an append-only WAL file.
 ///
 /// Each WAL entry is a raw `Message<PrepareHeader>`:
 /// `[PrepareHeader: 256 bytes][body: header.size - 256 bytes]`
 ///
 /// The in-memory index is a fixed-size slot array indexed by
 /// `op % SLOT_COUNT`.
-pub struct MetadataJournal {
+pub struct PrepareJournal {
     /// File-backed append-only WAL.
     storage: FileStorage,
     /// In-memory slot array of entry headers, indexed by `op % SLOT_COUNT`.
@@ -103,9 +103,9 @@ pub struct MetadataJournal {
     snapshot_op: Cell<u64>,
 }
 
-impl fmt::Debug for MetadataJournal {
+impl fmt::Debug for PrepareJournal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("MetadataJournal")
+        f.debug_struct("PrepareJournal")
             .field("write_offset", &self.storage.file_len())
             .field("last_op", &self.last_op.get())
             .finish_non_exhaustive()
@@ -118,7 +118,7 @@ const fn slot_for_op(op: u64) -> usize {
 }
 
 #[allow(clippy::cast_possible_truncation)]
-impl MetadataJournal {
+impl PrepareJournal {
     /// Open the WAL file, scanning forward to rebuild the in-memory index.
     ///
     /// `snapshot_op` is the highest op that has been durably snapshotted.
@@ -273,7 +273,7 @@ impl MetadataJournal {
     clippy::cast_sign_loss,
     clippy::future_not_send
 )]
-impl Journal<FileStorage> for MetadataJournal {
+impl Journal<FileStorage> for PrepareJournal {
     type Header = PrepareHeader;
     type Entry = Message<PrepareHeader>;
     type HeaderRef<'a> = Ref<'a, PrepareHeader>;
@@ -460,7 +460,7 @@ impl Journal<FileStorage> for MetadataJournal {
     }
 }
 
-impl JournalHandle for MetadataJournal {
+impl JournalHandle for PrepareJournal {
     type Storage = FileStorage;
     type Target = Self;
 
@@ -500,7 +500,7 @@ mod tests {
     async fn open_empty_wal() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let journal = MetadataJournal::open(&path, 0).await.unwrap();
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
 
         assert!(journal.last_op().is_none());
         assert!(journal.header(0).is_none());
@@ -510,7 +510,7 @@ mod tests {
     async fn append_and_read() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let journal = MetadataJournal::open(&path, 0).await.unwrap();
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
 
         let msg1 = make_prepare(1, 64);
         let msg2 = make_prepare(2, 32);
@@ -538,7 +538,7 @@ mod tests {
         let path = dir.path().join("journal.wal");
 
         {
-            let journal = MetadataJournal::open(&path, 0).await.unwrap();
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
             journal.append(make_prepare(1, 64)).await.unwrap();
             journal.append(make_prepare(2, 128)).await.unwrap();
             journal.append(make_prepare(3, 32)).await.unwrap();
@@ -546,7 +546,7 @@ mod tests {
         }
 
         // Reopen and verify index is rebuilt
-        let journal = MetadataJournal::open(&path, 0).await.unwrap();
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
         assert_eq!(journal.last_op(), Some(3));
 
         for op in 1..=3 {
@@ -563,7 +563,7 @@ mod tests {
         let path = dir.path().join("journal.wal");
 
         {
-            let journal = MetadataJournal::open(&path, 0).await.unwrap();
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
             journal.append(make_prepare(1, 64)).await.unwrap();
             journal.append(make_prepare(2, 128)).await.unwrap();
             journal.storage.fsync().await.unwrap();
@@ -579,7 +579,7 @@ mod tests {
         }
 
         // Reopen, should recover only the first entry
-        let journal = MetadataJournal::open(&path, 0).await.unwrap();
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
         assert_eq!(journal.last_op(), Some(1));
         assert!(journal.header(2).is_none());
 
@@ -592,7 +592,7 @@ mod tests {
     async fn iter_headers_from() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let journal = MetadataJournal::open(&path, 0).await.unwrap();
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
 
         journal.append(make_prepare(1, 32)).await.unwrap();
         journal.append(make_prepare(2, 32)).await.unwrap();
@@ -617,7 +617,7 @@ mod tests {
     async fn previous_header_navigation() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let journal = MetadataJournal::open(&path, 0).await.unwrap();
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
 
         journal.append(make_prepare(0, 32)).await.unwrap();
         journal.append(make_prepare(1, 32)).await.unwrap();
@@ -632,11 +632,11 @@ mod tests {
     async fn slot_wraparound_evicts_snapshotted_entry() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let journal = MetadataJournal::open(&path, 0).await.unwrap();
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
 
         // Op 3 goes to slot 3
         journal.append(make_prepare(3, 32)).await.unwrap();
-        // Mark op 3 as snapshotted — safe to evict
+        // Mark op 3 as snapshotted - safe to evict
         journal.set_snapshot_op(3);
         // Op 3 + SLOT_COUNT goes to the same slot, evicting op 3
         let wraparound_op = 3 + SLOT_COUNT as u64;
@@ -656,7 +656,7 @@ mod tests {
     async fn drain_shrinks_wal_and_preserves_live_entries() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let journal = MetadataJournal::open(&path, 0).await.unwrap();
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
 
         // Append 5 entries
         for op in 1..=5 {
@@ -696,7 +696,7 @@ mod tests {
 
         // Reopen and verify the drained WAL is valid
         drop(journal);
-        let journal = MetadataJournal::open(&path, 3).await.unwrap();
+        let journal = PrepareJournal::open(&path, 3).await.unwrap();
         assert_eq!(journal.last_op(), Some(5));
         for op in 4..=5 {
             let h = *journal.header(op as usize).unwrap();
@@ -711,7 +711,7 @@ mod tests {
     async fn append_panics_on_evicting_unsnapshotted_entry() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
-        let journal = MetadataJournal::open(&path, 0).await.unwrap();
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
 
         journal.append(make_prepare(3, 32)).await.unwrap();
         // No snapshot taken, evicting op 3 must panic

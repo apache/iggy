@@ -226,6 +226,7 @@ where
         partition.on_replicate(message).await;
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareOkHeader>) {
         let namespace = IggyNamespace::from_raw(message.header().namespace);
         let config = self.config.clone();

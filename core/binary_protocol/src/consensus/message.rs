@@ -52,7 +52,7 @@ where
     fn fragments(&self) -> &[Frozen<MESSAGE_ALIGN>];
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RequestBacking {
     owned: Owned<MESSAGE_ALIGN>,
 }
@@ -359,6 +359,18 @@ where
     #[must_use]
     pub fn fragments(&self) -> &[Frozen<MESSAGE_ALIGN>] {
         <ResponseBacking as FragmentedBacking<H>>::fragments(&self.backing)
+    }
+}
+
+impl<H> Clone for Message<H, RequestBacking>
+where
+    H: ConsensusHeader,
+{
+    fn clone(&self) -> Self {
+        Self {
+            backing: self.backing.clone(),
+            _marker: PhantomData,
+        }
     }
 }
 

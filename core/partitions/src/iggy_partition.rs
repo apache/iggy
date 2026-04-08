@@ -656,7 +656,7 @@ where
     pub async fn on_replicate(&mut self, message: Message<PrepareHeader>) {
         self.clear_pending_consumer_offset_commits_if_view_changed();
         let header = *message.header();
-        let previous_commit = self.consensus.commit();
+        let previous_commit = self.consensus.commit_max();
         let current_op = {
             let consensus = self.consensus();
             let current_op = match replicate_preflight(consensus, &header) {
@@ -705,7 +705,7 @@ where
         };
         let replicated_result = self.apply_replicated_operation(message).await;
 
-        let commit = self.consensus.commit();
+        let commit = self.consensus.commit_max();
         if commit > previous_commit
             && let Err(error) = self.apply_committed_consumer_offset_commits_up_to(commit)
         {
@@ -801,7 +801,7 @@ where
             emit_namespace_progress_event(
                 SimEventKind::NamespaceProgressUpdated,
                 &ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
-                consensus.commit(),
+                consensus.commit_min(),
                 consensus.pipeline().borrow().len(),
             );
         }
@@ -1029,6 +1029,8 @@ where
             {
                 continue;
             }
+
+            self.consensus.advance_commit_min(prepare_header.op);
 
             let pipeline_depth = self.consensus.pipeline().borrow().len();
             let event = CommitLogEvent {
