@@ -287,6 +287,15 @@ read_current_version() {
     esac
 }
 
+# Portable sed -i wrapper (works on both GNU and BSD/macOS sed).
+sedi() {
+    if sed --version 2>/dev/null | grep -q 'GNU'; then
+        sed -i "$@"
+    else
+        sed -i '' "$@"
+    fi
+}
+
 # Write translated version into file using sed.
 write_version() {
     local file="$1" format="$2" new_canonical="$3"
@@ -297,25 +306,25 @@ write_version() {
 
     case "$fmt_base" in
         cargo)
-            sed -i "1,/^version = \".*\"/s/^version = \".*\"/version = \"${translated}\"/" "$abs_file" ;;
+            sedi "1,/^version = \".*\"/s/^version = \".*\"/version = \"${translated}\"/" "$abs_file" ;;
         cargo-ws-dep)
             local pkg="${format#cargo-ws-dep:}"
-            sed -i "s/^\(${pkg} = .*version = \"\)[^\"]*/\1${translated}/" "$abs_file" ;;
+            sedi "s/^\(${pkg} = .*version = \"\)[^\"]*/\1${translated}/" "$abs_file" ;;
         cargo-dep)
             local pkg="${format#cargo-dep:}"
-            sed -i "s/^\(${pkg} = .*version = \"\)[^\"]*/\1${translated}/" "$abs_file" ;;
+            sedi "s/^\(${pkg} = .*version = \"\)[^\"]*/\1${translated}/" "$abs_file" ;;
         python-cargo)
-            sed -i "1,/^version = \".*\"/s/^version = \".*\"/version = \"${translated}\"/" "$abs_file" ;;
+            sedi "1,/^version = \".*\"/s/^version = \".*\"/version = \"${translated}\"/" "$abs_file" ;;
         pyproject)
-            sed -i '/^\[project\]/,/^\[/{ s/^version = ".*"/version = "'"${translated}"'"/ }' "$abs_file" ;;
+            sedi '/^\[project\]/,/^\[/{s/^version = ".*"/version = "'"${translated}"'"/;}' "$abs_file" ;;
         json)
-            sed -i "0,/\"version\": *\"[^\"]*\"/{s/\"version\": *\"[^\"]*\"/\"version\": \"${translated}\"/}" "$abs_file" ;;
+            sedi "1,/\"version\": *\"[^\"]*\"/{s/\"version\": *\"[^\"]*\"/\"version\": \"${translated}\"/;}" "$abs_file" ;;
         csproj)
-            sed -i "0,/<Version>[^<]*<\/Version>/{s/<Version>[^<]*<\/Version>/<Version>${translated}<\/Version>/}" "$abs_file" ;;
+            sedi "1,/<Version>[^<]*<\/Version>/{s/<Version>[^<]*<\/Version>/<Version>${translated}<\/Version>/;}" "$abs_file" ;;
         gradle)
-            sed -i "s/^version=.*/version=${translated}/" "$abs_file" ;;
+            sedi "s/^version=.*/version=${translated}/" "$abs_file" ;;
         go)
-            sed -i "0,/const Version = \"[^\"]*\"/{s/const Version = \"[^\"]*\"/const Version = \"${translated}\"/}" "$abs_file" ;;
+            sedi "1,/const Version = \"[^\"]*\"/{s/const Version = \"[^\"]*\"/const Version = \"${translated}\"/;}" "$abs_file" ;;
         *)
             echo -e "${RED}Unknown format: ${format}${NC}" >&2
             return 1 ;;
