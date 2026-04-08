@@ -405,6 +405,7 @@ where
             stats,
             consensus,
             partitions.config().segment_size,
+            partitions.config().enforce_fsync,
         );
         partitions.insert(namespace, partition);
     }

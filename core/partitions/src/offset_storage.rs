@@ -22,7 +22,7 @@ use compio::{
 use iggy_common::IggyError;
 use std::path::Path;
 
-pub async fn persist_offset(path: &str, offset: u64) -> Result<(), IggyError> {
+pub async fn persist_offset(path: &str, offset: u64, enforce_fsync: bool) -> Result<(), IggyError> {
     if let Some(parent) = Path::new(path).parent()
         && !parent.exists()
     {
@@ -34,6 +34,7 @@ pub async fn persist_offset(path: &str, offset: u64) -> Result<(), IggyError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(true)
         .open(path)
         .await
         .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
@@ -42,6 +43,13 @@ pub async fn persist_offset(path: &str, offset: u64) -> Result<(), IggyError> {
         .await
         .0
         .map_err(|_| IggyError::CannotWriteToFile)?;
+
+    if enforce_fsync {
+        file.sync_data()
+            .await
+            .map_err(|_| IggyError::CannotWriteToFile)?;
+    }
+
     Ok(())
 }
 

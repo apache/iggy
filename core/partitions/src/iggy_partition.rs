@@ -29,9 +29,10 @@ use crate::{
     PollingArgs, PollingConsumer,
 };
 use consensus::{
-    CommitLogEvent, Consensus, Pipeline, PipelineEntry, PlaneKind, Project, ReplicaLogContext,
-    RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
-    build_reply_message, drain_committable_prefix, emit_namespace_progress_event, emit_sim_event,
+    CommitLogEvent, Consensus, PartitionDiagEvent, Pipeline, PipelineEntry, PlaneKind, Project,
+    ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
+    ack_quorum_reached, build_reply_message, drain_committable_prefix,
+    emit_namespace_progress_event, emit_partition_diag, emit_sim_event,
     fence_old_prepare_by_commit, replicate_preflight, replicate_to_next_in_chain,
     send_prepare_ok as send_prepare_ok_common,
 };
@@ -77,7 +78,9 @@ where
     pub write_lock: Arc<TokioMutex<()>>,
     consumer_offsets_path: Option<String>,
     consumer_group_offsets_path: Option<String>,
+    consumer_offset_enforce_fsync: bool,
     pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
+    observed_view: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -133,6 +136,7 @@ where
     B: MessageBus,
 {
     pub fn new(stats: Arc<PartitionStats>, consensus: VsrConsensus<B>) -> Self {
+        let observed_view = consensus.view();
         Self {
             consensus,
             log: SegmentedLog::default(),
@@ -147,7 +151,9 @@ where
             write_lock: Arc::new(TokioMutex::new(())),
             consumer_offsets_path: None,
             consumer_group_offsets_path: None,
+            consumer_offset_enforce_fsync: false,
             pending_consumer_offset_commits: HashMap::new(),
+            observed_view,
         }
     }
 
@@ -161,8 +167,10 @@ where
         stats: Arc<PartitionStats>,
         consensus: VsrConsensus<B>,
         segment_size: IggyByteSize,
+        consumer_offset_enforce_fsync: bool,
     ) -> Self {
         let mut partition = Self::new(stats, consensus);
+        partition.consumer_offset_enforce_fsync = consumer_offset_enforce_fsync;
         let start_offset = 0;
         let segment = Segment::new(start_offset, segment_size);
         let storage = SegmentStorage::default();
@@ -184,11 +192,13 @@ where
         consumer_group_offsets_path: String,
         consumer_offsets: ConsumerOffsets,
         consumer_group_offsets: ConsumerGroupOffsets,
+        consumer_offset_enforce_fsync: bool,
     ) {
         self.consumer_offsets = Arc::new(consumer_offsets);
         self.consumer_group_offsets = Arc::new(consumer_group_offsets);
         self.consumer_offsets_path = Some(consumer_offsets_path);
         self.consumer_group_offsets_path = Some(consumer_group_offsets_path);
+        self.consumer_offset_enforce_fsync = consumer_offset_enforce_fsync;
     }
 
     pub(crate) async fn persist_and_stage_consumer_offset_upsert(
@@ -210,6 +220,7 @@ where
         kind: ConsumerKind,
         consumer_id: u32,
     ) -> Result<(), IggyError> {
+        self.ensure_consumer_offset_exists(kind, consumer_id)?;
         let pending = PendingConsumerOffsetCommit::delete(kind, consumer_id);
         self.persist_consumer_offset_commit(pending).await?;
         self.pending_consumer_offset_commits.insert(op, pending);
@@ -221,7 +232,7 @@ where
             .pending_consumer_offset_commits
             .remove(&op)
             .ok_or(IggyError::InvalidCommand)?;
-        self.apply_consumer_offset_commit(pending);
+        self.apply_consumer_offset_commit(pending)?;
         Ok(())
     }
 
@@ -233,12 +244,17 @@ where
             return Ok(());
         };
         match pending.mutation {
-            PendingConsumerOffsetMutation::Upsert(offset) => persist_offset(&path, offset).await,
+            PendingConsumerOffsetMutation::Upsert(offset) => {
+                persist_offset(&path, offset, self.consumer_offset_enforce_fsync).await
+            }
             PendingConsumerOffsetMutation::Delete => delete_persisted_offset(&path).await,
         }
     }
 
-    fn apply_consumer_offset_commit(&self, pending: PendingConsumerOffsetCommit) {
+    fn apply_consumer_offset_commit(
+        &self,
+        pending: PendingConsumerOffsetCommit,
+    ) -> Result<(), IggyError> {
         match pending.mutation {
             PendingConsumerOffsetMutation::Upsert(offset)
                 if pending.kind == ConsumerKind::Consumer =>
@@ -256,6 +272,7 @@ where
                     created.offset.store(offset, Ordering::Relaxed);
                     guard.insert(key, created);
                 }
+                Ok(())
             }
             PendingConsumerOffsetMutation::Upsert(offset)
                 if pending.kind == ConsumerKind::ConsumerGroup =>
@@ -282,12 +299,16 @@ where
                     created.offset.store(offset, Ordering::Relaxed);
                     guard.insert(key, created);
                 }
+                Ok(())
             }
             PendingConsumerOffsetMutation::Delete if pending.kind == ConsumerKind::Consumer => {
                 let id = pending.consumer_id;
                 let guard = self.consumer_offsets.pin();
                 let key = usize::try_from(id).expect("u32 consumer id must fit usize");
-                let _ = guard.remove(&key);
+                let _ = guard
+                    .remove(&key)
+                    .ok_or(IggyError::ConsumerOffsetNotFound(key))?;
+                Ok(())
             }
             PendingConsumerOffsetMutation::Delete
                 if pending.kind == ConsumerKind::ConsumerGroup =>
@@ -297,9 +318,12 @@ where
                 let key = ConsumerGroupId(
                     usize::try_from(group_id).expect("u32 group id must fit usize"),
                 );
-                let _ = guard.remove(&key);
+                let _ = guard
+                    .remove(&key)
+                    .ok_or(IggyError::ConsumerOffsetNotFound(key.0))?;
+                Ok(())
             }
-            _ => {}
+            _ => Ok(()),
         }
     }
 
@@ -310,7 +334,7 @@ where
     ) -> Result<(), IggyError> {
         let pending = PendingConsumerOffsetCommit::try_from_polling_consumer(consumer, offset)?;
         self.persist_consumer_offset_commit(pending).await?;
-        self.apply_consumer_offset_commit(pending);
+        self.apply_consumer_offset_commit(pending)?;
         Ok(())
     }
 
@@ -325,6 +349,48 @@ where
                 .as_ref()
                 .map(|path| format!("{path}/{consumer_id}")),
         }
+    }
+
+    fn ensure_consumer_offset_exists(
+        &self,
+        kind: ConsumerKind,
+        consumer_id: u32,
+    ) -> Result<(), IggyError> {
+        let found = match kind {
+            ConsumerKind::Consumer => {
+                let key = usize::try_from(consumer_id).expect("u32 consumer id must fit usize");
+                self.consumer_offsets.pin().contains_key(&key)
+            }
+            ConsumerKind::ConsumerGroup => {
+                let key = ConsumerGroupId(
+                    usize::try_from(consumer_id).expect("u32 group id must fit usize"),
+                );
+                self.consumer_group_offsets.pin().contains_key(&key)
+            }
+        };
+
+        if found {
+            Ok(())
+        } else {
+            Err(IggyError::ConsumerOffsetNotFound(
+                usize::try_from(consumer_id).expect("u32 consumer id must fit usize"),
+            ))
+        }
+    }
+
+    #[must_use]
+    fn diag_ctx(&self) -> ReplicaLogContext {
+        ReplicaLogContext::from_consensus(self.consensus(), PlaneKind::Partitions)
+    }
+
+    fn clear_pending_consumer_offset_commits_if_view_changed(&mut self) {
+        let current_view = self.consensus.view();
+        if current_view == self.observed_view {
+            return;
+        }
+
+        self.pending_consumer_offset_commits.clear();
+        self.observed_view = current_view;
     }
 }
 
@@ -476,7 +542,7 @@ where
         offset: u64,
     ) -> Result<(), IggyError> {
         let pending = PendingConsumerOffsetCommit::try_from_polling_consumer(consumer, offset)?;
-        self.apply_consumer_offset_commit(pending);
+        self.apply_consumer_offset_commit(pending)?;
         Ok(())
     }
 
@@ -519,6 +585,7 @@ where
     /// primary, is not in normal status, or is currently syncing.
     #[allow(clippy::future_not_send)]
     pub async fn on_request(&mut self, message: Message<RequestHeader>) {
+        self.clear_pending_consumer_offset_commits_if_view_changed();
         let namespace = IggyNamespace::from_raw(message.header().namespace);
         let prepare = {
             let consensus = self.consensus();
@@ -536,14 +603,14 @@ where
                 match convert_request_message(namespace, message) {
                     Ok(message) => message,
                     Err(error) => {
-                        warn!(
-                            target: "iggy.partitions.diag",
-                            plane = "partitions",
-                            replica_id = consensus.replica(),
-                            namespace_raw = namespace.inner(),
-                            operation = ?Operation::SendMessages,
-                            error = %error,
-                            "failed to convert send_messages request"
+                        emit_partition_diag(
+                            tracing::Level::WARN,
+                            &PartitionDiagEvent::new(
+                                ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                                "failed to convert send_messages request",
+                            )
+                            .with_operation(Operation::SendMessages)
+                            .with_error(error.to_string()),
                         );
                         return;
                     }
@@ -551,6 +618,27 @@ where
             } else {
                 message
             };
+
+            if message.header().operation == Operation::DeleteConsumerOffset {
+                match Self::parse_consumer_offset_request(message.header().operation, &message)
+                    .and_then(|(kind, consumer_id, _)| {
+                        self.ensure_consumer_offset_exists(kind, consumer_id)
+                    }) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        emit_partition_diag(
+                            tracing::Level::WARN,
+                            &PartitionDiagEvent::new(
+                                ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                                "rejecting delete_consumer_offset for missing offset",
+                            )
+                            .with_operation(Operation::DeleteConsumerOffset)
+                            .with_error(error.to_string()),
+                        );
+                        return;
+                    }
+                }
+            }
 
             assert!(!consensus.is_follower(), "on_request: primary only");
             assert!(consensus.is_normal(), "on_request: status must be normal");
@@ -566,38 +654,37 @@ where
 
     #[allow(clippy::future_not_send)]
     pub async fn on_replicate(&mut self, message: Message<PrepareHeader>) {
+        self.clear_pending_consumer_offset_commits_if_view_changed();
         let header = *message.header();
+        let previous_commit = self.consensus.commit();
         let current_op = {
             let consensus = self.consensus();
             let current_op = match replicate_preflight(consensus, &header) {
                 Ok(current_op) => current_op,
                 Err(reason) => {
-                    warn!(
-                        target: "iggy.partitions.diag",
-                        plane = "partitions",
-                        replica_id = consensus.replica(),
-                        view = consensus.view(),
-                        op = header.op,
-                        namespace_raw = header.namespace,
-                        operation = ?header.operation,
-                        reason = reason.as_str(),
-                        "ignoring prepare during replicate preflight"
+                    emit_partition_diag(
+                        tracing::Level::WARN,
+                        &PartitionDiagEvent::new(
+                            ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                            "ignoring prepare during replicate preflight",
+                        )
+                        .with_operation(header.operation)
+                        .with_op(header.op)
+                        .with_reason(reason.as_str()),
                     );
                     return;
                 }
             };
 
             if fence_old_prepare_by_commit(consensus, &header) {
-                warn!(
-                    target: "iggy.partitions.diag",
-                    plane = "partitions",
-                    replica_id = consensus.replica(),
-                    view = consensus.view(),
-                    op = header.op,
-                    commit = consensus.commit(),
-                    namespace_raw = header.namespace,
-                    operation = ?header.operation,
-                    "received old prepare, skipping replication"
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                        "received old prepare, skipping replication",
+                    )
+                    .with_operation(header.operation)
+                    .with_op(header.op),
                 );
                 return;
             }
@@ -605,30 +692,52 @@ where
             current_op
         };
 
-        let message = {
-            let consensus = self.consensus();
-            replicate_to_next_in_chain(consensus, message).await
-        };
-        if let Err(error) = self.apply_replicated_operation(message).await {
-            let replica_id = self.consensus.replica();
-            warn!(
-                target: "iggy.partitions.diag",
-                plane = "partitions",
-                replica_id,
-                op = header.op,
-                namespace_raw = self.namespace().inner(),
-                operation = ?header.operation,
-                %error,
-                "failed to apply replicated partition operation"
-            );
-            return;
-        }
-
         debug_assert_eq!(header.op, current_op + 1);
         {
             let consensus = self.consensus();
             consensus.sequencer().set_sequence(header.op);
             consensus.set_last_prepare_checksum(header.checksum);
+        }
+
+        let message = {
+            let consensus = self.consensus();
+            replicate_to_next_in_chain(consensus, message).await
+        };
+        let replicated_result = self.apply_replicated_operation(message).await;
+
+        let commit = self.consensus.commit();
+        if commit > previous_commit
+            && let Err(error) = self.apply_committed_consumer_offset_commits_up_to(commit)
+        {
+            emit_partition_diag(
+                tracing::Level::WARN,
+                &PartitionDiagEvent::new(
+                    self.diag_ctx(),
+                    "failed to apply committed consumer offset updates after commit advanced",
+                )
+                .with_operation(header.operation)
+                .with_op(header.op)
+                .with_error(error.to_string()),
+            );
+            return;
+        }
+
+        if let Err(error) = replicated_result {
+            emit_partition_diag(
+                tracing::Level::WARN,
+                &PartitionDiagEvent::new(
+                    self.diag_ctx(),
+                    "failed to apply replicated partition operation",
+                )
+                .with_operation(header.operation)
+                .with_op(header.op)
+                .with_error(error.to_string()),
+            );
+            return;
+        }
+
+        {
+            let consensus = self.consensus();
             emit_namespace_progress_event(
                 SimEventKind::NamespaceProgressUpdated,
                 &ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
@@ -642,18 +751,19 @@ where
 
     #[allow(clippy::future_not_send)]
     pub async fn on_ack(&mut self, message: Message<PrepareOkHeader>, config: &PartitionsConfig) {
+        self.clear_pending_consumer_offset_commits_if_view_changed();
         let header = *message.header();
         {
             let consensus = self.consensus();
             if let Err(reason) = ack_preflight(consensus) {
-                warn!(
-                    target: "iggy.partitions.diag",
-                    plane = "partitions",
-                    replica_id = consensus.replica(),
-                    view = consensus.view(),
-                    op = header.op,
-                    reason = reason.as_str(),
-                    "ignoring ack during preflight"
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                        "ignoring ack during preflight",
+                    )
+                    .with_op(header.op)
+                    .with_reason(reason.as_str()),
                 );
                 return;
             }
@@ -663,13 +773,14 @@ where
                 .entry_by_op_and_checksum(header.op, header.prepare_checksum)
                 .is_none()
             {
-                debug!(
-                    target: "iggy.partitions.diag",
-                    plane = "partitions",
-                    replica_id = consensus.replica(),
-                    op = header.op,
-                    prepare_checksum = header.prepare_checksum,
-                    "ack target prepare not in pipeline"
+                emit_partition_diag(
+                    tracing::Level::DEBUG,
+                    &PartitionDiagEvent::new(
+                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                        "ack target prepare not in pipeline",
+                    )
+                    .with_op(header.op)
+                    .with_prepare_checksum(header.prepare_checksum),
                 );
                 return;
             }
@@ -1076,12 +1187,36 @@ where
         ))
     }
 
+    fn parse_consumer_offset_request(
+        operation: Operation,
+        message: &Message<RequestHeader>,
+    ) -> Result<(ConsumerKind, u32, Option<u64>), IggyError> {
+        let total_size =
+            usize::try_from(message.header().size).map_err(|_| IggyError::InvalidCommand)?;
+        let body = message
+            .as_slice()
+            .get(std::mem::size_of::<RequestHeader>()..total_size)
+            .ok_or(IggyError::InvalidCommand)?;
+        Self::parse_consumer_offset_payload(operation, body)
+    }
+
     fn parse_staged_consumer_offset_commit(
         operation: Operation,
         message: &Message<PrepareHeader>,
     ) -> Result<(ConsumerKind, u32, Option<u64>), IggyError> {
-        let total_size = message.header().size as usize;
-        let body = &message.as_slice()[std::mem::size_of::<PrepareHeader>()..total_size];
+        let total_size =
+            usize::try_from(message.header().size).map_err(|_| IggyError::InvalidCommand)?;
+        let body = message
+            .as_slice()
+            .get(std::mem::size_of::<PrepareHeader>()..total_size)
+            .ok_or(IggyError::InvalidCommand)?;
+        Self::parse_consumer_offset_payload(operation, body)
+    }
+
+    fn parse_consumer_offset_payload(
+        operation: Operation,
+        body: &[u8],
+    ) -> Result<(ConsumerKind, u32, Option<u64>), IggyError> {
         let consumer_kind = *body.first().ok_or(IggyError::InvalidCommand)?;
         let consumer_id = body
             .get(1..5)
@@ -1107,6 +1242,25 @@ where
             Operation::DeleteConsumerOffset => Ok((kind, consumer_id, None)),
             _ => Err(IggyError::InvalidCommand),
         }
+    }
+
+    fn apply_committed_consumer_offset_commits_up_to(
+        &mut self,
+        commit: u64,
+    ) -> Result<(), IggyError> {
+        let mut committed_ops: Vec<_> = self
+            .pending_consumer_offset_commits
+            .keys()
+            .copied()
+            .filter(|op| *op <= commit)
+            .collect();
+        committed_ops.sort_unstable();
+
+        for op in committed_ops {
+            self.apply_staged_consumer_offset_commit(op)?;
+        }
+
+        Ok(())
     }
 
     async fn commit_consumer_offset_entry(
