@@ -109,9 +109,11 @@ impl Simulator {
     ///
     /// Returns all client replies delivered during this tick.
     ///
-    /// The tick has three phases that never borrow replicas and network
+    /// The tick has four phases that never borrow replicas and network
     /// simultaneously:
     ///
+    /// 0. **Consensus tick**: advance consensus timeouts on live replicas,
+    ///    dispatching any resulting actions (view change messages, retransmissions).
     /// 1. **Deliver**: `network.step()` returns ready packets; each is
     ///    dispatched to its target replica (or collected as a client reply).
     /// 2. **Drain**: each live replica's outbox is drained and fed into
@@ -125,6 +127,14 @@ impl Simulator {
     #[allow(clippy::cast_possible_truncation)]
     pub fn step(&mut self) -> Vec<Message<ReplyHeader>> {
         let mut client_replies = Vec::new();
+
+        // Phase 0: Advance consensus timeouts (skip crashed replicas).
+        for (i, replica) in self.replicas.iter().enumerate() {
+            if !self.crashed.contains(&(i as u8)) {
+                futures::executor::block_on(replica.tick_partitions());
+                futures::executor::block_on(replica.tick_metadata());
+            }
+        }
 
         // Phase 1: Deliver ready packets from the network.
         let packets = self.network.step();
@@ -226,14 +236,17 @@ impl Simulator {
         self.crashed.contains(&replica_index)
     }
 
-    /// Advance consensus timeouts and dispatch actions on every replica.
+    /// Advance consensus timeouts and dispatch actions on every live replica.
     ///
-    /// Call this once per simulation tick. Handles prepare retransmission
-    /// (and eventually view-change messages) via the timeout system.
-    #[allow(clippy::future_not_send)]
+    /// Note: `step()` already calls this internally. This method is provided
+    /// for callers that need to tick consensus without a full step cycle.
+    #[allow(clippy::future_not_send, clippy::cast_possible_truncation)]
     pub async fn tick(&self) {
-        for replica in &self.replicas {
-            replica.tick_partitions().await;
+        for (i, replica) in self.replicas.iter().enumerate() {
+            if !self.crashed.contains(&(i as u8)) {
+                replica.tick_partitions().await;
+                replica.tick_metadata().await;
+            }
         }
     }
 
@@ -291,3 +304,97 @@ impl Simulator {
 // 2. Send a request to ns_b, step until ns_b reply arrives.
 // 3. Assert ns_b committed while ns_a pipeline is still full.
 // Requires namespace-aware stepping (filter bus by namespace) or two-phase delivery.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::SimClient;
+    use consensus::Status;
+    use iggy_common::sharding::IggyNamespace;
+
+    /// After crashing the primary in a 5-node cluster, the 4 remaining
+    /// backups should detect the failure via heartbeat timeout and elect
+    /// a new primary through the view change protocol.
+    #[test]
+    fn view_change_after_primary_crash() {
+        iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 5;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            ..packet::PacketSimulatorOptions::default()
+        };
+
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+        let ns = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns);
+
+        // Send a message through the primary (replica 0) to verify normal operation.
+        let msg = client.send_messages(ns, &[b"before crash"]);
+        sim.submit_request(client_id, 0, msg.into_generic());
+        let mut got_reply = false;
+        for _ in 0..100 {
+            if !sim.step().is_empty() {
+                got_reply = true;
+                break;
+            }
+        }
+        assert!(got_reply, "expected reply before crash");
+
+        // Crash the primary.
+        sim.replica_crash(0);
+
+        // Run enough steps for the heartbeat timeout to fire
+        // and the view change  to complete across 4 surviving replicas.
+        for _ in 0..800 {
+            sim.step();
+        }
+
+        // Verify that a new primary was elected in a higher view.
+        let mut new_primary_found = false;
+        for replica_idx in 1..replica_count {
+            let replica = &sim.replicas[replica_idx as usize];
+            let partitions = replica.plane.partitions();
+            let consensus = partitions.consensus().unwrap();
+            if consensus.view() > 0
+                && consensus.status() == Status::Normal
+                && consensus.is_primary()
+            {
+                new_primary_found = true;
+            }
+        }
+        assert!(
+            new_primary_found,
+            "expected a new primary after crashing replica 0"
+        );
+
+        // Submit a request to the new primary and verify it commits.
+        let c = sim.replicas[1].plane.partitions().consensus().unwrap();
+        let new_primary_idx = c.primary_index(c.view());
+
+        let msg2 = client.send_messages(ns, &[b"after view change"]);
+        sim.submit_request(client_id, new_primary_idx, msg2.into_generic());
+        let mut got_reply_after = false;
+        for _ in 0..200 {
+            if !sim.step().is_empty() {
+                got_reply_after = true;
+                break;
+            }
+        }
+        assert!(
+            got_reply_after,
+            "expected reply from new primary after view change"
+        );
+    }
+}

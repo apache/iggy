@@ -18,7 +18,9 @@
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, Receiver, ShardFrame};
 use futures::FutureExt;
-use iggy_binary_protocol::{ConsensusError, GenericHeader, Message, MessageBag, PrepareHeader};
+use iggy_binary_protocol::{
+    ConsensusError, ConsensusHeader, GenericHeader, Message, MessageBag, PrepareHeader,
+};
 use iggy_common::sharding::IggyNamespace;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
@@ -63,6 +65,22 @@ where
                 let h = *p.header();
                 (h.operation, h.namespace, p.into_generic())
             }
+            MessageBag::StartViewChange(m) => {
+                let h = *m.header();
+                (h.operation(), h.namespace, m.into_generic())
+            }
+            MessageBag::DoViewChange(m) => {
+                let h = *m.header();
+                (h.operation(), h.namespace, m.into_generic())
+            }
+            MessageBag::StartView(m) => {
+                let h = *m.header();
+                (h.operation(), h.namespace, m.into_generic())
+            }
+            MessageBag::Commit(m) => {
+                let h = *m.header();
+                (h.operation(), h.namespace, m.into_generic())
+            }
         };
         let namespace = IggyNamespace::from_raw(namespace);
         let target = if operation.is_metadata() {
@@ -79,6 +97,12 @@ where
                 0
             })
         } else {
+            // TODO: View change messages (StartViewChange, DoViewChange, StartView) return
+            // Operation::Reserved, so they always land here and route to shard 0. This is
+            // correct only in single-shard deployments. In multi-shard, partition-plane view
+            // change messages must reach the shard owning that consensus group. Fixing this
+            // requires routing by Command2 + consensus namespace (a u64) rather than by
+            // Operation + IggyNamespace, since view change headers don't carry an IggyNamespace.
             0
         };
         let _ = self.senders[target as usize].send(ShardFrame::fire_and_forget(generic));
@@ -107,6 +131,22 @@ where
                 let h = *p.header();
                 (h.operation, h.namespace, p.into_generic())
             }
+            MessageBag::StartViewChange(m) => {
+                let h = *m.header();
+                (h.operation(), h.namespace, m.into_generic())
+            }
+            MessageBag::DoViewChange(m) => {
+                let h = *m.header();
+                (h.operation(), h.namespace, m.into_generic())
+            }
+            MessageBag::StartView(m) => {
+                let h = *m.header();
+                (h.operation(), h.namespace, m.into_generic())
+            }
+            MessageBag::Commit(m) => {
+                let h = *m.header();
+                (h.operation(), h.namespace, m.into_generic())
+            }
         };
         let namespace = IggyNamespace::from_raw(namespace);
 
@@ -131,6 +171,7 @@ where
                 0
             })
         } else {
+            // TODO: Same view-change routing issue as dispatch() above.
             0
         };
         // Create a frame and send it to the target shard.

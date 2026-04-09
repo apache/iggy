@@ -448,6 +448,22 @@ pub enum VsrAction {
     RetransmitPrepares {
         targets: Vec<(PrepareHeader, Vec<u8>)>,
     },
+    /// Rebuild the pipeline from the journal after a view change.
+    ///
+    /// The new primary must re-populate its pipeline with uncommitted ops
+    /// from the WAL so that incoming `PrepareOk` messages can be matched
+    /// and commits can proceed.
+    RebuildPipeline { from_op: u64, to_op: u64 },
+    /// Primary heartbeat: send current commit point to all backups.
+    ///
+    /// Emitted when the `CommitMessage` timeout fires. Prevents backups
+    /// from starting a view change during idle periods.
+    SendCommit {
+        view: u32,
+        commit: u64,
+        namespace: u64,
+        timestamp_monotonic: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,6 +546,10 @@ where
 
     timeouts: RefCell<TimeoutManager>,
 
+    /// Monotonic timestamp from the most recent accepted commit heartbeat.
+    /// Old/replayed commit messages with a lower timestamp are ignored.
+    heartbeat_timestamp: Cell<u64>,
+
     /// VSR client-table for duplicate detection and reply caching.
     client_table: RefCell<ClientTable>,
 }
@@ -577,13 +597,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             sent_own_start_view_change: Cell::new(false),
             sent_own_do_view_change: Cell::new(false),
             timeouts: RefCell::new(TimeoutManager::new(timeout_seed)),
+            heartbeat_timestamp: Cell::new(0),
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
         }
     }
 
-    // TODO: More init logic.
     pub fn init(&self) {
         self.status.set(Status::Normal);
+        let mut timeouts = self.timeouts.borrow_mut();
+        if self.is_primary() {
+            timeouts.start(TimeoutKind::Prepare);
+            timeouts.start(TimeoutKind::CommitMessage);
+        } else {
+            timeouts.start(TimeoutKind::NormalHeartbeat);
+        }
     }
 
     #[must_use]
@@ -817,6 +844,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts = self.timeouts.borrow_mut();
         }
 
+        if timeouts.fired(TimeoutKind::CommitMessage) {
+            drop(timeouts);
+            actions.extend(self.handle_commit_message_timeout());
+            timeouts = self.timeouts.borrow_mut();
+        }
+
         if timeouts.fired(TimeoutKind::ViewChangeStatus) {
             drop(timeouts);
             actions.extend(self.handle_view_change_status_timeout(plane));
@@ -1041,6 +1074,35 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.timeouts.borrow_mut().backoff(TimeoutKind::Prepare);
 
         vec![VsrAction::RetransmitPrepares { targets }]
+    }
+
+    /// Primary heartbeat: send commit point to all backups so they know
+    /// the primary is alive and can advance their own `commit_max`.
+    fn handle_commit_message_timeout(&self) -> Vec<VsrAction> {
+        if !self.is_primary() || self.status.get() != Status::Normal {
+            return Vec::new();
+        }
+
+        assert_eq!(
+            self.commit_min.get(),
+            self.commit_max.get(),
+            "primary commit_min ({}) != commit_max ({}): cannot send commit heartbeat \
+             for ops not yet locally executed",
+            self.commit_min.get(),
+            self.commit_max.get()
+        );
+
+        self.timeouts.borrow_mut().reset(TimeoutKind::CommitMessage);
+
+        let ts = self.heartbeat_timestamp.get() + 1;
+        self.heartbeat_timestamp.set(ts);
+
+        vec![VsrAction::SendCommit {
+            view: self.view.get(),
+            commit: self.commit_max.get(),
+            namespace: self.namespace,
+            timestamp_monotonic: ts,
+        }]
     }
 
     /// Handle a received `StartViewChange` message.
@@ -1397,6 +1459,58 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
     }
 
+    /// Handle a `Commit` (heartbeat) message from the primary.
+    ///
+    /// Advances `commit_max` and resets the backup's `NormalHeartbeat` timeout
+    /// so it doesn't start a spurious view change. Returns `true` if
+    /// `commit_max` advanced, signalling the caller to run `commit_journal`.
+    ///
+    /// Only accepts heartbeats with a strictly newer monotonic timestamp
+    /// to prevent old/replayed messages from suppressing view changes.
+    ///
+    /// # Panics
+    /// - If `header.namespace` does not match this replica's namespace.
+    /// - If `header.replica` is not the primary for `header.view` (protocol violation).
+    pub fn handle_commit(&self, header: &iggy_binary_protocol::CommitHeader) -> bool {
+        assert_eq!(
+            header.namespace, self.namespace,
+            "Commit routed to wrong group"
+        );
+
+        if self.is_primary() {
+            return false;
+        }
+
+        if self.status.get() != Status::Normal {
+            return false;
+        }
+
+        if header.view != self.view.get() {
+            return false;
+        }
+
+        assert_eq!(
+            header.replica,
+            self.primary_index(header.view),
+            "Commit from non-primary replica {} in view {}",
+            header.replica,
+            header.view
+        );
+
+        // Only accept heartbeats with a strictly newer timestamp to prevent
+        // old/replayed commit messages from resetting the timeout.
+        if self.heartbeat_timestamp.get() < header.timestamp_monotonic {
+            self.heartbeat_timestamp.set(header.timestamp_monotonic);
+            self.timeouts
+                .borrow_mut()
+                .reset(TimeoutKind::NormalHeartbeat);
+        }
+
+        let old_commit_max = self.commit_max.get();
+        self.advance_commit_max(header.commit);
+        self.commit_max.get() > old_commit_max
+    }
+
     /// Complete view change as the new primary after collecting DVC quorum.
     ///
     /// # Client-table maintenance
@@ -1439,6 +1553,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts.stop(TimeoutKind::DoViewChangeMessage);
             timeouts.stop(TimeoutKind::StartViewChangeMessage);
             timeouts.start(TimeoutKind::CommitMessage);
+            // If there are uncommitted ops in the rebuilt pipeline, start the
+            // Prepare timeout so that lost PrepareOks trigger retransmission.
+            if max_commit < new_op {
+                timeouts.start(TimeoutKind::Prepare);
+            }
         }
 
         let state = ReplicaLogContext::from_consensus(self, plane);
@@ -1458,7 +1577,26 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 &action,
             ),
         );
-        vec![action]
+
+        let mut actions = vec![action];
+        // The new primary must rebuild its pipeline from the journal so that
+        // incoming PrepareOk messages can be matched and commits can proceed.
+        if max_commit < new_op {
+            assert!(
+                (new_op - max_commit) <= PIPELINE_PREPARE_QUEUE_MAX as u64,
+                "view change: uncommitted range {}..={} ({} ops) exceeds pipeline capacity ({}); \
+                 DVC winner claims more in-flight ops than the pipeline can hold",
+                max_commit + 1,
+                new_op,
+                new_op - max_commit,
+                PIPELINE_PREPARE_QUEUE_MAX,
+            );
+            actions.push(VsrAction::RebuildPipeline {
+                from_op: max_commit + 1,
+                to_op: new_op,
+            });
+        }
+        actions
     }
 
     /// Handle a `PrepareOk` message from a replica.
