@@ -21,7 +21,14 @@ use iggy_common::IggyError;
 use jsonwebtoken::DecodingKey;
 use serde::Deserialize;
 use std::hash::Hash;
+use std::sync::OnceLock;
 use strum::{Display, EnumString};
+
+static HTTP_CLIENT: OnceLock<cyper::Client> = OnceLock::new();
+
+fn get_http_client() -> &'static cyper::Client {
+    HTTP_CLIENT.get_or_init(cyper::Client::new)
+}
 
 /// JWK key type enumeration
 #[derive(Debug, Clone, Copy, Display, EnumString, Deserialize, PartialEq, Eq)]
@@ -34,6 +41,22 @@ enum JwkKeyType {
     /// EC (Elliptic Curve) key type
     #[strum(serialize = "EC")]
     Ec,
+}
+
+/// EC curve type enumeration
+#[derive(Debug, Clone, Copy, Display, EnumString, Deserialize, PartialEq, Eq)]
+#[strum(serialize_all = "UPPERCASE")]
+#[serde(rename_all = "UPPERCASE")]
+enum EcCurve {
+    /// P-256 curve
+    #[strum(serialize = "P-256")]
+    P256,
+    /// P-384 curve
+    #[strum(serialize = "P-384")]
+    P384,
+    /// P-521 curve
+    #[strum(serialize = "P-521")]
+    P521,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,13 +139,19 @@ impl JwksClient {
     }
 
     async fn refresh_keys(&self, issuer: &str, jwks_url: &str) -> Result<(), IggyError> {
-        let response = ureq::get(jwks_url)
-            .call()
-            .map_err(|_| IggyError::CannotFetchJwks(jwks_url.to_string()))?;
+        let client = get_http_client();
+        let request = client
+            .get(jwks_url)
+            .map_err(|e| IggyError::CannotFetchJwks(format!("Failed to build request: {}", e)))?
+            .build();
+        let response = client
+            .execute(request)
+            .await
+            .map_err(|e| IggyError::CannotFetchJwks(format!("HTTP request failed: {}", e)))?;
 
-        let body = response
-            .into_string()
-            .map_err(|_| IggyError::CannotFetchJwks(jwks_url.to_string()))?;
+        let body = response.text().await.map_err(|e| {
+            IggyError::CannotFetchJwks(format!("Failed to read response body: {}", e))
+        })?;
 
         let jwks: JwkSet = serde_json::from_str(&body)
             .map_err(|e| IggyError::CannotFetchJwks(format!("Failed to parse JWKS: {}", e)))?;
@@ -159,16 +188,15 @@ impl JwksClient {
                         }
                     }
                     JwkKeyType::Ec => {
-                        if let (Some(x), Some(y), Some(crv)) =
+                        if let (Some(x), Some(y), Some(crv_str)) =
                             (key.x.as_deref(), key.y.as_deref(), key.crv.as_deref())
                         {
-                            match crv.to_ascii_uppercase().as_str() {
-                                "P-256" | "P-384" | "P-521" => {
-                                    DecodingKey::from_ec_components(x, y).map_err(|e| {
-                                        IggyError::CannotFetchJwks(format!("Invalid EC key: {}", e))
-                                    })?
-                                }
-                                _ => continue,
+                            if let Ok(_curve) = crv_str.parse::<EcCurve>() {
+                                DecodingKey::from_ec_components(x, y).map_err(|e| {
+                                    IggyError::CannotFetchJwks(format!("Invalid EC key: {}", e))
+                                })?
+                            } else {
+                                continue;
                             }
                         } else {
                             continue;

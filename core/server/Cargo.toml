@@ -102,7 +102,6 @@ tracing-appender = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
-ureq = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(not(target_env = "musl"))'.dependencies]

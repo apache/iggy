@@ -36,23 +36,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
-fn normalize_issuer_url(url: &str) -> String {
-    // Only lowercase the scheme and host, preserve path case
-    // Example: "HTTPS://Example.COM/PATH" -> "https://example.com/PATH"
-    match url.split_once("://") {
-        Some((scheme, rest)) => {
-            let scheme = scheme.to_lowercase();
-            // Find end of host (first '/' or end of string)
-            let (host, path) = match rest.find('/') {
-                Some(idx) => rest.split_at(idx),
-                None => (rest, ""),
-            };
-            format!("{}://{}{}", scheme, host.to_lowercase(), path)
-        }
-        None => url.trim_end_matches('/').to_lowercase(),
-    }
-}
-
 pub struct IssuerOptions {
     pub issuer: String,
     pub audience: String,
@@ -403,5 +386,73 @@ impl JwtManager {
     pub async fn is_token_revoked(&self, token_id: &str) -> bool {
         let revoked_tokens = self.revoked_tokens.read().await;
         revoked_tokens.contains_key(token_id)
+    }
+}
+
+/// Normalize issuer URL by lowercasing scheme and host, preserving path case
+///
+/// Example: "HTTPS://Example.COM/PATH" -> "https://example.com/PATH"
+fn normalize_issuer_url(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let scheme = scheme.to_lowercase();
+            // Find end of host (first '/' or end of string)
+            let (host, path) = match rest.find('/') {
+                Some(idx) => rest.split_at(idx),
+                None => (rest, ""),
+            };
+            format!("{}://{}{}", scheme, host.to_lowercase(), path)
+        }
+        None => url.trim_end_matches('/').to_lowercase(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_issuer_url_basic() {
+        assert_eq!(
+            normalize_issuer_url("HTTPS://Example.COM/PATH"),
+            "https://example.com/PATH"
+        );
+    }
+
+    #[test]
+    fn test_normalize_issuer_url_no_path() {
+        assert_eq!(
+            normalize_issuer_url("HTTPS://Example.COM"),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn test_normalize_issuer_url_no_scheme() {
+        assert_eq!(normalize_issuer_url("Example.COM"), "example.com");
+    }
+
+    #[test]
+    fn test_normalize_issuer_url_trailing_slash() {
+        assert_eq!(
+            normalize_issuer_url("HTTPS://Example.COM/"),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn test_normalize_issuer_url_preserves_path_case() {
+        assert_eq!(
+            normalize_issuer_url("https://EXAMPLE.com/MyPath/SubPath"),
+            "https://example.com/MyPath/SubPath"
+        );
+    }
+
+    #[test]
+    fn test_normalize_issuer_url_already_normalized() {
+        assert_eq!(
+            normalize_issuer_url("https://example.com/path"),
+            "https://example.com/path"
+        );
     }
 }
