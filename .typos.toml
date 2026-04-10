@@ -142,4 +142,6 @@ extend-exclude = [
     "go.work",
     # Benchmark dashboard frontend build output
     "core/bench/dashboard/frontend/dist",
+    # WireMock test fixtures with base64-encoded JWT data
+    "**/wiremock/__files/*.json",
 ]

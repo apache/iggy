@@ -1,0 +1,10 @@
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "kid": "iggy-jwt-key-1",
+      "n": "2cuC8EotFJdBYkwg78EzQNIejpKcI_5EB2yNMskZK37KWQmyXtYBUS0NeSg3G7IxraFOq1RqibWzN7SF5GBwaReWefHqE2zbfLLJD_fZIiHzVE8fREzGLtAYIj1U8sP5pEWJYMhEKK35ARth8iRLuTbGQiKkmyiqkEsnIUwzbPr4oRrMltTQCPHHDzWds5IVIZIwPt0hWCeh34bKkwEqHOWx6-fkxNwQnVU9YCfBIuwVR5nUytQE6LZuvCsPvJjv1gDtyBm_K1MDf1-7BrCmTsDw0ACB2CoSwPZM4A1jHZo4unWdfsuyph5FzzCK4Lf5jdsxQD6W8bqQbATibKBqsw",
+      "e": "AQAB"
+    }
+  ]
+}
