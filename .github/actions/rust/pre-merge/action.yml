@@ -59,6 +59,42 @@ runs:
         esac
       shell: bash
 
+    # DAG-based test scoping: compute affected crates from cargo metadata + git diff
+    # to avoid running the full test suite when only a subset of crates changed.
+    # Safety: cargo check/clippy run on the full workspace separately, catching all
+    # compilation errors. This only scopes test BUILD and EXECUTION.
+    - name: Fetch base branch for DAG analysis
+      if: startsWith(inputs.task, 'test-')
+      run: git fetch origin master --depth=1 2>/dev/null || true
+      shell: bash
+
+    - name: Compute affected crates (DAG-based)
+      if: startsWith(inputs.task, 'test-')
+      id: affected
+      run: |
+        NEXTEST_FILTER=""
+        PACKAGES=""
+
+        if python3 scripts/ci/affected-crates.py --base-ref origin/master --format nextest-filter > /tmp/nextest-filter.txt 2>/tmp/affected-stderr.txt; then
+          NEXTEST_FILTER=$(cat /tmp/nextest-filter.txt)
+        fi
+        if python3 scripts/ci/affected-crates.py --base-ref origin/master --format packages > /tmp/packages.txt 2>/tmp/affected-stderr.txt; then
+          PACKAGES=$(cat /tmp/packages.txt)
+        fi
+
+        if [[ -n "$NEXTEST_FILTER" ]]; then
+          CRATE_COUNT=$(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l)
+          echo "::notice::DAG analysis: ${CRATE_COUNT} affected crates (of 43 total)"
+          echo "scoped=true" >> $GITHUB_OUTPUT
+        else
+          STDERR=$(cat /tmp/affected-stderr.txt 2>/dev/null || echo "")
+          echo "::warning::Could not compute affected crates, running full test suite. ${STDERR}"
+          echo "scoped=false" >> $GITHUB_OUTPUT
+          # Clear filter files so test step runs everything
+          rm -f /tmp/nextest-filter.txt /tmp/packages.txt
+        fi
+      shell: bash
+
     # Individual lint tasks for parallel execution
     - name: Cargo check
       if: inputs.task == 'check'
@@ -117,16 +153,41 @@ runs:
           echo "::notice::Running test partition ${PARTITION_INDEX}/2"
         fi
 
+        # Read DAG-based affected crate filter (computed in earlier step)
+        NEXTEST_FILTER=""
+        PACKAGE_FLAGS=""
+        if [[ -f /tmp/nextest-filter.txt ]]; then
+          NEXTEST_FILTER=$(cat /tmp/nextest-filter.txt)
+        fi
+        if [[ -f /tmp/packages.txt ]]; then
+          PACKAGE_FLAGS=$(cat /tmp/packages.txt)
+        fi
+
+        if [[ -n "$PACKAGE_FLAGS" ]]; then
+          CRATE_COUNT=$(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l)
+          echo "::notice::DAG-scoped build: ${CRATE_COUNT} crates (cargo check/clippy cover full workspace separately)"
+        else
+          echo "::notice::Full workspace build (no DAG filter available)"
+        fi
+
         source <(cargo llvm-cov show-env --export-prefix)
 
         bins_start=$(date +%s)
-        cargo build --locked
+        if [[ -n "$PACKAGE_FLAGS" ]]; then
+          cargo build --locked $PACKAGE_FLAGS
+        else
+          cargo build --locked
+        fi
         bins_end=$(date +%s)
         bins_duration=$((bins_end - bins_start))
         echo "::notice::Binaries and libraries built in ${bins_duration}s ($(date -ud @${bins_duration} +'%M:%S'))"
 
         compile_start=$(date +%s)
-        cargo test --locked --no-run
+        if [[ -n "$PACKAGE_FLAGS" ]]; then
+          cargo test --locked --no-run $PACKAGE_FLAGS
+        else
+          cargo test --locked --no-run
+        fi
         compile_end=$(date +%s)
         compile_duration=$((compile_end - compile_start))
         echo "::notice::Tests compiled in ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
@@ -144,12 +205,20 @@ runs:
 
         test_start=$(date +%s)
         if command -v cargo-nextest &> /dev/null; then
-          cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG
+          if [[ -n "$NEXTEST_FILTER" ]]; then
+            cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG -E "$NEXTEST_FILTER"
+          else
+            cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG
+          fi
         else
           if [[ -n "$PARTITION_FLAG" ]]; then
             echo "::error::cargo-nextest not found, falling back to cargo test without partitioning (all tests will run on every partition)"
           fi
-          cargo test --locked --no-fail-fast
+          if [[ -n "$PACKAGE_FLAGS" ]]; then
+            cargo test --locked --no-fail-fast $PACKAGE_FLAGS
+          else
+            cargo test --locked --no-fail-fast
+          fi
         fi
         test_end=$(date +%s)
         test_duration=$((test_end - test_start))
@@ -159,6 +228,12 @@ runs:
         total_duration=$((build_duration + test_duration))
         echo ""
         echo "========================================="
+        if [[ -n "$PACKAGE_FLAGS" ]]; then
+          CRATE_COUNT=$(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l)
+          echo "DAG scope:                     ${CRATE_COUNT}/43 crates"
+        else
+          echo "DAG scope:                     full workspace (43 crates)"
+        fi
         echo "All targets build:             ${bins_duration}s ($(date -ud @${bins_duration} +'%M:%S'))"
         echo "Tests compile:                 ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
         echo "Tests execute:                 ${test_duration}s ($(date -ud @${test_duration} +'%M:%S'))"
