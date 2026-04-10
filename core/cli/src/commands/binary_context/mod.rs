@@ -21,4 +21,5 @@ pub mod common;
 pub mod create_context;
 pub mod delete_context;
 pub mod get_contexts;
+pub mod show_context;
 pub mod use_context;
