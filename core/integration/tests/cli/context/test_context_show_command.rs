@@ -115,7 +115,10 @@ pub async fn should_show_context_with_all_fields() {
             vec![
                 ("Name".to_string(), "production".to_string()),
                 ("Transport".to_string(), "tcp".to_string()),
-                ("TCP Server Address".to_string(), "10.0.0.1:8090".to_string()),
+                (
+                    "TCP Server Address".to_string(),
+                    "10.0.0.1:8090".to_string(),
+                ),
                 ("TCP TLS Enabled".to_string(), "true".to_string()),
                 ("Username".to_string(), "admin".to_string()),
                 ("Password".to_string(), "********".to_string()),
