@@ -51,12 +51,11 @@ mod helpers;
 mod orchestrator;
 mod port_reserver;
 pub mod seeds;
-mod shared;
 mod traits;
 
 pub use config::{
     AutoLoginConfig, ClientConfig, ConnectorsRuntimeConfig, EncryptionConfig, IpAddrKind,
-    McpConfig, TestServerConfig, TlsConfig, resolve_config_paths,
+    JwksConfig, McpConfig, TestServerConfig, TlsConfig, resolve_config_paths,
 };
 
 pub use context::{TestContext, get_test_directory};
@@ -72,4 +71,3 @@ pub use helpers::{
 };
 
 pub use fixture::TestFixture;
-pub use shared::{SharedServerInfo, SharedServerRegistry};

@@ -48,12 +48,6 @@ impl ClusterNodesValue {
     }
 }
 
-/// Shared server configuration.
-#[derive(Debug, Clone)]
-pub struct SharedServerAttrs {
-    pub key: String,
-}
-
 /// Parsed `#[iggy_harness(...)]` attributes.
 #[derive(Debug, Default)]
 pub struct IggyTestAttrs {
@@ -63,7 +57,14 @@ pub struct IggyTestAttrs {
     pub server: ServerAttrs,
     pub seed_fn: Option<syn::Path>,
     pub cluster_nodes: ClusterNodesValue,
-    pub shared_server: Option<SharedServerAttrs>,
+    pub jwks_server: Option<JwksAttrs>,
+}
+
+/// JWKS server attributes.
+#[derive(Debug, Default, Clone)]
+pub struct JwksAttrs {
+    pub enabled: bool,
+    pub store_path: Option<String>,
 }
 
 /// MCP configuration attributes.
@@ -89,7 +90,7 @@ impl IggyTestAttrs {
             server: ServerAttrs::default(),
             seed_fn: None,
             cluster_nodes: ClusterNodesValue::None,
-            shared_server: None,
+            jwks_server: None,
         }
     }
 }
@@ -181,6 +182,9 @@ pub struct ServerAttrs {
     /// Dynamic config overrides using dot-notation paths.
     pub config_overrides: Vec<ConfigOverride>,
 
+    /// Path to a TOML config file for the server.
+    pub config_path: Option<String>,
+
     /// Special cases requiring custom codegen.
     pub mcp: Option<McpAttrs>,
     pub connectors_runtime: Option<ConnectorsRuntimeAttrs>,
@@ -256,8 +260,8 @@ impl Parse for IggyTestAttrs {
                 AttrItem::ClusterNodes(cluster) => {
                     attrs.cluster_nodes = cluster;
                 }
-                AttrItem::SharedServer(shared) => {
-                    attrs.shared_server = Some(shared);
+                AttrItem::JwksServer(jwks) => {
+                    attrs.jwks_server = Some(jwks);
                 }
             }
         }
@@ -275,7 +279,7 @@ enum AttrItem {
     Server(Box<ServerAttrs>),
     Seed(syn::Path),
     ClusterNodes(ClusterNodesValue),
-    SharedServer(SharedServerAttrs),
+    JwksServer(JwksAttrs),
 }
 
 impl Parse for AttrItem {
@@ -305,9 +309,11 @@ impl Parse for AttrItem {
                 let path: syn::Path = input.parse()?;
                 Ok(AttrItem::Seed(path))
             }
-            "shared_server" => {
-                let shared = parse_shared_server_attrs(input)?;
-                Ok(AttrItem::SharedServer(shared))
+            "jwks_server" => {
+                let content;
+                parenthesized!(content in input);
+                let jwks = parse_jwks_attrs(&content)?;
+                Ok(AttrItem::JwksServer(jwks))
             }
             _ => Err(syn::Error::new(
                 ident.span(),
@@ -429,6 +435,11 @@ fn parse_server_attrs(input: ParseStream) -> syn::Result<ServerAttrs> {
                 input.parse::<Token![=]>()?;
                 server.websocket_tls = Some(parse_tls_value(input, span)?);
             }
+            "config_path" => {
+                input.parse::<Token![=]>()?;
+                let lit: LitStr = input.parse()?;
+                server.config_path = Some(lit.value());
+            }
             _ => {
                 input.parse::<Token![=]>()?;
                 let value = parse_config_value(input)?;
@@ -487,13 +498,6 @@ fn parse_mcp_attrs(input: ParseStream) -> syn::Result<McpAttrs> {
     }
 
     Ok(mcp)
-}
-
-/// Parse `shared_server = "key"`.
-fn parse_shared_server_attrs(input: ParseStream) -> syn::Result<SharedServerAttrs> {
-    input.parse::<Token![=]>()?;
-    let lit: LitStr = input.parse()?;
-    Ok(SharedServerAttrs { key: lit.value() })
 }
 
 fn parse_connectors_runtime_attrs(input: ParseStream) -> syn::Result<ConnectorsRuntimeAttrs> {
@@ -559,6 +563,34 @@ impl ArrayLiteral {
             ArrayLiteral::Int(i) => i.base10_digits().to_string(),
         }
     }
+}
+
+fn parse_jwks_attrs(input: ParseStream) -> syn::Result<JwksAttrs> {
+    let mut attrs = JwksAttrs {
+        enabled: true,
+        ..Default::default()
+    };
+
+    let items: Punctuated<KeyValueAttrItem, Token![,]> = Punctuated::parse_terminated(input)?;
+
+    for item in items {
+        match item.key.as_str() {
+            "enabled" => {
+                attrs.enabled = item.value.parse().map_err(|_| {
+                    syn::Error::new(Span::call_site(), "enabled must be true or false")
+                })?;
+            }
+            "store_path" => attrs.store_path = Some(item.value),
+            other => {
+                return Err(syn::Error::new(
+                    Span::call_site(),
+                    format!("unknown jwks_server attribute: {other}"),
+                ));
+            }
+        }
+    }
+
+    Ok(attrs)
 }
 
 #[cfg(test)]

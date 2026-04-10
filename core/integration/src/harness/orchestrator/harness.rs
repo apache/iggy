@@ -18,20 +18,21 @@
  */
 
 use super::builder::TestHarnessBuilder;
-use crate::harness::config::{ClientConfig, ConnectorsRuntimeConfig};
+use crate::harness::config::{ClientConfig, JwksConfig};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::handle::{
-    ClientBuilder, ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerConnection,
-    ServerHandle, ServerLogs,
+    ClientBuilder, ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle,
+    ServerLogs,
 };
-use crate::harness::shared::SharedServerInfo;
-use crate::harness::traits::{IggyServerDependent, Restartable, TestBinary};
+use crate::harness::traits::{Restartable, TestBinary};
 use futures::executor::block_on;
 use iggy::prelude::{ClientWrapper, IggyClient};
 use iggy_common::TransportProtocol;
 use std::path::Path;
 use std::sync::Arc;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Collected logs from all binaries in the harness.
 #[derive(Debug)]
@@ -47,9 +48,9 @@ pub struct TestHarness {
     pub(super) client_configs: Vec<ClientConfig>,
     pub(super) primary_transport: Option<TransportProtocol>,
     pub(super) primary_client_config: Option<ClientConfig>,
+    pub(super) jwks_config: Option<JwksConfig>,
+    pub(super) jwks_server: Option<MockServer>,
     pub(super) started: bool,
-    pub(super) shared_server: Option<Arc<SharedServerInfo>>,
-    pub(super) shared_connectors_runtime: Option<ConnectorsRuntimeHandle>,
 }
 
 impl std::fmt::Debug for TestHarness {
@@ -73,39 +74,6 @@ impl std::fmt::Debug for TestHarness {
 impl TestHarness {
     pub fn builder() -> TestHarnessBuilder {
         TestHarnessBuilder::default()
-    }
-
-    /// Create a harness that uses a shared server (no ownership of server process).
-    ///
-    /// Each test still gets its own `TestContext` (for logs), connector runtime,
-    /// and clients. Only the iggy-server process is shared.
-    pub async fn from_shared(
-        shared: Arc<SharedServerInfo>,
-        connectors_runtime_config: Option<ConnectorsRuntimeConfig>,
-        primary_client_config: Option<ClientConfig>,
-    ) -> Result<Self, TestBinaryError> {
-        let mut context = TestContext::new(None, true)?;
-        context.ensure_created()?;
-        let context = Arc::new(context);
-
-        let shared_cr = connectors_runtime_config
-            .map(|cfg| ConnectorsRuntimeHandle::with_server_id(cfg, context.clone(), 0));
-
-        let primary_transport = primary_client_config.as_ref().map(|c| c.transport);
-
-        shared.acquire();
-
-        Ok(TestHarness {
-            context,
-            servers: Vec::new(),
-            clients: Vec::new(),
-            client_configs: Vec::new(),
-            primary_transport,
-            primary_client_config,
-            started: false,
-            shared_server: Some(shared),
-            shared_connectors_runtime: shared_cr,
-        })
     }
 
     /// Start all configured binaries and create clients.
@@ -133,76 +101,6 @@ impl TestHarness {
         self.start_internal(Some(seed)).await
     }
 
-    /// Start a shared-server harness without a seed function.
-    pub async fn start_shared(&mut self) -> Result<(), TestBinaryError> {
-        self.start_shared_internal(
-            None::<
-                fn(
-                    IggyClient,
-                )
-                    -> std::future::Ready<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-            >,
-        )
-        .await
-    }
-
-    /// Start a shared-server harness with a seed function.
-    ///
-    /// The seed runs BEFORE the connector runtime starts, allowing it to
-    /// create streams/topics that the connector expects to find.
-    pub async fn start_shared_with_seed<F, Fut>(&mut self, seed: F) -> Result<(), TestBinaryError>
-    where
-        F: FnOnce(IggyClient) -> Fut,
-        Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-    {
-        self.start_shared_internal(Some(seed)).await
-    }
-
-    async fn start_shared_internal<F, Fut>(
-        &mut self,
-        seed: Option<F>,
-    ) -> Result<(), TestBinaryError>
-    where
-        F: FnOnce(IggyClient) -> Fut,
-        Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-    {
-        if self.started {
-            return Err(TestBinaryError::AlreadyStarted);
-        }
-
-        let shared = self
-            .shared_server
-            .as_ref()
-            .ok_or_else(|| TestBinaryError::InvalidState {
-                message: "start_shared called without shared server".to_string(),
-            })?;
-
-        let tcp_addr = shared
-            .tcp_addr()
-            .ok_or_else(|| TestBinaryError::InvalidState {
-                message: "Shared server has no TCP address".to_string(),
-            })?;
-
-        // Seed runs before connector runtime - creates streams/topics
-        if let Some(seed_fn) = seed {
-            let client = self.tcp_root_client().await?;
-            seed_fn(client)
-                .await
-                .map_err(|e| TestBinaryError::SeedFailed(e.to_string()))?;
-        }
-
-        // Connector runtime starts after seed - streams/topics exist now
-        if let Some(ref mut cr) = self.shared_connectors_runtime {
-            cr.set_iggy_address(tcp_addr);
-            cr.start()?;
-            cr.wait_ready().await?;
-        }
-
-        self.create_clients().await?;
-        self.started = true;
-        Ok(())
-    }
-
     async fn start_internal<F, Fut>(&mut self, seed: Option<F>) -> Result<(), TestBinaryError>
     where
         F: FnOnce(IggyClient) -> Fut,
@@ -210,6 +108,44 @@ impl TestHarness {
     {
         if self.started {
             return Err(TestBinaryError::AlreadyStarted);
+        }
+
+        if let Some(jwks_config) = &self.jwks_config
+            && jwks_config.enabled
+        {
+            let mock_server = MockServer::start().await;
+
+            if let Some(store_path) = &jwks_config.store_path {
+                let content = std::fs::read_to_string(store_path).map_err(|e| {
+                    TestBinaryError::InvalidState {
+                        message: format!("Failed to read JWKS file at {}: {}", store_path, e),
+                    }
+                })?;
+
+                Mock::given(method("GET"))
+                    .and(path("/.well-known/jwks.json"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(content))
+                    .mount(&mock_server)
+                    .await;
+            }
+
+            let jwks_url = format!("{}/.well-known/jwks.json", mock_server.uri());
+            let issuer = jwks_config
+                .issuer_url
+                .as_deref()
+                .unwrap_or("https://test-issuer.com");
+
+            for server in &mut self.servers {
+                server.add_env("IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_ISSUER", issuer);
+                server.add_env(
+                    "IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_JWKS_URL",
+                    jwks_url.as_str(),
+                );
+                server.add_env("IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_AUDIENCE", "iggy");
+                server.add_env("IGGY_HTTP_JWT_TRUSTED_ISSUERS_0_USER_ID", "1");
+            }
+
+            self.jwks_server = Some(mock_server);
         }
 
         for server in &mut self.servers {
@@ -244,20 +180,6 @@ impl TestHarness {
         }
         self.clients.clear();
 
-        // Stop per-test connector runtime (shared server mode)
-        if let Some(ref mut cr) = self.shared_connectors_runtime {
-            cr.stop()?;
-        }
-
-        // Release shared server ref - last test stops the server and cleans up
-        if let Some(shared) = self.shared_server.take() {
-            if std::thread::panicking() {
-                shared.mark_failed();
-            }
-            shared.release();
-        }
-
-        // Stop owned servers (non-shared mode only)
         for server in self.servers.iter_mut().rev() {
             server.stop_dependents()?;
             server.stop()?;
@@ -288,24 +210,12 @@ impl TestHarness {
     }
 
     /// Get reference to the first (primary) server handle.
-    ///
-    /// Not available in `shared_server` mode - the server is managed by `SharedServerRegistry`.
     pub fn server(&self) -> &ServerHandle {
-        assert!(
-            self.shared_server.is_none(),
-            "server() is not available in shared_server mode"
-        );
         self.servers.first().expect("No servers configured")
     }
 
     /// Get mutable reference to the first (primary) server handle.
-    ///
-    /// Not available in `shared_server` mode - the server is managed by `SharedServerRegistry`.
     pub fn server_mut(&mut self) -> &mut ServerHandle {
-        assert!(
-            self.shared_server.is_none(),
-            "server_mut() is not available in shared_server mode"
-        );
         self.servers.first_mut().expect("No servers configured")
     }
 
@@ -382,15 +292,9 @@ impl TestHarness {
 
     /// Get the connectors runtime handle from the primary server if configured.
     ///
-    /// Returns the per-test connector runtime for shared-server harnesses,
-    /// or the server-owned one for standard harnesses.
-    ///
     /// # Panics
     /// Panics if called on a cluster (multiple servers). Use `node(i).connectors_runtime()` instead.
     pub fn connectors_runtime(&self) -> Option<&ConnectorsRuntimeHandle> {
-        if self.shared_connectors_runtime.is_some() {
-            return self.shared_connectors_runtime.as_ref();
-        }
         assert!(
             self.servers.len() <= 1,
             "connectors_runtime() is only available for single-server setups. Use node(i).connectors_runtime() for clusters."
@@ -425,18 +329,6 @@ impl TestHarness {
         &self,
         transport: TransportProtocol,
     ) -> Result<ClientBuilder, TestBinaryError> {
-        if let Some(ref shared) = self.shared_server {
-            let connection = ServerConnection {
-                tcp_addr: shared.tcp_addr(),
-                http_addr: shared.http_addr(),
-                quic_addr: shared.quic_addr(),
-                websocket_addr: shared.websocket_addr(),
-                tls: None,
-                websocket_tls: None,
-                tls_ca_cert_path: shared.tls_ca_cert_path().cloned(),
-            };
-            return Ok(ClientBuilder::new(transport, connection));
-        }
         let server = self.servers.first().ok_or(TestBinaryError::MissingServer)?;
         match transport {
             TransportProtocol::Tcp => server.tcp_client(),
@@ -464,7 +356,14 @@ impl TestHarness {
         &self,
         transport: TransportProtocol,
     ) -> Result<IggyClient, TestBinaryError> {
-        self.client_builder_for(transport)?.connect().await
+        let server = self.servers.first().ok_or(TestBinaryError::MissingServer)?;
+        let builder = match transport {
+            TransportProtocol::Tcp => server.tcp_client()?,
+            TransportProtocol::Http => server.http_client()?,
+            TransportProtocol::Quic => server.quic_client()?,
+            TransportProtocol::WebSocket => server.websocket_client()?,
+        };
+        builder.connect().await
     }
 
     pub async fn tcp_root_client(&self) -> Result<IggyClient, TestBinaryError> {
@@ -564,33 +463,16 @@ impl TestHarness {
     }
 
     pub(super) async fn create_clients(&mut self) -> Result<(), TestBinaryError> {
-        // Resolve addresses from either owned server or shared server
-        let (tcp, http, quic, ws, ca_cert) = if let Some(ref shared) = self.shared_server {
-            (
-                shared.tcp_addr(),
-                shared.http_addr(),
-                shared.quic_addr(),
-                shared.websocket_addr(),
-                shared.tls_ca_cert_path().cloned(),
-            )
-        } else if let Some(server) = self.servers.first() {
-            (
-                server.tcp_addr(),
-                server.http_addr(),
-                server.quic_addr(),
-                server.websocket_addr(),
-                server.tls_ca_cert_path(),
-            )
-        } else {
+        let Some(server) = self.servers.first() else {
             return Ok(());
         };
 
         for config in &self.client_configs {
             let address = match config.transport {
-                TransportProtocol::Tcp => tcp,
-                TransportProtocol::Http => http,
-                TransportProtocol::Quic => quic,
-                TransportProtocol::WebSocket => ws,
+                TransportProtocol::Tcp => server.tcp_addr(),
+                TransportProtocol::Http => server.http_addr(),
+                TransportProtocol::Quic => server.quic_addr(),
+                TransportProtocol::WebSocket => server.websocket_addr(),
             };
 
             let Some(address) = address else {
@@ -601,9 +483,9 @@ impl TestHarness {
 
             let mut config = config.clone();
             if config.tls_enabled
-                && let Some(ref path) = ca_cert
+                && let Some(ca_cert_path) = server.tls_ca_cert_path()
             {
-                config.tls_ca_file = Some(path.clone());
+                config.tls_ca_file = Some(ca_cert_path);
             }
 
             let mut client = ClientHandle::new(config, address);

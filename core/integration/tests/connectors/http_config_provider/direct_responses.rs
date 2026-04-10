@@ -23,9 +23,8 @@ use integration::iggy_harness;
 use reqwest::StatusCode;
 
 #[iggy_harness(
-    shared_server = "http_config_direct",
     server(connectors_runtime(config_path = "tests/connectors/http_config_provider/config_direct.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn source_configs_list_returns_all_versions(
     harness: &TestHarness,
@@ -66,8 +65,8 @@ async fn source_configs_list_returns_all_versions(
     assert_eq!(streams.len(), 1, "Should have 1 stream config");
 
     let stream = &streams[0];
-    assert_eq!(stream["stream"].as_str().unwrap(), seeds::names::STREAM);
-    assert_eq!(stream["topic"].as_str().unwrap(), seeds::names::TOPIC);
+    assert_eq!(stream["stream"].as_str().unwrap(), "test_stream");
+    assert_eq!(stream["topic"].as_str().unwrap(), "test_topic");
     assert_eq!(stream["schema"].as_str().unwrap(), "json");
     assert!(stream["batch_length"].as_u64().is_some());
     assert!(stream["linger_time"].as_str().is_some());
@@ -81,9 +80,8 @@ async fn source_configs_list_returns_all_versions(
 }
 
 #[iggy_harness(
-    shared_server = "http_config_direct",
     server(connectors_runtime(config_path = "tests/connectors/http_config_provider/config_direct.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn source_config_by_version_returns_specific_version(
     harness: &TestHarness,
@@ -113,13 +111,12 @@ async fn source_config_by_version_returns_specific_version(
 
     let streams = body["streams"].as_array().unwrap();
     assert_eq!(streams.len(), 1);
-    assert_eq!(streams[0]["topic"].as_str().unwrap(), seeds::names::TOPIC);
+    assert_eq!(streams[0]["topic"].as_str().unwrap(), "test_topic");
 }
 
 #[iggy_harness(
-    shared_server = "http_config_direct",
     server(connectors_runtime(config_path = "tests/connectors/http_config_provider/config_direct.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn source_active_config_returns_current_version(
     harness: &TestHarness,
@@ -154,9 +151,8 @@ async fn source_active_config_returns_current_version(
 }
 
 #[iggy_harness(
-    shared_server = "http_config_direct",
     server(connectors_runtime(config_path = "tests/connectors/http_config_provider/config_direct.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn sink_configs_list_returns_all_versions(
     harness: &TestHarness,
@@ -197,10 +193,10 @@ async fn sink_configs_list_returns_all_versions(
     assert_eq!(streams.len(), 1, "Should have 1 stream config");
 
     let stream = &streams[0];
-    assert_eq!(stream["stream"].as_str().unwrap(), seeds::names::STREAM);
+    assert_eq!(stream["stream"].as_str().unwrap(), "test_stream");
     let topics = stream["topics"].as_array().unwrap();
     assert_eq!(topics.len(), 1);
-    assert_eq!(topics[0].as_str().unwrap(), seeds::names::TOPIC);
+    assert_eq!(topics[0].as_str().unwrap(), "test_topic");
     assert_eq!(stream["schema"].as_str().unwrap(), "json");
     assert!(stream["batch_length"].as_u64().is_some());
     assert!(stream["poll_interval"].as_str().is_some());
@@ -211,9 +207,8 @@ async fn sink_configs_list_returns_all_versions(
 }
 
 #[iggy_harness(
-    shared_server = "http_config_direct",
     server(connectors_runtime(config_path = "tests/connectors/http_config_provider/config_direct.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn sink_config_by_version_returns_specific_version(
     harness: &TestHarness,
@@ -244,13 +239,12 @@ async fn sink_config_by_version_returns_specific_version(
     let streams = body["streams"].as_array().unwrap();
     assert_eq!(streams.len(), 1);
     let topics = streams[0]["topics"].as_array().unwrap();
-    assert_eq!(topics[0].as_str().unwrap(), seeds::names::TOPIC);
+    assert_eq!(topics[0].as_str().unwrap(), "test_topic");
 }
 
 #[iggy_harness(
-    shared_server = "http_config_direct",
     server(connectors_runtime(config_path = "tests/connectors/http_config_provider/config_direct.toml")),
-    seed = seeds::connector_stream_idempotent
+    seed = seeds::connector_stream
 )]
 async fn sink_active_config_returns_current_version(
     harness: &TestHarness,
