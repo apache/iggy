@@ -97,15 +97,26 @@ where
                 0
             })
         } else {
-            // TODO: View change messages (StartViewChange, DoViewChange, StartView) return
-            // Operation::Reserved, so they always land here and route to shard 0. This is
-            // correct only in single-shard deployments. In multi-shard, partition-plane view
-            // change messages must reach the shard owning that consensus group. Fixing this
-            // requires routing by Command2 + consensus namespace (a u64) rather than by
-            // Operation + IggyNamespace, since view change headers don't carry an IggyNamespace.
+            // TODO: View change messages (StartViewChange, DoViewChange, StartView) and
+            // Commit heartbeats return Operation::Reserved, so they always land here and
+            // route to shard 0. This is correct only in single-shard deployments. In
+            // multi-shard, partition-plane messages must reach the shard owning that
+            // consensus group. Fixing this requires routing by Command2 + consensus
+            // namespace (a u64) rather than by Operation + IggyNamespace, since these
+            // headers don't carry an IggyNamespace.
             0
         };
-        let _ = self.senders[target as usize].send(ShardFrame::fire_and_forget(generic));
+        if self.senders[target as usize]
+            .send(ShardFrame::fire_and_forget(generic))
+            .is_err()
+        {
+            tracing::warn!(
+                shard = self.id,
+                target,
+                ?operation,
+                "dispatch: shard channel full or closed, message dropped"
+            );
+        }
     }
 
     /// Dispatch a message and return a receiver that resolves when the target
@@ -171,12 +182,19 @@ where
                 0
             })
         } else {
-            // TODO: Same view-change routing issue as dispatch() above.
+            // TODO: Same view-change and Commit routing issue as dispatch() above.
             0
         };
         // Create a frame and send it to the target shard.
         let (frame, rx) = ShardFrame::<R>::with_response(generic);
-        let _ = self.senders[target as usize].send(frame);
+        if self.senders[target as usize].send(frame).is_err() {
+            tracing::warn!(
+                shard = self.id,
+                target,
+                ?operation,
+                "dispatch_request: shard channel full or closed, message dropped"
+            );
+        }
         Ok(rx)
     }
 

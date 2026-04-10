@@ -116,6 +116,7 @@ pub enum ControlActionKind {
     SendPrepareOk,
     SendPrepare,
     RebuildPipeline,
+    CommitJournal,
     SendCommit,
 }
 
@@ -129,6 +130,7 @@ impl ControlActionKind {
             Self::SendPrepareOk => "send_prepare_ok",
             Self::SendPrepare => "send_prepare",
             Self::RebuildPipeline => "rebuild_pipeline",
+            Self::CommitJournal => "commit_journal",
             Self::SendCommit => "send_commit",
         }
     }
@@ -350,6 +352,13 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: Some(from_op),
                 commit: Some(to_op),
+            },
+            VsrAction::CommitJournal => Self {
+                replica,
+                action: ControlActionKind::CommitJournal,
+                target_replica: None,
+                op: None,
+                commit: None,
             },
             VsrAction::SendCommit { commit, .. } => Self {
                 replica,

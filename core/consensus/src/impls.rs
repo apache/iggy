@@ -454,6 +454,10 @@ pub enum VsrAction {
     /// from the WAL so that incoming `PrepareOk` messages can be matched
     /// and commits can proceed.
     RebuildPipeline { from_op: u64, to_op: u64 },
+    /// Catch up `commit_min` to `commit_max` by applying committed ops from the
+    /// journal. Emitted during view change completion so the new primary
+    /// is fully caught up before accepting new requests.
+    CommitJournal,
     /// Primary heartbeat: send current commit point to all backups.
     ///
     /// Emitted when the `CommitMessage` timeout fires. Prevents backups
@@ -1083,23 +1087,18 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
-        assert_eq!(
-            self.commit_min.get(),
-            self.commit_max.get(),
-            "primary commit_min ({}) != commit_max ({}): cannot send commit heartbeat \
-             for ops not yet locally executed",
-            self.commit_min.get(),
-            self.commit_max.get()
-        );
-
         self.timeouts.borrow_mut().reset(TimeoutKind::CommitMessage);
 
+        // Don't advertise a commit point we haven't locally executed yet.
+        // After view change the new primary may have commit_min < commit_max
+        // until commit_journal catches up. Send commit_min (what we've
+        // actually applied) so backups don't advance past us.
         let ts = self.heartbeat_timestamp.get() + 1;
         self.heartbeat_timestamp.set(ts);
 
         vec![VsrAction::SendCommit {
             view: self.view.get(),
-            commit: self.commit_max.get(),
+            commit: self.commit_min.get(),
             namespace: self.namespace,
             timestamp_monotonic: ts,
         }]
@@ -1469,8 +1468,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// to prevent old/replayed messages from suppressing view changes.
     ///
     /// # Panics
-    /// - If `header.namespace` does not match this replica's namespace.
-    /// - If `header.replica` is not the primary for `header.view` (protocol violation).
+    /// If `header.namespace` does not match this replica's namespace.
     pub fn handle_commit(&self, header: &iggy_binary_protocol::CommitHeader) -> bool {
         assert_eq!(
             header.namespace, self.namespace,
@@ -1489,13 +1487,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return false;
         }
 
-        assert_eq!(
-            header.replica,
-            self.primary_index(header.view),
-            "Commit from non-primary replica {} in view {}",
-            header.replica,
-            header.view
-        );
+        // TODO: Once connection-level peer verification is added promote
+        // this to an assert — the network layer would guarantee the sender
+        // matches header.replica.
+        if header.replica != self.primary_index(header.view) {
+            return false;
+        }
 
         // Only accept heartbeats with a strictly newer timestamp to prevent
         // old/replayed commit messages from resetting the timeout.
@@ -1579,6 +1576,10 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         );
 
         let mut actions = vec![action];
+        // Catch up commit_min to commit_max before rebuilding the pipeline.
+        // Without this, a behind backup (commit_min < max_commit) that becomes
+        // primary would have unapplied committed ops.
+        actions.push(VsrAction::CommitJournal);
         // The new primary must rebuild its pipeline from the journal so that
         // incoming PrepareOk messages can be matched and commits can proceed.
         if max_commit < new_op {

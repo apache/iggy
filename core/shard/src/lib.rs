@@ -448,6 +448,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
+        M: StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = bytes::Bytes,
+                Error = iggy_common::IggyError,
+            >,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -457,6 +462,12 @@ where
         {
             let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &header);
             dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            if actions
+                .iter()
+                .any(|a| matches!(a, VsrAction::CommitJournal))
+            {
+                planes.0.commit_journal().await;
+            }
             return;
         }
 
@@ -465,6 +476,12 @@ where
         {
             let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header);
             dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
+            if actions
+                .iter()
+                .any(|a| matches!(a, VsrAction::CommitJournal))
+            {
+                planes.1.0.commit_journal().await;
+            }
             return;
         }
 
@@ -791,8 +808,11 @@ async fn dispatch_vsr_actions<B, P, J>(
                     })
                     .collect();
                 if let Some(missing_op) = gap_at {
-                    // Journal repair is not yet implemented. The new primary
-                    // will stall on this op until repair is added.
+                    // Journal repair is not yet implemented.Truncate the sequencer
+                    // to the last op we could rebuild so the next client
+                    // prepare chains correctly. Ops above the
+                    // gap are lost until journal repair is added.
+                    let rebuilt_up_to = missing_op.saturating_sub(1);
                     tracing::warn!(
                         replica = self_id,
                         missing_op,
@@ -800,16 +820,21 @@ async fn dispatch_vsr_actions<B, P, J>(
                         range_end = to_op,
                         rebuilt = entries.len(),
                         "RebuildPipeline: journal gap at op {missing_op}, \
-                         pipeline partially rebuilt ({}/{} ops)",
+                         truncating sequencer from {to_op} to {rebuilt_up_to} \
+                         ({}/{} ops rebuilt)",
                         entries.len(),
                         to_op - from_op + 1,
                     );
+                    consensus.sequencer().set_sequence(rebuilt_up_to);
                 }
                 let mut pipeline = consensus.pipeline().borrow_mut();
                 for entry in entries {
                     pipeline.push(entry);
                 }
             }
+            // Handled by the caller (shard view change handlers) since it
+            // requires access to the plane's commit_journal method.
+            VsrAction::CommitJournal => {}
             VsrAction::SendCommit {
                 view,
                 commit,

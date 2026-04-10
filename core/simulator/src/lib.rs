@@ -397,4 +397,71 @@ mod tests {
             "expected reply from new primary after view change"
         );
     }
+
+    /// Regression: a behind backup (`commit_min < commit_max`) becoming the new
+    /// primary must not panic during the `CommitMessage` heartbeat timeout.
+    /// Previously, `handle_commit_message_timeout` asserted `commit_min == commit_max`,
+    /// which fails when the new primary hasn't caught up yet.
+    #[test]
+    fn view_change_behind_backup_becomes_primary() {
+        iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            ..packet::PacketSimulatorOptions::default()
+        };
+
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+        let ns = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns);
+
+        // Send several messages so the primary commits ahead of backups.
+        // Backups receive prepares but may not have committed all of them
+        // (commit_max lags behind the primary's commit_min because the
+        // primary's commit point is only propagated via subsequent Prepare
+        // headers or Commit heartbeats).
+        for i in 0..3 {
+            let msg = client.send_messages(ns, &[format!("msg-{i}").as_bytes()]);
+            sim.submit_request(client_id, 0, msg.into_generic());
+            // Only a few steps — enough for replication but not for the
+            // backup to fully learn the commit point.
+            for _ in 0..10 {
+                sim.step();
+            }
+        }
+
+        // Crash the primary immediately. Backups may have commit_min < commit_max.
+        sim.replica_crash(0);
+
+        // Run view change. This must not panic in handle_commit_message_timeout.
+        for _ in 0..800 {
+            sim.step();
+        }
+
+        // Verify a new primary was elected and is functional.
+        let mut new_primary_found = false;
+        for idx in 1..replica_count {
+            let c = sim.replicas[idx as usize]
+                .plane
+                .partitions()
+                .consensus()
+                .unwrap();
+            if c.view() > 0 && c.status() == Status::Normal && c.is_primary() {
+                new_primary_found = true;
+            }
+        }
+        assert!(new_primary_found, "expected a new primary");
+    }
 }
