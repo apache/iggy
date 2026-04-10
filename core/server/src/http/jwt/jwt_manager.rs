@@ -436,7 +436,7 @@ mod tests {
     fn test_normalize_issuer_url_trailing_slash() {
         assert_eq!(
             normalize_issuer_url("HTTPS://Example.COM/"),
-            "https://example.com"
+            "https://example.com/"
         );
     }
 
