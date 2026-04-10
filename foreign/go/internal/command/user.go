@@ -37,7 +37,7 @@ func (c *CreateUser) Code() Code {
 func (c *CreateUser) MarshalBinary() ([]byte, error) {
 	capacity := 4 + len(c.Username) + len(c.Password)
 	if c.Permissions != nil {
-		capacity += 1 + 4 + c.Permissions.Size()
+		capacity += 4 + c.Permissions.Size()
 	}
 
 	bytes := make([]byte, capacity)
@@ -116,10 +116,10 @@ func (u *UpdatePermissions) MarshalBinary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	length := len(userIdBytes)
+	length := len(userIdBytes) + 1
 
 	if u.Permissions != nil {
-		length += 1 + 4 + u.Permissions.Size()
+		length += 4 + u.Permissions.Size()
 	}
 
 	bytes := make([]byte, length)
