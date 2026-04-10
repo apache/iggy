@@ -23,6 +23,14 @@ use secrecy::SecretString;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackendType {
+    S3,
+    Azure,
+    Gcs,
+}
+
 mod coercions;
 mod sink;
 mod storage;
@@ -49,7 +57,7 @@ struct SinkState {
 pub struct DeltaSinkConfig {
     pub table_uri: String,
     #[serde(default)]
-    pub storage_backend_type: Option<String>,
+    pub storage_backend_type: Option<StorageBackendType>,
 
     // AWS S3
     #[serde(default)]

@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::DeltaSinkConfig;
+use crate::{DeltaSinkConfig, StorageBackendType};
 use iggy_connector_sdk::Error;
 use secrecy::ExposeSecret;
 use std::collections::HashMap;
@@ -26,8 +26,8 @@ pub(crate) fn build_storage_options(
 ) -> Result<HashMap<String, String>, Error> {
     let mut opts = HashMap::new();
 
-    match config.storage_backend_type.as_deref() {
-        Some("s3") => {
+    match config.storage_backend_type {
+        Some(StorageBackendType::S3) => {
             let access_key = config.aws_s3_access_key.as_ref().ok_or_else(|| {
                 Error::InitError("S3 backend requires 'aws_s3_access_key'".into())
             })?;
@@ -54,7 +54,7 @@ pub(crate) fn build_storage_options(
                 opts.insert("AWS_S3_ALLOW_HTTP".into(), allow_http.to_string());
             }
         }
-        Some("azure") => {
+        Some(StorageBackendType::Azure) => {
             let account_name = config.azure_storage_account_name.as_ref().ok_or_else(|| {
                 Error::InitError("Azure backend requires 'azure_storage_account_name'".into())
             })?;
@@ -89,7 +89,7 @@ pub(crate) fn build_storage_options(
                 }
             }
         }
-        Some("gcs") => {
+        Some(StorageBackendType::Gcs) => {
             let service_account_key = config.gcs_service_account_key.as_ref().ok_or_else(|| {
                 Error::InitError("GCS backend requires 'gcs_service_account_key'".into())
             })?;
@@ -104,11 +104,6 @@ pub(crate) fn build_storage_options(
             );
             opts.insert("GCS_BUCKET".into(), bucket.clone());
         }
-        Some(unknown) => {
-            return Err(Error::InitError(format!(
-                "Unknown storage backend type: '{unknown}'. Valid options are 's3', 'azure', 'gcs'"
-            )));
-        }
         None => {}
     }
 
@@ -118,7 +113,7 @@ pub(crate) fn build_storage_options(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DeltaSinkConfig;
+    use crate::{DeltaSinkConfig, StorageBackendType};
 
     fn default_config() -> DeltaSinkConfig {
         DeltaSinkConfig {
@@ -147,7 +142,7 @@ mod tests {
 
     fn s3_config() -> DeltaSinkConfig {
         DeltaSinkConfig {
-            storage_backend_type: Some("s3".into()),
+            storage_backend_type: Some(StorageBackendType::S3),
             aws_s3_access_key: Some("AKID".into()),
             aws_s3_secret_key: Some("SECRET".to_string().into()),
             aws_s3_region: Some("us-east-1".into()),
@@ -159,7 +154,7 @@ mod tests {
 
     fn azure_config_with_key() -> DeltaSinkConfig {
         DeltaSinkConfig {
-            storage_backend_type: Some("azure".into()),
+            storage_backend_type: Some(StorageBackendType::Azure),
             azure_storage_account_name: Some("myaccount".into()),
             azure_storage_account_key: Some("mykey".to_string().into()),
             azure_storage_sas_token: None,
@@ -170,7 +165,7 @@ mod tests {
 
     fn azure_config_with_sas() -> DeltaSinkConfig {
         DeltaSinkConfig {
-            storage_backend_type: Some("azure".into()),
+            storage_backend_type: Some(StorageBackendType::Azure),
             azure_storage_account_name: Some("myaccount".into()),
             azure_storage_account_key: None,
             azure_storage_sas_token: Some("mysas".to_string().into()),
@@ -181,7 +176,7 @@ mod tests {
 
     fn gcs_config() -> DeltaSinkConfig {
         DeltaSinkConfig {
-            storage_backend_type: Some("gcs".into()),
+            storage_backend_type: Some(StorageBackendType::Gcs),
             gcs_service_account_key: Some("{\"key\": \"value\"}".to_string().into()),
             gcs_bucket: Some("mybucket".into()),
             ..default_config()
@@ -316,12 +311,4 @@ mod tests {
         assert!(build_storage_options(&config).is_err());
     }
 
-    #[test]
-    fn unknown_backend_type_errors() {
-        let config = DeltaSinkConfig {
-            storage_backend_type: Some("unknown".into()),
-            ..default_config()
-        };
-        assert!(build_storage_options(&config).is_err());
-    }
 }
