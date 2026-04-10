@@ -88,6 +88,7 @@ rustls-pemfile = { workspace = true }
 secrecy = { workspace = true }
 send_wrapper = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true }
 strum = { workspace = true }

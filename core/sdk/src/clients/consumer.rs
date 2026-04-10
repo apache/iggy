@@ -569,6 +569,9 @@ impl IggyConsumer {
                     DiagnosticEvent::Connected => {
                         trace!("Connected to the server");
                         joined_consumer_group.store(false, ORDERING);
+                        if !is_consumer_group {
+                            can_poll.store(true, ORDERING);
+                        }
                         if disconnected {
                             reconnected = true;
                             disconnected = false;
