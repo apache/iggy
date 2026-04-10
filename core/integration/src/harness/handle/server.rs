@@ -216,7 +216,7 @@ impl ServerHandle {
 
         for (key, value) in std::env::vars() {
             if key.starts_with("IGGY_") && !PROTECTED_PREFIXES.iter().any(|p| key.starts_with(p)) {
-                self.envs.insert(key, value);
+                self.envs.entry(key).or_insert(value);
             }
         }
 

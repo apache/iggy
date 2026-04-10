@@ -23,4 +23,4 @@ license = "Apache-2.0"
 
 [dependencies]
 aligned-vec = "0.6"
-compio-buf = "0.8.0"
+compio-buf = "0.8.1"

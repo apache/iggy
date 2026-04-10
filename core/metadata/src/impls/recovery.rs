@@ -21,7 +21,7 @@ use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, Snapshot
 use iggy_binary_protocol::consensus::PrepareHeader;
 use iggy_binary_protocol::consensus::message::Message;
 use iggy_common::IggyError;
-use journal::metadata_journal::{JournalError, MetadataJournal};
+use journal::prepare_journal::{JournalError, PrepareJournal};
 use std::fmt;
 use std::path::Path;
 
@@ -82,7 +82,7 @@ impl From<std::io::Error> for RecoveryError {
 
 /// Result of a successful metadata recovery.
 pub struct RecoveredMetadata<M> {
-    pub journal: MetadataJournal,
+    pub journal: PrepareJournal,
     pub snapshot: IggySnapshot,
     pub mux_stm: M,
     /// `None` means no snapshot existed and no journal entries were replayed.
@@ -125,7 +125,7 @@ where
 
     // 3. Open journal, scan the WAL and build index
     let journal_path = metadata_dir.join("journal.wal");
-    let journal = MetadataJournal::open(&journal_path, snapshot.sequence_number()).await?;
+    let journal = PrepareJournal::open(&journal_path, snapshot.sequence_number()).await?;
 
     // 4. Replay journal entries after snapshot
     let headers_to_replay = journal.iter_headers_from(replay_from);
@@ -214,7 +214,7 @@ mod tests {
         std::fs::create_dir_all(&metadata_dir).unwrap();
 
         {
-            let journal = MetadataJournal::open(&metadata_dir.join("journal.wal"), 0)
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
                 .await
                 .unwrap();
             journal.append(make_prepare(1, 32)).await.unwrap();
@@ -242,7 +242,7 @@ mod tests {
 
         // WAL has ops 1-10
         {
-            let journal = MetadataJournal::open(&metadata_dir.join("journal.wal"), 0)
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
                 .await
                 .unwrap();
             for op in 1..=10 {

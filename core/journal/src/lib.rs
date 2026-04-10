@@ -19,7 +19,7 @@ use std::io;
 use std::ops::{Deref, RangeInclusive};
 
 pub mod file_storage;
-pub mod metadata_journal;
+pub mod prepare_journal;
 
 pub trait Journal<S>
 where

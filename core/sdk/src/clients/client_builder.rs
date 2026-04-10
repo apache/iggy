@@ -308,6 +308,12 @@ impl HttpClientBuilder {
         self
     }
 
+    /// Sets the JWT for A2A (Agent-to-Agent) authentication.
+    pub fn with_jwt(mut self, token: String) -> Self {
+        self.config = self.config.with_jwt(token);
+        self
+    }
+
     /// Builds the parent `IggyClient` with HTTP configuration.
     pub fn build(self) -> Result<IggyClient, IggyError> {
         let client = HttpClient::create(Arc::new(self.config.build()))?;

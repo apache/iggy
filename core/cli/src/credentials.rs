@@ -22,7 +22,7 @@ use anyhow::{Context, bail};
 use iggy::clients::client::IggyClient;
 use iggy::prelude::{Args, IggyError, PersonalAccessTokenClient, UserClient};
 use iggy_cli::commands::binary_system::session::ServerSession;
-use passterm::{Stream, isatty, prompt_password_stdin, prompt_password_tty};
+use passterm::{Stream, isatty, prompt_password_tty};
 use secrecy::{ExposeSecret, SecretString};
 use std::env::var;
 
@@ -121,7 +121,9 @@ impl<'a> IggyCredentials<'a> {
                     let pwd = if isatty(Stream::Stdin) {
                         prompt_password_tty(Some("Password: "))?
                     } else {
-                        prompt_password_stdin(None, Stream::Stdout)?
+                        let mut pwd = String::new();
+                        std::io::stdin().read_line(&mut pwd)?;
+                        pwd.trim_end_matches(['\n', '\r']).to_string()
                     };
                     SecretString::from(pwd)
                 }
