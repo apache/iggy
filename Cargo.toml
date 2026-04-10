@@ -164,11 +164,11 @@ hostname = "0.4.2"
 http = "1"
 human-repr = "1.1.0"
 humantime = "2.3.0"
-hwlocality = "1.0.0-alpha.11"
+hwlocality = "1.0.0-alpha.12"
 iceberg = "0.9.0"
 iceberg-catalog-rest = "0.9.0"
 iceberg-storage-opendal = "0.9.0"
-iggy = { path = "core/sdk", version = "0.10.0" }
+iggy = { path = "core/sdk", version = "0.10.1" }
 iggy-cli = { path = "core/cli", version = "0.13.0" }
 iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.0" }
 iggy_common = { path = "core/common", version = "0.10.0" }
@@ -218,7 +218,7 @@ opentelemetry_sdk = { version = "0.31.0", features = [
 papaya = "0.2.4"
 parquet = "57.3.0"
 partitions = { path = "core/partitions" }
-passterm = "=2.0.1"
+passterm = "2.0.6"
 paste = "1.0"
 postcard = { version = "1.1.3", features = ["alloc"] }
 predicates = "3.1.4"
@@ -295,7 +295,7 @@ trait-variant = "0.1.2"
 tungstenite = "0.29.0"
 twox-hash = { version = "2.1.2", features = ["xxhash32"] }
 ulid = "1.2.1"
-url = "2.5.8"
+ureq = "2.10"
 uuid = { version = "1.23.0", features = ["v4", "v7", "fast-rng", "serde", "zerocopy"] }
 vergen-git2 = { version = "9.1.0", features = ["build", "cargo", "rustc", "si"] }
 walkdir = "2.5.0"

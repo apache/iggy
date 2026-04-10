@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::client_table::ClientTable;
 use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
 use crate::{
     AckLogEvent, Consensus, ControlActionLogEvent, DvcQuorumArray, IgnoreReason, Pipeline,
@@ -85,6 +86,10 @@ pub const PIPELINE_PREPARE_QUEUE_MAX: usize = 8;
 
 /// Maximum number of replicas in a cluster.
 pub const REPLICAS_MAX: usize = 32;
+
+/// Maximum number of clients tracked in the clients table.
+/// When exceeded, the client with the oldest committed request is evicted.
+pub const CLIENTS_TABLE_MAX: usize = 8192;
 
 #[derive(Debug)]
 pub struct PipelineEntry {
@@ -403,7 +408,7 @@ pub enum Status {
 }
 
 /// Actions to be taken by the caller after processing a VSR event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum VsrAction {
     /// Send `StartViewChange` to all replicas.
     SendStartViewChange { view: u32, namespace: u64 },
@@ -423,12 +428,45 @@ pub enum VsrAction {
         commit: u64,
         namespace: u64,
     },
-    /// Send `PrepareOK` to primary.
+    /// Send `PrepareOK` for each op in `[from_op, to_op]` that is present in the WAL.
+    ///
+    /// The caller MUST verify each op exists in the journal before sending.
+    /// Sending `PrepareOk` for a missing op is a safety violation, it can
+    /// cause the primary to commit an op without enough replicas holding the data.
     SendPrepareOk {
         view: u32,
-        op: u64,
+        from_op: u64,
+        to_op: u64,
         target: u8,
         namespace: u64,
+    },
+    /// Retransmit uncommitted prepares from the WAL to replicas that haven't acked.
+    ///
+    /// Emitted when the primary's prepare timeout fires and there are
+    /// uncommitted entries in the pipeline. Each entry is a prepare header
+    /// (for journal lookup) and the list of replica IDs that need it.
+    RetransmitPrepares {
+        targets: Vec<(PrepareHeader, Vec<u8>)>,
+    },
+    /// Rebuild the pipeline from the journal after a view change.
+    ///
+    /// The new primary must re-populate its pipeline with uncommitted ops
+    /// from the WAL so that incoming `PrepareOk` messages can be matched
+    /// and commits can proceed.
+    RebuildPipeline { from_op: u64, to_op: u64 },
+    /// Catch up `commit_min` to `commit_max` by applying committed ops from the
+    /// journal. Emitted during view change completion so the new primary
+    /// is fully caught up before accepting new requests.
+    CommitJournal,
+    /// Primary heartbeat: send current commit point to all backups.
+    ///
+    /// Emitted when the `CommitMessage` timeout fires. Prevents backups
+    /// from starting a view change during idle periods.
+    SendCommit {
+        view: u32,
+        commit: u64,
+        namespace: u64,
+        timestamp_monotonic: u64,
     },
 }
 
@@ -477,7 +515,16 @@ where
     // * `replica.log_view = 0` when replica_count=1.
     log_view: Cell<u32>,
     status: Cell<Status>,
-    commit: Cell<u64>,
+
+    /// Highest op number that has been locally executed (state machine applied,
+    /// client table updated). Advances one-by-one in `commit_journal` (backup)
+    /// and `on_ack` (primary). On a normal primary, `commit_min == commit_max`.
+    commit_min: Cell<u64>,
+
+    /// Highest op number known to be committed by the cluster. Advances
+    /// immediately when the replica learns about commits (from prepare
+    /// messages, commit heartbeats, or view change messages).
+    commit_max: Cell<u64>,
 
     sequencer: LocalSequencer,
 
@@ -502,6 +549,13 @@ where
     sent_own_do_view_change: Cell<bool>,
 
     timeouts: RefCell<TimeoutManager>,
+
+    /// Monotonic timestamp from the most recent accepted commit heartbeat.
+    /// Old/replayed commit messages with a lower timestamp are ignored.
+    heartbeat_timestamp: Cell<u64>,
+
+    /// VSR client-table for duplicate detection and reply caching.
+    client_table: RefCell<ClientTable>,
 }
 
 impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
@@ -534,7 +588,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             log_view: Cell::new(0),
             status: Cell::new(Status::Recovering),
             sequencer: LocalSequencer::new(0),
-            commit: Cell::new(0),
+            commit_min: Cell::new(0),
+            commit_max: Cell::new(0),
             last_timestamp: Cell::new(0),
             last_prepare_checksum: Cell::new(0),
             pipeline: RefCell::new(pipeline),
@@ -546,12 +601,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             sent_own_start_view_change: Cell::new(false),
             sent_own_do_view_change: Cell::new(false),
             timeouts: RefCell::new(TimeoutManager::new(timeout_seed)),
+            heartbeat_timestamp: Cell::new(0),
+            client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
         }
     }
 
-    // TODO: More init logic.
     pub fn init(&self) {
         self.status.set(Status::Normal);
+        let mut timeouts = self.timeouts.borrow_mut();
+        if self.is_primary() {
+            timeouts.start(TimeoutKind::Prepare);
+            timeouts.start(TimeoutKind::CommitMessage);
+        } else {
+            timeouts.start(TimeoutKind::NormalHeartbeat);
+        }
     }
 
     #[must_use]
@@ -567,14 +630,38 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.primary_index(self.view.get()) == self.replica
     }
 
+    /// Advance `commit_max` - the highest op known to be committed by the cluster.
+    ///
+    /// Called when the replica learns about new commits from the primary
+    /// (via prepare messages, commit heartbeats, or view change messages).
+    ///
     /// # Panics
-    /// If the stored commit number somehow exceeds the given `commit` after update.
-    pub fn advance_commit_number(&self, commit: u64) {
-        if commit > self.commit.get() {
-            self.commit.set(commit);
+    /// If `commit_max` would be less than `commit_min` after the update
+    /// (invariant violation).
+    pub fn advance_commit_max(&self, commit: u64) {
+        if commit > self.commit_max.get() {
+            self.commit_max.set(commit);
         }
+        assert!(self.commit_max.get() >= self.commit_min.get());
+    }
 
-        assert!(self.commit.get() >= commit);
+    /// Advance `commit_min` - the highest op locally executed.
+    ///
+    /// Called after each op is applied through `commit_journal` (backup)
+    /// or `on_ack` (primary). Must advance sequentially (by 1).
+    ///
+    /// # Panics
+    /// - If `op` is not exactly `commit_min + 1` (must advance sequentially).
+    /// - If `commit_min` would exceed `commit_max` after the update.
+    pub fn advance_commit_min(&self, op: u64) {
+        assert_eq!(
+            op,
+            self.commit_min.get() + 1,
+            "commit_min must advance sequentially: expected {}, got {op}",
+            self.commit_min.get() + 1
+        );
+        self.commit_min.set(op);
+        assert!(self.commit_max.get() >= self.commit_min.get());
     }
 
     /// Maximum number of faulty replicas that can be tolerated.
@@ -590,9 +677,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.max_faulty() + 1
     }
 
+    /// Highest op locally executed (state machine applied, client table updated).
     #[must_use]
-    pub const fn commit(&self) -> u64 {
-        self.commit.get()
+    pub const fn commit_min(&self) -> u64 {
+        self.commit_min.get()
+    }
+
+    /// Highest op known to be committed by the cluster.
+    #[must_use]
+    pub const fn commit_max(&self) -> u64 {
+        self.commit_max.get()
     }
 
     #[must_use]
@@ -630,6 +724,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub const fn pipeline_mut(&mut self) -> &mut RefCell<P> {
         &mut self.pipeline
+    }
+
+    #[must_use]
+    pub const fn client_table(&self) -> &RefCell<ClientTable> {
+        &self.client_table
     }
 
     #[must_use]
@@ -706,6 +805,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.sent_own_start_view_change.set(false);
         self.sent_own_do_view_change.set(false);
         self.loopback_queue.borrow_mut().clear();
+        self.client_table.borrow_mut().clear_pending();
     }
 
     /// Process one tick. Call this periodically (e.g., every 10ms).
@@ -739,6 +839,18 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 current_op,
                 current_commit,
             ));
+            timeouts = self.timeouts.borrow_mut();
+        }
+
+        if timeouts.fired(TimeoutKind::Prepare) {
+            drop(timeouts);
+            actions.extend(self.handle_prepare_timeout());
+            timeouts = self.timeouts.borrow_mut();
+        }
+
+        if timeouts.fired(TimeoutKind::CommitMessage) {
+            drop(timeouts);
+            actions.extend(self.handle_commit_message_timeout());
             timeouts = self.timeouts.borrow_mut();
         }
 
@@ -919,6 +1031,79 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         vec![action]
     }
 
+    /// Collect uncommitted pipeline entries that should be retransmitted.
+    ///
+    /// Returns `(PrepareHeader, Vec<u8>)` pairs: each op that hasn't reached
+    /// quorum paired with the replica IDs that haven't acked it.
+    fn retransmit_targets(&self) -> Vec<(PrepareHeader, Vec<u8>)> {
+        let pipeline = self.pipeline.borrow();
+        let current_op = self.sequencer.current_sequence();
+        let replica_count = self.replica_count;
+        let mut targets = Vec::new();
+
+        let mut op = self.commit_max() + 1;
+        while op <= current_op {
+            if let Some(entry) = pipeline.entry_by_op(op)
+                && !entry.ok_quorum_received
+            {
+                let missing: Vec<u8> = (0..replica_count).filter(|&r| !entry.has_ack(r)).collect();
+                if !missing.is_empty() {
+                    targets.push((entry.header, missing));
+                }
+            }
+            op += 1;
+        }
+
+        targets
+    }
+
+    /// Retransmit uncommitted prepares when the prepare timeout fires.
+    ///
+    /// Only acts on the primary in normal status with a non-empty pipeline.
+    /// Resets the timeout with backoff on each firing.
+    fn handle_prepare_timeout(&self) -> Vec<VsrAction> {
+        if !self.is_primary() || self.status.get() != Status::Normal {
+            return Vec::new();
+        }
+
+        if self.pipeline.borrow().is_empty() {
+            return Vec::new();
+        }
+
+        let targets = self.retransmit_targets();
+        if targets.is_empty() {
+            return Vec::new();
+        }
+
+        self.timeouts.borrow_mut().backoff(TimeoutKind::Prepare);
+
+        vec![VsrAction::RetransmitPrepares { targets }]
+    }
+
+    /// Primary heartbeat: send commit point to all backups so they know
+    /// the primary is alive and can advance their own `commit_max`.
+    fn handle_commit_message_timeout(&self) -> Vec<VsrAction> {
+        if !self.is_primary() || self.status.get() != Status::Normal {
+            return Vec::new();
+        }
+
+        self.timeouts.borrow_mut().reset(TimeoutKind::CommitMessage);
+
+        // Don't advertise a commit point we haven't locally executed yet.
+        // After view change the new primary may have commit_min < commit_max
+        // until commit_journal catches up. Send commit_min (what we've
+        // actually applied) so backups don't advance past us.
+        let ts = self.heartbeat_timestamp.get() + 1;
+        self.heartbeat_timestamp.set(ts);
+
+        vec![VsrAction::SendCommit {
+            view: self.view.get(),
+            commit: self.commit_min.get(),
+            namespace: self.namespace,
+            timestamp_monotonic: ts,
+        }]
+    }
+
     /// Handle a received `StartViewChange` message.
     ///
     /// "When replica i receives STARTVIEWCHANGE messages for its view-number
@@ -1004,7 +1189,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
             let primary_candidate = self.primary_index(self.view.get());
             let current_op = self.sequencer.current_sequence();
-            let current_commit = self.commit.get();
+            // DVC uses commit_min: the replica's actual execution progress.
+            let current_commit = self.commit_min.get();
 
             // Start DVC timeout
             self.timeouts
@@ -1137,7 +1323,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         let current_op = self.sequencer.current_sequence();
-        let current_commit = self.commit.get();
+        // Use commit_min: the replica's actual execution progress.
+        let current_commit = self.commit_min.get();
 
         // If we haven't sent our own DVC yet, record it
         if !self.sent_own_do_view_change.get() {
@@ -1184,6 +1371,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// # Panics
     /// If `header.namespace` does not match this replica's namespace.
+    /// # Client-table maintenance
+    ///
+    /// Backups maintain the client-table during normal operation via
+    /// `commit_journal` in `on_replicate`, which walks the WAL and updates
+    /// the client table for each committed op. The WAL survives view changes,
+    /// so the new primary can process any committed op it received.
+    ///
+    /// Gap: if a backup never received a prepare (lost message),
+    /// `commit_journal` stops at the gap. Requires message repair.
     pub fn handle_start_view(&self, plane: PlaneKind, header: &StartViewHeader) -> Vec<VsrAction> {
         assert_eq!(header.namespace, self.namespace, "SV routed to wrong group");
         let from_replica = header.replica;
@@ -1210,13 +1406,19 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.view.set(msg_view);
         self.log_view.set(msg_view);
         self.status.set(Status::Normal);
-        self.advance_commit_number(msg_commit);
+        self.advance_commit_max(msg_commit);
         self.reset_view_change_state();
 
         // Stale pipeline entries from the old view must be discarded
         self.pipeline.borrow_mut().clear();
 
-        // Update our op to match the new primary's log
+        // TODO: TigerBeetle's StartView message carries uncommitted op headers,
+        // allowing the backup to install them into the WAL and set op to a
+        // WAL-verified value. We don't carry headers yet, so we blindly trust
+        // msg_op. This is correct for truncation (sequencer > msg_op) but wrong
+        // when the backup is behind (sequencer < msg_op) — the gap between the
+        // WAL and msg_op becomes unreachable without message repair. Fix by
+        // either carrying headers in StartView or implementing message repair.
         self.sequencer.set_sequence(msg_op);
 
         // Update timeouts for normal backup operation
@@ -1228,12 +1430,18 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts.start(TimeoutKind::NormalHeartbeat);
         }
 
-        // Send PrepareOK for uncommitted ops (commit+1 to op)
-        let mut actions = Vec::new();
-        for op_num in (msg_commit + 1)..=msg_op {
+        // Send PrepareOK for uncommitted ops that we actually have in the WAL.
+        // The caller must verify each op exists before sending.
+        emit_replica_event(
+            SimEventKind::ReplicaStateChanged,
+            &ReplicaLogContext::from_consensus(self, plane),
+        );
+
+        if msg_commit < msg_op {
             let action = VsrAction::SendPrepareOk {
                 view: msg_view,
-                op: op_num,
+                from_op: msg_commit + 1,
+                to_op: msg_op,
                 target: from_replica,
                 namespace: self.namespace,
             };
@@ -1244,18 +1452,72 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                     &action,
                 ),
             );
-            actions.push(action);
+            vec![action]
+        } else {
+            Vec::new()
         }
+    }
 
-        emit_replica_event(
-            SimEventKind::ReplicaStateChanged,
-            &ReplicaLogContext::from_consensus(self, plane),
+    /// Handle a `Commit` (heartbeat) message from the primary.
+    ///
+    /// Advances `commit_max` and resets the backup's `NormalHeartbeat` timeout
+    /// so it doesn't start a spurious view change. Returns `true` if
+    /// `commit_max` advanced, signalling the caller to run `commit_journal`.
+    ///
+    /// Only accepts heartbeats with a strictly newer monotonic timestamp
+    /// to prevent old/replayed messages from suppressing view changes.
+    ///
+    /// # Panics
+    /// If `header.namespace` does not match this replica's namespace.
+    pub fn handle_commit(&self, header: &iggy_binary_protocol::CommitHeader) -> bool {
+        assert_eq!(
+            header.namespace, self.namespace,
+            "Commit routed to wrong group"
         );
 
-        actions
+        if self.is_primary() {
+            return false;
+        }
+
+        if self.status.get() != Status::Normal {
+            return false;
+        }
+
+        if header.view != self.view.get() {
+            return false;
+        }
+
+        // TODO: Once connection-level peer verification is added promote
+        // this to an assert — the network layer would guarantee the sender
+        // matches header.replica.
+        if header.replica != self.primary_index(header.view) {
+            return false;
+        }
+
+        // Only accept heartbeats with a strictly newer timestamp to prevent
+        // old/replayed commit messages from resetting the timeout.
+        if self.heartbeat_timestamp.get() < header.timestamp_monotonic {
+            self.heartbeat_timestamp.set(header.timestamp_monotonic);
+            self.timeouts
+                .borrow_mut()
+                .reset(TimeoutKind::NormalHeartbeat);
+        }
+
+        let old_commit_max = self.commit_max.get();
+        self.advance_commit_max(header.commit);
+        self.commit_max.get() > old_commit_max
     }
 
     /// Complete view change as the new primary after collecting DVC quorum.
+    ///
+    /// # Client-table maintenance
+    ///
+    /// Backups populate the client-table during normal operation via
+    /// `commit_journal` in `on_replicate`. The WAL survives view changes, so
+    /// when this replica transitions from backup to primary, its table
+    /// contains entries for all committed ops it received.
+    ///
+    /// Gap: missing prepares (lost messages) require message repair.
     fn complete_view_change_as_primary(&self, plane: PlaneKind) -> Vec<VsrAction> {
         let dvc_array = self.do_view_change_from_all_replicas.borrow();
 
@@ -1269,7 +1531,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // Update state
         self.log_view.set(self.view.get());
         self.status.set(Status::Normal);
-        self.advance_commit_number(max_commit);
+        self.advance_commit_max(max_commit);
         self.sequencer.set_sequence(new_op);
 
         // Stale pipeline entries from the old view are invalid in the new view.
@@ -1288,6 +1550,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             timeouts.stop(TimeoutKind::DoViewChangeMessage);
             timeouts.stop(TimeoutKind::StartViewChangeMessage);
             timeouts.start(TimeoutKind::CommitMessage);
+            // If there are uncommitted ops in the rebuilt pipeline, start the
+            // Prepare timeout so that lost PrepareOks trigger retransmission.
+            if max_commit < new_op {
+                timeouts.start(TimeoutKind::Prepare);
+            }
         }
 
         let state = ReplicaLogContext::from_consensus(self, plane);
@@ -1307,7 +1574,30 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 &action,
             ),
         );
-        vec![action]
+
+        let mut actions = vec![action];
+        // Catch up commit_min to commit_max before rebuilding the pipeline.
+        // Without this, a behind backup (commit_min < max_commit) that becomes
+        // primary would have unapplied committed ops.
+        actions.push(VsrAction::CommitJournal);
+        // The new primary must rebuild its pipeline from the journal so that
+        // incoming PrepareOk messages can be matched and commits can proceed.
+        if max_commit < new_op {
+            assert!(
+                (new_op - max_commit) <= PIPELINE_PREPARE_QUEUE_MAX as u64,
+                "view change: uncommitted range {}..={} ({} ops) exceeds pipeline capacity ({}); \
+                 DVC winner claims more in-flight ops than the pipeline can hold",
+                max_commit + 1,
+                new_op,
+                new_op - max_commit,
+                PIPELINE_PREPARE_QUEUE_MAX,
+            );
+            actions.push(VsrAction::RebuildPipeline {
+                from_op: max_commit + 1,
+                to_op: new_op,
+            });
+        }
+        actions
     }
 
     /// Handle a `PrepareOk` message from a replica.
@@ -1472,7 +1762,7 @@ where
                 parent: consensus.last_prepare_checksum(),
                 request_checksum: old.request_checksum,
                 request: old.request,
-                commit: consensus.commit.get(),
+                commit: consensus.commit_max.get(),
                 op,
                 timestamp: 0, // 0 for now. Implement correct way to get timestamp later
                 operation: old.operation,
@@ -1502,7 +1792,7 @@ where
                 // It's important to use the view of the replica, not the received prepare!
                 view: consensus.view.get(),
                 op: old.op,
-                commit: consensus.commit.get(),
+                commit: consensus.commit_max.get(),
                 timestamp: old.timestamp,
                 operation: old.operation,
                 namespace: old.namespace,
@@ -1554,6 +1844,14 @@ where
                 pipeline_depth,
             },
         );
+
+        // Start the prepare timeout so the primary retransmits if backups
+        // don't ack in time. It is only started (not reset) so that an
+        // already-ticking timeout is not pushed out by every new request.
+        let mut timeouts = self.timeouts.borrow_mut();
+        if !timeouts.is_ticking(TimeoutKind::Prepare) {
+            timeouts.start(TimeoutKind::Prepare);
+        }
     }
 
     fn verify_pipeline(&self) {

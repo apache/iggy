@@ -114,6 +114,10 @@ pub enum ControlActionKind {
     SendDoViewChange,
     SendStartView,
     SendPrepareOk,
+    SendPrepare,
+    RebuildPipeline,
+    CommitJournal,
+    SendCommit,
 }
 
 impl ControlActionKind {
@@ -124,6 +128,10 @@ impl ControlActionKind {
             Self::SendDoViewChange => "send_do_view_change",
             Self::SendStartView => "send_start_view",
             Self::SendPrepareOk => "send_prepare_ok",
+            Self::SendPrepare => "send_prepare",
+            Self::RebuildPipeline => "rebuild_pipeline",
+            Self::CommitJournal => "commit_journal",
+            Self::SendCommit => "send_commit",
         }
     }
 }
@@ -230,7 +238,7 @@ impl ReplicaLogContext {
             namespace: NamespaceLogContext::from_raw(plane, consensus.namespace()),
             view: consensus.view(),
             log_view: consensus.log_view(),
-            commit: consensus.commit(),
+            commit: consensus.commit_max(),
             status: consensus.status(),
             role,
         }
@@ -322,12 +330,42 @@ impl ControlActionLogEvent {
                 op: Some(op),
                 commit: Some(commit),
             },
-            VsrAction::SendPrepareOk { target, op, .. } => Self {
+            VsrAction::SendPrepareOk {
+                target, from_op, ..
+            } => Self {
                 replica,
                 action: ControlActionKind::SendPrepareOk,
                 target_replica: Some(target),
-                op: Some(op),
+                op: Some(from_op),
                 commit: None,
+            },
+            VsrAction::RetransmitPrepares { .. } => Self {
+                replica,
+                action: ControlActionKind::SendPrepare,
+                target_replica: None,
+                op: None,
+                commit: None,
+            },
+            VsrAction::RebuildPipeline { from_op, to_op, .. } => Self {
+                replica,
+                action: ControlActionKind::RebuildPipeline,
+                target_replica: None,
+                op: Some(from_op),
+                commit: Some(to_op),
+            },
+            VsrAction::CommitJournal => Self {
+                replica,
+                action: ControlActionKind::CommitJournal,
+                target_replica: None,
+                op: None,
+                commit: None,
+            },
+            VsrAction::SendCommit { commit, .. } => Self {
+                replica,
+                action: ControlActionKind::SendCommit,
+                target_replica: None,
+                op: None,
+                commit: Some(commit),
             },
         }
     }

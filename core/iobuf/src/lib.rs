@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering, fence};
 use aligned_vec::{AVec, ConstAlign};
 use compio_buf::IoBuf;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Owned<const ALIGN: usize = 4096> {
     inner: AVec<u8, ConstAlign<ALIGN>>,
 }

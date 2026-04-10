@@ -20,23 +20,15 @@ use crate::impls::{PIPELINE_PREPARE_QUEUE_MAX, PipelineEntry};
 use iggy_binary_protocol::{Message, PrepareHeader};
 use std::collections::{HashMap, VecDeque};
 
-/// Pipeline that partitions entries by namespace for independent commit draining.
+/// Pipeline that partitions entries by namespace.
 ///
 /// A single global op sequence and hash chain spans all namespaces, but entries
-/// are stored in per-namespace `VecDeques`. Each namespace tracks its own commit
-/// frontier so `drain_committable_all` drains quorum'd entries per-namespace
-/// without waiting for the global commit to advance past unrelated namespaces.
+/// are stored in per-namespace `VecDeque`s. Ops are committed strictly in global
+/// order via `drain_committable_prefix`, which drains the contiguous prefix of
+/// quorum'd ops regardless of namespace. This ensures `commit_min` advances
+/// sequentially.
 ///
-/// The global commit (on `VsrConsensus`) remains a conservative lower bound
-/// for the VSR protocol (view change, follower commit piggybacking). It only
-/// advances when all ops up to that point are drained. Per-namespace draining
-/// can run ahead of the global commit.
-///
-/// An alternative (simpler) approach would drain purely by per-entry quorum
-/// flag without tracking per-namespace commit numbers, relying solely on
-/// `global_commit_frontier` for the protocol commit. We track per-namespace
-/// commits explicitly for observability and to make the independence model
-/// visible in the data structure.
+/// Per-namespace commit frontiers (`ns_commits`) are tracked for observability.
 #[derive(Debug)]
 pub struct NamespacedPipeline {
     queues: HashMap<u64, VecDeque<PipelineEntry>>,
@@ -142,6 +134,58 @@ impl NamespacedPipeline {
         }
         commit
     }
+
+    /// Drain the contiguous prefix of committed ops in global op order.
+    ///
+    /// Starting from `commit + 1`, drains ops from their per-namespace queues
+    /// while each consecutive op has `ok_quorum_received == true`. Stops at the
+    /// first gap or non-quorum op, ensuring ops are committed strictly in order.
+    ///
+    /// Returns `(drained_entries, new_commit)` where `new_commit` is the highest
+    /// op drained (or `commit` if nothing was drained).
+    ///
+    /// # Panics
+    /// If internal queue state is inconsistent (namespace found in scan but
+    /// missing from map, or front entry disappears between lookup and pop).
+    pub fn drain_committable_prefix(&mut self, commit: u64) -> (Vec<PipelineEntry>, u64) {
+        let mut drained = Vec::new();
+        let mut new_commit = commit;
+        let mut op = commit + 1;
+
+        while op <= self.last_push_op {
+            // Find the entry across all namespace queues.
+            let ns = {
+                let mut found_ns = None;
+                for (&ns, queue) in &self.queues {
+                    if queue.front().is_some_and(|f| f.header.op == op) {
+                        found_ns = Some(ns);
+                        break;
+                    }
+                }
+                match found_ns {
+                    Some(ns) => ns,
+                    None => break, // op not at front of any queue - gap
+                }
+            };
+
+            let queue = self.queues.get_mut(&ns).expect("ns must exist");
+            let front = queue.front().expect("front must exist");
+            if !front.ok_quorum_received {
+                break; // not yet committed
+            }
+
+            let entry = queue.pop_front().expect("front exists");
+            self.total_count -= 1;
+            if let Some(ns_commit) = self.ns_commits.get_mut(&ns) {
+                *ns_commit = entry.header.op;
+            }
+            new_commit = entry.header.op;
+            drained.push(entry);
+            op += 1;
+        }
+
+        (drained, new_commit)
+    }
 }
 
 impl Pipeline for NamespacedPipeline {
@@ -210,6 +254,11 @@ impl Pipeline for NamespacedPipeline {
     fn clear(&mut self) {
         for queue in self.queues.values_mut() {
             queue.clear();
+        }
+        // Reset ns_commits, stale values from a previous view could mislead
+        // global_commit_frontier after a view change.
+        for commit in self.ns_commits.values_mut() {
+            *commit = 0;
         }
         self.total_count = 0;
         self.last_push_checksum = 0;
@@ -558,23 +607,22 @@ mod tests {
     }
 
     #[test]
-    fn clear_preserves_ns_commits() {
+    fn clear_resets_ns_commits() {
         let mut pipeline = NamespacedPipeline::new();
         pipeline.register_namespace(100);
         pipeline.register_namespace(200);
         pipeline.push_message(make_prepare(1, 0, 10, 100));
         pipeline.push_message(make_prepare(2, 10, 20, 200));
 
-        // Mark op 1 as committed in ns 100 before clearing
         pipeline.ns_commits.insert(100, 1);
 
         pipeline.clear();
         assert!(pipeline.is_empty());
         assert_eq!(pipeline.total_count, 0);
 
-        // ns_commits must survive clear -- they represent durable knowledge
-        // about already-drained ops, not pipeline state
-        assert_eq!(pipeline.ns_commits.get(&100), Some(&1));
+        // ns_commits must be reset on clear -- stale values from a previous
+        // view would mislead global_commit_frontier.
+        assert_eq!(pipeline.ns_commits.get(&100), Some(&0));
         assert_eq!(pipeline.ns_commits.get(&200), Some(&0));
     }
 }

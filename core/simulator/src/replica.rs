@@ -31,10 +31,21 @@ use std::sync::Arc;
 // TODO: Make configurable
 const CLUSTER_ID: u128 = 1;
 
+/// Consensus-level namespace for the partitions plane.
+///
+/// Must differ from the metadata namespace (0) so that view change messages
+/// can be routed to the correct consensus group.
+pub const PARTITIONS_CONSENSUS_NAMESPACE: u64 = 1;
+
 // For now there is only one shard per replica,
 // we will add support for multiple shards per replica in the future.
-pub type Replica =
-    shard::IggyShard<SharedSimOutbox, SimJournal<MemStorage>, SimSnapshot, SimMuxStateMachine>;
+pub type Replica = shard::IggyShard<
+    SharedSimOutbox,
+    SimJournal<MemStorage>, // MJ: metadata journal
+    SimSnapshot,
+    SimMuxStateMachine,
+    SimJournal<MemStorage>, // PJ: partitions journal
+>;
 
 pub fn new_replica(id: u8, name: String, bus: &Arc<SimOutbox>, replica_count: u8) -> Replica {
     let users: Users = UsersInner::new().into();
@@ -69,14 +80,13 @@ pub fn new_replica(id: u8, name: String, bus: &Arc<SimOutbox>, replica_count: u8
     };
 
     let mut partitions = IggyPartitions::new(ShardId::new(u16::from(id)), partitions_config);
+    partitions.set_journal(SimJournal::<MemStorage>::default());
 
-    // TODO: namespace=0 collides with metadata consensus. Safe for now because the simulator
-    // routes by Operation type, but a shared view change bus would produce namespace collisions.
     let partition_consensus = VsrConsensus::new(
         CLUSTER_ID,
         id,
         replica_count,
-        0,
+        PARTITIONS_CONSENSUS_NAMESPACE,
         SharedSimOutbox(Arc::clone(bus)),
         NamespacedPipeline::new(),
     );

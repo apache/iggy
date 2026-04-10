@@ -78,7 +78,7 @@ jobs:
           eval $(echo -n "test" | gnome-keyring-daemon --unlock --components=secrets)
           echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
 
-          cargo test --locked --no-fail-fast
+          cargo nextest run --locked --no-fail-fast --profile ci
         shell: bash
 
       - name: Generate coverage report
