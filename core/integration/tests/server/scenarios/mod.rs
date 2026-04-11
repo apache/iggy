@@ -33,6 +33,7 @@ pub mod encryption_scenario;
 pub mod invalid_consumer_offset_scenario;
 pub mod log_rotation_scenario;
 pub mod message_cleanup_scenario;
+pub mod message_deduplication_scenario;
 pub mod message_headers_scenario;
 pub mod message_size_scenario;
 pub mod offset_scenario;

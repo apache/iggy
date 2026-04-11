@@ -18,9 +18,9 @@
  */
 
 use crate::server::scenarios::{
-    message_size_scenario, reconnect_after_restart_scenario, restart_offset_skip_scenario,
-    segment_rotation_race_scenario, single_message_per_batch_scenario, tcp_tls_scenario,
-    websocket_tls_scenario,
+    message_deduplication_scenario, message_size_scenario, reconnect_after_restart_scenario,
+    restart_offset_skip_scenario, segment_rotation_race_scenario,
+    single_message_per_batch_scenario, tcp_tls_scenario, websocket_tls_scenario,
 };
 use integration::iggy_harness;
 
@@ -146,4 +146,13 @@ async fn restart_offset_skip(harness: &mut TestHarness) {
 ))]
 async fn segment_rotation_scenario(harness: &TestHarness) {
     segment_rotation_race_scenario::run(harness).await;
+}
+
+#[iggy_harness(server(
+    message_deduplication.enabled = true,
+    message_deduplication.expiry = "2s",
+    partition.messages_required_to_save = "1"
+))]
+async fn message_deduplication(harness: &TestHarness) {
+    message_deduplication_scenario::run(harness).await;
 }
