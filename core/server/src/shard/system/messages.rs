@@ -355,6 +355,10 @@ impl IggyShard {
             )
             .await;
 
+        if batch.count() == 0 {
+            return Ok(());
+        }
+
         let (journal_messages_count, journal_size, is_full) = {
             let mut partitions = self.local_partitions.borrow_mut();
             let partition = partitions
@@ -380,14 +384,10 @@ impl IggyShard {
             segment.end_timestamp = batch.last_timestamp().unwrap();
             segment.end_offset = batch.last_offset().unwrap();
 
+            let last_offset = segment.end_offset;
+
             let (journal_messages_count, journal_size) =
                 partition.log.journal_mut().append(batch)?;
-
-            let last_offset = if batch_messages_count == 0 {
-                current_offset
-            } else {
-                current_offset + batch_messages_count as u64 - 1
-            };
 
             if partition.should_increment_offset {
                 partition.offset.store(last_offset, Ordering::Relaxed);
