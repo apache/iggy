@@ -310,5 +310,4 @@ mod tests {
         config.gcs_bucket = None;
         assert!(build_storage_options(&config).is_err());
     }
-
 }
