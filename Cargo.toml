@@ -166,7 +166,7 @@ hwlocality = "1.0.0-alpha.12"
 iceberg = "0.9.0"
 iceberg-catalog-rest = "0.9.0"
 iceberg-storage-opendal = "0.9.0"
-iggy = { path = "core/sdk", version = "0.10.0" }
+iggy = { path = "core/sdk", version = "0.10.1" }
 iggy-cli = { path = "core/cli", version = "0.13.0" }
 iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.0" }
 iggy_common = { path = "core/common", version = "0.10.0" }
@@ -293,6 +293,7 @@ trait-variant = "0.1.2"
 tungstenite = "0.29.0"
 twox-hash = { version = "2.1.2", features = ["xxhash32"] }
 ulid = "1.2.1"
+ureq = "2.10"
 uuid = { version = "1.23.0", features = ["v4", "v7", "fast-rng", "serde", "zerocopy"] }
 vergen-git2 = { version = "9.1.0", features = ["build", "cargo", "rustc", "si"] }
 walkdir = "2.5.0"
