@@ -58,6 +58,10 @@ inputs:
     description: "SHA256 checksum for the helm-docs tarball"
     required: false
     default: "a8cf72ada34fad93285ba2a452b38bdc5bd52cc9a571236244ec31022928d6cc"
+  helmfmt-checksum:
+    description: "SHA256 checksum for the helmfmt Linux x86_64 tarball"
+    required: false
+    default: "17e6de3266b7bfeb50f4e425736d3362c3c7a01bf9756710b1d350f9ced78fb2"
 
 runs:
   using: "composite"
@@ -99,9 +103,12 @@ runs:
     - name: Install helmfmt
       if: inputs.install-helmfmt == 'true'
       shell: bash
+      env:
+        HELMFMT_CHECKSUM: ${{ inputs.helmfmt-checksum }}
       run: |
         set -euo pipefail
         HELMFMT_VERSION="v0.5.0"
         wget -qO /tmp/helmfmt.tar.gz "https://github.com/digitalstudium/helmfmt/releases/download/${HELMFMT_VERSION}/helmfmt_Linux_x86_64.tar.gz"
+        echo "${HELMFMT_CHECKSUM}  /tmp/helmfmt.tar.gz" | sha256sum -c -
         tar -xzf /tmp/helmfmt.tar.gz -C /tmp helmfmt
         sudo install -m 0755 /tmp/helmfmt /usr/local/bin/helmfmt
