@@ -351,8 +351,7 @@ impl IggyShard {
             }
         }
 
-        let message_deduplicator =
-            create_message_deduplicator(&self.config.system).map(Arc::new);
+        let message_deduplicator = create_message_deduplicator(&self.config.system).map(Arc::new);
         let partition = LocalPartition::with_log(
             loaded_log,
             stats,

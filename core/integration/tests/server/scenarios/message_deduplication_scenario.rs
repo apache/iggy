@@ -72,12 +72,7 @@ pub async fn run(harness: &TestHarness) {
     let explicit_ids: Vec<u128> = (1..=MESSAGES_PER_BATCH as u128).collect();
     let mut original_messages = build_messages("original", &explicit_ids);
     client
-        .send_messages(
-            &stream_id,
-            &topic_id,
-            &partitioning,
-            &mut original_messages,
-        )
+        .send_messages(&stream_id, &topic_id, &partitioning, &mut original_messages)
         .await
         .unwrap();
 
@@ -113,12 +108,7 @@ pub async fn run(harness: &TestHarness) {
     // Step 4: Send all-duplicate batch (regression test for empty batch panic)
     let mut all_dup_messages = build_messages("all-dup", &explicit_ids);
     client
-        .send_messages(
-            &stream_id,
-            &topic_id,
-            &partitioning,
-            &mut all_dup_messages,
-        )
+        .send_messages(&stream_id, &topic_id, &partitioning, &mut all_dup_messages)
         .await
         .unwrap();
 
@@ -223,17 +213,25 @@ pub async fn run(harness: &TestHarness) {
 
 fn build_messages(prefix: &str, ids: &[u128]) -> Vec<IggyMessage> {
     ids.iter()
-        .map(|&id| {
+        .enumerate()
+        .map(|(idx, &id)| {
             let payload = if id == 0 {
-                format!("{prefix}-auto")
+                format!("{prefix}-auto-{idx}")
             } else {
                 format!("{prefix}-{id}")
             };
-            let mut builder = IggyMessage::builder().payload(Bytes::from(payload));
             if id != 0 {
-                builder = builder.id(id);
+                IggyMessage::builder()
+                    .id(id)
+                    .payload(Bytes::from(payload))
+                    .build()
+                    .expect("Failed to build message")
+            } else {
+                IggyMessage::builder()
+                    .payload(Bytes::from(payload))
+                    .build()
+                    .expect("Failed to build message")
             }
-            builder.build().expect("Failed to build message")
         })
         .collect()
 }
