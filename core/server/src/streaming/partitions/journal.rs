@@ -84,12 +84,14 @@ impl Journal for MemoryMessageJournal {
             && let Some(first_offset) = entry.first_offset()
         {
             // Allow disagreement when either side is 0 (fresh partition or
-            // reset after purge). Only flag when both are non-zero and differ.
+            // reset after purge), or when first_offset > base_offset (offset
+            // gap from deduplicated batches that skipped journal append).
+            // Only flag when first_offset < base_offset (offset regression).
             debug_assert!(
                 self.inner.base_offset == 0
                     || first_offset == 0
-                    || self.inner.base_offset == first_offset,
-                "journal base_offset ({}) disagrees with batch first_offset ({})",
+                    || self.inner.base_offset <= first_offset,
+                "journal base_offset ({}) is ahead of batch first_offset ({})",
                 self.inner.base_offset,
                 first_offset
             );
@@ -99,6 +101,7 @@ impl Journal for MemoryMessageJournal {
         let batch_size = entry.size();
         let first_timestamp = entry.first_timestamp().unwrap();
         let last_timestamp = entry.last_timestamp().unwrap();
+        let last_offset = entry.last_offset().unwrap();
         self.batches.add_batch(entry);
 
         if self.inner.first_timestamp == 0 {
@@ -106,7 +109,7 @@ impl Journal for MemoryMessageJournal {
         }
         self.inner.end_timestamp = last_timestamp;
         self.inner.messages_count += batch_messages_count;
-        self.inner.current_offset = self.inner.base_offset + self.inner.messages_count as u64 - 1;
+        self.inner.current_offset = last_offset;
         self.inner.size = IggyByteSize::from(self.inner.size.as_bytes_u64() + batch_size as u64);
 
         Ok((self.inner.messages_count, self.inner.size.as_bytes_u32()))

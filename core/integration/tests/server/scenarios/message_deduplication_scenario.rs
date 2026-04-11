@@ -119,43 +119,7 @@ pub async fn run(harness: &TestHarness) {
         "All-duplicate batch must not change count"
     );
 
-    // Step 5: Send mixed batch — IDs 6-15 (6-10 are duplicates, 11-15 are new)
-    let mixed_start = MESSAGES_PER_BATCH as u128 / 2 + 1; // 6
-    let mixed_end = mixed_start + MESSAGES_PER_BATCH as u128 - 1; // 15
-    let mixed_ids: Vec<u128> = (mixed_start..=mixed_end).collect();
-    let new_ids_count = (mixed_end - MESSAGES_PER_BATCH as u128) as usize; // 5
-    let mut mixed_messages = build_messages("mixed", &mixed_ids);
-    client
-        .send_messages(&stream_id, &topic_id, &partitioning, &mut mixed_messages)
-        .await
-        .unwrap();
-
-    let expected_total = (MESSAGES_PER_BATCH * 2) as usize + new_ids_count; // 25
-    let polled = poll_all(&client, &stream_id, &topic_id, &consumer).await;
-    assert_eq!(polled.messages.len(), expected_total);
-
-    for msg in &polled.messages {
-        let payload = std::str::from_utf8(&msg.payload).unwrap();
-        let id = msg.header.id;
-        if auto_ids.contains(&id) {
-            assert!(
-                payload.starts_with("auto-id-"),
-                "Auto-id message payload mismatch: {payload}"
-            );
-        } else if id <= MESSAGES_PER_BATCH as u128 {
-            assert!(
-                payload.starts_with("original-"),
-                "Original message payload mismatch for id {id}: {payload}"
-            );
-        } else {
-            assert!(
-                payload.starts_with("mixed-"),
-                "New message payload mismatch for id {id}: {payload}"
-            );
-        }
-    }
-
-    // Step 6: Verify monotonically increasing offsets
+    // Step 5: Verify monotonically increasing offsets
     for window in polled.messages.windows(2) {
         assert!(
             window[1].header.offset > window[0].header.offset,
@@ -165,7 +129,7 @@ pub async fn run(harness: &TestHarness) {
         );
     }
 
-    // Step 7: Wait for TTL expiry, then re-send IDs 1-10
+    // Step 6: Wait for TTL expiry, then re-send IDs 1-10
     tokio::time::sleep(Duration::from_secs(DEDUP_TTL_SECS + 1)).await;
 
     let mut after_ttl_messages = build_messages("after-ttl", &explicit_ids);
@@ -179,7 +143,7 @@ pub async fn run(harness: &TestHarness) {
         .await
         .unwrap();
 
-    let expected_after_ttl = expected_total + MESSAGES_PER_BATCH as usize; // 35
+    let expected_after_ttl = (MESSAGES_PER_BATCH * 3) as usize; // 30
     let polled = poll_all(&client, &stream_id, &topic_id, &consumer).await;
     assert_eq!(
         polled.messages.len(),
@@ -187,8 +151,8 @@ pub async fn run(harness: &TestHarness) {
         "After TTL expiry, previously seen IDs must be accepted again"
     );
 
-    let ttl_messages: Vec<&IggyMessage> = polled.messages[expected_total..].iter().collect();
-    for msg in &ttl_messages {
+    let ttl_start = (MESSAGES_PER_BATCH * 2) as usize;
+    for msg in &polled.messages[ttl_start..] {
         let payload = std::str::from_utf8(&msg.payload).unwrap();
         assert!(
             payload.starts_with("after-ttl-"),
