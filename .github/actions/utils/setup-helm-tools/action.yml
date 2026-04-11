@@ -98,7 +98,7 @@ runs:
     - name: Install yamllint
       if: inputs.install-yamllint == 'true'
       shell: bash
-      run: pip install yamllint
+      run: pip install "yamllint==1.38.0"
 
     - name: Install helmfmt
       if: inputs.install-helmfmt == 'true'
