@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use colored::Colorize;
+use colored::{Color, Colorize};
 use comfy_table::{Cell, Color as TableColor, ContentArrangement, Table, presets::UTF8_FULL};
 use human_repr::HumanCount;
 use tracing::info;
@@ -31,7 +31,7 @@ use crate::{
 };
 
 impl BenchmarkReport {
-    pub fn print_summary(&self) {
+    pub fn print_summary(&self, pretty: bool) {
         let kind = self.params.benchmark_kind;
         let total_messages = format!("{} messages, ", self.total_messages());
         let total_size = format!(
@@ -76,7 +76,7 @@ impl BenchmarkReport {
 
         self.group_metrics
             .iter()
-            .for_each(|s| println!("\n{}", s.formatted_string()));
+            .for_each(|s| println!("\n{}", s.formatted_string(pretty)));
     }
 
     pub fn total_messages(&self) -> u64 {
@@ -141,14 +141,57 @@ impl BenchmarkReport {
 }
 
 impl BenchmarkGroupMetrics {
-    pub fn formatted_string(&self) -> String {
-        let width = get_terminal_width();
-
-        if width >= WIDE_LAYOUT_THRESHOLD {
-            self.format_wide_layout()
+    pub fn formatted_string(&self, pretty: bool) -> String {
+        if pretty {
+            let width = get_terminal_width();
+            if width >= WIDE_LAYOUT_THRESHOLD {
+                self.format_wide_layout()
+            } else {
+                self.format_narrow_layout()
+            }
         } else {
-            self.format_narrow_layout()
+            self.format_original()
         }
+    }
+
+    fn format_original(&self) -> String {
+        let (prefix, color) = match self.summary.kind {
+            GroupMetricsKind::Producers => ("Producers Results", Color::Green),
+            GroupMetricsKind::Consumers => ("Consumers Results", Color::Green),
+            GroupMetricsKind::ProducersAndConsumers => ("Aggregate Results", Color::Red),
+            GroupMetricsKind::ProducingConsumers => ("Producing Consumer Results", Color::Red),
+        };
+        let actor = self.summary.kind.actor();
+        let total_mb = format!("{:.2}", self.summary.total_throughput_megabytes_per_second);
+        let total_msg = format!("{:.0}", self.summary.total_throughput_messages_per_second);
+        let avg_mb = format!(
+            "{:.2}",
+            self.summary.average_throughput_megabytes_per_second
+        );
+        let p50 = format!("{:.2}", self.summary.average_p50_latency_ms);
+        let p90 = format!("{:.2}", self.summary.average_p90_latency_ms);
+        let p95 = format!("{:.2}", self.summary.average_p95_latency_ms);
+        let p99 = format!("{:.2}", self.summary.average_p99_latency_ms);
+        let p999 = format!("{:.2}", self.summary.average_p999_latency_ms);
+        let p9999 = format!("{:.2}", self.summary.average_p9999_latency_ms);
+        let avg = format!("{:.2}", self.summary.average_latency_ms);
+        let median = format!("{:.2}", self.summary.average_median_latency_ms);
+        let min = format!("{:.2}", self.summary.min_latency_ms);
+        let max = format!("{:.2}", self.summary.max_latency_ms);
+        let std_dev = format!("{:.2}", self.summary.std_dev_latency_ms);
+        let total_test_time = format!(
+            "{:.2}",
+            self.avg_throughput_mb_ts.points.last().unwrap().time_s
+        );
+
+        format!(
+        "{prefix}: Total throughput: {total_mb} MB/s, {total_msg} messages/s, average throughput per {actor}: {avg_mb} MB/s, \
+        p50 latency: {p50} ms, p90 latency: {p90} ms, p95 latency: {p95} ms, \
+        p99 latency: {p99} ms, p999 latency: {p999} ms, p9999 latency: {p9999} ms, average latency: {avg} ms, \
+        median latency: {median} ms, min: {min} ms, max: {max} ms, std dev: {std_dev} ms, total time: {total_test_time} s"
+    )
+    .color(color)
+    .to_string()
     }
 
     fn format_wide_layout(&self) -> String {

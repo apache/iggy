@@ -168,6 +168,7 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
             batches_processed,
             &self.config.messages_per_batch,
             &metrics,
+            self.config.pretty,
         );
 
         Ok(metrics)
@@ -198,24 +199,51 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
         message_batches: u64,
         messages_per_batch: &BenchmarkNumericParameter,
         metrics: &BenchmarkIndividualMetrics,
+        pretty: bool,
     ) {
-        let width = get_terminal_width();
+        if pretty {
+            let width = get_terminal_width();
 
-        if width >= WIDE_LAYOUT_THRESHOLD {
-            Self::print_wide_layout(
-                producer_id,
-                total_messages,
-                message_batches,
-                messages_per_batch,
-                metrics,
-            );
+            if width >= WIDE_LAYOUT_THRESHOLD {
+                Self::print_wide_layout(
+                    producer_id,
+                    total_messages,
+                    message_batches,
+                    messages_per_batch,
+                    metrics,
+                );
+            } else {
+                Self::print_narrow_layout(
+                    producer_id,
+                    total_messages,
+                    message_batches,
+                    messages_per_batch,
+                    metrics,
+                );
+            }
         } else {
-            Self::print_narrow_layout(
+            info!(
+                "Producer #{} → sent {} messages in {} batches of {} messages in {:.2} s, total size: {}, average throughput: {:.2} MB/s, \
+            p50 latency: {:.2} ms, p90 latency: {:.2} ms, p95 latency: {:.2} ms, p99 latency: {:.2} ms, p999 latency: {:.2} ms, p9999 latency: {:.2} ms, \
+            average latency: {:.2} ms, median latency: {:.2} ms, min latency: {:.2} ms, max latency: {:.2} ms, std dev latency: {:.2} ms",
                 producer_id,
-                total_messages,
-                message_batches,
+                total_messages.human_count_bare(),
+                message_batches.human_count_bare(),
                 messages_per_batch,
-                metrics,
+                metrics.summary.total_time_secs,
+                IggyByteSize::from(metrics.summary.total_user_data_bytes),
+                metrics.summary.throughput_megabytes_per_second,
+                metrics.summary.p50_latency_ms,
+                metrics.summary.p90_latency_ms,
+                metrics.summary.p95_latency_ms,
+                metrics.summary.p99_latency_ms,
+                metrics.summary.p999_latency_ms,
+                metrics.summary.p9999_latency_ms,
+                metrics.summary.avg_latency_ms,
+                metrics.summary.median_latency_ms,
+                metrics.summary.min_latency_ms,
+                metrics.summary.max_latency_ms,
+                metrics.summary.std_dev_latency_ms,
             );
         }
     }
