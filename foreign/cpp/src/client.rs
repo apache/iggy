@@ -20,10 +20,111 @@ use iggy::prelude::{
     Client as IggyConnectionClient, CompressionAlgorithm as RustCompressionAlgorithm,
     ConsumerGroupClient, Identifier as RustIdentifier, IggyClient as RustIggyClient,
     IggyClientBuilder as RustIggyClientBuilder, IggyError, IggyExpiry as RustIggyExpiry,
-    MaxTopicSize as RustMaxTopicSize, PartitionClient, StreamClient, TopicClient, UserClient,
+    MaxTopicSize as RustMaxTopicSize, PartitionClient,
+    SnapshotCompression as RustSnapshotCompression, StreamClient, SystemClient as RustSystemClient,
+    SystemSnapshotType as RustSystemSnapshotType, TopicClient, UserClient,
 };
+use iggy_common::{
+    CacheMetrics as RustCacheMetrics, CacheMetricsKey as RustCacheMetricsKey,
+    ClientInfo as RustClientInfo, ClientInfoDetails as RustClientInfoDetails, Stats as RustStats,
+};
+use std::convert::TryFrom;
 use std::str::FromStr;
 use std::sync::Arc;
+
+impl From<RustClientInfo> for ffi::ClientInfo {
+    fn from(client: RustClientInfo) -> Self {
+        ffi::ClientInfo {
+            client_id: client.client_id,
+            // TODO(slbotbm): In high-level client, this should be converted to None.
+            user_id: client.user_id.unwrap_or(u32::MAX),
+            address: client.address,
+            transport: client.transport,
+            consumer_groups_count: client.consumer_groups_count,
+        }
+    }
+}
+
+impl From<RustClientInfoDetails> for ffi::ClientInfoDetails {
+    fn from(client: RustClientInfoDetails) -> Self {
+        ffi::ClientInfoDetails {
+            client_id: client.client_id,
+            // TODO(slbotbm): In high-level client, this should be converted to None.
+            user_id: client.user_id.unwrap_or(u32::MAX),
+            address: client.address,
+            transport: client.transport,
+            consumer_groups_count: client.consumer_groups_count,
+            consumer_groups: client
+                .consumer_groups
+                .into_iter()
+                .map(ffi::ConsumerGroupInfo::from)
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<Option<RustClientInfoDetails>> for ffi::ClientInfoDetails {
+    type Error = String;
+
+    fn try_from(client: Option<RustClientInfoDetails>) -> Result<Self, Self::Error> {
+        match client {
+            Some(client) => Ok(ffi::ClientInfoDetails::from(client)),
+            None => Err("client not found".to_string()),
+        }
+    }
+}
+
+impl From<(RustCacheMetricsKey, RustCacheMetrics)> for ffi::CacheMetricEntry {
+    fn from((key, metrics): (RustCacheMetricsKey, RustCacheMetrics)) -> Self {
+        ffi::CacheMetricEntry {
+            stream_id: key.stream_id,
+            topic_id: key.topic_id,
+            partition_id: key.partition_id,
+            hits: metrics.hits,
+            misses: metrics.misses,
+            hit_ratio: metrics.hit_ratio,
+        }
+    }
+}
+
+impl From<RustStats> for ffi::Stats {
+    fn from(stats: RustStats) -> Self {
+        ffi::Stats {
+            process_id: stats.process_id,
+            cpu_usage: stats.cpu_usage,
+            total_cpu_usage: stats.total_cpu_usage,
+            memory_usage: stats.memory_usage.as_bytes_u64(),
+            total_memory: stats.total_memory.as_bytes_u64(),
+            available_memory: stats.available_memory.as_bytes_u64(),
+            run_time: stats.run_time.as_micros(),
+            start_time: stats.start_time.as_micros(),
+            read_bytes: stats.read_bytes.as_bytes_u64(),
+            written_bytes: stats.written_bytes.as_bytes_u64(),
+            messages_size_bytes: stats.messages_size_bytes.as_bytes_u64(),
+            streams_count: stats.streams_count,
+            topics_count: stats.topics_count,
+            partitions_count: stats.partitions_count,
+            segments_count: stats.segments_count,
+            messages_count: stats.messages_count,
+            clients_count: stats.clients_count,
+            consumer_groups_count: stats.consumer_groups_count,
+            hostname: stats.hostname,
+            os_name: stats.os_name,
+            os_version: stats.os_version,
+            kernel_version: stats.kernel_version,
+            iggy_server_version: stats.iggy_server_version,
+            iggy_server_semver: stats.iggy_server_semver.unwrap_or(u32::MAX),
+            cache_metrics: stats
+                .cache_metrics
+                .into_iter()
+                .map(ffi::CacheMetricEntry::from)
+                .collect(),
+            threads_count: stats.threads_count,
+            free_disk_space: stats.free_disk_space.as_bytes_u64(),
+            total_disk_space: stats.total_disk_space.as_bytes_u64(),
+        }
+    }
+}
 
 pub struct Client {
     pub inner: Arc<RustIggyClient>,
@@ -376,6 +477,98 @@ impl Client {
                     )
                 })?;
             Ok(())
+        })
+    }
+
+    pub fn get_stats(&self) -> Result<ffi::Stats, String> {
+        RUNTIME.block_on(async {
+            let stats = self
+                .inner
+                .get_stats()
+                .await
+                .map_err(|error| format!("Could not get stats: {error}"))?;
+            Ok(ffi::Stats::from(stats))
+        })
+    }
+
+    pub fn get_me(&self) -> Result<ffi::ClientInfoDetails, String> {
+        RUNTIME.block_on(async {
+            let client = self
+                .inner
+                .get_me()
+                .await
+                .map_err(|error| format!("Could not get current client info: {error}"))?;
+            Ok(ffi::ClientInfoDetails::from(client))
+        })
+    }
+
+    pub fn get_client(&self, client_id: u32) -> Result<ffi::ClientInfoDetails, String> {
+        RUNTIME.block_on(async {
+            let client = self
+                .inner
+                .get_client(client_id)
+                .await
+                .map_err(|error| format!("Could not get client '{client_id}': {error}"))?;
+            ffi::ClientInfoDetails::try_from(client)
+                .map_err(|error| format!("Could not get client '{client_id}': {error}"))
+        })
+    }
+
+    pub fn get_clients(&self) -> Result<Vec<ffi::ClientInfo>, String> {
+        RUNTIME.block_on(async {
+            let clients = self
+                .inner
+                .get_clients()
+                .await
+                .map_err(|error| format!("Could not get clients: {error}"))?;
+            Ok(clients.into_iter().map(ffi::ClientInfo::from).collect())
+        })
+    }
+
+    pub fn ping(&self) -> Result<(), String> {
+        RUNTIME.block_on(async {
+            self.inner
+                .ping()
+                .await
+                .map_err(|error| format!("Could not ping server: {error}"))?;
+            Ok(())
+        })
+    }
+
+    pub fn heartbeat_interval(&self) -> u64 {
+        RUNTIME.block_on(async { self.inner.heartbeat_interval().await.as_micros() })
+    }
+
+    pub fn snapshot(
+        &self,
+        snapshot_compression: String,
+        snapshot_types: Vec<String>,
+    ) -> Result<Vec<u8>, String> {
+        let rust_compression = match snapshot_compression.trim() {
+            "" => RustSnapshotCompression::default(),
+            value => RustSnapshotCompression::from_str(value).map_err(|error| {
+                format!("Could not capture snapshot: invalid compression '{value}': {error}")
+            })?,
+        };
+        let rust_snapshot_types = snapshot_types
+            .into_iter()
+            .map(|snapshot_type| {
+                RustSystemSnapshotType::from_str(&snapshot_type).map_err(|error| {
+                    format!(
+                        "Could not capture snapshot: invalid snapshot type '{}': {}",
+                        snapshot_type, error
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        RUNTIME.block_on(async {
+            let snapshot = self
+                .inner
+                .snapshot(rust_compression, rust_snapshot_types)
+                .await
+                .map_err(|error| format!("Could not capture snapshot: {error}"))?;
+            Ok(snapshot.0)
         })
     }
 }
