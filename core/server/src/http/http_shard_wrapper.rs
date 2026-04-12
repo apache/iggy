@@ -205,7 +205,8 @@ impl HttpSafeShard {
         };
 
         let future = SendWrapper::new(self.shard().append_messages(partition, batch));
-        future.await
+        future.await?;
+        Ok(())
     }
 
     pub fn login_user(

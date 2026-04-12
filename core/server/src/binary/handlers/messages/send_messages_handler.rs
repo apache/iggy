@@ -23,6 +23,8 @@ use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
 use crate::streaming::topics;
 use compio::buf::{IntoInner as _, IoBuf};
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::responses::messages::SendMessagesResponse;
 use iggy_common::Identifier;
 use iggy_common::PooledBuffer;
 use iggy_common::SenderKind;
@@ -197,8 +199,12 @@ pub async fn handle_send_messages(
         topic_id: topic.topic_id,
         partition_id,
     };
-    shard.append_messages(partition, batch).await?;
+    let base_offset = shard.append_messages(partition, batch).await?;
 
-    sender.send_empty_ok_response().await?;
+    let response = SendMessagesResponse {
+        base_offset,
+        partition_id: partition_id as u32,
+    };
+    sender.send_ok_response(&response.to_bytes()).await?;
     Ok(HandlerResult::Finished)
 }

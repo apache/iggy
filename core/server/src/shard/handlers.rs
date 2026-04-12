@@ -67,12 +67,12 @@ async fn handle_request(
 
             shard.ensure_partition(&namespace).await?;
 
-            shard
+            let base_offset = shard
                 .append_messages_to_local_partition(&namespace, batch, &shard.config.system)
                 .await?;
 
             shard.metrics.increment_messages(messages_count as u64);
-            Ok(ShardResponse::SendMessages)
+            Ok(ShardResponse::SendMessages { base_offset })
         }
         ShardRequestPayload::PollMessages { args, consumer } => {
             let namespace = namespace.expect("PollMessages requires routing namespace");

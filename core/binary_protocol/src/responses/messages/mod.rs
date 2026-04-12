@@ -16,5 +16,7 @@
 // under the License.
 
 pub mod poll_messages;
+pub mod send_messages;
 
 pub use poll_messages::{PollMessagesResponse, PollMessagesResponseHeader};
+pub use send_messages::SendMessagesResponse;

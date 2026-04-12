@@ -66,7 +66,7 @@ export const handleResponseTransform = () => new Transform({
  * @returns True if the response indicates success with no data
  */
 export const deserializeVoidResponse =
-  (r: CommandResponse) => r.status === 0 && r.data.length === 0;
+  (r: CommandResponse) => r.status === 0;
 
 /** Length of the command code in bytes */
 const COMMAND_LENGTH = 4;

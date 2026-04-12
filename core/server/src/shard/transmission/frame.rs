@@ -59,7 +59,9 @@ pub struct ConsumerGroupResponseData {
 #[derive(Debug)]
 pub enum ShardResponse {
     PollMessages((IggyPollMetadata, IggyMessagesBatchSet)),
-    SendMessages,
+    SendMessages {
+        base_offset: u64,
+    },
     FlushUnsavedBuffer {
         flushed_count: u32,
     },

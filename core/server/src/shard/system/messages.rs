@@ -42,9 +42,9 @@ impl IggyShard {
         &self,
         partition: ResolvedPartition,
         batch: IggyMessagesBatchMut,
-    ) -> Result<(), IggyError> {
+    ) -> Result<u64, IggyError> {
         if batch.count() == 0 {
-            return Ok(());
+            return Ok(0);
         }
 
         let namespace = IggyNamespace::new(
@@ -57,7 +57,7 @@ impl IggyShard {
         let request = ShardRequest::data_plane(namespace, payload);
 
         match self.send_to_data_plane(request).await? {
-            ShardResponse::SendMessages => Ok(()),
+            ShardResponse::SendMessages { base_offset } => Ok(base_offset),
             ShardResponse::ErrorResponse(err) => Err(err),
             _ => unreachable!("Expected SendMessages response"),
         }
@@ -315,7 +315,7 @@ impl IggyShard {
         namespace: &IggyNamespace,
         mut batch: IggyMessagesBatchMut,
         config: &crate::configs::system::SystemConfig,
-    ) -> Result<(), IggyError> {
+    ) -> Result<u64, IggyError> {
         let (
             current_offset,
             current_position,
@@ -438,7 +438,7 @@ impl IggyShard {
             }
         }
 
-        Ok(())
+        Ok(current_offset)
     }
 
     /// Persists already-frozen batches to disk. Caller must have set in_flight buffer.
