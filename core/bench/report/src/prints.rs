@@ -17,7 +17,7 @@
  */
 
 use colored::{Color, Colorize};
-use comfy_table::{Cell, Color as TableColor, ContentArrangement, Table, presets::UTF8_FULL};
+use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use human_repr::HumanCount;
 use tracing::info;
 
@@ -195,11 +195,11 @@ impl BenchmarkGroupMetrics {
     }
 
     fn format_wide_layout(&self) -> String {
-        let (prefix, color) = match self.summary.kind {
-            GroupMetricsKind::Producers => ("Producers Results", TableColor::Green),
-            GroupMetricsKind::Consumers => ("Consumers Results", TableColor::Green),
-            GroupMetricsKind::ProducersAndConsumers => ("Aggregate Results", TableColor::Red),
-            GroupMetricsKind::ProducingConsumers => ("Producing Consumer Results", TableColor::Red),
+        let prefix = match self.summary.kind {
+            GroupMetricsKind::Producers => "Producers Results",
+            GroupMetricsKind::Consumers => "Consumers Results",
+            GroupMetricsKind::ProducersAndConsumers => "Aggregate Results",
+            GroupMetricsKind::ProducingConsumers => "Producing Consumer Results",
         };
         let actor = self.summary.kind.actor();
 
@@ -209,27 +209,23 @@ impl BenchmarkGroupMetrics {
             .set_content_arrangement(ContentArrangement::Dynamic);
 
         summary_table.add_row(vec![
-            Cell::new(prefix).fg(color),
-            Cell::new(format!(
+            prefix.to_string(),
+            format!(
                 "{:.2} s",
                 self.avg_throughput_mb_ts.points.last().unwrap().time_s
-            ))
-            .fg(color),
-            Cell::new(format!(
+            ),
+            format!(
                 "{:.2} MB/s",
                 self.summary.total_throughput_megabytes_per_second
-            ))
-            .fg(color),
-            Cell::new(format!(
+            ),
+            format!(
                 "{:.0} msg/s",
                 self.summary.total_throughput_messages_per_second
-            ))
-            .fg(color),
-            Cell::new(format!(
+            ),
+            format!(
                 "{:.2} MB/s per {}",
                 self.summary.average_throughput_megabytes_per_second, actor
-            ))
-            .fg(color),
+            ),
         ]);
 
         let mut latency_table = Table::new();
@@ -260,11 +256,11 @@ impl BenchmarkGroupMetrics {
     }
 
     fn format_narrow_layout(&self) -> String {
-        let (prefix, color) = match self.summary.kind {
-            GroupMetricsKind::Producers => ("Producers Results", TableColor::Green),
-            GroupMetricsKind::Consumers => ("Consumers Results", TableColor::Green),
-            GroupMetricsKind::ProducersAndConsumers => ("Aggregate Results", TableColor::Red),
-            GroupMetricsKind::ProducingConsumers => ("Producing Consumer Results", TableColor::Red),
+        let prefix = match self.summary.kind {
+            GroupMetricsKind::Producers => "Producers Results",
+            GroupMetricsKind::Consumers => "Consumers Results",
+            GroupMetricsKind::ProducersAndConsumers => "Aggregate Results",
+            GroupMetricsKind::ProducingConsumers => "Producing Consumer Results",
         };
         let actor = self.summary.kind.actor();
 
@@ -274,7 +270,7 @@ impl BenchmarkGroupMetrics {
             .set_content_arrangement(ContentArrangement::Dynamic)
             .set_width(60);
 
-        table.add_row(vec![Cell::new(prefix).fg(color), Cell::new("").fg(color)]);
+        table.add_row(vec![prefix.to_string(), String::new()]);
 
         table.add_row(vec!["Summary", ""]);
         table.add_row(vec![

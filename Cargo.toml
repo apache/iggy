@@ -102,7 +102,7 @@ clap = { version = "4.6.0", features = ["derive", "wrap_help"] }
 clap_complete = "4.6.0"
 clock = { path = "core/clock" }
 colored = "3.1.1"
-comfy-table = "7.2.2"
+comfy-table = { version = "7.2.2", default-features = false }
 compio = { version = "0.18.0", features = [
     "runtime",
     "macros",
