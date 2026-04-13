@@ -59,8 +59,9 @@ runs:
         esac
       shell: bash
 
-    # DAG-based test scoping: compute affected crates from cargo metadata + git diff
-    # to avoid running the full test suite when only a subset of crates changed.
+    # DAG-based test scoping: use cargo-rail to compute affected crates from the
+    # workspace dependency graph + git diff, avoiding the full test suite when only
+    # a subset of crates changed.
     # Safety: cargo check/clippy run on the full workspace separately, catching all
     # compilation errors. This only scopes test BUILD and EXECUTION.
     - name: Fetch base branch for DAG analysis
@@ -68,29 +69,36 @@ runs:
       run: git fetch origin master --depth=1 2>/dev/null || true
       shell: bash
 
-    - name: Compute affected crates (DAG-based)
+    - name: Install cargo-rail
       if: startsWith(inputs.task, 'test-')
-      id: affected
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-rail
+
+    - name: Compute affected crates (cargo-rail)
+      if: startsWith(inputs.task, 'test-')
       run: |
-        NEXTEST_FILTER=""
-        PACKAGES=""
+        TOTAL_CRATES=$(cargo metadata --format-version 1 --no-deps 2>/dev/null | jq '.workspace_members | length' 2>/dev/null || echo "?")
+        echo "$TOTAL_CRATES" > /tmp/total-crates.txt
 
-        if python3 scripts/ci/affected-crates.py --base-ref origin/master --format nextest-filter > /tmp/nextest-filter.txt 2>/tmp/affected-stderr.txt; then
-          NEXTEST_FILTER=$(cat /tmp/nextest-filter.txt)
-        fi
-        if python3 scripts/ci/affected-crates.py --base-ref origin/master --format packages > /tmp/packages.txt 2>/tmp/affected-stderr.txt; then
-          PACKAGES=$(cat /tmp/packages.txt)
-        fi
+        PLAN_JSON=$(cargo rail plan --since origin/master -f json 2>/tmp/affected-stderr.txt || echo "")
 
-        if [[ -n "$NEXTEST_FILTER" ]]; then
-          CRATE_COUNT=$(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l)
-          echo "::notice::DAG analysis: ${CRATE_COUNT} affected crates (of 43 total)"
-          echo "scoped=true" >> $GITHUB_OUTPUT
+        if [[ -n "$PLAN_JSON" ]]; then
+          MODE=$(echo "$PLAN_JSON" | jq -r '.scope.mode')
+          if [[ "$MODE" == "crates" ]]; then
+            CRATES=$(echo "$PLAN_JSON" | jq -r '.scope.crates[]')
+            CRATE_COUNT=$(echo "$CRATES" | wc -l)
+            # Build -p flags for cargo build/test
+            echo "$CRATES" | sed 's/^/-p /' | tr '\n' ' ' > /tmp/packages.txt
+            # Build nextest filter expression for cargo nextest run
+            echo "$CRATES" | sed 's/^/package(/; s/$/)/' | paste -sd ' | ' > /tmp/nextest-filter.txt
+            echo "::notice::DAG analysis: ${CRATE_COUNT} affected crates (of ${TOTAL_CRATES} total)"
+          else
+            echo "::notice::Full workspace affected (${TOTAL_CRATES} crates)"
+          fi
         else
           STDERR=$(cat /tmp/affected-stderr.txt 2>/dev/null || echo "")
           echo "::warning::Could not compute affected crates, running full test suite. ${STDERR}"
-          echo "scoped=false" >> $GITHUB_OUTPUT
-          # Clear filter files so test step runs everything
           rm -f /tmp/nextest-filter.txt /tmp/packages.txt
         fi
       shell: bash
@@ -156,11 +164,15 @@ runs:
         # Read DAG-based affected crate filter (computed in earlier step)
         NEXTEST_FILTER=""
         PACKAGE_FLAGS=""
+        TOTAL_CRATES="?"
         if [[ -f /tmp/nextest-filter.txt ]]; then
           NEXTEST_FILTER=$(cat /tmp/nextest-filter.txt)
         fi
         if [[ -f /tmp/packages.txt ]]; then
           PACKAGE_FLAGS=$(cat /tmp/packages.txt)
+        fi
+        if [[ -f /tmp/total-crates.txt ]]; then
+          TOTAL_CRATES=$(cat /tmp/total-crates.txt)
         fi
 
         if [[ -n "$PACKAGE_FLAGS" ]]; then
@@ -230,9 +242,9 @@ runs:
         echo "========================================="
         if [[ -n "$PACKAGE_FLAGS" ]]; then
           CRATE_COUNT=$(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l)
-          echo "DAG scope:                     ${CRATE_COUNT}/43 crates"
+          echo "DAG scope:                     ${CRATE_COUNT}/${TOTAL_CRATES} crates"
         else
-          echo "DAG scope:                     full workspace (43 crates)"
+          echo "DAG scope:                     full workspace (${TOTAL_CRATES} crates)"
         fi
         echo "All targets build:             ${bins_duration}s ($(date -ud @${bins_duration} +'%M:%S'))"
         echo "Tests compile:                 ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
