@@ -67,10 +67,12 @@ components:
       - "rust-cluster"
     paths:
       - "core/server/**"
+      - "core/server-ng/**"
 
   rust-cluster:
     depends_on:
       - "rust-workspace"
+      - "rust-binary-protocol" # cluster crates depend on binary_protocol
     paths:
       - "core/clock/**"
       - "core/consensus/**"
@@ -79,6 +81,14 @@ components:
       - "core/metadata/**"
       - "core/message_bus/**"
       - "core/partitions/**"
+
+  # Standalone simulation tool, does NOT affect server binary or foreign SDKs.
+  # Split from rust-cluster to avoid triggering SDK tests on simulator-only changes.
+  rust-simulator:
+    depends_on:
+      - "rust-workspace"
+      - "rust-cluster"
+    paths:
       - "core/simulator/**"
 
   # Main Rust workspace testing
@@ -91,6 +101,7 @@ components:
       - "rust-binary-protocol"
       - "rust-server"
       - "rust-cluster"
+      - "rust-simulator"
       - "rust-tools"
       - "rust-cli"
       - "rust-bench"

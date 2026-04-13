@@ -15,27 +15,31 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[package]
-name = "journal"
-version = "0.1.0"
-description = "Iggy journal module"
-edition = "2024"
-license = "Apache-2.0"
-keywords = ["iggy", "messaging", "streaming"]
-homepage = "https://iggy.apache.org"
-documentation = "https://iggy.apache.org/docs"
-repository = "https://github.com/apache/iggy"
-readme = "../../../README.md"
+type = "sink"
+key = "iceberg"
+enabled = true
+version = 0
+name = "Iceberg sink"
+path = "../../target/debug/libiggy_connector_iceberg_sink"
+verbose = true
 
-[dependencies]
-bytemuck = { workspace = true }
-compio = { workspace = true }
-iggy_binary_protocol = { workspace = true }
+[[streams]]
+stream = "test_stream"
+topics = ["test_topic"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "iceberg_sink_connector"
 
-[dev-dependencies]
-tempfile = { workspace = true }
-
-[lints.clippy]
-enum_glob_use = "deny"
-pedantic = "deny"
-nursery = "warn"
+# Notice: This configuration deliberately omits 'store_access_key_id' and 'store_secret_access_key'.
+# It is used exclusively by integration tests to test the default credential provider chain fallback behavior.
+[plugin_config]
+tables = ["test.messages"]
+catalog_type = "rest"
+warehouse = "warehouse"
+uri = "http://localhost:8181"
+dynamic_routing = false
+dynamic_route_field = ""
+store_url = "http://localhost:9000"
+store_region = "us-east-1"
+store_class = "s3"

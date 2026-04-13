@@ -112,7 +112,6 @@ pub use types::personal_access_tokens::*;
 pub use types::segment::Segment;
 pub use types::segment_storage::*;
 pub use types::send_messages2;
-pub use types::send_messages2::*;
 pub use types::snapshot::*;
 pub use types::stats::*;
 pub use types::stream::*;
