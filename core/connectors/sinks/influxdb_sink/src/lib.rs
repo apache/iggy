@@ -20,6 +20,9 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use iggy_common::serde_secret::serialize_secret;
+use iggy_connector_influxdb_common::{
+    ApiVersion, InfluxDbAdapter, write_field_string, write_measurement, write_tag_value,
+};
 use iggy_connector_sdk::retry::{
     CircuitBreaker, ConnectivityConfig, build_retry_client, check_connectivity_with_retry,
     parse_duration,
@@ -78,12 +81,18 @@ pub struct InfluxDbSink {
     /// on every message in the hot path.
     payload_format: PayloadFormat,
     circuit_breaker: Arc<CircuitBreaker>,
+    /// Version-specific HTTP adapter (V2 or V3), resolved from `config.api_version`
+    /// at construction time.
+    adapter: Box<dyn InfluxDbAdapter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfluxDbSinkConfig {
     pub url: String,
+    /// Organization name — required for V2; ignored when `api_version = "v3"`.
     pub org: String,
+    /// Bucket name — used for V2.  For V3 set `db` instead (falls back to
+    /// `bucket` when `db` is absent so existing V2 configs keep working).
     pub bucket: String,
     #[serde(serialize_with = "serialize_secret")]
     pub token: SecretString,
@@ -112,6 +121,14 @@ pub struct InfluxDbSinkConfig {
     // Circuit breaker configuration
     pub circuit_breaker_threshold: Option<u32>,
     pub circuit_breaker_cool_down: Option<String>,
+    // ── V3-specific fields (ignored when api_version = "v2") ────────────────
+    /// InfluxDB API version: `"v2"` (default) or `"v3"`.
+    /// Determines the write/query endpoint URLs and auth header scheme.
+    pub api_version: Option<String>,
+    /// Database name for InfluxDB V3 (`?db=X`).  Falls back to `bucket` when
+    /// absent so that a V2 config can be extended to V3 by just adding
+    /// `api_version = "v3"` without renaming the `bucket` field.
+    pub db: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -141,66 +158,6 @@ impl PayloadFormat {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Write an escaped measurement name into `buf`.
-/// Escapes: `\` → `\\`, `,` → `\,`, ` ` → `\ `, `\n` → `\\n`, `\r` → `\\r`
-///
-/// Newline (`\n`) and carriage-return (`\r`) are the InfluxDB line-protocol
-/// record delimiters; a literal newline inside a measurement name would split
-/// the line and corrupt the batch.
-fn write_measurement(buf: &mut String, value: &str) {
-    for ch in value.chars() {
-        match ch {
-            '\\' => buf.push_str("\\\\"),
-            ',' => buf.push_str("\\,"),
-            ' ' => buf.push_str("\\ "),
-            '\n' => buf.push_str("\\n"),
-            '\r' => buf.push_str("\\r"),
-            _ => buf.push(ch),
-        }
-    }
-}
-
-/// Write an escaped tag key/value into `buf`.
-/// Escapes: `\` → `\\`, `,` → `\,`, `=` → `\=`, ` ` → `\ `, `\n` → `\\n`, `\r` → `\\r`
-///
-/// Newline and carriage-return are escaped for the same reason as in
-/// [`write_measurement`]: they are InfluxDB line-protocol record delimiters.
-fn write_tag_value(buf: &mut String, value: &str) {
-    for ch in value.chars() {
-        match ch {
-            '\\' => buf.push_str("\\\\"),
-            ',' => buf.push_str("\\,"),
-            '=' => buf.push_str("\\="),
-            ' ' => buf.push_str("\\ "),
-            '\n' => buf.push_str("\\n"),
-            '\r' => buf.push_str("\\r"),
-            _ => buf.push(ch),
-        }
-    }
-}
-
-/// Write an escaped string field value (without surrounding quotes) into `buf`.
-/// Escapes: `\` → `\\`, `"` → `\"`, `\n` → `\\n`, `\r` → `\\r`
-///
-/// Newline and carriage-return are the InfluxDB line-protocol record
-/// delimiters; a literal newline inside a string field value (e.g. from a
-/// multi-line text payload) would split the line and corrupt the batch.
-fn write_field_string(buf: &mut String, value: &str) {
-    for ch in value.chars() {
-        match ch {
-            '\\' => buf.push_str("\\\\"),
-            '"' => buf.push_str("\\\""),
-            '\n' => buf.push_str("\\n"),
-            '\r' => buf.push_str("\\r"),
-            _ => buf.push(ch),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // InfluxDbSink implementation
 // ---------------------------------------------------------------------------
 
@@ -219,6 +176,10 @@ impl InfluxDbSink {
             DEFAULT_CIRCUIT_COOL_DOWN,
         );
 
+        // Resolve the version-specific adapter once at construction time so
+        // per-message hot paths incur no string comparisons.
+        let adapter = ApiVersion::from_config(config.api_version.as_deref()).make_adapter();
+
         InfluxDbSink {
             id,
             config,
@@ -231,6 +192,7 @@ impl InfluxDbSink {
             retry_delay,
             payload_format,
             circuit_breaker: Arc::new(CircuitBreaker::new(cb_threshold, cb_cool_down)),
+            adapter,
         }
     }
 
@@ -244,26 +206,29 @@ impl InfluxDbSink {
 
     fn build_write_url(&self) -> Result<Url, Error> {
         let base = self.config.url.trim_end_matches('/');
-        let mut url = Url::parse(&format!("{base}/api/v2/write"))
-            .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))?;
-
+        // V3 uses `db`; fall back to `bucket` so existing V2 configs work
+        // with `api_version = "v3"` without renaming the field.
+        let bucket_or_db = self
+            .config
+            .db
+            .as_deref()
+            .unwrap_or(self.config.bucket.as_str());
+        let org = if self.config.org.is_empty() {
+            None
+        } else {
+            Some(self.config.org.as_str())
+        };
         let precision = self
             .config
             .precision
             .as_deref()
             .unwrap_or(DEFAULT_PRECISION);
-        url.query_pairs_mut()
-            .append_pair("org", &self.config.org)
-            .append_pair("bucket", &self.config.bucket)
-            .append_pair("precision", precision);
-
-        Ok(url)
+        self.adapter.write_url(base, bucket_or_db, org, precision)
     }
 
     fn build_health_url(&self) -> Result<Url, Error> {
         let base = self.config.url.trim_end_matches('/');
-        Url::parse(&format!("{base}/health"))
-            .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))
+        self.adapter.health_url(base)
     }
 
     fn get_client(&self) -> Result<&ClientWithMiddleware, Error> {
@@ -366,11 +331,11 @@ impl InfluxDbSink {
         write_field_string(buf, &message.id.to_string());
         buf.push('"');
 
-        // offset as a numeric field (queryable in Flux) in addition to the tag
-        {
-            use std::fmt::Write as _;
-            write!(buf, ",offset={}u", message.offset).expect("write to String is infallible");
-        }
+        // NOTE: `offset` is already in the tag set above (as a string tag that
+        // makes every point unique in the deduplication key).  InfluxDB 3 rejects
+        // writing the same column name as both a tag AND a field, so we do NOT
+        // duplicate it here as a `u` (uinteger) field.  V2/Flux users can still
+        // query the offset via the tag column.
 
         // Optional metadata fields written when the corresponding tag is
         // disabled (so the value is still queryable as a field).
@@ -521,7 +486,9 @@ impl InfluxDbSink {
         let url = self.write_url.clone().ok_or_else(|| {
             Error::Connection("write_url not initialised — was open() called?".to_string())
         })?;
-        let token = self.config.token.expose_secret().to_owned();
+        let auth = self
+            .adapter
+            .auth_header_value(self.config.token.expose_secret());
 
         // Convert once before sending — Bytes is reference-counted so any
         // retry inside the middleware clones the pointer, not the payload data.
@@ -529,7 +496,7 @@ impl InfluxDbSink {
 
         let response = client
             .post(url)
-            .header("Authorization", format!("Token {token}"))
+            .header("Authorization", auth)
             .header("Content-Type", "text/plain; charset=utf-8")
             .body(body)
             .send()
@@ -568,9 +535,13 @@ impl InfluxDbSink {
 #[async_trait]
 impl Sink for InfluxDbSink {
     async fn open(&mut self) -> Result<(), Error> {
+        let api_ver = self.config.api_version.as_deref().unwrap_or("v2");
         info!(
-            "Opening InfluxDB sink connector with ID: {}. Bucket: {}, org: {}",
-            self.id, self.config.bucket, self.config.org
+            "Opening InfluxDB sink connector with ID: {} (api_version={api_ver}). \
+             Bucket/db: {}, org: {}",
+            self.id,
+            self.config.db.as_deref().unwrap_or(&self.config.bucket),
+            self.config.org
         );
 
         // Build the raw client first and use it for the startup connectivity
@@ -778,6 +749,9 @@ mod tests {
             retry_max_delay: Some("1s".to_string()),
             circuit_breaker_threshold: Some(5),
             circuit_breaker_cool_down: Some("30s".to_string()),
+            // V3 fields — default to None (V2 behaviour)
+            api_version: None,
+            db: None,
         }
     }
 
@@ -1620,5 +1594,82 @@ mod tests {
         let sink = InfluxDbSink::new(1, config);
         let result = sink.to_precision_timestamp(u64::MAX);
         assert_eq!(result, u64::MAX, "saturating_mul must clamp at u64::MAX");
+    }
+
+    // ── V3 adapter selection ─────────────────────────────────────────────────────
+
+    #[test]
+    fn v3_write_url_uses_api_v3_write_lp_endpoint() {
+        let mut config = make_config();
+        config.api_version = Some("v3".to_string());
+        config.db = Some("sensors_db".to_string());
+        let sink = InfluxDbSink::new(1, config);
+        let url = sink.build_write_url().unwrap();
+        assert_eq!(
+            url.path(),
+            "/api/v3/write_lp",
+            "V3 write must use /api/v3/write_lp, got: {}",
+            url.path()
+        );
+        let q = url.query().unwrap_or("");
+        assert!(q.contains("db=sensors_db"), "V3 must use db param: {q}");
+        assert!(!q.contains("bucket="), "V3 must not use bucket param: {q}");
+        assert!(!q.contains("org="), "V3 must not include org: {q}");
+    }
+
+    #[test]
+    fn v3_write_url_falls_back_to_bucket_when_db_absent() {
+        let mut config = make_config();
+        config.api_version = Some("v3".to_string());
+        // No db set — must fall back to bucket field for migration convenience
+        config.db = None;
+        let sink = InfluxDbSink::new(1, config);
+        let url = sink.build_write_url().unwrap();
+        assert_eq!(url.path(), "/api/v3/write_lp");
+        let q = url.query().unwrap_or("");
+        assert!(
+            q.contains("db=test_bucket"),
+            "must fall back to bucket value: {q}"
+        );
+    }
+
+    #[test]
+    fn v2_write_url_still_uses_api_v2_write() {
+        let mut config = make_config();
+        config.api_version = Some("v2".to_string());
+        let sink = InfluxDbSink::new(1, config);
+        let url = sink.build_write_url().unwrap();
+        assert_eq!(url.path(), "/api/v2/write");
+    }
+
+    #[test]
+    fn default_api_version_is_v2() {
+        let config = make_config(); // api_version = None
+        let sink = InfluxDbSink::new(1, config);
+        let url = sink.build_write_url().unwrap();
+        assert_eq!(
+            url.path(),
+            "/api/v2/write",
+            "omitting api_version must default to V2"
+        );
+    }
+
+    #[test]
+    fn v3_auth_header_uses_bearer_scheme() {
+        // The adapter chosen for V3 must produce "Bearer {token}".
+        // Verify indirectly by inspecting the adapter's auth_header_value.
+        let mut config = make_config();
+        config.api_version = Some("v3".to_string());
+        let sink = InfluxDbSink::new(1, config);
+        let auth = sink.adapter.auth_header_value("mytoken");
+        assert_eq!(auth, "Bearer mytoken");
+    }
+
+    #[test]
+    fn v2_auth_header_uses_token_scheme() {
+        let config = make_config(); // api_version = None → V2
+        let sink = InfluxDbSink::new(1, config);
+        let auth = sink.adapter.auth_header_value("mytoken");
+        assert_eq!(auth, "Token mytoken");
     }
 }

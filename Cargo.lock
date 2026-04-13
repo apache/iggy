@@ -5589,6 +5589,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_influxdb_common"
+version = "0.1.0-edge.1"
+dependencies = [
+ "csv",
+ "iggy_connector_sdk",
+ "reqwest 0.13.2",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "iggy_connector_influxdb_sink"
 version = "0.1.0-edge.1"
 dependencies = [
@@ -5598,6 +5609,7 @@ dependencies = [
  "dashmap",
  "futures",
  "iggy_common",
+ "iggy_connector_influxdb_common",
  "iggy_connector_sdk",
  "once_cell",
  "reqwest 0.13.2",
@@ -5620,6 +5632,7 @@ dependencies = [
  "dashmap",
  "futures",
  "iggy_common",
+ "iggy_connector_influxdb_common",
  "iggy_connector_sdk",
  "once_cell",
  "regex",
@@ -5703,6 +5716,7 @@ dependencies = [
  "serde",
  "serde_yaml_ng",
  "simd-json",
+ "tokio",
  "tracing",
 ]
 

@@ -18,9 +18,9 @@
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
-use csv::StringRecord;
 use iggy_common::serde_secret::serialize_secret;
 use iggy_common::{DateTime, Utc};
+use iggy_connector_influxdb_common::{ApiVersion, InfluxDbAdapter};
 use iggy_connector_sdk::retry::{
     CircuitBreaker, ConnectivityConfig, build_retry_client, check_connectivity_with_retry,
     parse_duration,
@@ -96,14 +96,21 @@ pub struct InfluxDbSource {
     /// `open()` refuses to start when this is `true` so operators are not
     /// surprised by a silent cursor reset and full re-delivery.
     state_restore_failed: bool,
+    /// Version-specific HTTP adapter (V2 or V3), resolved from `config.api_version`
+    /// at construction time.
+    adapter: Box<dyn InfluxDbAdapter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfluxDbSourceConfig {
     pub url: String,
+    /// Organisation name — required for V2.  Ignored when `api_version = "v3"`.
     pub org: String,
     #[serde(serialize_with = "serialize_secret")]
     pub token: SecretString,
+    /// Query template.  Use `$cursor` and `$limit` placeholders.
+    /// - V2: Flux query, e.g. `from(bucket:"b") |> range(start: time(v:"$cursor")) |> limit(n: $limit)`
+    /// - V3: SQL query, e.g. `SELECT _time, _value FROM tbl WHERE _time > '$cursor' ORDER BY _time LIMIT $limit`
     pub query: String,
     pub poll_interval: Option<String>,
     pub batch_size: Option<u32>,
@@ -127,6 +134,14 @@ pub struct InfluxDbSourceConfig {
     // Circuit breaker configuration
     pub circuit_breaker_threshold: Option<u32>,
     pub circuit_breaker_cool_down: Option<String>,
+    // ── V3-specific fields (ignored when api_version = "v2") ────────────────
+    /// InfluxDB API version: `"v2"` (default) or `"v3"`.
+    pub api_version: Option<String>,
+    /// Database name for InfluxDB V3.  Used as the `"db"` key in the query
+    /// body.  Falls back to parsing the bucket name from the `query` field is
+    /// not a concern for V3 since the query body carries the database.  For
+    /// V3, set `db` explicitly.
+    pub db: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -204,22 +219,6 @@ fn parse_scalar(value: &str) -> serde_json::Value {
     serde_json::Value::String(value.to_string())
 }
 
-/// Recognise an InfluxDB CSV header row.
-///
-/// A header row must contain a `_time` column. The `_value` column is
-/// intentionally **not** required: Flux aggregation queries (`count()`,
-/// `mean()`, `group()`) produce result tables with columns like `_count` or
-/// `_mean` instead of `_value`. Requiring `_value` would cause those header
-/// rows to be missed, silently skipping all subsequent data rows until the
-/// next recognised header.
-///
-/// InfluxDB annotation rows (`#group`, `#datatype`, `#default`) are already
-/// filtered out earlier in `parse_csv_rows` by the leading-`#` check, so
-/// they will never reach this function.
-fn is_header_record(record: &StringRecord) -> bool {
-    record.iter().any(|v| v == "_time")
-}
-
 /// Compare two RFC 3339 timestamp strings chronologically.
 ///
 /// InfluxDB strips trailing fractional-second zeros, producing timestamps like
@@ -284,6 +283,9 @@ impl InfluxDbSource {
             },
         };
 
+        // Resolve the version-specific adapter once at construction time.
+        let adapter = ApiVersion::from_config(config.api_version.as_deref()).make_adapter();
+
         InfluxDbSource {
             id,
             config,
@@ -300,6 +302,7 @@ impl InfluxDbSource {
             payload_format,
             circuit_breaker: Arc::new(CircuitBreaker::new(cb_threshold, cb_cool_down)),
             state_restore_failed,
+            adapter,
         }
     }
 
@@ -338,21 +341,26 @@ impl InfluxDbSource {
 
     fn build_health_url(&self) -> Result<Url, Error> {
         let base = self.config.url.trim_end_matches('/');
-        Url::parse(&format!("{base}/health"))
-            .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))
+        self.adapter.health_url(base)
     }
 
-    fn build_query_url(&self) -> Result<Url, Error> {
-        let base = self.config.url.trim_end_matches('/');
-        let mut url = Url::parse(&format!("{base}/api/v2/query"))
-            .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))?;
-        url.query_pairs_mut().append_pair("org", &self.config.org);
-        Ok(url)
+    /// Returns the db/bucket name to pass to the adapter's `build_query`.
+    /// - V3: uses `db` config field (falls back to empty string; V3 embeds
+    ///   the db in the query body so this is always explicit in V3 configs).
+    /// - V2: `build_query` ignores this value (bucket is embedded in the
+    ///   Flux query template by the user).
+    fn db_or_bucket(&self) -> &str {
+        self.config.db.as_deref().unwrap_or("")
     }
 
     fn cursor_re() -> &'static Regex {
         CURSOR_RE.get_or_init(|| {
-            Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+            // The timezone suffix is optional: InfluxDB 3 returns timestamps
+            // without a timezone designator (e.g. "2026-01-02T03:04:05.123456"),
+            // treating them as implicit UTC.  RFC 3339 / V2 timestamps include
+            // "Z" or "+HH:MM".  Both forms are safe against query injection
+            // because the full pattern is strictly anchored.
+            Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$")
                 .expect("hardcoded regex is valid")
         })
     }
@@ -411,29 +419,37 @@ impl InfluxDbSource {
         Ok(query)
     }
 
-    /// Execute a Flux query against `/api/v2/query` and return the raw CSV
-    /// response body. Retry/back-off is handled transparently by the
-    /// `ClientWithMiddleware` stack (see `build_retry_client`).
+    /// Execute a query and return the raw response body.
+    ///
+    /// The adapter decides the URL, request body shape, and auth header based
+    /// on the configured API version:
+    /// - V2: POSTs Flux to `/api/v2/query?org=X`, expects annotated CSV.
+    /// - V3: POSTs SQL to `/api/v3/query_sql`, expects JSONL.
+    ///
+    /// Retry/back-off is handled transparently by the `ClientWithMiddleware`
+    /// stack (see `build_retry_client`).
     async fn run_query(&self, query: &str) -> Result<String, Error> {
         let client = self.get_client()?;
-        let url = self.build_query_url()?;
-        let token = self.config.token.expose_secret().to_owned();
+        let base = self.config.url.trim_end_matches('/');
+        let org = if self.config.org.is_empty() {
+            None
+        } else {
+            Some(self.config.org.as_str())
+        };
 
-        let body = json!({
-            "query": query,
-            "dialect": {
-                "annotations": [],
-                "delimiter": ",",
-                "header": true,
-                "commentPrefix": "#"
-            }
-        });
+        let (url, body) = self
+            .adapter
+            .build_query(base, query, self.db_or_bucket(), org)?;
 
         let response = client
             .post(url)
-            .header("Authorization", format!("Token {token}"))
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/csv")
+            .header(
+                "Authorization",
+                self.adapter
+                    .auth_header_value(self.config.token.expose_secret()),
+            )
+            .header("Content-Type", self.adapter.query_content_type())
+            .header("Accept", self.adapter.query_accept_header())
             .json(&body)
             .send()
             .await
@@ -452,6 +468,18 @@ impl InfluxDbSource {
             .await
             .unwrap_or_else(|_| "failed to read response body".to_string());
 
+        // InfluxDB 3: 404 "database not found" means the database / namespace
+        // has not been written to yet — it will be created on the first write.
+        // Treat this as an empty result rather than a permanent error so the
+        // circuit breaker doesn't accumulate failures during startup.
+        if status.as_u16() == 404 && body_text.contains("database not found") {
+            debug!(
+                "InfluxDB source ID: {} — database not found (404), returning empty result",
+                self.id
+            );
+            return Ok(String::new());
+        }
+
         // Use PermanentHttpError for non-transient 4xx (400 Bad Request, 401
         // Unauthorized, etc.) so poll() can skip the circuit breaker for these
         // — they indicate a config/data issue, not an infrastructure failure.
@@ -466,56 +494,14 @@ impl InfluxDbSource {
         }
     }
 
-    fn parse_csv_rows(&self, csv_text: &str) -> Result<Vec<HashMap<String, String>>, Error> {
-        let mut reader = csv::ReaderBuilder::new()
-            .has_headers(false)
-            .from_reader(csv_text.as_bytes());
-
-        let mut headers: Option<StringRecord> = None;
-        let mut rows = Vec::new();
-
-        for result in reader.records() {
-            let record = result
-                .map_err(|e| Error::InvalidRecordValue(format!("Invalid CSV record: {e}")))?;
-
-            if record.is_empty() {
-                continue;
-            }
-
-            if let Some(first) = record.get(0)
-                && first.starts_with('#')
-            {
-                continue;
-            }
-
-            if is_header_record(&record) {
-                headers = Some(record.clone());
-                continue;
-            }
-
-            let Some(active_headers) = headers.as_ref() else {
-                continue;
-            };
-
-            if record == *active_headers {
-                continue;
-            }
-
-            let mut mapped = HashMap::new();
-            for (idx, key) in active_headers.iter().enumerate() {
-                if key.is_empty() {
-                    continue;
-                }
-                let value = record.get(idx).unwrap_or("").to_string();
-                mapped.insert(key.to_string(), value);
-            }
-
-            if !mapped.is_empty() {
-                rows.push(mapped);
-            }
-        }
-
-        Ok(rows)
+    /// Parse the raw query response body into a list of field-maps.
+    ///
+    /// Delegates to the adapter so V2 uses the annotated CSV parser and V3
+    /// uses the JSONL parser.  The cursor-tracking and payload-building logic
+    /// in `poll_messages` operates on the `Vec<HashMap<String,String>>` result
+    /// unchanged for both versions.
+    fn parse_rows(&self, response_body: &str) -> Result<Vec<HashMap<String, String>>, Error> {
+        self.adapter.parse_rows(response_body)
     }
 
     fn build_payload(
@@ -556,6 +542,15 @@ impl InfluxDbSource {
             if include_metadata || key == "_value" || key == "_time" || key == "_measurement" {
                 json_row.insert(key.clone(), parse_scalar(value));
             }
+        }
+
+        // V3 rows are flat JSONL objects — output them as-is so the native
+        // field names (e.g. `time`, `temp`) are visible at the top level.
+        // V2 uses the wrapped envelope with `measurement`, `field`,
+        // `timestamp`, `value`, and `row` for backward-compatibility.
+        if self.config.api_version.as_deref() == Some("v3") {
+            return serde_json::to_vec(&serde_json::Value::Object(json_row))
+                .map_err(|e| Error::Serialization(format!("JSON serialization failed: {e}")));
         }
 
         let wrapped = json!({
@@ -606,9 +601,9 @@ impl InfluxDbSource {
             );
             e
         })?;
-        let csv_data = self.run_query(&query).await?;
+        let response_data = self.run_query(&query).await?;
 
-        let rows = self.parse_csv_rows(&csv_data)?;
+        let rows = self.parse_rows(&response_data)?;
         let include_metadata = self.config.include_metadata.unwrap_or(true);
         let cursor_field = self.cursor_field().to_string();
 
@@ -678,8 +673,9 @@ impl Source for InfluxDbSource {
             return Err(Error::InvalidState);
         }
 
+        let api_ver = self.config.api_version.as_deref().unwrap_or("v2");
         info!(
-            "Opening InfluxDB source connector with ID: {}. Org: {}",
+            "Opening InfluxDB source connector with ID: {} (api_version={api_ver}). Org: {}",
             self.id, self.config.org
         );
 
@@ -884,6 +880,9 @@ mod tests {
             retry_max_delay: Some("1s".to_string()),
             circuit_breaker_threshold: Some(5),
             circuit_breaker_cool_down: Some("30s".to_string()),
+            // V3 fields — default to None (V2 behaviour)
+            api_version: None,
+            db: None,
         }
     }
 
@@ -899,6 +898,9 @@ mod tests {
         assert!(InfluxDbSource::validate_cursor("2024-01-15T10:30:00.123456789Z").is_ok());
         assert!(InfluxDbSource::validate_cursor("2024-01-15T10:30:00+05:30").is_ok());
         assert!(InfluxDbSource::validate_cursor("1970-01-01T00:00:00Z").is_ok());
+        // InfluxDB 3 returns timestamps without timezone suffix (implicit UTC)
+        assert!(InfluxDbSource::validate_cursor("2026-04-12T11:28:25.180749").is_ok());
+        assert!(InfluxDbSource::validate_cursor("2026-04-12T11:28:25").is_ok());
     }
 
     #[test]
@@ -1013,7 +1015,7 @@ mod tests {
     #[test]
     fn parse_csv_rows_empty_string_returns_empty() {
         let source = make_source();
-        let rows = source.parse_csv_rows("").unwrap();
+        let rows = source.parse_rows("").unwrap();
         assert!(rows.is_empty());
     }
 
@@ -1023,7 +1025,7 @@ mod tests {
         // Annotation rows must have the same field count as data rows for the CSV
         // reader to accept them.  InfluxDB always emits uniformly-wide rows.
         let csv = "#group,false\n#datatype,string\n_time,_value\n2024-01-01T00:00:00Z,42\n";
-        let rows = source.parse_csv_rows(csv).unwrap();
+        let rows = source.parse_rows(csv).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("_value").map(String::as_str), Some("42"));
     }
@@ -1033,7 +1035,7 @@ mod tests {
         let source = make_source();
         // Two data records separated by a blank line (multi-table CSV format)
         let csv = "_time,_value\n2024-01-01T00:00:00Z,1\n\n_time,_value\n2024-01-01T00:00:01Z,2\n";
-        let rows = source.parse_csv_rows(csv).unwrap();
+        let rows = source.parse_rows(csv).unwrap();
         // Both data rows should be parsed (second header line is skipped)
         assert_eq!(rows.len(), 2, "expected 2 data rows, got {}", rows.len());
     }
@@ -1043,7 +1045,7 @@ mod tests {
         let source = make_source();
         // Same header appears twice (InfluxDB multi-table result format)
         let csv = "_time,_value\n2024-01-01T00:00:00Z,10\n_time,_value\n2024-01-01T00:00:01Z,20\n";
-        let rows = source.parse_csv_rows(csv).unwrap();
+        let rows = source.parse_rows(csv).unwrap();
         assert_eq!(rows.len(), 2);
     }
 
@@ -1053,7 +1055,7 @@ mod tests {
         // Data row with an empty field value (column present but blank).
         // The CSV reader requires uniform field counts, so we keep all 3 columns.
         let csv = "_time,_value,_measurement\n2024-01-01T00:00:00Z,42,\n";
-        let rows = source.parse_csv_rows(csv).unwrap();
+        let rows = source.parse_rows(csv).unwrap();
         assert_eq!(rows.len(), 1);
         // _measurement is present but empty
         assert_eq!(
@@ -1395,5 +1397,137 @@ mod tests {
         assert_eq!(PayloadFormat::Json.schema(), Schema::Json);
         assert_eq!(PayloadFormat::Text.schema(), Schema::Text);
         assert_eq!(PayloadFormat::Raw.schema(), Schema::Raw);
+    }
+
+    // ── V3 adapter selection ─────────────────────────────────────────────────────
+
+    #[test]
+    fn v2_auth_header_uses_token_scheme() {
+        let config = make_config(); // api_version = None → V2
+        let source = InfluxDbSource::new(1, config, None);
+        let auth = source.adapter.auth_header_value("mytoken");
+        assert_eq!(auth, "Token mytoken");
+    }
+
+    #[test]
+    fn v3_auth_header_uses_bearer_scheme() {
+        let mut config = make_config();
+        config.api_version = Some("v3".to_string());
+        let source = InfluxDbSource::new(1, config, None);
+        let auth = source.adapter.auth_header_value("mytoken");
+        assert_eq!(auth, "Bearer mytoken");
+    }
+
+    #[test]
+    fn v2_query_uses_api_v2_query_endpoint() {
+        let config = make_config(); // api_version = None → V2
+        let source = InfluxDbSource::new(1, config, None);
+        let base = "http://localhost:8086";
+        let (url, body) = source
+            .adapter
+            .build_query(
+                base,
+                "from(bucket:\"b\") |> range(start:-1h)",
+                "",
+                Some("org"),
+            )
+            .unwrap();
+        assert!(
+            url.path().ends_with("/api/v2/query"),
+            "V2 must use /api/v2/query, got: {}",
+            url.path()
+        );
+        assert!(body["query"].is_string(), "V2 body must have 'query' field");
+        assert!(
+            body["dialect"].is_object(),
+            "V2 body must have 'dialect' field"
+        );
+    }
+
+    #[test]
+    fn v3_query_uses_api_v3_query_sql_endpoint() {
+        let mut config = make_config();
+        config.api_version = Some("v3".to_string());
+        config.db = Some("sensors".to_string());
+        let source = InfluxDbSource::new(1, config, None);
+        let base = "http://localhost:8181";
+        let (url, body) = source
+            .adapter
+            .build_query(
+                base,
+                "SELECT _time, _value FROM cpu WHERE _time > '2024-01-01T00:00:00Z' LIMIT 100",
+                "sensors",
+                None,
+            )
+            .unwrap();
+        assert!(
+            url.path().ends_with("/api/v3/query_sql"),
+            "V3 must use /api/v3/query_sql, got: {}",
+            url.path()
+        );
+        assert_eq!(
+            body["db"].as_str(),
+            Some("sensors"),
+            "V3 body must have 'db'"
+        );
+        assert_eq!(
+            body["format"].as_str(),
+            Some("jsonl"),
+            "V3 body must specify jsonl"
+        );
+        assert!(
+            body["q"].as_str().unwrap().contains("SELECT"),
+            "V3 body must have 'q'"
+        );
+    }
+
+    #[test]
+    fn v3_parse_rows_accepts_jsonl_response() {
+        let mut config = make_config();
+        config.api_version = Some("v3".to_string());
+        let source = InfluxDbSource::new(1, config, None);
+        let jsonl = r#"{"_time":"2024-01-01T00:00:00Z","_value":"42","host":"s1"}
+{"_time":"2024-01-01T00:00:01Z","_value":"43","host":"s2"}
+"#;
+        let rows = source.parse_rows(jsonl).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("host").map(String::as_str), Some("s1"));
+        assert_eq!(rows[1].get("_value").map(String::as_str), Some("43"));
+    }
+
+    #[test]
+    fn v2_parse_rows_accepts_csv_response() {
+        let config = make_config(); // api_version = None → V2
+        let source = InfluxDbSource::new(1, config, None);
+        let csv = "_time,_measurement,_value\n2024-01-01T00:00:00Z,cpu,75.0\n";
+        let rows = source.parse_rows(csv).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("_measurement").map(String::as_str), Some("cpu"));
+    }
+
+    #[test]
+    fn v3_accept_header_is_json() {
+        let mut config = make_config();
+        config.api_version = Some("v3".to_string());
+        let source = InfluxDbSource::new(1, config, None);
+        assert_eq!(source.adapter.query_accept_header(), "application/json");
+    }
+
+    #[test]
+    fn v2_accept_header_is_csv() {
+        let config = make_config();
+        let source = InfluxDbSource::new(1, config, None);
+        assert_eq!(source.adapter.query_accept_header(), "text/csv");
+    }
+
+    #[test]
+    fn default_api_version_is_v2_for_source() {
+        let config = make_config(); // api_version = None
+        let source = InfluxDbSource::new(1, config, None);
+        // V2 adapter uses "Token" auth
+        assert!(
+            source.adapter.auth_header_value("t").starts_with("Token"),
+            "default must be V2 adapter"
+        );
     }
 }
