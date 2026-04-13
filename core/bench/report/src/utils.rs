@@ -18,6 +18,15 @@
 
 use crate::time_series::{TimePoint, TimeSeries};
 use serde::Serializer;
+use terminal_size::{Width, terminal_size};
+
+/// Terminal width threshold for switching between narrow and wide table layouts
+pub const WIDE_LAYOUT_THRESHOLD: u16 = 140;
+
+/// Returns current terminal width in columns
+pub fn get_terminal_width() -> u16 {
+    terminal_size().map(|(Width(w), _)| w).unwrap_or(80)
+}
 
 pub(crate) fn round_float<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
 where

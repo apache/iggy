@@ -24,10 +24,14 @@ use crate::{
         rate_limiter::BenchmarkRateLimiter,
     },
 };
-use bench_report::actor_kind::ActorKind;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
+use bench_report::{
+    actor_kind::ActorKind,
+    utils::{WIDE_LAYOUT_THRESHOLD, get_terminal_width},
+};
+use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use human_repr::HumanCount;
 use iggy::prelude::*;
 use std::{sync::Arc, time::Duration};
@@ -164,6 +168,7 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
             batches_processed,
             &self.config.messages_per_batch,
             &metrics,
+            self.config.pretty,
         );
 
         Ok(metrics)
@@ -194,29 +199,201 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
         message_batches: u64,
         messages_per_batch: &BenchmarkNumericParameter,
         metrics: &BenchmarkIndividualMetrics,
+        pretty: bool,
     ) {
-        info!(
-            "Producer #{} → sent {} messages in {} batches of {} messages in {:.2} s, total size: {}, average throughput: {:.2} MB/s, \
-    p50 latency: {:.2} ms, p90 latency: {:.2} ms, p95 latency: {:.2} ms, p99 latency: {:.2} ms, p999 latency: {:.2} ms, p9999 latency: {:.2} ms, \
-    average latency: {:.2} ms, median latency: {:.2} ms, min latency: {:.2} ms, max latency: {:.2} ms, std dev latency: {:.2} ms",
-            producer_id,
-            total_messages.human_count_bare(),
-            message_batches.human_count_bare(),
-            messages_per_batch,
-            metrics.summary.total_time_secs,
-            IggyByteSize::from(metrics.summary.total_user_data_bytes),
-            metrics.summary.throughput_megabytes_per_second,
-            metrics.summary.p50_latency_ms,
-            metrics.summary.p90_latency_ms,
-            metrics.summary.p95_latency_ms,
-            metrics.summary.p99_latency_ms,
-            metrics.summary.p999_latency_ms,
-            metrics.summary.p9999_latency_ms,
-            metrics.summary.avg_latency_ms,
-            metrics.summary.median_latency_ms,
-            metrics.summary.min_latency_ms,
-            metrics.summary.max_latency_ms,
-            metrics.summary.std_dev_latency_ms,
-        );
+        if pretty {
+            let width = get_terminal_width();
+
+            if width >= WIDE_LAYOUT_THRESHOLD {
+                Self::print_wide_layout(
+                    producer_id,
+                    total_messages,
+                    message_batches,
+                    messages_per_batch,
+                    metrics,
+                );
+            } else {
+                Self::print_narrow_layout(
+                    producer_id,
+                    total_messages,
+                    message_batches,
+                    messages_per_batch,
+                    metrics,
+                );
+            }
+        } else {
+            info!(
+                "Producer #{} → sent {} messages in {} batches of {} messages in {:.2} s, total size: {}, average throughput: {:.2} MB/s, \
+            p50 latency: {:.2} ms, p90 latency: {:.2} ms, p95 latency: {:.2} ms, p99 latency: {:.2} ms, p999 latency: {:.2} ms, p9999 latency: {:.2} ms, \
+            average latency: {:.2} ms, median latency: {:.2} ms, min latency: {:.2} ms, max latency: {:.2} ms, std dev latency: {:.2} ms",
+                producer_id,
+                total_messages.human_count_bare(),
+                message_batches.human_count_bare(),
+                messages_per_batch,
+                metrics.summary.total_time_secs,
+                IggyByteSize::from(metrics.summary.total_user_data_bytes),
+                metrics.summary.throughput_megabytes_per_second,
+                metrics.summary.p50_latency_ms,
+                metrics.summary.p90_latency_ms,
+                metrics.summary.p95_latency_ms,
+                metrics.summary.p99_latency_ms,
+                metrics.summary.p999_latency_ms,
+                metrics.summary.p9999_latency_ms,
+                metrics.summary.avg_latency_ms,
+                metrics.summary.median_latency_ms,
+                metrics.summary.min_latency_ms,
+                metrics.summary.max_latency_ms,
+                metrics.summary.std_dev_latency_ms,
+            );
+        }
+    }
+
+    fn print_wide_layout(
+        producer_id: u32,
+        total_messages: u64,
+        message_batches: u64,
+        messages_per_batch: &BenchmarkNumericParameter,
+        metrics: &BenchmarkIndividualMetrics,
+    ) {
+        let mut summary_table = Table::new();
+        summary_table
+            .load_preset(UTF8_FULL)
+            .set_content_arrangement(ContentArrangement::Dynamic);
+
+        summary_table.add_row(vec![
+            format!("Producer #{}", producer_id),
+            format!("{} msgs", total_messages.human_count_bare()),
+            format!(
+                "{} x {}",
+                message_batches.human_count_bare(),
+                messages_per_batch
+            ),
+            IggyByteSize::from(metrics.summary.total_user_data_bytes).to_string(),
+            format!("{:.2} s", metrics.summary.total_time_secs),
+            format!(
+                "{:.2} MB/s",
+                metrics.summary.throughput_megabytes_per_second
+            ),
+        ]);
+
+        println!("\n{summary_table}");
+
+        let mut latency_table = Table::new();
+        latency_table
+            .load_preset(UTF8_FULL)
+            .set_content_arrangement(ContentArrangement::Dynamic);
+
+        latency_table.add_row(vec![
+            "Latency", "p50", "p90", "p95", "p99", "p999", "p9999", "avg", "median", "min", "max",
+            "std dev",
+        ]);
+        latency_table.add_row(vec![
+            "(ms)".to_string(),
+            format!("{:.2}", metrics.summary.p50_latency_ms),
+            format!("{:.2}", metrics.summary.p90_latency_ms),
+            format!("{:.2}", metrics.summary.p95_latency_ms),
+            format!("{:.2}", metrics.summary.p99_latency_ms),
+            format!("{:.2}", metrics.summary.p999_latency_ms),
+            format!("{:.2}", metrics.summary.p9999_latency_ms),
+            format!("{:.2}", metrics.summary.avg_latency_ms),
+            format!("{:.2}", metrics.summary.median_latency_ms),
+            format!("{:.2}", metrics.summary.min_latency_ms),
+            format!("{:.2}", metrics.summary.max_latency_ms),
+            format!("{:.2}", metrics.summary.std_dev_latency_ms),
+        ]);
+
+        println!("{latency_table}");
+    }
+
+    fn print_narrow_layout(
+        producer_id: u32,
+        total_messages: u64,
+        message_batches: u64,
+        messages_per_batch: &BenchmarkNumericParameter,
+        metrics: &BenchmarkIndividualMetrics,
+    ) {
+        let mut table = Table::new();
+        table
+            .load_preset(UTF8_FULL)
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_width(60);
+
+        table.add_row(vec![format!("Producer #{}", producer_id), String::new()]);
+
+        table.add_row(vec!["Summary", ""]);
+        table.add_row(vec![
+            "Messages".to_string(),
+            total_messages.human_count_bare().to_string(),
+        ]);
+        table.add_row(vec![
+            "Batches".to_string(),
+            format!(
+                "{} x {}",
+                message_batches.human_count_bare(),
+                messages_per_batch
+            ),
+        ]);
+        table.add_row(vec![
+            "Total Size".to_string(),
+            IggyByteSize::from(metrics.summary.total_user_data_bytes).to_string(),
+        ]);
+        table.add_row(vec![
+            "Duration".to_string(),
+            format!("{:.2} s", metrics.summary.total_time_secs),
+        ]);
+
+        table.add_row(vec!["Throughput", ""]);
+        table.add_row(vec![
+            "MB/s".to_string(),
+            format!("{:.2}", metrics.summary.throughput_megabytes_per_second),
+        ]);
+
+        table.add_row(vec!["Latency", ""]);
+        table.add_row(vec![
+            "p50".to_string(),
+            format!("{:.2} ms", metrics.summary.p50_latency_ms),
+        ]);
+        table.add_row(vec![
+            "p90".to_string(),
+            format!("{:.2} ms", metrics.summary.p90_latency_ms),
+        ]);
+        table.add_row(vec![
+            "p95".to_string(),
+            format!("{:.2} ms", metrics.summary.p95_latency_ms),
+        ]);
+        table.add_row(vec![
+            "p99".to_string(),
+            format!("{:.2} ms", metrics.summary.p99_latency_ms),
+        ]);
+        table.add_row(vec![
+            "p999".to_string(),
+            format!("{:.2} ms", metrics.summary.p999_latency_ms),
+        ]);
+        table.add_row(vec![
+            "p9999".to_string(),
+            format!("{:.2} ms", metrics.summary.p9999_latency_ms),
+        ]);
+        table.add_row(vec![
+            "avg".to_string(),
+            format!("{:.2} ms", metrics.summary.avg_latency_ms),
+        ]);
+        table.add_row(vec![
+            "median".to_string(),
+            format!("{:.2} ms", metrics.summary.median_latency_ms),
+        ]);
+        table.add_row(vec![
+            "min".to_string(),
+            format!("{:.2} ms", metrics.summary.min_latency_ms),
+        ]);
+        table.add_row(vec![
+            "max".to_string(),
+            format!("{:.2} ms", metrics.summary.max_latency_ms),
+        ]);
+        table.add_row(vec![
+            "std dev".to_string(),
+            format!("{:.2} ms", metrics.summary.std_dev_latency_ms),
+        ]);
+
+        println!("\n{table}");
     }
 }
