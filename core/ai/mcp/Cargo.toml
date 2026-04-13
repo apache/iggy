@@ -25,6 +25,7 @@ repository = "https://github.com/apache/iggy"
 homepage = "https://iggy.apache.org"
 keywords = ["iggy", "messaging", "streaming", "mcp"]
 readme = "README.md"
+publish = false
 
 [dependencies]
 axum = { workspace = true }

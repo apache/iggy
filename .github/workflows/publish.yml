@@ -118,8 +118,13 @@ permissions:
   packages: write
   id-token: write
 
+# Static group so two concurrent release dispatches cannot race the
+# crates.io / Maven Central / npm / NuGet / DockerHub / PyPI uploads.
+# `run_id` in the group was effectively a no-op because it is unique
+# per dispatch. `cancel-in-progress: false` keeps any in-flight upload
+# running to completion rather than leaving partial state in registries.
 concurrency:
-  group: publish-${{ github.run_id }}
+  group: publish-release
   cancel-in-progress: false
 
 jobs:
