@@ -46,7 +46,7 @@ on:
       connector_plugins:
         type: string
         required: false
-        default: "iggy_connector_elasticsearch_sink,iggy_connector_elasticsearch_source,iggy_connector_iceberg_sink,iggy_connector_postgres_sink,iggy_connector_postgres_source,iggy_connector_quickwit_sink,iggy_connector_random_source,iggy_connector_stdout_sink"
+        default: "iggy_connector_elasticsearch_sink,iggy_connector_elasticsearch_source,iggy_connector_iceberg_sink,iggy_connector_postgres_sink,iggy_connector_postgres_source,iggy_connector_quickwit_sink,iggy_connector_random_source,iggy_connector_s3_sink,iggy_connector_stdout_sink"
         description: "Comma-separated list of connector plugin crates to build as shared libraries"
     outputs:
       artifact_name:
