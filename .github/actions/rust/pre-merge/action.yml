@@ -91,7 +91,7 @@ runs:
             # Build -p flags for cargo build/test
             echo "$CRATES" | sed 's/^/-p /' | tr '\n' ' ' > /tmp/packages.txt
             # Build nextest filter expression for cargo nextest run
-            echo "$CRATES" | sed 's/^/package(/; s/$/)/' | paste -sd ' | ' > /tmp/nextest-filter.txt
+            echo "$CRATES" | sed 's/^/package(/; s/$/)/' | paste -sd '|' | sed 's/|/ | /g' > /tmp/nextest-filter.txt
             echo "::notice::DAG analysis: ${CRATE_COUNT} affected crates (of ${TOTAL_CRATES} total)"
           else
             echo "::notice::Full workspace affected (${TOTAL_CRATES} crates)"
