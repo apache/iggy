@@ -22,8 +22,16 @@ use bytemuck::{CheckedBitPattern, NoUninit};
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, NoUninit, CheckedBitPattern)]
 #[repr(u8)]
 pub enum Operation {
+    /// The value 0 is reserved to prevent a spurious zero from being
+    /// interpreted as a valid operation.
     #[default]
     Reserved = 0,
+
+    /// Register a client session with the cluster. Goes through the same
+    /// consensus pipeline (prepare/replicate/commit) as normal operations
+    /// but skips state machine dispatch at commit time, the metadata
+    /// plane calls `commit_register` directly. Session number = commit op.
+    Register = 1,
 
     // Metadata operations (shard 0)
     CreateStream = 128,
@@ -84,6 +92,14 @@ impl Operation {
         )
     }
 
+    /// VSR protocol-level operations that go through consensus but skip
+    /// state machine dispatch at commit time.
+    #[must_use]
+    #[inline]
+    pub const fn is_vsr_reserved(&self) -> bool {
+        matches!(self, Self::Reserved | Self::Register)
+    }
+
     /// Data-plane operations routed to the shard owning the partition.
     #[must_use]
     #[inline]
@@ -100,7 +116,7 @@ impl Operation {
     #[must_use]
     pub const fn to_command_code(&self) -> Option<u32> {
         match self {
-            Self::Reserved => None,
+            Self::Reserved | Self::Register => None,
             Self::CreateStream
             | Self::UpdateStream
             | Self::DeleteStream
@@ -182,8 +198,19 @@ mod tests {
     }
 
     #[test]
-    fn reserved_has_no_code() {
+    fn vsr_reserved_have_no_code() {
         assert_eq!(Operation::Reserved.to_command_code(), None);
+        assert_eq!(Operation::Register.to_command_code(), None);
+    }
+
+    #[test]
+    fn vsr_reserved_classification() {
+        assert!(Operation::Reserved.is_vsr_reserved());
+        assert!(Operation::Register.is_vsr_reserved());
+        assert!(!Operation::CreateStream.is_vsr_reserved());
+        assert!(!Operation::SendMessages.is_vsr_reserved());
+        assert!(!Operation::Register.is_metadata());
+        assert!(!Operation::Register.is_partition());
     }
 
     #[test]

@@ -21,11 +21,11 @@ use consensus::{
     ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
     ack_quorum_reached, build_reply_message, drain_committable_prefix, emit_sim_event,
     fence_old_prepare_by_commit, panic_if_hash_chain_would_break_in_same_view,
-    pipeline_prepare_common, replicate_preflight, replicate_to_next_in_chain, request_preflight,
-    send_prepare_ok as send_prepare_ok_common,
+    pipeline_prepare_common, register_preflight, replicate_preflight, replicate_to_next_in_chain,
+    request_preflight, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, GenericHeader, Message, PrepareHeader, PrepareOkHeader,
+    Command2, ConsensusHeader, GenericHeader, Message, Operation, PrepareHeader, PrepareOkHeader,
     RequestHeader,
 };
 use journal::{Journal, JournalHandle};
@@ -292,7 +292,9 @@ where
     async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
         let client_id = message.header().client;
+        let session = message.header().session;
         let request = message.header().request;
+        let operation = message.header().operation;
 
         // TODO: Add a bounded request queue instead of dropping here.
         // When the prepare queue (8 max) is full, buffer
@@ -311,9 +313,18 @@ where
             return;
         }
 
-        let Some(_notify) = request_preflight(consensus, client_id, request).await else {
-            return;
+        // Register uses a dedicated preflight (check_register, request=0).
+        // Normal metadata ops use request_preflight (check_request with session).
+        let preflight_ok = if operation == Operation::Register {
+            register_preflight(consensus, client_id).await.is_some()
+        } else {
+            request_preflight(consensus, client_id, session, request)
+                .await
+                .is_some()
         };
+        if !preflight_ok {
+            return;
+        }
 
         emit_sim_event(
             SimEventKind::ClientRequestReceived,
@@ -537,14 +548,6 @@ where
                         )
                     });
 
-                // Committed ops must be infallible — if the state machine cannot
-                // apply a committed op, replicas will diverge.
-                let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
-                    panic!(
-                        "on_ack: committed metadata op={} failed to apply: {err}",
-                        prepare_header.op
-                    );
-                });
                 consensus.advance_commit_min(prepare_header.op);
                 let pipeline_depth = consensus.pipeline().borrow().len();
                 let event = CommitLogEvent {
@@ -555,14 +558,40 @@ where
                     operation: prepare_header.operation,
                     pipeline_depth,
                 };
-                emit_sim_event(SimEventKind::OperationCommitted, &event);
 
-                let reply = build_reply_message(consensus, &prepare_header, response);
-                // Cache reply for duplicate detection:
-                consensus
-                    .client_table()
-                    .borrow_mut()
-                    .commit_reply(prepare_header.client, reply.clone());
+                let reply = if prepare_header.operation == Operation::Register {
+                    // Register: no state machine, commit_register creates session.
+                    let reply =
+                        build_reply_message(consensus, &prepare_header, bytes::Bytes::new());
+                    consensus
+                        .client_table()
+                        .borrow_mut()
+                        .commit_register(prepare_header.client, reply.clone());
+                    reply
+                } else {
+                    // Normal metadata op: apply state machine, commit_reply.
+                    let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                        panic!(
+                            "on_ack: committed metadata op={} failed to apply: {err}",
+                            prepare_header.op
+                        );
+                    });
+                    let reply = build_reply_message(consensus, &prepare_header, response);
+                    let session = consensus
+                        .client_table()
+                        .borrow()
+                        .get_session(prepare_header.client)
+                        .unwrap_or_else(|| {
+                            panic!("on_ack: client {} not registered", prepare_header.client)
+                        });
+                    consensus.client_table().borrow_mut().commit_reply(
+                        prepare_header.client,
+                        session,
+                        reply.clone(),
+                    );
+                    reply
+                };
+                emit_sim_event(SimEventKind::OperationCommitted, &event);
 
                 let generic_reply = reply.into_generic();
                 let reply_buffers = freeze_client_reply(generic_reply);
@@ -599,7 +628,8 @@ where
             message.header().command(),
             Command2::Request | Command2::Prepare | Command2::PrepareOk
         ));
-        message.header().operation().is_metadata()
+        let op = message.header().operation();
+        op.is_metadata() || op == Operation::Register
     }
 }
 
@@ -667,18 +697,33 @@ where
                 break;
             };
 
-            // Committed ops must be infallible (see on_ack comment).
-            let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
-                panic!("commit_journal: committed metadata op={op} failed to apply: {err}");
-            });
-
             consensus.advance_commit_min(op);
 
-            let reply = build_reply_message(consensus, &header, response);
-            consensus
-                .client_table()
-                .borrow_mut()
-                .commit_reply(header.client, reply);
+            if header.operation == Operation::Register {
+                // Register: no state machine, commit_register creates session.
+                let reply = build_reply_message(consensus, &header, bytes::Bytes::new());
+                consensus
+                    .client_table()
+                    .borrow_mut()
+                    .commit_register(header.client, reply);
+            } else {
+                // Normal metadata op: apply state machine, commit_reply.
+                let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                    panic!("commit_journal: committed metadata op={op} failed to apply: {err}");
+                });
+                let reply = build_reply_message(consensus, &header, response);
+                let session = consensus
+                    .client_table()
+                    .borrow()
+                    .get_session(header.client)
+                    .unwrap_or_else(|| {
+                        panic!("commit_journal: client {} not registered", header.client)
+                    });
+                consensus
+                    .client_table()
+                    .borrow_mut()
+                    .commit_reply(header.client, session, reply);
+            }
 
             debug!("commit_journal: committed op={op}");
         }

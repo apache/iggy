@@ -418,6 +418,7 @@ where
             .consensus()
             .expect("on_request: consensus not initialized");
         let client_id = message.header().client;
+        let session = message.header().session;
         let request = message.header().request;
 
         // TODO: Add a bounded request queue instead of dropping here.
@@ -467,7 +468,7 @@ where
             message
         };
 
-        let Some(_notify) = request_preflight(consensus, client_id, request).await else {
+        let Some(_notify) = request_preflight(consensus, client_id, session, request).await else {
             return;
         };
 
@@ -684,10 +685,18 @@ where
             emit_sim_event(SimEventKind::OperationCommitted, &event);
 
             let reply = build_reply_message(consensus, &prepare_header, bytes::Bytes::new());
-            consensus
+            let session = consensus
                 .client_table()
-                .borrow_mut()
-                .commit_reply(prepare_header.client, reply.clone());
+                .borrow()
+                .get_session(prepare_header.client)
+                .unwrap_or_else(|| {
+                    panic!("on_ack: client {} not registered", prepare_header.client)
+                });
+            consensus.client_table().borrow_mut().commit_reply(
+                prepare_header.client,
+                session,
+                reply.clone(),
+            );
 
             let reply_buffers = freeze_client_reply(reply.into_generic());
             emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
@@ -919,10 +928,17 @@ where
             consensus.advance_commit_min(op);
 
             let reply = build_reply_message(consensus, &header, bytes::Bytes::new());
+            let session = consensus
+                .client_table()
+                .borrow()
+                .get_session(header.client)
+                .unwrap_or_else(|| {
+                    panic!("commit_journal: client {} not registered", header.client)
+                });
             consensus
                 .client_table()
                 .borrow_mut()
-                .commit_reply(header.client, reply);
+                .commit_reply(header.client, session, reply);
             debug!("commit_journal: committed op={op}");
         }
     }
@@ -1119,10 +1135,21 @@ where
 
             let reply = build_reply_message(consensus, &prepare_header, bytes::Bytes::new());
             // Cache reply for duplicate detection:
-            consensus
+            let session = consensus
                 .client_table()
-                .borrow_mut()
-                .commit_reply(prepare_header.client, reply.clone());
+                .borrow()
+                .get_session(prepare_header.client)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "handle_committed_entries: client {} not registered",
+                        prepare_header.client
+                    )
+                });
+            consensus.client_table().borrow_mut().commit_reply(
+                prepare_header.client,
+                session,
+                reply.clone(),
+            );
 
             let reply_buffers = freeze_client_reply(reply.into_generic());
             emit_sim_event(SimEventKind::ClientReplyEmitted, &event);

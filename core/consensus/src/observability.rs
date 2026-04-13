@@ -408,6 +408,7 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::UpdatePermissions => "update_permissions",
         Operation::CreatePersonalAccessToken => "create_personal_access_token",
         Operation::DeletePersonalAccessToken => "delete_personal_access_token",
+        Operation::Register => "register",
         Operation::SendMessages => "send_messages",
         Operation::StoreConsumerOffset => "store_consumer_offset",
     }
