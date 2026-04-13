@@ -162,15 +162,38 @@ struct SinkState {
 
 impl S3Sink {
     pub fn new(id: u32, config: S3SinkConfig) -> Self {
-        let output_format = OutputFormat::from_str_config(&config.output_format)
-            .unwrap_or(OutputFormat::JsonLines);
+        let output_format = match OutputFormat::from_str_config(&config.output_format) {
+            Ok(fmt) => fmt,
+            Err(e) => {
+                tracing::warn!(
+                    "S3 sink ID: {id} invalid output_format '{}': {e}, defaulting to json_lines",
+                    config.output_format,
+                );
+                OutputFormat::JsonLines
+            }
+        };
 
-        let max_file_size_bytes = parse_file_size(&config.max_file_size).unwrap_or(8 * 1024 * 1024);
+        let max_file_size_bytes = match parse_file_size(&config.max_file_size) {
+            Ok(size) => size,
+            Err(e) => {
+                tracing::warn!(
+                    "S3 sink ID: {id} invalid max_file_size '{}': {e}, defaulting to 8 MiB",
+                    config.max_file_size,
+                );
+                8 * 1024 * 1024
+            }
+        };
 
         let delay_str = config.retry_delay.as_deref().unwrap_or(DEFAULT_RETRY_DELAY);
-        let retry_delay = humantime::Duration::from_str(delay_str)
-            .map(|d| d.into())
-            .unwrap_or_else(|_| std::time::Duration::from_secs(1));
+        let retry_delay = match humantime::Duration::from_str(delay_str) {
+            Ok(d) => d.into(),
+            Err(e) => {
+                tracing::warn!(
+                    "S3 sink ID: {id} invalid retry_delay '{delay_str}': {e}, defaulting to 1s",
+                );
+                std::time::Duration::from_secs(1)
+            }
+        };
 
         S3Sink {
             id,

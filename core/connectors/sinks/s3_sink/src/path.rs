@@ -119,37 +119,20 @@ mod tests {
             199,
             OutputFormat::JsonArray,
         );
-        assert_eq!(
-            key,
-            "app_logs/api_requests/1/2024-03-16/000100-000199.json"
-        );
+        assert_eq!(key, "app_logs/api_requests/1/2024-03-16/000100-000199.json");
     }
 
     #[test]
     fn render_no_prefix() {
         let ctx = test_ctx();
-        let key = render_s3_key(
-            None,
-            "{stream}/{topic}",
-            &ctx,
-            0,
-            9,
-            OutputFormat::Raw,
-        );
+        let key = render_s3_key(None, "{stream}/{topic}", &ctx, 0, 9, OutputFormat::Raw);
         assert_eq!(key, "app_logs/api_requests/000000-000009.bin");
     }
 
     #[test]
     fn render_empty_prefix() {
         let ctx = test_ctx();
-        let key = render_s3_key(
-            Some(""),
-            "{stream}",
-            &ctx,
-            0,
-            0,
-            OutputFormat::JsonLines,
-        );
+        let key = render_s3_key(Some(""), "{stream}", &ctx, 0, 0, OutputFormat::JsonLines);
         assert_eq!(key, "app_logs/000000-000000.jsonl");
     }
 

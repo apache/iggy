@@ -137,6 +137,15 @@ impl Sink for S3Sink {
                     self.flush_buffer(bucket, &key, buffer).await;
                 }
             }
+        } else {
+            let buffers = self.buffers.lock().await;
+            let pending: u64 = buffers.values().map(|b| b.message_count()).sum();
+            if pending > 0 {
+                warn!(
+                    "S3 sink ID: {} closing without S3 client — {pending} buffered messages will be lost",
+                    self.id,
+                );
+            }
         }
 
         let state = self.state.lock().await;
@@ -150,12 +159,7 @@ impl Sink for S3Sink {
 }
 
 impl S3Sink {
-    async fn flush_buffer(
-        &self,
-        bucket: &s3::Bucket,
-        key: &BufferKey,
-        buffer: &mut FileBuffer,
-    ) {
+    async fn flush_buffer(&self, bucket: &s3::Bucket, key: &BufferKey, buffer: &mut FileBuffer) {
         if buffer.is_empty() {
             return;
         }
@@ -191,18 +195,23 @@ impl S3Sink {
                 );
                 let mut state = self.state.lock().await;
                 state.uploads_completed += 1;
+                drop(state);
+                buffer.reset();
             }
             Err(e) => {
                 error!(
-                    "S3 sink ID: {} failed to upload {}: {e}",
-                    self.id, s3_key
+                    "S3 sink ID: {} failed to upload {} ({} messages lost): {e}",
+                    self.id, s3_key, msg_count
                 );
                 let mut state = self.state.lock().await;
                 state.upload_errors += 1;
+                drop(state);
+                // Reset buffer even on failure to prevent unbounded growth.
+                // Messages are lost but offsets will be re-delivered by the
+                // runtime on next poll since consume() returned Ok.
+                buffer.reset();
             }
         }
-
-        buffer.reset();
     }
 
     async fn upload_with_retry(
