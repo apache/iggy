@@ -51,9 +51,17 @@ components:
     paths:
       - "core/common/**"
 
+  # Leaf crate: zero-copy I/O buffer, depended on by binary_protocol and cluster
+  rust-iobuf:
+    depends_on:
+      - "rust-workspace"
+    paths:
+      - "core/iobuf/**"
+
   rust-binary-protocol:
     depends_on:
       - "rust-workspace" # Protocol is affected by workspace changes
+      - "rust-iobuf" # binary_protocol depends on iobuf
       - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "core/binary_protocol/**"
@@ -67,10 +75,13 @@ components:
       - "rust-cluster"
     paths:
       - "core/server/**"
+      - "core/server-ng/**"
 
   rust-cluster:
     depends_on:
       - "rust-workspace"
+      - "rust-iobuf" # cluster crates depend on iobuf
+      - "rust-binary-protocol" # cluster crates depend on binary_protocol
     paths:
       - "core/clock/**"
       - "core/consensus/**"
@@ -79,18 +90,28 @@ components:
       - "core/metadata/**"
       - "core/message_bus/**"
       - "core/partitions/**"
+
+  # Standalone simulation tool, does NOT affect server binary or foreign SDKs.
+  # Split from rust-cluster to avoid triggering SDK tests on simulator-only changes.
+  rust-simulator:
+    depends_on:
+      - "rust-workspace"
+      - "rust-cluster"
+    paths:
       - "core/simulator/**"
 
   # Main Rust workspace testing
   rust:
     depends_on:
       - "rust-workspace"
+      - "rust-iobuf"
       - "rust-configs"
       - "rust-sdk"
       - "rust-common"
       - "rust-binary-protocol"
       - "rust-server"
       - "rust-cluster"
+      - "rust-simulator"
       - "rust-tools"
       - "rust-cli"
       - "rust-bench"
