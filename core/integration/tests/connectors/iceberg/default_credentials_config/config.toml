@@ -15,24 +15,31 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[package]
-name = "bench-report"
-version = "0.3.0"
-edition = "2024"
-description = "Benchmark report and chart generation library for iggy-bench binary and iggy-benchmarks-dashboard web app"
-license = "Apache-2.0"
+type = "sink"
+key = "iceberg"
+enabled = true
+version = 0
+name = "Iceberg sink"
+path = "../../target/debug/libiggy_connector_iceberg_sink"
+verbose = true
 
-[dependencies]
-charming = { workspace = true }
-colored = { workspace = true }
-comfy-table = { workspace = true }
-derive-new = { workspace = true }
-derive_more = { workspace = true }
-human-repr = { workspace = true }
-rand = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-sysinfo = { workspace = true }
-terminal_size = { workspace = true }
-tracing = { workspace = true }
-uuid = { workspace = true }
+[[streams]]
+stream = "test_stream"
+topics = ["test_topic"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "iceberg_sink_connector"
+
+# Notice: This configuration deliberately omits 'store_access_key_id' and 'store_secret_access_key'.
+# It is used exclusively by integration tests to test the default credential provider chain fallback behavior.
+[plugin_config]
+tables = ["test.messages"]
+catalog_type = "rest"
+warehouse = "warehouse"
+uri = "http://localhost:8181"
+dynamic_routing = false
+dynamic_route_field = ""
+store_url = "http://localhost:9000"
+store_region = "us-east-1"
+store_class = "s3"
