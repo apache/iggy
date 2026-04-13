@@ -46,7 +46,6 @@ tracing = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
 compio = { workspace = true }
-iobuf = { workspace = true }
 tempfile = { workspace = true }
 
 [lints.clippy]

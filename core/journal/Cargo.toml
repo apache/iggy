@@ -31,7 +31,6 @@ readme = "../../../README.md"
 bytemuck = { workspace = true }
 compio = { workspace = true }
 iggy_binary_protocol = { workspace = true }
-iobuf = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
