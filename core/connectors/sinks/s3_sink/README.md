@@ -57,7 +57,7 @@ retry_delay = "1s"
 ### Options Reference
 
 | Option | Type | Default | Description |
-|--------|------|---------|-------------|
+| ------ | ---- | ------- | ----------- |
 | `bucket` | String | **required** | S3 bucket name |
 | `region` | String | **required** | AWS region (e.g. `us-east-1`) |
 | `prefix` | String | `None` | Key prefix prepended to all objects |
@@ -78,7 +78,7 @@ retry_delay = "1s"
 ### Path Template Variables
 
 | Variable | Description | Example |
-|----------|-------------|---------|
+| -------- | ----------- | ------- |
 | `{stream}` | Iggy stream name | `application_logs` |
 | `{topic}` | Iggy topic name | `api_requests` |
 | `{partition}` | Partition ID | `1` |
@@ -100,7 +100,7 @@ Both `access_key_id` and `secret_access_key` must be provided together or both o
 
 With `output_format = "json_lines"` and `include_metadata = true`, writing `api_requests` messages produces:
 
-```
+```text
 s3://my-data-lake/iggy/raw/application_logs/api_requests/2026-03-16/14/000000-000999.jsonl
 ```
 

@@ -31,15 +31,13 @@ pub fn format_message(
     format: OutputFormat,
 ) -> Vec<u8> {
     match format {
-        OutputFormat::JsonLines | OutputFormat::JsonArray => {
-            format_json_message(
-                message,
-                topic_metadata,
-                messages_metadata,
-                include_metadata,
-                include_headers,
-            )
-        }
+        OutputFormat::JsonLines | OutputFormat::JsonArray => format_json_message(
+            message,
+            topic_metadata,
+            messages_metadata,
+            include_metadata,
+            include_headers,
+        ),
         OutputFormat::Raw => format_raw_message(message),
     }
 }
@@ -71,9 +69,7 @@ fn format_json_message(
         );
     }
 
-    if include_headers
-        && let Some(headers) = &message.headers
-    {
+    if include_headers && let Some(headers) = &message.headers {
         let mut headers_obj = Map::new();
         for (key, value) in headers {
             headers_obj.insert(key.to_string(), Value::String(value.to_string()));
@@ -84,14 +80,20 @@ fn format_json_message(
     let payload_value = payload_to_json_value(&message.payload);
     obj.insert("payload".to_string(), payload_value);
 
-    serde_json::to_vec(&Value::Object(obj)).unwrap_or_default()
+    match serde_json::to_vec(&Value::Object(obj)) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to serialize message at offset {}: {e}",
+                message.offset
+            );
+            Vec::new()
+        }
+    }
 }
 
 fn format_raw_message(message: &ConsumedMessage) -> Vec<u8> {
-    message
-        .payload
-        .try_to_bytes()
-        .unwrap_or_default()
+    message.payload.try_to_bytes().unwrap_or_default()
 }
 
 fn payload_to_json_value(payload: &Payload) -> Value {
@@ -101,12 +103,10 @@ fn payload_to_json_value(payload: &Payload) -> Value {
             serde_json::from_slice(&bytes).unwrap_or(Value::Null)
         }
         Payload::Text(text) => Value::String(text.clone()),
-        Payload::Raw(bytes) => {
-            match serde_json::from_slice(bytes) {
-                Ok(v) => v,
-                Err(_) => Value::String(base64_encode(bytes)),
-            }
-        }
+        Payload::Raw(bytes) => match serde_json::from_slice(bytes) {
+            Ok(v) => v,
+            Err(_) => Value::String(base64_encode(bytes)),
+        },
         Payload::Proto(text) => Value::String(text.clone()),
         Payload::FlatBuffer(bytes) => Value::String(base64_encode(bytes)),
     }
@@ -258,20 +258,14 @@ mod tests {
 
     #[test]
     fn finalize_json_lines() {
-        let entries = vec![
-            b"{\"a\":1}".to_vec(),
-            b"{\"b\":2}".to_vec(),
-        ];
+        let entries = vec![b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()];
         let result = finalize_buffer(&entries, OutputFormat::JsonLines);
         assert_eq!(result, b"{\"a\":1}\n{\"b\":2}\n");
     }
 
     #[test]
     fn finalize_json_array() {
-        let entries = vec![
-            b"{\"a\":1}".to_vec(),
-            b"{\"b\":2}".to_vec(),
-        ];
+        let entries = vec![b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()];
         let result = finalize_buffer(&entries, OutputFormat::JsonArray);
         let value: Value = serde_json::from_slice(&result).unwrap();
         assert!(value.is_array());

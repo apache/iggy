@@ -41,14 +41,16 @@ pub async fn create_bucket(config: &S3SinkConfig) -> Result<Box<Bucket>, Error> 
         (Some(key), Some(secret)) => {
             let redacted_key = key.chars().take(3).collect::<String>();
             info!("Using explicit S3 credentials (access key: {redacted_key}***)");
-            Credentials::new(Some(key), Some(secret), None, None, None).map_err(|e| {
-                Error::InitError(format!("Failed to create S3 credentials: {e}"))
-            })?
+            Credentials::new(Some(key), Some(secret), None, None, None)
+                .map_err(|e| Error::InitError(format!("Failed to create S3 credentials: {e}")))?
         }
         _ => {
-            info!("No explicit credentials provided, using default credential chain (env vars / instance profile)");
-            Credentials::default()
-                .map_err(|e| Error::InitError(format!("Failed to load default S3 credentials: {e}")))?
+            info!(
+                "No explicit credentials provided, using default credential chain (env vars / instance profile)"
+            );
+            Credentials::default().map_err(|e| {
+                Error::InitError(format!("Failed to load default S3 credentials: {e}"))
+            })?
         }
     };
 
@@ -77,22 +79,21 @@ pub async fn create_bucket(config: &S3SinkConfig) -> Result<Box<Bucket>, Error> 
 }
 
 pub async fn verify_bucket(bucket: &Bucket) -> Result<(), Error> {
-    bucket
-        .head_object("/")
-        .await
-        .map_err(|e| {
-            Error::InitError(format!(
-                "S3 bucket '{}' connectivity check failed: {e}",
-                bucket.name
-            ))
-        })?;
+    bucket.head_object("/").await.map_err(|e| {
+        Error::InitError(format!(
+            "S3 bucket '{}' connectivity check failed: {e}",
+            bucket.name
+        ))
+    })?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FileRotation, default_max_file_size, default_output_format, default_path_template};
+    use crate::{
+        FileRotation, default_max_file_size, default_output_format, default_path_template,
+    };
 
     fn base_config() -> S3SinkConfig {
         S3SinkConfig {
