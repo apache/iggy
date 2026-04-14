@@ -165,22 +165,40 @@ jobs:
 
       - name: Resolve commit
         id: resolve
+        env:
+          INPUT_COMMIT: ${{ inputs.commit }}
+          IS_WORKFLOW_CALL: ${{ steps.detect.outputs.is_workflow_call }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          COMMIT="${{ inputs.commit }}"
+          set -euo pipefail
+          COMMIT="${INPUT_COMMIT}"
           if [ -z "$COMMIT" ]; then
             COMMIT="${{ github.sha }}"
             echo "ℹ️ No commit specified, using github.sha: $COMMIT"
           fi
 
-          if ! git rev-parse --verify "$COMMIT^{commit}" >/dev/null 2>&1; then
+          # Validate AND normalize to the canonical full 40-char SHA in one
+          # shot. Downstream jobs (rust crates, docker manifests, SDK matrix,
+          # tag creation) all need the same fully-qualified SHA so they cannot
+          # drift if HEAD moves on the input branch mid-run.
+          FULL_SHA=$(git rev-parse --verify "${COMMIT}^{commit}" 2>/dev/null || true)
+          if [ -z "$FULL_SHA" ]; then
             echo "❌ Invalid commit: $COMMIT"
             exit 1
           fi
+          if ! [[ "$FULL_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "❌ git rev-parse returned non-canonical SHA: $FULL_SHA"
+            exit 1
+          fi
+          if [ "$FULL_SHA" != "$COMMIT" ]; then
+            echo "ℹ️ Normalized $COMMIT -> $FULL_SHA"
+          fi
+          COMMIT="$FULL_SHA"
 
           # Skip master branch check for workflow_call (caller already verified on master)
-          if [ "${{ steps.detect.outputs.is_workflow_call }}" = "true" ]; then
+          if [ "$IS_WORKFLOW_CALL" = "true" ]; then
             echo "✅ Called from workflow, skipping master check"
-          elif ${{ inputs.dry_run }}; then
+          elif [ "$DRY_RUN" = "true" ]; then
             echo "🌵 Dry run, skipping master branch check"
           else
             echo "🔍 Verifying commit is on master branch..."
@@ -490,12 +508,21 @@ jobs:
               exit 1
             fi
 
-            # Check if tag exists
-            if git rev-parse "$TAG" >/dev/null 2>&1; then
+            # Check if tag exists on the remote. Querying the REMOTE (not
+            # local `git rev-parse`) so this operator summary agrees with
+            # the authoritative view used by create-git-tag: a tag can exist
+            # on origin without being in this checkout, and the old local
+            # query hid exactly that case - you would see "will create" in
+            # the summary and then create-git-tag would refuse the push.
+            REMOTE_LINE=$(git ls-remote --tags origin "refs/tags/${TAG}" 2>/dev/null || true)
+            if [ -n "$REMOTE_LINE" ]; then
               EXISTING_TAGS+=("$TAG")
-              COMMIT_SHA=$(git rev-parse "$TAG" | head -c 8)
-              echo "⚠️  Tag exists: $TAG (points to $COMMIT_SHA)"
-              echo "| $NAME | $VERSION | $TAG | ⚠️ Exists at $COMMIT_SHA |" >> $GITHUB_STEP_SUMMARY
+              REMOTE_PEELED=$(git ls-remote --tags origin "refs/tags/${TAG}^{}" 2>/dev/null | awk '{print $1}')
+              REMOTE_RAW=$(echo "$REMOTE_LINE" | awk '{print $1}')
+              EXISTING_SHA="${REMOTE_PEELED:-${REMOTE_RAW}}"
+              SHORT_SHA=$(echo "$EXISTING_SHA" | head -c 8)
+              echo "⚠️  Tag exists on remote: $TAG (points to $SHORT_SHA)"
+              echo "| $NAME | $VERSION | $TAG | ⚠️ Exists at $SHORT_SHA |" >> $GITHUB_STEP_SUMMARY
             else
               NEW_TAGS+=("$TAG")
               echo "✅ Tag will be created: $TAG"
@@ -573,7 +600,6 @@ jobs:
     with:
       crates: ${{ inputs.publish_crates }}
       dry_run: ${{ inputs.dry_run }}
-      create_tags: false  # publish.yml handles tags separately in create-tags job
       commit: ${{ needs.validate.outputs.commit }}
       use_latest_ci: ${{ inputs.use_latest_ci }}
     secrets:
@@ -705,16 +731,48 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.validate.outputs.commit }}
+          # Full history so create-git-tag can `git tag -a <commit>` against
+          # any historical SHA the operator passed in, not just HEAD.
+          fetch-depth: 0
 
       - name: Ensure version extractor is executable
         run: |
           test -x scripts/extract-version.sh || chmod +x scripts/extract-version.sh
 
-      - name: Extract version
+      - name: Extract version & tag
         id: ver
+        shell: bash
+        env:
+          MATRIX_KEY: ${{ matrix.key }}
+          MATRIX_TAG_PATTERN: ${{ matrix.tag_pattern }}
+          CREATE_EDGE_DOCKER_TAG: ${{ inputs.create_edge_docker_tag }}
         run: |
-          VERSION=$(scripts/extract-version.sh "${{ matrix.key }}")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          VERSION=$(scripts/extract-version.sh "$MATRIX_KEY")
+          TAG=""
+          if [ -n "$MATRIX_TAG_PATTERN" ] && [ "$MATRIX_TAG_PATTERN" != "null" ]; then
+            TAG=$(scripts/extract-version.sh "$MATRIX_KEY" --tag)
+          fi
+
+          # Base should_tag rule (SNAPSHOT + tag_pattern presence) is owned by
+          # extract-version.sh so it stays in sync with the SDK matrix below.
+          # The Docker-only auto-publish stable-skip rule layers on top: in
+          # auto-publish mode (create_edge_docker_tag=true) stable versions
+          # only get the rolling :edge tag, never a versioned git tag. This
+          # mirrors the manifest push policy a few steps below.
+          SHOULD_TAG=$(scripts/extract-version.sh "$MATRIX_KEY" --should-tag)
+          if [ "$SHOULD_TAG" = "true" ] \
+             && [ "$CREATE_EDGE_DOCKER_TAG" = "true" ] \
+             && [[ ! "$VERSION" =~ -(edge|rc) ]]; then
+            SHOULD_TAG=false
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "should_tag=$SHOULD_TAG"
+          } >> "$GITHUB_OUTPUT"
+          echo "✅ Resolved $MATRIX_KEY -> version=$VERSION tag=${TAG:-<none>} should_tag=$SHOULD_TAG"
 
       - name: Resolve image from config
         id: config
@@ -812,6 +870,27 @@ jobs:
             docker buildx imagetools inspect "${IMAGE}:${VERSION}"
           fi
 
+      # Inline per-component tagging: tightly couple the git tag to the
+      # multi-arch manifest that just shipped. should_tag was computed in the
+      # version step above and already encodes the SNAPSHOT and auto-publish
+      # stable-Docker skip rules. dry_run is gated at the job level.
+      - name: Tag Docker release (${{ matrix.key }})
+        if: |
+          success() &&
+          inputs.skip_tag_creation == false &&
+          steps.ver.outputs.should_tag == 'true'
+        uses: ./.github/actions/utils/create-git-tag
+        with:
+          tag: ${{ steps.ver.outputs.tag }}
+          commit: ${{ needs.validate.outputs.commit }}
+          message: |
+            Release ${{ matrix.key }} ${{ steps.ver.outputs.version }}
+
+            Component: ${{ matrix.key }}
+            Tag: ${{ steps.ver.outputs.tag }}
+            Commit: ${{ needs.validate.outputs.commit }}
+            Released by: GitHub Actions (workflow ${{ github.run_id }})
+
   # Non-Docker, non-Rust publishing (Python, Node, Java, C#, Go SDKs)
   # Note: This job runs in parallel with Docker publishing - no dependency between them
   publish:
@@ -884,18 +963,26 @@ jobs:
       - name: Extract version & tag
         id: ver
         shell: bash
+        env:
+          MATRIX_KEY: ${{ matrix.key }}
+          MATRIX_TAG_PATTERN: ${{ matrix.tag_pattern }}
         run: |
           set -euo pipefail
-          VERSION=$(scripts/extract-version.sh "${{ matrix.key }}")
+          VERSION=$(scripts/extract-version.sh "$MATRIX_KEY")
           # If a tag pattern exists for this component, ask the script for a tag as well
-          if [ -n "${{ matrix.tag_pattern }}" ] && [ "${{ matrix.tag_pattern }}" != "null" ]; then
-            TAG=$(scripts/extract-version.sh "${{ matrix.key }}" --tag)
+          if [ -n "$MATRIX_TAG_PATTERN" ] && [ "$MATRIX_TAG_PATTERN" != "null" ]; then
+            TAG=$(scripts/extract-version.sh "$MATRIX_KEY" --tag)
           else
             TAG=""
           fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG"       >> "$GITHUB_OUTPUT"
-          echo "✅ Resolved ${{ matrix.key }} -> version=$VERSION tag=${TAG:-<none>}"
+          # Single source of truth for the SNAPSHOT/no-tag-pattern skip rule.
+          SHOULD_TAG=$(scripts/extract-version.sh "$MATRIX_KEY" --should-tag)
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "should_tag=$SHOULD_TAG"
+          } >> "$GITHUB_OUTPUT"
+          echo "✅ Resolved $MATRIX_KEY -> version=$VERSION tag=${TAG:-<none>} should_tag=$SHOULD_TAG"
 
       # ─────────────────────────────────────────
       # Python SDK Publishing
@@ -949,126 +1036,103 @@ jobs:
           version: ${{ steps.ver.outputs.version }}
           dry_run: ${{ inputs.dry_run }}
 
+      # ─────────────────────────────────────────
+      # Wait gates: do not push the git tag until the registry is actually
+      # serving the new version. The Rust path already does this via
+      # wait-for-crate; mirroring it here closes the "artifact published,
+      # tag never created" rc1 failure class for foreign SDKs.
+      #
+      # Go has no registry wait: the tag IS the release (the Go proxy
+      # fetches from git on demand).
+      # ─────────────────────────────────────────
+      - name: Wait for PyPI availability
+        if: |
+          success() &&
+          inputs.dry_run == false &&
+          matrix.type == 'python' &&
+          steps.ver.outputs.should_tag == 'true'
+        uses: ./.github/actions/utils/wait-for-url
+        with:
+          url: https://pypi.org/pypi/apache-iggy/${{ steps.ver.outputs.version }}/json
+          description: apache-iggy ${{ steps.ver.outputs.version }} on PyPI
+          max_attempts: "15"
+          initial_sleep_seconds: "3"
+
+      - name: Wait for npm availability
+        if: |
+          success() &&
+          inputs.dry_run == false &&
+          matrix.type == 'node' &&
+          steps.ver.outputs.should_tag == 'true'
+        uses: ./.github/actions/utils/wait-for-url
+        with:
+          url: https://registry.npmjs.org/apache-iggy/${{ steps.ver.outputs.version }}
+          description: apache-iggy ${{ steps.ver.outputs.version }} on npm
+          max_attempts: "15"
+          initial_sleep_seconds: "3"
+
+      # Maven Central propagation via the Central Portal is usually minutes
+      # but has a long tail; budget is ~25 minutes of real wall time (cap 30s
+      # sleep × ~50 attempts). `iggy-<version>.pom` is the lightest per-version
+      # URL that only appears once the artifact is fully indexed.
+      - name: Wait for Maven Central availability
+        if: |
+          success() &&
+          inputs.dry_run == false &&
+          matrix.type == 'java' &&
+          steps.ver.outputs.should_tag == 'true'
+        uses: ./.github/actions/utils/wait-for-url
+        with:
+          url: https://repo1.maven.org/maven2/org/apache/iggy/iggy/${{ steps.ver.outputs.version }}/iggy-${{ steps.ver.outputs.version }}.pom
+          description: org.apache.iggy:iggy:${{ steps.ver.outputs.version }} on Maven Central
+          max_attempts: "50"
+          initial_sleep_seconds: "5"
+          max_sleep_seconds: "30"
+
+      # NuGet v3 flat container URLs use lowercase package id and version;
+      # Apache.Iggy → apache.iggy.
+      - name: Wait for NuGet availability
+        if: |
+          success() &&
+          inputs.dry_run == false &&
+          matrix.type == 'csharp' &&
+          steps.ver.outputs.should_tag == 'true'
+        uses: ./.github/actions/utils/wait-for-url
+        with:
+          url: https://api.nuget.org/v3-flatcontainer/apache.iggy/${{ steps.ver.outputs.version }}/apache.iggy.${{ steps.ver.outputs.version }}.nupkg
+          description: Apache.Iggy ${{ steps.ver.outputs.version }} on NuGet
+          max_attempts: "20"
+          initial_sleep_seconds: "3"
+
+      # Inline per-row tagging: tightly couple the git tag to the publish that
+      # just succeeded for THIS matrix row. should_tag was computed by
+      # extract-version.sh and encodes both the SNAPSHOT skip (mutable Java
+      # releases) and the "no tag_pattern" skip in one place — keeping the
+      # rule symmetric with the docker-manifests job above. The wait gates
+      # above ensure the tag is never pushed before the registry is serving
+      # the artifact (Go is exempt: the tag IS the release).
+      - name: Tag SDK release (${{ matrix.key }})
+        if: |
+          success() &&
+          inputs.dry_run == false &&
+          inputs.skip_tag_creation == false &&
+          steps.ver.outputs.should_tag == 'true'
+        uses: ./.github/actions/utils/create-git-tag
+        with:
+          tag: ${{ steps.ver.outputs.tag }}
+          commit: ${{ needs.validate.outputs.commit }}
+          message: |
+            Release ${{ matrix.key }} ${{ steps.ver.outputs.version }}
+
+            Component: ${{ matrix.key }}
+            Tag: ${{ steps.ver.outputs.tag }}
+            Commit: ${{ needs.validate.outputs.commit }}
+            Released by: GitHub Actions (workflow ${{ github.run_id }})
+
       - name: Set status output
         id: status
         if: always()
         run: echo "status=${{ job.status }}" >> "$GITHUB_OUTPUT"
-
-  create-tags:
-    name: Create Git tags
-    needs:
-      [
-        validate,
-        plan,
-        check-tags,
-        build-python-wheels,
-        publish-rust-crates,
-        publish-docker,
-        docker-manifests,
-        publish,
-      ]
-    if: |
-      always() &&
-      needs.validate.outputs.has_targets == 'true' &&
-      inputs.dry_run == false &&
-      inputs.skip_tag_creation == false &&
-      (needs.publish.result == 'success' || needs.publish.result == 'skipped') &&
-      (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped') &&
-      (needs.publish-docker.result == 'success' || needs.publish-docker.result == 'skipped') &&
-      (needs.docker-manifests.result == 'success' || needs.docker-manifests.result == 'skipped') &&
-      (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download latest copy script from master
-        if: inputs.use_latest_ci
-        run: |
-          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
-            -o /tmp/copy-latest-from-master.sh
-          chmod +x /tmp/copy-latest-from-master.sh
-          echo "✅ Downloaded latest copy script from master"
-
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.validate.outputs.commit }}
-          fetch-depth: 0
-
-      - name: Save and apply latest CI from master
-        if: inputs.use_latest_ci
-        run: |
-          /tmp/copy-latest-from-master.sh save \
-            .github \
-            scripts
-
-          /tmp/copy-latest-from-master.sh apply
-
-      - name: Configure Git
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Ensure version extractor is executable
-        run: |
-          test -x scripts/extract-version.sh || chmod +x scripts/extract-version.sh
-
-      - name: Create and push tags (for tagged components)
-        shell: bash
-        run: |
-          set -euo pipefail
-          TARGETS_JSON='${{ needs.plan.outputs.targets }}'
-          CREATE_EDGE_DOCKER_TAG="${{ inputs.create_edge_docker_tag }}"
-
-          echo "$TARGETS_JSON" | jq -r '.include[] | select(.key!="noop") | @base64' | while read -r row; do
-            _jq() { echo "$row" | base64 -d | jq -r "$1"; }
-
-            KEY=$(_jq '.key')
-            NAME=$(_jq '.name')
-            TAG_PATTERN=$(_jq '.tag_pattern')
-            REGISTRY=$(_jq '.registry')
-
-            # Only components that define tag_pattern will be tagged
-            if [ -z "$TAG_PATTERN" ] || [ "$TAG_PATTERN" = "null" ]; then
-              continue
-            fi
-
-            VERSION=$(scripts/extract-version.sh "$KEY")
-            TAG=$(scripts/extract-version.sh "$KEY" --tag)
-
-            # SNAPSHOT versions are mutable; tagging would block future publishes
-            if [[ "$VERSION" =~ -SNAPSHOT$ ]]; then
-              echo "ℹ️ Skipping git tag for $NAME (SNAPSHOT version)"
-              continue
-            fi
-
-            # In auto-publish mode (create_edge_docker_tag=true), skip Docker components
-            # with stable versions - only pre-release versions should get versioned tags.
-            # This matches the behavior where versioned Docker manifests are also skipped.
-            if [ "$CREATE_EDGE_DOCKER_TAG" = "true" ] && [ "$REGISTRY" = "dockerhub" ]; then
-              if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
-                echo "ℹ️ Skipping git tag for $NAME (stable Docker version in auto-publish mode)"
-                continue
-              fi
-            fi
-
-            echo "Creating tag: $TAG for $NAME"
-
-            if git rev-parse "$TAG" >/dev/null 2>&1; then
-              echo "  ⚠️ Tag $TAG already exists, skipping"
-              continue
-            fi
-
-            git tag -a "$TAG" "${{ needs.validate.outputs.commit }}" \
-              -m "Release $NAME ($TAG)
-            Component: $NAME
-            Tag: $TAG
-            Commit: ${{ needs.validate.outputs.commit }}
-            Released by: GitHub Actions
-            Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
-
-            git push origin "$TAG"
-            echo "  ✅ Created and pushed tag: $TAG"
-          done
 
   summary:
     name: Publish Summary
@@ -1082,7 +1146,6 @@ jobs:
         publish-docker,
         docker-manifests,
         publish,
-        create-tags,
       ]
     if: always() && needs.validate.outputs.has_targets == 'true'
     runs-on: ubuntu-latest
@@ -1255,11 +1318,8 @@ jobs:
               echo
               echo "**ℹ️ Tag creation was skipped as requested**"
             else
-              case "${{ needs.create-tags.result }}" in
-                success)  echo "✅ **Git tags created successfully**" ;;
-                failure)  echo "⚠️ **Tag creation had issues**" ;;
-                skipped)  echo "⏭️ **Tag creation was skipped (publish failed)**" ;;
-              esac
+              echo
+              echo "**ℹ️ Git tags are created inline with each successful publish; see individual job logs for tag status**"
             fi
             echo
             echo "---"
@@ -1277,7 +1337,6 @@ jobs:
         publish-docker,
         docker-manifests,
         publish,
-        create-tags,
         summary,
       ]
     if: failure() && inputs.dry_run == false
