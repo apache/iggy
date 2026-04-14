@@ -15,23 +15,31 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[package]
-name = "bench-runner"
-license = "Apache-2.0"
-version = "0.1.0"
-edition = "2024"
-publish = false
+type = "sink"
+key = "iceberg"
+enabled = true
+version = 0
+name = "Iceberg sink"
+path = "../../target/debug/libiggy_connector_iceberg_sink"
+verbose = true
 
-[[bin]]
-name = "iggy-bench-runner"
-path = "src/main.rs"
+[[streams]]
+stream = "test_stream"
+topics = ["test_topic"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "iceberg_sink_connector"
 
-[dependencies]
-anyhow = { workspace = true }
-clap = { workspace = true }
-dircpy = { workspace = true }
-git2 = { workspace = true }
-tempfile = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+# Notice: This configuration deliberately omits 'store_access_key_id' and 'store_secret_access_key'.
+# It is used exclusively by integration tests to test the default credential provider chain fallback behavior.
+[plugin_config]
+tables = ["test.messages"]
+catalog_type = "rest"
+warehouse = "warehouse"
+uri = "http://localhost:8181"
+dynamic_routing = false
+dynamic_route_field = ""
+store_url = "http://localhost:9000"
+store_region = "us-east-1"
+store_class = "s3"

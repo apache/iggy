@@ -52,6 +52,9 @@ pub const ENV_SINK_STORE_SECRET: &str =
 pub const ENV_SINK_STORE_REGION: &str = "IGGY_CONNECTORS_SINK_ICEBERG_PLUGIN_CONFIG_STORE_REGION";
 pub const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_ICEBERG_PATH";
 
+pub const ENV_AWS_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
+pub const ENV_AWS_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
+
 pub struct MinioContainer {
     #[allow(dead_code)]
     container: ContainerAsync<GenericImage>,
@@ -64,7 +67,11 @@ impl MinioContainer {
         let container = GenericImage::new(MINIO_IMAGE, MINIO_TAG)
             .with_exposed_port(MINIO_PORT.tcp())
             .with_exposed_port(MINIO_CONSOLE_PORT.tcp())
-            .with_wait_for(WaitFor::message_on_stderr("API:"))
+            .with_wait_for(WaitFor::http(
+                HttpWaitStrategy::new("/minio/health/live")
+                    .with_port(MINIO_PORT.tcp())
+                    .with_expected_status_code(200u16),
+            ))
             .with_network(network)
             .with_container_name(container_name)
             .with_env_var("MINIO_ROOT_USER", MINIO_ACCESS_KEY)
@@ -530,5 +537,45 @@ impl TestFixture for IcebergPreCreatedFixture {
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         self.inner.connectors_runtime_envs()
+    }
+}
+
+pub struct IcebergEnvAuthFixture {
+    inner: IcebergPreCreatedFixture,
+}
+
+impl IcebergOps for IcebergEnvAuthFixture {
+    fn catalog_url(&self) -> &str {
+        self.inner.catalog_url()
+    }
+
+    fn http_client(&self) -> &HttpClient {
+        self.inner.http_client()
+    }
+}
+
+#[async_trait]
+impl TestFixture for IcebergEnvAuthFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let inner = IcebergPreCreatedFixture::setup().await?;
+        Ok(Self { inner })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        // Remove the explicit credentials injected by the underlying fixture.
+        // This forces the Iceberg Sink to use the default credential provider chain instead of explicit config.
+        envs.remove(ENV_SINK_STORE_ACCESS_KEY);
+        envs.remove(ENV_SINK_STORE_SECRET);
+        // Inject standard AWS env vars to test the default credential provider chain.
+        envs.insert(
+            ENV_AWS_ACCESS_KEY_ID.to_string(),
+            MINIO_ACCESS_KEY.to_string(),
+        );
+        envs.insert(
+            ENV_AWS_SECRET_ACCESS_KEY.to_string(),
+            MINIO_SECRET_KEY.to_string(),
+        );
+        envs
     }
 }

@@ -20,6 +20,7 @@ name = "iggy_examples"
 version = "0.0.6"
 edition = "2024"
 license = "Apache-2.0"
+publish = false
 
 [dependencies]
 anyhow = { workspace = true }
