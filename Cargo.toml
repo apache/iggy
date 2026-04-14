@@ -72,9 +72,9 @@ ahash = { version = "0.8.12", features = ["serde"] }
 aligned-vec = "0.6.4"
 anyhow = "1.0.102"
 argon2 = "0.5.3"
-arrow = "58.1.0"
-arrow-array = "58.1.0"
-arrow-json = "58.1.0"
+arrow = "57.3.0"
+arrow-array = "57.3.0"
+arrow-json = "57.3.0"
 assert_cmd = "2.2.0"
 async-broadcast = "0.7.2"
 async-channel = "2.5.0"
@@ -213,7 +213,7 @@ opentelemetry_sdk = { version = "0.31.0", features = [
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
 papaya = "0.2.4"
-parquet = "58.1.0"
+parquet = "57.3.0"
 partitions = { path = "core/partitions" }
 passterm = "2.0.6"
 paste = "1.0"
