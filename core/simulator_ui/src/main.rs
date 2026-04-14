@@ -29,6 +29,7 @@ mod tracing_layer;
 mod types;
 mod util;
 mod visuals;
+mod vocabulary;
 
 use bevy::asset::AssetPlugin;
 use bevy::prelude::*;
@@ -38,6 +39,7 @@ use bridge::UiSimulator;
 use resources::*;
 use theme::*;
 use tracing_layer::EventBuffer;
+use vocabulary::Vocab;
 
 #[derive(States, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) enum AppPhase {
@@ -123,6 +125,7 @@ fn main() {
             count: DEFAULT_REPLICA_COUNT,
         })
         .insert_resource(SelectionState::default())
+        .insert_resource(Vocab::default())
         .insert_resource(SharedBuffers { event_buffer })
         .insert_resource(ReplicaPositions::default())
         .insert_resource(ReplicaFxState::default())

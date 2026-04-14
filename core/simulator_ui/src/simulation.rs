@@ -27,7 +27,9 @@ use crate::resources::*;
 use crate::theme::*;
 use crate::tracing_layer::CapturedSimEvent;
 use crate::types::{MessageType, Status};
+use crate::vocabulary::{Vocab, VocabMode};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn tick_simulation(
     mut commands: Commands,
     time: Res<Time>,
@@ -36,6 +38,7 @@ pub(crate) fn tick_simulation(
     positions: Res<ReplicaPositions>,
     mut fx: FxParams,
     mut event_log: ResMut<EventLog>,
+    vocab: Res<Vocab>,
 ) {
     let elapsed_secs = time.elapsed_secs_f64();
     if elapsed_secs - sim.ops_window_start >= 1.0 {
@@ -60,7 +63,7 @@ pub(crate) fn tick_simulation(
         let events = sim.simulator.step();
 
         for event in &events {
-            if let Some(entry) = narrate_event(event, tick, replica_count) {
+            if let Some(entry) = narrate_event(event, tick, replica_count, vocab.mode) {
                 event_log.push(entry);
             }
             match event.sim_event.as_str() {
@@ -84,6 +87,7 @@ pub(crate) fn tick_simulation(
                         &mut fx.replica_fx,
                         &mut fx.app_fx,
                         &mut fx.track_pulse,
+                        vocab.mode,
                     );
                 }
                 "ViewChangeStarted" => {
@@ -96,6 +100,7 @@ pub(crate) fn tick_simulation(
                         &mut fx.app_fx,
                         &mut fx.screen_flash,
                         replica_count,
+                        vocab.mode,
                     );
                 }
                 "ClientRequestReceived" => {
@@ -109,6 +114,7 @@ pub(crate) fn tick_simulation(
                         &positions,
                         &mut fx.replica_fx,
                         &mut fx.screen_flash,
+                        vocab.mode,
                     );
                 }
                 "ReplicaStateChanged" => {
@@ -119,9 +125,9 @@ pub(crate) fn tick_simulation(
                         .map(Status::from_str)
                         .unwrap_or(Status::Normal);
                     let (label, color, duration) = match new_status {
-                        Status::Normal => ("RUNNING!", NEON_CYAN, 0.85),
-                        Status::ViewChange => ("HOWLING!", NEON_MAGENTA, 1.1),
-                        Status::Recovering => ("LIMPING...", NEON_YELLOW, 1.1),
+                        Status::Normal => (vocab.mode.callout_normal(), NEON_CYAN, 0.85),
+                        Status::ViewChange => (vocab.mode.callout_view_change(), NEON_MAGENTA, 1.1),
+                        Status::Recovering => (vocab.mode.callout_recovering(), NEON_YELLOW, 1.1),
                     };
                     trigger_replica_callout(&mut fx.replica_fx, replica_id, label, color, duration);
                 }
@@ -239,6 +245,7 @@ pub(crate) fn spawn_prepare_particles(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_commit_event(
     commands: &mut Commands,
     event: &CapturedSimEvent,
@@ -247,12 +254,19 @@ pub(crate) fn handle_commit_event(
     replica_fx: &mut ResMut<ReplicaFxState>,
     app_fx: &mut ResMut<AppFxState>,
     track_pulse: &mut ResMut<TrackPulse>,
+    vocab: VocabMode,
 ) {
     let replica_id = event.replica_id.unwrap_or(0) as u8;
     sim.total_commits += 1;
     sim.ops_window_count += 1;
     replica_fx.healthy[replica_id as usize] = 0.45;
-    trigger_replica_callout(replica_fx, replica_id, "GOOD BOY!", IGGY_ORANGE, 0.9);
+    trigger_replica_callout(
+        replica_fx,
+        replica_id,
+        vocab.callout_committed(),
+        IGGY_ORANGE,
+        0.9,
+    );
     app_fx.pulse[2] = 0.55;
     track_pulse.energy = (track_pulse.energy + 0.4).min(1.0);
     commands.spawn(GlowFlash {
@@ -364,9 +378,16 @@ pub(crate) fn handle_view_change_event(
     app_fx: &mut ResMut<AppFxState>,
     screen_flash: &mut ResMut<ScreenFlash>,
     replica_count: u8,
+    vocab: VocabMode,
 ) {
     let replica_id = event.replica_id.unwrap_or(0) as u8;
-    trigger_replica_callout(replica_fx, replica_id, "PACK SHUFFLE!", NEON_MAGENTA, 1.15);
+    trigger_replica_callout(
+        replica_fx,
+        replica_id,
+        vocab.callout_view_change_started(),
+        NEON_MAGENTA,
+        1.15,
+    );
     app_fx.pulse[3] = 0.8;
     screen_flash.timer = SCREEN_FLASH_DURATION;
     screen_flash.color = NEON_MAGENTA;
@@ -435,9 +456,16 @@ pub(crate) fn handle_primary_elected_event(
     positions: &ReplicaPositions,
     replica_fx: &mut ResMut<ReplicaFxState>,
     screen_flash: &mut ResMut<ScreenFlash>,
+    vocab: VocabMode,
 ) {
     let replica_id = event.replica_id.unwrap_or(0) as u8;
-    trigger_replica_callout(replica_fx, replica_id, "NEW LEAD DOG!", NEON_YELLOW, 1.2);
+    trigger_replica_callout(
+        replica_fx,
+        replica_id,
+        vocab.callout_primary_elected(),
+        NEON_YELLOW,
+        1.2,
+    );
     screen_flash.timer = SCREEN_FLASH_DURATION * 0.7;
     screen_flash.color = NEON_YELLOW;
     screen_flash.intensity = 0.08;

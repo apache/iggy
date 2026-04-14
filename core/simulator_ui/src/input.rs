@@ -23,11 +23,13 @@ use crate::helpers::*;
 use crate::queries::FxParams;
 use crate::resources::*;
 use crate::theme::*;
+use crate::vocabulary::Vocab;
 
 pub(crate) fn handle_selection_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<SelectionState>,
     mut config: ResMut<ReplicaConfig>,
+    mut vocab: ResMut<Vocab>,
     mut next_state: ResMut<NextState<AppPhase>>,
 ) {
     if keys.just_pressed(KeyCode::ArrowLeft) && state.index > 0 {
@@ -47,6 +49,10 @@ pub(crate) fn handle_selection_input(
         state.index = 2;
     }
 
+    if keys.just_pressed(KeyCode::Tab) {
+        vocab.mode = vocab.mode.toggle();
+    }
+
     if keys.just_pressed(KeyCode::Space) || keys.just_pressed(KeyCode::Enter) {
         config.count = PACK_OPTIONS[state.index];
         next_state.set(AppPhase::Simulating);
@@ -62,6 +68,7 @@ pub(crate) fn handle_keyboard_input(
     mut console: ResMut<GameConsole>,
     config: Res<ReplicaConfig>,
     positions: Res<ReplicaPositions>,
+    vocab: Res<Vocab>,
     mut fx: FxParams,
 ) {
     let replica_count = config.count;
@@ -96,7 +103,7 @@ pub(crate) fn handle_keyboard_input(
             if !state.alive {
                 continue;
             }
-            let name = dog_name(state.id);
+            let name = vocab.mode.node_name(state.id);
             sim.simulator.kill_replica(state.id);
             fx.screen_flash.timer = SCREEN_FLASH_DURATION;
             fx.screen_flash.color = NEON_MAGENTA;
@@ -105,18 +112,15 @@ pub(crate) fn handle_keyboard_input(
             trigger_replica_callout(
                 &mut fx.replica_fx,
                 state.id,
-                "GREYHOUND DOWN",
+                vocab.mode.callout_node_down(),
                 NEON_MAGENTA,
                 1.4,
             );
             event_log.push(EventLogEntry {
                 tick: sim.simulator.tick,
                 icon: "[KIL]",
-                headline: format!("{name} (R{}) was tripped!", state.id),
-                detail: format!(
-                    "{name} crashed! Network links disabled. The pack loses a member -- \
-                     if quorum is lost, no new operations can commit."
-                ),
+                headline: vocab.mode.kill_headline(name, state.id),
+                detail: vocab.mode.kill_detail(name),
                 color: NEON_MAGENTA,
             });
             let center = positions.0[state.id as usize];
@@ -143,7 +147,13 @@ pub(crate) fn handle_keyboard_input(
         for replica_id in 0..replica_count {
             fx.replica_fx.revive[replica_id as usize] = 1.0;
             fx.replica_fx.healthy[replica_id as usize] = 0.6;
-            trigger_replica_callout(&mut fx.replica_fx, replica_id, "HEALED!", NEON_CYAN, 1.2);
+            trigger_replica_callout(
+                &mut fx.replica_fx,
+                replica_id,
+                vocab.mode.callout_healed(),
+                NEON_CYAN,
+                1.2,
+            );
             let center = positions.0[replica_id as usize];
             commands.spawn((
                 CommitRing {
@@ -160,10 +170,8 @@ pub(crate) fn handle_keyboard_input(
         event_log.push(EventLogEntry {
             tick: sim.simulator.tick,
             icon: "[HEL]",
-            headline: "Pack healed! All dogs back, all fences down.".to_string(),
-            detail: "All crashed replicas re-enabled, all network partitions cleared. \
-                     The pack is whole again."
-                .to_string(),
+            headline: vocab.mode.heal_headline().to_string(),
+            detail: vocab.mode.heal_detail().to_string(),
             color: NEON_CYAN,
         });
     }
@@ -177,13 +185,25 @@ pub(crate) fn handle_keyboard_input(
             let first = alive[0];
             let second = alive[1];
             sim.simulator.partition_link(first, second);
-            let name_first = dog_name(first);
-            let name_second = dog_name(second);
+            let name_first = vocab.mode.node_name(first);
+            let name_second = vocab.mode.node_name(second);
             fx.screen_flash.timer = SCREEN_FLASH_DURATION * 0.5;
             fx.screen_flash.color = NEON_MAGENTA;
             fx.screen_flash.intensity = 0.04;
-            trigger_replica_callout(&mut fx.replica_fx, first, "FENCED!", NEON_MAGENTA, 1.3);
-            trigger_replica_callout(&mut fx.replica_fx, second, "FENCED!", NEON_MAGENTA, 1.3);
+            trigger_replica_callout(
+                &mut fx.replica_fx,
+                first,
+                vocab.mode.callout_fenced(),
+                NEON_MAGENTA,
+                1.3,
+            );
+            trigger_replica_callout(
+                &mut fx.replica_fx,
+                second,
+                vocab.mode.callout_fenced(),
+                NEON_MAGENTA,
+                1.3,
+            );
             for &replica_id in &[first, second] {
                 let center = positions.0[replica_id as usize];
                 commands.spawn((
@@ -201,12 +221,10 @@ pub(crate) fn handle_keyboard_input(
             event_log.push(EventLogEntry {
                 tick: sim.simulator.tick,
                 icon: "[FNC]",
-                headline: format!("Fence between {name_first} and {name_second}!"),
-                detail: format!(
-                    "Network partition between {name_first} (R{first}) and {name_second} (R{second}). \
-                     Messages between them will be dropped. If this splits quorum, \
-                     expect a view change."
-                ),
+                headline: vocab.mode.partition_headline(name_first, name_second),
+                detail: vocab
+                    .mode
+                    .partition_detail(name_first, first, name_second, second),
                 color: NEON_MAGENTA,
             });
         }

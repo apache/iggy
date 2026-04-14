@@ -25,6 +25,7 @@ use crate::components::*;
 use crate::helpers::*;
 use crate::resources::*;
 use crate::theme::*;
+use crate::vocabulary::{Vocab, VocabMode};
 
 pub(crate) fn setup_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
@@ -251,13 +252,56 @@ pub(crate) fn setup_selection_screen(mut commands: Commands, asset_server: Res<A
                 flex_direction: FlexDirection::Row,
                 column_gap: Val::Px(20.0),
                 align_items: AlignItems::Center,
-                margin: UiRect::top(Val::Px(12.0)),
+                margin: UiRect::top(Val::Px(8.0)),
+                ..default()
+            })
+            .with_children(|row| {
+                row.spawn((
+                    Text::new("STYLE"),
+                    TextFont {
+                        font_size: 11.0,
+                        ..default()
+                    },
+                    TextColor(DIM_GRAY),
+                ));
+
+                for (is_dog, label) in [(true, "FUN"), (false, "TECHNICAL")] {
+                    row.spawn((
+                        VocabCard { is_dog },
+                        Node {
+                            padding: UiRect::axes(Val::Px(14.0), Val::Px(6.0)),
+                            border: UiRect::all(Val::Px(1.0)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba_u8(0x0c, 0x14, 0x24, 0xcc)),
+                        BorderColor::all(DIM_GRAY.with_alpha(0.2)),
+                    ))
+                    .with_children(|card| {
+                        card.spawn((
+                            VocabLabel { is_dog },
+                            Text::new(label),
+                            TextFont {
+                                font_size: 14.0,
+                                ..default()
+                            },
+                            TextColor(DIM_GRAY.with_alpha(0.4)),
+                        ));
+                    });
+                }
+            });
+
+            root.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(20.0),
+                align_items: AlignItems::Center,
+                margin: UiRect::top(Val::Px(10.0)),
                 ..default()
             })
             .with_children(|hint| {
                 for (key, action, color) in [
-                    ("< >", "select", NEON_CYAN),
-                    ("SPACE", "unleash the pack!", IGGY_ORANGE),
+                    ("< >", "select pack", NEON_CYAN),
+                    ("TAB", "switch style", NEON_YELLOW),
+                    ("SPACE", "start!", IGGY_ORANGE),
                 ] {
                     hint.spawn(Node {
                         flex_direction: FlexDirection::Row,
@@ -279,7 +323,7 @@ pub(crate) fn setup_selection_screen(mut commands: Commands, asset_server: Res<A
                             badge.spawn((
                                 Text::new(key),
                                 TextFont {
-                                    font_size: 15.0,
+                                    font_size: 14.0,
                                     ..default()
                                 },
                                 TextColor(color),
@@ -299,29 +343,56 @@ pub(crate) fn setup_selection_screen(mut commands: Commands, asset_server: Res<A
         });
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn update_selection_screen(
     time: Res<Time>,
     state: Res<SelectionState>,
+    vocab: Res<Vocab>,
     mut cards: Query<
         (&SelectionCard, &mut BorderColor, &mut BackgroundColor),
-        Without<SelectionNumber>,
+        (Without<SelectionNumber>, Without<VocabCard>),
     >,
     mut numbers: Query<
         (&SelectionNumber, &mut TextColor),
-        (Without<SelectionCard>, Without<SelectionLabel>),
+        (
+            Without<SelectionCard>,
+            Without<SelectionLabel>,
+            Without<SelectionTitle>,
+            Without<VocabLabel>,
+        ),
     >,
     mut labels: Query<
-        (&SelectionLabel, &mut TextColor),
-        (Without<SelectionCard>, Without<SelectionNumber>),
+        (&SelectionLabel, &mut Text, &mut TextColor),
+        (
+            Without<SelectionCard>,
+            Without<SelectionNumber>,
+            Without<SelectionTitle>,
+            Without<VocabLabel>,
+        ),
     >,
     mut title: Query<
-        &mut TextColor,
+        (&mut Text, &mut TextColor),
         (
             With<SelectionTitle>,
             Without<SelectionCard>,
             Without<SelectionNumber>,
             Without<SelectionLabel>,
+            Without<VocabCard>,
+            Without<VocabLabel>,
+        ),
+    >,
+    mut vocab_cards: Query<
+        (&VocabCard, &mut BorderColor, &mut BackgroundColor),
+        (Without<SelectionCard>, Without<VocabLabel>),
+    >,
+    mut vocab_labels: Query<
+        (&VocabLabel, &mut TextColor),
+        (
+            Without<SelectionCard>,
+            Without<SelectionLabel>,
+            Without<SelectionNumber>,
+            Without<SelectionTitle>,
+            Without<VocabCard>,
         ),
     >,
 ) {
@@ -329,8 +400,10 @@ pub(crate) fn update_selection_screen(
     let pulse = (elapsed * 3.5).sin() * 0.5 + 0.5;
     let fast_pulse = (elapsed * 5.0).sin() * 0.5 + 0.5;
     let slow_pulse = (elapsed * 1.8).sin() * 0.5 + 0.5;
+    let is_dog = vocab.mode == VocabMode::Dog;
 
-    for mut color in title.iter_mut() {
+    for (mut text, mut color) in title.iter_mut() {
+        **text = vocab.mode.choose_label().to_string();
         *color = TextColor(NEON_CYAN.with_alpha(0.7 + slow_pulse * 0.3));
     }
 
@@ -354,11 +427,32 @@ pub(crate) fn update_selection_screen(
         }
     }
 
-    for (label, mut color) in labels.iter_mut() {
+    for (label, mut text, mut color) in labels.iter_mut() {
+        **text = vocab.mode.pack_option_name(label.index).to_string();
         if label.index == state.index {
             *color = TextColor(NEON_CYAN.with_alpha(0.8 + pulse * 0.2));
         } else {
             *color = TextColor(DIM_GRAY.with_alpha(0.18));
+        }
+    }
+
+    for (vc, mut border, mut bg) in vocab_cards.iter_mut() {
+        let selected = vc.is_dog == is_dog;
+        if selected {
+            *border = BorderColor::all(NEON_YELLOW.with_alpha(0.6 + fast_pulse * 0.4));
+            *bg = BackgroundColor(NEON_YELLOW.with_alpha(0.06 + pulse * 0.04));
+        } else {
+            *border = BorderColor::all(Color::srgba_u8(0x22, 0x2a, 0x3a, 0x44));
+            *bg = BackgroundColor(Color::srgba_u8(0x08, 0x0e, 0x1a, 0x88));
+        }
+    }
+
+    for (vl, mut color) in vocab_labels.iter_mut() {
+        let selected = vl.is_dog == is_dog;
+        if selected {
+            *color = TextColor(NEON_YELLOW.with_alpha(0.85 + fast_pulse * 0.15));
+        } else {
+            *color = TextColor(DIM_GRAY.with_alpha(0.25));
         }
     }
 }
@@ -399,6 +493,7 @@ pub(crate) fn setup_simulation_world(
     config: Res<ReplicaConfig>,
     positions: Res<ReplicaPositions>,
     asset_server: Res<AssetServer>,
+    vocab: Res<Vocab>,
 ) {
     let replica_count = config.count;
     let mascot_handle: Handle<Image> = asset_server.load("iggy.png");
@@ -561,7 +656,7 @@ pub(crate) fn setup_simulation_world(
     let apps = [
         (
             0usize,
-            "BALL THROWER",
+            vocab.mode.app_name(0),
             AppKind::Producer,
             Vec2::new(-560.0, 330.0),
             0u8,
@@ -570,7 +665,7 @@ pub(crate) fn setup_simulation_world(
         ),
         (
             1usize,
-            "BALL FETCHER",
+            vocab.mode.app_name(1),
             AppKind::Consumer,
             Vec2::new(560.0, 330.0),
             1u8.min(replica_count - 1),
@@ -579,7 +674,7 @@ pub(crate) fn setup_simulation_world(
         ),
         (
             2usize,
-            "TREAT DISPENSER",
+            vocab.mode.app_name(2),
             AppKind::Producer,
             Vec2::new(-560.0, 70.0),
             2u8.min(replica_count - 1),
@@ -588,7 +683,7 @@ pub(crate) fn setup_simulation_world(
         ),
         (
             3usize,
-            "TREAT GOBBLER",
+            vocab.mode.app_name(3),
             AppKind::Consumer,
             Vec2::new(560.0, 70.0),
             0u8,
@@ -646,13 +741,15 @@ pub(crate) fn setup_hud(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     config: Res<ReplicaConfig>,
+    vocab: Res<Vocab>,
 ) {
     let sygnet_handle: Handle<Image> =
         asset_server.load("logo/4x/iggy-apache-sygnet-color-darkbg@4x.png");
     let wordmark_handle: Handle<Image> =
         asset_server.load("logo/4x/iggy-apache-logo-wo-sygnet-light@4x.png");
 
-    let greyhound_label = format!("{} GREYHOUNDS", config.count);
+    let v = vocab.mode;
+    let node_unit_label = format!("{} {}", config.count, v.node_unit());
 
     commands
         .spawn(Node {
@@ -684,7 +781,7 @@ pub(crate) fn setup_hud(
                 })
                 .with_children(|left| {
                     left.spawn((
-                        Text::new("iggy::pack"),
+                        Text::new(v.hud_title()),
                         TextFont {
                             font_size: 16.0,
                             ..default()
@@ -699,7 +796,7 @@ pub(crate) fn setup_hud(
                     })
                     .with_children(|stat| {
                         stat.spawn((
-                            Text::new("TREATS"),
+                            Text::new(v.hud_commits_label()),
                             TextFont {
                                 font_size: 9.0,
                                 ..default()
@@ -724,7 +821,7 @@ pub(crate) fn setup_hud(
                     })
                     .with_children(|stat| {
                         stat.spawn((
-                            Text::new("LAPS/S"),
+                            Text::new(v.hud_ops_label()),
                             TextFont {
                                 font_size: 9.0,
                                 ..default()
@@ -793,7 +890,7 @@ pub(crate) fn setup_hud(
                         .with_children(|col| {
                             col.spawn((
                                 HudStateText,
-                                Text::new("RACING"),
+                                Text::new(v.hud_playing()),
                                 TextFont {
                                     font_size: 16.0,
                                     ..default()
@@ -836,7 +933,7 @@ pub(crate) fn setup_hud(
                 })
                 .with_children(|col| {
                     col.spawn((
-                        Text::new("APACHE IGGY SIMULATOR"),
+                        Text::new("APACHE IGGY VSR SIMULATOR"),
                         TextFont {
                             font_size: 16.0,
                             ..default()
@@ -844,7 +941,7 @@ pub(crate) fn setup_hud(
                         TextColor(COOL_WHITE),
                     ));
                     col.spawn((
-                        Text::new("Italian greyhounds racing to consensus"),
+                        Text::new(v.subtitle()),
                         TextFont {
                             font_size: 12.0,
                             ..default()
@@ -861,9 +958,9 @@ pub(crate) fn setup_hud(
                 })
                 .with_children(|keys| {
                     for (key, action, color) in [
-                        ("SPACE", "race/rest", NEON_CYAN),
-                        ("R", "throw ball", IGGY_ORANGE),
-                        ("K", "trip dog", HUD_ALERT),
+                        ("SPACE", v.action_toggle(), NEON_CYAN),
+                        ("R", v.action_inject(), IGGY_ORANGE),
+                        ("K", v.action_kill(), HUD_ALERT),
                         ("P", "partition", NEON_MAGENTA),
                         ("H", "heal all", NEON_CYAN),
                         ("UP/DN", "speed", NEON_YELLOW),
@@ -916,7 +1013,7 @@ pub(crate) fn setup_hud(
                 })
                 .with_children(|chips| {
                     for (label, color) in [
-                        (greyhound_label.as_str(), IGGY_ORANGE),
+                        (node_unit_label.as_str(), IGGY_ORANGE),
                         ("FAULT READY", HUD_ALERT),
                     ] {
                         chips
@@ -960,7 +1057,7 @@ pub(crate) fn setup_hud(
             .with_children(|col| {
                 col.spawn((
                     PauseMainText,
-                    Text::new("RESTING"),
+                    Text::new(v.pause_title()),
                     TextFont {
                         font_size: 52.0,
                         ..default()
@@ -969,7 +1066,7 @@ pub(crate) fn setup_hud(
                 ));
                 col.spawn((
                     PauseSubtext,
-                    Text::new("press SPACE to unleash"),
+                    Text::new(v.pause_hint()),
                     TextFont {
                         font_size: 16.0,
                         ..default()
@@ -997,7 +1094,7 @@ pub(crate) fn setup_hud(
             ))
             .with_children(|panel| {
                 panel.spawn((
-                    Text::new("PACK ACTIVITY LOG"),
+                    Text::new(v.event_log_title()),
                     TextFont {
                         font_size: 16.0,
                         ..default()

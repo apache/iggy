@@ -26,16 +26,18 @@ use crate::queries::*;
 use crate::resources::*;
 use crate::theme::*;
 use crate::types::{Role, Status};
+use crate::vocabulary::Vocab;
 
 #[allow(clippy::type_complexity)]
 pub(crate) fn update_replica_visuals(
-    (time, sim, config, positions, mut replica_fx, mut commands): (
+    (time, sim, config, positions, mut replica_fx, mut commands, vocab): (
         Res<Time>,
         NonSend<SimulationState>,
         Res<ReplicaConfig>,
         Res<ReplicaPositions>,
         ResMut<ReplicaFxState>,
         Commands,
+        Res<Vocab>,
     ),
     mut flash_query: Query<(Entity, &mut GlowFlash)>,
     mut shape_visuals: ParamSet<(
@@ -91,10 +93,22 @@ pub(crate) fn update_replica_visuals(
             if state.alive {
                 replica_fx.revive[idx] = 1.0;
                 replica_fx.healthy[idx] = 0.6;
-                trigger_replica_callout(&mut replica_fx, id, "BACK ON TRACK!", IGGY_ORANGE, 1.3);
+                trigger_replica_callout(
+                    &mut replica_fx,
+                    id,
+                    vocab.mode.callout_recovered(),
+                    IGGY_ORANGE,
+                    1.3,
+                );
             } else {
                 replica_fx.kill[idx] = 1.0;
-                trigger_replica_callout(&mut replica_fx, id, "GREYHOUND DOWN", NEON_MAGENTA, 1.4);
+                trigger_replica_callout(
+                    &mut replica_fx,
+                    id,
+                    vocab.mode.callout_node_down(),
+                    NEON_MAGENTA,
+                    1.4,
+                );
             }
         }
 
@@ -103,14 +117,32 @@ pub(crate) fn update_replica_visuals(
             match state.status {
                 Status::Normal => {
                     replica_fx.healthy[idx] = 0.5;
-                    trigger_replica_callout(&mut replica_fx, id, "RUNNING!", NEON_CYAN, 0.8);
+                    trigger_replica_callout(
+                        &mut replica_fx,
+                        id,
+                        vocab.mode.callout_normal(),
+                        NEON_CYAN,
+                        0.8,
+                    );
                 }
                 Status::Recovering => {
                     replica_fx.revive[idx] = 0.8;
-                    trigger_replica_callout(&mut replica_fx, id, "LIMPING...", NEON_YELLOW, 1.1);
+                    trigger_replica_callout(
+                        &mut replica_fx,
+                        id,
+                        vocab.mode.callout_recovering(),
+                        NEON_YELLOW,
+                        1.1,
+                    );
                 }
                 Status::ViewChange => {
-                    trigger_replica_callout(&mut replica_fx, id, "HOWLING!", NEON_MAGENTA, 1.1);
+                    trigger_replica_callout(
+                        &mut replica_fx,
+                        id,
+                        vocab.mode.callout_view_change(),
+                        NEON_MAGENTA,
+                        1.1,
+                    );
                 }
             }
         }
@@ -275,9 +307,9 @@ pub(crate) fn update_replica_visuals(
                 continue;
             }
             let label = if !state.alive {
-                "NAPPING"
+                vocab.mode.callout_crashed()
             } else {
-                role_label(state.role, state.status)
+                vocab.mode.role_label(state.role, state.status)
             };
             **text = label.to_string();
             let status_pulse = ((elapsed * 4.2 + id as f32 * 0.7).sin() * 0.5) + 0.5;
@@ -303,12 +335,12 @@ pub(crate) fn update_replica_visuals(
 
             let timer = replica_fx.callout_timer[idx];
             let persistent = if !state.alive {
-                Some(("NAPPING", NEON_MAGENTA))
+                Some((vocab.mode.callout_crashed(), NEON_MAGENTA))
             } else {
                 match state.status {
                     Status::Normal => None,
-                    Status::ViewChange => Some(("HOWLING!", NEON_MAGENTA)),
-                    Status::Recovering => Some(("LIMPING...", NEON_YELLOW)),
+                    Status::ViewChange => Some((vocab.mode.callout_view_change(), NEON_MAGENTA)),
+                    Status::Recovering => Some((vocab.mode.callout_recovering(), NEON_YELLOW)),
                 }
             };
 
@@ -588,6 +620,7 @@ pub(crate) fn update_app_flow_particles(
 
 pub(crate) fn update_hud_text(
     sim: NonSend<SimulationState>,
+    vocab: Res<Vocab>,
     mut hud: ParamSet<(
         HudTickQuery,
         HudOpsQuery,
@@ -610,10 +643,10 @@ pub(crate) fn update_hud_text(
 
     for (mut text, mut color) in hud.p3().iter_mut() {
         if sim.playing {
-            **text = "RACING".to_string();
+            **text = vocab.mode.hud_playing().to_string();
             *color = TextColor(NEON_CYAN);
         } else {
-            **text = "RESTING".to_string();
+            **text = vocab.mode.hud_paused().to_string();
             *color = TextColor(NEON_YELLOW);
         }
     }

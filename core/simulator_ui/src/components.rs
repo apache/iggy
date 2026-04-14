@@ -247,3 +247,13 @@ pub(crate) struct SelectionLabel {
 
 #[derive(Component)]
 pub(crate) struct SelectionTitle;
+
+#[derive(Component)]
+pub(crate) struct VocabCard {
+    pub(crate) is_dog: bool,
+}
+
+#[derive(Component)]
+pub(crate) struct VocabLabel {
+    pub(crate) is_dog: bool,
+}
