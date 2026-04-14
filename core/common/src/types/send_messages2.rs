@@ -17,8 +17,8 @@
 
 use crate::{INDEX_SIZE, IggyError, random_id, sharding::IggyNamespace};
 use bytes::{Bytes, BytesMut};
+use iggy_binary_protocol::consensus::iobuf::Owned;
 use iggy_binary_protocol::{Message, PrepareHeader, RequestHeader};
-use iobuf::Owned;
 use std::hash::Hasher;
 use twox_hash::XxHash3_64;
 
@@ -544,7 +544,7 @@ impl<'a> Iterator for SendMessages2IteratorWithOffsets<'a> {
     }
 }
 
-pub type FrozenBatchHeader = iobuf::Frozen<MESSAGE_ALIGN>;
+pub(crate) type FrozenBatchHeader = iggy_binary_protocol::consensus::iobuf::Frozen<MESSAGE_ALIGN>;
 
 pub fn convert_request_message(
     namespace: IggyNamespace,

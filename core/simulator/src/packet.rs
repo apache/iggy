@@ -781,8 +781,10 @@ mod tests {
         let header: &mut GenericHeader =
             bytemuck::checked::try_from_bytes_mut(&mut buf).expect("zeroed bytes are valid");
         header.command = command;
-        Message::try_from(iobuf::Owned::<4096>::copy_from_slice(&buf))
-            .expect("generic test buffer must contain a valid generic message")
+        Message::try_from(
+            iggy_binary_protocol::consensus::iobuf::Owned::<4096>::copy_from_slice(&buf),
+        )
+        .expect("generic test buffer must contain a valid generic message")
     }
 
     /// Helper: disable all links to/from a given replica (isolate it).

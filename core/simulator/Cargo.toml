@@ -19,6 +19,7 @@
 name = "simulator"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 bytemuck = { workspace = true }
@@ -28,7 +29,6 @@ enumset = { workspace = true }
 futures = { workspace = true }
 iggy_binary_protocol = { path = "../binary_protocol" }
 iggy_common = { path = "../common" }
-iobuf = { workspace = true }
 journal = { path = "../journal" }
 message_bus = { path = "../message_bus" }
 metadata = { path = "../metadata" }

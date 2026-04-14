@@ -25,7 +25,7 @@ use iggy::prelude::{
 use requests::*;
 use rmcp::{
     ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::wrapper::Parameters,
     model::{CallToolResult, Content, ErrorData, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
 };
@@ -38,7 +38,6 @@ mod requests;
 
 #[derive(Debug, Clone)]
 pub struct IggyService {
-    tool_router: ToolRouter<Self>,
     client: Arc<IggyClient>,
     consumer: Arc<Consumer>,
     permissions: Permissions,
@@ -48,7 +47,6 @@ pub struct IggyService {
 impl IggyService {
     pub fn new(client: Arc<IggyClient>, consumer: Arc<Consumer>, permissions: Permissions) -> Self {
         Self {
-            tool_router: Self::tool_router(),
             client,
             consumer,
             permissions,
