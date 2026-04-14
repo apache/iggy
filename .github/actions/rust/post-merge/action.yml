@@ -18,8 +18,10 @@
 name: rust-post-merge
 description: >
   Publish a single Rust crate to crates.io. Idempotent on rerun via a
-  sparse-index pre-check. Intended to be called once per crate, in
-  dependency order, from .github/workflows/_publish_rust_crates.yml.
+  sparse-index pre-check and a post-publish CAS verify. Intended to be
+  called once per crate, in dependency order, from
+  .github/workflows/_publish_rust_crates.yml. Dry-run publishing is
+  handled one level up by scripts/verify-crates-publish.sh.
 
 inputs:
   package:
@@ -28,41 +30,14 @@ inputs:
   version:
     description: "Version for publishing"
     required: true
-  dry_run:
-    description: |
-      Deprecated. Retained only to avoid silently breaking downstream forks
-      that pin this composite by SHA and still pass `dry_run: true`.
-
-      Dry-run publishing is now handled one level up, by
-      scripts/verify-crates-publish.sh invoked from
-      .github/workflows/_publish_rust_crates.yml on the dry-run path. When
-      this composite is called with dry_run=true it prints a deprecation
-      warning and no-ops every publish step so forks keep getting the
-      "don't touch the real registry" semantics they expected. This input
-      will be removed in a future release once forks have migrated.
-    required: false
-    default: "false"
 
 runs:
   using: "composite"
   steps:
-    - name: Deprecated dry_run warning
-      if: inputs.dry_run == 'true'
-      shell: bash
-      run: |
-        echo "::warning::rust/post-merge: the 'dry_run' input is deprecated."
-        echo "::warning::Dry-run publishing now happens at the workflow level via"
-        echo "::warning::scripts/verify-crates-publish.sh (see _publish_rust_crates.yml)."
-        echo "::warning::Honoring dry_run=true by skipping every step in this composite."
-        echo "::warning::This input will be removed in a future release; please migrate."
-        echo "⏭️ dry_run=true → skipping all publish steps"
-
     - name: Setup Rust with cache
-      if: inputs.dry_run != 'true'
       uses: ./.github/actions/utils/setup-rust-with-cache
 
     - name: Validate package
-      if: inputs.dry_run != 'true'
       env:
         PACKAGE: ${{ inputs.package }}
         VERSION: ${{ inputs.version }}
@@ -74,24 +49,48 @@ runs:
         echo "Version: $VERSION"
         echo ""
 
-        if ! cargo metadata --format-version 1 | jq -e --arg pkg "$PACKAGE" '.packages[] | select(.name == $pkg)' > /dev/null; then
+        # Single cargo metadata invocation reused for presence check, version,
+        # and manifest path. --no-deps keeps all three fields we read and
+        # avoids walking the dep graph, saving ~30-60s across a 4-crate release.
+        #
+        # Reuse the cache written by _publish_rust_crates.yml's `Extract
+        # versions and tags` step if present (propagated via $GITHUB_ENV).
+        # Saves ~8s per crate on a 36-crate workspace; across 4 crates in
+        # the chain, ~30s per release. Falls back to a fresh cargo metadata
+        # fork if the cache is missing (e.g., the composite is invoked from
+        # a different workflow that doesn't set up the cache).
+        if [[ -n "${IGGY_CARGO_METADATA_FILE:-}" ]] && [[ -r "${IGGY_CARGO_METADATA_FILE}" ]]; then
+          META=$(cat "${IGGY_CARGO_METADATA_FILE}")
+        else
+          META=$(cargo metadata --format-version 1 --no-deps)
+        fi
+
+        if ! echo "$META" | jq -e --arg pkg "$PACKAGE" '.packages[] | select(.name == $pkg)' > /dev/null; then
           echo "❌ Package '$PACKAGE' not found in workspace"
           echo ""
           echo "Available packages:"
-          cargo metadata --format-version 1 | jq -r '.packages[].name' | sort
+          echo "$META" | jq -r '.packages[].name' | sort
           exit 1
         fi
 
-        CARGO_VERSION=$(cargo metadata --format-version 1 | jq -r --arg pkg "$PACKAGE" '.packages[] | select(.name == $pkg) | .version')
-        CARGO_PATH=$(cargo metadata --format-version 1 | jq -r --arg pkg "$PACKAGE" '.packages[] | select(.name == $pkg) | .manifest_path')
+        CARGO_VERSION=$(echo "$META" | jq -r --arg pkg "$PACKAGE" '.packages[] | select(.name == $pkg) | .version')
+        CARGO_PATH=$(echo "$META" | jq -r --arg pkg "$PACKAGE" '.packages[] | select(.name == $pkg) | .manifest_path')
 
         echo "Current Cargo.toml version: $CARGO_VERSION"
         echo "Target version: $VERSION"
         echo "Manifest path: $CARGO_PATH"
 
         if [ "$CARGO_VERSION" != "$VERSION" ]; then
-          echo "⚠️ Warning: Cargo.toml version ($CARGO_VERSION) doesn't match target version ($VERSION)"
-          echo "Make sure to update Cargo.toml before publishing"
+          echo "❌ Cargo.toml version ($CARGO_VERSION) doesn't match target version ($VERSION)"
+          echo ""
+          echo "cargo publish uses the Cargo.toml version, not the input, so a mismatch"
+          echo "would upload the WRONG version and then fail the downstream wait-for-crate"
+          echo "on the target version ~15 min later. Fail fast here instead."
+          echo ""
+          echo "Recovery:"
+          echo "  scripts/bump-version.sh $PACKAGE --set $VERSION"
+          echo "  git commit -am 'chore(release): bump $PACKAGE to $VERSION'"
+          exit 1
         fi
 
         echo ""
@@ -99,7 +98,6 @@ runs:
         cargo tree -p "$PACKAGE" --depth 1 | head -20
 
     - name: Build package
-      if: inputs.dry_run != 'true'
       env:
         PACKAGE: ${{ inputs.package }}
       shell: bash
@@ -112,7 +110,6 @@ runs:
         echo "✅ Package built successfully"
 
     - name: Verify package contents
-      if: inputs.dry_run != 'true'
       env:
         PACKAGE: ${{ inputs.package }}
       shell: bash
@@ -129,28 +126,47 @@ runs:
         cargo package -p "$PACKAGE" --list | wc -l
         echo "files would be included"
 
-    # Idempotency pre-check: ask the crates.io sparse index (same data the
-    # publish wait gate uses) whether this exact version is already live.
-    # If it is, we skip `cargo publish` cleanly instead of hard-failing on
-    # "crate version already uploaded", which is the failure mode that blocks
-    # reruns after a transient post-publish issue (e.g. tag push failure).
+    # Idempotency pre-check: ask the crates.io sparse index whether this
+    # exact version is already live. A success here is a warm-cache fast
+    # path that skips `cargo publish` entirely (used by reruns after a
+    # transient post-publish issue like a tag push failure). A failure
+    # here does NOT prove the crate is absent - the CDN can serve a
+    # stale 404 or 5xx - so a failure flips through to the publish path,
+    # which is guarded by the post-publish CAS verify below.
     #
-    # continue-on-error: true so an exit 1 ("not there") flips through to
-    # steps.already_published.outcome == 'failure' and gates the publish
-    # step below, instead of failing the job.
+    # max_attempts=5 with initial_sleep=1 closes the common cold-cache
+    # race (CDN not yet caught up from a prior successful publish: sleeps
+    # 1+2+4+8=15s worst case per crate). continue-on-error: true so an
+    # exit 1 surfaces as steps.already_published.outcome == 'failure'
+    # instead of failing the job.
     - name: Check if crate is already on crates.io
-      if: inputs.dry_run != 'true'
       id: already_published
       continue-on-error: true
       uses: ./.github/actions/utils/wait-for-crate
       with:
         package: ${{ inputs.package }}
         version: ${{ inputs.version }}
-        max_attempts: "1"
+        max_attempts: "5"
         initial_sleep_seconds: "1"
 
+    # Publish runs WITHOUT continue-on-error so any failure that is NOT the
+    # "already uploaded" class (invalid CARGO_REGISTRY_TOKEN, 401/403, 429
+    # rate limit, 5xx, Cargo.toml validation error, dependency resolution)
+    # surfaces loudly with its actual error instead of getting swallowed
+    # into a misleading "not on sparse index" CAS timeout ~3 min later.
+    #
+    # The only expected benign failure is the race where a prior run
+    # already uploaded this exact version between our pre-check and our
+    # publish attempt; cargo emits that as "crate version X.Y.Z is
+    # already uploaded", which the stderr-grep below classifies as a
+    # benign skip and translates into exit 0. The CAS verify step
+    # immediately below is then the authoritative state oracle: if the
+    # sparse index serves this version after the publish path ran, the
+    # crate is live regardless of whether THIS run uploaded it or an
+    # earlier one did.
     - name: Publish to crates.io
-      if: inputs.dry_run != 'true' && steps.already_published.outcome == 'failure'
+      if: steps.already_published.outcome == 'failure'
+      id: publish
       shell: bash
       env:
         CARGO_REGISTRY_TOKEN: ${{ env.CARGO_REGISTRY_TOKEN }}
@@ -167,14 +183,77 @@ runs:
         echo "📦 Publishing $PACKAGE v$VERSION to crates.io..."
         echo ""
 
-        cargo publish -p "$PACKAGE"
+        # Capture cargo publish stderr to a tempfile so we can classify the
+        # "already uploaded" benign class after the fact. A previous version
+        # used `2> >(tee ...)` to also stream stderr live to the job log, but
+        # bash does not wait on process-substitution children before the
+        # grep classifier runs, producing a measured 2-3% race where the
+        # classifier misses the benign-rerun signature. GitHub Actions step
+        # logs are line-buffered via the agent regardless, so `cat` after
+        # cargo exits gives the operator the same experience without the
+        # race.
+        publish_stderr="$(mktemp)"
+        trap 'rm -f "${publish_stderr}"' EXIT
+
+        rc=0
+        cargo publish -p "$PACKAGE" 2>"${publish_stderr}" || rc=$?
+        cat "${publish_stderr}" >&2
+
+        if [ "${rc}" -eq 0 ]; then
+          echo ""
+          echo "✅ cargo publish reports success"
+          echo "View on crates.io: https://crates.io/crates/$PACKAGE/$VERSION"
+          exit 0
+        fi
+
+        # Narrow benign class: race where a prior run already uploaded
+        # this exact version. cargo's message shape has changed across
+        # releases:
+        #   * cargo <1.75 (server-side error passed through):
+        #       error: failed to publish to registry at https://...
+        #       caused by: the remote server responded with an error
+        #       (status 200 OK): crate version `X.Y.Z` is already uploaded
+        #   * cargo ≥1.75 (local sparse-index pre-check):
+        #       error: crate <name>@<version> already exists on crates.io index
+        # We match both by disjunction: "is already uploaded" OR "already
+        # exists on ... index". Both substrings are specific to this
+        # class of failure and would not appear in token/network/5xx/
+        # validation errors.
+        if grep -qE "(is already uploaded|already exists on .*index)" "${publish_stderr}"; then
+          echo ""
+          echo "ℹ️ $PACKAGE v$VERSION is already uploaded (race with prior run)"
+          echo "   Continuing to CAS verify to confirm the crate is live on the sparse index."
+          exit 0
+        fi
 
         echo ""
-        echo "✅ Successfully published to crates.io"
-        echo "View on crates.io: https://crates.io/crates/$PACKAGE/$VERSION"
+        echo "❌ cargo publish failed with rc=${rc} and no 'already uploaded' signature"
+        echo "   The actual error is in the stderr above. Common causes:"
+        echo "     - invalid or expired CARGO_REGISTRY_TOKEN (401/403)"
+        echo "     - crates.io rate limit (429)"
+        echo "     - crates.io 5xx (transient, rerun should recover)"
+        echo "     - Cargo.toml validation error or dependency resolution failure"
+        exit "${rc}"
+
+    # CAS verify: authoritative post-publish state check. Runs whenever
+    # the pre-check fell through to the publish path, regardless of
+    # whether cargo publish itself succeeded. Success = crate is live on
+    # the sparse index, which is the same contract the top-level wait
+    # gates in _publish_rust_crates.yml use before tagging. Failure of
+    # this step fails the job (no continue-on-error), so a genuine
+    # upload failure still surfaces loudly - we only swallow the
+    # "already uploaded" false-negative class.
+    - name: Verify crate landed on crates.io (CAS)
+      if: steps.already_published.outcome == 'failure'
+      uses: ./.github/actions/utils/wait-for-crate
+      with:
+        package: ${{ inputs.package }}
+        version: ${{ inputs.version }}
+        max_attempts: "10"
+        initial_sleep_seconds: "2"
 
     - name: Publish skipped (crate already on crates.io)
-      if: inputs.dry_run != 'true' && steps.already_published.outcome == 'success'
+      if: steps.already_published.outcome == 'success'
       shell: bash
       env:
         PACKAGE: ${{ inputs.package }}

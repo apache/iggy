@@ -57,19 +57,32 @@ runs:
           exit 1
         fi
 
-        # Reject inputs that could mangle git invocation. Tag and commit are
-        # both derived from trusted sources today (extract-version.sh outputs
-        # and pre-validated SHAs), but the composite has no caller context, so
-        # validate defensively.
-        #
-        # `+` is allowed in the tag alphabet because every tag_pattern in
-        # .github/config/publish.yml already permits the semver build
-        # metadata suffix `(?:\+[0-9A-Za-z.-]+)?`. Rejecting `+` here would
-        # hard-fail the entire chain after a successful publish the first
-        # time a release uses a `X.Y.Z+build.N` version - the exact rc1
-        # failure shape this PR is trying to eliminate.
-        if ! [[ "${TAG}" =~ ^[A-Za-z0-9._/+-]+$ ]]; then
-          echo "❌ create-git-tag: tag '${TAG}' contains characters outside [A-Za-z0-9._/+-]"
+        # Validate the tag name with two layers of defense:
+        #  1. Shell-option injection: reject anything not starting with
+        #     alphanumeric / `_` / `/` so the composite cannot be coerced
+        #     into parsing the tag as a git or shell short-option (a
+        #     leading `-` would be the classic attack shape). A leading
+        #     `.` is also rejected because git's own check_refname_format
+        #     would reject it later and we prefer a fast, actionable
+        #     failure here.
+        #  2. Git refname format: delegate to `git check-ref-format`, which
+        #     enforces the full refs/tags/ restrictions (no `..`, no
+        #     `.lock`, no trailing slash, no control chars, etc.).
+        #     Strictly stronger than a hand-rolled alphabet rule, and
+        #     stays in sync with git's own receive-pack check instead of
+        #     drifting from it. In particular this accepts every real
+        #     tag_pattern in .github/config/publish.yml, including the
+        #     semver build metadata suffix `X.Y.Z+build.N` that rc1
+        #     choked on, and the `foreign/go/v0.7.0` slash-containing
+        #     Go module tag shape.
+        if ! [[ "${TAG}" =~ ^[A-Za-z0-9_/] ]]; then
+          echo "❌ create-git-tag: tag '${TAG}' must start with [A-Za-z0-9_/]"
+          exit 1
+        fi
+        if ! git check-ref-format "refs/tags/${TAG}" 2>/dev/null; then
+          echo "❌ create-git-tag: tag '${TAG}' is not a valid git ref name"
+          echo "   git check-ref-format rejected it. See"
+          echo "   https://git-scm.com/docs/git-check-ref-format for the rules."
           exit 1
         fi
         if ! [[ "${COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
@@ -83,14 +96,16 @@ runs:
 
         # Ensure the commit object exists locally; required by `git tag -a`.
         # If the workflow used a shallow checkout, fetch just the one commit.
+        # GitHub enables allowReachableSHA1InWant=true, so single-commit
+        # fetches work even when the caller's checkout used fetch-depth:1.
         if ! git cat-file -e "${COMMIT}^{commit}" 2>/dev/null; then
           echo "ℹ️ Commit ${COMMIT} not in local clone, fetching..."
           if ! git fetch --no-tags --depth=1 origin "${COMMIT}" 2>/dev/null; then
             echo "❌ Failed to fetch commit ${COMMIT} from origin"
             echo "   Recovery:"
-            echo "     - verify the caller's checkout step uses fetch-depth: 0"
             echo "     - verify the commit still exists on origin (was it force-pushed away?)"
             echo "     - verify the commit is reachable from a branch on origin (not only from a PR ref)"
+            echo "     - if the caller's network restricts single-commit fetches, increase fetch-depth on the calling checkout step"
             exit 1
           fi
         fi
@@ -163,7 +178,12 @@ runs:
         # always 0.
         push_rc=0
         push_stderr_file="$(mktemp)"
-        trap 'rm -f "${push_stderr_file}"' EXIT
+        # Cleanup wrapped in a named function so future traps can append
+        # to it instead of overwriting (trap 'foo' EXIT replaces any
+        # earlier EXIT trap). No earlier EXIT trap exists today, so this
+        # is purely refactor-defensive.
+        _create_git_tag_cleanup() { rm -f "${push_stderr_file}"; }
+        trap _create_git_tag_cleanup EXIT
         git push origin "${TAG}" 2>"${push_stderr_file}" || push_rc=$?
         if [ "${push_rc}" -eq 0 ]; then
           echo "✅ Created and pushed tag: ${TAG}"
@@ -174,8 +194,12 @@ runs:
         echo "   push stderr:"
         sed 's/^/     /' "${push_stderr_file}"
 
-        REMOTE_RAW=$(git ls-remote --tags origin "refs/tags/${TAG}" | awk '{print $1}')
-        if [ -z "${REMOTE_RAW}" ]; then
+        # Use the same peeled-then-raw resolver as the early-skip and
+        # post-push branches so all three agree on what the tag points at.
+        # The previous inline `git ls-remote ... | awk` only read the raw
+        # line, which would miss an annotated-tag same-commit race.
+        REMOTE_SHA="$(remote_tag_commit)"
+        if [ -z "${REMOTE_SHA}" ]; then
           echo "❌ Push failed and tag ${TAG} is not on remote - propagating failure"
           echo "   The push stderr above should explain why (permission denied, protected"
           echo "   ref, missing upstream, etc.). If this is a token/permissions issue,"
@@ -183,13 +207,12 @@ runs:
           exit "${push_rc}"
         fi
 
-        TARGET_SHA="$(remote_tag_commit)"
-        if [ "${TARGET_SHA}" = "${COMMIT}" ]; then
+        if [ "${REMOTE_SHA}" = "${COMMIT}" ]; then
           echo "⏭️ Tag ${TAG} was created concurrently at the same commit, treating as skip"
           exit 0
         fi
 
-        echo "❌ Tag ${TAG} exists on remote at ${TARGET_SHA} but this run wanted ${COMMIT}"
+        echo "❌ Tag ${TAG} exists on remote at ${REMOTE_SHA} but this run wanted ${COMMIT}"
         echo "   This is the 'rc1 failure shape': the tag points at the wrong commit."
         echo "   Recovery (verify the intended release commit first):"
         echo "     - delete the wrong tag:   git push --delete origin ${TAG}"

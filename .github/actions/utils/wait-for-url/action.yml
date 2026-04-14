@@ -92,16 +92,27 @@ runs:
         echo "📊 Budget: up to ${MAX_ATTEMPTS} attempts"
         echo ""
 
+        # Capture curl stderr to a tempfile so hard errors (DNS, TLS,
+        # connection refused, --max-time timeouts) are preserved across
+        # retries and surfaced on the final failure branch. The previous
+        # code redirected stderr to /dev/null, which contradicted the -sS
+        # flag's intent of keeping hard errors visible.
+        curl_stderr="$(mktemp)"
+        trap 'rm -f "${curl_stderr}"' EXIT
+
         sleep_s="${INITIAL_SLEEP_SECONDS}"
         http_code="000"
         for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
-          # -sS: silent but still report hard errors. -L: follow redirects
-          # (registries often sit behind a CDN that issues a 301/302).
+          # -sS: silent but still report hard errors on stderr (captured
+          # to ${curl_stderr} for the final-failure dump below).
+          # -L: follow redirects (registries sit behind CDNs that issue
+          # 301/302).
           # No -f: we want the HTTP code on 4xx so we can distinguish 404
           # ("not yet there") from 5xx ("transient") in the log.
           # --max-time: cap per-request so a dead TCP connection does not
           # burn the whole budget on one attempt.
-          http_code=$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "${URL}" 2>/dev/null || echo "000")
+          : >"${curl_stderr}"
+          http_code=$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "${URL}" 2>"${curl_stderr}" || echo "000")
 
           if [ "${http_code}" = "200" ]; then
             echo "✅ ${DESCRIPTION} is available (HTTP 200 from ${URL})"
@@ -122,6 +133,10 @@ runs:
         echo "❌ Timed out waiting for ${DESCRIPTION} after ${MAX_ATTEMPTS} attempts"
         echo "   URL: ${URL}"
         echo "   Last HTTP code: ${http_code}"
+        if [ -s "${curl_stderr}" ]; then
+          echo "   last curl stderr:"
+          sed 's/^/     /' "${curl_stderr}"
+        fi
         echo "   Common causes:"
         echo "     - registry propagation is slow (Maven Central especially can take >10 minutes)"
         echo "     - the publish step did not actually land the artifact (inspect the preceding publish step)"

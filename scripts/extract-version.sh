@@ -115,6 +115,27 @@ extract_cargo_version() {
 
     cd "$REPO_ROOT"
 
+    # Caller-provided cache: if IGGY_CARGO_METADATA_FILE points at a
+    # readable file containing `cargo metadata --no-deps --format-version=1`
+    # JSON, use it instead of re-forking cargo. This is the fast path used
+    # by .github/workflows/_publish_rust_crates.yml's Extract versions and
+    # tags step, which needs 8 version lookups against the same workspace
+    # snapshot and would otherwise pay the cargo metadata cost 8 times.
+    # File-based (not env-var-based) because cargo metadata for a 36-crate
+    # workspace is ~220 KB, which exceeds Linux's per-env-var limit
+    # MAX_ARG_STRLEN (128 KB) and would fail with E2BIG on exec().
+    if [[ -n "${IGGY_CARGO_METADATA_FILE:-}" ]] && [[ -r "${IGGY_CARGO_METADATA_FILE}" ]] \
+       && command -v jq &> /dev/null; then
+        local version
+        version=$(jq -r --arg pkg "$package" \
+                    '.packages[] | select(.name == $pkg) | .version' \
+                    "${IGGY_CARGO_METADATA_FILE}" | head -1)
+        if [[ -n "$version" ]]; then
+            echo "$version"
+            return 0
+        fi
+    fi
+
     if command -v cargo &> /dev/null && command -v jq &> /dev/null; then
         local version
         version=$(cargo metadata --no-deps --format-version=1 2>/dev/null | \
@@ -253,6 +274,7 @@ handle_check() {
 COMPONENT=""
 RETURN_TAG=false
 RETURN_SHOULD_TAG=false
+RETURN_IS_PRE_RELEASE=false
 
 # Detect mode flags as first argument only
 case "${1:-}" in
@@ -274,6 +296,10 @@ while [[ $# -gt 0 ]]; do
             RETURN_SHOULD_TAG=true
             shift
             ;;
+        --is-pre-release)
+            RETURN_IS_PRE_RELEASE=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1" >&2
             exit 1
@@ -281,21 +307,31 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$RETURN_TAG" == "true" && "$RETURN_SHOULD_TAG" == "true" ]]; then
-    echo "Error: --tag and --should-tag are mutually exclusive" >&2
+mutex_count=0
+[[ "$RETURN_TAG" == "true" ]] && mutex_count=$((mutex_count + 1))
+[[ "$RETURN_SHOULD_TAG" == "true" ]] && mutex_count=$((mutex_count + 1))
+[[ "$RETURN_IS_PRE_RELEASE" == "true" ]] && mutex_count=$((mutex_count + 1))
+if [[ $mutex_count -gt 1 ]]; then
+    echo "Error: --tag, --should-tag, and --is-pre-release are mutually exclusive" >&2
     exit 1
 fi
 
 if [[ -z "$COMPONENT" ]]; then
-    echo "Usage: $0 <component> [--tag|--should-tag]" >&2
+    echo "Usage: $0 <component> [--tag|--should-tag|--is-pre-release]" >&2
     echo "       $0 --all" >&2
     echo "       $0 --check" >&2
     echo "" >&2
-    echo "  --tag         Print the git tag this component would use for its current version." >&2
-    echo "  --should-tag  Print 'true' if the current version should produce a git tag, 'false'" >&2
-    echo "                otherwise (SNAPSHOT or missing tag_pattern). This is the SINGLE" >&2
-    echo "                source of truth for taggability; publish.yml consults it for every" >&2
-    echo "                SDK matrix row." >&2
+    echo "  --tag             Print the git tag this component would use for its current version." >&2
+    echo "  --should-tag      Print 'true' if the current version should produce a git tag, 'false'" >&2
+    echo "                    otherwise (SNAPSHOT or missing tag_pattern). This is the SINGLE" >&2
+    echo "                    source of truth for taggability; publish.yml consults it for every" >&2
+    echo "                    SDK matrix row." >&2
+    echo "  --is-pre-release  Print 'true' if the current version is a pre-release/pre-stable" >&2
+    echo "                    marker across ANY SDK version scheme (-edge, -rc, .devN, bare rcN)," >&2
+    echo "                    'false' otherwise. SINGLE source of truth for the auto-publish and" >&2
+    echo "                    stable-Docker skip rules in post-merge.yml and publish.yml." >&2
+    echo "" >&2
+    echo "  --tag, --should-tag, and --is-pre-release are mutually exclusive." >&2
     echo "" >&2
     echo "Available components:" >&2
     yq eval '.components | keys | .[]' "$CONFIG_FILE" | sed 's/^/  - /' >&2
@@ -354,6 +390,32 @@ if [[ "$RETURN_SHOULD_TAG" == "true" ]]; then
         exit 0
     fi
     echo "true"
+    exit 0
+fi
+
+# --is-pre-release: returns "true" for versions that are pre-release/
+# pre-stable markers across ALL SDK version schemes we publish. This is
+# THE SINGLE SOURCE OF TRUTH for the "is this a pre-release" rule.
+# post-merge.yml uses it to decide whether to auto-publish; publish.yml
+# uses it for the auto-publish stable-Docker skip rule. Keeping one
+# regex here prevents the two call sites from drifting (which they
+# previously did - post-merge.yml accepted `.devN` and bare `rcN` while
+# publish.yml only accepted `-edge`/`-rc`, so a Python SDK `.devN`
+# version would be auto-published to PyPI but never git-tagged).
+#
+# Matches (any of):
+#   -edge[.N]   (rust crates, docker, node SDK)
+#   -rc[.N]     (all SDKs)
+#   .devN       (Python SDK PEP 440 development markers)
+#   rcN$        (legacy bare rcN, retained for compatibility)
+if [[ "$RETURN_IS_PRE_RELEASE" == "true" ]]; then
+    if [[ "$VERSION" =~ -(edge|rc) ]] \
+       || [[ "$VERSION" =~ \.dev[0-9]+$ ]] \
+       || [[ "$VERSION" =~ rc[0-9]+$ ]]; then
+        echo "true"
+    else
+        echo "false"
+    fi
     exit 0
 fi
 
