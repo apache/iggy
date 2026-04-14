@@ -151,17 +151,18 @@ pub(crate) fn update_game_console(
         return;
     }
 
-    let (line_count, lines) = {
-        let raw = console.raw_lines.lock().unwrap_or_else(|e| e.into_inner());
-        (
-            raw.len(),
-            raw.iter().rev().take(60).cloned().collect::<Vec<_>>(),
-        )
-    };
-    if line_count == console.last_line_count {
+    let current_generation = console
+        .raw_generation
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if current_generation == console.last_seen_generation {
         return;
     }
-    console.last_line_count = line_count;
+    console.last_seen_generation = current_generation;
+
+    let lines = {
+        let raw = console.raw_lines.lock().unwrap_or_else(|e| e.into_inner());
+        raw.iter().rev().take(60).cloned().collect::<Vec<_>>()
+    };
 
     for (content_entity, children) in content_query.iter() {
         if let Some(children) = children {

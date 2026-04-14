@@ -226,3 +226,24 @@ pub(crate) struct Lightning {
     pub(crate) lifetime: f32,
     pub(crate) max_lifetime: f32,
 }
+
+#[derive(Component)]
+pub(crate) struct SelectionScreen;
+
+#[derive(Component)]
+pub(crate) struct SelectionCard {
+    pub(crate) index: usize,
+}
+
+#[derive(Component)]
+pub(crate) struct SelectionNumber {
+    pub(crate) index: usize,
+}
+
+#[derive(Component)]
+pub(crate) struct SelectionLabel {
+    pub(crate) index: usize,
+}
+
+#[derive(Component)]
+pub(crate) struct SelectionTitle;

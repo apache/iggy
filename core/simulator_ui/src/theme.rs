@@ -29,7 +29,7 @@ pub(crate) const GRID_LINE: Color = Color::srgb_u8(0x11, 0x1d, 0x35);
 pub(crate) const HUD_EDGE: Color = Color::srgb_u8(0x3d, 0x44, 0x50);
 pub(crate) const HUD_ALERT: Color = Color::srgb_u8(0xff, 0x5f, 0x57);
 
-pub(crate) const REPLICA_COUNT: u8 = 3;
+pub(crate) const DEFAULT_REPLICA_COUNT: u8 = 3;
 pub(crate) const CIRCLE_RADIUS: f32 = 300.0;
 pub(crate) const WORLD_CENTER_Y: f32 = 90.0;
 pub(crate) const IGGY_SPRITE_SIZE: Vec2 = Vec2::new(210.0, 176.0);

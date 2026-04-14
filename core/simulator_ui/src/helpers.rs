@@ -121,6 +121,8 @@ pub(crate) fn dog_name(id: u8) -> &'static str {
         2 => "Dash",
         3 => "Bolt",
         4 => "Flash",
+        5 => "Storm",
+        6 => "Blaze",
         _ => "Pup",
     }
 }
@@ -226,7 +228,11 @@ pub(crate) fn spawn_trail_dot(commands: &mut Commands, position: Vec2, color: Co
     ));
 }
 
-pub(crate) fn narrate_event(event: &CapturedSimEvent, tick: u64) -> Option<EventLogEntry> {
+pub(crate) fn narrate_event(
+    event: &CapturedSimEvent,
+    tick: u64,
+    replica_count: u8,
+) -> Option<EventLogEntry> {
     match event.sim_event.as_str() {
         "ClientRequestReceived" => {
             let replica_id = event.replica_id.unwrap_or(0) as u8;
@@ -414,9 +420,9 @@ pub(crate) fn narrate_event(event: &CapturedSimEvent, tick: u64) -> Option<Event
                 headline: format!("{name} started view change! (v{old_view} -> v{new_view})"),
                 detail: format!(
                     "{reason_text} The pack is reshuffling -- \
-                     the dog at position (view {new_view} mod {REPLICA_COUNT}) = R{} \
+                     the dog at position (view {new_view} mod {replica_count}) = R{} \
                      will become the new lead dog if quorum agrees.",
-                    new_view % REPLICA_COUNT as u64
+                    new_view % replica_count as u64
                 ),
                 color: NEON_MAGENTA,
             })

@@ -17,6 +17,7 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::util::recover_lock;
@@ -54,6 +55,7 @@ pub struct CapturedSimEvent {
 
 pub type EventBuffer = Arc<Mutex<Vec<CapturedSimEvent>>>;
 pub type RawLineBuffer = Arc<Mutex<VecDeque<String>>>;
+pub type RawLineGeneration = Arc<AtomicU64>;
 
 struct SimEventVisitor(CapturedSimEvent);
 
@@ -124,11 +126,20 @@ impl Visit for SimEventVisitor {
 pub struct SimEventLayer {
     buffer: EventBuffer,
     raw_lines: RawLineBuffer,
+    raw_generation: RawLineGeneration,
 }
 
 impl SimEventLayer {
-    pub fn new(buffer: EventBuffer, raw_lines: RawLineBuffer) -> Self {
-        Self { buffer, raw_lines }
+    pub fn new(
+        buffer: EventBuffer,
+        raw_lines: RawLineBuffer,
+        raw_generation: RawLineGeneration,
+    ) -> Self {
+        Self {
+            buffer,
+            raw_lines,
+            raw_generation,
+        }
     }
 }
 
@@ -153,6 +164,8 @@ impl<S: Subscriber> Layer<S> for SimEventLayer {
         }
         raw.push_back(line);
         drop(raw);
+
+        self.raw_generation.fetch_add(1, Ordering::Relaxed);
 
         recover_lock(&self.buffer).push(visitor.0);
     }

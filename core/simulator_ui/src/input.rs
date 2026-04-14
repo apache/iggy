@@ -17,21 +17,55 @@
 
 use bevy::prelude::*;
 
+use crate::AppPhase;
 use crate::components::*;
 use crate::helpers::*;
 use crate::queries::FxParams;
 use crate::resources::*;
 use crate::theme::*;
 
+pub(crate) fn handle_selection_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut state: ResMut<SelectionState>,
+    mut config: ResMut<ReplicaConfig>,
+    mut next_state: ResMut<NextState<AppPhase>>,
+) {
+    if keys.just_pressed(KeyCode::ArrowLeft) && state.index > 0 {
+        state.index -= 1;
+    }
+    if keys.just_pressed(KeyCode::ArrowRight) && state.index < PACK_OPTIONS.len() - 1 {
+        state.index += 1;
+    }
+
+    if keys.just_pressed(KeyCode::Digit3) || keys.just_pressed(KeyCode::Numpad3) {
+        state.index = 0;
+    }
+    if keys.just_pressed(KeyCode::Digit5) || keys.just_pressed(KeyCode::Numpad5) {
+        state.index = 1;
+    }
+    if keys.just_pressed(KeyCode::Digit7) || keys.just_pressed(KeyCode::Numpad7) {
+        state.index = 2;
+    }
+
+    if keys.just_pressed(KeyCode::Space) || keys.just_pressed(KeyCode::Enter) {
+        config.count = PACK_OPTIONS[state.index];
+        next_state.set(AppPhase::Simulating);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_keyboard_input(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     mut sim: NonSendMut<SimulationState>,
     mut event_log: ResMut<EventLog>,
     mut console: ResMut<GameConsole>,
+    config: Res<ReplicaConfig>,
     positions: Res<ReplicaPositions>,
     mut fx: FxParams,
 ) {
+    let replica_count = config.count;
+
     if keys.just_pressed(KeyCode::Space) {
         sim.playing = !sim.playing;
     }
@@ -50,7 +84,6 @@ pub(crate) fn handle_keyboard_input(
     if keys.just_pressed(KeyCode::KeyR) {
         sim.simulator.inject_client_request();
         if !sim.playing {
-            // Auto-step so the request gets processed even when paused
             for _ in 0..50 {
                 sim.simulator.step();
             }
@@ -107,7 +140,7 @@ pub(crate) fn handle_keyboard_input(
         fx.screen_flash.timer = SCREEN_FLASH_DURATION * 0.5;
         fx.screen_flash.color = NEON_CYAN;
         fx.screen_flash.intensity = 0.04;
-        for replica_id in 0..REPLICA_COUNT {
+        for replica_id in 0..replica_count {
             fx.replica_fx.revive[replica_id as usize] = 1.0;
             fx.replica_fx.healthy[replica_id as usize] = 0.6;
             trigger_replica_callout(&mut fx.replica_fx, replica_id, "HEALED!", NEON_CYAN, 1.2);
@@ -136,7 +169,7 @@ pub(crate) fn handle_keyboard_input(
     }
 
     if keys.just_pressed(KeyCode::KeyP) {
-        let alive: Vec<u8> = (0..REPLICA_COUNT)
+        let alive: Vec<u8> = (0..replica_count)
             .filter(|&replica_id| !sim.simulator.is_crashed(replica_id))
             .collect();
 

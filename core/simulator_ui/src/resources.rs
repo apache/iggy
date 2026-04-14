@@ -15,14 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use bevy::prelude::*;
 use std::collections::VecDeque;
 use std::f32::consts::PI;
 
-use bevy::prelude::*;
-
 use crate::bridge::UiSimulator;
 use crate::theme::*;
-use crate::tracing_layer::RawLineBuffer;
+use crate::tracing_layer::{EventBuffer, RawLineBuffer, RawLineGeneration};
 use crate::types::Status;
 
 pub(crate) struct SimulationState {
@@ -38,13 +37,23 @@ pub(crate) struct SimulationState {
 }
 
 #[derive(Resource)]
+pub(crate) struct ReplicaConfig {
+    pub(crate) count: u8,
+}
+
+#[derive(Resource, Clone)]
+pub(crate) struct SharedBuffers {
+    pub(crate) event_buffer: EventBuffer,
+}
+
+#[derive(Resource)]
 pub(crate) struct ReplicaPositions(pub(crate) Vec<Vec2>);
 
-impl Default for ReplicaPositions {
-    fn default() -> Self {
-        let mut positions = Vec::with_capacity(REPLICA_COUNT as usize);
-        for idx in 0..REPLICA_COUNT {
-            let angle = 2.0 * PI * (idx as f32) / (REPLICA_COUNT as f32) - PI / 2.0;
+impl ReplicaPositions {
+    pub(crate) fn new(count: u8) -> Self {
+        let mut positions = Vec::with_capacity(count as usize);
+        for idx in 0..count {
+            let angle = 2.0 * PI * (idx as f32) / (count as f32) - PI / 2.0;
             positions.push(Vec2::new(
                 CIRCLE_RADIUS * angle.cos(),
                 CIRCLE_RADIUS * angle.sin() + WORLD_CENTER_Y,
@@ -54,30 +63,43 @@ impl Default for ReplicaPositions {
     }
 }
 
+impl Default for ReplicaPositions {
+    fn default() -> Self {
+        Self::new(DEFAULT_REPLICA_COUNT)
+    }
+}
+
 #[derive(Resource)]
 pub(crate) struct ReplicaFxState {
-    pub(crate) kill: [f32; REPLICA_COUNT as usize],
-    pub(crate) revive: [f32; REPLICA_COUNT as usize],
-    pub(crate) healthy: [f32; REPLICA_COUNT as usize],
-    pub(crate) last_alive: [bool; REPLICA_COUNT as usize],
-    pub(crate) last_status: [Status; REPLICA_COUNT as usize],
-    pub(crate) callout_timer: [f32; REPLICA_COUNT as usize],
-    pub(crate) callout_text: [String; REPLICA_COUNT as usize],
-    pub(crate) callout_color: [Color; REPLICA_COUNT as usize],
+    pub(crate) kill: Vec<f32>,
+    pub(crate) revive: Vec<f32>,
+    pub(crate) healthy: Vec<f32>,
+    pub(crate) last_alive: Vec<bool>,
+    pub(crate) last_status: Vec<Status>,
+    pub(crate) callout_timer: Vec<f32>,
+    pub(crate) callout_text: Vec<String>,
+    pub(crate) callout_color: Vec<Color>,
+}
+
+impl ReplicaFxState {
+    pub(crate) fn new(count: u8) -> Self {
+        let n = count as usize;
+        Self {
+            kill: vec![0.0; n],
+            revive: vec![0.0; n],
+            healthy: vec![0.0; n],
+            last_alive: vec![true; n],
+            last_status: vec![Status::Normal; n],
+            callout_timer: vec![0.0; n],
+            callout_text: (0..n).map(|_| String::new()).collect(),
+            callout_color: vec![COOL_WHITE; n],
+        }
+    }
 }
 
 impl Default for ReplicaFxState {
     fn default() -> Self {
-        Self {
-            kill: [0.0; REPLICA_COUNT as usize],
-            revive: [0.0; REPLICA_COUNT as usize],
-            healthy: [0.0; REPLICA_COUNT as usize],
-            last_alive: [true; REPLICA_COUNT as usize],
-            last_status: [Status::Normal; REPLICA_COUNT as usize],
-            callout_timer: [0.0; REPLICA_COUNT as usize],
-            callout_text: std::array::from_fn(|_| String::new()),
-            callout_color: [COOL_WHITE; REPLICA_COUNT as usize],
-        }
+        Self::new(DEFAULT_REPLICA_COUNT)
     }
 }
 
@@ -131,9 +153,24 @@ impl EventLog {
 #[derive(Resource)]
 pub(crate) struct GameConsole {
     pub(crate) raw_lines: RawLineBuffer,
+    pub(crate) raw_generation: RawLineGeneration,
     pub(crate) open: bool,
     pub(crate) slide: f32,
-    pub(crate) last_line_count: usize,
+    pub(crate) last_seen_generation: u64,
+}
+
+pub(crate) const PACK_OPTIONS: [u8; 3] = [3, 5, 7];
+
+#[derive(Resource)]
+pub(crate) struct SelectionState {
+    pub(crate) index: usize,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for SelectionState {
+    fn default() -> Self {
+        Self { index: 0 }
+    }
 }
 
 #[derive(Resource, Default)]

@@ -27,10 +27,12 @@ use crate::resources::*;
 use crate::theme::*;
 use crate::types::{Role, Status};
 
+#[allow(clippy::type_complexity)]
 pub(crate) fn update_replica_visuals(
-    (time, sim, positions, mut replica_fx, mut commands): (
+    (time, sim, config, positions, mut replica_fx, mut commands): (
         Res<Time>,
         NonSend<SimulationState>,
+        Res<ReplicaConfig>,
         Res<ReplicaPositions>,
         ResMut<ReplicaFxState>,
         Commands,
@@ -53,15 +55,15 @@ pub(crate) fn update_replica_visuals(
     let elapsed = time.elapsed_secs();
     let delta = time.delta_secs();
 
-    for idx in 0..REPLICA_COUNT as usize {
+    let replica_count = config.count;
+    for idx in 0..replica_count as usize {
         replica_fx.kill[idx] = (replica_fx.kill[idx] - delta * 1.4).max(0.0);
         replica_fx.revive[idx] = (replica_fx.revive[idx] - delta * 1.1).max(0.0);
         replica_fx.healthy[idx] = (replica_fx.healthy[idx] - delta * 0.9).max(0.0);
         replica_fx.callout_timer[idx] = (replica_fx.callout_timer[idx] - delta).max(0.0);
     }
 
-    let mut flash_overrides: [Option<Color>; REPLICA_COUNT as usize] =
-        [None; REPLICA_COUNT as usize];
+    let mut flash_overrides: Vec<Option<Color>> = vec![None; replica_count as usize];
     for (entity, mut flash) in flash_query.iter_mut() {
         flash.timer -= delta;
         if flash.timer <= 0.0 {
@@ -70,7 +72,7 @@ pub(crate) fn update_replica_visuals(
         }
 
         let idx = flash.id as usize;
-        if idx >= REPLICA_COUNT as usize {
+        if idx >= replica_count as usize {
             continue;
         }
         flash_overrides[idx] = Some(flash.flash_color);

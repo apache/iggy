@@ -20,6 +20,7 @@ use std::f32::consts::PI;
 use bevy::prelude::*;
 use bevy_prototype_lyon::prelude::*;
 
+use crate::bridge::UiSimulator;
 use crate::components::*;
 use crate::helpers::*;
 use crate::resources::*;
@@ -29,13 +30,7 @@ pub(crate) fn setup_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
 }
 
-pub(crate) fn setup_world(
-    mut commands: Commands,
-    positions: Res<ReplicaPositions>,
-    asset_server: Res<AssetServer>,
-) {
-    let mascot_handle: Handle<Image> = asset_server.load("iggy.png");
-
+pub(crate) fn setup_background(mut commands: Commands) {
     for offset in [-420.0, -280.0, -140.0, 0.0, 140.0, 280.0, 420.0] {
         let rising = shapes::Line(
             Vec2::new(-700.0, -520.0 + offset),
@@ -70,44 +65,6 @@ pub(crate) fn setup_world(
         ));
     }
 
-    for scan_idx in 0..SCAN_LINE_COUNT {
-        let y_pos = -500.0 + (scan_idx as f32) * (1000.0 / SCAN_LINE_COUNT as f32);
-        let line = shapes::Line(Vec2::new(-700.0, 0.0), Vec2::new(700.0, 0.0));
-        commands.spawn((
-            ScanLine {
-                speed: 30.0 + (scan_idx as f32) * 15.0,
-            },
-            build_stroke(&line, NEON_CYAN.with_alpha(0.03), 1.0),
-            Transform::from_xyz(0.0, y_pos, -0.05),
-        ));
-    }
-
-    commands.spawn((
-        TrackRing,
-        build_stroke(
-            &circle_shape(CIRCLE_RADIUS),
-            GRID_LINE.with_alpha(0.35),
-            0.9,
-        ),
-        Transform::from_xyz(0.0, WORLD_CENTER_Y, 0.0),
-    ));
-    commands.spawn((
-        build_stroke(
-            &circle_shape(CIRCLE_RADIUS - 18.0),
-            GRID_LINE.with_alpha(0.12),
-            0.5,
-        ),
-        Transform::from_xyz(0.0, WORLD_CENTER_Y, -0.01),
-    ));
-    commands.spawn((
-        build_stroke(
-            &circle_shape(CIRCLE_RADIUS + 18.0),
-            GRID_LINE.with_alpha(0.12),
-            0.5,
-        ),
-        Transform::from_xyz(0.0, WORLD_CENTER_Y, -0.01),
-    ));
-
     for particle_idx in 0..AMBIENT_PARTICLE_COUNT {
         let phase = particle_idx as f32 / AMBIENT_PARTICLE_COUNT as f32;
         let x_pos = (phase * 17.3 + 0.5).fract() * 1600.0 - 800.0;
@@ -140,8 +97,353 @@ pub(crate) fn setup_world(
         Sprite::from_color(NEON_CYAN.with_alpha(0.0), Vec2::new(1600.0, 1100.0)),
         Transform::from_xyz(0.0, 0.0, 90.0),
     ));
+}
 
-    for replica_id in 0..REPLICA_COUNT {
+pub(crate) fn setup_selection_screen(mut commands: Commands, asset_server: Res<AssetServer>) {
+    // sygnet is the properly cropped mascot (6910x5211, ~1.33:1 ratio)
+    let sygnet: Handle<Image> = asset_server.load("logo/4x/iggy-apache-sygnet-color-darkbg@4x.png");
+    let full_logo: Handle<Image> = asset_server.load("logo/4x/iggy-apache-color-darkbg@4x.png");
+
+    commands
+        .spawn((
+            SelectionScreen,
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(10.0),
+                ..default()
+            },
+        ))
+        .with_children(|root| {
+            root.spawn((
+                ImageNode::new(full_logo),
+                Node {
+                    width: Val::Px(300.0),
+                    height: Val::Px(100.0),
+                    margin: UiRect::bottom(Val::Px(8.0)),
+                    ..default()
+                },
+            ));
+
+            root.spawn((
+                Text::new("VSR SIMULATOR"),
+                TextFont {
+                    font_size: 46.0,
+                    ..default()
+                },
+                TextColor(IGGY_ORANGE),
+            ));
+
+            root.spawn((
+                Text::new("Viewstamped Replication visualized with racing greyhounds"),
+                TextFont {
+                    font_size: 13.0,
+                    ..default()
+                },
+                TextColor(DIM_GRAY),
+            ));
+
+            root.spawn((
+                SelectionTitle,
+                Text::new("CHOOSE YOUR PACK"),
+                TextFont {
+                    font_size: 22.0,
+                    ..default()
+                },
+                TextColor(NEON_CYAN),
+                Node {
+                    margin: UiRect::top(Val::Px(20.0)),
+                    ..default()
+                },
+            ));
+
+            root.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(28.0),
+                margin: UiRect::axes(Val::Px(0.0), Val::Px(10.0)),
+                ..default()
+            })
+            .with_children(|row| {
+                let options: [(u8, &str, &str); 3] = [
+                    (3, "TIGHT PACK", "tolerates 1 fault"),
+                    (5, "BALANCED", "tolerates 2 faults"),
+                    (7, "FULL PACK", "tolerates 3 faults"),
+                ];
+
+                for (idx, (count, title, detail)) in options.iter().enumerate() {
+                    row.spawn((
+                        SelectionCard { index: idx },
+                        Node {
+                            width: Val::Px(220.0),
+                            flex_direction: FlexDirection::Column,
+                            align_items: AlignItems::Center,
+                            justify_content: JustifyContent::Center,
+                            padding: UiRect::new(
+                                Val::Px(20.0),
+                                Val::Px(20.0),
+                                Val::Px(22.0),
+                                Val::Px(18.0),
+                            ),
+                            border: UiRect::all(Val::Px(2.0)),
+                            row_gap: Val::Px(6.0),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgba_u8(0x0c, 0x14, 0x24, 0xcc)),
+                        BorderColor::all(DIM_GRAY.with_alpha(0.15)),
+                    ))
+                    .with_children(|card| {
+                        card.spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(2.0),
+                            margin: UiRect::bottom(Val::Px(4.0)),
+                            justify_content: JustifyContent::Center,
+                            ..default()
+                        })
+                        .with_children(|dogs_row| {
+                            for _ in 0..*count {
+                                dogs_row.spawn((
+                                    ImageNode::new(sygnet.clone()),
+                                    Node {
+                                        width: Val::Px(28.0),
+                                        height: Val::Px(21.0),
+                                        ..default()
+                                    },
+                                ));
+                            }
+                        });
+
+                        card.spawn((
+                            SelectionNumber { index: idx },
+                            Text::new(format!("{count}")),
+                            TextFont {
+                                font_size: 56.0,
+                                ..default()
+                            },
+                            TextColor(DIM_GRAY.with_alpha(0.4)),
+                        ));
+
+                        card.spawn((
+                            SelectionLabel { index: idx },
+                            Text::new(*title),
+                            TextFont {
+                                font_size: 15.0,
+                                ..default()
+                            },
+                            TextColor(DIM_GRAY.with_alpha(0.35)),
+                        ));
+
+                        card.spawn((
+                            Text::new(*detail),
+                            TextFont {
+                                font_size: 11.0,
+                                ..default()
+                            },
+                            TextColor(DIM_GRAY.with_alpha(0.3)),
+                        ));
+                    });
+                }
+            });
+
+            root.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(20.0),
+                align_items: AlignItems::Center,
+                margin: UiRect::top(Val::Px(12.0)),
+                ..default()
+            })
+            .with_children(|hint| {
+                for (key, action, color) in [
+                    ("< >", "select", NEON_CYAN),
+                    ("SPACE", "unleash the pack!", IGGY_ORANGE),
+                ] {
+                    hint.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(6.0),
+                        ..default()
+                    })
+                    .with_children(|pair| {
+                        pair.spawn((
+                            Node {
+                                padding: UiRect::axes(Val::Px(12.0), Val::Px(6.0)),
+                                border: UiRect::all(Val::Px(1.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgba_u8(0x0c, 0x14, 0x24, 0xdd)),
+                            BorderColor::all(color.with_alpha(0.5)),
+                        ))
+                        .with_children(|badge| {
+                            badge.spawn((
+                                Text::new(key),
+                                TextFont {
+                                    font_size: 15.0,
+                                    ..default()
+                                },
+                                TextColor(color),
+                            ));
+                        });
+                        pair.spawn((
+                            Text::new(action),
+                            TextFont {
+                                font_size: 13.0,
+                                ..default()
+                            },
+                            TextColor(COOL_WHITE.with_alpha(0.7)),
+                        ));
+                    });
+                }
+            });
+        });
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn update_selection_screen(
+    time: Res<Time>,
+    state: Res<SelectionState>,
+    mut cards: Query<
+        (&SelectionCard, &mut BorderColor, &mut BackgroundColor),
+        Without<SelectionNumber>,
+    >,
+    mut numbers: Query<
+        (&SelectionNumber, &mut TextColor),
+        (Without<SelectionCard>, Without<SelectionLabel>),
+    >,
+    mut labels: Query<
+        (&SelectionLabel, &mut TextColor),
+        (Without<SelectionCard>, Without<SelectionNumber>),
+    >,
+    mut title: Query<
+        &mut TextColor,
+        (
+            With<SelectionTitle>,
+            Without<SelectionCard>,
+            Without<SelectionNumber>,
+            Without<SelectionLabel>,
+        ),
+    >,
+) {
+    let elapsed = time.elapsed_secs();
+    let pulse = (elapsed * 3.5).sin() * 0.5 + 0.5;
+    let fast_pulse = (elapsed * 5.0).sin() * 0.5 + 0.5;
+    let slow_pulse = (elapsed * 1.8).sin() * 0.5 + 0.5;
+
+    for mut color in title.iter_mut() {
+        *color = TextColor(NEON_CYAN.with_alpha(0.7 + slow_pulse * 0.3));
+    }
+
+    for (card, mut border, mut bg) in cards.iter_mut() {
+        if card.index == state.index {
+            let glow = 0.6 + fast_pulse * 0.4;
+            *border = BorderColor::all(IGGY_ORANGE.with_alpha(glow));
+            *bg = BackgroundColor(IGGY_ORANGE.with_alpha(0.08 + pulse * 0.06));
+        } else {
+            *border = BorderColor::all(Color::srgba_u8(0x22, 0x2a, 0x3a, 0x44));
+            *bg = BackgroundColor(Color::srgba_u8(0x08, 0x0e, 0x1a, 0x88));
+        }
+    }
+
+    for (num, mut color) in numbers.iter_mut() {
+        if num.index == state.index {
+            let bright = 0.9 + fast_pulse * 0.1;
+            *color = TextColor(IGGY_ORANGE.with_alpha(bright));
+        } else {
+            *color = TextColor(DIM_GRAY.with_alpha(0.22));
+        }
+    }
+
+    for (label, mut color) in labels.iter_mut() {
+        if label.index == state.index {
+            *color = TextColor(NEON_CYAN.with_alpha(0.8 + pulse * 0.2));
+        } else {
+            *color = TextColor(DIM_GRAY.with_alpha(0.18));
+        }
+    }
+}
+
+pub(crate) fn despawn_selection_screen(
+    mut commands: Commands,
+    query: Query<Entity, With<SelectionScreen>>,
+) {
+    for entity in query.iter() {
+        commands.entity(entity).despawn();
+    }
+}
+
+pub(crate) fn reinit_simulation(
+    mut sim: NonSendMut<SimulationState>,
+    config: Res<ReplicaConfig>,
+    buffers: Res<SharedBuffers>,
+    mut positions: ResMut<ReplicaPositions>,
+    mut fx: ResMut<ReplicaFxState>,
+) {
+    *sim = SimulationState {
+        simulator: UiSimulator::new(config.count, 42, buffers.event_buffer.clone()),
+        playing: false,
+        speed: 1.0,
+        tick_accumulator: 0.0,
+        total_commits: 0,
+        ops_per_second: 0.0,
+        ops_window_start: 0.0,
+        ops_window_count: 0,
+        frame_count: 0,
+    };
+    *positions = ReplicaPositions::new(config.count);
+    *fx = ReplicaFxState::new(config.count);
+}
+
+pub(crate) fn setup_simulation_world(
+    mut commands: Commands,
+    config: Res<ReplicaConfig>,
+    positions: Res<ReplicaPositions>,
+    asset_server: Res<AssetServer>,
+) {
+    let replica_count = config.count;
+    let mascot_handle: Handle<Image> = asset_server.load("iggy.png");
+
+    for scan_idx in 0..SCAN_LINE_COUNT {
+        let y_pos = -500.0 + (scan_idx as f32) * (1000.0 / SCAN_LINE_COUNT as f32);
+        let line = shapes::Line(Vec2::new(-700.0, 0.0), Vec2::new(700.0, 0.0));
+        commands.spawn((
+            ScanLine {
+                speed: 30.0 + (scan_idx as f32) * 15.0,
+            },
+            build_stroke(&line, NEON_CYAN.with_alpha(0.03), 1.0),
+            Transform::from_xyz(0.0, y_pos, -0.05),
+        ));
+    }
+
+    // Track rings
+    commands.spawn((
+        TrackRing,
+        build_stroke(
+            &circle_shape(CIRCLE_RADIUS),
+            GRID_LINE.with_alpha(0.35),
+            0.9,
+        ),
+        Transform::from_xyz(0.0, WORLD_CENTER_Y, 0.0),
+    ));
+    commands.spawn((
+        build_stroke(
+            &circle_shape(CIRCLE_RADIUS - 18.0),
+            GRID_LINE.with_alpha(0.12),
+            0.5,
+        ),
+        Transform::from_xyz(0.0, WORLD_CENTER_Y, -0.01),
+    ));
+    commands.spawn((
+        build_stroke(
+            &circle_shape(CIRCLE_RADIUS + 18.0),
+            GRID_LINE.with_alpha(0.12),
+            0.5,
+        ),
+        Transform::from_xyz(0.0, WORLD_CENTER_Y, -0.01),
+    ));
+
+    // Replicas
+    for replica_id in 0..replica_count {
         let position = positions.0[replica_id as usize];
         let is_primary = replica_id == 0;
         let accent = if is_primary { IGGY_ORANGE } else { NEON_CYAN };
@@ -235,8 +537,9 @@ pub(crate) fn setup_world(
         ));
     }
 
-    for from_id in 0..REPLICA_COUNT {
-        for to_id in (from_id + 1)..REPLICA_COUNT {
+    // Network links between replicas
+    for from_id in 0..replica_count {
+        for to_id in (from_id + 1)..replica_count {
             let from_pos = positions.0[from_id as usize];
             let to_pos = positions.0[to_id as usize];
             let bend = if (from_id + to_id) % 2 == 0 {
@@ -254,6 +557,7 @@ pub(crate) fn setup_world(
         }
     }
 
+    // App cards (producers / consumers)
     let apps = [
         (
             0usize,
@@ -269,7 +573,7 @@ pub(crate) fn setup_world(
             "BALL FETCHER",
             AppKind::Consumer,
             Vec2::new(560.0, 330.0),
-            1u8,
+            1u8.min(replica_count - 1),
             NEON_CYAN,
             false,
         ),
@@ -278,7 +582,7 @@ pub(crate) fn setup_world(
             "TREAT DISPENSER",
             AppKind::Producer,
             Vec2::new(-560.0, 70.0),
-            2u8,
+            2u8.min(replica_count - 1),
             NEON_YELLOW,
             true,
         ),
@@ -338,11 +642,17 @@ pub(crate) fn setup_world(
     }
 }
 
-pub(crate) fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) {
+pub(crate) fn setup_hud(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    config: Res<ReplicaConfig>,
+) {
     let sygnet_handle: Handle<Image> =
         asset_server.load("logo/4x/iggy-apache-sygnet-color-darkbg@4x.png");
     let wordmark_handle: Handle<Image> =
         asset_server.load("logo/4x/iggy-apache-logo-wo-sygnet-light@4x.png");
+
+    let greyhound_label = format!("{} GREYHOUNDS", config.count);
 
     commands
         .spawn(Node {
@@ -605,9 +915,10 @@ pub(crate) fn setup_hud(mut commands: Commands, asset_server: Res<AssetServer>) 
                     ..default()
                 })
                 .with_children(|chips| {
-                    for (label, color) in
-                        [("3 GREYHOUNDS", IGGY_ORANGE), ("FAULT READY", HUD_ALERT)]
-                    {
+                    for (label, color) in [
+                        (greyhound_label.as_str(), IGGY_ORANGE),
+                        ("FAULT READY", HUD_ALERT),
+                    ] {
                         chips
                             .spawn((
                                 Node {

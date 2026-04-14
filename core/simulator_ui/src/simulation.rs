@@ -32,6 +32,7 @@ pub(crate) fn tick_simulation(
     mut commands: Commands,
     time: Res<Time>,
     mut sim: NonSendMut<SimulationState>,
+    config: Res<ReplicaConfig>,
     positions: Res<ReplicaPositions>,
     mut fx: FxParams,
     mut event_log: ResMut<EventLog>,
@@ -47,6 +48,7 @@ pub(crate) fn tick_simulation(
         return;
     }
 
+    let replica_count = config.count;
     let delta = time.delta_secs();
     sim.tick_accumulator += delta * sim.speed * 60.0;
 
@@ -58,15 +60,20 @@ pub(crate) fn tick_simulation(
         let events = sim.simulator.step();
 
         for event in &events {
-            if let Some(entry) = narrate_event(event, tick) {
+            if let Some(entry) = narrate_event(event, tick, replica_count) {
                 event_log.push(entry);
             }
             match event.sim_event.as_str() {
                 "ControlMessageScheduled" => {
-                    spawn_control_message_particles(&mut commands, event, &positions);
+                    spawn_control_message_particles(
+                        &mut commands,
+                        event,
+                        &positions,
+                        replica_count,
+                    );
                 }
                 "PrepareQueued" => {
-                    spawn_prepare_particles(&mut commands, event, &positions);
+                    spawn_prepare_particles(&mut commands, event, &positions, replica_count);
                 }
                 "OperationCommitted" => {
                     handle_commit_event(
@@ -88,6 +95,7 @@ pub(crate) fn tick_simulation(
                         &mut fx.replica_fx,
                         &mut fx.app_fx,
                         &mut fx.screen_flash,
+                        replica_count,
                     );
                 }
                 "ClientRequestReceived" => {
@@ -127,13 +135,14 @@ pub(crate) fn spawn_control_message_particles(
     commands: &mut Commands,
     event: &CapturedSimEvent,
     positions: &ReplicaPositions,
+    replica_count: u8,
 ) {
     let action = event.action.as_deref().unwrap_or("");
     let msg_type = MessageType::from_action(action).unwrap_or(MessageType::Prepare);
     let from_idx = event.replica_id.unwrap_or(0) as usize;
     let to_idx = event.target_replica.unwrap_or(0) as usize;
 
-    if from_idx >= REPLICA_COUNT as usize || to_idx >= REPLICA_COUNT as usize {
+    if from_idx >= replica_count as usize || to_idx >= replica_count as usize {
         return;
     }
 
@@ -179,16 +188,17 @@ pub(crate) fn spawn_prepare_particles(
     commands: &mut Commands,
     event: &CapturedSimEvent,
     positions: &ReplicaPositions,
+    replica_count: u8,
 ) {
     let from_idx = event.replica_id.unwrap_or(0) as usize;
-    if from_idx >= REPLICA_COUNT as usize {
+    if from_idx >= replica_count as usize {
         return;
     }
 
     let from_pos = positions.0[from_idx];
     let msg_color = MessageType::Prepare.color();
 
-    for to_idx in 0..REPLICA_COUNT as usize {
+    for to_idx in 0..replica_count as usize {
         if to_idx == from_idx {
             continue;
         }
@@ -344,6 +354,7 @@ pub(crate) fn handle_commit_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_view_change_event(
     commands: &mut Commands,
     event: &CapturedSimEvent,
@@ -352,6 +363,7 @@ pub(crate) fn handle_view_change_event(
     replica_fx: &mut ResMut<ReplicaFxState>,
     app_fx: &mut ResMut<AppFxState>,
     screen_flash: &mut ResMut<ScreenFlash>,
+    replica_count: u8,
 ) {
     let replica_id = event.replica_id.unwrap_or(0) as u8;
     trigger_replica_callout(replica_fx, replica_id, "PACK SHUFFLE!", NEON_MAGENTA, 1.15);
@@ -359,7 +371,7 @@ pub(crate) fn handle_view_change_event(
     screen_flash.timer = SCREEN_FLASH_DURATION;
     screen_flash.color = NEON_MAGENTA;
     screen_flash.intensity = 0.12;
-    for rid in 0..REPLICA_COUNT {
+    for rid in 0..replica_count {
         commands.spawn(GlowFlash {
             id: rid,
             timer: 0.3,
@@ -386,8 +398,8 @@ pub(crate) fn handle_view_change_event(
 
     let bolt_count = 3 + (sim.frame_count % 2) as usize;
     for bolt_idx in 0..bolt_count {
-        let from_idx = bolt_idx % REPLICA_COUNT as usize;
-        let to_idx = (bolt_idx + 1) % REPLICA_COUNT as usize;
+        let from_idx = bolt_idx % replica_count as usize;
+        let to_idx = (bolt_idx + 1) % replica_count as usize;
         let from_pos = positions.0[from_idx];
         let to_pos = positions.0[to_idx];
         let segment_count = 3 + (bolt_idx % 2);

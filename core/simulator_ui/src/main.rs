@@ -39,6 +39,13 @@ use resources::*;
 use theme::*;
 use tracing_layer::EventBuffer;
 
+#[derive(States, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub(crate) enum AppPhase {
+    #[default]
+    Selecting,
+    Simulating,
+}
+
 fn main() {
     use tracing_layer::SimEventLayer;
     use tracing_subscriber::prelude::*;
@@ -46,18 +53,27 @@ fn main() {
 
     let event_buffer = EventBuffer::default();
     let raw_lines = tracing_layer::RawLineBuffer::default();
+    let raw_generation = tracing_layer::RawLineGeneration::default();
 
-    let filter =
+    let fmt_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,iggy.sim=debug"));
+    let sim_filter = EnvFilter::new("off,iggy.sim=debug");
 
     let fmt_layer = fmt::layer()
         .with_target(true)
         .with_ansi(true)
         .compact()
-        .with_filter(filter);
+        .with_filter(fmt_filter);
 
     tracing_subscriber::registry()
-        .with(SimEventLayer::new(event_buffer.clone(), raw_lines.clone()))
+        .with(
+            SimEventLayer::new(
+                event_buffer.clone(),
+                raw_lines.clone(),
+                raw_generation.clone(),
+            )
+            .with_filter(sim_filter),
+        )
         .with(fmt_layer)
         .init();
 
@@ -67,8 +83,9 @@ fn main() {
         bucket_capacity: 1,
     });
 
-    let simulation = SimulationState {
-        simulator: UiSimulator::new(REPLICA_COUNT, 42, event_buffer),
+    // Placeholder simulation — overwritten in OnEnter(Simulating) by reinit_simulation
+    let placeholder_sim = SimulationState {
+        simulator: UiSimulator::new(DEFAULT_REPLICA_COUNT, 42, event_buffer.clone()),
         playing: false,
         speed: 1.0,
         tick_accumulator: 0.0,
@@ -99,8 +116,14 @@ fn main() {
                 }),
         )
         .add_plugins(ShapePlugin)
+        .init_state::<AppPhase>()
         .insert_resource(ClearColor(BG_DARK))
-        .insert_non_send_resource(simulation)
+        .insert_non_send_resource(placeholder_sim)
+        .insert_resource(ReplicaConfig {
+            count: DEFAULT_REPLICA_COUNT,
+        })
+        .insert_resource(SelectionState::default())
+        .insert_resource(SharedBuffers { event_buffer })
         .insert_resource(ReplicaPositions::default())
         .insert_resource(ReplicaFxState::default())
         .insert_resource(AppFxState::default())
@@ -109,31 +132,68 @@ fn main() {
         .insert_resource(EventLog::default())
         .insert_resource(GameConsole {
             raw_lines,
+            raw_generation,
             open: false,
             slide: 0.0,
-            last_line_count: 0,
+            last_seen_generation: 0,
         })
         .add_systems(Startup, setup::setup_camera)
+        .add_systems(Startup, setup::setup_background.after(setup::setup_camera))
+        .add_systems(OnEnter(AppPhase::Selecting), setup::setup_selection_screen)
         .add_systems(
-            Startup,
-            (setup::setup_world, setup::setup_hud).after(setup::setup_camera),
+            Update,
+            (
+                input::handle_selection_input,
+                setup::update_selection_screen,
+            )
+                .run_if(in_state(AppPhase::Selecting)),
         )
-        .add_systems(Update, input::handle_keyboard_input)
+        .add_systems(OnExit(AppPhase::Selecting), setup::despawn_selection_screen)
+        .add_systems(OnEnter(AppPhase::Simulating), setup::reinit_simulation)
+        .add_systems(
+            OnEnter(AppPhase::Simulating),
+            (setup::setup_simulation_world, setup::setup_hud).after(setup::reinit_simulation),
+        )
+        .add_systems(
+            Update,
+            input::handle_keyboard_input.run_if(in_state(AppPhase::Simulating)),
+        )
         .add_systems(Update, simulation::tick_simulation)
-        .add_systems(Update, visuals::update_replica_visuals)
-        .add_systems(Update, visuals::update_hud_text)
-        .add_systems(Update, visuals::update_pause_overlay)
-        .add_systems(Update, visuals::update_app_visuals)
-        .add_systems(Update, visuals::update_app_flow_particles)
+        .add_systems(
+            Update,
+            visuals::update_replica_visuals.run_if(in_state(AppPhase::Simulating)),
+        )
+        .add_systems(
+            Update,
+            visuals::update_hud_text.run_if(in_state(AppPhase::Simulating)),
+        )
+        .add_systems(
+            Update,
+            visuals::update_pause_overlay.run_if(in_state(AppPhase::Simulating)),
+        )
+        .add_systems(
+            Update,
+            visuals::update_app_visuals.run_if(in_state(AppPhase::Simulating)),
+        )
+        .add_systems(
+            Update,
+            visuals::update_app_flow_particles.run_if(in_state(AppPhase::Simulating)),
+        )
         .add_systems(Update, visuals::update_message_particles)
         .add_systems(Update, visuals::update_trail_dots)
-        .add_systems(Update, visuals::update_link_lines)
+        .add_systems(
+            Update,
+            visuals::update_link_lines.run_if(in_state(AppPhase::Simulating)),
+        )
         .add_systems(Update, visuals::update_scan_lines)
         .add_systems(Update, visuals::update_commit_rings)
         .add_systems(Update, visuals::update_ambient_particles)
         .add_systems(Update, visuals::update_screen_flash)
         .add_systems(Update, visuals::update_speed_lines)
-        .add_systems(Update, visuals::update_track_ring)
+        .add_systems(
+            Update,
+            visuals::update_track_ring.run_if(in_state(AppPhase::Simulating)),
+        )
         .add_systems(Update, visuals::update_paw_bursts)
         .add_systems(Update, visuals::update_lightning)
         .add_systems(Update, panels::update_event_log_panel)
