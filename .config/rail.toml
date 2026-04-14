@@ -15,12 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[package]
-name = "iobuf"
-version = "0.1.0"
-edition = "2024"
-license = "Apache-2.0"
+# cargo-rail change detection configuration
+# See: https://github.com/loadingalias/cargo-rail
 
-[dependencies]
-aligned-vec = "0.6"
-compio-buf = "0.8.1"
+[change-detection]
+# Changes to these paths trigger a full workspace rebuild/retest
+infrastructure = [
+    "Cargo.lock",
+    "rust-toolchain.toml",
+    ".cargo/**",
+    ".github/**",
+]

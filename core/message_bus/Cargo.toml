@@ -26,6 +26,7 @@ homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../../README.md"
+publish = false
 
 [dependencies]
 iggy_binary_protocol = { workspace = true }

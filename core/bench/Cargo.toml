@@ -25,6 +25,7 @@ homepage = "https://iggy.apache.org"
 description = "Benchmarking CLI for Iggy message streaming platform"
 keywords = ["iggy", "cli", "messaging", "streaming"]
 readme = "../../README.md"
+publish = false
 
 [[bin]]
 name = "iggy-bench"
@@ -37,6 +38,7 @@ bytes = { workspace = true }
 charming = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+comfy-table = { workspace = true }
 figlet-rs = { workspace = true }
 futures-util = { workspace = true }
 governor = { workspace = true }

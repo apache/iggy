@@ -57,6 +57,7 @@ impl TypedBenchmarkConsumer {
         polling_kind: PollingKind,
         limit_bytes_per_second: Option<IggyByteSize>,
         origin_timestamp_latency_calculation: bool,
+        pretty: bool,
     ) -> Self {
         let config = BenchmarkConsumerConfig {
             consumer_id,
@@ -66,6 +67,7 @@ impl TypedBenchmarkConsumer {
             warmup_time,
             polling_kind,
             origin_timestamp_latency_calculation,
+            pretty,
         };
 
         if use_high_level_api {

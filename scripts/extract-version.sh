@@ -23,7 +23,7 @@
 # versions from Cargo.toml, package.json, pyproject.toml, and other formats.
 #
 # Usage:
-#   ./extract-version.sh <component> [--tag]
+#   ./extract-version.sh <component> [--tag|--should-tag]
 #   ./extract-version.sh --all
 #   ./extract-version.sh --check
 #
@@ -33,6 +33,10 @@
 #
 #   # Get git tag for Rust SDK
 #   ./extract-version.sh rust-sdk --tag              # Output: iggy-0.7.0
+#
+#   # Check whether component should be tagged in git
+#   ./extract-version.sh sdk-java --should-tag       # Output: false (SNAPSHOT)
+#   ./extract-version.sh rust-sdk --should-tag       # Output: true
 #
 #   # Get version for Python SDK
 #   ./extract-version.sh sdk-python                  # Output: 0.5.0
@@ -248,6 +252,7 @@ handle_check() {
 # ── Argument parsing ─────────────────────────────────────────────────────────
 COMPONENT=""
 RETURN_TAG=false
+RETURN_SHOULD_TAG=false
 
 # Detect mode flags as first argument only
 case "${1:-}" in
@@ -257,13 +262,16 @@ esac
 
 # Original single-component flow
 COMPONENT="${1:-}"
-RETURN_TAG=false
 
 shift || true
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --tag)
             RETURN_TAG=true
+            shift
+            ;;
+        --should-tag)
+            RETURN_SHOULD_TAG=true
             shift
             ;;
         *)
@@ -273,10 +281,21 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$RETURN_TAG" == "true" && "$RETURN_SHOULD_TAG" == "true" ]]; then
+    echo "Error: --tag and --should-tag are mutually exclusive" >&2
+    exit 1
+fi
+
 if [[ -z "$COMPONENT" ]]; then
-    echo "Usage: $0 <component> [--tag]" >&2
+    echo "Usage: $0 <component> [--tag|--should-tag]" >&2
     echo "       $0 --all" >&2
     echo "       $0 --check" >&2
+    echo "" >&2
+    echo "  --tag         Print the git tag this component would use for its current version." >&2
+    echo "  --should-tag  Print 'true' if the current version should produce a git tag, 'false'" >&2
+    echo "                otherwise (SNAPSHOT or missing tag_pattern). This is the SINGLE" >&2
+    echo "                source of truth for taggability; publish.yml consults it for every" >&2
+    echo "                SDK matrix row." >&2
     echo "" >&2
     echo "Available components:" >&2
     yq eval '.components | keys | .[]' "$CONFIG_FILE" | sed 's/^/  - /' >&2
@@ -307,6 +326,35 @@ if [[ -z "$VERSION" ]]; then
         echo "  Using regex: $local_vr" >&2
     fi
     exit 1
+fi
+
+# --should-tag: derive whether this version should produce a git tag.
+#
+# This is THE SINGLE SOURCE OF TRUTH for taggability. Every component
+# matrix row in .github/workflows/publish.yml consults this value and
+# gates its create-git-tag step on it. Any new SDK whose versioning
+# model has mutable pre-release states (another -SNAPSHOT-style language,
+# for example) MUST extend the rules here, not add ad-hoc conditions in
+# publish.yml - otherwise the SDK matrix and the Docker manifests job
+# diverge on what counts as a release.
+#
+# A component is taggable when (a) it declares a tag_pattern in
+# publish.yml and (b) its version is not a -SNAPSHOT placeholder (Java
+# mutable releases). The Docker-only "create_edge_docker_tag stable skip"
+# rule depends on a workflow input, not the version, and stays in the
+# workflow (it layers on top of this result).
+if [[ "$RETURN_SHOULD_TAG" == "true" ]]; then
+    TAG_PATTERN=$(get_config "$COMPONENT" "tag_pattern")
+    if [[ -z "$TAG_PATTERN" ]]; then
+        echo "false"
+        exit 0
+    fi
+    if [[ "$VERSION" == *-SNAPSHOT ]]; then
+        echo "false"
+        exit 0
+    fi
+    echo "true"
+    exit 0
 fi
 
 # Return tag or version based on flag
