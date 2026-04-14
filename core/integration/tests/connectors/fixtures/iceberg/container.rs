@@ -67,7 +67,11 @@ impl MinioContainer {
         let container = GenericImage::new(MINIO_IMAGE, MINIO_TAG)
             .with_exposed_port(MINIO_PORT.tcp())
             .with_exposed_port(MINIO_CONSOLE_PORT.tcp())
-            .with_wait_for(WaitFor::message_on_stderr("API:"))
+            .with_wait_for(WaitFor::http(
+                HttpWaitStrategy::new("/minio/health/live")
+                    .with_port(MINIO_PORT.tcp())
+                    .with_expected_status_code(200u16),
+            ))
             .with_network(network)
             .with_container_name(container_name)
             .with_env_var("MINIO_ROOT_USER", MINIO_ACCESS_KEY)

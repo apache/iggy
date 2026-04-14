@@ -20,6 +20,7 @@ name = "server-ng"
 version = "0.8.0"
 edition = "2024"
 license = "Apache-2.0"
+publish = false
 
 [package.metadata.cargo-udeps.ignore]
 normal = ["tracing-appender"]

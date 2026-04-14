@@ -34,6 +34,7 @@ use consensus::{
     pipeline_prepare_common, replicate_preflight, replicate_to_next_in_chain, request_preflight,
     send_prepare_ok as send_prepare_ok_common,
 };
+use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, GenericHeader, Message, Operation, PrepareHeader, PrepareOkHeader,
     RequestHeader,
@@ -43,7 +44,6 @@ use iggy_common::{
     send_messages2::{convert_request_message, decode_prepare_slice},
     sharding::{IggyNamespace, LocalIdx, ShardId},
 };
-use iobuf::Frozen;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use std::cell::UnsafeCell;

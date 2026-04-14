@@ -16,6 +16,7 @@
 // under the License.
 
 use bytes::Bytes;
+use iggy_binary_protocol::consensus::iobuf::Owned;
 use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
 use iggy_binary_protocol::{
     Message, Operation, RequestHeader, WireEncode, WireIdentifier, WireName,
@@ -24,7 +25,6 @@ use iggy_common::send_messages2::{
     IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned,
 };
 use iggy_common::sharding::IggyNamespace;
-use iobuf::Owned;
 use std::cell::Cell;
 
 // TODO: Proper client which implements the full client SDK API
