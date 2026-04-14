@@ -81,10 +81,11 @@ runs:
         METADATA_JSON=$(cargo metadata --format-version 1 --no-deps 2>/dev/null || echo "{}")
         TOTAL_CRATES=$(echo "$METADATA_JSON" | jq '.workspace_members | length' 2>/dev/null || echo "?")
         echo "$TOTAL_CRATES" > /tmp/total-crates.txt
-        # Extract packages with binary targets — integration tests may invoke
-        # binaries from other packages via assert_cmd (CARGO_BIN_EXE_<name>),
-        # so these must always be compiled alongside affected crates.
-        echo "$METADATA_JSON" | jq -r '.packages[] | select(.targets[] | .kind[] == "bin") | .name' 2>/dev/null > /tmp/bin-packages.txt || true
+        # Extract packages with binary or cdylib targets — integration tests may
+        # invoke binaries via assert_cmd (CARGO_BIN_EXE_<name>), and connector
+        # plugins (cdylib) are loaded at runtime via dlopen by iggy-connectors.
+        # Both must always be compiled alongside affected crates.
+        echo "$METADATA_JSON" | jq -r '.packages[] | select(.targets[] | .kind[] | (. == "bin" or . == "cdylib")) | .name' 2>/dev/null > /tmp/bin-packages.txt || true
 
         PLAN_JSON=$(cargo rail plan --since origin/master -f json 2>/tmp/affected-stderr.txt || echo "")
 
