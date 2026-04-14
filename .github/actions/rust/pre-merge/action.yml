@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, fmt, clippy, sort, machete, doctest, test-1, test-2, compat)"
+    description: "Task to run (check, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, compat)"
     required: true
   component:
     description: "Component name (for context)"
@@ -55,6 +55,11 @@ runs:
             ;;
           machete)
             cargo install cargo-machete --locked
+            ;;
+          verify-publish)
+            if ! command -v cargo-http-registry >/dev/null 2>&1; then
+              cargo install cargo-http-registry --locked
+            fi
             ;;
         esac
       shell: bash
@@ -148,6 +153,13 @@ runs:
       run: |
         cargo test --locked --doc
         cargo doc --no-deps --all-features --quiet
+      shell: bash
+
+    - name: Verify crates publish chain to local alt-registry
+      if: inputs.task == 'verify-publish'
+      env:
+        CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      run: ./scripts/verify-crates-publish.sh
       shell: bash
 
     - name: Install dependencies for Rust tests
