@@ -1,0 +1,220 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: create-git-tag
+description: >
+  Idempotently create and push an annotated git tag against a specific commit.
+  Skips cleanly if the tag already exists on the remote AT THE SAME COMMIT
+  (including races where another job pushed the same tag between our pre-check
+  and our push). A pre-existing tag pointing at a different commit is always
+  a hard failure with operator recovery instructions: the whole point of the
+  invariant is "no tag without a matching, reviewed release commit".
+
+inputs:
+  tag:
+    description: "Tag name to create (e.g. iggy-0.10.1, web-ui-0.3.0)"
+    required: true
+  commit:
+    description: "Full commit SHA the tag should point to (never HEAD, never a short SHA)"
+    required: true
+  message:
+    description: "Annotated tag message. Defaults to 'Release <tag>'."
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Create and push git tag
+      shell: bash
+      env:
+        TAG: ${{ inputs.tag }}
+        COMMIT: ${{ inputs.commit }}
+        MESSAGE: ${{ inputs.message }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${TAG}" ]; then
+          echo "❌ create-git-tag: 'tag' input is empty"
+          exit 1
+        fi
+        if [ -z "${COMMIT}" ]; then
+          echo "❌ create-git-tag: 'commit' input is empty"
+          exit 1
+        fi
+
+        # Validate the tag name with two layers of defense:
+        #  1. Shell-option injection: reject anything not starting with
+        #     alphanumeric / `_` / `/` so the composite cannot be coerced
+        #     into parsing the tag as a git or shell short-option (a
+        #     leading `-` would be the classic attack shape). A leading
+        #     `.` is also rejected because git's own check_refname_format
+        #     would reject it later and we prefer a fast, actionable
+        #     failure here.
+        #  2. Git refname format: delegate to `git check-ref-format`, which
+        #     enforces the full refs/tags/ restrictions (no `..`, no
+        #     `.lock`, no trailing slash, no control chars, etc.).
+        #     Strictly stronger than a hand-rolled alphabet rule, and
+        #     stays in sync with git's own receive-pack check instead of
+        #     drifting from it. In particular this accepts every real
+        #     tag_pattern in .github/config/publish.yml, including the
+        #     semver build metadata suffix `X.Y.Z+build.N` that rc1
+        #     choked on, and the `foreign/go/v0.7.0` slash-containing
+        #     Go module tag shape.
+        if ! [[ "${TAG}" =~ ^[A-Za-z0-9_/] ]]; then
+          echo "❌ create-git-tag: tag '${TAG}' must start with [A-Za-z0-9_/]"
+          exit 1
+        fi
+        if ! git check-ref-format "refs/tags/${TAG}" 2>/dev/null; then
+          echo "❌ create-git-tag: tag '${TAG}' is not a valid git ref name"
+          echo "   git check-ref-format rejected it. See"
+          echo "   https://git-scm.com/docs/git-check-ref-format for the rules."
+          exit 1
+        fi
+        if ! [[ "${COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "❌ create-git-tag: commit '${COMMIT}' is not a full 40-char SHA"
+          exit 1
+        fi
+
+        if [ -z "${MESSAGE}" ]; then
+          MESSAGE="Release ${TAG}"
+        fi
+
+        # Ensure the commit object exists locally; required by `git tag -a`.
+        # If the workflow used a shallow checkout, fetch just the one commit.
+        # GitHub enables allowReachableSHA1InWant=true, so single-commit
+        # fetches work even when the caller's checkout used fetch-depth:1.
+        if ! git cat-file -e "${COMMIT}^{commit}" 2>/dev/null; then
+          echo "ℹ️ Commit ${COMMIT} not in local clone, fetching..."
+          if ! git fetch --no-tags --depth=1 origin "${COMMIT}" 2>/dev/null; then
+            echo "❌ Failed to fetch commit ${COMMIT} from origin"
+            echo "   Recovery:"
+            echo "     - verify the commit still exists on origin (was it force-pushed away?)"
+            echo "     - verify the commit is reachable from a branch on origin (not only from a PR ref)"
+            echo "     - if the caller's network restricts single-commit fetches, increase fetch-depth on the calling checkout step"
+            exit 1
+          fi
+        fi
+
+        # Resolve a remote tag ref to the commit it points at, preferring the
+        # peeled form (for annotated tags) and falling back to the raw object.
+        # Used by both the early-skip branch and the post-push race-recovery
+        # branch so that they behave the same way.
+        remote_tag_commit() {
+          local peeled raw
+          peeled=$(git ls-remote --tags origin "refs/tags/${TAG}^{}" 2>/dev/null | awk '{print $1}')
+          raw=$(git ls-remote --tags origin "refs/tags/${TAG}" 2>/dev/null | awk '{print $1}')
+          echo "${peeled:-${raw}}"
+        }
+
+        # Idempotency: if the tag already exists on the remote, accept it
+        # ONLY if it points at the same commit we're being asked to tag.
+        # Before this, the early-skip path checked name existence only and
+        # silently passed a pre-existing wrong-target tag (the exact state
+        # rc1 left behind), which is incompatible with the "no tag without
+        # a matching, reviewed commit" invariant.
+        if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+          EXISTING_SHA="$(remote_tag_commit)"
+          if [ -z "${EXISTING_SHA}" ]; then
+            echo "❌ Tag ${TAG} exists on remote but its target commit could not be resolved"
+            exit 1
+          fi
+          if [ "${EXISTING_SHA}" = "${COMMIT}" ]; then
+            echo "⏭️ Tag ${TAG} already exists on remote at ${COMMIT}, skipping"
+            exit 0
+          fi
+          echo "❌ Tag ${TAG} exists on remote at ${EXISTING_SHA}, but this run wants it at ${COMMIT}"
+          echo "   Recovery (verify the intended release commit first):"
+          echo "     - delete the wrong tag:   git push --delete origin ${TAG}"
+          echo "     - or bump the version and rerun the publish workflow"
+          exit 1
+        fi
+
+        # Local fallback for clones that already fetched the tag locally but
+        # somehow failed the ls-remote check above (e.g. a transient network
+        # blip). Same symmetric-SHA rule applies.
+        if git rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
+          LOCAL_PEELED=$(git rev-parse --verify --quiet "refs/tags/${TAG}^{commit}" 2>/dev/null || true)
+          LOCAL_SHA="${LOCAL_PEELED:-$(git rev-parse --verify --quiet "refs/tags/${TAG}" 2>/dev/null || true)}"
+          if [ "${LOCAL_SHA}" = "${COMMIT}" ]; then
+            echo "⏭️ Tag ${TAG} already exists locally at ${COMMIT}, skipping"
+            exit 0
+          fi
+          echo "❌ Tag ${TAG} exists locally at ${LOCAL_SHA}, but this run wants it at ${COMMIT}"
+          echo "   Recovery (verify the intended release commit first):"
+          echo "     - delete the local tag:   git tag -d ${TAG}"
+          echo "     - then rerun so the ls-remote check above re-evaluates the remote state"
+          exit 1
+        fi
+
+        git config user.name  "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        git tag -a "${TAG}" "${COMMIT}" -m "${MESSAGE}"
+
+        # Push, recovering from the only race the concurrency group does not
+        # cover: a second job inside this same workflow run pushing the same
+        # tag between our ls-remote check and our push. If push fails AND the
+        # tag now exists on the remote pointing at the same commit, treat it
+        # as a benign skip; any other failure (permission denied, missing
+        # commit, mismatched target) is fatal so the operator sees it.
+        #
+        # `|| push_rc=$?` is needed because `set -e` plus the `if` form would
+        # both swallow the failing exit code: `$?` after a non-taken `if` is
+        # always 0.
+        push_rc=0
+        push_stderr_file="$(mktemp)"
+        # Cleanup wrapped in a named function so future traps can append
+        # to it instead of overwriting (trap 'foo' EXIT replaces any
+        # earlier EXIT trap). No earlier EXIT trap exists today, so this
+        # is purely refactor-defensive.
+        _create_git_tag_cleanup() { rm -f "${push_stderr_file}"; }
+        trap _create_git_tag_cleanup EXIT
+        git push origin "${TAG}" 2>"${push_stderr_file}" || push_rc=$?
+        if [ "${push_rc}" -eq 0 ]; then
+          echo "✅ Created and pushed tag: ${TAG}"
+          exit 0
+        fi
+
+        echo "⚠️ git push failed (rc=${push_rc}), checking remote for race..."
+        echo "   push stderr:"
+        sed 's/^/     /' "${push_stderr_file}"
+
+        # Use the same peeled-then-raw resolver as the early-skip and
+        # post-push branches so all three agree on what the tag points at.
+        # The previous inline `git ls-remote ... | awk` only read the raw
+        # line, which would miss an annotated-tag same-commit race.
+        REMOTE_SHA="$(remote_tag_commit)"
+        if [ -z "${REMOTE_SHA}" ]; then
+          echo "❌ Push failed and tag ${TAG} is not on remote - propagating failure"
+          echo "   The push stderr above should explain why (permission denied, protected"
+          echo "   ref, missing upstream, etc.). If this is a token/permissions issue,"
+          echo "   verify the calling workflow has 'contents: write' on the job."
+          exit "${push_rc}"
+        fi
+
+        if [ "${REMOTE_SHA}" = "${COMMIT}" ]; then
+          echo "⏭️ Tag ${TAG} was created concurrently at the same commit, treating as skip"
+          exit 0
+        fi
+
+        echo "❌ Tag ${TAG} exists on remote at ${REMOTE_SHA} but this run wanted ${COMMIT}"
+        echo "   This is the 'rc1 failure shape': the tag points at the wrong commit."
+        echo "   Recovery (verify the intended release commit first):"
+        echo "     - delete the wrong tag:   git push --delete origin ${TAG}"
+        echo "     - or bump the version and rerun the publish workflow"
+        exit 1

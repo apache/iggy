@@ -21,6 +21,7 @@ version = "0.3.0"
 edition = "2024"
 description = "Benchmark report and chart generation library for iggy-bench binary and iggy-benchmarks-dashboard web app"
 license = "Apache-2.0"
+publish = false
 
 [dependencies]
 charming = { workspace = true }
