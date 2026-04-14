@@ -40,12 +40,13 @@ Components:
   rust-cli             core/cli + workspace dep
   rust-connector-sdk   core/connectors/sdk + workspace dep
   rust-all             All Rust crates at once
-  --all                All components (Rust + SDKs)
+  --all                All components (Rust + SDKs + web-ui)
   sdk-python           foreign/python/Cargo.toml + foreign/python/pyproject.toml
   sdk-node             foreign/node/package.json
   sdk-go               foreign/go/contracts/version.go
   sdk-csharp           foreign/csharp/Iggy_SDK/Iggy_SDK.csproj
   sdk-java             foreign/java/gradle.properties
+  web-ui               web/package.json
 
 Version flags (exactly one required):
   --patch       Bump patch version (0.9.3 -> 0.9.4)
@@ -74,7 +75,7 @@ EOF
 
 RUST_COMPONENTS="rust-sdk rust-common rust-binary-protocol rust-server rust-cli rust-connector-sdk"
 SDK_COMPONENTS="sdk-python sdk-node sdk-go sdk-csharp sdk-java"
-ALL_COMPONENTS="${RUST_COMPONENTS} ${SDK_COMPONENTS}"
+ALL_COMPONENTS="${RUST_COMPONENTS} ${SDK_COMPONENTS} web-ui"
 
 # Returns "file:format" lines per component.
 # Format keys: cargo, cargo-ws-dep:PKG, cargo-dep:PKG, python-cargo, pyproject, json, csproj, gradle, go
@@ -120,6 +121,9 @@ get_version_files() {
             ;;
         sdk-java)
             echo "foreign/java/gradle.properties:gradle"
+            ;;
+        web-ui)
+            echo "web/package.json:json"
             ;;
         *)
             echo -e "${RED}Unknown component: ${component}${NC}" >&2

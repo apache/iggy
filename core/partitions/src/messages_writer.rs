@@ -19,8 +19,8 @@ use compio::{
     fs::{File, OpenOptions},
     io::AsyncWriteAtExt,
 };
+use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_common::{IggyByteSize, IggyError};
-use iobuf::Frozen;
 use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
