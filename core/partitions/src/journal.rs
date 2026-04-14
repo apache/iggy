@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::consensus::iobuf::{Frozen, Owned};
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice};
-use iobuf::{Frozen, Owned};
 use journal::{Journal, Storage};
 use std::io;
 use std::{

@@ -48,7 +48,6 @@ members = [
     "core/consensus",
     "core/harness_derive",
     "core/integration",
-    "core/iobuf",
     "core/journal",
     "core/message_bus",
     "core/metadata",
@@ -102,7 +101,7 @@ clap = { version = "4.6.0", features = ["derive", "wrap_help"] }
 clap_complete = "4.6.0"
 clock = { path = "core/clock" }
 colored = "3.1.1"
-comfy-table = "7.2.2"
+comfy-table = { version = "7.2.2", default-features = false }
 compio = { version = "0.18.0", features = [
     "runtime",
     "macros",
@@ -116,6 +115,7 @@ compio = { version = "0.18.0", features = [
     "ws",
     "fs",
 ] }
+compio-buf = "0.8.1"
 # Pin compio-driver >= 0.11.2 to fix musl compilation (compio-rs/compio#668)
 compio-driver = "0.11.4"
 configs = { path = "core/configs", version = "0.1.0" }
@@ -172,7 +172,6 @@ iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.0" }
 iggy_common = { path = "core/common", version = "0.10.0" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.3.0" }
 integration = { path = "core/integration" }
-iobuf = { path = "core/iobuf" }
 journal = { path = "core/journal" }
 js-sys = "0.3"
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }

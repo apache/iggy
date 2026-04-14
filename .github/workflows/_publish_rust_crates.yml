@@ -112,29 +112,7 @@ jobs:
           echo "  iggy: $(scripts/extract-version.sh rust-sdk)"
           echo "  iggy-cli: $(scripts/extract-version.sh rust-cli)"
 
-      # Step 1: Publish iggy_common
-      - name: Publish iggy_common
-        if: contains(inputs.crates, 'rust-common')
-        uses: ./.github/actions/rust/post-merge
-        with:
-          package: iggy_common
-          version: ${{ steps.versions.outputs.common }}
-          dry_run: ${{ inputs.dry_run }}
-
-      - name: Wait for iggy_common to be available
-        if: contains(inputs.crates, 'rust-common') && inputs.dry_run == false
-        run: |
-          echo "⏳ Waiting for iggy_common to be available on crates.io..."
-          for i in {1..30}; do
-            if cargo search iggy_common --limit 1 | grep -q "^iggy_common = \"${{ steps.versions.outputs.common }}\""; then
-              echo "✅ iggy_common is now available"
-              break
-            fi
-            echo "Waiting... (attempt $i/30)"
-            sleep 10
-          done
-
-      # Step 2: Publish iggy_binary_protocol (depends on common)
+      # Step 1: Publish iggy_binary_protocol (depends on nothing in-tree)
       - name: Publish iggy_binary_protocol
         if: contains(inputs.crates, 'rust-binary-protocol')
         uses: ./.github/actions/rust/post-merge
@@ -147,14 +125,48 @@ jobs:
         if: contains(inputs.crates, 'rust-binary-protocol') && inputs.dry_run == false
         run: |
           echo "⏳ Waiting for iggy_binary_protocol to be available on crates.io..."
+          found=false
           for i in {1..30}; do
             if cargo search iggy_binary_protocol --limit 1 | grep -q "^iggy_binary_protocol = \"${{ steps.versions.outputs.protocol }}\""; then
               echo "✅ iggy_binary_protocol is now available"
+              found=true
               break
             fi
             echo "Waiting... (attempt $i/30)"
             sleep 10
           done
+          if [ "$found" != "true" ]; then
+            echo "❌ Timed out waiting for iggy_binary_protocol on crates.io index"
+            exit 1
+          fi
+
+      # Step 2: Publish iggy_common (depends on iggy_binary_protocol)
+      - name: Publish iggy_common
+        if: contains(inputs.crates, 'rust-common')
+        uses: ./.github/actions/rust/post-merge
+        with:
+          package: iggy_common
+          version: ${{ steps.versions.outputs.common }}
+          dry_run: ${{ inputs.dry_run }}
+
+      - name: Wait for iggy_common to be available
+        if: contains(inputs.crates, 'rust-common') && inputs.dry_run == false
+        run: |
+          echo "⏳ Waiting for iggy_common to be available on crates.io..."
+          found=false
+          for i in {1..30}; do
+            if cargo search iggy_common --limit 1 | grep -q "^iggy_common = \"${{ steps.versions.outputs.common }}\""; then
+              echo "✅ iggy_common is now available"
+              found=true
+              break
+            fi
+            echo "Waiting... (attempt $i/30)"
+            sleep 10
+          done
+          if [ "$found" != "true" ]; then
+            echo "❌ Timed out waiting for iggy_common on crates.io index"
+            exit 1
+          fi
 
       # Step 3: Publish iggy SDK (depends on common and protocol)
       - name: Publish iggy SDK
@@ -169,14 +181,20 @@ jobs:
         if: contains(inputs.crates, 'rust-sdk') && inputs.dry_run == false
         run: |
           echo "⏳ Waiting for iggy to be available on crates.io..."
+          found=false
           for i in {1..30}; do
             if cargo search iggy --limit 1 | grep -q "^iggy = \"${{ steps.versions.outputs.sdk }}\""; then
               echo "✅ iggy SDK is now available"
+              found=true
               break
             fi
             echo "Waiting... (attempt $i/30)"
             sleep 10
           done
+          if [ "$found" != "true" ]; then
+            echo "❌ Timed out waiting for iggy SDK on crates.io index"
+            exit 1
+          fi
 
       # Step 4: Publish iggy-cli (depends on SDK and protocol)
       - name: Publish iggy-cli
@@ -187,9 +205,34 @@ jobs:
           version: ${{ steps.versions.outputs.cli }}
           dry_run: ${{ inputs.dry_run }}
 
-      # Create git tags
-      - name: Create git tags
-        if: inputs.create_tags && inputs.dry_run == false
+      - name: Set final status output
+        id: final-status
+        if: always()
+        run: echo "status=${{ job.status }}" >> "$GITHUB_OUTPUT"
+
+  # Tag creation runs in a separate job so it only fires when every crate
+  # in the `publish` job has been uploaded successfully. Inlining this at
+  # the end of `publish` created zombie tags whenever a mid-chain publish
+  # step failed (leaving a version burned on crates.io with no matching
+  # git tag, which then prevented re-running the publish at that version).
+  create-tags:
+    name: Create git tags
+    needs: [publish]
+    runs-on: ubuntu-latest
+    if: success() && inputs.create_tags && inputs.dry_run == false
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          # We only need the tip commit to run the tagging script, but tags
+          # must be available for the existence probe (`git rev-parse`) so
+          # we don't try to re-create tags that were already pushed.
+          fetch-depth: 1
+          fetch-tags: true
+      - name: Create and push tags
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -204,8 +247,3 @@ jobs:
               echo "⏭️ Tag $TAG already exists"
             fi
           done
-
-      - name: Set final status output
-        id: final-status
-        if: always()
-        run: echo "status=${{ job.status }}" >> "$GITHUB_OUTPUT"
