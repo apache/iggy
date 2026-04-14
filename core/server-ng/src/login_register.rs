@@ -28,6 +28,7 @@
 use crate::session_manager::{SessionError, SessionManager};
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
+use secrecy::ExposeSecret;
 
 /// Credential verification abstraction.
 ///
@@ -84,7 +85,7 @@ pub async fn handle_login_register<V: CredentialVerifier, R: RegisterSubmitter>(
     }
 
     // Phase 1: Local credential verification (NOT replicated).
-    let user_id = verifier.verify(request.username.as_str(), &request.password)?;
+    let user_id = verifier.verify(request.username.as_str(), request.password.expose_secret())?;
 
     // Transition: Connected -> Authenticated.
     session_manager
@@ -185,7 +186,7 @@ mod tests {
         LoginRegisterRequest {
             client_id,
             username: iggy_binary_protocol::WireName::new("admin").unwrap(),
-            password: "secret".to_string(),
+            password: secrecy::SecretString::from("secret"),
             version: None,
             client_context: None,
         }

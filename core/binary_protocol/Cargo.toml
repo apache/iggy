@@ -34,6 +34,7 @@ bytemuck = { workspace = true }
 bytes = { workspace = true }
 compio-buf = { workspace = true }
 enumset = { workspace = true }
+secrecy = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
 

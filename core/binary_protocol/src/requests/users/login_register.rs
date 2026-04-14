@@ -19,6 +19,7 @@ use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_str, read_u8, read_u32_le, read_u128_le};
 use crate::primitives::identifier::WireName;
 use bytes::{BufMut, BytesMut};
+use secrecy::{ExposeSecret, SecretString};
 
 /// Combined login + register request for server-ng.
 ///
@@ -31,11 +32,11 @@ use bytes::{BufMut, BytesMut};
 /// [client_id:16 LE][username_len:u8][username:N][password_len:u8][password:N]
 /// [version_len:u32_le][version:N?][context_len:u32_le][context:N?]
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct LoginRegisterRequest {
     pub client_id: u128,
     pub username: WireName,
-    pub password: String,
+    pub password: SecretString,
     pub version: Option<String>,
     pub client_context: Option<String>,
 }
@@ -44,7 +45,7 @@ impl WireEncode for LoginRegisterRequest {
     fn encoded_size(&self) -> usize {
         16 + self.username.encoded_size()
             + 1
-            + self.password.len()
+            + self.password.expose_secret().len()
             + 4
             + self.version.as_ref().map_or(0, String::len)
             + 4
@@ -54,9 +55,10 @@ impl WireEncode for LoginRegisterRequest {
     fn encode(&self, buf: &mut BytesMut) {
         buf.put_u128_le(self.client_id);
         self.username.encode(buf);
+        let password = self.password.expose_secret();
         #[allow(clippy::cast_possible_truncation)]
-        buf.put_u8(self.password.len() as u8);
-        buf.put_slice(self.password.as_bytes());
+        buf.put_u8(password.len() as u8);
+        buf.put_slice(password.as_bytes());
         match &self.version {
             Some(v) => {
                 #[allow(clippy::cast_possible_truncation)]
@@ -86,7 +88,7 @@ impl WireDecode for LoginRegisterRequest {
 
         let password_len = read_u8(buf, pos)? as usize;
         pos += 1;
-        let password = read_str(buf, pos, password_len)?;
+        let password = SecretString::from(read_str(buf, pos, password_len)?);
         pos += password_len;
 
         let version_len = read_u32_le(buf, pos)? as usize;
@@ -126,19 +128,27 @@ impl WireDecode for LoginRegisterRequest {
 mod tests {
     use super::*;
 
+    fn assert_req_eq(a: &LoginRegisterRequest, b: &LoginRegisterRequest) {
+        assert_eq!(a.client_id, b.client_id);
+        assert_eq!(a.username, b.username);
+        assert_eq!(a.password.expose_secret(), b.password.expose_secret());
+        assert_eq!(a.version, b.version);
+        assert_eq!(a.client_context, b.client_context);
+    }
+
     #[test]
     fn roundtrip_full() {
         let req = LoginRegisterRequest {
             client_id: 0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0,
             username: WireName::new("admin").unwrap(),
-            password: "secret".to_string(),
+            password: SecretString::from("secret"),
             version: Some("1.0.0".to_string()),
             client_context: Some("rust-sdk".to_string()),
         };
         let bytes = req.to_bytes();
         let (decoded, consumed) = LoginRegisterRequest::decode(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
-        assert_eq!(decoded, req);
+        assert_req_eq(&decoded, &req);
     }
 
     #[test]
@@ -146,14 +156,14 @@ mod tests {
         let req = LoginRegisterRequest {
             client_id: 42,
             username: WireName::new("user").unwrap(),
-            password: "pass".to_string(),
+            password: SecretString::from("pass"),
             version: None,
             client_context: None,
         };
         let bytes = req.to_bytes();
         let (decoded, consumed) = LoginRegisterRequest::decode(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
-        assert_eq!(decoded, req);
+        assert_req_eq(&decoded, &req);
     }
 
     #[test]
@@ -161,7 +171,7 @@ mod tests {
         let req = LoginRegisterRequest {
             client_id: 1,
             username: WireName::new("admin").unwrap(),
-            password: "p".to_string(),
+            password: SecretString::from("p"),
             version: Some("v1".to_string()),
             client_context: Some("ctx".to_string()),
         };
@@ -173,7 +183,7 @@ mod tests {
         let req = LoginRegisterRequest {
             client_id: 1,
             username: WireName::new("u").unwrap(),
-            password: "p".to_string(),
+            password: SecretString::from("p"),
             version: Some("v".to_string()),
             client_context: Some("c".to_string()),
         };
@@ -191,7 +201,7 @@ mod tests {
         let req = LoginRegisterRequest {
             client_id: 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10,
             username: WireName::new("u").unwrap(),
-            password: "p".to_string(),
+            password: SecretString::from("p"),
             version: None,
             client_context: None,
         };
