@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::iobuf::{Frozen, Owned};
 use crate::consensus::{
     self, Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
     GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader, StartViewChangeHeader,
     StartViewHeader,
 };
-use iobuf::{Frozen, Owned};
 use smallvec::SmallVec;
 use std::{marker::PhantomData, mem::size_of};
 
@@ -46,12 +46,18 @@ where
     fn as_mut_slice(&mut self) -> &mut [u8];
 }
 
-pub trait FragmentedBacking<H>: MessageBacking<H> + ResponseBackingKind
+mod sealed {
+    pub trait Sealed {}
+}
+
+pub trait FragmentedBacking<H>: MessageBacking<H> + ResponseBackingKind + sealed::Sealed
 where
     H: ConsensusHeader,
 {
     fn fragments(&self) -> &[Frozen<MESSAGE_ALIGN>];
 }
+
+impl sealed::Sealed for ResponseBacking {}
 
 #[derive(Debug, Clone)]
 pub struct RequestBacking {

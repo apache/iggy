@@ -2253,7 +2253,6 @@ dependencies = [
  "futures",
  "iggy_binary_protocol",
  "iggy_common",
- "iobuf",
  "message_bus",
  "rand 0.10.0",
  "rand_xoshiro",
@@ -5642,10 +5641,11 @@ dependencies = [
 name = "iggy_binary_protocol"
 version = "0.10.0"
 dependencies = [
+ "aligned-vec",
  "bytemuck",
  "bytes",
+ "compio-buf",
  "enumset",
- "iobuf",
  "smallvec",
  "thiserror 2.0.18",
 ]
@@ -5674,7 +5674,6 @@ dependencies = [
  "human-repr",
  "humantime",
  "iggy_binary_protocol",
- "iobuf",
  "lending-iterator",
  "moka",
  "nix",
@@ -6241,14 +6240,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iobuf"
-version = "0.1.0"
-dependencies = [
- "aligned-vec",
- "compio-buf",
-]
-
-[[package]]
 name = "ipconfig"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6409,7 +6400,6 @@ dependencies = [
  "bytemuck",
  "compio",
  "iggy_binary_protocol",
- "iobuf",
  "tempfile",
 ]
 
@@ -7026,7 +7016,6 @@ dependencies = [
  "consensus",
  "iggy_binary_protocol",
  "iggy_common",
- "iobuf",
  "journal",
  "left-right",
  "message_bus",
@@ -8007,7 +7996,6 @@ dependencies = [
  "consensus",
  "iggy_binary_protocol",
  "iggy_common",
- "iobuf",
  "journal",
  "message_bus",
  "ringbuffer",
@@ -10382,7 +10370,6 @@ dependencies = [
  "futures",
  "iggy_binary_protocol",
  "iggy_common",
- "iobuf",
  "journal",
  "message_bus",
  "metadata",
