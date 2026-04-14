@@ -78,8 +78,13 @@ runs:
     - name: Compute affected crates (cargo-rail)
       if: startsWith(inputs.task, 'test-')
       run: |
-        TOTAL_CRATES=$(cargo metadata --format-version 1 --no-deps 2>/dev/null | jq '.workspace_members | length' 2>/dev/null || echo "?")
+        METADATA_JSON=$(cargo metadata --format-version 1 --no-deps 2>/dev/null || echo "{}")
+        TOTAL_CRATES=$(echo "$METADATA_JSON" | jq '.workspace_members | length' 2>/dev/null || echo "?")
         echo "$TOTAL_CRATES" > /tmp/total-crates.txt
+        # Extract packages with binary targets — integration tests may invoke
+        # binaries from other packages via assert_cmd (CARGO_BIN_EXE_<name>),
+        # so these must always be compiled alongside affected crates.
+        echo "$METADATA_JSON" | jq -r '.packages[] | select(.targets[] | .kind[] == "bin") | .name' 2>/dev/null > /tmp/bin-packages.txt || true
 
         PLAN_JSON=$(cargo rail plan --since origin/master -f json 2>/tmp/affected-stderr.txt || echo "")
 
@@ -88,11 +93,19 @@ runs:
           if [[ "$MODE" == "crates" ]]; then
             CRATES=$(echo "$PLAN_JSON" | jq -r '.scope.crates[]')
             CRATE_COUNT=$(echo "$CRATES" | wc -l)
-            # Build -p flags for cargo build/test
-            echo "$CRATES" | sed 's/^/-p /' | tr '\n' ' ' > /tmp/packages.txt
-            # Build nextest filter expression for cargo nextest run
-            echo "$CRATES" | sed 's/^/package(/; s/$/)/' | paste -sd '|' | sed 's/|/ | /g' > /tmp/nextest-filter.txt
-            echo "::notice::DAG analysis: ${CRATE_COUNT} affected crates (of ${TOTAL_CRATES} total)"
+            # Build nextest filter expression for cargo nextest run (affected crates only)
+            echo "$CRATES" | sed 's/^/package(/; s/$/)/' | paste -sd ' | ' > /tmp/nextest-filter.txt
+            # Save affected-only -p flags for cargo test fallback (no nextest filter)
+            echo "$CRATES" | sed 's/^/-p /' | tr '\n' ' ' > /tmp/test-packages.txt
+            # Build -p flags: affected crates + packages with binary targets.
+            # cargo nextest sets CARGO_BIN_EXE_<name> from compiled binary
+            # artifacts, so binary packages must be in the build to avoid
+            # "CARGO_BIN_EXE_<name> is unset" panics in assert_cmd tests.
+            BIN_PKGS=$(cat /tmp/bin-packages.txt 2>/dev/null || echo "")
+            ALL_BUILD_PKGS=$(printf '%s\n%s\n' "$CRATES" "$BIN_PKGS" | sort -u | grep -v '^$')
+            echo "$ALL_BUILD_PKGS" | sed 's/^/-p /' | tr '\n' ' ' > /tmp/packages.txt
+            BUILD_COUNT=$(echo "$ALL_BUILD_PKGS" | wc -l)
+            echo "::notice::DAG analysis: testing ${CRATE_COUNT} crates, building ${BUILD_COUNT} (of ${TOTAL_CRATES} total, +$(( BUILD_COUNT - CRATE_COUNT )) binary pkgs)"
           else
             echo "::notice::Full workspace affected (${TOTAL_CRATES} crates)"
           fi
@@ -164,6 +177,7 @@ runs:
         # Read DAG-based affected crate filter (computed in earlier step)
         NEXTEST_FILTER=""
         PACKAGE_FLAGS=""
+        TEST_PACKAGE_FLAGS=""
         TOTAL_CRATES="?"
         if [[ -f /tmp/nextest-filter.txt ]]; then
           NEXTEST_FILTER=$(cat /tmp/nextest-filter.txt)
@@ -171,13 +185,17 @@ runs:
         if [[ -f /tmp/packages.txt ]]; then
           PACKAGE_FLAGS=$(cat /tmp/packages.txt)
         fi
+        if [[ -f /tmp/test-packages.txt ]]; then
+          TEST_PACKAGE_FLAGS=$(cat /tmp/test-packages.txt)
+        fi
         if [[ -f /tmp/total-crates.txt ]]; then
           TOTAL_CRATES=$(cat /tmp/total-crates.txt)
         fi
 
         if [[ -n "$PACKAGE_FLAGS" ]]; then
-          CRATE_COUNT=$(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l)
-          echo "::notice::DAG-scoped build: ${CRATE_COUNT} crates (cargo check/clippy cover full workspace separately)"
+          TEST_CRATE_COUNT=$(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l)
+          BUILD_CRATE_COUNT=$(echo "$PACKAGE_FLAGS" | grep -o '\-p ' | wc -l)
+          echo "::notice::DAG-scoped: testing ${TEST_CRATE_COUNT} crates, building ${BUILD_CRATE_COUNT} (cargo check/clippy cover full workspace separately)"
         else
           echo "::notice::Full workspace build (no DAG filter available)"
         fi
@@ -226,8 +244,10 @@ runs:
           if [[ -n "$PARTITION_FLAG" ]]; then
             echo "::error::cargo-nextest not found, falling back to cargo test without partitioning (all tests will run on every partition)"
           fi
-          if [[ -n "$PACKAGE_FLAGS" ]]; then
-            cargo test --locked --no-fail-fast $PACKAGE_FLAGS
+          # Use TEST_PACKAGE_FLAGS (affected crates only), not PACKAGE_FLAGS
+          # (which includes binary packages whose tests should NOT run).
+          if [[ -n "$TEST_PACKAGE_FLAGS" ]]; then
+            cargo test --locked --no-fail-fast $TEST_PACKAGE_FLAGS
           else
             cargo test --locked --no-fail-fast
           fi
@@ -241,8 +261,10 @@ runs:
         echo ""
         echo "========================================="
         if [[ -n "$PACKAGE_FLAGS" ]]; then
-          CRATE_COUNT=$(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l)
-          echo "DAG scope:                     ${CRATE_COUNT}/${TOTAL_CRATES} crates"
+          TEST_CRATE_COUNT=$(echo "$NEXTEST_FILTER" | grep -o 'package(' | wc -l)
+          BUILD_CRATE_COUNT=$(echo "$PACKAGE_FLAGS" | grep -o '\-p ' | wc -l)
+          echo "DAG scope (test):              ${TEST_CRATE_COUNT}/${TOTAL_CRATES} crates"
+          echo "DAG scope (build):             ${BUILD_CRATE_COUNT}/${TOTAL_CRATES} crates"
         else
           echo "DAG scope:                     full workspace (${TOTAL_CRATES} crates)"
         fi
