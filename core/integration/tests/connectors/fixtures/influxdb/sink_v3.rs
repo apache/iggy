@@ -18,8 +18,8 @@
  */
 
 use super::container_v3::{
-    DEFAULT_TEST_STREAM_V3, DEFAULT_TEST_TOPIC_V3, ENV_V3_SINK_API_VERSION, ENV_V3_SINK_BUCKET,
-    ENV_V3_SINK_DB, ENV_V3_SINK_ORG, ENV_V3_SINK_PATH, ENV_V3_SINK_PAYLOAD_FORMAT,
+    DEFAULT_TEST_STREAM_V3, DEFAULT_TEST_TOPIC_V3, ENV_V3_SINK_BUCKET, ENV_V3_SINK_DB,
+    ENV_V3_SINK_ORG, ENV_V3_SINK_PATH, ENV_V3_SINK_PAYLOAD_FORMAT, ENV_V3_SINK_VERSION,
     ENV_V3_SINK_STREAMS_0_CONSUMER_GROUP, ENV_V3_SINK_STREAMS_0_SCHEMA,
     ENV_V3_SINK_STREAMS_0_STREAM, ENV_V3_SINK_STREAMS_0_TOPICS, ENV_V3_SINK_TOKEN, ENV_V3_SINK_URL,
     HEALTH_CHECK_ATTEMPTS_V3, HEALTH_CHECK_INTERVAL_MS_V3, INFLUXDB3_DB, INFLUXDB3_TOKEN,
@@ -125,7 +125,7 @@ impl TestFixture for InfluxDb3SinkFixture {
         envs.insert(ENV_V3_SINK_URL.to_string(), self.container.base_url.clone());
         envs.insert(ENV_V3_SINK_TOKEN.to_string(), INFLUXDB3_TOKEN.to_string());
         envs.insert(ENV_V3_SINK_DB.to_string(), INFLUXDB3_DB.to_string());
-        envs.insert(ENV_V3_SINK_API_VERSION.to_string(), "v3".to_string());
+        envs.insert(ENV_V3_SINK_VERSION.to_string(), "v3".to_string());
         // org and bucket set to empty placeholders for V3 (adapter ignores them)
         envs.insert(ENV_V3_SINK_ORG.to_string(), "".to_string());
         envs.insert(ENV_V3_SINK_BUCKET.to_string(), INFLUXDB3_DB.to_string());

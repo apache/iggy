@@ -46,6 +46,9 @@ pub const DEFAULT_TEST_TOPIC: &str = "test_topic";
 
 // ── env-var keys injected into the connectors runtime ────────────────────────
 
+pub const ENV_SOURCE_VERSION: &str = "IGGY_CONNECTORS_SOURCE_INFLUXDB_PLUGIN_CONFIG_VERSION";
+pub const ENV_SINK_VERSION: &str = "IGGY_CONNECTORS_SINK_INFLUXDB_PLUGIN_CONFIG_VERSION";
+
 pub const ENV_SOURCE_URL: &str = "IGGY_CONNECTORS_SOURCE_INFLUXDB_PLUGIN_CONFIG_URL";
 pub const ENV_SOURCE_ORG: &str = "IGGY_CONNECTORS_SOURCE_INFLUXDB_PLUGIN_CONFIG_ORG";
 pub const ENV_SOURCE_TOKEN: &str = "IGGY_CONNECTORS_SOURCE_INFLUXDB_PLUGIN_CONFIG_TOKEN";
@@ -118,14 +121,16 @@ impl InfluxDbContainer {
                     message: format!("Failed to start container: {e}"),
                 })?;
 
-        let mapped_port = container
+        let ports = container
             .ports()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
                 fixture_type: "InfluxDbContainer".to_string(),
                 message: format!("Failed to get ports: {e}"),
-            })?
+            })?;
+        let mapped_port = ports
             .map_to_host_port_ipv4(INFLUXDB_PORT)
+            .or_else(|| ports.map_to_host_port_ipv6(INFLUXDB_PORT))
             .ok_or_else(|| TestBinaryError::FixtureSetup {
                 fixture_type: "InfluxDbContainer".to_string(),
                 message: "No mapping for InfluxDB port".to_string(),
