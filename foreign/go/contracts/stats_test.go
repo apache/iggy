@@ -29,7 +29,6 @@ import (
 
 // buildStatsPayload constructs a wire payload for Stats using the same
 // layout as the Rust binary_protocol StatsResponse encoder.
-// The semver field controls whether tail fields (threads, disk) are encoded.
 func buildStatsPayload(t *testing.T, s Stats) []byte {
 	t.Helper()
 	w := codec.NewWriter()
@@ -57,20 +56,16 @@ func buildStatsPayload(t *testing.T, s Stats) []byte {
 	w.U32LenStr(s.KernelVersion)
 	w.U32LenStr(s.IggyServerVersion)
 
-	if s.IggyServerSemver != nil {
-		w.U32(*s.IggyServerSemver)
-	}
+	w.U32(s.IggyServerSemver)
 
 	w.U32(uint32(len(s.CacheMetrics)))
 	for i := range s.CacheMetrics {
 		w.Obj(&s.CacheMetrics[i])
 	}
 
-	if s.IggyServerSemver != nil {
-		w.U32(s.ThreadsCount)
-		w.U64(s.FreeDiskSpace)
-		w.U64(s.TotalDiskSpace)
-	}
+	w.U32(s.ThreadsCount)
+	w.U64(s.FreeDiskSpace)
+	w.U64(s.TotalDiskSpace)
 
 	if err := w.Err(); err != nil {
 		t.Fatalf("buildStatsPayload: %v", err)
@@ -79,7 +74,6 @@ func buildStatsPayload(t *testing.T, s Stats) []byte {
 }
 
 func sampleStats() Stats {
-	iggyServerSemver := uint32(600)
 	return Stats{
 		ProcessId:           1234,
 		CpuUsage:            25.5,
@@ -104,7 +98,7 @@ func sampleStats() Stats {
 		OsVersion:           "6.1",
 		KernelVersion:       "6.1.0",
 		IggyServerVersion:   "0.6.0",
-		IggyServerSemver:    &iggyServerSemver,
+		IggyServerSemver:    600,
 		ThreadsCount:        16,
 		FreeDiskSpace:       107_374_182_400,
 		TotalDiskSpace:      512_110_190_592,
@@ -140,7 +134,9 @@ func TestUnmarshalBinary_maliciousCacheCount(t *testing.T) {
 		IggyServerVersion: "v",
 	}
 	payload := buildStatsPayload(t, s)
-	binary.LittleEndian.PutUint32(payload[len(payload)-4:], math.MaxUint32)
+	// cache_metrics_count sits before the tail fields: threads(4) + free_disk(8) + total_disk(8) = 20
+	cacheCountOffset := len(payload) - 20 - 4
+	binary.LittleEndian.PutUint32(payload[cacheCountOffset:], math.MaxUint32)
 
 	var stats Stats
 	err := stats.UnmarshalBinary(payload)
@@ -168,22 +164,6 @@ func TestUnmarshalBinary_withCacheMetrics(t *testing.T) {
 	assertStatsEqual(t, got, want)
 }
 
-func TestUnmarshalBinary_noSemver(t *testing.T) {
-	want := sampleStats()
-	want.IggyServerSemver = nil
-	want.ThreadsCount = 0
-	want.FreeDiskSpace = 0
-	want.TotalDiskSpace = 0
-	payload := buildStatsPayload(t, want)
-
-	var got Stats
-	if err := got.UnmarshalBinary(payload); err != nil {
-		t.Fatalf("UnmarshalBinary error: %v", err)
-	}
-
-	assertStatsEqual(t, got, want)
-}
-
 func TestUnmarshalBinary_truncatedFixedFields(t *testing.T) {
 	// Payload too short to contain all fixed fields.
 	payload := make([]byte, 10) // far too small
@@ -194,7 +174,7 @@ func TestUnmarshalBinary_truncatedFixedFields(t *testing.T) {
 }
 
 func TestUnmarshalBinary_truncatedAfterStrings(t *testing.T) {
-	// Build a valid payload with no semver, then chop off the cache_metrics_count
+	// Build a valid payload then chop off everything after the semver
 	// so that reading cache count fails.
 	s := Stats{
 		Hostname:          "h",
@@ -204,8 +184,8 @@ func TestUnmarshalBinary_truncatedAfterStrings(t *testing.T) {
 		IggyServerVersion: "s",
 	}
 	payload := buildStatsPayload(t, s)
-	// The last 4 bytes are cache_metrics_count (0). Remove them.
-	payload = payload[:len(payload)-4]
+	// Remove tail fields + cache_metrics_count (4+4+8+8 = 24 bytes from the end).
+	payload = payload[:len(payload)-24]
 
 	var stats Stats
 	if err := stats.UnmarshalBinary(payload); err == nil {
@@ -220,10 +200,6 @@ func TestUnmarshalBinary_emptyStrings(t *testing.T) {
 	want.OsVersion = ""
 	want.KernelVersion = ""
 	want.IggyServerVersion = ""
-	want.IggyServerSemver = nil
-	want.ThreadsCount = 0
-	want.FreeDiskSpace = 0
-	want.TotalDiskSpace = 0
 	payload := buildStatsPayload(t, want)
 
 	var got Stats

@@ -61,7 +61,7 @@ type Stats struct {
 	OsVersion           string         `json:"os_version"`
 	KernelVersion       string         `json:"kernel_version"`
 	IggyServerVersion   string         `json:"iggy_server_version"`
-	IggyServerSemver    *uint32        `json:"iggy_server_semver,omitempty"`
+	IggyServerSemver    uint32         `json:"iggy_server_semver"`
 	CacheMetrics        []CacheMetrics `json:"cache_metrics"`
 	ThreadsCount        uint32         `json:"threads_count"`
 	FreeDiskSpace       uint64         `json:"free_disk_space"`
@@ -115,19 +115,7 @@ func (s *Stats) UnmarshalBinary(payload []byte) error {
 	s.OsVersion = r.U32LenStr()
 	s.KernelVersion = r.U32LenStr()
 	s.IggyServerVersion = r.U32LenStr()
-
-	if r.Err() != nil {
-		return r.Err()
-	}
-
-	// iggy_server_semver is optional. If at least 8 bytes remain, the next 4
-	// bytes are the semver and the following 4 are cache_metrics_count.
-	// If only 4 bytes remain, there is no semver and those 4 bytes are cache_metrics_count.
-	if r.Remaining() >= 8 {
-		v := r.U32()
-		s.IggyServerSemver = &v
-	}
-
+	s.IggyServerSemver = r.U32()
 	cacheCount := int(r.U32())
 	if r.Err() != nil {
 		return r.Err()
@@ -144,15 +132,9 @@ func (s *Stats) UnmarshalBinary(payload []byte) error {
 		}
 	}
 
-	if r.Err() == nil && r.Remaining() >= 4 {
-		s.ThreadsCount = r.U32()
-	}
-	if r.Err() == nil && r.Remaining() >= 8 {
-		s.FreeDiskSpace = r.U64()
-	}
-	if r.Err() == nil && r.Remaining() >= 8 {
-		s.TotalDiskSpace = r.U64()
-	}
+	s.ThreadsCount = r.U32()
+	s.FreeDiskSpace = r.U64()
+	s.TotalDiskSpace = r.U64()
 
 	return r.Err()
 }
