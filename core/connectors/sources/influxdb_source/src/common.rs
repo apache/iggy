@@ -16,21 +16,21 @@
  * under the License.
  */
 
-use csv::StringRecord;
 use iggy_common::serde_secret::serialize_secret;
 use iggy_common::{DateTime, Utc};
 use iggy_connector_sdk::{Error, Schema};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::OnceLock;
 use tracing::warn;
 
-pub(crate) type Row = HashMap<String, String>;
+pub(crate) use iggy_connector_influxdb_common::{Row, parse_csv_rows, parse_jsonl_rows};
 
-// ---------------------------------------------------------------------------
-// Config — tagged enum (no serde(flatten) to avoid deserialization issues)
-// ---------------------------------------------------------------------------
+// ── Config ────────────────────────────────────────────────────────────────────
+//
+// Uses `#[serde(tag = "version")]` instead of `#[serde(flatten)]` because
+// serde's flatten interacts poorly with tagged enums — the tag field can be
+// consumed before the variant content is parsed, causing deserialization to fail.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "version")]
@@ -93,35 +93,81 @@ pub struct V3SourceConfig {
     pub stuck_batch_cap_factor: Option<u32>,
 }
 
+// Eliminates the repetitive "match self { V2(c) => …, V3(c) => … }" pattern for
+// fields that are identical across all config variants. Methods with version-specific
+// logic (cursor_field, max_retries, version_label) remain explicit.
+macro_rules! delegate {
+    // &T field reference  →  fn foo(&self) -> &T
+    (ref $self:ident . $field:ident) => {
+        match $self {
+            Self::V2(c) => &c.$field,
+            Self::V3(c) => &c.$field,
+        }
+    };
+    // Option<String>  →  Option<&str>
+    (opt $self:ident . $field:ident) => {
+        match $self {
+            Self::V2(c) => c.$field.as_deref(),
+            Self::V3(c) => c.$field.as_deref(),
+        }
+    };
+    // Option<T: Copy>  →  T with fallback
+    (unwrap $self:ident . $field:ident, $default:expr) => {
+        match $self {
+            Self::V2(c) => c.$field.unwrap_or($default),
+            Self::V3(c) => c.$field.unwrap_or($default),
+        }
+    };
+}
+
 impl InfluxDbSourceConfig {
     pub fn url(&self) -> &str {
-        match self {
-            Self::V2(c) => &c.url,
-            Self::V3(c) => &c.url,
-        }
+        delegate!(ref    self.url)
     }
-
     pub fn token_secret(&self) -> &SecretString {
-        match self {
-            Self::V2(c) => &c.token,
-            Self::V3(c) => &c.token,
-        }
+        delegate!(ref    self.token)
     }
-
     pub fn poll_interval(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.poll_interval.as_deref(),
-            Self::V3(c) => c.poll_interval.as_deref(),
-        }
+        delegate!(opt    self.poll_interval)
     }
-
     pub fn batch_size(&self) -> u32 {
-        match self {
-            Self::V2(c) => c.batch_size.unwrap_or(500),
-            Self::V3(c) => c.batch_size.unwrap_or(500),
-        }
+        delegate!(unwrap self.batch_size, 500)
+    }
+    pub fn initial_offset(&self) -> Option<&str> {
+        delegate!(opt    self.initial_offset)
+    }
+    pub fn payload_column(&self) -> Option<&str> {
+        delegate!(opt    self.payload_column)
+    }
+    pub fn payload_format(&self) -> Option<&str> {
+        delegate!(opt    self.payload_format)
+    }
+    pub fn verbose_logging(&self) -> bool {
+        delegate!(unwrap self.verbose_logging, false)
+    }
+    pub fn retry_delay(&self) -> Option<&str> {
+        delegate!(opt    self.retry_delay)
+    }
+    pub fn timeout(&self) -> Option<&str> {
+        delegate!(opt    self.timeout)
+    }
+    pub fn max_open_retries(&self) -> u32 {
+        delegate!(unwrap self.max_open_retries, 10)
+    }
+    pub fn open_retry_max_delay(&self) -> Option<&str> {
+        delegate!(opt  self.open_retry_max_delay)
+    }
+    pub fn retry_max_delay(&self) -> Option<&str> {
+        delegate!(opt    self.retry_max_delay)
+    }
+    pub fn circuit_breaker_threshold(&self) -> u32 {
+        delegate!(unwrap self.circuit_breaker_threshold, 5)
+    }
+    pub fn circuit_breaker_cool_down(&self) -> Option<&str> {
+        delegate!(opt self.circuit_breaker_cool_down)
     }
 
+    // V2 and V3 use different default cursor column names.
     pub fn cursor_field(&self) -> &str {
         match self {
             Self::V2(c) => c.cursor_field.as_deref().unwrap_or("_time"),
@@ -129,87 +175,11 @@ impl InfluxDbSourceConfig {
         }
     }
 
-    pub fn initial_offset(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.initial_offset.as_deref(),
-            Self::V3(c) => c.initial_offset.as_deref(),
-        }
-    }
-
-    pub fn payload_column(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.payload_column.as_deref(),
-            Self::V3(c) => c.payload_column.as_deref(),
-        }
-    }
-
-    pub fn payload_format(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.payload_format.as_deref(),
-            Self::V3(c) => c.payload_format.as_deref(),
-        }
-    }
-
-    pub fn verbose_logging(&self) -> bool {
-        match self {
-            Self::V2(c) => c.verbose_logging.unwrap_or(false),
-            Self::V3(c) => c.verbose_logging.unwrap_or(false),
-        }
-    }
-
+    // Enforces a minimum of 1 retry regardless of configuration.
     pub fn max_retries(&self) -> u32 {
         match self {
             Self::V2(c) => c.max_retries.unwrap_or(3).max(1),
             Self::V3(c) => c.max_retries.unwrap_or(3).max(1),
-        }
-    }
-
-    pub fn retry_delay(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.retry_delay.as_deref(),
-            Self::V3(c) => c.retry_delay.as_deref(),
-        }
-    }
-
-    pub fn timeout(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.timeout.as_deref(),
-            Self::V3(c) => c.timeout.as_deref(),
-        }
-    }
-
-    pub fn max_open_retries(&self) -> u32 {
-        match self {
-            Self::V2(c) => c.max_open_retries.unwrap_or(10),
-            Self::V3(c) => c.max_open_retries.unwrap_or(10),
-        }
-    }
-
-    pub fn open_retry_max_delay(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.open_retry_max_delay.as_deref(),
-            Self::V3(c) => c.open_retry_max_delay.as_deref(),
-        }
-    }
-
-    pub fn retry_max_delay(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.retry_max_delay.as_deref(),
-            Self::V3(c) => c.retry_max_delay.as_deref(),
-        }
-    }
-
-    pub fn circuit_breaker_threshold(&self) -> u32 {
-        match self {
-            Self::V2(c) => c.circuit_breaker_threshold.unwrap_or(5),
-            Self::V3(c) => c.circuit_breaker_threshold.unwrap_or(5),
-        }
-    }
-
-    pub fn circuit_breaker_cool_down(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.circuit_breaker_cool_down.as_deref(),
-            Self::V3(c) => c.circuit_breaker_cool_down.as_deref(),
         }
     }
 
@@ -221,9 +191,7 @@ impl InfluxDbSourceConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Versioned persisted state
-// ---------------------------------------------------------------------------
+// ── Persisted state ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "version")]
@@ -234,7 +202,7 @@ pub enum PersistedState {
     V3(V3State),
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct V2State {
     pub last_timestamp: Option<String>,
     pub processed_rows: u64,
@@ -243,7 +211,7 @@ pub struct V2State {
     pub cursor_row_count: u64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct V3State {
     pub last_timestamp: Option<String>,
     pub processed_rows: u64,
@@ -252,9 +220,7 @@ pub struct V3State {
     pub effective_batch_size: u32,
 }
 
-// ---------------------------------------------------------------------------
-// PayloadFormat
-// ---------------------------------------------------------------------------
+// ── Payload format ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PayloadFormat {
@@ -291,18 +257,14 @@ impl PayloadFormat {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Cursor validation
-// ---------------------------------------------------------------------------
+// ── Cursor validation ─────────────────────────────────────────────────────────
 
 static CURSOR_RE: OnceLock<regex::Regex> = OnceLock::new();
 
 pub fn cursor_re() -> &'static regex::Regex {
     CURSOR_RE.get_or_init(|| {
-        regex::Regex::new(
-            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$",
-        )
-        .expect("hardcoded regex is valid")
+        regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$")
+            .expect("hardcoded regex is valid")
     })
 }
 
@@ -327,10 +289,15 @@ pub fn validate_cursor_field(field: &str) -> Result<(), Error> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Timestamp helpers
-// ---------------------------------------------------------------------------
+// ── Timestamp helpers ─────────────────────────────────────────────────────────
 
+/// Return `true` if timestamp `a` is strictly after `b`.
+///
+/// Parses both strings as RFC 3339 / chrono `DateTime<Utc>`. Falls back to
+/// lexicographic comparison if either value fails to parse — this covers the
+/// nanosecond-precision timestamps that InfluxDB 3 returns (e.g.
+/// `"2026-03-18T12:00:00.609521Z"`), which chrono parses correctly when the
+/// fractional-seconds component is six or fewer digits.
 pub fn is_timestamp_after(a: &str, b: &str) -> bool {
     match (a.parse::<DateTime<Utc>>(), b.parse::<DateTime<Utc>>()) {
         (Ok(dt_a), Ok(dt_b)) => dt_a > dt_b,
@@ -344,10 +311,13 @@ pub fn is_timestamp_after(a: &str, b: &str) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// parse_scalar
-// ---------------------------------------------------------------------------
+// ── Scalar parsing ────────────────────────────────────────────────────────────
 
+/// Parse a string value from InfluxDB into the most specific JSON scalar type.
+///
+/// Tries `bool`, then `i64`, then `f64`; falls back to `String`. An empty
+/// string becomes `null`. This is used when building the JSON payload for
+/// messages produced by the source connector.
 pub fn parse_scalar(value: &str) -> serde_json::Value {
     if value.is_empty() {
         return serde_json::Value::Null;
@@ -366,110 +336,32 @@ pub fn parse_scalar(value: &str) -> serde_json::Value {
     serde_json::Value::String(value.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// V2 annotated-CSV parser
-// ---------------------------------------------------------------------------
+// ── Query template substitution ───────────────────────────────────────────────
 
-fn is_header_record(record: &StringRecord) -> bool {
-    record.iter().any(|v| v == "_time")
-}
-
-pub fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(false)
-        .from_reader(csv_text.as_bytes());
-
-    let mut headers: Option<StringRecord> = None;
-    let mut rows = Vec::new();
-
-    for result in reader.records() {
-        let record =
-            result.map_err(|e| Error::InvalidRecordValue(format!("Invalid CSV record: {e}")))?;
-
-        if record.is_empty() {
-            continue;
-        }
-
-        if let Some(first) = record.get(0)
-            && first.starts_with('#')
-        {
-            continue;
-        }
-
-        if is_header_record(&record) {
-            headers = Some(record.clone());
-            continue;
-        }
-
-        let Some(active_headers) = headers.as_ref() else {
-            continue;
-        };
-
-        if record == *active_headers {
-            continue;
-        }
-
-        let mut mapped = Row::new();
-        for (idx, key) in active_headers.iter().enumerate() {
-            if key.is_empty() {
-                continue;
-            }
-            let value = record.get(idx).unwrap_or("").to_string();
-            mapped.insert(key.to_string(), value);
-        }
-
-        if !mapped.is_empty() {
-            rows.push(mapped);
+/// Substitute `$cursor` and `$limit` placeholders in a query template in a
+/// single pass, avoiding the two intermediate `String` allocations that
+/// `clone() + replace() + replace()` would produce.
+pub(crate) fn apply_query_params(template: &str, cursor: &str, limit: &str) -> String {
+    let capacity = template.len() + cursor.len() + limit.len();
+    let mut result = String::with_capacity(capacity);
+    let mut remaining = template;
+    while let Some(pos) = remaining.find('$') {
+        result.push_str(&remaining[..pos]);
+        let after = &remaining[pos..];
+        if after.starts_with("$cursor") {
+            result.push_str(cursor);
+            remaining = &remaining[pos + "$cursor".len()..];
+        } else if after.starts_with("$limit") {
+            result.push_str(limit);
+            remaining = &remaining[pos + "$limit".len()..];
+        } else {
+            result.push('$');
+            remaining = &remaining[pos + 1..];
         }
     }
-
-    Ok(rows)
+    result.push_str(remaining);
+    result
 }
-
-// ---------------------------------------------------------------------------
-// V3 JSONL parser
-// ---------------------------------------------------------------------------
-
-pub fn parse_jsonl_rows(jsonl_text: &str) -> Result<Vec<Row>, Error> {
-    let mut rows = Vec::new();
-
-    for (line_no, line) in jsonl_text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let obj: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(line).map_err(|e| {
-                Error::InvalidRecordValue(format!(
-                    "JSONL parse error on line {}: {e} — raw: {line:?}",
-                    line_no + 1
-                ))
-            })?;
-
-        let row: Row = obj
-            .into_iter()
-            .map(|(k, v)| {
-                let s = match v {
-                    serde_json::Value::String(s) => s,
-                    serde_json::Value::Null => "null".to_string(),
-                    serde_json::Value::Bool(b) => b.to_string(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    other => other.to_string(),
-                };
-                (k, s)
-            })
-            .collect();
-
-        rows.push(row);
-    }
-
-    Ok(rows)
-}
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -526,38 +418,130 @@ mod tests {
     }
 
     #[test]
-    fn parse_csv_rows_basics() {
-        let csv = "#group,false\n#datatype,string\n_time,_value\n2024-01-01T00:00:00Z,42\n";
-        let rows = parse_csv_rows(csv).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get("_value").map(String::as_str), Some("42"));
+    fn apply_query_params_substitutes_both_placeholders() {
+        let tmpl = "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit";
+        let out = apply_query_params(tmpl, "2024-01-01T00:00:00Z", "100");
+        assert_eq!(
+            out,
+            "SELECT * FROM t WHERE time > '2024-01-01T00:00:00Z' LIMIT 100"
+        );
     }
 
     #[test]
-    fn parse_csv_rows_multi_table() {
-        let csv = "_time,_value\n2024-01-01T00:00:00Z,1\n\n_time,_value\n2024-01-01T00:00:01Z,2\n";
-        let rows = parse_csv_rows(csv).unwrap();
-        assert_eq!(rows.len(), 2);
+    fn apply_query_params_no_placeholders() {
+        let tmpl = "SELECT 1";
+        assert_eq!(apply_query_params(tmpl, "ignored", "ignored"), "SELECT 1");
     }
 
     #[test]
-    fn parse_jsonl_rows_basics() {
-        let jsonl = r#"{"time":"2024-01-01T00:00:00Z","val":42}"#;
-        let rows = parse_jsonl_rows(jsonl).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get("val").map(String::as_str), Some("42"));
+    fn apply_query_params_repeated_placeholders() {
+        let tmpl = "$cursor $cursor $limit";
+        let out = apply_query_params(tmpl, "T", "5");
+        assert_eq!(out, "T T 5");
+    }
+
+    // ── V2State / V3State ─────────────────────────────────────────────────
+
+    #[test]
+    fn v2_state_default_is_zeroed() {
+        let s = V2State::default();
+        assert!(s.last_timestamp.is_none());
+        assert_eq!(s.processed_rows, 0);
+        assert_eq!(s.cursor_row_count, 0);
     }
 
     #[test]
-    fn parse_jsonl_rows_stringifies_types() {
-        let jsonl = r#"{"b":true,"n":null,"f":1.5}"#;
-        let rows = parse_jsonl_rows(jsonl).unwrap();
-        assert_eq!(rows[0].get("b").map(String::as_str), Some("true"));
-        assert_eq!(rows[0].get("n").map(String::as_str), Some("null"));
+    fn v3_state_default_is_zeroed() {
+        let s = V3State::default();
+        assert!(s.last_timestamp.is_none());
+        assert_eq!(s.processed_rows, 0);
+        assert_eq!(s.effective_batch_size, 0);
     }
 
     #[test]
-    fn parse_jsonl_invalid_returns_error() {
-        assert!(parse_jsonl_rows("not json\n").is_err());
+    fn v2_state_clone_preserves_all_fields() {
+        let original = V2State {
+            last_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            processed_rows: 42,
+            cursor_row_count: 3,
+        };
+        let cloned = original.clone();
+        assert_eq!(cloned.last_timestamp, original.last_timestamp);
+        assert_eq!(cloned.processed_rows, original.processed_rows);
+        assert_eq!(cloned.cursor_row_count, original.cursor_row_count);
+    }
+
+    #[test]
+    fn v3_state_clone_preserves_all_fields() {
+        let original = V3State {
+            last_timestamp: Some("2024-06-15T12:30:00Z".to_string()),
+            processed_rows: 100,
+            effective_batch_size: 1000,
+        };
+        let cloned = original.clone();
+        assert_eq!(cloned.last_timestamp, original.last_timestamp);
+        assert_eq!(cloned.processed_rows, original.processed_rows);
+        assert_eq!(cloned.effective_batch_size, original.effective_batch_size);
+    }
+
+    #[test]
+    fn v2_state_serde_round_trip() {
+        let original = V2State {
+            last_timestamp: Some("2024-06-15T12:30:00Z".to_string()),
+            processed_rows: 999,
+            cursor_row_count: 7,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: V2State = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.last_timestamp, original.last_timestamp);
+        assert_eq!(restored.processed_rows, original.processed_rows);
+        assert_eq!(restored.cursor_row_count, original.cursor_row_count);
+    }
+
+    #[test]
+    fn v3_state_serde_round_trip() {
+        let original = V3State {
+            last_timestamp: Some("2024-06-15T12:30:00Z".to_string()),
+            processed_rows: 500,
+            effective_batch_size: 2000,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: V3State = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.last_timestamp, original.last_timestamp);
+        assert_eq!(restored.processed_rows, original.processed_rows);
+        assert_eq!(restored.effective_batch_size, original.effective_batch_size);
+    }
+
+    #[test]
+    fn persisted_state_v2_serde_includes_version_tag() {
+        let state = PersistedState::V2(V2State {
+            last_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            processed_rows: 1,
+            cursor_row_count: 0,
+        });
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains(r#""version":"v2""#));
+        let restored: PersistedState = serde_json::from_str(&json).unwrap();
+        assert!(matches!(restored, PersistedState::V2(_)));
+    }
+
+    #[test]
+    fn persisted_state_v3_serde_includes_version_tag() {
+        let state = PersistedState::V3(V3State {
+            last_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            processed_rows: 1,
+            effective_batch_size: 500,
+        });
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains(r#""version":"v3""#));
+        let restored: PersistedState = serde_json::from_str(&json).unwrap();
+        assert!(matches!(restored, PersistedState::V3(_)));
+    }
+
+    #[test]
+    fn persisted_state_wrong_version_tag_fails_to_deserialize() {
+        let json = r#"{"version":"v9","last_timestamp":null,"processed_rows":0}"#;
+        let result: Result<PersistedState, _> = serde_json::from_str(json);
+        assert!(result.is_err());
     }
 }

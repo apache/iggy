@@ -70,8 +70,7 @@ pub const ENV_V3_SINK_PAYLOAD_FORMAT: &str =
 pub const ENV_V3_SOURCE_URL: &str = "IGGY_CONNECTORS_SOURCE_INFLUXDB_PLUGIN_CONFIG_URL";
 pub const ENV_V3_SOURCE_TOKEN: &str = "IGGY_CONNECTORS_SOURCE_INFLUXDB_PLUGIN_CONFIG_TOKEN";
 pub const ENV_V3_SOURCE_DB: &str = "IGGY_CONNECTORS_SOURCE_INFLUXDB_PLUGIN_CONFIG_DB";
-pub const ENV_V3_SOURCE_VERSION: &str =
-    "IGGY_CONNECTORS_SOURCE_INFLUXDB_PLUGIN_CONFIG_VERSION";
+pub const ENV_V3_SOURCE_VERSION: &str = "IGGY_CONNECTORS_SOURCE_INFLUXDB_PLUGIN_CONFIG_VERSION";
 pub const ENV_V3_SOURCE_ORG: &str = "IGGY_CONNECTORS_SOURCE_INFLUXDB_PLUGIN_CONFIG_ORG";
 pub const ENV_V3_SOURCE_QUERY: &str = "IGGY_CONNECTORS_SOURCE_INFLUXDB_PLUGIN_CONFIG_QUERY";
 pub const ENV_V3_SOURCE_POLL_INTERVAL: &str =
@@ -127,16 +126,11 @@ impl InfluxDb3Container {
                 })?;
 
         let mapped_port = container
-            .ports()
+            .get_host_port_ipv4(INFLUXDB3_PORT)
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
                 fixture_type: "InfluxDb3Container".to_string(),
-                message: format!("Failed to get ports: {e}"),
-            })?
-            .map_to_host_port_ipv4(INFLUXDB3_PORT)
-            .ok_or_else(|| TestBinaryError::FixtureSetup {
-                fixture_type: "InfluxDb3Container".to_string(),
-                message: "No mapping for InfluxDB 3 port".to_string(),
+                message: format!("No mapping for InfluxDB 3 port: {e}"),
             })?;
 
         let base_url = format!("http://localhost:{mapped_port}");

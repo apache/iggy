@@ -24,11 +24,14 @@ use async_trait::async_trait;
 use common::{
     InfluxDbSourceConfig, PayloadFormat, PersistedState, V2State, V3State, validate_cursor_field,
 };
+use iggy_connector_influxdb_common::{ApiVersion, InfluxDbAdapter};
 use iggy_connector_sdk::retry::{
     CircuitBreaker, ConnectivityConfig, build_retry_client, check_connectivity_with_retry,
     parse_duration,
 };
-use iggy_connector_sdk::{ConnectorState, Error, ProducedMessages, Schema, Source, source_connector};
+use iggy_connector_sdk::{
+    ConnectorState, Error, ProducedMessages, Schema, Source, source_connector,
+};
 use reqwest_middleware::ClientWithMiddleware;
 use secrecy::ExposeSecret;
 use std::sync::Arc;
@@ -46,9 +49,7 @@ const DEFAULT_OPEN_RETRY_MAX_DELAY: &str = "60s";
 const DEFAULT_RETRY_MAX_DELAY: &str = "5s";
 const DEFAULT_CIRCUIT_COOL_DOWN: &str = "30s";
 
-// ---------------------------------------------------------------------------
-// Connector state enum — version-specific polling state
-// ---------------------------------------------------------------------------
+// ── Connector state ───────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 enum VersionState {
@@ -56,9 +57,7 @@ enum VersionState {
     V3(Mutex<V3State>),
 }
 
-// ---------------------------------------------------------------------------
-// Main connector struct
-// ---------------------------------------------------------------------------
+// ── Connector struct ──────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct InfluxDbSource {
@@ -81,8 +80,10 @@ impl InfluxDbSource {
         let payload_format = PayloadFormat::from_config(config.payload_format());
 
         let cb_threshold = config.circuit_breaker_threshold();
-        let cb_cool_down =
-            parse_duration(config.circuit_breaker_cool_down(), DEFAULT_CIRCUIT_COOL_DOWN);
+        let cb_cool_down = parse_duration(
+            config.circuit_breaker_cool_down(),
+            DEFAULT_CIRCUIT_COOL_DOWN,
+        );
         let circuit_breaker = Arc::new(CircuitBreaker::new(cb_threshold, cb_cool_down));
 
         let (version_state, state_restore_failed) = match &config {
@@ -117,9 +118,7 @@ impl InfluxDbSource {
     }
 }
 
-// ---------------------------------------------------------------------------
-// State restore helpers
-// ---------------------------------------------------------------------------
+// ── State restore helpers ─────────────────────────────────────────────────────
 
 fn restore_v2_state(id: u32, state: Option<ConnectorState>) -> (V2State, bool) {
     let Some(cs) = state else {
@@ -183,9 +182,7 @@ fn restore_v3_state(id: u32, state: Option<ConnectorState>) -> (V3State, bool) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Source trait
-// ---------------------------------------------------------------------------
+// ── Source trait ──────────────────────────────────────────────────────────────
 
 #[async_trait]
 impl Source for InfluxDbSource {
@@ -208,10 +205,11 @@ impl Source for InfluxDbSource {
             .build()
             .map_err(|e| Error::InitError(format!("Failed to create HTTP client: {e}")))?;
 
-        let health_url = match &self.config {
-            InfluxDbSourceConfig::V2(c) => v2::health_url(c.url.trim_end_matches('/'))?,
-            InfluxDbSourceConfig::V3(c) => v3::health_url(c.url.trim_end_matches('/'))?,
+        let adapter: Box<dyn InfluxDbAdapter> = match &self.config {
+            InfluxDbSourceConfig::V2(_) => ApiVersion::V2.make_adapter(),
+            InfluxDbSourceConfig::V3(_) => ApiVersion::V3.make_adapter(),
         };
+        let health_url = adapter.health_url(self.config.url().trim_end_matches('/'))?;
 
         check_connectivity_with_retry(
             &raw_client,
@@ -239,10 +237,8 @@ impl Source for InfluxDbSource {
             "InfluxDB",
         ));
 
-        self.auth_header = Some(match &self.config {
-            InfluxDbSourceConfig::V2(c) => v2::auth_header(c.token.expose_secret()),
-            InfluxDbSourceConfig::V3(c) => v3::auth_header(c.token.expose_secret()),
-        });
+        self.auth_header =
+            Some(adapter.auth_header_value(self.config.token_secret().expose_secret()));
 
         info!(
             "{CONNECTOR_NAME} ID: {} opened successfully (version={ver})",
@@ -276,7 +272,7 @@ impl Source for InfluxDbSource {
                     unreachable!("V2 state with non-V2 config")
                 };
 
-                let state_snap = state_mu.lock().await.clone_for_poll();
+                let state_snap = state_mu.lock().await.clone();
                 match v2::poll(client, cfg, auth, &state_snap, self.payload_format).await {
                     Ok(result) => {
                         self.circuit_breaker.record_success();
@@ -289,7 +285,7 @@ impl Source for InfluxDbSource {
                             result.skipped,
                         );
 
-                        if cfg.verbose_logging.unwrap_or(false) {
+                        if self.config.verbose_logging() {
                             info!(
                                 "{CONNECTOR_NAME} ID: {} produced {} messages (V2). \
                                  Total: {}. Cursor: {:?}",
@@ -334,7 +330,7 @@ impl Source for InfluxDbSource {
                     unreachable!("V3 state with non-V3 config")
                 };
 
-                let state_snap = state_mu.lock().await.clone_for_poll();
+                let state_snap = state_mu.lock().await.clone();
                 match v3::poll(client, cfg, auth, &state_snap, self.payload_format).await {
                     Ok(result) => {
                         if result.trip_circuit_breaker {
@@ -348,7 +344,7 @@ impl Source for InfluxDbSource {
                         let mut state = state_mu.lock().await;
                         *state = new;
 
-                        if cfg.verbose_logging.unwrap_or(false) {
+                        if self.config.verbose_logging() {
                             info!(
                                 "{CONNECTOR_NAME} ID: {} produced {} messages (V3). \
                                  Total: {}. Cursor: {:?}",
@@ -403,19 +399,24 @@ impl InfluxDbSource {
         if !matches!(e, Error::PermanentHttpError(_)) {
             self.circuit_breaker.record_failure().await;
         }
-        error!(
-            "{CONNECTOR_NAME} ID: {} poll failed: {e}",
-            self.id
-        );
+        error!("{CONNECTOR_NAME} ID: {} poll failed: {e}", self.id);
         tokio::time::sleep(self.poll_interval).await;
         Err(e)
     }
 }
 
-// ---------------------------------------------------------------------------
-// V2 cursor advance logic
-// ---------------------------------------------------------------------------
+// ── V2 cursor advance logic ───────────────────────────────────────────────────
 
+/// Update V2 polling state after a successful poll.
+///
+/// V2 uses `>= $cursor` semantics, so the first batch after a cursor advance
+/// will include rows already delivered at the previous max timestamp. The
+/// `cursor_row_count` tracks how many such rows to skip on the next poll.
+///
+/// - New cursor → store it with the count of rows that landed at that timestamp.
+/// - Same cursor → accumulate: more rows at this timestamp were delivered.
+/// - No new cursor (all skipped) → correct `cursor_row_count` to `skipped`
+///   so the skip counter reflects reality rather than a stale inflated value.
 fn apply_v2_cursor_advance(
     state: &mut V2State,
     max_cursor: Option<String>,
@@ -438,38 +439,6 @@ fn apply_v2_cursor_advance(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Clone helpers for poll snapshots (avoids holding the lock across await)
-// ---------------------------------------------------------------------------
-
-trait CloneForPoll: Sized {
-    fn clone_for_poll(&self) -> Self;
-}
-
-impl CloneForPoll for V2State {
-    fn clone_for_poll(&self) -> Self {
-        V2State {
-            last_timestamp: self.last_timestamp.clone(),
-            processed_rows: self.processed_rows,
-            cursor_row_count: self.cursor_row_count,
-        }
-    }
-}
-
-impl CloneForPoll for V3State {
-    fn clone_for_poll(&self) -> Self {
-        V3State {
-            last_timestamp: self.last_timestamp.clone(),
-            processed_rows: self.processed_rows,
-            effective_batch_size: self.effective_batch_size,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,8 +450,7 @@ mod tests {
             url: "http://localhost:8086".to_string(),
             org: "test_org".to_string(),
             token: SecretString::from("test_token"),
-            query: r#"from(bucket:"b") |> range(start: $cursor) |> limit(n: $limit)"#
-                .to_string(),
+            query: r#"from(bucket:"b") |> range(start: $cursor) |> limit(n: $limit)"#.to_string(),
             poll_interval: Some("1s".to_string()),
             batch_size: Some(100),
             cursor_field: None,
@@ -507,9 +475,8 @@ mod tests {
             url: "http://localhost:8181".to_string(),
             db: "test_db".to_string(),
             token: SecretString::from("test_token"),
-            query:
-                "SELECT time, val FROM tbl WHERE time > '$cursor' ORDER BY time LIMIT $limit"
-                    .to_string(),
+            query: "SELECT time, val FROM tbl WHERE time > '$cursor' ORDER BY time LIMIT $limit"
+                .to_string(),
             poll_interval: Some("1s".to_string()),
             batch_size: Some(100),
             cursor_field: None,
@@ -602,12 +569,7 @@ mod tests {
     #[test]
     fn apply_v2_cursor_advance_moves_cursor() {
         let mut state = V2State::default();
-        apply_v2_cursor_advance(
-            &mut state,
-            Some("2024-01-01T00:00:01Z".to_string()),
-            3,
-            0,
-        );
+        apply_v2_cursor_advance(&mut state, Some("2024-01-01T00:00:01Z".to_string()), 3, 0);
         assert_eq!(
             state.last_timestamp.as_deref(),
             Some("2024-01-01T00:00:01Z")
@@ -622,12 +584,7 @@ mod tests {
             cursor_row_count: 3,
             processed_rows: 0,
         };
-        apply_v2_cursor_advance(
-            &mut state,
-            Some("2024-01-01T00:00:00Z".to_string()),
-            2,
-            0,
-        );
+        apply_v2_cursor_advance(&mut state, Some("2024-01-01T00:00:00Z".to_string()), 2, 0);
         assert_eq!(state.cursor_row_count, 5);
     }
 

@@ -5604,13 +5604,12 @@ name = "iggy_connector_influxdb_sink"
 version = "0.1.0-edge.1"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "bytes",
- "dashmap",
- "futures",
  "iggy_common",
+ "iggy_connector_influxdb_common",
  "iggy_connector_sdk",
- "once_cell",
  "reqwest 0.13.2",
  "reqwest-middleware",
  "secrecy",
@@ -5626,11 +5625,13 @@ name = "iggy_connector_influxdb_source"
 version = "0.1.0-edge.1"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "csv",
  "dashmap",
  "futures",
  "iggy_common",
+ "iggy_connector_influxdb_common",
  "iggy_connector_sdk",
  "once_cell",
  "regex",

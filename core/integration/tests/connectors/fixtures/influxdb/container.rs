@@ -121,19 +121,12 @@ impl InfluxDbContainer {
                     message: format!("Failed to start container: {e}"),
                 })?;
 
-        let ports = container
-            .ports()
+        let mapped_port = container
+            .get_host_port_ipv4(INFLUXDB_PORT)
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
                 fixture_type: "InfluxDbContainer".to_string(),
-                message: format!("Failed to get ports: {e}"),
-            })?;
-        let mapped_port = ports
-            .map_to_host_port_ipv4(INFLUXDB_PORT)
-            .or_else(|| ports.map_to_host_port_ipv6(INFLUXDB_PORT))
-            .ok_or_else(|| TestBinaryError::FixtureSetup {
-                fixture_type: "InfluxDbContainer".to_string(),
-                message: "No mapping for InfluxDB port".to_string(),
+                message: format!("No mapping for InfluxDB port: {e}"),
             })?;
 
         let base_url = format!("http://localhost:{mapped_port}");

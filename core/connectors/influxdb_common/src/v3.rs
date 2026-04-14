@@ -23,6 +23,19 @@ use crate::row::parse_jsonl_rows;
 use iggy_connector_sdk::Error;
 use reqwest::Url;
 
+/// Map a short precision string to InfluxDB 3's long-form equivalent.
+///
+/// InfluxDB 3 rejects the V2 short forms (`"ns"`, `"us"`, `"ms"`, `"s"`)
+/// on the `/api/v3/write_lp` endpoint; it expects the full English words.
+fn map_precision(p: &str) -> &'static str {
+    match p {
+        "ns" => "nanosecond",
+        "ms" => "millisecond",
+        "s" => "second",
+        _ => "microsecond", // covers "us" and any unrecognised value
+    }
+}
+
 /// Adapter for InfluxDB 3.x (Core / Enterprise).
 ///
 /// | Aspect | Detail |
@@ -58,7 +71,7 @@ impl InfluxDbAdapter for V3Adapter {
 
         url.query_pairs_mut()
             .append_pair("db", bucket_or_db)
-            .append_pair("precision", precision);
+            .append_pair("precision", map_precision(precision));
 
         Ok(url)
     }
@@ -103,15 +116,20 @@ impl InfluxDbAdapter for V3Adapter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const BASE: &str = "http://localhost:8181";
+
+    #[test]
+    fn map_precision_maps_all_short_forms() {
+        assert_eq!(map_precision("ns"), "nanosecond");
+        assert_eq!(map_precision("ms"), "millisecond");
+        assert_eq!(map_precision("s"), "second");
+        assert_eq!(map_precision("us"), "microsecond");
+        assert_eq!(map_precision("xx"), "microsecond"); // unknown → microsecond
+    }
 
     #[test]
     fn auth_uses_bearer_scheme() {
@@ -129,7 +147,7 @@ mod tests {
         assert!(q.contains("db=sensors"), "missing db: {q}");
         assert!(!q.contains("bucket="), "bucket should not appear: {q}");
         assert!(!q.contains("org="), "org should not appear: {q}");
-        assert!(q.contains("precision=ns"), "missing precision: {q}");
+        assert!(q.contains("precision=nanosecond"), "missing precision: {q}");
         assert!(
             url.path().ends_with("/api/v3/write_lp"),
             "wrong path: {}",

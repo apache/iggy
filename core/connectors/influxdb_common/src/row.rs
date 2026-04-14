@@ -27,9 +27,7 @@ use crate::adapter::Row;
 use csv::StringRecord;
 use iggy_connector_sdk::Error;
 
-// ---------------------------------------------------------------------------
-// InfluxDB V2 — annotated CSV
-// ---------------------------------------------------------------------------
+// ── InfluxDB V2 — annotated CSV ───────────────────────────────────────────────
 
 /// Return `true` if `record` is a CSV header row (contains `"_time"`).
 ///
@@ -107,9 +105,7 @@ pub fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
     Ok(rows)
 }
 
-// ---------------------------------------------------------------------------
-// InfluxDB V3 — JSONL (newline-delimited JSON)
-// ---------------------------------------------------------------------------
+// ── InfluxDB V3 — JSONL (newline-delimited JSON) ──────────────────────────────
 
 /// Parse an InfluxDB V3 JSONL response body into a list of rows.
 ///
@@ -159,10 +155,6 @@ pub fn parse_jsonl_rows(jsonl_text: &str) -> Result<Vec<Row>, Error> {
 
     Ok(rows)
 }
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

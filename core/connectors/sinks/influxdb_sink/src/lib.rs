@@ -20,6 +20,9 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use iggy_common::serde_secret::serialize_secret;
+use iggy_connector_influxdb_common::{
+    ApiVersion, InfluxDbAdapter, write_field_string, write_measurement, write_tag_value,
+};
 use iggy_connector_sdk::retry::{
     CircuitBreaker, ConnectivityConfig, build_retry_client, check_connectivity_with_retry,
     parse_duration,
@@ -115,183 +118,138 @@ pub enum InfluxDbSinkConfig {
     V3(V3SinkConfig),
 }
 
+// Eliminates the repetitive "match self { V2(c) => …, V3(c) => … }" pattern for
+// fields that are identical across all config variants. Methods with version-specific
+// logic (auth_header, build_write_url, build_health_url, version_label) remain explicit.
+macro_rules! delegate {
+    // &T field reference  →  fn foo(&self) -> &T
+    (ref $self:ident . $field:ident) => {
+        match $self {
+            Self::V2(c) => &c.$field,
+            Self::V3(c) => &c.$field,
+        }
+    };
+    // Option<String>  →  Option<&str>
+    (opt $self:ident . $field:ident) => {
+        match $self {
+            Self::V2(c) => c.$field.as_deref(),
+            Self::V3(c) => c.$field.as_deref(),
+        }
+    };
+    // Option<String>  →  &str with fallback
+    (str_or $self:ident . $field:ident, $default:expr) => {
+        match $self {
+            Self::V2(c) => c.$field.as_deref().unwrap_or($default),
+            Self::V3(c) => c.$field.as_deref().unwrap_or($default),
+        }
+    };
+    // Option<T: Copy>  →  T with fallback
+    (unwrap $self:ident . $field:ident, $default:expr) => {
+        match $self {
+            Self::V2(c) => c.$field.unwrap_or($default),
+            Self::V3(c) => c.$field.unwrap_or($default),
+        }
+    };
+}
+
 impl InfluxDbSinkConfig {
     fn url(&self) -> &str {
-        match self {
-            Self::V2(c) => &c.url,
-            Self::V3(c) => &c.url,
-        }
+        delegate!(ref     self.url)
+    }
+    fn measurement(&self) -> Option<&str> {
+        delegate!(opt     self.measurement)
+    }
+    fn precision(&self) -> &str {
+        delegate!(str_or  self.precision, DEFAULT_PRECISION)
+    }
+    fn batch_size(&self) -> u32 {
+        delegate!(unwrap  self.batch_size, 500)
+    }
+    fn include_metadata(&self) -> bool {
+        delegate!(unwrap  self.include_metadata, true)
+    }
+    fn include_checksum(&self) -> bool {
+        delegate!(unwrap  self.include_checksum, true)
+    }
+    fn include_origin_timestamp(&self) -> bool {
+        delegate!(unwrap  self.include_origin_timestamp, true)
+    }
+    fn include_stream_tag(&self) -> bool {
+        delegate!(unwrap  self.include_stream_tag, true)
+    }
+    fn include_topic_tag(&self) -> bool {
+        delegate!(unwrap  self.include_topic_tag, true)
+    }
+    fn include_partition_tag(&self) -> bool {
+        delegate!(unwrap  self.include_partition_tag, true)
+    }
+    fn payload_format(&self) -> Option<&str> {
+        delegate!(opt     self.payload_format)
+    }
+    fn verbose_logging(&self) -> bool {
+        delegate!(unwrap  self.verbose_logging, false)
+    }
+    fn max_retries(&self) -> u32 {
+        delegate!(unwrap  self.max_retries, DEFAULT_MAX_RETRIES)
+    }
+    fn retry_delay(&self) -> Option<&str> {
+        delegate!(opt     self.retry_delay)
+    }
+    fn timeout(&self) -> Option<&str> {
+        delegate!(opt     self.timeout)
+    }
+    fn max_open_retries(&self) -> u32 {
+        delegate!(unwrap  self.max_open_retries, DEFAULT_MAX_OPEN_RETRIES)
+    }
+    fn open_retry_max_delay(&self) -> Option<&str> {
+        delegate!(opt   self.open_retry_max_delay)
+    }
+    fn retry_max_delay(&self) -> Option<&str> {
+        delegate!(opt     self.retry_max_delay)
+    }
+    fn circuit_breaker_threshold(&self) -> u32 {
+        delegate!(unwrap  self.circuit_breaker_threshold, DEFAULT_CIRCUIT_BREAKER_THRESHOLD)
+    }
+    fn circuit_breaker_cool_down(&self) -> Option<&str> {
+        delegate!(opt self.circuit_breaker_cool_down)
     }
 
     fn auth_header(&self) -> String {
-        match self {
-            Self::V2(c) => format!("Token {}", c.token.expose_secret()),
-            Self::V3(c) => format!("Bearer {}", c.token.expose_secret()),
-        }
-    }
-
-    fn measurement(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.measurement.as_deref(),
-            Self::V3(c) => c.measurement.as_deref(),
-        }
-    }
-
-    fn precision(&self) -> &str {
-        match self {
-            Self::V2(c) => c.precision.as_deref().unwrap_or(DEFAULT_PRECISION),
-            Self::V3(c) => c.precision.as_deref().unwrap_or(DEFAULT_PRECISION),
-        }
-    }
-
-    fn batch_size(&self) -> u32 {
-        match self {
-            Self::V2(c) => c.batch_size.unwrap_or(500),
-            Self::V3(c) => c.batch_size.unwrap_or(500),
-        }
-    }
-
-    fn include_metadata(&self) -> bool {
-        match self {
-            Self::V2(c) => c.include_metadata.unwrap_or(true),
-            Self::V3(c) => c.include_metadata.unwrap_or(true),
-        }
-    }
-
-    fn include_checksum(&self) -> bool {
-        match self {
-            Self::V2(c) => c.include_checksum.unwrap_or(true),
-            Self::V3(c) => c.include_checksum.unwrap_or(true),
-        }
-    }
-
-    fn include_origin_timestamp(&self) -> bool {
-        match self {
-            Self::V2(c) => c.include_origin_timestamp.unwrap_or(true),
-            Self::V3(c) => c.include_origin_timestamp.unwrap_or(true),
-        }
-    }
-
-    fn include_stream_tag(&self) -> bool {
-        match self {
-            Self::V2(c) => c.include_stream_tag.unwrap_or(true),
-            Self::V3(c) => c.include_stream_tag.unwrap_or(true),
-        }
-    }
-
-    fn include_topic_tag(&self) -> bool {
-        match self {
-            Self::V2(c) => c.include_topic_tag.unwrap_or(true),
-            Self::V3(c) => c.include_topic_tag.unwrap_or(true),
-        }
-    }
-
-    fn include_partition_tag(&self) -> bool {
-        match self {
-            Self::V2(c) => c.include_partition_tag.unwrap_or(true),
-            Self::V3(c) => c.include_partition_tag.unwrap_or(true),
-        }
-    }
-
-    fn payload_format(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.payload_format.as_deref(),
-            Self::V3(c) => c.payload_format.as_deref(),
-        }
-    }
-
-    fn verbose_logging(&self) -> bool {
-        match self {
-            Self::V2(c) => c.verbose_logging.unwrap_or(false),
-            Self::V3(c) => c.verbose_logging.unwrap_or(false),
-        }
-    }
-
-    fn max_retries(&self) -> u32 {
-        match self {
-            Self::V2(c) => c.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
-            Self::V3(c) => c.max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
-        }
-    }
-
-    fn retry_delay(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.retry_delay.as_deref(),
-            Self::V3(c) => c.retry_delay.as_deref(),
-        }
-    }
-
-    fn timeout(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.timeout.as_deref(),
-            Self::V3(c) => c.timeout.as_deref(),
-        }
-    }
-
-    fn max_open_retries(&self) -> u32 {
-        match self {
-            Self::V2(c) => c.max_open_retries.unwrap_or(DEFAULT_MAX_OPEN_RETRIES),
-            Self::V3(c) => c.max_open_retries.unwrap_or(DEFAULT_MAX_OPEN_RETRIES),
-        }
-    }
-
-    fn open_retry_max_delay(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.open_retry_max_delay.as_deref(),
-            Self::V3(c) => c.open_retry_max_delay.as_deref(),
-        }
-    }
-
-    fn retry_max_delay(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.retry_max_delay.as_deref(),
-            Self::V3(c) => c.retry_max_delay.as_deref(),
-        }
-    }
-
-    fn circuit_breaker_threshold(&self) -> u32 {
-        match self {
-            Self::V2(c) => c.circuit_breaker_threshold.unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD),
-            Self::V3(c) => c.circuit_breaker_threshold.unwrap_or(DEFAULT_CIRCUIT_BREAKER_THRESHOLD),
-        }
-    }
-
-    fn circuit_breaker_cool_down(&self) -> Option<&str> {
-        match self {
-            Self::V2(c) => c.circuit_breaker_cool_down.as_deref(),
-            Self::V3(c) => c.circuit_breaker_cool_down.as_deref(),
-        }
+        let adapter: Box<dyn InfluxDbAdapter> = match self {
+            Self::V2(_) => ApiVersion::V2.make_adapter(),
+            Self::V3(_) => ApiVersion::V3.make_adapter(),
+        };
+        let token = match self {
+            Self::V2(c) => c.token.expose_secret(),
+            Self::V3(c) => c.token.expose_secret(),
+        };
+        adapter.auth_header_value(token)
     }
 
     fn build_write_url(&self) -> Result<Url, Error> {
         let precision = self.precision();
         match self {
-            Self::V2(c) => {
-                let mut url =
-                    Url::parse(&format!("{}/api/v2/write", c.url.trim_end_matches('/')))
-                        .map_err(|e| Error::InvalidConfigValue(format!("Invalid URL: {e}")))?;
-                url.query_pairs_mut()
-                    .append_pair("org", &c.org)
-                    .append_pair("bucket", &c.bucket)
-                    .append_pair("precision", precision);
-                Ok(url)
-            }
-            Self::V3(c) => {
-                let v3_precision = map_precision_v3(precision);
-                let mut url =
-                    Url::parse(&format!("{}/api/v3/write_lp", c.url.trim_end_matches('/')))
-                        .map_err(|e| Error::InvalidConfigValue(format!("Invalid URL: {e}")))?;
-                url.query_pairs_mut()
-                    .append_pair("db", &c.db)
-                    .append_pair("precision", v3_precision);
-                Ok(url)
-            }
+            Self::V2(c) => ApiVersion::V2.make_adapter().write_url(
+                c.url.trim_end_matches('/'),
+                &c.bucket,
+                Some(&c.org),
+                precision,
+            ),
+            Self::V3(c) => ApiVersion::V3.make_adapter().write_url(
+                c.url.trim_end_matches('/'),
+                &c.db,
+                None,
+                precision,
+            ),
         }
     }
 
     fn build_health_url(&self) -> Result<Url, Error> {
-        Url::parse(&format!("{}/health", self.url().trim_end_matches('/')))
-            .map_err(|e| Error::InvalidConfigValue(format!("Invalid URL: {e}")))
+        let adapter: Box<dyn InfluxDbAdapter> = match self {
+            Self::V2(_) => ApiVersion::V2.make_adapter(),
+            Self::V3(_) => ApiVersion::V3.make_adapter(),
+        };
+        adapter.health_url(self.url().trim_end_matches('/'))
     }
 
     fn version_label(&self) -> &'static str {
@@ -299,15 +257,6 @@ impl InfluxDbSinkConfig {
             Self::V2(_) => "v2",
             Self::V3(_) => "v3",
         }
-    }
-}
-
-fn map_precision_v3(p: &str) -> &'static str {
-    match p {
-        "ns" => "nanosecond",
-        "ms" => "millisecond",
-        "s" => "second",
-        _ => "microsecond",
     }
 }
 
@@ -358,47 +307,6 @@ impl PayloadFormat {
     }
 }
 
-// ── Line-protocol escaping ────────────────────────────────────────────────────
-
-fn write_measurement(buf: &mut String, value: &str) {
-    for ch in value.chars() {
-        match ch {
-            '\\' => buf.push_str("\\\\"),
-            ',' => buf.push_str("\\,"),
-            ' ' => buf.push_str("\\ "),
-            '\n' => buf.push_str("\\n"),
-            '\r' => buf.push_str("\\r"),
-            _ => buf.push(ch),
-        }
-    }
-}
-
-fn write_tag_value(buf: &mut String, value: &str) {
-    for ch in value.chars() {
-        match ch {
-            '\\' => buf.push_str("\\\\"),
-            ',' => buf.push_str("\\,"),
-            '=' => buf.push_str("\\="),
-            ' ' => buf.push_str("\\ "),
-            '\n' => buf.push_str("\\n"),
-            '\r' => buf.push_str("\\r"),
-            _ => buf.push(ch),
-        }
-    }
-}
-
-fn write_field_string(buf: &mut String, value: &str) {
-    for ch in value.chars() {
-        match ch {
-            '\\' => buf.push_str("\\\\"),
-            '"' => buf.push_str("\\\""),
-            '\n' => buf.push_str("\\n"),
-            '\r' => buf.push_str("\\r"),
-            _ => buf.push(ch),
-        }
-    }
-}
-
 // ── InfluxDbSink impl ─────────────────────────────────────────────────────────
 
 impl InfluxDbSink {
@@ -408,12 +316,12 @@ impl InfluxDbSink {
         let payload_format = PayloadFormat::from_config(config.payload_format());
         let circuit_breaker = Arc::new(CircuitBreaker::new(
             config.circuit_breaker_threshold(),
-            parse_duration(config.circuit_breaker_cool_down(), DEFAULT_CIRCUIT_COOL_DOWN),
+            parse_duration(
+                config.circuit_breaker_cool_down(),
+                DEFAULT_CIRCUIT_COOL_DOWN,
+            ),
         ));
-        let measurement = config
-            .measurement()
-            .unwrap_or("iggy_messages")
-            .to_string();
+        let measurement = config.measurement().unwrap_or("iggy_messages").to_string();
         let precision = config.precision().to_string();
         let include_metadata = config.include_metadata();
         let include_checksum = config.include_checksum();
@@ -492,6 +400,10 @@ impl InfluxDbSink {
         if self.include_metadata && self.include_partition_tag {
             write!(buf, ",partition={}", messages_metadata.partition_id).expect("infallible");
         }
+        // `offset` is always written as a tag regardless of `include_metadata`.
+        // It forms the deduplication key for idempotent writes: without it, two
+        // messages at the same timestamp in the same measurement+tag-set would
+        // silently overwrite each other in InfluxDB's last-write-wins model.
         write!(buf, ",offset={}", message.offset).expect("infallible");
 
         buf.push(' ');
@@ -510,8 +422,12 @@ impl InfluxDbSink {
             buf.push('"');
         }
         if self.include_metadata && !self.include_partition_tag {
-            write!(buf, ",iggy_partition={}u", messages_metadata.partition_id as u64)
-                .expect("infallible");
+            write!(
+                buf,
+                ",iggy_partition={}u",
+                messages_metadata.partition_id as u64
+            )
+            .expect("infallible");
         }
         if self.include_checksum {
             write!(buf, ",iggy_checksum={}u", message.checksum).expect("infallible");
@@ -582,6 +498,26 @@ impl InfluxDbSink {
         Ok(())
     }
 
+    /// Build the newline-separated line-protocol body for a batch of messages.
+    /// Pure function — no I/O; extracted for testability.
+    fn build_body(
+        &self,
+        topic_metadata: &TopicMetadata,
+        messages_metadata: &MessagesMetadata,
+        messages: &[ConsumedMessage],
+    ) -> Result<String, Error> {
+        // 1 KiB per message is a conservative estimate that accommodates JSON
+        // payloads without excessive reallocation.
+        let mut body = String::with_capacity(messages.len() * 1024);
+        for (i, msg) in messages.iter().enumerate() {
+            if i > 0 {
+                body.push('\n');
+            }
+            self.append_line(&mut body, topic_metadata, messages_metadata, msg)?;
+        }
+        Ok(body)
+    }
+
     async fn process_batch(
         &self,
         topic_metadata: &TopicMetadata,
@@ -592,16 +528,10 @@ impl InfluxDbSink {
             return Ok(());
         }
 
-        let mut body = String::with_capacity(messages.len() * 256);
-        for (i, msg) in messages.iter().enumerate() {
-            if i > 0 {
-                body.push('\n');
-            }
-            self.append_line(&mut body, topic_metadata, messages_metadata, msg)?;
-        }
+        let body = self.build_body(topic_metadata, messages_metadata, messages)?;
 
         let client = self.get_client()?;
-        let url = self.write_url.clone().ok_or_else(|| {
+        let url = self.write_url.as_ref().ok_or_else(|| {
             Error::Connection("write_url not initialized — call open() first".to_string())
         })?;
         let auth = self.auth_header.as_deref().ok_or_else(|| {
@@ -609,10 +539,11 @@ impl InfluxDbSink {
         })?;
 
         let response = client
-            .post(url)
+            .post(url.as_str())
             .header("Authorization", auth)
             .header("Content-Type", "text/plain; charset=utf-8")
-            .body(Bytes::from(body))
+            // into_bytes() hands the Vec<u8> directly to Bytes without copying.
+            .body(Bytes::from(body.into_bytes()))
             .send()
             .await
             .map_err(|e| Error::CannotStoreData(format!("InfluxDB write failed: {e}")))?;
@@ -695,7 +626,9 @@ impl Sink for InfluxDbSink {
                 "InfluxDB sink ID: {} — circuit breaker OPEN, skipping {} messages",
                 self.id, total
             );
-            return Err(Error::CannotStoreData("Circuit breaker is open".to_string()));
+            return Err(Error::CannotStoreData(
+                "Circuit breaker is open".to_string(),
+            ));
         }
 
         let mut first_error: Option<Error> = None;
@@ -900,15 +833,6 @@ mod tests {
         assert!(!q.contains("bucket="));
     }
 
-    #[test]
-    fn map_precision_v3_all_values() {
-        assert_eq!(map_precision_v3("ns"), "nanosecond");
-        assert_eq!(map_precision_v3("ms"), "millisecond");
-        assert_eq!(map_precision_v3("s"), "second");
-        assert_eq!(map_precision_v3("us"), "microsecond");
-        assert_eq!(map_precision_v3("xx"), "microsecond");
-    }
-
     // ── to_precision_timestamp ────────────────────────────────────────────
 
     #[test]
@@ -1013,7 +937,13 @@ mod tests {
             &make_message(iggy_connector_sdk::Payload::Raw(b"not json!".to_vec())),
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().to_lowercase().contains("json"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("json")
+        );
     }
 
     #[test]
@@ -1031,21 +961,28 @@ mod tests {
             &make_message(iggy_connector_sdk::Payload::Raw(vec![0xff, 0xfe, 0xfd])),
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().to_uppercase().contains("UTF"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .to_uppercase()
+                .contains("UTF")
+        );
     }
 
     #[test]
     fn append_line_valid_json_payload_succeeds() {
         let sink = make_sink();
         let mut buf = String::new();
-        assert!(sink
-            .append_line(
+        assert!(
+            sink.append_line(
                 &mut buf,
                 &make_topic_metadata(),
                 &make_messages_metadata(),
                 &make_message(iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec())),
             )
-            .is_ok());
+            .is_ok()
+        );
         assert!(buf.contains("payload_json="));
     }
 
@@ -1057,14 +994,15 @@ mod tests {
         });
         let sink = InfluxDbSink::new(1, config);
         let mut buf = String::new();
-        assert!(sink
-            .append_line(
+        assert!(
+            sink.append_line(
                 &mut buf,
                 &make_topic_metadata(),
                 &make_messages_metadata(),
                 &make_message(iggy_connector_sdk::Payload::Raw(b"binary data".to_vec())),
             )
-            .is_ok());
+            .is_ok()
+        );
         assert!(buf.contains("payload_base64="));
     }
 
@@ -1095,6 +1033,105 @@ mod tests {
         .unwrap();
         assert!(buf.starts_with("test_measurement"));
     }
+
+    // ── V3 append_line parity ─────────────────────────────────────────────
+
+    #[test]
+    fn v3_append_line_produces_same_line_protocol_as_v2() {
+        // Only URL, auth header, and write endpoint differ between V2 and V3.
+        // The line-protocol body itself must be identical so existing tests
+        // cover both configs implicitly.
+        let v2_sink = InfluxDbSink::new(1, make_v2_config());
+        let v3_sink = InfluxDbSink::new(2, make_v3_config());
+        let msg = make_message(iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec()));
+        let topic = make_topic_metadata();
+        let meta = make_messages_metadata();
+
+        let mut v2_buf = String::new();
+        let mut v3_buf = String::new();
+        v2_sink
+            .append_line(&mut v2_buf, &topic, &meta, &msg)
+            .unwrap();
+        v3_sink
+            .append_line(&mut v3_buf, &topic, &meta, &msg)
+            .unwrap();
+
+        assert_eq!(v2_buf, v3_buf);
+    }
+
+    // ── build_body batching logic ─────────────────────────────────────────
+
+    #[test]
+    fn build_body_empty_messages_returns_empty_string() {
+        let sink = make_sink();
+        let body = sink
+            .build_body(&make_topic_metadata(), &make_messages_metadata(), &[])
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn build_body_single_message_no_leading_or_trailing_newline() {
+        let sink = make_sink();
+        let msg = make_message(iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec()));
+        let body = sink
+            .build_body(&make_topic_metadata(), &make_messages_metadata(), &[msg])
+            .unwrap();
+        assert!(!body.is_empty());
+        assert!(!body.starts_with('\n'));
+        assert!(!body.ends_with('\n'));
+        assert_eq!(body.lines().count(), 1);
+    }
+
+    #[test]
+    fn build_body_multiple_messages_newline_separated() {
+        let sink = make_sink();
+        let msgs: Vec<_> = (0..3)
+            .map(|_| make_message(iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec())))
+            .collect();
+        let body = sink
+            .build_body(&make_topic_metadata(), &make_messages_metadata(), &msgs)
+            .unwrap();
+        // 3 records → 2 separating newlines
+        assert_eq!(body.lines().count(), 3);
+        assert_eq!(body.chars().filter(|&c| c == '\n').count(), 2);
+    }
+
+    #[test]
+    fn build_body_batch_size_one_produces_single_line() {
+        // When batch_size=1, consume() calls process_batch with a single-element
+        // slice. Verify that build_body returns exactly one line (no newlines).
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            batch_size: Some(1),
+            ..make_v2_config().into_v2().unwrap()
+        });
+        let sink = InfluxDbSink::new(1, config);
+        assert_eq!(sink.batch_size_limit, 1);
+
+        let msg = make_message(iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec()));
+        let body = sink
+            .build_body(&make_topic_metadata(), &make_messages_metadata(), &[msg])
+            .unwrap();
+        assert_eq!(body.lines().count(), 1);
+        assert!(!body.contains('\n'));
+    }
+
+    #[test]
+    fn build_body_exactly_batch_size_limit_messages() {
+        // Edge case: exactly batch_size messages in one call.
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            batch_size: Some(3),
+            ..make_v2_config().into_v2().unwrap()
+        });
+        let sink = InfluxDbSink::new(1, config);
+        let msgs: Vec<_> = (0..3)
+            .map(|_| make_message(iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec())))
+            .collect();
+        let body = sink
+            .build_body(&make_topic_metadata(), &make_messages_metadata(), &msgs)
+            .unwrap();
+        assert_eq!(body.lines().count(), 3);
+    }
 }
 
 // ── Helper for tests: destructure config variants ─────────────────────────────
@@ -1106,5 +1143,477 @@ impl InfluxDbSinkConfig {
             Self::V2(c) => Some(c),
             Self::V3(_) => None,
         }
+    }
+}
+
+// ── HTTP integration tests ────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use axum::Router;
+    use axum::extract::Request;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::{get, post};
+    use iggy_connector_sdk::{MessagesMetadata, Schema, Sink, TopicMetadata};
+    use secrecy::SecretString;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::sync::Mutex;
+
+    // ── test helpers ─────────────────────────────────────────────────────────
+
+    async fn start_server(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// Minimal V2 config that points at `url`, has batch_size=2,
+    /// and uses 1-retry / fast timeouts to keep tests quick.
+    fn v2_config(url: &str) -> InfluxDbSinkConfig {
+        InfluxDbSinkConfig::V2(V2SinkConfig {
+            url: url.to_string(),
+            org: "org".to_string(),
+            bucket: "bucket".to_string(),
+            token: SecretString::from("tok"),
+            measurement: Some("m".to_string()),
+            precision: Some("us".to_string()),
+            batch_size: Some(2),
+            include_metadata: Some(false),
+            include_checksum: Some(false),
+            include_origin_timestamp: Some(false),
+            include_stream_tag: Some(false),
+            include_topic_tag: Some(false),
+            include_partition_tag: Some(false),
+            payload_format: Some("json".to_string()),
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: Some("1ms".to_string()),
+            timeout: Some("5s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("10ms".to_string()),
+            retry_max_delay: Some("10ms".to_string()),
+            circuit_breaker_threshold: Some(5),
+            circuit_breaker_cool_down: Some("30s".to_string()),
+        })
+    }
+
+    fn v3_config(url: &str) -> InfluxDbSinkConfig {
+        InfluxDbSinkConfig::V3(V3SinkConfig {
+            url: url.to_string(),
+            db: "db".to_string(),
+            token: SecretString::from("tok"),
+            measurement: Some("m".to_string()),
+            precision: Some("us".to_string()),
+            batch_size: Some(2),
+            include_metadata: Some(false),
+            include_checksum: Some(false),
+            include_origin_timestamp: Some(false),
+            include_stream_tag: Some(false),
+            include_topic_tag: Some(false),
+            include_partition_tag: Some(false),
+            payload_format: Some("json".to_string()),
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: Some("1ms".to_string()),
+            timeout: Some("5s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("10ms".to_string()),
+            retry_max_delay: Some("10ms".to_string()),
+            circuit_breaker_threshold: Some(5),
+            circuit_breaker_cool_down: Some("30s".to_string()),
+        })
+    }
+
+    /// Build a mock app that responds 200 to GET /health and `write_status` to
+    /// POST on the V2 write endpoint.
+    fn v2_app(write_status: StatusCode) -> Router {
+        Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route("/api/v2/write", post(move || async move { write_status }))
+    }
+
+    fn v3_app(write_status: StatusCode) -> Router {
+        Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/api/v3/write_lp",
+                post(move || async move { write_status }),
+            )
+    }
+
+    async fn open_sink(config: InfluxDbSinkConfig) -> InfluxDbSink {
+        let mut sink = InfluxDbSink::new(1, config);
+        sink.open()
+            .await
+            .expect("open() should succeed against mock");
+        sink
+    }
+
+    fn topic() -> TopicMetadata {
+        TopicMetadata {
+            stream: "s".to_string(),
+            topic: "t".to_string(),
+        }
+    }
+
+    fn meta() -> MessagesMetadata {
+        MessagesMetadata {
+            partition_id: 0,
+            current_offset: 0,
+            schema: Schema::Json,
+        }
+    }
+
+    fn msg() -> ConsumedMessage {
+        ConsumedMessage {
+            id: 1,
+            offset: 0,
+            checksum: 0,
+            timestamp: 1_000_000,
+            origin_timestamp: 1_000_000,
+            headers: None,
+            payload: iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec()),
+        }
+    }
+
+    // ── open() ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn open_v2_succeeds_when_health_returns_200() {
+        let base = start_server(v2_app(StatusCode::NO_CONTENT)).await;
+        let mut sink = InfluxDbSink::new(1, v2_config(&base));
+        assert!(sink.open().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn open_v3_succeeds_when_health_returns_200() {
+        let base = start_server(v3_app(StatusCode::NO_CONTENT)).await;
+        let mut sink = InfluxDbSink::new(1, v3_config(&base));
+        assert!(sink.open().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn open_fails_when_health_returns_503() {
+        let app = Router::new().route("/health", get(|| async { StatusCode::SERVICE_UNAVAILABLE }));
+        let base = start_server(app).await;
+        let mut sink = InfluxDbSink::new(1, v2_config(&base));
+        assert!(sink.open().await.is_err());
+    }
+
+    // ── process_batch() ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn process_batch_204_returns_ok() {
+        let base = start_server(v2_app(StatusCode::NO_CONTENT)).await;
+        let sink = open_sink(v2_config(&base)).await;
+        assert!(
+            sink.process_batch(&topic(), &meta(), &[msg()])
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn process_batch_v3_204_returns_ok() {
+        let base = start_server(v3_app(StatusCode::NO_CONTENT)).await;
+        let sink = open_sink(v3_config(&base)).await;
+        assert!(
+            sink.process_batch(&topic(), &meta(), &[msg()])
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn process_batch_500_returns_can_not_store_data_error() {
+        let base = start_server(v2_app(StatusCode::INTERNAL_SERVER_ERROR)).await;
+        let sink = open_sink(v2_config(&base)).await;
+        let err = sink
+            .process_batch(&topic(), &meta(), &[msg()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::CannotStoreData(_)));
+    }
+
+    #[tokio::test]
+    async fn process_batch_400_returns_permanent_http_error() {
+        let base = start_server(v2_app(StatusCode::BAD_REQUEST)).await;
+        let sink = open_sink(v2_config(&base)).await;
+        let err = sink
+            .process_batch(&topic(), &meta(), &[msg()])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PermanentHttpError(_)));
+    }
+
+    #[tokio::test]
+    async fn process_batch_sends_token_authorization_header() {
+        let captured: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let cap2 = captured.clone();
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/api/v2/write",
+                post(move |headers: HeaderMap| {
+                    let cap = cap2.clone();
+                    async move {
+                        *cap.lock().await = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let base = start_server(app).await;
+        let sink = open_sink(v2_config(&base)).await;
+        sink.process_batch(&topic(), &meta(), &[msg()])
+            .await
+            .unwrap();
+        assert_eq!(*captured.lock().await, "Token tok");
+    }
+
+    #[tokio::test]
+    async fn process_batch_v3_sends_bearer_authorization_header() {
+        let captured: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let cap2 = captured.clone();
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/api/v3/write_lp",
+                post(move |headers: HeaderMap| {
+                    let cap = cap2.clone();
+                    async move {
+                        *cap.lock().await = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let base = start_server(app).await;
+        let sink = open_sink(v3_config(&base)).await;
+        sink.process_batch(&topic(), &meta(), &[msg()])
+            .await
+            .unwrap();
+        assert_eq!(*captured.lock().await, "Bearer tok");
+    }
+
+    #[tokio::test]
+    async fn process_batch_sends_line_protocol_content_type() {
+        let captured: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let cap2 = captured.clone();
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/api/v2/write",
+                post(move |headers: HeaderMap| {
+                    let cap = cap2.clone();
+                    async move {
+                        *cap.lock().await = headers
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let base = start_server(app).await;
+        let sink = open_sink(v2_config(&base)).await;
+        sink.process_batch(&topic(), &meta(), &[msg()])
+            .await
+            .unwrap();
+        assert!(captured.lock().await.starts_with("text/plain"));
+    }
+
+    #[tokio::test]
+    async fn process_batch_body_is_valid_line_protocol() {
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap2 = captured.clone();
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/api/v2/write",
+                post(move |request: Request| {
+                    let cap = cap2.clone();
+                    async move {
+                        let b = axum::body::to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .unwrap();
+                        *cap.lock().await = b.to_vec();
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let base = start_server(app).await;
+        let sink = open_sink(v2_config(&base)).await;
+        sink.process_batch(&topic(), &meta(), &[msg()])
+            .await
+            .unwrap();
+
+        let body = String::from_utf8(captured.lock().await.clone()).unwrap();
+        // measurement name is "m" from config
+        assert!(body.starts_with("m,"), "expected measurement tag: {body}");
+        // offset tag is always written
+        assert!(body.contains(",offset=0"), "expected offset tag: {body}");
+        // JSON payload field
+        assert!(
+            body.contains("payload_json="),
+            "expected payload field: {body}"
+        );
+        // ends with a timestamp
+        let last_token = body.split_whitespace().last().unwrap();
+        assert!(
+            last_token.parse::<u64>().is_ok(),
+            "expected numeric ts: {body}"
+        );
+    }
+
+    // ── consume() chunking ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn consume_chunks_into_batches_of_batch_size() {
+        // batch_size=2 with 5 messages → 3 HTTP calls: (2, 2, 1)
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc2 = call_count.clone();
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/api/v2/write",
+                post(move || {
+                    let cc = cc2.clone();
+                    async move {
+                        cc.fetch_add(1, Ordering::Relaxed);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let base = start_server(app).await;
+        let sink = open_sink(v2_config(&base)).await;
+        let msgs: Vec<_> = (0..5).map(|_| msg()).collect();
+        sink.consume(&topic(), meta(), msgs).await.unwrap();
+        assert_eq!(call_count.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn consume_single_message_batch_size_one_makes_one_call() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc2 = call_count.clone();
+        // Override batch_size to 1
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            batch_size: Some(1),
+            ..v2_config("placeholder").into_v2().unwrap()
+        });
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/api/v2/write",
+                post(move || {
+                    let cc = cc2.clone();
+                    async move {
+                        cc.fetch_add(1, Ordering::Relaxed);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let base = start_server(app).await;
+        // Patch the url in after server started
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            url: base.clone(),
+            ..config.into_v2().unwrap()
+        });
+        let sink = open_sink(config).await;
+        sink.consume(&topic(), meta(), vec![msg()]).await.unwrap();
+        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn consume_returns_first_error_after_all_batches_attempt() {
+        // First batch fails (500), second batch succeeds.
+        // consume() should return an error but still attempt the second batch.
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc2 = call_count.clone();
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/api/v2/write",
+                post(move || {
+                    let cc = cc2.clone();
+                    async move {
+                        let n = cc.fetch_add(1, Ordering::Relaxed);
+                        if n == 0 {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            );
+        let base = start_server(app).await;
+        let sink = open_sink(v2_config(&base)).await;
+        // 4 messages, batch_size=2 → 2 batches; first fails, second succeeds
+        let msgs: Vec<_> = (0..4).map(|_| msg()).collect();
+        let result = sink.consume(&topic(), meta(), msgs).await;
+        assert!(result.is_err()); // error from the first batch is returned
+        assert_eq!(call_count.load(Ordering::Relaxed), 2); // both batches were attempted
+    }
+
+    // ── write URL routing ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn v2_writes_to_api_v2_write_endpoint() {
+        let hit = Arc::new(AtomicU32::new(0));
+        let hit2 = hit.clone();
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/api/v2/write",
+                post(move || {
+                    let h = hit2.clone();
+                    async move {
+                        h.fetch_add(1, Ordering::Relaxed);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let base = start_server(app).await;
+        let sink = open_sink(v2_config(&base)).await;
+        sink.process_batch(&topic(), &meta(), &[msg()])
+            .await
+            .unwrap();
+        assert_eq!(hit.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn v3_writes_to_api_v3_write_lp_endpoint() {
+        let hit = Arc::new(AtomicU32::new(0));
+        let hit2 = hit.clone();
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/api/v3/write_lp",
+                post(move || {
+                    let h = hit2.clone();
+                    async move {
+                        h.fetch_add(1, Ordering::Relaxed);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let base = start_server(app).await;
+        let sink = open_sink(v3_config(&base)).await;
+        sink.process_batch(&topic(), &meta(), &[msg()])
+            .await
+            .unwrap();
+        assert_eq!(hit.load(Ordering::Relaxed), 1);
     }
 }
