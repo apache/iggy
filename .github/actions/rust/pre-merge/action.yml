@@ -81,10 +81,11 @@ runs:
         METADATA_JSON=$(cargo metadata --format-version 1 --no-deps 2>/dev/null || echo "{}")
         TOTAL_CRATES=$(echo "$METADATA_JSON" | jq '.workspace_members | length' 2>/dev/null || echo "?")
         echo "$TOTAL_CRATES" > /tmp/total-crates.txt
-        # Extract packages with binary targets — integration tests may invoke
-        # binaries from other packages via assert_cmd (CARGO_BIN_EXE_<name>),
-        # so these must always be compiled alongside affected crates.
-        echo "$METADATA_JSON" | jq -r '.packages[] | select(.targets[] | .kind[] == "bin") | .name' 2>/dev/null > /tmp/bin-packages.txt || true
+        # Extract packages with binary or cdylib targets — integration tests may
+        # invoke binaries via assert_cmd (CARGO_BIN_EXE_<name>), and connector
+        # plugins (cdylib) are loaded at runtime via dlopen by iggy-connectors.
+        # Both must always be compiled alongside affected crates.
+        echo "$METADATA_JSON" | jq -r '.packages[] | select(.targets[] | .kind[] | (. == "bin" or . == "cdylib")) | .name' 2>/dev/null > /tmp/bin-packages.txt || true
 
         PLAN_JSON=$(cargo rail plan --since origin/master -f json 2>/tmp/affected-stderr.txt || echo "")
 
@@ -94,13 +95,13 @@ runs:
             CRATES=$(echo "$PLAN_JSON" | jq -r '.scope.crates[]')
             CRATE_COUNT=$(echo "$CRATES" | wc -l)
             # Build nextest filter expression for cargo nextest run (affected crates only)
-            echo "$CRATES" | sed 's/^/package(/; s/$/)/' | paste -sd ' | ' > /tmp/nextest-filter.txt
+            echo "$CRATES" | sed 's/^/package(/; s/$/)/' | paste -sd '|' | sed 's/|/ | /g' > /tmp/nextest-filter.txt
             # Save affected-only -p flags for cargo test fallback (no nextest filter)
             echo "$CRATES" | sed 's/^/-p /' | tr '\n' ' ' > /tmp/test-packages.txt
-            # Build -p flags: affected crates + packages with binary targets.
-            # cargo nextest sets CARGO_BIN_EXE_<name> from compiled binary
-            # artifacts, so binary packages must be in the build to avoid
-            # "CARGO_BIN_EXE_<name> is unset" panics in assert_cmd tests.
+            # Build -p flags: affected crates + packages with bin/cdylib targets.
+            # Binary packages: nextest sets CARGO_BIN_EXE_<name> from compiled
+            # artifacts; cdylib packages: connector plugins loaded via dlopen.
+            # Both must be in the build even if not directly in the DAG scope.
             BIN_PKGS=$(cat /tmp/bin-packages.txt 2>/dev/null || echo "")
             ALL_BUILD_PKGS=$(printf '%s\n%s\n' "$CRATES" "$BIN_PKGS" | sort -u | grep -v '^$')
             echo "$ALL_BUILD_PKGS" | sed 's/^/-p /' | tr '\n' ' ' > /tmp/packages.txt
@@ -236,7 +237,7 @@ runs:
         test_start=$(date +%s)
         if command -v cargo-nextest &> /dev/null; then
           if [[ -n "$NEXTEST_FILTER" ]]; then
-            cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG -E "$NEXTEST_FILTER"
+            cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG $PACKAGE_FLAGS -E "$NEXTEST_FILTER"
           else
             cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG
           fi
