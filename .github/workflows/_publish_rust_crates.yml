@@ -30,14 +30,22 @@ on:
         description: "Dry run mode - validate without publishing"
       commit:
         type: string
-        required: false
-        default: ""
-        description: "Specific commit to checkout (defaults to github.sha)"
+        required: true
+        description: |
+          Full 40-char commit SHA to publish from. The caller is responsible
+          for resolving and validating this (including master-ancestry) before
+          invoking. This workflow re-verifies master-ancestry defensively in
+          the `Resolve commit` step below.
       use_latest_ci:
         type: boolean
         required: false
         default: false
         description: "Use latest CI configuration from master branch"
+      skip_tag_creation:
+        type: boolean
+        required: false
+        default: false
+        description: "Skip git tag creation after successful publish (useful for re-publishing)"
     secrets:
       CARGO_REGISTRY_TOKEN:
         required: true
@@ -51,6 +59,19 @@ permissions:
 
 env:
   IGGY_CI_BUILD: true
+
+# Child-level concurrency group as defense-in-depth. The in-tree caller
+# (publish.yml) already holds `publish-release` via its own concurrency
+# block, and reusable workflow runs are nested under the parent's group,
+# so this is a no-op for the current topology. But `workflow_call` is a
+# publicly-reachable entry point: any future direct caller (auto-publish
+# runbook, vendored fork, parallel workflow) would bypass the parent
+# group and race on the inline tag steps below. A distinct group name
+# (`publish-release-rust` vs parent `publish-release`) avoids self-block
+# when this workflow is called from publish.yml.
+concurrency:
+  group: publish-release-rust
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -72,7 +93,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.commit || github.sha }}
+          # No `|| github.sha` fallback: the `Resolve commit` step below
+          # requires an explicit, non-empty `inputs.commit` so the tag step
+          # downstream points at the exact reviewed commit. A silent fall
+          # back to github.sha would bypass publish.yml's master-ancestry
+          # check for direct workflow_call callers. Empty input here will
+          # fail the checkout fast, which is the intended hard-fail shape.
+          ref: ${{ inputs.commit }}
           fetch-depth: 0
 
       - name: Save and apply latest CI from master
@@ -118,13 +145,48 @@ jobs:
             echo "❌ Could not resolve commit '${INPUT_COMMIT}' to a full SHA"
             exit 1
           fi
+
+          # Defensive re-check of the master-ancestry invariant that publish.yml's
+          # validate job enforces. This workflow is a publicly-reachable
+          # workflow_call entry point; a direct caller (runbook, vendored fork)
+          # that bypasses publish.yml would otherwise skip the ancestry check
+          # entirely. Re-running it here is cheap (one shallow fetch + one
+          # merge-base call) and closes the I2 invariant hole.
+          git fetch origin master --depth=1000 --quiet
+          if ! git merge-base --is-ancestor "$FULL_SHA" origin/master; then
+            echo "❌ Commit $FULL_SHA is not an ancestor of origin/master"
+            echo ""
+            echo "_publish_rust_crates.yml refuses to publish from a non-master commit."
+            echo "If you reached this error via a direct workflow_call, route through"
+            echo "publish.yml instead (which does the same check in its validate job)"
+            echo "or rebase your branch onto master before invoking."
+            exit 1
+          fi
+
           echo "commit=$FULL_SHA" >> "$GITHUB_OUTPUT"
-          echo "✅ Resolved commit: $FULL_SHA"
+          echo "✅ Resolved commit: $FULL_SHA (on origin/master)"
 
       - name: Extract versions and tags
         id: versions
+        shell: bash
         run: |
+          set -euo pipefail
           chmod +x scripts/extract-version.sh
+
+          # Cache cargo metadata once across ALL extract-version.sh and
+          # composite post-merge.yml invocations in this job. The 8
+          # extract-version calls in this step plus the 4 per-crate
+          # composite `Validate package` steps all hit the same workspace
+          # snapshot, and cargo metadata on this 36-crate workspace costs
+          # ~8s cold per fork. File-based rather than env-var inlined
+          # because the JSON is ~220 KB, exceeding Linux MAX_ARG_STRLEN
+          # (128 KB). Propagated via $GITHUB_ENV so it also reaches the
+          # downstream post-merge composite steps; a plain `export` would
+          # only affect THIS step's shell.
+          IGGY_CARGO_METADATA_FILE="${RUNNER_TEMP:-/tmp}/iggy-cargo-metadata.json"
+          cargo metadata --format-version 1 --no-deps > "${IGGY_CARGO_METADATA_FILE}"
+          echo "IGGY_CARGO_METADATA_FILE=${IGGY_CARGO_METADATA_FILE}" >> "${GITHUB_ENV}"
+          export IGGY_CARGO_METADATA_FILE  # also make it available to this step's extract-version calls
 
           common=$(scripts/extract-version.sh rust-common)
           protocol=$(scripts/extract-version.sh rust-binary-protocol)
@@ -169,6 +231,31 @@ jobs:
       # the upload landed. If the wait times out, the tag is never pushed and
       # a rerun can safely re-enter the chain: the publish step is idempotent
       # via a sparse-index pre-check inside actions/rust/post-merge.
+      #
+      # Two-layer wait (defense-in-depth budget cascading - NOT independent
+      # signals; both layers poll the same sparse index URL):
+      #
+      #   * Inner CAS verify inside actions/rust/post-merge on a tight
+      #     ~8 min worst-case budget (max_attempts=10, initial_sleep=2,
+      #     cap=30; sleeps 2+4+8+16+30*5=180s + 10 * 30s curl = ~480s).
+      #     Runs only when the idempotency pre-check fell through to the
+      #     publish path, and acts as an authoritative per-step state
+      #     check: "did my cargo publish land on the sparse index in time
+      #     to continue cleanly?"
+      #   * Outer wait-for-crate below on a larger ~28 min worst-case
+      #     budget (default max_attempts=30, initial_sleep=3, cap=30;
+      #     sleeps 3+6+12+24+30*25=795s + 30 * 30s curl = ~1725s). Runs
+      #     on every crate in the chain and acts as the operational
+      #     safety net before the NEXT downstream crate's `cargo publish`
+      #     resolves its path deps from crates.io. Separate budget so a
+      #     slow CDN does not starve the tight inner check.
+      #
+      # 4-crate chain aggregate worst case: ~144 min (4 * (8+28)). In
+      # practice the happy path short-circuits on the first 200 response
+      # and total wait per crate is single-digit seconds. Chain halts on
+      # the first failing wait, so the 144 min figure is a ceiling, not
+      # an expected duration. Operators should only intervene after ~60
+      # min of sustained CDN 404s on a single crate.
 
       # Step 1: Publish iggy_binary_protocol (depends on nothing in-tree)
       - name: Publish iggy_binary_protocol
@@ -186,7 +273,7 @@ jobs:
           version: ${{ steps.versions.outputs.protocol }}
 
       - name: Tag iggy_binary_protocol
-        if: inputs.dry_run == false && contains(inputs.crates, 'rust-binary-protocol')
+        if: inputs.dry_run == false && inputs.skip_tag_creation == false && contains(inputs.crates, 'rust-binary-protocol')
         uses: ./.github/actions/utils/create-git-tag
         with:
           tag: ${{ steps.versions.outputs.protocol_tag }}
@@ -215,7 +302,7 @@ jobs:
           version: ${{ steps.versions.outputs.common }}
 
       - name: Tag iggy_common
-        if: inputs.dry_run == false && contains(inputs.crates, 'rust-common')
+        if: inputs.dry_run == false && inputs.skip_tag_creation == false && contains(inputs.crates, 'rust-common')
         uses: ./.github/actions/utils/create-git-tag
         with:
           tag: ${{ steps.versions.outputs.common_tag }}
@@ -244,7 +331,7 @@ jobs:
           version: ${{ steps.versions.outputs.sdk }}
 
       - name: Tag iggy SDK
-        if: inputs.dry_run == false && contains(inputs.crates, 'rust-sdk')
+        if: inputs.dry_run == false && inputs.skip_tag_creation == false && contains(inputs.crates, 'rust-sdk')
         uses: ./.github/actions/utils/create-git-tag
         with:
           tag: ${{ steps.versions.outputs.sdk_tag }}
@@ -273,7 +360,7 @@ jobs:
           version: ${{ steps.versions.outputs.cli }}
 
       - name: Tag iggy-cli
-        if: inputs.dry_run == false && contains(inputs.crates, 'rust-cli')
+        if: inputs.dry_run == false && inputs.skip_tag_creation == false && contains(inputs.crates, 'rust-cli')
         uses: ./.github/actions/utils/create-git-tag
         with:
           tag: ${{ steps.versions.outputs.cli_tag }}

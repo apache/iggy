@@ -42,9 +42,13 @@ inputs:
     required: false
     default: "30"
   initial_sleep_seconds:
-    description: "Sleep between the first two attempts in seconds. Doubles each attempt, capped at 30."
+    description: "Sleep between the first two attempts in seconds. Doubles each attempt, capped at max_sleep_seconds."
     required: false
     default: "3"
+  max_sleep_seconds:
+    description: "Upper bound on per-attempt sleep, in seconds."
+    required: false
+    default: "30"
 
 runs:
   using: composite
@@ -56,6 +60,7 @@ runs:
         VERSION: ${{ inputs.version }}
         MAX_ATTEMPTS: ${{ inputs.max_attempts }}
         INITIAL_SLEEP_SECONDS: ${{ inputs.initial_sleep_seconds }}
+        MAX_SLEEP_SECONDS: ${{ inputs.max_sleep_seconds }}
       run: |
         set -euo pipefail
 
@@ -85,6 +90,10 @@ runs:
           echo "❌ wait-for-crate: initial_sleep_seconds '${INITIAL_SLEEP_SECONDS}' must be a non-negative integer"
           exit 1
         fi
+        if ! [[ "${MAX_SLEEP_SECONDS}" =~ ^[0-9]+$ ]] || [ "${MAX_SLEEP_SECONDS}" -lt 1 ]; then
+          echo "❌ wait-for-crate: max_sleep_seconds '${MAX_SLEEP_SECONDS}' must be a positive integer"
+          exit 1
+        fi
 
         # Compute the sparse-index prefix path from the leading characters
         # of the lowercased crate name. Layout is documented at
@@ -106,22 +115,50 @@ runs:
         echo "🎯 Target version:   ${VERSION}"
         echo ""
 
+        # Capture curl stderr AND body to tempfiles. Stderr preserves hard
+        # curl errors (DNS, TLS, connection refused, --max-time timeouts) so
+        # they can be surfaced on the final failure branch instead of being
+        # silenced by 2>/dev/null. Body goes to a file so we can distinguish
+        # "HTTP 200 but empty body" from "HTTP 4xx" from "network failure",
+        # and only parse JSON when the HTTP code says it's worth parsing.
+        curl_stderr="$(mktemp)"
+        body_file="$(mktemp)"
+        trap 'rm -f "${curl_stderr}" "${body_file}"' EXIT
+
         sleep_s="${INITIAL_SLEEP_SECONDS}"
+        http_code="000"
         for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
-          # -f: fail on HTTP >= 400, so a 404 ("crate not yet on index")
-          #     surfaces as a non-zero exit with an empty body, which the
-          #     `|| true` swallows so the loop can keep going.
-          # -sS: quiet but still show hard curl errors on stderr (network
-          #     failure, DNS, TLS) so operators see them in the step log.
+          # -sS: silent but still show hard curl errors on stderr (network,
+          #     DNS, TLS, --max-time timeout) — captured to ${curl_stderr}.
           # -L: follow redirects (the CDN may redirect to a mirror).
-          body=$(curl -fsSL "${URL}" 2>/dev/null || true)
+          # -w '%{http_code}': capture the HTTP status code so we can tell
+          #     404 ("not yet on index") from 5xx ("transient") from 200
+          #     ("live") in the per-attempt log and the final-failure
+          #     branch. Symmetric with wait-for-url.
+          # --max-time 30: per-request wall-clock cap so a wedged TCP
+          #     connection does not burn the whole retry budget on one
+          #     attempt. Without this, kernel TCP keepalive can hold a
+          #     dead connection for ~5 min silently — the exact tail
+          #     latency bug we are trying to avoid. Symmetric with
+          #     wait-for-url:115.
+          # No -f: we inspect the HTTP code ourselves, so 4xx surfaces as
+          #     a code we can log instead of an empty body + non-zero exit.
+          : >"${curl_stderr}"
+          : >"${body_file}"
+          http_code=$(curl -sSL -o "${body_file}" -w '%{http_code}' \
+                        --max-time 30 "${URL}" 2>"${curl_stderr}" || echo "000")
 
           # The sparse-index body is newline-delimited JSON: one record
-          # per published version. `jq -r '.vers'` emits one version per
-          # line and `grep -Fxq` does an exact literal full-line match,
-          # so `0.10.0+build.5` is matched as itself, not as a regex
-          # where `.` and `+` would mean something else.
-          if [ -n "${body}" ] && echo "${body}" | jq -r '.vers' 2>/dev/null | grep -Fxq "${VERSION}"; then
+          # per published version. `jq -R 'fromjson?'` reads each line as
+          # a raw string and silently drops lines that fail to parse, so
+          # a malformed or partially-truncated response (e.g., CDN
+          # serving an HTML error page or an incomplete body) does not
+          # kill the whole pipeline under `set -o pipefail`. `grep -Fxq`
+          # does an exact literal full-line match, so `0.10.0+build.5`
+          # is matched as itself, not as a regex where `.` and `+` would
+          # mean something else.
+          if [ "${http_code}" = "200" ] && [ -s "${body_file}" ] \
+             && jq -Rr 'fromjson? | .vers // empty' "${body_file}" 2>/dev/null | grep -Fxq "${VERSION}"; then
             echo "✅ ${PACKAGE} v${VERSION} is on the sparse index"
             exit 0
           fi
@@ -129,11 +166,11 @@ runs:
           if [ "${attempt}" -eq "${MAX_ATTEMPTS}" ]; then
             break
           fi
-          echo "⏳ ${PACKAGE} v${VERSION} not yet visible (attempt ${attempt}/${MAX_ATTEMPTS}, sleep ${sleep_s}s)"
+          echo "⏳ HTTP ${http_code} - ${PACKAGE} v${VERSION} not yet visible (attempt ${attempt}/${MAX_ATTEMPTS}, sleep ${sleep_s}s)"
           sleep "${sleep_s}"
           sleep_s=$(( sleep_s * 2 ))
-          if [ "${sleep_s}" -gt 30 ]; then
-            sleep_s=30
+          if [ "${sleep_s}" -gt "${MAX_SLEEP_SECONDS}" ]; then
+            sleep_s="${MAX_SLEEP_SECONDS}"
           fi
         done
 
@@ -142,6 +179,11 @@ runs:
         #   * max_attempts>1 → "never appeared inside the budget"
         echo "❌ ${PACKAGE} v${VERSION} is not on the sparse index after ${MAX_ATTEMPTS} attempt(s)"
         echo "   URL: ${URL}"
+        echo "   Last HTTP code: ${http_code}"
+        if [ -s "${curl_stderr}" ]; then
+          echo "   last curl stderr:"
+          sed 's/^/     /' "${curl_stderr}"
+        fi
         echo "   Common causes:"
         echo "     - cargo publish did not actually land the upload (inspect the preceding publish step)"
         echo "     - the crates.io sparse-index CDN is lagging (usually seconds, rarely >1 min)"
