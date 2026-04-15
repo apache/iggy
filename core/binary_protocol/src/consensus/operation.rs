@@ -25,6 +25,10 @@ pub enum Operation {
     #[default]
     Reserved = 0,
 
+    // Internal metadata operations (journal / replica-only)
+    CreateTopicWithAssignments = 64,
+    CreatePartitionsWithAssignments = 65,
+
     // Metadata operations (shard 0)
     CreateStream = 128,
     UpdateStream = 129,
@@ -57,10 +61,25 @@ pub enum Operation {
 }
 
 impl Operation {
+    pub const INTERNAL_START: u8 = Self::CreateTopicWithAssignments as u8;
+    pub const METADATA_START: u8 = Self::CreateStream as u8;
+    pub const PARTITION_START: u8 = Self::SendMessages as u8;
+
+    /// Internal-only operations reserved for replica / journal use.
+    #[must_use]
+    #[inline]
+    pub const fn is_internal(&self) -> bool {
+        (*self as u8) >= Self::INTERNAL_START && (*self as u8) < Self::METADATA_START
+    }
+
     /// Metadata / control-plane operations handled by shard 0.
     #[must_use]
     #[inline]
     pub const fn is_metadata(&self) -> bool {
+        if self.is_internal() {
+            return true;
+        }
+
         matches!(
             self,
             Self::CreateStream
@@ -89,13 +108,14 @@ impl Operation {
     #[must_use]
     #[inline]
     pub const fn is_partition(&self) -> bool {
-        matches!(
-            self,
-            Self::SendMessages
-                | Self::StoreConsumerOffset
-                | Self::DeleteConsumerOffset
-                | Self::DeleteSegments
-        )
+        matches!(self, Self::DeleteSegments) || (*self as u8) >= Self::PARTITION_START
+    }
+
+    /// Operations clients are allowed to send directly.
+    #[must_use]
+    #[inline]
+    pub const fn is_client_allowed(&self) -> bool {
+        !matches!(self, Self::Reserved) && !self.is_internal()
     }
 
     /// Bidirectional mapping: `Operation` -> client command code.
@@ -104,7 +124,9 @@ impl Operation {
     #[must_use]
     pub const fn to_command_code(&self) -> Option<u32> {
         match self {
-            Self::Reserved => None,
+            Self::Reserved
+            | Self::CreateTopicWithAssignments
+            | Self::CreatePartitionsWithAssignments => None,
             Self::CreateStream
             | Self::UpdateStream
             | Self::DeleteStream
@@ -190,6 +212,14 @@ mod tests {
     #[test]
     fn reserved_has_no_code() {
         assert_eq!(Operation::Reserved.to_command_code(), None);
+        assert_eq!(
+            Operation::CreateTopicWithAssignments.to_command_code(),
+            None
+        );
+        assert_eq!(
+            Operation::CreatePartitionsWithAssignments.to_command_code(),
+            None
+        );
     }
 
     #[test]
@@ -203,8 +233,12 @@ mod tests {
 
     #[test]
     fn metadata_vs_partition() {
+        assert!(Operation::CreateTopicWithAssignments.is_internal());
+        assert!(Operation::CreateTopicWithAssignments.is_metadata());
+        assert!(!Operation::CreateTopicWithAssignments.is_client_allowed());
         assert!(Operation::CreateStream.is_metadata());
         assert!(!Operation::CreateStream.is_partition());
+        assert!(Operation::CreateStream.is_client_allowed());
         assert!(Operation::SendMessages.is_partition());
         assert!(!Operation::SendMessages.is_metadata());
         assert!(Operation::DeleteSegments.is_partition());

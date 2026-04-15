@@ -29,6 +29,7 @@ readme = "../../../README.md"
 
 [dependencies]
 ahash = { workspace = true }
+bytemuck = { workspace = true }
 bytes = { workspace = true }
 consensus = { workspace = true }
 iggy_binary_protocol = { workspace = true }
@@ -43,7 +44,6 @@ slab = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-bytemuck = { workspace = true }
 bytes = { workspace = true }
 compio = { workspace = true }
 iobuf = { workspace = true }
