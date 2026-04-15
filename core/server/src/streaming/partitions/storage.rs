@@ -28,7 +28,7 @@ use compio::{
 use err_trail::ErrContext;
 use iggy_common::{ConsumerKind, IggyError};
 use std::{io::Read, path::Path, sync::atomic::AtomicU64};
-use tracing::{error, trace};
+use tracing::{error, trace, warn};
 
 pub async fn create_partition_file_hierarchy(
     stream_id: usize,
@@ -181,9 +181,16 @@ pub fn load_consumer_offsets(path: &str) -> Result<Vec<ConsumerOffset>, IggyErro
         }
 
         let name = dir_entry.file_name().into_string().unwrap();
-        let consumer_id = name.parse::<u32>().unwrap_or_else(|_| {
-            panic!("Invalid consumer ID file with name: '{}'.", name);
-        });
+        let consumer_id = match name.parse::<u32>() {
+            Ok(id) => id,
+            Err(_) => {
+                warn!(
+                    "Unexpected non-numeric consumer offset file: '{}', skipping.",
+                    name
+                );
+                continue;
+            }
+        };
 
         let path = dir_entry.path();
         let path = path.to_str();
@@ -244,12 +251,16 @@ pub fn load_consumer_group_offsets(
 
         let name = dir_entry.file_name().into_string().unwrap();
 
-        let consumer_group_id = name.parse::<u32>().unwrap_or_else(|_| {
-            panic!(
-                "Invalid consumer group ID in consumer group file with name: '{}'.",
-                name
-            );
-        });
+        let consumer_group_id = match name.parse::<u32>() {
+            Ok(id) => id,
+            Err(_) => {
+                warn!(
+                    "Unexpected non-numeric consumer group offset file: '{}', skipping.",
+                    name
+                );
+                continue;
+            }
+        };
         let consumer_group_id = ConsumerGroupId(consumer_group_id as usize);
 
         let path = dir_entry.path();
