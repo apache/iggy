@@ -88,7 +88,7 @@ pub fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
             continue;
         }
 
-        let mut mapped = Row::new();
+        let mut mapped = Row::with_capacity(active_headers.len());
         for (idx, key) in active_headers.iter().enumerate() {
             if key.is_empty() {
                 continue;

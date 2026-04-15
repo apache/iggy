@@ -102,7 +102,7 @@ impl InfluxDbAdapter for V2Adapter {
     }
 
     fn health_url(&self, base: &str) -> Result<Url, Error> {
-        Url::parse(&format!("{base}/health"))
+        Url::parse(&format!("{}/health", base.trim_end_matches('/')))
             .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))
     }
 }
@@ -186,11 +186,45 @@ mod tests {
     }
 
     #[test]
+    fn write_url_encodes_bucket_with_special_characters() {
+        // Bucket names with spaces and slashes are valid in InfluxDB Cloud.
+        // query_pairs_mut().append_pair() percent-encodes them; this test
+        // confirms the round-trip: encoded in the wire URL, recoverable on decode.
+        let a = V2Adapter;
+        let url = a
+            .write_url(BASE, "my bucket/v1", Some("my org"), "ns")
+            .unwrap();
+        let q = url.query().unwrap_or("");
+        // Raw characters must not appear verbatim in the query string.
+        assert!(!q.contains("my bucket"), "space should be encoded: {q}");
+        assert!(!q.contains("my org"), "space in org should be encoded: {q}");
+        // Decoding must recover the original values exactly.
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            pairs.get("bucket").map(String::as_str),
+            Some("my bucket/v1"),
+            "decoded bucket mismatch"
+        );
+        assert_eq!(
+            pairs.get("org").map(String::as_str),
+            Some("my org"),
+            "decoded org mismatch"
+        );
+    }
+
+    #[test]
     fn parse_rows_delegates_to_csv_parser() {
         let a = V2Adapter;
         let csv = "_time,_value\n2024-01-01T00:00:00Z,99\n";
         let rows = a.parse_rows(csv).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("_value").map(String::as_str), Some("99"));
+    }
+
+    #[test]
+    fn health_url_handles_trailing_slash() {
+        let a = V2Adapter;
+        let url = a.health_url("http://localhost:8086/").unwrap();
+        assert!(!url.path().contains("//"));
     }
 }

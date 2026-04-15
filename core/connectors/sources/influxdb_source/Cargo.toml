@@ -28,8 +28,14 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
+# dashmap and once_cell are not imported directly in this crate's source, but
+# the source_connector! macro (in iggy_connector_sdk::source) expands bare
+# `use dashmap::DashMap` and `use once_cell::sync::Lazy` into this crate's
+# namespace, so they must be listed here. Remove them only after the SDK macro
+# is updated to use `$crate::connector_macro_support::{DashMap, Lazy}` (the
+# same fix already applied to sink_connector!).
 [package.metadata.cargo-machete]
-ignored = ["dashmap", "once_cell", "futures"]
+ignored = ["dashmap", "once_cell"]
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -37,9 +43,7 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }
-csv = { workspace = true }
 dashmap = { workspace = true }
-futures = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_influxdb_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }

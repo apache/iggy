@@ -111,7 +111,7 @@ impl InfluxDbAdapter for V3Adapter {
     }
 
     fn health_url(&self, base: &str) -> Result<Url, Error> {
-        Url::parse(&format!("{base}/health"))
+        Url::parse(&format!("{}/health", base.trim_end_matches('/')))
             .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))
     }
 }
@@ -135,6 +135,28 @@ mod tests {
     fn auth_uses_bearer_scheme() {
         let a = V3Adapter;
         assert_eq!(a.auth_header_value("secret"), "Bearer secret");
+    }
+
+    #[test]
+    fn write_url_encodes_db_with_special_characters() {
+        // Database names with spaces and slashes are valid in InfluxDB 3.
+        // query_pairs_mut().append_pair() percent-encodes them; this test
+        // confirms the round-trip: encoded in the wire URL, recoverable on decode.
+        let a = V3Adapter;
+        let url = a.write_url(BASE, "team/sensors v2", None, "ns").unwrap();
+        let q = url.query().unwrap_or("");
+        // Raw characters must not appear verbatim in the query string.
+        assert!(
+            !q.contains("team/sensors v2"),
+            "special chars should be encoded: {q}"
+        );
+        // Decoding must recover the original value exactly.
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            pairs.get("db").map(String::as_str),
+            Some("team/sensors v2"),
+            "decoded db name mismatch"
+        );
     }
 
     #[test]
@@ -198,6 +220,13 @@ mod tests {
             "wrong path: {}",
             url.path()
         );
+    }
+
+    #[test]
+    fn health_url_handles_trailing_slash() {
+        let a = V3Adapter;
+        let url = a.health_url("http://localhost:8181/").unwrap();
+        assert!(!url.path().contains("//"));
     }
 
     #[test]
