@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_common::{IggyByteSize, PollingStrategy};
-use iobuf::Frozen;
 use smallvec::SmallVec;
 
 #[derive(Debug, Clone)]

@@ -268,3 +268,27 @@ repos:
         files: ^(foreign|examples)/csharp/.*\.cs$
         pass_filenames: false
         stages: [pre-push]
+
+  # Helm chart formatting and linting
+  - repo: local
+    hooks:
+      - id: helmfmt
+        name: helmfmt
+        entry: helmfmt
+        language: system
+        files: ^helm/charts/.*/templates/.*\.(yaml|tpl)$
+        pass_filenames: true
+
+      - id: yamllint-helm
+        name: yamllint (helm)
+        entry: yamllint -c helm/charts/iggy/.yamllint.yml
+        language: system
+        files: ^helm/charts/iggy/(values\.yaml|Chart\.yaml)$
+        pass_filenames: true
+
+      - id: helm-docs
+        name: helm-docs
+        entry: bash -c 'cd helm/charts/iggy && helm-docs'
+        language: system
+        files: ^helm/charts/iggy/(values\.yaml|README\.md\.gotmpl)$
+        pass_filenames: false

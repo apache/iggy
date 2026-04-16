@@ -158,8 +158,8 @@ where
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+    use iggy_binary_protocol::consensus::iobuf::Owned;
     use iggy_binary_protocol::consensus::{Command2, Operation};
-    use iobuf::Owned;
     use journal::Journal;
     use tempfile::tempdir;
 
