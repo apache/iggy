@@ -115,7 +115,7 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
         let name = entry.name;
 
         // ================================================================
-        // SKIPPED COMMANDS (9 total)
+        // SKIPPED COMMANDS (10 total)
         // ================================================================
         // No auth required
         if matches!(
@@ -124,6 +124,7 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                 | LOGIN_USER_CODE
                 | LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE
                 | LOGIN_REGISTER_CODE
+                | LOGIN_REGISTER_WITH_PAT_CODE
         ) {
             continue;
         }
