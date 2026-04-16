@@ -36,6 +36,7 @@ use consensus::{
     fence_old_prepare_by_commit, replicate_preflight, replicate_to_next_in_chain,
     send_prepare_ok as send_prepare_ok_common,
 };
+use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_binary_protocol::{GenericHeader, PrepareOkHeader, RequestHeader};
 use iggy_binary_protocol::{Message, Operation, PrepareHeader};
 use iggy_common::{
@@ -45,7 +46,6 @@ use iggy_common::{
     send_messages2::{convert_request_message, decode_prepare_slice},
     sharding::IggyNamespace,
 };
-use iobuf::Frozen;
 use journal::Journal as _;
 use message_bus::{IggyMessageBus, MessageBus};
 use std::collections::HashMap;

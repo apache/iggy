@@ -20,10 +20,10 @@ use crate::{
     Consensus, IgnoreReason, Pipeline, PipelineEntry, PlaneKind, PrepareOkOutcome, Sequencer,
     Status, VsrConsensus,
 };
+use iggy_binary_protocol::consensus::iobuf::Owned;
 use iggy_binary_protocol::{
     Command2, GenericHeader, Message, PrepareHeader, PrepareOkHeader, ReplyHeader,
 };
-use iobuf::Owned;
 use message_bus::MessageBus;
 use std::ops::AsyncFnOnce;
 

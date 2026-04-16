@@ -646,9 +646,9 @@ where
     /// and updating the client table for each.
     ///
     /// The backup does NOT send replies to clients, only the primary does that.
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::missing_panics_doc)]
     #[allow(clippy::future_not_send)]
-    async fn commit_journal(&self) {
+    pub async fn commit_journal(&self) {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 

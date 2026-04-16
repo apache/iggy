@@ -116,6 +116,9 @@ pub enum ControlActionKind {
     SendStartView,
     SendPrepareOk,
     SendPrepare,
+    RebuildPipeline,
+    CommitJournal,
+    SendCommit,
 }
 
 impl ControlActionKind {
@@ -127,6 +130,9 @@ impl ControlActionKind {
             Self::SendStartView => "send_start_view",
             Self::SendPrepareOk => "send_prepare_ok",
             Self::SendPrepare => "send_prepare",
+            Self::RebuildPipeline => "rebuild_pipeline",
+            Self::CommitJournal => "commit_journal",
+            Self::SendCommit => "send_commit",
         }
     }
 }
@@ -340,6 +346,27 @@ impl ControlActionLogEvent {
                 target_replica: None,
                 op: None,
                 commit: None,
+            },
+            VsrAction::RebuildPipeline { from_op, to_op, .. } => Self {
+                replica,
+                action: ControlActionKind::RebuildPipeline,
+                target_replica: None,
+                op: Some(from_op),
+                commit: Some(to_op),
+            },
+            VsrAction::CommitJournal => Self {
+                replica,
+                action: ControlActionKind::CommitJournal,
+                target_replica: None,
+                op: None,
+                commit: None,
+            },
+            VsrAction::SendCommit { commit, .. } => Self {
+                replica,
+                action: ControlActionKind::SendCommit,
+                target_replica: None,
+                op: None,
+                commit: Some(commit),
             },
         }
     }

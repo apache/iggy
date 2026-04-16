@@ -92,6 +92,10 @@ pub struct IggyBenchArgs {
     #[arg(long, short = 'p', default_value_t = DEFAULT_ROOT_PASSWORD.to_string())]
     pub password: String,
 
+    /// Pretty table output for benchmark results
+    #[arg(long, default_value_t = false)]
+    pub pretty: bool,
+
     /// Reuse existing bench streams instead of deleting and recreating them.
     /// Without this flag, existing bench streams are deleted to ensure
     /// consumers start with fresh data and accurate latency measurements.

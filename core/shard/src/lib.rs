@@ -19,10 +19,12 @@ mod router;
 pub mod shards_table;
 
 use consensus::{
-    LocalPipeline, MuxPlane, PartitionsHandle, Plane, PlaneKind, Sequencer, VsrConsensus,
+    MetadataHandle, LocalPipeline, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind,
+    Sequencer, VsrAction, VsrConsensus,
 };
 use iggy_binary_protocol::{
-    GenericHeader, Message, MessageBag, PrepareHeader, PrepareOkHeader, RequestHeader,
+    Command2, CommitHeader, DoViewChangeHeader, GenericHeader, Message, MessageBag, PrepareHeader,
+    PrepareOkHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
 use iggy_common::variadic;
 use iggy_common::{PartitionStats, sharding::IggyNamespace};
@@ -244,6 +246,10 @@ where
             Ok(MessageBag::Request(request)) => self.on_request(request).await,
             Ok(MessageBag::Prepare(prepare)) => self.on_replicate(prepare).await,
             Ok(MessageBag::PrepareOk(prepare_ok)) => self.on_ack(prepare_ok).await,
+            Ok(MessageBag::StartViewChange(msg)) => self.on_start_view_change(msg).await,
+            Ok(MessageBag::DoViewChange(msg)) => self.on_do_view_change(msg).await,
+            Ok(MessageBag::StartView(msg)) => self.on_start_view(msg).await,
+            Ok(MessageBag::Commit(ref msg)) => self.on_commit(msg).await,
             Err(e) => {
                 tracing::warn!(shard = self.id, error = %e, "dropping message with invalid command");
             }
@@ -412,10 +418,423 @@ where
         partitions.insert(namespace, partition);
     }
 
-    /// Tick the partitions consensus and dispatch any resulting actions.
+    /// Handle an incoming view change message by routing it to the correct
+    /// consensus group (metadata or partitions) based on the message namespace.
+    #[allow(clippy::future_not_send)]
+    async fn on_start_view_change(&self, msg: Message<StartViewChangeHeader>)
+    where
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+    {
+        let header = *msg.header();
+        let planes = self.plane.inner();
+
+        if let Some(ref consensus) = planes.0.consensus
+            && consensus.namespace() == header.namespace
+        {
+            let actions = consensus.handle_start_view_change(PlaneKind::Metadata, &header);
+            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            return;
+        }
+
+        if let Some(consensus) = planes.1.0.consensus()
+            && consensus.namespace() == header.namespace
+        {
+            let actions = consensus.handle_start_view_change(PlaneKind::Partitions, &header);
+            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
+            return;
+        }
+
+        tracing::warn!(
+            shard = self.id,
+            namespace = header.namespace,
+            view = header.view,
+            replica = header.replica,
+            "dropping StartViewChange: namespace matches neither metadata nor partitions consensus"
+        );
+    }
+
+    /// Handle an incoming view change message by routing it to the correct
+    /// consensus group (metadata or partitions) based on the message namespace.
+    #[allow(clippy::future_not_send)]
+    async fn on_start_view_change(&self, msg: Message<StartViewChangeHeader>)
+    where
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        PJ: JournalHandle,
+        <PJ as JournalHandle>::Target: Journal<
+                <PJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+    {
+        let header = *msg.header();
+        let planes = self.plane.inner();
+
+        if let Some(ref consensus) = planes.0.consensus
+            && consensus.namespace() == header.namespace
+        {
+            let actions = consensus.handle_start_view_change(PlaneKind::Metadata, &header);
+            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            return;
+        }
+
+        if let Some(consensus) = planes.1.0.consensus()
+            && consensus.namespace() == header.namespace
+        {
+            let actions = consensus.handle_start_view_change(PlaneKind::Partitions, &header);
+            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
+            return;
+        }
+
+        tracing::warn!(
+            shard = self.id,
+            namespace = header.namespace,
+            view = header.view,
+            replica = header.replica,
+            "dropping StartViewChange: namespace matches neither metadata nor partitions consensus"
+        );
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn on_do_view_change(&self, msg: Message<DoViewChangeHeader>)
+    where
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        PJ: JournalHandle,
+        <PJ as JournalHandle>::Target: Journal<
+                <PJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        M: StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = bytes::Bytes,
+                Error = iggy_common::IggyError,
+            >,
+    {
+        let header = *msg.header();
+        let planes = self.plane.inner();
+
+        if let Some(ref consensus) = planes.0.consensus
+            && consensus.namespace() == header.namespace
+        {
+            let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &header);
+            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            if actions
+                .iter()
+                .any(|a| matches!(a, VsrAction::CommitJournal))
+            {
+                planes.0.commit_journal().await;
+            }
+            return;
+        }
+
+        if let Some(consensus) = planes.1.0.consensus()
+            && consensus.namespace() == header.namespace
+        {
+            let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header);
+            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
+            if actions
+                .iter()
+                .any(|a| matches!(a, VsrAction::CommitJournal))
+            {
+                planes.1.0.commit_journal().await;
+            }
+            return;
+        }
+
+        tracing::warn!(
+            shard = self.id,
+            namespace = header.namespace,
+            view = header.view,
+            replica = header.replica,
+            "dropping DoViewChange: namespace matches neither metadata nor partitions consensus"
+        );
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn on_start_view(&self, msg: Message<StartViewHeader>)
+    where
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        PJ: JournalHandle,
+        <PJ as JournalHandle>::Target: Journal<
+                <PJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+    {
+        let header = *msg.header();
+        let planes = self.plane.inner();
+
+        if let Some(ref consensus) = planes.0.consensus
+            && consensus.namespace() == header.namespace
+        {
+            let actions = consensus.handle_start_view(PlaneKind::Metadata, &header);
+            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            return;
+        }
+
+        if let Some(consensus) = planes.1.0.consensus()
+            && consensus.namespace() == header.namespace
+        {
+            let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
+            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
+            return;
+        }
+
+        tracing::warn!(
+            shard = self.id,
+            namespace = header.namespace,
+            view = header.view,
+            replica = header.replica,
+            "dropping StartView: namespace matches neither metadata nor partitions consensus"
+        );
+    }
+
+    /// Handle an incoming `Commit` (primary heartbeat) message.
     ///
-    /// Currently handles `RetransmitPrepares` (primary retransmits
-    /// uncommitted prepares when the prepare timeout fires).
+    /// Routes to the correct consensus by namespace. The backup advances
+    /// `commit_max`, resets its `NormalHeartbeat` timeout, and commits
+    /// any newly committable ops from the journal.
+    #[allow(clippy::future_not_send)]
+    async fn on_commit(&self, msg: &Message<CommitHeader>)
+    where
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        PJ: JournalHandle,
+        <PJ as JournalHandle>::Target: Journal<
+                <PJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        M: StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = bytes::Bytes,
+                Error = iggy_common::IggyError,
+            >,
+    {
+        let header = *msg.header();
+        let planes = self.plane.inner();
+
+        if let Some(ref consensus) = planes.0.consensus
+            && consensus.namespace() == header.namespace
+        {
+            if consensus.handle_commit(&header) {
+                planes.0.commit_journal().await;
+            }
+            return;
+        }
+
+        if let Some(consensus) = planes.1.0.consensus()
+            && consensus.namespace() == header.namespace
+        {
+            if consensus.handle_commit(&header) {
+                planes.1.0.commit_journal().await;
+            }
+            return;
+        }
+
+        tracing::warn!(
+            shard = self.id,
+            namespace = header.namespace,
+            view = header.view,
+            replica = header.replica,
+            "dropping Commit: namespace matches neither metadata nor partitions consensus"
+        );
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn on_do_view_change(&self, msg: Message<DoViewChangeHeader>)
+    where
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        PJ: JournalHandle,
+        <PJ as JournalHandle>::Target: Journal<
+                <PJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        M: StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = bytes::Bytes,
+                Error = iggy_common::IggyError,
+            >,
+    {
+        let header = *msg.header();
+        let planes = self.plane.inner();
+
+        if let Some(ref consensus) = planes.0.consensus
+            && consensus.namespace() == header.namespace
+        {
+            let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &header);
+            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            if actions
+                .iter()
+                .any(|a| matches!(a, VsrAction::CommitJournal))
+            {
+                planes.0.commit_journal().await;
+            }
+            return;
+        }
+
+        if let Some(consensus) = planes.1.0.consensus()
+            && consensus.namespace() == header.namespace
+        {
+            let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header);
+            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
+            if actions
+                .iter()
+                .any(|a| matches!(a, VsrAction::CommitJournal))
+            {
+                planes.1.0.commit_journal().await;
+            }
+            return;
+        }
+
+        tracing::warn!(
+            shard = self.id,
+            namespace = header.namespace,
+            view = header.view,
+            replica = header.replica,
+            "dropping DoViewChange: namespace matches neither metadata nor partitions consensus"
+        );
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn on_start_view(&self, msg: Message<StartViewHeader>)
+    where
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        PJ: JournalHandle,
+        <PJ as JournalHandle>::Target: Journal<
+                <PJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+    {
+        let header = *msg.header();
+        let planes = self.plane.inner();
+
+        if let Some(ref consensus) = planes.0.consensus
+            && consensus.namespace() == header.namespace
+        {
+            let actions = consensus.handle_start_view(PlaneKind::Metadata, &header);
+            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
+            return;
+        }
+
+        if let Some(consensus) = planes.1.0.consensus()
+            && consensus.namespace() == header.namespace
+        {
+            let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
+            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
+            return;
+        }
+
+        tracing::warn!(
+            shard = self.id,
+            namespace = header.namespace,
+            view = header.view,
+            replica = header.replica,
+            "dropping StartView: namespace matches neither metadata nor partitions consensus"
+        );
+    }
+
+    /// Handle an incoming `Commit` (primary heartbeat) message.
+    ///
+    /// Routes to the correct consensus by namespace. The backup advances
+    /// `commit_max`, resets its `NormalHeartbeat` timeout, and commits
+    /// any newly committable ops from the journal.
+    #[allow(clippy::future_not_send)]
+    async fn on_commit(&self, msg: &Message<CommitHeader>)
+    where
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        PJ: JournalHandle,
+        <PJ as JournalHandle>::Target: Journal<
+                <PJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+        M: StateMachine<
+                Input = Message<PrepareHeader>,
+                Output = bytes::Bytes,
+                Error = iggy_common::IggyError,
+            >,
+    {
+        let header = *msg.header();
+        let planes = self.plane.inner();
+
+        if let Some(ref consensus) = planes.0.consensus
+            && consensus.namespace() == header.namespace
+        {
+            if consensus.handle_commit(&header) {
+                planes.0.commit_journal().await;
+            }
+            return;
+        }
+
+        if let Some(consensus) = planes.1.0.consensus()
+            && consensus.namespace() == header.namespace
+        {
+            if consensus.handle_commit(&header) {
+                planes.1.0.commit_journal().await;
+            }
+            return;
+        }
+
+        tracing::warn!(
+            shard = self.id,
+            namespace = header.namespace,
+            view = header.view,
+            replica = header.replica,
+            "dropping Commit: namespace matches neither metadata nor partitions consensus"
+        );
+    }
+
+    /// Tick the partitions consensus and dispatch any resulting actions.
     #[allow(clippy::future_not_send)]
     pub async fn tick_partitions(&self)
     where
@@ -430,30 +849,252 @@ where
             };
 
             let consensus = partition.consensus();
+            let journal = partition.log.journal();
             let current_op = consensus.sequencer().current_sequence();
             let current_commit = consensus.commit_min();
             let actions = consensus.tick(PlaneKind::Partitions, current_op, current_commit);
+            dispatch_vsr_actions(consensus, Some(journal), &actions).await;
+        }
+    }
+        #[allow(clippy::future_not_send)]
+    pub async fn tick_metadata(&self)
+    where
+        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
+    {
+        let metadata = self.plane.metadata();
+        let Some(ref consensus) = metadata.consensus else {
+            return;
+        };
 
-            for action in actions {
-                if let consensus::VsrAction::RetransmitPrepares { targets } = action {
-                    for (header, replicas) in targets {
-                        let Some(prepare) = partition.log.journal().inner.entry(&header).await
-                        else {
-                            continue;
-                        };
-                        let mut prepare_message = Message::<PrepareHeader>::new(prepare.len());
-                        prepare_message
-                            .as_mut_slice()
-                            .copy_from_slice(prepare.as_slice());
-                        for replica in replicas {
-                            let _ = consensus
-                                .message_bus()
-                                .send_to_replica(replica, prepare_message.clone().into_generic())
-                                .await;
-                        }
+        let current_op = consensus.sequencer().current_sequence();
+        let current_commit = consensus.commit_min();
+        let actions = consensus.tick(PlaneKind::Metadata, current_op, current_commit);
+
+        dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &actions).await;
+    }
+}
+
+
+
+/// Dispatch a list of `VsrAction`s by constructing the appropriate
+/// protocol messages and sending them via the consensus message bus.
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation
+)]
+async fn dispatch_vsr_actions<B, P, J>(
+    consensus: &VsrConsensus<B, P>,
+    journal: Option<&J>,
+    actions: &[VsrAction],
+) where
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+    J: JournalHandle,
+    <J as JournalHandle>::Target: Journal<
+            <J as JournalHandle>::Storage,
+            Entry = Message<PrepareHeader>,
+            Header = PrepareHeader,
+        >,
+{
+    use std::mem::size_of;
+
+    let bus = consensus.message_bus();
+    let self_id = consensus.replica();
+    let cluster = consensus.cluster();
+    let replica_count = consensus.replica_count();
+
+    let send = |target: u8, msg: Message<GenericHeader>| async move {
+        if let Err(e) = bus.send_to_replica(target, msg).await {
+            tracing::debug!(replica = self_id, target, "bus send failed: {e}");
+        }
+    };
+
+    for action in actions {
+        match action {
+            VsrAction::SendStartViewChange { view, namespace } => {
+                let msg = Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
+                    .transmute_header(|_, h: &mut StartViewChangeHeader| {
+                        h.command = Command2::StartViewChange;
+                        h.cluster = cluster;
+                        h.replica = self_id;
+                        h.view = *view;
+                        h.namespace = *namespace;
+                        h.size = size_of::<StartViewChangeHeader>() as u32;
+                    });
+                for target in 0..replica_count {
+                    if target != self_id {
+                        send(target, msg.deep_copy().into_generic()).await;
                     }
                 }
-                // TODO: Dispatch other VsrActions (view change messages, etc.)
+            }
+            VsrAction::SendDoViewChange {
+                view,
+                target,
+                log_view,
+                op,
+                commit,
+                namespace,
+            } => {
+                let msg = Message::<DoViewChangeHeader>::new(size_of::<DoViewChangeHeader>())
+                    .transmute_header(|_, h: &mut DoViewChangeHeader| {
+                        h.command = Command2::DoViewChange;
+                        h.cluster = cluster;
+                        h.replica = self_id;
+                        h.view = *view;
+                        h.log_view = *log_view;
+                        h.op = *op;
+                        h.commit = *commit;
+                        h.namespace = *namespace;
+                        h.size = size_of::<DoViewChangeHeader>() as u32;
+                    });
+                send(*target, msg.into_generic()).await;
+            }
+            VsrAction::SendStartView {
+                view,
+                op,
+                commit,
+                namespace,
+            } => {
+                let msg = Message::<StartViewHeader>::new(size_of::<StartViewHeader>())
+                    .transmute_header(|_, h: &mut StartViewHeader| {
+                        h.command = Command2::StartView;
+                        h.cluster = cluster;
+                        h.replica = self_id;
+                        h.view = *view;
+                        h.op = *op;
+                        h.commit = *commit;
+                        h.namespace = *namespace;
+                        h.size = size_of::<StartViewHeader>() as u32;
+                    });
+                for target in 0..replica_count {
+                    if target != self_id {
+                        send(target, msg.deep_copy().into_generic()).await;
+                    }
+                }
+            }
+            VsrAction::SendPrepareOk {
+                view,
+                from_op,
+                to_op,
+                target,
+                namespace,
+            } => {
+                let Some(journal) = journal else {
+                    continue;
+                };
+                for op in *from_op..=*to_op {
+                    let Some(prepare_header) = journal.handle().header(op as usize) else {
+                        continue;
+                    };
+                    let prepare_header = *prepare_header;
+                    let msg = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>())
+                        .transmute_header(|_, h: &mut PrepareOkHeader| {
+                            h.command = Command2::PrepareOk;
+                            h.cluster = cluster;
+                            h.replica = self_id;
+                            h.view = *view;
+                            h.op = op;
+                            h.commit = consensus.commit_max();
+                            h.timestamp = prepare_header.timestamp;
+                            h.parent = prepare_header.parent;
+                            h.prepare_checksum = prepare_header.checksum;
+                            h.request = prepare_header.request;
+                            h.operation = prepare_header.operation;
+                            h.namespace = *namespace;
+                            h.size = size_of::<PrepareOkHeader>() as u32;
+                        });
+                    send(*target, msg.into_generic()).await;
+                }
+            }
+            VsrAction::RetransmitPrepares { targets } => {
+                let Some(journal) = journal else {
+                    continue;
+                };
+                for (header, replicas) in targets {
+                    let Some(prepare) = journal.handle().entry(header).await else {
+                        continue;
+                    };
+                    for replica in replicas {
+                        send(*replica, prepare.clone().into_generic()).await;
+                    }
+                }
+            }
+            VsrAction::RebuildPipeline { from_op, to_op } => {
+                let Some(journal) = journal else {
+                    continue;
+                };
+                // Collect headers before borrowing the pipeline to avoid
+                // holding borrow_mut() across journal reads.
+                let mut gap_at = None;
+                let entries: Vec<_> = (*from_op..=*to_op)
+                    .map_while(|op| {
+                        let Some(header) = journal.handle().header(op as usize) else {
+                            gap_at = Some(op);
+                            return None;
+                        };
+                        let mut entry = consensus::PipelineEntry::new(*header);
+                        entry.add_ack(self_id);
+                        Some(entry)
+                    })
+                    .collect();
+                if let Some(missing_op) = gap_at {
+                    // Journal repair is not yet implemented.Truncate the sequencer
+                    // to the last op we could rebuild so the next client
+                    // prepare chains correctly. Ops above the
+                    // gap are lost until journal repair is added.
+                    let rebuilt_up_to = missing_op.saturating_sub(1);
+                    tracing::warn!(
+                        replica = self_id,
+                        missing_op,
+                        range_start = from_op,
+                        range_end = to_op,
+                        rebuilt = entries.len(),
+                        "RebuildPipeline: journal gap at op {missing_op}, \
+                         truncating sequencer from {to_op} to {rebuilt_up_to} \
+                         ({}/{} ops rebuilt)",
+                        entries.len(),
+                        to_op - from_op + 1,
+                    );
+                    consensus.sequencer().set_sequence(rebuilt_up_to);
+                }
+                let mut pipeline = consensus.pipeline().borrow_mut();
+                for entry in entries {
+                    pipeline.push(entry);
+                }
+            }
+            // Handled by the caller (shard view change handlers) since it
+            // requires access to the plane's commit_journal method.
+            VsrAction::CommitJournal => {}
+            VsrAction::SendCommit {
+                view,
+                commit,
+                namespace,
+                timestamp_monotonic,
+            } => {
+                let msg = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
+                    |_, h: &mut CommitHeader| {
+                        h.command = Command2::Commit;
+                        h.cluster = cluster;
+                        h.replica = self_id;
+                        h.view = *view;
+                        h.commit = *commit;
+                        h.namespace = *namespace;
+                        h.timestamp_monotonic = *timestamp_monotonic;
+                        h.size = size_of::<CommitHeader>() as u32;
+                    },
+                );
+                for target in 0..replica_count {
+                    if target != self_id {
+                        send(target, msg.deep_copy().into_generic()).await;
+                    }
+                }
             }
         }
     }

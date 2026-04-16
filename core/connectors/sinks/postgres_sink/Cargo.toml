@@ -27,6 +27,7 @@ homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
+publish = false
 
 [package.metadata.cargo-machete]
 ignored = ["dashmap", "once_cell", "futures", "simd-json", "prost"]
