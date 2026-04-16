@@ -795,7 +795,28 @@ where
             return;
         }
 
-        self.handle_committed_entries(drained, config).await;
+        self.handle_committed_entries(drained, config, true).await;
+        {
+            let consensus = self.consensus();
+            emit_namespace_progress_event(
+                SimEventKind::NamespaceProgressUpdated,
+                &ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                consensus.commit_min(),
+                consensus.pipeline().borrow().len(),
+            );
+        }
+    }
+
+    #[allow(clippy::future_not_send)]
+    pub async fn commit_journal(&mut self, config: &PartitionsConfig) {
+        self.clear_pending_consumer_offset_commits_if_view_changed();
+
+        let drained = drain_committable_prefix(self.consensus());
+        if drained.is_empty() {
+            return;
+        }
+
+        self.handle_committed_entries(drained, config, false).await;
         {
             let consensus = self.consensus();
             emit_namespace_progress_event(
@@ -993,6 +1014,7 @@ where
         &mut self,
         drained: Vec<PipelineEntry>,
         config: &PartitionsConfig,
+        send_client_replies: bool,
     ) {
         let replica_id = self.consensus.replica();
         let namespace_raw = self.consensus.namespace();
@@ -1049,26 +1071,28 @@ where
                 pipeline_depth,
             );
 
-            let reply_buffers =
-                build_reply_message(&self.consensus, &prepare_header, bytes::Bytes::new())
-                    .into_generic();
-            emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
+            if send_client_replies {
+                let reply_buffers =
+                    build_reply_message(&self.consensus, &prepare_header, bytes::Bytes::new())
+                        .into_generic();
+                emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
 
-            if let Err(error) = self
-                .consensus
-                .message_bus()
-                .send_to_client(prepare_header.client, reply_buffers)
-                .await
-            {
-                warn!(
-                    target: "iggy.partitions.diag",
-                    plane = "partitions",
-                    client = prepare_header.client,
-                    op = prepare_header.op,
-                    namespace_raw,
-                    %error,
-                    "failed to send reply to client"
-                );
+                if let Err(error) = self
+                    .consensus
+                    .message_bus()
+                    .send_to_client(prepare_header.client, reply_buffers)
+                    .await
+                {
+                    warn!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        client = prepare_header.client,
+                        op = prepare_header.op,
+                        namespace_raw,
+                        %error,
+                        "failed to send reply to client"
+                    );
+                }
             }
         }
 

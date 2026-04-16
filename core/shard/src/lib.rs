@@ -19,7 +19,7 @@ mod router;
 pub mod shards_table;
 
 use consensus::{
-    MetadataHandle, LocalPipeline, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind,
+    LocalPipeline, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind,
     Sequencer, VsrAction, VsrConsensus,
 };
 use iggy_binary_protocol::{
@@ -418,8 +418,8 @@ where
         partitions.insert(namespace, partition);
     }
 
-    /// Handle an incoming view change message by routing it to the correct
-    /// consensus group (metadata or partitions) based on the message namespace.
+    /// Handle incoming view-change/control message. Metadata use metadata
+    /// consensus. Partitions loop all partitions, use partition consensus.
     #[allow(clippy::future_not_send)]
     async fn on_start_view_change(&self, msg: Message<StartViewChangeHeader>)
     where
@@ -442,11 +442,18 @@ where
             return;
         }
 
-        if let Some(consensus) = planes.1.0.consensus()
-            && consensus.namespace() == header.namespace
-        {
+        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
+        for namespace in namespaces {
+            let Some(partition) = planes.1.0.get_by_ns(&namespace) else {
+                continue;
+            };
+            let consensus = partition.consensus();
+            if consensus.namespace() != header.namespace {
+                continue;
+            }
+
             let actions = consensus.handle_start_view_change(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
+            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
             return;
         }
 
@@ -455,54 +462,7 @@ where
             namespace = header.namespace,
             view = header.view,
             replica = header.replica,
-            "dropping StartViewChange: namespace matches neither metadata nor partitions consensus"
-        );
-    }
-
-    /// Handle an incoming view change message by routing it to the correct
-    /// consensus group (metadata or partitions) based on the message namespace.
-    #[allow(clippy::future_not_send)]
-    async fn on_start_view_change(&self, msg: Message<StartViewChangeHeader>)
-    where
-        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-        MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-    {
-        let header = *msg.header();
-        let planes = self.plane.inner();
-
-        if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
-        {
-            let actions = consensus.handle_start_view_change(PlaneKind::Metadata, &header);
-            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
-            return;
-        }
-
-        if let Some(consensus) = planes.1.0.consensus()
-            && consensus.namespace() == header.namespace
-        {
-            let actions = consensus.handle_start_view_change(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
-            return;
-        }
-
-        tracing::warn!(
-            shard = self.id,
-            namespace = header.namespace,
-            view = header.view,
-            replica = header.replica,
-            "dropping StartViewChange: namespace matches neither metadata nor partitions consensus"
+            "dropping StartViewChange: namespace matches neither metadata nor partition consensus"
         );
     }
 
@@ -513,12 +473,6 @@ where
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target: Journal<
                 <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
@@ -538,23 +492,31 @@ where
             dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
             if actions
                 .iter()
-                .any(|a| matches!(a, VsrAction::CommitJournal))
+                .any(|action| matches!(action, VsrAction::CommitJournal))
             {
                 planes.0.commit_journal().await;
             }
             return;
         }
 
-        if let Some(consensus) = planes.1.0.consensus()
-            && consensus.namespace() == header.namespace
-        {
+        let config = planes.1.0.config().clone();
+        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
+        for namespace in namespaces {
+            let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
+                continue;
+            };
+            let consensus = partition.consensus();
+            if consensus.namespace() != header.namespace {
+                continue;
+            }
+
             let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
+            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
             if actions
                 .iter()
-                .any(|a| matches!(a, VsrAction::CommitJournal))
+                .any(|action| matches!(action, VsrAction::CommitJournal))
             {
-                planes.1.0.commit_journal().await;
+                partition.commit_journal(&config).await;
             }
             return;
         }
@@ -564,7 +526,7 @@ where
             namespace = header.namespace,
             view = header.view,
             replica = header.replica,
-            "dropping DoViewChange: namespace matches neither metadata nor partitions consensus"
+            "dropping DoViewChange: namespace matches neither metadata nor partition consensus"
         );
     }
 
@@ -575,12 +537,6 @@ where
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target: Journal<
                 <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
@@ -596,11 +552,18 @@ where
             return;
         }
 
-        if let Some(consensus) = planes.1.0.consensus()
-            && consensus.namespace() == header.namespace
-        {
+        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
+        for namespace in namespaces {
+            let Some(partition) = planes.1.0.get_by_ns(&namespace) else {
+                continue;
+            };
+            let consensus = partition.consensus();
+            if consensus.namespace() != header.namespace {
+                continue;
+            }
+
             let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
+            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
             return;
         }
 
@@ -609,15 +572,10 @@ where
             namespace = header.namespace,
             view = header.view,
             replica = header.replica,
-            "dropping StartView: namespace matches neither metadata nor partitions consensus"
+            "dropping StartView: namespace matches neither metadata nor partition consensus"
         );
     }
 
-    /// Handle an incoming `Commit` (primary heartbeat) message.
-    ///
-    /// Routes to the correct consensus by namespace. The backup advances
-    /// `commit_max`, resets its `NormalHeartbeat` timeout, and commits
-    /// any newly committable ops from the journal.
     #[allow(clippy::future_not_send)]
     async fn on_commit(&self, msg: &Message<CommitHeader>)
     where
@@ -628,12 +586,6 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
@@ -652,11 +604,19 @@ where
             return;
         }
 
-        if let Some(consensus) = planes.1.0.consensus()
-            && consensus.namespace() == header.namespace
-        {
+        let config = planes.1.0.config().clone();
+        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
+        for namespace in namespaces {
+            let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
+                continue;
+            };
+            let consensus = partition.consensus();
+            if consensus.namespace() != header.namespace {
+                continue;
+            }
+
             if consensus.handle_commit(&header) {
-                planes.1.0.commit_journal().await;
+                partition.commit_journal(&config).await;
             }
             return;
         }
@@ -666,179 +626,21 @@ where
             namespace = header.namespace,
             view = header.view,
             replica = header.replica,
-            "dropping Commit: namespace matches neither metadata nor partitions consensus"
+            "dropping Commit: namespace matches neither metadata nor partition consensus"
         );
     }
 
-    #[allow(clippy::future_not_send)]
-    async fn on_do_view_change(&self, msg: Message<DoViewChangeHeader>)
-    where
-        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-        MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-        M: StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
-                Error = iggy_common::IggyError,
-            >,
-    {
-        let header = *msg.header();
-        let planes = self.plane.inner();
-
-        if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
-        {
-            let actions = consensus.handle_do_view_change(PlaneKind::Metadata, &header);
-            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
-            if actions
-                .iter()
-                .any(|a| matches!(a, VsrAction::CommitJournal))
-            {
-                planes.0.commit_journal().await;
-            }
-            return;
-        }
-
-        if let Some(consensus) = planes.1.0.consensus()
-            && consensus.namespace() == header.namespace
-        {
-            let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
-            if actions
-                .iter()
-                .any(|a| matches!(a, VsrAction::CommitJournal))
-            {
-                planes.1.0.commit_journal().await;
-            }
-            return;
-        }
-
-        tracing::warn!(
-            shard = self.id,
-            namespace = header.namespace,
-            view = header.view,
-            replica = header.replica,
-            "dropping DoViewChange: namespace matches neither metadata nor partitions consensus"
-        );
-    }
-
-    #[allow(clippy::future_not_send)]
-    async fn on_start_view(&self, msg: Message<StartViewHeader>)
-    where
-        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-        MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-    {
-        let header = *msg.header();
-        let planes = self.plane.inner();
-
-        if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
-        {
-            let actions = consensus.handle_start_view(PlaneKind::Metadata, &header);
-            dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
-            return;
-        }
-
-        if let Some(consensus) = planes.1.0.consensus()
-            && consensus.namespace() == header.namespace
-        {
-            let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
-            return;
-        }
-
-        tracing::warn!(
-            shard = self.id,
-            namespace = header.namespace,
-            view = header.view,
-            replica = header.replica,
-            "dropping StartView: namespace matches neither metadata nor partitions consensus"
-        );
-    }
-
-    /// Handle an incoming `Commit` (primary heartbeat) message.
-    ///
-    /// Routes to the correct consensus by namespace. The backup advances
-    /// `commit_max`, resets its `NormalHeartbeat` timeout, and commits
-    /// any newly committable ops from the journal.
-    #[allow(clippy::future_not_send)]
-    async fn on_commit(&self, msg: &Message<CommitHeader>)
-    where
-        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-        MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-        M: StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = bytes::Bytes,
-                Error = iggy_common::IggyError,
-            >,
-    {
-        let header = *msg.header();
-        let planes = self.plane.inner();
-
-        if let Some(ref consensus) = planes.0.consensus
-            && consensus.namespace() == header.namespace
-        {
-            if consensus.handle_commit(&header) {
-                planes.0.commit_journal().await;
-            }
-            return;
-        }
-
-        if let Some(consensus) = planes.1.0.consensus()
-            && consensus.namespace() == header.namespace
-        {
-            if consensus.handle_commit(&header) {
-                planes.1.0.commit_journal().await;
-            }
-            return;
-        }
-
-        tracing::warn!(
-            shard = self.id,
-            namespace = header.namespace,
-            view = header.view,
-            replica = header.replica,
-            "dropping Commit: namespace matches neither metadata nor partitions consensus"
-        );
-    }
-
-    /// Tick the partitions consensus and dispatch any resulting actions.
+    /// Tick partition consensuses. Loop partitions. No partitions-plane journal.
     #[allow(clippy::future_not_send)]
     pub async fn tick_partitions(&self)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
+                Entry = Message<PrepareHeader>,
+                Header = PrepareHeader,
+            >,
     {
         let partitions = self.plane.partitions();
         let namespaces: Vec<_> = partitions.namespaces().copied().collect();
@@ -849,14 +651,14 @@ where
             };
 
             let consensus = partition.consensus();
-            let journal = partition.log.journal();
             let current_op = consensus.sequencer().current_sequence();
             let current_commit = consensus.commit_min();
             let actions = consensus.tick(PlaneKind::Partitions, current_op, current_commit);
-            dispatch_vsr_actions(consensus, Some(journal), &actions).await;
+            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
         }
     }
-        #[allow(clippy::future_not_send)]
+
+    #[allow(clippy::future_not_send)]
     pub async fn tick_metadata(&self)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
@@ -879,8 +681,6 @@ where
         dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &actions).await;
     }
 }
-
-
 
 /// Dispatch a list of `VsrAction`s by constructing the appropriate
 /// protocol messages and sending them via the consensus message bus.
