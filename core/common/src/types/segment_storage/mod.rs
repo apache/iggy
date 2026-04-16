@@ -15,21 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod direct_file;
 mod index_reader;
 mod index_writer;
 mod messages_reader;
 mod messages_writer;
 
 use crate::{IggyError, IggyMessagesBatch};
+use std::rc::Rc;
+
 use bytes::Bytes;
 use compio::{fs::File, io::AsyncWriteAtExt};
-use std::rc::Rc;
-use tracing::error;
-
 pub use index_reader::IndexReader;
 pub use index_writer::IndexWriter;
 pub use messages_reader::MessagesReader;
 pub use messages_writer::MessagesWriter;
+use tracing::error;
 
 /// Maximum number of IO vectors for a single writev() call.
 /// Linux typically has IOV_MAX=1024, but we use a conservative value to ensure
@@ -88,21 +89,47 @@ pub struct SegmentStorage {
     pub index_reader: Option<Rc<IndexReader>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StorageOpenOptions {
+    pub messages_size: u64,
+    pub indexes_size: u64,
+    pub log_fsync: bool,
+    pub index_fsync: bool,
+    pub file_exists: bool,
+    pub direct_io: bool,
+    pub direct_io_dsync: bool,
+}
+
 impl SegmentStorage {
     pub async fn new(
         messages_path: &str,
         index_path: &str,
-        messages_size: u64,
-        indexes_size: u64,
-        log_fsync: bool,
-        index_fsync: bool,
-        file_exists: bool,
+        opts: StorageOpenOptions,
     ) -> Result<Self, IggyError> {
+        let StorageOpenOptions {
+            messages_size,
+            indexes_size,
+            log_fsync,
+            index_fsync,
+            file_exists,
+            direct_io,
+            direct_io_dsync,
+        } = opts;
+
         let size = Rc::new(std::sync::atomic::AtomicU64::new(messages_size));
         let indexes_size = Rc::new(std::sync::atomic::AtomicU64::new(indexes_size));
         let messages_writer = Rc::new(
-            MessagesWriter::new(messages_path, size.clone(), log_fsync, file_exists).await?,
+            MessagesWriter::new(
+                messages_path,
+                size.clone(),
+                log_fsync,
+                file_exists,
+                direct_io,
+                direct_io_dsync,
+            )
+            .await?,
         );
+        let shared_tail = messages_writer.try_get_shared_tail();
 
         let index_writer = Rc::new(
             IndexWriter::new(index_path, indexes_size.clone(), index_fsync, file_exists).await?,
@@ -113,7 +140,7 @@ impl SegmentStorage {
             index_writer.fsync().await?;
         }
 
-        let messages_reader = Rc::new(MessagesReader::new(messages_path, size).await?);
+        let messages_reader = Rc::new(MessagesReader::new(messages_path, size, shared_tail).await?);
         let index_reader = Rc::new(IndexReader::new(index_path, indexes_size).await?);
         Ok(Self {
             messages_writer: Some(messages_writer),

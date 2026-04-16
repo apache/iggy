@@ -205,9 +205,24 @@ impl<'a> Iterator for IggyMessageViewIterator<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::{str::FromStr, sync::Once};
+
     use super::*;
-    use crate::IggyMessage;
+    use crate::{IggyMessage, MemoryPool, MemoryPoolConfigOther};
     use bytes::Bytes;
+
+    static TEST_INIT: Once = Once::new();
+
+    fn initialize_pool_for_tests() {
+        TEST_INIT.call_once(|| {
+            let config = MemoryPoolConfigOther {
+                enabled: true,
+                size: IggyByteSize::from_str("4GiB").unwrap(),
+                bucket_capacity: 8192,
+            };
+            MemoryPool::init_pool(&config);
+        });
+    }
 
     fn build_batch() -> crate::IggyMessagesBatch {
         let messages = vec![
@@ -229,6 +244,7 @@ mod tests {
 
     #[test]
     fn should_return_tail_for_indexed_last_after_next() {
+        initialize_pool_for_tests();
         let batch = build_batch();
         let mut iter = IggyMessageViewIterator::new_with_boundaries(
             batch.buffer(),
@@ -246,6 +262,7 @@ mod tests {
 
     #[test]
     fn should_return_last_message_for_raw_last() {
+        initialize_pool_for_tests();
         let batch = build_batch();
         let last = IggyMessageViewIterator::new(batch.buffer()).last().unwrap();
         assert_eq!(last.payload(), b"three");

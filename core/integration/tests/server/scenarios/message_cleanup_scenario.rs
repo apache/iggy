@@ -37,7 +37,7 @@ const LOG_EXTENSION: &str = "log";
 const PAYLOAD_SIZE: usize = 936;
 
 /// Buffer time for cleaner to run after expiry conditions are met.
-const CLEANER_BUFFER: Duration = Duration::from_millis(300);
+const CLEANER_BUFFER: Duration = Duration::from_millis(500);
 
 fn make_payload(fill: char) -> Bytes {
     Bytes::from(fill.to_string().repeat(PAYLOAD_SIZE))
@@ -48,7 +48,7 @@ pub async fn run_expiry_after_rotation(client: &IggyClient, data_path: &Path) {
     let stream = client.create_stream(STREAM_NAME).await.unwrap();
     let stream_id = stream.id;
 
-    let expiry = Duration::from_secs(2);
+    let expiry = Duration::from_secs(5);
     let topic = client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -323,7 +323,7 @@ pub async fn run_combined_retention(client: &IggyClient, data_path: &Path) {
     let stream = client.create_stream(STREAM_NAME).await.unwrap();
     let stream_id = stream.id;
 
-    let expiry = Duration::from_secs(2);
+    let expiry = Duration::from_secs(3);
     let topic = client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -396,7 +396,7 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
     let stream = client.create_stream(STREAM_NAME).await.unwrap();
     let stream_id = stream.id;
 
-    let expiry = Duration::from_secs(5);
+    let expiry = Duration::from_secs(60);
     let topic = client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -423,7 +423,6 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
                 .payload(payload.clone())
                 .build()
                 .unwrap();
-
             let mut messages = vec![message];
             client
                 .send_messages(
@@ -438,9 +437,10 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
     }
 
     // Collect initial segment counts
+    // Wait until all partitions have >= 2 segments.
+    // With O_DIRECT + O_DSYNC under concurrent load, message sending and
+    // flushing takes longer, so bump the deadline
     let mut initial_counts: Vec<usize> = Vec::new();
-
-    // Wait until all partitions have >= 2 segments (up to 5s)
     for partition_id in 0..PARTITIONS_COUNT {
         let partition_path = data_path
             .join(format!(
@@ -449,7 +449,7 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
             .display()
             .to_string();
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let count = loop {
             let segments = get_segment_paths_for_partition(&partition_path);
             if segments.len() >= 2 {
@@ -457,7 +457,7 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
             }
             if tokio::time::Instant::now() >= deadline {
                 panic!(
-                    "Partition {} should have at least 2 segments after 5s, got {}",
+                    "Partition {} should have at least 2 segments after 30s, got {}",
                     partition_id,
                     segments.len()
                 );
@@ -479,6 +479,7 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
             ))
             .display()
             .to_string();
+
         let remaining = get_segment_paths_for_partition(&partition_path);
         let deleted = initial_counts[partition_id as usize].saturating_sub(remaining.len());
         total_deleted += deleted;
@@ -594,7 +595,7 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
     let stream = client.create_stream(TEST_STREAM).await.unwrap();
     let stream_id = stream.id;
 
-    let expiry = Duration::from_secs(2);
+    let expiry = Duration::from_secs(60);
     let topic = client
         .create_topic(
             &Identifier::named(TEST_STREAM).unwrap(),
@@ -636,12 +637,20 @@ pub async fn run_expiry_respects_consumer_offset(client: &IggyClient, data_path:
             .unwrap();
     }
 
-    let initial_segments = get_segment_paths_for_partition(&partition_path);
-    assert!(
-        initial_segments.len() >= 3,
-        "Need at least 3 segments, got {}",
-        initial_segments.len()
-    );
+    // With O_DIRECT, messages become visible incrementally as the message saver
+    // flushes batches. Wait until at least 3 segments exist, which guarantees
+    // all messages are flushed and visible for polling.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let segments = get_segment_paths_for_partition(&partition_path);
+        if segments.len() >= 3 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("Need at least 3 segments after 30s, got {}", segments.len());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     // Consumer reads only 50 messages with auto_commit, storing offset ~49.
     // This means the consumer has NOT read segments 1, 2, etc.

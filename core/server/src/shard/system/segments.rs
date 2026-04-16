@@ -525,11 +525,15 @@ impl IggyShard {
     /// Safety: called exclusively from the message pump (via append handler) — the captured
     /// `old_segment_index` remains valid across the `create_segment_storage` await because
     /// no other handler can modify the segment vec while this frame is in progress.
+    /// SAFETY: Single-threaded compio shard. No concurrent borrows possible.
+    #[allow(clippy::await_holding_refcell_ref)]
     pub(crate) async fn rotate_segment_in_local_partitions(
         &self,
         namespace: &IggyNamespace,
     ) -> Result<(), IggyError> {
         use crate::streaming::segments::storage::create_segment_storage;
+
+        tracing::error!("===append_messages: ROTATING segment for {:?}", namespace);
 
         let (start_offset, old_segment_index) = {
             let mut partitions = self.local_partitions.borrow_mut();
@@ -569,6 +573,11 @@ impl IggyShard {
             // Close writers for the sealed segment - they're never needed after sealing.
             // This releases file handles and associated kernel/io_uring resources.
             let old_storage = &mut partition.log.storages_mut()[old_segment_index];
+
+            // TODO(tungtose): this should be remove after MessageReader open with O_DIRECT
+            if let Some(ref messages_writer) = old_storage.messages_writer {
+                messages_writer.flush_and_truncate().await?;
+            }
             let _ = old_storage.shutdown();
 
             partition.log.add_persisted_segment(segment, storage);

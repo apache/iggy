@@ -216,6 +216,10 @@ pub struct PartitionsConfig {
     pub enforce_fsync: bool,
     /// Maximum size of a single segment before rotation.
     pub segment_size: IggyByteSize,
+    /// Whether to use direct io
+    pub direct_io: bool,
+    /// Use `O_DSYNC`
+    pub direct_io_dsync: bool,
 }
 
 impl PartitionsConfig {

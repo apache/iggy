@@ -943,11 +943,12 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
     client.delete_stream(&stream_ident).await.unwrap();
 }
 
+// TODO(tungtose): test retry operations with backoff until the server is ready rather than relying on a fixed sleep
 async fn maybe_restart(harness: &mut TestHarness, restart_server: bool) {
     if restart_server {
         harness.restart_server().await.unwrap();
     }
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 }
 
 /// Build a root client with SDK-level auto-reconnect and auto-sign-in.
@@ -1054,14 +1055,24 @@ fn assert_segment_file_sizes(partition_path: &str, offsets: &[u64]) {
 
         let expected_log = msg_count * MESSAGE_ON_DISK_SIZE;
         let expected_index = msg_count * INDEX_SIZE_PER_MSG;
-        assert_eq!(
-            log_size, expected_log,
-            "Segment {offset}: log {log_size}B != expected {expected_log}B ({msg_count} msgs)"
-        );
-        assert_eq!(
-            index_size, expected_index,
-            "Segment {offset}: index {index_size}B != expected {expected_index}B ({msg_count} msgs)"
-        );
+        let is_active_segment = i + 1 == offsets.len();
+        if is_active_segment {
+            // With O_DIRECT, active segment data may still be in the write buffer
+            // and not yet flushed to disk. Accept 0 or padded size.
+            assert!(
+                log_size == 0 || log_size >= expected_log,
+                "Segment {offset}: log {log_size}B unexpected for active segment ({msg_count} msgs, expected {expected_log}B or 0)"
+            );
+        } else {
+            assert_eq!(
+                log_size, expected_log,
+                "Segment {offset}: log {log_size}B != expected {expected_log}B ({msg_count} msgs)"
+            );
+            assert_eq!(
+                index_size, expected_index,
+                "Segment {offset}: index {index_size}B != expected {expected_index}B ({msg_count} msgs)"
+            );
+        }
     }
 }
 

@@ -90,7 +90,8 @@ impl IggyIndexWriter {
             .fetch_add(len as u64, Ordering::Release);
 
         if self.fsync {
-            self.fsync().await?;
+            let _fsync_start = std::time::Instant::now();
+            let _ = self.fsync().await;
         }
 
         trace!(

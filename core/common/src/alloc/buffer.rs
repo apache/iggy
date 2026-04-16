@@ -24,6 +24,7 @@ use compio::buf::{IoBuf, IoBufMut, SetLen};
 use std::{
     mem::MaybeUninit,
     ops::{Deref, DerefMut},
+    sync::Arc,
 };
 
 /// A buffer wrapper that participates in memory pooling.
@@ -265,10 +266,9 @@ impl PooledBuffer {
     /// After calling this method, the PooledBuffer becomes empty and will not
     /// return memory to the pool on drop (the frozen Bytes owns the allocation).
     /// The returned `Bytes` is Arc-backed, allowing cheap clones.
-    pub fn freeze(&mut self) -> Bytes {
+    pub fn freeze_to_bytes(&mut self) -> Bytes {
         let buf = std::mem::replace(&mut self.inner, AlignedBuffer::new(ALIGNMENT));
 
-        // Update pool accounting
         if self.from_pool
             && let Some(bucket_idx) = self.original_bucket_idx
         {
@@ -278,9 +278,36 @@ impl PooledBuffer {
         self.original_capacity = 0;
         self.original_bucket_idx = None;
 
-        // Zero copy: Bytes takes ownership of the AlignedBuffer
-        // and will drop it when refcount reaches zero
         Bytes::from_owner(buf)
+    }
+
+    pub fn freeze(&mut self) -> FrozenPooledBuffer {
+        let buf = std::mem::replace(&mut self.inner, AlignedBuffer::new(ALIGNMENT));
+        let len = buf.len();
+
+        // Transfer pool metadata to frozen buffer
+        let pool_meta = if self.from_pool {
+            Some(PoolMeta {
+                original_capacity: self.original_capacity,
+                original_bucket_idx: self.original_bucket_idx,
+            })
+        } else {
+            None
+        };
+
+        // Reset self, pool accounting now lives in FrozenPooledBuffer
+        self.from_pool = false;
+        self.original_capacity = 0;
+        self.original_bucket_idx = None;
+
+        FrozenPooledBuffer {
+            inner: Arc::new(FrozenInner {
+                buffer: buf,
+                pool_meta,
+            }),
+            offset: 0,
+            len,
+        }
     }
 }
 
@@ -344,5 +371,135 @@ impl IoBufMut for PooledBuffer {
         let ptr = self.inner.as_mut_ptr().cast::<MaybeUninit<u8>>();
         let cap = self.inner.capacity();
         unsafe { std::slice::from_raw_parts_mut(ptr, cap) }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PoolMeta {
+    original_capacity: usize,
+    original_bucket_idx: Option<usize>,
+}
+
+#[derive(Debug)]
+struct FrozenInner {
+    buffer: AlignedBuffer,
+    pool_meta: Option<PoolMeta>,
+}
+
+impl Drop for FrozenInner {
+    fn drop(&mut self) {
+        if let Some(ref meta) = self.pool_meta {
+            let buf = std::mem::replace(&mut self.buffer, AlignedBuffer::new(ALIGNMENT));
+            buf.return_to_pool(meta.original_capacity, true);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FrozenPooledBuffer {
+    inner: Arc<FrozenInner>,
+    offset: usize,
+    len: usize,
+}
+
+impl FrozenPooledBuffer {
+    /// Try to reclaim the underlying `PooledBuffer` without copying.
+    ///
+    /// Success when:
+    /// 1. This is the sole `Arc` reference (refcount == 1)
+    /// 2. This view covers the entire buffer (not a sub-slice)
+    ///
+    ///
+    /// On success, pool accounting is transferred back to the returned `PooledBuffer`.
+    /// On failure, `self` is return unchanged
+    pub fn thaw(self) -> Result<PooledBuffer, FrozenPooledBuffer> {
+        // Sub-slice views can't reclaim the whole buffer
+        if self.offset != 0 || self.len != self.inner.buffer.len() {
+            return Err(self);
+        }
+
+        match Arc::try_unwrap(self.inner) {
+            Ok(mut frozen_inner) => {
+                let buffer =
+                    std::mem::replace(&mut frozen_inner.buffer, AlignedBuffer::new(ALIGNMENT));
+
+                // Extract pool metadata and prevent FrozenInner::drop from returning the buffer to
+                // the pool -> we are taking ownership
+                let pool_meta = frozen_inner.pool_meta.take();
+                let (from_pool, original_capacity, original_bucket_idx) = match pool_meta {
+                    Some(meta) => (true, meta.original_capacity, meta.original_bucket_idx),
+                    None => (false, buffer.capacity(), None),
+                };
+
+                Ok(PooledBuffer {
+                    from_pool,
+                    original_capacity,
+                    original_bucket_idx,
+                    inner: buffer,
+                })
+            }
+            Err(arc) => Err(FrozenPooledBuffer {
+                inner: arc,
+                offset: self.offset,
+                len: self.len,
+            }),
+        }
+    }
+
+    /// Create a subslice view. Try to be cheap.
+    /// Panics if the range is out of bounds
+    pub fn slice(&self, range: std::ops::Range<usize>) -> FrozenPooledBuffer {
+        assert!(
+            range.end <= self.len,
+            "slice out of bounds: {}..{} but len is {}",
+            range.start,
+            range.end,
+            self.len
+        );
+
+        FrozenPooledBuffer {
+            inner: Arc::clone(&self.inner),
+            offset: self.offset + range.start,
+            len: range.end - range.start,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn is_aligned(&self) -> bool {
+        (self.as_ref().as_ptr() as usize).is_multiple_of(ALIGNMENT)
+    }
+}
+
+impl AsRef<[u8]> for FrozenPooledBuffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.inner.buffer[self.offset..self.offset + self.len]
+    }
+}
+
+impl Deref for FrozenPooledBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl PartialEq for FrozenPooledBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+/// Allow passing FrozenPooledBuffer directly to DirectFile's write methods without any copy
+impl IoBuf for FrozenPooledBuffer {
+    fn as_init(&self) -> &[u8] {
+        self.as_ref()
     }
 }

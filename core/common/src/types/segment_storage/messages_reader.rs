@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::types::segment_storage::direct_file::SharedTail;
 use crate::{IggyError, IggyIndexesMut, IggyMessagesBatchMut, PooledBuffer};
 use compio::buf::{IntoInner, IoBuf};
 use compio::fs::{File, OpenOptions};
@@ -33,6 +34,7 @@ pub struct MessagesReader {
     file_path: String,
     file: File,
     messages_size_bytes: Rc<AtomicU64>,
+    shared_tail: Option<Rc<SharedTail>>,
 }
 
 // Safety: We are guaranteeing that MessagesReader will never be used from multiple threads
@@ -43,6 +45,7 @@ impl MessagesReader {
     pub async fn new(
         file_path: &str,
         messages_size_bytes: Rc<AtomicU64>,
+        shared_tail: Option<Rc<SharedTail>>,
     ) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
             .read(true)
@@ -77,6 +80,7 @@ impl MessagesReader {
             file_path: file_path.to_string(),
             file,
             messages_size_bytes,
+            shared_tail,
         })
     }
 
@@ -127,21 +131,85 @@ impl MessagesReader {
         self.messages_size_bytes.load(Ordering::Acquire) as u32
     }
 
-    /// Reads `len` bytes from the messages file at the specified `offset`.
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn read_at(
         &self,
         offset: u32,
         len: u32,
         _use_pool: bool,
     ) -> Result<PooledBuffer, std::io::Error> {
-        let buf = PooledBuffer::with_capacity(len as usize);
+        if let Some(ref tail) = self.shared_tail {
+            let (tail_start, tail_end, tail_data) = tail.snapshot();
+            let read_start = offset as u64;
+            let read_end = read_start + len as u64;
 
+            // Entirely before tail — normal disk read
+            if read_end <= tail_start || tail_data.is_empty() {
+                return self.read_from_disk(offset, len).await;
+            }
+
+            // Entirely within tail
+            if read_start >= tail_start && read_end <= tail_end {
+                let tail_offset = (read_start - tail_start) as usize;
+                let end = tail_offset + len as usize;
+                if end > tail_data.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "tail read out of bounds: offset {} + len {} > tail {}",
+                            tail_offset,
+                            len,
+                            tail_data.len()
+                        ),
+                    ));
+                }
+                let mut result = PooledBuffer::with_capacity(len as usize);
+                result.extend_from_slice(&tail_data[tail_offset..end]);
+                return Ok(result);
+            }
+
+            // Split: part disk, part tail
+            if read_start < tail_start && read_end > tail_start {
+                let disk_len = (tail_start - read_start) as u32;
+                let tail_read_len = (read_end - tail_start) as usize;
+                if tail_read_len > tail_data.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "tail split read out of bounds: need {} but tail has {}",
+                            tail_read_len,
+                            tail_data.len()
+                        ),
+                    ));
+                }
+
+                // Read disk portion
+                let disk_buf = PooledBuffer::with_capacity(disk_len as usize);
+                let (res, disk_buf) = self
+                    .file
+                    .read_exact_at(disk_buf.slice(..disk_len as usize), read_start)
+                    .await
+                    .into();
+                let disk_buf = disk_buf.into_inner();
+                res?;
+
+                let mut result = PooledBuffer::with_capacity(len as usize);
+                result.extend_from_slice(&disk_buf[..disk_len as usize]);
+                result.extend_from_slice(&tail_data[..tail_read_len]);
+                return Ok(result);
+            }
+        }
+
+        self.read_from_disk(offset, len).await
+    }
+
+    async fn read_from_disk(&self, offset: u32, len: u32) -> Result<PooledBuffer, std::io::Error> {
+        let buf = PooledBuffer::with_capacity(len as usize);
         let (result, buf) = self
             .file
             .read_exact_at(buf.slice(..len as usize), offset as u64)
             .await
             .into();
-
         let buf = buf.into_inner();
         result?;
         Ok(buf)

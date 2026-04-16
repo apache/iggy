@@ -114,7 +114,7 @@ async fn handle_request(
         ShardRequestPayload::FlushUnsavedBuffer { fsync } => {
             let ns = namespace.expect("FlushUnsavedBuffer requires routing namespace");
             let flushed_count = shard
-                .flush_unsaved_buffer_from_local_partitions(&ns, fsync)
+                .flush_unsaved_buffer_from_local_partitions(&ns, fsync, false)
                 .await?;
             Ok(ShardResponse::FlushUnsavedBuffer { flushed_count })
         }
@@ -603,7 +603,7 @@ pub async fn handle_event(shard: &Rc<IggyShard>, event: ShardEvent) -> Result<()
             let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
             if shard.local_partitions.borrow().get(&ns).is_some() {
                 shard
-                    .flush_unsaved_buffer_from_local_partitions(&ns, fsync)
+                    .flush_unsaved_buffer_from_local_partitions(&ns, fsync, false)
                     .await?;
             }
             Ok(())

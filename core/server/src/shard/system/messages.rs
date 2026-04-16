@@ -150,6 +150,7 @@ impl IggyShard {
         &self,
         namespace: &IggyNamespace,
         fsync: bool,
+        shutdown: bool,
     ) -> Result<u32, IggyError> {
         let frozen_batches = {
             let mut partitions = self.local_partitions.borrow_mut();
@@ -177,7 +178,7 @@ impl IggyShard {
             .await?;
 
         if fsync {
-            self.fsync_all_messages_from_local_partitions(namespace)
+            self.fsync_all_messages_from_local_partitions(namespace, shutdown)
                 .await?;
         }
 
@@ -187,6 +188,7 @@ impl IggyShard {
     pub(crate) async fn fsync_all_messages_from_local_partitions(
         &self,
         namespace: &IggyNamespace,
+        shutdown: bool,
     ) -> Result<(), IggyError> {
         let storage = {
             let partitions = self.local_partitions.borrow();
@@ -203,15 +205,18 @@ impl IggyShard {
             return Ok(());
         }
 
-        if let Some(ref messages_writer) = storage.messages_writer
-            && let Err(e) = messages_writer.fsync().await
-        {
-            tracing::error!(
-                "Failed to fsync messages writer for partition {:?}: {}",
-                namespace,
-                e
-            );
-            return Err(e);
+        // TODO(tungtose)
+        if let Some(ref messages_writer) = storage.messages_writer {
+            if shutdown {
+                messages_writer.as_ref().flush_and_truncate().await?;
+            } else if let Err(e) = messages_writer.fsync().await {
+                tracing::error!(
+                    "Failed to fsync messages writer for partition {:?}: {}",
+                    namespace,
+                    e
+                );
+                return Err(e);
+            }
         }
 
         if let Some(ref index_writer) = storage.index_writer
