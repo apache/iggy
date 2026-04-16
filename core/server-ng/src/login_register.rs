@@ -26,7 +26,7 @@
 //! The handler is trait-based so it can be tested via mocking.
 
 use crate::session_manager::{SessionError, SessionManager};
-use iggy_binary_protocol::requests::users::LoginRegisterRequest;
+use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use secrecy::ExposeSecret;
 
@@ -40,6 +40,18 @@ pub trait CredentialVerifier {
     /// # Errors
     /// Returns `LoginRegisterError` if credentials are invalid.
     fn verify(&self, username: &str, password: &str) -> Result<u32, LoginRegisterError>;
+}
+
+/// Personal access token verification abstraction.
+///
+/// The real implementation looks up the PAT by hash in the user store,
+/// checks expiry, and returns the owning user's ID.
+pub trait TokenVerifier {
+    /// Verify a personal access token. Returns `user_id` on success.
+    ///
+    /// # Errors
+    /// Returns `LoginRegisterError` if the token is invalid or expired.
+    fn verify_token(&self, token: &str) -> Result<u32, LoginRegisterError>;
 }
 
 /// Consensus register submission abstraction.
@@ -60,14 +72,12 @@ pub trait RegisterSubmitter {
     ) -> impl std::future::Future<Output = Result<u64, LoginRegisterError>> + '_;
 }
 
-/// Handle a combined login + register request.
+/// Handle a combined login + register request (username/password).
 ///
 /// 1. Validates input
 /// 2. Verifies credentials locally (no consensus)
-/// 3. Transitions connection to `Authenticated`
-/// 4. Submits `Register` through consensus (no password in WAL)
-/// 5. Transitions connection to `Bound`
-/// 6. Returns `user_id` + `session`
+/// 3. Submits `Register` through consensus.
+/// 4. Returns `user_id` + `session`
 ///
 /// # Errors
 /// Returns `LoginRegisterError` on auth failure, consensus failure, or
@@ -87,13 +97,70 @@ pub async fn handle_login_register<V: CredentialVerifier, R: RegisterSubmitter>(
     // Phase 1: Local credential verification (NOT replicated).
     let user_id = verifier.verify(request.username.as_str(), request.password.expose_secret())?;
 
+    // Phase 2: Register through consensus.
+    complete_register(
+        request.client_id,
+        user_id,
+        submitter,
+        session_manager,
+        connection_id,
+    )
+    .await
+}
+
+/// Handle a combined login + register request (personal access token).
+///
+/// Same two-phase flow as [`handle_login_register`], but Phase 1 verifies
+/// a personal access token instead of username/password.
+///
+/// # Errors
+/// Returns `LoginRegisterError` on token failure, consensus failure, or
+/// session state errors.
+#[allow(clippy::future_not_send)]
+pub async fn handle_login_register_with_pat<T: TokenVerifier, R: RegisterSubmitter>(
+    request: &LoginRegisterWithPatRequest,
+    token_verifier: &T,
+    submitter: &R,
+    session_manager: &mut SessionManager,
+    connection_id: u64,
+) -> Result<LoginRegisterResponse, LoginRegisterError> {
+    if request.client_id == 0 {
+        return Err(LoginRegisterError::InvalidClientId);
+    }
+
+    // Phase 1: Token verification (local, not replicated).
+    let user_id = token_verifier.verify_token(request.token.expose_secret())?;
+
+    // Phase 2: Register through consensus (shared).
+    complete_register(
+        request.client_id,
+        user_id,
+        submitter,
+        session_manager,
+        connection_id,
+    )
+    .await
+}
+
+/// Phase 2 - transition session state and register through consensus.
+///
+/// Called by both password and PAT handlers after their respective Phase 1
+/// credential verification succeeds.
+#[allow(clippy::future_not_send)]
+async fn complete_register<R: RegisterSubmitter>(
+    client_id: u128,
+    user_id: u32,
+    submitter: &R,
+    session_manager: &mut SessionManager,
+    connection_id: u64,
+) -> Result<LoginRegisterResponse, LoginRegisterError> {
     // Transition: Connected -> Authenticated.
     session_manager
         .login(connection_id, user_id)
         .map_err(LoginRegisterError::Session)?;
 
-    // Phase 2: Submit Register through consensus (replicated, no password).
-    let session = match submitter.submit_register(request.client_id).await {
+    // Submit Register through consensus.
+    let session = match submitter.submit_register(client_id).await {
         Ok(session) => session,
         Err(e) => {
             // Rollback: Authenticated -> Connected so the client can retry
@@ -105,7 +172,7 @@ pub async fn handle_login_register<V: CredentialVerifier, R: RegisterSubmitter>(
 
     // Transition: Authenticated -> Bound.
     session_manager
-        .bind_session(connection_id, request.client_id, session)
+        .bind_session(connection_id, client_id, session)
         .map_err(LoginRegisterError::Session)?;
 
     Ok(LoginRegisterResponse { user_id, session })
@@ -115,6 +182,7 @@ pub async fn handle_login_register<V: CredentialVerifier, R: RegisterSubmitter>(
 pub enum LoginRegisterError {
     InvalidClientId,
     InvalidCredentials,
+    InvalidToken,
     UserInactive,
     Session(SessionError),
     PipelineFull,
@@ -126,6 +194,7 @@ impl std::fmt::Display for LoginRegisterError {
         match self {
             Self::InvalidClientId => write!(f, "client_id must be non-zero"),
             Self::InvalidCredentials => write!(f, "invalid username or password"),
+            Self::InvalidToken => write!(f, "invalid or expired personal access token"),
             Self::UserInactive => write!(f, "user account is inactive"),
             Self::Session(e) => write!(f, "session error: {e}"),
             Self::PipelineFull => write!(f, "consensus pipeline full, try again later"),
@@ -277,6 +346,118 @@ mod tests {
             let req = make_request(0);
 
             let err = handle_login_register(&req, &verifier, &submitter, &mut mgr, conn)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, LoginRegisterError::InvalidClientId));
+        });
+    }
+
+    // PAT tests
+
+    struct MockTokenVerifier {
+        result: Result<u32, LoginRegisterError>,
+    }
+
+    impl TokenVerifier for MockTokenVerifier {
+        fn verify_token(&self, _token: &str) -> Result<u32, LoginRegisterError> {
+            match &self.result {
+                Ok(uid) => Ok(*uid),
+                Err(LoginRegisterError::UserInactive) => Err(LoginRegisterError::UserInactive),
+                _ => Err(LoginRegisterError::InvalidToken),
+            }
+        }
+    }
+
+    fn make_pat_request(client_id: u128) -> LoginRegisterWithPatRequest {
+        LoginRegisterWithPatRequest {
+            client_id,
+            token: secrecy::SecretString::from("test-pat-token"),
+            version: None,
+            client_context: None,
+        }
+    }
+
+    #[test]
+    fn pat_happy_path() {
+        block_on!(async {
+            let mut mgr = SessionManager::new();
+            let conn = mgr.add_connection(addr(5000));
+            let verifier = MockTokenVerifier { result: Ok(42) };
+            let submitter = MockSubmitter { session: Ok(100) };
+            let req = make_pat_request(0xDEAD);
+
+            let resp = handle_login_register_with_pat(&req, &verifier, &submitter, &mut mgr, conn)
+                .await
+                .unwrap();
+
+            assert_eq!(resp.user_id, 42);
+            assert_eq!(resp.session, 100);
+            assert_eq!(mgr.get_session(conn), Some((0xDEAD, 100)));
+            assert_eq!(mgr.bound_count(), 1);
+        });
+    }
+
+    #[test]
+    fn pat_auth_failure_stays_connected() {
+        block_on!(async {
+            let mut mgr = SessionManager::new();
+            let conn = mgr.add_connection(addr(5000));
+            let verifier = MockTokenVerifier {
+                result: Err(LoginRegisterError::InvalidToken),
+            };
+            let submitter = MockSubmitter { session: Ok(100) };
+            let req = make_pat_request(0xDEAD);
+
+            let err = handle_login_register_with_pat(&req, &verifier, &submitter, &mut mgr, conn)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, LoginRegisterError::InvalidToken));
+            assert!(mgr.get_session(conn).is_none());
+        });
+    }
+
+    #[test]
+    fn pat_consensus_failure_rolls_back_to_connected() {
+        block_on!(async {
+            let mut mgr = SessionManager::new();
+            let conn = mgr.add_connection(addr(5000));
+            let verifier = MockTokenVerifier { result: Ok(42) };
+            let submitter = MockSubmitter {
+                session: Err(LoginRegisterError::PipelineFull),
+            };
+            let req = make_pat_request(0xDEAD);
+
+            let err = handle_login_register_with_pat(&req, &verifier, &submitter, &mut mgr, conn)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(err, LoginRegisterError::PipelineFull));
+            assert!(mgr.get_session(conn).is_none());
+
+            // Connection rolled back to Connected. Retry.
+            let submitter_ok = MockSubmitter { session: Ok(100) };
+            let resp =
+                handle_login_register_with_pat(&req, &verifier, &submitter_ok, &mut mgr, conn)
+                    .await
+                    .unwrap();
+            assert_eq!(resp.user_id, 42);
+            assert_eq!(resp.session, 100);
+            assert_eq!(mgr.get_session(conn), Some((0xDEAD, 100)));
+        });
+    }
+
+    #[test]
+    fn pat_zero_client_id_rejected() {
+        block_on!(async {
+            let mut mgr = SessionManager::new();
+            let conn = mgr.add_connection(addr(5000));
+            let verifier = MockTokenVerifier { result: Ok(42) };
+            let submitter = MockSubmitter { session: Ok(100) };
+            let req = make_pat_request(0);
+
+            let err = handle_login_register_with_pat(&req, &verifier, &submitter, &mut mgr, conn)
                 .await
                 .unwrap_err();
 

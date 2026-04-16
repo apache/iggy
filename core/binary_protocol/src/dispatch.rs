@@ -168,6 +168,8 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
     ),
     CommandMeta::non_replicated(JOIN_CONSUMER_GROUP_CODE, "consumer_group.join"),
     CommandMeta::non_replicated(LEAVE_CONSUMER_GROUP_CODE, "consumer_group.leave"),
+    // Login + Register (PAT - Personal Access Token variant)
+    CommandMeta::non_replicated(LOGIN_REGISTER_WITH_PAT_CODE, "user.login_register_with_pat"),
 ];
 
 /// Lookup command metadata by command code.
@@ -227,6 +229,7 @@ pub const fn lookup_command(code: u32) -> Option<&'static CommandMeta> {
         DELETE_CONSUMER_GROUP_CODE => 45,
         JOIN_CONSUMER_GROUP_CODE => 46,
         LEAVE_CONSUMER_GROUP_CODE => 47,
+        LOGIN_REGISTER_WITH_PAT_CODE => 48,
         _ => return None,
     };
     Some(&COMMAND_TABLE[idx])
@@ -291,6 +294,7 @@ mod tests {
             LOGIN_USER_CODE,
             LOGOUT_USER_CODE,
             LOGIN_REGISTER_CODE,
+            LOGIN_REGISTER_WITH_PAT_CODE,
             GET_PERSONAL_ACCESS_TOKENS_CODE,
             CREATE_PERSONAL_ACCESS_TOKEN_CODE,
             DELETE_PERSONAL_ACCESS_TOKEN_CODE,
