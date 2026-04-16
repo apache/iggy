@@ -229,6 +229,11 @@ where
         }
     }
 
+    pub fn header_by_op(&self, op: u64) -> Option<PrepareHeader> {
+        let headers = unsafe { &*self.headers.get() };
+        headers.iter().find(|header| header.op == op).copied()
+    }
+
     #[allow(dead_code)]
     fn candidate_start_op(&self, query: &MessageLookup) -> Option<u64> {
         match query {

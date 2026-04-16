@@ -659,7 +659,7 @@ where
         let previous_commit = self.consensus.commit_max();
         let current_op = {
             let consensus = self.consensus();
-            let current_op = match replicate_preflight(consensus, &header) {
+            match replicate_preflight(consensus, &header) {
                 Ok(current_op) => current_op,
                 Err(reason) => {
                     emit_partition_diag(
@@ -674,35 +674,44 @@ where
                     );
                     return;
                 }
-            };
-
-            if fence_old_prepare_by_commit(consensus, &header) {
-                emit_partition_diag(
-                    tracing::Level::WARN,
-                    &PartitionDiagEvent::new(
-                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
-                        "received old prepare, skipping replication",
-                    )
-                    .with_operation(header.operation)
-                    .with_op(header.op),
-                );
-                return;
             }
-
-            current_op
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let is_old_prepare = {
+            let consensus = self.consensus();
+            fence_old_prepare_by_commit(consensus, &header)
+                || self.log.journal().inner.header_by_op(header.op).is_some()
+        };
+        let message = if is_old_prepare {
+            emit_partition_diag(
+                tracing::Level::WARN,
+                &PartitionDiagEvent::new(
+                    self.diag_ctx(),
+                    "received old prepare, skipping replication",
+                )
+                .with_operation(header.operation)
+                .with_op(header.op),
+            );
+            message
+        } else {
+            let consensus = self.consensus();
+            replicate_to_next_in_chain(consensus, message).await
         };
 
-        debug_assert_eq!(header.op, current_op + 1);
+        if header.op != current_op + 1 {
+            emit_partition_diag(
+                tracing::Level::WARN,
+                &PartitionDiagEvent::new(self.diag_ctx(), "dropping out-of-order prepare (gap)")
+                    .with_operation(header.operation)
+                    .with_op(header.op),
+            );
+            return;
+        }
         {
             let consensus = self.consensus();
             consensus.sequencer().set_sequence(header.op);
             consensus.set_last_prepare_checksum(header.checksum);
         }
-
-        let message = {
-            let consensus = self.consensus();
-            replicate_to_next_in_chain(consensus, message).await
-        };
         let replicated_result = self.apply_replicated_operation(message).await;
 
         let commit = self.consensus.commit_max();

@@ -454,6 +454,7 @@ where
 
             let actions = consensus.handle_start_view_change(PlaneKind::Partitions, &header);
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+            dispatch_partition_journal_actions(consensus, partition, &actions).await;
             return;
         }
 
@@ -512,6 +513,7 @@ where
 
             let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header);
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+            dispatch_partition_journal_actions(consensus, partition, &actions).await;
             if actions
                 .iter()
                 .any(|action| matches!(action, VsrAction::CommitJournal))
@@ -564,6 +566,7 @@ where
 
             let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+            dispatch_partition_journal_actions(consensus, partition, &actions).await;
             return;
         }
 
@@ -655,6 +658,7 @@ where
             let current_commit = consensus.commit_min();
             let actions = consensus.tick(PlaneKind::Partitions, current_op, current_commit);
             dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+            dispatch_partition_journal_actions(consensus, partition, &actions).await;
         }
     }
 
@@ -896,6 +900,119 @@ async fn dispatch_vsr_actions<B, P, J>(
                     }
                 }
             }
+        }
+    }
+}
+
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation
+)]
+async fn dispatch_partition_journal_actions<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    partition: &IggyPartition<B>,
+    actions: &[VsrAction],
+) where
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+{
+    use std::mem::size_of;
+
+    let bus = consensus.message_bus();
+    let self_id = consensus.replica();
+    let cluster = consensus.cluster();
+    let journal = &partition.log.journal().inner;
+
+    let send = |target: u8, msg: Message<GenericHeader>| async move {
+        if let Err(e) = bus.send_to_replica(target, msg).await {
+            tracing::debug!(replica = self_id, target, "bus send failed: {e}");
+        }
+    };
+
+    for action in actions {
+        match action {
+            VsrAction::SendPrepareOk {
+                view,
+                from_op,
+                to_op,
+                target,
+                namespace,
+            } => {
+                for op in *from_op..=*to_op {
+                    let Some(prepare_header) = journal.header_by_op(op) else {
+                        continue;
+                    };
+                    let msg = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>())
+                        .transmute_header(|_, h: &mut PrepareOkHeader| {
+                            h.command = Command2::PrepareOk;
+                            h.cluster = cluster;
+                            h.replica = self_id;
+                            h.view = *view;
+                            h.op = op;
+                            h.commit = consensus.commit_max();
+                            h.timestamp = prepare_header.timestamp;
+                            h.parent = prepare_header.parent;
+                            h.prepare_checksum = prepare_header.checksum;
+                            h.request = prepare_header.request;
+                            h.operation = prepare_header.operation;
+                            h.namespace = *namespace;
+                            h.size = size_of::<PrepareOkHeader>() as u32;
+                        });
+                    send(*target, msg.into_generic()).await;
+                }
+            }
+            VsrAction::RetransmitPrepares { targets } => {
+                for (header, replicas) in targets {
+                    let Some(prepare) = journal.entry(header).await else {
+                        continue;
+                    };
+                    let prepare = Message::<PrepareHeader>::try_from(
+                        iggy_binary_protocol::consensus::iobuf::Owned::<4096>::copy_from_slice(
+                            prepare.as_slice(),
+                        ),
+                    )
+                    .expect("partition journal entry must contain valid prepare");
+                    for replica in replicas {
+                        send(*replica, prepare.deep_copy().into_generic()).await;
+                    }
+                }
+            }
+            VsrAction::RebuildPipeline { from_op, to_op } => {
+                let mut gap_at = None;
+                let entries: Vec<_> = (*from_op..=*to_op)
+                    .map_while(|op| {
+                        let Some(header) = journal.header_by_op(op) else {
+                            gap_at = Some(op);
+                            return None;
+                        };
+                        let mut entry = consensus::PipelineEntry::new(header);
+                        entry.add_ack(self_id);
+                        Some(entry)
+                    })
+                    .collect();
+                if let Some(missing_op) = gap_at {
+                    let rebuilt_up_to = missing_op.saturating_sub(1);
+                    tracing::warn!(
+                        replica = self_id,
+                        missing_op,
+                        range_start = from_op,
+                        range_end = to_op,
+                        rebuilt = entries.len(),
+                        "RebuildPipeline: journal gap at op {missing_op}, \
+                         truncating sequencer from {to_op} to {rebuilt_up_to} \
+                         ({}/{} ops rebuilt)",
+                        entries.len(),
+                        to_op - from_op + 1,
+                    );
+                    consensus.sequencer().set_sequence(rebuilt_up_to);
+                }
+                let mut pipeline = consensus.pipeline().borrow_mut();
+                for entry in entries {
+                    pipeline.push(entry);
+                }
+            }
+            _ => {}
         }
     }
 }
