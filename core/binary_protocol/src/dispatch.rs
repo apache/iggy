@@ -270,7 +270,10 @@ pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> 
         Operation::SendMessages => 22,
         Operation::StoreConsumerOffset => 25,
         Operation::DeleteConsumerOffset => 26,
-        Operation::Reserved | Operation::Register => return None,
+        Operation::CreateTopicWithAssignments
+        | Operation::CreatePartitionsWithAssignments
+        | Operation::Reserved
+        | Operation::Register => return None,
     };
     Some(&COMMAND_TABLE[idx])
 }
