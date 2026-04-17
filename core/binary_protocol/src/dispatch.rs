@@ -121,7 +121,11 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
         "consumer_offset.store",
         Operation::StoreConsumerOffset,
     ),
-    CommandMeta::non_replicated(DELETE_CONSUMER_OFFSET_CODE, "consumer_offset.delete"),
+    CommandMeta::replicated(
+        DELETE_CONSUMER_OFFSET_CODE,
+        "consumer_offset.delete",
+        Operation::DeleteConsumerOffset,
+    ),
     // Streams
     CommandMeta::non_replicated(GET_STREAM_CODE, "stream.get"),
     CommandMeta::non_replicated(GET_STREAMS_CODE, "stream.list"),
@@ -265,6 +269,7 @@ pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> 
         Operation::DeletePersonalAccessToken => 19,
         Operation::SendMessages => 22,
         Operation::StoreConsumerOffset => 25,
+        Operation::DeleteConsumerOffset => 26,
         Operation::Reserved | Operation::Register => return None,
     };
     Some(&COMMAND_TABLE[idx])
@@ -385,6 +390,7 @@ mod tests {
             Operation::DeletePersonalAccessToken,
             Operation::SendMessages,
             Operation::StoreConsumerOffset,
+            Operation::DeleteConsumerOffset,
         ];
         for op in replicated_ops {
             let meta = lookup_by_operation(op)

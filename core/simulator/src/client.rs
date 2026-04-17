@@ -168,6 +168,19 @@ impl SimClient {
         self.build_request_with_namespace(Operation::StoreConsumerOffset, &payload, namespace)
     }
 
+    pub fn delete_consumer_offset(
+        &self,
+        namespace: IggyNamespace,
+        consumer_kind: u8,
+        consumer_id: u32,
+    ) -> Message<RequestHeader> {
+        let mut payload = Vec::with_capacity(5);
+        payload.push(consumer_kind);
+        payload.extend_from_slice(&consumer_id.to_le_bytes());
+
+        self.build_request_with_namespace(Operation::DeleteConsumerOffset, &payload, namespace)
+    }
+
     #[allow(clippy::cast_possible_truncation)]
     fn build_request_with_namespace(
         &self,

@@ -32,7 +32,7 @@ use metadata::stm::StateMachine;
 /// through the channel into the target shard's message pump.  This ensures
 /// that every mutation on a shard is serialized through a single point (the
 /// pump), preventing concurrent access from independent async tasks.
-impl<B, MJ, S, M, PJ, T, R> IggyShard<B, MJ, S, M, PJ, T, R>
+impl<B, MJ, S, M, T, R> IggyShard<B, MJ, S, M, T, R>
 where
     B: MessageBus,
     T: ShardsTable,
@@ -209,12 +209,6 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
@@ -246,12 +240,6 @@ where
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target: Journal<
                 <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,

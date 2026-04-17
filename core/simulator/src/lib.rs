@@ -263,17 +263,23 @@ impl Simulator {
         // Seed the partition consensus client tables on all live replicas.
         // The partition plane doesn't route Register operations yet, so we
         // do it directly to match what the full server will do once the
-        // partition-level registration is wired up.
+        // partition-level registration is wired up. With per-partition
+        // consensus, every partition's client_table needs the entry.
         for (i, replica) in self.replicas.iter().enumerate() {
             if self.crashed.contains(&(i as u8)) {
                 continue;
             }
-            if let Some(consensus) = replica.plane.partitions().consensus() {
-                let reply = build_register_reply(client.client_id(), session);
-                consensus
-                    .client_table()
-                    .borrow_mut()
-                    .commit_register(client.client_id(), reply);
+            let partitions = replica.plane.partitions();
+            let namespaces: Vec<_> = partitions.namespaces().copied().collect();
+            for ns in namespaces {
+                if let Some(partition) = partitions.get_by_ns(&ns) {
+                    let reply = build_register_reply(client.client_id(), session);
+                    partition
+                        .consensus()
+                        .client_table()
+                        .borrow_mut()
+                        .commit_register(client.client_id(), reply);
+                }
             }
         }
     }
@@ -441,7 +447,10 @@ mod tests {
         for replica_idx in 1..replica_count {
             let replica = &sim.replicas[replica_idx as usize];
             let partitions = replica.plane.partitions();
-            let consensus = partitions.consensus().unwrap();
+            let consensus = partitions
+                .get_by_ns(&ns)
+                .expect("partition must exist on every live replica")
+                .consensus();
             if consensus.view() > 0
                 && consensus.status() == Status::Normal
                 && consensus.is_primary()
@@ -455,7 +464,12 @@ mod tests {
         );
 
         // Submit a request to the new primary and verify it commits.
-        let c = sim.replicas[1].plane.partitions().consensus().unwrap();
+        let c = sim.replicas[1]
+            .plane
+            .partitions()
+            .get_by_ns(&ns)
+            .expect("partition must exist on replica 1")
+            .consensus();
         let new_primary_idx = c.primary_index(c.view());
 
         let msg2 = client.send_messages(ns, &[b"after view change"]);
@@ -534,8 +548,9 @@ mod tests {
             let c = sim.replicas[idx as usize]
                 .plane
                 .partitions()
-                .consensus()
-                .unwrap();
+                .get_by_ns(&ns)
+                .expect("partition must exist on every live replica")
+                .consensus();
             if c.view() > 0 && c.status() == Status::Normal && c.is_primary() {
                 new_primary_found = true;
             }
