@@ -71,6 +71,12 @@ pub fn write_tag_value(buf: &mut String, value: &str) {
 /// Newline and carriage-return are the InfluxDB line-protocol record
 /// delimiters; a literal newline inside a string field value would split the
 /// line and corrupt the batch.
+///
+/// Tab (`\t`) is intentionally NOT escaped here. String field values are
+/// double-quoted in line protocol, and the spec permits literal tabs inside
+/// quoted strings. Measurement names and tag values (see [`write_measurement`]
+/// and [`write_tag_value`]) are unquoted, so tabs must be escaped there to
+/// avoid mis-parsing the tag set.
 pub fn write_field_string(buf: &mut String, value: &str) {
     for ch in value.chars() {
         match ch {

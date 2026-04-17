@@ -265,11 +265,14 @@ pub fn cursor_re() -> &'static regex::Regex {
     CURSOR_RE.get_or_init(|| {
         // Validates RFC 3339 timestamp structure with proper field ranges:
         // month 01-12, day 01-31, hour 00-23, minute/second 00-59.
-        // Timezone suffix is optional to allow naive local timestamps from user config.
+        // Timezone suffix is required: a naive timestamp without Z or +HH:MM
+        // is rejected to prevent silent UTC-vs-local ambiguity between V2 (Flux
+        // always treats timestamps as UTC) and V3 (SQL engine timezone depends
+        // on server config).
         // Note: day 29-31 validity for a given month is not checked by the regex;
         // chrono parsing inside validate_cursor handles that for tz-aware timestamps.
         regex::Regex::new(
-            r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d+)?(Z|[+-]\d{2}:\d{2})?$"
+            r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
         )
         .expect("hardcoded regex is valid")
     })
@@ -380,7 +383,21 @@ mod tests {
         assert!(validate_cursor("2024-01-15T10:30:00.123456789Z").is_ok());
         assert!(validate_cursor("2024-01-15T10:30:00+05:30").is_ok());
         assert!(validate_cursor("1970-01-01T00:00:00Z").is_ok());
-        assert!(validate_cursor("2026-04-12T11:28:25.180749").is_ok());
+    }
+
+    #[test]
+    fn validate_cursor_rejects_timezone_free_timestamp() {
+        // A naive timestamp without a timezone suffix is rejected to prevent
+        // silent UTC-vs-local ambiguity between V2 (always UTC) and V3
+        // (SQL engine may apply a different default timezone).
+        assert!(
+            validate_cursor("2026-04-12T11:28:25.180749").is_err(),
+            "no timezone suffix must be rejected"
+        );
+        assert!(
+            validate_cursor("2024-01-15T10:30:00").is_err(),
+            "bare datetime without tz must be rejected"
+        );
     }
 
     #[test]

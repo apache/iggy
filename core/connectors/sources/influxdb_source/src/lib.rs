@@ -22,7 +22,8 @@ mod v3;
 
 use async_trait::async_trait;
 use common::{
-    InfluxDbSourceConfig, PayloadFormat, PersistedState, V2State, V3State, validate_cursor_field,
+    InfluxDbSourceConfig, PayloadFormat, PersistedState, V2State, V3State, validate_cursor,
+    validate_cursor_field,
 };
 use iggy_connector_influxdb_common::{ApiVersion, InfluxDbAdapter};
 use iggy_connector_sdk::retry::{
@@ -198,6 +199,24 @@ impl Source for InfluxDbSource {
         );
 
         validate_cursor_field(self.config.cursor_field())?;
+        if let Some(offset) = self.config.initial_offset() {
+            validate_cursor(offset)?;
+        }
+
+        // Skip-N dedup for V2 requires rows to arrive sorted by time. If the Flux
+        // query lacks an explicit sort, InfluxDB may return rows in storage order,
+        // causing the dedup to skip the wrong rows silently.
+        if let InfluxDbSourceConfig::V2(cfg) = &self.config {
+            if !cfg.query.contains("sort(") {
+                warn!(
+                    "{CONNECTOR_NAME} ID: {}: V2 query does not appear to contain \
+                     `|> sort(columns: [\"_time\"])`. Skip-N dedup relies on stable \
+                     row ordering; out-of-order Flux results will silently deliver \
+                     the wrong rows. Add `|> sort(columns: [\"_time\"])` to your query.",
+                    self.id
+                );
+            }
+        }
 
         let timeout = parse_duration(self.config.timeout(), DEFAULT_TIMEOUT);
         let raw_client = reqwest::Client::builder()
@@ -535,6 +554,71 @@ mod tests {
         assert!(
             matches!(result, Err(Error::InvalidState)),
             "open() must fail fast on restore failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_rejects_invalid_initial_offset() {
+        // Validates initial_offset before attempting any network connection.
+        let config = InfluxDbSourceConfig::V2(V2SourceConfig {
+            url: "http://localhost:18086".to_string(),
+            initial_offset: Some("not-a-timestamp".to_string()),
+            org: "o".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT 1".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "expected InvalidConfigValue for bad initial_offset, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_rejects_timezone_free_initial_offset() {
+        let config = InfluxDbSourceConfig::V2(V2SourceConfig {
+            url: "http://localhost:18086".to_string(),
+            initial_offset: Some("2024-01-15T10:30:00".to_string()),
+            org: "o".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT 1".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "initial_offset without timezone must be rejected"
         );
     }
 

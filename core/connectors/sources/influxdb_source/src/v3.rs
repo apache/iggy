@@ -228,6 +228,15 @@ pub(crate) fn process_rows(
         });
     }
 
+    if !rows.is_empty() && max_cursor.is_none() {
+        warn!(
+            "No '{}' field found in any returned row — cursor will not advance; \
+             the connector will re-deliver the same rows on every poll. \
+             Check that the query selects the cursor column.",
+            cursor_field
+        );
+    }
+
     Ok(RowProcessingResult {
         messages,
         max_cursor,
@@ -416,6 +425,31 @@ mod tests {
         assert!(
             !result.all_at_cursor,
             "row missing cursor field must clear all_at_cursor"
+        );
+        // The message is still emitted (V3 does not skip rows), but max_cursor
+        // is None — the caller (poll) will keep the same cursor and re-deliver
+        // these rows. A warn! is emitted inside process_rows to surface the issue.
+    }
+
+    #[test]
+    fn process_rows_all_rows_missing_cursor_field_produces_none_max_cursor() {
+        // All rows lack the cursor column — max_cursor stays None for every row.
+        // This exercises the warn! path inside process_rows and confirms that
+        // messages are still emitted (no rows are silently dropped).
+        let rows = vec![
+            row(&[("val", "1")]),
+            row(&[("val", "2")]),
+            row(&[("val", "3")]),
+        ];
+        let result = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0).unwrap();
+        assert_eq!(result.messages.len(), 3, "all rows must be emitted");
+        assert!(
+            result.max_cursor.is_none(),
+            "max_cursor must stay None when no row has the cursor field"
+        );
+        assert!(
+            !result.all_at_cursor,
+            "all_at_cursor must be false when cursor field is absent"
         );
     }
 

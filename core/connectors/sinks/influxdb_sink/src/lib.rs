@@ -21,7 +21,7 @@ use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use iggy_common::serde_secret::serialize_secret;
 use iggy_connector_influxdb_common::{
-    ApiVersion, InfluxDbAdapter, write_field_string, write_measurement, write_tag_value,
+    ApiVersion, write_field_string, write_measurement, write_tag_value,
 };
 use iggy_connector_sdk::retry::{
     CircuitBreaker, ConnectivityConfig, build_retry_client, check_connectivity_with_retry,
@@ -215,15 +215,10 @@ impl InfluxDbSinkConfig {
     }
 
     fn auth_header(&self) -> String {
-        let adapter: Box<dyn InfluxDbAdapter> = match self {
-            Self::V2(_) => ApiVersion::V2.make_adapter(),
-            Self::V3(_) => ApiVersion::V3.make_adapter(),
-        };
-        let token = match self {
-            Self::V2(c) => c.token.expose_secret(),
-            Self::V3(c) => c.token.expose_secret(),
-        };
-        adapter.auth_header_value(token)
+        match self {
+            Self::V2(c) => format!("Token {}", c.token.expose_secret()),
+            Self::V3(c) => format!("Bearer {}", c.token.expose_secret()),
+        }
     }
 
     fn build_write_url(&self) -> Result<Url, Error> {
@@ -245,11 +240,9 @@ impl InfluxDbSinkConfig {
     }
 
     fn build_health_url(&self) -> Result<Url, Error> {
-        let adapter: Box<dyn InfluxDbAdapter> = match self {
-            Self::V2(_) => ApiVersion::V2.make_adapter(),
-            Self::V3(_) => ApiVersion::V3.make_adapter(),
-        };
-        adapter.health_url(self.url().trim_end_matches('/'))
+        let base = self.url().trim_end_matches('/');
+        Url::parse(&format!("{base}/health"))
+            .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))
     }
 
     fn version_label(&self) -> &'static str {
@@ -376,7 +369,7 @@ impl InfluxDbSink {
             "us" => micros,
             "ms" => micros / 1_000,
             "s" => micros / 1_000_000,
-            _ => micros,
+            _ => unreachable!("precision validated in open()"),
         }
     }
 
@@ -583,6 +576,14 @@ impl Sink for InfluxDbSink {
             )));
         }
 
+        if let InfluxDbSinkConfig::V2(c) = &self.config {
+            if c.org.trim().is_empty() {
+                return Err(Error::InvalidConfigValue(
+                    "V2 sink config requires a non-empty 'org'".to_string(),
+                ));
+            }
+        }
+
         info!(
             "Opening InfluxDB sink ID: {} (version={})",
             self.id,
@@ -647,6 +648,7 @@ impl Sink for InfluxDbSink {
                 .await
             {
                 Ok(()) => {
+                    self.circuit_breaker.record_success();
                     self.write_success
                         .fetch_add(batch.len() as u64, Ordering::Relaxed);
                 }
@@ -668,10 +670,6 @@ impl Sink for InfluxDbSink {
             }
         }
 
-        if first_error.is_none() {
-            self.circuit_breaker.record_success();
-        }
-
         let total_processed = self
             .messages_attempted
             .fetch_add(total as u64, Ordering::Relaxed)
@@ -682,16 +680,16 @@ impl Sink for InfluxDbSink {
                 "InfluxDB sink ID: {} — processed={total}, cumulative={total_processed}, \
                  success={}, errors={}",
                 self.id,
-                self.write_success.load(Ordering::Relaxed),
-                self.write_errors.load(Ordering::Relaxed),
+                self.write_success.load(Ordering::SeqCst),
+                self.write_errors.load(Ordering::SeqCst),
             );
         } else {
             debug!(
                 "InfluxDB sink ID: {} — processed={total}, cumulative={total_processed}, \
                  success={}, errors={}",
                 self.id,
-                self.write_success.load(Ordering::Relaxed),
-                self.write_errors.load(Ordering::Relaxed),
+                self.write_success.load(Ordering::SeqCst),
+                self.write_errors.load(Ordering::SeqCst),
             );
         }
 
@@ -703,9 +701,9 @@ impl Sink for InfluxDbSink {
         info!(
             "InfluxDB sink ID: {} closed — processed={}, success={}, errors={}",
             self.id,
-            self.messages_attempted.load(Ordering::Relaxed),
-            self.write_success.load(Ordering::Relaxed),
-            self.write_errors.load(Ordering::Relaxed),
+            self.messages_attempted.load(Ordering::SeqCst),
+            self.write_success.load(Ordering::SeqCst),
+            self.write_errors.load(Ordering::SeqCst),
         );
         Ok(())
     }
@@ -893,6 +891,37 @@ mod tests {
             matches!(err, Error::InvalidConfigValue(_)),
             "expected InvalidConfigValue, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn open_rejects_empty_org_in_v2() {
+        // An empty org generates `?org=` in the write URL, which InfluxDB V2
+        // rejects at runtime with a 400. Catch it eagerly at open().
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            url: "http://localhost:18086".to_string(),
+            org: "".to_string(),
+            ..make_v2_config().into_v2().unwrap()
+        });
+        let mut sink = InfluxDbSink::new(1, config);
+        let err = sink.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "expected InvalidConfigValue for empty org, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_rejects_whitespace_only_org_in_v2() {
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            url: "http://localhost:18086".to_string(),
+            org: "   ".to_string(),
+            ..make_v2_config().into_v2().unwrap()
+        });
+        let mut sink = InfluxDbSink::new(1, config);
+        assert!(matches!(
+            sink.open().await,
+            Err(Error::InvalidConfigValue(_))
+        ));
     }
 
     // ── line-protocol escaping ────────────────────────────────────────────
@@ -1516,7 +1545,7 @@ mod http_tests {
         let sink = open_sink(v2_config(&base)).await;
         let msgs: Vec<_> = (0..5).map(|_| msg()).collect();
         sink.consume(&topic(), meta(), msgs).await.unwrap();
-        assert_eq!(call_count.load(Ordering::Relaxed), 3);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -1548,7 +1577,7 @@ mod http_tests {
         });
         let sink = open_sink(config).await;
         sink.consume(&topic(), meta(), vec![msg()]).await.unwrap();
-        assert_eq!(call_count.load(Ordering::Relaxed), 1);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1579,7 +1608,50 @@ mod http_tests {
         let msgs: Vec<_> = (0..4).map(|_| msg()).collect();
         let result = sink.consume(&topic(), meta(), msgs).await;
         assert!(result.is_err()); // error from the first batch is returned
-        assert_eq!(call_count.load(Ordering::Relaxed), 2); // both batches were attempted
+        assert_eq!(call_count.load(Ordering::SeqCst), 2); // both batches were attempted
+    }
+
+    #[tokio::test]
+    async fn consume_records_success_per_successful_batch() {
+        // With 2 batches where the first fails and the second succeeds, the circuit
+        // breaker must record 1 failure AND 1 success — not 1 failure and 0 successes.
+        // If only failures are recorded, the breaker will trip after enough intermittent
+        // errors even when most batches succeed.
+        let call_count = Arc::new(AtomicU32::new(0));
+        let cc2 = call_count.clone();
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::OK }))
+            .route(
+                "/api/v2/write",
+                post(move || {
+                    let cc = cc2.clone();
+                    async move {
+                        let n = cc.fetch_add(1, Ordering::Relaxed);
+                        if n == 0 {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            );
+        let base = start_server(app).await;
+        // Use a threshold of 2 so the breaker trips after 2 failures.
+        // If the success of batch 2 is not recorded, successive calls that have
+        // 1 failure each would trip the breaker after 2 invocations.
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            circuit_breaker_threshold: Some(2),
+            circuit_breaker_cool_down: Some("60s".to_string()),
+            ..v2_config(&base).into_v2().unwrap()
+        });
+        let sink = open_sink(config).await;
+        let msgs: Vec<_> = (0..4).map(|_| msg()).collect();
+        let _ = sink.consume(&topic(), meta(), msgs).await; // first fails, second succeeds
+        // Circuit breaker should NOT be open: 1 failure + 1 success → not tripped.
+        assert!(
+            !sink.circuit_breaker.is_open().await,
+            "circuit breaker must not trip when at least one batch succeeded"
+        );
     }
 
     // ── write URL routing ─────────────────────────────────────────────────────
@@ -1605,7 +1677,7 @@ mod http_tests {
         sink.process_batch(&topic(), &meta(), &[msg()])
             .await
             .unwrap();
-        assert_eq!(hit.load(Ordering::Relaxed), 1);
+        assert_eq!(hit.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1629,6 +1701,6 @@ mod http_tests {
         sink.process_batch(&topic(), &meta(), &[msg()])
             .await
             .unwrap();
-        assert_eq!(hit.load(Ordering::Relaxed), 1);
+        assert_eq!(hit.load(Ordering::SeqCst), 1);
     }
 }
