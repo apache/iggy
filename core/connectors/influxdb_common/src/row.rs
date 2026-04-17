@@ -36,27 +36,29 @@ pub type Row = HashMap<String, String>;
 
 // ── InfluxDB V2 — annotated CSV ───────────────────────────────────────────────
 
-/// Return `true` if `record` is a CSV header row (contains `"_time"`).
+/// Return `true` if `record` is a CSV header row.
 ///
-/// A header row must contain a `_time` column. The `_value` column is
-/// intentionally **not** required: Flux aggregation queries (`count()`,
-/// `mean()`, `group()`) produce result tables with columns like `_count` or
-/// `_mean` instead of `_value`. Requiring `_value` would cause those header
-/// rows to be missed, silently skipping all subsequent data rows until the
-/// next recognised header.
+/// Checks for any of the standard InfluxDB temporal column names:
+/// `_time`, `_start`, or `_stop`. Regular time-series queries include `_time`;
+/// Flux window-aggregate queries (`count()`, `mean()`, `distinct()`) produce
+/// result tables with `_start` and `_stop` but no `_time`. Requiring only
+/// `_time` would cause those header rows to be missed, silently dropping all
+/// subsequent data rows until the next recognised header.
 ///
 /// InfluxDB annotation rows (`#group`, `#datatype`, `#default`) are already
 /// filtered out earlier in [`parse_csv_rows`] by the leading-`#` check, so
 /// they will never reach this function.
 fn is_header_record(record: &StringRecord) -> bool {
-    record.iter().any(|v| v == "_time")
+    record
+        .iter()
+        .any(|v| v == "_time" || v == "_start" || v == "_stop")
 }
 
 /// Parse an InfluxDB V2 annotated-CSV response body into a list of rows.
 ///
 /// - Annotation rows (first field starts with `#`) are skipped.
 /// - Blank lines are skipped.
-/// - The first non-annotation row containing `_time` becomes the header.
+/// - The first non-annotation row containing `_time`, `_start`, or `_stop` becomes the header.
 /// - Repeated identical header rows (multi-table result format) are skipped.
 /// - Each subsequent data row is mapped `header[i] → row[i]`.
 pub fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
@@ -228,6 +230,29 @@ mod tests {
         let csv = "_time,_value\n"; // header only
         let rows = parse_csv_rows(csv).unwrap();
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn csv_aggregation_query_without_time_column_parses_rows() {
+        // Flux window-aggregate queries (count(), mean(), etc.) produce result
+        // tables with _start and _stop but no _time. Before the _start/_stop fix,
+        // is_header_record returned false, headers stayed None, and all data rows
+        // were silently dropped.
+        let csv = "_start,_stop,_field,_value\n\
+                   2024-01-01T00:00:00Z,2024-01-01T01:00:00Z,usage,42\n\
+                   2024-01-01T01:00:00Z,2024-01-01T02:00:00Z,usage,55\n";
+        let rows = parse_csv_rows(csv).unwrap();
+        assert_eq!(rows.len(), 2, "rows must not be silently dropped");
+        assert_eq!(rows[0].get("_value").map(String::as_str), Some("42"));
+        assert_eq!(rows[1].get("_value").map(String::as_str), Some("55"));
+    }
+
+    #[test]
+    fn csv_stop_only_header_is_recognised() {
+        let csv = "_stop,_count\n2024-01-01T01:00:00Z,7\n";
+        let rows = parse_csv_rows(csv).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("_count").map(String::as_str), Some("7"));
     }
 
     // ── parse_jsonl_rows ─────────────────────────────────────────────────────

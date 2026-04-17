@@ -650,14 +650,14 @@ impl Sink for InfluxDbSink {
                 Ok(()) => {
                     self.circuit_breaker.record_success();
                     self.write_success
-                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                        .fetch_add(batch.len() as u64, Ordering::AcqRel);
                 }
                 Err(e) => {
                     if !matches!(e, Error::PermanentHttpError(_)) {
                         self.circuit_breaker.record_failure().await;
                     }
                     self.write_errors
-                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                        .fetch_add(batch.len() as u64, Ordering::AcqRel);
                     error!(
                         "InfluxDB sink ID: {} failed batch of {}: {e}",
                         self.id,
@@ -672,7 +672,7 @@ impl Sink for InfluxDbSink {
 
         let total_processed = self
             .messages_attempted
-            .fetch_add(total as u64, Ordering::Relaxed)
+            .fetch_add(total as u64, Ordering::AcqRel)
             + total as u64;
 
         if self.verbose {
@@ -680,16 +680,16 @@ impl Sink for InfluxDbSink {
                 "InfluxDB sink ID: {} — processed={total}, cumulative={total_processed}, \
                  success={}, errors={}",
                 self.id,
-                self.write_success.load(Ordering::SeqCst),
-                self.write_errors.load(Ordering::SeqCst),
+                self.write_success.load(Ordering::Acquire),
+                self.write_errors.load(Ordering::Acquire),
             );
         } else {
             debug!(
                 "InfluxDB sink ID: {} — processed={total}, cumulative={total_processed}, \
                  success={}, errors={}",
                 self.id,
-                self.write_success.load(Ordering::SeqCst),
-                self.write_errors.load(Ordering::SeqCst),
+                self.write_success.load(Ordering::Acquire),
+                self.write_errors.load(Ordering::Acquire),
             );
         }
 
@@ -701,9 +701,9 @@ impl Sink for InfluxDbSink {
         info!(
             "InfluxDB sink ID: {} closed — processed={}, success={}, errors={}",
             self.id,
-            self.messages_attempted.load(Ordering::SeqCst),
-            self.write_success.load(Ordering::SeqCst),
-            self.write_errors.load(Ordering::SeqCst),
+            self.messages_attempted.load(Ordering::Acquire),
+            self.write_success.load(Ordering::Acquire),
+            self.write_errors.load(Ordering::Acquire),
         );
         Ok(())
     }
@@ -1536,7 +1536,7 @@ mod http_tests {
                 post(move || {
                     let cc = cc2.clone();
                     async move {
-                        cc.fetch_add(1, Ordering::Relaxed);
+                        cc.fetch_add(1, Ordering::AcqRel);
                         StatusCode::NO_CONTENT
                     }
                 }),
@@ -1545,7 +1545,7 @@ mod http_tests {
         let sink = open_sink(v2_config(&base)).await;
         let msgs: Vec<_> = (0..5).map(|_| msg()).collect();
         sink.consume(&topic(), meta(), msgs).await.unwrap();
-        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+        assert_eq!(call_count.load(Ordering::Acquire), 3);
     }
 
     #[tokio::test]
@@ -1564,7 +1564,7 @@ mod http_tests {
                 post(move || {
                     let cc = cc2.clone();
                     async move {
-                        cc.fetch_add(1, Ordering::Relaxed);
+                        cc.fetch_add(1, Ordering::AcqRel);
                         StatusCode::NO_CONTENT
                     }
                 }),
@@ -1577,7 +1577,7 @@ mod http_tests {
         });
         let sink = open_sink(config).await;
         sink.consume(&topic(), meta(), vec![msg()]).await.unwrap();
-        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(call_count.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
@@ -1593,7 +1593,7 @@ mod http_tests {
                 post(move || {
                     let cc = cc2.clone();
                     async move {
-                        let n = cc.fetch_add(1, Ordering::Relaxed);
+                        let n = cc.fetch_add(1, Ordering::AcqRel);
                         if n == 0 {
                             StatusCode::INTERNAL_SERVER_ERROR
                         } else {
@@ -1608,7 +1608,7 @@ mod http_tests {
         let msgs: Vec<_> = (0..4).map(|_| msg()).collect();
         let result = sink.consume(&topic(), meta(), msgs).await;
         assert!(result.is_err()); // error from the first batch is returned
-        assert_eq!(call_count.load(Ordering::SeqCst), 2); // both batches were attempted
+        assert_eq!(call_count.load(Ordering::Acquire), 2); // both batches were attempted
     }
 
     #[tokio::test]
@@ -1626,7 +1626,7 @@ mod http_tests {
                 post(move || {
                     let cc = cc2.clone();
                     async move {
-                        let n = cc.fetch_add(1, Ordering::Relaxed);
+                        let n = cc.fetch_add(1, Ordering::AcqRel);
                         if n == 0 {
                             StatusCode::INTERNAL_SERVER_ERROR
                         } else {
@@ -1667,7 +1667,7 @@ mod http_tests {
                 post(move || {
                     let h = hit2.clone();
                     async move {
-                        h.fetch_add(1, Ordering::Relaxed);
+                        h.fetch_add(1, Ordering::AcqRel);
                         StatusCode::NO_CONTENT
                     }
                 }),
@@ -1677,7 +1677,7 @@ mod http_tests {
         sink.process_batch(&topic(), &meta(), &[msg()])
             .await
             .unwrap();
-        assert_eq!(hit.load(Ordering::SeqCst), 1);
+        assert_eq!(hit.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
@@ -1691,7 +1691,7 @@ mod http_tests {
                 post(move || {
                     let h = hit2.clone();
                     async move {
-                        h.fetch_add(1, Ordering::Relaxed);
+                        h.fetch_add(1, Ordering::AcqRel);
                         StatusCode::NO_CONTENT
                     }
                 }),
@@ -1701,6 +1701,6 @@ mod http_tests {
         sink.process_batch(&topic(), &meta(), &[msg()])
             .await
             .unwrap();
-        assert_eq!(hit.load(Ordering::SeqCst), 1);
+        assert_eq!(hit.load(Ordering::Acquire), 1);
     }
 }

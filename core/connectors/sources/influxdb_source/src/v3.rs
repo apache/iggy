@@ -167,6 +167,7 @@ pub(crate) struct PollResult {
 // ── Row processing (pure, testable without HTTP) ──────────────────────────────
 
 /// Result of processing a batch of V3 rows into Iggy messages.
+#[derive(Debug)]
 pub(crate) struct RowProcessingResult {
     pub messages: Vec<ProducedMessage>,
     pub max_cursor: Option<String>,
@@ -229,12 +230,12 @@ pub(crate) fn process_rows(
     }
 
     if !rows.is_empty() && max_cursor.is_none() {
-        warn!(
-            "No '{}' field found in any returned row — cursor will not advance; \
-             the connector will re-deliver the same rows on every poll. \
-             Check that the query selects the cursor column.",
+        return Err(Error::InvalidRecordValue(format!(
+            "No '{}' field found in any returned row — cursor cannot advance; \
+             the connector would re-deliver the same rows on every poll. \
+             Ensure your query selects the cursor column.",
             cursor_field
-        );
+        )));
     }
 
     Ok(RowProcessingResult {
@@ -417,39 +418,33 @@ mod tests {
     }
 
     #[test]
-    fn process_rows_row_without_cursor_field_does_not_update_cursor() {
+    fn process_rows_row_without_cursor_field_returns_error() {
+        // A batch where no row has the cursor column must return Err rather than
+        // silently re-delivering the same rows on every poll.
         let rows = vec![row(&[("val", "1")])]; // no "time" field
-        let result = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0).unwrap();
-        assert_eq!(result.messages.len(), 1);
-        assert!(result.max_cursor.is_none());
+        let err = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0)
+            .unwrap_err();
         assert!(
-            !result.all_at_cursor,
-            "row missing cursor field must clear all_at_cursor"
+            matches!(err, Error::InvalidRecordValue(_)),
+            "expected InvalidRecordValue when cursor column is absent, got {err:?}"
         );
-        // The message is still emitted (V3 does not skip rows), but max_cursor
-        // is None — the caller (poll) will keep the same cursor and re-deliver
-        // these rows. A warn! is emitted inside process_rows to surface the issue.
     }
 
     #[test]
-    fn process_rows_all_rows_missing_cursor_field_produces_none_max_cursor() {
-        // All rows lack the cursor column — max_cursor stays None for every row.
-        // This exercises the warn! path inside process_rows and confirms that
-        // messages are still emitted (no rows are silently dropped).
+    fn process_rows_all_rows_missing_cursor_field_returns_error() {
+        // When no row in the batch contains the cursor column, process_rows
+        // returns Err. This trips the circuit breaker via poll()'s `?`, giving
+        // the operator a visible failure rather than a silent infinite re-delivery.
         let rows = vec![
             row(&[("val", "1")]),
             row(&[("val", "2")]),
             row(&[("val", "3")]),
         ];
-        let result = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0).unwrap();
-        assert_eq!(result.messages.len(), 3, "all rows must be emitted");
+        let err = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0)
+            .unwrap_err();
         assert!(
-            result.max_cursor.is_none(),
-            "max_cursor must stay None when no row has the cursor field"
-        );
-        assert!(
-            !result.all_at_cursor,
-            "all_at_cursor must be false when cursor field is absent"
+            matches!(err, Error::InvalidRecordValue(_)),
+            "expected InvalidRecordValue when cursor column is absent, got {err:?}"
         );
     }
 
