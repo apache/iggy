@@ -59,7 +59,7 @@ pub mod row;
 mod v2;
 mod v3;
 
-pub use adapter::{InfluxDbAdapter, Row};
+pub use adapter::InfluxDbAdapter;
 pub use config::ApiVersion;
 pub use protocol::{write_field_string, write_measurement, write_tag_value};
-pub use row::{parse_csv_rows, parse_jsonl_rows};
+pub use row::{Row, parse_csv_rows, parse_jsonl_rows};

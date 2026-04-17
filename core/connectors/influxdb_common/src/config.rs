@@ -21,7 +21,7 @@
 use crate::adapter::InfluxDbAdapter;
 use crate::v2::V2Adapter;
 use crate::v3::V3Adapter;
-use tracing::warn;
+use iggy_connector_sdk::Error;
 
 /// Which InfluxDB wire protocol to use.
 ///
@@ -44,19 +44,16 @@ impl ApiVersion {
     /// Parse `api_version` from a config string.
     ///
     /// Accepts `"v2"`, `"2"`, `"v3"`, `"3"` (case-insensitive).
-    /// Unrecognised values warn and default to [`ApiVersion::V2`].
-    pub fn from_config(value: Option<&str>) -> Self {
+    /// Returns `Err` for unrecognised values — a typo in `api_version` would
+    /// otherwise silently run as V2 against a V3 server with wrong auth and
+    /// endpoints, causing silent data loss that is very hard to diagnose.
+    pub fn from_config(value: Option<&str>) -> Result<Self, Error> {
         match value.map(|v| v.to_ascii_lowercase()).as_deref() {
-            Some("v3") | Some("3") => ApiVersion::V3,
-            Some("v2") | Some("2") | None => ApiVersion::V2,
-            Some(other) => {
-                warn!(
-                    "Unrecognised api_version {:?}; valid values are \"v2\" or \"v3\". \
-                     Defaulting to v2.",
-                    other
-                );
-                ApiVersion::V2
-            }
+            Some("v3") | Some("3") => Ok(ApiVersion::V3),
+            Some("v2") | Some("2") | None => Ok(ApiVersion::V2),
+            Some(other) => Err(Error::InvalidConfigValue(format!(
+                "unrecognised api_version {other:?}; valid values are \"v2\" or \"v3\""
+            ))),
         }
     }
 
@@ -78,28 +75,29 @@ mod tests {
 
     #[test]
     fn v2_is_default() {
-        assert_eq!(ApiVersion::from_config(None), ApiVersion::V2);
+        assert_eq!(ApiVersion::from_config(None).unwrap(), ApiVersion::V2);
     }
 
     #[test]
     fn parses_v2_strings() {
-        assert_eq!(ApiVersion::from_config(Some("v2")), ApiVersion::V2);
-        assert_eq!(ApiVersion::from_config(Some("V2")), ApiVersion::V2);
-        assert_eq!(ApiVersion::from_config(Some("2")), ApiVersion::V2);
+        assert_eq!(ApiVersion::from_config(Some("v2")).unwrap(), ApiVersion::V2);
+        assert_eq!(ApiVersion::from_config(Some("V2")).unwrap(), ApiVersion::V2);
+        assert_eq!(ApiVersion::from_config(Some("2")).unwrap(), ApiVersion::V2);
     }
 
     #[test]
     fn parses_v3_strings() {
-        assert_eq!(ApiVersion::from_config(Some("v3")), ApiVersion::V3);
-        assert_eq!(ApiVersion::from_config(Some("V3")), ApiVersion::V3);
-        assert_eq!(ApiVersion::from_config(Some("3")), ApiVersion::V3);
+        assert_eq!(ApiVersion::from_config(Some("v3")).unwrap(), ApiVersion::V3);
+        assert_eq!(ApiVersion::from_config(Some("V3")).unwrap(), ApiVersion::V3);
+        assert_eq!(ApiVersion::from_config(Some("3")).unwrap(), ApiVersion::V3);
     }
 
     #[test]
-    fn unknown_value_falls_back_to_v2() {
-        assert_eq!(ApiVersion::from_config(Some("v4")), ApiVersion::V2);
-        assert_eq!(ApiVersion::from_config(Some("auto")), ApiVersion::V2);
-        assert_eq!(ApiVersion::from_config(Some("")), ApiVersion::V2);
+    fn unknown_value_is_an_error() {
+        assert!(ApiVersion::from_config(Some("v4")).is_err());
+        assert!(ApiVersion::from_config(Some("auto")).is_err());
+        assert!(ApiVersion::from_config(Some("")).is_err());
+        assert!(ApiVersion::from_config(Some("v33")).is_err());
     }
 
     #[test]

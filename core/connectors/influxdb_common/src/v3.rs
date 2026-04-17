@@ -18,21 +18,29 @@
 
 //! InfluxDB V3 adapter — SQL/InfluxQL, `/api/v3/*`, `Bearer` auth, JSONL.
 
-use crate::adapter::{InfluxDbAdapter, Row};
-use crate::row::parse_jsonl_rows;
+use crate::adapter::InfluxDbAdapter;
+use crate::row::{Row, parse_jsonl_rows};
 use iggy_connector_sdk::Error;
 use reqwest::Url;
+
+/// The format parameter value used in V3 query request bodies.
+const JSONL_FORMAT: &str = "jsonl";
 
 /// Map a short precision string to InfluxDB 3's long-form equivalent.
 ///
 /// InfluxDB 3 rejects the V2 short forms (`"ns"`, `"us"`, `"ms"`, `"s"`)
 /// on the `/api/v3/write_lp` endpoint; it expects the full English words.
-fn map_precision(p: &str) -> &'static str {
+/// Returns an error for unrecognised precision values rather than silently
+/// defaulting, which would timestamp data at the wrong precision.
+fn map_precision(p: &str) -> Result<&'static str, Error> {
     match p {
-        "ns" => "nanosecond",
-        "ms" => "millisecond",
-        "s" => "second",
-        _ => "microsecond", // covers "us" and any unrecognised value
+        "ns" => Ok("nanosecond"),
+        "us" => Ok("microsecond"),
+        "ms" => Ok("millisecond"),
+        "s" => Ok("second"),
+        other => Err(Error::InvalidConfigValue(format!(
+            "unknown precision {other:?}; valid values are \"ns\", \"us\", \"ms\", \"s\""
+        ))),
     }
 }
 
@@ -52,7 +60,7 @@ fn map_precision(p: &str) -> &'static str {
 /// If you need to target the V2-compat path you can switch `api_version = "v2"`
 /// in your connector config — the `V2Adapter` will then be selected instead.
 #[derive(Debug)]
-pub struct V3Adapter;
+pub(crate) struct V3Adapter;
 
 impl InfluxDbAdapter for V3Adapter {
     fn auth_header_value(&self, token: &str) -> String {
@@ -71,7 +79,7 @@ impl InfluxDbAdapter for V3Adapter {
 
         url.query_pairs_mut()
             .append_pair("db", bucket_or_db)
-            .append_pair("precision", map_precision(precision));
+            .append_pair("precision", map_precision(precision)?);
 
         Ok(url)
     }
@@ -89,7 +97,7 @@ impl InfluxDbAdapter for V3Adapter {
         let body = serde_json::json!({
             "db":     bucket_or_db,
             "q":      query,
-            "format": "jsonl"
+            "format": JSONL_FORMAT
         });
 
         Ok((url, body))
@@ -124,11 +132,17 @@ mod tests {
 
     #[test]
     fn map_precision_maps_all_short_forms() {
-        assert_eq!(map_precision("ns"), "nanosecond");
-        assert_eq!(map_precision("ms"), "millisecond");
-        assert_eq!(map_precision("s"), "second");
-        assert_eq!(map_precision("us"), "microsecond");
-        assert_eq!(map_precision("xx"), "microsecond"); // unknown → microsecond
+        assert_eq!(map_precision("ns").unwrap(), "nanosecond");
+        assert_eq!(map_precision("ms").unwrap(), "millisecond");
+        assert_eq!(map_precision("s").unwrap(), "second");
+        assert_eq!(map_precision("us").unwrap(), "microsecond");
+    }
+
+    #[test]
+    fn map_precision_rejects_unknown_values() {
+        assert!(map_precision("xx").is_err());
+        assert!(map_precision("").is_err());
+        assert!(map_precision("nanosecond").is_err());
     }
 
     #[test]
@@ -237,5 +251,32 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get("host").map(String::as_str), Some("s1"));
         assert_eq!(rows[0].get("_value").map(String::as_str), Some("42"));
+    }
+
+    #[test]
+    fn write_url_invalid_base_returns_error() {
+        let a = V3Adapter;
+        assert!(a.write_url("not a url", "db", None, "ns").is_err());
+        assert!(a.write_url("", "db", None, "ns").is_err());
+    }
+
+    #[test]
+    fn build_query_invalid_base_returns_error() {
+        let a = V3Adapter;
+        assert!(a.build_query("not a url", "SELECT 1", "db", None).is_err());
+    }
+
+    #[test]
+    fn health_url_invalid_base_returns_error() {
+        let a = V3Adapter;
+        assert!(a.health_url("not a url").is_err());
+        assert!(a.health_url("").is_err());
+    }
+
+    #[test]
+    fn build_query_format_is_jsonl() {
+        let a = V3Adapter;
+        let (_, body) = a.build_query(BASE, "SELECT 1", "db", None).unwrap();
+        assert_eq!(body["format"].as_str(), Some(JSONL_FORMAT));
     }
 }

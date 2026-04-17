@@ -23,17 +23,18 @@
 
 /// Write an escaped measurement name into `buf`.
 ///
-/// Escapes: `\` → `\\`, `,` → `\,`, ` ` → `\ `, `\n` → `\\n`, `\r` → `\\r`
+/// Escapes: `\` → `\\`, `,` → `\,`, ` ` → `\ `, `\t` → `\\t`, `\n` → `\\n`, `\r` → `\\r`
 ///
-/// Newline and carriage-return are the InfluxDB line-protocol record
-/// delimiters; a literal newline inside a measurement name would split the
-/// line and corrupt the batch.
+/// Newline, carriage-return, and tab are the InfluxDB line-protocol record
+/// delimiters or whitespace that can corrupt parsing; a literal newline inside
+/// a measurement name would split the line and corrupt the batch.
 pub fn write_measurement(buf: &mut String, value: &str) {
     for ch in value.chars() {
         match ch {
             '\\' => buf.push_str("\\\\"),
             ',' => buf.push_str("\\,"),
             ' ' => buf.push_str("\\ "),
+            '\t' => buf.push_str("\\t"),
             '\n' => buf.push_str("\\n"),
             '\r' => buf.push_str("\\r"),
             _ => buf.push(ch),
@@ -43,10 +44,11 @@ pub fn write_measurement(buf: &mut String, value: &str) {
 
 /// Write an escaped tag key/value into `buf`.
 ///
-/// Escapes: `\` → `\\`, `,` → `\,`, `=` → `\=`, ` ` → `\ `, `\n` → `\\n`, `\r` → `\\r`
+/// Escapes: `\` → `\\`, `,` → `\,`, `=` → `\=`, ` ` → `\ `, `\t` → `\\t`, `\n` → `\\n`, `\r` → `\\r`
 ///
-/// Newline and carriage-return are escaped for the same reason as in
-/// [`write_measurement`]: they are InfluxDB line-protocol record delimiters.
+/// Newline, carriage-return, and tab are escaped for the same reason as in
+/// [`write_measurement`]: they are InfluxDB line-protocol record delimiters or
+/// whitespace that can corrupt tag-set parsing.
 pub fn write_tag_value(buf: &mut String, value: &str) {
     for ch in value.chars() {
         match ch {
@@ -54,6 +56,7 @@ pub fn write_tag_value(buf: &mut String, value: &str) {
             ',' => buf.push_str("\\,"),
             '=' => buf.push_str("\\="),
             ' ' => buf.push_str("\\ "),
+            '\t' => buf.push_str("\\t"),
             '\n' => buf.push_str("\\n"),
             '\r' => buf.push_str("\\r"),
             _ => buf.push(ch),
@@ -145,5 +148,61 @@ mod tests {
         let mut buf = String::new();
         write_field_string(&mut buf, "hello world");
         assert_eq!(buf, "hello world");
+    }
+
+    #[test]
+    fn measurement_empty_string_produces_empty_output() {
+        let mut buf = String::new();
+        write_measurement(&mut buf, "");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn tag_value_empty_string_produces_empty_output() {
+        let mut buf = String::new();
+        write_tag_value(&mut buf, "");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn field_string_empty_string_produces_empty_output() {
+        let mut buf = String::new();
+        write_field_string(&mut buf, "");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn measurement_escapes_tab() {
+        let mut buf = String::new();
+        write_measurement(&mut buf, "m\teasure");
+        assert_eq!(buf, "m\\teasure");
+    }
+
+    #[test]
+    fn tag_value_escapes_tab() {
+        let mut buf = String::new();
+        write_tag_value(&mut buf, "val\tue");
+        assert_eq!(buf, "val\\tue");
+    }
+
+    #[test]
+    fn measurement_unicode_passthrough() {
+        let mut buf = String::new();
+        write_measurement(&mut buf, "温度");
+        assert_eq!(buf, "温度");
+    }
+
+    #[test]
+    fn tag_value_unicode_passthrough() {
+        let mut buf = String::new();
+        write_tag_value(&mut buf, "µ-sensor");
+        assert_eq!(buf, "µ-sensor");
+    }
+
+    #[test]
+    fn field_string_unicode_passthrough() {
+        let mut buf = String::new();
+        write_field_string(&mut buf, "café");
+        assert_eq!(buf, "café");
     }
 }

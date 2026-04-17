@@ -263,8 +263,15 @@ static CURSOR_RE: OnceLock<regex::Regex> = OnceLock::new();
 
 pub fn cursor_re() -> &'static regex::Regex {
     CURSOR_RE.get_or_init(|| {
-        regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$")
-            .expect("hardcoded regex is valid")
+        // Validates RFC 3339 timestamp structure with proper field ranges:
+        // month 01-12, day 01-31, hour 00-23, minute/second 00-59.
+        // Timezone suffix is optional to allow naive local timestamps from user config.
+        // Note: day 29-31 validity for a given month is not checked by the regex;
+        // chrono parsing inside validate_cursor handles that for tz-aware timestamps.
+        regex::Regex::new(
+            r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d+)?(Z|[+-]\d{2}:\d{2})?$"
+        )
+        .expect("hardcoded regex is valid")
     })
 }
 
@@ -383,6 +390,23 @@ mod tests {
         assert!(validate_cursor("not-a-timestamp").is_err());
         assert!(validate_cursor("").is_err());
         assert!(validate_cursor("2024-01-15").is_err());
+    }
+
+    #[test]
+    fn validate_cursor_rejects_out_of_range_date_parts() {
+        assert!(validate_cursor("2024-13-01T00:00:00Z").is_err(), "month 13");
+        assert!(validate_cursor("2024-00-01T00:00:00Z").is_err(), "month 0");
+        assert!(validate_cursor("2024-01-00T00:00:00Z").is_err(), "day 0");
+        assert!(validate_cursor("2024-01-32T00:00:00Z").is_err(), "day 32");
+        assert!(validate_cursor("2024-01-01T24:00:00Z").is_err(), "hour 24");
+        assert!(
+            validate_cursor("2024-01-01T00:60:00Z").is_err(),
+            "minute 60"
+        );
+        assert!(
+            validate_cursor("2024-01-01T00:00:60Z").is_err(),
+            "second 60"
+        );
     }
 
     #[test]

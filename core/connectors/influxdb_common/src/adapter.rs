@@ -19,16 +19,9 @@
 //! The `InfluxDbAdapter` trait — the single seam between version-agnostic
 //! orchestration logic and version-specific HTTP details.
 
+pub use crate::row::Row;
 use iggy_connector_sdk::Error;
 use reqwest::Url;
-use std::collections::HashMap;
-
-/// A single row returned by a query, field name → string value.
-///
-/// Both V2 (annotated CSV) and V3 (JSONL) responses are normalised into this
-/// common representation so the cursor-tracking and payload-building logic
-/// above this layer remains version-agnostic.
-pub type Row = HashMap<String, String>;
 
 /// Version-specific HTTP details for InfluxDB sink and source connectors.
 ///

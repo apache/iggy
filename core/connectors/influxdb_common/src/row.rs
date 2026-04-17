@@ -23,9 +23,16 @@
 //! operates on this common representation so it runs unchanged regardless of
 //! which InfluxDB version is in use.
 
-use crate::adapter::Row;
 use csv::StringRecord;
 use iggy_connector_sdk::Error;
+use std::collections::HashMap;
+
+/// A single row returned by a query, field name → string value.
+///
+/// Both V2 (annotated CSV) and V3 (JSONL) responses are normalised into this
+/// common representation so the cursor-tracking and payload-building logic
+/// above this layer remains version-agnostic.
+pub type Row = HashMap<String, String>;
 
 // ── InfluxDB V2 — annotated CSV ───────────────────────────────────────────────
 
@@ -55,6 +62,7 @@ fn is_header_record(record: &StringRecord) -> bool {
 pub fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
+        .flexible(true) // multi-table results have variable column counts per table
         .from_reader(csv_text.as_bytes());
 
     let mut headers: Option<StringRecord> = None;
@@ -187,6 +195,21 @@ mod tests {
         let csv = "_time,_value\n2024-01-01T00:00:00Z,10\n_time,_value\n2024-01-01T00:00:01Z,20\n";
         let rows = parse_csv_rows(csv).unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn csv_new_table_different_columns_updates_headers() {
+        // Multi-table result: second table has an extra _measurement column.
+        // The parser should recognise the new header row and update accordingly.
+        let csv = "_time,_value\n\
+                   2024-01-01T00:00:00Z,10\n\
+                   _time,_measurement,_value\n\
+                   2024-01-01T00:00:01Z,cpu,20\n";
+        let rows = parse_csv_rows(csv).unwrap();
+        assert_eq!(rows.len(), 2);
+        //assert!(rows[0].contains_key("_measurement"));
+        assert!(rows[0].get("_measurement").is_none());
+        assert_eq!(rows[1].get("_measurement").map(String::as_str), Some("cpu"));
     }
 
     #[test]

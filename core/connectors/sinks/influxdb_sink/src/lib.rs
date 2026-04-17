@@ -575,6 +575,14 @@ impl InfluxDbSink {
 #[async_trait]
 impl Sink for InfluxDbSink {
     async fn open(&mut self) -> Result<(), Error> {
+        const VALID_PRECISIONS: &[&str] = &["ns", "us", "ms", "s"];
+        if !VALID_PRECISIONS.contains(&self.precision.as_str()) {
+            return Err(Error::InvalidConfigValue(format!(
+                "unknown precision {:?}; valid values are \"ns\", \"us\", \"ms\", \"s\"",
+                self.precision
+            )));
+        }
+
         info!(
             "Opening InfluxDB sink ID: {} (version={})",
             self.id,
@@ -870,14 +878,21 @@ mod tests {
         assert_eq!(sink.to_precision_timestamp(7_000_000), 7);
     }
 
-    #[test]
-    fn precision_unknown_falls_back_to_us() {
+    #[tokio::test]
+    async fn open_rejects_unknown_precision() {
+        // Unknown precision must fail at open() rather than silently defaulting
+        // to microseconds, which would timestamp data at the wrong precision.
         let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            url: "http://localhost:18086".to_string(),
             precision: Some("xx".to_string()),
             ..make_v2_config().into_v2().unwrap()
         });
-        let sink = InfluxDbSink::new(1, config);
-        assert_eq!(sink.to_precision_timestamp(999), 999);
+        let mut sink = InfluxDbSink::new(1, config);
+        let err = sink.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "expected InvalidConfigValue, got {err:?}"
+        );
     }
 
     // ── line-protocol escaping ────────────────────────────────────────────

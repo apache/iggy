@@ -18,8 +18,8 @@
 
 //! InfluxDB V2 adapter — Flux, `/api/v2/*`, `Token` auth, annotated CSV.
 
-use crate::adapter::{InfluxDbAdapter, Row};
-use crate::row::parse_csv_rows;
+use crate::adapter::InfluxDbAdapter;
+use crate::row::{Row, parse_csv_rows};
 use iggy_connector_sdk::Error;
 use reqwest::Url;
 
@@ -33,7 +33,7 @@ use reqwest::Url;
 /// | Query language | Flux |
 /// | Response format | Annotated CSV (RFC 4180) |
 #[derive(Debug)]
-pub struct V2Adapter;
+pub(crate) struct V2Adapter;
 
 impl InfluxDbAdapter for V2Adapter {
     fn auth_header_value(&self, token: &str) -> String {
@@ -79,7 +79,7 @@ impl InfluxDbAdapter for V2Adapter {
         let body = serde_json::json!({
             "query": query,
             "dialect": {
-                "annotations": [],
+                "annotations": ["datatype", "group", "default"],
                 "delimiter": ",",
                 "header": true,
                 "commentPrefix": "#"
@@ -165,6 +165,45 @@ mod tests {
         assert!(q.contains("org=org"), "missing org: {q}");
         assert!(body["query"].is_string(), "query field missing");
         assert!(body["dialect"].is_object(), "dialect field missing");
+        let annotations = body["dialect"]["annotations"].as_array().unwrap();
+        assert!(
+            annotations.iter().any(|v| v.as_str() == Some("datatype")),
+            "datatype annotation missing: {annotations:?}"
+        );
+        assert!(
+            annotations.iter().any(|v| v.as_str() == Some("group")),
+            "group annotation missing: {annotations:?}"
+        );
+        assert!(
+            annotations.iter().any(|v| v.as_str() == Some("default")),
+            "default annotation missing: {annotations:?}"
+        );
+    }
+
+    #[test]
+    fn write_url_invalid_base_returns_error() {
+        let a = V2Adapter;
+        assert!(
+            a.write_url("not a url", "bucket", Some("org"), "us")
+                .is_err()
+        );
+        assert!(a.write_url("", "bucket", None, "us").is_err());
+    }
+
+    #[test]
+    fn build_query_invalid_base_returns_error() {
+        let a = V2Adapter;
+        assert!(
+            a.build_query("not a url", "from(bucket:\"b\")", "b", Some("org"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn health_url_invalid_base_returns_error() {
+        let a = V2Adapter;
+        assert!(a.health_url("not a url").is_err());
+        assert!(a.health_url("").is_err());
     }
 
     #[test]
