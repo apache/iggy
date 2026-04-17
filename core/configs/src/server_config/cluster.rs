@@ -36,12 +36,28 @@ pub struct NodeConfig {
 pub struct CurrentNodeConfig {
     pub name: String,
     pub ip: String,
+    /// Explicit numeric replica ID for VSR consensus (0-based).
+    ///
+    /// Required when `cluster.enabled` is true. `None` is a configuration
+    /// error caught by [`ClusterConfig::validate`]; a silent default of 0
+    /// would wedge the cluster into a permanent view change as soon as a
+    /// second replica joined.
+    pub replica_id: Option<u8>,
+    /// Bind ports for the current node. Symmetric with [`OtherNodeConfig`]
+    /// so the consensus listener can pick a dedicated `tcp_replica` port
+    /// without borrowing it from the client-facing `tcp.address`.
+    #[serde(default)]
+    pub ports: TransportPorts,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct OtherNodeConfig {
     pub name: String,
     pub ip: String,
+    /// Explicit numeric replica ID for VSR consensus (0-based).
+    ///
+    /// Required when `cluster.enabled` is true. See [`CurrentNodeConfig::replica_id`].
+    pub replica_id: Option<u8>,
     pub ports: TransportPorts,
 }
 
@@ -51,4 +67,6 @@ pub struct TransportPorts {
     pub quic: Option<u16>,
     pub http: Option<u16>,
     pub websocket: Option<u16>,
+    /// Dedicated port for replica-to-replica consensus traffic.
+    pub tcp_replica: Option<u16>,
 }

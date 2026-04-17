@@ -37,8 +37,8 @@ use consensus::{
     request_preflight, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::consensus::iobuf::Frozen;
-use iggy_binary_protocol::{GenericHeader, PrepareOkHeader, RequestHeader};
 use iggy_binary_protocol::{Message, Operation, PrepareHeader};
+use iggy_binary_protocol::{PrepareOkHeader, RequestHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
     IggyByteSize, IggyError, IggyTimestamp, PartitionStats, PollingKind, SegmentStorage,
@@ -571,7 +571,7 @@ where
 
 impl<B> IggyPartition<B>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
 {
     #[must_use]
     fn namespace(&self) -> IggyNamespace {
@@ -683,7 +683,7 @@ where
         self.on_replicate(prepare).await;
     }
 
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn on_replicate(&mut self, message: Message<PrepareHeader>) {
         self.clear_pending_consumer_offset_commits_if_view_changed();
         let header = *message.header();
@@ -713,7 +713,7 @@ where
             fence_old_prepare_by_commit(consensus, &header)
                 || self.log.journal().inner.header_by_op(header.op).is_some()
         };
-        let message = if is_old_prepare {
+        if is_old_prepare {
             emit_partition_diag(
                 tracing::Level::WARN,
                 &PartitionDiagEvent::new(
@@ -723,11 +723,21 @@ where
                 .with_operation(header.operation)
                 .with_op(header.op),
             );
-            message
         } else {
             let consensus = self.consensus();
-            replicate_to_next_in_chain(consensus, message).await
-        };
+            if let Err(error) = replicate_to_next_in_chain(consensus, &message).await {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        self.diag_ctx(),
+                        "failed to replicate prepare to next in chain",
+                    )
+                    .with_operation(header.operation)
+                    .with_op(header.op)
+                    .with_error(error.to_string()),
+                );
+            }
+        }
 
         if header.op != current_op + 1 {
             emit_partition_diag(
@@ -1133,7 +1143,7 @@ where
             );
 
             if send_client_replies {
-                let reply_buffers = reply.into_generic();
+                let reply_buffers = reply.into_generic().into_frozen();
                 emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
 
                 if let Err(error) = self

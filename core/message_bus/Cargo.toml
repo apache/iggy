@@ -29,9 +29,16 @@ readme = "../../../README.md"
 publish = false
 
 [dependencies]
+async-channel = { workspace = true }
+compio = { workspace = true }
+futures = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
-rand = { workspace = true }
+libc = { workspace = true }
+rand = "0.10"
+socket2 = { workspace = true, features = ["all"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [lints.clippy]
 enum_glob_use = "deny"

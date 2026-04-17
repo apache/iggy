@@ -15,15 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cache::connection::ShardedState;
+//! Bus lifecycle primitives.
+//!
+//! A root cancellation token and a keyed connection registry. Intentionally
+//! narrow: these are the only two abstractions we need to drive graceful
+//! shutdown for the TCP path (IGGY-99).
 
-/// Allocation strategy that produces deltas for a specific sharded state type.
-pub trait AllocationStrategy<SS>
-where
-    SS: ShardedState,
-{
-    fn allocate(&self, entry: SS::Entry) -> Option<SS::Delta>;
-    fn deallocate(&self, entry: SS::Entry) -> Option<SS::Delta>;
-}
+pub mod connection_registry;
+pub mod shutdown;
 
-pub mod connection;
+pub use connection_registry::{
+    AlreadyRegistered, BusMessage, BusReceiver, BusSender, ConnectionRegistry, DrainOutcome,
+    ReplicaRegistry,
+};
+pub use shutdown::{Shutdown, ShutdownToken};

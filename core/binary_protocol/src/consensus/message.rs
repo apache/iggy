@@ -24,7 +24,7 @@ use crate::consensus::{
 use smallvec::SmallVec;
 use std::{marker::PhantomData, mem::size_of};
 
-const MESSAGE_ALIGN: usize = 4096;
+pub const MESSAGE_ALIGN: usize = 4096;
 
 pub trait MessageBacking<H>
 where

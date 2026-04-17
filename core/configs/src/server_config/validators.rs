@@ -412,6 +412,35 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             }
         }
 
+        // VSR needs every replica to have a stable, unique id strictly
+        // less than the total replica count. Missing ids would let serde's
+        // default wedge a backup into thinking it is replica 0, which is
+        // the primary in view 0; duplicate ids split the cluster into two
+        // replicas claiming the same slot; out-of-range ids never win a
+        // primary election. All of these are unrecoverable at runtime -
+        // fail fast at startup.
+        let Some(current_id) = self.node.current.replica_id else {
+            eprintln!(
+                "Invalid cluster configuration: cluster.node.current.replica_id must be set when cluster is enabled"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        };
+
+        let total_replicas = u8::try_from(self.node.others.len() + 1).map_err(|_| {
+            eprintln!("Invalid cluster configuration: more than 255 replicas is unsupported");
+            ConfigurationError::InvalidConfigurationValue
+        })?;
+
+        if current_id >= total_replicas {
+            eprintln!(
+                "Invalid cluster configuration: current replica_id {current_id} must be < total replica count {total_replicas}"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        let mut seen_ids = std::collections::HashSet::new();
+        seen_ids.insert(current_id);
+
         let mut used_endpoints = std::collections::HashSet::new();
         for node in &self.node.others {
             if node.name.trim().is_empty() {
@@ -423,6 +452,29 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                 eprintln!(
                     "Invalid cluster configuration: IP cannot be empty for node '{}'",
                     node.name
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+
+            let Some(other_id) = node.replica_id else {
+                eprintln!(
+                    "Invalid cluster configuration: replica_id must be set for node '{}' when cluster is enabled",
+                    node.name
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            };
+
+            if other_id >= total_replicas {
+                eprintln!(
+                    "Invalid cluster configuration: replica_id {other_id} for node '{}' must be < total replica count {total_replicas}",
+                    node.name
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+
+            if !seen_ids.insert(other_id) {
+                eprintln!(
+                    "Invalid cluster configuration: duplicate replica_id {other_id} (already held by current node or another other node)"
                 );
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
@@ -457,5 +509,76 @@ impl Validatable<ConfigurationError> for ClusterConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cluster_validate_tests {
+    use super::*;
+    use crate::server_config::cluster::{
+        ClusterConfig, CurrentNodeConfig, NodeConfig, OtherNodeConfig, TransportPorts,
+    };
+
+    fn other(name: &str, id: Option<u8>) -> OtherNodeConfig {
+        OtherNodeConfig {
+            name: name.to_string(),
+            ip: "127.0.0.1".to_string(),
+            replica_id: id,
+            ports: TransportPorts::default(),
+        }
+    }
+
+    fn cfg(current_id: Option<u8>, others: Vec<OtherNodeConfig>) -> ClusterConfig {
+        ClusterConfig {
+            enabled: true,
+            name: "iggy-cluster".to_string(),
+            node: NodeConfig {
+                current: CurrentNodeConfig {
+                    name: "iggy-node-1".to_string(),
+                    ip: "127.0.0.1".to_string(),
+                    replica_id: current_id,
+                    ports: TransportPorts::default(),
+                },
+                others,
+            },
+        }
+    }
+
+    #[test]
+    fn validate_rejects_missing_current_replica_id() {
+        let c = cfg(None, vec![other("n2", Some(1))]);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_missing_other_replica_id() {
+        let c = cfg(Some(0), vec![other("n2", None)]);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_replica_ids() {
+        let c = cfg(Some(0), vec![other("n2", Some(0))]);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_replica_id() {
+        // 2 replicas total (current + 1 other), so id 2 is out of range.
+        let c = cfg(Some(2), vec![other("n2", Some(1))]);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_unique_contiguous_replica_ids() {
+        let c = cfg(Some(0), vec![other("n2", Some(1)), other("n3", Some(2))]);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_skips_checks_when_disabled() {
+        let mut c = cfg(None, vec![]);
+        c.enabled = false;
+        assert!(c.validate().is_ok());
     }
 }

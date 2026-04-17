@@ -17,13 +17,14 @@
 
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, Receiver, ShardFrame};
+use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{
     ConsensusError, ConsensusHeader, GenericHeader, Message, MessageBag, PrepareHeader,
 };
 use iggy_common::sharding::IggyNamespace;
 use journal::{Journal, JournalHandle};
-use message_bus::MessageBus;
+use message_bus::{ConnectionInstaller, MessageBus};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 
@@ -35,7 +36,7 @@ use metadata::stm::StateMachine;
 /// pump), preventing concurrent access from independent async tasks.
 impl<B, MJ, S, M, T, R> IggyShard<B, MJ, S, M, T, R>
 where
-    B: MessageBus,
+    B: MessageBus + ConnectionInstaller,
     T: ShardsTable,
     R: Send + 'static,
 {
@@ -107,16 +108,29 @@ where
             // headers don't carry an IggyNamespace.
             0
         };
-        if self.senders[target as usize]
-            .send(ShardFrame::fire_and_forget(generic))
-            .is_err()
-        {
-            tracing::warn!(
-                shard = self.id,
-                target,
-                ?operation,
-                "dispatch: shard channel full or closed, message dropped"
-            );
+        // `senders[target]` is a `crossfire::MTx`, which in compio is
+        // running on an io_uring reactor: a blocking `send` on a full
+        // inbox would park the reactor thread and stall every other
+        // connection on the shard. Drop instead - consensus recovers via
+        // WAL retransmit or a view change.
+        match self.senders[target as usize].try_send(ShardFrame::fire_and_forget(generic)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!(
+                    shard = self.id,
+                    target,
+                    ?operation,
+                    "dispatch: shard inbox full, message dropped"
+                );
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                tracing::warn!(
+                    shard = self.id,
+                    target,
+                    ?operation,
+                    "dispatch: shard inbox closed, message dropped"
+                );
+            }
         }
     }
 
@@ -186,15 +200,33 @@ where
             // TODO: Same view-change and Commit routing issue as dispatch() above.
             0
         };
-        // Create a frame and send it to the target shard.
+        // Create a frame and send it to the target shard. Same non-
+        // blocking `try_send` reason as `dispatch` above: blocking on a
+        // full inbox would park the io_uring reactor.
+        //
+        // On `Full` / `Disconnected` we drop the frame and let the
+        // caller's `rx` observe the disconnect (the `response_sender`
+        // inside the frame is dropped together with the frame). Callers
+        // see an early error rather than hanging.
         let (frame, rx) = ShardFrame::<R>::with_response(generic);
-        if self.senders[target as usize].send(frame).is_err() {
-            tracing::warn!(
-                shard = self.id,
-                target,
-                ?operation,
-                "dispatch_request: shard channel full or closed, message dropped"
-            );
+        match self.senders[target as usize].try_send(frame) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!(
+                    shard = self.id,
+                    target,
+                    ?operation,
+                    "dispatch_request: shard inbox full, message dropped"
+                );
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                tracing::warn!(
+                    shard = self.id,
+                    target,
+                    ?operation,
+                    "dispatch_request: shard inbox closed, message dropped"
+                );
+            }
         }
         Ok(rx)
     }
@@ -203,7 +235,7 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn run_message_pump(&self, stop: Receiver<()>)
     where
-        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        B: MessageBus,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target: Journal<
                 <MJ as JournalHandle>::Storage,
@@ -237,7 +269,7 @@ where
     #[allow(clippy::future_not_send)]
     async fn process_frame(&self, frame: ShardFrame<R>)
     where
-        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        B: MessageBus,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target: Journal<
                 <MJ as JournalHandle>::Storage,
@@ -250,7 +282,87 @@ where
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
-        self.on_message(frame.message).await;
+        match frame.payload {
+            crate::ShardFramePayload::Consensus(message) => {
+                self.on_message(message).await;
+            }
+            crate::ShardFramePayload::ReplicaConnectionSetup { raw_fd, replica_id } => {
+                tracing::info!(
+                    shard = self.id,
+                    replica_id,
+                    raw_fd,
+                    "installing delegated replica fd"
+                );
+                self.bus
+                    .install_replica_fd(raw_fd, replica_id, self.on_replica_message.clone());
+            }
+            crate::ShardFramePayload::ClientConnectionSetup { raw_fd, client_id } => {
+                tracing::info!(
+                    shard = self.id,
+                    client_id,
+                    raw_fd,
+                    "installing delegated client fd"
+                );
+                self.bus
+                    .install_client_fd(raw_fd, client_id, self.on_client_request.clone());
+            }
+            crate::ShardFramePayload::ReplicaMappingUpdate {
+                replica_id,
+                owning_shard,
+            } => {
+                self.bus.set_shard_mapping(replica_id, owning_shard);
+            }
+            crate::ShardFramePayload::ReplicaMappingClear { replica_id } => {
+                self.bus.remove_shard_mapping(replica_id);
+            }
+            crate::ShardFramePayload::ForwardReplicaSend { replica_id, msg } => {
+                // Fast path on the owning shard: re-enter `send_to_replica`
+                // which finds the local `BusSender` in the replicas registry.
+                if let Err(e) = self.bus.send_to_replica(replica_id, msg).await {
+                    tracing::debug!(
+                        shard = self.id,
+                        replica_id,
+                        error = ?e,
+                        "forward-replica-send delivery failed"
+                    );
+                }
+            }
+            crate::ShardFramePayload::ForwardClientSend { client_id, msg } => {
+                if let Err(e) = self.bus.send_to_client(client_id, msg).await {
+                    tracing::debug!(
+                        shard = self.id,
+                        client_id,
+                        error = ?e,
+                        "forward-client-send delivery failed"
+                    );
+                }
+            }
+            crate::ShardFramePayload::ConnectionLost { replica_id } => {
+                // Shard 0 is the sole responder; the next reconnect sweep
+                // will re-dial the peer. Non-zero shards should not see this
+                // variant.
+                if self.id == 0 {
+                    tracing::warn!(replica_id, "shard 0 observed replica connection loss");
+                    // If a coordinator is attached, let it broadcast the
+                    // clear AND drop its tracked mapping so the periodic
+                    // refresh task stops re-broadcasting a dead replica's
+                    // mapping. Tests that bypass the coordinator fall back
+                    // to the direct broadcast.
+                    if let Some(coord) = &self.coordinator {
+                        coord.forget_mapping(replica_id);
+                        coord.broadcast_mapping_clear(replica_id);
+                    } else {
+                        crate::broadcast_mapping_clear(&self.senders, replica_id);
+                    }
+                } else {
+                    tracing::warn!(
+                        shard = self.id,
+                        replica_id,
+                        "non-zero shard received ConnectionLost; dropping"
+                    );
+                }
+            }
+        }
         // TODO: once on_message returns an R (e.g. ShardResponse), send it
         // back via frame.response_sender.  For now the sender is dropped and
         // the caller's receiver will observe a disconnect.

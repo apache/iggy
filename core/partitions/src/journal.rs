@@ -542,3 +542,50 @@ fn push_selected_batch_fragments(
     *last_matching_offset = Some(selection.last_matching_offset);
     *matched_messages += selection.matched_messages;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_binary_protocol::{Command2, HEADER_SIZE, Message};
+    use journal::Journal;
+
+    fn build_prepare(op: u64, size: usize) -> Message<PrepareHeader> {
+        Message::<PrepareHeader>::new(size).transmute_header(|_, h: &mut PrepareHeader| {
+            h.command = Command2::Prepare;
+            h.op = op;
+            h.size = u32::try_from(size).expect("size fits in u32");
+        })
+    }
+
+    #[compio::test]
+    async fn entry_round_trips_bytes_for_retransmit() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+
+        let payload_size = HEADER_SIZE + 64;
+        let prepare = build_prepare(3, payload_size);
+        let expected_bytes = prepare.as_slice().to_vec();
+        let frozen = prepare.into_frozen();
+
+        journal.append(frozen).await.expect("append");
+
+        let header = journal.header_by_op(3).expect("header for op 3");
+        let entry = journal
+            .entry(&header)
+            .await
+            .expect("entry for op 3 must exist");
+
+        assert_eq!(
+            entry.as_slice(),
+            expected_bytes.as_slice(),
+            "retransmit path must read back the exact bytes that were appended; \
+             cloning the returned Frozen is the sole payload copy"
+        );
+
+        let cloned = entry.clone();
+        assert_eq!(
+            cloned.as_slice(),
+            entry.as_slice(),
+            "cloning a journal entry must yield identical bytes (refcount bump, not deep copy)"
+        );
+    }
+}

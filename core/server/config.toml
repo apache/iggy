@@ -552,6 +552,8 @@ name = "iggy-cluster"
 name = "iggy-node-1"
 # IP address that other nodes should use to connect to this node
 ip = "127.0.0.1"
+# Explicit numeric replica ID for VSR consensus (0-based, must be unique per cluster)
+replica_id = 0
 
 # Other nodes in the cluster
 # Each field in 'ports' is optional. If omitted, the current node's configured port will be used.
@@ -559,7 +561,8 @@ ip = "127.0.0.1"
 [[cluster.node.others]]
 name = "iggy-node-2"
 ip = "127.0.0.1"
-ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093 }
+replica_id = 1
+ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 9091 }
 
 # [[cluster.node.others]]
 # name = "iggy-node-3"

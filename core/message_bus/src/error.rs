@@ -15,15 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cache::connection::ShardedState;
+use thiserror::Error;
 
-/// Allocation strategy that produces deltas for a specific sharded state type.
-pub trait AllocationStrategy<SS>
-where
-    SS: ShardedState,
-{
-    fn allocate(&self, entry: SS::Entry) -> Option<SS::Delta>;
-    fn deallocate(&self, entry: SS::Entry) -> Option<SS::Delta>;
+/// Transport-level error for `MessageBus::send_to_*` operations.
+///
+/// All variants are non-fatal from the consensus perspective.
+/// VSR handles message loss via timeout-driven retransmission from the WAL.
+#[derive(Debug, Error)]
+pub enum SendError {
+    #[error("client {0} not found")]
+    ClientNotFound(u128),
+
+    #[error("replica {0} not connected")]
+    ReplicaNotConnected(u8),
+
+    #[error("connection closed")]
+    ConnectionClosed,
+
+    #[error("bus is shutting down")]
+    BusShuttingDown,
+
+    #[error("queue full, message dropped")]
+    Backpressure,
+
+    #[error("inter-shard routing to shard {0} failed")]
+    RoutingFailed(u16),
+
+    #[error("fd duplication failed: errno={0}")]
+    DupFailed(i32),
 }
-
-pub mod connection;

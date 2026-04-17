@@ -583,6 +583,8 @@ impl Default for NodeConfig {
             current: CurrentNodeConfig {
                 name: SERVER_CONFIG.cluster.node.current.name.parse().unwrap(),
                 ip: SERVER_CONFIG.cluster.node.current.ip.parse().unwrap(),
+                replica_id: Some(SERVER_CONFIG.cluster.node.current.replica_id as u8),
+                ports: TransportPorts::default(),
             },
             others: SERVER_CONFIG
                 .cluster
@@ -592,11 +594,13 @@ impl Default for NodeConfig {
                 .map(|other| OtherNodeConfig {
                     name: other.name.parse().unwrap(),
                     ip: other.ip.parse().unwrap(),
+                    replica_id: Some(other.replica_id as u8),
                     ports: TransportPorts {
                         tcp: Some(other.ports.tcp as u16),
                         quic: Some(other.ports.quic as u16),
                         http: Some(other.ports.http as u16),
                         websocket: Some(other.ports.websocket as u16),
+                        tcp_replica: Some(other.ports.tcp_replica as u16),
                     },
                 })
                 .collect(),

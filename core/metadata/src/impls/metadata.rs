@@ -45,8 +45,12 @@ use std::mem::size_of;
 use std::path::Path;
 use tracing::{debug, error, warn};
 
-const fn freeze_client_reply(message: Message<GenericHeader>) -> Message<GenericHeader> {
-    message
+fn freeze_client_reply(
+    message: Message<GenericHeader>,
+) -> iggy_binary_protocol::consensus::iobuf::Frozen<
+    { iggy_binary_protocol::consensus::MESSAGE_ALIGN },
+> {
+    message.into_frozen()
 }
 
 pub trait StreamsFrontend {
@@ -306,7 +310,7 @@ where
 #[allow(clippy::future_not_send)]
 impl<B, J, S, M> Plane<VsrConsensus<B>> for IggyMetadata<VsrConsensus<B>, J, S, M>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
@@ -408,7 +412,7 @@ where
         #[allow(clippy::cast_possible_truncation)]
         let is_old_prepare = fence_old_prepare_by_commit(consensus, &header)
             || journal.handle().header(header.op as usize).is_some();
-        let message = if is_old_prepare {
+        if is_old_prepare {
             warn!(
                 target: "iggy.metadata.diag",
                 plane = "metadata",
@@ -419,10 +423,15 @@ where
                 operation = ?header.operation,
                 "received old prepare, skipping replication"
             );
-            message
         } else {
-            self.replicate(message).await
-        };
+            // TODO(hubcio): is this correct? should we replicate and append,
+            // or append and replicate? Chain-replicating before the local
+            // append means a backup that crashes here forwarded a prepare
+            // it never persisted, violating VSR's tail-ahead-of-head
+            // invariant. The hash-chain fence + view change recovers but
+            // burns a view. Worth an ordering decision issue.
+            self.replicate(&message).await;
+        }
 
         // TODO add assertions for valid state here.
 
@@ -624,7 +633,7 @@ where
 
 impl<B, P, J, S, M> PlaneIdentity<VsrConsensus<B, P>> for IggyMetadata<VsrConsensus<B, P>, J, S, M>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
@@ -645,7 +654,7 @@ where
 
 impl<B, P, J, S, M> IggyMetadata<VsrConsensus<B, P>, J, S, M>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
@@ -778,8 +787,10 @@ where
     /// - Primary sends to first backup
     /// - Each backup forwards to the next
     /// - Stops when we would forward back to primary
+    ///
+    /// Borrows the message so the caller retains ownership for journal append.
     #[allow(clippy::future_not_send)]
-    async fn replicate(&self, message: Message<PrepareHeader>) -> Message<PrepareHeader> {
+    async fn replicate(&self, message: &Message<PrepareHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
@@ -793,7 +804,9 @@ where
             journal.handle().header(idx).is_none(),
             "replicate: must not already have prepare"
         );
-        replicate_to_next_in_chain(consensus, message).await
+        if let Err(e) = replicate_to_next_in_chain(consensus, message).await {
+            tracing::warn!(op = header.op, error = ?e, "chain replication failed");
+        }
     }
 
     // TODO: Implement jump_to_newer_op

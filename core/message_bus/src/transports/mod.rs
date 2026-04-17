@@ -15,15 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cache::connection::ShardedState;
-
-/// Allocation strategy that produces deltas for a specific sharded state type.
-pub trait AllocationStrategy<SS>
-where
-    SS: ShardedState,
-{
-    fn allocate(&self, entry: SS::Entry) -> Option<SS::Delta>;
-    fn deallocate(&self, entry: SS::Entry) -> Option<SS::Delta>;
-}
-
-pub mod connection;
+//! Transport abstraction - placeholder.
+//!
+//! Tracked by IGGY-112. This module is deliberately empty until the
+//! `Transport` / `TransportListener` / `TransportConn` trait family lands;
+//! do not grow speculative scaffolding here.
