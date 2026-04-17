@@ -17,7 +17,7 @@
 
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_u32_le};
-use crate::requests::partitions::CreatedPartitionAssignment;
+use crate::primitives::partition_assignment::CreatedPartitionAssignment;
 use crate::requests::topics::CreateTopicRequest;
 use bytes::{BufMut, BytesMut};
 
@@ -97,7 +97,7 @@ mod tests {
     use crate::WireIdentifier;
     use crate::codec::{WireDecode, WireEncode};
     use crate::primitives::identifier::WireName;
-    use crate::requests::partitions::CreatedPartitionAssignment;
+    use crate::primitives::partition_assignment::CreatedPartitionAssignment;
     use crate::requests::topics::CreateTopicRequest;
 
     #[test]

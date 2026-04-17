@@ -18,9 +18,8 @@
 pub mod create_partitions;
 pub mod create_partitions_with_assignments;
 pub mod delete_partitions;
-pub mod partition_assignment;
 
+pub use crate::primitives::partition_assignment::CreatedPartitionAssignment;
 pub use create_partitions::CreatePartitionsRequest;
 pub use create_partitions_with_assignments::CreatePartitionsWithAssignmentsRequest;
 pub use delete_partitions::DeletePartitionsRequest;
-pub use partition_assignment::CreatedPartitionAssignment;

@@ -28,11 +28,9 @@ use consensus::{
     pipeline_prepare_common, register_preflight, replicate_preflight, replicate_to_next_in_chain,
     request_preflight, send_prepare_ok as send_prepare_ok_common,
 };
+use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest as WireCreatePartitionsRequest;
-use iggy_binary_protocol::requests::partitions::{
-    CreatePartitionsWithAssignmentsRequest as PersistedCreatePartitionsRequest,
-    CreatedPartitionAssignment,
-};
+use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsRequest as PersistedCreatePartitionsRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
 use iggy_binary_protocol::{

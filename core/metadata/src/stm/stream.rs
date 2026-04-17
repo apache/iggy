@@ -748,9 +748,10 @@ impl_fill_restore!(Streams, streams);
 mod tests {
     use super::*;
     use iggy_binary_protocol::WireName;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::partitions::{
         CreatePartitionsRequest as WireCreatePartitionsRequest,
-        CreatePartitionsWithAssignmentsRequest, CreatedPartitionAssignment,
+        CreatePartitionsWithAssignmentsRequest,
     };
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest as WireCreateTopicRequest, CreateTopicWithAssignmentsRequest,
