@@ -25,6 +25,7 @@ use std::time::Duration;
 const STREAM_NAME: &str = "dedup-test-stream";
 const TOPIC_NAME: &str = "dedup-test-topic";
 const MESSAGES_PER_BATCH: u32 = 10;
+// This must match the server config `message_deduplication.expiry` in specific.rs.
 const DEDUP_TTL_SECS: u64 = 2;
 
 pub async fn run(harness: &TestHarness) {
@@ -184,18 +185,11 @@ fn build_messages(prefix: &str, ids: &[u128]) -> Vec<IggyMessage> {
             } else {
                 format!("{prefix}-{id}")
             };
+            let mut builder = IggyMessage::builder().payload(Bytes::from(payload));
             if id != 0 {
-                IggyMessage::builder()
-                    .id(id)
-                    .payload(Bytes::from(payload))
-                    .build()
-                    .expect("Failed to build message")
-            } else {
-                IggyMessage::builder()
-                    .payload(Bytes::from(payload))
-                    .build()
-                    .expect("Failed to build message")
+                builder = builder.id(id);
             }
+            builder.build().expect("Failed to build message")
         })
         .collect()
 }
