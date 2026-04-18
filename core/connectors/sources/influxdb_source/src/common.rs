@@ -32,13 +32,36 @@ pub(crate) use crate::row::{Row, parse_csv_rows, parse_jsonl_rows};
 // serde's flatten interacts poorly with tagged enums — the tag field can be
 // consumed before the variant content is parsed, causing deserialization to fail.
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "version")]
 pub enum InfluxDbSourceConfig {
     #[serde(rename = "v2")]
     V2(V2SourceConfig),
     #[serde(rename = "v3")]
     V3(V3SourceConfig),
+}
+
+/// Deserializes `InfluxDbSourceConfig` with backward-compatible version defaulting.
+///
+/// Existing V2 configs that omit the `version` field are treated as `"v2"` so
+/// deployments can upgrade without touching their config files. Explicitly
+/// unknown version strings are rejected with a clear error.
+impl<'de> serde::Deserialize<'de> for InfluxDbSourceConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(d)?;
+        let version = raw.get("version").and_then(|v| v.as_str()).unwrap_or("v2");
+        match version {
+            "v2" => serde_json::from_value::<V2SourceConfig>(raw)
+                .map(Self::V2)
+                .map_err(serde::de::Error::custom),
+            "v3" => serde_json::from_value::<V3SourceConfig>(raw)
+                .map(Self::V3)
+                .map_err(serde::de::Error::custom),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown InfluxDB version {other:?}; expected \"v2\" or \"v3\""
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +102,10 @@ pub struct V3SourceConfig {
     pub initial_offset: Option<String>,
     pub payload_column: Option<String>,
     pub payload_format: Option<String>,
+    /// When `false`, the cursor column (`time` by default) is excluded from the
+    /// emitted JSON payload. Useful when consumers don't need the timestamp in
+    /// the message body since it's available as message metadata.
+    pub include_metadata: Option<bool>,
     pub verbose_logging: Option<bool>,
     pub max_retries: Option<u32>,
     pub retry_delay: Option<String>,
@@ -90,6 +117,7 @@ pub struct V3SourceConfig {
     pub circuit_breaker_cool_down: Option<String>,
     /// Maximum factor by which batch_size may be inflated before the stuck-timestamp
     /// circuit breaker trips. Defaults to 10 (i.e. up to 10× the configured batch_size).
+    /// Maximum accepted value is 100; higher values risk OOM-inducing queries.
     pub stuck_batch_cap_factor: Option<u32>,
 }
 
@@ -303,20 +331,20 @@ pub fn validate_cursor_field(field: &str) -> Result<(), Error> {
 
 /// Return `true` if timestamp `a` is strictly after `b`.
 ///
-/// Parses both strings as RFC 3339 / chrono `DateTime<Utc>`. Falls back to
-/// lexicographic comparison if either value fails to parse — this covers the
-/// nanosecond-precision timestamps that InfluxDB 3 returns (e.g.
-/// `"2026-03-18T12:00:00.609521Z"`), which chrono parses correctly when the
-/// fractional-seconds component is six or fewer digits.
+/// Parses both strings as RFC 3339 / chrono `DateTime<Utc>`. Returns `false`
+/// conservatively when either value fails to parse — do NOT advance the cursor
+/// when comparison is ambiguous. Lexicographic comparison is incorrect for
+/// timestamps with different timezone offsets (e.g. `+05:30` vs `Z`) and would
+/// silently produce wrong cursor advancement.
 pub fn is_timestamp_after(a: &str, b: &str) -> bool {
     match (a.parse::<DateTime<Utc>>(), b.parse::<DateTime<Utc>>()) {
         (Ok(dt_a), Ok(dt_b)) => dt_a > dt_b,
         _ => {
             warn!(
                 "is_timestamp_after: could not parse timestamps as RFC 3339 \
-                 ({a:?} vs {b:?}); falling back to lexicographic comparison"
+                 ({a:?} vs {b:?}); returning false to avoid incorrect cursor advancement"
             );
-            a > b
+            false
         }
     }
 }
@@ -459,6 +487,18 @@ mod tests {
     }
 
     #[test]
+    fn is_timestamp_after_fallback_is_conservative() {
+        // Unparseable timestamps must NOT advance the cursor. Lexicographic
+        // comparison is wrong for cross-timezone values, so the safe default is
+        // false — refuse to advance rather than risk skipping data.
+        assert!(!is_timestamp_after("not-a-timestamp", "also-not"));
+        assert!(!is_timestamp_after(
+            "2024-01-01T00:00:00Z",
+            "not-a-timestamp"
+        ));
+    }
+
+    #[test]
     fn apply_query_params_substitutes_both_placeholders() {
         let tmpl = "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit";
         let out = apply_query_params(tmpl, "2024-01-01T00:00:00Z", "100");
@@ -584,5 +624,77 @@ mod tests {
         let json = r#"{"version":"v9","last_timestamp":null,"processed_rows":0}"#;
         let result: Result<PersistedState, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    // ── InfluxDbSourceConfig backward-compat deserialization ─────────────────
+
+    #[test]
+    fn source_config_without_version_defaults_to_v2() {
+        // Existing V2 configs that pre-date the version field must deserialize
+        // as V2 without any modification to the config file.
+        let json =
+            r#"{"url":"http://localhost:8086","org":"myorg","token":"t","query":"SELECT 1"}"#;
+        let cfg: InfluxDbSourceConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            matches!(cfg, InfluxDbSourceConfig::V2(_)),
+            "missing version must default to v2"
+        );
+    }
+
+    #[test]
+    fn source_config_with_explicit_v2_version_deserializes_v2() {
+        let json = r#"{"version":"v2","url":"http://localhost:8086","org":"o","token":"t","query":"SELECT 1"}"#;
+        let cfg: InfluxDbSourceConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(cfg, InfluxDbSourceConfig::V2(_)));
+    }
+
+    #[test]
+    fn source_config_with_version_v3_deserializes_v3() {
+        let json = r#"{"version":"v3","url":"http://localhost:8181","db":"d","token":"t","query":"SELECT 1"}"#;
+        let cfg: InfluxDbSourceConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(cfg, InfluxDbSourceConfig::V3(_)));
+    }
+
+    #[test]
+    fn source_config_unknown_version_returns_error() {
+        let json =
+            r#"{"version":"v9","url":"http://localhost","org":"o","token":"t","query":"SELECT 1"}"#;
+        let result: Result<InfluxDbSourceConfig, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "unknown version must be rejected");
+    }
+
+    #[test]
+    fn source_config_serializes_with_version_tag() {
+        // Round-trip: serialize produces the version tag so the output can be
+        // loaded back by a version-aware deserializer.
+        let cfg = InfluxDbSourceConfig::V2(V2SourceConfig {
+            url: "http://localhost".to_string(),
+            org: "o".to_string(),
+            token: SecretString::from("t"),
+            query: "q".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: None,
+            retry_delay: None,
+            timeout: None,
+            max_open_retries: None,
+            open_retry_max_delay: None,
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+        });
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            json.contains(r#""version":"v2""#),
+            "serialized form must include version tag"
+        );
+        let restored: InfluxDbSourceConfig = serde_json::from_str(&json).unwrap();
+        assert!(matches!(restored, InfluxDbSourceConfig::V2(_)));
     }
 }

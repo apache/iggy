@@ -204,6 +204,18 @@ impl Source for InfluxDbSource {
             validate_cursor(offset)?;
         }
 
+        if let InfluxDbSourceConfig::V3(cfg) = &self.config
+            && let Some(cap) = cfg.stuck_batch_cap_factor
+            && cap > v3::MAX_STUCK_CAP_FACTOR
+        {
+            return Err(Error::InvalidConfigValue(format!(
+                "stuck_batch_cap_factor {cap} exceeds maximum of {}; \
+                 reduce it to avoid querying up to {}×batch_size rows per poll.",
+                v3::MAX_STUCK_CAP_FACTOR,
+                v3::MAX_STUCK_CAP_FACTOR
+            )));
+        }
+
         // Skip-N dedup for V2 requires rows to arrive sorted by time. If the Flux
         // query lacks an explicit sort, InfluxDB may return rows in storage order,
         // causing the dedup to skip the wrong rows silently.
@@ -504,6 +516,7 @@ mod tests {
             initial_offset: None,
             payload_column: None,
             payload_format: None,
+            include_metadata: None,
             verbose_logging: None,
             max_retries: Some(3),
             retry_delay: Some("100ms".to_string()),
@@ -684,6 +697,39 @@ mod tests {
         // None + skipped=3 → correction
         apply_v2_cursor_advance(&mut state, None, 0, 3);
         assert_eq!(state.cursor_row_count, 3);
+    }
+
+    #[tokio::test]
+    async fn open_rejects_stuck_batch_cap_factor_above_max() {
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "db".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT 1".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: Some(v3::MAX_STUCK_CAP_FACTOR + 1),
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "expected InvalidConfigValue for oversized stuck_batch_cap_factor, got {err:?}"
+        );
     }
 
     #[test]

@@ -109,13 +109,31 @@ pub struct V3SinkConfig {
     pub circuit_breaker_cool_down: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "version")]
 pub enum InfluxDbSinkConfig {
     #[serde(rename = "v2")]
     V2(V2SinkConfig),
     #[serde(rename = "v3")]
     V3(V3SinkConfig),
+}
+
+impl<'de> serde::Deserialize<'de> for InfluxDbSinkConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(d)?;
+        let version = raw.get("version").and_then(|v| v.as_str()).unwrap_or("v2");
+        match version {
+            "v2" => serde_json::from_value::<V2SinkConfig>(raw)
+                .map(Self::V2)
+                .map_err(serde::de::Error::custom),
+            "v3" => serde_json::from_value::<V3SinkConfig>(raw)
+                .map(Self::V3)
+                .map_err(serde::de::Error::custom),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown InfluxDB version {other:?}; expected \"v2\" or \"v3\""
+            ))),
+        }
+    }
 }
 
 /// Map a short precision string to InfluxDB 3's long-form equivalent.
@@ -528,10 +546,10 @@ impl InfluxDbSink {
         // payloads without excessive reallocation.
         let mut body = String::with_capacity(messages.len() * 1024);
         for (i, msg) in messages.iter().enumerate() {
-            if i > 0 {
+            self.append_line(&mut body, topic_metadata, messages_metadata, msg)?;
+            if i + 1 < messages.len() {
                 body.push('\n');
             }
-            self.append_line(&mut body, topic_metadata, messages_metadata, msg)?;
         }
         Ok(body)
     }
@@ -825,6 +843,44 @@ mod tests {
             headers: None,
             payload,
         }
+    }
+
+    // ── config deserialization ────────────────────────────────────────────
+
+    #[test]
+    fn sink_config_without_version_defaults_to_v2() {
+        let json = r#"{"url":"http://localhost:8086","org":"o","bucket":"b","token":"t"}"#;
+        let raw: serde_json::Value = serde_json::from_str(json).unwrap();
+        let config: InfluxDbSinkConfig = serde_json::from_value(raw).unwrap();
+        assert!(matches!(config, InfluxDbSinkConfig::V2(_)));
+    }
+
+    #[test]
+    fn sink_config_with_explicit_v2_version_deserializes_v2() {
+        let json =
+            r#"{"version":"v2","url":"http://localhost:8086","org":"o","bucket":"b","token":"t"}"#;
+        let config: InfluxDbSinkConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(config, InfluxDbSinkConfig::V2(_)));
+    }
+
+    #[test]
+    fn sink_config_with_version_v3_deserializes_v3() {
+        let json = r#"{"version":"v3","url":"http://localhost:8181","db":"d","token":"t"}"#;
+        let config: InfluxDbSinkConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(config, InfluxDbSinkConfig::V3(_)));
+    }
+
+    #[test]
+    fn sink_config_unknown_version_returns_error() {
+        let json = r#"{"version":"v9","url":"http://x","org":"o","bucket":"b","token":"t"}"#;
+        let result = serde_json::from_str::<InfluxDbSinkConfig>(json);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown InfluxDB version")
+        );
     }
 
     // ── config ────────────────────────────────────────────────────────────

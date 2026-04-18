@@ -101,7 +101,6 @@ mod tests {
             None,
             PayloadFormat::Json,
             1000,
-            0,
         )
         .unwrap();
         assert!(result.messages.is_empty());
@@ -122,7 +121,6 @@ mod tests {
             None,
             PayloadFormat::Json,
             1000,
-            0,
         )
         .unwrap();
         assert_eq!(result.messages.len(), 1);
@@ -139,18 +137,8 @@ mod tests {
             row(&[("_time", T1), ("_value", "2")]),
             row(&[("_time", T1), ("_value", "3")]),
         ];
-        let result = process_rows(
-            &rows,
-            T1,
-            1,
-            "_time",
-            true,
-            None,
-            PayloadFormat::Json,
-            1000,
-            0,
-        )
-        .unwrap();
+        let result =
+            process_rows(&rows, T1, 1, "_time", true, None, PayloadFormat::Json, 1000).unwrap();
         assert_eq!(result.skipped, 1);
         assert_eq!(result.messages.len(), 2);
     }
@@ -163,18 +151,8 @@ mod tests {
             row(&[("_time", T1)]),
             row(&[("_time", T1)]),
         ];
-        let result = process_rows(
-            &rows,
-            T1,
-            1,
-            "_time",
-            true,
-            None,
-            PayloadFormat::Json,
-            1000,
-            0,
-        )
-        .unwrap();
+        let result =
+            process_rows(&rows, T1, 1, "_time", true, None, PayloadFormat::Json, 1000).unwrap();
         assert_eq!(result.skipped, 1);
         assert_eq!(result.messages.len(), 2);
     }
@@ -195,7 +173,6 @@ mod tests {
             None,
             PayloadFormat::Json,
             1000,
-            0,
         )
         .unwrap();
         assert_eq!(result.max_cursor.as_deref(), Some(T3));
@@ -218,7 +195,6 @@ mod tests {
             None,
             PayloadFormat::Json,
             1000,
-            0,
         )
         .unwrap();
         assert_eq!(result.max_cursor.as_deref(), Some(T2));
@@ -226,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn process_rows_message_ids_are_sequential_from_uuid_base() {
+    fn process_rows_message_ids_are_some_and_unique() {
         let rows = vec![row(&[("_time", T1)]), row(&[("_time", T2)])];
         let result = process_rows(
             &rows,
@@ -237,11 +213,11 @@ mod tests {
             None,
             PayloadFormat::Json,
             1000,
-            100,
         )
         .unwrap();
-        assert_eq!(result.messages[0].id, Some(100u128));
-        assert_eq!(result.messages[1].id, Some(101u128));
+        assert!(result.messages[0].id.is_some());
+        assert!(result.messages[1].id.is_some());
+        assert_ne!(result.messages[0].id, result.messages[1].id);
     }
 
     #[test]
@@ -256,7 +232,6 @@ mod tests {
             None,
             PayloadFormat::Json,
             999_999,
-            0,
         )
         .unwrap();
         assert_eq!(result.messages[0].timestamp, Some(999_999));
@@ -275,7 +250,6 @@ mod tests {
             None,
             PayloadFormat::Json,
             1000,
-            0,
         )
         .unwrap();
         assert_eq!(result.messages.len(), 1);
@@ -441,8 +415,8 @@ pub(crate) struct RowProcessingResult {
 /// Skips the first `already_seen` rows whose `cursor_field` value equals
 /// `cursor` — these were delivered in the previous batch and re-appear
 /// because V2's `>= $cursor` query semantics are inclusive. All other rows
-/// become messages with UUIDs derived from `uuid_base` (sequential, no PRNG
-/// per message) and timestamps set to `now_micros`.
+/// become messages with unique UUIDs (generated per message) and timestamps
+/// set to `now_micros`.
 #[allow(clippy::too_many_arguments)] // Each parameter controls a distinct axis of behaviour.
 pub(crate) fn process_rows(
     rows: &[Row],
@@ -453,14 +427,13 @@ pub(crate) fn process_rows(
     payload_col: Option<&str>,
     payload_format: PayloadFormat,
     now_micros: u64,
-    uuid_base: u128,
 ) -> Result<RowProcessingResult, Error> {
     let mut messages = Vec::with_capacity(rows.len());
     let mut max_cursor: Option<String> = None;
     let mut rows_at_max_cursor = 0u64;
     let mut skipped = 0u64;
 
-    for (i, row) in rows.iter().enumerate() {
+    for row in rows.iter() {
         // Single lookup for cursor_field — used for both skip logic and max-cursor tracking.
         let cv = row.get(cursor_field);
         if let Some(cv) = cv
@@ -490,8 +463,7 @@ pub(crate) fn process_rows(
 
         let payload = build_payload(row, payload_col, payload_format, include_metadata)?;
         messages.push(ProducedMessage {
-            // Unique per message within the batch without repeated PRNG calls.
-            id: Some(uuid_base.wrapping_add(i as u128)),
+            id: Some(Uuid::new_v4().as_u128()),
             checksum: None,
             timestamp: Some(now_micros),
             origin_timestamp: Some(now_micros),
@@ -529,9 +501,7 @@ pub(crate) async fn poll(
     let include_metadata = config.include_metadata.unwrap_or(true);
     let payload_col = config.payload_column.as_deref();
 
-    // Captured once per poll to avoid a syscall and PRNG invocation per message.
     let now_micros = iggy_common::Utc::now().timestamp_micros() as u64;
-    let uuid_base = Uuid::new_v4().as_u128();
 
     let result = process_rows(
         &rows,
@@ -542,7 +512,6 @@ pub(crate) async fn poll(
         payload_col,
         payload_format,
         now_micros,
-        uuid_base,
     )?;
 
     let schema = if payload_col.is_some() {
@@ -978,7 +947,7 @@ mod http_tests {
     #[test]
     fn build_query_without_org_omits_param() {
         let (url, _) = build_query(BASE, "SELECT 1", None).unwrap();
-        assert!(url.query().map_or(true, |q| !q.contains("org=")));
+        assert!(url.query().is_none_or(|q| !q.contains("org=")));
     }
 
     #[test]

@@ -37,7 +37,13 @@ use serde_json::json;
 use tracing::warn;
 use uuid::Uuid;
 
-const DEFAULT_STUCK_CAP_FACTOR: u32 = 10;
+pub(crate) const DEFAULT_STUCK_CAP_FACTOR: u32 = 10;
+/// Upper bound for `stuck_batch_cap_factor`. A value of 1000 with batch_size=1000
+/// would issue 1,000,000-row queries before tripping the circuit breaker.
+pub(crate) const MAX_STUCK_CAP_FACTOR: u32 = 100;
+
+/// InfluxDB V3 query endpoint expects this exact string for JSONL response format.
+const QUERY_FORMAT_JSONL: &str = "jsonl";
 
 fn build_query(base: &str, query: &str, db: &str) -> Result<(Url, serde_json::Value), Error> {
     let url = Url::parse(&format!("{base}/api/v3/query_sql"))
@@ -45,7 +51,7 @@ fn build_query(base: &str, query: &str, db: &str) -> Result<(Url, serde_json::Va
     let body = json!({
         "db":     db,
         "q":      query,
-        "format": "jsonl"
+        "format": QUERY_FORMAT_JSONL
     });
     Ok((url, body))
 }
@@ -110,6 +116,8 @@ fn build_payload(
     row: &Row,
     payload_column: Option<&str>,
     payload_format: PayloadFormat,
+    include_metadata: bool,
+    cursor_field: &str,
 ) -> Result<Vec<u8>, Error> {
     if let Some(col) = payload_column {
         let raw = row
@@ -135,9 +143,11 @@ fn build_payload(
         };
     }
 
-    // V3 rows are flat objects — emit them directly with all fields.
+    // V3 rows are flat SQL results. When include_metadata=false, exclude the
+    // cursor column (timestamp) — it is used for deduplication, not user data.
     let json_row: serde_json::Map<_, _> = row
         .iter()
+        .filter(|(k, _)| include_metadata || k.as_str() != cursor_field)
         .map(|(k, v)| (k.clone(), parse_scalar(v)))
         .collect();
     serde_json::to_vec(&json_row)
@@ -194,8 +204,8 @@ pub(crate) fn process_rows(
     current_cursor: &str,
     payload_col: Option<&str>,
     payload_format: PayloadFormat,
+    include_metadata: bool,
     now_micros: u64,
-    uuid_base: u128,
 ) -> Result<RowProcessingResult, Error> {
     let mut messages = Vec::with_capacity(rows.len());
     let mut max_cursor: Option<String> = None;
@@ -203,7 +213,7 @@ pub(crate) fn process_rows(
     // either has a different cursor value or has no cursor field at all.
     let mut all_at_cursor = !rows.is_empty();
 
-    for (i, row) in rows.iter().enumerate() {
+    for row in rows.iter() {
         if let Some(cv) = row.get(cursor_field) {
             if cv != current_cursor {
                 all_at_cursor = false;
@@ -219,10 +229,15 @@ pub(crate) fn process_rows(
             all_at_cursor = false;
         }
 
-        let payload = build_payload(row, payload_col, payload_format)?;
+        let payload = build_payload(
+            row,
+            payload_col,
+            payload_format,
+            include_metadata,
+            cursor_field,
+        )?;
         messages.push(ProducedMessage {
-            // Unique per message within the batch without repeated PRNG calls.
-            id: Some(uuid_base.wrapping_add(i as u128)),
+            id: Some(Uuid::new_v4().as_u128()),
             checksum: None,
             timestamp: Some(now_micros),
             origin_timestamp: Some(now_micros),
@@ -272,14 +287,13 @@ pub(crate) async fn poll(
 
     let cursor_field = config.cursor_field.as_deref().unwrap_or("time");
     let payload_col = config.payload_column.as_deref();
+    let include_metadata = config.include_metadata.unwrap_or(true);
     let cap_factor = config
         .stuck_batch_cap_factor
         .unwrap_or(DEFAULT_STUCK_CAP_FACTOR);
 
-    // Single pass: build messages and detect stuck-timestamp in one iteration.
-    // Captured once per poll to avoid a syscall and PRNG invocation per message.
+    // Captured once per poll; UUIDs are generated per-message inside process_rows.
     let now_micros = iggy_common::Utc::now().timestamp_micros() as u64;
-    let uuid_base = Uuid::new_v4().as_u128();
 
     let result = process_rows(
         &rows,
@@ -287,8 +301,8 @@ pub(crate) async fn poll(
         &cursor,
         payload_col,
         payload_format,
+        include_metadata,
         now_micros,
-        uuid_base,
     )?;
 
     // Stuck-timestamp detection: if every row is at the current cursor
@@ -379,7 +393,7 @@ mod tests {
 
     #[test]
     fn process_rows_empty_returns_empty() {
-        let result = process_rows(&[], "time", T1, None, PayloadFormat::Json, 1000, 0).unwrap();
+        let result = process_rows(&[], "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
         assert!(result.messages.is_empty());
         assert!(result.max_cursor.is_none());
         assert!(
@@ -391,7 +405,8 @@ mod tests {
     #[test]
     fn process_rows_single_row_advances_cursor() {
         let rows = vec![row(&[("time", T1), ("val", "1")])];
-        let result = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0).unwrap();
+        let result =
+            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
         assert_eq!(result.messages.len(), 1);
         assert_eq!(result.max_cursor.as_deref(), Some(T1));
     }
@@ -403,7 +418,8 @@ mod tests {
             row(&[("time", T3)]),
             row(&[("time", T2)]),
         ];
-        let result = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0).unwrap();
+        let result =
+            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
         assert_eq!(result.max_cursor.as_deref(), Some(T3));
         assert_eq!(result.messages.len(), 3);
     }
@@ -415,7 +431,8 @@ mod tests {
             row(&[("time", T1)]), // earlier — must not overwrite max
             row(&[("time", T2)]),
         ];
-        let result = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0).unwrap();
+        let result =
+            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
         assert_eq!(result.max_cursor.as_deref(), Some(T2));
     }
 
@@ -424,7 +441,8 @@ mod tests {
         // A batch where no row has the cursor column must return Err rather than
         // silently re-delivering the same rows on every poll.
         let rows = vec![row(&[("val", "1")])]; // no "time" field
-        let err = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0).unwrap_err();
+        let err =
+            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap_err();
         assert!(
             matches!(err, Error::InvalidRecordValue(_)),
             "expected InvalidRecordValue when cursor column is absent, got {err:?}"
@@ -441,7 +459,8 @@ mod tests {
             row(&[("val", "2")]),
             row(&[("val", "3")]),
         ];
-        let err = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0).unwrap_err();
+        let err =
+            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap_err();
         assert!(
             matches!(err, Error::InvalidRecordValue(_)),
             "expected InvalidRecordValue when cursor column is absent, got {err:?}"
@@ -449,18 +468,20 @@ mod tests {
     }
 
     #[test]
-    fn process_rows_message_ids_sequential_from_uuid_base() {
+    fn process_rows_message_ids_are_some_and_unique() {
         let rows = vec![row(&[("time", T1)]), row(&[("time", T2)])];
-        let result = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 50).unwrap();
-        assert_eq!(result.messages[0].id, Some(50u128));
-        assert_eq!(result.messages[1].id, Some(51u128));
+        let result =
+            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
+        assert!(result.messages[0].id.is_some());
+        assert!(result.messages[1].id.is_some());
+        assert_ne!(result.messages[0].id, result.messages[1].id);
     }
 
     #[test]
     fn process_rows_message_timestamps_use_now_micros() {
         let rows = vec![row(&[("time", T1)])];
         let result =
-            process_rows(&rows, "time", T1, None, PayloadFormat::Json, 888_888, 0).unwrap();
+            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 888_888).unwrap();
         assert_eq!(result.messages[0].timestamp, Some(888_888));
         assert_eq!(result.messages[0].origin_timestamp, Some(888_888));
     }
@@ -476,8 +497,8 @@ mod tests {
             T1,
             Some("payload"),
             PayloadFormat::Text,
+            true,
             1000,
-            0,
         )
         .unwrap();
         assert_eq!(result.messages.len(), 1);
@@ -488,20 +509,22 @@ mod tests {
     #[test]
     fn process_rows_all_at_cursor_true_when_all_rows_match() {
         let rows = vec![row(&[("time", T1)]), row(&[("time", T1)])];
-        let result = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0).unwrap();
+        let result =
+            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
         assert!(result.all_at_cursor);
     }
 
     #[test]
     fn process_rows_all_at_cursor_false_when_any_row_advances() {
         let rows = vec![row(&[("time", T1)]), row(&[("time", T2)])];
-        let result = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0).unwrap();
+        let result =
+            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
         assert!(!result.all_at_cursor);
     }
 
     #[test]
     fn process_rows_all_at_cursor_false_for_empty_slice() {
-        let result = process_rows(&[], "time", T1, None, PayloadFormat::Json, 1000, 0).unwrap();
+        let result = process_rows(&[], "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
         assert!(!result.all_at_cursor);
     }
 
@@ -565,6 +588,7 @@ mod http_tests {
             initial_offset: None,
             payload_column: None,
             payload_format: None,
+            include_metadata: None,
             verbose_logging: None,
             max_retries: Some(1),
             retry_delay: Some("1ms".to_string()),
@@ -1025,7 +1049,7 @@ mod http_tests {
             url.path()
         );
         assert!(
-            url.query().map_or(true, |q| !q.contains("org=")),
+            url.query().is_none_or(|q| !q.contains("org=")),
             "org must not appear in URL"
         );
         assert_eq!(body["db"].as_str(), Some("sensors"));

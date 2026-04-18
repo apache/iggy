@@ -210,7 +210,7 @@ mod tests {
         let rows = parse_csv_rows(csv).unwrap();
         assert_eq!(rows.len(), 2);
         //assert!(rows[0].contains_key("_measurement"));
-        assert!(rows[0].get("_measurement").is_none());
+        assert!(!rows[0].contains_key("_measurement"));
         assert_eq!(rows[1].get("_measurement").map(String::as_str), Some("cpu"));
     }
 
