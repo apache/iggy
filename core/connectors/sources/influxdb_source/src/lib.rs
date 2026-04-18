@@ -199,7 +199,7 @@ impl Source for InfluxDbSource {
             self.id
         );
 
-        validate_cursor_field(self.config.cursor_field())?;
+        validate_cursor_field(self.config.cursor_field(), self.config.version_label())?;
         if let Some(offset) = self.config.initial_offset() {
             validate_cursor(offset)?;
         }
@@ -220,7 +220,7 @@ impl Source for InfluxDbSource {
         // query lacks an explicit sort, InfluxDB may return rows in storage order,
         // causing the dedup to skip the wrong rows silently.
         if let InfluxDbSourceConfig::V2(cfg) = &self.config
-            && !cfg.query.contains("sort(")
+            && !query_has_sort_call(&cfg.query)
         {
             warn!(
                 "{CONNECTOR_NAME} ID: {}: V2 query does not appear to contain \
@@ -237,8 +237,7 @@ impl Source for InfluxDbSource {
             .build()
             .map_err(|e| Error::InitError(format!("Failed to create HTTP client: {e}")))?;
 
-        let base = self.config.url().trim_end_matches('/');
-        let health_url = Url::parse(&format!("{base}/health"))
+        let health_url = Url::parse(&format!("{}/health", self.config.base_url()))
             .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))?;
 
         check_connectivity_with_retry(
@@ -306,7 +305,7 @@ impl Source for InfluxDbSource {
                 };
 
                 let state_snap = state_mu.lock().await.clone();
-                match v2::poll(client, cfg, auth, &state_snap, self.payload_format).await {
+                match v2::poll(client, cfg, auth, &state_snap, self.payload_format, self.config.include_metadata()).await {
                     Ok(result) => {
                         self.circuit_breaker.record_success();
                         let mut state = state_mu.lock().await;
@@ -364,7 +363,7 @@ impl Source for InfluxDbSource {
                 };
 
                 let state_snap = state_mu.lock().await.clone();
-                match v3::poll(client, cfg, auth, &state_snap, self.payload_format).await {
+                match v3::poll(client, cfg, auth, &state_snap, self.payload_format, self.config.include_metadata()).await {
                     Ok(result) => {
                         if result.trip_circuit_breaker {
                             self.circuit_breaker.record_failure().await;
@@ -436,6 +435,31 @@ impl InfluxDbSource {
         tokio::time::sleep(self.poll_interval).await;
         Err(e)
     }
+}
+
+// ── Sort heuristic ────────────────────────────────────────────────────────────
+
+/// Return `true` if `query` contains a `sort(` call that is not part of a longer
+/// identifier (e.g. `mysort(` is excluded; `|> sort(` and bare `sort(` are included).
+fn query_has_sort_call(query: &str) -> bool {
+    let needle = "sort(";
+    let mut search = query;
+    while let Some(idx) = search.find(needle) {
+        // Word-boundary check: the character immediately before `sort` must not be
+        // an ASCII alphanumeric or underscore (which would make it part of a longer name).
+        let abs_idx = query.len() - search.len() + idx;
+        let prev = if abs_idx == 0 {
+            None
+        } else {
+            query.as_bytes().get(abs_idx - 1).copied()
+        };
+        let is_word_start = prev.map_or(true, |b| !b.is_ascii_alphanumeric() && b != b'_');
+        if is_word_start {
+            return true;
+        }
+        search = &search[idx + needle.len()..];
+    }
+    false
 }
 
 // ── V2 cursor advance logic ───────────────────────────────────────────────────
@@ -746,5 +770,38 @@ mod tests {
         assert_eq!(cfg.version_label(), "v3");
         assert_eq!(cfg.cursor_field(), "time");
         assert_eq!(cfg.batch_size(), 100);
+    }
+
+    // ── query_has_sort_call heuristic ─────────────────────────────────────────
+
+    #[test]
+    fn sort_call_detected_in_flux_pipeline() {
+        assert!(query_has_sort_call(
+            r#"from(bucket:"b") |> range(start: -1h) |> sort(columns: ["_time"])"#
+        ));
+    }
+
+    #[test]
+    fn sort_call_detected_without_pipe() {
+        assert!(query_has_sort_call("sort(columns: [\"_time\"])"));
+    }
+
+    #[test]
+    fn sort_call_not_detected_when_absent() {
+        assert!(!query_has_sort_call(
+            r#"from(bucket:"b") |> range(start: $cursor) |> limit(n: $limit)"#
+        ));
+    }
+
+    #[test]
+    fn sort_call_not_false_positive_on_identifier_prefix() {
+        // `mysort(` must NOT be treated as a sort call — it is a different function name.
+        assert!(!query_has_sort_call("mysort(columns: [\"_time\"])"));
+        assert!(!query_has_sort_call("do_sort(x)"));
+    }
+
+    #[test]
+    fn sort_call_detected_at_start_of_string() {
+        assert!(query_has_sort_call("sort(columns: [\"_time\"]) |> limit(n: 10)"));
     }
 }

@@ -22,5 +22,5 @@
 config_type = "local"
 config_dir = "../connectors/sources/influxdb_source"
 [plugin_config]
-api_version = "v3"
+version     = "v3"
 precision   = "ns"

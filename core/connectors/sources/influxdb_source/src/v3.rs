@@ -26,8 +26,8 @@
 //! circuit breaker is tripped.
 
 use crate::common::{
-    PayloadFormat, Row, V3SourceConfig, V3State, apply_query_params, is_timestamp_after,
-    parse_jsonl_rows, parse_scalar, validate_cursor,
+    PayloadFormat, Row, RowContext, V3SourceConfig, V3State, apply_query_params,
+    is_timestamp_after, parse_jsonl_rows, parse_scalar, validate_cursor,
 };
 use base64::{Engine as _, engine::general_purpose};
 use iggy_connector_sdk::{Error, ProducedMessage, Schema};
@@ -192,7 +192,7 @@ pub(crate) struct RowProcessingResult {
 
 /// Convert a slice of V3 query rows into Iggy messages.
 ///
-/// Also detects whether all rows share the same cursor value as `current_cursor`
+/// Also detects whether all rows share the same cursor value as `ctx.current_cursor`
 /// (the `all_at_cursor` flag). The caller uses this together with batch fullness
 /// to decide whether to inflate the batch size for the next poll.
 ///
@@ -200,22 +200,20 @@ pub(crate) struct RowProcessingResult {
 /// All rows in the slice are emitted as messages.
 pub(crate) fn process_rows(
     rows: &[Row],
-    cursor_field: &str,
-    current_cursor: &str,
-    payload_col: Option<&str>,
-    payload_format: PayloadFormat,
-    include_metadata: bool,
-    now_micros: u64,
+    ctx: &RowContext<'_>,
 ) -> Result<RowProcessingResult, Error> {
     let mut messages = Vec::with_capacity(rows.len());
     let mut max_cursor: Option<String> = None;
     // Starts true for non-empty batches; flipped to false as soon as any row
     // either has a different cursor value or has no cursor field at all.
     let mut all_at_cursor = !rows.is_empty();
+    // Generate the base UUID once per poll; derive per-message IDs by addition.
+    // This is O(1) PRNG calls per batch instead of O(n), measurable at batch ≥ 100.
+    let id_base = Uuid::new_v4().as_u128();
 
     for row in rows.iter() {
-        if let Some(cv) = row.get(cursor_field) {
-            if cv != current_cursor {
+        if let Some(cv) = row.get(ctx.cursor_field) {
+            if cv != ctx.current_cursor {
                 all_at_cursor = false;
             }
             match &max_cursor {
@@ -231,16 +229,16 @@ pub(crate) fn process_rows(
 
         let payload = build_payload(
             row,
-            payload_col,
-            payload_format,
-            include_metadata,
-            cursor_field,
+            ctx.payload_col,
+            ctx.payload_format,
+            ctx.include_metadata,
+            ctx.cursor_field,
         )?;
         messages.push(ProducedMessage {
-            id: Some(Uuid::new_v4().as_u128()),
+            id: Some(id_base.wrapping_add(messages.len() as u128)),
             checksum: None,
-            timestamp: Some(now_micros),
-            origin_timestamp: Some(now_micros),
+            timestamp: Some(ctx.now_micros),
+            origin_timestamp: Some(ctx.now_micros),
             headers: None,
             payload,
         });
@@ -251,7 +249,7 @@ pub(crate) fn process_rows(
             "No '{}' field found in any returned row — cursor cannot advance; \
              the connector would re-deliver the same rows on every poll. \
              Ensure your query selects the cursor column.",
-            cursor_field
+            ctx.cursor_field
         )));
     }
 
@@ -268,6 +266,7 @@ pub(crate) async fn poll(
     auth: &str,
     state: &V3State,
     payload_format: PayloadFormat,
+    include_metadata: bool,
 ) -> Result<PollResult, Error> {
     let cursor = state
         .last_timestamp
@@ -285,25 +284,19 @@ pub(crate) async fn poll(
     let response_data = run_query(client, config, auth, &cursor, effective_batch).await?;
     let rows = parse_jsonl_rows(&response_data)?;
 
-    let cursor_field = config.cursor_field.as_deref().unwrap_or("time");
-    let payload_col = config.payload_column.as_deref();
-    let include_metadata = config.include_metadata.unwrap_or(true);
     let cap_factor = config
         .stuck_batch_cap_factor
         .unwrap_or(DEFAULT_STUCK_CAP_FACTOR);
-
-    // Captured once per poll; UUIDs are generated per-message inside process_rows.
-    let now_micros = iggy_common::Utc::now().timestamp_micros() as u64;
-
-    let result = process_rows(
-        &rows,
-        cursor_field,
-        &cursor,
-        payload_col,
-        payload_format,
+    let ctx = RowContext {
+        cursor_field: config.cursor_field.as_deref().unwrap_or("time"),
+        current_cursor: &cursor,
         include_metadata,
-        now_micros,
-    )?;
+        payload_col: config.payload_column.as_deref(),
+        payload_format,
+        now_micros: iggy_common::Utc::now().timestamp_micros() as u64,
+    };
+
+    let result = process_rows(&rows, &ctx)?;
 
     // Stuck-timestamp detection: if every row is at the current cursor
     // and the batch was full, inflate and request more next time.
@@ -359,8 +352,8 @@ pub(crate) async fn poll(
         effective_batch_size: base_batch, // reset on successful advance
     };
 
-    let schema = if payload_col.is_some() {
-        payload_format.schema()
+    let schema = if ctx.payload_col.is_some() {
+        ctx.payload_format.schema()
     } else {
         Schema::Json
     };
@@ -376,7 +369,7 @@ pub(crate) async fn poll(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::Row;
+    use crate::common::{Row, RowContext};
 
     fn row(pairs: &[(&str, &str)]) -> Row {
         pairs
@@ -389,11 +382,22 @@ mod tests {
     const T2: &str = "2024-01-01T00:00:01Z";
     const T3: &str = "2024-01-01T00:00:02Z";
 
+    fn ctx(current_cursor: &str, now_micros: u64) -> RowContext<'_> {
+        RowContext {
+            cursor_field: "time",
+            current_cursor,
+            include_metadata: true,
+            payload_col: None,
+            payload_format: PayloadFormat::Json,
+            now_micros,
+        }
+    }
+
     // ── process_rows ─────────────────────────────────────────────────────────
 
     #[test]
     fn process_rows_empty_returns_empty() {
-        let result = process_rows(&[], "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
+        let result = process_rows(&[], &ctx(T1, 1000)).unwrap();
         assert!(result.messages.is_empty());
         assert!(result.max_cursor.is_none());
         assert!(
@@ -405,8 +409,7 @@ mod tests {
     #[test]
     fn process_rows_single_row_advances_cursor() {
         let rows = vec![row(&[("time", T1), ("val", "1")])];
-        let result =
-            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
+        let result = process_rows(&rows, &ctx(T1, 1000)).unwrap();
         assert_eq!(result.messages.len(), 1);
         assert_eq!(result.max_cursor.as_deref(), Some(T1));
     }
@@ -418,8 +421,7 @@ mod tests {
             row(&[("time", T3)]),
             row(&[("time", T2)]),
         ];
-        let result =
-            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
+        let result = process_rows(&rows, &ctx(T1, 1000)).unwrap();
         assert_eq!(result.max_cursor.as_deref(), Some(T3));
         assert_eq!(result.messages.len(), 3);
     }
@@ -431,8 +433,7 @@ mod tests {
             row(&[("time", T1)]), // earlier — must not overwrite max
             row(&[("time", T2)]),
         ];
-        let result =
-            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
+        let result = process_rows(&rows, &ctx(T1, 1000)).unwrap();
         assert_eq!(result.max_cursor.as_deref(), Some(T2));
     }
 
@@ -441,8 +442,7 @@ mod tests {
         // A batch where no row has the cursor column must return Err rather than
         // silently re-delivering the same rows on every poll.
         let rows = vec![row(&[("val", "1")])]; // no "time" field
-        let err =
-            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap_err();
+        let err = process_rows(&rows, &ctx(T1, 1000)).unwrap_err();
         assert!(
             matches!(err, Error::InvalidRecordValue(_)),
             "expected InvalidRecordValue when cursor column is absent, got {err:?}"
@@ -459,8 +459,7 @@ mod tests {
             row(&[("val", "2")]),
             row(&[("val", "3")]),
         ];
-        let err =
-            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap_err();
+        let err = process_rows(&rows, &ctx(T1, 1000)).unwrap_err();
         assert!(
             matches!(err, Error::InvalidRecordValue(_)),
             "expected InvalidRecordValue when cursor column is absent, got {err:?}"
@@ -470,8 +469,7 @@ mod tests {
     #[test]
     fn process_rows_message_ids_are_some_and_unique() {
         let rows = vec![row(&[("time", T1)]), row(&[("time", T2)])];
-        let result =
-            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
+        let result = process_rows(&rows, &ctx(T1, 1000)).unwrap();
         assert!(result.messages[0].id.is_some());
         assert!(result.messages[1].id.is_some());
         assert_ne!(result.messages[0].id, result.messages[1].id);
@@ -480,8 +478,7 @@ mod tests {
     #[test]
     fn process_rows_message_timestamps_use_now_micros() {
         let rows = vec![row(&[("time", T1)])];
-        let result =
-            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 888_888).unwrap();
+        let result = process_rows(&rows, &ctx(T1, 888_888)).unwrap();
         assert_eq!(result.messages[0].timestamp, Some(888_888));
         assert_eq!(result.messages[0].origin_timestamp, Some(888_888));
     }
@@ -493,12 +490,14 @@ mod tests {
         let rows = vec![row(&[("time", T1), ("payload", &encoded)])];
         let result = process_rows(
             &rows,
-            "time",
-            T1,
-            Some("payload"),
-            PayloadFormat::Text,
-            true,
-            1000,
+            &RowContext {
+                cursor_field: "time",
+                current_cursor: T1,
+                include_metadata: true,
+                payload_col: Some("payload"),
+                payload_format: PayloadFormat::Text,
+                now_micros: 1000,
+            },
         )
         .unwrap();
         assert_eq!(result.messages.len(), 1);
@@ -509,22 +508,20 @@ mod tests {
     #[test]
     fn process_rows_all_at_cursor_true_when_all_rows_match() {
         let rows = vec![row(&[("time", T1)]), row(&[("time", T1)])];
-        let result =
-            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
+        let result = process_rows(&rows, &ctx(T1, 1000)).unwrap();
         assert!(result.all_at_cursor);
     }
 
     #[test]
     fn process_rows_all_at_cursor_false_when_any_row_advances() {
         let rows = vec![row(&[("time", T1)]), row(&[("time", T2)])];
-        let result =
-            process_rows(&rows, "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
+        let result = process_rows(&rows, &ctx(T1, 1000)).unwrap();
         assert!(!result.all_at_cursor);
     }
 
     #[test]
     fn process_rows_all_at_cursor_false_for_empty_slice() {
-        let result = process_rows(&[], "time", T1, None, PayloadFormat::Json, true, 1000).unwrap();
+        let result = process_rows(&[], &ctx(T1, 1000)).unwrap();
         assert!(!result.all_at_cursor);
     }
 
@@ -803,6 +800,7 @@ mod http_tests {
             "Bearer tok",
             &state,
             PayloadFormat::Json,
+            true,
         )
         .await
         .unwrap();
@@ -832,6 +830,7 @@ mod http_tests {
             "Bearer tok",
             &state,
             PayloadFormat::Json,
+            true,
         )
         .await
         .unwrap();
@@ -856,6 +855,7 @@ mod http_tests {
             "Bearer tok",
             &state,
             PayloadFormat::Json,
+            true,
         )
         .await
         .unwrap();
@@ -893,6 +893,7 @@ mod http_tests {
             "Bearer tok",
             &state,
             PayloadFormat::Json,
+            true,
         )
         .await
         .unwrap();
@@ -934,6 +935,7 @@ mod http_tests {
             "Bearer tok",
             &state,
             PayloadFormat::Json,
+            true,
         )
         .await
         .unwrap();
@@ -962,6 +964,7 @@ mod http_tests {
             "Bearer tok",
             &state,
             PayloadFormat::Json,
+            true,
         )
         .await
         .unwrap();
@@ -992,6 +995,7 @@ mod http_tests {
             "Bearer tok",
             &state,
             PayloadFormat::Json,
+            true,
         )
         .await
         .unwrap();
@@ -1012,6 +1016,7 @@ mod http_tests {
             "Bearer tok",
             &state,
             PayloadFormat::Json,
+            true,
         )
         .await;
         assert!(matches!(result, Err(Error::Storage(_))));
@@ -1031,6 +1036,7 @@ mod http_tests {
             "Bearer tok",
             &state,
             PayloadFormat::Json,
+            true,
         )
         .await;
         assert!(matches!(result, Err(Error::PermanentHttpError(_))));

@@ -66,59 +66,59 @@ impl<'de> serde::Deserialize<'de> for InfluxDbSourceConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct V2SourceConfig {
-    pub url: String,
-    pub org: String,
+    pub(crate) url: String,
+    pub(crate) org: String,
     #[serde(serialize_with = "serialize_secret")]
-    pub token: SecretString,
-    pub query: String,
-    pub poll_interval: Option<String>,
-    pub batch_size: Option<u32>,
-    pub cursor_field: Option<String>,
-    pub initial_offset: Option<String>,
-    pub payload_column: Option<String>,
-    pub payload_format: Option<String>,
-    pub include_metadata: Option<bool>,
-    pub verbose_logging: Option<bool>,
-    pub max_retries: Option<u32>,
-    pub retry_delay: Option<String>,
-    pub timeout: Option<String>,
-    pub max_open_retries: Option<u32>,
-    pub open_retry_max_delay: Option<String>,
-    pub retry_max_delay: Option<String>,
-    pub circuit_breaker_threshold: Option<u32>,
-    pub circuit_breaker_cool_down: Option<String>,
+    pub(crate) token: SecretString,
+    pub(crate) query: String,
+    pub(crate) poll_interval: Option<String>,
+    pub(crate) batch_size: Option<u32>,
+    pub(crate) cursor_field: Option<String>,
+    pub(crate) initial_offset: Option<String>,
+    pub(crate) payload_column: Option<String>,
+    pub(crate) payload_format: Option<String>,
+    pub(crate) include_metadata: Option<bool>,
+    pub(crate) verbose_logging: Option<bool>,
+    pub(crate) max_retries: Option<u32>,
+    pub(crate) retry_delay: Option<String>,
+    pub(crate) timeout: Option<String>,
+    pub(crate) max_open_retries: Option<u32>,
+    pub(crate) open_retry_max_delay: Option<String>,
+    pub(crate) retry_max_delay: Option<String>,
+    pub(crate) circuit_breaker_threshold: Option<u32>,
+    pub(crate) circuit_breaker_cool_down: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct V3SourceConfig {
-    pub url: String,
-    pub db: String,
+    pub(crate) url: String,
+    pub(crate) db: String,
     #[serde(serialize_with = "serialize_secret")]
-    pub token: SecretString,
-    pub query: String,
-    pub poll_interval: Option<String>,
-    pub batch_size: Option<u32>,
-    pub cursor_field: Option<String>,
-    pub initial_offset: Option<String>,
-    pub payload_column: Option<String>,
-    pub payload_format: Option<String>,
+    pub(crate) token: SecretString,
+    pub(crate) query: String,
+    pub(crate) poll_interval: Option<String>,
+    pub(crate) batch_size: Option<u32>,
+    pub(crate) cursor_field: Option<String>,
+    pub(crate) initial_offset: Option<String>,
+    pub(crate) payload_column: Option<String>,
+    pub(crate) payload_format: Option<String>,
     /// When `false`, the cursor column (`time` by default) is excluded from the
     /// emitted JSON payload. Useful when consumers don't need the timestamp in
     /// the message body since it's available as message metadata.
-    pub include_metadata: Option<bool>,
-    pub verbose_logging: Option<bool>,
-    pub max_retries: Option<u32>,
-    pub retry_delay: Option<String>,
-    pub timeout: Option<String>,
-    pub max_open_retries: Option<u32>,
-    pub open_retry_max_delay: Option<String>,
-    pub retry_max_delay: Option<String>,
-    pub circuit_breaker_threshold: Option<u32>,
-    pub circuit_breaker_cool_down: Option<String>,
+    pub(crate) include_metadata: Option<bool>,
+    pub(crate) verbose_logging: Option<bool>,
+    pub(crate) max_retries: Option<u32>,
+    pub(crate) retry_delay: Option<String>,
+    pub(crate) timeout: Option<String>,
+    pub(crate) max_open_retries: Option<u32>,
+    pub(crate) open_retry_max_delay: Option<String>,
+    pub(crate) retry_max_delay: Option<String>,
+    pub(crate) circuit_breaker_threshold: Option<u32>,
+    pub(crate) circuit_breaker_cool_down: Option<String>,
     /// Maximum factor by which batch_size may be inflated before the stuck-timestamp
     /// circuit breaker trips. Defaults to 10 (i.e. up to 10× the configured batch_size).
     /// Maximum accepted value is 100; higher values risk OOM-inducing queries.
-    pub stuck_batch_cap_factor: Option<u32>,
+    pub(crate) stuck_batch_cap_factor: Option<u32>,
 }
 
 // Eliminates the repetitive "match self { V2(c) => …, V3(c) => … }" pattern for
@@ -203,7 +203,12 @@ impl InfluxDbSourceConfig {
         }
     }
 
-    // Enforces a minimum of 1 retry regardless of configuration.
+    pub fn include_metadata(&self) -> bool {
+        delegate!(unwrap self.include_metadata, true)
+    }
+
+    // Both arms are identical; `delegate!` is not used because the `.max(1)` chain
+    // cannot be expressed in the macro without adding a new variant.
     pub fn max_retries(&self) -> u32 {
         match self {
             Self::V2(c) => c.max_retries.unwrap_or(3).max(1),
@@ -217,6 +222,25 @@ impl InfluxDbSourceConfig {
             Self::V3(_) => "v3",
         }
     }
+
+    /// URL with any trailing slash stripped — used as the base for all endpoint URLs.
+    pub fn base_url(&self) -> &str {
+        self.url().trim_end_matches('/')
+    }
+}
+
+// ── Row processing context ────────────────────────────────────────────────────
+
+/// Per-poll fields that are constant across all rows in a batch.
+/// Passed by reference to `process_rows` so the function signature stays at ≤ 3 parameters.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RowContext<'a> {
+    pub cursor_field: &'a str,
+    pub current_cursor: &'a str,
+    pub include_metadata: bool,
+    pub payload_col: Option<&'a str>,
+    pub payload_format: PayloadFormat,
+    pub now_micros: u64,
 }
 
 // ── Persisted state ───────────────────────────────────────────────────────────
@@ -317,13 +341,19 @@ pub fn validate_cursor(cursor: &str) -> Result<(), Error> {
     }
 }
 
-pub fn validate_cursor_field(field: &str) -> Result<(), Error> {
+/// Validate `cursor_field` for the given connector version.
+///
+/// `version` should be `"v2"` or `"v3"`. The error message suggests the correct
+/// column name for that version so users do not have to guess.
+pub fn validate_cursor_field(field: &str, version: &str) -> Result<(), Error> {
     match field {
         "_time" | "time" => Ok(()),
-        other => Err(Error::InvalidConfigValue(format!(
-            "cursor_field {other:?} is not supported — only \"_time\" (V2) and \"time\" (V3) \
-             are valid timestamp cursor columns"
-        ))),
+        other => {
+            let suggestion = if version == "v2" { "\"_time\"" } else { "\"time\"" };
+            Err(Error::InvalidConfigValue(format!(
+                "cursor_field {other:?} is not supported for {version} — use {suggestion}"
+            )))
+        }
     }
 }
 
@@ -354,8 +384,9 @@ pub fn is_timestamp_after(a: &str, b: &str) -> bool {
 /// Parse a string value from InfluxDB into the most specific JSON scalar type.
 ///
 /// Tries `bool`, then `i64`, then `f64`; falls back to `String`. An empty
-/// string becomes `null`. This is used when building the JSON payload for
-/// messages produced by the source connector.
+/// string becomes `null`. `NaN` and `±Infinity` are emitted as strings because
+/// JSON has no representation for non-finite floats
+/// (`serde_json::Number::from_f64` returns `None` for them).
 pub fn parse_scalar(value: &str) -> serde_json::Value {
     if value.is_empty() {
         return serde_json::Value::Null;
@@ -456,14 +487,25 @@ mod tests {
 
     #[test]
     fn validate_cursor_field_accepts_time_columns() {
-        assert!(validate_cursor_field("_time").is_ok());
-        assert!(validate_cursor_field("time").is_ok());
+        assert!(validate_cursor_field("_time", "v2").is_ok());
+        assert!(validate_cursor_field("time", "v3").is_ok());
     }
 
     #[test]
     fn validate_cursor_field_rejects_others() {
-        assert!(validate_cursor_field("_value").is_err());
-        assert!(validate_cursor_field("").is_err());
+        assert!(validate_cursor_field("_value", "v2").is_err());
+        assert!(validate_cursor_field("", "v3").is_err());
+    }
+
+    #[test]
+    fn validate_cursor_field_error_is_version_specific() {
+        let v2_err = validate_cursor_field("timestamp", "v2").unwrap_err().to_string();
+        assert!(v2_err.contains("v2"), "error should mention v2");
+        assert!(v2_err.contains("\"_time\""), "v2 error should suggest _time");
+
+        let v3_err = validate_cursor_field("timestamp", "v3").unwrap_err().to_string();
+        assert!(v3_err.contains("v3"), "error should mention v3");
+        assert!(v3_err.contains("\"time\""), "v3 error should suggest time");
     }
 
     #[test]
@@ -696,5 +738,35 @@ mod tests {
         );
         let restored: InfluxDbSourceConfig = serde_json::from_str(&json).unwrap();
         assert!(matches!(restored, InfluxDbSourceConfig::V2(_)));
+    }
+
+    #[test]
+    fn source_config_toml_without_version_defaults_to_v2() {
+        // Connectors load config from TOML files in production. Verify the
+        // backward-compat path works with TOML, not just JSON.
+        let toml_str = r#"
+url   = "http://localhost:8086"
+org   = "myorg"
+token = "t"
+query = "SELECT 1"
+"#;
+        let cfg: InfluxDbSourceConfig = toml::from_str(toml_str).unwrap();
+        assert!(
+            matches!(cfg, InfluxDbSourceConfig::V2(_)),
+            "TOML config without version= must default to V2"
+        );
+    }
+
+    #[test]
+    fn source_config_toml_with_version_v3_deserializes_v3() {
+        let toml_str = r#"
+version = "v3"
+url     = "http://localhost:8181"
+db      = "mydb"
+token   = "t"
+query   = "SELECT 1"
+"#;
+        let cfg: InfluxDbSourceConfig = toml::from_str(toml_str).unwrap();
+        assert!(matches!(cfg, InfluxDbSourceConfig::V3(_)));
     }
 }

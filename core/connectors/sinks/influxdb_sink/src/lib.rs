@@ -56,57 +56,57 @@ const DEFAULT_CIRCUIT_COOL_DOWN: &str = "30s";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct V2SinkConfig {
-    pub url: String,
-    pub org: String,
-    pub bucket: String,
+    pub(crate) url: String,
+    pub(crate) org: String,
+    pub(crate) bucket: String,
     #[serde(serialize_with = "serialize_secret")]
-    pub token: SecretString,
-    pub measurement: Option<String>,
-    pub precision: Option<String>,
-    pub batch_size: Option<u32>,
-    pub include_metadata: Option<bool>,
-    pub include_checksum: Option<bool>,
-    pub include_origin_timestamp: Option<bool>,
-    pub include_stream_tag: Option<bool>,
-    pub include_topic_tag: Option<bool>,
-    pub include_partition_tag: Option<bool>,
-    pub payload_format: Option<String>,
-    pub verbose_logging: Option<bool>,
-    pub max_retries: Option<u32>,
-    pub retry_delay: Option<String>,
-    pub timeout: Option<String>,
-    pub max_open_retries: Option<u32>,
-    pub open_retry_max_delay: Option<String>,
-    pub retry_max_delay: Option<String>,
-    pub circuit_breaker_threshold: Option<u32>,
-    pub circuit_breaker_cool_down: Option<String>,
+    pub(crate) token: SecretString,
+    pub(crate) measurement: Option<String>,
+    pub(crate) precision: Option<String>,
+    pub(crate) batch_size: Option<u32>,
+    pub(crate) include_metadata: Option<bool>,
+    pub(crate) include_checksum: Option<bool>,
+    pub(crate) include_origin_timestamp: Option<bool>,
+    pub(crate) include_stream_tag: Option<bool>,
+    pub(crate) include_topic_tag: Option<bool>,
+    pub(crate) include_partition_tag: Option<bool>,
+    pub(crate) payload_format: Option<String>,
+    pub(crate) verbose_logging: Option<bool>,
+    pub(crate) max_retries: Option<u32>,
+    pub(crate) retry_delay: Option<String>,
+    pub(crate) timeout: Option<String>,
+    pub(crate) max_open_retries: Option<u32>,
+    pub(crate) open_retry_max_delay: Option<String>,
+    pub(crate) retry_max_delay: Option<String>,
+    pub(crate) circuit_breaker_threshold: Option<u32>,
+    pub(crate) circuit_breaker_cool_down: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct V3SinkConfig {
-    pub url: String,
-    pub db: String,
+    pub(crate) url: String,
+    pub(crate) db: String,
     #[serde(serialize_with = "serialize_secret")]
-    pub token: SecretString,
-    pub measurement: Option<String>,
-    pub precision: Option<String>,
-    pub batch_size: Option<u32>,
-    pub include_metadata: Option<bool>,
-    pub include_checksum: Option<bool>,
-    pub include_origin_timestamp: Option<bool>,
-    pub include_stream_tag: Option<bool>,
-    pub include_topic_tag: Option<bool>,
-    pub include_partition_tag: Option<bool>,
-    pub payload_format: Option<String>,
-    pub verbose_logging: Option<bool>,
-    pub max_retries: Option<u32>,
-    pub retry_delay: Option<String>,
-    pub timeout: Option<String>,
-    pub max_open_retries: Option<u32>,
-    pub open_retry_max_delay: Option<String>,
-    pub retry_max_delay: Option<String>,
-    pub circuit_breaker_threshold: Option<u32>,
-    pub circuit_breaker_cool_down: Option<String>,
+    pub(crate) token: SecretString,
+    pub(crate) measurement: Option<String>,
+    pub(crate) precision: Option<String>,
+    pub(crate) batch_size: Option<u32>,
+    pub(crate) include_metadata: Option<bool>,
+    pub(crate) include_checksum: Option<bool>,
+    pub(crate) include_origin_timestamp: Option<bool>,
+    pub(crate) include_stream_tag: Option<bool>,
+    pub(crate) include_topic_tag: Option<bool>,
+    pub(crate) include_partition_tag: Option<bool>,
+    pub(crate) payload_format: Option<String>,
+    pub(crate) verbose_logging: Option<bool>,
+    pub(crate) max_retries: Option<u32>,
+    pub(crate) retry_delay: Option<String>,
+    pub(crate) timeout: Option<String>,
+    pub(crate) max_open_retries: Option<u32>,
+    pub(crate) open_retry_max_delay: Option<String>,
+    pub(crate) retry_max_delay: Option<String>,
+    pub(crate) circuit_breaker_threshold: Option<u32>,
+    pub(crate) circuit_breaker_cool_down: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,6 +191,9 @@ impl InfluxDbSinkConfig {
     fn url(&self) -> &str {
         delegate!(ref     self.url)
     }
+    fn base_url(&self) -> &str {
+        self.url().trim_end_matches('/')
+    }
     fn measurement(&self) -> Option<&str> {
         delegate!(opt     self.measurement)
     }
@@ -260,7 +263,12 @@ impl InfluxDbSinkConfig {
         let precision = self.precision();
         match self {
             Self::V2(c) => {
-                let mut url = Url::parse(&format!("{}/api/v2/write", c.url.trim_end_matches('/')))
+                if c.org.trim().is_empty() {
+                    return Err(Error::InvalidConfigValue(
+                        "InfluxDB V2 'org' must not be empty".into(),
+                    ));
+                }
+                let mut url = Url::parse(&format!("{}/api/v2/write", self.base_url()))
                     .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))?;
                 url.query_pairs_mut()
                     .append_pair("org", &c.org)
@@ -269,11 +277,8 @@ impl InfluxDbSinkConfig {
                 Ok(url)
             }
             Self::V3(c) => {
-                let mut url =
-                    Url::parse(&format!("{}/api/v3/write_lp", c.url.trim_end_matches('/')))
-                        .map_err(|e| {
-                            Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}"))
-                        })?;
+                let mut url = Url::parse(&format!("{}/api/v3/write_lp", self.base_url()))
+                    .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))?;
                 url.query_pairs_mut()
                     .append_pair("db", &c.db)
                     .append_pair("precision", map_precision_v3(precision)?);
@@ -283,8 +288,7 @@ impl InfluxDbSinkConfig {
     }
 
     fn build_health_url(&self) -> Result<Url, Error> {
-        let base = self.url().trim_end_matches('/');
-        Url::parse(&format!("{base}/health"))
+        Url::parse(&format!("{}/health", self.base_url()))
             .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))
     }
 
@@ -298,6 +302,15 @@ impl InfluxDbSinkConfig {
 
 // ── Sink struct ───────────────────────────────────────────────────────────────
 
+/// InfluxDB sink connector state.
+///
+/// **Init-time fields** (populated in `new()` from config, never `None`):
+/// `id`, `config`, `circuit_breaker`, `verbose`, `retry_delay`, `payload_format`,
+/// `measurement`, `precision`, `include_*`, `batch_size_limit`.
+///
+/// **Open-time fields** (populated in `open()`, guarded by `Option<T>`):
+/// `client`, `write_url`, `auth_header` — callers must invoke `open()` before
+/// any `process_batch()` call; `get_client()` returns an error otherwise.
 #[derive(Debug)]
 pub struct InfluxDbSink {
     id: u32,
@@ -425,6 +438,12 @@ impl InfluxDbSink {
     ) -> Result<(), Error> {
         write_measurement(buf, &self.measurement);
 
+        // Tag *key* strings below ("stream", "topic", "partition", "offset", etc.) are
+        // static ASCII literals — they contain no InfluxDB line-protocol special chars
+        // (comma, equals, space, backslash, newline) and therefore do not need escaping.
+        // Only the tag *values* (user-supplied stream/topic names) are escaped via
+        // `write_tag_value`. The user-supplied `measurement` is escaped via
+        // `write_measurement`.
         if self.include_metadata && self.include_stream_tag {
             buf.push_str(",stream=");
             write_tag_value(buf, &topic_metadata.stream);
@@ -475,6 +494,10 @@ impl InfluxDbSink {
 
         match self.payload_format {
             PayloadFormat::Json => {
+                // simd_json is used here (not serde_json) because this is the hot path:
+                // every message in every batch passes through this branch. The ~2× throughput
+                // gain is measurable at batch sizes ≥ 100. The source uses serde_json since
+                // its serialization path runs once per poll, not once per message.
                 let compact = match &message.payload {
                     iggy_connector_sdk::Payload::Json(value) => simd_json::to_string(value)
                         .map_err(|e| {
@@ -881,6 +904,35 @@ mod tests {
                 .to_string()
                 .contains("unknown InfluxDB version")
         );
+    }
+
+    #[test]
+    fn sink_config_toml_without_version_defaults_to_v2() {
+        // Connectors load config from TOML files in production. Verify the
+        // backward-compat path works with TOML, not just JSON.
+        let toml_str = r#"
+url    = "http://localhost:8086"
+org    = "myorg"
+bucket = "mybucket"
+token  = "t"
+"#;
+        let cfg: InfluxDbSinkConfig = toml::from_str(toml_str).unwrap();
+        assert!(
+            matches!(cfg, InfluxDbSinkConfig::V2(_)),
+            "TOML config without version= must default to V2"
+        );
+    }
+
+    #[test]
+    fn sink_config_toml_with_version_v3_deserializes_v3() {
+        let toml_str = r#"
+version = "v3"
+url     = "http://localhost:8181"
+db      = "mydb"
+token   = "t"
+"#;
+        let cfg: InfluxDbSinkConfig = toml::from_str(toml_str).unwrap();
+        assert!(matches!(cfg, InfluxDbSinkConfig::V3(_)));
     }
 
     // ── config ────────────────────────────────────────────────────────────

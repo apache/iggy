@@ -22,7 +22,7 @@
 config_type = "local"
 config_dir = "../connectors/sinks/influxdb_sink"
 [plugin_config]
-api_version   = "v3"
+version       = "v3"
 precision     = "ns"
 measurement   = "iggy_messages"
 batch_size    = 100

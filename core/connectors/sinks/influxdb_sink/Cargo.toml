@@ -48,3 +48,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+toml = { workspace = true }
