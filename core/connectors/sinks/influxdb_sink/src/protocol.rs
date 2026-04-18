@@ -28,7 +28,7 @@
 /// Newline, carriage-return, and tab are the InfluxDB line-protocol record
 /// delimiters or whitespace that can corrupt parsing; a literal newline inside
 /// a measurement name would split the line and corrupt the batch.
-pub fn write_measurement(buf: &mut String, value: &str) {
+pub(crate) fn write_measurement(buf: &mut String, value: &str) {
     for ch in value.chars() {
         match ch {
             '\\' => buf.push_str("\\\\"),
@@ -49,7 +49,7 @@ pub fn write_measurement(buf: &mut String, value: &str) {
 /// Newline, carriage-return, and tab are escaped for the same reason as in
 /// [`write_measurement`]: they are InfluxDB line-protocol record delimiters or
 /// whitespace that can corrupt tag-set parsing.
-pub fn write_tag_value(buf: &mut String, value: &str) {
+pub(crate) fn write_tag_value(buf: &mut String, value: &str) {
     for ch in value.chars() {
         match ch {
             '\\' => buf.push_str("\\\\"),
@@ -77,7 +77,7 @@ pub fn write_tag_value(buf: &mut String, value: &str) {
 /// quoted strings. Measurement names and tag values (see [`write_measurement`]
 /// and [`write_tag_value`]) are unquoted, so tabs must be escaped there to
 /// avoid mis-parsing the tag set.
-pub fn write_field_string(buf: &mut String, value: &str) {
+pub(crate) fn write_field_string(buf: &mut String, value: &str) {
     for ch in value.chars() {
         match ch {
             '\\' => buf.push_str("\\\\"),

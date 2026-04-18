@@ -31,7 +31,6 @@ members = [
     "core/common",
     "core/configs",
     "core/configs_derive",
-    "core/connectors/influxdb_common",
     "core/connectors/runtime",
     "core/connectors/sdk",
     "core/connectors/sinks/elasticsearch_sink",
@@ -170,7 +169,6 @@ iggy = { path = "core/sdk", version = "0.9.5-edge.1" }
 iggy-cli = { path = "core/cli", version = "0.12.1-edge.1" }
 iggy_binary_protocol = { path = "core/binary_protocol", version = "0.9.5-edge.1" }
 iggy_common = { path = "core/common", version = "0.9.5-edge.1" }
-iggy_connector_influxdb_common = { path = "core/connectors/influxdb_common", version = "0.1.0-edge.1" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.2.2-edge.1" }
 integration = { path = "core/integration" }
 iobuf = { path = "core/iobuf" }

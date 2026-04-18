@@ -17,6 +17,7 @@
  */
 
 mod common;
+mod row;
 mod v2;
 mod v3;
 
@@ -25,7 +26,6 @@ use common::{
     InfluxDbSourceConfig, PayloadFormat, PersistedState, V2State, V3State, validate_cursor,
     validate_cursor_field,
 };
-use iggy_connector_influxdb_common::{ApiVersion, InfluxDbAdapter};
 use iggy_connector_sdk::retry::{
     CircuitBreaker, ConnectivityConfig, build_retry_client, check_connectivity_with_retry,
     parse_duration,
@@ -33,6 +33,7 @@ use iggy_connector_sdk::retry::{
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessages, Schema, Source, source_connector,
 };
+use reqwest::Url;
 use reqwest_middleware::ClientWithMiddleware;
 use secrecy::ExposeSecret;
 use std::sync::Arc;
@@ -206,16 +207,16 @@ impl Source for InfluxDbSource {
         // Skip-N dedup for V2 requires rows to arrive sorted by time. If the Flux
         // query lacks an explicit sort, InfluxDB may return rows in storage order,
         // causing the dedup to skip the wrong rows silently.
-        if let InfluxDbSourceConfig::V2(cfg) = &self.config {
-            if !cfg.query.contains("sort(") {
-                warn!(
-                    "{CONNECTOR_NAME} ID: {}: V2 query does not appear to contain \
-                     `|> sort(columns: [\"_time\"])`. Skip-N dedup relies on stable \
-                     row ordering; out-of-order Flux results will silently deliver \
-                     the wrong rows. Add `|> sort(columns: [\"_time\"])` to your query.",
-                    self.id
-                );
-            }
+        if let InfluxDbSourceConfig::V2(cfg) = &self.config
+            && !cfg.query.contains("sort(")
+        {
+            warn!(
+                "{CONNECTOR_NAME} ID: {}: V2 query does not appear to contain \
+                 `|> sort(columns: [\"_time\"])`. Skip-N dedup relies on stable \
+                 row ordering; out-of-order Flux results will silently deliver \
+                 the wrong rows. Add `|> sort(columns: [\"_time\"])` to your query.",
+                self.id
+            );
         }
 
         let timeout = parse_duration(self.config.timeout(), DEFAULT_TIMEOUT);
@@ -224,11 +225,9 @@ impl Source for InfluxDbSource {
             .build()
             .map_err(|e| Error::InitError(format!("Failed to create HTTP client: {e}")))?;
 
-        let adapter: Box<dyn InfluxDbAdapter> = match &self.config {
-            InfluxDbSourceConfig::V2(_) => ApiVersion::V2.make_adapter(),
-            InfluxDbSourceConfig::V3(_) => ApiVersion::V3.make_adapter(),
-        };
-        let health_url = adapter.health_url(self.config.url().trim_end_matches('/'))?;
+        let base = self.config.url().trim_end_matches('/');
+        let health_url = Url::parse(&format!("{base}/health"))
+            .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))?;
 
         check_connectivity_with_retry(
             &raw_client,
@@ -256,8 +255,11 @@ impl Source for InfluxDbSource {
             "InfluxDB",
         ));
 
-        self.auth_header =
-            Some(adapter.auth_header_value(self.config.token_secret().expose_secret()));
+        let token = self.config.token_secret().expose_secret();
+        self.auth_header = Some(match &self.config {
+            InfluxDbSourceConfig::V2(_) => format!("Token {token}"),
+            InfluxDbSourceConfig::V3(_) => format!("Bearer {token}"),
+        });
 
         info!(
             "{CONNECTOR_NAME} ID: {} opened successfully (version={ver})",

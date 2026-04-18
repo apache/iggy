@@ -36,7 +36,6 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 iggy_common = { workspace = true }
-iggy_connector_influxdb_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }

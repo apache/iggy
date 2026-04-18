@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use tracing::warn;
 
-pub(crate) use iggy_connector_influxdb_common::{Row, parse_csv_rows, parse_jsonl_rows};
+pub(crate) use crate::row::{Row, parse_csv_rows, parse_jsonl_rows};
 
 // ── Config ────────────────────────────────────────────────────────────────────
 //

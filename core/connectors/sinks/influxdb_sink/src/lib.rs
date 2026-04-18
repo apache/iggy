@@ -16,13 +16,13 @@
  * under the License.
  */
 
+mod protocol;
+
+use crate::protocol::{write_field_string, write_measurement, write_tag_value};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use iggy_common::serde_secret::serialize_secret;
-use iggy_connector_influxdb_common::{
-    ApiVersion, write_field_string, write_measurement, write_tag_value,
-};
 use iggy_connector_sdk::retry::{
     CircuitBreaker, ConnectivityConfig, build_retry_client, check_connectivity_with_retry,
     parse_duration,
@@ -116,6 +116,23 @@ pub enum InfluxDbSinkConfig {
     V2(V2SinkConfig),
     #[serde(rename = "v3")]
     V3(V3SinkConfig),
+}
+
+/// Map a short precision string to InfluxDB 3's long-form equivalent.
+///
+/// InfluxDB 3 rejects the short forms (`"ns"`, `"us"`, `"ms"`, `"s"`) on the
+/// `/api/v3/write_lp` endpoint and expects full English words. Returns an error
+/// for unrecognised values rather than silently defaulting.
+fn map_precision_v3(p: &str) -> Result<&'static str, Error> {
+    match p {
+        "ns" => Ok("nanosecond"),
+        "us" => Ok("microsecond"),
+        "ms" => Ok("millisecond"),
+        "s" => Ok("second"),
+        other => Err(Error::InvalidConfigValue(format!(
+            "unknown precision {other:?}; valid values are \"ns\", \"us\", \"ms\", \"s\""
+        ))),
+    }
 }
 
 // Eliminates the repetitive "match self { V2(c) => …, V3(c) => … }" pattern for
@@ -224,18 +241,26 @@ impl InfluxDbSinkConfig {
     fn build_write_url(&self) -> Result<Url, Error> {
         let precision = self.precision();
         match self {
-            Self::V2(c) => ApiVersion::V2.make_adapter().write_url(
-                c.url.trim_end_matches('/'),
-                &c.bucket,
-                Some(&c.org),
-                precision,
-            ),
-            Self::V3(c) => ApiVersion::V3.make_adapter().write_url(
-                c.url.trim_end_matches('/'),
-                &c.db,
-                None,
-                precision,
-            ),
+            Self::V2(c) => {
+                let mut url = Url::parse(&format!("{}/api/v2/write", c.url.trim_end_matches('/')))
+                    .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))?;
+                url.query_pairs_mut()
+                    .append_pair("org", &c.org)
+                    .append_pair("bucket", &c.bucket)
+                    .append_pair("precision", precision);
+                Ok(url)
+            }
+            Self::V3(c) => {
+                let mut url =
+                    Url::parse(&format!("{}/api/v3/write_lp", c.url.trim_end_matches('/')))
+                        .map_err(|e| {
+                            Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}"))
+                        })?;
+                url.query_pairs_mut()
+                    .append_pair("db", &c.db)
+                    .append_pair("precision", map_precision_v3(precision)?);
+                Ok(url)
+            }
         }
     }
 
@@ -576,12 +601,12 @@ impl Sink for InfluxDbSink {
             )));
         }
 
-        if let InfluxDbSinkConfig::V2(c) = &self.config {
-            if c.org.trim().is_empty() {
-                return Err(Error::InvalidConfigValue(
-                    "V2 sink config requires a non-empty 'org'".to_string(),
-                ));
-            }
+        if let InfluxDbSinkConfig::V2(c) = &self.config
+            && c.org.trim().is_empty()
+        {
+            return Err(Error::InvalidConfigValue(
+                "V2 sink config requires a non-empty 'org'".to_string(),
+            ));
         }
 
         info!(
@@ -1702,5 +1727,49 @@ mod http_tests {
             .await
             .unwrap();
         assert_eq!(hit.load(Ordering::Acquire), 1);
+    }
+
+    // ── map_precision_v3 ──────────────────────────────────────────────────
+
+    #[test]
+    fn map_precision_v3_maps_all_short_forms() {
+        assert_eq!(map_precision_v3("ns").unwrap(), "nanosecond");
+        assert_eq!(map_precision_v3("us").unwrap(), "microsecond");
+        assert_eq!(map_precision_v3("ms").unwrap(), "millisecond");
+        assert_eq!(map_precision_v3("s").unwrap(), "second");
+    }
+
+    #[test]
+    fn map_precision_v3_rejects_unknown_values() {
+        assert!(map_precision_v3("xx").is_err());
+        assert!(map_precision_v3("").is_err());
+        assert!(map_precision_v3("nanosecond").is_err());
+    }
+
+    #[test]
+    fn v3_write_url_invalid_base_returns_error() {
+        let config = InfluxDbSinkConfig::V3(V3SinkConfig {
+            url: "not-a-url".to_string(),
+            ..v3_config("http://placeholder").into_v3().unwrap()
+        });
+        assert!(config.build_write_url().is_err());
+    }
+
+    #[test]
+    fn v2_write_url_invalid_base_returns_error() {
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            url: "not-a-url".to_string(),
+            ..v2_config("http://placeholder").into_v2().unwrap()
+        });
+        assert!(config.build_write_url().is_err());
+    }
+
+    impl InfluxDbSinkConfig {
+        fn into_v3(self) -> Option<V3SinkConfig> {
+            match self {
+                Self::V3(c) => Some(c),
+                Self::V2(_) => None,
+            }
+        }
     }
 }

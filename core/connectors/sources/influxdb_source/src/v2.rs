@@ -23,19 +23,32 @@ use crate::common::{
     parse_csv_rows, parse_scalar, validate_cursor,
 };
 use base64::{Engine as _, engine::general_purpose};
-use iggy_connector_influxdb_common::ApiVersion;
 use iggy_connector_sdk::{Error, ProducedMessage, Schema};
+use reqwest::Url;
 use reqwest_middleware::ClientWithMiddleware;
 use serde_json::json;
-use std::sync::OnceLock;
 use uuid::Uuid;
 
-// Allocated once; reused on every poll to avoid a per-call Box allocation.
-static ADAPTER: OnceLock<Box<dyn iggy_connector_influxdb_common::InfluxDbAdapter>> =
-    OnceLock::new();
-
-fn adapter() -> &'static dyn iggy_connector_influxdb_common::InfluxDbAdapter {
-    &**ADAPTER.get_or_init(|| ApiVersion::V2.make_adapter())
+fn build_query(
+    base: &str,
+    query: &str,
+    org: Option<&str>,
+) -> Result<(Url, serde_json::Value), Error> {
+    let mut url = Url::parse(&format!("{base}/api/v2/query"))
+        .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))?;
+    if let Some(o) = org {
+        url.query_pairs_mut().append_pair("org", o);
+    }
+    let body = json!({
+        "query": query,
+        "dialect": {
+            "annotations": ["datatype", "group", "default"],
+            "delimiter": ",",
+            "header": true,
+            "commentPrefix": "#"
+        }
+    });
+    Ok((url, body))
 }
 
 /// Maximum multiple of `batch_size` by which `already_seen` may inflate the
@@ -281,14 +294,13 @@ pub(crate) async fn run_query(
 ) -> Result<String, Error> {
     let query = render_query(config, cursor, already_seen)?;
     let base = config.url.trim_end_matches('/');
-    let adp = adapter();
-    let (url, body) = adp.build_query(base, &query, "", Some(&config.org))?;
+    let (url, body) = build_query(base, &query, Some(&config.org))?;
 
     let response = client
         .post(url)
         .header("Authorization", auth)
-        .header("Content-Type", adp.query_content_type())
-        .header("Accept", adp.query_accept_header())
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/csv")
         .json(&body)
         .send()
         .await
@@ -933,5 +945,44 @@ mod http_tests {
         )
         .await;
         assert!(matches!(result, Err(Error::PermanentHttpError(_))));
+    }
+
+    // ── build_query ──────────────────────────────────────────────────────────
+
+    const BASE: &str = "http://localhost:8086";
+
+    #[test]
+    fn build_query_url_path_and_org_param() {
+        let (url, body) = build_query(
+            BASE,
+            "from(bucket:\"b\") |> range(start:-1h)",
+            Some("myorg"),
+        )
+        .unwrap();
+        assert!(
+            url.path().ends_with("/api/v2/query"),
+            "wrong path: {}",
+            url.path()
+        );
+        assert!(
+            url.query().unwrap_or("").contains("org=myorg"),
+            "missing org param"
+        );
+        assert!(body["query"].is_string());
+        let annotations = body["dialect"]["annotations"].as_array().unwrap();
+        assert!(annotations.iter().any(|v| v.as_str() == Some("datatype")));
+        assert!(annotations.iter().any(|v| v.as_str() == Some("group")));
+        assert!(annotations.iter().any(|v| v.as_str() == Some("default")));
+    }
+
+    #[test]
+    fn build_query_without_org_omits_param() {
+        let (url, _) = build_query(BASE, "SELECT 1", None).unwrap();
+        assert!(url.query().map_or(true, |q| !q.contains("org=")));
+    }
+
+    #[test]
+    fn build_query_invalid_base_returns_error() {
+        assert!(build_query("not-a-url", "SELECT 1", None).is_err());
     }
 }

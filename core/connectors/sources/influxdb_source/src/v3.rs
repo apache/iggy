@@ -30,22 +30,25 @@ use crate::common::{
     parse_jsonl_rows, parse_scalar, validate_cursor,
 };
 use base64::{Engine as _, engine::general_purpose};
-use iggy_connector_influxdb_common::ApiVersion;
 use iggy_connector_sdk::{Error, ProducedMessage, Schema};
+use reqwest::Url;
 use reqwest_middleware::ClientWithMiddleware;
-use std::sync::OnceLock;
+use serde_json::json;
 use tracing::warn;
 use uuid::Uuid;
 
-// Allocated once; reused on every poll to avoid a per-call Box allocation.
-static ADAPTER: OnceLock<Box<dyn iggy_connector_influxdb_common::InfluxDbAdapter>> =
-    OnceLock::new();
-
-fn adapter() -> &'static dyn iggy_connector_influxdb_common::InfluxDbAdapter {
-    &**ADAPTER.get_or_init(|| ApiVersion::V3.make_adapter())
-}
-
 const DEFAULT_STUCK_CAP_FACTOR: u32 = 10;
+
+fn build_query(base: &str, query: &str, db: &str) -> Result<(Url, serde_json::Value), Error> {
+    let url = Url::parse(&format!("{base}/api/v3/query_sql"))
+        .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))?;
+    let body = json!({
+        "db":     db,
+        "q":      query,
+        "format": "jsonl"
+    });
+    Ok((url, body))
+}
 
 // ── Query execution ───────────────────────────────────────────────────────────
 
@@ -59,14 +62,13 @@ pub(crate) async fn run_query(
     validate_cursor(cursor)?;
     let q = apply_query_params(&config.query, cursor, &effective_batch.to_string());
     let base = config.url.trim_end_matches('/');
-    let adp = adapter();
-    let (url, body) = adp.build_query(base, &q, &config.db, None)?;
+    let (url, body) = build_query(base, &q, &config.db)?;
 
     let response = client
         .post(url)
         .header("Authorization", auth)
-        .header("Content-Type", adp.query_content_type())
-        .header("Accept", adp.query_accept_header())
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
         .json(&body)
         .send()
         .await
@@ -422,8 +424,7 @@ mod tests {
         // A batch where no row has the cursor column must return Err rather than
         // silently re-delivering the same rows on every poll.
         let rows = vec![row(&[("val", "1")])]; // no "time" field
-        let err = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0)
-            .unwrap_err();
+        let err = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0).unwrap_err();
         assert!(
             matches!(err, Error::InvalidRecordValue(_)),
             "expected InvalidRecordValue when cursor column is absent, got {err:?}"
@@ -440,8 +441,7 @@ mod tests {
             row(&[("val", "2")]),
             row(&[("val", "3")]),
         ];
-        let err = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0)
-            .unwrap_err();
+        let err = process_rows(&rows, "time", T1, None, PayloadFormat::Json, 1000, 0).unwrap_err();
         assert!(
             matches!(err, Error::InvalidRecordValue(_)),
             "expected InvalidRecordValue when cursor column is absent, got {err:?}"
@@ -1010,5 +1010,37 @@ mod http_tests {
         )
         .await;
         assert!(matches!(result, Err(Error::PermanentHttpError(_))));
+    }
+
+    // ── build_query ──────────────────────────────────────────────────────────
+
+    const BASE: &str = "http://localhost:8181";
+
+    #[test]
+    fn build_query_url_path_and_body_fields() {
+        let (url, body) = build_query(BASE, "SELECT * FROM cpu LIMIT 10", "sensors").unwrap();
+        assert!(
+            url.path().ends_with("/api/v3/query_sql"),
+            "wrong path: {}",
+            url.path()
+        );
+        assert!(
+            url.query().map_or(true, |q| !q.contains("org=")),
+            "org must not appear in URL"
+        );
+        assert_eq!(body["db"].as_str(), Some("sensors"));
+        assert_eq!(body["format"].as_str(), Some("jsonl"));
+        assert!(body["q"].as_str().unwrap().contains("SELECT"));
+    }
+
+    #[test]
+    fn build_query_format_is_always_jsonl() {
+        let (_, body) = build_query(BASE, "SELECT 1", "db").unwrap();
+        assert_eq!(body["format"].as_str(), Some("jsonl"));
+    }
+
+    #[test]
+    fn build_query_invalid_base_returns_error() {
+        assert!(build_query("not-a-url", "SELECT 1", "db").is_err());
     }
 }

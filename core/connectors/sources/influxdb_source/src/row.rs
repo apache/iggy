@@ -32,7 +32,7 @@ use std::collections::HashMap;
 /// Both V2 (annotated CSV) and V3 (JSONL) responses are normalised into this
 /// common representation so the cursor-tracking and payload-building logic
 /// above this layer remains version-agnostic.
-pub type Row = HashMap<String, String>;
+pub(crate) type Row = HashMap<String, String>;
 
 // ── InfluxDB V2 — annotated CSV ───────────────────────────────────────────────
 
@@ -61,7 +61,7 @@ fn is_header_record(record: &StringRecord) -> bool {
 /// - The first non-annotation row containing `_time`, `_start`, or `_stop` becomes the header.
 /// - Repeated identical header rows (multi-table result format) are skipped.
 /// - Each subsequent data row is mapped `header[i] → row[i]`.
-pub fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
+pub(crate) fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true) // multi-table results have variable column counts per table
@@ -129,7 +129,7 @@ pub fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
 ///
 /// Blank lines are silently skipped. Lines that fail to parse as JSON objects
 /// return an error.
-pub fn parse_jsonl_rows(jsonl_text: &str) -> Result<Vec<Row>, Error> {
+pub(crate) fn parse_jsonl_rows(jsonl_text: &str) -> Result<Vec<Row>, Error> {
     let mut rows = Vec::new();
 
     for (line_no, line) in jsonl_text.lines().enumerate() {
