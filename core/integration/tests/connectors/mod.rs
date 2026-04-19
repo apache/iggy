@@ -27,7 +27,6 @@ mod mongodb;
 mod postgres;
 mod quickwit;
 mod random;
-mod redshift;
 mod stdout;
 
 use iggy_common::IggyTimestamp;
