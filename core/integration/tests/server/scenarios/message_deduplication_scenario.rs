@@ -185,11 +185,11 @@ fn build_messages(prefix: &str, ids: &[u128]) -> Vec<IggyMessage> {
             } else {
                 format!("{prefix}-{id}")
             };
-            let mut builder = IggyMessage::builder().payload(Bytes::from(payload));
-            if id != 0 {
-                builder = builder.id(id);
-            }
-            builder.build().expect("Failed to build message")
+            IggyMessage::builder()
+                .payload(Bytes::from(payload))
+                .maybe_id((id != 0).then_some(id))
+                .build()
+                .expect("Failed to build message")
         })
         .collect()
 }
