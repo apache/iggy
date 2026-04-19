@@ -22,15 +22,15 @@
 config_type = "local"
 config_dir = "../connectors/sinks/influxdb_sink"
 [plugin_config]
-version       = "v3"
-precision     = "ns"
-measurement   = "iggy_messages"
-batch_size    = 100
+version = "v3"
+precision = "ns"
+measurement = "iggy_messages"
+batch_size = 100
 payload_format = "json"
-max_retries   = 3
-retry_delay   = "200ms"
-timeout       = "10s"
-max_open_retries          = 5
-open_retry_max_delay      = "10s"
+max_retries = 3
+retry_delay = "200ms"
+timeout = "10s"
+max_open_retries = 5
+open_retry_max_delay = "10s"
 circuit_breaker_threshold = 10
 circuit_breaker_cool_down = "5s"
