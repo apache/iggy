@@ -26,6 +26,13 @@ use tracing::warn;
 
 pub(crate) use crate::row::{Row, parse_csv_rows, parse_jsonl_rows};
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Default cursor column for V2 (Flux annotated-CSV timestamp annotation).
+pub(crate) const DEFAULT_V2_CURSOR_FIELD: &str = "_time";
+/// Default cursor column for V3 (SQL timestamp column name).
+pub(crate) const DEFAULT_V3_CURSOR_FIELD: &str = "time";
+
 // ── Config ────────────────────────────────────────────────────────────────────
 //
 // Uses `#[serde(tag = "version")]` instead of `#[serde(flatten)]` because
@@ -124,6 +131,16 @@ pub struct V3SourceConfig {
 // Eliminates the repetitive "match self { V2(c) => …, V3(c) => … }" pattern for
 // fields that are identical across all config variants. Methods with version-specific
 // logic (cursor_field, max_retries, version_label) remain explicit.
+//
+// Supported patterns:
+//   delegate!(ref  self.url)                        →  &String (borrow)
+//   delegate!(opt  self.poll_interval)              →  Option<&str>
+//   delegate!(unwrap self.batch_size, 500)          →  T: Copy with value fallback
+//
+// Not supported (use explicit match arms instead):
+//   Fields with version-specific defaults (e.g. cursor_field: "_time" vs "time")
+//   Fields with chained transformations (e.g. max_retries + .max(1))
+//   Fields that only exist on one variant (e.g. V3's stuck_batch_cap_factor)
 macro_rules! delegate {
     // &T field reference  →  fn foo(&self) -> &T
     (ref $self:ident . $field:ident) => {
@@ -198,8 +215,8 @@ impl InfluxDbSourceConfig {
     // V2 and V3 use different default cursor column names.
     pub fn cursor_field(&self) -> &str {
         match self {
-            Self::V2(c) => c.cursor_field.as_deref().unwrap_or("_time"),
-            Self::V3(c) => c.cursor_field.as_deref().unwrap_or("time"),
+            Self::V2(c) => c.cursor_field.as_deref().unwrap_or(DEFAULT_V2_CURSOR_FIELD),
+            Self::V3(c) => c.cursor_field.as_deref().unwrap_or(DEFAULT_V3_CURSOR_FIELD),
         }
     }
 
@@ -224,7 +241,7 @@ impl InfluxDbSourceConfig {
     }
 
     /// URL with any trailing slash stripped — used as the base for all endpoint URLs.
-    pub fn base_url(&self) -> &str {
+    pub(crate) fn base_url(&self) -> &str {
         self.url().trim_end_matches('/')
     }
 }
@@ -343,12 +360,24 @@ pub fn validate_cursor(cursor: &str) -> Result<(), Error> {
 
 /// Validate `cursor_field` for the given connector version.
 ///
-/// `version` should be `"v2"` or `"v3"`. The error message suggests the correct
-/// column name for that version so users do not have to guess.
+/// `version` should be `"v2"` or `"v3"`. The function is version-strict: `"_time"`
+/// is only valid for V2 (Flux annotation column) and `"time"` is only valid for V3
+/// (SQL timestamp column). Swapping them silently would produce empty result sets
+/// or query errors at the InfluxDB level.
 pub fn validate_cursor_field(field: &str, version: &str) -> Result<(), Error> {
-    match field {
-        "_time" | "time" => Ok(()),
-        other => {
+    match (field, version) {
+        ("_time", "v2") | ("time", "v3") => Ok(()),
+        ("time", "v2") => Err(Error::InvalidConfigValue(
+            "cursor_field \"time\" is not valid for v2 — use \"_time\" \
+             (the Flux annotated-CSV timestamp column)"
+                .into(),
+        )),
+        ("_time", "v3") => Err(Error::InvalidConfigValue(
+            "cursor_field \"_time\" is not valid for v3 — use \"time\" \
+             (the SQL timestamp column)"
+                .into(),
+        )),
+        (other, _) => {
             let suggestion = if version == "v2" { "\"_time\"" } else { "\"time\"" };
             Err(Error::InvalidConfigValue(format!(
                 "cursor_field {other:?} is not supported for {version} — use {suggestion}"
@@ -495,6 +524,20 @@ mod tests {
     fn validate_cursor_field_rejects_others() {
         assert!(validate_cursor_field("_value", "v2").is_err());
         assert!(validate_cursor_field("", "v3").is_err());
+    }
+
+    #[test]
+    fn validate_cursor_field_is_version_strict() {
+        // Swapping column names across versions is an error, not a silent passthrough:
+        // using "time" with v2 or "_time" with v3 produces empty results at the DB level.
+        assert!(
+            validate_cursor_field("time", "v2").is_err(),
+            "\"time\" must be rejected for v2 — correct column is \"_time\""
+        );
+        assert!(
+            validate_cursor_field("_time", "v3").is_err(),
+            "\"_time\" must be rejected for v3 — correct column is \"time\""
+        );
     }
 
     #[test]

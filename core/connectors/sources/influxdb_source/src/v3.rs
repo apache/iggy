@@ -26,8 +26,8 @@
 //! circuit breaker is tripped.
 
 use crate::common::{
-    PayloadFormat, Row, RowContext, V3SourceConfig, V3State, apply_query_params,
-    is_timestamp_after, parse_jsonl_rows, parse_scalar, validate_cursor,
+    DEFAULT_V3_CURSOR_FIELD, PayloadFormat, Row, RowContext, V3SourceConfig, V3State,
+    apply_query_params, is_timestamp_after, parse_jsonl_rows, parse_scalar, validate_cursor,
 };
 use base64::{Engine as _, engine::general_purpose};
 use iggy_connector_sdk::{Error, ProducedMessage, Schema};
@@ -268,6 +268,10 @@ pub(crate) async fn poll(
     payload_format: PayloadFormat,
     include_metadata: bool,
 ) -> Result<PollResult, Error> {
+    // Access config.initial_offset directly (not via the enum accessor) because
+    // poll() receives &V3SourceConfig — the inner struct — already matched by the
+    // caller in lib.rs. The enum accessor InfluxDbSourceConfig::initial_offset()
+    // is not available here.
     let cursor = state
         .last_timestamp
         .clone()
@@ -288,7 +292,7 @@ pub(crate) async fn poll(
         .stuck_batch_cap_factor
         .unwrap_or(DEFAULT_STUCK_CAP_FACTOR);
     let ctx = RowContext {
-        cursor_field: config.cursor_field.as_deref().unwrap_or("time"),
+        cursor_field: config.cursor_field.as_deref().unwrap_or(DEFAULT_V3_CURSOR_FIELD),
         current_cursor: &cursor,
         include_metadata,
         payload_col: config.payload_column.as_deref(),

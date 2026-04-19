@@ -141,6 +141,7 @@ impl<'de> serde::Deserialize<'de> for InfluxDbSinkConfig {
 /// InfluxDB 3 rejects the short forms (`"ns"`, `"us"`, `"ms"`, `"s"`) on the
 /// `/api/v3/write_lp` endpoint and expects full English words. Returns an error
 /// for unrecognised values rather than silently defaulting.
+#[must_use = "precision mapping errors must be propagated — ignoring this silently corrupts timestamps"]
 fn map_precision_v3(p: &str) -> Result<&'static str, Error> {
     match p {
         "ns" => Ok("nanosecond"),
@@ -156,6 +157,17 @@ fn map_precision_v3(p: &str) -> Result<&'static str, Error> {
 // Eliminates the repetitive "match self { V2(c) => …, V3(c) => … }" pattern for
 // fields that are identical across all config variants. Methods with version-specific
 // logic (auth_header, build_write_url, build_health_url, version_label) remain explicit.
+//
+// Supported patterns:
+//   delegate!(ref  self.url)                        →  &String (borrow)
+//   delegate!(opt  self.measurement)                →  Option<&str>
+//   delegate!(str_or self.precision, "us")          →  &str with string fallback
+//   delegate!(unwrap self.batch_size, 500)          →  T: Copy with value fallback
+//
+// Not supported (use explicit match arms instead):
+//   Fields with version-specific defaults (e.g. cursor_field: "_time" vs "time")
+//   Fields with chained transformations (e.g. .max(1))
+//   Fields requiring complex construction (e.g. auth_header building)
 macro_rules! delegate {
     // &T field reference  →  fn foo(&self) -> &T
     (ref $self:ident . $field:ident) => {
@@ -259,6 +271,7 @@ impl InfluxDbSinkConfig {
         }
     }
 
+    #[must_use = "URL construction can fail; the error must be propagated or open() will silently use a stale URL"]
     fn build_write_url(&self) -> Result<Url, Error> {
         let precision = self.precision();
         match self {
@@ -287,6 +300,7 @@ impl InfluxDbSinkConfig {
         }
     }
 
+    #[must_use = "URL construction can fail; the error must be propagated"]
     fn build_health_url(&self) -> Result<Url, Error> {
         Url::parse(&format!("{}/health", self.base_url()))
             .map_err(|e| Error::InvalidConfigValue(format!("Invalid InfluxDB URL: {e}")))
@@ -419,6 +433,7 @@ impl InfluxDbSink {
         })
     }
 
+    #[inline]
     fn to_precision_timestamp(&self, micros: u64) -> u64 {
         match self.precision.as_str() {
             "ns" => micros.saturating_mul(1_000),
@@ -558,7 +573,9 @@ impl InfluxDbSink {
     }
 
     /// Build the newline-separated line-protocol body for a batch of messages.
-    /// Pure function — no I/O; extracted for testability.
+    /// Pure function — no I/O; extracted for testability. The empty-slice path is
+    /// unreachable in production (process_batch returns early when messages is empty)
+    /// but is exercised by unit tests for defensive completeness.
     fn build_body(
         &self,
         topic_metadata: &TopicMetadata,

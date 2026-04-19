@@ -804,4 +804,13 @@ mod tests {
     fn sort_call_detected_at_start_of_string() {
         assert!(query_has_sort_call("sort(columns: [\"_time\"]) |> limit(n: 10)"));
     }
+
+    #[test]
+    fn sort_call_not_detected_with_space_before_paren() {
+        // `sort (` with a space is not valid Flux syntax; the heuristic searches
+        // for the literal token `sort(` and does not match this form. The warning
+        // is therefore not emitted, which is acceptable: a query written this way
+        // would fail at the InfluxDB level for a different reason.
+        assert!(!query_has_sort_call("sort (columns: [\"_time\"])"));
+    }
 }

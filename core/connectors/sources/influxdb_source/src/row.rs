@@ -129,6 +129,11 @@ pub(crate) fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
 ///
 /// Blank lines are silently skipped. Lines that fail to parse as JSON objects
 /// return an error.
+///
+/// Uses `simd_json` for accelerated JSON tokenization in the hot path.
+/// `simd_json::from_slice` requires `&mut [u8]` and modifies the bytes in
+/// place for zero-copy SIMD parsing; we clone each line into a `Vec<u8>` to
+/// satisfy the mutability requirement without borrowing the original string.
 pub(crate) fn parse_jsonl_rows(jsonl_text: &str) -> Result<Vec<Row>, Error> {
     let mut rows = Vec::new();
 
@@ -138,8 +143,11 @@ pub(crate) fn parse_jsonl_rows(jsonl_text: &str) -> Result<Vec<Row>, Error> {
             continue;
         }
 
+        // simd_json modifies the slice in place during parsing (it replaces escaped
+        // sequences with their decoded form), so we need an owned copy of the bytes.
+        let mut line_bytes: Vec<u8> = line.as_bytes().to_vec();
         let obj: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(line).map_err(|e| {
+            simd_json::from_slice(&mut line_bytes).map_err(|e| {
                 Error::InvalidRecordValue(format!(
                     "JSONL parse error on line {}: {e} — raw: {line:?}",
                     line_no + 1

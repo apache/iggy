@@ -355,6 +355,12 @@ pub(crate) struct RowProcessingResult {
 /// cursor — these were delivered in the previous batch and re-appear because
 /// V2's `>= $cursor` query semantics are inclusive. All other rows become
 /// messages with unique UUIDs and timestamps set to `ctx.now_micros`.
+///
+/// `already_seen` is a separate parameter rather than a `RowContext` field
+/// because it is V2-specific: V3 uses strict `> cursor` semantics and never
+/// needs to skip rows. Adding it to `RowContext` would require V3's
+/// `process_rows` to accept a field it never uses, or require a separate context
+/// type just for V2.
 pub(crate) fn process_rows(
     rows: &[Row],
     ctx: &RowContext<'_>,
