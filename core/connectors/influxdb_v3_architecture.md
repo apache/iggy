@@ -25,7 +25,7 @@
 
 ## Layered Architecture Diagram
 
-```
+```text
 ╔══════════════════════════════════════════════════════════════════════════════════╗
 ║                          LAYER 1 — PUBLIC INTERFACE                            ║
 ║                                                                                  ║
@@ -186,7 +186,7 @@ response_format = "jsonl"  # "jsonl" | "json" | "csv"      (V3 only)
 ## Code Reuse Summary
 
 | Component | Reuse | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `Sink` / `Source` trait impls | 100% | Same `open/consume/poll/close` logic |
 | Line Protocol builder | 100% | Body format identical in V2 and V3 |
 | Batch accumulator | 100% | Flush logic unchanged |
