@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::bus::{MemBus, SharedMemBus};
+use crate::bus::{SharedSimOutbox, SimOutbox};
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
-use consensus::{LocalPipeline, NamespacedPipeline, VsrConsensus};
+use consensus::{LocalPipeline, VsrConsensus};
 use iggy_common::IggyByteSize;
 use iggy_common::sharding::ShardId;
 use iggy_common::variadic;
@@ -31,12 +31,22 @@ use std::sync::Arc;
 // TODO: Make configurable
 const CLUSTER_ID: u128 = 1;
 
+/// Consensus-level namespace for the partitions plane.
+///
+/// Must differ from the metadata namespace (0) so that view change messages
+/// can be routed to the correct consensus group.
+pub const PARTITIONS_CONSENSUS_NAMESPACE: u64 = 1;
+
 // For now there is only one shard per replica,
 // we will add support for multiple shards per replica in the future.
-pub type Replica =
-    shard::IggyShard<SharedMemBus, SimJournal<MemStorage>, SimSnapshot, SimMuxStateMachine>;
+pub type Replica = shard::IggyShard<
+    SharedSimOutbox,
+    SimJournal<MemStorage>, // MJ: metadata journal
+    SimSnapshot,
+    SimMuxStateMachine,
+>;
 
-pub fn new_replica(id: u8, name: String, bus: &Arc<MemBus>, replica_count: u8) -> Replica {
+pub fn new_replica(id: u8, name: String, bus: &Arc<SimOutbox>, replica_count: u8) -> Replica {
     let users: Users = UsersInner::new().into();
     let streams: Streams = StreamsInner::new().into();
     let consumer_groups: ConsumerGroups = ConsumerGroupsInner::new().into();
@@ -48,7 +58,7 @@ pub fn new_replica(id: u8, name: String, bus: &Arc<MemBus>, replica_count: u8) -
         id,
         replica_count,
         0,
-        SharedMemBus(Arc::clone(bus)),
+        SharedSimOutbox(Arc::clone(bus)),
         LocalPipeline::new(),
     );
     metadata_consensus.init();
@@ -68,32 +78,17 @@ pub fn new_replica(id: u8, name: String, bus: &Arc<MemBus>, replica_count: u8) -
         segment_size: IggyByteSize::from(1024 * 1024 * 1024),
     };
 
-    let mut partitions = IggyPartitions::new(ShardId::new(u16::from(id)), partitions_config);
+    let partitions = IggyPartitions::new(ShardId::new(u16::from(id)), partitions_config);
 
-    // TODO: namespace=0 collides with metadata consensus. Safe for now because the simulator
-    // routes by Operation type, but a shared view change bus would produce namespace collisions.
-    let partition_consensus = VsrConsensus::new(
-        CLUSTER_ID,
-        id,
-        replica_count,
-        0,
-        SharedMemBus(Arc::clone(bus)),
-        NamespacedPipeline::new(),
-    );
-    partition_consensus.init();
-    partitions.set_consensus(partition_consensus);
-
-    // TODO: previously we used used unbounded channel with flume,
-    // but this is not possible with crossfire without mangling types due to Flavor trait in crossfire.
-    // This needs to be revisited in the future.
-    let (_tx, inbox) = shard::channel(1024);
-    shard::IggyShard::new(
-        u16::from(id),
-        name,
+    shard::IggyShard::without_inbox(
+        shard::ShardIdentity::new(u16::from(id), name),
         metadata,
         partitions,
-        Vec::new(),
-        inbox,
         (),
+        shard::PartitionConsensusConfig::new(
+            CLUSTER_ID,
+            replica_count,
+            SharedSimOutbox(Arc::clone(bus)),
+        ),
     )
 }

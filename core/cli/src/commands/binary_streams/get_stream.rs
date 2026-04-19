@@ -22,40 +22,32 @@ use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::Client;
 use iggy_common::Identifier;
-use iggy_common::get_stream::GetStream;
 use tracing::{Level, event};
 
 pub struct GetStreamCmd {
-    get_stream: GetStream,
+    stream_id: Identifier,
 }
 
 impl GetStreamCmd {
     pub fn new(stream_id: Identifier) -> Self {
-        Self {
-            get_stream: GetStream { stream_id },
-        }
+        Self { stream_id }
     }
 }
 
 #[async_trait]
 impl CliCommand for GetStreamCmd {
     fn explain(&self) -> String {
-        format!("get stream with ID: {}", self.get_stream.stream_id)
+        format!("get stream with ID: {}", self.stream_id)
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let stream = client
-            .get_stream(&self.get_stream.stream_id)
+            .get_stream(&self.stream_id)
             .await
-            .with_context(|| {
-                format!(
-                    "Problem getting stream with ID: {}",
-                    self.get_stream.stream_id
-                )
-            })?;
+            .with_context(|| format!("Problem getting stream with ID: {}", self.stream_id))?;
 
         if stream.is_none() {
-            event!(target: PRINT_TARGET, Level::INFO, "Stream with ID: {} was not found", self.get_stream.stream_id);
+            event!(target: PRINT_TARGET, Level::INFO, "Stream with ID: {} was not found", self.stream_id);
             return Ok(());
         }
 

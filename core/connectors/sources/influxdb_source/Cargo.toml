@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_influxdb_source"
-version = "0.1.0-edge.1"
+version = "0.4.0"
 description = "Iggy InfluxDB source connector supporting V2 (Flux) and V3 (SQL) queries"
 edition = "2024"
 license = "Apache-2.0"
@@ -27,6 +27,7 @@ homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
+publish = false
 
 # dashmap and once_cell are not imported directly in this crate's source, but
 # the source_connector! macro (in iggy_connector_sdk::source) expands bare

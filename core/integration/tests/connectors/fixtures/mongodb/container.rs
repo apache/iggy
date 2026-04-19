@@ -89,14 +89,16 @@ impl MongoDbContainer {
 
         info!("Started MongoDB container");
 
-        let mapped_port = container
+        let ports = container
             .ports()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
                 fixture_type: "MongoDbContainer".to_string(),
                 message: format!("Failed to get ports: {e}"),
-            })?
+            })?;
+        let mapped_port = ports
             .map_to_host_port_ipv4(MONGODB_PORT)
+            .or_else(|| ports.map_to_host_port_ipv6(MONGODB_PORT))
             .ok_or_else(|| TestBinaryError::FixtureSetup {
                 fixture_type: "MongoDbContainer".to_string(),
                 message: "No mapping for MongoDB port".to_string(),
@@ -141,14 +143,16 @@ impl MongoDbContainer {
                 message: format!("Failed to start replica-set container: {e}"),
             })?;
 
-        let mapped_port = container
+        let ports = container
             .ports()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
                 fixture_type: "MongoDbContainer".to_string(),
                 message: format!("Failed to get ports: {e}"),
-            })?
+            })?;
+        let mapped_port = ports
             .map_to_host_port_ipv4(MONGODB_PORT)
+            .or_else(|| ports.map_to_host_port_ipv6(MONGODB_PORT))
             .ok_or_else(|| TestBinaryError::FixtureSetup {
                 fixture_type: "MongoDbContainer".to_string(),
                 message: "No mapping for MongoDB port".to_string(),

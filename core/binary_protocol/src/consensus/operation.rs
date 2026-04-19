@@ -22,8 +22,16 @@ use bytemuck::{CheckedBitPattern, NoUninit};
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, NoUninit, CheckedBitPattern)]
 #[repr(u8)]
 pub enum Operation {
+    /// The value 0 is reserved to prevent a spurious zero from being
+    /// interpreted as a valid operation.
     #[default]
     Reserved = 0,
+
+    /// Register a client session with the cluster. Goes through the same
+    /// consensus pipeline (prepare/replicate/commit) as normal operations
+    /// but skips state machine dispatch at commit time, the metadata
+    /// plane calls `commit_register` directly. Session number = commit op.
+    Register = 1,
 
     // Metadata operations (shard 0)
     CreateStream = 128,
@@ -37,7 +45,7 @@ pub enum Operation {
     CreatePartitions = 136,
     DeletePartitions = 137,
     // TODO: DeleteSegments is a partition operation (is_partition() == true) but its
-    // discriminant sits in the metadata range (128-147). Should be moved to 162 once
+    // discriminant sits in the metadata range (128-147). Should be moved to 163 once
     // iggy_common's Operation enum is removed and wire compat is no longer a concern.
     DeleteSegments = 138,
     CreateConsumerGroup = 139,
@@ -53,6 +61,7 @@ pub enum Operation {
     // Partition operations (routed by namespace)
     SendMessages = 160,
     StoreConsumerOffset = 161,
+    DeleteConsumerOffset = 162,
 }
 
 impl Operation {
@@ -84,13 +93,24 @@ impl Operation {
         )
     }
 
+    /// VSR protocol-level operations that go through consensus but skip
+    /// state machine dispatch at commit time.
+    #[must_use]
+    #[inline]
+    pub const fn is_vsr_reserved(&self) -> bool {
+        matches!(self, Self::Reserved | Self::Register)
+    }
+
     /// Data-plane operations routed to the shard owning the partition.
     #[must_use]
     #[inline]
     pub const fn is_partition(&self) -> bool {
         matches!(
             self,
-            Self::SendMessages | Self::StoreConsumerOffset | Self::DeleteSegments
+            Self::SendMessages
+                | Self::StoreConsumerOffset
+                | Self::DeleteConsumerOffset
+                | Self::DeleteSegments
         )
     }
 
@@ -100,7 +120,7 @@ impl Operation {
     #[must_use]
     pub const fn to_command_code(&self) -> Option<u32> {
         match self {
-            Self::Reserved => None,
+            Self::Reserved | Self::Register => None,
             Self::CreateStream
             | Self::UpdateStream
             | Self::DeleteStream
@@ -122,7 +142,8 @@ impl Operation {
             | Self::CreatePersonalAccessToken
             | Self::DeletePersonalAccessToken
             | Self::SendMessages
-            | Self::StoreConsumerOffset => match crate::dispatch::lookup_by_operation(*self) {
+            | Self::StoreConsumerOffset
+            | Self::DeleteConsumerOffset => match crate::dispatch::lookup_by_operation(*self) {
                 Some(meta) => Some(meta.code),
                 None => None,
             },
@@ -170,6 +191,7 @@ mod tests {
             Operation::DeletePersonalAccessToken,
             Operation::SendMessages,
             Operation::StoreConsumerOffset,
+            Operation::DeleteConsumerOffset,
         ];
         for op in ops {
             let code = op
@@ -182,8 +204,19 @@ mod tests {
     }
 
     #[test]
-    fn reserved_has_no_code() {
+    fn vsr_reserved_have_no_code() {
         assert_eq!(Operation::Reserved.to_command_code(), None);
+        assert_eq!(Operation::Register.to_command_code(), None);
+    }
+
+    #[test]
+    fn vsr_reserved_classification() {
+        assert!(Operation::Reserved.is_vsr_reserved());
+        assert!(Operation::Register.is_vsr_reserved());
+        assert!(!Operation::CreateStream.is_vsr_reserved());
+        assert!(!Operation::SendMessages.is_vsr_reserved());
+        assert!(!Operation::Register.is_metadata());
+        assert!(!Operation::Register.is_partition());
     }
 
     #[test]
@@ -202,5 +235,6 @@ mod tests {
         assert!(Operation::SendMessages.is_partition());
         assert!(!Operation::SendMessages.is_metadata());
         assert!(Operation::DeleteSegments.is_partition());
+        assert!(Operation::DeleteConsumerOffset.is_partition());
     }
 }

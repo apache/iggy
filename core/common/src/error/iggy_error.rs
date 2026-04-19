@@ -148,6 +148,8 @@ pub enum IggyError {
     AccessTokenMissing = 77,
     #[error("Invalid access token")]
     InvalidAccessToken = 78,
+    #[error("Cannot fetch JWKS from URL: {0}")]
+    CannotFetchJwks(String) = 79,
     #[error("Invalid size bytes")]
     InvalidSizeBytes = 80,
     #[error("Invalid UTF-8")]
@@ -388,6 +390,8 @@ pub enum IggyError {
     InvalidMessageTimestampDelta(u64) = 4038,
     #[error("Invalid batch checksum: {0}, expected: {1}, for base offset: {2}")]
     InvalidBatchChecksum(u64, u64, u64) = 4039,
+    #[error("Invalid header kind code: {0}")]
+    InvalidHeaderKind(u8) = 4040,
     #[error("Cannot sed messages due to client disconnection")]
     CannotSendMessagesDueToClientDisconnection = 4050,
     #[error("Background send error")]

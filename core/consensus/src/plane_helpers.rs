@@ -15,18 +15,107 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::client_table::{Notify, RequestStatus};
 use crate::{
     Consensus, IgnoreReason, Pipeline, PipelineEntry, PlaneKind, PrepareOkOutcome, Sequencer,
     Status, VsrConsensus,
 };
+use iggy_binary_protocol::consensus::iobuf::Owned;
 use iggy_binary_protocol::{
     Command2, GenericHeader, Message, PrepareHeader, PrepareOkHeader, ReplyHeader,
 };
-use iobuf::Owned;
 use message_bus::MessageBus;
 use std::ops::AsyncFnOnce;
 
 // TODO: Rework all of those helpers, once the boundaries are more clear and we have a better picture of the commonalities between all of the planes.
+
+/// Shared request preflight: duplicate detection + pending registration.
+///
+/// Returns `Some(Notify)` if the request is new and should proceed through
+/// consensus. Returns `None` if the request was already handled (duplicate
+/// reply sent, in-progress, stale, or session error), the caller should
+/// return early.
+#[allow(clippy::future_not_send)]
+pub async fn request_preflight<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    client_id: u128,
+    session: u64,
+    request: u64,
+) -> Option<Notify>
+where
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let status = consensus
+        .client_table()
+        .borrow()
+        .check_request(client_id, session, request);
+    match status {
+        RequestStatus::Duplicate(cached_reply) => {
+            // Best-effort resend, client may have disconnected.
+            let _ = consensus
+                .message_bus()
+                .send_to_client(client_id, cached_reply.into_generic())
+                .await;
+            None
+        }
+        RequestStatus::InProgress
+        | RequestStatus::Stale
+        | RequestStatus::NoSession
+        | RequestStatus::SessionMismatch { .. }
+        | RequestStatus::RequestGap { .. }
+        | RequestStatus::AlreadyRegistered { .. } => None,
+        RequestStatus::New => {
+            let notify = consensus
+                .client_table()
+                .borrow_mut()
+                .register_pending(client_id, request);
+            Some(notify)
+        }
+    }
+}
+
+/// Shared register preflight: duplicate detection for `Operation::Register`.
+///
+/// Returns `Some(Notify)` if the register is new and should proceed through
+/// consensus. Returns `None` if the client is already registered (session
+/// number sent back) or the register is already in progress.
+#[allow(clippy::future_not_send, clippy::unused_async)]
+pub async fn register_preflight<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    client_id: u128,
+) -> Option<Notify>
+where
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let status = consensus.client_table().borrow().check_register(client_id);
+    match status {
+        RequestStatus::AlreadyRegistered { session } => {
+            // Synthesize a register reply with the existing session.
+            // The caller can extract session from reply.header().commit.
+            tracing::debug!(
+                client_id,
+                session,
+                "register_preflight: client already registered, ignoring"
+            );
+            None
+        }
+        RequestStatus::InProgress => None,
+        RequestStatus::New => {
+            let notify = consensus
+                .client_table()
+                .borrow_mut()
+                .register_pending(client_id, 0);
+            Some(notify)
+        }
+        // check_register only returns AlreadyRegistered, InProgress, or New.
+        other => {
+            tracing::warn!(client_id, ?other, "register_preflight: unexpected status");
+            None
+        }
+    }
+}
 
 /// Shared pipeline-first request flow used by metadata and partitions.
 ///
@@ -54,6 +143,11 @@ pub async fn pipeline_prepare_common<C, F>(
 }
 
 /// Shared commit-based old-prepare fence.
+///
+/// Uses `commit_min` (locally executed), not `commit_max`. A backup may know
+/// that op 50 is committed (`commit_max = 50`) but only have executed up to
+/// op 14 (`commit_min = 14`). A retransmitted prepare for op 15 must NOT be
+/// fenced out, the backup still needs it in the WAL for `commit_journal`.
 #[must_use]
 pub const fn fence_old_prepare_by_commit<B, P>(
     consensus: &VsrConsensus<B, P>,
@@ -63,14 +157,14 @@ where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    header.op <= consensus.commit()
+    header.op <= consensus.commit_min()
 }
 
 /// Shared chain-replication forwarding to the next replica.
 ///
 /// # Panics
 /// - If `header.command` is not `Command2::Prepare`.
-/// - If `header.op <= consensus.commit()`.
+/// - If `header.op <= consensus.commit_min()`.
 /// - If the computed next replica equals self.
 /// - If the message bus send fails.
 #[allow(clippy::future_not_send)]
@@ -85,7 +179,7 @@ where
     let header = *message.header();
 
     assert_eq!(header.command, Command2::Prepare);
-    assert!(header.op > consensus.commit());
+    assert!(header.op > consensus.commit_min());
 
     let next = (consensus.replica() + 1) % consensus.replica_count();
     let primary = consensus.primary_index(header.view);
@@ -142,7 +236,7 @@ where
     }
 
     if consensus.is_follower() {
-        consensus.advance_commit_number(header.commit);
+        consensus.advance_commit_max(header.commit);
     }
 
     Ok(current_op)
@@ -194,7 +288,7 @@ where
     }
 
     let pipeline = consensus.pipeline().borrow();
-    let mut new_commit = consensus.commit();
+    let mut new_commit = consensus.commit_max();
     while let Some(entry) = pipeline.entry_by_op(new_commit + 1) {
         if !entry.ok_quorum_received {
             break;
@@ -203,8 +297,8 @@ where
     }
     drop(pipeline);
 
-    if new_commit > consensus.commit() {
-        consensus.advance_commit_number(new_commit);
+    if new_commit > consensus.commit_max() {
+        consensus.advance_commit_max(new_commit);
         return true;
     }
 
@@ -223,7 +317,7 @@ where
     B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    let commit = consensus.commit();
+    let commit = consensus.commit_max();
     let mut drained = Vec::new();
     let mut pipeline = consensus.pipeline().borrow_mut();
 
@@ -273,8 +367,11 @@ where
         reserved_frame: [0; 66],
         request_checksum: prepare_header.request_checksum,
         context: 0,
+        client: prepare_header.client,
         op: prepare_header.op,
-        commit: consensus.commit(),
+        // Use the prepare's op, not commit_max. This value drives eviction
+        // ordering in ClientTable, it must be deterministic across replicas.
+        commit: prepare_header.op,
         timestamp: prepare_header.timestamp,
         request: prepare_header.request,
         operation: prepare_header.operation,
@@ -354,7 +451,7 @@ pub async fn send_prepare_ok<B, P>(
         replica: consensus.replica(),
         view: consensus.view(),
         op: header.op,
-        commit: consensus.commit(),
+        commit: consensus.commit_max(),
         timestamp: header.timestamp,
         parent: header.parent,
         prepare_checksum: header.checksum,
@@ -673,7 +770,7 @@ mod tests {
         consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(2, 10, 20));
         consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(3, 20, 30));
 
-        consensus.advance_commit_number(3);
+        consensus.advance_commit_max(3);
 
         let drained = drain_committable_prefix(&consensus);
         let drained_ops: Vec<_> = drained.into_iter().map(|entry| entry.header.op).collect();
@@ -690,7 +787,7 @@ mod tests {
         consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(6, 50, 60));
         consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(7, 60, 70));
 
-        consensus.advance_commit_number(6);
+        consensus.advance_commit_max(6);
         let drained = drain_committable_prefix(&consensus);
         let drained_ops: Vec<_> = drained.into_iter().map(|entry| entry.header.op).collect();
 

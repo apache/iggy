@@ -60,8 +60,8 @@ pub struct IcebergSinkConfig {
     pub dynamic_routing: bool,
     pub dynamic_route_field: String,
     pub store_url: String,
-    pub store_access_key_id: String,
-    pub store_secret_access_key: String,
+    pub store_access_key_id: Option<String>,
+    pub store_secret_access_key: Option<String>,
     pub store_region: String,
     pub store_class: IcebergSinkStoreClass,
 }

@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::iobuf::{Frozen, Owned};
 use crate::consensus::{
-    self, Command2, ConsensusError, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
-    RequestHeader,
+    self, Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
+    GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader, StartViewChangeHeader,
+    StartViewHeader,
 };
-use iobuf::{Frozen, Owned};
 use smallvec::SmallVec;
 use std::{marker::PhantomData, mem::size_of};
 
@@ -45,14 +46,20 @@ where
     fn as_mut_slice(&mut self) -> &mut [u8];
 }
 
-pub trait FragmentedBacking<H>: MessageBacking<H> + ResponseBackingKind
+mod sealed {
+    pub trait Sealed {}
+}
+
+pub trait FragmentedBacking<H>: MessageBacking<H> + ResponseBackingKind + sealed::Sealed
 where
     H: ConsensusHeader,
 {
     fn fragments(&self) -> &[Frozen<MESSAGE_ALIGN>];
 }
 
-#[derive(Debug)]
+impl sealed::Sealed for ResponseBacking {}
+
+#[derive(Debug, Clone)]
 pub struct RequestBacking {
     owned: Owned<MESSAGE_ALIGN>,
 }
@@ -362,6 +369,18 @@ where
     }
 }
 
+impl<H> Clone for Message<H, RequestBacking>
+where
+    H: ConsensusHeader,
+{
+    fn clone(&self) -> Self {
+        Self {
+            backing: self.backing.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
 impl<H> Clone for Message<H, ResponseBacking>
 where
     H: ConsensusHeader,
@@ -446,6 +465,10 @@ pub enum MessageBag {
     Request(Message<RequestHeader>),
     Prepare(Message<PrepareHeader>),
     PrepareOk(Message<PrepareOkHeader>),
+    StartViewChange(Message<StartViewChangeHeader>),
+    DoViewChange(Message<DoViewChangeHeader>),
+    StartView(Message<StartViewHeader>),
+    Commit(Message<CommitHeader>),
 }
 
 impl MessageBag {
@@ -455,6 +478,10 @@ impl MessageBag {
             Self::Request(message) => message.header().command,
             Self::Prepare(message) => message.header().command,
             Self::PrepareOk(message) => message.header().command,
+            Self::StartViewChange(message) => message.header().command,
+            Self::DoViewChange(message) => message.header().command,
+            Self::StartView(message) => message.header().command,
+            Self::Commit(message) => message.header().command,
         }
     }
 
@@ -464,6 +491,10 @@ impl MessageBag {
             Self::Request(message) => message.header().size(),
             Self::Prepare(message) => message.header().size(),
             Self::PrepareOk(message) => message.header().size(),
+            Self::StartViewChange(message) => message.header().size(),
+            Self::DoViewChange(message) => message.header().size(),
+            Self::StartView(message) => message.header().size(),
+            Self::Commit(message) => message.header().size(),
         }
     }
 
@@ -473,6 +504,10 @@ impl MessageBag {
             Self::Request(message) => message.header().operation,
             Self::Prepare(message) => message.header().operation,
             Self::PrepareOk(message) => message.header().operation,
+            Self::StartViewChange(message) => message.header().operation(),
+            Self::DoViewChange(message) => message.header().operation(),
+            Self::StartView(message) => message.header().operation(),
+            Self::Commit(message) => message.header().operation(),
         }
     }
 }
@@ -499,6 +534,23 @@ where
             Command2::PrepareOk => {
                 let msg = unsafe { Message::<PrepareOkHeader>::from_backing_unchecked(backing) };
                 Ok(Self::PrepareOk(msg))
+            }
+            Command2::StartViewChange => {
+                let msg =
+                    unsafe { Message::<StartViewChangeHeader>::from_backing_unchecked(backing) };
+                Ok(Self::StartViewChange(msg))
+            }
+            Command2::DoViewChange => {
+                let msg = unsafe { Message::<DoViewChangeHeader>::from_backing_unchecked(backing) };
+                Ok(Self::DoViewChange(msg))
+            }
+            Command2::StartView => {
+                let msg = unsafe { Message::<StartViewHeader>::from_backing_unchecked(backing) };
+                Ok(Self::StartView(msg))
+            }
+            Command2::Commit => {
+                let msg = unsafe { Message::<CommitHeader>::from_backing_unchecked(backing) };
+                Ok(Self::Commit(msg))
             }
             other => Err(ConsensusError::InvalidCommand {
                 expected: Command2::Reserved,

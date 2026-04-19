@@ -103,12 +103,13 @@ where
         H: ConsensusHeader;
 }
 
+pub mod client_table;
+pub use client_table::ClientTable;
+
 mod impls;
 pub use impls::*;
 mod plane_mux;
 pub use plane_mux::*;
-mod namespaced_pipeline;
-pub use namespaced_pipeline::*;
 mod plane_helpers;
 pub use plane_helpers::*;
 mod observability;

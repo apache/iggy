@@ -20,6 +20,7 @@ name = "integration"
 version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
+publish = false
 
 # Some tests are failing in CI due to lack of IPv6 interfaces
 # inside the docker containers. This is a temporary workaround (hopefully).
@@ -27,7 +28,6 @@ license = "Apache-2.0"
 ci-qemu = []
 
 [dependencies]
-ahash = { workspace = true }
 assert_cmd = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
@@ -46,6 +46,7 @@ iggy-cli = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true, features = ["api"] }
+jsonwebtoken = { workspace = true }
 keyring = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
@@ -80,4 +81,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 twox-hash = { workspace = true }
 uuid = { workspace = true }
+wiremock = "0.6"
 zip = { workspace = true }

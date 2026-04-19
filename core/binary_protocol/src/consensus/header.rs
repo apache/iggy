@@ -105,7 +105,8 @@ pub struct RequestHeader {
     pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
-    pub reserved: [u8; 64],
+    pub session: u64,
+    pub reserved: [u8; 56],
 }
 const _: () = {
     assert!(size_of::<RequestHeader>() == HEADER_SIZE);
@@ -113,7 +114,7 @@ const _: () = {
         offset_of!(RequestHeader, client)
             == offset_of!(RequestHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 64]>() == HEADER_SIZE);
+    assert!(offset_of!(RequestHeader, reserved) + size_of::<[u8; 56]>() == HEADER_SIZE);
 };
 
 impl Default for RequestHeader {
@@ -135,7 +136,8 @@ impl Default for RequestHeader {
             operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
-            reserved: [0; 64],
+            session: 0,
+            reserved: [0; 56],
         }
     }
 }
@@ -159,6 +161,31 @@ impl ConsensusHeader for RequestHeader {
                 found: self.command,
             });
         }
+        // Register: session must be 0, request must be 0.
+        // Non-register: session must be > 0, request must be > 0.
+        if self.operation == Operation::Register {
+            if self.session != 0 {
+                return Err(ConsensusError::InvalidField(
+                    "register: session must be 0".to_string(),
+                ));
+            }
+            if self.request != 0 {
+                return Err(ConsensusError::InvalidField(
+                    "register: request must be 0".to_string(),
+                ));
+            }
+        } else if self.operation != Operation::Reserved {
+            if self.session == 0 {
+                return Err(ConsensusError::InvalidField(
+                    "non-register: session must be > 0".to_string(),
+                ));
+            }
+            if self.request == 0 {
+                return Err(ConsensusError::InvalidField(
+                    "non-register: request must be > 0".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -181,6 +208,7 @@ pub struct ReplyHeader {
 
     pub request_checksum: u128,
     pub context: u128,
+    pub client: u128,
     pub op: u64,
     pub commit: u64,
     pub timestamp: u64,
@@ -188,7 +216,7 @@ pub struct ReplyHeader {
     pub operation: Operation,
     pub operation_padding: [u8; 7],
     pub namespace: u64,
-    pub reserved: [u8; 48],
+    pub reserved: [u8; 32],
 }
 const _: () = {
     assert!(size_of::<ReplyHeader>() == HEADER_SIZE);
@@ -196,7 +224,7 @@ const _: () = {
         offset_of!(ReplyHeader, request_checksum)
             == offset_of!(ReplyHeader, reserved_frame) + size_of::<[u8; 66]>()
     );
-    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 48]>() == HEADER_SIZE);
+    assert!(offset_of!(ReplyHeader, reserved) + size_of::<[u8; 32]>() == HEADER_SIZE);
 };
 
 impl Default for ReplyHeader {
@@ -213,6 +241,7 @@ impl Default for ReplyHeader {
             reserved_frame: [0; 66],
             request_checksum: 0,
             context: 0,
+            client: 0,
             op: 0,
             commit: 0,
             timestamp: 0,
@@ -220,7 +249,7 @@ impl Default for ReplyHeader {
             operation: Operation::Reserved,
             operation_padding: [0; 7],
             namespace: 0,
-            reserved: [0; 48],
+            reserved: [0; 32],
         }
     }
 }
@@ -668,8 +697,9 @@ impl ConsensusHeader for StartViewHeader {
 #[cfg(test)]
 mod tests {
     use super::{
-        Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader,
-        PrepareOkHeader, ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
+        Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader, Operation,
+        PrepareHeader, PrepareOkHeader, ReplyHeader, RequestHeader, StartViewChangeHeader,
+        StartViewHeader,
     };
 
     fn aligned_zeroed(size: usize) -> bytes::BytesMut {
@@ -710,6 +740,66 @@ mod tests {
     fn request_header_wrong_command_fails_validation() {
         let buf = aligned_zeroed(256);
         let header: &RequestHeader = bytemuck::checked::try_from_bytes(&buf).unwrap();
+        assert!(header.validate().is_err());
+    }
+
+    #[test]
+    fn request_register_nonzero_session_rejected() {
+        let header = RequestHeader {
+            command: Command2::Request,
+            operation: Operation::Register,
+            session: 5,
+            request: 0,
+            ..RequestHeader::default()
+        };
+        assert!(header.validate().is_err());
+    }
+
+    #[test]
+    fn request_register_nonzero_request_rejected() {
+        let header = RequestHeader {
+            command: Command2::Request,
+            operation: Operation::Register,
+            session: 0,
+            request: 1,
+            ..RequestHeader::default()
+        };
+        assert!(header.validate().is_err());
+    }
+
+    #[test]
+    fn request_non_register_valid() {
+        let header = RequestHeader {
+            command: Command2::Request,
+            operation: Operation::SendMessages,
+            session: 10,
+            request: 1,
+            ..RequestHeader::default()
+        };
+        assert!(header.validate().is_ok());
+    }
+
+    #[test]
+    fn request_non_register_zero_session_rejected() {
+        let header = RequestHeader {
+            command: Command2::Request,
+            operation: Operation::SendMessages,
+            session: 0,
+            request: 1,
+            ..RequestHeader::default()
+        };
+        assert!(header.validate().is_err());
+    }
+
+    #[test]
+    fn request_non_register_zero_request_rejected() {
+        let header = RequestHeader {
+            command: Command2::Request,
+            operation: Operation::SendMessages,
+            session: 10,
+            request: 0,
+            ..RequestHeader::default()
+        };
         assert!(header.validate().is_err());
     }
 

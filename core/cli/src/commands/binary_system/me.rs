@@ -21,22 +21,14 @@ use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::Client;
-use iggy_common::get_me::GetMe;
 use tracing::{Level, event};
 
-pub struct GetMeCmd {
-    _get_me: GetMe,
-}
+#[derive(Default)]
+pub struct GetMeCmd;
 
 impl GetMeCmd {
     pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Default for GetMeCmd {
-    fn default() -> Self {
-        Self { _get_me: GetMe {} }
+        Self
     }
 }
 

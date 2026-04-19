@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_binary_protocol"
-version = "0.9.5-edge.1"
+version = "0.10.0"
 description = "Wire protocol types and codec for the Iggy binary protocol. Shared between server and SDK."
 edition = "2024"
 license = "Apache-2.0"
@@ -29,11 +29,13 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
 [dependencies]
+aligned-vec = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
+compio-buf = { workspace = true }
 enumset = { workspace = true }
-iobuf = { workspace = true }
-smallvec = "1.13"
+secrecy = { workspace = true }
+smallvec = { workspace = true }
 thiserror = { workspace = true }
 
 [lints.clippy]

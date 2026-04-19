@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_common::{IggyByteSize, PollingStrategy};
-use iobuf::Frozen;
 use smallvec::SmallVec;
 
 #[derive(Debug, Clone)]
@@ -219,6 +219,16 @@ pub struct PartitionsConfig {
 }
 
 impl PartitionsConfig {
+    #[must_use]
+    pub fn get_partition_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!("/tmp/iggy_stub/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}",)
+    }
+
     /// Constructs the file path for segment messages.
     ///
     /// TODO: This is a stub waiting for completion of issue to move server config
@@ -233,7 +243,8 @@ impl PartitionsConfig {
         start_offset: u64,
     ) -> String {
         format!(
-            "/tmp/iggy_stub/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}/{start_offset:0>20}.log",
+            "{}/{start_offset:0>20}.log",
+            self.get_partition_path(stream_id, topic_id, partition_id)
         )
     }
 
@@ -251,7 +262,47 @@ impl PartitionsConfig {
         start_offset: u64,
     ) -> String {
         format!(
-            "/tmp/iggy_stub/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}/{start_offset:0>20}.index",
+            "{}/{start_offset:0>20}.index",
+            self.get_partition_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    #[must_use]
+    pub fn get_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/offsets",
+            self.get_partition_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    #[must_use]
+    pub fn get_consumer_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/consumers",
+            self.get_offsets_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    #[must_use]
+    pub fn get_consumer_group_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/groups",
+            self.get_offsets_path(stream_id, topic_id, partition_id)
         )
     }
 }

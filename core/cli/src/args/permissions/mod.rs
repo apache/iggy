@@ -17,9 +17,9 @@
  */
 
 use self::{global::GlobalPermissionsArg, stream::StreamPermissionsArg};
-use ahash::AHashMap;
 use clap::ValueEnum;
 use iggy::prelude::{Permissions, StreamPermissions, UserStatus};
+use std::collections::BTreeMap;
 
 pub(crate) mod constants;
 pub(crate) mod global;
@@ -49,7 +49,7 @@ impl From<PermissionsArgs> for Option<Permissions> {
             .stream
             .into_iter()
             .map(|s| (s.stream_id, s.into()))
-            .collect::<AHashMap<usize, StreamPermissions>>();
+            .collect::<BTreeMap<usize, StreamPermissions>>();
 
         match (value.global, stream_permissions.is_empty()) {
             (Some(global), true) => Some(Permissions {
@@ -114,7 +114,7 @@ mod tests {
             Option::from(PermissionsArgs::new(None, Some(vec![stream])));
 
         let permissions = Permissions {
-            streams: Some(AHashMap::from([(1, StreamPermissions::default())])),
+            streams: Some(BTreeMap::from([(1, StreamPermissions::default())])),
             ..Default::default()
         };
         assert_eq!(permissions_args, Some(permissions));
@@ -128,7 +128,7 @@ mod tests {
             Option::from(PermissionsArgs::new(Some(global), Some(vec![stream])));
 
         let mut permissions = Permissions {
-            streams: Some(AHashMap::from([(1, StreamPermissions::default())])),
+            streams: Some(BTreeMap::from([(1, StreamPermissions::default())])),
             ..Default::default()
         };
         permissions.global.manage_topics = true;

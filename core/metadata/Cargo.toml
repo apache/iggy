@@ -26,6 +26,7 @@ homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../../README.md"
+publish = false
 
 [dependencies]
 ahash = { workspace = true }
@@ -38,7 +39,6 @@ left-right = { workspace = true }
 message_bus = { workspace = true }
 paste = { workspace = true }
 rmp-serde = { workspace = true }
-secrecy = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 slab = { workspace = true }
 tracing = { workspace = true }
@@ -47,7 +47,6 @@ tracing = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
 compio = { workspace = true }
-iobuf = { workspace = true }
 tempfile = { workspace = true }
 
 [lints.clippy]

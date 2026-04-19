@@ -26,9 +26,9 @@ use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_common::{
-    AutoLogin, ClientState, Command, ConnectionString, ConnectionStringUtils, Credentials,
-    DiagnosticEvent, IggyDuration, IggyError, IggyErrorDiscriminants, IggyTimestamp,
-    TcpConnectionStringOptions, TransportProtocol,
+    AutoLogin, ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
+    IggyDuration, IggyError, IggyErrorDiscriminants, IggyTimestamp, TcpConnectionStringOptions,
+    TransportProtocol,
 };
 use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
@@ -100,12 +100,6 @@ impl BinaryTransport for TcpClient {
         if let Err(error) = self.events.0.broadcast(event).await {
             error!("Failed to send a TCP diagnostic event: {error}");
         }
-    }
-
-    async fn send_with_response<T: Command>(&self, command: &T) -> Result<Bytes, IggyError> {
-        command.validate()?;
-        self.send_raw_with_response(command.code(), command.to_bytes())
-            .await
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {

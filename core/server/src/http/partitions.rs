@@ -25,10 +25,15 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Extension, Json, Router, debug_handler};
+use iggy_binary_protocol::requests::partitions::{
+    CreatePartitionsRequest as WireCreatePartitions,
+    DeletePartitionsRequest as WireDeletePartitions,
+};
 use iggy_common::Identifier;
 use iggy_common::Validatable;
 use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::delete_partitions::DeletePartitions;
+use iggy_common::wire_conversions::identifier_to_wire;
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -53,9 +58,14 @@ async fn create_partitions(
     command.topic_id = Identifier::from_str_value(&topic_id)?;
     command.validate()?;
 
+    let wire_command = WireCreatePartitions {
+        stream_id: identifier_to_wire(&command.stream_id)?,
+        topic_id: identifier_to_wire(&command.topic_id)?,
+        partitions_count: command.partitions_count,
+    };
     let request = ShardRequest::control_plane(ShardRequestPayload::CreatePartitionsRequest {
         user_id: identity.user_id,
-        command,
+        command: wire_command,
     });
 
     match state.shard.send_to_control_plane(request).await? {
@@ -77,13 +87,14 @@ async fn delete_partitions(
     query.topic_id = Identifier::from_str_value(&topic_id)?;
     query.validate()?;
 
+    let wire_command = WireDeletePartitions {
+        stream_id: identifier_to_wire(&query.stream_id)?,
+        topic_id: identifier_to_wire(&query.topic_id)?,
+        partitions_count: query.partitions_count,
+    };
     let request = ShardRequest::control_plane(ShardRequestPayload::DeletePartitionsRequest {
         user_id: identity.user_id,
-        command: DeletePartitions {
-            stream_id: query.stream_id.clone(),
-            topic_id: query.topic_id.clone(),
-            partitions_count: query.partitions_count,
-        },
+        command: wire_command,
     });
 
     match state.shard.send_to_control_plane(request).await? {

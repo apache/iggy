@@ -16,9 +16,7 @@
  * under the License.
  */
 
-use crate::binary::dispatch::{
-    HandlerResult, domain_permissions_to_wire, wire_permissions_to_permissions,
-};
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
@@ -27,9 +25,11 @@ use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::users::CreateUserRequest;
 use iggy_binary_protocol::responses::users::{UserDetailsResponse, UserResponse};
-use iggy_common::create_user::CreateUser;
-use iggy_common::{IggyError, SenderKind, UserStatus, Validatable};
-use secrecy::SecretString;
+use iggy_common::defaults::{
+    MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
+};
+use iggy_common::wire_conversions::permissions_to_wire;
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -47,20 +47,18 @@ pub async fn handle_create_user(
     shard.ensure_authenticated(session)?;
     shard.metadata.perm_create_user(session.get_user_id())?;
 
-    let command = CreateUser {
-        username: req.username.to_string(),
-        password: SecretString::from(req.password),
-        status: UserStatus::from_code(req.status)?,
-        permissions: req
-            .permissions
-            .as_ref()
-            .map(wire_permissions_to_permissions),
-    };
-    command.validate()?;
+    let username_len = req.username.as_str().len();
+    if !(MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&username_len) {
+        return Err(IggyError::InvalidUsername);
+    }
+    let password_len = req.password.len();
+    if !(MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH).contains(&password_len) {
+        return Err(IggyError::InvalidPassword);
+    }
 
     let request = ShardRequest::control_plane(ShardRequestPayload::CreateUserRequest {
         user_id: session.get_user_id(),
-        command,
+        command: req,
     });
 
     match shard.send_to_control_plane(request).await? {
@@ -73,7 +71,7 @@ pub async fn handle_create_user(
                     username: WireName::new(&user.username)
                         .map_err(|_| IggyError::InvalidCommand)?,
                 },
-                permissions: user.permissions.as_ref().map(domain_permissions_to_wire),
+                permissions: user.permissions.as_ref().map(permissions_to_wire),
             };
             sender.send_ok_response(&response.to_bytes()).await?;
         }

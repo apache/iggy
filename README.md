@@ -91,15 +91,15 @@ This is the high-level architecture of the Iggy message streaming server, where 
 
 ## Version
 
-The official releases follow the regular semver (`0.5.0`) or have `latest` tag applied (`apache/iggy:latest`).
+The official releases follow the regular semver (`0.7.0`) or have `latest` tag applied (`apache/iggy:latest`).
 
-We do also publish edge/dev/nightly releases (e.g. `0.6.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
+We do also publish edge/dev/nightly releases (e.g. `0.7.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
 
 ---
 
 ## Roadmap
 
-- **Clustering** & data replication based on **[VSR](http://pmg.csail.mit.edu/papers/vr-revisited.pdf)** (on sandbox project using Raft, will be implemented after shared-nothing design is completed)
+- **Clustering** & data replication based on **[VSR](https://github.com/apache/iggy/blob/master/assets/vsr.pdf)** (coming soon)
 
 ---
 
@@ -112,7 +112,7 @@ We do also publish edge/dev/nightly releases (e.g. `0.6.0-edge.1` or `apache/igg
 - [Node.js (TypeScript)](https://www.npmjs.com/package/apache-iggy)
 - [Go](https://pkg.go.dev/github.com/apache/iggy/foreign/go)
 
-C++ and Elixir are work in progress.
+[C++](https://github.com/apache/iggy/tree/master/foreign/cpp) is work in progress.
 
 ---
 
@@ -421,43 +421,43 @@ Then, run the benchmarking app with the desired options:
 1. Sending (writing) benchmark
 
    ```bash
-   cargo run --bin iggy-bench -r -- -v pinned-producer tcp
+   cargo run --bin iggy-bench -r -- pinned-producer tcp
    ```
 
 2. Polling (reading) benchmark
 
    ```bash
-   cargo run --bin iggy-bench -r -- -v pinned-consumer tcp
+   cargo run --bin iggy-bench -r -- pinned-consumer tcp
    ```
 
 3. Parallel sending and polling benchmark
 
    ```bash
-   cargo run --bin iggy-bench -r -- -v pinned-producer-and-consumer tcp
+   cargo run --bin iggy-bench -r -- pinned-producer-and-consumer tcp
    ```
 
 4. Balanced sending to multiple partitions benchmark
 
    ```bash
-   cargo run --bin iggy-bench -r -- -v balanced-producer tcp
+   cargo run --bin iggy-bench -r -- balanced-producer tcp
    ```
 
 5. Consumer group polling benchmark:
 
    ```bash
-   cargo run --bin iggy-bench -r -- -v balanced-consumer-group tcp
+   cargo run --bin iggy-bench -r -- balanced-consumer-group tcp
    ```
 
 6. Parallel balanced sending and polling from consumer group benchmark:
 
    ```bash
-   cargo run --bin iggy-bench -r -- -v balanced-producer-and-consumer-group tcp
+   cargo run --bin iggy-bench -r -- balanced-producer-and-consumer-group tcp
    ```
 
 7. End to end producing and consuming benchmark (single task produces and consumes messages in sequence):
 
    ```bash
-   cargo run --bin iggy-bench -r -- -v end-to-end-producing-consumer tcp
+   cargo run --bin iggy-bench -r -- end-to-end-producing-consumer tcp
    ```
 
 These benchmarks would start the server with the default configuration, create a stream, topic and partition, and then send or poll the messages. The default configuration is optimized for the best performance, so you might want to tweak it for your needs. If you need more options, please refer to `iggy-bench` subcommands `help` and `examples`.

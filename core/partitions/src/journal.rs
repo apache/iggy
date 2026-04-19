@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::consensus::iobuf::{Frozen, Owned};
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use iggy_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice};
-use iobuf::{Frozen, Owned};
 use journal::{Journal, Storage};
 use std::io;
 use std::{
@@ -227,6 +227,11 @@ where
             headers: UnsafeCell::new(Vec::new()),
             inner: UnsafeCell::new(JournalInner { storage }),
         }
+    }
+
+    pub fn header_by_op(&self, op: u64) -> Option<PrepareHeader> {
+        let headers = unsafe { &*self.headers.get() };
+        headers.iter().find(|header| header.op == op).copied()
     }
 
     #[allow(dead_code)]

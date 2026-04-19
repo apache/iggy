@@ -21,7 +21,7 @@ use iggy::prelude::*;
 use iggy_common::TransportProtocol;
 use integration::harness::{TestHarness, TestServerConfig};
 use serial_test::parallel;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use test_case::test_matrix;
@@ -63,7 +63,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
     let mut messages_batch_1 = Vec::new();
 
     for i in 0..messages_per_batch {
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert(HeaderKey::try_from("batch").unwrap(), 1u64.into());
         headers.insert(HeaderKey::try_from("index").unwrap(), i.into());
         headers.insert(
@@ -217,7 +217,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
     let mut messages_batch_2 = Vec::new();
 
     for i in 0..messages_per_batch {
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert(HeaderKey::try_from("batch").unwrap(), 2u64.into());
         headers.insert(HeaderKey::try_from("index").unwrap(), i.into());
         headers.insert(
@@ -384,7 +384,7 @@ async fn should_encrypt_and_decrypt_headers_with_client_side_encryption(
 
     let mut messages = Vec::new();
     for i in 0..10i64 {
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert(HeaderKey::try_from("index").unwrap(), HeaderValue::from(i));
         headers.insert(
             HeaderKey::try_from("transport").unwrap(),
