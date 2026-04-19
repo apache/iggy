@@ -118,16 +118,14 @@ impl ElasticsearchContainer {
 
         info!("Started Elasticsearch container");
 
-        let ports = container
+        let mapped_port = container
             .ports()
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
                 fixture_type: "ElasticsearchContainer".to_string(),
                 message: format!("Failed to get ports: {e}"),
-            })?;
-        let mapped_port = ports
+            })?
             .map_to_host_port_ipv4(ELASTICSEARCH_PORT)
-            .or_else(|| ports.map_to_host_port_ipv6(ELASTICSEARCH_PORT))
             .ok_or_else(|| TestBinaryError::FixtureSetup {
                 fixture_type: "ElasticsearchContainer".to_string(),
                 message: "No mapping for Elasticsearch port".to_string(),

@@ -378,7 +378,11 @@ pub fn validate_cursor_field(field: &str, version: &str) -> Result<(), Error> {
                 .into(),
         )),
         (other, _) => {
-            let suggestion = if version == "v2" { "\"_time\"" } else { "\"time\"" };
+            let suggestion = if version == "v2" {
+                "\"_time\""
+            } else {
+                "\"time\""
+            };
             Err(Error::InvalidConfigValue(format!(
                 "cursor_field {other:?} is not supported for {version} — use {suggestion}"
             )))
@@ -542,11 +546,18 @@ mod tests {
 
     #[test]
     fn validate_cursor_field_error_is_version_specific() {
-        let v2_err = validate_cursor_field("timestamp", "v2").unwrap_err().to_string();
+        let v2_err = validate_cursor_field("timestamp", "v2")
+            .unwrap_err()
+            .to_string();
         assert!(v2_err.contains("v2"), "error should mention v2");
-        assert!(v2_err.contains("\"_time\""), "v2 error should suggest _time");
+        assert!(
+            v2_err.contains("\"_time\""),
+            "v2 error should suggest _time"
+        );
 
-        let v3_err = validate_cursor_field("timestamp", "v3").unwrap_err().to_string();
+        let v3_err = validate_cursor_field("timestamp", "v3")
+            .unwrap_err()
+            .to_string();
         assert!(v3_err.contains("v3"), "error should mention v3");
         assert!(v3_err.contains("\"time\""), "v3 error should suggest time");
     }

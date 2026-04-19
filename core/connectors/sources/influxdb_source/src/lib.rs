@@ -305,7 +305,16 @@ impl Source for InfluxDbSource {
                 };
 
                 let state_snap = state_mu.lock().await.clone();
-                match v2::poll(client, cfg, auth, &state_snap, self.payload_format, self.config.include_metadata()).await {
+                match v2::poll(
+                    client,
+                    cfg,
+                    auth,
+                    &state_snap,
+                    self.payload_format,
+                    self.config.include_metadata(),
+                )
+                .await
+                {
                     Ok(result) => {
                         self.circuit_breaker.record_success();
                         let mut state = state_mu.lock().await;
@@ -363,7 +372,16 @@ impl Source for InfluxDbSource {
                 };
 
                 let state_snap = state_mu.lock().await.clone();
-                match v3::poll(client, cfg, auth, &state_snap, self.payload_format, self.config.include_metadata()).await {
+                match v3::poll(
+                    client,
+                    cfg,
+                    auth,
+                    &state_snap,
+                    self.payload_format,
+                    self.config.include_metadata(),
+                )
+                .await
+                {
                     Ok(result) => {
                         if result.trip_circuit_breaker {
                             self.circuit_breaker.record_failure().await;
@@ -453,7 +471,7 @@ fn query_has_sort_call(query: &str) -> bool {
         } else {
             query.as_bytes().get(abs_idx - 1).copied()
         };
-        let is_word_start = prev.map_or(true, |b| !b.is_ascii_alphanumeric() && b != b'_');
+        let is_word_start = prev.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_');
         if is_word_start {
             return true;
         }
@@ -802,7 +820,9 @@ mod tests {
 
     #[test]
     fn sort_call_detected_at_start_of_string() {
-        assert!(query_has_sort_call("sort(columns: [\"_time\"]) |> limit(n: 10)"));
+        assert!(query_has_sort_call(
+            "sort(columns: [\"_time\"]) |> limit(n: 10)"
+        ));
     }
 
     #[test]

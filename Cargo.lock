@@ -5783,13 +5783,11 @@ name = "iggy_connector_influxdb_sink"
 version = "0.4.0"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "bytes",
- "dashmap",
- "futures",
  "iggy_common",
  "iggy_connector_sdk",
- "once_cell",
  "reqwest 0.13.2",
  "reqwest-middleware",
  "secrecy",
@@ -5797,6 +5795,7 @@ dependencies = [
  "serde_json",
  "simd-json",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
 ]
 
@@ -5805,10 +5804,10 @@ name = "iggy_connector_influxdb_source"
 version = "0.4.0"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "csv",
  "dashmap",
- "futures",
  "iggy_common",
  "iggy_connector_sdk",
  "once_cell",
@@ -5818,7 +5817,9 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "simd-json",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
  "uuid",
 ]
@@ -5893,6 +5894,7 @@ dependencies = [
  "serde",
  "serde_yaml_ng",
  "simd-json",
+ "tokio",
  "tracing",
 ]
 
@@ -5974,7 +5976,7 @@ dependencies = [
  "futures-util",
  "iggy",
  "iggy_common",
- "lz4_flex 0.13.0",
+ "lz4_flex",
  "rand 0.10.1",
  "serde",
  "serde_json",
@@ -6876,15 +6878,6 @@ name = "lz4_flex"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98c23545df7ecf1b16c303910a69b079e8e251d60f7dd2cc9b4177f2afaf1746"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
-name = "lz4_flex"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db9a0d582c2874f68138a16ce1867e0ffde6c0bb0a0df85e1f36d04146db488a"
 dependencies = [
  "twox-hash",
 ]
@@ -7954,7 +7947,7 @@ dependencies = [
  "futures",
  "half",
  "hashbrown 0.16.1",
- "lz4_flex 0.12.1",
+ "lz4_flex",
  "num-bigint",
  "num-integer",
  "num-traits",

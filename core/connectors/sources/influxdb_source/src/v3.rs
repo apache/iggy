@@ -292,7 +292,10 @@ pub(crate) async fn poll(
         .stuck_batch_cap_factor
         .unwrap_or(DEFAULT_STUCK_CAP_FACTOR);
     let ctx = RowContext {
-        cursor_field: config.cursor_field.as_deref().unwrap_or(DEFAULT_V3_CURSOR_FIELD),
+        cursor_field: config
+            .cursor_field
+            .as_deref()
+            .unwrap_or(DEFAULT_V3_CURSOR_FIELD),
         current_cursor: &cursor,
         include_metadata,
         payload_col: config.payload_column.as_deref(),
