@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn is_timestamp_after_fallback_is_conservative() {
-        // Unparseable timestamps must NOT advance the cursor. Lexicographic
+        // Unparsable timestamps must NOT advance the cursor. Lexicographic
         // comparison is wrong for cross-timezone values, so the safe default is
         // false — refuse to advance rather than risk skipping data.
         assert!(!is_timestamp_after("not-a-timestamp", "also-not"));

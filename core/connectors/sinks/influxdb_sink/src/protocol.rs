@@ -78,7 +78,7 @@ pub(crate) fn write_tag_value(buf: &mut String, value: &str) {
 /// double-quoted in line protocol, and the spec permits literal tabs inside
 /// quoted strings. Measurement names and tag values (see [`write_measurement`]
 /// and [`write_tag_value`]) are unquoted, so tabs must be escaped there to
-/// avoid mis-parsing the tag set.
+/// avoid misparsing the tag set.
 #[inline]
 pub(crate) fn write_field_string(buf: &mut String, value: &str) {
     for ch in value.chars() {

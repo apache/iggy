@@ -3,7 +3,7 @@
 ## InfluxDB V2 vs V3 — API Delta (Feasibility Checklist)
 
 | Concern | InfluxDB V2 | InfluxDB V3 | Shared? |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Write body** | Line Protocol | Line Protocol | **Yes — identical** |
 | **Write endpoint** | `POST /api/v2/write` | `POST /api/v3/write_lp` | No (URL differs) |
 | **Write params** | `?org=X&bucket=Y&precision=P` | `?db=X&precision=P` | Partial |
