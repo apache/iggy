@@ -286,25 +286,25 @@ where
             crate::ShardFramePayload::Consensus(message) => {
                 self.on_message(message).await;
             }
-            crate::ShardFramePayload::ReplicaConnectionSetup { raw_fd, replica_id } => {
+            crate::ShardFramePayload::ReplicaConnectionSetup { fd, replica_id } => {
                 tracing::info!(
                     shard = self.id,
                     replica_id,
-                    raw_fd,
+                    raw_fd = fd.as_raw_fd(),
                     "installing delegated replica fd"
                 );
                 self.bus
-                    .install_replica_fd(raw_fd, replica_id, self.on_replica_message.clone());
+                    .install_replica_fd(fd, replica_id, self.on_replica_message.clone());
             }
-            crate::ShardFramePayload::ClientConnectionSetup { raw_fd, client_id } => {
+            crate::ShardFramePayload::ClientConnectionSetup { fd, client_id } => {
                 tracing::info!(
                     shard = self.id,
                     client_id,
-                    raw_fd,
+                    raw_fd = fd.as_raw_fd(),
                     "installing delegated client fd"
                 );
                 self.bus
-                    .install_client_fd(raw_fd, client_id, self.on_client_request.clone());
+                    .install_client_fd(fd, client_id, self.on_client_request.clone());
             }
             crate::ShardFramePayload::ReplicaMappingUpdate {
                 replica_id,

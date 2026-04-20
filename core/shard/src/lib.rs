@@ -37,6 +37,7 @@ use iggy_common::{PartitionStats, sharding::IggyNamespace};
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use message_bus::client_listener::RequestHandler;
+use message_bus::fd_transfer::DupedFd;
 use message_bus::replica_listener::MessageHandler;
 use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
@@ -179,13 +180,16 @@ pub enum ShardFramePayload {
     Consensus(Message<GenericHeader>),
     /// Shard 0 distributes an inbound replica TCP connection fd to the owning
     /// shard. The receiving shard wraps the fd in a `TcpStream` and spawns
-    /// writer + reader tasks on its own compio runtime.
-    ReplicaConnectionSetup { raw_fd: i32, replica_id: u8 },
+    /// writer + reader tasks on its own compio runtime. The `fd` is an
+    /// owning [`DupedFd`] so that a frame dropped unprocessed (shutdown,
+    /// pump drain abort, router panic before `install_*_fd`) closes the
+    /// dup instead of leaking it.
+    ReplicaConnectionSetup { fd: DupedFd, replica_id: u8 },
     /// Shard 0 distributes an inbound SDK client TCP connection fd to the
     /// owning shard. The receiving shard wraps the fd and installs client
     /// reader / writer tasks locally. The owning shard is encoded in the top
     /// 16 bits of `client_id`.
-    ClientConnectionSetup { raw_fd: i32, client_id: u128 },
+    ClientConnectionSetup { fd: DupedFd, client_id: u128 },
     /// Shard 0 broadcasts the owner for a replica to every shard so each
     /// bus' `send_to_replica` slow path can route through the correct owner.
     ReplicaMappingUpdate { replica_id: u8, owning_shard: u16 },

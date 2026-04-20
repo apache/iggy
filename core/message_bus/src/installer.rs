@@ -25,7 +25,7 @@
 //! the concrete bus type.
 
 use crate::client_listener::RequestHandler;
-use crate::fd_transfer;
+use crate::fd_transfer::{self, DupedFd};
 use crate::framing;
 use crate::replica_listener::MessageHandler;
 use crate::socket_opts::apply_keepalive_for_connection;
@@ -34,7 +34,6 @@ use compio::net::{OwnedReadHalf, TcpStream};
 use futures::FutureExt;
 use iggy_binary_protocol::Command2;
 use std::cell::Cell;
-use std::os::unix::io::RawFd;
 use std::rc::Rc;
 use tracing::{debug, info, warn};
 
@@ -50,12 +49,14 @@ pub trait ConnectionInstaller {
     /// connection on this shard.
     ///
     /// Takes ownership of `fd`. On registration failure the fd is closed
-    /// via `close_fd` (by dropping the wrapping `TcpStream`).
-    fn install_replica_fd(&self, fd: RawFd, replica_id: u8, on_message: MessageHandler);
+    /// by dropping the wrapping `TcpStream`; on caller-side failure (e.g.
+    /// inter-shard send drops the setup frame) the `DupedFd` closes the
+    /// fd on drop.
+    fn install_replica_fd(&self, fd: DupedFd, replica_id: u8, on_message: MessageHandler);
 
     /// Same for an SDK client connection. The owning shard is already
     /// encoded in the top 16 bits of `client_id`.
-    fn install_client_fd(&self, fd: RawFd, client_id: u128, on_request: RequestHandler);
+    fn install_client_fd(&self, fd: DupedFd, client_id: u128, on_request: RequestHandler);
 
     /// Update the replica -> owning shard mapping used by the `send_to_replica`
     /// slow path on non-owning shards.
@@ -67,17 +68,13 @@ pub trait ConnectionInstaller {
 }
 
 impl ConnectionInstaller for Rc<IggyMessageBus> {
-    fn install_replica_fd(&self, fd: RawFd, replica_id: u8, on_message: MessageHandler) {
-        // SAFETY: Shard 0 duped the fd via `dup(2)` and sent it to this
-        // shard via the inter-shard channel. Ownership is being transferred
-        // to us; no other TcpStream holds it.
-        let stream = unsafe { fd_transfer::wrap_duped_fd(fd) };
+    fn install_replica_fd(&self, fd: DupedFd, replica_id: u8, on_message: MessageHandler) {
+        let stream = fd_transfer::wrap_duped_fd(fd);
         install_replica_stream(self, replica_id, stream, on_message);
     }
 
-    fn install_client_fd(&self, fd: RawFd, client_id: u128, on_request: RequestHandler) {
-        // SAFETY: see install_replica_fd.
-        let stream = unsafe { fd_transfer::wrap_duped_fd(fd) };
+    fn install_client_fd(&self, fd: DupedFd, client_id: u128, on_request: RequestHandler) {
+        let stream = fd_transfer::wrap_duped_fd(fd);
         install_client_stream(self, client_id, stream, on_request);
     }
 

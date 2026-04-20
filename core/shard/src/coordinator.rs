@@ -157,16 +157,18 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
     /// inbox refuses the setup frame (full or disconnected).
     pub fn delegate_replica(&self, stream: TcpStream, replica_id: u8) -> Result<u16, SendError> {
         let target = self.next_replica_target();
-        let raw_fd = fd_transfer::dup_fd(&stream)
+        let fd = fd_transfer::dup_fd(&stream)
             .map_err(|e| SendError::DupFailed(e.raw_os_error().unwrap_or(-1)))?;
 
-        let setup = ShardFramePayload::ReplicaConnectionSetup { raw_fd, replica_id };
+        let setup = ShardFramePayload::ReplicaConnectionSetup { fd, replica_id };
         if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
+            // The frame (and the `DupedFd` inside) is returned in `e` and
+            // dropped at end-of-block, which closes the dup. No explicit
+            // `close_fd` needed.
             warn!(
                 replica_id,
                 target, "delegate_replica try_send failed: {e:?}"
             );
-            fd_transfer::close_fd(raw_fd);
             return Err(SendError::RoutingFailed(target));
         }
 
@@ -216,12 +218,12 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
         let target = self.next_client_target();
         let client_id = self.mint_client_id(target);
 
-        let raw_fd = fd_transfer::dup_fd(&stream)
+        let fd = fd_transfer::dup_fd(&stream)
             .map_err(|e| SendError::DupFailed(e.raw_os_error().unwrap_or(-1)))?;
-        let setup = ShardFramePayload::ClientConnectionSetup { raw_fd, client_id };
+        let setup = ShardFramePayload::ClientConnectionSetup { fd, client_id };
         if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
+            // The returned frame owns the `DupedFd` and closes it on drop.
             warn!(client_id, target, "delegate_client try_send failed: {e:?}");
-            fd_transfer::close_fd(raw_fd);
             return Err(SendError::RoutingFailed(target));
         }
 
@@ -458,10 +460,10 @@ mod tests {
         // Target shard should observe ReplicaConnectionSetup.
         let setup_frame = receivers[target as usize].recv().await.unwrap();
         match setup_frame.payload {
-            ShardFramePayload::ReplicaConnectionSetup { raw_fd, replica_id } => {
+            ShardFramePayload::ReplicaConnectionSetup { fd, replica_id } => {
                 assert_eq!(replica_id, 7);
-                // Clean up the dup'd fd so the test does not leak.
-                fd_transfer::close_fd(raw_fd);
+                // Drop closes the dup'd fd via `DupedFd::Drop`.
+                drop(fd);
             }
             _ => panic!("expected ReplicaConnectionSetup on target shard"),
         }

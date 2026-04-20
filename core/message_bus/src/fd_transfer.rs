@@ -19,26 +19,71 @@
 //!
 //! After shard 0 accepts or connects a TCP socket and completes the
 //! handshake, it calls [`dup_fd`] to create a second kernel reference
-//! to the same socket. The duplicated fd (a plain `i32`) is sent to
-//! the target shard via the inter-shard channel. The target shard
-//! calls [`wrap_duped_fd`] to construct a compio `TcpStream` on its
-//! own runtime.
+//! to the same socket. The duplicated fd is wrapped in an owning
+//! [`DupedFd`] and sent to the target shard via the inter-shard channel.
+//! The target shard calls [`wrap_duped_fd`] to construct a compio
+//! `TcpStream` on its own runtime.
 //!
 //! Shard 0 then drops its original `TcpStream`, closing its fd. The
 //! socket stays alive because the duplicated fd still references it
 //! in the kernel's file table.
+//!
+//! [`DupedFd`] closes the underlying fd on drop, so a `ShardFrame`
+//! discarded mid-flight (shutdown, pump drain abort, router panic
+//! before `install_*_fd`) does not leak the dup.
 
 use compio::net::TcpStream;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use tracing::warn;
 
+/// Owning handle for a duplicated TCP socket fd.
+///
+/// Produced by [`dup_fd`] and consumed by [`wrap_duped_fd`] on the
+/// target shard. If neither happens (frame dropped unprocessed), the
+/// fd is closed on drop so duped-but-unused sockets cannot accumulate.
+///
+/// The type is deliberately opaque: there is no public constructor
+/// from a raw fd. Call sites wishing to transfer ownership out (into
+/// a `TcpStream` wrapper) must go through [`wrap_duped_fd`], which
+/// consumes `self` by value.
+#[derive(Debug)]
+pub struct DupedFd(RawFd);
+
+impl DupedFd {
+    /// Expose the raw fd for logging purposes only. The fd remains
+    /// owned by `self` and is still closed on drop; callers must not
+    /// pass this value to `close(2)`, `from_raw_fd`, or similar.
+    #[must_use]
+    pub const fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+
+    /// Release ownership of the raw fd. The returned value becomes the
+    /// caller's responsibility to close. Used internally by
+    /// [`wrap_duped_fd`].
+    const fn into_raw(self) -> RawFd {
+        let fd = self.0;
+        std::mem::forget(self);
+        fd
+    }
+}
+
+impl Drop for DupedFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            close_fd(self.0);
+        }
+    }
+}
+
 /// Duplicate the underlying file descriptor of a TCP stream with
 /// `FD_CLOEXEC` set atomically.
 ///
-/// Returns the new fd number. The caller must arrange for the new fd
-/// to be consumed by [`wrap_duped_fd`] on the target shard; leaking
-/// it is a resource leak.
+/// Returns an owning [`DupedFd`]. The caller must arrange for it to
+/// be consumed by [`wrap_duped_fd`] on the target shard; otherwise
+/// the `Drop` impl closes the dup when the holder (typically a
+/// `ShardFrame`) is discarded.
 ///
 /// Uses `fcntl(F_DUPFD_CLOEXEC)` rather than `dup(2)` so that any
 /// future `fork`+`exec` child cannot inherit this socket.
@@ -46,7 +91,7 @@ use tracing::warn;
 /// # Errors
 ///
 /// Returns `io::Error` if the `fcntl(2)` syscall fails.
-pub fn dup_fd(stream: &TcpStream) -> io::Result<RawFd> {
+pub fn dup_fd(stream: &TcpStream) -> io::Result<DupedFd> {
     let original = stream.as_raw_fd();
     // SAFETY: F_DUPFD_CLOEXEC allocates the lowest-numbered free fd >= 0
     // referring to the same open file description as `original`, with
@@ -55,35 +100,32 @@ pub fn dup_fd(stream: &TcpStream) -> io::Result<RawFd> {
     if duped == -1 {
         return Err(io::Error::last_os_error());
     }
-    Ok(duped)
+    Ok(DupedFd(duped))
 }
 
-/// Wrap a previously duplicated raw fd into a compio `TcpStream`.
+/// Wrap a previously duplicated fd into a compio `TcpStream`.
 ///
 /// Must be called on the target shard's compio runtime so the
 /// `TcpStream` is registered with the correct `io_uring` instance.
 ///
-/// # Safety
-///
-/// - `fd` must be a valid, open file descriptor referring to a TCP socket.
-/// - `fd` must not be owned by any other `TcpStream` or resource that
-///   will close it.
-/// - The caller takes ownership: the returned `TcpStream` will close
-///   `fd` on drop.
+/// Takes `DupedFd` by value, so the type-system guarantees that (a)
+/// the fd originated from [`dup_fd`] and (b) ownership is transferred
+/// into the returned `TcpStream`, which will close the fd on drop.
 #[must_use]
-pub unsafe fn wrap_duped_fd(fd: RawFd) -> TcpStream {
-    unsafe { TcpStream::from_raw_fd(fd) }
+pub fn wrap_duped_fd(fd: DupedFd) -> TcpStream {
+    let raw = fd.into_raw();
+    // SAFETY: `DupedFd` guarantees `raw` is an open TCP fd whose
+    // ownership is being transferred here. No other resource holds it.
+    unsafe { TcpStream::from_raw_fd(raw) }
 }
 
-/// Close a raw fd without wrapping it in a `TcpStream`.
+/// Close a raw fd. Internal helper used by [`DupedFd::drop`].
 ///
-/// Used for cleanup on error paths when the fd was duped but the
-/// target shard setup failed. Logs a warning if `close(2)` fails
-/// with anything other than `EINTR`, since that signals a resource
-/// accounting issue (wrong fd, double-close, or kernel fd table
-/// corruption) that callers cannot recover from here.
-pub fn close_fd(fd: RawFd) {
-    // SAFETY: We own this fd and are explicitly closing it.
+/// Logs a warning on anything other than `EINTR` since that signals a
+/// resource accounting issue (wrong fd, double-close, or kernel fd
+/// table corruption) that callers cannot recover from here.
+fn close_fd(fd: RawFd) {
+    // SAFETY: caller (DupedFd::drop) owns this fd and is closing it.
     let rc = unsafe { libc::close(fd) };
     if rc == -1 {
         let err = io::Error::last_os_error();
@@ -111,15 +153,40 @@ mod tests {
 
         let duped = dup_fd(&client).expect("dup_fd failed");
 
-        // SAFETY: F_GETFD is safe on any valid fd; duped was just allocated.
-        let flags = unsafe { libc::fcntl(duped, libc::F_GETFD) };
+        // SAFETY: F_GETFD is safe on any valid fd; duped still owns it.
+        let flags = unsafe { libc::fcntl(duped.as_raw_fd(), libc::F_GETFD) };
         assert!(flags >= 0, "F_GETFD failed: {}", io::Error::last_os_error());
         assert_ne!(
             flags & libc::FD_CLOEXEC,
             0,
             "duped fd must have FD_CLOEXEC set"
         );
+        // Drop `duped` closes the fd via Drop impl.
+    }
 
-        close_fd(duped);
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn duped_fd_drops_close_underlying_fd() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(addr);
+        let accept = listener.accept();
+        let (client_res, accept_res) = futures::join!(connect, accept);
+        let (_server, _) = accept_res.unwrap();
+        let client = client_res.unwrap();
+
+        let duped = dup_fd(&client).expect("dup_fd failed");
+        let raw = duped.as_raw_fd();
+        drop(duped);
+
+        // After drop the fd must be gone from this process' fd table.
+        // SAFETY: F_GETFD on a closed fd is defined and returns -1/EBADF.
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        assert_eq!(flags, -1, "fd must be closed after DupedFd drop");
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF),
+            "closed fd must report EBADF"
+        );
     }
 }
