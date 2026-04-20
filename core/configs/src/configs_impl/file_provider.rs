@@ -25,10 +25,49 @@ use figment::{
     Figment, Provider,
     providers::{Data, Format, Toml},
 };
-use std::{env, path::Path};
+use std::{env, fs, path::Path};
 use tracing::{error, info, warn};
 
 const DISPLAY_CONFIG_ENV: &str = "IGGY_DISPLAY_CONFIG";
+
+/// Migration guard for the pre-3134 nested cluster schema.
+///
+/// Before the flatten refactor, the roster lived at `cluster.node.current`
+/// (the running node) and `cluster.node.others` (its peers). The new schema
+/// uses a flat `cluster.nodes` array. Old TOMLs parse silently against the
+/// new `ClusterConfig` because `#[serde(default)]` on `nodes` fills the
+/// missing field with an empty vec: an operator who only bumped binaries
+/// would boot as a single-node deployment with no cluster roster and no
+/// warning. Refuse to start with an explicit migration pointer instead.
+fn reject_legacy_cluster_schema(raw: &str) -> Result<(), ConfigurationError> {
+    let parsed: toml::Value = match toml::from_str(raw) {
+        Ok(v) => v,
+        // A malformed file will fail later in figment with a clearer
+        // parser-level error; don't duplicate that diagnostic here.
+        Err(_) => return Ok(()),
+    };
+
+    let Some(node_table) = parsed.get("cluster").and_then(|c| c.get("node")) else {
+        return Ok(());
+    };
+
+    let legacy_key = ["current", "others"]
+        .into_iter()
+        .find(|k| node_table.get(*k).is_some());
+    let Some(key) = legacy_key else {
+        return Ok(());
+    };
+
+    error!(
+        "Legacy cluster schema detected: `cluster.node.{key}` is no longer \
+         supported. Migrate to the flat `[[cluster.nodes]]` array: move \
+         `cluster.node.current` and every entry in `cluster.node.others` \
+         into a single `cluster.nodes` list and set each node's \
+         `replica_id` explicitly. The running node is selected at startup \
+         via the `--replica-id` CLI flag."
+    );
+    Err(ConfigurationError::CannotLoadConfiguration)
+}
 
 /// File-based configuration provider that combines file, default, and environment configurations.
 pub struct FileConfigProvider<P> {
@@ -77,6 +116,9 @@ impl<P: Provider + Clone> ConfigProvider for FileConfigProvider<P> {
         // If the config file exists, merge it into the configuration
         if file_exists(&self.file_path) {
             info!("Found configuration file at path: '{}'.", self.file_path);
+            if let Ok(raw) = fs::read_to_string(&self.file_path) {
+                reject_legacy_cluster_schema(&raw)?;
+            }
             config_builder = config_builder.merge(Toml::file(&self.file_path));
         } else {
             warn!(
@@ -138,5 +180,76 @@ fn file_exists<P: AsRef<Path>>(path: P) -> bool {
             Some(parent) => parent,
             None => return false,
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_flat_cluster_schema() {
+        let raw = r#"
+[cluster]
+enabled = true
+name = "demo"
+
+[[cluster.nodes]]
+name = "n0"
+ip = "127.0.0.1"
+replica_id = 0
+ports = { tcp = 8090 }
+"#;
+        reject_legacy_cluster_schema(raw).expect("flat schema must be accepted");
+    }
+
+    #[test]
+    fn accepts_file_with_no_cluster_section() {
+        let raw = r#"
+[tcp]
+enabled = true
+address = "0.0.0.0:8090"
+"#;
+        reject_legacy_cluster_schema(raw).expect("no cluster.node: nothing to reject");
+    }
+
+    #[test]
+    fn rejects_legacy_cluster_node_current() {
+        let raw = r#"
+[cluster]
+enabled = true
+name = "demo"
+
+[cluster.node.current]
+name = "n0"
+ip = "127.0.0.1"
+replica_id = 0
+"#;
+        let err = reject_legacy_cluster_schema(raw).expect_err("legacy schema must fail");
+        assert_eq!(err, ConfigurationError::CannotLoadConfiguration);
+    }
+
+    #[test]
+    fn rejects_legacy_cluster_node_others() {
+        let raw = r#"
+[cluster]
+enabled = true
+name = "demo"
+
+[[cluster.node.others]]
+name = "n1"
+ip = "127.0.0.2"
+replica_id = 1
+"#;
+        let err = reject_legacy_cluster_schema(raw).expect_err("legacy schema must fail");
+        assert_eq!(err, ConfigurationError::CannotLoadConfiguration);
+    }
+
+    #[test]
+    fn ignores_malformed_toml() {
+        // Upstream figment emits a parser error on malformed input; the
+        // migration guard must not turn that into its own error.
+        let raw = "[cluster\nnot valid toml";
+        reject_legacy_cluster_schema(raw).expect("malformed toml defers to figment");
     }
 }

@@ -2229,6 +2229,7 @@ dependencies = [
  "serde_with",
  "static-toml",
  "strum 0.28.0",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tungstenite 0.29.0",
 ]
