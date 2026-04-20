@@ -32,6 +32,29 @@ These require design discussion in the issue before coding:
 
 Authors of PRs must run the code locally. "Relying on CI" is not acceptable.
 
+### System Dependencies
+
+The server crates depend on `hwlocality` (hwloc bindings).
+On non-`musl` targets, install the system `hwloc` development package before building.
+
+Common install commands:
+
+```bash
+# Ubuntu / Debian
+sudo apt-get update && sudo apt-get install -y libhwloc-dev pkg-config
+
+# Fedora / RHEL / CentOS
+sudo dnf install -y hwloc-devel pkgconf-pkg-config
+
+# Arch Linux
+sudo pacman -S --needed hwloc pkgconf
+
+# macOS (Homebrew)
+brew install hwloc pkg-config
+```
+
+For `musl` targets, `hwlocality` is built with vendored support in this repository.
+
 ### Single Purpose
 
 One PR = one thing. Bug fix, refactor, feature - separate PRs. Mixed PRs will be closed.
