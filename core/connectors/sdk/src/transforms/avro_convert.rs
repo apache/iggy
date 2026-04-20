@@ -36,7 +36,7 @@ pub struct AvroConvertConfig {
     pub conversion_options: AvroConversionOptions,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AvroConversionOptions {
     pub pretty_json: bool,
     pub include_metadata: bool,
@@ -52,16 +52,6 @@ impl Default for AvroConvertConfig {
             schema_json: None,
             field_mappings: None,
             conversion_options: AvroConversionOptions::default(),
-        }
-    }
-}
-
-impl Default for AvroConversionOptions {
-    fn default() -> Self {
-        Self {
-            pretty_json: false,
-            include_metadata: false,
-            strict_mode: false,
         }
     }
 }
@@ -122,12 +112,10 @@ impl Transform for AvroConvert {
         _metadata: &TopicMetadata,
         mut message: DecodedMessage,
     ) -> Result<Option<DecodedMessage>, Error> {
-        // Apply field mappings if configured
         if let Some(field_mappings) = &self.config.field_mappings {
             message.payload = self.apply_field_mappings(message.payload, field_mappings)?;
         }
 
-        // Perform format conversion based on configuration
         message.payload = match (&self.config.source_format, &self.config.target_format) {
             (Schema::Json, Schema::Avro) => {
                 let encoder_config = AvroEncoderConfig {

@@ -24,21 +24,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{error, info};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AvroEncoderConfig {
     pub schema_path: Option<PathBuf>,
     pub schema_json: Option<String>,
     pub field_mappings: Option<HashMap<String, String>>,
-}
-
-impl Default for AvroEncoderConfig {
-    fn default() -> Self {
-        Self {
-            schema_path: None,
-            schema_json: None,
-            field_mappings: None,
-        }
-    }
 }
 
 pub struct AvroStreamEncoder {
@@ -47,7 +37,7 @@ pub struct AvroStreamEncoder {
 }
 
 impl AvroStreamEncoder {
-    /// If you need fail-fast behaviour (e.g. at start-up),
+    /// If you need fail-fast behaviour,
     /// use [`try_new`](Self::try_new) instead.
     pub fn new(config: AvroEncoderConfig) -> Self {
         let mut encoder = Self {
@@ -273,7 +263,7 @@ impl AvroStreamEncoder {
                 }
                 Ok(AvroValue::Bytes(bytes))
             }
-            // Fallback: use the generic From implementation only when schema is basic type
+
             (value, schema) => {
                 let avro_val: AvroValue = value.into();
                 if avro_val.validate(schema) {
