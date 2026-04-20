@@ -209,6 +209,19 @@ fn main() -> Result<(), ServerError> {
                 });
             }
             info!("Cluster mode enabled; running as replica_id={id}");
+            // The only `Storage` impl wired into `PartitionJournal` today
+            // is `PartitionJournalMemStorage`, which is non-durable. VSR
+            // retransmit reads from that journal, so a post-restart node
+            // will silently no-op retransmit requests and peers will stall
+            // until a view change resolves the gap. Acceptable for dev /
+            // CI; not acceptable for any restart-sensitive deployment.
+            // See `partitions::PartitionJournalMemStorage` for details.
+            warn!(
+                "Cluster mode runs on a non-durable in-memory journal. This is \
+                 a development configuration: replicas cannot recover WAL state \
+                 across restarts. Do not serve production cluster traffic on \
+                 this build."
+            );
             Some(id)
         } else {
             if cli_replica_id.is_some() {

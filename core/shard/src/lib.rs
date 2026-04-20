@@ -1184,6 +1184,16 @@ async fn dispatch_partition_journal_actions<B, P>(
                 }
             }
             VsrAction::RetransmitPrepares { targets } => {
+                // DURABILITY CAVEAT: the only `Storage` impl on
+                // `PartitionJournal` right now is the in-memory
+                // `PartitionJournalMemStorage`. After a process restart
+                // the journal is empty and every `journal.entry` below
+                // returns `None`, so retransmit silently drops the
+                // request and peers stall until a view change. The bus
+                // and consensus plumbing is correct; only the storage
+                // needs to become durable before cluster workloads go to
+                // production. Server boot emits a loud warning to the
+                // operator (see `main.rs`).
                 for (header, replicas) in targets {
                     let Some(prepare) = journal.entry(header).await else {
                         continue;

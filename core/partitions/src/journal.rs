@@ -65,6 +65,29 @@ where
     fn get(&self, query: &Self::Query) -> impl Future<Output = Option<PollQueryResult<4096>>>;
 }
 
+/// In-memory only partition journal storage. Non-durable.
+///
+/// # Warning — development storage only
+///
+/// This storage backs the `Journal` trait with a plain `Vec<JournalBuffer>`
+/// inside an `UnsafeCell`. Writes never hit disk, nothing is `fsync`ed, and
+/// every entry is lost on process exit.
+///
+/// That property breaks VSR invariants in two visible ways once a cluster
+/// is running real workloads:
+///
+/// - `VsrAction::RetransmitPrepares` (see `shard::IggyShard::apply_actions`)
+///   reads from this journal. After a node restart the journal is empty, so
+///   the retransmit is a silent no-op and peers waiting on the missing ops
+///   stall until a view change kicks in.
+/// - A restarting replica that rejoins the cluster cannot replay its WAL
+///   to catch up; it looks to peers like a pristine empty node claiming
+///   the replica slot.
+///
+/// These are safe for single-process tests, the simulator, and local dev
+/// workloads. They are NOT safe for any multi-process or restart-sensitive
+/// deployment. Use a disk-backed `Storage` implementation before serving
+/// production cluster traffic.
 #[derive(Debug, Default)]
 pub struct PartitionJournalMemStorage {
     entries: UnsafeCell<Vec<JournalBuffer>>,
