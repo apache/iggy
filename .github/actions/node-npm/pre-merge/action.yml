@@ -92,8 +92,6 @@ runs:
       id: iggy
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
-      env:
-        IGGY_CLUSTER_ENABLED: true
 
     - name: E2E tests
       if: inputs.task == 'e2e'

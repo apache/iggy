@@ -65,8 +65,32 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
             .WithName($"iggy-cluster-{Guid.NewGuid():N}")
             .Build();
 
+        // Cluster.nodes roster env vars are byte-identical on both
+        // containers; only the bind addresses and the --replica-id CLI arg
+        // differ per node.
+        var clusterRosterEnv = new Dictionary<string, string>
+        {
+            ["IGGY_CLUSTER_ENABLED"] = "true",
+            ["IGGY_CLUSTER_NAME"] = "test-cluster",
+            ["IGGY_CLUSTER_NODES_0_NAME"] = "leader-node",
+            ["IGGY_CLUSTER_NODES_0_IP"] = "127.0.0.1",
+            ["IGGY_CLUSTER_NODES_0_REPLICA_ID"] = "0",
+            ["IGGY_CLUSTER_NODES_0_PORTS_TCP"] = _leaderTcpPort.ToString(),
+            ["IGGY_CLUSTER_NODES_0_PORTS_QUIC"] = _leaderQuicPort.ToString(),
+            ["IGGY_CLUSTER_NODES_0_PORTS_HTTP"] = _leaderHttpPort.ToString(),
+            ["IGGY_CLUSTER_NODES_0_PORTS_WEBSOCKET"] = _leaderWsPort.ToString(),
+            ["IGGY_CLUSTER_NODES_1_NAME"] = "follower-node",
+            ["IGGY_CLUSTER_NODES_1_IP"] = "127.0.0.1",
+            ["IGGY_CLUSTER_NODES_1_REPLICA_ID"] = "1",
+            ["IGGY_CLUSTER_NODES_1_PORTS_TCP"] = _followerTcpPort.ToString(),
+            ["IGGY_CLUSTER_NODES_1_PORTS_QUIC"] = _followerQuicPort.ToString(),
+            ["IGGY_CLUSTER_NODES_1_PORTS_HTTP"] = _followerHttpPort.ToString(),
+            ["IGGY_CLUSTER_NODES_1_PORTS_WEBSOCKET"] = _followerWsPort.ToString(),
+        };
+
         _leaderContainer = new ContainerBuilder(DockerImage)
             .WithName($"iggy-leader-{Guid.NewGuid():N}")
+            .WithCommand("--replica-id", "0")
             .WithNetwork(_network)
             .WithNetworkAliases(LeaderAlias)
             .WithPortBinding(_leaderTcpPort.ToString(), _leaderTcpPort.ToString())
@@ -80,16 +104,7 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
             .WithEnvironment("IGGY_HTTP_ADDRESS", $"0.0.0.0:{_leaderHttpPort}")
             .WithEnvironment("IGGY_QUIC_ADDRESS", $"0.0.0.0:{_leaderQuicPort}")
             .WithEnvironment("IGGY_WEBSOCKET_ADDRESS", $"0.0.0.0:{_leaderWsPort}")
-            .WithEnvironment("IGGY_CLUSTER_ENABLED", "true")
-            .WithEnvironment("IGGY_CLUSTER_NAME", "test-cluster")
-            .WithEnvironment("IGGY_CLUSTER_NODE_CURRENT_NAME", "leader-node")
-            .WithEnvironment("IGGY_CLUSTER_NODE_CURRENT_IP", "127.0.0.1")
-            .WithEnvironment("IGGY_CLUSTER_NODE_OTHERS_0_NAME", "follower-node")
-            .WithEnvironment("IGGY_CLUSTER_NODE_OTHERS_0_IP", "127.0.0.1")
-            .WithEnvironment("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_TCP", _followerTcpPort.ToString())
-            .WithEnvironment("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_HTTP", _followerHttpPort.ToString())
-            .WithEnvironment("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_QUIC", _followerQuicPort.ToString())
-            .WithEnvironment("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_WEBSOCKET", _followerWsPort.ToString())
+            .WithEnvironment(clusterRosterEnv)
             .WithPrivileged(true)
             .WithCleanUp(true)
             .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(_leaderTcpPort))
@@ -97,7 +112,7 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
 
         _followerContainer = new ContainerBuilder(DockerImage)
             .WithName($"iggy-follower-{Guid.NewGuid():N}")
-            .WithCommand("--follower")
+            .WithCommand("--follower", "--replica-id", "1")
             .WithNetwork(_network)
             .WithNetworkAliases(FollowerAlias)
             .WithPortBinding(_followerTcpPort.ToString(), _followerTcpPort.ToString())
@@ -111,16 +126,7 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
             .WithEnvironment("IGGY_HTTP_ADDRESS", $"0.0.0.0:{_followerHttpPort}")
             .WithEnvironment("IGGY_QUIC_ADDRESS", $"0.0.0.0:{_followerQuicPort}")
             .WithEnvironment("IGGY_WEBSOCKET_ADDRESS", $"0.0.0.0:{_followerWsPort}")
-            .WithEnvironment("IGGY_CLUSTER_ENABLED", "true")
-            .WithEnvironment("IGGY_CLUSTER_NAME", "test-cluster")
-            .WithEnvironment("IGGY_CLUSTER_NODE_CURRENT_NAME", "follower-node")
-            .WithEnvironment("IGGY_CLUSTER_NODE_CURRENT_IP", "127.0.0.1")
-            .WithEnvironment("IGGY_CLUSTER_NODE_OTHERS_0_NAME", "leader-node")
-            .WithEnvironment("IGGY_CLUSTER_NODE_OTHERS_0_IP", "127.0.0.1")
-            .WithEnvironment("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_TCP", _leaderTcpPort.ToString())
-            .WithEnvironment("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_HTTP", _leaderHttpPort.ToString())
-            .WithEnvironment("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_QUIC", _leaderQuicPort.ToString())
-            .WithEnvironment("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_WEBSOCKET", _leaderWsPort.ToString())
+            .WithEnvironment(clusterRosterEnv)
             .WithPrivileged(true)
             .WithCleanUp(true)
             .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(_followerTcpPort))

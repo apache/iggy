@@ -23,41 +23,23 @@ use serde::{Deserialize, Serialize};
 pub struct ClusterConfig {
     pub enabled: bool,
     pub name: String,
-    pub node: NodeConfig,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct NodeConfig {
-    pub current: CurrentNodeConfig,
-    pub others: Vec<OtherNodeConfig>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct CurrentNodeConfig {
-    pub name: String,
-    pub ip: String,
-    /// Explicit numeric replica ID for VSR consensus (0-based).
-    ///
-    /// Required when `cluster.enabled` is true. `None` is a configuration
-    /// error caught by [`ClusterConfig::validate`]; a silent default of 0
-    /// would wedge the cluster into a permanent view change as soon as a
-    /// second replica joined.
-    pub replica_id: Option<u8>,
-    /// Bind ports for the current node. Symmetric with [`OtherNodeConfig`]
-    /// so the consensus listener can pick a dedicated `tcp_replica` port
-    /// without borrowing it from the client-facing `tcp.address`.
+    /// Full roster of cluster members. Intended to be byte-identical across
+    /// every node so operators ship one config. The running node's identity
+    /// is supplied out-of-band via the `--replica-id` CLI flag, which
+    /// selects the entry in this list that describes the current node.
     #[serde(default)]
-    pub ports: TransportPorts,
+    pub nodes: Vec<ClusterNodeConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct OtherNodeConfig {
+pub struct ClusterNodeConfig {
     pub name: String,
     pub ip: String,
-    /// Explicit numeric replica ID for VSR consensus (0-based).
+    /// Numeric replica ID for VSR consensus (0-based).
     ///
-    /// Required when `cluster.enabled` is true. See [`CurrentNodeConfig::replica_id`].
-    pub replica_id: Option<u8>,
+    /// Must be unique across [`ClusterConfig::nodes`] and strictly less than
+    /// `nodes.len()`. Validated by [`ClusterConfig::validate`].
+    pub replica_id: u8,
     pub ports: TransportPorts,
 }
 

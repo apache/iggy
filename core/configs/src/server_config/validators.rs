@@ -394,55 +394,28 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        if self.node.current.name.trim().is_empty() {
-            eprintln!("Invalid cluster configuration: current node name cannot be empty");
+        if self.nodes.is_empty() {
+            eprintln!(
+                "Invalid cluster configuration: cluster.nodes must contain at least one entry when cluster is enabled"
+            );
             return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        let mut node_names = std::collections::HashSet::new();
-        node_names.insert(self.node.current.name.clone());
-
-        for node in &self.node.others {
-            if !node_names.insert(node.name.clone()) {
-                eprintln!(
-                    "Invalid cluster configuration: duplicate node name '{}' found",
-                    node.name
-                );
-                return Err(ConfigurationError::InvalidConfigurationValue);
-            }
         }
 
         // VSR needs every replica to have a stable, unique id strictly
-        // less than the total replica count. Missing ids would let serde's
-        // default wedge a backup into thinking it is replica 0, which is
-        // the primary in view 0; duplicate ids split the cluster into two
-        // replicas claiming the same slot; out-of-range ids never win a
-        // primary election. All of these are unrecoverable at runtime -
-        // fail fast at startup.
-        let Some(current_id) = self.node.current.replica_id else {
-            eprintln!(
-                "Invalid cluster configuration: cluster.node.current.replica_id must be set when cluster is enabled"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        };
-
-        let total_replicas = u8::try_from(self.node.others.len() + 1).map_err(|_| {
+        // less than the total replica count. Duplicate ids would split the
+        // cluster into two replicas claiming the same slot; out-of-range
+        // ids never win a primary election. Both are unrecoverable at
+        // runtime - fail fast at startup.
+        let total_replicas = u8::try_from(self.nodes.len()).map_err(|_| {
             eprintln!("Invalid cluster configuration: more than 255 replicas is unsupported");
             ConfigurationError::InvalidConfigurationValue
         })?;
 
-        if current_id >= total_replicas {
-            eprintln!(
-                "Invalid cluster configuration: current replica_id {current_id} must be < total replica count {total_replicas}"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
         let mut seen_ids = std::collections::HashSet::new();
-        seen_ids.insert(current_id);
-
+        let mut seen_names = std::collections::HashSet::new();
         let mut used_endpoints = std::collections::HashSet::new();
-        for node in &self.node.others {
+
+        for node in &self.nodes {
             if node.name.trim().is_empty() {
                 eprintln!("Invalid cluster configuration: node name cannot be empty");
                 return Err(ConfigurationError::InvalidConfigurationValue);
@@ -456,25 +429,26 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
 
-            let Some(other_id) = node.replica_id else {
+            if !seen_names.insert(node.name.clone()) {
                 eprintln!(
-                    "Invalid cluster configuration: replica_id must be set for node '{}' when cluster is enabled",
-                    node.name
-                );
-                return Err(ConfigurationError::InvalidConfigurationValue);
-            };
-
-            if other_id >= total_replicas {
-                eprintln!(
-                    "Invalid cluster configuration: replica_id {other_id} for node '{}' must be < total replica count {total_replicas}",
+                    "Invalid cluster configuration: duplicate node name '{}' found",
                     node.name
                 );
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
 
-            if !seen_ids.insert(other_id) {
+            if node.replica_id >= total_replicas {
                 eprintln!(
-                    "Invalid cluster configuration: duplicate replica_id {other_id} (already held by current node or another other node)"
+                    "Invalid cluster configuration: replica_id {} for node '{}' must be < total replica count {total_replicas}",
+                    node.replica_id, node.name
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+
+            if !seen_ids.insert(node.replica_id) {
+                eprintln!(
+                    "Invalid cluster configuration: duplicate replica_id {} (two nodes claim the same slot)",
+                    node.replica_id
                 );
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
@@ -515,12 +489,10 @@ impl Validatable<ConfigurationError> for ClusterConfig {
 #[cfg(test)]
 mod cluster_validate_tests {
     use super::*;
-    use crate::server_config::cluster::{
-        ClusterConfig, CurrentNodeConfig, NodeConfig, OtherNodeConfig, TransportPorts,
-    };
+    use crate::server_config::cluster::{ClusterConfig, ClusterNodeConfig, TransportPorts};
 
-    fn other(name: &str, id: Option<u8>) -> OtherNodeConfig {
-        OtherNodeConfig {
+    fn node(name: &str, id: u8) -> ClusterNodeConfig {
+        ClusterNodeConfig {
             name: name.to_string(),
             ip: "127.0.0.1".to_string(),
             replica_id: id,
@@ -528,56 +500,48 @@ mod cluster_validate_tests {
         }
     }
 
-    fn cfg(current_id: Option<u8>, others: Vec<OtherNodeConfig>) -> ClusterConfig {
+    fn cfg(nodes: Vec<ClusterNodeConfig>) -> ClusterConfig {
         ClusterConfig {
             enabled: true,
             name: "iggy-cluster".to_string(),
-            node: NodeConfig {
-                current: CurrentNodeConfig {
-                    name: "iggy-node-1".to_string(),
-                    ip: "127.0.0.1".to_string(),
-                    replica_id: current_id,
-                    ports: TransportPorts::default(),
-                },
-                others,
-            },
+            nodes,
         }
     }
 
     #[test]
-    fn validate_rejects_missing_current_replica_id() {
-        let c = cfg(None, vec![other("n2", Some(1))]);
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_missing_other_replica_id() {
-        let c = cfg(Some(0), vec![other("n2", None)]);
+    fn validate_rejects_empty_nodes() {
+        let c = cfg(vec![]);
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn validate_rejects_duplicate_replica_ids() {
-        let c = cfg(Some(0), vec![other("n2", Some(0))]);
+        let c = cfg(vec![node("n1", 0), node("n2", 0)]);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_names() {
+        let c = cfg(vec![node("n1", 0), node("n1", 1)]);
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn validate_rejects_out_of_range_replica_id() {
-        // 2 replicas total (current + 1 other), so id 2 is out of range.
-        let c = cfg(Some(2), vec![other("n2", Some(1))]);
+        // 2 nodes total, so id 2 is out of range.
+        let c = cfg(vec![node("n1", 0), node("n2", 2)]);
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn validate_accepts_unique_contiguous_replica_ids() {
-        let c = cfg(Some(0), vec![other("n2", Some(1)), other("n3", Some(2))]);
+        let c = cfg(vec![node("n1", 0), node("n2", 1), node("n3", 2)]);
         assert!(c.validate().is_ok());
     }
 
     #[test]
     fn validate_skips_checks_when_disabled() {
-        let mut c = cfg(None, vec![]);
+        let mut c = cfg(vec![]);
         c.enabled = false;
         assert!(c.validate().is_ok());
     }

@@ -136,6 +136,7 @@ fn main() -> Result<(), ServerError> {
         print_ascii_art("Iggy Server");
 
         let is_follower = args.follower;
+        let cli_replica_id: Option<u8> = args.replica_id;
 
         // FIRST DISCRETE LOADING STEP.
         // Initialize early logging before config parsing so we can log during bootstrap.
@@ -177,6 +178,44 @@ fn main() -> Result<(), ServerError> {
         if is_follower {
             info!("Server is running in FOLLOWER mode for testing leader redirection");
         }
+
+        // Resolve the current node's replica identity for cluster mode.
+        // The same byte-identical config.toml ships to every node; the
+        // running node's identity is supplied out-of-band via the
+        // `--replica-id` CLI flag and must match exactly one entry in
+        // `config.cluster.nodes`.
+        let current_replica_id: Option<u8> = if config.cluster.enabled {
+            let Some(id) = cli_replica_id else {
+                error!(
+                    "cluster.enabled = true but --replica-id was not provided (pass --replica-id <N>)"
+                );
+                return Err(ServerError::ShardFailure {
+                    message: "missing --replica-id for cluster mode".to_string(),
+                });
+            };
+            if !config
+                .cluster
+                .nodes
+                .iter()
+                .any(|node| node.replica_id == id)
+            {
+                error!(
+                    "--replica-id {id} does not match any cluster.nodes[*].replica_id entry in the loaded configuration"
+                );
+                return Err(ServerError::ShardFailure {
+                    message: format!(
+                        "replica_id {id} not found in cluster.nodes; check config.toml"
+                    ),
+                });
+            }
+            info!("Cluster mode enabled; running as replica_id={id}");
+            Some(id)
+        } else {
+            if cli_replica_id.is_some() {
+                warn!("--replica-id ignored because cluster.enabled = false");
+            }
+            None
+        };
 
         if args.with_default_root_credentials {
             let username_set = std::env::var("IGGY_ROOT_USERNAME").is_ok();
@@ -433,6 +472,7 @@ fn main() -> Result<(), ServerError> {
                                 .version(current_version)
                                 .metrics(metrics)
                                 .is_follower(is_follower)
+                                .current_replica_id(current_replica_id)
                                 .metadata(shard_metadata);
 
                             if let Some(writer) = shard_metadata_writer {

@@ -16,8 +16,7 @@
  * under the License.
  */
 
-use super::cluster::CurrentNodeConfig;
-use super::cluster::{ClusterConfig, NodeConfig, OtherNodeConfig, TransportPorts};
+use super::cluster::{ClusterConfig, ClusterNodeConfig, TransportPorts};
 use super::http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig};
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use super::server::{
@@ -572,35 +571,20 @@ impl Default for ClusterConfig {
         ClusterConfig {
             enabled: SERVER_CONFIG.cluster.enabled,
             name: SERVER_CONFIG.cluster.name.parse().unwrap(),
-            node: NodeConfig::default(),
-        }
-    }
-}
-
-impl Default for NodeConfig {
-    fn default() -> NodeConfig {
-        NodeConfig {
-            current: CurrentNodeConfig {
-                name: SERVER_CONFIG.cluster.node.current.name.parse().unwrap(),
-                ip: SERVER_CONFIG.cluster.node.current.ip.parse().unwrap(),
-                replica_id: Some(SERVER_CONFIG.cluster.node.current.replica_id as u8),
-                ports: TransportPorts::default(),
-            },
-            others: SERVER_CONFIG
+            nodes: SERVER_CONFIG
                 .cluster
-                .node
-                .others
+                .nodes
                 .iter()
-                .map(|other| OtherNodeConfig {
-                    name: other.name.parse().unwrap(),
-                    ip: other.ip.parse().unwrap(),
-                    replica_id: Some(other.replica_id as u8),
+                .map(|node| ClusterNodeConfig {
+                    name: node.name.parse().unwrap(),
+                    ip: node.ip.parse().unwrap(),
+                    replica_id: node.replica_id as u8,
                     ports: TransportPorts {
-                        tcp: Some(other.ports.tcp as u16),
-                        quic: Some(other.ports.quic as u16),
-                        http: Some(other.ports.http as u16),
-                        websocket: Some(other.ports.websocket as u16),
-                        tcp_replica: Some(other.ports.tcp_replica as u16),
+                        tcp: Some(node.ports.tcp as u16),
+                        quic: Some(node.ports.quic as u16),
+                        http: Some(node.ports.http as u16),
+                        websocket: Some(node.ports.websocket as u16),
+                        tcp_replica: Some(node.ports.tcp_replica as u16),
                     },
                 })
                 .collect(),
