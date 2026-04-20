@@ -18,6 +18,7 @@
 use crate::{
     api,
     state::benchmark::{BenchmarkAction, use_benchmark},
+    state::ui::{UiAction, use_ui},
 };
 use bench_dashboard_shared::BenchmarkReportLight;
 use chrono::{DateTime, Utc};
@@ -56,6 +57,9 @@ pub struct RecentBenchmarksSelectorProps {
 #[function_component(RecentBenchmarksSelector)]
 pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html {
     let benchmark_ctx = use_benchmark();
+    let ui_state = use_ui();
+    let filters = ui_state.param_filters.clone();
+    let pinned_uuid = ui_state.compare_pin.as_ref().map(|b| b.uuid);
 
     let recent_benchmarks = use_state(Vec::<BenchmarkReportLight>::new);
     let is_loading = use_state(|| true);
@@ -64,23 +68,31 @@ pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html
         let recent_benchmarks = recent_benchmarks.clone();
         let is_loading = is_loading.clone();
         let limit = props.limit;
+        let benchmark_dispatch = benchmark_ctx.dispatch.clone();
+        let ui_dispatch_handle = ui_state.clone();
 
         use_effect_with((), move |_| {
             spawn_local(async move {
                 match api::fetch_recent_benchmarks(Some(limit)).await {
                     Ok(mut data) => {
-                        data.sort_by(|a, b| {
-                            let parse_a = DateTime::parse_from_rfc3339(&a.timestamp);
-                            let parse_b = DateTime::parse_from_rfc3339(&b.timestamp);
-                            match (parse_a, parse_b) {
-                                (Ok(time_a), Ok(time_b)) => time_b.cmp(&time_a),
+                        data.sort_by(|left, right| {
+                            let parse_left = DateTime::parse_from_rfc3339(&left.timestamp);
+                            let parse_right = DateTime::parse_from_rfc3339(&right.timestamp);
+                            match (parse_left, parse_right) {
+                                (Ok(time_left), Ok(time_right)) => time_right.cmp(&time_left),
                                 _ => std::cmp::Ordering::Equal,
                             }
                         });
+                        if let Some(most_recent) = data.first().cloned() {
+                            ui_dispatch_handle.dispatch(UiAction::SetLanding(false));
+                            benchmark_dispatch.emit(BenchmarkAction::SelectBenchmark(Box::new(
+                                Some(most_recent),
+                            )));
+                        }
                         recent_benchmarks.set(data);
                     }
-                    Err(e) => {
-                        log!(format!("Error fetching recent benchmarks: {}", e));
+                    Err(error) => {
+                        log!(format!("Error fetching recent benchmarks: {}", error));
                     }
                 }
                 is_loading.set(false);
@@ -90,15 +102,30 @@ pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html
 
     let on_benchmark_select = {
         let benchmark_ctx = benchmark_ctx.clone();
+        let ui_state = ui_state.clone();
         Callback::from(move |benchmark: BenchmarkReportLight| {
+            ui_state.dispatch(UiAction::SetLanding(false));
             benchmark_ctx
                 .dispatch
                 .emit(BenchmarkAction::SelectBenchmark(Box::new(Some(benchmark))));
         })
     };
 
+    let on_toggle_pin = {
+        let ui_state = ui_state.clone();
+        Callback::from(move |benchmark: BenchmarkReportLight| {
+            let next = if ui_state.compare_pin.as_ref().map(|b| b.uuid) == Some(benchmark.uuid) {
+                None
+            } else {
+                Some(Box::new(benchmark))
+            };
+            ui_state.dispatch(UiAction::SetComparePin(next));
+        })
+    };
+
     let filtered_benchmarks = (*recent_benchmarks)
         .iter()
+        .filter(|benchmark| filters.matches(benchmark))
         .filter(|benchmark| {
             if props.search_query.is_empty() {
                 return true;
@@ -151,7 +178,11 @@ pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html
                     <p class="loading-message">{"Loading recent benchmarks..."}</p>
                 } else if filtered_benchmarks.is_empty() {
                     <div class="no-search-results">
-                        <p>{format!("No benchmarks found matching \"{}\"", props.search_query)}</p>
+                        { if props.search_query.is_empty() && filters.is_any_active() {
+                            html! { <p>{"No benchmarks match the active filters."}</p> }
+                        } else {
+                            html! { <p>{format!("No benchmarks found matching \"{}\"", props.search_query)}</p> }
+                        }}
                     </div>
                 } else {
                     <ul class="benchmark-list">
@@ -163,14 +194,29 @@ pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html
                                     on_benchmark_select.emit(benchmark_clone.clone());
                                 })
                             };
+                            let on_pin_click = {
+                                let on_toggle_pin = on_toggle_pin.clone();
+                                let benchmark_clone = benchmark.clone();
+                                Callback::from(move |e: MouseEvent| {
+                                    e.stop_propagation();
+                                    on_toggle_pin.emit(benchmark_clone.clone());
+                                })
+                            };
                             let timestamp_display = format_relative_time(&benchmark.timestamp);
 
                             let is_selected = benchmark_ctx.state.selected_benchmark.as_ref()
                                 .map(|selected| selected.uuid == benchmark.uuid)
                                 .unwrap_or(false);
+                            let is_pinned = Some(benchmark.uuid) == pinned_uuid;
+                            let pin_title = if is_pinned { "Unpin from compare" } else { "Pin for compare" };
 
                             html! {
-                                <li class={classes!("benchmark-list-item", "recent-benchmark-item", is_selected.then_some("active"))} onclick={on_select}>
+                                <li class={classes!(
+                                    "benchmark-list-item",
+                                    "recent-benchmark-item",
+                                    is_selected.then_some("active"),
+                                    is_pinned.then_some("pinned"),
+                                )} onclick={on_select}>
                                     <div class="benchmark-list-item-content">
                                         <div class="benchmark-list-item-header">
                                             <div class="benchmark-list-item-title">
@@ -178,6 +224,20 @@ pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html
                                                 {benchmark.params.benchmark_kind.to_string()}
                                             </div>
                                             <div class="benchmark-list-item-time">{timestamp_display}</div>
+                                            <button
+                                                type="button"
+                                                class={classes!("compare-pin-btn", is_pinned.then_some("active"))}
+                                                onclick={on_pin_click}
+                                                title={pin_title}
+                                                aria-label={pin_title}
+                                            >
+                                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
+                                                     fill={if is_pinned { "currentColor" } else { "none" }}
+                                                     stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                                    <path d="M12 17v5" />
+                                                    <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
+                                                </svg>
+                                            </button>
                                         </div>
 
                                         <div class="benchmark-list-item-details">

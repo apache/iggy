@@ -20,6 +20,7 @@ use bench_report::{
     benchmark_kind::BenchmarkKind, numeric_parameter::BenchmarkNumericParameter,
     transport::BenchmarkTransport,
 };
+use chrono::{DateTime, Duration};
 use gloo::console::log;
 use std::{collections::BTreeMap, rc::Rc};
 use yew::prelude::*;
@@ -224,7 +225,7 @@ impl BenchmarkState {
                 self.current_hardware, hardware, self.current_gitref, gitref_for_entries
             ));
 
-            let best = Self::find_best_benchmark(&entries);
+            let best = self.find_best_benchmark(&entries);
             if let Some(best) = best {
                 new_selected_benchmark = Some(best.clone());
                 new_selected_kind = best.params.benchmark_kind;
@@ -332,21 +333,70 @@ impl BenchmarkState {
         }
     }
 
+    /// Pick a sensible default benchmark from the freshest run batch.
+    ///
+    /// Scopes to `self.selected_kind` when that kind has entries (keeps the default
+    /// consistent with the active sidebar tab); otherwise falls back to all entries.
     fn find_best_benchmark(
-        benchmarks: &BTreeMap<BenchmarkKind, Vec<BenchmarkReportLight>>,
+        &self,
+        entries: &BTreeMap<BenchmarkKind, Vec<BenchmarkReportLight>>,
     ) -> Option<BenchmarkReportLight> {
-        benchmarks
-            .values()
+        let in_kind: Vec<&BenchmarkReportLight> = entries
+            .get(&self.selected_kind)
+            .into_iter()
             .flatten()
-            .max_by_key(|bm| {
-                bm.group_metrics
-                    .first()
-                    .unwrap()
-                    .summary
-                    .average_p99_latency_ms as u64
-            })
-            .cloned()
+            .collect();
+        let scoped: Vec<&BenchmarkReportLight> = if in_kind.is_empty() {
+            entries.values().flatten().collect()
+        } else {
+            in_kind
+        };
+        pick_best_from_recent_batch(&scoped)
     }
+}
+
+/// From a set of benchmarks, pick the one that best represents "current peak":
+/// restrict to runs within 2h of the latest timestamp (avoids UTC day-split artifacts
+/// on overnight benchmark sweeps), then pick lowest P99 latency; ties broken by
+/// highest total throughput.
+pub fn pick_best_from_recent_batch(
+    benchmarks: &[&BenchmarkReportLight],
+) -> Option<BenchmarkReportLight> {
+    let latest_timestamp = benchmarks
+        .iter()
+        .filter_map(|benchmark| DateTime::parse_from_rfc3339(&benchmark.timestamp).ok())
+        .max()?;
+    let window_start = latest_timestamp - Duration::hours(2);
+
+    benchmarks
+        .iter()
+        .copied()
+        .filter(|benchmark| {
+            DateTime::parse_from_rfc3339(&benchmark.timestamp)
+                .map(|timestamp| timestamp >= window_start)
+                .unwrap_or(false)
+        })
+        .min_by(|left, right| {
+            let metrics = |report: &BenchmarkReportLight| {
+                report.group_metrics.first().map(|group| {
+                    (
+                        group.summary.average_p99_latency_ms,
+                        group.summary.total_throughput_megabytes_per_second,
+                    )
+                })
+            };
+            let (left_p99, left_throughput) = metrics(left).unwrap_or((f64::INFINITY, 0.0));
+            let (right_p99, right_throughput) = metrics(right).unwrap_or((f64::INFINITY, 0.0));
+            left_p99
+                .partial_cmp(&right_p99)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(
+                    right_throughput
+                        .partial_cmp(&left_throughput)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+        })
+        .cloned()
 }
 
 /// Actions that can be performed on the benchmark state

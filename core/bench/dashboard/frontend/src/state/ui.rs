@@ -16,15 +16,117 @@
 // under the License.
 
 use crate::components::selectors::measurement_type_selector::MeasurementType;
+use bench_dashboard_shared::BenchmarkReportLight;
 use std::rc::Rc;
 use yew::prelude::*;
 
 #[derive(Clone, Debug, PartialEq)]
 #[allow(dead_code)]
 pub enum ViewMode {
-    SingleGitref,     // View detailed performance for a specific gitref
-    GitrefTrend,      // View performance trends across all gitrefs
-    RecentBenchmarks, // View recently added benchmarks
+    SingleGitref,
+    GitrefTrend,
+    RecentBenchmarks,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ParamRange {
+    pub from: Option<u32>,
+    pub to: Option<u32>,
+}
+
+impl ParamRange {
+    pub fn is_active(&self) -> bool {
+        self.from.is_some() || self.to.is_some()
+    }
+
+    pub fn matches(&self, value: u32) -> bool {
+        self.from.is_none_or(|f| value >= f) && self.to.is_none_or(|t| value <= t)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MetricRange {
+    pub from: Option<f64>,
+    pub to: Option<f64>,
+}
+
+impl MetricRange {
+    pub fn is_active(&self) -> bool {
+        self.from.is_some() || self.to.is_some()
+    }
+
+    pub fn matches(&self, value: f64) -> bool {
+        self.from.is_none_or(|f| value >= f) && self.to.is_none_or(|t| value <= t)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ParamFilters {
+    pub producers: ParamRange,
+    pub consumers: ParamRange,
+    pub streams: ParamRange,
+    pub partitions: ParamRange,
+    pub consumer_groups: ParamRange,
+    pub throughput_mb_s: MetricRange,
+    pub p99_latency_ms: MetricRange,
+}
+
+impl ParamFilters {
+    pub fn active_count(&self) -> usize {
+        let u32_active = [
+            &self.producers,
+            &self.consumers,
+            &self.streams,
+            &self.partitions,
+            &self.consumer_groups,
+        ]
+        .iter()
+        .filter(|r| r.is_active())
+        .count();
+        let metric_active = [&self.throughput_mb_s, &self.p99_latency_ms]
+            .iter()
+            .filter(|r| r.is_active())
+            .count();
+        u32_active + metric_active
+    }
+
+    pub fn is_any_active(&self) -> bool {
+        self.active_count() > 0
+    }
+
+    pub fn matches(&self, benchmark: &BenchmarkReportLight) -> bool {
+        let p = &benchmark.params;
+        let params_ok = self.producers.matches(p.producers)
+            && self.consumers.matches(p.consumers)
+            && self.streams.matches(p.streams)
+            && self.partitions.matches(p.partitions)
+            && self.consumer_groups.matches(p.consumer_groups);
+        if !params_ok {
+            return false;
+        }
+        let metrics_active = self.throughput_mb_s.is_active() || self.p99_latency_ms.is_active();
+        let Some(summary) = benchmark.group_metrics.first().map(|m| &m.summary) else {
+            return !metrics_active;
+        };
+        self.throughput_mb_s
+            .matches(summary.total_throughput_megabytes_per_second)
+            && self.p99_latency_ms.matches(summary.average_p99_latency_ms)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamField {
+    Producers,
+    Consumers,
+    Streams,
+    Partitions,
+    ConsumerGroups,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetricField {
+    ThroughputMbS,
+    P99LatencyMs,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +136,12 @@ pub struct UiState {
     pub is_benchmark_tooltip_visible: bool,
     pub is_server_stats_tooltip_visible: bool,
     pub is_embed_modal_visible: bool,
+    pub param_filters: ParamFilters,
+    pub is_sidebar_collapsed: bool,
+    pub compare_pin: Option<Box<BenchmarkReportLight>>,
+    /// Overrides chart rendering to keep the hero landing on screen until the user picks a benchmark.
+    /// Reducer never mutates selected_benchmark for this; the flag only gates rendering in MainContent.
+    pub is_landing: bool,
 }
 
 impl Default for UiState {
@@ -44,6 +152,10 @@ impl Default for UiState {
             is_benchmark_tooltip_visible: false,
             is_server_stats_tooltip_visible: false,
             is_embed_modal_visible: false,
+            param_filters: ParamFilters::default(),
+            is_sidebar_collapsed: false,
+            compare_pin: None,
+            is_landing: true,
         }
     }
 }
@@ -54,6 +166,12 @@ pub enum UiAction {
     ToggleServerStatsTooltip,
     ToggleEmbedModal,
     SetViewMode(ViewMode),
+    SetParamRange(ParamField, ParamRange),
+    SetMetricRange(MetricField, MetricRange),
+    ClearParamFilters,
+    ToggleSidebar,
+    SetComparePin(Option<Box<BenchmarkReportLight>>),
+    SetLanding(bool),
 }
 
 impl Reducible for UiState {
@@ -79,6 +197,47 @@ impl Reducible for UiState {
             },
             UiAction::SetViewMode(vm) => UiState {
                 view_mode: vm,
+                ..(*self).clone()
+            },
+            UiAction::SetParamRange(field, range) => {
+                let mut filters = self.param_filters.clone();
+                match field {
+                    ParamField::Producers => filters.producers = range,
+                    ParamField::Consumers => filters.consumers = range,
+                    ParamField::Streams => filters.streams = range,
+                    ParamField::Partitions => filters.partitions = range,
+                    ParamField::ConsumerGroups => filters.consumer_groups = range,
+                }
+                UiState {
+                    param_filters: filters,
+                    ..(*self).clone()
+                }
+            }
+            UiAction::SetMetricRange(field, range) => {
+                let mut filters = self.param_filters.clone();
+                match field {
+                    MetricField::ThroughputMbS => filters.throughput_mb_s = range,
+                    MetricField::P99LatencyMs => filters.p99_latency_ms = range,
+                }
+                UiState {
+                    param_filters: filters,
+                    ..(*self).clone()
+                }
+            }
+            UiAction::ClearParamFilters => UiState {
+                param_filters: ParamFilters::default(),
+                ..(*self).clone()
+            },
+            UiAction::ToggleSidebar => UiState {
+                is_sidebar_collapsed: !self.is_sidebar_collapsed,
+                ..(*self).clone()
+            },
+            UiAction::SetComparePin(pin) => UiState {
+                compare_pin: pin,
+                ..(*self).clone()
+            },
+            UiAction::SetLanding(is_landing) => UiState {
+                is_landing,
                 ..(*self).clone()
             },
         };

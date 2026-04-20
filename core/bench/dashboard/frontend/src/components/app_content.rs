@@ -17,7 +17,10 @@
 
 use crate::{
     api,
-    components::layout::{main_content::MainContent, sidebar::Sidebar},
+    components::layout::{
+        main_content::MainContent, sidebar::Sidebar, sidebar_toggle::SidebarToggle,
+        theme_toggle_floating::ThemeToggleFloating,
+    },
     router::AppRoute,
     state::{
         benchmark::{BenchmarkAction, BenchmarkContext, use_benchmark},
@@ -82,14 +85,12 @@ fn use_init_hardware(
 }
 
 fn preferred_hardware_identifier(hw_list: &[BenchmarkHardware]) -> Option<String> {
-    hw_list
+    const PREFERRED: &str = "spetz-amd-rkyv";
+    let preferred = hw_list
         .iter()
-        .filter_map(|hw| {
-            hw.identifier
-                .clone()
-                .filter(|identifier| identifier == "spetz-amd-rkyv")
-        })
-        .next()
+        .filter_map(|hw| hw.identifier.clone())
+        .find(|identifier| identifier == PREFERRED);
+    preferred.or_else(|| hw_list.iter().find_map(|hw| hw.identifier.clone()))
 }
 
 #[hook]
@@ -342,7 +343,9 @@ pub fn app_content() -> Html {
     );
 
     html! {
-        <div class="container">
+        <div class={classes!("container", ui_state.is_sidebar_collapsed.then_some("sidebar-collapsed"))}>
+            <SidebarToggle />
+            <ThemeToggleFloating />
             <Sidebar
                 on_gitref_select={Callback::from(move |gitref: String| {
                     // When gitref is selected, we might also want to navigate to Home with new query params

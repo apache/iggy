@@ -20,6 +20,7 @@ use crate::components::selectors::benchmark_search_box::BenchmarkSearchBox;
 use crate::components::selectors::benchmark_selector::BenchmarkSelector;
 use crate::components::selectors::gitref_selector::GitrefSelector;
 use crate::components::selectors::hardware_selector::HardwareSelector;
+use crate::components::selectors::param_filters_panel::ParamFiltersPanel;
 use crate::components::selectors::recent_benchmarks_selector::RecentBenchmarksSelector;
 use crate::components::selectors::view_mode_selector::ViewModeSelector;
 use crate::state::benchmark::{BenchmarkAction, use_benchmark};
@@ -86,12 +87,14 @@ pub fn sidebar(props: &SidebarProps) -> Html {
         )
     };
 
+    let filters = ui_state.param_filters.clone();
+
     let has_benchmarks = |f: fn(&BenchmarkKind) -> bool| {
-        benchmark_ctx
-            .state
-            .entries
-            .values()
-            .any(|benchmarks| benchmarks.iter().any(|b| f(&b.params.benchmark_kind)))
+        benchmark_ctx.state.entries.values().any(|benchmarks| {
+            benchmarks
+                .iter()
+                .any(|b| f(&b.params.benchmark_kind) && filters.matches(b))
+        })
     };
 
     let count_benchmarks = |f: fn(&BenchmarkKind) -> bool| {
@@ -102,7 +105,7 @@ pub fn sidebar(props: &SidebarProps) -> Html {
             .map(|benchmarks| {
                 benchmarks
                     .iter()
-                    .filter(|b| f(&b.params.benchmark_kind))
+                    .filter(|b| f(&b.params.benchmark_kind) && filters.matches(b))
                     .count()
             })
             .sum::<usize>()
@@ -139,6 +142,7 @@ pub fn sidebar(props: &SidebarProps) -> Html {
             <div class="sidebar-fixed-header">
                 <Logo />
                 <ViewModeSelector />
+                <ParamFiltersPanel />
 
                 if !is_recent_view {
                     <HardwareSelector

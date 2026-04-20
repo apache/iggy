@@ -18,7 +18,6 @@
 use crate::api;
 use crate::components::embed_modal::EmbedModal;
 use crate::components::selectors::measurement_type_selector::MeasurementType;
-use crate::components::theme::theme_toggle::ThemeToggle;
 use crate::components::tooltips::benchmark_info_toggle::BenchmarkInfoToggle;
 use crate::components::tooltips::benchmark_info_tooltip::BenchmarkInfoTooltip;
 use crate::components::tooltips::server_stats_toggle::ServerStatsToggle;
@@ -100,10 +99,6 @@ pub fn topbar(props: &TopBarProps) -> Html {
     html! {
         <div class="top-buttons">
             <div class="controls">
-                <ThemeToggle
-                    is_dark={props.is_dark}
-                    on_toggle={props.on_theme_toggle.clone()}
-                />
                 {
                     if !props.selected_gitref.is_empty() {
                         html! {
@@ -226,6 +221,15 @@ pub fn topbar(props: &TopBarProps) -> Html {
                                         onclick={on_measurement_select.reform(|_| MeasurementType::Throughput)}
                                     >
                                         { "Throughput" }
+                                    </button>
+                                    <button
+                                        class={classes!(
+                                            "measurement-button",
+                                            (selected_measurement == MeasurementType::Tail).then_some("active")
+                                        )}
+                                        onclick={on_measurement_select.reform(|_| MeasurementType::Tail)}
+                                    >
+                                        { "Tail" }
                                     </button>
                                 </div>
                             </>

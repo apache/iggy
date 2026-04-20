@@ -105,7 +105,7 @@ pub fn single_chart(props: &SingleChartProps) -> Html {
 
                 if !is_loading {
                     let chart = match measurement_type {
-                        MeasurementType::Latency => {
+                        MeasurementType::Latency | MeasurementType::Tail => {
                             bench_report::create_latency_chart(data, config.is_dark, true)
                         }
                         MeasurementType::Throughput => {
