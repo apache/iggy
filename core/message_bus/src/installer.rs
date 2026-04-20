@@ -173,6 +173,7 @@ pub fn install_replica_stream(
             read_half,
             &on_message,
             &read_token,
+            &aborted_reader,
             max_message_size,
         )
         .await;
@@ -318,12 +319,19 @@ pub fn install_client_stream(
 
 /// Read loop for a delegated replica connection. Identical to the
 /// `replica_listener` version but kept here to avoid cross-module coupling.
+///
+/// `aborted` is set by the installer when the registry insert loses a
+/// duplicate-replica-id race. The loop checks it before dispatching each
+/// message so the losing reader can never invoke `on_message` with the
+/// replica id owned by the winning install — otherwise two physical peers
+/// would feed the same VSR slot and break replication safety.
 #[allow(clippy::future_not_send)]
 async fn replica_read_loop(
     replica_id: u8,
     mut read_half: OwnedReadHalf<TcpStream>,
     on_message: &MessageHandler,
     token: &ShutdownToken,
+    aborted: &Cell<bool>,
     max_message_size: usize,
 ) {
     loop {
@@ -334,7 +342,12 @@ async fn replica_read_loop(
             }
             result = framing::read_message(&mut read_half, max_message_size).fuse() => {
                 match result {
-                    Ok(msg) => on_message(replica_id, msg),
+                    Ok(msg) => {
+                        if aborted.get() {
+                            return;
+                        }
+                        on_message(replica_id, msg);
+                    }
                     Err(e) => {
                         debug!(replica = replica_id, "read error: {e}");
                         return;
