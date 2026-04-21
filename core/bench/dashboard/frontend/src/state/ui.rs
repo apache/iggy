@@ -376,3 +376,185 @@ pub fn ui_provider(props: &UiProviderProps) -> Html {
 pub fn use_ui() -> UseReducerHandle<UiState> {
     use_context::<UseReducerHandle<UiState>>().expect("Ui context not found")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bench_dashboard_shared::BenchmarkGroupMetricsLight;
+    use bench_report::group_metrics_kind::GroupMetricsKind;
+    use bench_report::group_metrics_summary::BenchmarkGroupMetricsSummary;
+
+    #[test]
+    fn given_empty_range_when_checking_activity_should_be_inactive() {
+        let range = ParamRange::default();
+        assert!(!range.is_active());
+        assert!(range.matches(0));
+        assert!(range.matches(u32::MAX));
+    }
+
+    #[test]
+    fn given_from_bound_when_matching_should_reject_below_and_accept_above() {
+        let range = ParamRange {
+            from: Some(4),
+            to: None,
+        };
+        assert!(range.is_active());
+        assert!(!range.matches(3));
+        assert!(range.matches(4));
+        assert!(range.matches(100));
+    }
+
+    #[test]
+    fn given_inclusive_range_when_matching_should_include_both_bounds() {
+        let range = ParamRange {
+            from: Some(2),
+            to: Some(8),
+        };
+        assert!(range.matches(2));
+        assert!(range.matches(8));
+        assert!(!range.matches(1));
+        assert!(!range.matches(9));
+    }
+
+    #[test]
+    fn given_no_filters_when_counting_active_should_return_zero() {
+        let filters = ParamFilters::default();
+        assert_eq!(filters.active_count(), 0);
+    }
+
+    #[test]
+    fn given_multiple_active_filters_when_counting_should_sum_all_kinds() {
+        let filters = ParamFilters {
+            producers: ParamRange {
+                from: Some(1),
+                to: None,
+            },
+            p99_latency_ms: MetricRange {
+                from: None,
+                to: Some(50.0),
+            },
+            ..Default::default()
+        };
+        assert_eq!(filters.active_count(), 2);
+    }
+
+    #[test]
+    fn given_benchmark_matching_param_range_when_matching_should_pass() {
+        let filters = ParamFilters {
+            producers: ParamRange {
+                from: Some(4),
+                to: Some(16),
+            },
+            ..Default::default()
+        };
+        let benchmark = benchmark_with(8, 0, 1, 1, 0, 100.0, 1.0);
+        assert!(filters.matches(&benchmark));
+    }
+
+    #[test]
+    fn given_benchmark_outside_param_range_when_matching_should_fail() {
+        let filters = ParamFilters {
+            producers: ParamRange {
+                from: Some(4),
+                to: Some(16),
+            },
+            ..Default::default()
+        };
+        let benchmark = benchmark_with(2, 0, 1, 1, 0, 100.0, 1.0);
+        assert!(!filters.matches(&benchmark));
+    }
+
+    #[test]
+    fn given_metric_filter_when_benchmark_has_no_metrics_should_fail() {
+        let filters = ParamFilters {
+            p99_latency_ms: MetricRange {
+                from: None,
+                to: Some(10.0),
+            },
+            ..Default::default()
+        };
+        let mut benchmark = benchmark_with(1, 0, 1, 1, 0, 0.0, 0.0);
+        benchmark.group_metrics.clear();
+        assert!(!filters.matches(&benchmark));
+    }
+
+    #[test]
+    fn given_no_metric_filter_when_benchmark_has_no_metrics_should_pass() {
+        let filters = ParamFilters::default();
+        let mut benchmark = benchmark_with(1, 0, 1, 1, 0, 0.0, 0.0);
+        benchmark.group_metrics.clear();
+        assert!(filters.matches(&benchmark));
+    }
+
+    #[test]
+    fn given_pinned_kind_group_when_matching_should_accept_pinned_kinds_only() {
+        assert!(KindGroup::Pinned.matches(BenchmarkKind::PinnedProducer));
+        assert!(KindGroup::Pinned.matches(BenchmarkKind::PinnedConsumer));
+        assert!(KindGroup::Pinned.matches(BenchmarkKind::PinnedProducerAndConsumer));
+        assert!(!KindGroup::Pinned.matches(BenchmarkKind::BalancedProducer));
+        assert!(!KindGroup::Pinned.matches(BenchmarkKind::EndToEndProducingConsumer));
+    }
+
+    #[test]
+    fn given_balanced_kind_group_when_matching_should_accept_balanced_kinds_only() {
+        assert!(KindGroup::Balanced.matches(BenchmarkKind::BalancedProducer));
+        assert!(KindGroup::Balanced.matches(BenchmarkKind::BalancedConsumerGroup));
+        assert!(KindGroup::Balanced.matches(BenchmarkKind::BalancedProducerAndConsumerGroup));
+        assert!(!KindGroup::Balanced.matches(BenchmarkKind::PinnedProducer));
+        assert!(!KindGroup::Balanced.matches(BenchmarkKind::EndToEndProducingConsumer));
+    }
+
+    #[test]
+    fn given_end_to_end_kind_group_when_matching_should_accept_e2e_kinds_only() {
+        assert!(KindGroup::EndToEnd.matches(BenchmarkKind::EndToEndProducingConsumer));
+        assert!(KindGroup::EndToEnd.matches(BenchmarkKind::EndToEndProducingConsumerGroup));
+        assert!(!KindGroup::EndToEnd.matches(BenchmarkKind::PinnedProducer));
+        assert!(!KindGroup::EndToEnd.matches(BenchmarkKind::BalancedProducer));
+    }
+
+    fn benchmark_with(
+        producers: u32,
+        consumers: u32,
+        streams: u32,
+        partitions: u32,
+        consumer_groups: u32,
+        throughput_mb_s: f64,
+        p99_ms: f64,
+    ) -> BenchmarkReportLight {
+        let mut report = BenchmarkReportLight {
+            params: Default::default(),
+            ..Default::default()
+        };
+        report.params.producers = producers;
+        report.params.consumers = consumers;
+        report.params.streams = streams;
+        report.params.partitions = partitions;
+        report.params.consumer_groups = consumer_groups;
+        report.group_metrics.push(BenchmarkGroupMetricsLight {
+            summary: summary_with(throughput_mb_s, p99_ms),
+            latency_distribution: None,
+        });
+        report
+    }
+
+    fn summary_with(throughput_mb_s: f64, p99_ms: f64) -> BenchmarkGroupMetricsSummary {
+        BenchmarkGroupMetricsSummary {
+            kind: GroupMetricsKind::Producers,
+            total_throughput_megabytes_per_second: throughput_mb_s,
+            total_throughput_messages_per_second: 0.0,
+            average_throughput_megabytes_per_second: 0.0,
+            average_throughput_messages_per_second: 0.0,
+            average_p50_latency_ms: 0.0,
+            average_p90_latency_ms: 0.0,
+            average_p95_latency_ms: 0.0,
+            average_p99_latency_ms: p99_ms,
+            average_p999_latency_ms: 0.0,
+            average_p9999_latency_ms: 0.0,
+            average_latency_ms: 0.0,
+            average_median_latency_ms: 0.0,
+            min_latency_ms: 0.0,
+            max_latency_ms: 0.0,
+            std_dev_latency_ms: 0.0,
+        }
+    }
+}

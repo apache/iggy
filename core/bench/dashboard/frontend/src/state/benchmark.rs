@@ -341,3 +341,86 @@ pub fn benchmark_provider(props: &BenchmarkProviderProps) -> Html {
 pub fn use_benchmark() -> BenchmarkContext {
     use_context::<BenchmarkContext>().expect("Benchmark context not found")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bench_dashboard_shared::BenchmarkGroupMetricsLight;
+    use bench_report::group_metrics_kind::GroupMetricsKind;
+    use bench_report::group_metrics_summary::BenchmarkGroupMetricsSummary;
+
+    #[test]
+    fn given_empty_slice_when_picking_best_should_return_none() {
+        let input: Vec<&BenchmarkReportLight> = Vec::new();
+        assert!(pick_best_from_recent_batch(&input).is_none());
+    }
+
+    #[test]
+    fn given_runs_within_window_when_picking_should_return_lowest_p99() {
+        let a = benchmark("2026-04-21T10:00:00Z", 5.0, 100.0);
+        let b = benchmark("2026-04-21T10:30:00Z", 2.0, 80.0);
+        let c = benchmark("2026-04-21T11:00:00Z", 3.5, 120.0);
+        let picked = pick_best_from_recent_batch(&[&a, &b, &c]).expect("expected a pick");
+        assert_eq!(picked.timestamp, b.timestamp);
+    }
+
+    #[test]
+    fn given_tie_on_p99_when_picking_should_break_tie_on_throughput() {
+        let low_tput = benchmark("2026-04-21T10:00:00Z", 2.0, 100.0);
+        let high_tput = benchmark("2026-04-21T10:10:00Z", 2.0, 200.0);
+        let picked = pick_best_from_recent_batch(&[&low_tput, &high_tput]).expect("expected pick");
+        assert_eq!(picked.timestamp, high_tput.timestamp);
+    }
+
+    #[test]
+    fn given_runs_outside_window_when_picking_should_ignore_old_runs() {
+        let old = benchmark("2026-04-20T10:00:00Z", 1.0, 500.0);
+        let fresh_slow = benchmark("2026-04-21T12:00:00Z", 10.0, 100.0);
+        let fresh_fast = benchmark("2026-04-21T12:30:00Z", 5.0, 90.0);
+        let picked = pick_best_from_recent_batch(&[&old, &fresh_slow, &fresh_fast])
+            .expect("expected a pick");
+        assert_eq!(picked.timestamp, fresh_fast.timestamp);
+    }
+
+    #[test]
+    fn given_nan_p99_when_picking_should_prefer_finite_values() {
+        let mut nan_run = benchmark("2026-04-21T10:00:00Z", 0.0, 100.0);
+        nan_run.group_metrics[0].summary.average_p99_latency_ms = f64::NAN;
+        let good = benchmark("2026-04-21T10:10:00Z", 3.0, 80.0);
+        let picked = pick_best_from_recent_batch(&[&nan_run, &good]).expect("expected a pick");
+        assert_eq!(picked.timestamp, good.timestamp);
+    }
+
+    fn benchmark(timestamp: &str, p99_ms: f64, throughput_mb_s: f64) -> BenchmarkReportLight {
+        let mut report = BenchmarkReportLight {
+            timestamp: timestamp.to_string(),
+            ..Default::default()
+        };
+        report.group_metrics.push(BenchmarkGroupMetricsLight {
+            summary: summary_with(throughput_mb_s, p99_ms),
+            latency_distribution: None,
+        });
+        report
+    }
+
+    fn summary_with(throughput_mb_s: f64, p99_ms: f64) -> BenchmarkGroupMetricsSummary {
+        BenchmarkGroupMetricsSummary {
+            kind: GroupMetricsKind::Producers,
+            total_throughput_megabytes_per_second: throughput_mb_s,
+            total_throughput_messages_per_second: 0.0,
+            average_throughput_megabytes_per_second: 0.0,
+            average_throughput_messages_per_second: 0.0,
+            average_p50_latency_ms: 0.0,
+            average_p90_latency_ms: 0.0,
+            average_p95_latency_ms: 0.0,
+            average_p99_latency_ms: p99_ms,
+            average_p999_latency_ms: 0.0,
+            average_p9999_latency_ms: 0.0,
+            average_latency_ms: 0.0,
+            average_median_latency_ms: 0.0,
+            min_latency_ms: 0.0,
+            max_latency_ms: 0.0,
+            std_dev_latency_ms: 0.0,
+        }
+    }
+}
