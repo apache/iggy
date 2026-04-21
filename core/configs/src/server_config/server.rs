@@ -30,7 +30,10 @@ use err_trail::ErrContext;
 use figment::providers::{Format, Toml};
 use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
-use iggy_common::{IggyByteSize, IggyDuration, MemoryPoolConfigOther, Validatable};
+use iggy_common::{
+    IggyByteSize, IggyDuration, MemoryPoolConfigOther, Validatable,
+    sharding::{MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS},
+};
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
@@ -45,6 +48,8 @@ const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
 pub struct ServerConfig {
     pub consumer_group: ConsumerGroupConfig,
     pub data_maintenance: DataMaintenanceConfig,
+    #[serde(default)]
+    pub extra: ExtraConfig,
     pub message_saver: MessageSaverConfig,
     pub personal_access_token: PersonalAccessTokenConfig,
     pub heartbeat: HeartbeatConfig,
@@ -55,6 +60,29 @@ pub struct ServerConfig {
     pub websocket: WebSocketConfig,
     pub telemetry: TelemetryConfig,
     pub cluster: ClusterConfig,
+}
+
+// TODO: Rename this to something more sensible, once we figure out all of the extra configuration we need.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
+pub struct ExtraConfig {
+    pub namespace: NamespaceConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+pub struct NamespaceConfig {
+    pub max_streams: usize,
+    pub max_topics: usize,
+    pub max_partitions: usize,
+}
+
+impl Default for NamespaceConfig {
+    fn default() -> Self {
+        Self {
+            max_streams: MAX_STREAMS,
+            max_topics: MAX_TOPICS,
+            max_partitions: MAX_PARTITIONS,
+        }
+    }
 }
 
 /// Configuration for the memory pool.
@@ -183,9 +211,21 @@ impl ServerConfig {
     ///
     /// Uses compile-time generated env var mappings for unambiguous resolution.
     pub async fn load() -> Result<ServerConfig, ConfigurationError> {
+        Self::load_with_path(
+            DEFAULT_CONFIG_PATH,
+            include_str!("../../../server/config.toml"),
+        )
+        .await
+    }
+
+    pub async fn load_with_path(
+        default_config_path: &str,
+        default_config: &'static str,
+    ) -> Result<ServerConfig, ConfigurationError> {
         let config_path =
-            env::var("IGGY_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
-        let config_provider = ServerConfig::config_provider(&config_path);
+            env::var("IGGY_CONFIG_PATH").unwrap_or_else(|_| default_config_path.to_string());
+        let config_provider =
+            ServerConfig::config_provider_with_default(&config_path, default_config);
         let server_config: ServerConfig =
             config_provider
                 .load_config()
@@ -203,7 +243,15 @@ impl ServerConfig {
 
     /// Create a config provider using compile-time generated env var mappings.
     pub fn config_provider(config_path: &str) -> FileConfigProvider<ServerConfigEnvProvider> {
-        let default_config = Toml::string(include_str!("../../../server/config.toml"));
+        Self::config_provider_with_default(config_path, include_str!("../../../server/config.toml"))
+    }
+
+    /// Create a config provider using compile-time generated env var mappings.
+    pub fn config_provider_with_default(
+        config_path: &str,
+        default_config: &'static str,
+    ) -> FileConfigProvider<ServerConfigEnvProvider> {
+        let default_config = Toml::string(default_config);
         FileConfigProvider::new(
             config_path.to_string(),
             ServerConfigEnvProvider::default(),

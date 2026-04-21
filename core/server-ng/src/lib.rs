@@ -17,5 +17,7 @@
  * under the License.
  */
 
+pub mod bootstrap;
 pub mod login_register;
+pub mod server_error;
 pub mod session_manager;

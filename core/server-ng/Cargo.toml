@@ -105,7 +105,6 @@ iggy-web = ["dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
 ahash = { workspace = true }
-anyhow = { workspace = true }
 argon2 = { workspace = true }
 async-channel = { workspace = true }
 async_zip = { workspace = true }
@@ -116,6 +115,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
+consensus = { workspace = true }
 ctrlc = { workspace = true }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }
@@ -131,9 +131,11 @@ hash32 = { workspace = true }
 human-repr = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+journal = { workspace = true }
 jsonwebtoken = { workspace = true }
 left-right = { workspace = true }
 metadata = { workspace = true }
+message_bus = { workspace = true }
 mimalloc = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
 nix = { workspace = true }
@@ -143,6 +145,7 @@ opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 papaya = { workspace = true }
+partitions = { workspace = true }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
 ringbuffer = { workspace = true }
@@ -162,6 +165,8 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true }
+server = { workspace = true }
+shard = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-opentelemetry = { workspace = true }

@@ -17,7 +17,22 @@
  * under the License.
  */
 
-fn main() {
-    tracing_subscriber::fmt::init();
-    tracing::info!("iggy-server-ng starting...");
+use server_ng::server_error::ServerNgError;
+
+fn main() -> Result<(), ServerNgError> {
+    let runtime = compio::runtime::Runtime::new().expect("failed to create compio runtime");
+    runtime.block_on(async {
+        if let Ok(env_path) = std::env::var("IGGY_ENV_PATH") {
+            let _ = dotenvy::from_path(&env_path);
+        } else {
+            let _ = dotenvy::dotenv();
+        }
+
+        use server_ng::bootstrap::RunServerNg;
+        let mut logging = server::log::logger::Logging::new();
+        logging.early_init();
+
+        let shard = server_ng::bootstrap::bootstrap(&mut logging).await?;
+        shard.run().await
+    })
 }
