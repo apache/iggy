@@ -22,14 +22,6 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use yew::prelude::*;
 
-#[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
-pub enum ViewMode {
-    SingleGitref,
-    GitrefTrend,
-    RecentBenchmarks,
-}
-
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ParamRange {
     pub from: Option<u32>,
@@ -201,7 +193,6 @@ impl KindGroup {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UiState {
-    pub view_mode: ViewMode,
     pub selected_measurement: MeasurementType,
     pub is_benchmark_tooltip_visible: bool,
     pub is_server_stats_tooltip_visible: bool,
@@ -212,12 +203,13 @@ pub struct UiState {
     pub sidebar_search: String,
     pub sidebar_sort: SidebarSort,
     pub sidebar_kind_filter: HashSet<KindGroup>,
+    pub hardware_filter: Option<String>,
+    pub gitref_filter: Option<String>,
 }
 
 impl Default for UiState {
     fn default() -> Self {
         Self {
-            view_mode: ViewMode::SingleGitref,
             selected_measurement: MeasurementType::Latency,
             is_benchmark_tooltip_visible: false,
             is_server_stats_tooltip_visible: false,
@@ -228,6 +220,8 @@ impl Default for UiState {
             sidebar_search: String::new(),
             sidebar_sort: SidebarSort::default(),
             sidebar_kind_filter: HashSet::new(),
+            hardware_filter: None,
+            gitref_filter: None,
         }
     }
 }
@@ -242,7 +236,6 @@ pub enum TopBarPopup {
 pub enum UiAction {
     SetMeasurementType(MeasurementType),
     TogglePopup(TopBarPopup),
-    SetViewMode(ViewMode),
     SetParamRange(ParamField, ParamRange),
     SetMetricRange(MetricField, MetricRange),
     ClearParamFilters,
@@ -252,6 +245,8 @@ pub enum UiAction {
     SetSidebarSearch(String),
     SetSidebarSort(SidebarSort),
     ToggleKindFilter(KindGroup),
+    SetHardwareFilter(Option<String>),
+    SetGitrefFilter(Option<String>),
 }
 
 impl Reducible for UiState {
@@ -285,8 +280,12 @@ impl Reducible for UiState {
                     ..(*self).clone()
                 }
             }
-            UiAction::SetViewMode(vm) => UiState {
-                view_mode: vm,
+            UiAction::SetHardwareFilter(value) => UiState {
+                hardware_filter: value,
+                ..(*self).clone()
+            },
+            UiAction::SetGitrefFilter(value) => UiState {
+                gitref_filter: value,
                 ..(*self).clone()
             },
             UiAction::SetParamRange(field, range) => {

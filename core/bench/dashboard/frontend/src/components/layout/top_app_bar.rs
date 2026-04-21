@@ -25,10 +25,8 @@ use crate::components::tooltips::server_stats_tooltip::ServerStatsTooltip;
 use crate::router::AppRoute;
 use crate::state::benchmark::{BenchmarkAction, use_benchmark};
 use crate::state::ui::{TopBarPopup, UiAction, use_ui};
-use bench_dashboard_shared::BenchmarkReportLight;
-use bench_report::benchmark_kind::BenchmarkKind;
 use gloo::console::log;
-use std::collections::BTreeMap;
+use gloo::timers::callback::Timeout;
 use yew::platform::spawn_local;
 use yew::prelude::*;
 use yew_router::prelude::{Navigator, use_navigator};
@@ -115,6 +113,26 @@ pub fn top_app_bar(props: &TopAppBarProps) -> Html {
         })
     };
 
+    let share_copied = use_state(|| false);
+    let on_share = {
+        let share_copied = share_copied.clone();
+        Callback::from(move |_| {
+            let Some(window) = web_sys::window() else {
+                return;
+            };
+            let url = window.location().href().unwrap_or_else(|_| String::new());
+            if url.is_empty() {
+                return;
+            }
+            let clipboard = window.navigator().clipboard();
+            let _ = clipboard.write_text(&url);
+            share_copied.set(true);
+            let share_copied_for_timer = share_copied.clone();
+            let timeout = Timeout::new(1_400, move || share_copied_for_timer.set(false));
+            timeout.forget();
+        })
+    };
+
     let on_embed_toggle = {
         let ui = ui.clone();
         Callback::from(move |_| ui.dispatch(UiAction::TogglePopup(TopBarPopup::Embed)))
@@ -132,18 +150,13 @@ pub fn top_app_bar(props: &TopAppBarProps) -> Html {
 
     let on_browse_click = {
         let navigator = navigator.clone();
-        let entries = benchmark_ctx.state.entries.clone();
         Callback::from(move |_| {
-            if let Some(uuid) = latest_uuid_from_entries(&entries) {
-                navigate_to_benchmark(&navigator, uuid);
-            } else {
-                let navigator = navigator.clone();
-                spawn_local(async move {
-                    if let Some(uuid) = fetch_latest_uuid().await {
-                        navigate_to_benchmark(&navigator, uuid);
-                    }
-                });
-            }
+            let navigator = navigator.clone();
+            spawn_local(async move {
+                if let Some(uuid) = fetch_latest_uuid().await {
+                    navigate_to_benchmark(&navigator, uuid);
+                }
+            });
         })
     };
 
@@ -212,6 +225,20 @@ pub fn top_app_bar(props: &TopAppBarProps) -> Html {
                     </button>
                 }
                 if props.show_detail_actions && selected_benchmark.is_some() {
+                    <div class="app-bar-icon-wrap">
+                        <button
+                            type="button"
+                            class={classes!("app-bar-icon-btn", (*share_copied).then_some("active"))}
+                            onclick={on_share}
+                            title={if *share_copied { "Link copied" } else { "Copy share link" }}
+                            aria-label="Copy share link"
+                        >
+                            { render_share_icon(*share_copied) }
+                        </button>
+                        if *share_copied {
+                            <span class="app-bar-toast" role="status">{"Link copied"}</span>
+                        }
+                    </div>
                     <button
                         type="button"
                         class="app-bar-icon-btn"
@@ -252,7 +279,6 @@ pub fn top_app_bar(props: &TopAppBarProps) -> Html {
                             <ServerStatsTooltip
                                 benchmark_report={selected_benchmark.clone()}
                                 visible={true}
-                                view_mode={ui.view_mode.clone()}
                             />
                         }
                     </div>
@@ -267,7 +293,6 @@ pub fn top_app_bar(props: &TopAppBarProps) -> Html {
                             <BenchmarkInfoTooltip
                                 benchmark_report={benchmark.clone()}
                                 visible={true}
-                                view_mode={ui.view_mode.clone()}
                             />
                         }
                     </div>
@@ -354,6 +379,27 @@ fn render_download_icon() -> Html {
     }
 }
 
+fn render_share_icon(copied: bool) -> Html {
+    if copied {
+        return html! {
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"
+                 fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="20 6 9 17 4 12" />
+            </svg>
+        };
+    }
+    html! {
+        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"
+             fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="18" cy="5" r="3" />
+            <circle cx="6" cy="12" r="3" />
+            <circle cx="18" cy="19" r="3" />
+            <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" />
+            <line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
+        </svg>
+    }
+}
+
 fn render_embed_icon() -> Html {
     html! {
         <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"
@@ -362,16 +408,6 @@ fn render_embed_icon() -> Html {
             <polyline points="8 6 2 12 8 18" />
         </svg>
     }
-}
-
-fn latest_uuid_from_entries(
-    entries: &BTreeMap<BenchmarkKind, Vec<BenchmarkReportLight>>,
-) -> Option<String> {
-    entries
-        .values()
-        .flatten()
-        .max_by(|left, right| left.timestamp.cmp(&right.timestamp))
-        .map(|benchmark| benchmark.uuid.to_string())
 }
 
 async fn fetch_latest_uuid() -> Option<String> {

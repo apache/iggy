@@ -23,6 +23,7 @@ mod format;
 mod hooks;
 mod router;
 mod state;
+mod version;
 
 use crate::{
     components::{app_content::AppContent, footer::Footer},

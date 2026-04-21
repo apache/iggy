@@ -17,15 +17,14 @@
 
 use crate::api;
 use crate::components::chart::tail_chart::TailChart;
-use crate::format::{format_ms, nan_safe_cmp};
+use crate::format::format_ms;
 use crate::router::AppRoute;
-use crate::state::benchmark::{pick_best_from_recent_batch, use_benchmark};
+use crate::state::benchmark::{latest_sweep, pick_best_from_recent_batch, use_benchmark};
 use bench_dashboard_shared::BenchmarkReportLight;
-use bench_report::benchmark_kind::BenchmarkKind;
 use chrono::DateTime;
 use gloo::console::log;
+use gloo::timers::callback::Timeout;
 use std::cell::Cell;
-use std::collections::BTreeMap;
 use std::rc::Rc;
 use yew::platform::spawn_local;
 use yew::prelude::*;
@@ -40,10 +39,14 @@ pub struct HeroProps {
 pub fn hero(props: &HeroProps) -> Html {
     let benchmark_ctx = use_benchmark();
     let navigator = use_navigator();
+    let (is_dark, _) = use_context::<(bool, Callback<()>)>().expect("Theme context not found");
     let recent = use_state(Vec::<BenchmarkReportLight>::new);
+    let is_loading = use_state(|| true);
+    let is_slow = use_state(|| false);
 
     {
         let recent = recent.clone();
+        let is_loading = is_loading.clone();
         let cancelled = Rc::new(Cell::new(false));
         let cancelled_async = cancelled.clone();
         use_effect_with((), move |_| {
@@ -52,49 +55,46 @@ pub fn hero(props: &HeroProps) -> Html {
                     Ok(data) => {
                         if !cancelled_async.get() {
                             recent.set(data);
+                            is_loading.set(false);
                         }
                     }
-                    Err(error) => log!(format!("Hero: fetch_recent_benchmarks failed: {}", error)),
+                    Err(error) => {
+                        log!(format!("Hero: fetch_recent_benchmarks failed: {}", error));
+                        if !cancelled_async.get() {
+                            is_loading.set(false);
+                        }
+                    }
                 }
             });
             move || cancelled.set(true)
         });
     }
 
-    let recent_vec = (*recent).clone();
-    let source: Vec<&BenchmarkReportLight> = if recent_vec.is_empty() {
-        benchmark_ctx.state.entries.values().flatten().collect()
-    } else {
-        recent_vec.iter().collect()
-    };
-    let unrestricted: Vec<&BenchmarkReportLight> = source
-        .iter()
-        .copied()
-        .filter(|benchmark| benchmark.params.rate_limit.is_none())
-        .collect();
-    let mut stats = compute_stats(unrestricted.iter().copied());
-    stats.showcase = unrestricted
-        .iter()
-        .copied()
-        .max_by(|left, right| nan_safe_cmp(throughput_mb(left), throughput_mb(right)))
-        .cloned();
-    if stats.showcase.is_none() && !source.is_empty() {
-        stats.showcase = pick_best_from_recent_batch(&source);
+    {
+        let is_slow = is_slow.clone();
+        let is_loading_value = *is_loading;
+        use_effect_with(is_loading_value, move |loading| {
+            if !*loading {
+                is_slow.set(false);
+                return Box::new(|| ()) as Box<dyn FnOnce()>;
+            }
+            let timeout = Timeout::new(2_000, move || is_slow.set(true));
+            Box::new(move || drop(timeout)) as Box<dyn FnOnce()>
+        });
     }
 
+    if *is_loading {
+        return render_hero_loading(is_dark, *is_slow);
+    }
+
+    let recent_vec = (*recent).clone();
+    let source: Vec<&BenchmarkReportLight> = recent_vec.iter().collect();
+    let sweep = latest_sweep(&source);
+    let mut stats = compute_stats(sweep.iter().copied());
+    stats.showcase = pick_best_from_recent_batch(&source);
+
     if stats.total == 0 {
-        return html! {
-            <div class="hero-v2 hero-v2-empty">
-                { render_background_grid() }
-                <div class="hero-v2-empty-inner">
-                    <div class="hero-v2-eyebrow">{"Apache Iggy"}</div>
-                    <h1 class="hero-v2-empty-title">{"Benchmarks"}</h1>
-                    <p class="hero-v2-empty-sub">
-                        {"Pick a hardware and gitref in the sidebar to view performance data."}
-                    </p>
-                </div>
-            </div>
-        };
+        return render_hero_loading(is_dark, true);
     }
 
     let hardware = benchmark_ctx
@@ -102,11 +102,12 @@ pub fn hero(props: &HeroProps) -> Html {
         .current_hardware
         .clone()
         .unwrap_or_default();
-    let gitref_suffix = if props.selected_gitref.is_empty() {
-        String::new()
-    } else {
-        format!(" @ {}", props.selected_gitref)
-    };
+    let sweep_gitref = stats
+        .showcase
+        .as_ref()
+        .and_then(|showcase| showcase.params.gitref.clone())
+        .filter(|gitref| !gitref.is_empty())
+        .or_else(|| Some(props.selected_gitref.clone()).filter(|gitref| !gitref.is_empty()));
 
     let on_view_details = stats.showcase.as_ref().map(|showcase| {
         let uuid = showcase.uuid.to_string();
@@ -119,19 +120,14 @@ pub fn hero(props: &HeroProps) -> Html {
     });
 
     let on_browse_click = {
-        let latest_uuid = latest_uuid_from_entries(&benchmark_ctx.state.entries);
         let navigator = navigator.clone();
         Callback::from(move |_: MouseEvent| {
-            if let Some(uuid) = latest_uuid.clone() {
-                navigate_to_benchmark(&navigator, uuid);
-            } else {
-                let navigator = navigator.clone();
-                spawn_local(async move {
-                    if let Some(uuid) = fetch_latest_uuid().await {
-                        navigate_to_benchmark(&navigator, uuid);
-                    }
-                });
-            }
+            let navigator = navigator.clone();
+            spawn_local(async move {
+                if let Some(uuid) = fetch_latest_uuid().await {
+                    navigate_to_benchmark(&navigator, uuid);
+                }
+            });
         })
     };
 
@@ -139,7 +135,7 @@ pub fn hero(props: &HeroProps) -> Html {
         <div class="hero-v2">
             { render_background_grid() }
             <div class="hero-v2-inner">
-                { render_headline(&stats, &hardware, &gitref_suffix, &on_browse_click) }
+                { render_headline(&stats, &hardware, sweep_gitref.as_deref(), &on_browse_click) }
                 { render_stat_cards(&stats) }
                 {
                     match (stats.showcase.as_ref(), on_view_details) {
@@ -155,16 +151,6 @@ pub fn hero(props: &HeroProps) -> Html {
             </div>
         </div>
     }
-}
-
-fn latest_uuid_from_entries(
-    entries: &BTreeMap<BenchmarkKind, Vec<BenchmarkReportLight>>,
-) -> Option<String> {
-    entries
-        .values()
-        .flatten()
-        .max_by(|left, right| left.timestamp.cmp(&right.timestamp))
-        .map(|benchmark| benchmark.uuid.to_string())
 }
 
 async fn fetch_latest_uuid() -> Option<String> {
@@ -273,7 +259,7 @@ fn render_background_grid() -> Html {
 fn render_headline(
     stats: &HeroStats,
     hardware: &str,
-    gitref_suffix: &str,
+    gitref: Option<&str>,
     on_browse_click: &Callback<MouseEvent>,
 ) -> Html {
     let (value, unit, subject) = match &stats.peak_mb_s {
@@ -283,11 +269,6 @@ fn render_headline(
         }
         None => ("-".to_string(), "MB/s", String::new()),
     };
-    let sub = if subject.is_empty() {
-        format!("{hardware}{gitref_suffix}")
-    } else {
-        format!("{subject} · {hardware}{gitref_suffix}")
-    };
 
     html! {
         <div class="hero-v2-headline">
@@ -296,7 +277,9 @@ fn render_headline(
                 <span class="hero-v2-big">{value}</span>
                 <span class="hero-v2-unit">{unit}</span>
             </h1>
-            <p class="hero-v2-sub">{sub}</p>
+            <p class="hero-v2-sub">
+                { render_hero_sub(&subject, hardware, gitref) }
+            </p>
             <p class="hero-v2-tagline">
                 {"Modern hardware is incredibly capable. "}
                 <span class="hero-v2-tagline-accent">{"Apache Iggy was built for it."}</span>
@@ -317,6 +300,50 @@ fn render_headline(
             </div>
         </div>
     }
+}
+
+fn render_hero_sub(subject: &str, hardware: &str, gitref: Option<&str>) -> Html {
+    let prefix = match (subject.is_empty(), hardware.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => hardware.to_string(),
+        (false, true) => subject.to_string(),
+        (false, false) => format!("{subject} · {hardware}"),
+    };
+    let has_prefix = !prefix.is_empty();
+    let gitref = gitref.map(str::to_string);
+    let gitref_owned = gitref.clone();
+
+    html! {
+        <>
+            if has_prefix {
+                <span>{prefix}</span>
+            }
+            if let Some(gitref) = gitref_owned {
+                if has_prefix {
+                    <span class="hero-v2-sub-sep">{" @ "}</span>
+                }
+                <a
+                    class="hero-v2-sub-gitref"
+                    href={iggy_gitref_url(&gitref)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title={format!("Browse apache/iggy at {gitref}")}
+                >
+                    {gitref}
+                    <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24"
+                         fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                        <polyline points="15 3 21 3 21 9" />
+                        <line x1="10" y1="14" x2="21" y2="3" />
+                    </svg>
+                </a>
+            }
+        </>
+    }
+}
+
+fn iggy_gitref_url(gitref: &str) -> String {
+    format!("https://github.com/apache/iggy/tree/{gitref}")
 }
 
 fn render_stat_cards(stats: &HeroStats) -> Html {
@@ -404,14 +431,6 @@ fn render_showcase_card(stagger: usize, showcase: Option<&BenchmarkReportLight>)
     }
 }
 
-fn throughput_mb(benchmark: &BenchmarkReportLight) -> f64 {
-    benchmark
-        .group_metrics
-        .first()
-        .map(|metrics| metrics.summary.total_throughput_megabytes_per_second)
-        .unwrap_or(0.0)
-}
-
 fn render_summary_card(stagger: usize, total: usize, latest_ts: Option<&str>) -> Html {
     let sub = match latest_ts {
         Some(ts) => format!("Latest: {}", format_date(ts)),
@@ -465,5 +484,34 @@ fn format_date(timestamp_str: &str) -> String {
     match DateTime::parse_from_rfc3339(timestamp_str) {
         Ok(t) => t.format("%Y-%m-%d").to_string(),
         Err(_) => "unknown".to_string(),
+    }
+}
+
+fn render_hero_loading(is_dark: bool, is_slow: bool) -> Html {
+    let logo_src = if is_dark {
+        "/assets/iggy-light.png"
+    } else {
+        "/assets/iggy-dark.png"
+    };
+    html! {
+        <div class="hero-v2 hero-v2-loading" aria-busy="true" aria-live="polite">
+            { render_background_grid() }
+            <div class="hero-v2-loading-inner">
+                <img
+                    class="hero-v2-loading-mark"
+                    src={logo_src}
+                    alt=""
+                    aria-hidden="true"
+                />
+                <div class="hero-v2-loading-brand">{"Apache Iggy"}</div>
+                <div class="hero-v2-loading-sub">{"Benchmarks"}</div>
+                if is_slow {
+                    <p class="hero-v2-loading-slow">
+                        {"Fetching the latest benchmark run. This can take a moment on a cold cache."}
+                    </p>
+                }
+                <span class="visually-hidden">{"Loading benchmarks"}</span>
+            </div>
+        </div>
     }
 }

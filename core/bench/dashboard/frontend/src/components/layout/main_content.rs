@@ -22,7 +22,7 @@ use crate::components::layout::sweep_view::SweepView;
 use crate::components::selectors::measurement_type_selector::MeasurementType;
 use crate::router::AppRoute;
 use crate::state::benchmark::use_benchmark;
-use crate::state::ui::{UiAction, ViewMode, use_ui};
+use crate::state::ui::{UiAction, use_ui};
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_report::benchmark_kind::BenchmarkKind;
 use std::collections::BTreeMap;
@@ -40,7 +40,6 @@ pub fn main_content(props: &MainContentProps) -> Html {
     let _ = &props.selected_gitref;
     let benchmark_ctx = use_benchmark();
     let ui = use_ui();
-    let is_recent_view = matches!(ui.view_mode, ViewMode::RecentBenchmarks);
     let selected = benchmark_ctx.state.selected_benchmark.clone();
     let pinned = ui.compare_pin.clone();
     let entries = benchmark_ctx.state.entries.clone();
@@ -101,7 +100,6 @@ pub fn main_content(props: &MainContentProps) -> Html {
             is_dark,
             &entries,
         ),
-        (None, _) if is_recent_view => render_empty_recent(),
         (None, _) => render_loading(),
     };
 
@@ -121,7 +119,7 @@ fn render_single(
                     { benchmark.title(&measurement.to_string()) }
                 </div>
                 <div class="chart-title-identifier">
-                    { benchmark.identifier_with_cpu_and_version() }
+                    { render_benchmark_identifier(benchmark) }
                 </div>
             </div>
             <BenchmarkMeta benchmark={benchmark.clone()} />
@@ -215,25 +213,12 @@ fn render_compare_pane(
                     { benchmark.title(&measurement.to_string()) }
                 </div>
                 <div class="chart-title-identifier">
-                    { benchmark.identifier_with_cpu_and_version() }
+                    { render_benchmark_identifier(benchmark) }
                 </div>
             </div>
             <BenchmarkMeta benchmark={benchmark.clone()} />
             <div class="single-view">
                 { render_measurement_chart(benchmark, measurement, is_dark) }
-            </div>
-        </div>
-    }
-}
-
-fn render_empty_recent() -> Html {
-    html! {
-        <div class="content-wrapper">
-            <div class="empty-state">
-                <div class="empty-state-content">
-                    <h2>{"Select a recent benchmark"}</h2>
-                    <p>{"Choose a benchmark from the sidebar to display performance data."}</p>
-                </div>
             </div>
         </div>
     }
@@ -248,5 +233,43 @@ fn render_loading() -> Html {
                 </div>
             </div>
         </div>
+    }
+}
+
+fn render_benchmark_identifier(benchmark: &BenchmarkReportLight) -> Html {
+    let hardware = benchmark
+        .hardware
+        .identifier
+        .as_deref()
+        .unwrap_or("identifier");
+    let cpu = benchmark.hardware.cpu_name.as_str();
+    let gitref = benchmark
+        .params
+        .gitref
+        .as_deref()
+        .filter(|gitref| !gitref.is_empty());
+
+    html! {
+        <>
+            <span>{format!("{hardware} @ {cpu}")}</span>
+            if let Some(gitref) = gitref {
+                <span class="chart-title-sep">{"·"}</span>
+                <a
+                    class="chart-title-gitref"
+                    href={format!("https://github.com/apache/iggy/tree/{gitref}")}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title={format!("Browse apache/iggy at {gitref}")}
+                >
+                    {gitref}
+                    <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24"
+                         fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                        <polyline points="15 3 21 3 21 9" />
+                        <line x1="10" y1="14" x2="21" y2="3" />
+                    </svg>
+                </a>
+            }
+        </>
     }
 }

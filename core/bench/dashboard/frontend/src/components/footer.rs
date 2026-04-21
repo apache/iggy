@@ -41,7 +41,9 @@ pub fn footer() -> Html {
                 <div class="footer-meta">
                     <span class="footer-version">{"v"}{env!("CARGO_PKG_VERSION")}</span>
                     <span class="footer-sep">{"•"}</span>
-                    <span>{"Apache Software Foundation"}</span>
+                    <a href="https://www.apache.org/" target="_blank" rel="noopener noreferrer">
+                        {"Apache Software Foundation"}
+                    </a>
                 </div>
             </div>
         </footer>

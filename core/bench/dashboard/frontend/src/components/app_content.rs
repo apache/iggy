@@ -218,23 +218,35 @@ pub fn app_content() -> Html {
         gitref_ctx.state.selected_gitref.clone(),
     );
 
-    let on_gitref_select = {
-        let gitref_dispatch = gitref_ctx.dispatch.clone();
-        Callback::from(move |gitref: String| {
-            gitref_dispatch.emit(GitrefAction::SetSelectedGitref(Some(gitref)));
-        })
-    };
-
-    let on_hardware_select = {
-        let hardware_dispatch = hardware_ctx.dispatch.clone();
+    {
+        let selected_uuid = benchmark_ctx
+            .state
+            .selected_benchmark
+            .as_ref()
+            .map(|benchmark| benchmark.uuid.to_string());
+        let route_uuid = match route.as_ref() {
+            Some(AppRoute::Benchmark { uuid }) => Some(uuid.clone()),
+            _ => None,
+        };
         let navigator = navigator.clone();
-        Callback::from(move |hardware_id: String| {
-            hardware_dispatch.emit(HardwareAction::SelectHardware(Some(hardware_id)));
-            if let Some(nav) = navigator.as_ref() {
-                nav.push(&AppRoute::Home);
-            }
-        })
-    };
+        let is_loading_handle = is_loading_from_url.clone();
+        use_effect_with(
+            (selected_uuid, route_uuid),
+            move |(selected_uuid, route_uuid)| {
+                if *is_loading_handle {
+                    return;
+                }
+                if let (Some(selected), Some(current)) = (selected_uuid, route_uuid)
+                    && selected != current
+                    && let Some(nav) = navigator.as_ref()
+                {
+                    nav.push(&AppRoute::Benchmark {
+                        uuid: selected.clone(),
+                    });
+                }
+            },
+        );
+    }
 
     let show_detail = matches!(
         route,
@@ -250,7 +262,7 @@ pub fn app_content() -> Html {
         )}>
             <TopAppBar show_sidebar_toggle={show_detail} show_detail_actions={show_detail} />
             if show_detail {
-                <Sidebar on_gitref_select={on_gitref_select} on_hardware_select={on_hardware_select} />
+                <Sidebar />
                 <MainContent selected_gitref={gitref_ctx.state.selected_gitref.clone().unwrap_or_default()} />
             } else {
                 <Hero selected_gitref={gitref_ctx.state.selected_gitref.clone().unwrap_or_default()} />

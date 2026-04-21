@@ -15,31 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::api;
 use crate::components::selectors::dense_benchmark_row::DenseBenchmarkRow;
 use crate::format::nan_safe_cmp;
 use crate::router::AppRoute;
-use crate::state::benchmark::{BenchmarkAction, use_benchmark};
+use crate::state::benchmark::{BenchmarkAction, recency_cmp, use_benchmark};
 use crate::state::ui::{KindGroup, SidebarSort, UiAction, use_ui};
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_report::benchmark_kind::BenchmarkKind;
-use chrono::DateTime;
-use gloo::console::log;
-use std::cell::Cell;
-use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::rc::Rc;
-use yew::platform::spawn_local;
 use yew::prelude::*;
 use yew_router::prelude::{Navigator, use_navigator};
 
 #[derive(Properties, PartialEq)]
-pub struct RecentBenchmarksSelectorProps {
-    pub limit: u32,
+pub struct BenchmarksListProps {
+    pub benchmarks: Vec<BenchmarkReportLight>,
+    pub is_loading: bool,
 }
 
-#[function_component(RecentBenchmarksSelector)]
-pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html {
+#[function_component(BenchmarksList)]
+pub fn benchmarks_list(props: &BenchmarksListProps) -> Html {
     let benchmark_ctx = use_benchmark();
     let ui_state = use_ui();
     let navigator = use_navigator();
@@ -51,55 +45,12 @@ pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html
         .as_ref()
         .map(|selected| selected.uuid);
 
-    let filters = ui_state.param_filters.clone();
+    let param_filters = ui_state.param_filters.clone();
     let search = ui_state.sidebar_search.to_lowercase();
     let kind_filter = ui_state.sidebar_kind_filter.clone();
+    let hardware_filter = ui_state.hardware_filter.clone();
+    let gitref_filter = ui_state.gitref_filter.clone();
     let sort = ui_state.sidebar_sort;
-
-    let recent_benchmarks = use_state(Vec::<BenchmarkReportLight>::new);
-    let is_loading = use_state(|| true);
-
-    {
-        let recent_benchmarks = recent_benchmarks.clone();
-        let is_loading = is_loading.clone();
-        let limit = props.limit;
-        let dispatch = benchmark_ctx.dispatch.clone();
-        let navigator = navigator.clone();
-        let has_selection = benchmark_ctx.state.selected_benchmark.is_some();
-
-        let cancelled = Rc::new(Cell::new(false));
-        let cancelled_async = cancelled.clone();
-        use_effect_with((), move |_| {
-            spawn_local(async move {
-                match api::fetch_recent_benchmarks(Some(limit)).await {
-                    Ok(mut data) => {
-                        data.sort_by(|left, right| {
-                            compare_timestamps(&right.timestamp, &left.timestamp)
-                        });
-                        if cancelled_async.get() {
-                            return;
-                        }
-                        if !has_selection && let Some(most_recent) = data.first().cloned() {
-                            if let Some(nav) = navigator.as_ref() {
-                                nav.push(&AppRoute::Benchmark {
-                                    uuid: most_recent.uuid.to_string(),
-                                });
-                            }
-                            dispatch.emit(BenchmarkAction::SelectBenchmark(Box::new(Some(
-                                most_recent,
-                            ))));
-                        }
-                        recent_benchmarks.set(data);
-                    }
-                    Err(error) => log!(format!("Error fetching recent benchmarks: {}", error)),
-                }
-                if !cancelled_async.get() {
-                    is_loading.set(false);
-                }
-            });
-            move || cancelled.set(true)
-        });
-    }
 
     let on_select = {
         let dispatch = benchmark_ctx.dispatch.clone();
@@ -163,14 +114,17 @@ pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html
         })
     };
 
-    if *is_loading {
+    if props.is_loading {
         return render_skeleton();
     }
 
-    let visible: Vec<BenchmarkReportLight> = (*recent_benchmarks)
+    let visible: Vec<BenchmarkReportLight> = props
+        .benchmarks
         .iter()
-        .filter(|benchmark| filters.matches(benchmark))
+        .filter(|benchmark| param_filters.matches(benchmark))
         .filter(|benchmark| kind_filter_matches(&kind_filter, benchmark.params.benchmark_kind))
+        .filter(|benchmark| hardware_matches(hardware_filter.as_deref(), benchmark))
+        .filter(|benchmark| gitref_matches(gitref_filter.as_deref(), benchmark))
         .filter(|benchmark| search_matches(&search, benchmark))
         .cloned()
         .collect();
@@ -178,7 +132,7 @@ pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html
     if visible.is_empty() {
         return html! {
             <div class="dense-list-empty">
-                <p>{"No benchmarks match the current search or filters."}</p>
+                <p>{"No benchmarks match the current filters."}</p>
             </div>
         };
     }
@@ -230,6 +184,20 @@ fn kind_filter_matches(filter: &HashSet<KindGroup>, kind: BenchmarkKind) -> bool
     filter.iter().any(|group| group.matches(kind))
 }
 
+fn hardware_matches(filter: Option<&str>, benchmark: &BenchmarkReportLight) -> bool {
+    match filter {
+        Some(expected) => benchmark.hardware.identifier.as_deref() == Some(expected),
+        None => true,
+    }
+}
+
+fn gitref_matches(filter: Option<&str>, benchmark: &BenchmarkReportLight) -> bool {
+    match filter {
+        Some(expected) => benchmark.params.gitref.as_deref() == Some(expected),
+        None => true,
+    }
+}
+
 fn search_matches(query: &str, benchmark: &BenchmarkReportLight) -> bool {
     if query.is_empty() {
         return true;
@@ -267,22 +235,12 @@ fn sort_benchmarks(
     sort: SidebarSort,
 ) -> Vec<BenchmarkReportLight> {
     benchmarks.sort_by(|left, right| match sort {
-        SidebarSort::MostRecent => compare_timestamps(&right.timestamp, &left.timestamp),
+        SidebarSort::MostRecent => recency_cmp(right, left),
         SidebarSort::PeakThroughput => nan_safe_cmp(throughput(right), throughput(left)),
         SidebarSort::LowestP99 => nan_safe_cmp(p99(left), p99(right)),
         SidebarSort::Name => left.params.pretty_name.cmp(&right.params.pretty_name),
     });
     benchmarks
-}
-
-fn compare_timestamps(left: &str, right: &str) -> Ordering {
-    match (
-        DateTime::parse_from_rfc3339(left),
-        DateTime::parse_from_rfc3339(right),
-    ) {
-        (Ok(left_time), Ok(right_time)) => left_time.cmp(&right_time),
-        _ => Ordering::Equal,
-    }
 }
 
 fn throughput(benchmark: &BenchmarkReportLight) -> f64 {

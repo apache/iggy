@@ -15,29 +15,79 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::components::selectors::benchmark_selector::BenchmarkSelector;
-use crate::components::selectors::gitref_selector::GitrefSelector;
-use crate::components::selectors::hardware_selector::HardwareSelector;
+use crate::api;
+use crate::components::selectors::benchmarks_list::BenchmarksList;
 use crate::components::selectors::param_filters_panel::ParamFiltersPanel;
-use crate::components::selectors::recent_benchmarks_selector::RecentBenchmarksSelector;
-use crate::state::gitref::use_gitref;
-use crate::state::ui::{KindGroup, SidebarSort, UiAction, ViewMode, use_ui};
+use crate::router::AppRoute;
+use crate::state::benchmark::{BenchmarkAction, recency_cmp, use_benchmark};
+use crate::state::ui::{KindGroup, SidebarSort, UiAction, use_ui};
+use bench_dashboard_shared::BenchmarkReportLight;
+use gloo::console::log;
+use std::cell::Cell;
+use std::collections::BTreeSet;
+use std::rc::Rc;
 use web_sys::HtmlInputElement;
+use web_sys::HtmlSelectElement;
+use yew::platform::spawn_local;
 use yew::prelude::*;
+use yew_router::prelude::{use_navigator, use_route};
+
+const RECENT_LIMIT: u32 = 10_000;
 
 #[derive(Properties, PartialEq)]
-pub struct SidebarProps {
-    pub on_gitref_select: Callback<String>,
-    pub on_hardware_select: Callback<String>,
-}
+pub struct SidebarProps;
 
 #[function_component(Sidebar)]
-pub fn sidebar(props: &SidebarProps) -> Html {
-    let gitref_ctx = use_gitref();
+pub fn sidebar(_props: &SidebarProps) -> Html {
     let ui = use_ui();
-    let is_recent_view = matches!(ui.view_mode, ViewMode::RecentBenchmarks);
-    let active_kind_filter = ui.sidebar_kind_filter.clone();
-    let current_sort = ui.sidebar_sort;
+    let benchmark_ctx = use_benchmark();
+    let navigator = use_navigator();
+    let route = use_route::<AppRoute>();
+
+    let benchmarks = use_state(Vec::<BenchmarkReportLight>::new);
+    let is_loading = use_state(|| true);
+
+    {
+        let benchmarks_handle = benchmarks.clone();
+        let is_loading_handle = is_loading.clone();
+        let dispatch = benchmark_ctx.dispatch.clone();
+        let navigator = navigator.clone();
+        let url_has_benchmark = matches!(
+            route,
+            Some(AppRoute::Benchmark { .. }) | Some(AppRoute::Compare { .. })
+        );
+        let cancelled = Rc::new(Cell::new(false));
+        let cancelled_async = cancelled.clone();
+        use_effect_with((), move |_| {
+            spawn_local(async move {
+                match api::fetch_recent_benchmarks(Some(RECENT_LIMIT)).await {
+                    Ok(mut data) => {
+                        data.sort_by(|left, right| {
+                            recency_cmp(right, left).then_with(|| right.uuid.cmp(&left.uuid))
+                        });
+                        if cancelled_async.get() {
+                            return;
+                        }
+                        if !url_has_benchmark && let Some(newest) = data.first().cloned() {
+                            if let Some(nav) = navigator.as_ref() {
+                                nav.push(&AppRoute::Benchmark {
+                                    uuid: newest.uuid.to_string(),
+                                });
+                            }
+                            dispatch.emit(BenchmarkAction::SelectBenchmark(Box::new(Some(newest))));
+                        }
+                        benchmarks_handle.set(data);
+                    }
+                    Err(error) => log!(format!("Sidebar: fetch_recent_benchmarks failed: {error}")),
+                }
+                if !cancelled_async.get() {
+                    is_loading_handle.set(false);
+                }
+            });
+            move || cancelled.set(true)
+        });
+    }
+
     let current_search = ui.sidebar_search.clone();
 
     let on_search = {
@@ -53,11 +103,6 @@ pub fn sidebar(props: &SidebarProps) -> Html {
         Callback::from(move |_: MouseEvent| {
             ui.dispatch(UiAction::SetSidebarSearch(String::new()));
         })
-    };
-
-    let on_scope_change = |mode: ViewMode| {
-        let ui = ui.clone();
-        Callback::from(move |_: MouseEvent| ui.dispatch(UiAction::SetViewMode(mode.clone())))
     };
 
     let on_kind_toggle = {
@@ -81,6 +126,33 @@ pub fn sidebar(props: &SidebarProps) -> Html {
         })
     };
 
+    let on_hardware_change = {
+        let ui = ui.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlSelectElement = event.target_unchecked_into();
+            let value = input.value();
+            let next = if value.is_empty() { None } else { Some(value) };
+            ui.dispatch(UiAction::SetHardwareFilter(next));
+        })
+    };
+
+    let on_gitref_change = {
+        let ui = ui.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlSelectElement = event.target_unchecked_into();
+            let value = input.value();
+            let next = if value.is_empty() { None } else { Some(value) };
+            ui.dispatch(UiAction::SetGitrefFilter(next));
+        })
+    };
+
+    let hardware_options = collect_hardware(&benchmarks);
+    let gitref_options = collect_gitrefs(&benchmarks, ui.hardware_filter.as_deref());
+    let active_kind_filter = ui.sidebar_kind_filter.clone();
+    let current_sort = ui.sidebar_sort;
+    let current_hardware = ui.hardware_filter.clone().unwrap_or_default();
+    let current_gitref = ui.gitref_filter.clone().unwrap_or_default();
+
     html! {
         <aside class="sidebar">
             <div class="sidebar-fixed-header">
@@ -94,7 +166,7 @@ pub fn sidebar(props: &SidebarProps) -> Html {
                     <input
                         type="search"
                         class="sidebar-search-input"
-                        placeholder="Search benchmarks, gitrefs, hardware..."
+                        placeholder="Search benchmarks..."
                         value={current_search.clone()}
                         oninput={on_search}
                     />
@@ -110,35 +182,41 @@ pub fn sidebar(props: &SidebarProps) -> Html {
                     }
                 </div>
 
-                <div class="sidebar-scope" role="tablist">
-                    <button
-                        type="button"
-                        role="tab"
-                        aria-selected={(!is_recent_view).to_string()}
-                        class={classes!("sidebar-scope-btn", (!is_recent_view).then_some("active"))}
-                        onclick={on_scope_change(ViewMode::SingleGitref)}
-                    >
-                        {"Version"}
-                    </button>
-                    <button
-                        type="button"
-                        role="tab"
-                        aria-selected={is_recent_view.to_string()}
-                        class={classes!("sidebar-scope-btn", is_recent_view.then_some("active"))}
-                        onclick={on_scope_change(ViewMode::RecentBenchmarks)}
-                    >
-                        {"Recent"}
-                    </button>
-                </div>
+                <div class="sidebar-facet-row">
+                    <label class="sidebar-facet">
+                        <span class="sidebar-facet-label">{"Hardware"}</span>
+                        <select class="sidebar-facet-select" onchange={on_hardware_change}>
+                            <option value="" selected={current_hardware.is_empty()}>
+                                {"All"}
+                            </option>
+                            { for hardware_options.iter().map(|option| html! {
+                                <option
+                                    value={option.clone()}
+                                    selected={option.as_str() == current_hardware}
+                                >
+                                    {option.clone()}
+                                </option>
+                            })}
+                        </select>
+                    </label>
 
-                if !is_recent_view {
-                    <HardwareSelector on_hardware_select={props.on_hardware_select.clone()} />
-                    <GitrefSelector
-                        gitrefs={gitref_ctx.state.gitrefs.clone()}
-                        selected_gitref={gitref_ctx.state.selected_gitref.clone().unwrap_or_default()}
-                        on_gitref_select={props.on_gitref_select.clone()}
-                    />
-                }
+                    <label class="sidebar-facet">
+                        <span class="sidebar-facet-label">{"Version"}</span>
+                        <select class="sidebar-facet-select" onchange={on_gitref_change}>
+                            <option value="" selected={current_gitref.is_empty()}>
+                                {"All"}
+                            </option>
+                            { for gitref_options.iter().map(|option| html! {
+                                <option
+                                    value={option.clone()}
+                                    selected={option.as_str() == current_gitref}
+                                >
+                                    {option.clone()}
+                                </option>
+                            })}
+                        </select>
+                    </label>
+                </div>
 
                 <div class="sidebar-kind-chips">
                     { for KindGroup::all().iter().map(|group| {
@@ -191,11 +269,10 @@ pub fn sidebar(props: &SidebarProps) -> Html {
             </div>
 
             <div class="sidebar-scrollable-content">
-                if is_recent_view {
-                    <RecentBenchmarksSelector limit={10000} />
-                } else {
-                    <BenchmarkSelector />
-                }
+                <BenchmarksList
+                    benchmarks={(*benchmarks).clone()}
+                    is_loading={*is_loading}
+                />
             </div>
         </aside>
     }
@@ -246,4 +323,52 @@ fn render_compare_hint(ui: &yew::UseReducerHandle<crate::state::ui::UiState>) ->
 
 fn short_name(full: &str) -> String {
     full.split('(').next().unwrap_or(full).trim().to_string()
+}
+
+fn collect_hardware(benchmarks: &[BenchmarkReportLight]) -> Vec<String> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for benchmark in benchmarks {
+        if let Some(id) = benchmark.hardware.identifier.as_deref()
+            && !id.is_empty()
+        {
+            set.insert(id.to_string());
+        }
+    }
+    set.into_iter().collect()
+}
+
+fn collect_gitrefs(
+    benchmarks: &[BenchmarkReportLight],
+    hardware_filter: Option<&str>,
+) -> Vec<String> {
+    let mut newest: std::collections::HashMap<String, &BenchmarkReportLight> =
+        std::collections::HashMap::new();
+    for benchmark in benchmarks {
+        if let Some(expected) = hardware_filter
+            && benchmark.hardware.identifier.as_deref() != Some(expected)
+        {
+            continue;
+        }
+        let Some(gitref) = benchmark.params.gitref.as_deref() else {
+            continue;
+        };
+        if gitref.is_empty() {
+            continue;
+        }
+        newest
+            .entry(gitref.to_string())
+            .and_modify(|existing| {
+                if recency_cmp(benchmark, existing).is_gt() {
+                    *existing = benchmark;
+                }
+            })
+            .or_insert(benchmark);
+    }
+
+    let mut ordered: Vec<(&BenchmarkReportLight, String)> = newest
+        .into_iter()
+        .map(|(gitref, benchmark)| (benchmark, gitref))
+        .collect();
+    ordered.sort_by(|left, right| recency_cmp(right.0, left.0));
+    ordered.into_iter().map(|(_, gitref)| gitref).collect()
 }
