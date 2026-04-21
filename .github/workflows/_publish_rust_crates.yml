@@ -28,21 +28,24 @@ on:
         required: false
         default: false
         description: "Dry run mode - validate without publishing"
-      create_tags:
-        type: boolean
-        required: false
-        default: true
-        description: "Create git tags after successful publishing"
       commit:
         type: string
-        required: false
-        default: ""
-        description: "Specific commit to checkout (defaults to github.sha)"
+        required: true
+        description: |
+          Full 40-char commit SHA to publish from. The caller is responsible
+          for resolving and validating this (including master-ancestry) before
+          invoking. This workflow re-verifies master-ancestry defensively in
+          the `Resolve commit` step below.
       use_latest_ci:
         type: boolean
         required: false
         default: false
         description: "Use latest CI configuration from master branch"
+      skip_tag_creation:
+        type: boolean
+        required: false
+        default: false
+        description: "Skip git tag creation after successful publish (useful for re-publishing)"
     secrets:
       CARGO_REGISTRY_TOKEN:
         required: true
@@ -56,6 +59,19 @@ permissions:
 
 env:
   IGGY_CI_BUILD: true
+
+# Child-level concurrency group as defense-in-depth. The in-tree caller
+# (publish.yml) already holds `publish-release` via its own concurrency
+# block, and reusable workflow runs are nested under the parent's group,
+# so this is a no-op for the current topology. But `workflow_call` is a
+# publicly-reachable entry point: any future direct caller (auto-publish
+# runbook, vendored fork, parallel workflow) would bypass the parent
+# group and race on the inline tag steps below. A distinct group name
+# (`publish-release-rust` vs parent `publish-release`) avoids self-block
+# when this workflow is called from publish.yml.
+concurrency:
+  group: publish-release-rust
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -77,7 +93,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.commit || github.sha }}
+          # No `|| github.sha` fallback: the `Resolve commit` step below
+          # requires an explicit, non-empty `inputs.commit` so the tag step
+          # downstream points at the exact reviewed commit. A silent fall
+          # back to github.sha would bypass publish.yml's master-ancestry
+          # check for direct workflow_call callers. Empty input here will
+          # fail the checkout fast, which is the intended hard-fail shape.
+          ref: ${{ inputs.commit }}
           fetch-depth: 0
 
       - name: Save and apply latest CI from master
@@ -97,113 +119,259 @@ jobs:
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
 
-      - name: Extract versions
-        id: versions
+      # Normalize the inbound commit to a canonical full SHA. Caller (publish.yml)
+      # already does this; a direct workflow_call caller must pass an explicit
+      # commit too. We used to fall back to github.sha here, but that bypasses
+      # publish.yml's master-ancestry check - callers get a false sense of
+      # safety from an ambient SHA that was never validated. Require the input
+      # explicitly so the contract is the same regardless of entry point.
+      - name: Resolve commit
+        id: resolve
+        env:
+          INPUT_COMMIT: ${{ inputs.commit }}
         run: |
+          set -euo pipefail
+          if [ -z "${INPUT_COMMIT}" ]; then
+            echo "❌ _publish_rust_crates.yml: 'commit' input is required"
+            echo ""
+            echo "The caller must pass a commit SHA explicitly so the tag step"
+            echo "downstream can point at the exact reviewed commit (not HEAD)."
+            echo "publish.yml resolves and validates this value in its 'validate' job;"
+            echo "direct workflow_call callers must do the same before invoking."
+            exit 1
+          fi
+          FULL_SHA=$(git rev-parse --verify "${INPUT_COMMIT}^{commit}" 2>/dev/null || true)
+          if [ -z "$FULL_SHA" ] || ! [[ "$FULL_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "❌ Could not resolve commit '${INPUT_COMMIT}' to a full SHA"
+            exit 1
+          fi
+
+          # Defensive re-check of the master-ancestry invariant that publish.yml's
+          # validate job enforces. This workflow is a publicly-reachable
+          # workflow_call entry point; a direct caller (runbook, vendored fork)
+          # that bypasses publish.yml would otherwise skip the ancestry check
+          # entirely. Re-running it here is cheap (one shallow fetch + one
+          # merge-base call) and closes the I2 invariant hole.
+          git fetch origin master --depth=1000 --quiet
+          if ! git merge-base --is-ancestor "$FULL_SHA" origin/master; then
+            echo "❌ Commit $FULL_SHA is not an ancestor of origin/master"
+            echo ""
+            echo "_publish_rust_crates.yml refuses to publish from a non-master commit."
+            echo "If you reached this error via a direct workflow_call, route through"
+            echo "publish.yml instead (which does the same check in its validate job)"
+            echo "or rebase your branch onto master before invoking."
+            exit 1
+          fi
+
+          echo "commit=$FULL_SHA" >> "$GITHUB_OUTPUT"
+          echo "✅ Resolved commit: $FULL_SHA (on origin/master)"
+
+      - name: Extract versions and tags
+        id: versions
+        shell: bash
+        run: |
+          set -euo pipefail
           chmod +x scripts/extract-version.sh
-          echo "common=$(scripts/extract-version.sh rust-common)" >> "$GITHUB_OUTPUT"
-          echo "protocol=$(scripts/extract-version.sh rust-binary-protocol)" >> "$GITHUB_OUTPUT"
-          echo "sdk=$(scripts/extract-version.sh rust-sdk)" >> "$GITHUB_OUTPUT"
-          echo "cli=$(scripts/extract-version.sh rust-cli)" >> "$GITHUB_OUTPUT"
+
+          # Cache cargo metadata once across ALL extract-version.sh and
+          # composite post-merge.yml invocations in this job. The 8
+          # extract-version calls in this step plus the 4 per-crate
+          # composite `Validate package` steps all hit the same workspace
+          # snapshot, and cargo metadata on this 36-crate workspace costs
+          # ~8s cold per fork. File-based rather than env-var inlined
+          # because the JSON is ~220 KB, exceeding Linux MAX_ARG_STRLEN
+          # (128 KB). Propagated via $GITHUB_ENV so it also reaches the
+          # downstream post-merge composite steps; a plain `export` would
+          # only affect THIS step's shell.
+          IGGY_CARGO_METADATA_FILE="${RUNNER_TEMP:-/tmp}/iggy-cargo-metadata.json"
+          cargo metadata --format-version 1 --no-deps > "${IGGY_CARGO_METADATA_FILE}"
+          echo "IGGY_CARGO_METADATA_FILE=${IGGY_CARGO_METADATA_FILE}" >> "${GITHUB_ENV}"
+          export IGGY_CARGO_METADATA_FILE  # also make it available to this step's extract-version calls
+
+          common=$(scripts/extract-version.sh rust-common)
+          protocol=$(scripts/extract-version.sh rust-binary-protocol)
+          sdk=$(scripts/extract-version.sh rust-sdk)
+          cli=$(scripts/extract-version.sh rust-cli)
+
+          {
+            echo "common=$common"
+            echo "protocol=$protocol"
+            echo "sdk=$sdk"
+            echo "cli=$cli"
+            echo "common_tag=$(scripts/extract-version.sh rust-common --tag)"
+            echo "protocol_tag=$(scripts/extract-version.sh rust-binary-protocol --tag)"
+            echo "sdk_tag=$(scripts/extract-version.sh rust-sdk --tag)"
+            echo "cli_tag=$(scripts/extract-version.sh rust-cli --tag)"
+          } >> "$GITHUB_OUTPUT"
 
           echo "📦 Versions to publish:"
-          echo "  iggy_common: $(scripts/extract-version.sh rust-common)"
-          echo "  iggy_binary_protocol: $(scripts/extract-version.sh rust-binary-protocol)"
-          echo "  iggy: $(scripts/extract-version.sh rust-sdk)"
-          echo "  iggy-cli: $(scripts/extract-version.sh rust-cli)"
+          echo "  iggy_common: $common"
+          echo "  iggy_binary_protocol: $protocol"
+          echo "  iggy: $sdk"
+          echo "  iggy-cli: $cli"
 
-      # Step 1: Publish iggy_common
-      - name: Publish iggy_common
-        if: contains(inputs.crates, 'rust-common')
-        uses: ./.github/actions/rust/post-merge
-        with:
-          package: iggy_common
-          version: ${{ steps.versions.outputs.common }}
-          dry_run: ${{ inputs.dry_run }}
+      # Dry-run path: route the entire chain through scripts/verify-crates-publish.sh,
+      # which spins up cargo-http-registry locally and publishes the four crates in
+      # topological order. `cargo package --no-verify` cannot be used here: it still
+      # resolves dependencies against crates.io (to lock the .crate's Cargo.lock),
+      # so the second crate in the chain (iggy_common -> iggy_binary_protocol) fails
+      # whenever the in-tree version isn't already on crates.io. The script bypasses
+      # that by pointing path deps at a real local registry for the duration of the
+      # publish, mirroring what the pre-merge `verify-publish` task does on PRs.
+      - name: Dry-run publish chain via local alt-registry
+        if: inputs.dry_run == true
+        env:
+          CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+          AUTO_INSTALL: "1"
+        run: ./scripts/verify-crates-publish.sh
 
-      - name: Wait for iggy_common to be available
-        if: contains(inputs.crates, 'rust-common') && inputs.dry_run == false
-        run: |
-          echo "⏳ Waiting for iggy_common to be available on crates.io..."
-          for i in {1..30}; do
-            if cargo search iggy_common --limit 1 | grep -q "^iggy_common = \"${{ steps.versions.outputs.common }}\""; then
-              echo "✅ iggy_common is now available"
-              break
-            fi
-            echo "Waiting... (attempt $i/30)"
-            sleep 10
-          done
+      # Per-crate ordering is publish -> wait-for-availability -> tag. The wait
+      # step gates on the crates.io sparse index actually serving the new
+      # version, so the git tag is only pushed after we have positive proof
+      # the upload landed. If the wait times out, the tag is never pushed and
+      # a rerun can safely re-enter the chain: the publish step is idempotent
+      # via a sparse-index pre-check inside actions/rust/post-merge.
+      #
+      # Two-layer wait (defense-in-depth budget cascading - NOT independent
+      # signals; both layers poll the same sparse index URL):
+      #
+      #   * Inner CAS verify inside actions/rust/post-merge on a tight
+      #     ~8 min worst-case budget (max_attempts=10, initial_sleep=2,
+      #     cap=30; sleeps 2+4+8+16+30*5=180s + 10 * 30s curl = ~480s).
+      #     Runs only when the idempotency pre-check fell through to the
+      #     publish path, and acts as an authoritative per-step state
+      #     check: "did my cargo publish land on the sparse index in time
+      #     to continue cleanly?"
+      #   * Outer wait-for-crate below on a larger ~28 min worst-case
+      #     budget (default max_attempts=30, initial_sleep=3, cap=30;
+      #     sleeps 3+6+12+24+30*25=795s + 30 * 30s curl = ~1725s). Runs
+      #     on every crate in the chain and acts as the operational
+      #     safety net before the NEXT downstream crate's `cargo publish`
+      #     resolves its path deps from crates.io. Separate budget so a
+      #     slow CDN does not starve the tight inner check.
+      #
+      # 4-crate chain aggregate worst case: ~144 min (4 * (8+28)). In
+      # practice the happy path short-circuits on the first 200 response
+      # and total wait per crate is single-digit seconds. Chain halts on
+      # the first failing wait, so the 144 min figure is a ceiling, not
+      # an expected duration. Operators should only intervene after ~60
+      # min of sustained CDN 404s on a single crate.
 
-      # Step 2: Publish iggy_binary_protocol (depends on common)
+      # Step 1: Publish iggy_binary_protocol (depends on nothing in-tree)
       - name: Publish iggy_binary_protocol
-        if: contains(inputs.crates, 'rust-binary-protocol')
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-binary-protocol')
         uses: ./.github/actions/rust/post-merge
         with:
           package: iggy_binary_protocol
           version: ${{ steps.versions.outputs.protocol }}
-          dry_run: ${{ inputs.dry_run }}
 
       - name: Wait for iggy_binary_protocol to be available
-        if: contains(inputs.crates, 'rust-binary-protocol') && inputs.dry_run == false
-        run: |
-          echo "⏳ Waiting for iggy_binary_protocol to be available on crates.io..."
-          for i in {1..30}; do
-            if cargo search iggy_binary_protocol --limit 1 | grep -q "^iggy_binary_protocol = \"${{ steps.versions.outputs.protocol }}\""; then
-              echo "✅ iggy_binary_protocol is now available"
-              break
-            fi
-            echo "Waiting... (attempt $i/30)"
-            sleep 10
-          done
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-binary-protocol')
+        uses: ./.github/actions/utils/wait-for-crate
+        with:
+          package: iggy_binary_protocol
+          version: ${{ steps.versions.outputs.protocol }}
+
+      - name: Tag iggy_binary_protocol
+        if: inputs.dry_run == false && inputs.skip_tag_creation == false && contains(inputs.crates, 'rust-binary-protocol')
+        uses: ./.github/actions/utils/create-git-tag
+        with:
+          tag: ${{ steps.versions.outputs.protocol_tag }}
+          commit: ${{ steps.resolve.outputs.commit }}
+          message: |
+            Release iggy_binary_protocol ${{ steps.versions.outputs.protocol }}
+
+            Component: rust-binary-protocol
+            Tag: ${{ steps.versions.outputs.protocol_tag }}
+            Commit: ${{ steps.resolve.outputs.commit }}
+            Released by: GitHub Actions (workflow ${{ github.run_id }})
+
+      # Step 2: Publish iggy_common (depends on iggy_binary_protocol)
+      - name: Publish iggy_common
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-common')
+        uses: ./.github/actions/rust/post-merge
+        with:
+          package: iggy_common
+          version: ${{ steps.versions.outputs.common }}
+
+      - name: Wait for iggy_common to be available
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-common')
+        uses: ./.github/actions/utils/wait-for-crate
+        with:
+          package: iggy_common
+          version: ${{ steps.versions.outputs.common }}
+
+      - name: Tag iggy_common
+        if: inputs.dry_run == false && inputs.skip_tag_creation == false && contains(inputs.crates, 'rust-common')
+        uses: ./.github/actions/utils/create-git-tag
+        with:
+          tag: ${{ steps.versions.outputs.common_tag }}
+          commit: ${{ steps.resolve.outputs.commit }}
+          message: |
+            Release iggy_common ${{ steps.versions.outputs.common }}
+
+            Component: rust-common
+            Tag: ${{ steps.versions.outputs.common_tag }}
+            Commit: ${{ steps.resolve.outputs.commit }}
+            Released by: GitHub Actions (workflow ${{ github.run_id }})
 
       # Step 3: Publish iggy SDK (depends on common and protocol)
       - name: Publish iggy SDK
-        if: contains(inputs.crates, 'rust-sdk')
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-sdk')
         uses: ./.github/actions/rust/post-merge
         with:
           package: iggy
           version: ${{ steps.versions.outputs.sdk }}
-          dry_run: ${{ inputs.dry_run }}
 
       - name: Wait for iggy SDK to be available
-        if: contains(inputs.crates, 'rust-sdk') && inputs.dry_run == false
-        run: |
-          echo "⏳ Waiting for iggy to be available on crates.io..."
-          for i in {1..30}; do
-            if cargo search iggy --limit 1 | grep -q "^iggy = \"${{ steps.versions.outputs.sdk }}\""; then
-              echo "✅ iggy SDK is now available"
-              break
-            fi
-            echo "Waiting... (attempt $i/30)"
-            sleep 10
-          done
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-sdk')
+        uses: ./.github/actions/utils/wait-for-crate
+        with:
+          package: iggy
+          version: ${{ steps.versions.outputs.sdk }}
+
+      - name: Tag iggy SDK
+        if: inputs.dry_run == false && inputs.skip_tag_creation == false && contains(inputs.crates, 'rust-sdk')
+        uses: ./.github/actions/utils/create-git-tag
+        with:
+          tag: ${{ steps.versions.outputs.sdk_tag }}
+          commit: ${{ steps.resolve.outputs.commit }}
+          message: |
+            Release iggy ${{ steps.versions.outputs.sdk }}
+
+            Component: rust-sdk
+            Tag: ${{ steps.versions.outputs.sdk_tag }}
+            Commit: ${{ steps.resolve.outputs.commit }}
+            Released by: GitHub Actions (workflow ${{ github.run_id }})
 
       # Step 4: Publish iggy-cli (depends on SDK and protocol)
       - name: Publish iggy-cli
-        if: contains(inputs.crates, 'rust-cli')
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-cli')
         uses: ./.github/actions/rust/post-merge
         with:
           package: iggy-cli
           version: ${{ steps.versions.outputs.cli }}
-          dry_run: ${{ inputs.dry_run }}
 
-      # Create git tags
-      - name: Create git tags
-        if: inputs.create_tags && inputs.dry_run == false
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Wait for iggy-cli to be available
+        if: inputs.dry_run == false && contains(inputs.crates, 'rust-cli')
+        uses: ./.github/actions/utils/wait-for-crate
+        with:
+          package: iggy-cli
+          version: ${{ steps.versions.outputs.cli }}
 
-          for crate in $(echo "${{ inputs.crates }}" | tr ',' ' '); do
-            TAG=$(scripts/extract-version.sh "$crate" --tag)
-            if ! git rev-parse "$TAG" >/dev/null 2>&1; then
-              git tag -a "$TAG" -m "Release $TAG"
-              git push origin "$TAG"
-              echo "✅ Created tag: $TAG"
-            else
-              echo "⏭️ Tag $TAG already exists"
-            fi
-          done
+      - name: Tag iggy-cli
+        if: inputs.dry_run == false && inputs.skip_tag_creation == false && contains(inputs.crates, 'rust-cli')
+        uses: ./.github/actions/utils/create-git-tag
+        with:
+          tag: ${{ steps.versions.outputs.cli_tag }}
+          commit: ${{ steps.resolve.outputs.commit }}
+          message: |
+            Release iggy-cli ${{ steps.versions.outputs.cli }}
+
+            Component: rust-cli
+            Tag: ${{ steps.versions.outputs.cli_tag }}
+            Commit: ${{ steps.resolve.outputs.commit }}
+            Released by: GitHub Actions (workflow ${{ github.run_id }})
 
       - name: Set final status output
         id: final-status

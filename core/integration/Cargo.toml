@@ -20,6 +20,7 @@ name = "integration"
 version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
+publish = false
 
 # Some tests are failing in CI due to lack of IPv6 interfaces
 # inside the docker containers. This is a temporary workaround (hopefully).

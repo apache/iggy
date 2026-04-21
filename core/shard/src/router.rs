@@ -24,6 +24,7 @@ use iggy_binary_protocol::{
 use iggy_common::sharding::IggyNamespace;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
+use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 
 /// Inter-shard dispatch logic.
@@ -32,7 +33,7 @@ use metadata::stm::StateMachine;
 /// through the channel into the target shard's message pump.  This ensures
 /// that every mutation on a shard is serialized through a single point (the
 /// pump), preventing concurrent access from independent async tasks.
-impl<B, MJ, S, M, PJ, T, R> IggyShard<B, MJ, S, M, PJ, T, R>
+impl<B, MJ, S, M, T, R> IggyShard<B, MJ, S, M, T, R>
 where
     B: MessageBus,
     T: ShardsTable,
@@ -209,17 +210,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            >,
+            > + StreamsFrontend,
     {
         loop {
             futures::select! {
@@ -249,17 +244,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            >,
+            > + StreamsFrontend,
     {
         self.on_message(frame.message).await;
         // TODO: once on_message returns an R (e.g. ShardResponse), send it

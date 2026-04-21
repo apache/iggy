@@ -16,6 +16,7 @@
 // under the License.
 
 use bytes::Bytes;
+use iggy_binary_protocol::consensus::iobuf::Owned;
 use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
 use iggy_binary_protocol::{
     Message, Operation, RequestHeader, WireEncode, WireIdentifier, WireName,
@@ -24,13 +25,13 @@ use iggy_common::send_messages2::{
     IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned,
 };
 use iggy_common::sharding::IggyNamespace;
-use iobuf::Owned;
 use std::cell::Cell;
 
 // TODO: Proper client which implements the full client SDK API
 pub struct SimClient {
     client_id: u128,
     request_counter: Cell<u64>,
+    session: Cell<u64>,
 }
 
 impl SimClient {
@@ -39,13 +40,64 @@ impl SimClient {
         Self {
             client_id,
             request_counter: Cell::new(0),
+            session: Cell::new(0),
         }
     }
 
+    #[must_use]
+    pub const fn client_id(&self) -> u128 {
+        self.client_id
+    }
+
+    /// Bind the session assigned by the consensus layer after registration.
+    ///
+    /// # Panics
+    /// Panics if `session` is 0.
+    pub fn bind_session(&self, session: u64) {
+        assert!(session > 0, "bind_session: session must be > 0");
+        self.session.set(session);
+    }
+
     fn next_request_number(&self) -> u64 {
-        let current = self.request_counter.get();
-        self.request_counter.set(current + 1);
-        current
+        let next = self.request_counter.get() + 1;
+        self.request_counter.set(next);
+        next
+    }
+
+    fn session_id(&self) -> u64 {
+        let s = self.session.get();
+        assert!(
+            s > 0,
+            "session not bound — call register() + bind_session() first"
+        );
+        s
+    }
+
+    /// Build a `Register` request for this client.
+    ///
+    /// Register uses `session=0, request=0` per the protocol spec.
+    /// The consensus layer assigns a session on commit.
+    ///
+    /// # Panics
+    /// Panics if the register request buffer is invalid.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn register(&self) -> Message<RequestHeader> {
+        let header_size = std::mem::size_of::<RequestHeader>();
+        let header = RequestHeader {
+            command: iggy_binary_protocol::Command2::Request,
+            operation: Operation::Register,
+            size: header_size as u32,
+            client: self.client_id,
+            session: 0,
+            request: 0,
+            ..Default::default()
+        };
+
+        let header_bytes = bytemuck::bytes_of(&header);
+        let buffer = header_bytes.to_vec();
+
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
+            .expect("register request must be valid")
     }
 
     /// # Panics
@@ -116,6 +168,19 @@ impl SimClient {
         self.build_request_with_namespace(Operation::StoreConsumerOffset, &payload, namespace)
     }
 
+    pub fn delete_consumer_offset(
+        &self,
+        namespace: IggyNamespace,
+        consumer_kind: u8,
+        consumer_id: u32,
+    ) -> Message<RequestHeader> {
+        let mut payload = Vec::with_capacity(5);
+        payload.push(consumer_kind);
+        payload.extend_from_slice(&consumer_id.to_le_bytes());
+
+        self.build_request_with_namespace(Operation::DeleteConsumerOffset, &payload, namespace)
+    }
+
     #[allow(clippy::cast_possible_truncation)]
     fn build_request_with_namespace(
         &self,
@@ -156,6 +221,7 @@ impl SimClient {
             client: self.client_id,
             request_checksum: 0,
             timestamp: 0, // TODO: Use actual timestamp
+            session: self.session_id(),
             request: self.next_request_number(),
             ..Default::default()
         };
@@ -190,6 +256,7 @@ impl SimClient {
             client: self.client_id,
             request_checksum: 0,
             timestamp: 0,
+            session: self.session_id(),
             request: self.next_request_number(),
             namespace: namespace.inner(),
             ..Default::default()
