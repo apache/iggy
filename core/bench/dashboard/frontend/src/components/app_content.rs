@@ -263,9 +263,9 @@ pub fn app_content() -> Html {
             <TopAppBar show_sidebar_toggle={show_detail} show_detail_actions={show_detail} />
             if show_detail {
                 <Sidebar />
-                <MainContent selected_gitref={gitref_ctx.state.selected_gitref.clone().unwrap_or_default()} />
+                <MainContent />
             } else {
-                <Hero selected_gitref={gitref_ctx.state.selected_gitref.clone().unwrap_or_default()} />
+                <Hero />
             }
         </div>
     }

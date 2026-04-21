@@ -29,15 +29,11 @@ use std::collections::BTreeMap;
 use yew::prelude::*;
 use yew_router::prelude::use_navigator;
 
-#[derive(Properties, PartialEq)]
-pub struct MainContentProps {
-    #[prop_or_default]
-    pub selected_gitref: String,
-}
+#[derive(Properties, PartialEq, Default)]
+pub struct MainContentProps;
 
 #[function_component(MainContent)]
-pub fn main_content(props: &MainContentProps) -> Html {
-    let _ = &props.selected_gitref;
+pub fn main_content(_props: &MainContentProps) -> Html {
     let benchmark_ctx = use_benchmark();
     let ui = use_ui();
     let selected = benchmark_ctx.state.selected_benchmark.clone();
@@ -236,12 +232,18 @@ fn render_loading() -> Html {
     }
 }
 
+/// Map a benchmark gitref to the matching apache/iggy URL.
+/// Tagged releases (`X.Y.Z`, `X.Y.Z-edge.N`) are prefixed `server-` to
+/// match the repo's tag scheme. Plain commit hashes link directly.
+fn iggy_gitref_url(gitref: &str) -> String {
+    if crate::version::parse_semver_recency(gitref).is_some() {
+        format!("https://github.com/apache/iggy/tree/server-{gitref}")
+    } else {
+        format!("https://github.com/apache/iggy/tree/{gitref}")
+    }
+}
+
 fn render_benchmark_identifier(benchmark: &BenchmarkReportLight) -> Html {
-    let hardware = benchmark
-        .hardware
-        .identifier
-        .as_deref()
-        .unwrap_or("identifier");
     let cpu = benchmark.hardware.cpu_name.as_str();
     let gitref = benchmark
         .params
@@ -251,12 +253,12 @@ fn render_benchmark_identifier(benchmark: &BenchmarkReportLight) -> Html {
 
     html! {
         <>
-            <span>{format!("{hardware} @ {cpu}")}</span>
+            <span>{cpu.to_string()}</span>
             if let Some(gitref) = gitref {
                 <span class="chart-title-sep">{"·"}</span>
                 <a
                     class="chart-title-gitref"
-                    href={format!("https://github.com/apache/iggy/tree/{gitref}")}
+                    href={iggy_gitref_url(gitref)}
                     target="_blank"
                     rel="noopener noreferrer"
                     title={format!("Browse apache/iggy at {gitref}")}

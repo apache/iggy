@@ -19,7 +19,7 @@ use crate::api;
 use crate::components::chart::tail_chart::TailChart;
 use crate::format::format_ms;
 use crate::router::AppRoute;
-use crate::state::benchmark::{latest_sweep, pick_best_from_recent_batch, use_benchmark};
+use crate::state::benchmark::{latest_sweep, pick_best_from_recent_batch};
 use bench_dashboard_shared::BenchmarkReportLight;
 use chrono::DateTime;
 use gloo::console::log;
@@ -30,14 +30,11 @@ use yew::platform::spawn_local;
 use yew::prelude::*;
 use yew_router::prelude::{Navigator, use_navigator};
 
-#[derive(Properties, PartialEq)]
-pub struct HeroProps {
-    pub selected_gitref: String,
-}
+#[derive(Properties, PartialEq, Default)]
+pub struct HeroProps;
 
 #[function_component(Hero)]
-pub fn hero(props: &HeroProps) -> Html {
-    let benchmark_ctx = use_benchmark();
+pub fn hero(_props: &HeroProps) -> Html {
     let navigator = use_navigator();
     let (is_dark, _) = use_context::<(bool, Callback<()>)>().expect("Theme context not found");
     let recent = use_state(Vec::<BenchmarkReportLight>::new);
@@ -97,17 +94,11 @@ pub fn hero(props: &HeroProps) -> Html {
         return render_hero_loading(is_dark, true);
     }
 
-    let hardware = benchmark_ctx
-        .state
-        .current_hardware
-        .clone()
-        .unwrap_or_default();
-    let sweep_gitref = stats
+    let display = stats
         .showcase
         .as_ref()
-        .and_then(|showcase| showcase.params.gitref.clone())
-        .filter(|gitref| !gitref.is_empty())
-        .or_else(|| Some(props.selected_gitref.clone()).filter(|gitref| !gitref.is_empty()));
+        .map(showcase_display)
+        .unwrap_or_default();
 
     let on_view_details = stats.showcase.as_ref().map(|showcase| {
         let uuid = showcase.uuid.to_string();
@@ -135,7 +126,7 @@ pub fn hero(props: &HeroProps) -> Html {
         <div class="hero-v2">
             { render_background_grid() }
             <div class="hero-v2-inner">
-                { render_headline(&stats, &hardware, sweep_gitref.as_deref(), &on_browse_click) }
+                { render_headline(&display, &on_browse_click) }
                 { render_stat_cards(&stats) }
                 {
                     match (stats.showcase.as_ref(), on_view_details) {
@@ -256,29 +247,16 @@ fn render_background_grid() -> Html {
     }
 }
 
-fn render_headline(
-    stats: &HeroStats,
-    hardware: &str,
-    gitref: Option<&str>,
-    on_browse_click: &Callback<MouseEvent>,
-) -> Html {
-    let (value, unit, subject) = match &stats.peak_mb_s {
-        Some((throughput, name)) => {
-            let (formatted, unit) = format_throughput_bytes(*throughput);
-            (formatted, unit, name.clone())
-        }
-        None => ("-".to_string(), "MB/s", String::new()),
-    };
-
+fn render_headline(display: &ShowcaseDisplay, on_browse_click: &Callback<MouseEvent>) -> Html {
     html! {
         <div class="hero-v2-headline">
             <div class="hero-v2-eyebrow">{"Peak sustained throughput"}</div>
             <h1 class="hero-v2-title">
-                <span class="hero-v2-big">{value}</span>
-                <span class="hero-v2-unit">{unit}</span>
+                <span class="hero-v2-big">{display.formatted_value.clone()}</span>
+                <span class="hero-v2-unit">{display.unit}</span>
             </h1>
             <p class="hero-v2-sub">
-                { render_hero_sub(&subject, hardware, gitref) }
+                { render_hero_sub(&display.pretty_name, &display.cpu_name, display.gitref.as_deref()) }
             </p>
             <p class="hero-v2-tagline">
                 {"Modern hardware is incredibly capable. "}
@@ -343,7 +321,11 @@ fn render_hero_sub(subject: &str, hardware: &str, gitref: Option<&str>) -> Html 
 }
 
 fn iggy_gitref_url(gitref: &str) -> String {
-    format!("https://github.com/apache/iggy/tree/{gitref}")
+    if crate::version::parse_semver_recency(gitref).is_some() {
+        format!("https://github.com/apache/iggy/tree/server-{gitref}")
+    } else {
+        format!("https://github.com/apache/iggy/tree/{gitref}")
+    }
 }
 
 fn render_stat_cards(stats: &HeroStats) -> Html {
@@ -513,5 +495,142 @@ fn render_hero_loading(is_dark: bool, is_slow: bool) -> Html {
                 <span class="visually-hidden">{"Loading benchmarks"}</span>
             </div>
         </div>
+    }
+}
+
+/// Every headline field comes from the SAME benchmark that powers the
+/// tail chart and "View details" link. Built through this single helper
+/// so the big number, subject name, CPU, and gitref can never drift to
+/// different benchmarks.
+#[derive(Default, Debug, PartialEq)]
+pub struct ShowcaseDisplay {
+    pub formatted_value: String,
+    pub unit: &'static str,
+    pub pretty_name: String,
+    pub cpu_name: String,
+    pub gitref: Option<String>,
+}
+
+pub fn showcase_display(showcase: &BenchmarkReportLight) -> ShowcaseDisplay {
+    let throughput = showcase
+        .group_metrics
+        .first()
+        .map(|metrics| metrics.summary.total_throughput_megabytes_per_second);
+    let (formatted_value, unit) = match throughput {
+        Some(value) => {
+            let (formatted, unit) = format_throughput_bytes(value);
+            (formatted, unit)
+        }
+        None => ("-".to_string(), "MB/s"),
+    };
+    let cpu_name = showcase.hardware.cpu_name.clone();
+    let gitref = showcase
+        .params
+        .gitref
+        .clone()
+        .filter(|gitref| !gitref.is_empty());
+    ShowcaseDisplay {
+        formatted_value,
+        unit,
+        pretty_name: showcase.params.pretty_name.clone(),
+        cpu_name,
+        gitref,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bench_dashboard_shared::BenchmarkGroupMetricsLight;
+    use bench_report::group_metrics_kind::GroupMetricsKind;
+    use bench_report::group_metrics_summary::BenchmarkGroupMetricsSummary;
+
+    #[test]
+    fn given_showcase_benchmark_when_building_display_should_copy_fields_verbatim() {
+        let showcase = showcase_fixture(
+            "pinned-producer 64P-1000B",
+            "AMD Ryzen 9 7950X3D",
+            Some("0.7.0-edge.3"),
+            1_200.0,
+        );
+
+        let display = showcase_display(&showcase);
+
+        assert_eq!(display.pretty_name, "pinned-producer 64P-1000B");
+        assert_eq!(display.cpu_name, "AMD Ryzen 9 7950X3D");
+        assert_eq!(display.gitref.as_deref(), Some("0.7.0-edge.3"));
+        assert_eq!(display.formatted_value, "1.20");
+        assert_eq!(display.unit, "GB/s");
+    }
+
+    #[test]
+    fn given_showcase_benchmark_when_rendering_should_never_mix_fields_from_other_benchmarks() {
+        let peak_throughput =
+            showcase_fixture("peak-throughput-run", "Decoy CPU", Some("0.6.0"), 9_999.0);
+        let lowest_p99 =
+            showcase_fixture("lowest-p99-run", "Real CPU", Some("0.7.0-edge.1"), 800.0);
+
+        // Hero always reads from THE SHOWCASE (lowest_p99), never from a
+        // sibling like peak_throughput. Changing peak_throughput must not
+        // affect the output of showcase_display(&lowest_p99).
+        let _ignored = showcase_display(&peak_throughput);
+        let display = showcase_display(&lowest_p99);
+
+        assert_eq!(display.pretty_name, "lowest-p99-run");
+        assert_eq!(display.cpu_name, "Real CPU");
+        assert_eq!(display.gitref.as_deref(), Some("0.7.0-edge.1"));
+        assert_ne!(display.pretty_name, "peak-throughput-run");
+        assert_ne!(display.cpu_name, "Decoy CPU");
+        assert_ne!(display.gitref.as_deref(), Some("0.6.0"));
+    }
+
+    #[test]
+    fn given_showcase_without_gitref_when_building_display_should_drop_gitref() {
+        let showcase = showcase_fixture("no-tag-run", "CPU", None, 100.0);
+        let display = showcase_display(&showcase);
+        assert_eq!(display.gitref, None);
+    }
+
+    #[test]
+    fn given_showcase_without_metrics_when_building_display_should_return_dash_placeholder() {
+        let mut showcase = showcase_fixture("empty", "CPU", Some("0.7.0"), 0.0);
+        showcase.group_metrics.clear();
+        let display = showcase_display(&showcase);
+        assert_eq!(display.formatted_value, "-");
+        assert_eq!(display.unit, "MB/s");
+    }
+
+    fn showcase_fixture(
+        pretty_name: &str,
+        cpu_name: &str,
+        gitref: Option<&str>,
+        throughput_mb_s: f64,
+    ) -> BenchmarkReportLight {
+        let mut report = BenchmarkReportLight::default();
+        report.params.pretty_name = pretty_name.to_string();
+        report.params.gitref = gitref.map(str::to_string);
+        report.hardware.cpu_name = cpu_name.to_string();
+        report.group_metrics.push(BenchmarkGroupMetricsLight {
+            summary: BenchmarkGroupMetricsSummary {
+                kind: GroupMetricsKind::Producers,
+                total_throughput_megabytes_per_second: throughput_mb_s,
+                total_throughput_messages_per_second: 0.0,
+                average_throughput_megabytes_per_second: 0.0,
+                average_throughput_messages_per_second: 0.0,
+                average_p50_latency_ms: 0.0,
+                average_p90_latency_ms: 0.0,
+                average_p95_latency_ms: 0.0,
+                average_p99_latency_ms: 0.0,
+                average_p999_latency_ms: 0.0,
+                average_p9999_latency_ms: 0.0,
+                average_latency_ms: 0.0,
+                average_median_latency_ms: 0.0,
+                min_latency_ms: 0.0,
+                max_latency_ms: 0.0,
+                std_dev_latency_ms: 0.0,
+            },
+            latency_distribution: None,
+        });
+        report
     }
 }
