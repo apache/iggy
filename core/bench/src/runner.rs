@@ -41,6 +41,7 @@ impl BenchmarkRunner {
     #[allow(clippy::cognitive_complexity)]
     pub async fn run(mut self) -> Result<(), IggyError> {
         let args = self.args.take().unwrap();
+        let pretty = args.pretty;
         let should_open_charts = args.open_charts();
 
         let transport = args.transport();
@@ -87,7 +88,7 @@ impl BenchmarkRunner {
         // Sleep just to see result prints after all tasks are joined (they print per-actor results)
         sleep(Duration::from_millis(10)).await;
 
-        report.print_summary();
+        report.print_summary(pretty);
 
         if let Some(output_dir) = benchmark.args().output_dir() {
             // Generate the full output path using the directory name generator

@@ -20,10 +20,10 @@ use crate::{
     Consensus, IgnoreReason, Pipeline, PipelineEntry, PlaneKind, PrepareOkOutcome, Sequencer,
     Status, VsrConsensus,
 };
+use iggy_binary_protocol::consensus::iobuf::Owned;
 use iggy_binary_protocol::{
     Command2, GenericHeader, Message, PrepareHeader, PrepareOkHeader, ReplyHeader,
 };
-use iobuf::Owned;
 use message_bus::MessageBus;
 use std::ops::AsyncFnOnce;
 
@@ -33,11 +33,13 @@ use std::ops::AsyncFnOnce;
 ///
 /// Returns `Some(Notify)` if the request is new and should proceed through
 /// consensus. Returns `None` if the request was already handled (duplicate
-/// reply sent, in-progress, or stale), the caller should return early.
+/// reply sent, in-progress, stale, or session error), the caller should
+/// return early.
 #[allow(clippy::future_not_send)]
 pub async fn request_preflight<B, P>(
     consensus: &VsrConsensus<B, P>,
     client_id: u128,
+    session: u64,
     request: u64,
 ) -> Option<Notify>
 where
@@ -47,7 +49,7 @@ where
     let status = consensus
         .client_table()
         .borrow()
-        .check_request(client_id, request);
+        .check_request(client_id, session, request);
     match status {
         RequestStatus::Duplicate(cached_reply) => {
             // Best-effort resend, client may have disconnected.
@@ -57,13 +59,60 @@ where
                 .await;
             None
         }
-        RequestStatus::InProgress | RequestStatus::Stale => None,
+        RequestStatus::InProgress
+        | RequestStatus::Stale
+        | RequestStatus::NoSession
+        | RequestStatus::SessionMismatch { .. }
+        | RequestStatus::RequestGap { .. }
+        | RequestStatus::AlreadyRegistered { .. } => None,
         RequestStatus::New => {
             let notify = consensus
                 .client_table()
                 .borrow_mut()
                 .register_pending(client_id, request);
             Some(notify)
+        }
+    }
+}
+
+/// Shared register preflight: duplicate detection for `Operation::Register`.
+///
+/// Returns `Some(Notify)` if the register is new and should proceed through
+/// consensus. Returns `None` if the client is already registered (session
+/// number sent back) or the register is already in progress.
+#[allow(clippy::future_not_send, clippy::unused_async)]
+pub async fn register_preflight<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    client_id: u128,
+) -> Option<Notify>
+where
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let status = consensus.client_table().borrow().check_register(client_id);
+    match status {
+        RequestStatus::AlreadyRegistered { session } => {
+            // Synthesize a register reply with the existing session.
+            // The caller can extract session from reply.header().commit.
+            tracing::debug!(
+                client_id,
+                session,
+                "register_preflight: client already registered, ignoring"
+            );
+            None
+        }
+        RequestStatus::InProgress => None,
+        RequestStatus::New => {
+            let notify = consensus
+                .client_table()
+                .borrow_mut()
+                .register_pending(client_id, 0);
+            Some(notify)
+        }
+        // check_register only returns AlreadyRegistered, InProgress, or New.
+        other => {
+            tracing::warn!(client_id, ?other, "register_preflight: unexpected status");
+            None
         }
     }
 }

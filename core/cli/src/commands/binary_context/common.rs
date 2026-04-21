@@ -149,7 +149,6 @@ impl ContextManager {
         let mut new_contexts = cs.contexts.clone();
         new_contexts.insert(name.to_string(), config);
 
-        self.context_rw.ensure_iggy_home_exists().await?;
         self.context_rw
             .write_contexts(new_contexts.clone())
             .await
@@ -289,6 +288,7 @@ impl ContextReaderWriter {
                 contexts_path.display()
             ))?;
 
+            self.ensure_iggy_home_exists().await?;
             tokio::fs::write(&contexts_path, contents).await?;
             Self::set_owner_only_permissions(&contexts_path).await?;
         }
@@ -320,6 +320,7 @@ impl ContextReaderWriter {
     }
 
     pub async fn write_active_context(&self, context_name: &str) -> Result<()> {
+        self.ensure_iggy_home_exists().await?;
         let maybe_active_context_path = self.active_context_path();
 
         if let Some(active_context_path) = maybe_active_context_path {

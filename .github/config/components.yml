@@ -24,6 +24,26 @@ components:
       - "rust-toolchain.toml"
       - ".cargo/**"
 
+  # crates.io publish chain verification. Runs scripts/verify-crates-publish.sh,
+  # which spins up cargo-http-registry as a local alt-registry and chain-publishes
+  # the four crates we ship to crates.io. Catches the class of bug that broke
+  # Apache Iggy 0.8.0 rc1 (path-only workspace dep without `version =`).
+  rust-publish:
+    depends_on:
+      - "rust-workspace" # rust-toolchain.toml / .cargo/** affect cargo publish
+      - "ci-infrastructure" # action.yml/workflow edits should re-run the check
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "core/binary_protocol/Cargo.toml"
+      - "core/common/Cargo.toml"
+      - "core/sdk/Cargo.toml"
+      - "core/cli/Cargo.toml"
+      - "scripts/verify-crates-publish.sh"
+      - ".github/actions/rust/pre-merge/action.yml"
+    tasks:
+      - "verify-publish"
+
   # CI/CD infrastructure changes that require full regression
   ci-infrastructure:
     paths:
@@ -67,10 +87,12 @@ components:
       - "rust-cluster"
     paths:
       - "core/server/**"
+      - "core/server-ng/**"
 
   rust-cluster:
     depends_on:
       - "rust-workspace"
+      - "rust-binary-protocol" # cluster crates depend on binary_protocol
     paths:
       - "core/clock/**"
       - "core/consensus/**"
@@ -79,6 +101,14 @@ components:
       - "core/metadata/**"
       - "core/message_bus/**"
       - "core/partitions/**"
+
+  # Standalone simulation tool, does NOT affect server binary or foreign SDKs.
+  # Split from rust-cluster to avoid triggering SDK tests on simulator-only changes.
+  rust-simulator:
+    depends_on:
+      - "rust-workspace"
+      - "rust-cluster"
+    paths:
       - "core/simulator/**"
 
   # Main Rust workspace testing
@@ -91,6 +121,7 @@ components:
       - "rust-binary-protocol"
       - "rust-server"
       - "rust-cluster"
+      - "rust-simulator"
       - "rust-tools"
       - "rust-cli"
       - "rust-bench"

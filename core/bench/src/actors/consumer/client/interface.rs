@@ -30,6 +30,7 @@ pub struct BenchmarkConsumerConfig {
     pub warmup_time: IggyDuration,
     pub polling_kind: PollingKind,
     pub origin_timestamp_latency_calculation: bool,
+    pub pretty: bool,
 }
 
 pub trait ConsumerClient: Send + Sync {

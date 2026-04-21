@@ -19,6 +19,7 @@
 
 pub mod consumer;
 pub mod identifier;
+pub mod partition_assignment;
 pub mod partitioning;
 pub mod permissions;
 pub mod polling_strategy;
