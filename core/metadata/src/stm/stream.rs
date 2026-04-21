@@ -271,6 +271,14 @@ impl StreamsInner {
 
 impl Streams {
     #[must_use]
+    pub fn read<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&StreamsInner) -> R,
+    {
+        self.inner.read(f)
+    }
+
+    #[must_use]
     pub fn partition_count_context(
         &self,
         stream_id: &WireIdentifier,
