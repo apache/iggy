@@ -39,6 +39,11 @@ where
     pub const fn new(inner: T) -> Self {
         Self { inner }
     }
+
+    #[must_use]
+    pub const fn inner(&self) -> &T {
+        &self.inner
+    }
 }
 
 impl<T> StateMachine for MuxStateMachine<T>

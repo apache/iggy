@@ -55,6 +55,63 @@
     </head>
 
     <body>
-        <div id="app"></div>
+        <div id="app">
+            <div class="boot-splash" role="status" aria-live="polite">
+                <div class="boot-splash-body">
+                    <img class="boot-splash-mark" src="/assets/iggy-dark.svg" alt="Apache Iggy" />
+                    <div class="boot-splash-sub">Benchmarks</div>
+                </div>
+            </div>
+        </div>
+        <style>
+            .boot-splash {
+                position: fixed;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: #f5f5f5;
+                color: #0b1220;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                z-index: 9999;
+            }
+            .boot-splash-body {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 14px;
+                padding: 0 24px;
+            }
+            @media (prefers-color-scheme: dark) {
+                .boot-splash { background: #0b1220; color: #f5f5f5; }
+                .boot-splash-mark { content: url("/assets/iggy-light.svg"); }
+            }
+            .boot-splash-mark {
+                width: auto;
+                height: 128px;
+                max-width: 440px;
+                object-fit: contain;
+                filter: drop-shadow(0 0 24px rgba(255, 145, 3, 0.35));
+                animation: boot-splash-pulse 1800ms ease-in-out infinite;
+            }
+            .boot-splash-brand {
+                margin-top: 4px;
+                font-size: 11px;
+                font-weight: 600;
+                letter-spacing: 0.22em;
+                text-transform: uppercase;
+                color: #ff9103;
+            }
+            .boot-splash-sub {
+                font-size: clamp(28px, 4vw, 44px);
+                font-weight: 800;
+                letter-spacing: -0.02em;
+                line-height: 1;
+            }
+            @keyframes boot-splash-pulse {
+                0%, 100% { opacity: 0.4; transform: scale(0.96); }
+                50% { opacity: 1; transform: scale(1); }
+            }
+        </style>
     </body>
 </html>

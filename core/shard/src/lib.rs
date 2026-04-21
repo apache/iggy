@@ -31,6 +31,7 @@ use iggy_common::{PartitionStats, sharding::IggyNamespace};
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use metadata::IggyMetadata;
+use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 use partitions::{IggyPartition, IggyPartitions};
 use shards_table::ShardsTable;
@@ -240,7 +241,7 @@ where
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            >,
+            > + StreamsFrontend,
     {
         match MessageBag::try_from(message) {
             Ok(MessageBag::Request(request)) => self.on_request(request).await,
@@ -270,7 +271,7 @@ where
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            >,
+            > + StreamsFrontend,
     {
         self.plane.on_request(request).await;
     }
@@ -289,7 +290,7 @@ where
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            >,
+            > + StreamsFrontend,
     {
         self.plane.on_replicate(prepare).await;
     }
@@ -308,7 +309,7 @@ where
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            >,
+            > + StreamsFrontend,
     {
         self.plane.on_ack(prepare_ok).await;
     }
@@ -338,7 +339,7 @@ where
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            >,
+            > + StreamsFrontend,
     {
         debug_assert!(buf.is_empty(), "buf must be empty on entry");
 
@@ -477,7 +478,8 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StateMachine<
+        M: StreamsFrontend
+            + StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
@@ -589,7 +591,8 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        M: StateMachine<
+        M: StreamsFrontend
+            + StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,

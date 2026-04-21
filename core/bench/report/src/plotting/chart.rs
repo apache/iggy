@@ -77,13 +77,7 @@ impl IggyChart {
                     .item_height(14)
                     .type_(LegendType::Scroll),
             )
-            .grid(
-                Grid::new()
-                    .left("5%")
-                    .right("20%")
-                    .top(grid_top)
-                    .bottom("8%"),
-            )
+            .grid(Grid::new().left(70).right("20%").top(grid_top).bottom("8%"))
             .data_zoom(
                 DataZoom::new()
                     .show(true)
@@ -145,9 +139,10 @@ impl IggyChart {
             Axis::new()
                 .type_(AxisType::Value)
                 .name(axis_label)
-                .name_location(NameLocation::End)
+                .name_location(NameLocation::Middle)
+                .name_rotation(90)
                 .name_text_style(TextStyle::new().font_size(AXIS_TEXT_SIZE))
-                .name_gap(15)
+                .name_gap(44)
                 .position("left")
                 .axis_label(AxisLabel::new())
                 .split_line(SplitLine::new().show(true)),
@@ -162,8 +157,9 @@ impl IggyChart {
             Axis::new()
                 .type_(AxisType::Value)
                 .name(y1_label)
-                .name_location(NameLocation::End)
-                .name_gap(15)
+                .name_location(NameLocation::Middle)
+                .name_rotation(90)
+                .name_gap(44)
                 .name_text_style(TextStyle::new().font_size(AXIS_TEXT_SIZE))
                 .position("left")
                 .axis_label(AxisLabel::new())
@@ -174,9 +170,10 @@ impl IggyChart {
             Axis::new()
                 .type_(AxisType::Value)
                 .name(y2_label)
-                .name_location(NameLocation::End)
+                .name_location(NameLocation::Middle)
+                .name_rotation(-90)
                 .name_text_style(TextStyle::new().font_size(AXIS_TEXT_SIZE))
-                .name_gap(15)
+                .name_gap(54)
                 .position("right")
                 .axis_label(AxisLabel::new())
                 .split_line(SplitLine::new().show(true)),
