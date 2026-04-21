@@ -17,6 +17,7 @@
 
 use crate::api::fetch_benchmark_report_full;
 use crate::components::chart::{PlotConfig, dispose_chart};
+use crate::components::loader::{IggyLoader, LoaderSize};
 use crate::components::selectors::measurement_type_selector::MeasurementType;
 use crate::hooks::use_size;
 use bench_report::report::BenchmarkReport;
@@ -26,7 +27,6 @@ use bench_report::{
 use charming::theme::Theme;
 use charming::{Echarts, WasmRenderer};
 use gloo::console::log;
-use gloo::history::{BrowserHistory, History};
 use uuid::Uuid;
 use yew::platform::spawn_local;
 use yew::prelude::*;
@@ -56,17 +56,6 @@ pub fn single_chart(props: &SingleChartProps) -> Html {
         use_effect_with(benchmark_uuid, move |benchmark_uuid| {
             let benchmark_uuid = *benchmark_uuid;
             is_loading.set(true);
-
-            let current_location = web_sys::window()
-                .and_then(|w| w.location().pathname().ok())
-                .unwrap_or_default();
-
-            let expected_path = format!("/benchmarks/{benchmark_uuid}");
-
-            if current_location != expected_path {
-                let history = BrowserHistory::new();
-                history.push(expected_path);
-            }
 
             spawn_local(async move {
                 match fetch_benchmark_report_full(&benchmark_uuid).await {
@@ -152,7 +141,7 @@ pub fn single_chart(props: &SingleChartProps) -> Html {
                 <div id={canvas_id} style="width: 100%; height: 100%;"></div>
             </div>
             <div class={classes!("loading-overlay", loading_class)}>
-                <div class="loading-spinner"></div>
+                <IggyLoader size={LoaderSize::Medium} />
             </div>
         </div>
     }

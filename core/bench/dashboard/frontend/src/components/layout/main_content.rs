@@ -19,6 +19,7 @@ use crate::components::chart::single_chart::SingleChart;
 use crate::components::chart::tail_chart::TailChart;
 use crate::components::layout::benchmark_meta::BenchmarkMeta;
 use crate::components::layout::sweep_view::SweepView;
+use crate::components::loader::{IggyLoader, LoaderSize};
 use crate::components::selectors::measurement_type_selector::MeasurementType;
 use crate::router::AppRoute;
 use crate::state::benchmark::use_benchmark;
@@ -224,17 +225,15 @@ fn render_loading() -> Html {
     html! {
         <div class="content-wrapper">
             <div class="empty-state">
-                <div class="empty-state-content">
-                    <h2>{"Loading benchmark..."}</h2>
-                </div>
+                <IggyLoader
+                    size={LoaderSize::Large}
+                    label={AttrValue::from("Loading the benchmark...")}
+                />
             </div>
         </div>
     }
 }
 
-/// Map a benchmark gitref to the matching apache/iggy URL.
-/// Tagged releases (`X.Y.Z`, `X.Y.Z-edge.N`) are prefixed `server-` to
-/// match the repo's tag scheme. Plain commit hashes link directly.
 fn iggy_gitref_url(gitref: &str) -> String {
     if crate::version::parse_semver_recency(gitref).is_some() {
         format!("https://github.com/apache/iggy/tree/server-{gitref}")

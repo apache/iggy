@@ -44,6 +44,12 @@ pub fn footer() -> Html {
                     <a href="https://www.apache.org/" target="_blank" rel="noopener noreferrer">
                         {"Apache Software Foundation"}
                     </a>
+                    <span class="footer-sep">{"•"}</span>
+                    <span class="footer-tagline">
+                        {"Built with "}
+                        <span class="footer-heart" aria-label="love">{"❤"}</span>
+                        {" for the message streaming community"}
+                    </span>
                 </div>
             </div>
         </footer>

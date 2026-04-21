@@ -172,9 +172,9 @@ pub fn top_app_bar(props: &TopAppBarProps) -> Html {
         "Switch to dark theme"
     };
     let logo_src = if is_dark {
-        "/assets/iggy-light.png"
+        "/assets/iggy-light.svg"
     } else {
-        "/assets/iggy-dark.png"
+        "/assets/iggy-dark.svg"
     };
 
     html! {
@@ -241,14 +241,14 @@ pub fn top_app_bar(props: &TopAppBarProps) -> Html {
                     </div>
                     <button
                         type="button"
-                        class="app-bar-icon-btn"
+                        class="app-bar-icon-btn mobile-hide"
                         onclick={on_download_artifacts}
                         title="Download test artifacts"
                         aria-label="Download test artifacts"
                     >
                         { render_download_icon() }
                     </button>
-                    <div class="app-bar-icon-wrap">
+                    <div class="app-bar-icon-wrap mobile-hide">
                         <button
                             type="button"
                             class={classes!("app-bar-icon-btn", ui.is_embed_modal_visible.then_some("active"))}
@@ -268,7 +268,7 @@ pub fn top_app_bar(props: &TopAppBarProps) -> Html {
                             />
                         }
                     </div>
-                    <div class="app-bar-icon-wrap">
+                    <div class="app-bar-icon-wrap mobile-hide">
                         <ServerStatsToggle
                             is_visible={ui.is_server_stats_tooltip_visible}
                             on_toggle={on_server_stats_toggle}
@@ -282,7 +282,7 @@ pub fn top_app_bar(props: &TopAppBarProps) -> Html {
                             />
                         }
                     </div>
-                    <div class="app-bar-icon-wrap">
+                    <div class="app-bar-icon-wrap mobile-hide">
                         <BenchmarkInfoToggle
                             is_visible={ui.is_benchmark_tooltip_visible}
                             on_toggle={on_benchmark_tooltip_toggle}

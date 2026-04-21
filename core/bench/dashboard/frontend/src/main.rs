@@ -67,5 +67,10 @@ fn switch(routes: AppRoute) -> Html {
 }
 
 fn main() {
+    if let Some(document) = web_sys::window().and_then(|w| w.document())
+        && let Ok(Some(splash)) = document.query_selector(".boot-splash")
+    {
+        splash.remove();
+    }
     yew::Renderer::<App>::new().render();
 }

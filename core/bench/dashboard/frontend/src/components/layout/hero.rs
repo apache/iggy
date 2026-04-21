@@ -21,7 +21,6 @@ use crate::format::format_ms;
 use crate::router::AppRoute;
 use crate::state::benchmark::{latest_sweep, pick_best_from_recent_batch};
 use bench_dashboard_shared::BenchmarkReportLight;
-use chrono::DateTime;
 use gloo::console::log;
 use gloo::timers::callback::Timeout;
 use std::cell::Cell;
@@ -166,7 +165,6 @@ struct HeroStats {
     peak_msg_s: Option<(f64, String)>,
     max_scale: Option<MaxScale>,
     total: usize,
-    latest_ts: Option<String>,
     showcase: Option<BenchmarkReportLight>,
 }
 
@@ -225,13 +223,6 @@ fn compute_stats<'a>(benchmarks: impl Iterator<Item = &'a BenchmarkReportLight>)
                 consumers,
                 pretty_name: pretty_name.clone(),
             });
-        }
-        if stats
-            .latest_ts
-            .as_ref()
-            .is_none_or(|current| &benchmark.timestamp > current)
-        {
-            stats.latest_ts = Some(benchmark.timestamp.clone());
         }
     }
     stats
@@ -339,7 +330,7 @@ fn render_stat_cards(stats: &HeroStats) -> Html {
             }
             { render_scale_card(1, stats.max_scale.as_ref()) }
             { render_showcase_card(2, stats.showcase.as_ref()) }
-            { render_summary_card(3, stats.total, stats.latest_ts.as_deref()) }
+            { render_volume_card(3, stats.showcase.as_ref()) }
         </div>
     }
 }
@@ -413,20 +404,55 @@ fn render_showcase_card(stagger: usize, showcase: Option<&BenchmarkReportLight>)
     }
 }
 
-fn render_summary_card(stagger: usize, total: usize, latest_ts: Option<&str>) -> Html {
-    let sub = match latest_ts {
-        Some(ts) => format!("Latest: {}", format_date(ts)),
-        None => String::new(),
+fn render_volume_card(stagger: usize, showcase: Option<&BenchmarkReportLight>) -> Html {
+    let Some(benchmark) = showcase else {
+        return html! {};
+    };
+    let total_bytes = benchmark.total_bytes();
+    if total_bytes == 0 {
+        return html! {};
+    }
+    let (value, unit) = format_volume(total_bytes);
+    let messages = benchmark.total_messages_sent() + benchmark.total_messages_received();
+    let sub = if messages > 0 {
+        format!("{} messages moved", format_count(messages))
+    } else {
+        String::new()
     };
     html! {
         <div class="hero-v2-card" style={format!("--stagger: {stagger}")}>
             <div class="hero-v2-card-value-row">
-                <span class="hero-v2-card-value">{total}</span>
-                <span class="hero-v2-card-unit">{"runs"}</span>
+                <span class="hero-v2-card-value">{value}</span>
+                <span class="hero-v2-card-unit">{unit}</span>
             </div>
-            <div class="hero-v2-card-label">{"Benchmarks loaded"}</div>
+            <div class="hero-v2-card-label">{"Volume pushed in run"}</div>
             <div class="hero-v2-card-sub">{sub}</div>
         </div>
+    }
+}
+
+fn format_volume(bytes: u64) -> (String, &'static str) {
+    let bytes = bytes as f64;
+    if bytes >= 1_000_000_000_000.0 {
+        (format_significant(bytes / 1_000_000_000_000.0), "TB")
+    } else if bytes >= 1_000_000_000.0 {
+        (format_significant(bytes / 1_000_000_000.0), "GB")
+    } else if bytes >= 1_000_000.0 {
+        (format_significant(bytes / 1_000_000.0), "MB")
+    } else {
+        (format_significant(bytes / 1_000.0), "kB")
+    }
+}
+
+fn format_count(value: u64) -> String {
+    if value >= 1_000_000_000 {
+        format!("{:.2}B", value as f64 / 1_000_000_000.0)
+    } else if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
     }
 }
 
@@ -462,18 +488,11 @@ fn format_significant(v: f64) -> String {
     }
 }
 
-fn format_date(timestamp_str: &str) -> String {
-    match DateTime::parse_from_rfc3339(timestamp_str) {
-        Ok(t) => t.format("%Y-%m-%d").to_string(),
-        Err(_) => "unknown".to_string(),
-    }
-}
-
 fn render_hero_loading(is_dark: bool, is_slow: bool) -> Html {
     let logo_src = if is_dark {
-        "/assets/iggy-light.png"
+        "/assets/iggy-light.svg"
     } else {
-        "/assets/iggy-dark.png"
+        "/assets/iggy-dark.svg"
     };
     html! {
         <div class="hero-v2 hero-v2-loading" aria-busy="true" aria-live="polite">
@@ -485,7 +504,6 @@ fn render_hero_loading(is_dark: bool, is_slow: bool) -> Html {
                     alt=""
                     aria-hidden="true"
                 />
-                <div class="hero-v2-loading-brand">{"Apache Iggy"}</div>
                 <div class="hero-v2-loading-sub">{"Benchmarks"}</div>
                 if is_slow {
                     <p class="hero-v2-loading-slow">
@@ -498,10 +516,6 @@ fn render_hero_loading(is_dark: bool, is_slow: bool) -> Html {
     }
 }
 
-/// Every headline field comes from the SAME benchmark that powers the
-/// tail chart and "View details" link. Built through this single helper
-/// so the big number, subject name, CPU, and gitref can never drift to
-/// different benchmarks.
 #[derive(Default, Debug, PartialEq)]
 pub struct ShowcaseDisplay {
     pub formatted_value: String,

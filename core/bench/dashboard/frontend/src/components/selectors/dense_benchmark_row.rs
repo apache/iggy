@@ -50,20 +50,16 @@ pub fn dense_benchmark_row(props: &DenseBenchmarkRowProps) -> Html {
         .to_lowercase()
         .replace(' ', "-");
 
-    let on_click = {
+    let on_select_click = {
         let on_select = props.on_select.clone();
         let benchmark = benchmark.clone();
-        Callback::from(move |_| on_select.emit(benchmark.clone()))
+        Callback::from(move |_: MouseEvent| on_select.emit(benchmark.clone()))
     };
 
     let on_pin_click = {
         let on_toggle_pin = props.on_toggle_pin.clone();
         let benchmark = benchmark.clone();
-        Callback::from(move |event: MouseEvent| {
-            event.stop_propagation();
-            event.prevent_default();
-            on_toggle_pin.emit(benchmark.clone());
-        })
+        Callback::from(move |_: MouseEvent| on_toggle_pin.emit(benchmark.clone()))
     };
 
     let pin_title = if is_pinned {
@@ -71,46 +67,33 @@ pub fn dense_benchmark_row(props: &DenseBenchmarkRowProps) -> Html {
     } else {
         "Compare with this"
     };
+    let select_aria = format!("Select benchmark {display_name}");
 
-    let on_key_down = {
-        let on_click = on_click.clone();
-        Callback::from(move |event: KeyboardEvent| {
-            if event.target() != event.current_target() {
-                return;
-            }
-            if event.key() == "Enter" || event.key() == " " {
-                event.prevent_default();
-                on_click.emit(MouseEvent::new("click").unwrap());
-            }
-        })
-    };
-
-    let row_aria = format!("Select benchmark {display_name}");
     html! {
-        <div
-            role="button"
-            tabindex="0"
-            aria-label={row_aria}
-            aria-pressed={is_selected.to_string()}
-            class={classes!(
-                "dense-row",
-                is_selected.then_some("active"),
-                is_pinned.then_some("pinned"),
-            )}
-            onclick={on_click}
-            onkeydown={on_key_down}
-        >
-            <span class={classes!("dense-row-dot", kind_class)} />
-            <div class="dense-row-body">
-                <div class="dense-row-title">{display_name}</div>
-                <div class="dense-row-meta">
-                    { render_metrics(benchmark) }
-                    if props.show_timestamp {
-                        <span class="dense-row-meta-sep">{"·"}</span>
-                        <span class="dense-row-time">{ relative_time(&benchmark.timestamp) }</span>
-                    }
+        <div class={classes!(
+            "dense-row",
+            is_selected.then_some("active"),
+            is_pinned.then_some("pinned"),
+        )}>
+            <button
+                type="button"
+                class="dense-row-select"
+                onclick={on_select_click}
+                aria-label={select_aria}
+                aria-pressed={is_selected.to_string()}
+            >
+                <span class={classes!("dense-row-dot", kind_class)} />
+                <div class="dense-row-body">
+                    <div class="dense-row-title">{display_name}</div>
+                    <div class="dense-row-meta">
+                        { render_metrics(benchmark) }
+                        if props.show_timestamp {
+                            <span class="dense-row-meta-sep">{"·"}</span>
+                            <span class="dense-row-time">{ relative_time(&benchmark.timestamp) }</span>
+                        }
+                    </div>
                 </div>
-            </div>
+            </button>
             <button
                 type="button"
                 class={classes!("dense-row-compare-btn", is_pinned.then_some("active"))}
