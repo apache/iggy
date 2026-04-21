@@ -17,6 +17,8 @@
 
 use crate::components::selectors::measurement_type_selector::MeasurementType;
 use bench_dashboard_shared::BenchmarkReportLight;
+use bench_report::benchmark_kind::BenchmarkKind;
+use std::collections::HashSet;
 use std::rc::Rc;
 use yew::prelude::*;
 
@@ -90,10 +92,6 @@ impl ParamFilters {
         u32_active + metric_active
     }
 
-    pub fn is_any_active(&self) -> bool {
-        self.active_count() > 0
-    }
-
     pub fn matches(&self, benchmark: &BenchmarkReportLight) -> bool {
         let p = &benchmark.params;
         let params_ok = self.producers.matches(p.producers)
@@ -129,6 +127,78 @@ pub enum MetricField {
     P99LatencyMs,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SidebarSort {
+    #[default]
+    MostRecent,
+    PeakThroughput,
+    LowestP99,
+    Name,
+}
+
+impl SidebarSort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::MostRecent => "Most recent",
+            Self::PeakThroughput => "Peak throughput",
+            Self::LowestP99 => "Lowest P99",
+            Self::Name => "Name",
+        }
+    }
+
+    pub fn all() -> [Self; 4] {
+        [
+            Self::MostRecent,
+            Self::PeakThroughput,
+            Self::LowestP99,
+            Self::Name,
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KindGroup {
+    Pinned,
+    Balanced,
+    EndToEnd,
+}
+
+impl KindGroup {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pinned => "Pinned",
+            Self::Balanced => "Balanced",
+            Self::EndToEnd => "End-to-end",
+        }
+    }
+
+    pub fn matches(self, kind: BenchmarkKind) -> bool {
+        match self {
+            Self::Pinned => matches!(
+                kind,
+                BenchmarkKind::PinnedProducer
+                    | BenchmarkKind::PinnedConsumer
+                    | BenchmarkKind::PinnedProducerAndConsumer
+            ),
+            Self::Balanced => matches!(
+                kind,
+                BenchmarkKind::BalancedProducer
+                    | BenchmarkKind::BalancedConsumerGroup
+                    | BenchmarkKind::BalancedProducerAndConsumerGroup
+            ),
+            Self::EndToEnd => matches!(
+                kind,
+                BenchmarkKind::EndToEndProducingConsumer
+                    | BenchmarkKind::EndToEndProducingConsumerGroup
+            ),
+        }
+    }
+
+    pub fn all() -> [Self; 3] {
+        [Self::Pinned, Self::Balanced, Self::EndToEnd]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct UiState {
     pub view_mode: ViewMode,
@@ -138,10 +208,10 @@ pub struct UiState {
     pub is_embed_modal_visible: bool,
     pub param_filters: ParamFilters,
     pub is_sidebar_collapsed: bool,
-    pub compare_pin: Option<Box<BenchmarkReportLight>>,
-    /// Overrides chart rendering to keep the hero landing on screen until the user picks a benchmark.
-    /// Reducer never mutates selected_benchmark for this; the flag only gates rendering in MainContent.
-    pub is_landing: bool,
+    pub compare_pin: Option<BenchmarkReportLight>,
+    pub sidebar_search: String,
+    pub sidebar_sort: SidebarSort,
+    pub sidebar_kind_filter: HashSet<KindGroup>,
 }
 
 impl Default for UiState {
@@ -155,23 +225,33 @@ impl Default for UiState {
             param_filters: ParamFilters::default(),
             is_sidebar_collapsed: false,
             compare_pin: None,
-            is_landing: true,
+            sidebar_search: String::new(),
+            sidebar_sort: SidebarSort::default(),
+            sidebar_kind_filter: HashSet::new(),
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopBarPopup {
+    BenchmarkInfo,
+    ServerStats,
+    Embed,
+}
+
 pub enum UiAction {
     SetMeasurementType(MeasurementType),
-    ToggleBenchmarkTooltip,
-    ToggleServerStatsTooltip,
-    ToggleEmbedModal,
+    TogglePopup(TopBarPopup),
     SetViewMode(ViewMode),
     SetParamRange(ParamField, ParamRange),
     SetMetricRange(MetricField, MetricRange),
     ClearParamFilters,
     ToggleSidebar,
-    SetComparePin(Option<Box<BenchmarkReportLight>>),
-    SetLanding(bool),
+    SetComparePin(Box<Option<BenchmarkReportLight>>),
+    CloseAllPopups,
+    SetSidebarSearch(String),
+    SetSidebarSort(SidebarSort),
+    ToggleKindFilter(KindGroup),
 }
 
 impl Reducible for UiState {
@@ -183,18 +263,28 @@ impl Reducible for UiState {
                 selected_measurement: mt,
                 ..(*self).clone()
             },
-            UiAction::ToggleBenchmarkTooltip => UiState {
-                is_benchmark_tooltip_visible: !self.is_benchmark_tooltip_visible,
-                ..(*self).clone()
-            },
-            UiAction::ToggleServerStatsTooltip => UiState {
-                is_server_stats_tooltip_visible: !self.is_server_stats_tooltip_visible,
-                ..(*self).clone()
-            },
-            UiAction::ToggleEmbedModal => UiState {
-                is_embed_modal_visible: !self.is_embed_modal_visible,
-                ..(*self).clone()
-            },
+            UiAction::TogglePopup(popup) => {
+                let already_open = match popup {
+                    TopBarPopup::BenchmarkInfo => self.is_benchmark_tooltip_visible,
+                    TopBarPopup::ServerStats => self.is_server_stats_tooltip_visible,
+                    TopBarPopup::Embed => self.is_embed_modal_visible,
+                };
+                let (info, stats, embed) = if already_open {
+                    (false, false, false)
+                } else {
+                    (
+                        matches!(popup, TopBarPopup::BenchmarkInfo),
+                        matches!(popup, TopBarPopup::ServerStats),
+                        matches!(popup, TopBarPopup::Embed),
+                    )
+                };
+                UiState {
+                    is_benchmark_tooltip_visible: info,
+                    is_server_stats_tooltip_visible: stats,
+                    is_embed_modal_visible: embed,
+                    ..(*self).clone()
+                }
+            }
             UiAction::SetViewMode(vm) => UiState {
                 view_mode: vm,
                 ..(*self).clone()
@@ -233,13 +323,33 @@ impl Reducible for UiState {
                 ..(*self).clone()
             },
             UiAction::SetComparePin(pin) => UiState {
-                compare_pin: pin,
+                compare_pin: *pin,
                 ..(*self).clone()
             },
-            UiAction::SetLanding(is_landing) => UiState {
-                is_landing,
+            UiAction::CloseAllPopups => UiState {
+                is_benchmark_tooltip_visible: false,
+                is_server_stats_tooltip_visible: false,
+                is_embed_modal_visible: false,
                 ..(*self).clone()
             },
+            UiAction::SetSidebarSearch(query) => UiState {
+                sidebar_search: query,
+                ..(*self).clone()
+            },
+            UiAction::SetSidebarSort(sort) => UiState {
+                sidebar_sort: sort,
+                ..(*self).clone()
+            },
+            UiAction::ToggleKindFilter(group) => {
+                let mut kinds = self.sidebar_kind_filter.clone();
+                if !kinds.remove(&group) {
+                    kinds.insert(group);
+                }
+                UiState {
+                    sidebar_kind_filter: kinds,
+                    ..(*self).clone()
+                }
+            }
         };
         next.into()
     }

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::format::format_ms;
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_report::group_metrics_summary::BenchmarkGroupMetricsSummary;
 use yew::prelude::*;
@@ -99,7 +100,7 @@ pub fn tail_chart(props: &TailChartProps) -> Html {
             </div>
             <svg
                 class="tail-chart"
-                viewBox={format!("0 0 {CHART_W} {CHART_H}")}
+                viewBox={format!("0 0 {} {}", CHART_W as i32, CHART_H as i32)}
                 preserveAspectRatio="xMidYMid meet"
                 onmouseleave={ {
                     let hovered = hovered.clone();
@@ -182,13 +183,23 @@ fn render_gridlines(max_latency: f64) -> Html {
                     <line x1={MARGIN_L.to_string()} y1={y.to_string()}
                           x2={(CHART_W - MARGIN_R).to_string()} y2={y.to_string()} />
                     <text x={(MARGIN_L - 10.0).to_string()} y={(y + 3.5).to_string()} text-anchor="end">
-                        {format_latency(value)}
+                        {format_ms(value)}
                     </text>
                 </g>
             }
         })
         .collect();
-    html! { <>{for items}</> }
+    html! {
+        <>
+            {for items}
+            <text
+                class="tail-chart-axis-unit"
+                x={(MARGIN_L - 10.0).to_string()}
+                y={(MARGIN_T - 8.0).to_string()}
+                text-anchor="end"
+            >{"ms"}</text>
+        </>
+    }
 }
 
 fn render_axis_labels(projected: &[Projected], hovered: Option<usize>) -> Html {
@@ -339,7 +350,7 @@ fn render_tooltip(hovered: Option<&Projected>) -> Html {
                 text-anchor="middle"
                 class="tail-chart-tooltip-value"
             >
-                {format!("{} ms", format_latency(point.latency_ms))}
+                {format!("{} ms", format_ms(point.latency_ms))}
             </text>
         </g>
     }
@@ -407,14 +418,4 @@ fn project_percentile(percentile: f64, latency_ms: f64, max_latency: f64) -> (f6
     };
     let screen_y = CHART_H - MARGIN_B - y_fraction * (CHART_H - MARGIN_T - MARGIN_B);
     (screen_x, screen_y)
-}
-
-fn format_latency(ms: f64) -> String {
-    if ms >= 10.0 {
-        format!("{ms:.1}")
-    } else if ms >= 1.0 {
-        format!("{ms:.2}")
-    } else {
-        format!("{ms:.3}")
-    }
 }

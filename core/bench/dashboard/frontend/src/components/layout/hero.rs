@@ -15,12 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::api;
 use crate::components::chart::tail_chart::TailChart;
-use crate::state::benchmark::{BenchmarkAction, pick_best_from_recent_batch, use_benchmark};
-use crate::state::ui::{UiAction, use_ui};
+use crate::format::{format_ms, nan_safe_cmp};
+use crate::router::AppRoute;
+use crate::state::benchmark::{pick_best_from_recent_batch, use_benchmark};
 use bench_dashboard_shared::BenchmarkReportLight;
+use bench_report::benchmark_kind::BenchmarkKind;
 use chrono::DateTime;
+use gloo::console::log;
+use std::cell::Cell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
+use yew::platform::spawn_local;
 use yew::prelude::*;
+use yew_router::prelude::{Navigator, use_navigator};
 
 #[derive(Properties, PartialEq)]
 pub struct HeroProps {
@@ -30,28 +39,47 @@ pub struct HeroProps {
 #[function_component(Hero)]
 pub fn hero(props: &HeroProps) -> Html {
     let benchmark_ctx = use_benchmark();
-    let ui = use_ui();
-    let unrestricted: Vec<&BenchmarkReportLight> = benchmark_ctx
-        .state
-        .entries
-        .values()
-        .flatten()
+    let navigator = use_navigator();
+    let recent = use_state(Vec::<BenchmarkReportLight>::new);
+
+    {
+        let recent = recent.clone();
+        let cancelled = Rc::new(Cell::new(false));
+        let cancelled_async = cancelled.clone();
+        use_effect_with((), move |_| {
+            spawn_local(async move {
+                match api::fetch_recent_benchmarks(Some(10_000)).await {
+                    Ok(data) => {
+                        if !cancelled_async.get() {
+                            recent.set(data);
+                        }
+                    }
+                    Err(error) => log!(format!("Hero: fetch_recent_benchmarks failed: {}", error)),
+                }
+            });
+            move || cancelled.set(true)
+        });
+    }
+
+    let recent_vec = (*recent).clone();
+    let source: Vec<&BenchmarkReportLight> = if recent_vec.is_empty() {
+        benchmark_ctx.state.entries.values().flatten().collect()
+    } else {
+        recent_vec.iter().collect()
+    };
+    let unrestricted: Vec<&BenchmarkReportLight> = source
+        .iter()
+        .copied()
         .filter(|benchmark| benchmark.params.rate_limit.is_none())
         .collect();
     let mut stats = compute_stats(unrestricted.iter().copied());
     stats.showcase = unrestricted
         .iter()
         .copied()
-        .max_by(|left, right| {
-            throughput_mb(left)
-                .partial_cmp(&throughput_mb(right))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        .max_by(|left, right| nan_safe_cmp(throughput_mb(left), throughput_mb(right)))
         .cloned();
-    if stats.showcase.is_none() {
-        let all_entries: Vec<&BenchmarkReportLight> =
-            benchmark_ctx.state.entries.values().flatten().collect();
-        stats.showcase = pick_best_from_recent_batch(&all_entries);
+    if stats.showcase.is_none() && !source.is_empty() {
+        stats.showcase = pick_best_from_recent_batch(&source);
     }
 
     if stats.total == 0 {
@@ -81,22 +109,37 @@ pub fn hero(props: &HeroProps) -> Html {
     };
 
     let on_view_details = stats.showcase.as_ref().map(|showcase| {
-        let benchmark = showcase.clone();
-        let ui = ui.clone();
-        let dispatch = benchmark_ctx.dispatch.clone();
+        let uuid = showcase.uuid.to_string();
+        let navigator = navigator.clone();
         Callback::from(move |_| {
-            ui.dispatch(UiAction::SetLanding(false));
-            dispatch.emit(BenchmarkAction::SelectBenchmark(Box::new(Some(
-                benchmark.clone(),
-            ))));
+            if let Some(nav) = navigator.as_ref() {
+                nav.push(&AppRoute::Benchmark { uuid: uuid.clone() });
+            }
         })
     });
+
+    let on_browse_click = {
+        let latest_uuid = latest_uuid_from_entries(&benchmark_ctx.state.entries);
+        let navigator = navigator.clone();
+        Callback::from(move |_: MouseEvent| {
+            if let Some(uuid) = latest_uuid.clone() {
+                navigate_to_benchmark(&navigator, uuid);
+            } else {
+                let navigator = navigator.clone();
+                spawn_local(async move {
+                    if let Some(uuid) = fetch_latest_uuid().await {
+                        navigate_to_benchmark(&navigator, uuid);
+                    }
+                });
+            }
+        })
+    };
 
     html! {
         <div class="hero-v2">
             { render_background_grid() }
             <div class="hero-v2-inner">
-                { render_headline(&stats, &hardware, &gitref_suffix) }
+                { render_headline(&stats, &hardware, &gitref_suffix, &on_browse_click) }
                 { render_stat_cards(&stats) }
                 {
                     match (stats.showcase.as_ref(), on_view_details) {
@@ -111,6 +154,32 @@ pub fn hero(props: &HeroProps) -> Html {
                 }
             </div>
         </div>
+    }
+}
+
+fn latest_uuid_from_entries(
+    entries: &BTreeMap<BenchmarkKind, Vec<BenchmarkReportLight>>,
+) -> Option<String> {
+    entries
+        .values()
+        .flatten()
+        .max_by(|left, right| left.timestamp.cmp(&right.timestamp))
+        .map(|benchmark| benchmark.uuid.to_string())
+}
+
+async fn fetch_latest_uuid() -> Option<String> {
+    match api::fetch_recent_benchmarks(Some(1)).await {
+        Ok(recent) => recent.into_iter().next().map(|b| b.uuid.to_string()),
+        Err(error) => {
+            log!(format!("Browse: fetch_recent_benchmarks failed: {}", error));
+            None
+        }
+    }
+}
+
+fn navigate_to_benchmark(navigator: &Option<Navigator>, uuid: String) {
+    if let Some(nav) = navigator.as_ref() {
+        nav.push(&AppRoute::Benchmark { uuid });
     }
 }
 
@@ -201,7 +270,12 @@ fn render_background_grid() -> Html {
     }
 }
 
-fn render_headline(stats: &HeroStats, hardware: &str, gitref_suffix: &str) -> Html {
+fn render_headline(
+    stats: &HeroStats,
+    hardware: &str,
+    gitref_suffix: &str,
+    on_browse_click: &Callback<MouseEvent>,
+) -> Html {
     let (value, unit, subject) = match &stats.peak_mb_s {
         Some((throughput, name)) => {
             let (formatted, unit) = format_throughput_bytes(*throughput);
@@ -225,8 +299,22 @@ fn render_headline(stats: &HeroStats, hardware: &str, gitref_suffix: &str) -> Ht
             <p class="hero-v2-sub">{sub}</p>
             <p class="hero-v2-tagline">
                 {"Modern hardware is incredibly capable. "}
-                <span class="hero-v2-tagline-accent">{"Iggy was built for it."}</span>
+                <span class="hero-v2-tagline-accent">{"Apache Iggy was built for it."}</span>
             </p>
+            <div class="hero-v2-actions">
+                <button
+                    type="button"
+                    class="hero-v2-browse-btn"
+                    onclick={on_browse_click.clone()}
+                >
+                    {"Browse all benchmarks"}
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
+                         fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="5" y1="12" x2="19" y2="12" />
+                        <polyline points="12 5 19 12 12 19" />
+                    </svg>
+                </button>
+            </div>
         </div>
     }
 }
@@ -307,7 +395,7 @@ fn render_showcase_card(stagger: usize, showcase: Option<&BenchmarkReportLight>)
     html! {
         <div class="hero-v2-card hero-v2-card-accent" style={format!("--stagger: {stagger}")}>
             <div class="hero-v2-card-value-row">
-                <span class="hero-v2-card-value">{format_latency(p99)}</span>
+                <span class="hero-v2-card-value">{format_ms(p99)}</span>
                 <span class="hero-v2-card-unit">{"ms"}</span>
             </div>
             <div class="hero-v2-card-label">{"P99 at peak throughput"}</div>
@@ -370,16 +458,6 @@ fn format_significant(v: f64) -> String {
         format!("{v:.1}")
     } else {
         format!("{v:.2}")
-    }
-}
-
-fn format_latency(ms: f64) -> String {
-    if ms >= 10.0 {
-        format!("{ms:.1}")
-    } else if ms >= 1.0 {
-        format!("{ms:.2}")
-    } else {
-        format!("{ms:.3}")
     }
 }
 

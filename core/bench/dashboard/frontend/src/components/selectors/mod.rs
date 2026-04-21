@@ -15,12 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod benchmark_kind_selector;
-pub mod benchmark_search_box;
 pub mod benchmark_selector;
+pub mod dense_benchmark_row;
 pub mod gitref_selector;
 pub mod hardware_selector;
 pub mod measurement_type_selector;
 pub mod param_filters_panel;
 pub mod recent_benchmarks_selector;
-pub mod view_mode_selector;

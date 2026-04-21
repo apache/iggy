@@ -15,51 +15,46 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{
-    api,
-    state::benchmark::{BenchmarkAction, use_benchmark},
-    state::ui::{UiAction, use_ui},
-};
+use crate::api;
+use crate::components::selectors::dense_benchmark_row::DenseBenchmarkRow;
+use crate::format::nan_safe_cmp;
+use crate::router::AppRoute;
+use crate::state::benchmark::{BenchmarkAction, use_benchmark};
+use crate::state::ui::{KindGroup, SidebarSort, UiAction, use_ui};
 use bench_dashboard_shared::BenchmarkReportLight;
-use chrono::{DateTime, Utc};
+use bench_report::benchmark_kind::BenchmarkKind;
+use chrono::DateTime;
 use gloo::console::log;
+use std::cell::Cell;
+use std::cmp::Ordering;
+use std::collections::HashSet;
+use std::rc::Rc;
 use yew::platform::spawn_local;
 use yew::prelude::*;
-
-/// Format a timestamp string as a human-readable relative time (e.g., "2 hours ago")
-fn format_relative_time(timestamp_str: &str) -> String {
-    if let Ok(timestamp) = DateTime::parse_from_rfc3339(timestamp_str) {
-        let now = Utc::now();
-        let duration = now.signed_duration_since(timestamp.with_timezone(&Utc));
-
-        if duration.num_seconds() < 60 {
-            format!("{} seconds ago", duration.num_seconds())
-        } else if duration.num_minutes() < 60 {
-            format!("{} minutes ago", duration.num_minutes())
-        } else if duration.num_hours() < 24 {
-            format!("{} hours ago", duration.num_hours())
-        } else if duration.num_days() < 30 {
-            format!("{} days ago", duration.num_days())
-        } else {
-            timestamp.format("%Y-%m-%d").to_string()
-        }
-    } else {
-        "Unknown time".to_string()
-    }
-}
+use yew_router::prelude::{Navigator, use_navigator};
 
 #[derive(Properties, PartialEq)]
 pub struct RecentBenchmarksSelectorProps {
     pub limit: u32,
-    pub search_query: String,
 }
 
 #[function_component(RecentBenchmarksSelector)]
 pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html {
     let benchmark_ctx = use_benchmark();
     let ui_state = use_ui();
+    let navigator = use_navigator();
+
+    let pinned_uuid = ui_state.compare_pin.as_ref().map(|pin| pin.uuid);
+    let selected_uuid = benchmark_ctx
+        .state
+        .selected_benchmark
+        .as_ref()
+        .map(|selected| selected.uuid);
+
     let filters = ui_state.param_filters.clone();
-    let pinned_uuid = ui_state.compare_pin.as_ref().map(|b| b.uuid);
+    let search = ui_state.sidebar_search.to_lowercase();
+    let kind_filter = ui_state.sidebar_kind_filter.clone();
+    let sort = ui_state.sidebar_sort;
 
     let recent_benchmarks = use_state(Vec::<BenchmarkReportLight>::new);
     let is_loading = use_state(|| true);
@@ -68,251 +63,240 @@ pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html
         let recent_benchmarks = recent_benchmarks.clone();
         let is_loading = is_loading.clone();
         let limit = props.limit;
-        let benchmark_dispatch = benchmark_ctx.dispatch.clone();
-        let ui_dispatch_handle = ui_state.clone();
+        let dispatch = benchmark_ctx.dispatch.clone();
+        let navigator = navigator.clone();
+        let has_selection = benchmark_ctx.state.selected_benchmark.is_some();
 
+        let cancelled = Rc::new(Cell::new(false));
+        let cancelled_async = cancelled.clone();
         use_effect_with((), move |_| {
             spawn_local(async move {
                 match api::fetch_recent_benchmarks(Some(limit)).await {
                     Ok(mut data) => {
                         data.sort_by(|left, right| {
-                            let parse_left = DateTime::parse_from_rfc3339(&left.timestamp);
-                            let parse_right = DateTime::parse_from_rfc3339(&right.timestamp);
-                            match (parse_left, parse_right) {
-                                (Ok(time_left), Ok(time_right)) => time_right.cmp(&time_left),
-                                _ => std::cmp::Ordering::Equal,
-                            }
+                            compare_timestamps(&right.timestamp, &left.timestamp)
                         });
-                        if let Some(most_recent) = data.first().cloned() {
-                            ui_dispatch_handle.dispatch(UiAction::SetLanding(false));
-                            benchmark_dispatch.emit(BenchmarkAction::SelectBenchmark(Box::new(
-                                Some(most_recent),
-                            )));
+                        if cancelled_async.get() {
+                            return;
+                        }
+                        if !has_selection && let Some(most_recent) = data.first().cloned() {
+                            if let Some(nav) = navigator.as_ref() {
+                                nav.push(&AppRoute::Benchmark {
+                                    uuid: most_recent.uuid.to_string(),
+                                });
+                            }
+                            dispatch.emit(BenchmarkAction::SelectBenchmark(Box::new(Some(
+                                most_recent,
+                            ))));
                         }
                         recent_benchmarks.set(data);
                     }
-                    Err(error) => {
-                        log!(format!("Error fetching recent benchmarks: {}", error));
-                    }
+                    Err(error) => log!(format!("Error fetching recent benchmarks: {}", error)),
                 }
-                is_loading.set(false);
+                if !cancelled_async.get() {
+                    is_loading.set(false);
+                }
             });
+            move || cancelled.set(true)
         });
     }
 
-    let on_benchmark_select = {
-        let benchmark_ctx = benchmark_ctx.clone();
-        let ui_state = ui_state.clone();
+    let on_select = {
+        let dispatch = benchmark_ctx.dispatch.clone();
+        let navigator = navigator.clone();
         Callback::from(move |benchmark: BenchmarkReportLight| {
-            ui_state.dispatch(UiAction::SetLanding(false));
-            benchmark_ctx
-                .dispatch
-                .emit(BenchmarkAction::SelectBenchmark(Box::new(Some(benchmark))));
+            if let Some(nav) = navigator.as_ref() {
+                nav.push(&AppRoute::Benchmark {
+                    uuid: benchmark.uuid.to_string(),
+                });
+            }
+            dispatch.emit(BenchmarkAction::SelectBenchmark(Box::new(Some(benchmark))));
         })
     };
 
     let on_toggle_pin = {
         let ui_state = ui_state.clone();
+        let navigator = navigator.clone();
+        let benchmark_ctx = benchmark_ctx.clone();
         Callback::from(move |benchmark: BenchmarkReportLight| {
-            let next = if ui_state.compare_pin.as_ref().map(|b| b.uuid) == Some(benchmark.uuid) {
-                None
-            } else {
-                Some(Box::new(benchmark))
-            };
-            ui_state.dispatch(UiAction::SetComparePin(next));
+            let clicked_uuid = benchmark.uuid.to_string();
+            let selected_uuid = benchmark_ctx
+                .state
+                .selected_benchmark
+                .as_ref()
+                .map(|selected| selected.uuid.to_string());
+            let pinned_uuid = ui_state
+                .compare_pin
+                .as_ref()
+                .map(|pin| pin.uuid.to_string());
+
+            if let Some(pinned) = pinned_uuid.as_ref()
+                && pinned == &clicked_uuid
+                && let Some(selected) = selected_uuid.as_ref()
+            {
+                push_route(
+                    &navigator,
+                    AppRoute::Benchmark {
+                        uuid: selected.clone(),
+                    },
+                );
+                return;
+            }
+
+            if let Some(selected) = selected_uuid
+                && selected != clicked_uuid
+            {
+                push_route(
+                    &navigator,
+                    AppRoute::Compare {
+                        left: selected,
+                        right: clicked_uuid,
+                    },
+                );
+                return;
+            }
+
+            let same_pin =
+                ui_state.compare_pin.as_ref().map(|pin| pin.uuid) == Some(benchmark.uuid);
+            let next = if same_pin { None } else { Some(benchmark) };
+            ui_state.dispatch(UiAction::SetComparePin(Box::new(next)));
         })
     };
 
-    let filtered_benchmarks = (*recent_benchmarks)
+    if *is_loading {
+        return render_skeleton();
+    }
+
+    let visible: Vec<BenchmarkReportLight> = (*recent_benchmarks)
         .iter()
         .filter(|benchmark| filters.matches(benchmark))
-        .filter(|benchmark| {
-            if props.search_query.is_empty() {
-                return true;
-            }
-
-            let query = props.search_query.to_lowercase();
-
-            if benchmark
-                .params
-                .benchmark_kind
-                .to_string()
-                .to_lowercase()
-                .contains(&query)
-            {
-                return true;
-            }
-
-            if let Some(identifier) = &benchmark.hardware.identifier
-                && identifier.to_lowercase().contains(&query)
-            {
-                return true;
-            }
-
-            if let Some(gitref) = &benchmark.params.gitref
-                && gitref.to_lowercase().contains(&query)
-            {
-                return true;
-            }
-
-            if let Some(remark) = &benchmark.params.remark
-                && remark.to_lowercase().contains(&query)
-            {
-                return true;
-            }
-
-            if benchmark.timestamp.to_lowercase().contains(&query) {
-                return true;
-            }
-
-            false
-        })
+        .filter(|benchmark| kind_filter_matches(&kind_filter, benchmark.params.benchmark_kind))
+        .filter(|benchmark| search_matches(&search, benchmark))
         .cloned()
-        .collect::<Vec<BenchmarkReportLight>>();
+        .collect();
+
+    if visible.is_empty() {
+        return html! {
+            <div class="dense-list-empty">
+                <p>{"No benchmarks match the current search or filters."}</p>
+            </div>
+        };
+    }
+
+    let sorted = sort_benchmarks(visible, sort);
 
     html! {
-        <div class="sidebar-tabs">
-            <div class="benchmark-list-container close-gap">
-                <div class="benchmark-list-wrapper">
-                if *is_loading {
-                    <p class="loading-message">{"Loading recent benchmarks..."}</p>
-                } else if filtered_benchmarks.is_empty() {
-                    <div class="no-search-results">
-                        { if props.search_query.is_empty() && filters.is_any_active() {
-                            html! { <p>{"No benchmarks match the active filters."}</p> }
-                        } else {
-                            html! { <p>{format!("No benchmarks found matching \"{}\"", props.search_query)}</p> }
-                        }}
-                    </div>
-                } else {
-                    <ul class="benchmark-list">
-                        {filtered_benchmarks.into_iter().map(|benchmark| {
-                            let on_select = {
-                                let on_benchmark_select = on_benchmark_select.clone();
-                                let benchmark_clone = benchmark.clone();
-                                Callback::from(move |_| {
-                                    on_benchmark_select.emit(benchmark_clone.clone());
-                                })
-                            };
-                            let on_pin_click = {
-                                let on_toggle_pin = on_toggle_pin.clone();
-                                let benchmark_clone = benchmark.clone();
-                                Callback::from(move |e: MouseEvent| {
-                                    e.stop_propagation();
-                                    on_toggle_pin.emit(benchmark_clone.clone());
-                                })
-                            };
-                            let timestamp_display = format_relative_time(&benchmark.timestamp);
-
-                            let is_selected = benchmark_ctx.state.selected_benchmark.as_ref()
-                                .map(|selected| selected.uuid == benchmark.uuid)
-                                .unwrap_or(false);
-                            let is_pinned = Some(benchmark.uuid) == pinned_uuid;
-                            let pin_title = if is_pinned { "Unpin from compare" } else { "Pin for compare" };
-
-                            html! {
-                                <li class={classes!(
-                                    "benchmark-list-item",
-                                    "recent-benchmark-item",
-                                    is_selected.then_some("active"),
-                                    is_pinned.then_some("pinned"),
-                                )} onclick={on_select}>
-                                    <div class="benchmark-list-item-content">
-                                        <div class="benchmark-list-item-header">
-                                            <div class="benchmark-list-item-title">
-                                                <span class={classes!("benchmark-list-item-dot", benchmark.params.benchmark_kind.to_string().to_lowercase().replace(" ", "-"))}></span>
-                                                {benchmark.params.benchmark_kind.to_string()}
-                                            </div>
-                                            <div class="benchmark-list-item-time">{timestamp_display}</div>
-                                            <button
-                                                type="button"
-                                                class={classes!("compare-pin-btn", is_pinned.then_some("active"))}
-                                                onclick={on_pin_click}
-                                                title={pin_title}
-                                                aria-label={pin_title}
-                                            >
-                                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
-                                                     fill={if is_pinned { "currentColor" } else { "none" }}
-                                                     stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                                                    <path d="M12 17v5" />
-                                                    <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
-                                                </svg>
-                                            </button>
-                                        </div>
-
-                                        <div class="benchmark-list-item-details">
-                                            <div class="benchmark-list-item-id-version-line">
-                                                <div class="benchmark-list-item-subtitle">
-                                                    <span class="benchmark-list-item-label">{"Identifier:"}</span>
-                                                    <span>{benchmark.hardware.identifier.as_deref().unwrap_or("Unknown")}</span>
-                                                </div>
-                                                <div class="benchmark-list-item-subtitle benchmark-version-subtitle">
-                                                    <span class="benchmark-list-item-label">{"Version:"}</span>
-                                                    <span>{benchmark.params.gitref.as_deref().unwrap_or("Unknown")}</span>
-                                                </div>
-                                            </div>
-
-                                            <div class="benchmark-list-item-metrics">
-                                                <div class="metrics-group">
-                                                    {if let Some(metrics) = benchmark.group_metrics.first() {
-                                                        html! {
-                                                            <>
-                                                                <div class="benchmark-list-item-metric latency">
-                                                                    <span class="benchmark-list-item-label">{"P99:"}</span>
-                                                                    <span>{format!("{:.2} ms", metrics.summary.average_p99_latency_ms)}</span>
-                                                                </div>
-                                                                <div class="benchmark-list-item-metric throughput">
-                                                                    <span>{format!("{:.2} MB/s", metrics.summary.total_throughput_megabytes_per_second)}</span>
-                                                                </div>
-                                                                <div class="benchmark-list-item-metric message-throughput">
-                                                                    <span>{format!("{} msg/s", metrics.summary.total_throughput_messages_per_second as u32)}</span>
-                                                                </div>
-                                                            </>
-                                                        }
-                                                    } else {
-                                                        html! {
-                                                            <>
-                                                                <div class="benchmark-list-item-metric latency">
-                                                                    <span class="benchmark-list-item-label">{"P99:"}</span>
-                                                                    <span>{"N/A"}</span>
-                                                                </div>
-                                                                <div class="benchmark-list-item-metric throughput">
-                                                                    <span>{"N/A"}</span>
-                                                                </div>
-                                                                <div class="benchmark-list-item-metric message-throughput">
-                                                                    <span>{"N/A"}</span>
-                                                                </div>
-                                                            </>
-                                                        }
-                                                    }}
-                                                </div>
-
-                                                {if let Some(remark) = benchmark.params.remark.as_deref()
-                                                    && !remark.is_empty()
-                                                {
-                                                        let truncated_remark = if remark.len() > 30 {
-                                                            format!("{}..", &remark[0..28])
-                                                        } else {
-                                                            remark.to_string()
-                                                        };
-                                                        html! {
-                                                            <div class="benchmark-list-item-remark inline-remark">
-                                                                {truncated_remark}
-                                                            </div>
-                                                        }
-                                                } else {
-                                                    html! {}
-                                                }}
-                                            </div>
-                                        </div>
-                                    </div>
-                                </li>
-                            }
-                        }).collect::<Html>()}
-                    </ul>
-                }
-                </div>
-            </div>
+        <div class="dense-list">
+            { for sorted.iter().map(|benchmark| html! {
+                <DenseBenchmarkRow
+                    benchmark={benchmark.clone()}
+                    selected_uuid={selected_uuid}
+                    pinned_uuid={pinned_uuid}
+                    on_select={on_select.clone()}
+                    on_toggle_pin={on_toggle_pin.clone()}
+                    show_timestamp={true}
+                />
+            })}
         </div>
     }
+}
+
+fn push_route(navigator: &Option<Navigator>, route: AppRoute) {
+    if let Some(nav) = navigator.as_ref() {
+        nav.push(&route);
+    }
+}
+
+fn render_skeleton() -> Html {
+    html! {
+        <div class="dense-list">
+            { for (0..5).map(|index| html! {
+                <div class="dense-row-skeleton" style={format!("--stagger: {index}")}>
+                    <span class="skeleton-dot" />
+                    <div class="skeleton-body">
+                        <span class="skeleton-line title" />
+                        <span class="skeleton-line meta" />
+                    </div>
+                </div>
+            })}
+        </div>
+    }
+}
+
+fn kind_filter_matches(filter: &HashSet<KindGroup>, kind: BenchmarkKind) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    filter.iter().any(|group| group.matches(kind))
+}
+
+fn search_matches(query: &str, benchmark: &BenchmarkReportLight) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let kind_label = benchmark.params.benchmark_kind.to_string().to_lowercase();
+    if kind_label.contains(query) {
+        return true;
+    }
+    if benchmark.params.pretty_name.to_lowercase().contains(query) {
+        return true;
+    }
+    if let Some(remark) = benchmark.params.remark.as_deref()
+        && remark.to_lowercase().contains(query)
+    {
+        return true;
+    }
+    if let Some(gitref) = benchmark.params.gitref.as_deref()
+        && gitref.to_lowercase().contains(query)
+    {
+        return true;
+    }
+    if let Some(hardware) = benchmark.hardware.identifier.as_deref()
+        && hardware.to_lowercase().contains(query)
+    {
+        return true;
+    }
+    if benchmark.timestamp.to_lowercase().contains(query) {
+        return true;
+    }
+    false
+}
+
+fn sort_benchmarks(
+    mut benchmarks: Vec<BenchmarkReportLight>,
+    sort: SidebarSort,
+) -> Vec<BenchmarkReportLight> {
+    benchmarks.sort_by(|left, right| match sort {
+        SidebarSort::MostRecent => compare_timestamps(&right.timestamp, &left.timestamp),
+        SidebarSort::PeakThroughput => nan_safe_cmp(throughput(right), throughput(left)),
+        SidebarSort::LowestP99 => nan_safe_cmp(p99(left), p99(right)),
+        SidebarSort::Name => left.params.pretty_name.cmp(&right.params.pretty_name),
+    });
+    benchmarks
+}
+
+fn compare_timestamps(left: &str, right: &str) -> Ordering {
+    match (
+        DateTime::parse_from_rfc3339(left),
+        DateTime::parse_from_rfc3339(right),
+    ) {
+        (Ok(left_time), Ok(right_time)) => left_time.cmp(&right_time),
+        _ => Ordering::Equal,
+    }
+}
+
+fn throughput(benchmark: &BenchmarkReportLight) -> f64 {
+    benchmark
+        .group_metrics
+        .first()
+        .map(|metrics| metrics.summary.total_throughput_megabytes_per_second)
+        .unwrap_or(0.0)
+}
+
+fn p99(benchmark: &BenchmarkReportLight) -> f64 {
+    benchmark
+        .group_metrics
+        .first()
+        .map(|metrics| metrics.summary.average_p99_latency_ms)
+        .unwrap_or(f64::INFINITY)
 }

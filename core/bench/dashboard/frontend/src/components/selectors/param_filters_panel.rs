@@ -40,14 +40,19 @@ pub fn param_filters_panel() -> Html {
     let active = filters.active_count();
     let chevron = if *is_open { "v" } else { ">" };
 
+    let title = if active > 0 {
+        format!("Filters ({active} active)")
+    } else {
+        "Filters".to_string()
+    };
+
     html! {
         <div class="param-filters-container">
             <button type="button" class="param-filters-header" onclick={toggle}>
                 <span class="param-filters-chevron">{chevron}</span>
-                <span class="param-filters-title">{"Filters"}</span>
-                if active > 0 {
-                    <span class="param-filters-badge">{active}</span>
-                }
+                <span class={classes!("param-filters-title", (active > 0).then_some("has-active"))}>
+                    {title}
+                </span>
             </button>
             if *is_open {
                 <div class="param-filters-body">

@@ -15,12 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod benchmark_meta;
 pub mod hero;
-pub mod logo;
 pub mod main_content;
-pub mod percentile_card;
 pub mod sidebar;
-pub mod sidebar_toggle;
 pub mod sweep_view;
-pub mod theme_toggle_floating;
-pub mod topbar;
+pub mod top_app_bar;

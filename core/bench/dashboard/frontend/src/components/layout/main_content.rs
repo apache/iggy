@@ -17,95 +17,102 @@
 
 use crate::components::chart::single_chart::SingleChart;
 use crate::components::chart::tail_chart::TailChart;
-use crate::components::layout::hero::Hero;
-use crate::components::layout::percentile_card::PercentileCard;
+use crate::components::layout::benchmark_meta::BenchmarkMeta;
 use crate::components::layout::sweep_view::SweepView;
-use crate::components::layout::topbar::TopBar;
 use crate::components::selectors::measurement_type_selector::MeasurementType;
+use crate::router::AppRoute;
 use crate::state::benchmark::use_benchmark;
 use crate::state::ui::{UiAction, ViewMode, use_ui};
 use bench_dashboard_shared::BenchmarkReportLight;
+use bench_report::benchmark_kind::BenchmarkKind;
+use std::collections::BTreeMap;
 use yew::prelude::*;
+use yew_router::prelude::use_navigator;
 
 #[derive(Properties, PartialEq)]
 pub struct MainContentProps {
+    #[prop_or_default]
     pub selected_gitref: String,
-    pub is_dark: bool,
-    pub on_theme_toggle: Callback<bool>,
-    pub view_mode: ViewMode,
 }
 
 #[function_component(MainContent)]
 pub fn main_content(props: &MainContentProps) -> Html {
+    let _ = &props.selected_gitref;
     let benchmark_ctx = use_benchmark();
     let ui = use_ui();
-    let is_recent_view = matches!(props.view_mode, ViewMode::RecentBenchmarks);
+    let is_recent_view = matches!(ui.view_mode, ViewMode::RecentBenchmarks);
     let selected = benchmark_ctx.state.selected_benchmark.clone();
-    let pinned = ui.compare_pin.as_deref().cloned();
+    let pinned = ui.compare_pin.clone();
     let entries = benchmark_ctx.state.entries.clone();
+    let (is_dark, _) = use_context::<(bool, Callback<()>)>().expect("Theme context not found");
 
+    let navigator = use_navigator();
     let on_unpin = {
+        let navigator = navigator.clone();
+        let selected_clone = selected.clone();
         let ui = ui.clone();
-        Callback::from(move |_: MouseEvent| ui.dispatch(UiAction::SetComparePin(None)))
-    };
-
-    let show_hero = ui.is_landing && !is_recent_view;
-    let content = if show_hero {
-        html! {
-            <div class="content-wrapper">
-                <Hero selected_gitref={props.selected_gitref.clone()} />
-            </div>
-        }
-    } else {
-        match (selected.as_ref(), pinned.as_ref()) {
-            (Some(selected_benchmark), Some(pinned_benchmark))
-                if selected_benchmark.uuid != pinned_benchmark.uuid =>
+        Callback::from(move |_: MouseEvent| {
+            if let (Some(selected_benchmark), Some(nav)) =
+                (selected_clone.as_ref(), navigator.as_ref())
             {
-                render_compare(
-                    selected_benchmark,
-                    pinned_benchmark,
-                    ui.selected_measurement.clone(),
-                    props.is_dark,
-                    on_unpin,
-                )
+                nav.push(&AppRoute::Benchmark {
+                    uuid: selected_benchmark.uuid.to_string(),
+                });
+            } else {
+                ui.dispatch(UiAction::SetComparePin(Box::new(None)));
             }
-            (Some(selected_benchmark), _) => render_single(
-                selected_benchmark,
-                ui.selected_measurement.clone(),
-                props.is_dark,
-                &entries,
-            ),
-            (None, _) if is_recent_view => render_empty_recent(),
-            (None, _) => html! {
-                <div class="content-wrapper">
-                    <Hero selected_gitref={props.selected_gitref.clone()} />
-                </div>
-            },
-        }
+        })
     };
 
-    html! {
-        <div class="content">
-            if !show_hero {
-                <TopBar
-                    is_dark={props.is_dark}
-                    selected_gitref={props.selected_gitref.clone()}
-                    on_theme_toggle={props.on_theme_toggle.clone()}
-                />
+    let on_swap = {
+        let navigator = navigator.clone();
+        let selected_clone = selected.clone();
+        let pinned_clone = pinned.clone();
+        Callback::from(move |_: MouseEvent| {
+            if let (Some(selected_benchmark), Some(pinned_benchmark), Some(nav)) = (
+                selected_clone.as_ref(),
+                pinned_clone.as_ref(),
+                navigator.as_ref(),
+            ) {
+                nav.push(&AppRoute::Compare {
+                    left: pinned_benchmark.uuid.to_string(),
+                    right: selected_benchmark.uuid.to_string(),
+                });
             }
-            {content}
-        </div>
-    }
+        })
+    };
+
+    let content = match (selected.as_ref(), pinned.as_ref()) {
+        (Some(selected_benchmark), Some(pinned_benchmark))
+            if selected_benchmark.uuid != pinned_benchmark.uuid =>
+        {
+            render_compare(
+                selected_benchmark,
+                pinned_benchmark,
+                ui.selected_measurement.clone(),
+                is_dark,
+                on_unpin,
+                on_swap,
+            )
+        }
+        (Some(selected_benchmark), _) => render_single(
+            selected_benchmark,
+            ui.selected_measurement.clone(),
+            is_dark,
+            &entries,
+        ),
+        (None, _) if is_recent_view => render_empty_recent(),
+        (None, _) => render_loading(),
+    };
+
+    html! { <main class="main-content">{content}</main> }
 }
 
 fn render_single(
     benchmark: &BenchmarkReportLight,
     measurement: MeasurementType,
     is_dark: bool,
-    entries: &std::collections::BTreeMap<
-        bench_report::benchmark_kind::BenchmarkKind,
-        Vec<BenchmarkReportLight>,
-    >,
+    entries: &BTreeMap<BenchmarkKind, Vec<BenchmarkReportLight>>,
 ) -> Html {
     html! {
         <div class="content-wrapper">
@@ -113,12 +120,11 @@ fn render_single(
                 <div class="chart-title-primary">
                     { benchmark.title(&measurement.to_string()) }
                 </div>
-                <div class="chart-title-sub">{ benchmark.subtext() }</div>
                 <div class="chart-title-identifier">
                     { benchmark.identifier_with_cpu_and_version() }
                 </div>
             </div>
-            <PercentileCard benchmark={benchmark.clone()} />
+            <BenchmarkMeta benchmark={benchmark.clone()} />
             <div class="single-view">
                 { render_measurement_chart(benchmark, measurement, is_dark) }
             </div>
@@ -150,21 +156,49 @@ fn render_compare(
     measurement: MeasurementType,
     is_dark: bool,
     on_unpin: Callback<MouseEvent>,
+    on_swap: Callback<MouseEvent>,
 ) -> Html {
     html! {
         <div class="content-wrapper compare-wrapper">
             <div class="compare-banner">
-                <span class="compare-banner-label">{"Compare mode"}</span>
-                <button type="button" class="compare-banner-unpin" onclick={on_unpin}>
-                    {"Unpin"}
+                <span class="compare-banner-badge">{"Compare"}</span>
+                <div class="compare-banner-names">
+                    <span class="compare-banner-name a">
+                        <span class="compare-banner-letter">{"A"}</span>
+                        {short_name(selected_benchmark)}
+                    </span>
+                    <button type="button" class="compare-banner-swap" onclick={on_swap}
+                            title="Swap A and B">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14"
+                             viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="17 1 21 5 17 9" />
+                            <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+                            <polyline points="7 23 3 19 7 15" />
+                            <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+                        </svg>
+                    </button>
+                    <span class="compare-banner-name b">
+                        <span class="compare-banner-letter">{"B"}</span>
+                        {short_name(pinned_benchmark)}
+                    </span>
+                </div>
+                <button type="button" class="compare-banner-unpin" onclick={on_unpin}
+                        title="Exit compare mode">
+                    {"Exit"}
                 </button>
             </div>
             <div class="compare-grid">
-                { render_compare_pane("A - selected", selected_benchmark, measurement.clone(), is_dark) }
-                { render_compare_pane("B - pinned", pinned_benchmark, measurement, is_dark) }
+                { render_compare_pane("A", selected_benchmark, measurement.clone(), is_dark) }
+                { render_compare_pane("B", pinned_benchmark, measurement, is_dark) }
             </div>
         </div>
     }
+}
+
+fn short_name(benchmark: &BenchmarkReportLight) -> String {
+    let full = &benchmark.params.pretty_name;
+    full.split('(').next().unwrap_or(full).trim().to_string()
 }
 
 fn render_compare_pane(
@@ -180,12 +214,11 @@ fn render_compare_pane(
                 <div class="chart-title-primary">
                     { benchmark.title(&measurement.to_string()) }
                 </div>
-                <div class="chart-title-sub">{ benchmark.subtext() }</div>
                 <div class="chart-title-identifier">
                     { benchmark.identifier_with_cpu_and_version() }
                 </div>
             </div>
-            <PercentileCard benchmark={benchmark.clone()} />
+            <BenchmarkMeta benchmark={benchmark.clone()} />
             <div class="single-view">
                 { render_measurement_chart(benchmark, measurement, is_dark) }
             </div>
@@ -198,14 +231,20 @@ fn render_empty_recent() -> Html {
         <div class="content-wrapper">
             <div class="empty-state">
                 <div class="empty-state-content">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
-                        <polyline points="13 2 13 9 20 9"/>
-                        <line x1="16" y1="13" x2="8" y2="13"/>
-                        <line x1="16" y1="17" x2="8" y2="17"/>
-                    </svg>
                     <h2>{"Select a recent benchmark"}</h2>
                     <p>{"Choose a benchmark from the sidebar to display performance data."}</p>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+fn render_loading() -> Html {
+    html! {
+        <div class="content-wrapper">
+            <div class="empty-state">
+                <div class="empty-state-content">
+                    <h2>{"Loading benchmark..."}</h2>
                 </div>
             </div>
         </div>

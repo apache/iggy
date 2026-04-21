@@ -19,6 +19,7 @@ mod api;
 mod components;
 mod config;
 mod error;
+mod format;
 mod hooks;
 mod router;
 mod state;
@@ -44,7 +45,7 @@ pub fn app() -> Html {
 
 fn switch(routes: AppRoute) -> Html {
     match routes {
-        AppRoute::Benchmark { .. } | AppRoute::Home => html! {
+        AppRoute::Benchmark { .. } | AppRoute::Compare { .. } | AppRoute::Home => html! {
             <ThemeProvider>
                 <UiProvider>
                     <div class="app-container">
