@@ -24,6 +24,7 @@ use iggy_binary_protocol::{
 use iggy_common::sharding::IggyNamespace;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
+use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 
 /// Inter-shard dispatch logic.
@@ -213,7 +214,7 @@ where
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            >,
+            > + StreamsFrontend,
     {
         loop {
             futures::select! {
@@ -247,7 +248,7 @@ where
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            >,
+            > + StreamsFrontend,
     {
         self.on_message(frame.message).await;
         // TODO: once on_message returns an R (e.g. ShardResponse), send it

@@ -618,6 +618,8 @@ pub const fn status_as_str(status: Status) -> &'static str {
 pub const fn operation_as_str(operation: Operation) -> &'static str {
     match operation {
         Operation::Reserved => "reserved",
+        Operation::CreateTopicWithAssignments => "create_topic_with_assignments",
+        Operation::CreatePartitionsWithAssignments => "create_partitions_with_assignments",
         Operation::CreateStream => "create_stream",
         Operation::UpdateStream => "update_stream",
         Operation::DeleteStream => "delete_stream",
