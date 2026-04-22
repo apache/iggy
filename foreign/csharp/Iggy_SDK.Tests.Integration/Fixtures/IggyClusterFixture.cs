@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Net;
+using System.Net.Sockets;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
 using DotNet.Testcontainers.Networks;
@@ -27,7 +29,6 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
     private const string LeaderAlias = "iggy-leader";
     private const string FollowerAlias = "iggy-follower";
 
-    private static readonly Random Random = new();
     private static readonly HashSet<ushort> UsedPorts = [];
     private readonly IContainer _followerContainer;
     private readonly ushort _followerHttpPort;
@@ -156,13 +157,18 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
     {
         lock (UsedPorts)
         {
-            ushort port;
-            do
+            while (true)
             {
-                port = (ushort)Random.Next(30000, 40000);
-            } while (!UsedPorts.Add(port));
+                using var listener = new TcpListener(IPAddress.Loopback, 0);
+                listener.Start();
+                var port = (ushort)((IPEndPoint)listener.LocalEndpoint).Port;
+                listener.Stop();
 
-            return port;
+                if (UsedPorts.Add(port))
+                {
+                    return port;
+                }
+            }
         }
     }
 
