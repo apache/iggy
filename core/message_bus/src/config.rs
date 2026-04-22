@@ -75,7 +75,12 @@ pub struct MessageBusConfig {
 impl Default for MessageBusConfig {
     fn default() -> Self {
         Self {
-            max_batch: 64,
+            // Match `peer_queue_capacity` so a saturated queue drains in a
+            // single `writev(2)` call. Previously capped at 64, which
+            // forced 4x writevs per full burst and delayed the next
+            // backpressure signal by the extra syscalls. Still well below
+            // `IOV_MAX=1024` on Linux.
+            max_batch: 256,
             max_message_size: 64 * 1024 * 1024,
             peer_queue_capacity: 256,
             reconnect_period: Duration::from_secs(5),

@@ -15,19 +15,42 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::io;
 use thiserror::Error;
 
 /// Transport-level error for `MessageBus::send_to_*` operations.
 ///
 /// All variants are non-fatal from the consensus perspective.
 /// VSR handles message loss via timeout-driven retransmission from the WAL.
+///
+/// The client- and replica-keyed variants separate three physically
+/// distinct failure modes so operators can tell apart routing bugs from
+/// transient disconnects:
+/// - `*NotFound` / `*NotConnected` — the key is unknown to this shard's
+///   local registry (genuine peer state, often recoverable by reconnect).
+/// - `*RouteMissing` — the bus cannot forward to the owning shard
+///   because no forward fn was installed (bootstrap ordering bug).
+/// - `*ForwardFailed` — the forward fn rejected the frame (inter-shard
+///   queue full, shutdown, etc.).
 #[derive(Debug, Error)]
 pub enum SendError {
-    #[error("client {0} not found")]
+    #[error("client {0} not found in local registry")]
     ClientNotFound(u128),
 
-    #[error("replica {0} not connected")]
+    #[error("client {0}: no inter-shard forward fn installed")]
+    ClientRouteMissing(u128),
+
+    #[error("client {0}: inter-shard forward failed")]
+    ClientForwardFailed(u128),
+
+    #[error("replica {0} not connected on this shard")]
     ReplicaNotConnected(u8),
+
+    #[error("replica {0}: no inter-shard forward fn installed")]
+    ReplicaRouteMissing(u8),
+
+    #[error("replica {0}: inter-shard forward failed")]
+    ReplicaForwardFailed(u8),
 
     #[error("connection closed")]
     ConnectionClosed,
@@ -41,6 +64,6 @@ pub enum SendError {
     #[error("inter-shard routing to shard {0} failed")]
     RoutingFailed(u16),
 
-    #[error("fd duplication failed: errno={0}")]
-    DupFailed(i32),
+    #[error("fd duplication failed: {0}")]
+    DupFailed(#[source] io::Error),
 }

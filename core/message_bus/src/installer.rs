@@ -27,14 +27,16 @@
 use crate::client_listener::RequestHandler;
 use crate::fd_transfer::{self, DupedFd};
 use crate::framing;
+use crate::lifecycle::RejectedRegistration;
 use crate::replica_listener::MessageHandler;
-use crate::socket_opts::apply_keepalive_for_connection;
+use crate::socket_opts::{apply_keepalive_for_connection, apply_nodelay_for_connection};
 use crate::{IggyMessageBus, lifecycle::ShutdownToken};
 use compio::net::{OwnedReadHalf, TcpStream};
 use futures::FutureExt;
 use iggy_binary_protocol::Command2;
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// Operations a shard needs to perform on its local bus when the router
@@ -115,6 +117,12 @@ pub fn install_replica_stream(
     ) {
         warn!(replica = peer_id, "keepalive failed on delegated fd: {e}");
     }
+    if let Err(e) = apply_nodelay_for_connection(&stream) {
+        // Linux does not propagate TCP_NODELAY from the listener to the
+        // accepted fd, so we toggle it here on every installed stream.
+        // A miss means we stay Nagle-on for this peer, not a failure.
+        warn!(replica = peer_id, "nodelay failed on delegated fd: {e}");
+    }
 
     let (read_half, write_half) = stream.into_split();
     let (tx, rx) = async_channel::bounded(bus.peer_queue_capacity());
@@ -193,20 +201,21 @@ pub fn install_replica_stream(
         info!(replica = peer_id, "peer replica disconnected");
     });
 
-    if bus
+    if let Err(rejected) = bus
         .replicas()
         .insert(peer_id, tx, writer_handle, reader_handle)
-        .is_err()
     {
         // Tell both halves to stand down: the winner's entry is live and
-        // must not be touched by this losing install. Dropping the
-        // `async_channel::Sender` (which `insert` already did on error)
-        // will wake the writer with `Err(Closed)`; the writer then drops
-        // its `OwnedWriteHalf`, the peer sees EOF, and the reader's
-        // `read_message` returns with an error. Both halves exit and hit
-        // their `install_aborted` check.
+        // must not be touched by this losing install.
         install_aborted.set(true);
         warn!(replica = peer_id, "replica registry insert raced");
+        // Explicitly drain the orphan handles instead of dropping them:
+        // `compio::runtime::JoinHandle::drop` only detaches, so a reader
+        // looping on `framing::read_message` could outlive the race on a
+        // half-open socket and hold the fd / read buffer until its peer
+        // EOF lands. Closing the sender wakes the writer; the reader
+        // exits on peer-close once shard 0 tears the duplicated fd down.
+        compio::runtime::spawn(drain_rejected_registration(rejected, close_peer_timeout)).detach();
     }
 }
 
@@ -228,6 +237,12 @@ pub fn install_client_stream(
         warn!(
             client = client_id,
             "keepalive failed on delegated client fd: {e}"
+        );
+    }
+    if let Err(e) = apply_nodelay_for_connection(&stream) {
+        warn!(
+            client = client_id,
+            "nodelay failed on delegated client fd: {e}"
         );
     }
 
@@ -293,10 +308,9 @@ pub fn install_client_stream(
         info!(client = client_id, "consensus client disconnected");
     });
 
-    if bus
+    if let Err(rejected) = bus
         .clients()
         .insert(client_id, tx, writer_handle, reader_handle)
-        .is_err()
     {
         // Shard 0 mints client ids as `(target_shard << 112) | seq` with a
         // monotonic `seq` starting at 1, so wrap requires 2^112 mints and
@@ -311,7 +325,29 @@ pub fn install_client_stream(
             "duplicate client id in registry, dropping delegated fd \
              (shard 0 counter invariant violated)"
         );
+        compio::runtime::spawn(drain_rejected_registration(rejected, close_peer_timeout)).detach();
     }
+}
+
+/// Drive a losing-insert's writer + reader [`JoinHandle`]s to completion
+/// (or force-cancel at the deadline).
+///
+/// The winning entry must never be touched here; `install_aborted` has
+/// already told both tasks to skip post-loop cleanup. All this does is
+/// wake the writer by closing its queue, then await both handles with
+/// `close_peer_timeout` budget so the reader cannot outlive the race on
+/// a half-open socket. `compio::runtime::JoinHandle::drop` detaches, so
+/// letting the handles go out of scope would leak the tasks.
+#[allow(clippy::future_not_send)] // single-threaded compio
+async fn drain_rejected_registration(rejected: RejectedRegistration, timeout: Duration) {
+    let RejectedRegistration {
+        sender,
+        writer_handle,
+        reader_handle,
+    } = rejected;
+    sender.close();
+    let _ = compio::time::timeout(timeout, writer_handle).await;
+    let _ = compio::time::timeout(timeout, reader_handle).await;
 }
 
 /// Read loop for a delegated replica connection. Identical to the

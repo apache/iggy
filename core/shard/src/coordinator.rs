@@ -157,8 +157,7 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
     /// inbox refuses the setup frame (full or disconnected).
     pub fn delegate_replica(&self, stream: TcpStream, replica_id: u8) -> Result<u16, SendError> {
         let target = self.next_replica_target();
-        let fd = fd_transfer::dup_fd(&stream)
-            .map_err(|e| SendError::DupFailed(e.raw_os_error().unwrap_or(-1)))?;
+        let fd = fd_transfer::dup_fd(&stream).map_err(SendError::DupFailed)?;
 
         let setup = ShardFramePayload::ReplicaConnectionSetup { fd, replica_id };
         if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
@@ -218,8 +217,7 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
         let target = self.next_client_target();
         let client_id = self.mint_client_id(target);
 
-        let fd = fd_transfer::dup_fd(&stream)
-            .map_err(|e| SendError::DupFailed(e.raw_os_error().unwrap_or(-1)))?;
+        let fd = fd_transfer::dup_fd(&stream).map_err(SendError::DupFailed)?;
         let setup = ShardFramePayload::ClientConnectionSetup { fd, client_id };
         if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
             // The returned frame owns the `DupedFd` and closes it on drop.

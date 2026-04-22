@@ -57,3 +57,20 @@ pub fn apply_keepalive_for_connection(
         .with_retries(retries);
     sock.set_tcp_keepalive(&params)
 }
+
+/// Disable Nagle on a per-connection socket.
+///
+/// Linux does not propagate `TCP_NODELAY` from a listener socket to the fd
+/// returned by `accept(2)`, so the bus must toggle it per-connection on both
+/// outbound dials and freshly accepted streams. Matching behaviour on both
+/// halves keeps small consensus frames (PrepareOk/Commit/SVC/DVC/SV) from
+/// getting held by the 40 ms Nagle coalescer.
+///
+/// # Errors
+///
+/// Returns the underlying `io::Error` if the kernel rejects the setsockopt
+/// call. Callers log-and-continue; VSR's prepare timeout absorbs a stray
+/// Nagle-delayed frame on the soft-failure path.
+pub fn apply_nodelay_for_connection(stream: &TcpStream) -> io::Result<()> {
+    SockRef::from(stream).set_tcp_nodelay(true)
+}

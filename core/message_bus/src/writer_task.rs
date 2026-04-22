@@ -34,7 +34,7 @@ use crate::lifecycle::{BusMessage, BusReceiver, ShutdownToken};
 use compio::io::AsyncWriteExt;
 use compio::net::{OwnedWriteHalf, TcpStream};
 use futures::FutureExt;
-use tracing::{debug, trace, warn};
+use tracing::{debug, error, trace};
 
 /// Run the per-connection writer loop until the channel closes, the
 /// shutdown token fires, or a write fails.
@@ -52,10 +52,16 @@ pub async fn run(
     max_batch: usize,
 ) {
     let mut batch: Vec<BusMessage> = Vec::with_capacity(max_batch);
+    // Build the shutdown wait future once and re-poll the same pinned
+    // instance every loop iteration. Re-creating `token.wait().fuse()`
+    // per batch re-registers the async-channel waker; a shared fused
+    // future resolves in-place the moment the token fires and then
+    // yields Ready on every subsequent poll.
+    let mut shutdown_fut = Box::pin(token.wait().fuse());
 
     loop {
         let first = futures::select! {
-            () = token.wait().fuse() => {
+            () = shutdown_fut.as_mut() => {
                 debug!(%label, %peer, "writer task: shutdown token fired");
                 return;
             }
@@ -89,7 +95,18 @@ pub async fn run(
         let to_write = std::mem::take(&mut batch);
         let compio::BufResult(result, mut returned) = write_half.write_vectored_all(to_write).await;
         if let Err(e) = result {
-            warn!(%label, %peer, error = ?e, "writer task: write_vectored_all failed");
+            // Error (not warn) because the batch is now on the floor:
+            // VSR's prepare-timeout or view-change will recover, but the
+            // operator needs a loud diagnostic to correlate with the
+            // underlying network fault. `batch_len` lets them estimate
+            // how many messages were in flight when the write failed.
+            error!(
+                %label,
+                %peer,
+                error = ?e,
+                batch_len = drained,
+                "writer task: write_vectored_all failed, dropping batch"
+            );
             return;
         }
 

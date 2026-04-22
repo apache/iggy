@@ -40,7 +40,6 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
-use thiserror::Error;
 use tracing::{debug, warn};
 
 /// Minimum deadline reserved for reader-handle drain, in addition to the
@@ -69,10 +68,24 @@ pub type BusSender = async_channel::Sender<BusMessage>;
 /// Consumer side of a per-peer queue. Owned by the writer task.
 pub type BusReceiver = async_channel::Receiver<BusMessage>;
 
-/// Attempt to register a duplicate key.
-#[derive(Debug, Error)]
-#[error("key already registered")]
-pub struct AlreadyRegistered;
+/// Rejected payload handed back to the caller when `insert` loses.
+///
+/// Exposes the writer and reader [`JoinHandle`]s so the loser can
+/// explicitly drain (or force-cancel on deadline) the orphan tasks
+/// rather than relying on them to self-exit via `install_aborted`.
+/// `compio::runtime::JoinHandle::drop` detaches; without this the loser
+/// would leak the handles and a reader looping on `framing::read_message`
+/// could outlive the race indefinitely on a half-open socket.
+#[derive(Debug)]
+pub struct RejectedRegistration {
+    /// Producer side of the losing queue. Drop or `close()` to wake the
+    /// writer task with `Closed`.
+    pub sender: BusSender,
+    /// Writer task spawned before `insert` was attempted.
+    pub writer_handle: JoinHandle<()>,
+    /// Reader task spawned before `insert` was attempted.
+    pub reader_handle: JoinHandle<()>,
+}
 
 /// Result of [`ConnectionRegistry::drain`] or [`crate::IggyMessageBus::shutdown`].
 ///
@@ -148,22 +161,20 @@ where
         self.entries.borrow().is_empty()
     }
 
-    /// Borrow the per-peer queue producer without cloning the `Sender`.
+    /// Run `f` with the per-peer queue producer without cloning the `Sender`.
     ///
     /// `async_channel::Sender::try_send` takes `&self` so a borrow is
     /// sufficient; cloning would trigger an atomic RMW on the inner
     /// `Arc<State>` on every send.
     ///
-    /// The returned guard holds a `RefCell` read borrow. Callers must
-    /// not invoke a mutating method on the same registry
-    /// (`insert` / `remove` / `close_peer`) while the guard is live -
-    /// that would panic on the `borrow_mut`. All `try_send` paths are
-    /// sync so no yield can occur while the guard is held.
-    pub fn borrow_sender(&self, key: K) -> Option<std::cell::Ref<'_, BusSender>> {
-        std::cell::Ref::filter_map(self.entries.borrow(), |entries| {
-            entries.get(&key).map(|entry| &entry.sender)
-        })
-        .ok()
+    /// Scoping the borrow to `f` keeps the read guard on the stack for
+    /// exactly the closure body. Any future edit that sneaks an `.await`
+    /// between borrow and send becomes a compile error instead of a
+    /// runtime `RefCell` panic on a concurrent `insert` / `remove` /
+    /// `close_peer`.
+    pub fn with_sender<R>(&self, key: K, f: impl FnOnce(&BusSender) -> R) -> Option<R> {
+        let entries = self.entries.borrow();
+        entries.get(&key).map(|entry| f(&entry.sender))
     }
 
     /// Register a new connection. Stores the producer side of the per-peer
@@ -172,18 +183,23 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`AlreadyRegistered`] if `key` is already present. Callers
-    /// resolve races (e.g. duplicate dial) by dropping the duplicate.
+    /// On duplicate `key` returns the rejected payload (sender +
+    /// both [`JoinHandle`]s) so the caller can explicitly drain the
+    /// orphan tasks instead of leaking them on drop.
     pub fn insert(
         &self,
         key: K,
         sender: BusSender,
         writer_handle: JoinHandle<()>,
         reader_handle: JoinHandle<()>,
-    ) -> Result<(), AlreadyRegistered> {
+    ) -> Result<(), RejectedRegistration> {
         let mut entries = self.entries.borrow_mut();
         if entries.contains_key(&key) {
-            return Err(AlreadyRegistered);
+            return Err(RejectedRegistration {
+                sender,
+                writer_handle,
+                reader_handle,
+            });
         }
         entries.insert(
             key,
@@ -405,30 +421,35 @@ impl ReplicaRegistry {
         self.len.get() == 0
     }
 
-    /// See [`ConnectionRegistry::borrow_sender`].
-    pub fn borrow_sender(&self, key: u8) -> Option<std::cell::Ref<'_, BusSender>> {
-        std::cell::Ref::filter_map(self.slots.borrow(), |slots| {
-            slots[usize::from(key)].as_ref().map(|entry| &entry.sender)
-        })
-        .ok()
+    /// See [`ConnectionRegistry::with_sender`].
+    pub fn with_sender<R>(&self, key: u8, f: impl FnOnce(&BusSender) -> R) -> Option<R> {
+        let slots = self.slots.borrow();
+        slots[usize::from(key)]
+            .as_ref()
+            .map(|entry| f(&entry.sender))
     }
 
     /// See [`ConnectionRegistry::insert`].
     ///
     /// # Errors
     ///
-    /// Returns [`AlreadyRegistered`] if `key` is already present.
+    /// On duplicate `key` returns the rejected payload so the caller
+    /// can drain orphan tasks instead of leaking them on drop.
     pub fn insert(
         &self,
         key: u8,
         sender: BusSender,
         writer_handle: JoinHandle<()>,
         reader_handle: JoinHandle<()>,
-    ) -> Result<(), AlreadyRegistered> {
+    ) -> Result<(), RejectedRegistration> {
         let mut slots = self.slots.borrow_mut();
         let slot = &mut slots[usize::from(key)];
         if slot.is_some() {
-            return Err(AlreadyRegistered);
+            return Err(RejectedRegistration {
+                sender,
+                writer_handle,
+                reader_handle,
+            });
         }
         *slot = Some(Entry {
             sender,
@@ -529,8 +550,10 @@ mod tests {
         assert!(reg.contains(1u8));
         assert_eq!(reg.len(), 1);
 
-        let sender = reg.borrow_sender(1u8).expect("sender present");
-        sender.try_send(make_bus_msg()).expect("queue accepts msg");
+        reg.with_sender(1u8, |sender| {
+            sender.try_send(make_bus_msg()).expect("queue accepts msg");
+        })
+        .expect("sender present");
     }
 
     #[compio::test]

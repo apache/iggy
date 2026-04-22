@@ -34,7 +34,7 @@ pub use config::MessageBusConfig;
 pub use error::SendError;
 pub use installer::ConnectionInstaller;
 pub use lifecycle::{
-    AlreadyRegistered, BusMessage, BusReceiver, BusSender, ConnectionRegistry, DrainOutcome,
+    BusMessage, BusReceiver, BusSender, ConnectionRegistry, DrainOutcome, RejectedRegistration,
     ReplicaRegistry, Shutdown, ShutdownToken,
 };
 
@@ -224,8 +224,12 @@ impl IggyMessageBus {
     ///
     /// Takes `&self` so it can be called through an `Rc<IggyMessageBus>`
     /// wrapper after the bus is shared with accept loops and periodic tasks.
-    /// Must not be called from within a forward closure invocation
-    /// (re-entrant `borrow_mut` panics) — call sites are bootstrap only.
+    ///
+    /// # Panics
+    ///
+    /// Panics on re-entrant `RefCell::borrow_mut` if called from inside
+    /// an in-flight forward-closure invocation. All production call sites
+    /// are bootstrap only (single-threaded compio, no re-entry).
     pub fn set_replica_forward_fn(&self, f: ShardForwardFn) {
         *self.replica_forward_fn.borrow_mut() = Some(f);
     }
@@ -236,8 +240,12 @@ impl IggyMessageBus {
     /// connection lives on a different shard (top 16 bits of `client_id`).
     ///
     /// Takes `&self` so it can be called through an `Rc<IggyMessageBus>`
-    /// wrapper. Must not be called from within a forward closure
-    /// invocation. Call sites are bootstrap only.
+    /// wrapper. Call sites are bootstrap only.
+    ///
+    /// # Panics
+    ///
+    /// Panics on re-entrant `RefCell::borrow_mut` if called from inside
+    /// an in-flight forward-closure invocation.
     pub fn set_client_forward_fn(&self, f: ShardForwardFn) {
         *self.client_forward_fn.borrow_mut() = Some(f);
     }
@@ -245,6 +253,13 @@ impl IggyMessageBus {
     /// Update the shard mapping for a replica.
     ///
     /// Called when the allocation strategy assigns or reassigns connections.
+    ///
+    /// # Panics
+    ///
+    /// Panics on re-entrant `RefCell::borrow_mut` if called while
+    /// [`IggyMessageBus::owning_shard`] (or any other read-side of
+    /// `shard_mapping`) holds an outstanding read borrow on the same
+    /// bus instance.
     pub fn set_shard_mapping(&self, replica: u8, owning_shard: u16) {
         self.shard_mapping
             .borrow_mut()
@@ -252,6 +267,11 @@ impl IggyMessageBus {
     }
 
     /// Remove all shard mappings for a replica (on deallocation).
+    ///
+    /// # Panics
+    ///
+    /// Same re-entrant-`borrow_mut` constraint as
+    /// [`IggyMessageBus::set_shard_mapping`].
     pub fn remove_shard_mapping(&self, replica: u8) {
         self.shard_mapping.borrow_mut().remove(&replica);
     }
@@ -411,17 +431,19 @@ impl MessageBus for IggyMessageBus {
         // Owning shard is encoded in the top 16 bits of client_id.
         let owning_shard = client_id_owning_shard(client_id);
         if owning_shard == self.shard_id {
-            let sender = self
+            if let Some(result) = self
                 .clients
-                .borrow_sender(client_id)
-                .ok_or(SendError::ClientNotFound(client_id))?;
-            return sender.try_send(message).map_err(map_try_send_err);
+                .with_sender(client_id, |s| s.try_send(message.clone()))
+            {
+                return result.map_err(map_try_send_err);
+            }
+            return Err(SendError::ClientNotFound(client_id));
         }
         let forward = self.client_forward_fn.borrow();
         let forward = forward
             .as_ref()
-            .ok_or(SendError::ClientNotFound(client_id))?;
-        forward(owning_shard, message)
+            .ok_or(SendError::ClientRouteMissing(client_id))?;
+        forward(owning_shard, message).map_err(|_| SendError::ClientForwardFailed(client_id))
     }
 
     async fn send_to_replica(
@@ -433,8 +455,11 @@ impl MessageBus for IggyMessageBus {
             return Err(SendError::BusShuttingDown);
         }
         // Fast path: this shard owns a connection to the replica.
-        if let Some(sender) = self.replicas.borrow_sender(replica) {
-            return sender.try_send(message).map_err(map_try_send_err);
+        if let Some(result) = self
+            .replicas
+            .with_sender(replica, |s| s.try_send(message.clone()))
+        {
+            return result.map_err(map_try_send_err);
         }
         // Slow path: route via the inter-shard channel to the owning shard.
         let owning_shard = self
@@ -446,8 +471,8 @@ impl MessageBus for IggyMessageBus {
         let forward = self.replica_forward_fn.borrow();
         let forward = forward
             .as_ref()
-            .ok_or(SendError::ReplicaNotConnected(replica))?;
-        forward(owning_shard, message)
+            .ok_or(SendError::ReplicaRouteMissing(replica))?;
+        forward(owning_shard, message).map_err(|_| SendError::ReplicaForwardFailed(replica))
     }
 }
 
@@ -523,7 +548,7 @@ mod tests {
 
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn send_to_client_returns_not_found_when_remote_and_no_forward_fn() {
+    async fn send_to_client_returns_route_missing_when_remote_and_no_forward_fn() {
         // shard_id != top-16-bits and no forward_fn installed.
         let bus = IggyMessageBus::new(0);
         let client_id = (9u128 << 112) | 1;
@@ -531,7 +556,7 @@ mod tests {
             .send_to_client(client_id, dummy_message().into_frozen())
             .await
             .unwrap_err();
-        assert!(matches!(err, SendError::ClientNotFound(_)));
+        assert!(matches!(err, SendError::ClientRouteMissing(_)));
     }
 
     #[compio::test]
