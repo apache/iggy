@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod builder;
 pub mod config;
 pub mod coordinator;
 mod router;
@@ -144,6 +145,15 @@ impl<R: Send + 'static> TaggedSender<R> {
     #[must_use]
     pub const fn sender(&self) -> &Sender<ShardFrame<R>> {
         &self.inner
+    }
+}
+
+impl<R: Send + 'static> Clone for TaggedSender<R> {
+    fn clone(&self) -> Self {
+        Self {
+            shard_id: self.shard_id,
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -395,6 +405,14 @@ where
     /// replica mappings.
     pub fn set_coordinator(&mut self, coord: Rc<crate::coordinator::ShardZeroCoordinator<R>>) {
         self.coordinator = Some(coord);
+    }
+
+    /// `true` when a [`coordinator::ShardZeroCoordinator`] has been attached
+    /// via [`set_coordinator`](Self::set_coordinator). Shard 0 bootstrap is
+    /// expected to flip this on; every other shard keeps it `false`.
+    #[must_use]
+    pub const fn has_coordinator(&self) -> bool {
+        self.coordinator.is_some()
     }
 
     /// Create a shard without inter-shard channels or delegated connections.
