@@ -137,7 +137,7 @@ mod tests {
 
         let mut journal_batch = create_batch(journal_count);
         journal_batch
-            .prepare_for_persistence(0, journal_base, in_flight_size as u32, None)
+            .prepare_for_persistence(0, journal_base, in_flight_size, None)
             .await;
         partition.log.journal_mut().append(journal_batch).unwrap();
 

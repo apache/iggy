@@ -46,7 +46,7 @@ pub fn map_users(users: &[&User]) -> Vec<UserInfo> {
         };
         users_data.push(user);
     }
-    users_data.sort_by(|a, b| a.id.cmp(&b.id));
+    users_data.sort_by_key(|u| u.id);
     users_data
 }
 
@@ -97,7 +97,7 @@ pub fn map_clients(clients: &[Client]) -> Vec<iggy_common::ClientInfo> {
         all_clients.push(client);
     }
 
-    all_clients.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+    all_clients.sort_by_key(|c| c.client_id);
     all_clients
 }
 
