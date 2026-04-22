@@ -53,6 +53,7 @@ moka = { workspace = true }
 once_cell = { workspace = true }
 papaya = { workspace = true }
 rcgen = { workspace = true }
+reqwest = { workspace = true }
 ring = { workspace = true }
 rustls = { workspace = true }
 secrecy = { workspace = true }
@@ -67,7 +68,6 @@ tungstenite = { workspace = true }
 twox-hash = { workspace = true }
 ulid = { workspace = true }
 uuid = { workspace = true }
-
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 
