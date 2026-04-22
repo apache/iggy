@@ -103,6 +103,12 @@ pub fn calculate_shard_assignment(ns: &IggyNamespace, shard_count: u32) -> u16 {
 /// shard (`shard_count == 1`) always returns `0` regardless of `ns`.
 #[must_use]
 pub fn calculate_shard_from_consensus_ns(ns: u64, shard_count: u32) -> u16 {
+    // Zero shards is a bootstrap invariant violation: the cluster validator
+    // rejects it at config load, and `IggyShard` ctors also guarantee at
+    // least one shard. A debug_assert here makes the invariant explicit so
+    // any future code path that skips the validator trips loudly before
+    // the `%` panics with an opaque "attempt to mod by zero".
+    debug_assert!(shard_count > 0, "shard_count must be > 0");
     let mut hasher = Murmur3Hasher::default();
     hasher.write_u64(ns);
     let hash = hasher.finish32();

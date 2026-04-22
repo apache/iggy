@@ -242,9 +242,13 @@ where
         &mut self,
         op: u64,
     ) -> Result<(), IggyError> {
-        let pending = self
+        // Peek (copy) instead of remove: if `persist_consumer_offset_commit`
+        // fails (e.g. disk full, fd exhausted) the pending entry must remain
+        // stageable for retry on the next apply. Removing first would strand
+        // the op - not on disk AND not in memory.
+        let pending = *self
             .pending_consumer_offset_commits
-            .remove(&op)
+            .get(&op)
             .ok_or(IggyError::InvalidCommand)?;
         // Persist to the on-disk offset table first so a crash after the
         // in-memory apply cannot observe a readable offset that was not
@@ -252,6 +256,7 @@ where
         // because we look up by (kind, id).
         self.persist_consumer_offset_commit(pending).await?;
         self.apply_consumer_offset_commit(pending)?;
+        self.pending_consumer_offset_commits.remove(&op);
         Ok(())
     }
 

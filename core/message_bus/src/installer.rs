@@ -36,7 +36,7 @@ use futures::FutureExt;
 use iggy_binary_protocol::Command2;
 use std::cell::Cell;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Operations a shard needs to perform on its local bus when the router
@@ -251,9 +251,13 @@ pub fn install_replica_stream(
             // its `io_uring` read SQE, then awaits writer / reader
             // handles. `compio::runtime::JoinHandle::drop` only detaches,
             // so without this drain the reader would outlive the race on
-            // a half-open socket until peer EOF.
-            compio::runtime::spawn(drain_rejected_registration(rejected, close_peer_timeout))
-                .detach();
+            // a half-open socket until peer EOF. Hand the handle to
+            // `track_background` so `IggyMessageBus::shutdown` awaits the
+            // drain before returning - `.detach()` would orphan it and
+            // leak the half-closed socket across shutdown.
+            let drain_handle =
+                compio::runtime::spawn(drain_rejected_registration(rejected, close_peer_timeout));
+            bus.track_background(drain_handle);
         }
     }
 }
@@ -386,8 +390,10 @@ pub fn install_client_stream(
                 "duplicate client id in registry, dropping delegated fd \
                  (shard 0 counter invariant violated)"
             );
-            compio::runtime::spawn(drain_rejected_registration(rejected, close_peer_timeout))
-                .detach();
+            // See replica installer for the track_background rationale.
+            let drain_handle =
+                compio::runtime::spawn(drain_rejected_registration(rejected, close_peer_timeout));
+            bus.track_background(drain_handle);
         }
     }
 }
@@ -403,6 +409,11 @@ pub fn install_client_stream(
 /// guarantees the reader cannot outlive the race on a half-open
 /// socket. `compio::runtime::JoinHandle::drop` detaches, so letting
 /// the handles go out of scope would leak the tasks.
+///
+/// Both handles share a single `timeout` budget: after the writer returns
+/// (or is cancelled) the reader only gets the remaining time. Two
+/// independent full-timeout awaits would let a stuck loser occupy up to
+/// `2 * timeout` of shutdown wall-clock on its own.
 #[allow(clippy::future_not_send)]
 async fn drain_rejected_registration(rejected: RejectedRegistration, timeout: Duration) {
     let RejectedRegistration {
@@ -413,8 +424,12 @@ async fn drain_rejected_registration(rejected: RejectedRegistration, timeout: Du
     } = rejected;
     sender.close();
     conn_shutdown.trigger();
+    let deadline = Instant::now() + timeout;
     let _ = compio::time::timeout(timeout, writer_handle).await;
-    let _ = compio::time::timeout(timeout, reader_handle).await;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if !remaining.is_zero() {
+        let _ = compio::time::timeout(remaining, reader_handle).await;
+    }
 }
 
 /// Read loop for a delegated replica connection. Identical to the

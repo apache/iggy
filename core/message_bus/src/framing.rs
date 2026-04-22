@@ -121,7 +121,12 @@ pub async fn read_message<S: AsyncReadExt + Unpin>(
     // (`Owned::with_capacity(HEADER_SIZE)` plus one in-place realloc of
     // the backing AVec). Zero memcpys of the data.
     let mut owned = owned;
-    let _ = IoBufMut::reserve_exact(&mut owned, body_size);
+    // Propagate any underlying reservation failure. `Owned::reserve_exact`
+    // is infallible today, but the `IoBufMut` contract allows an `Err`
+    // (e.g. capacity overflow, unsupported buffer kind) and silently
+    // ignoring it would leave `owned` at header-only capacity, causing the
+    // subsequent `read_exact` to read into an ungrown buffer.
+    IoBufMut::reserve_exact(&mut owned, body_size).map_err(|_| IggyError::TcpError)?;
     let BufResult(result, slice) = stream
         .read_exact(owned.slice(HEADER_SIZE..total_size))
         .await;
