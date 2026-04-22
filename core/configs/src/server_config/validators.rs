@@ -471,11 +471,11 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                         return Err(ConfigurationError::InvalidConfigurationValue);
                     }
 
-                    let endpoint = format!("{}:{}:{}", node.ip, name, port);
+                    let endpoint = format!("{}:{}", node.ip, port);
                     if !used_endpoints.insert(endpoint.clone()) {
                         eprintln!(
-                            "Invalid cluster configuration: port conflict - {}:{} is already used",
-                            node.ip, port
+                            "Invalid cluster configuration: port conflict - {endpoint} is already bound (node '{}', transport {name})",
+                            node.name
                         );
                         return Err(ConfigurationError::InvalidConfigurationValue);
                     }
@@ -562,6 +562,47 @@ mod cluster_validate_tests {
         n2.ports = ports;
         let c = cfg(vec![n1, n2]);
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_cross_transport_port_reuse() {
+        let mut n1 = node("n1", 0);
+        n1.ports = TransportPorts {
+            tcp: Some(8090),
+            quic: None,
+            http: Some(8090),
+            websocket: None,
+            tcp_replica: None,
+        };
+        let c = cfg(vec![n1]);
+        assert!(
+            c.validate().is_err(),
+            "same port on TCP and HTTP of the same node must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_same_port_on_different_ips() {
+        let mut n1 = node("n1", 0);
+        n1.ip = "127.0.0.1".to_string();
+        n1.ports = TransportPorts {
+            tcp: Some(8090),
+            quic: None,
+            http: None,
+            websocket: None,
+            tcp_replica: None,
+        };
+        let mut n2 = node("n2", 1);
+        n2.ip = "127.0.0.2".to_string();
+        n2.ports = TransportPorts {
+            tcp: Some(8090),
+            quic: None,
+            http: None,
+            websocket: None,
+            tcp_replica: None,
+        };
+        let c = cfg(vec![n1, n2]);
+        assert!(c.validate().is_ok());
     }
 
     #[test]
