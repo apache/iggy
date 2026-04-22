@@ -738,11 +738,6 @@ where
             );
             return;
         }
-        {
-            let consensus = self.consensus();
-            consensus.sequencer().set_sequence(header.op);
-            consensus.set_last_prepare_checksum(header.checksum);
-        }
         // Durability-before-ack: hold a clone for the chain-replicate so
         // we can forward only AFTER `apply_replicated_operation` has
         // persisted the prepare to our partition journal. Forwarding
@@ -755,7 +750,14 @@ where
         let clone_for_forward = message.clone();
         let replicated_result = self.apply_replicated_operation(message).await;
         if replicated_result.is_ok() {
+            // Advance sequencer + checksum only after the journal append
+            // succeeded. A pre-advance on a failing apply would leave
+            // consensus claiming we hold op N while the journal has no
+            // entry, and any retransmit of N would be silently dropped
+            // as `is_old_prepare` (header.op <= current_sequence).
             let consensus = self.consensus();
+            consensus.sequencer().set_sequence(header.op);
+            consensus.set_last_prepare_checksum(header.checksum);
             if let Err(error) = replicate_to_next_in_chain(consensus, &clone_for_forward).await {
                 emit_partition_diag(
                     tracing::Level::WARN,
