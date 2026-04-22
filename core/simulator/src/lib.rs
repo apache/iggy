@@ -24,8 +24,10 @@ pub mod ready_queue;
 pub mod replica;
 
 use bus::SimOutbox;
+use client::SimClient;
 use consensus::PartitionsHandle;
-use iggy_binary_protocol::{GenericHeader, Message, ReplyHeader};
+use iggy_binary_protocol::consensus::iobuf::Owned;
+use iggy_binary_protocol::{Command2, GenericHeader, Message, Operation, ReplyHeader};
 use iggy_common::IggyError;
 use iggy_common::sharding::IggyNamespace;
 use message_bus::MessageBus;
@@ -35,6 +37,27 @@ use partitions::{Partition, PartitionOffsets, PollQueryResult, PollingArgs, Poll
 use replica::{Replica, new_replica};
 use std::collections::HashSet;
 use std::sync::Arc;
+
+/// Build a minimal `ReplyHeader` message for a Register operation.
+///
+/// Used to seed partition-level client tables, which don't yet receive
+/// Register through the network protocol.
+#[allow(clippy::cast_possible_truncation)]
+fn build_register_reply(client_id: u128, session: u64) -> Message<ReplyHeader> {
+    let header_size = std::mem::size_of::<ReplyHeader>();
+    let header = ReplyHeader {
+        command: Command2::Reply,
+        operation: Operation::Register,
+        size: header_size as u32,
+        client: client_id,
+        commit: session,
+        request: 0,
+        ..Default::default()
+    };
+    let header_bytes = bytemuck::bytes_of(&header);
+    Message::try_from(Owned::<4096>::copy_from_slice(header_bytes))
+        .expect("register reply must be valid")
+}
 
 pub struct Simulator {
     /// All replicas, indexed by replica id. Always fully populated — crashed
@@ -206,6 +229,61 @@ impl Simulator {
         );
     }
 
+    /// Register a client with the consensus cluster via the primary (replica 0).
+    ///
+    /// This sends a `Register` through consensus (metadata plane) and also
+    /// directly registers the client in each live replica's partition consensus
+    /// client table. The partition plane doesn't yet handle `Register` via
+    /// the network protocol, so we seed it manually.
+    ///
+    /// Binds the assigned session on the `SimClient`.
+    ///
+    /// # Panics
+    /// Panics if no reply arrives within 100 steps.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn register_client_with_primary(&mut self, client: &SimClient) {
+        let msg = client.register();
+        self.submit_request(client.client_id(), 0, msg.into_generic());
+        let mut session = 0u64;
+        let mut got_reply = false;
+        for _ in 0..100 {
+            let replies = self.step();
+            if !replies.is_empty() {
+                session = replies[0].header().commit;
+                got_reply = true;
+                break;
+            }
+        }
+        assert!(
+            got_reply,
+            "register_client_with_primary: no reply within 100 steps"
+        );
+        client.bind_session(session);
+
+        // Seed the partition consensus client tables on all live replicas.
+        // The partition plane doesn't route Register operations yet, so we
+        // do it directly to match what the full server will do once the
+        // partition-level registration is wired up. With per-partition
+        // consensus, every partition's client_table needs the entry.
+        for (i, replica) in self.replicas.iter().enumerate() {
+            if self.crashed.contains(&(i as u8)) {
+                continue;
+            }
+            let partitions = replica.plane.partitions();
+            let namespaces: Vec<_> = partitions.namespaces().copied().collect();
+            for ns in namespaces {
+                if let Some(partition) = partitions.get_by_ns(&ns) {
+                    let reply = build_register_reply(client.client_id(), session);
+                    partition
+                        .consensus()
+                        .client_table()
+                        .borrow_mut()
+                        .commit_register(client.client_id(), reply);
+                }
+            }
+        }
+    }
+
     /// Crash a replica: disable its network links and discard its outbox.
     ///
     /// The replica object is kept alive but will not receive any messages or
@@ -340,6 +418,9 @@ mod tests {
         let ns = IggyNamespace::new(1, 1, 0);
         sim.init_partition(ns);
 
+        // Register the client with the consensus cluster.
+        sim.register_client_with_primary(&client);
+
         // Send a message through the primary (replica 0) to verify normal operation.
         let msg = client.send_messages(ns, &[b"before crash"]);
         sim.submit_request(client_id, 0, msg.into_generic());
@@ -366,7 +447,10 @@ mod tests {
         for replica_idx in 1..replica_count {
             let replica = &sim.replicas[replica_idx as usize];
             let partitions = replica.plane.partitions();
-            let consensus = partitions.consensus().unwrap();
+            let consensus = partitions
+                .get_by_ns(&ns)
+                .expect("partition must exist on every live replica")
+                .consensus();
             if consensus.view() > 0
                 && consensus.status() == Status::Normal
                 && consensus.is_primary()
@@ -380,7 +464,12 @@ mod tests {
         );
 
         // Submit a request to the new primary and verify it commits.
-        let c = sim.replicas[1].plane.partitions().consensus().unwrap();
+        let c = sim.replicas[1]
+            .plane
+            .partitions()
+            .get_by_ns(&ns)
+            .expect("partition must exist on replica 1")
+            .consensus();
         let new_primary_idx = c.primary_index(c.view());
 
         let msg2 = client.send_messages(ns, &[b"after view change"]);
@@ -427,6 +516,9 @@ mod tests {
         let ns = IggyNamespace::new(1, 1, 0);
         sim.init_partition(ns);
 
+        // Register the client with the consensus cluster.
+        sim.register_client_with_primary(&client);
+
         // Send several messages so the primary commits ahead of backups.
         // Backups receive prepares but may not have committed all of them
         // (commit_max lags behind the primary's commit_min because the
@@ -456,8 +548,9 @@ mod tests {
             let c = sim.replicas[idx as usize]
                 .plane
                 .partitions()
-                .consensus()
-                .unwrap();
+                .get_by_ns(&ns)
+                .expect("partition must exist on every live replica")
+                .consensus();
             if c.view() > 0 && c.status() == Status::Normal && c.is_primary() {
                 new_primary_found = true;
             }

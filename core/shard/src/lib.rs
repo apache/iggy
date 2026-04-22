@@ -19,30 +19,61 @@ mod router;
 pub mod shards_table;
 
 use consensus::{
-    MetadataHandle, MuxPlane, NamespacedPipeline, PartitionsHandle, Pipeline, Plane, PlaneKind,
+    LocalPipeline, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind,
     Sequencer, VsrAction, VsrConsensus,
 };
 use iggy_binary_protocol::{
     Command2, CommitHeader, DoViewChangeHeader, GenericHeader, Message, MessageBag, PrepareHeader,
     PrepareOkHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
-use iggy_common::sharding::IggyNamespace;
 use iggy_common::variadic;
+use iggy_common::{PartitionStats, sharding::IggyNamespace};
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use metadata::IggyMetadata;
+use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
-use partitions::IggyPartitions;
+use partitions::{IggyPartition, IggyPartitions};
 use shards_table::ShardsTable;
+use std::sync::Arc;
 
-// MJ - Metadata Journal
-// PJ - Partitions Journal
-pub type ShardPlane<B, MJ, S, M, PJ> = MuxPlane<
-    variadic!(
-        IggyMetadata<VsrConsensus<B>, MJ, S, M>,
-        IggyPartitions<VsrConsensus<B, NamespacedPipeline>, PJ>
-    ),
->;
+pub type ShardPlane<B, J, S, M> =
+    MuxPlane<variadic!(IggyMetadata<VsrConsensus<B>, J, S, M>, IggyPartitions<B>)>;
+
+pub struct ShardIdentity {
+    pub id: u16,
+    pub name: String,
+}
+
+impl ShardIdentity {
+    #[must_use]
+    pub const fn new(id: u16, name: String) -> Self {
+        Self { id, name }
+    }
+}
+
+pub struct PartitionConsensusConfig<B>
+where
+    B: MessageBus,
+{
+    pub cluster_id: u128,
+    pub replica_count: u8,
+    pub bus: B,
+}
+
+impl<B> PartitionConsensusConfig<B>
+where
+    B: MessageBus,
+{
+    #[must_use]
+    pub const fn new(cluster_id: u128, replica_count: u8, bus: B) -> Self {
+        Self {
+            cluster_id,
+            replica_count,
+            bus,
+        }
+    }
+}
 
 /// Bounded mpsc channel sender (blocking send).
 pub type Sender<T> = crossfire::MTx<crossfire::mpsc::Array<T>>;
@@ -95,13 +126,13 @@ impl<R: Send + 'static> ShardFrame<R> {
     }
 }
 
-pub struct IggyShard<B, MJ, S, M, PJ = (), T = (), R: Send + 'static = ()>
+pub struct IggyShard<B, MJ, S, M, T = (), R: Send + 'static = ()>
 where
     B: MessageBus,
 {
     pub id: u16,
     pub name: String,
-    pub plane: ShardPlane<B, MJ, S, M, PJ>,
+    pub plane: ShardPlane<B, MJ, S, M>,
 
     /// Channel senders to every shard, indexed by shard id.
     /// Includes a sender to self so that local routing goes through the
@@ -114,9 +145,11 @@ where
 
     /// Partition namespace -> owning shard lookup.
     shards_table: T,
+
+    partition_consensus: PartitionConsensusConfig<B>,
 }
 
-impl<B, MJ, S, M, PJ, T, R: Send + 'static> IggyShard<B, MJ, S, M, PJ, T, R>
+impl<B, MJ, S, M, T, R: Send + 'static> IggyShard<B, MJ, S, M, T, R>
 where
     B: MessageBus,
     T: ShardsTable,
@@ -127,16 +160,17 @@ where
     /// * `inbox` - the receiver that this shard drains in its message pump.
     /// * `shards_table` - namespace -> shard routing table.
     #[must_use]
-    pub const fn new(
-        id: u16,
-        name: String,
+    pub fn new(
+        identity: ShardIdentity,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
-        partitions: IggyPartitions<VsrConsensus<B, NamespacedPipeline>, PJ>,
+        partitions: IggyPartitions<B>,
         senders: Vec<Sender<ShardFrame<R>>>,
         inbox: Receiver<ShardFrame<R>>,
         shards_table: T,
+        partition_consensus: PartitionConsensusConfig<B>,
     ) -> Self {
         let plane = MuxPlane::new(variadic!(metadata, partitions));
+        let ShardIdentity { id, name } = identity;
         Self {
             id,
             name,
@@ -144,6 +178,7 @@ where
             senders,
             inbox,
             shards_table,
+            partition_consensus,
         }
     }
 
@@ -153,17 +188,18 @@ where
     /// via [`on_message`](Self::on_message) instead of through an inbox channel.
     #[must_use]
     pub fn without_inbox(
-        id: u16,
-        name: String,
+        identity: ShardIdentity,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
-        partitions: IggyPartitions<VsrConsensus<B, NamespacedPipeline>, PJ>,
+        partitions: IggyPartitions<B>,
         shards_table: T,
+        partition_consensus: PartitionConsensusConfig<B>,
     ) -> Self {
         // TODO: previously we used unbounded channel with flume,
         // but this is not possible with crossfire without mangling types due to Flavor trait in crossfire.
         // This needs to be revisited in the future.
         let (_tx, inbox) = channel(1);
         let plane = MuxPlane::new(variadic!(metadata, partitions));
+        let ShardIdentity { id, name } = identity;
         Self {
             id,
             name,
@@ -171,6 +207,7 @@ where
             senders: Vec::new(),
             inbox,
             shards_table,
+            partition_consensus,
         }
     }
 
@@ -182,7 +219,7 @@ where
 
 /// Local message processing — these methods handle messages that have been
 /// routed to this shard via the message pump.
-impl<B, MJ, S, M, PJ, T, R: Send + 'static> IggyShard<B, MJ, S, M, PJ, T, R>
+impl<B, MJ, S, M, T, R: Send + 'static> IggyShard<B, MJ, S, M, T, R>
 where
     B: MessageBus,
 {
@@ -200,17 +237,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            >,
+            > + StreamsFrontend,
     {
         match MessageBag::try_from(message) {
             Ok(MessageBag::Request(request)) => self.on_request(request).await,
@@ -236,17 +267,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            >,
+            > + StreamsFrontend,
     {
         self.plane.on_request(request).await;
     }
@@ -261,17 +286,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            >,
+            > + StreamsFrontend,
     {
         self.plane.on_replicate(prepare).await;
     }
@@ -286,17 +305,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            >,
+            > + StreamsFrontend,
     {
         self.plane.on_ack(prepare_ok).await;
     }
@@ -322,17 +335,11 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
-            >,
+            > + StreamsFrontend,
     {
         debug_assert!(buf.is_empty(), "buf must be empty on entry");
 
@@ -351,42 +358,69 @@ where
             }
         }
 
-        if let Some(consensus) = planes.1.0.consensus() {
-            consensus.drain_loopback_into(buf);
-            let count = buf.len();
-            total += count;
-            for msg in buf.drain(..) {
-                let typed: Message<PrepareOkHeader> = msg
-                    .try_into_typed()
-                    .expect("loopback queue must only contain PrepareOk messages");
-                planes.1.0.on_ack(typed).await;
-            }
+        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
+        for namespace in namespaces {
+            let partition = planes
+                .1
+                .0
+                .get_by_ns(&namespace)
+                .expect("partition namespace must resolve during loopback drain");
+            partition.consensus().drain_loopback_into(buf);
+        }
+        let count = buf.len();
+        total += count;
+        for msg in buf.drain(..) {
+            let typed: Message<PrepareOkHeader> = msg
+                .try_into_typed()
+                .expect("loopback queue must only contain PrepareOk messages");
+            planes.1.0.on_ack(typed).await;
         }
 
         total
     }
 
+    /// Initializes a partition and its dedicated consensus instance on this shard.
+    ///
+    /// # Panics
+    /// Panics if the shard id does not fit in `u8`, which is currently required
+    /// by the partition consensus replica id.
     pub fn init_partition(&mut self, namespace: IggyNamespace)
     where
         B: MessageBus<
                 Replica = u8,
                 Data = iggy_binary_protocol::Message<iggy_binary_protocol::GenericHeader>,
                 Client = u128,
-            >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+            > + Clone,
     {
         let partitions = self.plane.partitions_mut();
-        partitions.init_partition_in_memory(namespace);
-        partitions.register_namespace_in_pipeline(namespace.inner());
+        if partitions.contains(&namespace) {
+            return;
+        }
+
+        let replica_id =
+            u8::try_from(self.id).expect("shard id must fit in u8 for partition consensus");
+        let consensus = VsrConsensus::new(
+            self.partition_consensus.cluster_id,
+            replica_id,
+            self.partition_consensus.replica_count,
+            namespace.inner(),
+            self.partition_consensus.bus.clone(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+
+        let stats = Arc::new(PartitionStats::default());
+        let partition = IggyPartition::with_in_memory_storage(
+            stats,
+            consensus,
+            partitions.config().segment_size,
+            partitions.config().enforce_fsync,
+        );
+        partitions.insert(namespace, partition);
     }
 
-    /// Handle an incoming view change message by routing it to the correct
-    /// consensus group (metadata or partitions) based on the message namespace.
+    /// Handle incoming view-change/control message. Metadata use metadata
+    /// consensus. Partitions loop all partitions, use partition consensus.
     #[allow(clippy::future_not_send)]
     async fn on_start_view_change(&self, msg: Message<StartViewChangeHeader>)
     where
@@ -394,12 +428,6 @@ where
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target: Journal<
                 <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
@@ -415,11 +443,19 @@ where
             return;
         }
 
-        if let Some(consensus) = planes.1.0.consensus()
-            && consensus.namespace() == header.namespace
-        {
+        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
+        for namespace in namespaces {
+            let Some(partition) = planes.1.0.get_by_ns(&namespace) else {
+                continue;
+            };
+            let consensus = partition.consensus();
+            if consensus.namespace() != header.namespace {
+                continue;
+            }
+
             let actions = consensus.handle_start_view_change(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
+            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+            dispatch_partition_journal_actions(consensus, partition, &actions).await;
             return;
         }
 
@@ -428,7 +464,7 @@ where
             namespace = header.namespace,
             view = header.view,
             replica = header.replica,
-            "dropping StartViewChange: namespace matches neither metadata nor partitions consensus"
+            "dropping StartViewChange: namespace matches neither metadata nor partition consensus"
         );
     }
 
@@ -442,13 +478,8 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-        M: StateMachine<
+        M: StreamsFrontend
+            + StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
@@ -464,23 +495,32 @@ where
             dispatch_vsr_actions(consensus, planes.0.journal.as_ref(), &actions).await;
             if actions
                 .iter()
-                .any(|a| matches!(a, VsrAction::CommitJournal))
+                .any(|action| matches!(action, VsrAction::CommitJournal))
             {
                 planes.0.commit_journal().await;
             }
             return;
         }
 
-        if let Some(consensus) = planes.1.0.consensus()
-            && consensus.namespace() == header.namespace
-        {
+        let config = planes.1.0.config().clone();
+        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
+        for namespace in namespaces {
+            let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
+                continue;
+            };
+            let consensus = partition.consensus();
+            if consensus.namespace() != header.namespace {
+                continue;
+            }
+
             let actions = consensus.handle_do_view_change(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
+            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+            dispatch_partition_journal_actions(consensus, partition, &actions).await;
             if actions
                 .iter()
-                .any(|a| matches!(a, VsrAction::CommitJournal))
+                .any(|action| matches!(action, VsrAction::CommitJournal))
             {
-                planes.1.0.commit_journal().await;
+                partition.commit_journal(&config).await;
             }
             return;
         }
@@ -490,7 +530,7 @@ where
             namespace = header.namespace,
             view = header.view,
             replica = header.replica,
-            "dropping DoViewChange: namespace matches neither metadata nor partitions consensus"
+            "dropping DoViewChange: namespace matches neither metadata nor partition consensus"
         );
     }
 
@@ -501,12 +541,6 @@ where
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target: Journal<
                 <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
@@ -522,11 +556,19 @@ where
             return;
         }
 
-        if let Some(consensus) = planes.1.0.consensus()
-            && consensus.namespace() == header.namespace
-        {
+        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
+        for namespace in namespaces {
+            let Some(partition) = planes.1.0.get_by_ns(&namespace) else {
+                continue;
+            };
+            let consensus = partition.consensus();
+            if consensus.namespace() != header.namespace {
+                continue;
+            }
+
             let actions = consensus.handle_start_view(PlaneKind::Partitions, &header);
-            dispatch_vsr_actions(consensus, planes.1.0.journal(), &actions).await;
+            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+            dispatch_partition_journal_actions(consensus, partition, &actions).await;
             return;
         }
 
@@ -535,15 +577,10 @@ where
             namespace = header.namespace,
             view = header.view,
             replica = header.replica,
-            "dropping StartView: namespace matches neither metadata nor partitions consensus"
+            "dropping StartView: namespace matches neither metadata nor partition consensus"
         );
     }
 
-    /// Handle an incoming `Commit` (primary heartbeat) message.
-    ///
-    /// Routes to the correct consensus by namespace. The backup advances
-    /// `commit_max`, resets its `NormalHeartbeat` timeout, and commits
-    /// any newly committable ops from the journal.
     #[allow(clippy::future_not_send)]
     async fn on_commit(&self, msg: &Message<CommitHeader>)
     where
@@ -554,13 +591,8 @@ where
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
-        M: StateMachine<
+        M: StreamsFrontend
+            + StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = bytes::Bytes,
                 Error = iggy_common::IggyError,
@@ -578,11 +610,19 @@ where
             return;
         }
 
-        if let Some(consensus) = planes.1.0.consensus()
-            && consensus.namespace() == header.namespace
-        {
+        let config = planes.1.0.config().clone();
+        let namespaces: Vec<_> = planes.1.0.namespaces().copied().collect();
+        for namespace in namespaces {
+            let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
+                continue;
+            };
+            let consensus = partition.consensus();
+            if consensus.namespace() != header.namespace {
+                continue;
+            }
+
             if consensus.handle_commit(&header) {
-                planes.1.0.commit_journal().await;
+                partition.commit_journal(&config).await;
             }
             return;
         }
@@ -592,35 +632,39 @@ where
             namespace = header.namespace,
             view = header.view,
             replica = header.replica,
-            "dropping Commit: namespace matches neither metadata nor partitions consensus"
+            "dropping Commit: namespace matches neither metadata nor partition consensus"
         );
     }
 
-    /// Tick the partitions consensus and dispatch any resulting actions.
+    /// Tick partition consensuses. Loop partitions. No partitions-plane journal.
     #[allow(clippy::future_not_send)]
     pub async fn tick_partitions(&self)
     where
         B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-        PJ: JournalHandle,
-        <PJ as JournalHandle>::Target: Journal<
-                <PJ as JournalHandle>::Storage,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target: Journal<
+                <MJ as JournalHandle>::Storage,
                 Entry = Message<PrepareHeader>,
                 Header = PrepareHeader,
             >,
     {
         let partitions = self.plane.partitions();
-        let Some(consensus) = partitions.consensus() else {
-            return;
-        };
+        let namespaces: Vec<_> = partitions.namespaces().copied().collect();
 
-        let current_op = consensus.sequencer().current_sequence();
-        let current_commit = consensus.commit_min();
-        let actions = consensus.tick(PlaneKind::Partitions, current_op, current_commit);
+        for namespace in namespaces {
+            let Some(partition) = partitions.get_by_ns(&namespace) else {
+                continue;
+            };
 
-        dispatch_vsr_actions(consensus, partitions.journal(), &actions).await;
+            let consensus = partition.consensus();
+            let current_op = consensus.sequencer().current_sequence();
+            let current_commit = consensus.commit_min();
+            let actions = consensus.tick(PlaneKind::Partitions, current_op, current_commit);
+            dispatch_vsr_actions::<B, _, MJ>(consensus, None, &actions).await;
+            dispatch_partition_journal_actions(consensus, partition, &actions).await;
+        }
     }
 
-    /// Tick the metadata consensus and dispatch any resulting actions.
     #[allow(clippy::future_not_send)]
     pub async fn tick_metadata(&self)
     where
@@ -859,6 +903,119 @@ async fn dispatch_vsr_actions<B, P, J>(
                     }
                 }
             }
+        }
+    }
+}
+
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation
+)]
+async fn dispatch_partition_journal_actions<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    partition: &IggyPartition<B>,
+    actions: &[VsrAction],
+) where
+    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+{
+    use std::mem::size_of;
+
+    let bus = consensus.message_bus();
+    let self_id = consensus.replica();
+    let cluster = consensus.cluster();
+    let journal = &partition.log.journal().inner;
+
+    let send = |target: u8, msg: Message<GenericHeader>| async move {
+        if let Err(e) = bus.send_to_replica(target, msg).await {
+            tracing::debug!(replica = self_id, target, "bus send failed: {e}");
+        }
+    };
+
+    for action in actions {
+        match action {
+            VsrAction::SendPrepareOk {
+                view,
+                from_op,
+                to_op,
+                target,
+                namespace,
+            } => {
+                for op in *from_op..=*to_op {
+                    let Some(prepare_header) = journal.header_by_op(op) else {
+                        continue;
+                    };
+                    let msg = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>())
+                        .transmute_header(|_, h: &mut PrepareOkHeader| {
+                            h.command = Command2::PrepareOk;
+                            h.cluster = cluster;
+                            h.replica = self_id;
+                            h.view = *view;
+                            h.op = op;
+                            h.commit = consensus.commit_max();
+                            h.timestamp = prepare_header.timestamp;
+                            h.parent = prepare_header.parent;
+                            h.prepare_checksum = prepare_header.checksum;
+                            h.request = prepare_header.request;
+                            h.operation = prepare_header.operation;
+                            h.namespace = *namespace;
+                            h.size = size_of::<PrepareOkHeader>() as u32;
+                        });
+                    send(*target, msg.into_generic()).await;
+                }
+            }
+            VsrAction::RetransmitPrepares { targets } => {
+                for (header, replicas) in targets {
+                    let Some(prepare) = journal.entry(header).await else {
+                        continue;
+                    };
+                    let prepare = Message::<PrepareHeader>::try_from(
+                        iggy_binary_protocol::consensus::iobuf::Owned::<4096>::copy_from_slice(
+                            prepare.as_slice(),
+                        ),
+                    )
+                    .expect("partition journal entry must contain valid prepare");
+                    for replica in replicas {
+                        send(*replica, prepare.deep_copy().into_generic()).await;
+                    }
+                }
+            }
+            VsrAction::RebuildPipeline { from_op, to_op } => {
+                let mut gap_at = None;
+                let entries: Vec<_> = (*from_op..=*to_op)
+                    .map_while(|op| {
+                        let Some(header) = journal.header_by_op(op) else {
+                            gap_at = Some(op);
+                            return None;
+                        };
+                        let mut entry = consensus::PipelineEntry::new(header);
+                        entry.add_ack(self_id);
+                        Some(entry)
+                    })
+                    .collect();
+                if let Some(missing_op) = gap_at {
+                    let rebuilt_up_to = missing_op.saturating_sub(1);
+                    tracing::warn!(
+                        replica = self_id,
+                        missing_op,
+                        range_start = from_op,
+                        range_end = to_op,
+                        rebuilt = entries.len(),
+                        "RebuildPipeline: journal gap at op {missing_op}, \
+                         truncating sequencer from {to_op} to {rebuilt_up_to} \
+                         ({}/{} ops rebuilt)",
+                        entries.len(),
+                        to_op - from_op + 1,
+                    );
+                    consensus.sequencer().set_sequence(rebuilt_up_to);
+                }
+                let mut pipeline = consensus.pipeline().borrow_mut();
+                for entry in entries {
+                    pipeline.push(entry);
+                }
+            }
+            _ => {}
         }
     }
 }

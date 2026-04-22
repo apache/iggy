@@ -24,6 +24,7 @@ mod iggy_partitions;
 mod journal;
 mod log;
 mod messages_writer;
+mod offset_storage;
 mod segment;
 mod types;
 

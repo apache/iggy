@@ -25,6 +25,7 @@ pub mod http;
 mod leader_aware;
 pub mod prelude;
 pub mod quic;
+pub mod session;
 pub mod stream_builder;
 pub mod tcp;
 pub mod websocket;
