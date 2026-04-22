@@ -1585,6 +1585,16 @@ where
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) {
-        send_prepare_ok_common(self.consensus(), header, Some(true)).await;
+        // Durability flag must reflect the truth that `VsrAction::RetransmitPrepares`
+        // can read from the partition journal. SendMessages lands in
+        // `self.log.journal` via `append_send_messages_to_journal`; consumer
+        // offset ops currently persist only to their own on-disk tables and
+        // are not recoverable from the partition journal during a view
+        // change, so they must ACK as non-durable until journaled.
+        let durability = match header.operation {
+            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => Some(false),
+            _ => Some(true),
+        };
+        send_prepare_ok_common(self.consensus(), header, durability).await;
     }
 }
