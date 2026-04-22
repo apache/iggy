@@ -331,17 +331,15 @@ impl LocalPipeline {
 
         // Verify prepare queue hash chain
         if let Some(head) = self.prepare_queue.front() {
-            let mut expected_op = head.header.op;
             let mut expected_parent = head.header.parent;
 
-            for entry in &self.prepare_queue {
+            for (expected_op, entry) in (head.header.op..).zip(self.prepare_queue.iter()) {
                 let header = &entry.header;
 
                 assert_eq!(header.op, expected_op, "ops must be sequential");
                 assert_eq!(header.parent, expected_parent, "must be hash-chained");
 
                 expected_parent = header.checksum;
-                expected_op += 1;
             }
         }
     }
