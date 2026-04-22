@@ -708,24 +708,53 @@ where
             }
         };
         #[allow(clippy::cast_possible_truncation)]
-        let is_old_prepare = {
-            let consensus = self.consensus();
-            fence_old_prepare_by_commit(consensus, &header)
-                || self.log.journal().inner.header_by_op(header.op).is_some()
-        };
-        if is_old_prepare {
+        let fenced_by_commit = fence_old_prepare_by_commit(self.consensus(), &header);
+        if fenced_by_commit {
             emit_partition_diag(
                 tracing::Level::WARN,
                 &PartitionDiagEvent::new(
                     self.diag_ctx(),
-                    "received old prepare, skipping replication",
+                    "received old prepare (<= commit_min), skipping replication",
                 )
                 .with_operation(header.operation)
                 .with_op(header.op),
             );
-            // Old prepare: either it predates commit_max or our journal
-            // already holds it. No chain-replicate (downstream saw it
-            // too or will via a newer forward) and no re-append.
+            // Fenced by commit_min: we've already executed this op, the
+            // whole chain has it committed. Safe to drop entirely.
+            return;
+        }
+
+        let journal_holds_op = self.log.journal().inner.header_by_op(header.op).is_some();
+        if journal_holds_op {
+            // Retransmit after a downstream flap: our journal is durable
+            // but commit has not caught up, so we must re-forward to the
+            // next-in-chain and re-ACK so the primary's view of our state
+            // is consistent. Both downstream and primary are idempotent
+            // on duplicate (replica, op), so this is safe.
+            emit_partition_diag(
+                tracing::Level::DEBUG,
+                &PartitionDiagEvent::new(
+                    self.diag_ctx(),
+                    "journal already holds prepare, re-forwarding + re-acking",
+                )
+                .with_operation(header.operation)
+                .with_op(header.op),
+            );
+            let clone_for_forward = message.clone();
+            let consensus = self.consensus();
+            if let Err(error) = replicate_to_next_in_chain(consensus, &clone_for_forward).await {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        self.diag_ctx(),
+                        "failed to re-forward retransmitted prepare to next in chain",
+                    )
+                    .with_operation(header.operation)
+                    .with_op(header.op)
+                    .with_error(error.to_string()),
+                );
+            }
+            self.send_prepare_ok(&header).await;
             return;
         }
 
