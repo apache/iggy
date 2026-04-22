@@ -423,14 +423,10 @@ where
                 operation = ?header.operation,
                 "received old prepare, skipping replication"
             );
-        } else {
-            // TODO(hubcio): is this correct? should we replicate and append,
-            // or append and replicate? Chain-replicating before the local
-            // append means a backup that crashes here forwarded a prepare
-            // it never persisted, violating VSR's tail-ahead-of-head
-            // invariant. The hash-chain fence + view change recovers but
-            // burns a view. Worth an ordering decision issue.
-            self.replicate(&message).await;
+            // Old prepare: downstream already has it or will learn via a
+            // newer forward, so no chain-replicate either. Local WAL is
+            // also unaffected. Nothing more to do.
+            return;
         }
 
         // TODO add assertions for valid state here.
@@ -465,6 +461,12 @@ where
         // Append to journal first. Sequencer and checksum are updated AFTER
         // successful append so a failed write doesn't leave consensus state
         // pointing at a phantom entry.
+        //
+        // Durability must land BEFORE any chain-replicate or PrepareOk:
+        // forwarding an un-persisted prepare would leave this replica's
+        // tail advertising an op its WAL does not hold, violating the
+        // VSR tail-ahead-of-head invariant; the hash-chain fence plus a
+        // view change would recover it but burn a view in the process.
         if let Err(e) = journal.handle().append(message.clone()).await {
             error!(
                 target: "iggy.metadata.diag",
@@ -477,6 +479,12 @@ where
             );
             return;
         }
+
+        // Now that the prepare is durable, chain-replicate to the next
+        // replica in the chain. `replicate` borrows `&message` and does
+        // its own freeze; this replica retains the message for the
+        // sequencer/checksum bookkeeping below.
+        self.replicate(&message).await;
 
         self.observe_prepare_runtime_state(&message);
         consensus.sequencer().set_sequence(header.op);
@@ -788,7 +796,10 @@ where
     /// - Each backup forwards to the next
     /// - Stops when we would forward back to primary
     ///
-    /// Borrows the message so the caller retains ownership for journal append.
+    /// Caller must have already appended `message` to the local journal
+    /// before invoking this helper (VSR tail-ahead-of-head). Forwarding
+    /// an un-persisted prepare would leave downstream WALs with an op
+    /// this replica's journal does not hold.
     #[allow(clippy::future_not_send)]
     async fn replicate(&self, message: &Message<PrepareHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
@@ -801,8 +812,8 @@ where
         let idx = header.op as usize;
         assert_eq!(header.command, Command2::Prepare);
         assert!(
-            journal.handle().header(idx).is_none(),
-            "replicate: must not already have prepare"
+            journal.handle().header(idx).is_some(),
+            "replicate: prepare must be durable in local journal before chain-forward"
         );
         if let Err(e) = replicate_to_next_in_chain(consensus, message).await {
             tracing::warn!(op = header.op, error = ?e, "chain replication failed");

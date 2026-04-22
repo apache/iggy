@@ -196,8 +196,9 @@ where
     assert_ne!(next, consensus.replica());
 
     // Chain replication to the next replica is N=1, so the freeze-once
-    // trick does not apply: the caller retains ownership of `message` for
-    // the journal append, so we still deep_copy here. Future refactor
+    // trick does not apply: the caller has already appended `message` to
+    // its local journal (durability-before-ack) and kept a reference for
+    // this forward, so we deep_copy a fresh Frozen here. Future refactor
     // could freeze once and share the backing with the journal path.
     let frozen = message.deep_copy().into_generic().into_frozen();
     consensus.message_bus().send_to_replica(next, frozen).await

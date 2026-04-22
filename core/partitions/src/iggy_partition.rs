@@ -723,20 +723,10 @@ where
                 .with_operation(header.operation)
                 .with_op(header.op),
             );
-        } else {
-            let consensus = self.consensus();
-            if let Err(error) = replicate_to_next_in_chain(consensus, &message).await {
-                emit_partition_diag(
-                    tracing::Level::WARN,
-                    &PartitionDiagEvent::new(
-                        self.diag_ctx(),
-                        "failed to replicate prepare to next in chain",
-                    )
-                    .with_operation(header.operation)
-                    .with_op(header.op)
-                    .with_error(error.to_string()),
-                );
-            }
+            // Old prepare: either it predates commit_max or our journal
+            // already holds it. No chain-replicate (downstream saw it
+            // too or will via a newer forward) and no re-append.
+            return;
         }
 
         if header.op != current_op + 1 {
@@ -753,7 +743,32 @@ where
             consensus.sequencer().set_sequence(header.op);
             consensus.set_last_prepare_checksum(header.checksum);
         }
+        // Durability-before-ack: hold a clone for the chain-replicate so
+        // we can forward only AFTER `apply_replicated_operation` has
+        // persisted the prepare to our partition journal. Forwarding
+        // first would leave downstream replicas holding an op whose
+        // backing WAL entry this replica never wrote, violating VSR's
+        // tail-ahead-of-head invariant. The clone is cheap relative to
+        // the deep-copy `replicate_to_next_in_chain` already performs
+        // (see plane_helpers.rs) - both collapse to a couple of Arc
+        // refcount bumps in the common case.
+        let clone_for_forward = message.clone();
         let replicated_result = self.apply_replicated_operation(message).await;
+        if replicated_result.is_ok() {
+            let consensus = self.consensus();
+            if let Err(error) = replicate_to_next_in_chain(consensus, &clone_for_forward).await {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        self.diag_ctx(),
+                        "failed to replicate prepare to next in chain",
+                    )
+                    .with_operation(header.operation)
+                    .with_op(header.op)
+                    .with_error(error.to_string()),
+                );
+            }
+        }
 
         let commit = self.consensus.commit_max();
         if commit > previous_commit
