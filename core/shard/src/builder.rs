@@ -35,8 +35,8 @@
 
 use crate::coordinator::ShardZeroCoordinator;
 use crate::{
-    CoordinatorConfig, IggyShard, PartitionConsensusConfig, Receiver, ShardFrame, ShardIdentity,
-    TaggedSender,
+    CoordinatorConfig, IggyShard, PartitionConsensusConfig, Receiver, ShardFrame,
+    ShardFramePayload, ShardIdentity, TaggedSender,
 };
 use compio::runtime::JoinHandle;
 use consensus::VsrConsensus;
@@ -49,6 +49,7 @@ use metadata::IggyMetadata;
 use metadata::stm::StateMachine;
 use partitions::IggyPartitions;
 use std::rc::Rc;
+use tracing::warn;
 
 use crate::shards_table::ShardsTable;
 
@@ -148,6 +149,30 @@ where
 
         let total_shards = u16::try_from(self.senders.len())
             .expect("cluster shard count must fit in u16 (bootstrap invariant)");
+
+        // Wire the bus' connection-lost notifier to push a ConnectionLost
+        // frame into shard 0's inbox. Every shard's bus needs this so that
+        // a dead replica connection anywhere surfaces at the coordinator.
+        // Shard 0's sender is cloned once here; the closure captures that
+        // clone and runs on the owning shard's reader/writer tasks.
+        let shard_zero_sender = self.senders[0].sender().clone();
+        let connection_lost_fn: message_bus::ConnectionLostFn = Rc::new(move |replica_id: u8| {
+            let frame = ShardFrame::<R> {
+                payload: ShardFramePayload::ConnectionLost { replica_id },
+                response_sender: None,
+            };
+            if let Err(e) = shard_zero_sender.try_send(frame) {
+                // Inbox full: the coordinator's periodic refresh task
+                // re-broadcasts the authoritative snapshot and the bus
+                // retries on next dial, so a single drop is recoverable.
+                // Warn so operators see repeated drops if they occur.
+                warn!(
+                    replica_id,
+                    "shard-0 inbox rejected ConnectionLost frame: {e}"
+                );
+            }
+        });
+        self.bus.set_connection_lost_fn(connection_lost_fn);
 
         let coord_inputs = if is_shard_zero {
             let coord_senders: Vec<TaggedSender<R>> = self.senders.clone();

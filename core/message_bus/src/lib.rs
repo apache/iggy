@@ -116,6 +116,17 @@ pub trait MessageBus {
         replica: u8,
         data: Frozen<MESSAGE_ALIGN>,
     ) -> impl Future<Output = Result<(), SendError>>;
+
+    /// Install a notifier the bus will invoke when a delegated replica
+    /// connection dies abnormally. Used by shard-0 bootstrap to push a
+    /// `ShardFramePayload::ConnectionLost` into shard 0's inbox so the
+    /// coordinator can forget the replica's mapping.
+    ///
+    /// Default impl is a no-op for buses that do not delegate real
+    /// connections (simulator, test doubles); the production
+    /// `IggyMessageBus` overrides it to wire into its internal
+    /// `connection_lost_fn` hook.
+    fn set_connection_lost_fn(&self, _f: ConnectionLostFn) {}
 }
 
 /// Production message bus backed by real TCP connections.
@@ -416,6 +427,10 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
     ) -> impl Future<Output = Result<(), SendError>> {
         (**self).send_to_replica(replica, data)
     }
+
+    fn set_connection_lost_fn(&self, f: ConnectionLostFn) {
+        (**self).set_connection_lost_fn(f);
+    }
 }
 
 #[allow(clippy::future_not_send)] // single-threaded compio
@@ -473,6 +488,10 @@ impl MessageBus for IggyMessageBus {
             .as_ref()
             .ok_or(SendError::ReplicaRouteMissing(replica))?;
         forward(owning_shard, message).map_err(|_| SendError::ReplicaForwardFailed(replica))
+    }
+
+    fn set_connection_lost_fn(&self, f: ConnectionLostFn) {
+        Self::set_connection_lost_fn(self, f);
     }
 }
 
