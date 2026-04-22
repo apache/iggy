@@ -89,8 +89,22 @@ impl ShardsTable for PapayaShardsTable {
 /// are used to avoid the weak lower bits for small integer inputs.
 #[must_use]
 pub fn calculate_shard_assignment(ns: &IggyNamespace, shard_count: u32) -> u16 {
+    calculate_shard_from_consensus_ns(ns.inner(), shard_count)
+}
+
+/// Raw-`u64` variant of [`calculate_shard_assignment`].
+///
+/// Consensus control-plane messages (`StartViewChange`, `DoViewChange`,
+/// `StartView`, `Commit`) carry a `namespace: u64` in their header that is
+/// NOT an [`IggyNamespace`] bit-packed layout — it's an opaque consensus
+/// namespace picked by the partition group. Hash the raw `u64` with the
+/// same algorithm as partition lookups so the shard that owns the
+/// consensus group is deterministically the same across every node. Single
+/// shard (`shard_count == 1`) always returns `0` regardless of `ns`.
+#[must_use]
+pub fn calculate_shard_from_consensus_ns(ns: u64, shard_count: u32) -> u16 {
     let mut hasher = Murmur3Hasher::default();
-    hasher.write_u64(ns.inner());
+    hasher.write_u64(ns);
     let hash = hasher.finish32();
     ((hash >> 16) % shard_count) as u16
 }

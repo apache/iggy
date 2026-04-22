@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::shards_table::ShardsTable;
+use crate::shards_table::{ShardsTable, calculate_shard_from_consensus_ns};
 use crate::{IggyShard, Receiver, ShardFrame};
 use crossfire::TrySendError;
 use futures::FutureExt;
@@ -84,29 +84,33 @@ where
                 (h.operation(), h.namespace, m.into_generic())
             }
         };
-        let namespace = IggyNamespace::from_raw(namespace);
+        let raw_namespace = namespace;
+        let partition_namespace = IggyNamespace::from_raw(raw_namespace);
         let target = if operation.is_metadata() {
             0
         } else if operation.is_partition() {
-            self.shards_table.shard_for(namespace).unwrap_or_else(|| {
-                tracing::warn!(
-                    shard = self.id,
-                    stream = namespace.stream_id(),
-                    topic = namespace.topic_id(),
-                    partition = namespace.partition_id(),
-                    "namespace not found in shards_table, falling back to shard 0"
-                );
-                0
-            })
+            self.shards_table
+                .shard_for(partition_namespace)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        shard = self.id,
+                        stream = partition_namespace.stream_id(),
+                        topic = partition_namespace.topic_id(),
+                        partition = partition_namespace.partition_id(),
+                        "namespace not found in shards_table, falling back to shard 0"
+                    );
+                    0
+                })
         } else {
-            // TODO: View change messages (StartViewChange, DoViewChange, StartView) and
-            // Commit heartbeats return Operation::Reserved, so they always land here and
-            // route to shard 0. This is correct only in single-shard deployments. In
-            // multi-shard, partition-plane messages must reach the shard owning that
-            // consensus group. Fixing this requires routing by Command2 + consensus
-            // namespace (a u64) rather than by Operation + IggyNamespace, since these
-            // headers don't carry an IggyNamespace.
-            0
+            // View-change / Commit messages carry an opaque u64 consensus
+            // namespace (not an `IggyNamespace`). Hash it with the same
+            // function the partition-plane lookup table uses so the
+            // shard owning the consensus group is deterministically the
+            // same across every node. Single-shard deployments trivially
+            // collapse to 0.
+            #[allow(clippy::cast_lossless)]
+            let shard_count = u32::try_from(self.senders.len()).unwrap_or(u32::MAX);
+            calculate_shard_from_consensus_ns(raw_namespace, shard_count)
         };
         // `senders[target]` is a `crossfire::MTx`, which in compio is
         // running on an io_uring reactor: a blocking `send` on a full
@@ -174,7 +178,8 @@ where
                 (h.operation(), h.namespace, m.into_generic())
             }
         };
-        let namespace = IggyNamespace::from_raw(namespace);
+        let raw_namespace = namespace;
+        let partition_namespace = IggyNamespace::from_raw(raw_namespace);
 
         // Determine which shard should handle a message given its operation and
         // namespace.
@@ -182,23 +187,29 @@ where
         // - Metadata operations always route to shard 0 (the control plane).
         // - Partition operations route to the shard that owns the namespace,
         //   looked up via the [`ShardsTable`].
-        // - Unknown operations fall back to shard 0.
+        // - Consensus control-plane (`StartViewChange`, `DoViewChange`,
+        //   `StartView`, `Commit`) carries a raw `u64` consensus namespace;
+        //   hash-route it the same way partitions are looked up so every
+        //   node agrees on the owning shard.
         let target = if operation.is_metadata() {
             0
         } else if operation.is_partition() {
-            self.shards_table.shard_for(namespace).unwrap_or_else(|| {
-                tracing::warn!(
-                    shard = self.id,
-                    stream = namespace.stream_id(),
-                    topic = namespace.topic_id(),
-                    partition = namespace.partition_id(),
-                    "namespace not found in shards_table, falling back to shard 0"
-                );
-                0
-            })
+            self.shards_table
+                .shard_for(partition_namespace)
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        shard = self.id,
+                        stream = partition_namespace.stream_id(),
+                        topic = partition_namespace.topic_id(),
+                        partition = partition_namespace.partition_id(),
+                        "namespace not found in shards_table, falling back to shard 0"
+                    );
+                    0
+                })
         } else {
-            // TODO: Same view-change and Commit routing issue as dispatch() above.
-            0
+            #[allow(clippy::cast_lossless)]
+            let shard_count = u32::try_from(self.senders.len()).unwrap_or(u32::MAX);
+            calculate_shard_from_consensus_ns(raw_namespace, shard_count)
         };
         // Create a frame and send it to the target shard. Same non-
         // blocking `try_send` reason as `dispatch` above: blocking on a
