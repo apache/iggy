@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::{AutoLogin, IggyDuration, QuicClientConfig};
+use crate::{AutoLogin, IggyDuration, IggyError, QuicClientConfig, validate_server_address};
 
 /// Builder for the QUIC client configuration.
 ///
@@ -154,7 +154,10 @@ impl QuicClientConfigBuilder {
     }
 
     /// Finalizes the builder and returns the `QuicClientConfig`.
-    pub fn build(self) -> QuicClientConfig {
-        self.config
+    pub fn build(mut self) -> Result<QuicClientConfig, IggyError> {
+        self.config.server_address = self.config.server_address.trim().to_owned();
+        validate_server_address(&self.config.server_address)?;
+
+        Ok(self.config)
     }
 }

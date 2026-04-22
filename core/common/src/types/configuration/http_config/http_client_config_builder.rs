@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::HttpClientConfig;
+use crate::{HttpClientConfig, IggyError, utils::net::validate_api_url};
 
 /// The builder for the `HttpClientConfig` configuration.
 /// Allows configuring the HTTP client with custom settings or using defaults:
@@ -52,7 +52,10 @@ impl HttpClientConfigBuilder {
     }
 
     /// Builds the `HttpClientConfig` instance.
-    pub fn build(self) -> HttpClientConfig {
-        self.config
+    pub fn build(mut self) -> Result<HttpClientConfig, IggyError> {
+        self.config.api_url = self.config.api_url.trim().to_owned();
+        validate_api_url(&self.config.api_url)?;
+
+        Ok(self.config)
     }
 }
