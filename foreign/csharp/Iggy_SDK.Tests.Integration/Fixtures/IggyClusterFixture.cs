@@ -29,7 +29,11 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
     private const string LeaderAlias = "iggy-leader";
     private const string FollowerAlias = "iggy-follower";
 
-    private static readonly HashSet<ushort> UsedPorts = [];
+    // TcpListeners held open until just before the containers are started so that the
+    // OS keeps the chosen ports reserved across the whole fixture setup. Parallel test
+    // hosts (net8.0 + net10.0) would otherwise race on the gap between picking the port
+    // and docker binding it.
+    private readonly List<TcpListener> _portReservations = [];
     private readonly IContainer _followerContainer;
     private readonly ushort _followerHttpPort;
     private readonly ushort _followerQuicPort;
@@ -53,14 +57,14 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
 
     public IggyClusterFixture()
     {
-        _leaderTcpPort = GetRandomPort();
-        _leaderHttpPort = GetRandomPort();
-        _leaderQuicPort = GetRandomPort();
-        _leaderWsPort = GetRandomPort();
-        _followerTcpPort = GetRandomPort();
-        _followerHttpPort = GetRandomPort();
-        _followerQuicPort = GetRandomPort();
-        _followerWsPort = GetRandomPort();
+        _leaderTcpPort = ReservePort();
+        _leaderHttpPort = ReservePort();
+        _leaderQuicPort = ReservePort();
+        _leaderWsPort = ReservePort();
+        _followerTcpPort = ReservePort();
+        _followerHttpPort = ReservePort();
+        _followerQuicPort = ReservePort();
+        _followerWsPort = ReservePort();
 
         _network = new NetworkBuilder()
             .WithName($"iggy-cluster-{Guid.NewGuid():N}")
@@ -130,6 +134,7 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        ReleaseReservedPorts();
         await SaveContainerLogsAsync(_leaderContainer, "leader");
         await SaveContainerLogsAsync(_followerContainer, "follower");
         await _followerContainer.StopAsync();
@@ -140,6 +145,10 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
     public async Task InitializeAsync()
     {
         await _network.CreateAsync();
+        // Release the reservations at the last possible moment so the window between
+        // giving the port back to the OS and docker re-binding it is as small as we can
+        // make it.
+        ReleaseReservedPorts();
         await Task.WhenAll(_leaderContainer.StartAsync(), _followerContainer.StartAsync());
     }
 
@@ -153,23 +162,22 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
         return $"127.0.0.1:{_followerTcpPort}";
     }
 
-    private static ushort GetRandomPort()
+    private ushort ReservePort()
     {
-        lock (UsedPorts)
-        {
-            while (true)
-            {
-                using var listener = new TcpListener(IPAddress.Loopback, 0);
-                listener.Start();
-                var port = (ushort)((IPEndPoint)listener.LocalEndpoint).Port;
-                listener.Stop();
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        _portReservations.Add(listener);
+        return (ushort)((IPEndPoint)listener.LocalEndpoint).Port;
+    }
 
-                if (UsedPorts.Add(port))
-                {
-                    return port;
-                }
-            }
+    private void ReleaseReservedPorts()
+    {
+        foreach (var listener in _portReservations)
+        {
+            listener.Stop();
         }
+
+        _portReservations.Clear();
     }
 
     private static async Task SaveContainerLogsAsync(IContainer container, string role)
