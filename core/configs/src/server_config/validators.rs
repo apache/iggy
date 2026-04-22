@@ -109,15 +109,18 @@ impl Validatable<ConfigurationError> for ServerConfig {
         //
         // Because `cluster.nodes` is byte-identical across every host, the
         // only way shard counts can drift is if `system.sharding.cpu_allocation`
-        // depends on host topology. Reject those variants in cluster mode.
+        // depends on host topology. We can't prove divergence from a single
+        // node at load time (peers may be homogeneous), so this is a warning
+        // rather than a hard error; operators running heterogeneous hardware
+        // must pin a deterministic value themselves.
         if self.cluster.enabled
             && let Err(reason) = host_dependent_cpu_allocation(&self.system.sharding.cpu_allocation)
         {
-            eprintln!(
-                "cluster.enabled = true requires a deterministic system.sharding.cpu_allocation (count or explicit range/numa); \
-                 got {reason}. Cluster nodes must agree on shard count; host-dependent allocation splits the view-change quorum."
+            warn!(
+                "cluster.enabled = true with host-dependent system.sharding.cpu_allocation ({reason}); \
+                 if peers resolve this to different shard counts, view-change quorum will split. \
+                 Pin a deterministic value (count, explicit range, or explicit numa) on heterogeneous hardware."
             );
-            return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
         self.system
