@@ -26,10 +26,11 @@
 mod common;
 
 use common::{header_only, install_replicas_locally, loopback};
+use compio::net::TcpListener;
 use iggy_binary_protocol::Command2;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
 use message_bus::replica_listener::{MessageHandler, bind, run};
-use message_bus::{IggyMessageBus, MessageBus};
+use message_bus::{IggyMessageBus, MessageBus, SendError};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -62,28 +63,22 @@ async fn slow_peer_does_not_block_other_peers() {
     });
     bus_a.track_background(la_handle);
 
-    // Receiving bus 2 (peer B): handler is a no-op, but the listener stays
-    // up. The kernel TCP recv buffer is small, so once we send enough to
-    // peer B without it draining, peer B's writer task on the sender side
-    // will eventually block on writev.
-    let bus_b = Rc::new(IggyMessageBus::new(0));
-    let on_b: MessageHandler = Rc::new(|_, _| {});
-    let (lb, addr_b) = bind(loopback()).await.unwrap();
-    let token_b = bus_b.token();
-    let accept_b = install_replicas_locally(bus_b.clone(), on_b);
-    let lb_handle = compio::runtime::spawn(async move {
-        run(
-            lb,
-            token_b,
-            CLUSTER,
-            2,
-            3,
-            accept_b,
-            message_bus::framing::MAX_MESSAGE_SIZE,
-        )
-        .await;
+    // Peer B: raw TCP listener that accepts connections but never reads
+    // from them. This is how we force head-of-line blocking: bus0's dial
+    // completes (TCP connect + Ping write into the peer's kernel recv
+    // buffer), but subsequent Prepare frames pile up. Once the kernel send
+    // buffer on bus0's side and the per-peer queue are both full,
+    // send_to_replica(2) returns Backpressure.
+    let lb = TcpListener::bind(loopback()).await.unwrap();
+    let addr_b = lb.local_addr().unwrap();
+    let held_streams: Rc<std::cell::RefCell<Vec<compio::net::TcpStream>>> =
+        Rc::new(std::cell::RefCell::new(Vec::new()));
+    let held_streams_clone = held_streams.clone();
+    let accept_b_handle = compio::runtime::spawn(async move {
+        while let Ok((stream, _)) = lb.accept().await {
+            held_streams_clone.borrow_mut().push(stream);
+        }
     });
-    bus_b.track_background(lb_handle);
 
     // Sender bus 0 dials both A and B.
     let bus0 = Rc::new(IggyMessageBus::with_capacity(0, 16));
@@ -105,33 +100,63 @@ async fn slow_peer_does_not_block_other_peers() {
         compio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    // Time a single send_to_replica to the FAST peer A. With per-peer
-    // queues this must complete in microseconds even if peer B is busy.
+    // Baseline: a single send to A before any saturation. Both peers are
+    // healthy, both sends take try_send fast-path time.
+    bus0.send_to_replica(1, header_only(Command2::Prepare, 0, 0).into_frozen())
+        .await
+        .expect("send to A (baseline)");
+
+    // Saturate peer B until the per-peer queue returns Backpressure. Once
+    // that happens, we know the kernel send buffer + the 16-slot queue are
+    // both full and any further send-to-B completes synchronously with the
+    // Backpressure error (not by blocking on writev).
+    let mut b_saturated = false;
+    for _ in 0..100_000 {
+        match bus0
+            .send_to_replica(2, header_only(Command2::Prepare, 0, 0).into_frozen())
+            .await
+        {
+            Ok(()) => {}
+            Err(SendError::Backpressure) => {
+                b_saturated = true;
+                break;
+            }
+            Err(other) => panic!("unexpected error while saturating peer B: {other:?}"),
+        }
+    }
+    assert!(
+        b_saturated,
+        "peer B should return Backpressure once kernel + queue are full"
+    );
+
+    // Property under test: with peer B's queue fully backpressured,
+    // sends to peer A must NOT block on peer B. Compare A's send latency
+    // against a freshly-timed B send that we expect to return Backpressure
+    // instantly. HOL would manifest as A being as slow as a blocked writev.
     let send_a_start = Instant::now();
     bus0.send_to_replica(1, header_only(Command2::Prepare, 0, 0).into_frozen())
         .await
-        .expect("send to A");
+        .expect("send to A while B is saturated");
     let send_a_elapsed = send_a_start.elapsed();
-    assert!(
-        send_a_elapsed < Duration::from_millis(50),
-        "send_to_replica(A) took {send_a_elapsed:?}; head-of-line blocking?"
-    );
 
-    // Even after issuing many sends to B (which will eventually pile up in
-    // the kernel buffer and the per-peer queue), sends to A must stay fast.
-    for _ in 0..50 {
-        let _ = bus0
-            .send_to_replica(2, header_only(Command2::Prepare, 0, 0).into_frozen())
-            .await;
-    }
-    let send_a2_start = Instant::now();
-    bus0.send_to_replica(1, header_only(Command2::Prepare, 0, 0).into_frozen())
-        .await
-        .expect("send to A after B saturation");
-    let send_a2_elapsed = send_a2_start.elapsed();
+    let send_b_start = Instant::now();
+    let send_b_result = bus0
+        .send_to_replica(2, header_only(Command2::Prepare, 0, 0).into_frozen())
+        .await;
+    let send_b_elapsed = send_b_start.elapsed();
+    let b_backpressured = matches!(send_b_result, Err(SendError::Backpressure));
+
     assert!(
-        send_a2_elapsed < Duration::from_millis(50),
-        "second send_to_replica(A) took {send_a2_elapsed:?}; HOL after B saturation"
+        b_backpressured,
+        "peer B should still be backpressured, got {send_b_result:?}"
+    );
+    // Both the A-send and the Backpressure-B-send are fast-path sync
+    // operations; HOL blocking would push A into millisecond territory
+    // while a saturated B-send stays at Backpressure speed. Allow 100x
+    // slack so this holds across loaded CI without tuning thresholds.
+    assert!(
+        send_a_elapsed <= send_b_elapsed.saturating_mul(100),
+        "HOL: send_to_replica(A)={send_a_elapsed:?}, backpressured send_to_replica(B)={send_b_elapsed:?}"
     );
 
     // Wait for peer A to receive at least our two messages.
@@ -147,5 +172,6 @@ async fn slow_peer_does_not_block_other_peers() {
 
     bus0.shutdown(Duration::from_secs(2)).await;
     bus_a.shutdown(Duration::from_secs(2)).await;
-    bus_b.shutdown(Duration::from_secs(2)).await;
+    drop(accept_b_handle);
+    drop(held_streams);
 }
