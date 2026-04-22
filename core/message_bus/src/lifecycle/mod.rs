@@ -25,7 +25,7 @@ pub mod connection_registry;
 pub mod shutdown;
 
 pub use connection_registry::{
-    BusMessage, BusReceiver, BusSender, ConnectionRegistry, DrainOutcome, RejectedRegistration,
-    ReplicaRegistry,
+    BusMessage, BusReceiver, BusSender, ConnectionRegistry, DrainOutcome, InstanceToken,
+    RejectedRegistration, ReplicaRegistry,
 };
 pub use shutdown::{Shutdown, ShutdownToken};

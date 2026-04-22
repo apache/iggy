@@ -155,3 +155,46 @@ async fn orphan_reader_from_losing_install_does_not_invoke_on_request() {
     let outcome = bus.shutdown(Duration::from_secs(2)).await;
     assert_eq!(outcome.force, 0);
 }
+
+/// On a duplicate-client-id race, `drain_rejected_registration` must
+/// trigger the per-connection shutdown so the orphan reader wakes off
+/// its `io_uring` read SQE immediately. Without that wake the reader
+/// sits on `framing::read_message` until peer EOF and the drain
+/// awaits up to `close_peer_timeout` (default 5 s).
+///
+/// This test asserts the install completes in well under that
+/// timeout: the reader-wake path closes the orphan inside a single
+/// scheduler tick.
+#[compio::test]
+#[allow(clippy::future_not_send)]
+async fn losing_install_drains_well_before_close_peer_timeout() {
+    use std::time::Instant;
+
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let on_request: RequestHandler = Rc::new(|_, _| {});
+
+    let client_id: u128 = 0x00c0_ffee;
+    let (first_local, _first_peer) = loopback_peer_pair().await;
+    install_client_stream(&bus, client_id, first_local, on_request.clone());
+    assert!(bus.clients().contains(client_id));
+
+    // Race: second install loses the slot. The peer never sends EOF,
+    // so the only path that can drain the orphan reader is the
+    // per-connection shutdown trigger inside drain_rejected_registration.
+    let (second_local, _second_peer) = loopback_peer_pair().await;
+    let start = Instant::now();
+    install_client_stream(&bus, client_id, second_local, on_request);
+    // Yield once so the spawned drain task gets to poll. Even with the
+    // bus's default close_peer_timeout (5 s), we expect the drain to
+    // resolve in low double-digit milliseconds.
+    compio::time::sleep(Duration::from_millis(20)).await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "orphan drain elapsed = {elapsed:?}; expected << close_peer_timeout"
+    );
+
+    let outcome = bus.shutdown(Duration::from_secs(2)).await;
+    assert_eq!(outcome.force, 0);
+}

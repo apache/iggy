@@ -38,6 +38,24 @@ use tracing::warn;
 /// 1 GiB max segment size. Canonical definition; re-exported by core/server streaming.
 pub const SEGMENT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Return `Err(reason)` when `alloc` would yield a host-dependent shard
+/// count, disqualifying it for cluster mode where every node must derive
+/// the same count from its byte-identical config.
+///
+/// Deterministic variants (`Count(n)`, `Range(s, e)`, explicit
+/// `NumaAware`) return `Ok`.
+fn host_dependent_cpu_allocation(alloc: &CpuAllocation) -> Result<(), &'static str> {
+    match alloc {
+        CpuAllocation::All => Err("'all' (follows host CPU count)"),
+        CpuAllocation::NumaAware(numa) if numa.nodes.is_empty() && numa.cores_per_node == 0 => {
+            Err("'numa:auto' (follows host NUMA topology)")
+        }
+        CpuAllocation::Count(_) | CpuAllocation::Range(_, _) | CpuAllocation::NumaAware(_) => {
+            Ok(())
+        }
+    }
+}
+
 impl Validatable<ConfigurationError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
         self.system
@@ -82,6 +100,25 @@ impl Validatable<ConfigurationError> for ServerConfig {
         self.cluster.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate cluster config")
         })?;
+
+        // Cluster consensus routing (`calculate_shard_from_consensus_ns`)
+        // hashes namespaces modulo the local shard count. Every node must
+        // agree on that count or control-plane messages (StartViewChange,
+        // DoViewChange, StartView, Commit) route to different shards on
+        // different nodes, splitting the view-change quorum.
+        //
+        // Because `cluster.nodes` is byte-identical across every host, the
+        // only way shard counts can drift is if `system.sharding.cpu_allocation`
+        // depends on host topology. Reject those variants in cluster mode.
+        if self.cluster.enabled
+            && let Err(reason) = host_dependent_cpu_allocation(&self.system.sharding.cpu_allocation)
+        {
+            eprintln!(
+                "cluster.enabled = true requires a deterministic system.sharding.cpu_allocation (count or explicit range/numa); \
+                 got {reason}. Cluster nodes must agree on shard count; host-dependent allocation splits the view-change quorum."
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
 
         self.system
             .logging
@@ -618,5 +655,44 @@ mod cluster_validate_tests {
         n1.ports = ports;
         let c = cfg(vec![n1]);
         assert!(c.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod cluster_shards_count_determinism_tests {
+    use super::*;
+    use crate::server_config::sharding::NumaConfig;
+
+    #[test]
+    fn all_is_rejected() {
+        let err = host_dependent_cpu_allocation(&CpuAllocation::All).unwrap_err();
+        assert!(err.contains("all"));
+    }
+
+    #[test]
+    fn numa_auto_is_rejected() {
+        let err = host_dependent_cpu_allocation(&CpuAllocation::NumaAware(NumaConfig::default()))
+            .unwrap_err();
+        assert!(err.contains("numa:auto"));
+    }
+
+    #[test]
+    fn count_is_accepted() {
+        assert!(host_dependent_cpu_allocation(&CpuAllocation::Count(4)).is_ok());
+    }
+
+    #[test]
+    fn range_is_accepted() {
+        assert!(host_dependent_cpu_allocation(&CpuAllocation::Range(0, 4)).is_ok());
+    }
+
+    #[test]
+    fn explicit_numa_is_accepted() {
+        let numa = NumaConfig {
+            nodes: vec![0, 1],
+            cores_per_node: 4,
+            avoid_hyperthread: true,
+        };
+        assert!(host_dependent_cpu_allocation(&CpuAllocation::NumaAware(numa)).is_ok());
     }
 }

@@ -20,6 +20,7 @@ use configs::ConfigEnv;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     pub enabled: bool,
     pub name: String,

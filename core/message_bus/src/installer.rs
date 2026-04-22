@@ -27,7 +27,7 @@
 use crate::client_listener::RequestHandler;
 use crate::fd_transfer::{self, DupedFd};
 use crate::framing;
-use crate::lifecycle::RejectedRegistration;
+use crate::lifecycle::{InstanceToken, RejectedRegistration, Shutdown};
 use crate::replica_listener::MessageHandler;
 use crate::socket_opts::{apply_keepalive_for_connection, apply_nodelay_for_connection};
 use crate::{IggyMessageBus, lifecycle::ShutdownToken};
@@ -92,7 +92,7 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
 /// Install a pre-wrapped replica TCP stream on the bus. Shared by
 /// `install_replica_fd` and, once shard 0 acts as the delegate target for
 /// itself, the accept path.
-#[allow(clippy::future_not_send)] // single-threaded compio
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 pub fn install_replica_stream(
     bus: &Rc<IggyMessageBus>,
     peer_id: u8,
@@ -141,11 +141,31 @@ pub fn install_replica_stream(
     // stand down in-band.
     let install_aborted = Rc::new(Cell::new(false));
 
+    // Generation token published by the registry on a successful insert.
+    // Writer and reader post-loops release the slot only when the stored
+    // token matches; a stale-install exit that wakes up after a later
+    // reinstall would otherwise evict the new slot.
+    let install_token: Rc<Cell<Option<InstanceToken>>> = Rc::new(Cell::new(None));
+
+    // Per-connection shutdown used to kick the reader off its
+    // `io_uring` read SQE when the registry insert below loses a race.
+    // The bus-wide token cannot be triggered here (it would tear down
+    // every other connection); closing the writer's sender also does not
+    // reach a reader blocked on `framing::read_message`. The `Shutdown`
+    // is moved into the registry entry on success so its `Sender` survives
+    // the connection's lifetime: dropping the `Shutdown` would close the
+    // broadcast channel and falsely wake the reader's `select!` arm.
+    // On insert race the loser receives the `Shutdown` back via
+    // `RejectedRegistration` and triggers it before draining the orphan
+    // tasks.
+    let (conn_shutdown, conn_token) = Shutdown::new();
+
     let writer_token = bus.token();
     let bus_for_writer = Rc::clone(bus);
     let writer_label = format!("{peer_id}");
     let notified_writer = Rc::clone(&notified);
     let aborted_writer = Rc::clone(&install_aborted);
+    let token_for_writer = Rc::clone(&install_token);
     let max_batch = bus.config().max_batch;
     let writer_handle = compio::runtime::spawn(async move {
         crate::writer_task::run(
@@ -160,7 +180,15 @@ pub fn install_replica_stream(
         if aborted_writer.get() || bus_for_writer.is_shutting_down() {
             return;
         }
-        bus_for_writer.replicas().remove(peer_id);
+        let Some(token) = token_for_writer.get() else {
+            return;
+        };
+        if !bus_for_writer
+            .replicas()
+            .remove_if_token_matches(peer_id, token)
+        {
+            return;
+        }
         if !notified_writer.replace(true) {
             bus_for_writer.notify_connection_lost(peer_id);
         }
@@ -170,6 +198,7 @@ pub fn install_replica_stream(
     let read_token = bus.token();
     let notified_reader = Rc::clone(&notified);
     let aborted_reader = Rc::clone(&install_aborted);
+    let token_for_reader = Rc::clone(&install_token);
     let close_peer_timeout = bus.config().close_peer_timeout;
     let max_message_size = bus.config().max_message_size;
     let reader_handle = compio::runtime::spawn(async move {
@@ -178,6 +207,7 @@ pub fn install_replica_stream(
             read_half,
             &on_message,
             &read_token,
+            &conn_token,
             &aborted_reader,
             max_message_size,
         )
@@ -190,37 +220,46 @@ pub fn install_replica_stream(
             return;
         }
         if !read_token.is_triggered() {
-            bus_for_reader
+            let Some(token) = token_for_reader.get() else {
+                return;
+            };
+            let closed = bus_for_reader
                 .replicas()
-                .close_peer(peer_id, close_peer_timeout)
+                .close_peer_if_token_matches(peer_id, token, close_peer_timeout)
                 .await;
-            if !notified_reader.replace(true) {
+            if closed && !notified_reader.replace(true) {
                 bus_for_reader.notify_connection_lost(peer_id);
             }
         }
         info!(replica = peer_id, "peer replica disconnected");
     });
 
-    if let Err(rejected) = bus
+    match bus
         .replicas()
-        .insert(peer_id, tx, writer_handle, reader_handle)
+        .insert(peer_id, tx, writer_handle, reader_handle, conn_shutdown)
     {
-        // Tell both halves to stand down: the winner's entry is live and
-        // must not be touched by this losing install.
-        install_aborted.set(true);
-        warn!(replica = peer_id, "replica registry insert raced");
-        // Explicitly drain the orphan handles instead of dropping them:
-        // `compio::runtime::JoinHandle::drop` only detaches, so a reader
-        // looping on `framing::read_message` could outlive the race on a
-        // half-open socket and hold the fd / read buffer until its peer
-        // EOF lands. Closing the sender wakes the writer; the reader
-        // exits on peer-close once shard 0 tears the duplicated fd down.
-        compio::runtime::spawn(drain_rejected_registration(rejected, close_peer_timeout)).detach();
+        Ok(token) => {
+            install_token.set(Some(token));
+        }
+        Err(rejected) => {
+            // Tell both halves to stand down: the winner's entry is live and
+            // must not be touched by this losing install.
+            install_aborted.set(true);
+            warn!(replica = peer_id, "replica registry insert raced");
+            // `drain_rejected_registration` triggers the per-connection
+            // shutdown (returned with `rejected`) to wake the reader off
+            // its `io_uring` read SQE, then awaits writer / reader
+            // handles. `compio::runtime::JoinHandle::drop` only detaches,
+            // so without this drain the reader would outlive the race on
+            // a half-open socket until peer EOF.
+            compio::runtime::spawn(drain_rejected_registration(rejected, close_peer_timeout))
+                .detach();
+        }
     }
 }
 
 /// Install a pre-wrapped client TCP stream on the bus.
-#[allow(clippy::future_not_send)] // single-threaded compio
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 pub fn install_client_stream(
     bus: &Rc<IggyMessageBus>,
     client_id: u128,
@@ -256,10 +295,18 @@ pub fn install_client_stream(
     // above for the same pattern.
     let install_aborted = Rc::new(Cell::new(false));
 
+    // See replica path for the rationale on instance-token fencing.
+    let install_token: Rc<Cell<Option<InstanceToken>>> = Rc::new(Cell::new(None));
+
+    // Per-connection shutdown for fast reader wake on insert race; see
+    // the replica installer for the full rationale.
+    let (conn_shutdown, conn_token) = Shutdown::new();
+
     let writer_token = bus.token();
     let bus_for_writer = Rc::clone(bus);
     let writer_label = format!("{client_id:#034x}");
     let aborted_writer = Rc::clone(&install_aborted);
+    let token_for_writer = Rc::clone(&install_token);
     let max_batch = bus.config().max_batch;
     let writer_handle = compio::runtime::spawn(async move {
         crate::writer_task::run(
@@ -274,12 +321,18 @@ pub fn install_client_stream(
         if aborted_writer.get() || bus_for_writer.is_shutting_down() {
             return;
         }
-        bus_for_writer.clients().remove(client_id);
+        let Some(token) = token_for_writer.get() else {
+            return;
+        };
+        bus_for_writer
+            .clients()
+            .remove_if_token_matches(client_id, token);
     });
 
     let bus_for_reader = Rc::clone(bus);
     let read_token = bus.token();
     let aborted_reader = Rc::clone(&install_aborted);
+    let token_for_reader = Rc::clone(&install_token);
     let close_peer_timeout = bus.config().close_peer_timeout;
     let max_message_size = bus.config().max_message_size;
     let reader_handle = compio::runtime::spawn(async move {
@@ -288,6 +341,7 @@ pub fn install_client_stream(
             read_half,
             &on_request,
             &read_token,
+            &conn_token,
             &aborted_reader,
             max_message_size,
         )
@@ -300,32 +354,41 @@ pub fn install_client_stream(
             return;
         }
         if !read_token.is_triggered() {
+            let Some(token) = token_for_reader.get() else {
+                return;
+            };
             bus_for_reader
                 .clients()
-                .close_peer(client_id, close_peer_timeout)
+                .close_peer_if_token_matches(client_id, token, close_peer_timeout)
                 .await;
         }
         info!(client = client_id, "consensus client disconnected");
     });
 
-    if let Err(rejected) = bus
+    match bus
         .clients()
-        .insert(client_id, tx, writer_handle, reader_handle)
+        .insert(client_id, tx, writer_handle, reader_handle, conn_shutdown)
     {
-        // Shard 0 mints client ids as `(target_shard << 112) | seq` with a
-        // monotonic `seq` starting at 1, so wrap requires 2^112 mints and
-        // a collision here is a bootstrap bug or a foreign id leaking
-        // into the setup path. Flip `install_aborted` so the orphan
-        // reader drops inbound frames instead of forwarding them via
-        // `on_request` (which would route responses through the winner's
-        // entry and silently misroute).
-        install_aborted.set(true);
-        warn!(
-            client_id,
-            "duplicate client id in registry, dropping delegated fd \
-             (shard 0 counter invariant violated)"
-        );
-        compio::runtime::spawn(drain_rejected_registration(rejected, close_peer_timeout)).detach();
+        Ok(token) => {
+            install_token.set(Some(token));
+        }
+        Err(rejected) => {
+            // Shard 0 mints client ids as `(target_shard << 112) | seq` with a
+            // monotonic `seq` starting at 1, so wrap requires 2^112 mints and
+            // a collision here is a bootstrap bug or a foreign id leaking
+            // into the setup path. Flip `install_aborted` so the orphan
+            // reader drops inbound frames instead of forwarding them via
+            // `on_request` (which would route responses through the winner's
+            // entry and silently misroute).
+            install_aborted.set(true);
+            warn!(
+                client_id,
+                "duplicate client id in registry, dropping delegated fd \
+                 (shard 0 counter invariant violated)"
+            );
+            compio::runtime::spawn(drain_rejected_registration(rejected, close_peer_timeout))
+                .detach();
+        }
     }
 }
 
@@ -333,19 +396,23 @@ pub fn install_client_stream(
 /// (or force-cancel at the deadline).
 ///
 /// The winning entry must never be touched here; `install_aborted` has
-/// already told both tasks to skip post-loop cleanup. All this does is
-/// wake the writer by closing its queue, then await both handles with
-/// `close_peer_timeout` budget so the reader cannot outlive the race on
-/// a half-open socket. `compio::runtime::JoinHandle::drop` detaches, so
-/// letting the handles go out of scope would leak the tasks.
-#[allow(clippy::future_not_send)] // single-threaded compio
+/// already told both tasks to skip post-loop cleanup. Closing the
+/// sender wakes the writer; triggering the per-connection shutdown
+/// wakes the reader off its `io_uring` read SQE without waiting for
+/// peer EOF. Awaiting both handles with `close_peer_timeout` budget
+/// guarantees the reader cannot outlive the race on a half-open
+/// socket. `compio::runtime::JoinHandle::drop` detaches, so letting
+/// the handles go out of scope would leak the tasks.
+#[allow(clippy::future_not_send)]
 async fn drain_rejected_registration(rejected: RejectedRegistration, timeout: Duration) {
     let RejectedRegistration {
         sender,
         writer_handle,
         reader_handle,
+        conn_shutdown,
     } = rejected;
     sender.close();
+    conn_shutdown.trigger();
     let _ = compio::time::timeout(timeout, writer_handle).await;
     let _ = compio::time::timeout(timeout, reader_handle).await;
 }
@@ -358,12 +425,17 @@ async fn drain_rejected_registration(rejected: RejectedRegistration, timeout: Du
 /// message so the losing reader can never invoke `on_message` with the
 /// replica id owned by the winning install — otherwise two physical peers
 /// would feed the same VSR slot and break replication safety.
+///
+/// `conn_token` is a per-connection shutdown the installer triggers from
+/// the insert-race path: it wakes the reader off its `io_uring` read SQE
+/// immediately rather than waiting for peer EOF.
 #[allow(clippy::future_not_send)]
 async fn replica_read_loop(
     replica_id: u8,
     mut read_half: OwnedReadHalf<TcpStream>,
     on_message: &MessageHandler,
     token: &ShutdownToken,
+    conn_token: &ShutdownToken,
     aborted: &Cell<bool>,
     max_message_size: usize,
 ) {
@@ -371,6 +443,10 @@ async fn replica_read_loop(
         futures::select! {
             () = token.wait().fuse() => {
                 debug!(replica = replica_id, "replica read loop shutting down");
+                return;
+            }
+            () = conn_token.wait().fuse() => {
+                debug!(replica = replica_id, "replica read loop aborted by per-connection shutdown");
                 return;
             }
             result = framing::read_message(&mut read_half, max_message_size).fuse() => {
@@ -399,12 +475,17 @@ async fn replica_read_loop(
 /// duplicate-client-id race. The loop checks it before dispatching each
 /// request so the losing reader can never invoke `on_request` with the
 /// client id owned by the winning install.
+///
+/// `conn_token` is a per-connection shutdown the installer triggers from
+/// the insert-race path: it wakes the reader off its `io_uring` read SQE
+/// immediately rather than waiting for peer EOF.
 #[allow(clippy::future_not_send)]
 async fn client_read_loop(
     client_id: u128,
     mut read_half: OwnedReadHalf<TcpStream>,
     on_request: &RequestHandler,
     token: &ShutdownToken,
+    conn_token: &ShutdownToken,
     aborted: &Cell<bool>,
     max_message_size: usize,
 ) {
@@ -412,6 +493,10 @@ async fn client_read_loop(
         futures::select! {
             () = token.wait().fuse() => {
                 debug!(client = client_id, "client read loop shutting down");
+                return;
+            }
+            () = conn_token.wait().fuse() => {
+                debug!(client = client_id, "client read loop aborted by per-connection shutdown");
                 return;
             }
             result = framing::read_message(&mut read_half, max_message_size).fuse() => {

@@ -201,20 +201,32 @@ where
         self.consumer_offset_enforce_fsync = consumer_offset_enforce_fsync;
     }
 
-    pub(crate) async fn persist_and_stage_consumer_offset_upsert(
+    /// Stage a consumer offset upsert for the replicated op. The prepare
+    /// must already have been appended to `self.log.journal` by the caller
+    /// so `VsrAction::RetransmitPrepares` can recover it during a view
+    /// change. The on-disk offset table is NOT touched here: persist runs
+    /// from [`apply_staged_consumer_offset_commit`] at commit-time so a
+    /// view-change rollback of the in-memory pending entry also rolls
+    /// back the disk write (by never having performed it).
+    pub(crate) fn stage_consumer_offset_upsert(
         &mut self,
         op: u64,
         kind: ConsumerKind,
         consumer_id: u32,
         offset: u64,
-    ) -> Result<(), IggyError> {
+    ) {
         let pending = PendingConsumerOffsetCommit::upsert(kind, consumer_id, offset);
-        self.persist_consumer_offset_commit(pending).await?;
         self.pending_consumer_offset_commits.insert(op, pending);
-        Ok(())
     }
 
-    pub(crate) async fn persist_and_stage_consumer_offset_delete(
+    /// Stage a consumer offset delete for the replicated op. See
+    /// [`stage_consumer_offset_upsert`] for the ordering contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConsumerOffsetNotFound` if the consumer or group has no
+    /// existing on-disk / in-memory offset to delete.
+    pub(crate) fn stage_consumer_offset_delete(
         &mut self,
         op: u64,
         kind: ConsumerKind,
@@ -222,16 +234,23 @@ where
     ) -> Result<(), IggyError> {
         self.ensure_consumer_offset_exists(kind, consumer_id)?;
         let pending = PendingConsumerOffsetCommit::delete(kind, consumer_id);
-        self.persist_consumer_offset_commit(pending).await?;
         self.pending_consumer_offset_commits.insert(op, pending);
         Ok(())
     }
 
-    pub(crate) fn apply_staged_consumer_offset_commit(&mut self, op: u64) -> Result<(), IggyError> {
+    pub(crate) async fn apply_staged_consumer_offset_commit(
+        &mut self,
+        op: u64,
+    ) -> Result<(), IggyError> {
         let pending = self
             .pending_consumer_offset_commits
             .remove(&op)
             .ok_or(IggyError::InvalidCommand)?;
+        // Persist to the on-disk offset table first so a crash after the
+        // in-memory apply cannot observe a readable offset that was not
+        // durably stored; the in-memory update is idempotent on replay
+        // because we look up by (kind, id).
+        self.persist_consumer_offset_commit(pending).await?;
         self.apply_consumer_offset_commit(pending)?;
         Ok(())
     }
@@ -803,7 +822,9 @@ where
 
         let commit = self.consensus.commit_max();
         if commit > previous_commit
-            && let Err(error) = self.apply_committed_consumer_offset_commits_up_to(commit)
+            && let Err(error) = self
+                .apply_committed_consumer_offset_commits_up_to(commit)
+                .await
         {
             emit_partition_diag(
                 tracing::Level::WARN,
@@ -951,19 +972,34 @@ where
                     Self::parse_staged_consumer_offset_commit(header.operation, &message)?;
                 let write_lock = self.write_lock.clone();
                 let _guard = write_lock.lock().await;
+
+                // Journal the prepare before staging so
+                // `VsrAction::RetransmitPrepares` can read this op back
+                // on a view change. Without the journal entry, the
+                // `header_by_op` lookup in `on_replicate` would miss,
+                // the gap check would drop the retransmit, and the
+                // primary's pipeline would wedge indefinitely. Skip
+                // the `journal.info` accounting: it counts SendMessages
+                // batches for segment-commit thresholds, which do not
+                // apply to offset ops.
+                self.log
+                    .journal()
+                    .inner
+                    .append(message.clone().into_frozen())
+                    .await
+                    .map_err(|_| IggyError::CannotAppendMessage)?;
+
                 match header.operation {
                     Operation::StoreConsumerOffset => {
-                        self.persist_and_stage_consumer_offset_upsert(
+                        self.stage_consumer_offset_upsert(
                             header.op,
                             kind,
                             consumer_id,
                             offset.expect("store_consumer_offset must include offset"),
-                        )
-                        .await?;
+                        );
                     }
                     Operation::DeleteConsumerOffset => {
-                        self.persist_and_stage_consumer_offset_delete(header.op, kind, consumer_id)
-                            .await?;
+                        self.stage_consumer_offset_delete(header.op, kind, consumer_id)?;
                     }
                     _ => unreachable!(),
                 }
@@ -978,7 +1014,7 @@ where
                     consumer_kind = ?kind,
                     consumer_id,
                     offset = ?offset,
-                    "replicated consumer offset persisted and staged"
+                    "replicated consumer offset journaled and staged"
                 );
                 Ok(())
             }
@@ -1385,7 +1421,7 @@ where
         }
     }
 
-    fn apply_committed_consumer_offset_commits_up_to(
+    async fn apply_committed_consumer_offset_commits_up_to(
         &mut self,
         commit: u64,
     ) -> Result<(), IggyError> {
@@ -1398,7 +1434,7 @@ where
         committed_ops.sort_unstable();
 
         for op in committed_ops {
-            self.apply_staged_consumer_offset_commit(op)?;
+            self.apply_staged_consumer_offset_commit(op).await?;
         }
 
         Ok(())
@@ -1412,7 +1448,10 @@ where
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
 
-        if let Err(error) = self.apply_staged_consumer_offset_commit(prepare_header.op) {
+        if let Err(error) = self
+            .apply_staged_consumer_offset_commit(prepare_header.op)
+            .await
+        {
             *failed_commit = true;
             warn!(
                 target: "iggy.partitions.diag",
@@ -1614,16 +1653,11 @@ where
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) {
-        // Durability flag must reflect the truth that `VsrAction::RetransmitPrepares`
-        // can read from the partition journal. SendMessages lands in
-        // `self.log.journal` via `append_send_messages_to_journal`; consumer
-        // offset ops currently persist only to their own on-disk tables and
-        // are not recoverable from the partition journal during a view
-        // change, so they must ACK as non-durable until journaled.
-        let durability = match header.operation {
-            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => Some(false),
-            _ => Some(true),
-        };
-        send_prepare_ok_common(self.consensus(), header, durability).await;
+        // `VsrAction::RetransmitPrepares` reads from `self.log.journal`.
+        // Both `SendMessages` (via `append_send_messages_to_journal`) and
+        // consumer-offset ops (via `apply_replicated_operation`) append
+        // to that journal before `send_prepare_ok` fires, so every op
+        // that reaches here is journal-backed and ACKs as durable.
+        send_prepare_ok_common(self.consensus(), header, Some(true)).await;
     }
 }

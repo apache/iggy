@@ -42,7 +42,7 @@ use tracing::{debug, error, trace};
 /// `max_batch` caps how many messages a single `writev` syscall coalesces.
 /// Larger batches reduce syscalls per N messages at the cost of memory
 /// per batch and worst-case latency for the head-of-batch message.
-#[allow(clippy::future_not_send)] // single-threaded compio
+#[allow(clippy::future_not_send)]
 pub async fn run(
     rx: BusReceiver,
     mut write_half: OwnedWriteHalf<TcpStream>,

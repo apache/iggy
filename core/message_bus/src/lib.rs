@@ -366,7 +366,7 @@ impl IggyMessageBus {
     /// accept / reconnect / refresh periodic consumes it. Background
     /// tasks hold no in-flight wire frames, so force-cancelling them
     /// cannot truncate a frame on the wire.
-    #[allow(clippy::future_not_send)] // single-threaded compio
+    #[allow(clippy::future_not_send)]
     pub async fn shutdown(&self, timeout: Duration) -> DrainOutcome {
         self.shutdown.trigger();
 
@@ -410,7 +410,7 @@ impl IggyMessageBus {
 /// Forwarding impl so `VsrConsensus<Rc<IggyMessageBus>>` (two consensus
 /// planes sharing one bus) type-checks without duplicating the bus or
 /// taking it by value.
-#[allow(clippy::future_not_send)] // single-threaded compio
+#[allow(clippy::future_not_send)]
 impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
     fn send_to_client(
         &self,
@@ -433,7 +433,7 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
     }
 }
 
-#[allow(clippy::future_not_send)] // single-threaded compio
+#[allow(clippy::future_not_send)]
 impl MessageBus for IggyMessageBus {
     async fn send_to_client(
         &self,
@@ -534,7 +534,7 @@ mod tests {
     }
 
     #[compio::test]
-    #[allow(clippy::future_not_send)] // single-threaded compio
+    #[allow(clippy::future_not_send)]
     async fn send_to_client_slow_path_forwards_to_owning_shard() {
         // Bus on shard 5; client id encodes owning shard = 7.
         let bus = IggyMessageBus::new(5);
@@ -620,7 +620,7 @@ mod tests {
     }
 
     #[compio::test]
-    #[allow(clippy::future_not_send)] // single-threaded compio
+    #[allow(clippy::future_not_send)]
     async fn track_background_queues_handles() {
         let bus = IggyMessageBus::new(0);
 
@@ -632,7 +632,7 @@ mod tests {
     }
 
     #[compio::test]
-    #[allow(clippy::future_not_send)] // single-threaded compio
+    #[allow(clippy::future_not_send)]
     async fn shutdown_loop_drains_tasks_added_during_shutdown() {
         // Models the real race: a background task spawned after shutdown
         // has been triggered but before the loop-drain catches it up. The

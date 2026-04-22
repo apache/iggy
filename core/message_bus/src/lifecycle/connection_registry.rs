@@ -35,12 +35,27 @@
 use compio::runtime::JoinHandle;
 use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
 use iggy_binary_protocol::consensus::iobuf::Frozen;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry as HmEntry;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
+
+/// Opaque per-insert generation token.
+///
+/// Each successful [`ConnectionRegistry::insert`] / [`ReplicaRegistry::insert`]
+/// mints a fresh monotonically increasing token and stores it alongside the
+/// entry. Callers that want to release the slot from the post-loop of the
+/// very install they spawned must use the `*_if_token_matches` variants so
+/// a late-exiting predecessor cannot evict a later reinstall's slot.
+///
+/// Minted by a single-threaded `Cell<u64>` counter; single runtime = no
+/// atomic needed. u64 means ~585 years of single-ns-per-install wraparound
+/// headroom — treat as effectively unique within a process lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstanceToken(u64);
 
 /// Minimum deadline reserved for reader-handle drain, in addition to the
 /// writer drain's remaining budget.
@@ -70,12 +85,16 @@ pub type BusReceiver = async_channel::Receiver<BusMessage>;
 
 /// Rejected payload handed back to the caller when `insert` loses.
 ///
-/// Exposes the writer and reader [`JoinHandle`]s so the loser can
-/// explicitly drain (or force-cancel on deadline) the orphan tasks
-/// rather than relying on them to self-exit via `install_aborted`.
-/// `compio::runtime::JoinHandle::drop` detaches; without this the loser
-/// would leak the handles and a reader looping on `framing::read_message`
-/// could outlive the race indefinitely on a half-open socket.
+/// Exposes the writer and reader [`JoinHandle`]s plus the per-connection
+/// [`Shutdown`] so the loser can explicitly drain (or force-cancel on
+/// deadline) the orphan tasks rather than relying on them to self-exit via
+/// `install_aborted`. `compio::runtime::JoinHandle::drop` detaches; without
+/// this the loser would leak the handles and a reader looping on
+/// `framing::read_message` could outlive the race indefinitely on a
+/// half-open socket. Triggering the [`Shutdown`] wakes the reader off its
+/// `io_uring` read SQE without waiting for peer EOF.
+///
+/// [`Shutdown`]: crate::lifecycle::Shutdown
 #[derive(Debug)]
 pub struct RejectedRegistration {
     /// Producer side of the losing queue. Drop or `close()` to wake the
@@ -85,6 +104,9 @@ pub struct RejectedRegistration {
     pub writer_handle: JoinHandle<()>,
     /// Reader task spawned before `insert` was attempted.
     pub reader_handle: JoinHandle<()>,
+    /// Per-connection shutdown the caller passed into the failed insert.
+    /// Trigger to wake the reader without waiting for peer EOF.
+    pub conn_shutdown: super::Shutdown,
 }
 
 /// Result of [`ConnectionRegistry::drain`] or [`crate::IggyMessageBus::shutdown`].
@@ -112,6 +134,18 @@ struct Entry {
     sender: BusSender,
     writer_handle: Option<JoinHandle<()>>,
     reader_handle: Option<JoinHandle<()>>,
+    /// Generation token minted by the registry on insert. Entries that
+    /// must be released only by their originating install compare against
+    /// this value; a stale-install cleanup presenting a different token is
+    /// a no-op.
+    token: InstanceToken,
+    /// Per-connection shutdown captured at install time. Only kept alive
+    /// here so its `Sender` survives until the entry is removed; dropping
+    /// it earlier would close the broadcast channel and falsely wake
+    /// readers waiting on `conn_token.wait()`. Triggered explicitly by
+    /// [`drain_rejected_registration`](crate::installer) on insert race;
+    /// implicitly dropped on entry removal.
+    _conn_shutdown: super::Shutdown,
 }
 
 /// Map of live connections keyed by some transport-specific id.
@@ -124,6 +158,7 @@ where
     K: Eq + Hash + Copy + Debug + 'static,
 {
     entries: RefCell<HashMap<K, Entry>>,
+    next_token: Cell<u64>,
 }
 
 impl<K> Default for ConnectionRegistry<K>
@@ -143,7 +178,14 @@ where
     pub fn new() -> Self {
         Self {
             entries: RefCell::new(HashMap::new()),
+            next_token: Cell::new(1),
         }
+    }
+
+    fn mint_token(&self) -> InstanceToken {
+        let current = self.next_token.get();
+        self.next_token.set(current.wrapping_add(1));
+        InstanceToken(current)
     }
 
     #[must_use]
@@ -181,35 +223,52 @@ where
     /// queue alongside the writer + reader task handles so graceful shutdown
     /// can drain everything.
     ///
+    /// On success returns an [`InstanceToken`] the caller can later feed
+    /// into [`remove_if_token_matches`](Self::remove_if_token_matches) /
+    /// [`close_peer_if_token_matches`](Self::close_peer_if_token_matches)
+    /// to fence stale-install cleanup from evicting a later reinstall.
+    ///
+    /// `conn_shutdown` is moved into the entry so its `Sender` outlives
+    /// the connection: dropping it earlier would close the broadcast
+    /// channel and falsely wake the reader's `select!`.
+    ///
     /// # Errors
     ///
     /// On duplicate `key` returns the rejected payload (sender +
-    /// both [`JoinHandle`]s) so the caller can explicitly drain the
-    /// orphan tasks instead of leaking them on drop.
+    /// both [`JoinHandle`]s + the per-connection [`Shutdown`]) so the
+    /// caller can trigger the shutdown to wake the reader and explicitly
+    /// drain the orphan tasks instead of leaking them on drop.
+    ///
+    /// [`Shutdown`]: crate::lifecycle::Shutdown
     pub fn insert(
         &self,
         key: K,
         sender: BusSender,
         writer_handle: JoinHandle<()>,
         reader_handle: JoinHandle<()>,
-    ) -> Result<(), RejectedRegistration> {
+        conn_shutdown: super::Shutdown,
+    ) -> Result<InstanceToken, RejectedRegistration> {
         let mut entries = self.entries.borrow_mut();
         if entries.contains_key(&key) {
             return Err(RejectedRegistration {
                 sender,
                 writer_handle,
                 reader_handle,
+                conn_shutdown,
             });
         }
+        let token = self.mint_token();
         entries.insert(
             key,
             Entry {
                 sender,
                 writer_handle: Some(writer_handle),
                 reader_handle: Some(reader_handle),
+                token,
+                _conn_shutdown: conn_shutdown,
             },
         );
-        Ok(())
+        Ok(token)
     }
 
     /// Unregister a connection without awaiting its tasks.
@@ -222,8 +281,28 @@ where
     /// Prefer [`close_peer`](Self::close_peer) when closing from the reader
     /// task: the explicit close-sender, await-writer sequence prevents a
     /// mid-writev cancellation from landing a truncated frame on the wire.
+    ///
+    /// Unfenced: callers that need generation-safety must use
+    /// [`remove_if_token_matches`](Self::remove_if_token_matches).
     pub fn remove(&self, key: K) -> bool {
         self.entries.borrow_mut().remove(&key).is_some()
+    }
+
+    /// Token-fenced variant of [`remove`](Self::remove).
+    ///
+    /// Removes the entry only if its stored token equals `token`. Returns
+    /// `true` when the removal applied. Used by install post-loops so a
+    /// lagging predecessor cannot evict a newer reinstall's slot.
+    pub fn remove_if_token_matches(&self, key: K, token: InstanceToken) -> bool {
+        let mut entries = self.entries.borrow_mut();
+        let HmEntry::Occupied(slot) = entries.entry(key) else {
+            return false;
+        };
+        if slot.get().token != token {
+            return false;
+        }
+        slot.remove();
+        true
     }
 
     /// Close the entry keyed by `key` in the correct order: remove the
@@ -238,7 +317,10 @@ where
     /// Returns a best-effort result: this is a lifecycle convenience, not
     /// a signal of a problem if the writer needed to be force-cancelled
     /// at the deadline.
-    #[allow(clippy::future_not_send)] // single-threaded compio
+    ///
+    /// Unfenced: callers that need generation-safety must use
+    /// [`close_peer_if_token_matches`](Self::close_peer_if_token_matches).
+    #[allow(clippy::future_not_send)]
     pub async fn close_peer(&self, key: K, timeout: Duration) {
         let Some(mut entry) = self.entries.borrow_mut().remove(&key) else {
             return;
@@ -248,6 +330,36 @@ where
             let _ = compio::time::timeout(timeout, writer_handle).await;
         }
         drop(entry.reader_handle);
+    }
+
+    /// Token-fenced variant of [`close_peer`](Self::close_peer).
+    ///
+    /// Closes the entry only if its stored token equals `token`. Returns
+    /// without effect when the token does not match (stale-install
+    /// cleanup races against a newer reinstall).
+    #[allow(clippy::future_not_send)]
+    pub async fn close_peer_if_token_matches(
+        &self,
+        key: K,
+        token: InstanceToken,
+        timeout: Duration,
+    ) -> bool {
+        let mut entry = {
+            let mut entries = self.entries.borrow_mut();
+            let HmEntry::Occupied(slot) = entries.entry(key) else {
+                return false;
+            };
+            if slot.get().token != token {
+                return false;
+            }
+            slot.remove()
+        };
+        entry.sender.close();
+        if let Some(writer_handle) = entry.writer_handle.take() {
+            let _ = compio::time::timeout(timeout, writer_handle).await;
+        }
+        drop(entry.reader_handle);
+        true
     }
 
     /// Drain every entry, awaiting each task with a shared deadline.
@@ -265,7 +377,7 @@ where
     /// drain time is bounded by the slowest entry, not the sum across
     /// entries. Writer-before-reader sequencing is preserved inside each
     /// entry's future so a mid-writev cancellation cannot truncate a frame.
-    #[allow(clippy::future_not_send)] // single-threaded compio
+    #[allow(clippy::future_not_send)]
     pub async fn drain(&self, timeout: Duration) -> DrainOutcome {
         let drained: Vec<(K, Entry)> = self.entries.borrow_mut().drain().collect();
         drain_entries(drained, timeout).await
@@ -279,7 +391,7 @@ where
 /// backing type and hand the pre-collected `Vec` to this helper. Each
 /// entry's sender is closed, writer awaited, then reader awaited, all
 /// concurrently across entries via `FuturesUnordered`.
-#[allow(clippy::future_not_send)] // single-threaded compio
+#[allow(clippy::future_not_send)]
 async fn drain_entries<K>(drained: Vec<(K, Entry)>, timeout: Duration) -> DrainOutcome
 where
     K: Debug + 'static,
@@ -351,7 +463,7 @@ enum TaskOutcome {
     Force,
 }
 
-#[allow(clippy::future_not_send)] // single-threaded compio
+#[allow(clippy::future_not_send)]
 async fn drain_handle<K: Debug>(
     handle: Option<JoinHandle<()>>,
     deadline: Instant,
@@ -388,7 +500,8 @@ async fn drain_handle<K: Debug>(
 #[derive(Debug)]
 pub struct ReplicaRegistry {
     slots: RefCell<[Option<Entry>; 256]>,
-    len: std::cell::Cell<usize>,
+    len: Cell<usize>,
+    next_token: Cell<u64>,
 }
 
 impl Default for ReplicaRegistry {
@@ -402,8 +515,15 @@ impl ReplicaRegistry {
     pub fn new() -> Self {
         Self {
             slots: RefCell::new(std::array::from_fn(|_| None)),
-            len: std::cell::Cell::new(0),
+            len: Cell::new(0),
+            next_token: Cell::new(1),
         }
+    }
+
+    fn mint_token(&self) -> InstanceToken {
+        let current = self.next_token.get();
+        self.next_token.set(current.wrapping_add(1));
+        InstanceToken(current)
     }
 
     #[must_use]
@@ -441,7 +561,8 @@ impl ReplicaRegistry {
         sender: BusSender,
         writer_handle: JoinHandle<()>,
         reader_handle: JoinHandle<()>,
-    ) -> Result<(), RejectedRegistration> {
+        conn_shutdown: super::Shutdown,
+    ) -> Result<InstanceToken, RejectedRegistration> {
         let mut slots = self.slots.borrow_mut();
         let slot = &mut slots[usize::from(key)];
         if slot.is_some() {
@@ -449,15 +570,19 @@ impl ReplicaRegistry {
                 sender,
                 writer_handle,
                 reader_handle,
+                conn_shutdown,
             });
         }
+        let token = self.mint_token();
         *slot = Some(Entry {
             sender,
             writer_handle: Some(writer_handle),
             reader_handle: Some(reader_handle),
+            token,
+            _conn_shutdown: conn_shutdown,
         });
         self.len.set(self.len.get() + 1);
-        Ok(())
+        Ok(token)
     }
 
     /// See [`ConnectionRegistry::remove`].
@@ -470,8 +595,20 @@ impl ReplicaRegistry {
         }
     }
 
+    /// See [`ConnectionRegistry::remove_if_token_matches`].
+    pub fn remove_if_token_matches(&self, key: u8, token: InstanceToken) -> bool {
+        let mut slots = self.slots.borrow_mut();
+        let slot = &mut slots[usize::from(key)];
+        if !slot.as_ref().is_some_and(|e| e.token == token) {
+            return false;
+        }
+        *slot = None;
+        self.len.set(self.len.get() - 1);
+        true
+    }
+
     /// See [`ConnectionRegistry::close_peer`].
-    #[allow(clippy::future_not_send)] // single-threaded compio
+    #[allow(clippy::future_not_send)]
     pub async fn close_peer(&self, key: u8, timeout: Duration) {
         let mut entry = {
             let mut slots = self.slots.borrow_mut();
@@ -488,8 +625,42 @@ impl ReplicaRegistry {
         drop(entry.reader_handle);
     }
 
+    /// See [`ConnectionRegistry::close_peer_if_token_matches`].
+    ///
+    /// # Panics
+    ///
+    /// Cannot panic in practice: the `expect` after `slot.take()` is
+    /// guarded by a matching `slot.as_ref()` check under the same
+    /// single-threaded `RefCell` borrow.
+    #[allow(clippy::future_not_send)]
+    pub async fn close_peer_if_token_matches(
+        &self,
+        key: u8,
+        token: InstanceToken,
+        timeout: Duration,
+    ) -> bool {
+        let mut entry = {
+            let mut slots = self.slots.borrow_mut();
+            let slot = &mut slots[usize::from(key)];
+            if !slot.as_ref().is_some_and(|e| e.token == token) {
+                return false;
+            }
+            let removed_entry = slot
+                .take()
+                .expect("slot is Some: checked above under the same borrow");
+            self.len.set(self.len.get() - 1);
+            removed_entry
+        };
+        entry.sender.close();
+        if let Some(writer_handle) = entry.writer_handle.take() {
+            let _ = compio::time::timeout(timeout, writer_handle).await;
+        }
+        drop(entry.reader_handle);
+        true
+    }
+
     /// See [`ConnectionRegistry::drain`].
-    #[allow(clippy::future_not_send)] // single-threaded compio
+    #[allow(clippy::future_not_send)]
     pub async fn drain(&self, timeout: Duration) -> DrainOutcome {
         let drained: Vec<(u8, Entry)> = {
             let mut slots = self.slots.borrow_mut();
@@ -538,6 +709,13 @@ mod tests {
         })
     }
 
+    /// Throwaway per-connection [`Shutdown`] for tests that exercise
+    /// `insert` but do not care about the reader-wake plumbing.
+    fn dummy_conn_shutdown() -> Shutdown {
+        let (s, _t) = Shutdown::new();
+        s
+    }
+
     #[compio::test]
     async fn insert_and_get_sender() {
         let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
@@ -546,7 +724,8 @@ mod tests {
         let writer = spawn_dummy_writer(rx);
         let reader = spawn_dummy_reader(token);
 
-        reg.insert(1u8, tx, writer, reader).expect("insert ok");
+        reg.insert(1u8, tx, writer, reader, dummy_conn_shutdown())
+            .expect("insert ok");
         assert!(reg.contains(1u8));
         assert_eq!(reg.len(), 1);
 
@@ -567,8 +746,9 @@ mod tests {
         let w2 = spawn_dummy_writer(rx2);
         let r2 = spawn_dummy_reader(token);
 
-        reg.insert(1u8, tx1, w1, r1).expect("first insert");
-        let err = reg.insert(1u8, tx2, w2, r2);
+        reg.insert(1u8, tx1, w1, r1, dummy_conn_shutdown())
+            .expect("first insert");
+        let err = reg.insert(1u8, tx2, w2, r2, dummy_conn_shutdown());
         assert!(err.is_err());
     }
 
@@ -581,7 +761,7 @@ mod tests {
             let (tx, rx) = async_channel::bounded(8);
             let w = spawn_dummy_writer(rx);
             let r = spawn_dummy_reader(token.clone());
-            reg.insert(k, tx, w, r).unwrap();
+            reg.insert(k, tx, w, r, dummy_conn_shutdown()).unwrap();
         }
 
         shutdown.trigger();
@@ -604,7 +784,7 @@ mod tests {
                 compio::time::sleep(Duration::from_secs(10)).await;
             }
         });
-        reg.insert(1u8, tx, w, r).unwrap();
+        reg.insert(1u8, tx, w, r, dummy_conn_shutdown()).unwrap();
 
         let outcome = reg.drain(Duration::from_millis(40)).await;
         // Writer exits because the sender is closed by drain. Reader is
@@ -620,7 +800,8 @@ mod tests {
         let (tx, rx) = async_channel::bounded(8);
         let writer = spawn_dummy_writer(rx);
         let reader = spawn_dummy_reader(token);
-        reg.insert(7u8, tx, writer, reader).expect("insert ok");
+        reg.insert(7u8, tx, writer, reader, dummy_conn_shutdown())
+            .expect("insert ok");
 
         assert!(reg.contains(7u8));
         reg.close_peer(7u8, Duration::from_secs(1)).await;
@@ -649,7 +830,8 @@ mod tests {
             compio::time::sleep(Duration::from_millis(180)).await;
         });
         let reader = spawn_dummy_reader(token);
-        reg.insert(1u8, tx, writer, reader).unwrap();
+        reg.insert(1u8, tx, writer, reader, dummy_conn_shutdown())
+            .unwrap();
 
         shutdown.trigger();
         // Shared deadline = 200 ms. Writer consumes ~180 ms, leaving
@@ -679,7 +861,8 @@ mod tests {
                 compio::time::sleep(PER_ENTRY_LATENCY).await;
             });
             let reader = spawn_dummy_reader(token.clone());
-            reg.insert(k, tx, writer, reader).unwrap();
+            reg.insert(k, tx, writer, reader, dummy_conn_shutdown())
+                .unwrap();
         }
 
         // Shutdown so readers (which wait on the token) exit cleanly.
@@ -701,5 +884,123 @@ mod tests {
             parallel_budget,
             PER_ENTRY_LATENCY * u32::from(N),
         );
+    }
+
+    /// Each successful insert mints a distinct token.
+    #[compio::test]
+    async fn insert_mints_unique_tokens() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        let (_shutdown, token) = Shutdown::new();
+
+        let (tx1, rx1) = async_channel::bounded(8);
+        let tok1 = reg
+            .insert(
+                1u8,
+                tx1,
+                spawn_dummy_writer(rx1),
+                spawn_dummy_reader(token.clone()),
+                dummy_conn_shutdown(),
+            )
+            .expect("first insert ok");
+
+        assert!(reg.remove(1u8));
+
+        let (tx2, rx2) = async_channel::bounded(8);
+        let tok2 = reg
+            .insert(
+                1u8,
+                tx2,
+                spawn_dummy_writer(rx2),
+                spawn_dummy_reader(token),
+                dummy_conn_shutdown(),
+            )
+            .expect("second insert ok");
+
+        assert_ne!(tok1, tok2, "reinsert after remove must mint a fresh token");
+    }
+
+    /// Sequential install -> remove -> reinstall: an old install's stale
+    /// `remove_if_token_matches` call must NOT evict the new slot.
+    #[compio::test]
+    async fn stale_remove_does_not_evict_reinstall() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        let (_shutdown, token) = Shutdown::new();
+
+        let (tx_a, rx_a) = async_channel::bounded(8);
+        let tok_a = reg
+            .insert(
+                1u8,
+                tx_a,
+                spawn_dummy_writer(rx_a),
+                spawn_dummy_reader(token.clone()),
+                dummy_conn_shutdown(),
+            )
+            .expect("install A ok");
+
+        reg.remove(1u8);
+
+        let (tx_b, rx_b) = async_channel::bounded(8);
+        let tok_b = reg
+            .insert(
+                1u8,
+                tx_b,
+                spawn_dummy_writer(rx_b),
+                spawn_dummy_reader(token),
+                dummy_conn_shutdown(),
+            )
+            .expect("install B (reinstall) ok");
+
+        // Late-exiting A presents its stale token. Must be a no-op.
+        let evicted = reg.remove_if_token_matches(1u8, tok_a);
+        assert!(!evicted, "stale token must not evict newer slot");
+        assert!(reg.contains(1u8));
+
+        // B's own cleanup releases correctly.
+        assert!(reg.remove_if_token_matches(1u8, tok_b));
+        assert!(!reg.contains(1u8));
+    }
+
+    /// Same invariant on the fixed-array replica registry.
+    #[compio::test]
+    async fn replica_stale_close_does_not_evict_reinstall() {
+        let reg = ReplicaRegistry::new();
+        let (_shutdown, token) = Shutdown::new();
+
+        let (tx_a, rx_a) = async_channel::bounded(8);
+        let tok_a = reg
+            .insert(
+                2u8,
+                tx_a,
+                spawn_dummy_writer(rx_a),
+                spawn_dummy_reader(token.clone()),
+                dummy_conn_shutdown(),
+            )
+            .expect("install A ok");
+
+        reg.remove(2u8);
+
+        let (tx_b, rx_b) = async_channel::bounded(8);
+        let tok_b = reg
+            .insert(
+                2u8,
+                tx_b,
+                spawn_dummy_writer(rx_b),
+                spawn_dummy_reader(token),
+                dummy_conn_shutdown(),
+            )
+            .expect("install B ok");
+
+        let closed = reg
+            .close_peer_if_token_matches(2u8, tok_a, Duration::from_millis(100))
+            .await;
+        assert!(!closed, "stale token must not close newer slot");
+        assert!(reg.contains(2u8));
+
+        // New slot still owns the writer / reader pair.
+        let closed = reg
+            .close_peer_if_token_matches(2u8, tok_b, Duration::from_millis(100))
+            .await;
+        assert!(closed);
+        assert!(!reg.contains(2u8));
     }
 }
