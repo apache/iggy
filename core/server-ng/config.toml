@@ -547,20 +547,20 @@ name = "iggy-cluster"
 name = "iggy-node-1"
 ip = "127.0.0.1"
 replica_id = 0
-ports = { tcp = 8090, quic = 8080, http = 3000, websocket = 8070 }
+ports = { tcp = 8090, quic = 8080, http = 3000, websocket = 8070, tcp_replica = 9090 }
 
 [[cluster.nodes]]
 name = "iggy-node-2"
 ip = "127.0.0.1"
 replica_id = 1
-ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093 }
+ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 9091 }
 
 # Example additional node (commented out):
 # [[cluster.nodes]]
 # name = "iggy-node-3"
 # ip = "192.168.1.100"
 # replica_id = 2
-# ports = { tcp = 8092, http = 3002 }
+# ports = { tcp = 8092, http = 3002, tcp_replica = 9092 }
 
 # Sharding configuration
 [system.sharding]

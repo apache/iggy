@@ -458,6 +458,7 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                 ("QUIC", node.ports.quic),
                 ("HTTP", node.ports.http),
                 ("WebSocket", node.ports.websocket),
+                ("TCP_REPLICA", node.ports.tcp_replica),
             ];
 
             for (name, port_opt) in &port_list {
@@ -544,5 +545,37 @@ mod cluster_validate_tests {
         let mut c = cfg(vec![]);
         c.enabled = false;
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_tcp_replica_port() {
+        let ports = TransportPorts {
+            tcp: None,
+            quic: None,
+            http: None,
+            websocket: None,
+            tcp_replica: Some(9090),
+        };
+        let mut n1 = node("n1", 0);
+        n1.ports = ports.clone();
+        let mut n2 = node("n2", 1);
+        n2.ports = ports;
+        let c = cfg(vec![n1, n2]);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_tcp_replica_port() {
+        let ports = TransportPorts {
+            tcp: None,
+            quic: None,
+            http: None,
+            websocket: None,
+            tcp_replica: Some(0),
+        };
+        let mut n1 = node("n1", 0);
+        n1.ports = ports;
+        let c = cfg(vec![n1]);
+        assert!(c.validate().is_err());
     }
 }

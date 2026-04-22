@@ -578,13 +578,31 @@ impl Default for ClusterConfig {
                 .map(|node| ClusterNodeConfig {
                     name: node.name.parse().unwrap(),
                     ip: node.ip.parse().unwrap(),
-                    replica_id: node.replica_id as u8,
+                    replica_id: u8::try_from(node.replica_id).expect(
+                        "static_toml replica_id must fit in u8 (0..=255); \
+                         fix core/server/config.toml",
+                    ),
                     ports: TransportPorts {
-                        tcp: Some(node.ports.tcp as u16),
-                        quic: Some(node.ports.quic as u16),
-                        http: Some(node.ports.http as u16),
-                        websocket: Some(node.ports.websocket as u16),
-                        tcp_replica: Some(node.ports.tcp_replica as u16),
+                        tcp: Some(u16::try_from(node.ports.tcp).expect(
+                            "static_toml cluster.nodes.ports.tcp must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
+                        quic: Some(u16::try_from(node.ports.quic).expect(
+                            "static_toml cluster.nodes.ports.quic must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
+                        http: Some(u16::try_from(node.ports.http).expect(
+                            "static_toml cluster.nodes.ports.http must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
+                        websocket: Some(u16::try_from(node.ports.websocket).expect(
+                            "static_toml cluster.nodes.ports.websocket must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
+                        tcp_replica: Some(u16::try_from(node.ports.tcp_replica).expect(
+                            "static_toml cluster.nodes.ports.tcp_replica must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
                     },
                 })
                 .collect(),

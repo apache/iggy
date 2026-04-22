@@ -30,6 +30,15 @@ use tracing::{error, info, warn};
 
 const DISPLAY_CONFIG_ENV: &str = "IGGY_DISPLAY_CONFIG";
 
+/// Shared migration pointer for operators still on the pre-3134 schema,
+/// reused by both the TOML and env-var guards so the diagnostic is identical
+/// regardless of which surface carries the stale config.
+const LEGACY_CLUSTER_MIGRATION_HELP: &str = "Migrate to the flat `[[cluster.nodes]]` array: move the old \
+     `cluster.node.current` and every entry in `cluster.node.others` into a \
+     single `cluster.nodes` list and set each node's `replica_id` \
+     explicitly. The running node is selected at startup via the \
+     `--replica-id` CLI flag.";
+
 /// Migration guard for the pre-3134 nested cluster schema.
 ///
 /// Before the flatten refactor, the roster lived at `cluster.node.current`
@@ -60,13 +69,39 @@ fn reject_legacy_cluster_schema(raw: &str) -> Result<(), ConfigurationError> {
 
     error!(
         "Legacy cluster schema detected: `cluster.node.{key}` is no longer \
-         supported. Migrate to the flat `[[cluster.nodes]]` array: move \
-         `cluster.node.current` and every entry in `cluster.node.others` \
-         into a single `cluster.nodes` list and set each node's \
-         `replica_id` explicitly. The running node is selected at startup \
-         via the `--replica-id` CLI flag."
+         supported. {LEGACY_CLUSTER_MIGRATION_HELP}"
     );
     Err(ConfigurationError::CannotLoadConfiguration)
+}
+
+/// Mirrors [`reject_legacy_cluster_schema`] for the env-var surface.
+///
+/// Figment silently drops unknown env-var keys, so an operator who migrated
+/// only the TOML (or who shipped the cluster roster exclusively through
+/// env vars on docker/k8s) would keep `IGGY_CLUSTER_NODE_CURRENT_*` /
+/// `IGGY_CLUSTER_NODE_OTHERS_*` in the environment and boot with an empty
+/// roster post-upgrade. Fail fast with the same migration pointer.
+///
+/// Accepts an iterator over `(String, String)` to keep the scan independent
+/// of `std::env::vars()` for testability.
+fn reject_legacy_cluster_env<I>(vars: I) -> Result<(), ConfigurationError>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    const LEGACY_PREFIXES: [&str; 2] = ["IGGY_CLUSTER_NODE_CURRENT_", "IGGY_CLUSTER_NODE_OTHERS_"];
+
+    for (key, _) in vars {
+        let upper = key.to_ascii_uppercase();
+        if let Some(matched) = LEGACY_PREFIXES.iter().find(|p| upper.starts_with(*p)) {
+            error!(
+                "Legacy cluster schema detected in environment: `{key}` \
+                 (prefix `{matched}`) is no longer supported. \
+                 {LEGACY_CLUSTER_MIGRATION_HELP}"
+            );
+            return Err(ConfigurationError::CannotLoadConfiguration);
+        }
+    }
+    Ok(())
 }
 
 /// File-based configuration provider that combines file, default, and environment configurations.
@@ -116,8 +151,22 @@ impl<P: Provider + Clone> ConfigProvider for FileConfigProvider<P> {
         // If the config file exists, merge it into the configuration
         if file_exists(&self.file_path) {
             info!("Found configuration file at path: '{}'.", self.file_path);
-            if let Ok(raw) = fs::read_to_string(&self.file_path) {
-                reject_legacy_cluster_schema(&raw)?;
+            match fs::read_to_string(&self.file_path) {
+                Ok(raw) => reject_legacy_cluster_schema(&raw)?,
+                Err(e) => {
+                    // Swallowing a read error here would silently skip the
+                    // legacy-schema guard while figment re-reads the same
+                    // file a line below, so an EACCES / permissions bug
+                    // would leak a confusing `Toml::file` error instead of
+                    // the migration pointer. Propagate so the operator
+                    // sees the real cause.
+                    error!(
+                        "Failed to read configuration file '{}' for legacy \
+                         schema scan: {e}",
+                        self.file_path
+                    );
+                    return Err(ConfigurationError::CannotLoadConfiguration);
+                }
             }
             config_builder = config_builder.merge(Toml::file(&self.file_path));
         } else {
@@ -131,6 +180,10 @@ impl<P: Provider + Clone> ConfigProvider for FileConfigProvider<P> {
                 );
             }
         }
+
+        // Reject stale `IGGY_CLUSTER_NODE_CURRENT_*` / `IGGY_CLUSTER_NODE_OTHERS_*`
+        // env vars before figment swallows them as unknown keys.
+        reject_legacy_cluster_env(env::vars())?;
 
         // Merge environment variables into the configuration
         config_builder = config_builder.merge(self.env_provider.clone());
@@ -251,5 +304,45 @@ replica_id = 1
         // migration guard must not turn that into its own error.
         let raw = "[cluster\nnot valid toml";
         reject_legacy_cluster_schema(raw).expect("malformed toml defers to figment");
+    }
+
+    #[test]
+    fn env_guard_accepts_empty_env() {
+        reject_legacy_cluster_env(std::iter::empty()).expect("no env vars: nothing to reject");
+    }
+
+    #[test]
+    fn env_guard_accepts_new_schema_env() {
+        let vars = vec![
+            ("IGGY_CLUSTER_ENABLED".into(), "true".into()),
+            ("IGGY_CLUSTER_NODES_0_NAME".into(), "n0".into()),
+            ("IGGY_CLUSTER_NODES_0_REPLICA_ID".into(), "0".into()),
+            ("IGGY_TCP_ADDRESS".into(), "0.0.0.0:8090".into()),
+        ];
+        reject_legacy_cluster_env(vars).expect("flat schema env vars must be accepted");
+    }
+
+    #[test]
+    fn env_guard_rejects_legacy_current() {
+        let vars = vec![("IGGY_CLUSTER_NODE_CURRENT_NAME".into(), "n0".into())];
+        let err = reject_legacy_cluster_env(vars).expect_err("legacy env var must fail");
+        assert_eq!(err, ConfigurationError::CannotLoadConfiguration);
+    }
+
+    #[test]
+    fn env_guard_rejects_legacy_others() {
+        let vars = vec![("IGGY_CLUSTER_NODE_OTHERS_0_NAME".into(), "n1".into())];
+        let err = reject_legacy_cluster_env(vars).expect_err("legacy env var must fail");
+        assert_eq!(err, ConfigurationError::CannotLoadConfiguration);
+    }
+
+    #[test]
+    fn env_guard_rejects_legacy_lowercase() {
+        // Environments are usually uppercase but operators occasionally
+        // set mixed-case keys; match case-insensitively to avoid a silent
+        // miss on stale overrides.
+        let vars = vec![("iggy_cluster_node_current_name".into(), "n0".into())];
+        let err = reject_legacy_cluster_env(vars).expect_err("lowercase legacy env var must fail");
+        assert_eq!(err, ConfigurationError::CannotLoadConfiguration);
     }
 }
