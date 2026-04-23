@@ -17,6 +17,8 @@
  * under the License.
  */
 
+#![allow(clippy::future_not_send)]
+
 pub mod bootstrap;
 pub mod login_register;
 pub mod server_error;

@@ -18,6 +18,7 @@
  */
 
 use metadata::impls::recovery::RecoveryError;
+// TODO: decouple logging errors from the `server` crate.
 use server::server_error::LogError;
 use thiserror::Error;
 
@@ -31,6 +32,17 @@ pub enum ServerNgError {
     Logging(#[source] LogError),
     #[error("failed to recover metadata snapshot and journal")]
     MetadataRecovery(#[source] RecoveryError),
+    #[error(
+        "recovered namespace stream {stream_id}, topic {topic_id}, partition {partition_id} exceeds configured limits (max_streams={max_streams}, max_topics={max_topics}, max_partitions={max_partitions})"
+    )]
+    RecoveredNamespaceOutOfBounds {
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        max_streams: usize,
+        max_topics: usize,
+        max_partitions: usize,
+    },
     #[error(
         "failed to load partition log for stream {stream_id}, topic {topic_id}, partition {partition_id}"
     )]

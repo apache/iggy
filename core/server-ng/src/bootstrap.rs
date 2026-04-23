@@ -22,8 +22,8 @@ use configs::server::ServerConfig;
 use consensus::{LocalPipeline, PartitionsHandle, Sequencer, VsrConsensus};
 use iggy_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use iggy_common::{
-    ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, PartitionStats, sharding::LocalIdx,
-    variadic,
+    ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, PartitionStats, TopicStats,
+    sharding::LocalIdx, variadic,
 };
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
@@ -39,6 +39,7 @@ use metadata::stm::user::Users;
 use partitions::{
     IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig, Segment,
 };
+// TODO: decouple bootstrap/storage helpers and logging from the `server` crate.
 use server::bootstrap::create_directories;
 use server::log::logger::Logging;
 use server::streaming::partitions::storage::{load_consumer_group_offsets, load_consumer_offsets};
@@ -54,6 +55,7 @@ use tracing::{info, warn};
 
 const CLUSTER_ID: u128 = 1;
 const SHARD_ID: u16 = 0;
+const SHARD_REPLICA_ID: u8 = 0;
 const SHARD_NAME: &str = "server-ng-shard-0";
 const DEFAULT_CONFIG_PATH: &str = "core/server-ng/config.toml";
 
@@ -90,10 +92,17 @@ impl RunServerNg for Rc<ServerNgShard> {
     }
 }
 
+/// Bootstraps `server-ng` from config and on-disk metadata/partition state.
+///
+/// # Errors
+///
+/// Returns an error if config loading, directory preparation, logging setup,
+/// metadata recovery, or partition hydration fails.
 pub async fn bootstrap(logging: &mut Logging) -> Result<Rc<ServerNgShard>, ServerNgError> {
     let config = ServerConfig::load_with_path(DEFAULT_CONFIG_PATH, include_str!("../config.toml"))
         .await
         .map_err(ServerNgError::Config)?;
+    // TODO: decouple directory bootstrap from the `server` crate.
     create_directories(&config.system)
         .await
         .map_err(ServerNgError::CreateDirectories)?;
@@ -133,7 +142,7 @@ fn restore_metadata_consensus(
 ) -> VsrConsensus<IggyMessageBus> {
     let mut consensus = VsrConsensus::new(
         CLUSTER_ID,
-        SHARD_ID as u8,
+        SHARD_REPLICA_ID,
         1,
         0,
         IggyMessageBus::new(1, SHARD_ID, 0),
@@ -142,17 +151,15 @@ fn restore_metadata_consensus(
 
     let last_header = journal
         .last_op()
-        .and_then(|op| journal.header(op as usize).map(|header| *header));
+        .and_then(|op| usize::try_from(op).ok())
+        .and_then(|op| journal.header(op).map(|header| *header));
     if let Some(header) = last_header {
         consensus.set_view(header.view);
     }
 
     consensus.init();
     consensus.sequencer().set_sequence(restored_op);
-    consensus.advance_commit_max(restored_op);
-    for op in 1..=restored_op {
-        consensus.advance_commit_min(op);
-    }
+    consensus.restore_commit_state(restored_op, restored_op);
     if let Some(header) = last_header {
         consensus.set_last_prepare_checksum(header.checksum);
         consensus.set_log_view(header.view);
@@ -194,20 +201,28 @@ async fn build_single_shard(
     );
     let shards_table = PapayaShardsTable::with_capacity(partition_count);
 
-    let mut namespaces = Vec::with_capacity(partition_count);
-    let _ = metadata.mux_stm.streams().read(|inner| {
-        for (_, stream) in inner.items.iter() {
-            for (topic_id, topic) in stream.topics.iter() {
+    let (topic_stats, namespaces) = metadata.mux_stm.streams().read(|inner| {
+        let mut topic_stats = Vec::new();
+        let mut namespaces = Vec::with_capacity(partition_count);
+        for (_, stream) in &inner.items {
+            for (topic_id, topic) in &stream.topics {
+                topic_stats.push(topic.stats.clone());
                 for partition in &topic.partitions {
-                    namespaces.push((stream.id, topic_id, partition.clone()));
+                    namespaces.push((stream.id, topic_id, topic.stats.clone(), partition.clone()));
                 }
             }
         }
+        (topic_stats, namespaces)
     });
 
-    for (stream_id, topic_id, partition_metadata) in namespaces {
+    for topic_stats in topic_stats {
+        topic_stats.zero_out_all();
+    }
+
+    for (stream_id, topic_id, topic_stats, partition_metadata) in namespaces {
+        validate_recovered_namespace(config, stream_id, topic_id, partition_metadata.id)?;
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
-        let partition = load_partition(config, namespace, &partition_metadata).await?;
+        let partition = load_partition(config, namespace, topic_stats, &partition_metadata).await?;
         let local_idx = partitions.insert(namespace, partition);
         shards_table.insert(
             namespace,
@@ -224,18 +239,43 @@ async fn build_single_shard(
     ))
 }
 
+const fn validate_recovered_namespace(
+    config: &ServerConfig,
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+) -> Result<(), ServerNgError> {
+    let namespace = &config.extra.namespace;
+    if stream_id < namespace.max_streams
+        && topic_id < namespace.max_topics
+        && partition_id < namespace.max_partitions
+    {
+        return Ok(());
+    }
+
+    Err(ServerNgError::RecoveredNamespaceOutOfBounds {
+        stream_id,
+        topic_id,
+        partition_id,
+        max_streams: namespace.max_streams,
+        max_topics: namespace.max_topics,
+        max_partitions: namespace.max_partitions,
+    })
+}
+
 async fn load_partition(
     config: &ServerConfig,
     namespace: IggyNamespace,
+    topic_stats: Arc<TopicStats>,
     partition_metadata: &Partition,
 ) -> Result<IggyPartition<IggyMessageBus>, ServerNgError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
-    let stats = Arc::new(PartitionStats::default());
+    let stats = Arc::new(PartitionStats::new(topic_stats));
     let consensus = VsrConsensus::new(
         CLUSTER_ID,
-        SHARD_ID as u8,
+        SHARD_REPLICA_ID,
         1,
         namespace.inner(),
         IggyMessageBus::new(1, SHARD_ID, namespace.inner()),
@@ -243,6 +283,8 @@ async fn load_partition(
     );
     consensus.init();
 
+    // TODO: decouple the loading logic from the `server` crate and load directly
+    // into the new `partitions` log/runtime types.
     let loaded_log = server::bootstrap::load_segments(
         &config.system,
         stream_id,
@@ -291,11 +333,8 @@ async fn load_partition(
         .iter()
         .any(|segment| segment.size > IggyByteSize::default());
     partition.stats.set_current_offset(current_offset);
-    partition
-        .stats
-        .increment_segments_count(partition.log.segments().len() as u32);
 
-    configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
+    configure_consumer_offsets(&mut partition, config, namespace, current_offset);
     ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
 
     Ok(partition)
@@ -311,10 +350,11 @@ async fn hydrate_partition_log(
         server::streaming::partitions::journal::MemoryMessageJournal,
     >,
 ) -> Result<(), ServerNgError> {
+    // TODO: decouple the loading logic from the `server` crate. This currently
+    // adapts the old server segmented log into the new `partitions` log.
     for (segment, storage) in loaded_log
         .segments()
         .iter()
-        .cloned()
         .zip(loaded_log.storages().iter().cloned())
     {
         partition
@@ -335,7 +375,7 @@ async fn hydrate_partition_log(
             partition.log.messages_writers_mut()[active_index] = Some(Rc::new(
                 MessagesWriter::new(
                     &messages_reader.path(),
-                    Rc::new(AtomicU64::new(messages_reader.file_size() as u64)),
+                    Rc::new(AtomicU64::new(u64::from(messages_reader.file_size()))),
                     config.system.partition.enforce_fsync,
                     true,
                 )
@@ -363,14 +403,12 @@ async fn hydrate_partition_log(
                 })?,
             ));
         }
-    } else {
-        let _ = (stream_id, topic_id, partition_id);
     }
 
     Ok(())
 }
 
-fn convert_segment(segment: iggy_common::Segment) -> Segment {
+fn convert_segment(segment: &iggy_common::Segment) -> Segment {
     Segment {
         sealed: segment.sealed,
         start_timestamp: segment.start_timestamp,
@@ -389,7 +427,7 @@ fn configure_consumer_offsets(
     config: &ServerConfig,
     namespace: IggyNamespace,
     current_offset: u64,
-) -> Result<(), ServerNgError> {
+) {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
@@ -402,6 +440,7 @@ fn configure_consumer_offsets(
             .system
             .get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
 
+    // TODO: decouple consumer offset loading from the `server` crate.
     let loaded_consumer_offsets = load_consumer_offsets(&consumer_offsets_path).unwrap_or_default();
     let consumer_offsets = ConsumerOffsets::with_capacity(loaded_consumer_offsets.len());
     {
@@ -414,6 +453,7 @@ fn configure_consumer_offsets(
         }
     }
 
+    // TODO: decouple consumer group offset loading from the `server` crate.
     let loaded_group_offsets =
         load_consumer_group_offsets(&consumer_group_offsets_path).unwrap_or_default();
     let consumer_group_offsets = ConsumerGroupOffsets::with_capacity(loaded_group_offsets.len());
@@ -434,8 +474,6 @@ fn configure_consumer_offsets(
         consumer_group_offsets,
         config.system.partition.enforce_fsync,
     );
-
-    Ok(())
 }
 
 async fn ensure_initial_segment(
@@ -449,6 +487,7 @@ async fn ensure_initial_segment(
         return Ok(());
     }
 
+    // TODO: decouple segment storage creation from the `server` crate.
     let storage =
         create_segment_storage(&config.system, stream_id, topic_id, partition_id, 0, 0, 0)
             .await
