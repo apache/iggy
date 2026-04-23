@@ -1,11 +1,34 @@
 # Contributing to Apache Iggy
 
+## System Dependencies
+
+The server crates depend on `hwlocality` (hwloc bindings).
+On non-`musl` targets, install the system `hwloc` development package before building.
+
+Common install commands:
+
+```bash
+# Ubuntu / Debian
+sudo apt-get update && sudo apt-get install -y libhwloc-dev pkg-config
+
+# Fedora / RHEL / CentOS
+sudo dnf install -y hwloc-devel pkgconf-pkg-config
+
+# Arch Linux
+sudo pacman -S --needed hwloc pkgconf
+
+# macOS (Homebrew)
+brew install hwloc pkg-config
+```
+
+For `musl` targets, `hwlocality` is built with vendored support in this repository.
+
 ## Issue First
 
 Every new PR that introduces new functionality must link to an approved issue.
 PRs without one may be closed at maintainer's discretion.
 
-1. Create an issue or comment under existing
+1. Create an issue or comment on an existing one
 2. Wait for maintainer approval (`good-first-issue` label or comment)
     - Maintainer may request for more details or a different approach
 3. Then code
@@ -31,29 +54,6 @@ These require design discussion in the issue before coding:
 **If you can't run it, you can't submit it.**
 
 Authors of PRs must run the code locally. "Relying on CI" is not acceptable.
-
-### System Dependencies
-
-The server crates depend on `hwlocality` (hwloc bindings).
-On non-`musl` targets, install the system `hwloc` development package before building.
-
-Common install commands:
-
-```bash
-# Ubuntu / Debian
-sudo apt-get update && sudo apt-get install -y libhwloc-dev pkg-config
-
-# Fedora / RHEL / CentOS
-sudo dnf install -y hwloc-devel pkgconf-pkg-config
-
-# Arch Linux
-sudo pacman -S --needed hwloc pkgconf
-
-# macOS (Homebrew)
-brew install hwloc pkg-config
-```
-
-For `musl` targets, `hwlocality` is built with vendored support in this repository.
 
 ### Single Purpose
 
@@ -95,6 +95,21 @@ cargo install prek
 prek install
 ```
 
+Dependencies used by pre-commit hooks:
+
+- Common:
+  - `shellcheck`
+  - `markdownlint` (`markdownlint-cli`)
+  - `taplo` (`taplo-cli`)
+  - `typos` (`typos-cli`)
+  - `cargo-sort`
+  - `cargo-license`
+- Version/release hooks:
+  - `yq` (required by `scripts/extract-version.sh`)
+
+Additional hooks are triggered by changed files (for example Python/Node/Go/Java/.NET/Helm paths) and may require extra toolchains.
+If a hook fails due to a missing tool, install the dependency shown in the hook output and rerun pre-commit.
+
 ## Code Style
 
 ### Comments: WHY, Not WHAT
@@ -131,7 +146,7 @@ PRs may be closed if:
 
 - Maintainer feels like proxy between maintainer and LLM
 - No approved issue or no approval from a maintainer
-- Code not ran and tested locally
+- Code not run and tested locally
 - Mixed purposes or purposes not clear
 - Can't answer questions about the change
 - Inactivity for longer than 7 days
