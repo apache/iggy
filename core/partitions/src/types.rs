@@ -226,7 +226,7 @@ impl PartitionsConfig {
         topic_id: usize,
         partition_id: usize,
     ) -> String {
-        format!("/tmp/iggy_stub/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}",)
+        format!("/tmp/iggy_stub/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}")
     }
 
     /// Constructs the file path for segment messages.

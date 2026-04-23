@@ -187,7 +187,6 @@ async fn execute_using_none_key(client: &IggyClient) {
     let consumer = Consumer::group(Identifier::named(CONSUMER_GROUP_NAME).unwrap());
     let mut partition_id = 1;
     let mut offset = 0;
-    let mut entity_id = 1;
     for i in 1..=PARTITIONS_COUNT * MESSAGES_COUNT {
         let polled_messages = client
             .poll_messages(
@@ -210,12 +209,8 @@ async fn execute_using_none_key(client: &IggyClient) {
         let message = &polled_messages.messages[0];
         assert_eq!(message.header.offset, offset);
         let payload = from_utf8(&message.payload).unwrap();
-        assert_eq!(
-            payload,
-            &create_extended_message_payload(partition_id, entity_id)
-        );
+        assert_eq!(payload, &create_extended_message_payload(partition_id, i));
         partition_id += 1;
-        entity_id += 1;
         if partition_id > PARTITIONS_COUNT {
             partition_id = 1;
             offset += 1;

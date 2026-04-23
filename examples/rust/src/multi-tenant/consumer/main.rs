@@ -122,11 +122,9 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
 
     print_info("Creating clients for each tenant");
     let mut tenants = Vec::new();
-    let mut tenant_id = 1;
-    for (stream, user) in streams_with_users.into_iter() {
+    for (tenant_id, (stream, user)) in (1u32..).zip(streams_with_users.into_iter()) {
         let client = create_client(&address, &user, PASSWORD).await?;
         tenants.push(Tenant::new(tenant_id, stream, user, client));
-        tenant_id += 1;
     }
 
     if ensure_access {
