@@ -21,16 +21,10 @@ package org.apache.iggy.bench.benchmarks.tcp.async;
 
 import org.apache.iggy.bench.models.cli.GlobalCliArgs;
 import org.apache.iggy.bench.models.cli.PinnedProducerCliArgs;
-import org.apache.iggy.bench.models.provisions.ProvisionedResources;
+import org.apache.iggy.bench.models.provision.ProvisionedResources;
 import org.apache.iggy.bench.provision.ResourceProvisioner;
-import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.message.Partitioning;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 public final class PinnedProducer {
-
-    private static final Logger LOGGER = LoggerFactory.getLogger(PinnedProducer.class);
 
     private final GlobalCliArgs globalCliArgs;
     private final PinnedProducerCliArgs pinnedProducerCliArgs;

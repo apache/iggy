@@ -21,7 +21,7 @@ package org.apache.iggy.bench.provision;
 
 import org.apache.iggy.bench.models.cli.GlobalCliArgs;
 import org.apache.iggy.bench.models.cli.PinnedProducerCliArgs;
-import org.apache.iggy.bench.models.provisions.ProvisionedResources;
+import org.apache.iggy.bench.models.provision.ProvisionedResources;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.topic.CompressionAlgorithm;
@@ -35,7 +35,7 @@ import java.util.Optional;
 
 public final class ResourceProvisioner {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(ResourceProvisioner.class);
+    private static final Logger log = LoggerFactory.getLogger(ResourceProvisioner.class);
 
     public ProvisionedResources provisionResources(
             GlobalCliArgs globalCliArgs, PinnedProducerCliArgs pinnedProducerCliArgs) {
@@ -55,14 +55,14 @@ public final class ResourceProvisioner {
             streamNames.add(streamName);
 
             if (existingStreamNames.contains(streamName) && !globalCliArgs.reuseStreams()) {
-                LOGGER.info("Deleting pre-existing stream '{}'", streamName);
+                log.info("Deleting pre-existing stream '{}'", streamName);
                 client.streams().deleteStream(StreamId.of(streamName));
             }
 
             if (existingStreamNames.contains(streamName) && globalCliArgs.reuseStreams()) {
-                LOGGER.info("Appending to existing stream '{}'", streamName);
+                log.info("Appending to existing stream '{}'", streamName);
             } else {
-                LOGGER.info("Creating the test stream '{}'", streamName);
+                log.info("Creating the test stream '{}'", streamName);
 
                 client.streams().createStream(streamName);
 
@@ -73,7 +73,7 @@ public final class ResourceProvisioner {
                         ? "never"
                         : Long.toString(pinnedProducerCliArgs.messageExpiry());
 
-                LOGGER.info(
+                log.info(
                         "Creating the test topic '{}' for stream '{}' with max topic size: {}, message expiry: {}",
                         topicNames.get(0),
                         streamName,

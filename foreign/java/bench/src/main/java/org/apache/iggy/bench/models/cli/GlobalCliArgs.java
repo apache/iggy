@@ -35,12 +35,22 @@ public record GlobalCliArgs(
         boolean reuseStreams) {
 
     public void validate() {
+        validateCredentials();
+        validateMessageSettings();
+        validateTimingSettings();
+        validateDataSettings();
+    }
+
+    private void validateCredentials() {
         if (username == null || username.isBlank()) {
             throw new BenchmarkException("--username cannot be blank.");
         }
         if (password == null || password.isBlank()) {
             throw new BenchmarkException("--password cannot be blank.");
         }
+    }
+
+    private void validateMessageSettings() {
         if (messageSize <= 0) {
             throw new BenchmarkException("--message-size must be greater than 0.");
         }
@@ -50,6 +60,9 @@ public record GlobalCliArgs(
         if (rateLimit < 0) {
             throw new BenchmarkException("--rate-limit must be greater than or equal to 0.");
         }
+    }
+
+    private void validateTimingSettings() {
         if (warmupTimeMs < 0) {
             throw new BenchmarkException("--warmup-time must be greater than or equal to 0.");
         }
@@ -59,6 +72,9 @@ public record GlobalCliArgs(
         if (movingAverageWindow <= 0) {
             throw new BenchmarkException("--moving-average-window must be greater than 0.");
         }
+    }
+
+    private void validateDataSettings() {
         if (totalData < 0) {
             throw new BenchmarkException("--total-data must be greater than or equal to 0.");
         }

@@ -17,7 +17,7 @@
  * under the License.
  */
 
-package org.apache.iggy.bench.models.provisions;
+package org.apache.iggy.bench.models.provision;
 
 import java.util.List;
 

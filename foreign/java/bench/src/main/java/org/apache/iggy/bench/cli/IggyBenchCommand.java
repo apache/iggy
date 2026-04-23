@@ -17,7 +17,7 @@
  * under the License.
  */
 
-package org.apache.iggy.bench.cli.command;
+package org.apache.iggy.bench.cli;
 
 import picocli.CommandLine.Command;
 import picocli.CommandLine.ExitCode;
@@ -38,64 +38,64 @@ public final class IggyBenchCommand implements Callable<Integer> {
             names = {"--message-size", "-m"},
             defaultValue = "1000",
             description = "Message size in bytes.")
-    public int messageSize = 1000;
+    private int messageSize = 1000;
 
     @Option(
             names = {"--messages-per-batch", "-P"},
             defaultValue = "1000",
             description = "Messages per batch.")
-    public int messagesPerBatch = 1000;
+    private int messagesPerBatch = 1000;
 
     @Option(
             names = {"--message-batches", "-b"},
             defaultValue = "1000",
             description = "Number of message batches.")
-    public int messageBatches = 1000;
+    private int messageBatches = 1000;
 
     @Option(
             names = {"--total-data", "-T"},
             defaultValue = "0",
             description = "Total data volume in bytes.")
-    public long totalData;
+    private long totalData;
 
     @Option(
             names = {"--rate-limit", "-r"},
             defaultValue = "0",
             description = "(NOT USED CURRENTLY) Optional total rate limit in bytes per second.")
-    public long rateLimit;
+    private long rateLimit;
 
     @Option(
             names = {"--warmup-time", "-w"},
             defaultValue = "20000",
             description = "Warmup time in milliseconds.")
-    public long warmupTimeMs;
+    private long warmupTimeMs;
 
     @Option(
             names = {"--sampling-time", "-t"},
             defaultValue = "10",
             description = "Sampling time in milliseconds.")
-    public long samplingTimeMs = 10L;
+    private long samplingTimeMs = 10L;
 
     @Option(
             names = {"--moving-average-window", "-W"},
             defaultValue = "20",
             description = "Moving average window size.")
-    public int movingAverageWindow = 20;
+    private int movingAverageWindow = 20;
 
     @Option(
             names = {"--username", "-u"},
             defaultValue = "iggy",
             description = "Server username.")
-    public String username = "iggy";
+    private String username = "iggy";
 
     @Option(
             names = {"--password", "-p"},
             defaultValue = "iggy",
             description = "Server password.")
-    public String password = "iggy";
+    private String password = "iggy";
 
     @Option(names = "--reuse-streams", defaultValue = "false", description = "Reuse existing benchmark streams.")
-    public boolean reuseStreams;
+    private boolean reuseStreams;
 
     @Spec
     private CommandSpec spec;
@@ -104,5 +104,49 @@ public final class IggyBenchCommand implements Callable<Integer> {
     public Integer call() {
         spec.commandLine().usage(spec.commandLine().getOut());
         return ExitCode.USAGE;
+    }
+
+    public int messageSize() {
+        return messageSize;
+    }
+
+    public int messagesPerBatch() {
+        return messagesPerBatch;
+    }
+
+    public int messageBatches() {
+        return messageBatches;
+    }
+
+    public long totalData() {
+        return totalData;
+    }
+
+    public long rateLimit() {
+        return rateLimit;
+    }
+
+    public long warmupTimeMs() {
+        return warmupTimeMs;
+    }
+
+    public long samplingTimeMs() {
+        return samplingTimeMs;
+    }
+
+    public int movingAverageWindow() {
+        return movingAverageWindow;
+    }
+
+    public String username() {
+        return username;
+    }
+
+    public String password() {
+        return password;
+    }
+
+    public boolean reuseStreams() {
+        return reuseStreams;
     }
 }

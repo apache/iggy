@@ -19,7 +19,7 @@
 
 package org.apache.iggy.bench;
 
-import org.apache.iggy.bench.cli.command.IggyBenchCommand;
+import org.apache.iggy.bench.cli.IggyBenchCommand;
 import picocli.CommandLine;
 
 public final class IggyBench {
