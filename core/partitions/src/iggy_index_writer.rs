@@ -31,6 +31,11 @@ pub struct IggyIndexWriter {
 }
 
 impl IggyIndexWriter {
+    /// Creates an index writer backed by the sparse index file at `file_path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened, synchronized, or queried for metadata.
     pub async fn new(
         file_path: &str,
         index_size_bytes: Rc<AtomicU64>,
@@ -72,6 +77,11 @@ impl IggyIndexWriter {
         })
     }
 
+    /// Appends encoded sparse index bytes to the backing file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index bytes cannot be written or synced to disk.
     pub async fn save_indexes(&self, indexes: Vec<u8>) -> Result<(), IggyError> {
         if indexes.is_empty() {
             return Ok(());
@@ -103,6 +113,11 @@ impl IggyIndexWriter {
         Ok(())
     }
 
+    /// Flushes buffered index file contents to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be synchronized.
     pub async fn fsync(&self) -> Result<(), IggyError> {
         self.file
             .sync_all()

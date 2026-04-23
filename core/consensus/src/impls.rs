@@ -662,6 +662,33 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         assert!(self.commit_max.get() >= self.commit_min.get());
     }
 
+    /// Restore local commit progress from already-applied state during bootstrap.
+    ///
+    /// Unlike `advance_commit_min`, this is intended for recovery paths where the
+    /// state machine has already been restored up to the supplied commit point.
+    ///
+    /// # Panics
+    /// - If `commit_min > commit_max`.
+    /// - If commit progress has already been initialized on this consensus instance.
+    pub fn restore_commit_state(&self, commit_min: u64, commit_max: u64) {
+        assert!(
+            commit_min <= commit_max,
+            "commit_min ({commit_min}) must be <= commit_max ({commit_max})"
+        );
+        assert_eq!(
+            self.commit_min.get(),
+            0,
+            "restore_commit_state must only be used on a fresh consensus instance"
+        );
+        assert_eq!(
+            self.commit_max.get(),
+            0,
+            "restore_commit_state must only be used on a fresh consensus instance"
+        );
+        self.commit_max.set(commit_max);
+        self.commit_min.set(commit_min);
+    }
+
     /// Maximum number of faulty replicas that can be tolerated.
     /// For a cluster of 2f+1 replicas, this returns f.
     #[must_use]
