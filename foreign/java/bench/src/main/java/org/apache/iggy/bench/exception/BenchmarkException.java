@@ -17,20 +17,15 @@
  * under the License.
  */
 
-rootProject.name = "iggy-java-sdk"
+package org.apache.iggy.bench.exception;
 
-include("iggy")
-project(":iggy").projectDir = file("java-sdk")
+public class BenchmarkException extends RuntimeException {
 
-include("iggy-bench")
-project(":iggy-bench").projectDir = file("bench")
+    public BenchmarkException(String message) {
+        super(message);
+    }
 
-// External processors - Stream processing integrations
-include("iggy-connector-library")
-project(":iggy-connector-library").projectDir = file("external-processors/iggy-connector-flink/iggy-connector-library")
-
-include("iggy-flink-examples")
-project(":iggy-flink-examples").projectDir = file("external-processors/iggy-connector-flink/iggy-flink-examples")
-
-include("iggy-connector-pinot")
-project(":iggy-connector-pinot").projectDir = file("external-processors/iggy-connector-pinot")
+    public BenchmarkException(String message, Throwable cause) {
+        super(message, cause);
+    }
+}
