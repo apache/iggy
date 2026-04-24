@@ -134,6 +134,10 @@ access_key_id = "..."
 secret_access_key = "..."
 ```
 
+## Data Delivery Guarantees
+
+This connector provides **at-least-once** delivery under normal operation. However, **data loss can occur** if all upload retries are exhausted (controlled by `max_retries`). When an upload fails after all retry attempts, the affected messages are dropped and an error is logged. Monitor your connector logs for `failed to upload` errors in production. Increase `max_retries` and `retry_delay` if transient S3 failures are common in your environment.
+
 ## Building
 
 ```bash

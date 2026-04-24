@@ -23,19 +23,19 @@ use s3::creds::Credentials;
 use s3::{Bucket, Region};
 use tracing::info;
 
-pub fn validate_credentials(config: &S3SinkConfig) -> Result<(), Error> {
-    match (&config.access_key_id, &config.secret_access_key) {
-        (Some(_), Some(_)) | (None, None) => Ok(()),
-        _ => Err(Error::InvalidConfigValue(
+fn validate_credential_pair(config: &S3SinkConfig) -> Result<(), Error> {
+    if config.access_key_id.is_some() != config.secret_access_key.is_some() {
+        return Err(Error::InvalidConfigValue(
             "Partially configured credentials. You must provide both access_key_id \
              and secret_access_key, or omit both."
                 .to_owned(),
-        )),
+        ));
     }
+    Ok(())
 }
 
 pub async fn create_bucket(config: &S3SinkConfig) -> Result<Box<Bucket>, Error> {
-    validate_credentials(config)?;
+    validate_credential_pair(config)?;
 
     let credentials = match (&config.access_key_id, &config.secret_access_key) {
         (Some(key), Some(secret)) => {
@@ -123,13 +123,13 @@ mod tests {
             secret_access_key: Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
             ..base_config()
         };
-        assert!(validate_credentials(&config).is_ok());
+        assert!(validate_credential_pair(&config).is_ok());
     }
 
     #[test]
     fn validate_no_credentials() {
         let config = base_config();
-        assert!(validate_credentials(&config).is_ok());
+        assert!(validate_credential_pair(&config).is_ok());
     }
 
     #[test]
@@ -139,7 +139,7 @@ mod tests {
             secret_access_key: None,
             ..base_config()
         };
-        assert!(validate_credentials(&config).is_err());
+        assert!(validate_credential_pair(&config).is_err());
     }
 
     #[test]
@@ -149,6 +149,6 @@ mod tests {
             secret_access_key: Some("secret".to_string()),
             ..base_config()
         };
-        assert!(validate_credentials(&config).is_err());
+        assert!(validate_credential_pair(&config).is_err());
     }
 }
