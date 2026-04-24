@@ -43,6 +43,7 @@ async fn lower_id_dials_higher_id_accepts() {
     let (l1, addr1) = bind(loopback()).await.unwrap();
 
     let token_for_l0 = bus0.token();
+    let nonces_for_l0 = bus0.replica_nonces();
     let accept_0 = install_replicas_locally(bus0.clone(), on_message.clone());
     let l0_handle = compio::runtime::spawn(async move {
         run(
@@ -54,12 +55,14 @@ async fn lower_id_dials_higher_id_accepts() {
             accept_0,
             message_bus::framing::MAX_MESSAGE_SIZE,
             test_token_source(),
+            nonces_for_l0,
         )
         .await;
     });
     bus0.track_background(l0_handle);
 
     let token_for_l1 = bus1.token();
+    let nonces_for_l1 = bus1.replica_nonces();
     let accept_1 = install_replicas_locally(bus1.clone(), on_message.clone());
     let l1_handle = compio::runtime::spawn(async move {
         run(
@@ -71,6 +74,7 @@ async fn lower_id_dials_higher_id_accepts() {
             accept_1,
             message_bus::framing::MAX_MESSAGE_SIZE,
             test_token_source(),
+            nonces_for_l1,
         )
         .await;
     });

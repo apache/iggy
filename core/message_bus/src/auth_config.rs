@@ -66,8 +66,8 @@ pub enum SecretLoadError {
     BothSet,
     #[error("secret has {got} hex characters; expected {HEX_SECRET_LEN}")]
     WrongLength { got: usize },
-    #[error("secret contains non-hex character at byte offset {0}")]
-    InvalidHex(usize),
+    #[error("secret contains non-hex character {byte:#04x} at byte offset {offset}")]
+    InvalidHex { offset: usize, byte: u8 },
     #[error("failed to read secret file {path}")]
     FileRead {
         path: String,
@@ -135,8 +135,14 @@ fn decode_hex_secret(input: &str) -> Result<[u8; SECRET_SIZE], SecretLoadError> 
     let bytes = input.as_bytes();
     let mut out = [0u8; SECRET_SIZE];
     for (i, chunk) in bytes.chunks_exact(2).enumerate() {
-        let hi = decode_hex_nibble(chunk[0]).ok_or(SecretLoadError::InvalidHex(i * 2))?;
-        let lo = decode_hex_nibble(chunk[1]).ok_or(SecretLoadError::InvalidHex(i * 2 + 1))?;
+        let hi = decode_hex_nibble(chunk[0]).ok_or(SecretLoadError::InvalidHex {
+            offset: i * 2,
+            byte: chunk[0],
+        })?;
+        let lo = decode_hex_nibble(chunk[1]).ok_or(SecretLoadError::InvalidHex {
+            offset: i * 2 + 1,
+            byte: chunk[1],
+        })?;
         out[i] = (hi << 4) | lo;
     }
     Ok(out)
@@ -211,7 +217,10 @@ mod tests {
         bad.replace_range(4..5, "Z");
         let err = resolve(Some(&bad), None).unwrap_err();
         match err {
-            SecretLoadError::InvalidHex(offset) => assert_eq!(offset, 4),
+            SecretLoadError::InvalidHex { offset, byte } => {
+                assert_eq!(offset, 4);
+                assert_eq!(byte, b'Z');
+            }
             other => panic!("unexpected error: {other:?}"),
         }
     }
@@ -260,6 +269,7 @@ mod tests {
             timestamp_ns: 3,
             release: 4,
             nonce: 5,
+            label: crate::auth::LABEL_REPLICA,
         };
         let from_loader = source.sign(&challenge);
         let from_reference = reference.sign(&challenge);

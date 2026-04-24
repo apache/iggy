@@ -17,25 +17,47 @@
  * under the License.
  */
 
-//! At-most-once request dedup window (IGGY-112, P0-T3).
+// `Dedup` is consumed only by the `#[cfg(test)]` tests below today; the
+// request dispatcher loop in server-ng is not yet wired up. Once the
+// dispatcher lands and calls `lookup` / `mark_in_flight` / `complete` /
+// `evict_client`, the `dead_code` warnings disappear without needing
+// this allow. See plan F6.
+#![allow(dead_code)]
+
+//! At-most-once **per-shard-lifetime** request dedup window (IGGY-112, P0-T3).
 //!
 //! Indexed by `(client_id, request)` pairs carried in the existing
 //! `RequestHeader.client` (u128) and `RequestHeader.request` (u64) fields.
 //! No wire-format change on the server-ng client plane was needed: the
 //! P0-T1 design note found the two fields already in place.
 //!
+//! # Lifetime scope (load-bearing)
+//!
+//! "At-most-once" applies for the lifetime of THIS shard's `Dedup`
+//! instance. Process restart drops every entry: a client that retries a
+//! request after a server restart re-applies side effects unless the
+//! request is idempotent at the handler level. Cross-process persistence
+//! would need a checkpoint file backed by the consensus WAL and is
+//! deferred. Operators sizing client-side retry policy must treat the
+//! dedup window as a *crash-window* mitigation only.
+//!
+//! # Per-client ring
+//!
 //! Per-client state is a fixed-capacity ring holding the last N
-//! `(request, Entry)` pairs.
+//! `(request, Entry)` pairs. A ring avoids unbounded growth under a
+//! chatty client without requiring TTL-driven purge ticks. Done entries
+//! also carry an `inserted_at_ns` timestamp; `lookup` treats entries
+//! older than `ttl_ns` as absent so a replay from far in the past sees
+//! `Fresh` rather than a stale cache hit.
 //!
-//! A ring avoids unbounded growth under a chatty client without
-//! requiring TTL-driven purge ticks. Done entries also carry an
-//! `inserted_at_ns` timestamp; `lookup` treats entries older than
-//! `ttl_ns` as absent so a replay from far in the past sees `Fresh`
-//! rather than a stale cache hit.
+//! # Threading
 //!
-//! The store is NOT thread-safe. Each server-ng shard owns a `Dedup`
-//! on its single-threaded compio runtime. Cross-shard routing happens
-//! above this layer.
+//! The store is NOT thread-safe. Each server-ng shard owns a `Dedup` on
+//! its single-threaded compio runtime. Cross-shard routing happens above
+//! this layer. Caller MUST invoke [`Dedup::evict_client`] on session
+//! disconnect / bind eviction so the per-client `AHashMap` entry is
+//! released; without that hook the outer map grows unbounded across the
+//! shard's session history.
 
 use ahash::AHashMap;
 use bytes::Bytes;
@@ -69,6 +91,11 @@ pub enum LookupResult<'a> {
     /// the cached reply once handler completes), or buffer.
     InFlight,
     /// Handler already ran; return the cached reply.
+    ///
+    /// The borrow ties to `&Dedup`. Callers MUST `clone()` the `Bytes`
+    /// (cheap, ref-counted) before invoking any `&mut Dedup` method on
+    /// the same instance; the borrow checker enforces this at compile
+    /// time but the contract is worth naming explicitly.
     Cached(&'a Bytes),
 }
 
@@ -93,7 +120,10 @@ struct PerClient {
 
 impl PerClient {
     fn with_capacity(capacity: usize) -> Self {
-        assert!(capacity > 0, "dedup ring capacity must be > 0");
+        // Capacity > 0 is validated at the public entry
+        // (`Dedup::with_config`); every callsite here goes through that
+        // path, so no second assert is needed.
+        debug_assert!(capacity > 0, "dedup ring capacity must be > 0");
         Self {
             slots: Vec::with_capacity(capacity),
             cursor: 0,

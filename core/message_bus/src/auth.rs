@@ -40,15 +40,39 @@ use thiserror::Error;
 pub const SECRET_SIZE: usize = 32;
 
 /// Byte range of the envelope within `GenericHeader.reserved_command`.
-pub const ENVELOPE_LEN: usize = 57;
+pub(crate) const ENVELOPE_LEN: usize = 57;
 
 /// Acceptance window around `auth_timestamp`, in nanoseconds. 30 s.
-pub const TIMESTAMP_WINDOW_NS: u128 = 30_000_000_000;
+pub(crate) const TIMESTAMP_WINDOW_NS: u128 = 30_000_000_000;
 
-/// Default nonce-dedup LRU capacity on the acceptor.
-pub const NONCE_LRU_CAPACITY: usize = 256;
+/// Per-peer nonce-dedup ring capacity on the acceptor.
+///
+/// 8 slots × 5-replica clusters × 16 B = 640 B inline; survives the
+/// 30 s acceptance window even at the worst-case dial cadence
+/// (`reconnect_period = 5 s`). Per-peer (rather than a single global
+/// ring) means a flapping or hostile peer cannot evict honest peers'
+/// nonce slots, so the verify-order guard in [`verify_envelope`] holds
+/// up against an attacker who can reach the listener but lacks the
+/// secret. See plan F2.
+#[doc(hidden)]
+pub const PER_PEER_NONCE_CAPACITY: usize = 8;
 
-const LABEL: &[u8; 16] = b"iggy-bus-auth-v1";
+/// Plane-tagged 16-byte label prefixed onto every challenge before the MAC.
+///
+/// Domain separation: same cluster secret produces distinct MACs across
+/// the replica plane and the (Phase 2) SDK-client plane, so a captured
+/// replica handshake cannot be replayed onto the client plane and vice
+/// versa even when both planes share a [`StaticSharedSecret`]. Bump the
+/// trailing version digits when the challenge layout itself changes;
+/// bump [`AuthKind`] when the MAC algorithm changes.
+pub(crate) const LABEL_REPLICA: &[u8; 16] = b"iggy-bus-rep-v01";
+
+/// Plane label for the SDK-client plane (reserved for Phase 2; not
+/// exercised on the wire today). Defined now so the cross-plane MAC
+/// guard test in this module can exercise both labels and the test
+/// catches a regression before Phase 2 wiring lands.
+#[allow(dead_code)]
+pub(crate) const LABEL_CLIENT: &[u8; 16] = b"iggy-bus-cli-v01";
 
 const KIND_OFFSET: usize = 56;
 const TAG_RANGE: std::ops::Range<usize> = 0..32;
@@ -59,7 +83,7 @@ const RESERVED_RANGE: std::ops::Range<usize> = ENVELOPE_LEN..128;
 /// Envelope version tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum AuthKind {
+pub(crate) enum AuthKind {
     Blake3V1 = 1,
 }
 
@@ -72,9 +96,13 @@ impl AuthKind {
     }
 }
 
-/// Fully reconstructed challenge input. All fields come from the header
-/// (`GenericHeader.cluster`, `GenericHeader.replica`, `GenericHeader.release`)
-/// plus the envelope timestamp and nonce.
+/// Fully reconstructed challenge input.
+///
+/// All fields come from the header (`GenericHeader.cluster`,
+/// `GenericHeader.replica`, `GenericHeader.release`) plus the envelope
+/// timestamp and nonce. `label` is the plane-tagged domain-separation
+/// prefix; pick [`LABEL_REPLICA`] for the consensus plane and
+/// [`LABEL_CLIENT`] for the SDK-client plane (Phase 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthChallenge {
     pub cluster: u128,
@@ -82,15 +110,17 @@ pub struct AuthChallenge {
     pub timestamp_ns: u64,
     pub release: u32,
     pub nonce: u128,
+    pub label: &'static [u8; 16],
 }
 
 impl AuthChallenge {
-    /// Serialize the challenge into a fixed-size buffer. Domain-separated by
-    /// a constant label so the same secret cannot be misused to forge a
-    /// different protocol's MAC.
+    /// Serialize the challenge into a fixed-size buffer. The leading 16 B
+    /// are the plane-tagged label, so the same secret cannot be misused
+    /// to forge a different plane's MAC even with otherwise-identical
+    /// inputs.
     fn encode(&self) -> [u8; 16 + 16 + 16 + 8 + 4 + 16] {
         let mut out = [0u8; 76];
-        out[0..16].copy_from_slice(LABEL);
+        out[0..16].copy_from_slice(self.label);
         out[16..32].copy_from_slice(&self.cluster.to_le_bytes());
         out[32..48].copy_from_slice(&self.peer_id.to_le_bytes());
         out[48..56].copy_from_slice(&self.timestamp_ns.to_le_bytes());
@@ -102,11 +132,15 @@ impl AuthChallenge {
 
 /// MAC over an `AuthChallenge`. Wraps `blake3::Hash` for its
 /// constant-time `PartialEq` implementation.
+///
+/// The inner `blake3::Hash` is `pub(crate)` so downstream callers cannot
+/// reach in for byte-level `==` comparisons that would bypass the
+/// constant-time `PartialEq` on the wrapper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AuthTag(pub blake3::Hash);
+pub struct AuthTag(pub(crate) blake3::Hash);
 
 impl AuthTag {
-    const fn as_bytes(&self) -> &[u8; 32] {
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
         self.0.as_bytes()
     }
 }
@@ -130,15 +164,25 @@ pub enum AuthError {
 
 /// Map a credential-layer `AuthError` to the public `IggyError` surface.
 ///
+/// `UnsupportedKind` is routed to `Unauthenticated` rather than
+/// `InvalidCommand` so that pre-auth peers in a mixed-version cluster
+/// (whose all-zero `reserved_command` decodes to `AuthKind::from_byte(0)
+/// -> UnsupportedKind`) surface in the operator's auth-bucket triage,
+/// matching the actual deployment failure mode. `ReservedNonzero` keeps
+/// the `InvalidCommand` mapping because the peer DID stamp a recognized
+/// kind byte and then violated the envelope's reserved-zero contract:
+/// that is a genuine protocol bug, not an auth gap.
+///
 /// Not implemented as `From<AuthError> for IggyError` because the impl
 /// would leak into every crate transitively linking `message_bus`, adding
 /// an extra `impl From<_> for IggyError` candidate to the orphan-rule set
 /// and tripping type inference (`?` ambiguity) in downstream crates.
 #[must_use]
-pub const fn to_iggy_error(e: AuthError) -> IggyError {
+pub(crate) const fn to_iggy_error(e: AuthError) -> IggyError {
     match e {
-        AuthError::UnsupportedKind | AuthError::ReservedNonzero => IggyError::InvalidCommand,
-        AuthError::TagMismatch
+        AuthError::ReservedNonzero => IggyError::InvalidCommand,
+        AuthError::UnsupportedKind
+        | AuthError::TagMismatch
         | AuthError::UnknownPeer
         | AuthError::TimestampOutOfWindow
         | AuthError::NonceReplay => IggyError::Unauthenticated,
@@ -193,50 +237,64 @@ impl TokenSource for StaticSharedSecret {
     }
 }
 
-/// Fixed-capacity ring-buffer nonce dedup.
+/// Fixed-capacity ring-buffer nonce dedup. Inline `[u128; CAP]` storage —
+/// no heap allocation, deterministic memory footprint.
 ///
-/// Eviction is O(1) via a round-robin cursor; lookup is O(N) over
-/// `NONCE_LRU_CAPACITY` entries, which is a 256-wide linear scan on the
-/// hot path. Memory footprint is deterministic and bounded regardless of
-/// peer behaviour.
+/// Eviction is O(1) via a round-robin cursor; lookup is O(N) over `CAP`
+/// entries (linear scan, but `CAP * 16 B` fits a single cache line for
+/// `CAP <= 4` and stays L1-resident through `CAP = 256`). Memory bound
+/// is `CAP * 16 B + 2 * sizeof(usize)` per ring; per-peer instances cap
+/// the cluster-wide cost.
+#[doc(hidden)]
 #[derive(Debug)]
-pub struct NonceRing {
-    slots: Vec<u128>,
+pub struct NonceRing<const CAP: usize> {
+    slots: [u128; CAP],
+    len: usize,
     cursor: usize,
-    capacity: usize,
 }
 
-impl NonceRing {
+impl<const CAP: usize> NonceRing<CAP> {
     #[must_use]
-    pub const fn new(capacity: usize) -> Self {
+    #[doc(hidden)]
+    pub const fn new() -> Self {
         Self {
-            slots: Vec::new(),
+            slots: [0u128; CAP],
+            len: 0,
             cursor: 0,
-            capacity,
         }
     }
 
     /// Returns `true` if `nonce` was not present (and has now been
     /// recorded); `false` if it was already seen.
+    ///
+    /// `slots[..self.len]` is the only range scanned for membership, so
+    /// the `[0; CAP]` initial state never collides with a real `0`
+    /// nonce: until the ring fills, untouched slots are out-of-range.
+    #[doc(hidden)]
     pub fn insert(&mut self, nonce: u128) -> bool {
-        if self.slots.contains(&nonce) {
+        if self.slots[..self.len].contains(&nonce) {
             return false;
         }
-        if self.slots.len() < self.capacity {
-            self.slots.push(nonce);
+        if self.len < CAP {
+            self.slots[self.len] = nonce;
+            self.len += 1;
         } else {
             self.slots[self.cursor] = nonce;
-            self.cursor = (self.cursor + 1) % self.capacity;
+            self.cursor = (self.cursor + 1) % CAP;
         }
         true
     }
 }
 
-impl Default for NonceRing {
+impl<const CAP: usize> Default for NonceRing<CAP> {
     fn default() -> Self {
-        Self::new(NONCE_LRU_CAPACITY)
+        Self::new()
     }
 }
+
+/// Per-peer nonce ring with the production [`PER_PEER_NONCE_CAPACITY`].
+#[doc(hidden)]
+pub type ReplicaNonceRing = NonceRing<PER_PEER_NONCE_CAPACITY>;
 
 /// Encode an auth envelope into `reserved_command`.
 ///
@@ -245,7 +303,7 @@ impl Default for NonceRing {
 /// and `nonce` are caller-controlled so the same routine can be used for
 /// deterministic tests (fake clock, fixed nonce) and production (system
 /// clock, CSPRNG).
-pub fn encode_envelope(
+pub(crate) fn encode_envelope(
     reserved: &mut [u8; 128],
     token_source: &dyn TokenSource,
     challenge: &AuthChallenge,
@@ -262,10 +320,10 @@ pub fn encode_envelope(
 
 /// Parsed view of an envelope's raw bytes. No cryptographic checks.
 #[derive(Debug, Clone, Copy)]
-pub struct DecodedEnvelope {
-    pub tag: AuthTag,
-    pub timestamp_ns: u64,
-    pub nonce: u128,
+pub(crate) struct DecodedEnvelope {
+    pub(crate) tag: AuthTag,
+    pub(crate) timestamp_ns: u64,
+    pub(crate) nonce: u128,
 }
 
 /// Decode an envelope and reject malformed layout.
@@ -278,7 +336,7 @@ pub struct DecodedEnvelope {
 ///
 /// Returns `AuthError::UnsupportedKind` for unknown envelope versions or
 /// `AuthError::ReservedNonzero` for non-zero reserved padding.
-pub fn decode_envelope(reserved: &[u8; 128]) -> Result<DecodedEnvelope, AuthError> {
+pub(crate) fn decode_envelope(reserved: &[u8; 128]) -> Result<DecodedEnvelope, AuthError> {
     AuthKind::from_byte(reserved[KIND_OFFSET])?;
     if reserved[RESERVED_RANGE].iter().any(|&b| b != 0) {
         return Err(AuthError::ReservedNonzero);
@@ -296,27 +354,34 @@ pub fn decode_envelope(reserved: &[u8; 128]) -> Result<DecodedEnvelope, AuthErro
     })
 }
 
-/// Full credential check: timestamp window -> nonce dedup -> tag.
+/// Full credential check: timestamp window -> tag verify -> nonce dedup.
+///
+/// **Order is load-bearing.** A tag-failed envelope must NOT consume a
+/// nonce-ring slot, otherwise an off-secret attacker with TCP reachability
+/// to the listener could flush the ring with forged-tag Pings (valid
+/// timestamps + random nonces) and open a replay window for any captured
+/// legit Ping inside the remaining timestamp slack.
 ///
 /// # Errors
 ///
 /// Returns the first `AuthError` triggered by the check sequence.
-pub fn verify_envelope(
+pub(crate) fn verify_envelope<const CAP: usize>(
     token_source: &dyn TokenSource,
     challenge: &AuthChallenge,
     decoded: &DecodedEnvelope,
     now_ns: u128,
-    nonces: &mut NonceRing,
+    nonces: &mut NonceRing<CAP>,
 ) -> Result<(), AuthError> {
     let ts_u128 = u128::from(decoded.timestamp_ns);
     let delta = now_ns.abs_diff(ts_u128);
     if delta > TIMESTAMP_WINDOW_NS {
         return Err(AuthError::TimestampOutOfWindow);
     }
+    token_source.verify(challenge, &decoded.tag)?;
     if !nonces.insert(decoded.nonce) {
         return Err(AuthError::NonceReplay);
     }
-    token_source.verify(challenge, &decoded.tag)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -330,6 +395,7 @@ mod tests {
             timestamp_ns: 1_700_000_000_000_000_000,
             release: 1,
             nonce: 0x11_2233_4455_6677_8899_aabb_ccdd_eeff,
+            label: LABEL_REPLICA,
         }
     }
 
@@ -341,7 +407,7 @@ mod tests {
         encode_envelope(&mut reserved, &source, &challenge);
 
         let decoded = decode_envelope(&reserved).expect("decode");
-        let mut ring = NonceRing::new(32);
+        let mut ring = NonceRing::<32>::new();
         verify_envelope(
             &source,
             &challenge,
@@ -361,7 +427,7 @@ mod tests {
         encode_envelope(&mut reserved, &signer, &challenge);
 
         let decoded = decode_envelope(&reserved).unwrap();
-        let mut ring = NonceRing::new(32);
+        let mut ring = NonceRing::<32>::new();
         let err = verify_envelope(
             &verifier,
             &challenge,
@@ -381,7 +447,7 @@ mod tests {
         encode_envelope(&mut reserved, &source, &challenge);
 
         let decoded = decode_envelope(&reserved).unwrap();
-        let mut ring = NonceRing::new(32);
+        let mut ring = NonceRing::<32>::new();
         let now = u128::from(challenge.timestamp_ns);
         verify_envelope(&source, &challenge, &decoded, now, &mut ring).unwrap();
         let err = verify_envelope(&source, &challenge, &decoded, now, &mut ring).unwrap_err();
@@ -396,7 +462,7 @@ mod tests {
         encode_envelope(&mut reserved, &source, &challenge);
 
         let decoded = decode_envelope(&reserved).unwrap();
-        let mut ring = NonceRing::new(32);
+        let mut ring = NonceRing::<32>::new();
         let now = u128::from(challenge.timestamp_ns) + TIMESTAMP_WINDOW_NS + 1;
         let err = verify_envelope(&source, &challenge, &decoded, now, &mut ring).unwrap_err();
         assert_eq!(err, AuthError::TimestampOutOfWindow);
@@ -410,7 +476,7 @@ mod tests {
         encode_envelope(&mut reserved, &source, &challenge);
 
         let decoded = decode_envelope(&reserved).unwrap();
-        let mut ring = NonceRing::new(32);
+        let mut ring = NonceRing::<32>::new();
         let now = u128::from(challenge.timestamp_ns).saturating_sub(TIMESTAMP_WINDOW_NS + 1);
         let err = verify_envelope(&source, &challenge, &decoded, now, &mut ring).unwrap_err();
         assert_eq!(err, AuthError::TimestampOutOfWindow);
@@ -439,8 +505,92 @@ mod tests {
     }
 
     #[test]
+    fn forged_tag_does_not_consume_ring_slot() {
+        // Sender signs with secret A; verifier holds secret B. Verifier's
+        // tag check fails. The ring MUST NOT have recorded the nonce -
+        // otherwise an attacker without the secret could flood forged
+        // Pings to evict honest entries (auth.rs verify_envelope ordering
+        // bug; review F1 critical).
+        let signer = StaticSharedSecret::new([1u8; SECRET_SIZE]);
+        let verifier = StaticSharedSecret::new([2u8; SECRET_SIZE]);
+        let challenge = sample_challenge();
+        let mut reserved = [0u8; 128];
+        encode_envelope(&mut reserved, &signer, &challenge);
+
+        let decoded = decode_envelope(&reserved).unwrap();
+        let mut ring = NonceRing::<4>::new();
+        let err = verify_envelope(
+            &verifier,
+            &challenge,
+            &decoded,
+            u128::from(challenge.timestamp_ns),
+            &mut ring,
+        )
+        .unwrap_err();
+        assert_eq!(err, AuthError::TagMismatch);
+
+        // Same nonce now signed correctly with secret B must succeed -
+        // proves the failed-tag attempt did NOT burn the ring slot.
+        let mut reserved_legit = [0u8; 128];
+        encode_envelope(&mut reserved_legit, &verifier, &challenge);
+        let decoded_legit = decode_envelope(&reserved_legit).unwrap();
+        verify_envelope(
+            &verifier,
+            &challenge,
+            &decoded_legit,
+            u128::from(challenge.timestamp_ns),
+            &mut ring,
+        )
+        .expect("legit verify must succeed; nonce slot must have been free");
+    }
+
+    #[test]
+    fn cross_plane_mac_does_not_verify() {
+        // Same secret, same numeric inputs - only label differs. Replica-
+        // plane signer must NOT pass client-plane verification (and vice
+        // versa). Otherwise a captured replica handshake could be replayed
+        // onto the client plane once Phase 2 ships. Review F4.
+        let secret = StaticSharedSecret::new([3u8; SECRET_SIZE]);
+        let replica_challenge = sample_challenge();
+        let mut client_challenge = replica_challenge;
+        client_challenge.label = LABEL_CLIENT;
+
+        let mut replica_envelope = [0u8; 128];
+        encode_envelope(&mut replica_envelope, &secret, &replica_challenge);
+        let decoded = decode_envelope(&replica_envelope).unwrap();
+        let mut ring = NonceRing::<4>::new();
+        let err = verify_envelope(
+            &secret,
+            &client_challenge,
+            &decoded,
+            u128::from(replica_challenge.timestamp_ns),
+            &mut ring,
+        )
+        .unwrap_err();
+        assert_eq!(err, AuthError::TagMismatch);
+    }
+
+    #[test]
+    fn unsupported_kind_maps_to_unauthenticated() {
+        // Mixed-version cluster: pre-auth peer sends zeroed
+        // reserved_command -> AuthKind::from_byte(0) -> UnsupportedKind.
+        // Operator log triage must hit the auth bucket, not the
+        // protocol-violation bucket. Review F3.
+        assert_eq!(
+            to_iggy_error(AuthError::UnsupportedKind),
+            IggyError::Unauthenticated
+        );
+        // ReservedNonzero stays InvalidCommand: peer DID stamp a known
+        // kind, then violated the envelope's reserved-zero contract.
+        assert_eq!(
+            to_iggy_error(AuthError::ReservedNonzero),
+            IggyError::InvalidCommand
+        );
+    }
+
+    #[test]
     fn nonce_ring_fills_and_evicts_fifo() {
-        let mut ring = NonceRing::new(3);
+        let mut ring = NonceRing::<3>::new();
         assert!(ring.insert(1));
         assert!(ring.insert(2));
         assert!(ring.insert(3));
@@ -448,5 +598,23 @@ mod tests {
         assert!(ring.insert(4));
         // Nonce 1 evicted; reinserting it should now succeed again.
         assert!(ring.insert(1));
+    }
+
+    #[test]
+    fn nonce_ring_zero_initial_does_not_false_positive() {
+        // [0; CAP] initial state must NOT match a real `0` nonce until
+        // the slot has been written. Edge case for the const-generic
+        // refactor (review F2).
+        let mut ring = NonceRing::<4>::new();
+        assert!(ring.insert(0));
+        assert!(!ring.insert(0));
+        assert!(ring.insert(1));
+        assert!(ring.insert(2));
+    }
+
+    #[test]
+    fn nonce_ring_default_is_empty() {
+        let mut ring = NonceRing::<4>::default();
+        assert!(ring.insert(42));
     }
 }

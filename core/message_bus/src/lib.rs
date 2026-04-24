@@ -40,6 +40,13 @@
 //! timestamp, 16 B nonce, 1 B kind — so the 256 B header layout is
 //! unchanged.
 //!
+//! Each plane prepends a distinct 16-byte LABEL into the MAC input
+//! (`auth::LABEL_REPLICA` for the consensus plane;
+//! `auth::LABEL_CLIENT` reserved for Phase 2). The label is part of
+//! the cryptographic challenge, so a captured handshake on one plane
+//! cannot be replayed onto the other even if both share one
+//! `StaticSharedSecret`.
+//!
 //! # Invariants worth naming
 //!
 //! - [`send_to_client`](IggyMessageBus::send_to_client) and
@@ -87,7 +94,7 @@ pub(crate) mod socket_opts;
 pub mod transports;
 pub mod writer_task;
 
-pub use config::MessageBusConfig;
+pub use config::{IOV_MAX_LIMIT, MessageBusConfig};
 pub use error::SendError;
 pub use installer::ConnectionInstaller;
 pub use lifecycle::{
@@ -95,13 +102,30 @@ pub use lifecycle::{
     ReplicaRegistry, Shutdown, ShutdownToken,
 };
 
+use auth::ReplicaNonceRing;
 use compio::runtime::JoinHandle;
 use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
 use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_binary_protocol::{GenericHeader, Message};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
+
+/// Per-replica nonce dedup store, owned by [`IggyMessageBus`] and
+/// shared with the listener task via [`Rc`]. Keyed by `replica_id` so
+/// each peer's ring is isolated; a flapping or hostile peer cannot
+/// evict honest peers' nonce slots. Bus-resident (rather than
+/// task-local on the listener) so the nonce window survives a listener
+/// task respawn within one process. Process restart still drops the
+/// store; cross-process persistence is out of scope.
+///
+/// Type is `pub` (rather than `pub(crate)`) only because it appears in
+/// the public signature of [`replica_listener::run`]; downstream code
+/// should obtain a clone via [`IggyMessageBus::replica_nonces`] rather
+/// than constructing one directly.
+#[doc(hidden)]
+pub type ReplicaNonceStore = RefCell<HashMap<u8, ReplicaNonceRing>>;
 
 /// Callback for forwarding a consensus message to a remote shard.
 ///
@@ -194,7 +218,10 @@ pub trait MessageBus {
 /// - a [`ConnectionRegistry<u128>`] for clients (`u128` id is shard-packed),
 /// - a [`ReplicaRegistry`] for replicas (`u8` id from the Ping handshake,
 ///   backed by a fixed-size array to avoid hash lookup on every send),
-/// - the `JoinHandle`s of background tasks (accept loops, reconnect periodic).
+/// - the `JoinHandle`s of background tasks (accept loops, reconnect periodic),
+/// - a per-peer [`ReplicaNonceStore`] used by the replica-plane handshake
+///   to dedup nonces inside the 30 s timestamp window (see
+///   [`Self::replica_nonces`]).
 ///
 /// Send semantics:
 /// - `send_to_*` clones the per-peer `Sender` out of the registry, calls
@@ -229,6 +256,10 @@ pub struct IggyMessageBus {
     /// when they exit abnormally. `None` when running without a shard-0
     /// coordinator (single-shard deployments and tests).
     connection_lost_fn: RefCell<Option<ConnectionLostFn>>,
+    /// Per-peer replica handshake nonce dedup store. Held in an `Rc` so
+    /// the listener task can take a clone across the spawn boundary
+    /// without stealing the bus's only handle. See [`ReplicaNonceStore`].
+    replica_nonces: Rc<ReplicaNonceStore>,
 }
 
 impl IggyMessageBus {
@@ -253,8 +284,20 @@ impl IggyMessageBus {
     }
 
     /// Construct a bus with the given [`MessageBusConfig`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.max_batch == 0` or
+    /// `config.max_batch > IOV_MAX_LIMIT`. Boot-time validation; surfaces
+    /// operator misconfiguration loudly rather than letting every writev
+    /// fail silently with `EMSGSIZE` once traffic starts.
     #[must_use]
     pub fn with_config(shard_id: u16, config: MessageBusConfig) -> Self {
+        assert!(
+            config.max_batch > 0 && config.max_batch <= IOV_MAX_LIMIT,
+            "MessageBusConfig::max_batch must be in 1..={IOV_MAX_LIMIT} (writev IOV_MAX/2 cap); got {}",
+            config.max_batch,
+        );
         let (shutdown, token) = Shutdown::new();
         Self {
             shard_id,
@@ -268,7 +311,22 @@ impl IggyMessageBus {
             replica_forward_fn: RefCell::new(None),
             client_forward_fn: RefCell::new(None),
             connection_lost_fn: RefCell::new(None),
+            replica_nonces: Rc::new(RefCell::new(HashMap::new())),
         }
+    }
+
+    /// Cheap clone of the bus-resident replica-plane nonce store.
+    ///
+    /// The listener task takes one clone at boot and reaches into it
+    /// from `handshake_verify`; the `Rc` keeps the store alive across
+    /// the listener task's lifetime and survives a respawn within one
+    /// process. Tests that drive `replica_listener::run` directly use
+    /// this accessor to obtain the same store the production bootstrap
+    /// would.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn replica_nonces(&self) -> Rc<ReplicaNonceStore> {
+        Rc::clone(&self.replica_nonces)
     }
 
     /// Install the notifier used by delegated replica connections to tell
@@ -278,8 +336,18 @@ impl IggyMessageBus {
     }
 
     /// Invoke the registered connection-lost notifier, if any.
+    ///
+    /// Clones the `Rc` out of the `RefCell` borrow before invoking the
+    /// closure so the closure body is free to call
+    /// [`Self::set_connection_lost_fn`] (which takes a `borrow_mut`)
+    /// without tripping the runtime borrow check.
     pub(crate) fn notify_connection_lost(&self, replica_id: u8) {
-        if let Some(f) = self.connection_lost_fn.borrow().as_ref() {
+        let cb = self
+            .connection_lost_fn
+            .borrow()
+            .as_ref()
+            .map(std::rc::Rc::clone);
+        if let Some(f) = cb {
             f(replica_id);
         }
     }
@@ -686,6 +754,96 @@ mod tests {
         bus.track_background(h1);
         bus.track_background(h2);
         assert_eq!(bus.background_tasks.borrow().len(), 2);
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn replica_nonce_store_isolates_peers() {
+        // Per-peer rings: two peers replaying the same nonce must both
+        // be admitted (different scopes), and a same-peer replay must
+        // be rejected. Review F2.
+        let bus = IggyMessageBus::new(0);
+        let nonces = bus.replica_nonces();
+        let mut store = nonces.borrow_mut();
+        assert!(store.entry(1).or_default().insert(0xdead_beef));
+        assert!(
+            store.entry(2).or_default().insert(0xdead_beef),
+            "different peer with same nonce must not be a replay"
+        );
+        assert!(
+            !store.entry(1).or_default().insert(0xdead_beef),
+            "same peer + same nonce is a replay"
+        );
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn replica_nonce_store_survives_handle_drop() {
+        // Listener task drop must NOT clear the nonce window; the store
+        // is `Rc`-shared and the bus retains a clone. Proves the
+        // restart-survival property the per-task `RefCell<NonceRing>`
+        // could not deliver. Review F2.
+        let bus = IggyMessageBus::new(0);
+        let nonces1 = bus.replica_nonces();
+        {
+            let mut store = nonces1.borrow_mut();
+            assert!(store.entry(1).or_default().insert(0xfeed_face));
+        }
+        drop(nonces1); // simulates listener task exit
+
+        let nonces2 = bus.replica_nonces();
+        let mut store = nonces2.borrow_mut();
+        assert!(
+            !store.entry(1).or_default().insert(0xfeed_face),
+            "post-restart replay must be rejected"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "MessageBusConfig::max_batch must be in")]
+    fn max_batch_oversize_rejected() {
+        let cfg = MessageBusConfig {
+            max_batch: 4096,
+            ..MessageBusConfig::default()
+        };
+        let _ = IggyMessageBus::with_config(0, cfg);
+    }
+
+    #[test]
+    #[should_panic(expected = "MessageBusConfig::max_batch must be in")]
+    fn max_batch_zero_rejected() {
+        let cfg = MessageBusConfig {
+            max_batch: 0,
+            ..MessageBusConfig::default()
+        };
+        let _ = IggyMessageBus::with_config(0, cfg);
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn notify_connection_lost_handles_reentrant_install() {
+        // Closure swaps itself out via `set_connection_lost_fn`, which
+        // calls `borrow_mut`. The pre-fix code held a `Ref` across the
+        // closure invocation and panicked here.
+        let bus = std::rc::Rc::new(IggyMessageBus::new(0));
+        let bus_for_closure = bus.clone();
+        let counter: std::rc::Rc<std::cell::Cell<u8>> = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter_inner = counter.clone();
+        let cb: ConnectionLostFn = std::rc::Rc::new(move |_replica: u8| {
+            counter_inner.set(counter_inner.get() + 1);
+            // Reentrant install: replace the closure mid-invoke.
+            let counter_replacement = counter_inner.clone();
+            bus_for_closure.set_connection_lost_fn(std::rc::Rc::new(move |_| {
+                counter_replacement.set(counter_replacement.get() + 10);
+            }));
+        });
+        bus.set_connection_lost_fn(cb);
+
+        bus.notify_connection_lost(1); // first closure runs (+1) and swaps
+        assert_eq!(counter.get(), 1);
+
+        bus.notify_connection_lost(1); // second closure runs (+10)
+        assert_eq!(counter.get(), 11);
     }
 
     #[compio::test]

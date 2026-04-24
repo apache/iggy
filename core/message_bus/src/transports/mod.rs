@@ -67,7 +67,14 @@
 
 pub mod tcp;
 
-pub use tcp::{TcpTransportConn, TcpTransportListener, TcpTransportReader, TcpTransportWriter};
+// Only `Conn` and `Writer` have crate-internal callers today
+// (`installer.rs` wraps the dialed/accepted stream in a `TcpTransportConn`;
+// `writer_task.rs` wraps the owned write half in a `TcpTransportWriter`).
+// `TcpTransportListener` and `TcpTransportReader` stay reachable via the
+// `tcp` submodule and exist primarily so the trait surface compiles
+// end-to-end against a real impl; future WSS / QUIC listeners drop in
+// alongside without touching call sites.
+pub(crate) use tcp::{TcpTransportConn, TcpTransportWriter};
 
 use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
 use iggy_binary_protocol::consensus::iobuf::Frozen;
@@ -118,8 +125,14 @@ pub trait TransportConn: 'static {
 }
 
 /// Read half. Produces one framed [`Message<GenericHeader>`] per call.
+///
+/// `'static` so the half can be moved into a `compio::runtime::spawn`'d
+/// task. `Unpin` is NOT required at the trait level: TCP impls satisfy it
+/// trivially via `OwnedReadHalf<TcpStream>`, and a future
+/// `compio-quic::RecvStream` impl that is not `Unpin` can pin internally
+/// without forcing every other impl to `Box::pin`.
 #[allow(async_fn_in_trait)]
-pub trait TransportReader: Unpin + 'static {
+pub trait TransportReader: 'static {
     /// Read the next `GenericHeader`-framed message off the wire.
     ///
     /// Validates the 256 B header and bounds the total frame size to
@@ -141,8 +154,12 @@ pub trait TransportReader: Unpin + 'static {
 }
 
 /// Write half. Atomic-or-error batched writer.
+///
+/// `'static` so the half can be moved into a `compio::runtime::spawn`'d
+/// task. `Unpin` is NOT required at the trait level (see
+/// [`TransportReader`] for the rationale).
 #[allow(async_fn_in_trait)]
-pub trait TransportWriter: Unpin + 'static {
+pub trait TransportWriter: 'static {
     /// Send every buffer in `batch` atomically.
     ///
     /// On success the Vec is drained (empty on return); the same

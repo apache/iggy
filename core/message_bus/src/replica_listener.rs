@@ -50,16 +50,35 @@
 //! NOT provided here: operators still need to deploy the replica port on a
 //! trusted network boundary (cluster-local VPC, private subnet, overlay)
 //! if wire confidentiality is required.
+//!
+//! # Trust model
+//!
+//! The cluster ships with one shared 32 B secret across all replicas
+//! (see [`crate::auth_config`]). Any holder of the secret can mint a
+//! valid MAC for ANY `peer_id` in either direction. The dialer-side
+//! directional rule (`peer_id > self_id` only dials) plus the
+//! acceptor-side check (`parsed.replica < self_id`) blocks UPWARD
+//! impersonation - a low-id peer cannot pretend to be a high-id peer
+//! during dial - but cross-impersonation in the OTHER direction is open
+//! by design under a single shared secret. A compromised replica B can
+//! authenticate as any replica A with `A < B`. Mitigation comes from
+//! the trusted-LAN deployment assumption + the fact that the
+//! authenticated identity is only used for VSR consensus framing on the
+//! same plane.
+//!
+//! Per-peer secrets (each replica gets its own key, the acceptor looks
+//! up the right one for the announced `peer_id`) is the documented
+//! Phase 2+ hardening. Until then, the cluster operator must treat
+//! "secret compromise" as equivalent to "any-replica compromise."
 
-use crate::auth::{self, NonceRing, TokenSource};
+use crate::auth::{self, LABEL_REPLICA, TokenSource};
 use crate::framing;
 use crate::lifecycle::ShutdownToken;
-use crate::{AcceptedReplicaFn, GenericHeader, Message};
+use crate::{AcceptedReplicaFn, GenericHeader, Message, ReplicaNonceStore};
 use compio::net::{SocketOpts, TcpListener, TcpStream};
 use futures::FutureExt;
 use iggy_binary_protocol::Command2;
 use iggy_common::{IggyError, IggyTimestamp};
-use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use tracing::{debug, error, info, warn};
@@ -94,6 +113,12 @@ pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyErr
 /// Run the inbound replica listener accept loop until the shutdown token
 /// fires. Every successful handshake fires the `on_accepted` callback; the
 /// callback owns the accepted stream from that point on.
+///
+/// `nonces` is the bus-resident per-peer nonce dedup store. The listener
+/// reaches into it via `borrow_mut().entry(peer).or_default()` for each
+/// handshake; the borrow is held only across the synchronous
+/// [`handshake_verify`], never across an `await`, so the `RefCell` is
+/// safe under the single-threaded compio runtime.
 #[allow(clippy::future_not_send)]
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -105,12 +130,12 @@ pub async fn run(
     on_accepted: AcceptedReplicaFn,
     max_message_size: usize,
     token_source: Rc<dyn TokenSource>,
+    nonces: Rc<ReplicaNonceStore>,
 ) {
     info!(
         "Replica listener accepting on {:?}",
         listener.local_addr().ok()
     );
-    let nonces = RefCell::new(NonceRing::default());
     loop {
         futures::select! {
             () = token.wait().fuse() => {
@@ -124,11 +149,12 @@ pub async fn run(
                         let outcome = match read {
                             Ok(parsed) => {
                                 let now_ns = IggyTimestamp::now().as_nanos();
-                                let mut ring = nonces.borrow_mut();
+                                let mut store = nonces.borrow_mut();
+                                let ring = store.entry(parsed.replica).or_default();
                                 handshake_verify(
                                     &parsed,
                                     token_source.as_ref(),
-                                    &mut ring,
+                                    ring,
                                     now_ns,
                                     self_id,
                                     replica_count,
@@ -186,6 +212,7 @@ async fn handshake_read(
         timestamp_ns: decoded.timestamp_ns,
         release: header.release,
         nonce: decoded.nonce,
+        label: LABEL_REPLICA,
     };
     Ok(ParsedHandshake {
         replica: header.replica,
@@ -195,11 +222,12 @@ async fn handshake_read(
 }
 
 /// Synchronous verifier: tag + replay, then the directional tiebreak.
-/// Runs outside any await so the `&mut NonceRing` borrow cannot span I/O.
+/// Runs outside any await so the `&mut ReplicaNonceRing` borrow cannot
+/// span I/O.
 fn handshake_verify(
     parsed: &ParsedHandshake,
     token_source: &dyn TokenSource,
-    nonces: &mut NonceRing,
+    nonces: &mut auth::ReplicaNonceRing,
     now_ns: u128,
     self_id: u8,
     replica_count: u8,

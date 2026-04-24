@@ -17,6 +17,10 @@
  * under the License.
  */
 
-pub mod dedup;
+// `dedup` is gated `pub(crate)` until the request dispatcher loop wires
+// up the lookup / mark / complete / evict_client API end-to-end. Marking
+// it crate-private now blocks downstream crates from coupling to a shape
+// the dispatcher PR will likely refine (see plan F6).
+pub(crate) mod dedup;
 pub mod login_register;
 pub mod session_manager;

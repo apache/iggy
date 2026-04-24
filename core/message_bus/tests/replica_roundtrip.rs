@@ -45,6 +45,7 @@ async fn two_replicas_exchange_prepare_and_ack() {
     let (l1, addr1) = bind(loopback()).await.expect("bind r1");
 
     let token_for_l1 = bus1.token();
+    let nonces_for_l1 = bus1.replica_nonces();
     let accept_delegate_1 = install_replicas_locally(bus1.clone(), on_message1.clone());
     let l1_handle = compio::runtime::spawn(async move {
         run(
@@ -56,6 +57,7 @@ async fn two_replicas_exchange_prepare_and_ack() {
             accept_delegate_1,
             message_bus::framing::MAX_MESSAGE_SIZE,
             test_token_source(),
+            nonces_for_l1,
         )
         .await;
     });

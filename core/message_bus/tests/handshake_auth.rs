@@ -47,6 +47,7 @@ async fn handshake_with_matching_secret_registers_peer() {
     let token_for_listener = bus_listener.token();
     let accept = install_replicas_locally(bus_listener.clone(), on_msg.clone());
     let secret_for_listener = Rc::clone(&secret);
+    let nonces_for_listener = bus_listener.replica_nonces();
     let listener_handle = compio::runtime::spawn(async move {
         run(
             listener,
@@ -57,6 +58,7 @@ async fn handshake_with_matching_secret_registers_peer() {
             accept,
             message_bus::framing::MAX_MESSAGE_SIZE,
             secret_for_listener,
+            nonces_for_listener,
         )
         .await;
     });
@@ -102,6 +104,7 @@ async fn handshake_with_mismatched_secret_rejects_peer() {
     let (listener, addr) = bind(loopback()).await.unwrap();
     let token_for_listener = bus_listener.token();
     let accept = install_replicas_locally(bus_listener.clone(), on_msg.clone());
+    let nonces_for_listener = bus_listener.replica_nonces();
     let listener_handle = compio::runtime::spawn(async move {
         run(
             listener,
@@ -112,6 +115,7 @@ async fn handshake_with_mismatched_secret_rejects_peer() {
             accept,
             message_bus::framing::MAX_MESSAGE_SIZE,
             listener_secret,
+            nonces_for_listener,
         )
         .await;
     });

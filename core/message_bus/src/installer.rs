@@ -157,9 +157,11 @@ pub fn install_replica_conn<C: TransportConn>(
     let notified = Rc::new(Cell::new(false));
     // If the registry insert below races with a concurrent install for
     // the same peer id and loses, both spawned halves must skip their
-    // post-loop cleanup: calling `replicas().remove` / `close_peer` or
-    // `notify_connection_lost` would evict the winner's entry and
-    // clobber its mapping broadcast. `compio::runtime::JoinHandle::drop`
+    // post-loop cleanup: the loser's `replicas().remove` /
+    // `close_peer_if_token_matches` calls would no-op against the winner's
+    // generation token (so they can't evict the live entry), but
+    // `notify_connection_lost` has no token guard and would still broadcast
+    // a spurious mapping-clear round. `compio::runtime::JoinHandle::drop`
     // does not cancel the spawned task, so we have to tell the tasks to
     // stand down in-band.
     let install_aborted = Rc::new(Cell::new(false));

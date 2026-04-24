@@ -49,13 +49,22 @@ use std::net::SocketAddr;
 /// `keepalive`) via `compio::net::SocketOpts`. See
 /// [`crate::replica_listener::bind`] and
 /// [`crate::client_listener::bind`] for the canonical construction.
-pub struct TcpTransportListener {
+///
+/// Currently only used by trait-conformance tests; production `accept`
+/// loops in [`crate::replica_listener`] / [`crate::client_listener`]
+/// drive a raw `TcpListener` directly. Kept `pub(crate)` so the
+/// `TransportListener` impl below is actually exercisable; the
+/// `dead_code` allow is intentional and will fall away when the listener
+/// loops migrate behind the trait (Phase 2+).
+#[allow(dead_code)]
+pub(crate) struct TcpTransportListener {
     inner: TcpListener,
 }
 
 impl TcpTransportListener {
     #[must_use]
-    pub const fn new(inner: TcpListener) -> Self {
+    #[allow(dead_code)]
+    pub(crate) const fn new(inner: TcpListener) -> Self {
         Self { inner }
     }
 }
@@ -76,13 +85,13 @@ impl TransportListener for TcpTransportListener {
 /// result of a `TcpStream::connect` on the dialer path. Takes ownership
 /// of the stream; [`Self::into_split`] transfers that ownership into
 /// the read and write halves bound to the per-connection tasks.
-pub struct TcpTransportConn {
+pub(crate) struct TcpTransportConn {
     stream: TcpStream,
 }
 
 impl TcpTransportConn {
     #[must_use]
-    pub const fn new(stream: TcpStream) -> Self {
+    pub(crate) const fn new(stream: TcpStream) -> Self {
         Self { stream }
     }
 }
@@ -106,13 +115,14 @@ impl TransportConn for TcpTransportConn {
 /// [`framing::read_message`]; the two paths share the same header
 /// decode, bounds check, and zero-copy `Owned<MESSAGE_ALIGN>`
 /// allocation strategy.
-pub struct TcpTransportReader {
+pub(crate) struct TcpTransportReader {
     inner: OwnedReadHalf<TcpStream>,
 }
 
 impl TcpTransportReader {
     #[must_use]
-    pub const fn new(inner: OwnedReadHalf<TcpStream>) -> Self {
+    #[allow(dead_code)]
+    pub(crate) const fn new(inner: OwnedReadHalf<TcpStream>) -> Self {
         Self { inner }
     }
 }
@@ -136,13 +146,13 @@ impl TransportReader for TcpTransportReader {
 /// `max_batch <= IOV_MAX / 2 = 512`; this impl does not enforce a cap
 /// because the Vec is already drained by the caller's admission
 /// control.
-pub struct TcpTransportWriter {
+pub(crate) struct TcpTransportWriter {
     inner: OwnedWriteHalf<TcpStream>,
 }
 
 impl TcpTransportWriter {
     #[must_use]
-    pub const fn new(inner: OwnedWriteHalf<TcpStream>) -> Self {
+    pub(crate) const fn new(inner: OwnedWriteHalf<TcpStream>) -> Self {
         Self { inner }
     }
 }
