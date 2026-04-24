@@ -30,6 +30,8 @@ impl Sink for S3Sink {
     async fn open(&mut self) -> Result<(), Error> {
         info!("Opening S3 sink connector with ID: {}", self.id);
 
+        self.validate_and_parse_config()?;
+
         let bucket = crate::client::create_bucket(&self.config).await?;
 
         info!(

@@ -113,8 +113,10 @@ pub enum OutputFormat {
     Raw,
 }
 
-impl OutputFormat {
-    pub fn from_str_config(s: &str) -> Result<Self, Error> {
+impl TryFrom<&str> for OutputFormat {
+    type Error = Error;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s.to_lowercase().as_str() {
             "json_lines" | "jsonl" | "jsonlines" => Ok(OutputFormat::JsonLines),
             "json_array" | "json" => Ok(OutputFormat::JsonArray),
@@ -124,7 +126,9 @@ impl OutputFormat {
             ))),
         }
     }
+}
 
+impl OutputFormat {
     pub fn file_extension(&self) -> &'static str {
         match self {
             OutputFormat::JsonLines => "jsonl",
@@ -162,53 +166,47 @@ struct SinkState {
 
 impl S3Sink {
     pub fn new(id: u32, config: S3SinkConfig) -> Self {
-        let output_format = match OutputFormat::from_str_config(&config.output_format) {
-            Ok(fmt) => fmt,
-            Err(e) => {
-                tracing::warn!(
-                    "S3 sink ID: {id} invalid output_format '{}': {e}, defaulting to json_lines",
-                    config.output_format,
-                );
-                OutputFormat::JsonLines
-            }
-        };
-
-        let max_file_size_bytes = match parse_file_size(&config.max_file_size) {
-            Ok(size) => size,
-            Err(e) => {
-                tracing::warn!(
-                    "S3 sink ID: {id} invalid max_file_size '{}': {e}, defaulting to 8 MiB",
-                    config.max_file_size,
-                );
-                8 * 1024 * 1024
-            }
-        };
-
-        let delay_str = config.retry_delay.as_deref().unwrap_or(DEFAULT_RETRY_DELAY);
-        let retry_delay = match humantime::Duration::from_str(delay_str) {
-            Ok(d) => d.into(),
-            Err(e) => {
-                tracing::warn!(
-                    "S3 sink ID: {id} invalid retry_delay '{delay_str}': {e}, defaulting to 1s",
-                );
-                std::time::Duration::from_secs(1)
-            }
-        };
-
         S3Sink {
             id,
             config,
             bucket: None,
             buffers: tokio::sync::Mutex::new(HashMap::new()),
-            max_file_size_bytes,
-            output_format,
+            max_file_size_bytes: 0,
+            output_format: OutputFormat::JsonLines,
             state: tokio::sync::Mutex::new(SinkState {
                 messages_processed: 0,
                 uploads_completed: 0,
                 upload_errors: 0,
             }),
-            retry_delay,
+            retry_delay: std::time::Duration::from_secs(1),
         }
+    }
+
+    pub fn validate_and_parse_config(&mut self) -> Result<(), Error> {
+        self.output_format = OutputFormat::try_from(self.config.output_format.as_str())?;
+        self.max_file_size_bytes = parse_file_size(&self.config.max_file_size)?;
+
+        let delay_str = self
+            .config
+            .retry_delay
+            .as_deref()
+            .unwrap_or(DEFAULT_RETRY_DELAY);
+        self.retry_delay = humantime::Duration::from_str(delay_str)
+            .map(|d| d.into())
+            .map_err(|e| {
+                Error::InvalidConfigValue(format!("Invalid retry_delay '{delay_str}': {e}"))
+            })?;
+
+        if self.config.file_rotation == FileRotation::Messages
+            && self.config.max_messages_per_file.is_none()
+        {
+            return Err(Error::InvalidConfigValue(
+                "file_rotation is set to 'messages' but max_messages_per_file is not configured"
+                    .to_owned(),
+            ));
+        }
+
+        Ok(())
     }
 
     fn max_retries(&self) -> u32 {
@@ -246,15 +244,15 @@ mod tests {
     #[test]
     fn output_format_json_lines_variants() {
         assert_eq!(
-            OutputFormat::from_str_config("json_lines").unwrap(),
+            OutputFormat::try_from("json_lines").unwrap(),
             OutputFormat::JsonLines
         );
         assert_eq!(
-            OutputFormat::from_str_config("jsonl").unwrap(),
+            OutputFormat::try_from("jsonl").unwrap(),
             OutputFormat::JsonLines
         );
         assert_eq!(
-            OutputFormat::from_str_config("JSONLINES").unwrap(),
+            OutputFormat::try_from("JSONLINES").unwrap(),
             OutputFormat::JsonLines
         );
     }
@@ -262,26 +260,23 @@ mod tests {
     #[test]
     fn output_format_json_array() {
         assert_eq!(
-            OutputFormat::from_str_config("json_array").unwrap(),
+            OutputFormat::try_from("json_array").unwrap(),
             OutputFormat::JsonArray
         );
         assert_eq!(
-            OutputFormat::from_str_config("json").unwrap(),
+            OutputFormat::try_from("json").unwrap(),
             OutputFormat::JsonArray
         );
     }
 
     #[test]
     fn output_format_raw() {
-        assert_eq!(
-            OutputFormat::from_str_config("raw").unwrap(),
-            OutputFormat::Raw
-        );
+        assert_eq!(OutputFormat::try_from("raw").unwrap(), OutputFormat::Raw);
     }
 
     #[test]
     fn output_format_invalid() {
-        assert!(OutputFormat::from_str_config("xml").is_err());
+        assert!(OutputFormat::try_from("xml").is_err());
     }
 
     #[test]
@@ -367,6 +362,8 @@ mod tests {
             retry_delay: None,
             path_style: None,
         };
-        assert!(client::validate_credentials(&config_with_key_only).is_err());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(client::create_bucket(&config_with_key_only));
+        assert!(result.is_err());
     }
 }
