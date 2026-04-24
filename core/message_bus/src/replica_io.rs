@@ -36,6 +36,7 @@ use std::time::Duration;
 
 use iggy_common::IggyError;
 
+use crate::auth::TokenSource;
 use crate::connector::start as start_connector;
 use crate::replica_listener::{bind as bind_replica_listener, run as run_replica_listener};
 use crate::{AcceptedClientFn, AcceptedReplicaFn, IggyMessageBus, client_listener};
@@ -71,6 +72,7 @@ pub async fn start_on_shard_zero(
     on_accepted_replica: AcceptedReplicaFn,
     on_accepted_client: AcceptedClientFn,
     reconnect_period: Duration,
+    token_source: Rc<dyn TokenSource>,
 ) -> Result<Option<BoundPlanes>, IggyError> {
     if bus.shard_id() != 0 {
         return Ok(None);
@@ -82,6 +84,7 @@ pub async fn start_on_shard_zero(
     let token_for_replica = bus.token();
     let on_accepted_replica_for_listener = on_accepted_replica.clone();
     let listener_max_message_size = bus.config().max_message_size;
+    let token_source_for_listener = Rc::clone(&token_source);
     let replica_handle = compio::runtime::spawn(async move {
         run_replica_listener(
             replica_listener,
@@ -91,6 +94,7 @@ pub async fn start_on_shard_zero(
             replica_count,
             on_accepted_replica_for_listener,
             listener_max_message_size,
+            token_source_for_listener,
         )
         .await;
     });
@@ -109,6 +113,7 @@ pub async fn start_on_shard_zero(
         peers,
         on_accepted_replica,
         reconnect_period,
+        token_source,
     )
     .await;
 
@@ -136,6 +141,7 @@ pub async fn start_on_shard_zero_default(
     peers: Vec<(u8, SocketAddr)>,
     on_accepted_replica: AcceptedReplicaFn,
     on_accepted_client: AcceptedClientFn,
+    token_source: Rc<dyn TokenSource>,
 ) -> Result<Option<BoundPlanes>, IggyError> {
     let reconnect_period = bus.config().reconnect_period;
     start_on_shard_zero(
@@ -149,6 +155,7 @@ pub async fn start_on_shard_zero_default(
         on_accepted_replica,
         on_accepted_client,
         reconnect_period,
+        token_source,
     )
     .await
 }

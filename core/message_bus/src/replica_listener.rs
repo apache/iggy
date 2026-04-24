@@ -29,20 +29,23 @@
 //!
 //! # Security
 //!
-//! The `Ping` handshake validates `cluster_id`, the directional bound, and
-//! `replica_count`. There is NO shared secret, no mTLS, no version
-//! negotiation. Deploy the replica listener on a trusted network boundary
-//! (cluster-local VPC, private subnet, overlay, or equivalent) - NEVER
-//! expose the replica port directly to the public internet. Follow-up work
-//! on an authenticated handshake is tracked under IGGY-112.
+//! The `Ping` handshake validates `cluster_id`, the directional bound,
+//! `replica_count`, and a BLAKE3-keyed MAC carried in
+//! `GenericHeader.reserved_command[0..57]` (see [`crate::auth`]). Peers
+//! that cannot produce a valid tag are rejected. Even so, TLS/encryption is
+//! NOT provided here: operators still need to deploy the replica port on a
+//! trusted network boundary (cluster-local VPC, private subnet, overlay)
+//! if wire confidentiality is required.
 
+use crate::auth::{self, NonceRing, TokenSource};
 use crate::framing;
 use crate::lifecycle::ShutdownToken;
 use crate::{AcceptedReplicaFn, GenericHeader, Message};
 use compio::net::{SocketOpts, TcpListener, TcpStream};
 use futures::FutureExt;
 use iggy_binary_protocol::Command2;
-use iggy_common::IggyError;
+use iggy_common::{IggyError, IggyTimestamp};
+use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use tracing::{debug, error, info, warn};
@@ -87,11 +90,13 @@ pub async fn run(
     replica_count: u8,
     on_accepted: AcceptedReplicaFn,
     max_message_size: usize,
+    token_source: Rc<dyn TokenSource>,
 ) {
     info!(
         "Replica listener accepting on {:?}",
         listener.local_addr().ok()
     );
+    let nonces = RefCell::new(NonceRing::default());
     loop {
         futures::select! {
             () = token.wait().fuse() => {
@@ -101,14 +106,23 @@ pub async fn run(
             result = listener.accept().fuse() => {
                 match result {
                     Ok((mut stream, peer_addr)) => {
-                        match handshake(
-                            &mut stream,
-                            cluster_id,
-                            self_id,
-                            replica_count,
-                            max_message_size,
-                        )
-                        .await {
+                        let read = handshake_read(&mut stream, cluster_id, max_message_size).await;
+                        let outcome = match read {
+                            Ok(parsed) => {
+                                let now_ns = IggyTimestamp::now().as_nanos();
+                                let mut ring = nonces.borrow_mut();
+                                handshake_verify(
+                                    &parsed,
+                                    token_source.as_ref(),
+                                    &mut ring,
+                                    now_ns,
+                                    self_id,
+                                    replica_count,
+                                )
+                            }
+                            Err(e) => Err(e),
+                        };
+                        match outcome {
                             Ok(peer_id) => {
                                 on_accepted(stream, peer_id);
                             }
@@ -126,26 +140,23 @@ pub async fn run(
     }
 }
 
-/// Read and validate the `Ping` handshake from an inbound peer connection.
-///
-/// Returns the peer replica id on success.
-//
-// TODO(IGGY-112): authenticate the replica handshake.
-//
-// Current validation covers `cluster_id` and the directional id bound
-// only: no shared secret, no mTLS, no protocol version negotiation.
-// Any peer that reaches the replica port and knows the `cluster_id`
-// can pose as a replica. Acceptable on the assumed trusted network
-// boundary; hardening is tracked under IGGY-112 (authenticated
-// handshake + version negotiation).
+/// Parsed-but-unverified handshake captured from the wire. Held across
+/// the await boundary between I/O and the sync verify step.
+struct ParsedHandshake {
+    replica: u8,
+    decoded: auth::DecodedEnvelope,
+    challenge: auth::AuthChallenge,
+}
+
+/// I/O-only portion of the handshake: read the 256 B `Ping` frame, enforce
+/// command + cluster match, and parse the auth envelope's bytes. Does NOT
+/// touch the nonce ring or verify the tag.
 #[allow(clippy::future_not_send)]
-async fn handshake(
+async fn handshake_read(
     stream: &mut TcpStream,
     our_cluster: u128,
-    self_id: u8,
-    replica_count: u8,
     max_message_size: usize,
-) -> Result<u8, IggyError> {
+) -> Result<ParsedHandshake, IggyError> {
     let msg = framing::read_message(stream, max_message_size).await?;
     let header = msg.header();
     if header.command != Command2::Ping {
@@ -154,11 +165,45 @@ async fn handshake(
     if header.cluster != our_cluster {
         return Err(IggyError::InvalidCommand);
     }
+    let decoded = auth::decode_envelope(&header.reserved_command).map_err(auth::to_iggy_error)?;
+    let challenge = auth::AuthChallenge {
+        cluster: header.cluster,
+        peer_id: u128::from(header.replica),
+        timestamp_ns: decoded.timestamp_ns,
+        release: header.release,
+        nonce: decoded.nonce,
+    };
+    Ok(ParsedHandshake {
+        replica: header.replica,
+        decoded,
+        challenge,
+    })
+}
+
+/// Synchronous verifier: tag + replay, then the directional tiebreak.
+/// Runs outside any await so the `&mut NonceRing` borrow cannot span I/O.
+fn handshake_verify(
+    parsed: &ParsedHandshake,
+    token_source: &dyn TokenSource,
+    nonces: &mut NonceRing,
+    now_ns: u128,
+    self_id: u8,
+    replica_count: u8,
+) -> Result<u8, IggyError> {
+    auth::verify_envelope(
+        token_source,
+        &parsed.challenge,
+        &parsed.decoded,
+        now_ns,
+        nonces,
+    )
+    .map_err(auth::to_iggy_error)?;
+
     // Directional rule: a replica only accepts inbound from peers with
     // strictly lower ids. The peer is responsible for not dialing us if
     // it has the higher id; this is just defensive.
-    if header.replica >= replica_count || header.replica >= self_id {
+    if parsed.replica >= replica_count || parsed.replica >= self_id {
         return Err(IggyError::InvalidCommand);
     }
-    Ok(header.replica)
+    Ok(parsed.replica)
 }

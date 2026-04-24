@@ -22,7 +22,7 @@
 
 mod common;
 
-use common::{install_replicas_locally, loopback};
+use common::{install_replicas_locally, loopback, test_token_source};
 use message_bus::IggyMessageBus;
 use message_bus::connector::start as start_connector;
 use message_bus::replica_listener::{MessageHandler, bind, run};
@@ -59,6 +59,7 @@ async fn periodic_reconnect_skips_already_connected_peer() {
             2,
             accept_delegate,
             message_bus::framing::MAX_MESSAGE_SIZE,
+            test_token_source(),
         )
         .await;
     });
@@ -69,7 +70,16 @@ async fn periodic_reconnect_skips_already_connected_peer() {
     // missing, bus1's listener will see N extra accepts.
     let period = Duration::from_millis(50);
     let dial_delegate = install_replicas_locally(bus0.clone(), on_message.clone());
-    start_connector(&bus0, CLUSTER, 0, vec![(1u8, addr1)], dial_delegate, period).await;
+    start_connector(
+        &bus0,
+        CLUSTER,
+        0,
+        vec![(1u8, addr1)],
+        dial_delegate,
+        period,
+        test_token_source(),
+    )
+    .await;
 
     // Wait for the initial connection to settle on both sides.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);

@@ -7009,6 +7009,7 @@ name = "message_bus"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "blake3",
  "compio",
  "futures",
  "iggy_binary_protocol",

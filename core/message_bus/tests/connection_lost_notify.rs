@@ -22,7 +22,7 @@
 
 mod common;
 
-use common::{install_replicas_locally, loopback};
+use common::{install_replicas_locally, loopback, test_token_source};
 use message_bus::IggyMessageBus;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
 use message_bus::replica_listener::{MessageHandler, bind, run};
@@ -64,6 +64,7 @@ async fn connection_lost_fires_exactly_once_per_peer_disconnect() {
             2,
             accept_1,
             message_bus::framing::MAX_MESSAGE_SIZE,
+            test_token_source(),
         )
         .await;
     });
@@ -77,6 +78,7 @@ async fn connection_lost_fires_exactly_once_per_peer_disconnect() {
         vec![(1u8, addr1)],
         dial_0,
         DEFAULT_RECONNECT_PERIOD,
+        test_token_source(),
     )
     .await;
 

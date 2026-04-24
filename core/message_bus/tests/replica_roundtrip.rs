@@ -23,7 +23,7 @@
 mod common;
 
 use async_channel::Receiver;
-use common::{header_only, install_replicas_locally, loopback};
+use common::{header_only, install_replicas_locally, loopback, test_token_source};
 use iggy_binary_protocol::Command2;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
 use message_bus::replica_listener::{MessageHandler, bind, run};
@@ -55,6 +55,7 @@ async fn two_replicas_exchange_prepare_and_ack() {
             2,
             accept_delegate_1,
             message_bus::framing::MAX_MESSAGE_SIZE,
+            test_token_source(),
         )
         .await;
     });
@@ -76,6 +77,7 @@ async fn two_replicas_exchange_prepare_and_ack() {
         vec![(1, addr1)],
         dial_delegate_0,
         DEFAULT_RECONNECT_PERIOD,
+        test_token_source(),
     )
     .await;
 
