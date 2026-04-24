@@ -93,7 +93,7 @@ public final class ResourceProvisioner {
                     }
                 }
             }
-        } catch (Exception exception) {
+        } catch (RuntimeException exception) {
             throw new BenchmarkException("Failed to provision benchmark resources.", exception);
         }
 
