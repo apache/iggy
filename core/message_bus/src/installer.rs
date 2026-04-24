@@ -26,12 +26,12 @@
 
 use crate::client_listener::RequestHandler;
 use crate::fd_transfer::{self, DupedFd};
-use crate::framing;
 use crate::lifecycle::{InstanceToken, RejectedRegistration, Shutdown};
 use crate::replica_listener::MessageHandler;
 use crate::socket_opts::{apply_keepalive_for_connection, apply_nodelay_for_connection};
+use crate::transports::{TcpTransportConn, TransportConn, TransportReader};
 use crate::{IggyMessageBus, lifecycle::ShutdownToken};
-use compio::net::{OwnedReadHalf, TcpStream};
+use compio::net::TcpStream;
 use futures::FutureExt;
 use iggy_binary_protocol::Command2;
 use std::cell::Cell;
@@ -89,25 +89,22 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
     }
 }
 
-/// Install a pre-wrapped replica TCP stream on the bus. Shared by
-/// `install_replica_fd` and, once shard 0 acts as the delegate target for
-/// itself, the accept path.
-#[allow(clippy::future_not_send, clippy::too_many_lines)]
+/// TCP entry point: apply socket options (keepalive, `TCP_NODELAY`) on
+/// the raw stream and delegate to the transport-generic install path.
+///
+/// Socket options live here (not on the generic path) because they are
+/// TCP-specific; other transports (WSS via TLS terminator, QUIC) lack a
+/// raw-fd level at this layer. Kept as a separate function so the
+/// `install_replica_fd` fd-delegation entry and the accept callbacks
+/// (`AcceptedReplicaFn` in tests and shard-0 coordinator) converge on
+/// one place for those options.
+#[allow(clippy::future_not_send)]
 pub fn install_replica_stream(
     bus: &Rc<IggyMessageBus>,
     peer_id: u8,
     stream: TcpStream,
     on_message: MessageHandler,
 ) {
-    if bus.replicas().contains(peer_id) {
-        debug!(
-            replica = peer_id,
-            "replica already registered on this shard, dropping delegated fd"
-        );
-        drop(stream);
-        return;
-    }
-
     let cfg = bus.config();
     if let Err(e) = apply_keepalive_for_connection(
         &stream,
@@ -123,8 +120,34 @@ pub fn install_replica_stream(
         // A miss means we stay Nagle-on for this peer, not a failure.
         warn!(replica = peer_id, "nodelay failed on delegated fd: {e}");
     }
+    install_replica_conn(bus, peer_id, TcpTransportConn::new(stream), on_message);
+}
 
-    let (read_half, write_half) = stream.into_split();
+/// Install a pre-wrapped replica connection on the bus.
+///
+/// Generic over [`TransportConn`] so alternate transports (WS via
+/// shard-0 TLS terminator, QUIC via `compio-quic`) plug in behind the
+/// same registry-insert + instance-token fencing + install-race
+/// handling. TCP-specific socket options live in
+/// [`install_replica_stream`]; transports with no equivalent layer call
+/// this entry directly with their already-configured connection.
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
+pub fn install_replica_conn<C: TransportConn>(
+    bus: &Rc<IggyMessageBus>,
+    peer_id: u8,
+    conn: C,
+    on_message: MessageHandler,
+) {
+    if bus.replicas().contains(peer_id) {
+        debug!(
+            replica = peer_id,
+            "replica already registered on this shard, dropping delegated fd"
+        );
+        drop(conn);
+        return;
+    }
+
+    let (read_half, write_half) = conn.into_split();
     let (tx, rx) = async_channel::bounded(bus.peer_queue_capacity());
 
     // Writer and reader both observe abnormal close and used to fire
@@ -168,7 +191,7 @@ pub fn install_replica_stream(
     let token_for_writer = Rc::clone(&install_token);
     let max_batch = bus.config().max_batch;
     let writer_handle = compio::runtime::spawn(async move {
-        crate::writer_task::run(
+        crate::writer_task::run_transport(
             rx,
             write_half,
             writer_token,
@@ -262,8 +285,10 @@ pub fn install_replica_stream(
     }
 }
 
-/// Install a pre-wrapped client TCP stream on the bus.
-#[allow(clippy::future_not_send, clippy::too_many_lines)]
+/// TCP entry point for client installs. Applies socket options and
+/// delegates to [`install_client_conn`]. See [`install_replica_stream`]
+/// for the plane-symmetric docs.
+#[allow(clippy::future_not_send)]
 pub fn install_client_stream(
     bus: &Rc<IggyMessageBus>,
     client_id: u128,
@@ -288,8 +313,19 @@ pub fn install_client_stream(
             "nodelay failed on delegated client fd: {e}"
         );
     }
+    install_client_conn(bus, client_id, TcpTransportConn::new(stream), on_request);
+}
 
-    let (read_half, write_half) = stream.into_split();
+/// Install a pre-wrapped client connection on the bus. Generic over
+/// [`TransportConn`]; plane-symmetric with [`install_replica_conn`].
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
+pub fn install_client_conn<C: TransportConn>(
+    bus: &Rc<IggyMessageBus>,
+    client_id: u128,
+    conn: C,
+    on_request: RequestHandler,
+) {
+    let (read_half, write_half) = conn.into_split();
     let (tx, rx) = async_channel::bounded(bus.peer_queue_capacity());
 
     // If the registry insert below loses a race for `client_id`, the
@@ -313,7 +349,7 @@ pub fn install_client_stream(
     let token_for_writer = Rc::clone(&install_token);
     let max_batch = bus.config().max_batch;
     let writer_handle = compio::runtime::spawn(async move {
-        crate::writer_task::run(
+        crate::writer_task::run_transport(
             rx,
             write_half,
             writer_token,
@@ -445,9 +481,9 @@ async fn drain_rejected_registration(rejected: RejectedRegistration, timeout: Du
 /// the insert-race path: it wakes the reader off its `io_uring` read SQE
 /// immediately rather than waiting for peer EOF.
 #[allow(clippy::future_not_send)]
-async fn replica_read_loop(
+async fn replica_read_loop<R: TransportReader>(
     replica_id: u8,
-    mut read_half: OwnedReadHalf<TcpStream>,
+    mut read_half: R,
     on_message: &MessageHandler,
     token: &ShutdownToken,
     conn_token: &ShutdownToken,
@@ -464,7 +500,7 @@ async fn replica_read_loop(
                 debug!(replica = replica_id, "replica read loop aborted by per-connection shutdown");
                 return;
             }
-            result = framing::read_message(&mut read_half, max_message_size).fuse() => {
+            result = read_half.read_message(max_message_size).fuse() => {
                 match result {
                     Ok(msg) => {
                         if aborted.get() {
@@ -495,9 +531,9 @@ async fn replica_read_loop(
 /// the insert-race path: it wakes the reader off its `io_uring` read SQE
 /// immediately rather than waiting for peer EOF.
 #[allow(clippy::future_not_send)]
-async fn client_read_loop(
+async fn client_read_loop<R: TransportReader>(
     client_id: u128,
-    mut read_half: OwnedReadHalf<TcpStream>,
+    mut read_half: R,
     on_request: &RequestHandler,
     token: &ShutdownToken,
     conn_token: &ShutdownToken,
@@ -514,7 +550,7 @@ async fn client_read_loop(
                 debug!(client = client_id, "client read loop aborted by per-connection shutdown");
                 return;
             }
-            result = framing::read_message(&mut read_half, max_message_size).fuse() => {
+            result = read_half.read_message(max_message_size).fuse() => {
                 match result {
                     Ok(msg) => {
                         if aborted.get() {
