@@ -17,9 +17,11 @@
  * under the License.
  */
 
+use crate::config_writer::write_current_config;
 use crate::server_error::ServerNgError;
 use configs::server::ServerConfig;
 use consensus::{LocalPipeline, PartitionsHandle, Sequencer, VsrConsensus};
+use iggy_binary_protocol::RequestHeader;
 use iggy_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use iggy_common::{
     ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, PartitionStats, TopicStats,
@@ -27,7 +29,13 @@ use iggy_common::{
 };
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
-use message_bus::IggyMessageBus;
+use message_bus::client_listener::{self, RequestHandler};
+use message_bus::installer;
+use message_bus::replica_io;
+use message_bus::replica_listener::MessageHandler;
+use message_bus::{
+    AcceptedClientFn, AcceptedReplicaFn, IggyMessageBus, connector, replica_listener,
+};
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
@@ -44,11 +52,16 @@ use server::bootstrap::create_directories;
 use server::log::logger::Logging;
 use server::streaming::partitions::storage::{load_consumer_group_offsets, load_consumer_offsets};
 use server::streaming::segments::storage::create_segment_storage;
+use shard::builder::IggyShardBuilder;
 use shard::shards_table::PapayaShardsTable;
-use shard::{IggyShard, PartitionConsensusConfig, ShardIdentity};
-use std::future::pending;
+use shard::{
+    CoordinatorConfig, IggyShard, PartitionConsensusConfig, ShardIdentity, channel, shard_channel,
+};
+use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{info, warn};
@@ -58,47 +71,92 @@ const SHARD_ID: u16 = 0;
 const SHARD_REPLICA_ID: u8 = 0;
 const SHARD_NAME: &str = "server-ng-shard-0";
 const DEFAULT_CONFIG_PATH: &str = "core/server-ng/config.toml";
+const SHARD_INBOX_CAPACITY: usize = 1024;
 
 type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
 type ServerNgMetadata = IggyMetadata<
-    VsrConsensus<IggyMessageBus>,
+    VsrConsensus<Rc<IggyMessageBus>>,
     PrepareJournal,
     IggySnapshot,
     ServerNgMuxStateMachine,
 >;
 type ServerNgShard = IggyShard<
-    IggyMessageBus,
+    Rc<IggyMessageBus>,
     PrepareJournal,
     IggySnapshot,
     ServerNgMuxStateMachine,
     PapayaShardsTable,
 >;
 
+type ServerNgShardHandle = Rc<RefCell<Option<Weak<ServerNgShard>>>>;
+
+struct TcpTopology {
+    self_replica_id: u8,
+    replica_count: u8,
+    client_listen_addr: SocketAddr,
+    replica_listen_addr: Option<SocketAddr>,
+    peers: Vec<(u8, SocketAddr)>,
+}
+
 pub trait RunServerNg {
-    fn run(&self) -> impl Future<Output = Result<(), ServerNgError>>;
+    fn run(
+        &self,
+        config: &ServerConfig,
+        current_replica_id: Option<u8>,
+    ) -> impl Future<Output = Result<(), ServerNgError>>;
 }
 
 impl RunServerNg for Rc<ServerNgShard> {
-    async fn run(&self) -> Result<(), ServerNgError> {
+    /// Run the fully bootstrapped `server-ng` shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if TCP listener bootstrap fails or cluster TCP
+    /// addresses cannot be resolved from config.
+    async fn run(
+        &self,
+        config: &ServerConfig,
+        current_replica_id: Option<u8>,
+    ) -> Result<(), ServerNgError> {
+        let topology = resolve_tcp_topology(config, current_replica_id)?;
+        let (stop_tx, stop_rx) = channel(1);
+        let message_pump_shard = Self::clone(self);
+        let message_pump_handle = compio::runtime::spawn(async move {
+            message_pump_shard.run_message_pump(stop_rx).await;
+        });
+        self.bus.track_background(message_pump_handle);
+
+        let on_replica_message = make_replica_message_handler(self);
+        let on_client_request = make_client_request_handler(self);
+        let accepted_replica = make_local_replica_accept_fn(&self.bus, on_replica_message);
+        let accepted_client = make_local_client_accept_fn(&self.bus, on_client_request);
+
         info!(
             shard = self.id,
             partitions = self.plane.partitions().len(),
             "server-ng shard initialized"
         );
-        warn!("TODO: start listeners, timers, and runtime services once the new infra exists");
-        pending::<()>().await;
-        #[allow(unreachable_code)]
+
+        if let Err(error) =
+            start_tcp_runtime(self, config, &topology, accepted_replica, accepted_client).await
+        {
+            let _ = stop_tx.try_send(());
+            return Err(error);
+        }
+
+        self.bus.token().wait().await;
+        let _ = stop_tx.try_send(());
         Ok(())
     }
 }
 
-/// Bootstraps `server-ng` from config and on-disk metadata/partition state.
+/// Load config, prepare directories, and complete late logging init.
 ///
 /// # Errors
 ///
-/// Returns an error if config loading, directory preparation, logging setup,
-/// metadata recovery, or partition hydration fails.
-pub async fn bootstrap(logging: &mut Logging) -> Result<Rc<ServerNgShard>, ServerNgError> {
+/// Returns an error if config loading, directory preparation, or logging
+/// setup fails.
+pub async fn load_config(logging: &mut Logging) -> Result<ServerConfig, ServerNgError> {
     let config = ServerConfig::load_with_path(DEFAULT_CONFIG_PATH, include_str!("../config.toml"))
         .await
         .map_err(ServerNgError::Config)?;
@@ -114,8 +172,21 @@ pub async fn bootstrap(logging: &mut Logging) -> Result<Rc<ServerNgShard>, Serve
         )
         .map_err(ServerNgError::Logging)?;
 
-    iggy_common::MemoryPool::init_pool(&config.system.memory_pool.into_other());
+    Ok(config)
+}
 
+/// Bootstraps `server-ng` from config and on-disk metadata/partition state.
+///
+/// # Errors
+///
+/// Returns an error if metadata recovery, consensus restoration, or
+/// partition hydration fails.
+pub async fn bootstrap(
+    config: &ServerConfig,
+    current_replica_id: Option<u8>,
+) -> Result<Rc<ServerNgShard>, ServerNgError> {
+    let topology = resolve_tcp_topology(config, current_replica_id)?;
+    let bus = Rc::new(IggyMessageBus::new(SHARD_ID));
     let recovered = recover::<ServerNgMuxStateMachine>(Path::new(&config.system.path))
         .await
         .map_err(ServerNgError::MetadataRecovery)?;
@@ -124,13 +195,19 @@ pub async fn bootstrap(logging: &mut Logging) -> Result<Rc<ServerNgShard>, Serve
         .unwrap_or_else(|| recovered.snapshot.sequence_number());
 
     let metadata = ServerNgMetadata::new(
-        Some(restore_metadata_consensus(&recovered.journal, restored_op)),
+        Some(restore_metadata_consensus(
+            &recovered.journal,
+            restored_op,
+            topology.self_replica_id,
+            topology.replica_count,
+            Rc::clone(&bus),
+        )),
         Some(recovered.journal),
         Some(recovered.snapshot),
         recovered.mux_stm,
         Some(PathBuf::from(&config.system.path)),
     );
-    let shard = Rc::new(build_single_shard(&config, metadata).await?);
+    let shard = build_single_shard(config, &topology, metadata, bus).await?;
     info!(shard = shard.id, "server-ng bootstrap complete");
 
     Ok(shard)
@@ -139,13 +216,16 @@ pub async fn bootstrap(logging: &mut Logging) -> Result<Rc<ServerNgShard>, Serve
 fn restore_metadata_consensus(
     journal: &PrepareJournal,
     restored_op: u64,
-) -> VsrConsensus<IggyMessageBus> {
+    self_replica_id: u8,
+    replica_count: u8,
+    bus: Rc<IggyMessageBus>,
+) -> VsrConsensus<Rc<IggyMessageBus>> {
     let mut consensus = VsrConsensus::new(
         CLUSTER_ID,
-        SHARD_REPLICA_ID,
-        1,
+        self_replica_id,
+        replica_count,
         0,
-        IggyMessageBus::new(1, SHARD_ID, 0),
+        bus,
         LocalPipeline::new(),
     );
 
@@ -170,8 +250,10 @@ fn restore_metadata_consensus(
 
 async fn build_single_shard(
     config: &ServerConfig,
+    topology: &TcpTopology,
     metadata: ServerNgMetadata,
-) -> Result<ServerNgShard, ServerNgError> {
+    bus: Rc<IggyMessageBus>,
+) -> Result<Rc<ServerNgShard>, ServerNgError> {
     let shard_id = ShardId::new(SHARD_ID);
     let partition_count = metadata.mux_stm.streams().read(|inner| {
         inner
@@ -222,7 +304,16 @@ async fn build_single_shard(
     for (stream_id, topic_id, topic_stats, partition_metadata) in namespaces {
         validate_recovered_namespace(config, stream_id, topic_id, partition_metadata.id)?;
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
-        let partition = load_partition(config, namespace, topic_stats, &partition_metadata).await?;
+        let partition = load_partition(
+            config,
+            namespace,
+            topic_stats,
+            &partition_metadata,
+            topology.self_replica_id,
+            topology.replica_count,
+            Rc::clone(&bus),
+        )
+        .await?;
         let local_idx = partitions.insert(namespace, partition);
         shards_table.insert(
             namespace,
@@ -230,13 +321,33 @@ async fn build_single_shard(
         );
     }
 
-    Ok(IggyShard::without_inbox(
+    let (sender, inbox) = shard_channel::<()>(SHARD_ID, SHARD_INBOX_CAPACITY);
+    let senders = vec![sender];
+    let shard_handle = Rc::new(RefCell::new(None));
+    let on_replica_message = make_deferred_replica_message_handler(&shard_handle);
+    let on_client_request = make_deferred_client_request_handler(&shard_handle);
+    let built = IggyShardBuilder::new(
         ShardIdentity::new(SHARD_ID, SHARD_NAME.to_string()),
+        Rc::clone(&bus),
+        on_replica_message,
+        on_client_request,
         metadata,
         partitions,
+        senders,
+        inbox,
         shards_table,
-        PartitionConsensusConfig::new(CLUSTER_ID, 1, IggyMessageBus::new(1, SHARD_ID, 0)),
-    ))
+        PartitionConsensusConfig::new(CLUSTER_ID, topology.replica_count, Rc::clone(&bus)),
+        CoordinatorConfig::default(),
+        bus.token(),
+    )
+    .build();
+    if let Some(refresh_task) = built.refresh_task {
+        bus.track_background(refresh_task);
+    }
+
+    let shard = Rc::new(built.shard);
+    *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
+    Ok(shard)
 }
 
 const fn validate_recovered_namespace(
@@ -268,17 +379,20 @@ async fn load_partition(
     namespace: IggyNamespace,
     topic_stats: Arc<TopicStats>,
     partition_metadata: &Partition,
-) -> Result<IggyPartition<IggyMessageBus>, ServerNgError> {
+    self_replica_id: u8,
+    replica_count: u8,
+    bus: Rc<IggyMessageBus>,
+) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerNgError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
     let stats = Arc::new(PartitionStats::new(topic_stats));
     let consensus = VsrConsensus::new(
         CLUSTER_ID,
-        SHARD_REPLICA_ID,
-        1,
+        self_replica_id,
+        replica_count,
         namespace.inner(),
-        IggyMessageBus::new(1, SHARD_ID, namespace.inner()),
+        bus,
         LocalPipeline::new(),
     );
     consensus.init();
@@ -341,7 +455,7 @@ async fn load_partition(
 }
 
 async fn hydrate_partition_log(
-    partition: &mut IggyPartition<IggyMessageBus>,
+    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
     config: &ServerConfig,
     stream_id: usize,
     topic_id: usize,
@@ -352,14 +466,26 @@ async fn hydrate_partition_log(
 ) -> Result<(), ServerNgError> {
     // TODO: decouple the loading logic from the `server` crate. This currently
     // adapts the old server segmented log into the new `partitions` log.
-    for (segment, storage) in loaded_log
+    for (segment_index, (segment, storage)) in loaded_log
         .segments()
         .iter()
         .zip(loaded_log.storages().iter().cloned())
+        .enumerate()
     {
-        partition
-            .log
-            .add_persisted_segment(convert_segment(segment), storage, None, None);
+        let max_timestamp = match loaded_log
+            .indexes()
+            .get(segment_index)
+            .and_then(|indexes| indexes.as_ref())
+        {
+            Some(indexes) => indexes_max_timestamp(indexes),
+            None => load_segment_max_timestamp(&storage, stream_id, topic_id, partition_id).await?,
+        };
+        partition.log.add_persisted_segment(
+            convert_segment(segment, max_timestamp),
+            storage,
+            None,
+            None,
+        );
     }
 
     if let Some(active_index) = partition.log.segments().len().checked_sub(1) {
@@ -369,9 +495,7 @@ async fn hydrate_partition_log(
             storage.index_reader.as_ref(),
         ) {
             let index_path = index_reader.path();
-            let index_size = std::fs::metadata(&index_path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
+            let index_size = std::fs::metadata(&index_path).map_or(0, |metadata| metadata.len());
             partition.log.messages_writers_mut()[active_index] = Some(Rc::new(
                 MessagesWriter::new(
                     &messages_reader.path(),
@@ -408,12 +532,12 @@ async fn hydrate_partition_log(
     Ok(())
 }
 
-fn convert_segment(segment: &iggy_common::Segment) -> Segment {
+fn convert_segment(segment: &iggy_common::Segment, max_timestamp: u64) -> Segment {
     Segment {
         sealed: segment.sealed,
         start_timestamp: segment.start_timestamp,
         end_timestamp: segment.end_timestamp,
-        max_timestamp: segment.end_timestamp,
+        max_timestamp,
         current_position: u64::from(segment.current_position),
         start_offset: segment.start_offset,
         end_offset: segment.end_offset,
@@ -422,8 +546,41 @@ fn convert_segment(segment: &iggy_common::Segment) -> Segment {
     }
 }
 
+fn indexes_max_timestamp(indexes: &server::streaming::segments::IggyIndexesMut) -> u64 {
+    let mut max_timestamp = 0;
+    for index in 0..indexes.count() {
+        if let Some(index_view) = indexes.get(index) {
+            max_timestamp = max_timestamp.max(index_view.timestamp());
+        }
+    }
+
+    max_timestamp
+}
+
+async fn load_segment_max_timestamp(
+    storage: &iggy_common::SegmentStorage,
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+) -> Result<u64, ServerNgError> {
+    let Some(index_reader) = storage.index_reader.as_ref() else {
+        return Ok(0);
+    };
+
+    let indexes = index_reader
+        .load_all_indexes_from_disk()
+        .await
+        .map_err(|source| ServerNgError::SegmentIndexesLoad {
+            stream_id,
+            topic_id,
+            partition_id,
+            source,
+        })?;
+    Ok(indexes_max_timestamp(&indexes))
+}
+
 fn configure_consumer_offsets(
-    partition: &mut IggyPartition<IggyMessageBus>,
+    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
     config: &ServerConfig,
     namespace: IggyNamespace,
     current_offset: u64,
@@ -477,7 +634,7 @@ fn configure_consumer_offsets(
 }
 
 async fn ensure_initial_segment(
-    partition: &mut IggyPartition<IggyMessageBus>,
+    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
     config: &ServerConfig,
     stream_id: usize,
     topic_id: usize,
@@ -540,4 +697,338 @@ async fn ensure_initial_segment(
     partition.stats.increment_segments_count(1);
 
     Ok(())
+}
+
+fn resolve_tcp_topology(
+    config: &ServerConfig,
+    current_replica_id: Option<u8>,
+) -> Result<TcpTopology, ServerNgError> {
+    let default_client_addr = parse_socket_addr("tcp.address", &config.tcp.address)?;
+    if !config.cluster.enabled {
+        return Ok(TcpTopology {
+            // Keep parity with the current server binary and the integration
+            // harness: `--replica-id` may be passed unconditionally, but in
+            // single-node mode there is only replica 0.
+            self_replica_id: SHARD_REPLICA_ID,
+            replica_count: 1,
+            client_listen_addr: default_client_addr,
+            replica_listen_addr: None,
+            peers: Vec::new(),
+        });
+    }
+
+    let self_replica_id = current_replica_id.ok_or(ServerNgError::MissingReplicaId)?;
+
+    let self_node = config
+        .cluster
+        .nodes
+        .iter()
+        .find(|node| node.replica_id == self_replica_id)
+        .ok_or(ServerNgError::ClusterNodeNotFound {
+            replica_id: self_replica_id,
+        })?;
+    let replica_count = u8::try_from(config.cluster.nodes.len()).map_err(|_| {
+        ServerNgError::ClusterReplicaCountTooLarge {
+            count: config.cluster.nodes.len(),
+        }
+    })?;
+    let client_port = self_node
+        .ports
+        .tcp
+        .unwrap_or_else(|| default_client_addr.port());
+    let client_listen_addr =
+        socket_addr_from_parts("cluster.nodes[*].ports.tcp", &self_node.ip, client_port)?;
+    let replica_port =
+        self_node
+            .ports
+            .tcp_replica
+            .ok_or(ServerNgError::ClusterReplicaPortMissing {
+                replica_id: self_node.replica_id,
+            })?;
+    let replica_listen_addr = Some(socket_addr_from_parts(
+        "cluster.nodes[*].ports.tcp_replica",
+        &self_node.ip,
+        replica_port,
+    )?);
+    let mut peers = Vec::with_capacity(config.cluster.nodes.len().saturating_sub(1));
+    for node in &config.cluster.nodes {
+        if node.replica_id == self_replica_id {
+            continue;
+        }
+        let replica_port =
+            node.ports
+                .tcp_replica
+                .ok_or(ServerNgError::ClusterReplicaPortMissing {
+                    replica_id: node.replica_id,
+                })?;
+        peers.push((
+            node.replica_id,
+            socket_addr_from_parts("cluster.nodes[*].ports.tcp_replica", &node.ip, replica_port)?,
+        ));
+    }
+
+    Ok(TcpTopology {
+        self_replica_id,
+        replica_count,
+        client_listen_addr,
+        replica_listen_addr,
+        peers,
+    })
+}
+
+async fn start_tcp_runtime(
+    shard: &Rc<ServerNgShard>,
+    config: &ServerConfig,
+    topology: &TcpTopology,
+    accepted_replica: AcceptedReplicaFn,
+    accepted_client: AcceptedClientFn,
+) -> Result<(), ServerNgError> {
+    if config.cluster.enabled {
+        return start_cluster_tcp_runtime(
+            shard,
+            config,
+            topology,
+            accepted_replica,
+            accepted_client,
+        )
+        .await;
+    }
+
+    start_single_node_tcp_runtime(shard, config, topology, accepted_client).await
+}
+
+async fn start_cluster_tcp_runtime(
+    shard: &Rc<ServerNgShard>,
+    config: &ServerConfig,
+    topology: &TcpTopology,
+    accepted_replica: AcceptedReplicaFn,
+    accepted_client: AcceptedClientFn,
+) -> Result<(), ServerNgError> {
+    let replica_addr = topology
+        .replica_listen_addr
+        .expect("cluster-enabled topology must include replica listener address");
+    if config.tcp.enabled {
+        let bound = replica_io::start_on_shard_zero_default(
+            &shard.bus,
+            replica_addr,
+            topology.client_listen_addr,
+            CLUSTER_ID,
+            topology.self_replica_id,
+            topology.replica_count,
+            topology.peers.clone(),
+            accepted_replica,
+            accepted_client,
+        )
+        .await
+        .map_err(ServerNgError::StartTcpListeners)?;
+        if let Some(bound) = bound {
+            write_current_config(
+                config,
+                Some(topology.self_replica_id),
+                Some(bound.client),
+                Some(bound.replica),
+            )
+            .await?;
+            info!(
+                shard = shard.id,
+                client = %bound.client,
+                replica = %bound.replica,
+                "server-ng TCP listeners started"
+            );
+        }
+        return Ok(());
+    }
+
+    let (replica_listener, bound_addr) = replica_listener::bind(replica_addr)
+        .await
+        .map_err(ServerNgError::StartTcpListeners)?;
+    let token = shard.bus.token();
+    let max_message_size = shard.bus.config().max_message_size;
+    let self_replica_id = topology.self_replica_id;
+    let replica_count = topology.replica_count;
+    let accepted_replica_for_listener = accepted_replica.clone();
+    let replica_handle = compio::runtime::spawn(async move {
+        replica_listener::run(
+            replica_listener,
+            token,
+            CLUSTER_ID,
+            self_replica_id,
+            replica_count,
+            accepted_replica_for_listener,
+            max_message_size,
+        )
+        .await;
+    });
+    shard.bus.track_background(replica_handle);
+    connector::start(
+        &shard.bus,
+        CLUSTER_ID,
+        topology.self_replica_id,
+        topology.peers.clone(),
+        accepted_replica,
+        shard.bus.config().reconnect_period,
+    )
+    .await;
+    write_current_config(
+        config,
+        Some(topology.self_replica_id),
+        None,
+        Some(bound_addr),
+    )
+    .await?;
+    info!(
+        shard = shard.id,
+        replica = %bound_addr,
+        "server-ng replica TCP listener started"
+    );
+    warn!("TCP client listener is disabled by config; only replica TCP is running");
+
+    Ok(())
+}
+
+async fn start_single_node_tcp_runtime(
+    shard: &Rc<ServerNgShard>,
+    config: &ServerConfig,
+    topology: &TcpTopology,
+    accepted_client: AcceptedClientFn,
+) -> Result<(), ServerNgError> {
+    if !config.tcp.enabled {
+        warn!("TCP listener is disabled by config");
+        return Ok(());
+    }
+
+    let (listener, bound_addr) = client_listener::bind(topology.client_listen_addr)
+        .await
+        .map_err(ServerNgError::StartTcpListeners)?;
+    let token = shard.bus.token();
+    let client_handle = compio::runtime::spawn(async move {
+        client_listener::run(listener, token, accepted_client).await;
+    });
+    shard.bus.track_background(client_handle);
+    write_current_config(
+        config,
+        Some(topology.self_replica_id),
+        Some(bound_addr),
+        None,
+    )
+    .await?;
+    info!(
+        shard = shard.id,
+        client = %bound_addr,
+        "server-ng TCP client listener started"
+    );
+
+    Ok(())
+}
+
+fn make_replica_message_handler(shard: &Rc<ServerNgShard>) -> MessageHandler {
+    let shard = Rc::clone(shard);
+    Rc::new(move |_replica_id, message| {
+        shard.dispatch(message);
+    })
+}
+
+fn make_client_request_handler(shard: &Rc<ServerNgShard>) -> RequestHandler {
+    let shard = Rc::clone(shard);
+    Rc::new(move |client_id, message| {
+        let request = match message.try_into_typed::<RequestHeader>() {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(client_id, error = %error, "dropping client request with invalid header");
+                return;
+            }
+        };
+        let request = request.transmute_header(|header, new_header: &mut RequestHeader| {
+            *new_header = header;
+            new_header.client = client_id;
+        });
+        shard.dispatch(request.into_generic());
+    })
+}
+
+fn make_deferred_replica_message_handler(shard_handle: &ServerNgShardHandle) -> MessageHandler {
+    let shard_handle = Rc::clone(shard_handle);
+    Rc::new(move |_replica_id, message| {
+        if let Some(shard) = upgrade_shard_handle(&shard_handle) {
+            shard.dispatch(message);
+        }
+    })
+}
+
+fn make_deferred_client_request_handler(shard_handle: &ServerNgShardHandle) -> RequestHandler {
+    let shard_handle = Rc::clone(shard_handle);
+    Rc::new(move |client_id, message| {
+        let Some(shard) = upgrade_shard_handle(&shard_handle) else {
+            return;
+        };
+        let request = match message.try_into_typed::<RequestHeader>() {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(client_id, error = %error, "dropping client request with invalid header");
+                return;
+            }
+        };
+        let request = request.transmute_header(|header, new_header: &mut RequestHeader| {
+            *new_header = header;
+            new_header.client = client_id;
+        });
+        shard.dispatch(request.into_generic());
+    })
+}
+
+fn upgrade_shard_handle(shard_handle: &ServerNgShardHandle) -> Option<Rc<ServerNgShard>> {
+    shard_handle
+        .borrow()
+        .as_ref()
+        .and_then(std::rc::Weak::upgrade)
+}
+
+fn make_local_replica_accept_fn(
+    bus: &Rc<IggyMessageBus>,
+    on_message: MessageHandler,
+) -> AcceptedReplicaFn {
+    let bus = Rc::clone(bus);
+    Rc::new(move |stream, peer_id| {
+        installer::install_replica_stream(&bus, peer_id, stream, on_message.clone());
+    })
+}
+
+fn make_local_client_accept_fn(
+    bus: &Rc<IggyMessageBus>,
+    on_request: RequestHandler,
+) -> AcceptedClientFn {
+    let bus = Rc::clone(bus);
+    let counter = Rc::new(Cell::new(1_u128));
+    let shard_id = u128::from(bus.shard_id());
+    Rc::new(move |stream| {
+        let seq = counter.get();
+        counter.set(seq.wrapping_add(1));
+        let client_id = (shard_id << 112) | seq;
+        installer::install_client_stream(&bus, client_id, stream, on_request.clone());
+    })
+}
+
+fn parse_socket_addr(context: &'static str, address: &str) -> Result<SocketAddr, ServerNgError> {
+    address
+        .parse()
+        .map_err(|source| ServerNgError::SocketAddressParse {
+            context,
+            address: address.to_string(),
+            source,
+        })
+}
+
+fn socket_addr_from_parts(
+    context: &'static str,
+    host: &str,
+    port: u16,
+) -> Result<SocketAddr, ServerNgError> {
+    let ip = host
+        .parse::<IpAddr>()
+        .map_err(|source| ServerNgError::SocketAddressParse {
+            context,
+            address: format!("{host}:{port}"),
+            source,
+        })?;
+    Ok(SocketAddr::new(ip, port))
 }

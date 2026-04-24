@@ -28,10 +28,33 @@ pub enum ServerNgError {
     Config(#[source] configs::ConfigurationError),
     #[error("failed to prepare server-ng directories")]
     CreateDirectories(#[source] iggy_common::IggyError),
+    #[error("failed to serialize current server-ng config")]
+    CurrentConfigSerialize(#[source] toml::ser::Error),
+    #[error("failed to write current server-ng config at {path}")]
+    CurrentConfigWrite {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to initialize server-ng logging")]
     Logging(#[source] LogError),
     #[error("failed to recover metadata snapshot and journal")]
     MetadataRecovery(#[source] RecoveryError),
+    #[error("failed to parse {context} socket address '{address}'")]
+    SocketAddressParse {
+        context: &'static str,
+        address: String,
+        #[source]
+        source: std::net::AddrParseError,
+    },
+    #[error("cluster enabled but no node is configured for replica {replica_id}")]
+    ClusterNodeNotFound { replica_id: u8 },
+    #[error("cluster node count {count} exceeds supported u8 replica count")]
+    ClusterReplicaCountTooLarge { count: usize },
+    #[error("cluster mode requires --replica-id to identify the current node")]
+    MissingReplicaId,
+    #[error("cluster node for replica {replica_id} is missing tcp_replica port")]
+    ClusterReplicaPortMissing { replica_id: u8 },
     #[error(
         "recovered namespace stream {stream_id}, topic {topic_id}, partition {partition_id} exceeds configured limits (max_streams={max_streams}, max_topics={max_topics}, max_partitions={max_partitions})"
     )]
@@ -53,6 +76,8 @@ pub enum ServerNgError {
         #[source]
         source: iggy_common::IggyError,
     },
+    #[error("failed to start server-ng TCP listeners")]
+    StartTcpListeners(#[source] iggy_common::IggyError),
     #[error(
         "failed to initialize messages writer for stream {stream_id}, topic {topic_id}, partition {partition_id}"
     )]
@@ -67,6 +92,16 @@ pub enum ServerNgError {
         "failed to initialize index writer for stream {stream_id}, topic {topic_id}, partition {partition_id}"
     )]
     IndexWriterInit {
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        #[source]
+        source: iggy_common::IggyError,
+    },
+    #[error(
+        "failed to load segment indexes for stream {stream_id}, topic {topic_id}, partition {partition_id}"
+    )]
+    SegmentIndexesLoad {
         stream_id: usize,
         topic_id: usize,
         partition_id: usize,

@@ -259,12 +259,16 @@ where
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
+        let mut loopback_buf = Vec::new();
         loop {
             futures::select! {
                 _ = stop.recv().fuse() => break,
                 frame = self.inbox.recv().fuse() => {
                     match frame {
-                        Ok(frame) => self.process_frame(frame).await,
+                        Ok(frame) => {
+                            self.process_frame(frame).await;
+                            self.process_loopback(&mut loopback_buf).await;
+                        }
                         Err(_) => break,
                     }
                 }
@@ -274,6 +278,7 @@ where
         // Drain remaining frames so in-flight requests get a response.
         while let Ok(frame) = self.inbox.try_recv() {
             self.process_frame(frame).await;
+            self.process_loopback(&mut loopback_buf).await;
         }
     }
 
