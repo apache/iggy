@@ -26,6 +26,12 @@
 //! constructs [`crate::IggyMessageBus`] from `ServerConfig` lands.
 //! Keeping the type in-crate for now avoids churning the configs crate
 //! ahead of that wiring.
+//!
+//! The replica-plane auth secret intentionally does NOT live on this
+//! struct: it has a different lifecycle (boot-time resolution, no
+//! `Clone` in debug traces) and is constructed via
+//! [`crate::auth_config`] at process start and threaded as an
+//! `Rc<dyn TokenSource>` into [`crate::replica_io::start_on_shard_zero`].
 
 use std::time::Duration;
 
