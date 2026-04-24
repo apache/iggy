@@ -31,7 +31,7 @@
 //! - a write to the wire fails (broken connection).
 
 use crate::lifecycle::{BusMessage, BusReceiver, ShutdownToken};
-use compio::io::AsyncWriteExt;
+use crate::transports::{TcpTransportWriter, TransportWriter};
 use compio::net::{OwnedWriteHalf, TcpStream};
 use futures::FutureExt;
 use tracing::{debug, error, trace};
@@ -42,10 +42,38 @@ use tracing::{debug, error, trace};
 /// `max_batch` caps how many messages a single `writev` syscall coalesces.
 /// Larger batches reduce syscalls per N messages at the cost of memory
 /// per batch and worst-case latency for the head-of-batch message.
+///
+/// TCP entry point. Wraps the owned write half in a
+/// [`TcpTransportWriter`] and delegates the drain loop to
+/// [`run_transport`]; every syscall still flows through
+/// [`TransportWriter::send_batch`] so future transports drop in behind
+/// the same drain logic.
 #[allow(clippy::future_not_send)]
 pub async fn run(
     rx: BusReceiver,
-    mut write_half: OwnedWriteHalf<TcpStream>,
+    write_half: OwnedWriteHalf<TcpStream>,
+    token: ShutdownToken,
+    label: &'static str,
+    peer: String,
+    max_batch: usize,
+) {
+    let writer = TcpTransportWriter::new(write_half);
+    run_transport(rx, writer, token, label, peer, max_batch).await;
+}
+
+/// Generic drain loop over any [`TransportWriter`].
+///
+/// Pulls `BusMessage`s off the per-peer mpsc, coalesces up to
+/// `max_batch` into a single [`TransportWriter::send_batch`] call, and
+/// exits cleanly on shutdown, channel close, or write error.
+///
+/// Public so alternate transports (WS, QUIC) can reuse the admission
+/// control and batch sizing identically to TCP; keep the body
+/// transport-agnostic.
+#[allow(clippy::future_not_send)]
+pub async fn run_transport<W: TransportWriter>(
+    rx: BusReceiver,
+    mut writer: W,
     token: ShutdownToken,
     label: &'static str,
     peer: String,
@@ -89,12 +117,10 @@ pub async fn run(
         let drained = batch.len();
         trace!(%label, %peer, batch = drained, "writev batch");
 
-        // Single writev for the whole batch. write_vectored_all loops
-        // internally on partial writes until the full batch lands or the
-        // socket errors.
-        let to_write = std::mem::take(&mut batch);
-        let compio::BufResult(result, mut returned) = write_half.write_vectored_all(to_write).await;
-        if let Err(e) = result {
+        // Single batch send. The `TransportWriter` impl is atomic-or-error
+        // and drains `batch` in place on success so the allocation is
+        // reused across iterations.
+        if let Err(e) = writer.send_batch(&mut batch).await {
             // Error (not warn) because the batch is now on the floor:
             // VSR's prepare-timeout or view-change will recover, but the
             // operator needs a loud diagnostic to correlate with the
@@ -105,13 +131,9 @@ pub async fn run(
                 %peer,
                 error = ?e,
                 batch_len = drained,
-                "writer task: write_vectored_all failed, dropping batch"
+                "writer task: send_batch failed, dropping batch"
             );
             return;
         }
-
-        // Reuse the Vec allocation across iterations.
-        returned.clear();
-        batch = returned;
     }
 }
