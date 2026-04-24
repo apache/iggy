@@ -19,6 +19,7 @@
 
 package org.apache.iggy.bench.provision;
 
+import org.apache.iggy.bench.exception.BenchmarkException;
 import org.apache.iggy.bench.models.cli.GlobalCliArgs;
 import org.apache.iggy.bench.models.cli.PinnedProducerCliArgs;
 import org.apache.iggy.bench.models.provision.ProvisionedResources;
@@ -42,57 +43,60 @@ public final class ResourceProvisioner {
         var streamNames = new ArrayList<String>();
         var topicNames = List.of("topic-1");
 
-        var client = IggyTcpClient.builder()
-                .credentials(globalCliArgs.username(), globalCliArgs.password())
-                .buildAndLogin();
+        try {
+            try (var client = IggyTcpClient.builder()
+                    .credentials(globalCliArgs.username(), globalCliArgs.password())
+                    .buildAndLogin()) {
+                var existingStreamNames = client.streams().getStreams().stream()
+                        .map(stream -> stream.name())
+                        .toList();
 
-        var existingStreamNames = client.streams().getStreams().stream()
-                .map(stream -> stream.name())
-                .toList();
+                for (var i = 1; i <= pinnedProducerCliArgs.producers(); i++) {
+                    var streamName = "bench-stream-" + i;
+                    streamNames.add(streamName);
 
-        for (var i = 1; i <= pinnedProducerCliArgs.producers(); i++) {
-            var streamName = "bench-stream-" + i;
-            streamNames.add(streamName);
+                    if (existingStreamNames.contains(streamName) && !globalCliArgs.reuseStreams()) {
+                        log.info("Deleting pre-existing stream '{}'", streamName);
+                        client.streams().deleteStream(StreamId.of(streamName));
+                    }
 
-            if (existingStreamNames.contains(streamName) && !globalCliArgs.reuseStreams()) {
-                log.info("Deleting pre-existing stream '{}'", streamName);
-                client.streams().deleteStream(StreamId.of(streamName));
+                    if (existingStreamNames.contains(streamName) && globalCliArgs.reuseStreams()) {
+                        log.info("Appending to existing stream '{}'", streamName);
+                    } else {
+                        log.info("Creating the test stream '{}'", streamName);
+
+                        client.streams().createStream(streamName);
+
+                        var maxTopicSize = pinnedProducerCliArgs.maxTopicSize() == 0L
+                                ? "server default"
+                                : Long.toString(pinnedProducerCliArgs.maxTopicSize());
+                        var messageExpiry = pinnedProducerCliArgs.messageExpiry() == 0L
+                                ? "never"
+                                : Long.toString(pinnedProducerCliArgs.messageExpiry());
+
+                        log.info(
+                                "Creating the test topic '{}' for stream '{}' with max topic size: {}, message expiry: {}",
+                                topicNames.get(0),
+                                streamName,
+                                maxTopicSize,
+                                messageExpiry);
+
+                        client.topics()
+                                .createTopic(
+                                        StreamId.of(streamName),
+                                        1L,
+                                        CompressionAlgorithm.None,
+                                        BigInteger.valueOf(pinnedProducerCliArgs.messageExpiry()),
+                                        BigInteger.valueOf(pinnedProducerCliArgs.maxTopicSize()),
+                                        Optional.empty(),
+                                        topicNames.get(0));
+                    }
+                }
             }
-
-            if (existingStreamNames.contains(streamName) && globalCliArgs.reuseStreams()) {
-                log.info("Appending to existing stream '{}'", streamName);
-            } else {
-                log.info("Creating the test stream '{}'", streamName);
-
-                client.streams().createStream(streamName);
-
-                var maxTopicSize = pinnedProducerCliArgs.maxTopicSize() == 0L
-                        ? "server default"
-                        : Long.toString(pinnedProducerCliArgs.maxTopicSize());
-                var messageExpiry = pinnedProducerCliArgs.messageExpiry() == 0L
-                        ? "never"
-                        : Long.toString(pinnedProducerCliArgs.messageExpiry());
-
-                log.info(
-                        "Creating the test topic '{}' for stream '{}' with max topic size: {}, message expiry: {}",
-                        topicNames.get(0),
-                        streamName,
-                        maxTopicSize,
-                        messageExpiry);
-
-                client.topics()
-                        .createTopic(
-                                StreamId.of(streamName),
-                                1L,
-                                CompressionAlgorithm.None,
-                                BigInteger.valueOf(pinnedProducerCliArgs.messageExpiry()),
-                                BigInteger.valueOf(pinnedProducerCliArgs.maxTopicSize()),
-                                Optional.empty(),
-                                topicNames.get(0));
-            }
+        } catch (Exception exception) {
+            throw new BenchmarkException("Failed to provision benchmark resources.", exception);
         }
 
-        client.close();
         return new ProvisionedResources(streamNames, topicNames);
     }
 }

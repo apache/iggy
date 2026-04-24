@@ -24,13 +24,13 @@ import org.apache.iggy.bench.models.cli.PinnedProducerCliArgs;
 import org.apache.iggy.bench.models.provision.ProvisionedResources;
 import org.apache.iggy.bench.provision.ResourceProvisioner;
 
-public final class PinnedProducer {
+public final class TcpAsyncPinnedProducer {
 
     private final GlobalCliArgs globalCliArgs;
     private final PinnedProducerCliArgs pinnedProducerCliArgs;
     private final ResourceProvisioner resourceProvisioner;
 
-    PinnedProducer(
+    TcpAsyncPinnedProducer(
             GlobalCliArgs globalCliArgs,
             PinnedProducerCliArgs pinnedProducerCliArgs,
             ResourceProvisioner resourceProvisioner) {
@@ -39,7 +39,7 @@ public final class PinnedProducer {
         this.resourceProvisioner = resourceProvisioner;
     }
 
-    public PinnedProducer(GlobalCliArgs globalCliArgs, PinnedProducerCliArgs pinnedProducerCliArgs) {
+    public TcpAsyncPinnedProducer(GlobalCliArgs globalCliArgs, PinnedProducerCliArgs pinnedProducerCliArgs) {
         this(globalCliArgs, pinnedProducerCliArgs, new ResourceProvisioner());
     }
 

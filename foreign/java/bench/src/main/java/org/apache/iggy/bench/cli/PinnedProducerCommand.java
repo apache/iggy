@@ -19,7 +19,7 @@
 
 package org.apache.iggy.bench.cli;
 
-import org.apache.iggy.bench.benchmarks.tcp.async.PinnedProducer;
+import org.apache.iggy.bench.benchmarks.tcp.async.TcpAsyncPinnedProducer;
 import org.apache.iggy.bench.models.cli.GlobalCliArgs;
 import org.apache.iggy.bench.models.cli.PinnedProducerCliArgs;
 import org.slf4j.Logger;
@@ -97,7 +97,7 @@ public final class PinnedProducerCommand implements Callable<Integer> {
             pinnedProducerCliArgs.validate();
 
             log.info("Starting the Pinned Producer benchmark...");
-            var benchmark = new PinnedProducer(globalCliArgs, pinnedProducerCliArgs);
+            var benchmark = new TcpAsyncPinnedProducer(globalCliArgs, pinnedProducerCliArgs);
             benchmark.provisionResources();
             benchmark.run();
 
