@@ -65,6 +65,10 @@
 //! plug in behind the same surface; see
 //! `Documents/silverhand/iggy/message_bus/transport-plan/`.
 
+pub mod tcp;
+
+pub use tcp::{TcpTransportConn, TcpTransportListener, TcpTransportReader, TcpTransportWriter};
+
 use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
 use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_binary_protocol::{GenericHeader, Message};
