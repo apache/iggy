@@ -20,28 +20,27 @@ use configs::ConfigEnv;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     pub enabled: bool,
     pub name: String,
-    pub node: NodeConfig,
+    /// Full roster of cluster members. Intended to be byte-identical across
+    /// every node so operators ship one config. The running node's identity
+    /// is supplied out-of-band via the `--replica-id` CLI flag, which
+    /// selects the entry in this list that describes the current node.
+    #[serde(default)]
+    pub nodes: Vec<ClusterNodeConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct NodeConfig {
-    pub current: CurrentNodeConfig,
-    pub others: Vec<OtherNodeConfig>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct CurrentNodeConfig {
+pub struct ClusterNodeConfig {
     pub name: String,
     pub ip: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct OtherNodeConfig {
-    pub name: String,
-    pub ip: String,
+    /// Numeric replica ID for VSR consensus (0-based).
+    ///
+    /// Must be unique across [`ClusterConfig::nodes`] and strictly less than
+    /// `nodes.len()`. Validated by [`ClusterConfig::validate`].
+    pub replica_id: u8,
     pub ports: TransportPorts,
 }
 
@@ -51,4 +50,6 @@ pub struct TransportPorts {
     pub quic: Option<u16>,
     pub http: Option<u16>,
     pub websocket: Option<u16>,
+    /// Dedicated port for replica-to-replica consensus traffic.
+    pub tcp_replica: Option<u16>,
 }

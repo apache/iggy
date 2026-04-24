@@ -54,6 +54,10 @@ pub struct IggyShardBuilder {
     version: Option<SemanticVersion>,
     metrics: Option<Metrics>,
     is_follower: bool,
+    /// Runtime-supplied replica identity. Resolved from the `--replica-id`
+    /// CLI flag and matched against `config.cluster.nodes[*].replica_id` at
+    /// startup. `None` when cluster mode is disabled.
+    current_replica_id: Option<u8>,
     metadata: Option<Metadata>,
     metadata_writer: Option<MetadataWriter>,
 }
@@ -109,6 +113,11 @@ impl IggyShardBuilder {
 
     pub fn is_follower(mut self, is_follower: bool) -> Self {
         self.is_follower = is_follower;
+        self
+    }
+
+    pub fn current_replica_id(mut self, current_replica_id: Option<u8>) -> Self {
+        self.current_replica_id = current_replica_id;
         self
     }
 
@@ -175,6 +184,7 @@ impl IggyShardBuilder {
             messages_receiver: Cell::new(Some(frame_receiver)),
             metrics,
             is_follower: self.is_follower,
+            current_replica_id: self.current_replica_id,
             is_shutting_down: AtomicBool::new(false),
             tcp_bound_address: Cell::new(None),
             quic_bound_address: Cell::new(None),

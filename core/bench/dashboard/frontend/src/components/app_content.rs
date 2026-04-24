@@ -17,224 +17,71 @@
 
 use crate::{
     api,
-    components::layout::{main_content::MainContent, sidebar::Sidebar},
+    components::layout::{
+        hero::Hero, main_content::MainContent, sidebar::Sidebar, top_app_bar::TopAppBar,
+    },
     router::AppRoute,
     state::{
         benchmark::{BenchmarkAction, BenchmarkContext, use_benchmark},
         gitref::{GitrefAction, GitrefContext, use_gitref},
         hardware::{HardwareAction, HardwareContext, use_hardware},
-        ui::use_ui,
+        ui::{UiAction, use_ui},
     },
 };
 use bench_report::hardware::BenchmarkHardware;
 use gloo::console::log;
+use std::cell::Cell;
+use std::rc::Rc;
 use yew::prelude::*;
 use yew_router::hooks::use_route;
 use yew_router::prelude::use_navigator;
 
-// Props definitions
+const MOBILE_BREAKPOINT_PX: f64 = 768.0;
+
+fn is_mobile_viewport() -> bool {
+    web_sys::window()
+        .and_then(|window| window.inner_width().ok())
+        .and_then(|value| value.as_f64())
+        .is_some_and(|width| width < MOBILE_BREAKPOINT_PX)
+}
+
+async fn apply_benchmark(
+    uuid: &str,
+    hardware_ctx: &HardwareContext,
+    gitref_ctx: &GitrefContext,
+    benchmark_ctx: &BenchmarkContext,
+) {
+    match api::fetch_benchmark_by_uuid(uuid).await {
+        Ok(target_benchmark) => {
+            if hardware_ctx.state.selected_hardware.as_ref()
+                != target_benchmark.hardware.identifier.as_ref()
+            {
+                hardware_ctx.dispatch.emit(HardwareAction::SelectHardware(
+                    target_benchmark.hardware.identifier.clone(),
+                ));
+            }
+            if gitref_ctx.state.selected_gitref.as_ref() != target_benchmark.params.gitref.as_ref()
+            {
+                gitref_ctx.dispatch.emit(GitrefAction::SetSelectedGitref(
+                    target_benchmark.params.gitref.clone(),
+                ));
+            }
+            benchmark_ctx
+                .dispatch
+                .emit(BenchmarkAction::SelectBenchmark(Box::new(Some(
+                    target_benchmark,
+                ))));
+        }
+        Err(error) => log!(format!(
+            "AppContent: fetch benchmark {} failed: {}",
+            uuid, error
+        )),
+    }
+}
+
 #[derive(Properties, PartialEq)]
 #[allow(dead_code)]
 pub struct AppContentProps {}
-
-#[hook]
-fn use_init_hardware(
-    hardware_ctx: HardwareContext,
-    route: Option<AppRoute>,
-    is_loading_from_url: bool,
-) {
-    use gloo::console::log;
-
-    use_effect_with(
-        (route, is_loading_from_url),
-        move |(route, is_loading_from_url)| {
-            let dispatch = hardware_ctx.dispatch.clone();
-            let already_selected = hardware_ctx.state.selected_hardware.clone();
-            let current_route = route.clone();
-            let loading_from_url = *is_loading_from_url;
-
-            yew::platform::spawn_local(async move {
-                match api::fetch_hardware_configurations().await {
-                    Ok(mut hw_list) => {
-                        if !hw_list.is_empty() {
-                            hw_list.sort_by(|a, b| a.identifier.cmp(&b.identifier));
-                            dispatch.emit(HardwareAction::SetHardwareList(hw_list.clone()));
-
-                            if already_selected.is_none() && !loading_from_url {
-                                if let Some(AppRoute::Benchmark { .. }) = current_route {
-                                    // Do nothing, app_content will handle selection for this route
-                                } else if let Some(preferred) =
-                                    preferred_hardware_identifier(&hw_list)
-                                {
-                                    dispatch.emit(HardwareAction::SelectHardware(Some(preferred)));
-                                } else {
-                                    log!("No preferred hardware found");
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => log!(format!("Error fetching hardware: {}", e)),
-                }
-            });
-            || ()
-        },
-    );
-}
-
-fn preferred_hardware_identifier(hw_list: &[BenchmarkHardware]) -> Option<String> {
-    hw_list
-        .iter()
-        .filter_map(|hw| {
-            hw.identifier
-                .clone()
-                .filter(|identifier| identifier == "spetz-amd-rkyv")
-        })
-        .next()
-}
-
-#[hook]
-fn use_load_gitrefs(
-    gitref_ctx: GitrefContext,
-    hardware: Option<String>,
-    route: Option<AppRoute>,
-    is_loading_from_url: bool,
-) {
-    use gloo::console::log;
-
-    use_effect_with(
-        (hardware.clone(), route.clone(), is_loading_from_url),
-        move |(hardware_dep, route_dep, is_loading_dep)| {
-            let gitref_ctx_effect = gitref_ctx.clone();
-            let hardware_val = hardware_dep.clone();
-            let current_route_val = route_dep.clone();
-            let loading_from_url_val = *is_loading_dep;
-
-            if let Some(hw) = hardware_val {
-                yew::platform::spawn_local(async move {
-                    match api::fetch_gitrefs_for_hardware(&hw).await {
-                        Ok(vers) => {
-                            gitref_ctx_effect
-                                .dispatch
-                                .emit(GitrefAction::SetGitrefs(vers.clone()));
-                            if !vers.is_empty() {
-                                let current_selected_gitref_val =
-                                    gitref_ctx_effect.state.selected_gitref.clone();
-
-                                log!(format!(
-                                    "use_load_gitrefs: Pre-auto-selection check. loading_from_url: {}, current_route: {:?}, has_versions: {}, current_selected_gitref: {:?}",
-                                    loading_from_url_val,
-                                    current_route_val,
-                                    !vers.is_empty(),
-                                    current_selected_gitref_val
-                                ));
-
-                                if !loading_from_url_val {
-                                    if let Some(AppRoute::Benchmark { .. }) = current_route_val {
-                                        log!(
-                                            "use_load_gitrefs: On Benchmark route, skipping auto gitref selection."
-                                        );
-                                    } else {
-                                        log!(
-                                            "use_load_gitrefs: Not on Benchmark route, proceeding with auto gitref selection logic."
-                                        );
-                                        let final_gitref = match current_selected_gitref_val {
-                                            Some(ref existing) if vers.contains(existing) => {
-                                                log!(format!(
-                                                    "use_load_gitrefs: Retaining existing gitref: {}",
-                                                    existing
-                                                ));
-                                                existing.clone()
-                                            }
-                                            _ => {
-                                                log!(format!(
-                                                    "use_load_gitrefs: Selecting first available gitref: {}",
-                                                    vers[0]
-                                                ));
-                                                vers[0].clone()
-                                            }
-                                        };
-
-                                        if Some(final_gitref.clone())
-                                            != gitref_ctx_effect.state.selected_gitref
-                                        {
-                                            log!(format!(
-                                                "use_load_gitrefs: Dispatching SetSelectedGitref with: {}",
-                                                final_gitref
-                                            ));
-                                            gitref_ctx_effect.dispatch.emit(
-                                                GitrefAction::SetSelectedGitref(Some(final_gitref)),
-                                            );
-                                        } else {
-                                            log!(format!(
-                                                "use_load_gitrefs: Gitref {} already selected or matches current state.",
-                                                final_gitref
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => log!(format!("Error fetching gitrefs: {}", e)),
-                    }
-                });
-            }
-            || ()
-        },
-    );
-}
-
-#[hook]
-fn use_load_benchmarks(
-    benchmark_ctx: BenchmarkContext,
-    hardware: Option<String>,
-    gitref: Option<String>,
-) {
-    use gloo::console::log;
-    use_effect_with(
-        (hardware.clone(), gitref.clone()),
-        move |(hardware_dep, gitref_dep)| {
-            let benchmark_ctx_effect = benchmark_ctx.clone();
-            if let (Some(hw), Some(gr)) = (hardware_dep.clone(), gitref_dep.clone()) {
-                log!(format!(
-                    "use_load_benchmarks: Triggered with HW: {:?}, GitRef: {:?}",
-                    hw, gr
-                ));
-                let hw_clone = hw.clone(); // Clone for async move
-                let gr_clone = gr.clone(); // Clone for async move
-                yew::platform::spawn_local(async move {
-                    match api::fetch_benchmarks_for_hardware_and_gitref(&hw_clone, &gr_clone).await
-                    {
-                        Ok(benchmarks) => {
-                            log!(format!(
-                                "use_load_benchmarks: Fetched {} benchmarks for {} & {}",
-                                benchmarks.len(),
-                                hw_clone,
-                                gr_clone
-                            ));
-                            benchmark_ctx_effect.dispatch.emit(
-                                BenchmarkAction::SetBenchmarksForGitref(
-                                    benchmarks, hw_clone, gr_clone,
-                                ),
-                            );
-                        }
-                        Err(e) => log!(format!(
-                            "use_load_benchmarks: Error fetching benchmarks: {}",
-                            e
-                        )),
-                    }
-                });
-            } else {
-                log!(format!(
-                    "use_load_benchmarks: Not fetching. HW: {:?}, GitRef: {:?}",
-                    hardware_dep, gitref_dep
-                ));
-                // Do nothing if hardware or gitref is None, allowing state to persist
-                // until both are available. This avoids clearing entries transiently.
-            }
-            || ()
-        },
-    );
-}
 
 #[function_component(AppContent)]
 pub fn app_content() -> Html {
@@ -245,84 +92,114 @@ pub fn app_content() -> Html {
     let route = use_route::<AppRoute>();
     let navigator = use_navigator();
 
-    // Get theme context from the provider
-    let (is_dark, theme_toggle) =
-        use_context::<(bool, Callback<()>)>().expect("Theme context not found");
-
     let is_loading_from_url = use_state(|| false);
-
     use_init_hardware(hardware_ctx.clone(), route.clone(), *is_loading_from_url);
+    {
+        let ui = ui_state.clone();
+        use_effect_with((), move |_| {
+            if is_mobile_viewport() && !ui.is_sidebar_collapsed {
+                ui.dispatch(UiAction::ToggleSidebar);
+            }
 
+            let last_mobile = Rc::new(Cell::new(is_mobile_viewport()));
+            let ui_inner = ui.clone();
+            let last_mobile_handler = last_mobile.clone();
+            let listener = gloo::events::EventListener::new(
+                &web_sys::window().expect("window"),
+                "resize",
+                move |_| {
+                    let now_mobile = is_mobile_viewport();
+                    if now_mobile == last_mobile_handler.get() {
+                        return;
+                    }
+                    last_mobile_handler.set(now_mobile);
+                    let should_toggle = now_mobile != ui_inner.is_sidebar_collapsed;
+                    if should_toggle {
+                        ui_inner.dispatch(UiAction::ToggleSidebar);
+                    }
+                },
+            );
+            move || drop(listener)
+        });
+    }
+
+    let route_generation = use_mut_ref(|| 0u64);
     {
         let route_clone = route.clone();
-        let hardware_ctx_cloned = hardware_ctx.clone();
-        let gitref_ctx_cloned = gitref_ctx.clone();
-        let benchmark_ctx_cloned = benchmark_ctx.clone();
-        let is_loading_from_url_handle = is_loading_from_url.clone();
+        let hardware_ctx_clone = hardware_ctx.clone();
+        let gitref_ctx_clone = gitref_ctx.clone();
+        let benchmark_ctx_clone = benchmark_ctx.clone();
+        let is_loading_handle = is_loading_from_url.clone();
+        let ui_state_clone = ui_state.clone();
+        let route_generation = route_generation.clone();
 
         use_effect_with(route_clone, move |current_route| {
-            if let Some(AppRoute::Benchmark { uuid }) = current_route {
-                let uuid_val = uuid.clone();
-                log!(format!(
-                    "AppContent: Processing benchmark UUID from URL: {}",
-                    uuid_val
-                ));
-                is_loading_from_url_handle.set(true);
+            let generation = {
+                let mut counter = route_generation.borrow_mut();
+                *counter = counter.wrapping_add(1);
+                *counter
+            };
+            let generation_source = route_generation.clone();
+            let is_current = move || *generation_source.borrow() == generation;
 
-                let hardware_ctx_effect = hardware_ctx_cloned.clone();
-                let gitref_ctx_effect = gitref_ctx_cloned.clone();
-                let benchmark_ctx_effect = benchmark_ctx_cloned.clone();
-                let is_loading_setter_effect = is_loading_from_url_handle.clone();
-
-                yew::platform::spawn_local(async move {
-                    match api::fetch_benchmark_by_uuid(&uuid_val).await {
-                        Ok(target_bm_light) => {
-                            log!(format!(
-                                "AppContent: URL Benchmark Details Fetched: UUID={}, Hardware={:?}, GitRef={:?}",
-                                uuid_val,
-                                target_bm_light.hardware.identifier,
-                                target_bm_light.params.gitref
-                            ));
-
-                            if hardware_ctx_effect.state.selected_hardware.as_ref()
-                                != target_bm_light.hardware.identifier.as_ref()
-                            {
-                                hardware_ctx_effect
-                                    .dispatch
-                                    .emit(HardwareAction::SelectHardware(
-                                        target_bm_light.hardware.identifier.clone(),
-                                    ));
-                            }
-
-                            if gitref_ctx_effect.state.selected_gitref.as_ref()
-                                != target_bm_light.params.gitref.as_ref()
-                            {
-                                gitref_ctx_effect
-                                    .dispatch
-                                    .emit(GitrefAction::SetSelectedGitref(
-                                        target_bm_light.params.gitref.clone(),
-                                    ));
-                            }
-
-                            benchmark_ctx_effect
-                                .dispatch
-                                .emit(BenchmarkAction::SelectBenchmark(Box::new(Some(
-                                    target_bm_light,
-                                ))));
-
-                            is_loading_setter_effect.set(false);
+            match current_route {
+                Some(AppRoute::Benchmark { uuid }) => {
+                    is_loading_handle.set(true);
+                    let uuid = uuid.clone();
+                    let hardware_ctx = hardware_ctx_clone.clone();
+                    let gitref_ctx = gitref_ctx_clone.clone();
+                    let benchmark_ctx = benchmark_ctx_clone.clone();
+                    let ui = ui_state_clone.clone();
+                    let is_loading_handle = is_loading_handle.clone();
+                    let is_current = is_current.clone();
+                    yew::platform::spawn_local(async move {
+                        apply_benchmark(&uuid, &hardware_ctx, &gitref_ctx, &benchmark_ctx).await;
+                        if !is_current() {
+                            return;
                         }
-                        Err(e) => {
-                            log!(format!(
-                                "AppContent: Error fetching benchmark {} for URL init: {}",
-                                uuid_val, e
-                            ));
-                            is_loading_setter_effect.set(false);
+                        ui.dispatch(UiAction::SetComparePin(Box::new(None)));
+                        is_loading_handle.set(false);
+                    });
+                }
+                Some(AppRoute::Compare { left, right }) => {
+                    is_loading_handle.set(true);
+                    let left_uuid = left.clone();
+                    let right_uuid = right.clone();
+                    let hardware_ctx = hardware_ctx_clone.clone();
+                    let gitref_ctx = gitref_ctx_clone.clone();
+                    let benchmark_ctx = benchmark_ctx_clone.clone();
+                    let ui = ui_state_clone.clone();
+                    let is_loading_handle = is_loading_handle.clone();
+                    let is_current = is_current.clone();
+                    yew::platform::spawn_local(async move {
+                        apply_benchmark(&left_uuid, &hardware_ctx, &gitref_ctx, &benchmark_ctx)
+                            .await;
+                        if !is_current() {
+                            return;
                         }
+                        match api::fetch_benchmark_by_uuid(&right_uuid).await {
+                            Ok(right_benchmark) => {
+                                if is_current() {
+                                    ui.dispatch(UiAction::SetComparePin(Box::new(Some(
+                                        right_benchmark,
+                                    ))));
+                                }
+                            }
+                            Err(error) => log!(format!(
+                                "AppContent: fetch right benchmark {} failed: {}",
+                                right_uuid, error
+                            )),
+                        }
+                        if is_current() {
+                            is_loading_handle.set(false);
+                        }
+                    });
+                }
+                _ => {
+                    if *is_loading_handle {
+                        is_loading_handle.set(false);
                     }
-                });
-            } else if *is_loading_from_url_handle {
-                is_loading_from_url_handle.set(false);
+                }
             }
             || ()
         });
@@ -341,35 +218,195 @@ pub fn app_content() -> Html {
         gitref_ctx.state.selected_gitref.clone(),
     );
 
+    {
+        let selected_uuid = benchmark_ctx
+            .state
+            .selected_benchmark
+            .as_ref()
+            .map(|benchmark| benchmark.uuid.to_string());
+        let route_uuid = match route.as_ref() {
+            Some(AppRoute::Benchmark { uuid }) => Some(uuid.clone()),
+            _ => None,
+        };
+        let navigator = navigator.clone();
+        let is_loading_handle = is_loading_from_url.clone();
+        use_effect_with(
+            (selected_uuid, route_uuid),
+            move |(selected_uuid, route_uuid)| {
+                if *is_loading_handle {
+                    return;
+                }
+                if let (Some(selected), Some(current)) = (selected_uuid, route_uuid)
+                    && selected != current
+                    && let Some(nav) = navigator.as_ref()
+                {
+                    nav.push(&AppRoute::Benchmark {
+                        uuid: selected.clone(),
+                    });
+                }
+            },
+        );
+    }
+
+    let show_detail = matches!(
+        route,
+        Some(AppRoute::Benchmark { .. }) | Some(AppRoute::Compare { .. })
+    );
+
     html! {
-        <div class="container">
-            <Sidebar
-                on_gitref_select={Callback::from(move |gitref: String| {
-                    // When gitref is selected, we might also want to navigate to Home with new query params
-                    // For now, let existing logic handle it. If issues persist, revisit.
-                    gitref_ctx.dispatch.emit(GitrefAction::SetSelectedGitref(Some(gitref)));
-                })}
-                on_hardware_select={Callback::from(move |hw: String| {
-                    let navigator_clone = navigator.clone();
-                    hardware_ctx.dispatch.emit(HardwareAction::SelectHardware(Some(hw.clone())));
-                    // Navigate to Home to reset the route context from a specific benchmark URL
-                    // This allows use_load_gitrefs to correctly auto-select a gitref
-                    if let Some(nav) = navigator_clone {
-                        log!(format!("Navigating to Home due to manual hardware selection: {}", hw));
-                        nav.push(&AppRoute::Home);
-                    } else {
-                        log!("Navigator not available for hardware selection navigation");
-                    }
-                })}
-            />
-            <MainContent
-                selected_gitref={gitref_ctx.state.selected_gitref.clone().unwrap_or_default()}
-                is_dark={is_dark}
-                on_theme_toggle={Callback::from(move |_: bool| {
-                    theme_toggle.emit(());
-                })}
-                view_mode={ui_state.view_mode.clone()}
-            />
+        <div class={classes!(
+            "app-shell",
+            show_detail.then_some("detail-layout"),
+            (!show_detail).then_some("landing-layout"),
+            (show_detail && ui_state.is_sidebar_collapsed).then_some("sidebar-collapsed"),
+        )}>
+            <TopAppBar show_sidebar_toggle={show_detail} show_detail_actions={show_detail} />
+            if show_detail {
+                <Sidebar />
+                <MainContent />
+            } else {
+                <Hero />
+            }
         </div>
     }
+}
+
+#[hook]
+fn use_init_hardware(
+    hardware_ctx: HardwareContext,
+    route: Option<AppRoute>,
+    is_loading_from_url: bool,
+) {
+    use_effect_with(
+        (route, is_loading_from_url),
+        move |(route, is_loading_from_url)| {
+            let dispatch = hardware_ctx.dispatch.clone();
+            let already_selected = hardware_ctx.state.selected_hardware.clone();
+            let current_route = route.clone();
+            let loading_from_url = *is_loading_from_url;
+
+            yew::platform::spawn_local(async move {
+                match api::fetch_hardware_configurations().await {
+                    Ok(mut hardware_list) => {
+                        if !hardware_list.is_empty() {
+                            hardware_list
+                                .sort_by(|left, right| left.identifier.cmp(&right.identifier));
+                            dispatch.emit(HardwareAction::SetHardwareList(hardware_list.clone()));
+
+                            if already_selected.is_none() && !loading_from_url {
+                                if matches!(
+                                    current_route,
+                                    Some(AppRoute::Benchmark { .. })
+                                        | Some(AppRoute::Compare { .. })
+                                ) {
+                                    // URL-driven routes: apply_benchmark picks hardware from the benchmark.
+                                } else if let Some(preferred) =
+                                    preferred_hardware_identifier(&hardware_list)
+                                {
+                                    dispatch.emit(HardwareAction::SelectHardware(Some(preferred)));
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => log!(format!("Error fetching hardware: {}", error)),
+                }
+            });
+            || ()
+        },
+    );
+}
+
+fn preferred_hardware_identifier(hardware_list: &[BenchmarkHardware]) -> Option<String> {
+    const PREFERRED: &str = "spetz-amd-rkyv";
+    let preferred = hardware_list
+        .iter()
+        .filter_map(|hardware| hardware.identifier.clone())
+        .find(|identifier| identifier == PREFERRED);
+    preferred.or_else(|| {
+        hardware_list
+            .iter()
+            .find_map(|hardware| hardware.identifier.clone())
+    })
+}
+
+#[hook]
+fn use_load_gitrefs(
+    gitref_ctx: GitrefContext,
+    hardware: Option<String>,
+    route: Option<AppRoute>,
+    is_loading_from_url: bool,
+) {
+    use_effect_with(
+        (hardware, route, is_loading_from_url),
+        move |(hardware_dep, route_dep, loading_dep)| {
+            let gitref_ctx = gitref_ctx.clone();
+            let hardware_val = hardware_dep.clone();
+            let route_val = route_dep.clone();
+            let loading = *loading_dep;
+
+            if let Some(hardware_id) = hardware_val {
+                yew::platform::spawn_local(async move {
+                    match api::fetch_gitrefs_for_hardware(&hardware_id).await {
+                        Ok(gitrefs) => {
+                            gitref_ctx
+                                .dispatch
+                                .emit(GitrefAction::SetGitrefs(gitrefs.clone()));
+                            if gitrefs.is_empty() || loading {
+                                return;
+                            }
+                            if matches!(
+                                route_val,
+                                Some(AppRoute::Benchmark { .. }) | Some(AppRoute::Compare { .. })
+                            ) {
+                                return;
+                            }
+                            let current = gitref_ctx.state.selected_gitref.clone();
+                            let final_gitref = match current {
+                                Some(existing) if gitrefs.contains(&existing) => existing,
+                                _ => gitrefs[0].clone(),
+                            };
+                            if Some(final_gitref.clone()) != gitref_ctx.state.selected_gitref {
+                                gitref_ctx
+                                    .dispatch
+                                    .emit(GitrefAction::SetSelectedGitref(Some(final_gitref)));
+                            }
+                        }
+                        Err(error) => log!(format!("Error fetching gitrefs: {}", error)),
+                    }
+                });
+            }
+            || ()
+        },
+    );
+}
+
+#[hook]
+fn use_load_benchmarks(
+    benchmark_ctx: BenchmarkContext,
+    hardware: Option<String>,
+    gitref: Option<String>,
+) {
+    use_effect_with((hardware, gitref), move |(hardware_dep, gitref_dep)| {
+        let benchmark_ctx = benchmark_ctx.clone();
+        if let (Some(hardware_id), Some(gitref_id)) = (hardware_dep.clone(), gitref_dep.clone()) {
+            yew::platform::spawn_local(async move {
+                match api::fetch_benchmarks_for_hardware_and_gitref(&hardware_id, &gitref_id).await
+                {
+                    Ok(benchmarks) => {
+                        benchmark_ctx
+                            .dispatch
+                            .emit(BenchmarkAction::SetBenchmarksForGitref(
+                                benchmarks,
+                                hardware_id,
+                                gitref_id,
+                            ));
+                    }
+                    Err(error) => {
+                        log!(format!("Error fetching benchmarks: {}", error));
+                    }
+                }
+            });
+        }
+        || ()
+    });
 }
