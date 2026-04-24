@@ -15,6 +15,50 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Shard-local message bus with two wire planes.
+//!
+//! # Plane split
+//!
+//! - **Replica plane (TCP forever)**: VSR consensus traffic between
+//!   replicas. Implemented in [`replica_listener`], [`connector`], and
+//!   [`replica_io`]. Datagram or gateway-terminated transports are NOT
+//!   supported here and never will be — see
+//!   `replica_listener`'s module docs for the rationale.
+//! - **SDK-client plane**: ephemeral client connections. TCP today via
+//!   [`client_listener`]; Phase 2+ adds WebSocket / QUIC on a
+//!   demand-gated basis. At-most-once semantics come from the
+//!   `(client: u128, request: u64)` pair in `RequestHeader`; the dedup
+//!   store lives in `core/server-ng/src/dedup.rs` on each shard.
+//!
+//! # Authenticated handshake
+//!
+//! Both planes use [`auth::TokenSource`] for identity. The replica
+//! plane ships with [`auth::StaticSharedSecret`] (all replicas share
+//! one 32-byte key); the client plane will grow per-client token
+//! sources in Phase 2+. The envelope lives in
+//! `GenericHeader.reserved_command[0..57]` — 32 B BLAKE3 MAC, 8 B
+//! timestamp, 16 B nonce, 1 B kind — so the 256 B header layout is
+//! unchanged.
+//!
+//! # Invariants worth naming
+//!
+//! - [`send_to_client`](IggyMessageBus::send_to_client) and
+//!   [`send_to_replica`](IggyMessageBus::send_to_replica) return
+//!   `Ready` on first poll. Consensus code relies on this for
+//!   reentrancy reasoning; any `.await` in the body breaks it.
+//! - [`writer_task`] coalesces up to `max_batch = 256`
+//!   `Frozen<MESSAGE_ALIGN>` into one `write_vectored_all`. Don't
+//!   introduce per-message syscalls or per-message encryption.
+//! - fd-delegation ([`fd_transfer`]) is TCP-only. TLS / QUIC
+//!   connections have no dupable plaintext fd, so shard 0 terminates
+//!   and forwards `Frozen<MESSAGE_ALIGN>` over the existing
+//!   inter-shard flume.
+//! - 0-RTT stays disabled by default on any future QUIC path. Per-
+//!   command opt-in requires a checked-in idempotence audit.
+//!
+//! The full invariant list and the transport-plan design notes live
+//! under `Documents/silverhand/iggy/message_bus/transport-plan/`.
+
 pub mod auth;
 pub mod cache;
 pub mod client_listener;
