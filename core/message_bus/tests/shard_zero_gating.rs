@@ -21,7 +21,7 @@
 
 mod common;
 
-use common::{install_clients_locally, install_replicas_locally, loopback};
+use common::{install_clients_locally, install_replicas_locally, loopback, test_token_source};
 use message_bus::IggyMessageBus;
 use message_bus::client_listener::RequestHandler;
 use message_bus::connector::DEFAULT_RECONNECT_PERIOD;
@@ -51,6 +51,7 @@ async fn shard_zero_binds_listener_and_starts_connector() {
             2,
             peer_accept,
             message_bus::framing::MAX_MESSAGE_SIZE,
+            test_token_source(),
         )
         .await;
     });
@@ -76,6 +77,7 @@ async fn shard_zero_binds_listener_and_starts_connector() {
         accepted_replica,
         accepted_client,
         DEFAULT_RECONNECT_PERIOD,
+        test_token_source(),
     )
     .await
     .expect("start_on_shard_zero must succeed on shard 0");
@@ -127,6 +129,7 @@ async fn non_zero_shard_skips_io() {
         accepted_replica,
         accepted_client,
         DEFAULT_RECONNECT_PERIOD,
+        test_token_source(),
     )
     .await
     .expect("start_on_shard_zero must succeed on non-zero shard (no-op)");

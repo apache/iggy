@@ -20,7 +20,7 @@
 
 mod common;
 
-use common::{header_only, install_replicas_locally, loopback};
+use common::{header_only, install_replicas_locally, loopback, test_token_source};
 use iggy_binary_protocol::Command2;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
 use message_bus::replica_listener::{MessageHandler, bind, run};
@@ -57,6 +57,7 @@ async fn writer_batches_pipelined_sends_in_order() {
             2,
             accept_1,
             message_bus::framing::MAX_MESSAGE_SIZE,
+            test_token_source(),
         )
         .await;
     });
@@ -72,6 +73,7 @@ async fn writer_batches_pipelined_sends_in_order() {
         vec![(1, addr1)],
         dial_0,
         DEFAULT_RECONNECT_PERIOD,
+        test_token_source(),
     )
     .await;
 

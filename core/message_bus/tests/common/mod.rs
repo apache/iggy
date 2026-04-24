@@ -27,12 +27,20 @@
 #![allow(dead_code)] // each test binary uses a subset
 
 use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, Message};
+use message_bus::auth::{StaticSharedSecret, TokenSource};
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica_listener::MessageHandler;
 use message_bus::{AcceptedClientFn, AcceptedReplicaFn, IggyMessageBus, installer};
 use std::cell::Cell;
 use std::net::SocketAddr;
 use std::rc::Rc;
+
+/// Default zero-byte shared secret for integration tests. All replicas
+/// authenticate against the same dummy source.
+#[must_use]
+pub fn test_token_source() -> Rc<dyn TokenSource> {
+    Rc::new(StaticSharedSecret::zero())
+}
 
 /// Loopback address with OS-chosen port.
 #[must_use]

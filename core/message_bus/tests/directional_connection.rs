@@ -22,7 +22,7 @@
 
 mod common;
 
-use common::{install_replicas_locally, loopback};
+use common::{install_replicas_locally, loopback, test_token_source};
 use message_bus::IggyMessageBus;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
 use message_bus::replica_listener::{MessageHandler, bind, run};
@@ -53,6 +53,7 @@ async fn lower_id_dials_higher_id_accepts() {
             2,
             accept_0,
             message_bus::framing::MAX_MESSAGE_SIZE,
+            test_token_source(),
         )
         .await;
     });
@@ -69,6 +70,7 @@ async fn lower_id_dials_higher_id_accepts() {
             2,
             accept_1,
             message_bus::framing::MAX_MESSAGE_SIZE,
+            test_token_source(),
         )
         .await;
     });
@@ -85,10 +87,20 @@ async fn lower_id_dials_higher_id_accepts() {
         peers.clone(),
         dial_0,
         DEFAULT_RECONNECT_PERIOD,
+        test_token_source(),
     )
     .await;
     let dial_1 = install_replicas_locally(bus1.clone(), on_message.clone());
-    start_connector(&bus1, CLUSTER, 1, peers, dial_1, DEFAULT_RECONNECT_PERIOD).await;
+    start_connector(
+        &bus1,
+        CLUSTER,
+        1,
+        peers,
+        dial_1,
+        DEFAULT_RECONNECT_PERIOD,
+        test_token_source(),
+    )
+    .await;
 
     // Wait for the directional connection to settle.
     let deadline = std::time::Instant::now() + Duration::from_secs(2);

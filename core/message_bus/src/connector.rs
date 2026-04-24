@@ -25,12 +25,15 @@
 //! (see `shard::coordinator::ShardZeroCoordinator`).
 
 use crate::IggyMessageBus;
+use crate::auth::{self, TokenSource};
 use crate::framing;
 use crate::lifecycle::ShutdownToken;
 use crate::socket_opts::apply_keepalive_for_connection;
 use crate::{AcceptedReplicaFn, GenericHeader, Message};
 use compio::net::TcpStream;
 use iggy_binary_protocol::{Command2, HEADER_SIZE};
+use iggy_common::IggyTimestamp;
+use rand::Rng;
 use std::mem::size_of;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -57,12 +60,14 @@ pub async fn start(
     peers: Vec<(u8, SocketAddr)>,
     on_dialed: AcceptedReplicaFn,
     reconnect_period: Duration,
+    token_source: Rc<dyn TokenSource>,
 ) {
-    connect_all(bus, cluster_id, self_id, &peers, &on_dialed).await;
+    connect_all(bus, cluster_id, self_id, &peers, &on_dialed, &token_source).await;
 
     let handler = on_dialed.clone();
     let token = bus.token();
     let bus_for_task = Rc::clone(bus);
+    let token_source_for_task = Rc::clone(&token_source);
     let handle = compio::runtime::spawn(async move {
         periodic_reconnect(
             &bus_for_task,
@@ -72,6 +77,7 @@ pub async fn start(
             handler,
             reconnect_period,
             token,
+            token_source_for_task,
         )
         .await;
     });
@@ -85,6 +91,7 @@ async fn connect_all(
     self_id: u8,
     peers: &[(u8, SocketAddr)],
     on_dialed: &AcceptedReplicaFn,
+    token_source: &Rc<dyn TokenSource>,
 ) {
     for &(peer_id, addr) in peers {
         if peer_id <= self_id {
@@ -105,11 +112,21 @@ async fn connect_all(
             );
             continue;
         }
-        connect_one(bus, cluster_id, self_id, peer_id, addr, on_dialed).await;
+        connect_one(
+            bus,
+            cluster_id,
+            self_id,
+            peer_id,
+            addr,
+            on_dialed,
+            token_source,
+        )
+        .await;
     }
 }
 
 #[allow(clippy::future_not_send)]
+#[allow(clippy::too_many_arguments)]
 async fn periodic_reconnect(
     bus: &Rc<IggyMessageBus>,
     cluster_id: u128,
@@ -118,9 +135,10 @@ async fn periodic_reconnect(
     on_dialed: AcceptedReplicaFn,
     period: Duration,
     token: ShutdownToken,
+    token_source: Rc<dyn TokenSource>,
 ) {
     while token.sleep_or_shutdown(period).await {
-        connect_all(bus, cluster_id, self_id, &peers, &on_dialed).await;
+        connect_all(bus, cluster_id, self_id, &peers, &on_dialed, &token_source).await;
     }
     debug!("replica reconnect periodic task exiting");
 }
@@ -129,6 +147,7 @@ async fn periodic_reconnect(
 /// `on_dialed` on success. Dial / handshake failures are logged and
 /// swallowed; VSR tolerates missing peers and the periodic sweep retries.
 #[allow(clippy::future_not_send)]
+#[allow(clippy::too_many_arguments)]
 async fn connect_one(
     bus: &Rc<IggyMessageBus>,
     cluster_id: u128,
@@ -136,6 +155,7 @@ async fn connect_one(
     peer_id: u8,
     addr: SocketAddr,
     on_dialed: &AcceptedReplicaFn,
+    token_source: &Rc<dyn TokenSource>,
 ) {
     let mut stream = match TcpStream::connect(addr).await {
         Ok(s) => s,
@@ -160,7 +180,7 @@ async fn connect_one(
         );
     }
 
-    let ping = build_ping_message(cluster_id, self_id);
+    let ping = build_ping_message(cluster_id, self_id, token_source.as_ref());
     if let Err(e) = framing::write_message(&mut stream, ping).await {
         warn!(replica = peer_id, %addr, "handshake write failed: {e}");
         return;
@@ -170,8 +190,21 @@ async fn connect_one(
     on_dialed(stream, peer_id);
 }
 
-/// Build a Ping handshake message identifying our replica id.
-fn build_ping_message(cluster_id: u128, replica_id: u8) -> Message<GenericHeader> {
+/// Build a Ping handshake message identifying our replica id and carrying
+/// a fresh auth envelope stamped by `token_source`.
+fn build_ping_message(
+    cluster_id: u128,
+    replica_id: u8,
+    token_source: &dyn TokenSource,
+) -> Message<GenericHeader> {
+    #[allow(clippy::cast_possible_truncation)]
+    let timestamp_ns = IggyTimestamp::now().as_nanos() as u64;
+    let nonce = {
+        let mut buf = [0u8; 16];
+        rand::rng().fill_bytes(&mut buf);
+        u128::from_le_bytes(buf)
+    };
+
     #[allow(clippy::cast_possible_truncation)]
     Message::<GenericHeader>::new(size_of::<GenericHeader>()).transmute_header(
         |_, h: &mut GenericHeader| {
@@ -179,6 +212,14 @@ fn build_ping_message(cluster_id: u128, replica_id: u8) -> Message<GenericHeader
             h.cluster = cluster_id;
             h.replica = replica_id;
             h.size = HEADER_SIZE as u32;
+            let challenge = auth::AuthChallenge {
+                cluster: cluster_id,
+                peer_id: u128::from(replica_id),
+                timestamp_ns,
+                release: h.release,
+                nonce,
+            };
+            auth::encode_envelope(&mut h.reserved_command, token_source, &challenge);
         },
     )
 }

@@ -25,7 +25,7 @@
 
 mod common;
 
-use common::{header_only, install_replicas_locally, loopback};
+use common::{header_only, install_replicas_locally, loopback, test_token_source};
 use compio::net::TcpListener;
 use iggy_binary_protocol::Command2;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
@@ -58,6 +58,7 @@ async fn slow_peer_does_not_block_other_peers() {
             3,
             accept_a,
             message_bus::framing::MAX_MESSAGE_SIZE,
+            test_token_source(),
         )
         .await;
     });
@@ -91,6 +92,7 @@ async fn slow_peer_does_not_block_other_peers() {
         vec![(1, addr_a), (2, addr_b)],
         dial_delegate,
         DEFAULT_RECONNECT_PERIOD,
+        test_token_source(),
     )
     .await;
 
