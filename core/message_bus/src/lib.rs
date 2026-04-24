@@ -56,6 +56,17 @@
 //! - 0-RTT stays disabled by default on any future QUIC path. Per-
 //!   command opt-in requires a checked-in idempotence audit.
 //!
+//! # Transport abstraction
+//!
+//! [`transports`] defines the trait surface every wire plane sits
+//! behind: [`transports::TransportListener`],
+//! [`transports::TransportConn`], [`transports::TransportReader`],
+//! [`transports::TransportWriter`]. TCP is the only production impl
+//! (see [`transports::tcp`]); [`installer::install_replica_conn`] /
+//! [`installer::install_client_conn`] and
+//! [`writer_task::run_transport`] are generic over it so WS / QUIC
+//! plug in behind the same registry, fencing, and batching logic.
+//!
 //! The full invariant list and the transport-plan design notes live
 //! under `Documents/silverhand/iggy/message_bus/transport-plan/`.
 
