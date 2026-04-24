@@ -7017,6 +7017,7 @@ dependencies = [
  "libc",
  "rand 0.10.1",
  "socket2 0.6.3",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]

@@ -156,9 +156,11 @@ pub trait TokenSource {
     fn verify(&self, challenge: &AuthChallenge, tag: &AuthTag) -> Result<(), AuthError>;
 }
 
-/// `TokenSource` that holds a single 32-byte cluster-wide secret. All
-/// replicas share one secret on the replica plane; the integration-test
-/// harness instantiates this with a fixed zero-byte secret.
+/// `TokenSource` that holds a single 32-byte cluster-wide secret.
+///
+/// All replicas share one secret on the replica plane; the integration-test
+/// harness instantiates this with a fixed zero-byte secret, and production
+/// bootstraps resolve one via [`crate::auth_config`].
 pub struct StaticSharedSecret {
     secret: [u8; SECRET_SIZE],
 }

@@ -71,6 +71,7 @@
 //! under `Documents/silverhand/iggy/message_bus/transport-plan/`.
 
 pub mod auth;
+pub mod auth_config;
 pub mod cache;
 pub mod client_listener;
 pub mod config;
