@@ -19,7 +19,7 @@
 //!
 //! Behavior-preserving wrappers around `compio::net::TcpListener`,
 //! `compio::net::TcpStream`, and the split halves. The hot path on
-//! [`TcpTransportWriter::send_batch`] is identical to
+//! `TcpTransportWriter::send_batch` is identical to
 //! [`crate::writer_task::run`]'s inner `write_vectored_all` call: one
 //! syscall per batch, zero intermediate copies of `Frozen`.
 //!

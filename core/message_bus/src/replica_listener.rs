@@ -117,7 +117,7 @@ pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyErr
 /// `nonces` is the bus-resident per-peer nonce dedup store. The listener
 /// reaches into it via `borrow_mut().entry(peer).or_default()` for each
 /// handshake; the borrow is held only across the synchronous
-/// [`handshake_verify`], never across an `await`, so the `RefCell` is
+/// `handshake_verify`, never across an `await`, so the `RefCell` is
 /// safe under the single-threaded compio runtime.
 #[allow(clippy::future_not_send)]
 #[allow(clippy::too_many_arguments)]

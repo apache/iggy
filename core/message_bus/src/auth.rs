@@ -101,8 +101,8 @@ impl AuthKind {
 /// All fields come from the header (`GenericHeader.cluster`,
 /// `GenericHeader.replica`, `GenericHeader.release`) plus the envelope
 /// timestamp and nonce. `label` is the plane-tagged domain-separation
-/// prefix; pick [`LABEL_REPLICA`] for the consensus plane and
-/// [`LABEL_CLIENT`] for the SDK-client plane (Phase 2).
+/// prefix; pick `LABEL_REPLICA` for the consensus plane and
+/// `LABEL_CLIENT` for the SDK-client plane (Phase 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthChallenge {
     pub cluster: u128,
