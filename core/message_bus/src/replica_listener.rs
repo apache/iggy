@@ -17,6 +17,20 @@
 
 //! Inbound TCP listener for replica-to-replica consensus traffic.
 //!
+//! # Replica plane = TCP forever (load-bearing invariant)
+//!
+//! This module is TCP-only by design, not by omission. Do NOT add WS,
+//! QUIC, or HTTP paths here. The VSR chain-hash safety proof
+//! (`last_prepare_checksum` in `core/consensus/src/plane_helpers.rs`),
+//! the fd-delegation path (`F_DUPFD_CLOEXEC` needs a dupable plaintext
+//! fd), the `writev` batching in `writer_task.rs`, and the single-digit
+//! RTT assumptions used by the view-change timer all rest on a FIFO
+//! byte stream between a bounded set of replicas on a trusted LAN. A
+//! datagram-oriented or gateway-terminated transport violates one or
+//! more of those assumptions. See
+//! `Documents/silverhand/iggy/message_bus/transport-plan/INVARIANTS.md`
+//! (I1) for the debate context.
+//!
 //! Runs only on shard 0. On every successful `Ping` handshake the listener
 //! hands the accepted `TcpStream` to an `on_accepted` callback provided by
 //! the shard bootstrap, which dup-and-ships the fd to the owning shard via
