@@ -41,6 +41,7 @@ async fn shard_zero_binds_listener_and_starts_connector() {
     let peer_handler: MessageHandler = Rc::new(|_, _| {});
     let (peer_listener, peer_addr) = bind(loopback()).await.expect("bind peer listener");
     let peer_token = peer_bus.token();
+    let peer_nonces = peer_bus.replica_nonces();
     let peer_accept = install_replicas_locally(peer_bus.clone(), peer_handler.clone());
     let peer_listen_handle = compio::runtime::spawn(async move {
         run(
@@ -52,6 +53,7 @@ async fn shard_zero_binds_listener_and_starts_connector() {
             peer_accept,
             message_bus::framing::MAX_MESSAGE_SIZE,
             test_token_source(),
+            peer_nonces,
         )
         .await;
     });

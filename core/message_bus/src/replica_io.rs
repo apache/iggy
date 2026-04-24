@@ -85,6 +85,7 @@ pub async fn start_on_shard_zero(
     let on_accepted_replica_for_listener = on_accepted_replica.clone();
     let listener_max_message_size = bus.config().max_message_size;
     let token_source_for_listener = Rc::clone(&token_source);
+    let nonces_for_listener = bus.replica_nonces();
     let replica_handle = compio::runtime::spawn(async move {
         run_replica_listener(
             replica_listener,
@@ -95,6 +96,7 @@ pub async fn start_on_shard_zero(
             on_accepted_replica_for_listener,
             listener_max_message_size,
             token_source_for_listener,
+            nonces_for_listener,
         )
         .await;
     });

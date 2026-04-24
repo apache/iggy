@@ -59,6 +59,7 @@ async fn periodic_retry_picks_up_late_listener() {
     let bus1 = Rc::new(IggyMessageBus::new(0));
     let (l1, _) = bind(addr).await.unwrap();
     let token_for_l1 = bus1.token();
+    let nonces_for_l1 = bus1.replica_nonces();
     let accept_delegate = install_replicas_locally(bus1.clone(), on_message.clone());
     let l1_handle = compio::runtime::spawn(async move {
         run(
@@ -70,6 +71,7 @@ async fn periodic_retry_picks_up_late_listener() {
             accept_delegate,
             message_bus::framing::MAX_MESSAGE_SIZE,
             test_token_source(),
+            nonces_for_l1,
         )
         .await;
     });

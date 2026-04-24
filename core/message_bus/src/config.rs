@@ -35,6 +35,17 @@
 
 use std::time::Duration;
 
+/// Hard upper bound on `max_batch`, in iovecs.
+///
+/// Linux's `IOV_MAX` is 1024 (`/usr/include/bits/uio_lim.h`). Future WS
+/// transports emit one iovec for the header and one for the body, so a
+/// batch of N messages costs `2 * N` iovecs; cap `max_batch` at
+/// `IOV_MAX / 2 = 512` to keep that worst case below the syscall limit.
+/// Bus construction asserts this in [`crate::IggyMessageBus::with_config`];
+/// breaching it at boot panics rather than silently delivering writev
+/// `EMSGSIZE` errors on every batch.
+pub const IOV_MAX_LIMIT: usize = 512;
+
 /// Aggregated runtime configuration for an `IggyMessageBus` instance.
 ///
 /// All fields map onto constants that previously lived inline across

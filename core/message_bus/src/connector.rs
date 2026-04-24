@@ -25,7 +25,7 @@
 //! (see `shard::coordinator::ShardZeroCoordinator`).
 
 use crate::IggyMessageBus;
-use crate::auth::{self, TokenSource};
+use crate::auth::{self, LABEL_REPLICA, TokenSource};
 use crate::framing;
 use crate::lifecycle::ShutdownToken;
 use crate::socket_opts::apply_keepalive_for_connection;
@@ -102,9 +102,11 @@ async fn connect_all(
         // connection lives on shard 0; `owning_shard` covers multi-shard
         // deployments where the fd was delegated to a peer shard but the
         // mapping broadcast reached shard 0. Either hit means a previous
-        // sweep (or the inbound listener) already installed this peer and
-        // we must not dial again - redialing would tear down the live
-        // socket via the `AlreadyRegistered` race and flap the mapping.
+        // sweep (or the inbound listener) already installed this peer.
+        // Redialing wastes a TCP round-trip; the live entry stays intact
+        // (the loser of the registry insert race in `install_replica_conn`
+        // gets `RejectedRegistration` back and tears DOWN ITS OWN orphan
+        // tasks via `drain_rejected_registration`, never the winner's).
         if bus.replicas().contains(peer_id) || bus.owning_shard(peer_id).is_some() {
             debug!(
                 replica = peer_id,
@@ -197,8 +199,13 @@ fn build_ping_message(
     replica_id: u8,
     token_source: &dyn TokenSource,
 ) -> Message<GenericHeader> {
+    let now_ns = IggyTimestamp::now().as_nanos();
+    debug_assert!(
+        now_ns <= u128::from(u64::MAX),
+        "auth_timestamp overflows u64 ns (year ~2554) - envelope TIMESTAMP_RANGE is 8 bytes by design"
+    );
     #[allow(clippy::cast_possible_truncation)]
-    let timestamp_ns = IggyTimestamp::now().as_nanos() as u64;
+    let timestamp_ns = now_ns as u64;
     let nonce = {
         let mut buf = [0u8; 16];
         rand::rng().fill_bytes(&mut buf);
@@ -218,6 +225,7 @@ fn build_ping_message(
                 timestamp_ns,
                 release: h.release,
                 nonce,
+                label: LABEL_REPLICA,
             };
             auth::encode_envelope(&mut h.reserved_command, token_source, &challenge);
         },

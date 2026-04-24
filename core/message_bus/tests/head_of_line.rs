@@ -48,6 +48,7 @@ async fn slow_peer_does_not_block_other_peers() {
     });
     let (la, addr_a) = bind(loopback()).await.unwrap();
     let token_a = bus_a.token();
+    let nonces_a = bus_a.replica_nonces();
     let accept_a = install_replicas_locally(bus_a.clone(), on_a.clone());
     let la_handle = compio::runtime::spawn(async move {
         run(
@@ -59,6 +60,7 @@ async fn slow_peer_does_not_block_other_peers() {
             accept_a,
             message_bus::framing::MAX_MESSAGE_SIZE,
             test_token_source(),
+            nonces_a,
         )
         .await;
     });

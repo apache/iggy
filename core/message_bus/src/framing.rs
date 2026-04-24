@@ -28,6 +28,7 @@ use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
 use iggy_binary_protocol::consensus::iobuf::Owned;
 use iggy_binary_protocol::{GenericHeader, HEADER_SIZE, Message};
 use iggy_common::IggyError;
+use tracing::error;
 
 /// Default hard ceiling on a single wire frame. Frames above this are
 /// almost certainly a protocol violation or a malicious peer; we drop
@@ -126,7 +127,17 @@ pub async fn read_message<S: AsyncReadExt + Unpin>(
     // (e.g. capacity overflow, unsupported buffer kind) and silently
     // ignoring it would leave `owned` at header-only capacity, causing the
     // subsequent `read_exact` to read into an ungrown buffer.
-    IoBufMut::reserve_exact(&mut owned, body_size).map_err(|_| IggyError::TcpError)?;
+    //
+    // No `IggyError::OutOfMemory` variant exists; `TcpError` is the closest
+    // bucket. The `error!` log gives operators the actionable diagnostic
+    // (size, OOM-vs-overflow signal) the error code itself loses.
+    IoBufMut::reserve_exact(&mut owned, body_size).map_err(|_| {
+        error!(
+            body_size,
+            "framing reserve_exact failed (OOM or capacity overflow); dropping connection"
+        );
+        IggyError::TcpError
+    })?;
     let BufResult(result, slice) = stream
         .read_exact(owned.slice(HEADER_SIZE..total_size))
         .await;

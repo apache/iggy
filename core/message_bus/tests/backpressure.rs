@@ -52,6 +52,7 @@ async fn try_send_returns_backpressure_when_queue_full() {
     });
     let (l1, addr1) = bind(loopback()).await.unwrap();
     let token_for_l1 = bus1.token();
+    let nonces_for_l1 = bus1.replica_nonces();
     let accept_1 = install_replicas_locally(bus1.clone(), on_message1);
     let l1_handle = compio::runtime::spawn(async move {
         run(
@@ -63,6 +64,7 @@ async fn try_send_returns_backpressure_when_queue_full() {
             accept_1,
             message_bus::framing::MAX_MESSAGE_SIZE,
             test_token_source(),
+            nonces_for_l1,
         )
         .await;
     });

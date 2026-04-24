@@ -43,8 +43,8 @@ use tracing::{debug, error, trace};
 /// Larger batches reduce syscalls per N messages at the cost of memory
 /// per batch and worst-case latency for the head-of-batch message.
 ///
-/// TCP entry point. Wraps the owned write half in a
-/// [`TcpTransportWriter`] and delegates the drain loop to
+/// TCP entry point. Wraps the owned write half in the crate-internal
+/// `TcpTransportWriter` and delegates the drain loop to
 /// [`run_transport`]; every syscall still flows through
 /// [`TransportWriter::send_batch`] so future transports drop in behind
 /// the same drain logic.

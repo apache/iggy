@@ -50,6 +50,7 @@ async fn periodic_reconnect_skips_already_connected_peer() {
         accept_inner(stream, peer_id);
     });
     let token_for_l1 = bus1.token();
+    let nonces_for_l1 = bus1.replica_nonces();
     let l1_handle = compio::runtime::spawn(async move {
         run(
             l1,
@@ -60,6 +61,7 @@ async fn periodic_reconnect_skips_already_connected_peer() {
             accept_delegate,
             message_bus::framing::MAX_MESSAGE_SIZE,
             test_token_source(),
+            nonces_for_l1,
         )
         .await;
     });
