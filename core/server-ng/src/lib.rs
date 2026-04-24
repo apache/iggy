@@ -17,5 +17,6 @@
  * under the License.
  */
 
+pub mod dedup;
 pub mod login_register;
 pub mod session_manager;
