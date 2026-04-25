@@ -134,72 +134,87 @@ async fn validate_cluster_config_env_override() {
     // Test data for cluster configuration
     let expected_cluster_enabled = true;
     let expected_cluster_name = "test-cluster";
-    let expected_current_node_name = "test-node-1";
 
-    // Test data for other nodes in cluster
-    let expected_other_node_0_name = "test-node-2";
-    let expected_other_node_0_ip = "192.168.1.101";
-    let expected_other_node_0_tcp = 9091_u16;
-    let expected_other_node_0_quic = 9081_u16;
-    let expected_other_node_0_http = 4001_u16;
-    let expected_other_node_0_websocket = 9093_u16;
+    let expected_node_0_name = "test-node-1";
+    let expected_node_0_ip = "192.168.1.100";
+    let expected_node_0_replica_id = 0_u8;
+    let expected_node_0_tcp = 9090_u16;
 
-    let expected_other_node_1_name = "test-node-3";
-    let expected_other_node_1_ip = "192.168.1.102";
-    let expected_other_node_1_tcp = 9092_u16;
-    let expected_other_node_1_quic = 9082_u16;
-    let expected_other_node_1_http = 4002_u16;
-    let expected_other_node_1_websocket = 9094_u16;
+    let expected_node_1_name = "test-node-2";
+    let expected_node_1_ip = "192.168.1.101";
+    let expected_node_1_replica_id = 1_u8;
+    let expected_node_1_tcp = 9091_u16;
+    let expected_node_1_quic = 9081_u16;
+    let expected_node_1_http = 4001_u16;
+    let expected_node_1_websocket = 9093_u16;
+
+    let expected_node_2_name = "test-node-3";
+    let expected_node_2_ip = "192.168.1.102";
+    let expected_node_2_replica_id = 2_u8;
+    let expected_node_2_tcp = 9092_u16;
+    let expected_node_2_quic = 9082_u16;
+    let expected_node_2_http = 4002_u16;
+    let expected_node_2_websocket = 9094_u16;
 
     unsafe {
-        // Set cluster configuration environment variables
         env::set_var("IGGY_CLUSTER_ENABLED", expected_cluster_enabled.to_string());
         env::set_var("IGGY_CLUSTER_NAME", expected_cluster_name);
-        env::set_var("IGGY_CLUSTER_NODE_CURRENT_NAME", expected_current_node_name);
 
-        // Set other nodes array environment variables
+        env::set_var("IGGY_CLUSTER_NODES_0_NAME", expected_node_0_name);
+        env::set_var("IGGY_CLUSTER_NODES_0_IP", expected_node_0_ip);
         env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_0_NAME",
-            expected_other_node_0_name,
-        );
-        env::set_var("IGGY_CLUSTER_NODE_OTHERS_0_IP", expected_other_node_0_ip);
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_TCP",
-            expected_other_node_0_tcp.to_string(),
+            "IGGY_CLUSTER_NODES_0_REPLICA_ID",
+            expected_node_0_replica_id.to_string(),
         );
         env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_QUIC",
-            expected_other_node_0_quic.to_string(),
-        );
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_HTTP",
-            expected_other_node_0_http.to_string(),
-        );
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_WEBSOCKET",
-            expected_other_node_0_websocket.to_string(),
+            "IGGY_CLUSTER_NODES_0_PORTS_TCP",
+            expected_node_0_tcp.to_string(),
         );
 
+        env::set_var("IGGY_CLUSTER_NODES_1_NAME", expected_node_1_name);
+        env::set_var("IGGY_CLUSTER_NODES_1_IP", expected_node_1_ip);
         env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_1_NAME",
-            expected_other_node_1_name,
-        );
-        env::set_var("IGGY_CLUSTER_NODE_OTHERS_1_IP", expected_other_node_1_ip);
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_TCP",
-            expected_other_node_1_tcp.to_string(),
+            "IGGY_CLUSTER_NODES_1_REPLICA_ID",
+            expected_node_1_replica_id.to_string(),
         );
         env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_QUIC",
-            expected_other_node_1_quic.to_string(),
+            "IGGY_CLUSTER_NODES_1_PORTS_TCP",
+            expected_node_1_tcp.to_string(),
         );
         env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_HTTP",
-            expected_other_node_1_http.to_string(),
+            "IGGY_CLUSTER_NODES_1_PORTS_QUIC",
+            expected_node_1_quic.to_string(),
         );
         env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_WEBSOCKET",
-            expected_other_node_1_websocket.to_string(),
+            "IGGY_CLUSTER_NODES_1_PORTS_HTTP",
+            expected_node_1_http.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODES_1_PORTS_WEBSOCKET",
+            expected_node_1_websocket.to_string(),
+        );
+
+        env::set_var("IGGY_CLUSTER_NODES_2_NAME", expected_node_2_name);
+        env::set_var("IGGY_CLUSTER_NODES_2_IP", expected_node_2_ip);
+        env::set_var(
+            "IGGY_CLUSTER_NODES_2_REPLICA_ID",
+            expected_node_2_replica_id.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODES_2_PORTS_TCP",
+            expected_node_2_tcp.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODES_2_PORTS_QUIC",
+            expected_node_2_quic.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODES_2_PORTS_HTTP",
+            expected_node_2_http.to_string(),
+        );
+        env::set_var(
+            "IGGY_CLUSTER_NODES_2_PORTS_WEBSOCKET",
+            expected_node_2_websocket.to_string(),
         );
     }
 
@@ -211,186 +226,139 @@ async fn validate_cluster_config_env_override() {
         .await
         .expect("Failed to load config.toml config with cluster env overrides");
 
-    // Verify cluster configuration
     assert_eq!(config.cluster.enabled, expected_cluster_enabled);
     assert_eq!(config.cluster.name, expected_cluster_name);
-    assert_eq!(config.cluster.node.current.name, expected_current_node_name);
-
-    // Verify other nodes array - should have 2 nodes from environment variables
     assert_eq!(
-        config.cluster.node.others.len(),
-        2,
-        "Should have 2 other nodes from environment variables"
+        config.cluster.nodes.len(),
+        3,
+        "Should have 3 cluster nodes from environment variables"
     );
 
-    // Verify first other node
+    assert_eq!(config.cluster.nodes[0].name, expected_node_0_name);
+    assert_eq!(config.cluster.nodes[0].ip, expected_node_0_ip);
     assert_eq!(
-        config.cluster.node.others[0].name,
-        expected_other_node_0_name
+        config.cluster.nodes[0].replica_id,
+        expected_node_0_replica_id
     );
-    assert_eq!(config.cluster.node.others[0].ip, expected_other_node_0_ip);
+    assert_eq!(config.cluster.nodes[0].ports.tcp, Some(expected_node_0_tcp));
+
+    assert_eq!(config.cluster.nodes[1].name, expected_node_1_name);
+    assert_eq!(config.cluster.nodes[1].ip, expected_node_1_ip);
     assert_eq!(
-        config.cluster.node.others[0].ports.tcp,
-        Some(expected_other_node_0_tcp)
+        config.cluster.nodes[1].replica_id,
+        expected_node_1_replica_id
+    );
+    assert_eq!(config.cluster.nodes[1].ports.tcp, Some(expected_node_1_tcp));
+    assert_eq!(
+        config.cluster.nodes[1].ports.quic,
+        Some(expected_node_1_quic)
     );
     assert_eq!(
-        config.cluster.node.others[0].ports.quic,
-        Some(expected_other_node_0_quic)
+        config.cluster.nodes[1].ports.http,
+        Some(expected_node_1_http)
     );
     assert_eq!(
-        config.cluster.node.others[0].ports.http,
-        Some(expected_other_node_0_http)
-    );
-    assert_eq!(
-        config.cluster.node.others[0].ports.websocket,
-        Some(expected_other_node_0_websocket)
+        config.cluster.nodes[1].ports.websocket,
+        Some(expected_node_1_websocket)
     );
 
-    // Verify second other node
+    assert_eq!(config.cluster.nodes[2].name, expected_node_2_name);
+    assert_eq!(config.cluster.nodes[2].ip, expected_node_2_ip);
     assert_eq!(
-        config.cluster.node.others[1].name,
-        expected_other_node_1_name
+        config.cluster.nodes[2].replica_id,
+        expected_node_2_replica_id
     );
-    assert_eq!(config.cluster.node.others[1].ip, expected_other_node_1_ip);
+    assert_eq!(config.cluster.nodes[2].ports.tcp, Some(expected_node_2_tcp));
     assert_eq!(
-        config.cluster.node.others[1].ports.tcp,
-        Some(expected_other_node_1_tcp)
-    );
-    assert_eq!(
-        config.cluster.node.others[1].ports.quic,
-        Some(expected_other_node_1_quic)
+        config.cluster.nodes[2].ports.quic,
+        Some(expected_node_2_quic)
     );
     assert_eq!(
-        config.cluster.node.others[1].ports.http,
-        Some(expected_other_node_1_http)
+        config.cluster.nodes[2].ports.http,
+        Some(expected_node_2_http)
     );
     assert_eq!(
-        config.cluster.node.others[1].ports.websocket,
-        Some(expected_other_node_1_websocket)
+        config.cluster.nodes[2].ports.websocket,
+        Some(expected_node_2_websocket)
     );
 
     unsafe {
-        // Clean up environment variables
         env::remove_var("IGGY_CLUSTER_ENABLED");
         env::remove_var("IGGY_CLUSTER_NAME");
-        env::remove_var("IGGY_CLUSTER_NODE_CURRENT_NAME");
-
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_NAME");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_IP");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_TCP");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_QUIC");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_HTTP");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_WEBSOCKET");
-
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_NAME");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_IP");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_TCP");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_QUIC");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_HTTP");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_WEBSOCKET");
+        for idx in 0..=2 {
+            env::remove_var(format!("IGGY_CLUSTER_NODES_{idx}_NAME"));
+            env::remove_var(format!("IGGY_CLUSTER_NODES_{idx}_IP"));
+            env::remove_var(format!("IGGY_CLUSTER_NODES_{idx}_REPLICA_ID"));
+            env::remove_var(format!("IGGY_CLUSTER_NODES_{idx}_PORTS_TCP"));
+            env::remove_var(format!("IGGY_CLUSTER_NODES_{idx}_PORTS_QUIC"));
+            env::remove_var(format!("IGGY_CLUSTER_NODES_{idx}_PORTS_HTTP"));
+            env::remove_var(format!("IGGY_CLUSTER_NODES_{idx}_PORTS_WEBSOCKET"));
+        }
     }
 }
 
 #[serial]
 #[tokio::test]
 async fn validate_four_node_cluster_config_env_override() {
-    // Test data for cluster configuration
     let expected_cluster_enabled = true;
     let expected_cluster_name = "test-4node-cluster";
-    let expected_current_node_name = "node-1";
-    let expected_current_node_ip = "10.0.0.1";
 
-    // Test data for other nodes in cluster (3 other nodes for a 4-node cluster)
-    let expected_other_node_0_name = "node-2";
-    let expected_other_node_0_ip = "10.0.0.2";
-    let expected_other_node_0_tcp = 8090_u16;
-    let expected_other_node_0_quic = 8080_u16;
-    let expected_other_node_0_http = 3000_u16;
-    let expected_other_node_0_websocket = 8092_u16;
-
-    let expected_other_node_1_name = "node-3";
-    let expected_other_node_1_ip = "10.0.0.3";
-    let expected_other_node_1_tcp = 8091_u16;
-    let expected_other_node_1_quic = 8081_u16;
-    let expected_other_node_1_http = 3001_u16;
-    let expected_other_node_1_websocket = 8093_u16;
-
-    let expected_other_node_2_name = "node-4";
-    let expected_other_node_2_ip = "10.0.0.4";
-    let expected_other_node_2_tcp = 8092_u16;
-    // QUIC and WebSocket ports will be None in config (defaults applied at runtime)
-    let expected_other_node_2_http = 3002_u16;
+    let nodes = [
+        (
+            "node-1", "10.0.0.1", 0_u8, 8090_u16, 8080_u16, 3000_u16, 8091_u16,
+        ),
+        (
+            "node-2", "10.0.0.2", 1_u8, 8092_u16, 8082_u16, 3002_u16, 8093_u16,
+        ),
+        (
+            "node-3", "10.0.0.3", 2_u8, 8094_u16, 8084_u16, 3004_u16, 8095_u16,
+        ),
+    ];
+    let sparse_name = "node-4";
+    let sparse_ip = "10.0.0.4";
+    let sparse_replica_id = 3_u8;
+    let sparse_tcp = 8096_u16;
+    let sparse_http = 3006_u16;
 
     unsafe {
-        // Set cluster configuration environment variables
         env::set_var("IGGY_CLUSTER_ENABLED", expected_cluster_enabled.to_string());
         env::set_var("IGGY_CLUSTER_NAME", expected_cluster_name);
-        env::set_var("IGGY_CLUSTER_NODE_CURRENT_NAME", expected_current_node_name);
-        env::set_var("IGGY_CLUSTER_NODE_CURRENT_IP", expected_current_node_ip);
 
-        // Set other nodes array environment variables - Node 2
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_0_NAME",
-            expected_other_node_0_name,
-        );
-        env::set_var("IGGY_CLUSTER_NODE_OTHERS_0_IP", expected_other_node_0_ip);
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_TCP",
-            expected_other_node_0_tcp.to_string(),
-        );
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_QUIC",
-            expected_other_node_0_quic.to_string(),
-        );
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_HTTP",
-            expected_other_node_0_http.to_string(),
-        );
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_0_PORTS_WEBSOCKET",
-            expected_other_node_0_websocket.to_string(),
-        );
+        for (idx, (name, ip, replica_id, tcp, quic, http, websocket)) in nodes.iter().enumerate() {
+            env::set_var(format!("IGGY_CLUSTER_NODES_{idx}_NAME"), name);
+            env::set_var(format!("IGGY_CLUSTER_NODES_{idx}_IP"), ip);
+            env::set_var(
+                format!("IGGY_CLUSTER_NODES_{idx}_REPLICA_ID"),
+                replica_id.to_string(),
+            );
+            env::set_var(
+                format!("IGGY_CLUSTER_NODES_{idx}_PORTS_TCP"),
+                tcp.to_string(),
+            );
+            env::set_var(
+                format!("IGGY_CLUSTER_NODES_{idx}_PORTS_QUIC"),
+                quic.to_string(),
+            );
+            env::set_var(
+                format!("IGGY_CLUSTER_NODES_{idx}_PORTS_HTTP"),
+                http.to_string(),
+            );
+            env::set_var(
+                format!("IGGY_CLUSTER_NODES_{idx}_PORTS_WEBSOCKET"),
+                websocket.to_string(),
+            );
+        }
 
-        // Set other nodes array environment variables - Node 3
+        // 4th node intentionally omits QUIC and WebSocket to exercise the
+        // defaults-applied-at-runtime path.
+        env::set_var("IGGY_CLUSTER_NODES_3_NAME", sparse_name);
+        env::set_var("IGGY_CLUSTER_NODES_3_IP", sparse_ip);
         env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_1_NAME",
-            expected_other_node_1_name,
+            "IGGY_CLUSTER_NODES_3_REPLICA_ID",
+            sparse_replica_id.to_string(),
         );
-        env::set_var("IGGY_CLUSTER_NODE_OTHERS_1_IP", expected_other_node_1_ip);
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_TCP",
-            expected_other_node_1_tcp.to_string(),
-        );
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_QUIC",
-            expected_other_node_1_quic.to_string(),
-        );
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_HTTP",
-            expected_other_node_1_http.to_string(),
-        );
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_1_PORTS_WEBSOCKET",
-            expected_other_node_1_websocket.to_string(),
-        );
-
-        // Set other nodes array environment variables - Node 4
-        // Only set TCP and HTTP ports, leaving QUIC and WebSocket to use defaults
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_2_NAME",
-            expected_other_node_2_name,
-        );
-        env::set_var("IGGY_CLUSTER_NODE_OTHERS_2_IP", expected_other_node_2_ip);
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_2_PORTS_TCP",
-            expected_other_node_2_tcp.to_string(),
-        );
-        // IGGY_CLUSTER_NODE_OTHERS_2_PORTS_QUIC is NOT set - should use default (8080)
-        env::set_var(
-            "IGGY_CLUSTER_NODE_OTHERS_2_PORTS_HTTP",
-            expected_other_node_2_http.to_string(),
-        );
-        // IGGY_CLUSTER_NODE_OTHERS_2_PORTS_WEBSOCKET is NOT set - should use default (8092)
+        env::set_var("IGGY_CLUSTER_NODES_3_PORTS_TCP", sparse_tcp.to_string());
+        env::set_var("IGGY_CLUSTER_NODES_3_PORTS_HTTP", sparse_http.to_string());
     }
 
     let config_path = get_root_path().join("../server/config.toml");
@@ -401,132 +369,51 @@ async fn validate_four_node_cluster_config_env_override() {
         .await
         .expect("Failed to load config.toml config with 4-node cluster env overrides");
 
-    // Verify cluster configuration
     assert_eq!(config.cluster.enabled, expected_cluster_enabled);
     assert_eq!(config.cluster.name, expected_cluster_name);
-    assert_eq!(config.cluster.node.current.name, expected_current_node_name);
-    assert_eq!(config.cluster.node.current.ip, expected_current_node_ip);
-
-    // Verify other nodes array - should have 3 nodes from environment variables
     assert_eq!(
-        config.cluster.node.others.len(),
-        3,
-        "Should have 3 other nodes from environment variables for a 4-node cluster"
+        config.cluster.nodes.len(),
+        4,
+        "Should have 4 cluster nodes from environment variables"
     );
 
-    // Verify first other node (Node 2)
-    assert_eq!(
-        config.cluster.node.others[0].name,
-        expected_other_node_0_name
-    );
-    assert_eq!(config.cluster.node.others[0].ip, expected_other_node_0_ip);
-    assert_eq!(
-        config.cluster.node.others[0].ports.tcp,
-        Some(expected_other_node_0_tcp)
-    );
-    assert_eq!(
-        config.cluster.node.others[0].ports.quic,
-        Some(expected_other_node_0_quic)
-    );
-    assert_eq!(
-        config.cluster.node.others[0].ports.http,
-        Some(expected_other_node_0_http)
-    );
-    assert_eq!(
-        config.cluster.node.others[0].ports.websocket,
-        Some(expected_other_node_0_websocket)
-    );
+    for (idx, (name, ip, replica_id, tcp, quic, http, websocket)) in nodes.iter().enumerate() {
+        assert_eq!(config.cluster.nodes[idx].name, *name);
+        assert_eq!(config.cluster.nodes[idx].ip, *ip);
+        assert_eq!(config.cluster.nodes[idx].replica_id, *replica_id);
+        assert_eq!(config.cluster.nodes[idx].ports.tcp, Some(*tcp));
+        assert_eq!(config.cluster.nodes[idx].ports.quic, Some(*quic));
+        assert_eq!(config.cluster.nodes[idx].ports.http, Some(*http));
+        assert_eq!(config.cluster.nodes[idx].ports.websocket, Some(*websocket));
+    }
 
-    // Verify second other node (Node 3)
+    // Sparse node: TCP and HTTP set, QUIC and WebSocket unset.
+    assert_eq!(config.cluster.nodes[3].name, sparse_name);
+    assert_eq!(config.cluster.nodes[3].ip, sparse_ip);
+    assert_eq!(config.cluster.nodes[3].replica_id, sparse_replica_id);
+    assert_eq!(config.cluster.nodes[3].ports.tcp, Some(sparse_tcp));
     assert_eq!(
-        config.cluster.node.others[1].name,
-        expected_other_node_1_name
+        config.cluster.nodes[3].ports.quic, None,
+        "QUIC port should be None (default applied at runtime)"
     );
-    assert_eq!(config.cluster.node.others[1].ip, expected_other_node_1_ip);
+    assert_eq!(config.cluster.nodes[3].ports.http, Some(sparse_http));
     assert_eq!(
-        config.cluster.node.others[1].ports.tcp,
-        Some(expected_other_node_1_tcp)
-    );
-    assert_eq!(
-        config.cluster.node.others[1].ports.quic,
-        Some(expected_other_node_1_quic)
-    );
-    assert_eq!(
-        config.cluster.node.others[1].ports.http,
-        Some(expected_other_node_1_http)
-    );
-    assert_eq!(
-        config.cluster.node.others[1].ports.websocket,
-        Some(expected_other_node_1_websocket)
-    );
-
-    // Verify third other node (Node 4)
-    // This node has only TCP and HTTP explicitly set, QUIC and WebSocket should be None
-    // (defaults will be applied at runtime by the cluster system)
-    assert_eq!(
-        config.cluster.node.others[2].name,
-        expected_other_node_2_name
-    );
-    assert_eq!(config.cluster.node.others[2].ip, expected_other_node_2_ip);
-
-    // TCP port was explicitly set via env var
-    assert_eq!(
-        config.cluster.node.others[2].ports.tcp,
-        Some(expected_other_node_2_tcp),
-        "TCP port should be the explicitly set value (8092)"
-    );
-
-    // QUIC port was NOT set via env var - should be None in config
-    // Runtime will use default port 8080 from current node's QUIC config
-    assert_eq!(
-        config.cluster.node.others[2].ports.quic, None,
-        "QUIC port should be None (default 8080 applied at runtime)"
-    );
-
-    // HTTP port was explicitly set via env var
-    assert_eq!(
-        config.cluster.node.others[2].ports.http,
-        Some(expected_other_node_2_http),
-        "HTTP port should be the explicitly set value (3002)"
-    );
-
-    // WebSocket port was NOT set via env var - should be None in config
-    // Runtime will use default port 8092 from current node's WebSocket config
-    assert_eq!(
-        config.cluster.node.others[2].ports.websocket, None,
-        "WebSocket port should be None (default 8092 applied at runtime)"
+        config.cluster.nodes[3].ports.websocket, None,
+        "WebSocket port should be None (default applied at runtime)"
     );
 
     unsafe {
-        // Clean up environment variables
         env::remove_var("IGGY_CLUSTER_ENABLED");
         env::remove_var("IGGY_CLUSTER_NAME");
-        env::remove_var("IGGY_CLUSTER_NODE_CURRENT_NAME");
-        env::remove_var("IGGY_CLUSTER_NODE_CURRENT_IP");
-
-        // Clean up Node 2 env vars
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_NAME");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_IP");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_TCP");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_QUIC");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_HTTP");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_0_PORTS_WEBSOCKET");
-
-        // Clean up Node 3 env vars
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_NAME");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_IP");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_TCP");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_QUIC");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_HTTP");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_1_PORTS_WEBSOCKET");
-
-        // Clean up Node 4 env vars (only TCP and HTTP were set)
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_2_NAME");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_2_IP");
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_2_PORTS_TCP");
-        // IGGY_CLUSTER_NODE_OTHERS_2_PORTS_QUIC was not set
-        env::remove_var("IGGY_CLUSTER_NODE_OTHERS_2_PORTS_HTTP");
-        // IGGY_CLUSTER_NODE_OTHERS_2_PORTS_WEBSOCKET was not set
+        for idx in 0..=3 {
+            env::remove_var(format!("IGGY_CLUSTER_NODES_{idx}_NAME"));
+            env::remove_var(format!("IGGY_CLUSTER_NODES_{idx}_IP"));
+            env::remove_var(format!("IGGY_CLUSTER_NODES_{idx}_REPLICA_ID"));
+            env::remove_var(format!("IGGY_CLUSTER_NODES_{idx}_PORTS_TCP"));
+            env::remove_var(format!("IGGY_CLUSTER_NODES_{idx}_PORTS_QUIC"));
+            env::remove_var(format!("IGGY_CLUSTER_NODES_{idx}_PORTS_HTTP"));
+            env::remove_var(format!("IGGY_CLUSTER_NODES_{idx}_PORTS_WEBSOCKET"));
+        }
     }
 }
 

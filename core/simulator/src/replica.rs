@@ -82,6 +82,7 @@ pub fn new_replica(id: u8, name: String, bus: &Arc<SimOutbox>, replica_count: u8
 
     shard::IggyShard::without_inbox(
         shard::ShardIdentity::new(u16::from(id), name),
+        SharedSimOutbox(Arc::clone(bus)),
         metadata,
         partitions,
         (),
