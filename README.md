@@ -1,30 +1,44 @@
-# Apache Iggy (Incubating)
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://benchmarks.iggy.apache.org/assets/iggy-light.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://benchmarks.iggy.apache.org/assets/iggy-dark.svg">
+    <img alt="Apache Iggy" src="https://benchmarks.iggy.apache.org/assets/iggy-dark.svg" width="400">
+  </picture>
+</div>
 
 <div align="center">
 
-[Website](https://iggy.apache.org) | [Getting started](https://iggy.apache.org/docs/introduction/getting-started/) | [Documentation](https://iggy.apache.org/docs/) | [Blog](https://iggy.apache.org/blogs/) | [Discord](https://discord.gg/C5Sux5NcRa) | [Crates](https://crates.io/crates/iggy)
+[Website](https://iggy.apache.org) | [Getting started](https://iggy.apache.org/docs/introduction/getting-started/) | [Documentation](https://iggy.apache.org/docs/) | [Blog](https://iggy.apache.org/blogs/) | [Discord](https://discord.gg/apache-iggy) | [Crates](https://crates.io/crates/iggy)
 
 </div>
-<div style="display: flex; flex-wrap: wrap; justify-content: center; align-items: center; text-align: center;">
-
-  [![crates.io](https://img.shields.io/crates/v/iggy.svg)](https://crates.io/crates/iggy)
-  [![crates.io](https://img.shields.io/crates/d/iggy.svg)](https://crates.io/crates/iggy)
-  [![codecov](https://codecov.io/github/apache/iggy/graph/badge.svg?token=D9TIWPBWE2)](https://codecov.io/github/apache/iggy)
-  [![dependency](https://deps.rs/repo/github/apache/iggy/status.svg)](https://deps.rs/repo/github/apache/iggy)
-  [![x](https://img.shields.io/twitter/follow/ApacheIggy?style=social)](https://twitter.com/ApacheIggy)
-  [![discord-badge](https://img.shields.io/discord/1144142576266530928)](https://discord.gg/C5Sux5NcRa)
-
-</div>
+<p align="center">
+  <a title="Releases" target="_blank" href="https://github.com/apache/iggy/releases"><img alt="Latest Release" src="https://img.shields.io/github/v/release/apache/iggy?style=flat-square&color=9CF"></a>
+  <a title="Rust" target="_blank" href="https://crates.io/crates/iggy"><img alt="Crate" src="https://img.shields.io/crates/v/iggy?label=rust&logo=rust&style=flat-square"></a>
+  <a title="JavaScript" target="_blank" href="https://www.npmjs.com/package/apache-iggy"><img alt="NPM" src="https://img.shields.io/npm/v/apache-iggy?label=npm&logo=npm&style=flat-square"></a>
+  <a title="Python" target="_blank" href="https://pypi.org/project/apache-iggy/"><img alt="PyPI" src="https://img.shields.io/pypi/v/apache-iggy?label=pypi&logo=pypi&style=flat-square"></a>
+  <a title="Java" target="_blank" href="https://central.sonatype.com/artifact/org.apache.iggy/iggy"><img alt="Maven Central" src="https://img.shields.io/maven-central/v/org.apache.iggy/iggy?label=maven&logo=apachemaven&style=flat-square"></a>
+  <a title=".NET" target="_blank" href="https://www.nuget.org/packages/Apache.Iggy/"><img alt="NuGet" src="https://img.shields.io/nuget/v/Apache.Iggy?label=nuget&logo=nuget&style=flat-square"></a>
+  <a title="Apache 2.0" target="_blank" href="https://github.com/apache/iggy/blob/master/LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg?style=flat-square"></a>
+  <br>
+  <a title="Crates Downloads" target="_blank" href="https://crates.io/crates/iggy"><img alt="Crate Downloads" src="https://img.shields.io/crates/d/iggy.svg?style=flat-square"></a>
+  <a title="Code Coverage" target="_blank" href="https://codecov.io/github/apache/iggy"><img alt="Code Coverage" src="https://codecov.io/github/apache/iggy/graph/badge.svg?token=D9TIWPBWE2"></a>
+  <a title="Dependencies" target="_blank" href="https://deps.rs/repo/github/apache/iggy"><img alt="Dependency Status" src="https://deps.rs/repo/github/apache/iggy/status.svg"></a>
+  <a title="GitHub Pull Requests" target="_blank" href="https://github.com/apache/iggy/pulls"><img alt="Closed Pull Requests" src="https://img.shields.io/github/issues-pr-closed/apache/iggy.svg?style=flat-square&color=FF9966"></a>
+  <br>
+  <a title="GitHub Commits" target="_blank" href="https://github.com/apache/iggy/commits/master"><img alt="Monthly Commit Activity" src="https://img.shields.io/github/commit-activity/m/apache/iggy.svg?style=flat-square"></a>
+  <a title="Last Commit" target="_blank" href="https://github.com/apache/iggy/commits/master"><img alt="Last Commit" src="https://img.shields.io/github/last-commit/apache/iggy.svg?style=flat-square&color=FF9900"></a>
+</p>
+<p align="center">
+  <a title="X" target="_blank" href="https://twitter.com/ApacheIggy"><img alt="Follow Apache Iggy on X" src="https://img.shields.io/twitter/follow/ApacheIggy?style=social"></a>
+  <a title="LinkedIn" target="_blank" href="https://www.linkedin.com/company/apache-iggy/"><img alt="Follow Apache Iggy on LinkedIn" src="https://img.shields.io/badge/LinkedIn-Apache%20Iggy-0A66C2?style=social&logo=linkedin"></a>
+</p>
+<p align="center">
+  <a title="Discord" target="_blank" href="https://discord.gg/apache-iggy"><img alt="Chat with Apache Iggy community on Discord" src="https://img.shields.io/discord/1144142576266530928?label=Discord&logo=Discord&style=social"></a>
+</p>
 
 ---
 
-<div align="center">
-
-  ![iggy](assets/iggy_black.png)
-
-</div>
-
----
+## What is Apache Iggy (Incubating)?
 
 **Iggy** is a persistent message streaming platform written in Rust, supporting QUIC, WebSocket, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at ultra-low latency**.
 
