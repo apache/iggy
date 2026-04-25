@@ -226,6 +226,13 @@ macro_rules! source_connector {
             state_len: usize,
             log_callback: LogCallback,
         ) -> i32 {
+            if INSTANCES.contains_key(&id) {
+                // Duplicate id: caller did not close before reopening. Without
+                // this guard the existing entry would be silently overwritten,
+                // discarding any in-flight buffered data and orphaning tasks.
+                return -1;
+            }
+
             let mut container = SourceContainer::new(id);
             let result = container.open(
                 id,
