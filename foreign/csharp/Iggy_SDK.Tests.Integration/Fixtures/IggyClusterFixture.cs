@@ -29,10 +29,21 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
     private const string LeaderAlias = "iggy-leader";
     private const string FollowerAlias = "iggy-follower";
 
-    // TcpListeners held open until just before the containers are started so that the
-    // OS keeps the chosen ports reserved across the whole fixture setup. Parallel test
-    // hosts (net8.0 + net10.0) would otherwise race on the gap between picking the port
-    // and docker binding it.
+    // Split the host-port pool by .NET major version so parallel `dotnet test`
+    // processes (net8.0 + net10.0) can never pick the same port and race docker's
+    // allocator. The ranges sit below Linux's default ephemeral range (32768+), so
+    // the kernel's auto-allocation won't steal from us either.
+    //   net8.0  - 30800..30899
+    //   net10.0 - 31000..31099
+    // Future TFMs slot in without overlap (e.g. net12.0 - 31200..31299).
+    private const ushort PortRangeSize = 100;
+    private static readonly ushort BasePort = (ushort)(30000 + Environment.Version.Major * 100);
+    private static readonly ushort EndPort = (ushort)(BasePort + PortRangeSize);
+
+    // Listeners only need to outlive the eight ReservePort() calls in the
+    // constructor so we don't pick the same port twice within one fixture.
+    // Partitioned ranges already guarantee sibling processes can't race us, so
+    // we can release them as soon as picking is done.
     private readonly List<TcpListener> _portReservations = [];
     private readonly IContainer _followerContainer;
     private readonly ushort _followerHttpPort;
@@ -57,14 +68,21 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
 
     public IggyClusterFixture()
     {
-        _leaderTcpPort = ReservePort();
-        _leaderHttpPort = ReservePort();
-        _leaderQuicPort = ReservePort();
-        _leaderWsPort = ReservePort();
-        _followerTcpPort = ReservePort();
-        _followerHttpPort = ReservePort();
-        _followerQuicPort = ReservePort();
-        _followerWsPort = ReservePort();
+        try
+        {
+            _leaderTcpPort = ReservePort();
+            _leaderHttpPort = ReservePort();
+            _leaderQuicPort = ReservePort();
+            _leaderWsPort = ReservePort();
+            _followerTcpPort = ReservePort();
+            _followerHttpPort = ReservePort();
+            _followerQuicPort = ReservePort();
+            _followerWsPort = ReservePort();
+        }
+        finally
+        {
+            ReleaseReservedPorts();
+        }
 
         _network = new NetworkBuilder()
             .WithName($"iggy-cluster-{Guid.NewGuid():N}")
@@ -140,7 +158,6 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        ReleaseReservedPorts();
         await SaveContainerLogsAsync(_leaderContainer, "leader");
         await SaveContainerLogsAsync(_followerContainer, "follower");
         await _followerContainer.StopAsync();
@@ -151,10 +168,6 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
     public async Task InitializeAsync()
     {
         await _network.CreateAsync();
-        // Release the reservations at the last possible moment so the window between
-        // giving the port back to the OS and docker re-binding it is as small as we can
-        // make it.
-        ReleaseReservedPorts();
         await Task.WhenAll(_leaderContainer.StartAsync(), _followerContainer.StartAsync());
     }
 
@@ -170,10 +183,25 @@ public class IggyClusterFixture : IAsyncInitializer, IAsyncDisposable
 
     private ushort ReservePort()
     {
-        var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        _portReservations.Add(listener);
-        return (ushort)((IPEndPoint)listener.LocalEndpoint).Port;
+        for (ushort candidate = BasePort; candidate < EndPort; candidate++)
+        {
+            try
+            {
+                var listener = new TcpListener(IPAddress.Loopback, candidate);
+                listener.Start();
+                _portReservations.Add(listener);
+                return candidate;
+            }
+            catch (SocketException)
+            {
+                // Port is held by a previous ReservePort() in this fixture
+                // (the common case) or by something else on the host; keep
+                // walking the range.
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"No free ports available in [{BasePort}, {EndPort}) for .NET {Environment.Version.Major}.x.");
     }
 
     private void ReleaseReservedPorts()
