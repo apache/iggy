@@ -38,7 +38,7 @@ const BULK_VERSION_POLL_ATTEMPTS: usize = 60;
     server(connectors_runtime(config_path = "tests/connectors/delta/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn delta_sink_initializes_and_runs(harness: &TestHarness, fixture: DeltaFixture) {
+async fn delta_sink_initializes_and_runs(harness: &TestHarness, _fixture: DeltaFixture) {
     let api_address = harness
         .connectors_runtime()
         .expect("connector runtime should be available")
@@ -58,8 +58,6 @@ async fn delta_sink_initializes_and_runs(harness: &TestHarness, fixture: DeltaFi
     assert_eq!(sinks.len(), 1);
     assert_eq!(sinks[0].key, DELTA_SINK_KEY);
     assert!(sinks[0].enabled);
-
-    drop(fixture);
 }
 
 #[iggy_harness(
@@ -102,12 +100,12 @@ async fn delta_sink_consumes_json_messages(harness: &TestHarness, fixture: Delta
         .await
         .expect("Failed to send messages");
 
-    let version_count = fixture
-        .wait_for_delta_log(1, VERSION_POLL_ATTEMPTS, VERSION_POLL_INTERVAL_MS)
+    let row_count = fixture
+        .wait_for_row_count(message_count, VERSION_POLL_ATTEMPTS, VERSION_POLL_INTERVAL_MS)
         .await
         .expect("Data should be written to Delta table");
 
-    assert!(version_count >= 1);
+    assert_eq!(row_count, message_count);
 
     let response = http_client
         .get(format!("{}/sinks", api_address))
@@ -122,8 +120,6 @@ async fn delta_sink_consumes_json_messages(harness: &TestHarness, fixture: Delta
     assert_eq!(sinks.len(), 1);
     assert_eq!(sinks[0].key, DELTA_SINK_KEY);
     assert!(sinks[0].last_error.is_none());
-
-    drop(fixture);
 }
 
 #[iggy_harness(
@@ -166,12 +162,12 @@ async fn delta_sink_handles_bulk_messages(harness: &TestHarness, fixture: DeltaF
         .await
         .expect("Failed to send messages");
 
-    let version_count = fixture
-        .wait_for_delta_log(1, BULK_VERSION_POLL_ATTEMPTS, VERSION_POLL_INTERVAL_MS)
+    let row_count = fixture
+        .wait_for_row_count(message_count, BULK_VERSION_POLL_ATTEMPTS, VERSION_POLL_INTERVAL_MS)
         .await
         .expect("Data should be written to Delta table");
 
-    assert!(version_count >= 1);
+    assert_eq!(row_count, message_count);
 
     let response = http_client
         .get(format!("{}/sinks", api_address))
@@ -185,8 +181,6 @@ async fn delta_sink_handles_bulk_messages(harness: &TestHarness, fixture: DeltaF
 
     assert_eq!(sinks.len(), 1);
     assert!(sinks[0].last_error.is_none());
-
-    drop(fixture);
 }
 
 #[iggy_harness(
@@ -195,11 +189,6 @@ async fn delta_sink_handles_bulk_messages(harness: &TestHarness, fixture: DeltaF
 )]
 async fn delta_sink_writes_to_s3(harness: &TestHarness, fixture: DeltaS3Fixture) {
     let client = harness.root_client().await.unwrap();
-    let api_address = harness
-        .connectors_runtime()
-        .expect("connector runtime should be available")
-        .http_url();
-    let http_client = Client::new();
 
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
@@ -229,54 +218,10 @@ async fn delta_sink_writes_to_s3(harness: &TestHarness, fixture: DeltaS3Fixture)
         .await
         .expect("Failed to send messages");
 
-    // For S3, we can't check local delta log files.
-    // Instead, poll the connector runtime API to verify successful consumption.
-    let max_attempts = 30;
-    let interval_ms = 500;
-    let mut last_error = None;
+    let row_count = fixture
+        .wait_for_row_count(message_count, VERSION_POLL_ATTEMPTS, VERSION_POLL_INTERVAL_MS)
+        .await
+        .expect("Data should be written to S3 Delta table");
 
-    for _ in 0..max_attempts {
-        let response = http_client
-            .get(format!("{}/sinks", api_address))
-            .header("api-key", API_KEY)
-            .send()
-            .await
-            .expect("Failed to get sinks");
-
-        let sinks: Vec<SinkInfoResponse> = response.json().await.expect("Failed to parse sinks");
-        if !sinks.is_empty() && sinks[0].last_error.is_none() && sinks[0].enabled {
-            last_error = None;
-            // Give the sink time to process the messages
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-            // Verify still healthy after processing
-            let response = http_client
-                .get(format!("{}/sinks", api_address))
-                .header("api-key", API_KEY)
-                .send()
-                .await
-                .expect("Failed to get sinks");
-            let sinks: Vec<SinkInfoResponse> =
-                response.json().await.expect("Failed to parse sinks");
-            assert_eq!(sinks.len(), 1);
-            assert_eq!(sinks[0].key, DELTA_SINK_KEY);
-            assert!(
-                sinks[0].last_error.is_none(),
-                "Sink reported error: {:?}",
-                sinks[0].last_error
-            );
-            break;
-        }
-
-        last_error = sinks.first().and_then(|s| s.last_error.clone());
-        tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
-    }
-
-    assert!(
-        last_error.is_none(),
-        "Delta S3 sink had errors: {:?}",
-        last_error
-    );
-
-    drop(fixture);
+    assert_eq!(row_count, message_count);
 }

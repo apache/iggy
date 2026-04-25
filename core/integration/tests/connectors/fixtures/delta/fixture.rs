@@ -57,45 +57,81 @@ pub struct DeltaFixture {
     table_path: PathBuf,
 }
 
-impl DeltaFixture {
-    pub async fn wait_for_delta_log(
-        &self,
-        min_versions: usize,
-        max_attempts: usize,
-        interval_ms: u64,
-    ) -> Result<usize, TestBinaryError> {
-        let delta_log_dir = self.table_path.join("_delta_log");
+async fn count_rows(
+    table_uri: url::Url,
+    storage_options: HashMap<String, String>,
+) -> Result<usize, TestBinaryError> {
+    use deltalake::arrow::array::Int64Array;
 
-        for _ in 0..max_attempts {
-            let count = Self::count_delta_versions(&delta_log_dir);
-            if count >= min_versions {
-                info!("Found {count} delta log versions (required: {min_versions})");
-                return Ok(count);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+    let table = deltalake::open_table_with_storage_options(table_uri, storage_options)
+        .await
+        .map_err(|e| TestBinaryError::InvalidState {
+            message: format!("Failed to open delta table: {e}"),
+        })?;
+
+    let batch = table
+        .snapshot()
+        .map_err(|e| TestBinaryError::InvalidState {
+            message: format!("Failed to get table snapshot: {e}"),
+        })?
+        .add_actions_table(false)
+        .map_err(|e| TestBinaryError::InvalidState {
+            message: format!("Failed to get add actions table: {e}"),
+        })?;
+
+    let total = batch
+        .column_by_name("num_records")
+        .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+        .map(|arr| arr.iter().filter_map(|v| v).sum::<i64>() as usize)
+        .unwrap_or(0);
+
+    Ok(total)
+}
+
+async fn wait_for_row_count(
+    table_uri: url::Url,
+    storage_options: HashMap<String, String>,
+    expected_rows: usize,
+    max_attempts: usize,
+    interval_ms: u64,
+) -> Result<usize, TestBinaryError> {
+    for _ in 0..max_attempts {
+        let count = count_rows(table_uri.clone(), storage_options.clone())
+            .await
+            .unwrap_or(0);
+        if count >= expected_rows {
+            info!("Found {count} rows in delta table (required: {expected_rows})");
+            return Ok(count);
         }
-
-        let final_count = Self::count_delta_versions(&delta_log_dir);
-        Err(TestBinaryError::InvalidState {
-            message: format!(
-                "Expected at least {min_versions} delta log versions, found {final_count} after {max_attempts} attempts"
-            ),
-        })
+        tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
     }
 
+    let final_count = count_rows(table_uri, storage_options).await.unwrap_or(0);
+    Err(TestBinaryError::InvalidState {
+        message: format!(
+            "Expected at least {expected_rows} rows, found {final_count} after {max_attempts} attempts"
+        ),
+    })
+}
+
+fn table_columns() -> Vec<StructField> {
+    vec![
+        StructField::new("id", DataType::Primitive(PrimitiveType::Long), true),
+        StructField::new("name", DataType::Primitive(PrimitiveType::String), true),
+        StructField::new("count", DataType::Primitive(PrimitiveType::Integer), true),
+        StructField::new("amount", DataType::Primitive(PrimitiveType::Double), true),
+        StructField::new("active", DataType::Primitive(PrimitiveType::Boolean), true),
+        StructField::new(
+            "timestamp",
+            DataType::Primitive(PrimitiveType::TimestampNtz),
+            true,
+        ),
+    ]
+}
+
+impl DeltaFixture {
     async fn create_table(table_uri: &str) -> Result<(), TestBinaryError> {
-        let columns = vec![
-            StructField::new("id", DataType::Primitive(PrimitiveType::Long), true),
-            StructField::new("name", DataType::Primitive(PrimitiveType::String), true),
-            StructField::new("count", DataType::Primitive(PrimitiveType::Integer), true),
-            StructField::new("amount", DataType::Primitive(PrimitiveType::Double), true),
-            StructField::new("active", DataType::Primitive(PrimitiveType::Boolean), true),
-            StructField::new(
-                "timestamp",
-                DataType::Primitive(PrimitiveType::TimestampNtz),
-                true,
-            ),
-        ];
+        let columns = table_columns();
         CreateBuilder::new()
             .with_location(table_uri)
             .with_columns(columns)
@@ -107,15 +143,17 @@ impl DeltaFixture {
         Ok(())
     }
 
-    fn count_delta_versions(delta_log_dir: &std::path::Path) -> usize {
-        std::fs::read_dir(delta_log_dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-                    .count()
-            })
-            .unwrap_or(0)
+    pub async fn wait_for_row_count(
+        &self,
+        expected_rows: usize,
+        max_attempts: usize,
+        interval_ms: u64,
+    ) -> Result<usize, TestBinaryError> {
+        let table_uri = url::Url::parse(&format!("file://{}", self.table_path.display()))
+            .map_err(|e| TestBinaryError::InvalidState {
+                message: format!("Failed to parse table URI: {e}"),
+            })?;
+        wait_for_row_count(table_uri, HashMap::new(), expected_rows, max_attempts, interval_ms).await
     }
 }
 
@@ -205,7 +243,7 @@ impl DeltaS3Fixture {
     }
 
     async fn create_bucket(minio_endpoint: &str) -> Result<(), TestBinaryError> {
-        use std::process::Command;
+        use tokio::process::Command;
 
         let host = minio_endpoint.trim_start_matches("http://");
         let mc_host = format!("http://{}:{}@{}", MINIO_ACCESS_KEY, MINIO_SECRET_KEY, host);
@@ -223,6 +261,7 @@ impl DeltaS3Fixture {
                 &format!("minio/{}", MINIO_BUCKET),
             ])
             .output()
+            .await
             .map_err(|error| TestBinaryError::FixtureSetup {
                 fixture_type: "DeltaS3Fixture".to_string(),
                 message: format!("Failed to run mc command: {error}"),
@@ -243,18 +282,7 @@ impl DeltaS3Fixture {
 
     async fn create_table(minio_endpoint: &str) -> Result<(), TestBinaryError> {
         let table_uri = format!("s3://{MINIO_BUCKET}/delta_table");
-        let columns = vec![
-            StructField::new("id", DataType::Primitive(PrimitiveType::Long), true),
-            StructField::new("name", DataType::Primitive(PrimitiveType::String), true),
-            StructField::new("count", DataType::Primitive(PrimitiveType::Integer), true),
-            StructField::new("amount", DataType::Primitive(PrimitiveType::Double), true),
-            StructField::new("active", DataType::Primitive(PrimitiveType::Boolean), true),
-            StructField::new(
-                "timestamp",
-                DataType::Primitive(PrimitiveType::TimestampNtz),
-                true,
-            ),
-        ];
+        let columns = table_columns();
         let storage_options = HashMap::from([
             ("AWS_ACCESS_KEY_ID".into(), MINIO_ACCESS_KEY.into()),
             ("AWS_SECRET_ACCESS_KEY".into(), MINIO_SECRET_KEY.into()),
@@ -273,6 +301,27 @@ impl DeltaS3Fixture {
                 message: format!("Failed to create Delta table in MinIO: {error}"),
             })?;
         Ok(())
+    }
+
+    pub async fn wait_for_row_count(
+        &self,
+        expected_rows: usize,
+        max_attempts: usize,
+        interval_ms: u64,
+    ) -> Result<usize, TestBinaryError> {
+        let table_uri = url::Url::parse(&format!("s3://{MINIO_BUCKET}/delta_table"))
+            .map_err(|e| TestBinaryError::InvalidState {
+                message: format!("Failed to parse table URI: {e}"),
+            })?;
+        let storage_options = HashMap::from([
+            ("AWS_ACCESS_KEY_ID".into(), MINIO_ACCESS_KEY.into()),
+            ("AWS_SECRET_ACCESS_KEY".into(), MINIO_SECRET_KEY.into()),
+            ("AWS_REGION".into(), "us-east-1".into()),
+            ("AWS_ENDPOINT_URL".into(), self.minio_endpoint.clone()),
+            ("AWS_ALLOW_HTTP".into(), "true".into()),
+            ("AWS_S3_ALLOW_HTTP".into(), "true".into()),
+        ]);
+        wait_for_row_count(table_uri, storage_options, expected_rows, max_attempts, interval_ms).await
     }
 }
 
