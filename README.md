@@ -1,3 +1,6 @@
+<p align="center">
+    <a href="https://trendshift.io/repositories/14204" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14204" alt="apache%2Figgy | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>  
+</p>
 <div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://benchmarks.iggy.apache.org/assets/iggy-light.svg">
