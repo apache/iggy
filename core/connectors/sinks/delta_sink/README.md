@@ -49,7 +49,6 @@ azure_container_name = "my-container"
 table_uri = "gs://my-bucket/delta-tables/users"
 storage_backend_type = "gcs"
 gcs_service_account_key = '{"type": "service_account", "project_id": "...", ...}'
-gcs_bucket = "my-bucket"
 ```
 
 ## Configuration Options
@@ -82,8 +81,7 @@ Required when `storage_backend_type = "azure"`.
 
 Required when `storage_backend_type = "gcs"`.
 
-- **gcs_service_account_key**: GCS service account JSON key (as a string).
-- **gcs_bucket**: GCS bucket name.
+- **gcs_service_account_key**: GCS service account JSON key (as a string). The bucket is inferred from the `gs://` URI in `table_uri`.
 
 ## Type Coercion
 

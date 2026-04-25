@@ -93,16 +93,11 @@ pub(crate) fn build_storage_options(
             let service_account_key = config.gcs_service_account_key.as_ref().ok_or_else(|| {
                 Error::InitError("GCS backend requires 'gcs_service_account_key'".into())
             })?;
-            let bucket = config
-                .gcs_bucket
-                .as_ref()
-                .ok_or_else(|| Error::InitError("GCS backend requires 'gcs_bucket'".into()))?;
 
             opts.insert(
                 "GOOGLE_SERVICE_ACCOUNT_KEY".into(),
                 service_account_key.expose_secret().to_owned(),
             );
-            opts.insert("GCS_BUCKET".into(), bucket.clone());
         }
         None => {}
     }
@@ -129,7 +124,6 @@ mod tests {
             azure_storage_sas_token: None,
             azure_container_name: None,
             gcs_service_account_key: None,
-            gcs_bucket: None,
         }
     }
 
@@ -178,7 +172,6 @@ mod tests {
         DeltaSinkConfig {
             storage_backend_type: Some(StorageBackendType::Gcs),
             gcs_service_account_key: Some("{\"key\": \"value\"}".to_string().into()),
-            gcs_bucket: Some("mybucket".into()),
             ..default_config()
         }
     }
@@ -288,13 +281,12 @@ mod tests {
     }
 
     #[test]
-    fn gcs_backend_maps_all_fields() {
+    fn gcs_backend_maps_service_account_key() {
         let opts = build_storage_options(&gcs_config()).unwrap();
         assert_eq!(
             opts.get("GOOGLE_SERVICE_ACCOUNT_KEY").unwrap(),
             "{\"key\": \"value\"}"
         );
-        assert_eq!(opts.get("GCS_BUCKET").unwrap(), "mybucket");
     }
 
     #[test]
@@ -304,10 +296,4 @@ mod tests {
         assert!(build_storage_options(&config).is_err());
     }
 
-    #[test]
-    fn gcs_backend_missing_bucket_errors() {
-        let mut config = gcs_config();
-        config.gcs_bucket = None;
-        assert!(build_storage_options(&config).is_err());
-    }
 }

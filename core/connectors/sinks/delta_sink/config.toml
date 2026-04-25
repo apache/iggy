@@ -60,4 +60,3 @@ table_uri = "file:///tmp/iggy_delta_table"
 # GCS options:
 # storage_backend_type = "gcs"
 # gcs_service_account_key = '{"type": "service_account", ...}'
-# gcs_bucket = "your-bucket"

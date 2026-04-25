@@ -84,8 +84,6 @@ pub struct DeltaSinkConfig {
     // Google Cloud Storage
     #[serde(default)]
     pub gcs_service_account_key: Option<SecretString>,
-    #[serde(default)]
-    pub gcs_bucket: Option<String>,
 }
 
 impl DeltaSink {
