@@ -616,6 +616,23 @@ impl TcpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    async fn make_dummy_stream(data: &[u8]) -> ConnectionStreamKind {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let data = data.to_vec();
+        tokio::spawn(async move {
+            let (mut server_side, _) = listener.accept().await.unwrap();
+            server_side.write_all(&data).await.unwrap();
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        ConnectionStreamKind::Tcp(TcpConnectionStream::new(client_addr, client))
+    }
 
     #[test]
     fn should_fail_with_empty_connection_string() {
@@ -883,5 +900,40 @@ mod tests {
             tcp_client_config.reconnection.reestablish_after,
             IggyDuration::from_str("5s").unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn should_return_error_when_status_is_non_zero() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(1, 0, &mut stream).await;
+        assert!(tcp_client.is_err());
+    }
+
+    #[tokio::test]
+    async fn should_return_ok_when_status_is_zero() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(0, 0, &mut stream).await;
+        assert!(tcp_client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn should_return_ok_when_length_is_less_than_data() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(0, 5, &mut stream).await;
+        assert!(tcp_client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn should_return_ok_when_length_is_equal_to_one() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(0, 1, &mut stream).await;
+        assert_eq!(tcp_client.unwrap(), Bytes::new());
+    }
+
+    #[tokio::test]
+    async fn should_return_err_when_length_exceeds_data() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(0, 50, &mut stream).await;
+        assert!(tcp_client.is_err());
     }
 }
