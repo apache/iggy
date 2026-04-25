@@ -101,7 +101,11 @@ async fn delta_sink_consumes_json_messages(harness: &TestHarness, fixture: Delta
         .expect("Failed to send messages");
 
     let row_count = fixture
-        .wait_for_row_count(message_count, VERSION_POLL_ATTEMPTS, VERSION_POLL_INTERVAL_MS)
+        .wait_for_row_count(
+            message_count,
+            VERSION_POLL_ATTEMPTS,
+            VERSION_POLL_INTERVAL_MS,
+        )
         .await
         .expect("Data should be written to Delta table");
 
@@ -163,7 +167,11 @@ async fn delta_sink_handles_bulk_messages(harness: &TestHarness, fixture: DeltaF
         .expect("Failed to send messages");
 
     let row_count = fixture
-        .wait_for_row_count(message_count, BULK_VERSION_POLL_ATTEMPTS, VERSION_POLL_INTERVAL_MS)
+        .wait_for_row_count(
+            message_count,
+            BULK_VERSION_POLL_ATTEMPTS,
+            VERSION_POLL_INTERVAL_MS,
+        )
         .await
         .expect("Data should be written to Delta table");
 
@@ -219,7 +227,11 @@ async fn delta_sink_writes_to_s3(harness: &TestHarness, fixture: DeltaS3Fixture)
         .expect("Failed to send messages");
 
     let row_count = fixture
-        .wait_for_row_count(message_count, VERSION_POLL_ATTEMPTS, VERSION_POLL_INTERVAL_MS)
+        .wait_for_row_count(
+            message_count,
+            VERSION_POLL_ATTEMPTS,
+            VERSION_POLL_INTERVAL_MS,
+        )
         .await
         .expect("Data should be written to S3 Delta table");
 

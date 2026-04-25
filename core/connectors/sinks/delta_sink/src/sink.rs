@@ -67,7 +67,7 @@ impl Sink for DeltaSink {
             })?
             .schema();
         // TODO: coercion tree is never refreshed if the schema changes concurrently,
-        // leading to opaque errors downstream. 
+        // leading to opaque errors downstream.
         let coercion_tree = create_coercion_tree(&kernel_schema);
 
         let writer = JsonWriter::for_table(&table).map_err(|e| {

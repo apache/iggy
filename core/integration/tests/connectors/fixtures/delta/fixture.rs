@@ -149,11 +149,20 @@ impl DeltaFixture {
         max_attempts: usize,
         interval_ms: u64,
     ) -> Result<usize, TestBinaryError> {
-        let table_uri = url::Url::parse(&format!("file://{}", self.table_path.display()))
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to parse table URI: {e}"),
+        let table_uri =
+            url::Url::parse(&format!("file://{}", self.table_path.display())).map_err(|e| {
+                TestBinaryError::InvalidState {
+                    message: format!("Failed to parse table URI: {e}"),
+                }
             })?;
-        wait_for_row_count(table_uri, HashMap::new(), expected_rows, max_attempts, interval_ms).await
+        wait_for_row_count(
+            table_uri,
+            HashMap::new(),
+            expected_rows,
+            max_attempts,
+            interval_ms,
+        )
+        .await
     }
 }
 
@@ -309,9 +318,11 @@ impl DeltaS3Fixture {
         max_attempts: usize,
         interval_ms: u64,
     ) -> Result<usize, TestBinaryError> {
-        let table_uri = url::Url::parse(&format!("s3://{MINIO_BUCKET}/delta_table"))
-            .map_err(|e| TestBinaryError::InvalidState {
-                message: format!("Failed to parse table URI: {e}"),
+        let table_uri =
+            url::Url::parse(&format!("s3://{MINIO_BUCKET}/delta_table")).map_err(|e| {
+                TestBinaryError::InvalidState {
+                    message: format!("Failed to parse table URI: {e}"),
+                }
             })?;
         let storage_options = HashMap::from([
             ("AWS_ACCESS_KEY_ID".into(), MINIO_ACCESS_KEY.into()),
@@ -321,7 +332,14 @@ impl DeltaS3Fixture {
             ("AWS_ALLOW_HTTP".into(), "true".into()),
             ("AWS_S3_ALLOW_HTTP".into(), "true".into()),
         ]);
-        wait_for_row_count(table_uri, storage_options, expected_rows, max_attempts, interval_ms).await
+        wait_for_row_count(
+            table_uri,
+            storage_options,
+            expected_rows,
+            max_attempts,
+            interval_ms,
+        )
+        .await
     }
 }
 

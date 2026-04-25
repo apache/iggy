@@ -295,5 +295,4 @@ mod tests {
         config.gcs_service_account_key = None;
         assert!(build_storage_options(&config).is_err());
     }
-
 }
