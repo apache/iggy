@@ -82,7 +82,7 @@ async fn count_rows(
     let total = batch
         .column_by_name("num_records")
         .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
-        .map(|arr| arr.iter().filter_map(|v| v).sum::<i64>() as usize)
+        .map(|arr| arr.iter().flatten().sum::<i64>() as usize)
         .unwrap_or(0);
 
     Ok(total)
