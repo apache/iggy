@@ -216,7 +216,7 @@ pub fn load_consumer_offsets(path: &str) -> Result<Vec<ConsumerOffset>, IggyErro
         });
     }
 
-    consumer_offsets.sort_by(|a, b| a.consumer_id.cmp(&b.consumer_id));
+    consumer_offsets.sort_by_key(|o| o.consumer_id);
     Ok(consumer_offsets)
 }
 

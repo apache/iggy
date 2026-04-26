@@ -24,6 +24,7 @@ pub mod user;
 use bytes::Bytes;
 use iggy_common::Either;
 use left_right::{Absorb, ReadHandle, WriteHandle};
+use std::cell::Cell;
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
@@ -157,6 +158,46 @@ pub trait StateMachine {
     type Output;
     type Error;
     fn update(&self, input: Self::Input) -> Result<Self::Output, Self::Error>;
+}
+
+#[derive(Debug)]
+pub struct ConsensusGroupAllocator {
+    highest: Cell<u64>,
+}
+
+impl ConsensusGroupAllocator {
+    #[must_use]
+    pub const fn new(initial_highest: u64) -> Self {
+        Self {
+            highest: Cell::new(initial_highest),
+        }
+    }
+
+    #[must_use]
+    pub const fn highest(&self) -> u64 {
+        self.highest.get()
+    }
+
+    pub fn observe(&self, assigned: u64) {
+        if assigned > self.highest.get() {
+            self.highest.set(assigned);
+        }
+    }
+
+    #[must_use]
+    ///
+    /// # Panics
+    /// Panics if allocating `count` more group IDs would overflow `u64`.
+    pub fn allocate_many(&self, count: usize) -> Vec<u64> {
+        let mut allocated = Vec::with_capacity(count);
+        let mut current = self.highest.get();
+        for _ in 0..count {
+            current = current.checked_add(1).expect("consensus group id overflow");
+            allocated.push(current);
+        }
+        self.highest.set(current);
+        allocated
+    }
 }
 
 /// Generates the state's inner struct and wrapper type.

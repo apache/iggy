@@ -15,21 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use yew::prelude::*;
+//! Bus lifecycle primitives.
+//!
+//! A root cancellation token and a keyed connection registry. Intentionally
+//! narrow: these are the only two abstractions we need to drive graceful
+//! shutdown for the TCP path (IGGY-99).
 
-#[function_component(Logo)]
-pub fn logo() -> Html {
-    let (is_dark, _) = use_context::<(bool, Callback<()>)>().expect("Theme context not found");
-    let logo_src = if !is_dark {
-        "/assets/iggy-dark.png"
-    } else {
-        "/assets/iggy-light.png"
-    };
+pub mod connection_registry;
+pub mod shutdown;
 
-    html! {
-        <div class="logo">
-            <img src={logo_src} alt="Apache Iggy Logo" />
-            <h1>{"Apache Iggy Benchmarks"}</h1>
-        </div>
-    }
-}
+pub use connection_registry::{
+    BusMessage, BusReceiver, BusSender, ConnectionRegistry, DrainOutcome, InstanceToken,
+    RejectedRegistration, ReplicaRegistry,
+};
+pub use shutdown::{Shutdown, ShutdownToken};

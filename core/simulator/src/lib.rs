@@ -30,7 +30,6 @@ use iggy_binary_protocol::consensus::iobuf::Owned;
 use iggy_binary_protocol::{Command2, GenericHeader, Message, Operation, ReplyHeader};
 use iggy_common::IggyError;
 use iggy_common::sharding::IggyNamespace;
-use message_bus::MessageBus;
 use network::Network;
 use packet::{PacketSimulatorOptions, ProcessId};
 use partitions::{Partition, PartitionOffsets, PollQueryResult, PollingArgs, PollingConsumer};
@@ -97,7 +96,7 @@ impl Simulator {
             let id = i as u8;
             let mut bus = SimOutbox::new(id);
             for &cid in &client_ids {
-                bus.add_client(cid, ());
+                bus.add_client(cid);
             }
             for j in 0..rc {
                 bus.add_replica(j);

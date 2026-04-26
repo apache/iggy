@@ -19,9 +19,11 @@ mod api;
 mod components;
 mod config;
 mod error;
+mod format;
 mod hooks;
 mod router;
 mod state;
+mod version;
 
 use crate::{
     components::{app_content::AppContent, footer::Footer},
@@ -44,7 +46,7 @@ pub fn app() -> Html {
 
 fn switch(routes: AppRoute) -> Html {
     match routes {
-        AppRoute::Benchmark { .. } | AppRoute::Home => html! {
+        AppRoute::Benchmark { .. } | AppRoute::Compare { .. } | AppRoute::Home => html! {
             <ThemeProvider>
                 <UiProvider>
                     <div class="app-container">
@@ -65,5 +67,10 @@ fn switch(routes: AppRoute) -> Html {
 }
 
 fn main() {
+    if let Some(document) = web_sys::window().and_then(|w| w.document())
+        && let Ok(Some(splash)) = document.query_selector(".boot-splash")
+    {
+        splash.remove();
+    }
     yew::Renderer::<App>::new().render();
 }
