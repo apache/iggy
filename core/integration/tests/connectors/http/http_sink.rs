@@ -159,11 +159,11 @@
 //!
 //! ## Known Limitations
 //!
-//! 1. **FFI return value ignored**: The runtime's `process_messages()` discards `consume()`'s
-//!    `i32` return code. Errors are logged by the sink but invisible to the runtime.
+//! 1. **No runtime retry after `consume()` failure**: The runtime treats a non-zero `consume()`
+//!    FFI status as a processing error, but it does not retry the already-polled batch.
 //!    See [#2927](https://github.com/apache/iggy/issues/2927).
 //! 2. **Offsets committed before processing**: `PollingMessages` auto-commit strategy commits
-//!    offsets before `consume()`. Combined with (1), effective guarantee is at-most-once.
+//!    offsets before `consume()`, so effective guarantee is at-most-once.
 //!    See [#2928](https://github.com/apache/iggy/issues/2928).
 //!
 //! ## Test History
