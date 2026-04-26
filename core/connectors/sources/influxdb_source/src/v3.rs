@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn normalize_invalid_returns_with_z_appended() {
-        // If the string is unparseable even with Z appended, return the Z-appended form.
+        // If the string is unparsable even with Z appended, return the Z-appended form.
         let result = normalize_v3_timestamp("not-a-timestamp");
         assert_eq!(result, "not-a-timestampZ");
     }
