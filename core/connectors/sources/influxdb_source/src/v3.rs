@@ -224,6 +224,34 @@ pub(crate) struct PollResult {
 
 // ── Row processing (pure, testable without HTTP) ──────────────────────────────
 
+/// Normalize a raw timestamp from InfluxDB V3 JSONL into a cursor-safe RFC 3339 string.
+///
+/// InfluxDB 3 Core returns timestamps without a timezone suffix and with nanosecond
+/// precision (e.g. `"2026-04-26T02:32:20.526360865"`). Two normalizations are applied:
+///
+/// 1. Append `"Z"` when no timezone suffix is present (InfluxDB always stores UTC).
+/// 2. Truncate fractional seconds to milliseconds so the value round-trips cleanly
+///    through `validate_cursor` and SQL `WHERE time > '$cursor'` string literals.
+///
+/// Already-normalized RFC 3339 strings with ≤ms precision are returned unchanged.
+fn normalize_v3_timestamp(ts: &str) -> String {
+    // Fast path: already valid RFC 3339 with timezone.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+        let dt_utc: DateTime<Utc> = dt.with_timezone(&Utc);
+        // Only reformat if there are sub-millisecond digits.
+        if dt_utc.timestamp_subsec_nanos().is_multiple_of(1_000_000) {
+            return ts.to_string(); // ≤ms precision already, return unchanged
+        }
+        return dt_utc.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    }
+    // Slow path: no timezone suffix — append "Z" and reformat to ms precision.
+    let with_z = format!("{ts}Z");
+    with_z
+        .parse::<DateTime<Utc>>()
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .unwrap_or(with_z)
+}
+
 /// Result of processing a batch of V3 rows into Iggy messages.
 #[derive(Debug)]
 pub(crate) struct RowProcessingResult {
@@ -260,7 +288,9 @@ pub(crate) fn process_rows(
     // This is O(1) PRNG calls per batch instead of O(n), measurable at batch ≥ 100.
     let id_base = Uuid::new_v4().as_u128();
     for row in rows.iter() {
-        if let Some(cv) = row.get(ctx.cursor_field).and_then(|v| v.as_str()) {
+        if let Some(raw_cv) = row.get(ctx.cursor_field).and_then(|v| v.as_str()) {
+            let cv_owned = normalize_v3_timestamp(raw_cv);
+            let cv = cv_owned.as_str();
             if !timestamps_equal(cv, ctx.current_cursor) {
                 all_at_cursor = false;
             }
@@ -275,12 +305,10 @@ pub(crate) fn process_rows(
                     max_cursor = Some(cv.to_string());
                     max_cursor_parsed = Some(new_dt);
                 }
-                (None, _) => {
-                    // Unparseable cursor — still track it (string fallback) if no
-                    // parseable cursor has been seen yet.
-                    if max_cursor_parsed.is_none() {
-                        max_cursor = Some(cv.to_string());
-                    }
+                (None, _) if max_cursor_parsed.is_none() => {
+                    // Unparsable cursor — still track it (string fallback) if no
+                    // parsable cursor has been seen yet.
+                    max_cursor = Some(cv.to_string());
                 }
                 _ => {}
             }
@@ -305,13 +333,14 @@ pub(crate) fn process_rows(
         });
     }
 
-    // In process_rows, after the loop:
     let rows_at_max_cursor = rows
         .iter()
         .filter(|r| {
-            max_cursor
-                .as_deref()
-                .is_some_and(|mc| r.get(ctx.cursor_field).and_then(|v| v.as_str()) == Some(mc))
+            max_cursor.as_deref().is_some_and(|mc| {
+                r.get(ctx.cursor_field)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|cv| normalize_v3_timestamp(cv) == mc)
+            })
         })
         .count() as u64;
 
@@ -642,6 +671,66 @@ mod tests {
         assert_eq!(next_stuck_batch_size(1000, 500, 10), Some(2000));
         assert_eq!(next_stuck_batch_size(4000, 500, 10), Some(5000));
         assert_eq!(next_stuck_batch_size(5000, 500, 10), None);
+    }
+
+    // ── normalize_v3_timestamp ────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_already_valid_rfc3339_unchanged() {
+        // Already valid RFC 3339 with Z and ms precision — must be returned as-is.
+        assert_eq!(
+            normalize_v3_timestamp("2024-01-01T00:00:00.123Z"),
+            "2024-01-01T00:00:00.123Z"
+        );
+        // Second-precision with Z is also ≤ms, returned unchanged.
+        assert_eq!(
+            normalize_v3_timestamp("2024-01-01T00:00:00Z"),
+            "2024-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalize_no_tz_nanoseconds_appends_z_and_truncates() {
+        // InfluxDB 3 Core returns timestamps like this — 9 fractional digits, no Z.
+        let result = normalize_v3_timestamp("2026-04-26T02:32:20.526360865");
+        assert_eq!(result, "2026-04-26T02:32:20.526Z");
+    }
+
+    #[test]
+    fn normalize_no_tz_milliseconds_appends_z() {
+        // No timezone suffix, but already ms precision.
+        let result = normalize_v3_timestamp("2026-04-26T02:32:20.526");
+        assert_eq!(result, "2026-04-26T02:32:20.526Z");
+    }
+
+    #[test]
+    fn normalize_rfc3339_sub_ms_precision_truncates() {
+        // Already has Z but has sub-millisecond precision — truncate.
+        let result = normalize_v3_timestamp("2026-04-26T02:32:20.526360865Z");
+        assert_eq!(result, "2026-04-26T02:32:20.526Z");
+    }
+
+    #[test]
+    fn normalize_invalid_returns_with_z_appended() {
+        // If the string is unparseable even with Z appended, return the Z-appended form.
+        let result = normalize_v3_timestamp("not-a-timestamp");
+        assert_eq!(result, "not-a-timestampZ");
+    }
+
+    #[test]
+    fn process_rows_accepts_influxdb3_no_tz_timestamps() {
+        // Regression test: process_rows must not return Err when timestamps lack Z suffix.
+        let rows = vec![
+            row(&[("time", "2026-04-26T02:32:20.526360865"), ("val", "1")]),
+            row(&[("time", "2026-04-26T02:32:21.000000000"), ("val", "2")]),
+        ];
+        let c = ctx("2026-04-26T02:32:19.000Z", 0);
+        let result = process_rows(&rows, &c).expect("should not fail on bare timestamps");
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(
+            result.max_cursor.as_deref(),
+            Some("2026-04-26T02:32:21.000Z")
+        );
     }
 }
 

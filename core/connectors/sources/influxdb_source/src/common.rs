@@ -1051,7 +1051,7 @@ query   = "SELECT 1"
     // ── timestamps_equal fallback ────────────────────────────────────────────
 
     #[test]
-    fn timestamps_equal_fallback_on_unparseable_string() {
+    fn timestamps_equal_fallback_on_unparsable_string() {
         // When either side is not a valid RFC 3339 timestamp the function
         // falls back to string equality rather than returning an incorrect result.
         assert!(timestamps_equal("abc", "abc"));
