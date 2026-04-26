@@ -27,9 +27,10 @@
 
 use crate::common::{
     DEFAULT_V3_CURSOR_FIELD, PayloadFormat, Row, RowContext, V3SourceConfig, V3State,
-    apply_query_params, is_timestamp_after, parse_jsonl_rows, parse_scalar, validate_cursor,
+    apply_query_params, is_timestamp_after, parse_jsonl_rows, timestamps_equal, validate_cursor,
 };
 use base64::{Engine as _, engine::general_purpose};
+use chrono::{DateTime, Utc};
 use iggy_connector_sdk::{Error, ProducedMessage, Schema};
 use reqwest::Url;
 use reqwest_middleware::ClientWithMiddleware;
@@ -41,6 +42,13 @@ pub(crate) const DEFAULT_STUCK_CAP_FACTOR: u32 = 10;
 /// Upper bound for `stuck_batch_cap_factor`. A value of 1000 with batch_size=1000
 /// would issue 1,000,000-row queries before tripping the circuit breaker.
 pub(crate) const MAX_STUCK_CAP_FACTOR: u32 = 100;
+
+/// Hard cap on buffered JSONL response body size.
+///
+/// `MAX_STUCK_CAP_FACTOR` can inflate the effective batch to 100 × `batch_size`,
+/// making unbounded `response.text()` a real OOM vector under misconfiguration.
+/// Streaming stops and returns an error once this many bytes have been read.
+const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 
 /// InfluxDB V3 query endpoint expects this exact string for JSONL response format.
 const QUERY_FORMAT_JSONL: &str = "jsonl";
@@ -64,13 +72,19 @@ pub(crate) async fn run_query(
     auth: &str,
     cursor: &str,
     effective_batch: u32,
+    offset: u64,
 ) -> Result<String, Error> {
     validate_cursor(cursor)?;
-    let q = apply_query_params(&config.query, cursor, &effective_batch.to_string());
+    let q = apply_query_params(
+        &config.query,
+        cursor,
+        &effective_batch.to_string(),
+        &offset.to_string(), /* &str */
+    );
     let base = config.url.trim_end_matches('/');
     let (url, body) = build_query(base, &q, &config.db)?;
 
-    let response = client
+    let mut response = client
         .post(url)
         .header("Authorization", auth)
         .header("Content-Type", "application/json")
@@ -82,10 +96,33 @@ pub(crate) async fn run_query(
 
     let status = response.status();
     if status.is_success() {
-        return response
-            .text()
+        // Stream chunk-by-chunk with a hard byte cap to prevent OOM when
+        // MAX_STUCK_CAP_FACTOR inflates the effective batch to 100 × batch_size.
+        if response
+            .content_length()
+            .is_some_and(|n| n as usize > MAX_RESPONSE_BODY_BYTES)
+        {
+            return Err(Error::Storage(format!(
+                "InfluxDB V3 response body exceeds {MAX_RESPONSE_BODY_BYTES} byte cap; \
+                 reduce batch_size to avoid OOM"
+            )));
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| Error::Storage(format!("Failed to read V3 response: {e}")));
+            .map_err(|e| Error::Storage(format!("Failed to read V3 response: {e}")))?
+        {
+            buf.extend_from_slice(&chunk);
+            if buf.len() > MAX_RESPONSE_BODY_BYTES {
+                return Err(Error::Storage(format!(
+                    "InfluxDB V3 response body exceeded {MAX_RESPONSE_BODY_BYTES} byte cap \
+                     while streaming; reduce batch_size to avoid OOM"
+                )));
+            }
+        }
+        return String::from_utf8(buf)
+            .map_err(|e| Error::Storage(format!("V3 response body is not valid UTF-8: {e}")));
     }
 
     let body_text = response
@@ -95,8 +132,14 @@ pub(crate) async fn run_query(
 
     // 404 "database not found" means the namespace has not been written to yet;
     // treat it as empty rather than a failure so the circuit breaker stays healthy.
-    if status.as_u16() == 404 && body_text.contains("database not found") {
-        return Ok(String::new());
+    // Any other 404 (e.g. "table not found") is a permanent error — don't swallow it.
+    if status.as_u16() == 404 {
+        if body_text.to_lowercase().contains("database not found") {
+            return Ok(String::new());
+        }
+        return Err(Error::PermanentHttpError(format!(
+            "InfluxDB V3 query failed with status {status}: {body_text}"
+        )));
     }
 
     if iggy_connector_sdk::retry::is_transient_status(status) {
@@ -125,30 +168,33 @@ fn build_payload(
             .cloned()
             .ok_or_else(|| Error::InvalidRecordValue(format!("Missing payload column '{col}'")))?;
         return match payload_format {
-            PayloadFormat::Json => {
-                let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            // raw is already a serde_json::Value — serialize directly, no re-parse.
+            PayloadFormat::Json => serde_json::to_vec(&raw)
+                .map_err(|e| Error::Serialization(format!("JSON serialization failed: {e}"))),
+            PayloadFormat::Text => match raw {
+                serde_json::Value::String(s) => Ok(s.into_bytes()),
+                other => serde_json::to_vec(&other)
+                    .map_err(|e| Error::Serialization(format!("JSON serialization failed: {e}"))),
+            },
+            PayloadFormat::Raw => {
+                let s = raw.as_str().ok_or_else(|| {
                     Error::InvalidRecordValue(format!(
-                        "Payload column '{col}' is not valid JSON: {e}"
+                        "Payload column '{col}' must be a string value for Raw format"
                     ))
                 })?;
-                serde_json::to_vec(&v)
-                    .map_err(|e| Error::Serialization(format!("JSON serialization failed: {e}")))
-            }
-            PayloadFormat::Text => Ok(raw.into_bytes()),
-            PayloadFormat::Raw => general_purpose::STANDARD
-                .decode(raw.as_bytes())
-                .map_err(|e| {
+                general_purpose::STANDARD.decode(s.as_bytes()).map_err(|e| {
                     Error::InvalidRecordValue(format!("Failed to decode payload as base64: {e}"))
-                }),
+                })
+            }
         };
     }
 
-    // V3 rows are flat SQL results. When include_metadata=false, exclude the
-    // cursor column (timestamp) — it is used for deduplication, not user data.
+    // V3 rows carry typed serde_json::Values — clone directly, no parse_scalar needed.
+    // When include_metadata=false, exclude the cursor column (timestamp).
     let json_row: serde_json::Map<_, _> = row
         .iter()
         .filter(|(k, _)| include_metadata || k.as_str() != cursor_field)
-        .map(|(k, v)| (k.clone(), parse_scalar(v)))
+        .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     serde_json::to_vec(&json_row)
         .map_err(|e| Error::Serialization(format!("JSON serialization failed: {e}")))
@@ -188,6 +234,8 @@ pub(crate) struct RowProcessingResult {
     /// all returned rows are at the current cursor, meaning the cursor cannot
     /// advance with `> cursor` semantics.
     pub all_at_cursor: bool,
+    /// Count of rows whose cursor == max_cursor (for tiebreaker offset).
+    pub rows_at_max_cursor: u64,
 }
 
 /// Convert a slice of V3 query rows into Iggy messages.
@@ -204,22 +252,35 @@ pub(crate) fn process_rows(
 ) -> Result<RowProcessingResult, Error> {
     let mut messages = Vec::with_capacity(rows.len());
     let mut max_cursor: Option<String> = None;
+    let mut max_cursor_parsed: Option<DateTime<Utc>> = None; // cache parsed form
     // Starts true for non-empty batches; flipped to false as soon as any row
     // either has a different cursor value or has no cursor field at all.
     let mut all_at_cursor = !rows.is_empty();
     // Generate the base UUID once per poll; derive per-message IDs by addition.
     // This is O(1) PRNG calls per batch instead of O(n), measurable at batch ≥ 100.
     let id_base = Uuid::new_v4().as_u128();
-
     for row in rows.iter() {
-        if let Some(cv) = row.get(ctx.cursor_field) {
-            if cv != ctx.current_cursor {
+        if let Some(cv) = row.get(ctx.cursor_field).and_then(|v| v.as_str()) {
+            if !timestamps_equal(cv, ctx.current_cursor) {
                 all_at_cursor = false;
             }
-            match &max_cursor {
-                None => max_cursor = Some(cv.clone()),
-                Some(current) if is_timestamp_after(cv, current) => {
-                    max_cursor = Some(cv.clone());
+            validate_cursor(cv)?;
+            let cv_parsed = cv.parse::<DateTime<Utc>>().ok();
+            match (cv_parsed, max_cursor_parsed) {
+                (Some(new_dt), Some(cur_dt)) if new_dt > cur_dt => {
+                    max_cursor = Some(cv.to_string());
+                    max_cursor_parsed = Some(new_dt);
+                }
+                (Some(new_dt), None) => {
+                    max_cursor = Some(cv.to_string());
+                    max_cursor_parsed = Some(new_dt);
+                }
+                (None, _) => {
+                    // Unparseable cursor — still track it (string fallback) if no
+                    // parseable cursor has been seen yet.
+                    if max_cursor_parsed.is_none() {
+                        max_cursor = Some(cv.to_string());
+                    }
                 }
                 _ => {}
             }
@@ -244,6 +305,16 @@ pub(crate) fn process_rows(
         });
     }
 
+    // In process_rows, after the loop:
+    let rows_at_max_cursor = rows
+        .iter()
+        .filter(|r| {
+            max_cursor
+                .as_deref()
+                .is_some_and(|mc| r.get(ctx.cursor_field).and_then(|v| v.as_str()) == Some(mc))
+        })
+        .count() as u64;
+
     if !rows.is_empty() && max_cursor.is_none() {
         return Err(Error::InvalidRecordValue(format!(
             "No '{}' field found in any returned row — cursor cannot advance; \
@@ -257,6 +328,7 @@ pub(crate) fn process_rows(
         messages,
         max_cursor,
         all_at_cursor,
+        rows_at_max_cursor,
     })
 }
 
@@ -285,7 +357,15 @@ pub(crate) async fn poll(
         state.effective_batch_size
     };
 
-    let response_data = run_query(client, config, auth, &cursor, effective_batch).await?;
+    let response_data = run_query(
+        client,
+        config,
+        auth,
+        &cursor,
+        effective_batch,
+        state.last_timestamp_row_offset,
+    )
+    .await?;
     let rows = parse_jsonl_rows(&response_data)?;
 
     let cap_factor = config
@@ -328,6 +408,7 @@ pub(crate) async fn poll(
                         last_timestamp: state.last_timestamp.clone(),
                         processed_rows: state.processed_rows,
                         effective_batch_size: next_batch,
+                        last_timestamp_row_offset: result.rows_at_max_cursor,
                     },
                     schema: Schema::Json,
                     trip_circuit_breaker: false,
@@ -344,6 +425,7 @@ pub(crate) async fn poll(
                         last_timestamp: state.last_timestamp.clone(),
                         processed_rows: state.processed_rows,
                         effective_batch_size: effective_batch,
+                        last_timestamp_row_offset: result.rows_at_max_cursor,
                     },
                     schema: Schema::Json,
                     trip_circuit_breaker: true,
@@ -353,10 +435,30 @@ pub(crate) async fn poll(
     }
 
     let processed_rows = state.processed_rows + result.messages.len() as u64;
+    let old_dt = state
+        .last_timestamp
+        .as_deref()
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok());
+    let advanced_cursor = match (
+        result.max_cursor.as_deref(),
+        state.last_timestamp.as_deref(),
+    ) {
+        (Some(new), Some(_)) if old_dt.is_some_and(|dt| is_timestamp_after(new, dt)) => {
+            result.max_cursor
+        }
+        (Some(_), Some(_)) => {
+            warn!("V3 source: max_cursor did not advance past saved cursor; keeping old value");
+            state.last_timestamp.clone()
+        }
+        (Some(_), None) => result.max_cursor, // first poll
+        _ => state.last_timestamp.clone(),    // empty batch
+    };
+
     let new_state = V3State {
-        last_timestamp: result.max_cursor.or_else(|| state.last_timestamp.clone()),
+        last_timestamp: advanced_cursor,
         processed_rows,
         effective_batch_size: base_batch, // reset on successful advance
+        last_timestamp_row_offset: result.rows_at_max_cursor,
     };
 
     let schema = if ctx.payload_col.is_some() {
@@ -381,7 +483,7 @@ mod tests {
     fn row(pairs: &[(&str, &str)]) -> Row {
         pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
             .collect()
     }
 
@@ -624,6 +726,7 @@ mod http_tests {
             "Bearer tok",
             CURSOR,
             10,
+            0,
         )
         .await
         .unwrap();
@@ -641,6 +744,7 @@ mod http_tests {
             "Bearer tok",
             CURSOR,
             10,
+            0,
         )
         .await
         .unwrap();
@@ -662,6 +766,7 @@ mod http_tests {
             "Bearer tok",
             CURSOR,
             10,
+            0,
         )
         .await
         .unwrap();
@@ -682,6 +787,7 @@ mod http_tests {
             "Bearer tok",
             CURSOR,
             10,
+            0,
         )
         .await;
         assert!(matches!(result, Err(Error::PermanentHttpError(_))));
@@ -700,6 +806,7 @@ mod http_tests {
             "Bearer tok",
             CURSOR,
             10,
+            0,
         )
         .await;
         assert!(matches!(result, Err(Error::Storage(_))));
@@ -718,6 +825,7 @@ mod http_tests {
             "Bearer tok",
             CURSOR,
             10,
+            0,
         )
         .await;
         assert!(matches!(result, Err(Error::PermanentHttpError(_))));
@@ -748,6 +856,7 @@ mod http_tests {
             "Bearer my_token",
             CURSOR,
             10,
+            0,
         )
         .await;
         assert_eq!(*captured.lock().await, "Bearer my_token");
@@ -778,6 +887,7 @@ mod http_tests {
             "Bearer tok",
             cursor,
             10,
+            0,
         )
         .await;
         let body = captured_body.lock().await;
@@ -893,6 +1003,7 @@ mod http_tests {
             last_timestamp: Some(t.to_string()),
             effective_batch_size: 10,
             processed_rows: 0,
+            last_timestamp_row_offset: 0,
         };
         let result = poll(
             &make_client(),
@@ -935,6 +1046,7 @@ mod http_tests {
             last_timestamp: Some(t.to_string()),
             effective_batch_size: 10,
             processed_rows: 0,
+            last_timestamp_row_offset: 0,
         };
         let result = poll(
             &make_client(),

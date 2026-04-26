@@ -25,14 +25,17 @@
 
 use csv::StringRecord;
 use iggy_connector_sdk::Error;
+use simd_json::BorrowedValue;
 use std::collections::HashMap;
 
-/// A single row returned by a query, field name → string value.
+/// A single row returned by a query, field name → typed JSON value.
 ///
-/// Both V2 (annotated CSV) and V3 (JSONL) responses are normalised into this
-/// common representation so the cursor-tracking and payload-building logic
-/// above this layer remains version-agnostic.
-pub(crate) type Row = HashMap<String, String>;
+/// V2 (annotated CSV) stores all values as `Value::String` since CSV has no
+/// type information; `parse_scalar` in `build_payload` converts them to typed
+/// values when building the message payload. V3 (JSONL) stores typed values
+/// directly — numbers, booleans, and nulls arrive pre-typed from SQL, so no
+/// string-round-trip parse is needed.
+pub(crate) type Row = HashMap<String, serde_json::Value>;
 
 // ── InfluxDB V2 — annotated CSV ───────────────────────────────────────────────
 
@@ -104,7 +107,7 @@ pub(crate) fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
                 continue;
             }
             let value = record.get(idx).unwrap_or("").to_string();
-            mapped.insert(key.to_string(), value);
+            mapped.insert(key.to_string(), serde_json::Value::String(value));
         }
 
         if !mapped.is_empty() {
@@ -134,46 +137,58 @@ pub(crate) fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
 /// `simd_json::from_slice` requires `&mut [u8]` and modifies the bytes in
 /// place for zero-copy SIMD parsing; we clone each line into a `Vec<u8>` to
 /// satisfy the mutability requirement without borrowing the original string.
-pub(crate) fn parse_jsonl_rows(jsonl_text: &str) -> Result<Vec<Row>, Error> {
-    let mut rows = Vec::new();
-
-    for (line_no, line) in jsonl_text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        // simd_json modifies the slice in place during parsing (it replaces escaped
-        // sequences with their decoded form), so we need an owned copy of the bytes.
-        let mut line_bytes: Vec<u8> = line.as_bytes().to_vec();
-        let obj: serde_json::Map<String, serde_json::Value> =
-            simd_json::from_slice(&mut line_bytes).map_err(|e| {
-                Error::InvalidRecordValue(format!(
-                    "JSONL parse error on line {}: {e} — raw: {line:?}",
-                    line_no + 1
-                ))
-            })?;
-
-        let row: Row = obj
-            .into_iter()
-            .map(|(k, v)| {
-                let s = match v {
-                    serde_json::Value::String(s) => s,
-                    serde_json::Value::Null => "null".to_string(),
-                    serde_json::Value::Bool(b) => b.to_string(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    other => other.to_string(),
-                };
-                (k, s)
-            })
-            .collect();
-
-        rows.push(row);
+fn parse_object(value: BorrowedValue<'_>) -> Result<Row, Error> {
+    let BorrowedValue::Object(map) = value else {
+        return Err(Error::InvalidRecordValue(
+            "expected a JSON object in JSONL response".to_string(),
+        ));
+    };
+    let mut row = Row::with_capacity(map.len());
+    for (k, v) in map.iter() {
+        // Convert simd_json BorrowedValue → serde_json::Value directly, preserving
+        // the original type. Numbers and booleans are kept typed so build_payload
+        // can emit them without a string-round-trip through parse_scalar.
+        let json_val = match v {
+            BorrowedValue::Static(simd_json::StaticNode::Null) => serde_json::Value::Null,
+            BorrowedValue::Static(simd_json::StaticNode::Bool(b)) => serde_json::Value::Bool(*b),
+            BorrowedValue::Static(simd_json::StaticNode::I64(n)) => {
+                serde_json::Value::Number((*n).into())
+            }
+            BorrowedValue::Static(simd_json::StaticNode::U64(n)) => {
+                serde_json::Value::Number((*n).into())
+            }
+            BorrowedValue::Static(simd_json::StaticNode::F64(n)) => {
+                serde_json::Number::from_f64(*n)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null)
+            }
+            BorrowedValue::String(s) => serde_json::Value::String(s.to_string()),
+            // Arrays/objects: serialize via simd_json then re-parse as serde_json.
+            // InfluxDB V3 SQL results are flat, so this path is rarely hit.
+            other => serde_json::to_value(other)
+                .map_err(|e| Error::InvalidRecordValue(format!("JSON conversion error: {e}")))?,
+        };
+        row.insert(k.to_string(), json_val);
     }
-
-    Ok(rows)
+    Ok(row)
 }
 
+pub fn parse_jsonl_rows(data: &str) -> Result<Vec<Row>, Error> {
+    let mut rows = Vec::new();
+    let mut scratch = Vec::new(); // reused across lines
+    for line in data.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        scratch.clear();
+        scratch.extend_from_slice(trimmed.as_bytes());
+        let obj: simd_json::BorrowedValue = simd_json::to_borrowed_value(&mut scratch)
+            .map_err(|e| Error::InvalidRecordValue(format!("JSON parse error: {e}")))?;
+        rows.push(parse_object(obj)?);
+    }
+    Ok(rows)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,7 +205,7 @@ mod tests {
         let csv = "#group,false\n#datatype,string\n_time,_value\n2024-01-01T00:00:00Z,42\n";
         let rows = parse_csv_rows(csv).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get("_value").map(String::as_str), Some("42"));
+        assert_eq!(rows[0].get("_value").and_then(|v| v.as_str()), Some("42"));
     }
 
     #[test]
@@ -219,7 +234,10 @@ mod tests {
         assert_eq!(rows.len(), 2);
         //assert!(rows[0].contains_key("_measurement"));
         assert!(!rows[0].contains_key("_measurement"));
-        assert_eq!(rows[1].get("_measurement").map(String::as_str), Some("cpu"));
+        assert_eq!(
+            rows[1].get("_measurement").and_then(|v| v.as_str()),
+            Some("cpu")
+        );
     }
 
     #[test]
@@ -228,9 +246,12 @@ mod tests {
         let rows = parse_csv_rows(csv).unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
-        assert_eq!(row.get("_measurement").map(String::as_str), Some("cpu"));
-        assert_eq!(row.get("_field").map(String::as_str), Some("usage"));
-        assert_eq!(row.get("_value").map(String::as_str), Some("75.0"));
+        assert_eq!(
+            row.get("_measurement").and_then(|v| v.as_str()),
+            Some("cpu")
+        );
+        assert_eq!(row.get("_field").and_then(|v| v.as_str()), Some("usage"));
+        assert_eq!(row.get("_value").and_then(|v| v.as_str()), Some("75.0"));
     }
 
     #[test]
@@ -251,8 +272,8 @@ mod tests {
                    2024-01-01T01:00:00Z,2024-01-01T02:00:00Z,usage,55\n";
         let rows = parse_csv_rows(csv).unwrap();
         assert_eq!(rows.len(), 2, "rows must not be silently dropped");
-        assert_eq!(rows[0].get("_value").map(String::as_str), Some("42"));
-        assert_eq!(rows[1].get("_value").map(String::as_str), Some("55"));
+        assert_eq!(rows[0].get("_value").and_then(|v| v.as_str()), Some("42"));
+        assert_eq!(rows[1].get("_value").and_then(|v| v.as_str()), Some("55"));
     }
 
     #[test]
@@ -260,7 +281,7 @@ mod tests {
         let csv = "_stop,_count\n2024-01-01T01:00:00Z,7\n";
         let rows = parse_csv_rows(csv).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get("_count").map(String::as_str), Some("7"));
+        assert_eq!(rows[0].get("_count").and_then(|v| v.as_str()), Some("7"));
     }
 
     // ── parse_jsonl_rows ─────────────────────────────────────────────────────
@@ -275,8 +296,12 @@ mod tests {
         let jsonl = r#"{"_time":"2024-01-01T00:00:00Z","_measurement":"cpu","_value":75.5}"#;
         let rows = parse_jsonl_rows(jsonl).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get("_measurement").map(String::as_str), Some("cpu"));
-        assert_eq!(rows[0].get("_value").map(String::as_str), Some("75.5"));
+        assert_eq!(
+            rows[0].get("_measurement").and_then(|v| v.as_str()),
+            Some("cpu")
+        );
+        // Numbers remain typed — no string round-trip.
+        assert_eq!(rows[0].get("_value").and_then(|v| v.as_f64()), Some(75.5));
     }
 
     #[test]
@@ -284,8 +309,8 @@ mod tests {
         let jsonl = "{\"_time\":\"2024-01-01T00:00:00Z\",\"v\":1}\n{\"_time\":\"2024-01-01T00:00:01Z\",\"v\":2}\n";
         let rows = parse_jsonl_rows(jsonl).unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].get("v").map(String::as_str), Some("1"));
-        assert_eq!(rows[1].get("v").map(String::as_str), Some("2"));
+        assert_eq!(rows[0].get("v").and_then(|v| v.as_i64()), Some(1));
+        assert_eq!(rows[1].get("v").and_then(|v| v.as_i64()), Some(2));
     }
 
     #[test]
@@ -296,25 +321,31 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_stringifies_bool_values() {
+    fn jsonl_bool_values_remain_typed() {
         let jsonl = r#"{"active":true,"disabled":false}"#;
         let rows = parse_jsonl_rows(jsonl).unwrap();
-        assert_eq!(rows[0].get("active").map(String::as_str), Some("true"));
-        assert_eq!(rows[0].get("disabled").map(String::as_str), Some("false"));
+        assert_eq!(rows[0].get("active"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            rows[0].get("disabled"),
+            Some(&serde_json::Value::Bool(false))
+        );
     }
 
     #[test]
-    fn jsonl_stringifies_null() {
+    fn jsonl_null_value_remains_typed() {
         let jsonl = r#"{"field":null}"#;
         let rows = parse_jsonl_rows(jsonl).unwrap();
-        assert_eq!(rows[0].get("field").map(String::as_str), Some("null"));
+        assert_eq!(rows[0].get("field"), Some(&serde_json::Value::Null));
     }
 
     #[test]
     fn jsonl_string_values_unquoted() {
         let jsonl = r#"{"host":"server1"}"#;
         let rows = parse_jsonl_rows(jsonl).unwrap();
-        assert_eq!(rows[0].get("host").map(String::as_str), Some("server1"));
+        assert_eq!(
+            rows[0].get("host").and_then(|v| v.as_str()),
+            Some("server1")
+        );
     }
 
     #[test]
@@ -328,5 +359,62 @@ mod tests {
         let jsonl = "{\"v\":42}\n";
         let rows = parse_jsonl_rows(jsonl).unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    // ── parse_jsonl_rows — additional type coverage ──────────────────────────
+
+    #[test]
+    fn jsonl_negative_integer_uses_i64_branch() {
+        // Negative integers are stored as I64 by simd_json; positive ones are U64.
+        let jsonl = r#"{"delta":-42,"count":7}"#;
+        let rows = parse_jsonl_rows(jsonl).unwrap();
+        assert_eq!(rows[0].get("delta").and_then(|v| v.as_i64()), Some(-42));
+        assert_eq!(rows[0].get("count").and_then(|v| v.as_u64()), Some(7));
+    }
+
+    #[test]
+    fn jsonl_nested_array_value_is_serialized_as_json() {
+        // The "other" arm in parse_object handles arrays and nested objects.
+        let jsonl = r#"{"tags":["a","b"]}"#;
+        let rows = parse_jsonl_rows(jsonl).unwrap();
+        let tags = rows[0].get("tags").unwrap();
+        assert!(tags.is_array(), "expected array value, got {tags:?}");
+    }
+
+    #[test]
+    fn jsonl_non_object_line_returns_error() {
+        // A JSONL line that is not a JSON object (e.g. a bare array) must be rejected.
+        let jsonl = "[1,2,3]\n";
+        assert!(parse_jsonl_rows(jsonl).is_err());
+    }
+
+    // ── parse_csv_rows — path coverage ──────────────────────────────────────
+
+    #[test]
+    fn csv_data_row_before_any_header_is_skipped() {
+        // A data row that appears before any _time/_start/_stop header row must be
+        // silently ignored (headers is None → continue).
+        let csv = "random,data\n_time,_value\n2024-01-01T00:00:00Z,1\n";
+        let rows = parse_csv_rows(csv).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the row after the header should be returned"
+        );
+        assert_eq!(rows[0].get("_value").and_then(|v| v.as_str()), Some("1"));
+    }
+
+    #[test]
+    fn csv_empty_header_column_name_is_skipped() {
+        // InfluxDB annotated CSV sometimes has a leading empty column (annotation prefix).
+        // Empty column names must be skipped so the row map stays clean.
+        let csv = "_time,,_value\n2024-01-01T00:00:00Z,extra,42\n";
+        let rows = parse_csv_rows(csv).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !rows[0].contains_key(""),
+            "empty key must not appear in row"
+        );
+        assert_eq!(rows[0].get("_value").and_then(|v| v.as_str()), Some("42"));
     }
 }

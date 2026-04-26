@@ -23,6 +23,7 @@ use crate::common::{
     is_timestamp_after, parse_csv_rows, parse_scalar, validate_cursor,
 };
 use base64::{Engine as _, engine::general_purpose};
+use chrono::{DateTime, Utc};
 use iggy_connector_sdk::{Error, ProducedMessage, Schema};
 use reqwest::Url;
 use reqwest_middleware::ClientWithMiddleware;
@@ -70,7 +71,7 @@ fn render_query(config: &V2SourceConfig, cursor: &str, already_seen: u64) -> Res
     // Cap inflation so a stuck cursor cannot issue arbitrarily large queries.
     let capped_seen = already_seen.min(batch.saturating_mul(MAX_SKIP_INFLATION_FACTOR));
     let limit = batch.saturating_add(capped_seen).to_string();
-    Ok(apply_query_params(&config.query, cursor, &limit))
+    Ok(apply_query_params(&config.query, cursor, &limit, ""))
 }
 
 #[cfg(test)]
@@ -81,7 +82,7 @@ mod tests {
     fn row(pairs: &[(&str, &str)]) -> Row {
         pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
             .collect()
     }
 
@@ -252,13 +253,14 @@ fn build_payload(
     include_metadata: bool,
 ) -> Result<Vec<u8>, Error> {
     if let Some(col) = payload_column {
+        // V2 CSV values are always Value::String; extract once and reuse.
         let raw = row
             .get(col)
-            .cloned()
+            .and_then(|v| v.as_str())
             .ok_or_else(|| Error::InvalidRecordValue(format!("Missing payload column '{col}'")))?;
         return match payload_format {
             PayloadFormat::Json => {
-                let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+                let v: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
                     Error::InvalidRecordValue(format!(
                         "Payload column '{col}' is not valid JSON: {e}"
                     ))
@@ -266,7 +268,7 @@ fn build_payload(
                 serde_json::to_vec(&v)
                     .map_err(|e| Error::Serialization(format!("JSON serialization failed: {e}")))
             }
-            PayloadFormat::Text => Ok(raw.into_bytes()),
+            PayloadFormat::Text => Ok(raw.as_bytes().to_vec()),
             PayloadFormat::Raw => general_purpose::STANDARD
                 .decode(raw.as_bytes())
                 .map_err(|e| {
@@ -287,7 +289,10 @@ fn build_payload(
     let mut timestamp_str: &str = "";
     let mut field_value = serde_json::Value::Null;
 
-    for (key, val_str) in row {
+    // V2 CSV values arrive as Value::String; extract the &str once and call
+    // parse_scalar to infer bool / i64 / f64 / string type from the raw text.
+    for (key, val) in row {
+        let val_str = val.as_str().unwrap_or("");
         match key.as_str() {
             "_measurement" => {
                 measurement = val_str;
@@ -368,6 +373,7 @@ pub(crate) fn process_rows(
 ) -> Result<RowProcessingResult, Error> {
     let mut messages = Vec::with_capacity(rows.len());
     let mut max_cursor: Option<String> = None;
+    let mut max_cursor_parsed: Option<DateTime<Utc>> = None;
     let mut rows_at_max_cursor = 0u64;
     let mut skipped = 0u64;
     // Generate the base UUID once per poll; derive per-message IDs by addition.
@@ -376,26 +382,26 @@ pub(crate) fn process_rows(
 
     for row in rows.iter() {
         // Single lookup for cursor_field — used for both skip logic and max-cursor tracking.
-        let cv = row.get(ctx.cursor_field);
-        if let Some(cv) = cv
-            && cv == ctx.current_cursor
-            && skipped < already_seen
-        {
+        // V2 CSV rows store all values as Value::String; .as_str() is always Some.
+        let cv = row.get(ctx.cursor_field).and_then(|v| v.as_str());
+        if cv == Some(ctx.current_cursor) && skipped < already_seen {
             skipped += 1;
             continue;
         }
 
         if let Some(cv) = cv {
-            match &max_cursor {
+            match max_cursor_parsed {
                 None => {
-                    max_cursor = Some(cv.clone());
+                    max_cursor = Some(cv.to_string());
+                    max_cursor_parsed = cv.parse::<DateTime<Utc>>().ok();
                     rows_at_max_cursor = 1;
                 }
-                Some(current) => {
-                    if is_timestamp_after(cv, current) {
-                        max_cursor = Some(cv.clone());
+                Some(current_dt) => {
+                    if is_timestamp_after(cv, current_dt) {
+                        max_cursor = Some(cv.to_string());
+                        max_cursor_parsed = cv.parse::<DateTime<Utc>>().ok();
                         rows_at_max_cursor = 1;
-                    } else if cv == current {
+                    } else if max_cursor.as_deref() == Some(cv) {
                         rows_at_max_cursor += 1;
                     }
                 }

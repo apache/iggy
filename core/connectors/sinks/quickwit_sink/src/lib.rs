@@ -114,7 +114,7 @@ impl QuickwitSink {
 
     pub async fn ingest(&self, messages: Vec<simd_json::OwnedValue>) -> Result<(), Error> {
         let url = format!(
-            "{}/api/v1/{}/ingest?commit=force",
+            "{}/api/v1/{}/ingest?commit=auto",
             self.config.url, self.index_id
         );
         info!("Ingesting messages for index: {}...", self.index_id);

@@ -56,7 +56,14 @@ pub enum InfluxDbSourceConfig {
 impl<'de> serde::Deserialize<'de> for InfluxDbSourceConfig {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = serde_json::Value::deserialize(d)?;
-        let version = raw.get("version").and_then(|v| v.as_str()).unwrap_or("v2");
+        let version = match raw.get("version") {
+            None => "v2", // absent key → backward compat default
+            Some(v) => v.as_str().ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "\"version\" must be a string (e.g. \"v2\" or \"v3\"), got: {v}"
+                ))
+            })?,
+        };
         match version {
             "v2" => serde_json::from_value::<V2SourceConfig>(raw)
                 .map(Self::V2)
@@ -176,7 +183,9 @@ impl InfluxDbSourceConfig {
         delegate!(opt    self.poll_interval)
     }
     pub fn batch_size(&self) -> u32 {
-        delegate!(unwrap self.batch_size, 500)
+        // Floor at 1 — callers build LIMIT $limit queries; LIMIT 0 stalls silently.
+        // open() also rejects 0 explicitly, but defense-in-depth here costs nothing.
+        delegate!(unwrap self.batch_size, 500).max(1)
     }
     pub fn initial_offset(&self) -> Option<&str> {
         delegate!(opt    self.initial_offset)
@@ -287,6 +296,9 @@ pub struct V3State {
     /// Current effective batch size after stuck-timestamp inflation.
     /// Reset to the configured base value when the cursor advances.
     pub effective_batch_size: u32,
+    /// Row offset within the last timestamp group — used as a tiebreaker
+    /// so that siblings at the same timestamp are not silently dropped.
+    pub last_timestamp_row_offset: u64,
 }
 
 // ── Payload format ────────────────────────────────────────────────────────────
@@ -341,21 +353,25 @@ pub fn cursor_re() -> &'static regex::Regex {
         // Note: day 29-31 validity for a given month is not checked by the regex;
         // chrono parsing inside validate_cursor handles that for tz-aware timestamps.
         regex::Regex::new(
-            r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
+            r"(?-u)^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):[0-5]\d:[0-5]\d(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
         )
         .expect("hardcoded regex is valid")
     })
 }
 
 pub fn validate_cursor(cursor: &str) -> Result<(), Error> {
-    if cursor_re().is_match(cursor) {
-        Ok(())
-    } else {
-        Err(Error::InvalidConfigValue(format!(
-            "cursor value {cursor:?} is not a valid RFC 3339 timestamp; \
-             refusing substitution to prevent query injection"
-        )))
+    if !cursor_re().is_match(cursor) {
+        return Err(Error::InvalidConfigValue(format!(
+            "cursor value {cursor:?} is not a valid RFC 3339 timestamp"
+        )));
     }
+    // Chain chrono parse to catch calendar-invalid dates (e.g. Feb 30)
+    chrono::DateTime::parse_from_rfc3339(cursor).map_err(|e| {
+        Error::InvalidConfigValue(format!(
+            "cursor value {cursor:?} failed chrono validation: {e}"
+        ))
+    })?;
+    Ok(())
 }
 
 /// Validate `cursor_field` for the given connector version.
@@ -365,8 +381,13 @@ pub fn validate_cursor(cursor: &str) -> Result<(), Error> {
 /// (SQL timestamp column). Swapping them silently would produce empty result sets
 /// or query errors at the InfluxDB level.
 pub fn validate_cursor_field(field: &str, version: &str) -> Result<(), Error> {
+    if field.is_empty() {
+        return Err(Error::InvalidConfigValue(format!(
+            "cursor_field must not be empty for {version} — \
+             use \"_time\" for v2 or \"time\" for v3"
+        )));
+    }
     match (field, version) {
-        ("_time", "v2") | ("time", "v3") => Ok(()),
         ("time", "v2") => Err(Error::InvalidConfigValue(
             "cursor_field \"time\" is not valid for v2 — use \"_time\" \
              (the Flux annotated-CSV timestamp column)"
@@ -377,41 +398,57 @@ pub fn validate_cursor_field(field: &str, version: &str) -> Result<(), Error> {
              (the SQL timestamp column)"
                 .into(),
         )),
-        (other, _) => {
-            let suggestion = if version == "v2" {
-                "\"_time\""
-            } else {
-                "\"time\""
-            };
-            Err(Error::InvalidConfigValue(format!(
-                "cursor_field {other:?} is not supported for {version} — use {suggestion}"
-            )))
-        }
+        // Allow everything else — custom column names are valid
+        _ => Ok(()),
     }
 }
 
 // ── Timestamp helpers ─────────────────────────────────────────────────────────
 
-/// Return `true` if timestamp `a` is strictly after `b`.
+/// Return `true` if timestamp string `a` is strictly after the pre-parsed `b`.
 ///
-/// Parses both strings as RFC 3339 / chrono `DateTime<Utc>`. Returns `false`
-/// conservatively when either value fails to parse — do NOT advance the cursor
-/// when comparison is ambiguous. Lexicographic comparison is incorrect for
-/// timestamps with different timezone offsets (e.g. `+05:30` vs `Z`) and would
-/// silently produce wrong cursor advancement.
-pub fn is_timestamp_after(a: &str, b: &str) -> bool {
-    match (a.parse::<DateTime<Utc>>(), b.parse::<DateTime<Utc>>()) {
-        (Ok(dt_a), Ok(dt_b)) => dt_a > dt_b,
-        _ => {
+/// `b` is accepted as an already-parsed `DateTime<Utc>` so callers that compare
+/// against the same cursor on every row in a batch parse it once, not O(n) times.
+/// `a` is parsed on each call. Returns `false` conservatively when `a` fails to
+/// parse — do NOT advance the cursor when comparison is ambiguous. Lexicographic
+/// comparison is incorrect for timestamps with different timezone offsets
+/// (e.g. `+05:30` vs `Z`) and would silently produce wrong cursor advancement.
+pub fn is_timestamp_after(a: &str, b_parsed: DateTime<Utc>) -> bool {
+    match a.parse::<DateTime<Utc>>() {
+        Ok(dt_a) => dt_a > b_parsed,
+        Err(_) => {
             warn!(
-                "is_timestamp_after: could not parse timestamps as RFC 3339 \
-                 ({a:?} vs {b:?}); returning false to avoid incorrect cursor advancement"
+                "is_timestamp_after: could not parse {a:?} as RFC 3339; \
+                 refusing to advance cursor"
             );
             false
         }
     }
 }
 
+/// Return `true` if timestamps `a` and `b` represent the same instant,
+/// regardless of timezone format differences.
+///
+/// Raw string equality is wrong here: `"2024-01-01T00:00:00Z"` and
+/// `"2024-01-01T00:00:00+00:00"` are the same instant but differ lexically.
+/// This causes `all_at_cursor` to flip `false` incorrectly for one poll round,
+/// producing duplicate delivery that self-heals next poll once the cursor
+/// string is overwritten.
+///
+/// Falls back to string equality if either value fails to parse — conservative,
+/// avoids a false "not equal" that would produce unnecessary duplicates.
+pub(crate) fn timestamps_equal(a: &str, b: &str) -> bool {
+    match (a.parse::<DateTime<Utc>>(), b.parse::<DateTime<Utc>>()) {
+        (Ok(dt_a), Ok(dt_b)) => dt_a == dt_b,
+        _ => {
+            warn!(
+                "timestamps_equal: could not parse timestamps as RFC 3339 \
+                 ({a:?} vs {b:?}); falling back to string equality"
+            );
+            a == b
+        }
+    }
+}
 // ── Scalar parsing ────────────────────────────────────────────────────────────
 
 /// Parse a string value from InfluxDB into the most specific JSON scalar type.
@@ -443,7 +480,12 @@ pub fn parse_scalar(value: &str) -> serde_json::Value {
 /// Substitute `$cursor` and `$limit` placeholders in a query template in a
 /// single pass, avoiding the two intermediate `String` allocations that
 /// `clone() + replace() + replace()` would produce.
-pub(crate) fn apply_query_params(template: &str, cursor: &str, limit: &str) -> String {
+pub(crate) fn apply_query_params(
+    template: &str,
+    cursor: &str,
+    limit: &str,
+    offset: &str,
+) -> String {
     let capacity = template.len() + cursor.len() + limit.len();
     let mut result = String::with_capacity(capacity);
     let mut remaining = template;
@@ -456,6 +498,9 @@ pub(crate) fn apply_query_params(template: &str, cursor: &str, limit: &str) -> S
         } else if after.starts_with("$limit") {
             result.push_str(limit);
             remaining = &remaining[pos + "$limit".len()..];
+        } else if after.starts_with("$offset") {
+            result.push_str(offset);
+            remaining = &remaining[pos + "$offset".len()..];
         } else {
             result.push('$');
             remaining = &remaining[pos + 1..];
@@ -525,8 +570,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_cursor_field_rejects_others() {
-        assert!(validate_cursor_field("_value", "v2").is_err());
+    fn validate_cursor_field_rejects_empty() {
+        // Empty cursor field must always be rejected — it produces no results.
+        assert!(validate_cursor_field("", "v2").is_err());
         assert!(validate_cursor_field("", "v3").is_err());
     }
 
@@ -546,22 +592,30 @@ mod tests {
 
     #[test]
     fn validate_cursor_field_error_is_version_specific() {
-        let v2_err = validate_cursor_field("timestamp", "v2")
-            .unwrap_err()
-            .to_string();
-        assert!(v2_err.contains("v2"), "error should mention v2");
+        // The cross-version error messages reference the wrong column and hint at
+        // the correct one, so users can fix config without reading the docs.
+        let v2_err = validate_cursor_field("time", "v2").unwrap_err().to_string();
+        assert!(
+            v2_err.contains("v2"),
+            "v2 error should mention v2, got: {v2_err}"
+        );
         assert!(
             v2_err.contains("\"_time\""),
-            "v2 error should suggest _time"
+            "v2 error should suggest _time, got: {v2_err}"
         );
 
-        let v3_err = validate_cursor_field("timestamp", "v3")
+        let v3_err = validate_cursor_field("_time", "v3")
             .unwrap_err()
             .to_string();
-        assert!(v3_err.contains("v3"), "error should mention v3");
-        assert!(v3_err.contains("\"time\""), "v3 error should suggest time");
+        assert!(
+            v3_err.contains("v3"),
+            "v3 error should mention v3, got: {v3_err}"
+        );
+        assert!(
+            v3_err.contains("\"time\""),
+            "v3 error should suggest time, got: {v3_err}"
+        );
     }
-
     #[test]
     fn parse_scalar_types() {
         assert_eq!(parse_scalar(""), serde_json::Value::Null);
@@ -575,29 +629,30 @@ mod tests {
 
     #[test]
     fn is_timestamp_after_chronological() {
-        let earlier = "2026-03-18T12:00:00.60952Z";
-        let later = "2026-03-18T12:00:00.609521Z";
-        assert!(is_timestamp_after(later, earlier));
-        assert!(!is_timestamp_after(earlier, later));
-        assert!(!is_timestamp_after(later, later));
+        let earlier = "2026-03-18T12:00:00.60952Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        let later = "2026-03-18T12:00:00.609521Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        assert!(is_timestamp_after("2026-03-18T12:00:00.609521Z", earlier));
+        assert!(!is_timestamp_after("2026-03-18T12:00:00.60952Z", later));
+        assert!(!is_timestamp_after("2026-03-18T12:00:00.609521Z", later));
     }
 
     #[test]
     fn is_timestamp_after_fallback_is_conservative() {
-        // Unparsable timestamps must NOT advance the cursor. Lexicographic
-        // comparison is wrong for cross-timezone values, so the safe default is
-        // false — refuse to advance rather than risk skipping data.
-        assert!(!is_timestamp_after("not-a-timestamp", "also-not"));
-        assert!(!is_timestamp_after(
-            "2024-01-01T00:00:00Z",
-            "not-a-timestamp"
-        ));
+        // Unparsable `a` must NOT advance the cursor.
+        let sentinel = "2024-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert!(!is_timestamp_after("not-a-timestamp", sentinel));
+        // Valid `a` that is older than `b` must also return false.
+        assert!(!is_timestamp_after("2023-01-01T00:00:00Z", sentinel));
     }
 
     #[test]
     fn apply_query_params_substitutes_both_placeholders() {
         let tmpl = "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit";
-        let out = apply_query_params(tmpl, "2024-01-01T00:00:00Z", "100");
+        let out = apply_query_params(tmpl, "2024-01-01T00:00:00Z", "100", "");
         assert_eq!(
             out,
             "SELECT * FROM t WHERE time > '2024-01-01T00:00:00Z' LIMIT 100"
@@ -607,13 +662,16 @@ mod tests {
     #[test]
     fn apply_query_params_no_placeholders() {
         let tmpl = "SELECT 1";
-        assert_eq!(apply_query_params(tmpl, "ignored", "ignored"), "SELECT 1");
+        assert_eq!(
+            apply_query_params(tmpl, "ignored", "ignored", ""),
+            "SELECT 1"
+        );
     }
 
     #[test]
     fn apply_query_params_repeated_placeholders() {
         let tmpl = "$cursor $cursor $limit";
-        let out = apply_query_params(tmpl, "T", "5");
+        let out = apply_query_params(tmpl, "T", "5", "");
         assert_eq!(out, "T T 5");
     }
 
@@ -654,6 +712,7 @@ mod tests {
             last_timestamp: Some("2024-06-15T12:30:00Z".to_string()),
             processed_rows: 100,
             effective_batch_size: 1000,
+            last_timestamp_row_offset: 0,
         };
         let cloned = original.clone();
         assert_eq!(cloned.last_timestamp, original.last_timestamp);
@@ -681,6 +740,7 @@ mod tests {
             last_timestamp: Some("2024-06-15T12:30:00Z".to_string()),
             processed_rows: 500,
             effective_batch_size: 2000,
+            last_timestamp_row_offset: 0,
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: V3State = serde_json::from_str(&json).unwrap();
@@ -708,6 +768,7 @@ mod tests {
             last_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
             processed_rows: 1,
             effective_batch_size: 500,
+            last_timestamp_row_offset: 0,
         });
         let json = serde_json::to_string(&state).unwrap();
         assert!(json.contains(r#""version":"v3""#));
@@ -822,5 +883,178 @@ query   = "SELECT 1"
 "#;
         let cfg: InfluxDbSourceConfig = toml::from_str(toml_str).unwrap();
         assert!(matches!(cfg, InfluxDbSourceConfig::V3(_)));
+    }
+
+    // ── InfluxDbSourceConfig accessors ───────────────────────────────────────
+
+    fn make_v2_cfg() -> InfluxDbSourceConfig {
+        let json = r#"{"version":"v2","url":"http://host:8086/","org":"o","token":"t","query":"q",
+            "poll_interval":"5s","batch_size":200,"cursor_field":"_time","initial_offset":"1970-01-01T00:00:00Z",
+            "payload_column":"data","payload_format":"json","include_metadata":false,
+            "verbose_logging":true,"retry_delay":"1s","timeout":"10s","max_open_retries":5,
+            "open_retry_max_delay":"30s","retry_max_delay":"2s","circuit_breaker_threshold":3,
+            "circuit_breaker_cool_down":"60s","max_retries":4}"#;
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn make_v3_cfg() -> InfluxDbSourceConfig {
+        let json = r#"{"version":"v3","url":"http://host:8181/","db":"mydb","token":"t","query":"q",
+            "batch_size":300,"payload_format":"text","include_metadata":true,"max_retries":2}"#;
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn config_accessors_v2_all_fields() {
+        let cfg = make_v2_cfg();
+        assert_eq!(cfg.url(), "http://host:8086/");
+        assert_eq!(cfg.poll_interval(), Some("5s"));
+        assert_eq!(cfg.batch_size(), 200);
+        assert_eq!(cfg.initial_offset(), Some("1970-01-01T00:00:00Z"));
+        assert_eq!(cfg.payload_column(), Some("data"));
+        assert_eq!(cfg.payload_format(), Some("json"));
+        assert!(!cfg.include_metadata());
+        assert!(cfg.verbose_logging());
+        assert_eq!(cfg.retry_delay(), Some("1s"));
+        assert_eq!(cfg.timeout(), Some("10s"));
+        assert_eq!(cfg.max_open_retries(), 5);
+        assert_eq!(cfg.open_retry_max_delay(), Some("30s"));
+        assert_eq!(cfg.retry_max_delay(), Some("2s"));
+        assert_eq!(cfg.circuit_breaker_threshold(), 3);
+        assert_eq!(cfg.circuit_breaker_cool_down(), Some("60s"));
+        assert_eq!(cfg.max_retries(), 4);
+        assert_eq!(cfg.base_url(), "http://host:8086");
+        assert_eq!(cfg.version_label(), "v2");
+        assert_eq!(cfg.cursor_field(), "_time");
+    }
+
+    #[test]
+    fn config_accessors_v3_all_fields() {
+        let cfg = make_v3_cfg();
+        assert_eq!(cfg.url(), "http://host:8181/");
+        assert_eq!(cfg.batch_size(), 300);
+        assert_eq!(cfg.payload_format(), Some("text"));
+        assert!(cfg.include_metadata());
+        assert_eq!(cfg.max_retries(), 2);
+        assert_eq!(cfg.base_url(), "http://host:8181");
+        assert_eq!(cfg.version_label(), "v3");
+        assert_eq!(cfg.cursor_field(), "time"); // V3 default
+    }
+
+    #[test]
+    fn config_accessor_batch_size_zero_is_floored_to_one() {
+        // batch_size: 0 would produce LIMIT 0 queries; the accessor floors it to 1.
+        let json =
+            r#"{"version":"v2","url":"http://h","org":"o","token":"t","query":"q","batch_size":0}"#;
+        let cfg: InfluxDbSourceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.batch_size(), 1);
+    }
+
+    #[test]
+    fn config_accessor_defaults_when_fields_absent() {
+        let json = r#"{"version":"v2","url":"http://h","org":"o","token":"t","query":"q"}"#;
+        let cfg: InfluxDbSourceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.batch_size(), 500);
+        assert!(cfg.poll_interval().is_none());
+        assert!(cfg.initial_offset().is_none());
+        assert!(cfg.payload_column().is_none());
+        assert!(cfg.payload_format().is_none());
+        assert!(cfg.include_metadata()); // default true
+        assert!(!cfg.verbose_logging()); // default false
+        assert!(cfg.retry_delay().is_none());
+        assert!(cfg.timeout().is_none());
+        assert_eq!(cfg.max_open_retries(), 10);
+        assert!(cfg.open_retry_max_delay().is_none());
+        assert!(cfg.retry_max_delay().is_none());
+        assert_eq!(cfg.circuit_breaker_threshold(), 5);
+        assert!(cfg.circuit_breaker_cool_down().is_none());
+        assert_eq!(cfg.max_retries(), 3);
+    }
+
+    #[test]
+    fn source_config_version_not_a_string_returns_error() {
+        // version must be a string — numeric or null version must be rejected.
+        let json = r#"{"version":42,"url":"http://h","org":"o","token":"t","query":"q"}"#;
+        let result: Result<InfluxDbSourceConfig, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "numeric version must be rejected");
+    }
+
+    // ── PayloadFormat ────────────────────────────────────────────────────────
+
+    #[test]
+    fn payload_format_from_config_all_variants() {
+        assert_eq!(
+            PayloadFormat::from_config(Some("text")),
+            PayloadFormat::Text
+        );
+        assert_eq!(
+            PayloadFormat::from_config(Some("utf8")),
+            PayloadFormat::Text
+        );
+        assert_eq!(PayloadFormat::from_config(Some("raw")), PayloadFormat::Raw);
+        assert_eq!(
+            PayloadFormat::from_config(Some("base64")),
+            PayloadFormat::Raw
+        );
+        assert_eq!(
+            PayloadFormat::from_config(Some("json")),
+            PayloadFormat::Json
+        );
+        assert_eq!(PayloadFormat::from_config(None), PayloadFormat::Json);
+    }
+
+    #[test]
+    fn payload_format_from_config_unrecognized_falls_back_to_json() {
+        assert_eq!(PayloadFormat::from_config(Some("xml")), PayloadFormat::Json);
+    }
+
+    #[test]
+    fn payload_format_schema_all_variants() {
+        use crate::common::Schema;
+        assert_eq!(PayloadFormat::Json.schema(), Schema::Json);
+        assert_eq!(PayloadFormat::Text.schema(), Schema::Text);
+        assert_eq!(PayloadFormat::Raw.schema(), Schema::Raw);
+    }
+
+    // ── parse_scalar float ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_scalar_float_values() {
+        // Finite f64 — can be represented as JSON number.
+        assert_eq!(
+            parse_scalar("1.23456"),
+            serde_json::Value::Number(serde_json::Number::from_f64(1.23456).unwrap())
+        );
+        // NaN is not representable in JSON — falls back to String.
+        assert_eq!(
+            parse_scalar("NaN"),
+            serde_json::Value::String("NaN".to_string())
+        );
+    }
+
+    // ── apply_query_params $offset and unknown $ ─────────────────────────────
+
+    #[test]
+    fn apply_query_params_substitutes_offset() {
+        let tmpl = "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset";
+        let out = apply_query_params(tmpl, "T", "10", "5");
+        assert_eq!(out, "SELECT * FROM t WHERE time > 'T' LIMIT 10 OFFSET 5");
+    }
+
+    #[test]
+    fn apply_query_params_unknown_dollar_passthrough() {
+        // An unrecognized $-placeholder is passed through literally.
+        let tmpl = "SELECT $unknown FROM t";
+        let out = apply_query_params(tmpl, "T", "10", "0");
+        assert_eq!(out, "SELECT $unknown FROM t");
+    }
+
+    // ── timestamps_equal fallback ────────────────────────────────────────────
+
+    #[test]
+    fn timestamps_equal_fallback_on_unparseable_string() {
+        // When either side is not a valid RFC 3339 timestamp the function
+        // falls back to string equality rather than returning an incorrect result.
+        assert!(timestamps_equal("abc", "abc"));
+        assert!(!timestamps_equal("abc", "xyz"));
     }
 }

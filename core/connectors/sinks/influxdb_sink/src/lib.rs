@@ -32,7 +32,7 @@ use iggy_connector_sdk::{
 };
 use reqwest::Url;
 use reqwest_middleware::ClientWithMiddleware;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::{ExposeSecret, SecretBox, SecretString};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -121,7 +121,14 @@ pub enum InfluxDbSinkConfig {
 impl<'de> serde::Deserialize<'de> for InfluxDbSinkConfig {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = serde_json::Value::deserialize(d)?;
-        let version = raw.get("version").and_then(|v| v.as_str()).unwrap_or("v2");
+        let version = match raw.get("version") {
+            None => "v2", // absent key → backward compat default
+            Some(v) => v.as_str().ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "\"version\" must be a string (e.g. \"v2\" or \"v3\"), got: {v}"
+                ))
+            })?,
+        };
         match version {
             "v2" => serde_json::from_value::<V2SinkConfig>(raw)
                 .map(Self::V2)
@@ -331,7 +338,7 @@ pub struct InfluxDbSink {
     config: InfluxDbSinkConfig,
     client: Option<ClientWithMiddleware>,
     write_url: Option<Url>,
-    auth_header: Option<String>,
+    auth_header: Option<SecretBox<String>>,
     circuit_breaker: Arc<CircuitBreaker>,
     messages_attempted: AtomicU64,
     write_success: AtomicU64,
@@ -440,7 +447,7 @@ impl InfluxDbSink {
             "us" => micros,
             "ms" => micros / 1_000,
             "s" => micros / 1_000_000,
-            _ => unreachable!("precision validated in open()"),
+            _ => micros, // unreachable if open() validated precision as the precision is validated in the config validation
         }
     }
 
@@ -478,7 +485,7 @@ impl InfluxDbSink {
 
         buf.push(' ');
         buf.push_str("message_id=\"");
-        write_field_string(buf, &message.id.to_string());
+        let _ = write!(buf, "{}", message.id);
         buf.push('"');
 
         if self.include_metadata && !self.include_stream_tag {
@@ -610,9 +617,13 @@ impl InfluxDbSink {
         let url = self.write_url.as_ref().ok_or_else(|| {
             Error::Connection("write_url not initialized — call open() first".to_string())
         })?;
-        let auth = self.auth_header.as_deref().ok_or_else(|| {
-            Error::Connection("auth_header not initialized — call open() first".to_string())
-        })?;
+        let auth = self
+            .auth_header
+            .as_ref()
+            .map(|s| s.expose_secret().as_str())
+            .ok_or_else(|| {
+                Error::Connection("auth_header not initialised — was open() called?".to_string())
+            })?;
 
         let response = client
             .post(url.as_str())
@@ -699,7 +710,7 @@ impl Sink for InfluxDbSink {
         ));
 
         self.write_url = Some(self.config.build_write_url()?);
-        self.auth_header = Some(self.config.auth_header());
+        self.auth_header = Some(SecretBox::new(Box::new(self.config.auth_header())));
 
         info!("InfluxDB sink ID: {} opened successfully", self.id);
         Ok(())
