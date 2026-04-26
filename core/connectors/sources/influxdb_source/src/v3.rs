@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn normalize_invalid_returns_with_z_appended() {
-        // Unparseable string — append Z and return (validate_cursor will reject it later).
+        // Unparsable string — append Z and return (validate_cursor will reject it later).
         let result = normalize_v3_timestamp("not-a-timestamp");
         assert_eq!(result, "not-a-timestampZ");
     }
