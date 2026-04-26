@@ -353,7 +353,10 @@ impl<T: ConfigEnvMappings> TypedEnvProvider<T> {
             })
             .collect();
 
-        suggestions.sort_by_key(|(_, dist)| *dist);
+        suggestions.sort_by(|(var_a, dist_a), (var_b, dist_b)| {
+            dist_a.cmp(dist_b).then_with(|| var_a.cmp(var_b))
+        });
+
         suggestions.truncate(3);
         suggestions.into_iter().map(|(s, _)| s).collect()
     }
@@ -526,6 +529,14 @@ mod tests {
 
         let suggestions = TypedEnvProvider::<TestConfig>::find_similar_vars("VAR_X", &known);
         assert!(suggestions.len() <= 3);
+    }
+
+    #[test]
+    fn find_similar_vars_has_deterministic_order_for_same_distance() {
+        let known: HashSet<&str> = ["VAR_D", "VAR_B", "VAR_A", "VAR_C"].into_iter().collect();
+
+        let suggestions = TypedEnvProvider::<TestConfig>::find_similar_vars("VAR_Z", &known);
+        assert_eq!(suggestions, vec!["VAR_A", "VAR_B", "VAR_C"]);
     }
 
     #[test]

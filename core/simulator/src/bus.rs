@@ -15,12 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
+use iggy_binary_protocol::consensus::iobuf::{Frozen, Owned};
 use iggy_binary_protocol::{GenericHeader, Message};
-use iggy_common::IggyError;
-use message_bus::MessageBus;
+use message_bus::{MessageBus, SendError};
 use std::collections::{HashSet, VecDeque};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
+
+/// Convert an inbound Frozen (bus trait payload) into a `Message` for the
+/// simulator's packet layer. The sim keeps `Message<GenericHeader>` in its
+/// envelope because the network and tick loop reason about typed headers,
+/// not raw byte buffers. One memcpy per send is acceptable under sim.
+fn frozen_to_message(frozen: &Frozen<MESSAGE_ALIGN>) -> Message<GenericHeader> {
+    Message::try_from(Owned::<MESSAGE_ALIGN>::copy_from_slice(frozen.as_slice()))
+        .expect("simulator bus must receive a valid generic message")
+}
 
 /// Message envelope for tracking sender/recipient
 #[derive(Debug)]
@@ -69,75 +79,69 @@ impl SimOutbox {
     pub fn drain(&self) -> Vec<Envelope> {
         self.pending_messages.lock().unwrap().drain(..).collect()
     }
-}
 
-impl MessageBus for SimOutbox {
-    type Client = u128;
-    type Replica = u8;
-    type Data = Message<GenericHeader>;
-    type Sender = ();
-
-    fn add_client(&mut self, client: Self::Client, _sender: Self::Sender) -> bool {
-        if self.clients.lock().unwrap().contains(&client) {
-            return false;
-        }
-        self.clients.lock().unwrap().insert(client);
-        true
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn add_client(&mut self, client: u128) -> bool {
+        self.clients.lock().unwrap().insert(client)
     }
 
-    fn remove_client(&mut self, client: Self::Client) -> bool {
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn add_replica(&mut self, replica: u8) -> bool {
+        self.replicas.lock().unwrap().insert(replica)
+    }
+
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn remove_client(&mut self, client: u128) -> bool {
         self.clients.lock().unwrap().remove(&client)
     }
 
-    fn add_replica(&mut self, replica: Self::Replica) -> bool {
-        if self.replicas.lock().unwrap().contains(&replica) {
-            return false;
-        }
-        self.replicas.lock().unwrap().insert(replica);
-        true
-    }
-
-    fn remove_replica(&mut self, replica: Self::Replica) -> bool {
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn remove_replica(&mut self, replica: u8) -> bool {
         self.replicas.lock().unwrap().remove(&replica)
     }
+}
 
+impl MessageBus for SimOutbox {
     async fn send_to_client(
         &self,
-        client_id: Self::Client,
-        message: Self::Data,
-    ) -> Result<Self::Data, IggyError> {
+        client_id: u128,
+        data: Frozen<MESSAGE_ALIGN>,
+    ) -> Result<(), SendError> {
         if !self.clients.lock().unwrap().contains(&client_id) {
-            #[allow(clippy::cast_possible_truncation)]
-            return Err(IggyError::ClientNotFound(client_id as u32));
+            return Err(SendError::ClientNotFound(client_id));
         }
 
         self.pending_messages.lock().unwrap().push_back(Envelope {
             from_replica: Some(self.self_id),
             to_replica: None,
             to_client: Some(client_id),
-            payload: EnvelopePayload::Client(message.deep_copy()),
+            payload: EnvelopePayload::Client(frozen_to_message(&data)),
         });
 
-        Ok(message)
+        Ok(())
     }
 
     async fn send_to_replica(
         &self,
-        replica: Self::Replica,
-        message: Self::Data,
-    ) -> Result<Self::Data, IggyError> {
+        replica: u8,
+        data: Frozen<MESSAGE_ALIGN>,
+    ) -> Result<(), SendError> {
         if !self.replicas.lock().unwrap().contains(&replica) {
-            return Err(IggyError::ResourceNotFound(format!("Replica {replica}")));
+            return Err(SendError::ReplicaNotConnected(replica));
         }
 
         self.pending_messages.lock().unwrap().push_back(Envelope {
             from_replica: Some(self.self_id),
             to_replica: Some(replica),
             to_client: None,
-            payload: EnvelopePayload::Replica(message.deep_copy()),
+            payload: EnvelopePayload::Replica(frozen_to_message(&data)),
         });
 
-        Ok(message)
+        Ok(())
     }
 }
 
@@ -153,40 +157,19 @@ impl Deref for SharedSimOutbox {
 }
 
 impl MessageBus for SharedSimOutbox {
-    type Client = u128;
-    type Replica = u8;
-    type Data = Message<GenericHeader>;
-    type Sender = ();
-
-    fn add_client(&mut self, client: Self::Client, _sender: Self::Sender) -> bool {
-        self.0.clients.lock().unwrap().insert(client)
-    }
-
-    fn remove_client(&mut self, client: Self::Client) -> bool {
-        self.0.clients.lock().unwrap().remove(&client)
-    }
-
-    fn add_replica(&mut self, replica: Self::Replica) -> bool {
-        self.0.replicas.lock().unwrap().insert(replica)
-    }
-
-    fn remove_replica(&mut self, replica: Self::Replica) -> bool {
-        self.0.replicas.lock().unwrap().remove(&replica)
-    }
-
     async fn send_to_client(
         &self,
-        client_id: Self::Client,
-        message: Self::Data,
-    ) -> Result<Self::Data, IggyError> {
-        self.0.send_to_client(client_id, message).await
+        client_id: u128,
+        data: Frozen<MESSAGE_ALIGN>,
+    ) -> Result<(), SendError> {
+        self.0.send_to_client(client_id, data).await
     }
 
     async fn send_to_replica(
         &self,
-        replica: Self::Replica,
-        message: Self::Data,
-    ) -> Result<Self::Data, IggyError> {
-        self.0.send_to_replica(replica, message).await
+        replica: u8,
+        data: Frozen<MESSAGE_ALIGN>,
+    ) -> Result<(), SendError> {
+        self.0.send_to_replica(replica, data).await
     }
 }

@@ -79,7 +79,7 @@ jobs:
 
             echo "Checking $crate: version=$VERSION, tag=$TAG"
 
-            if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
+            if [ "$(scripts/extract-version.sh "$crate" --is-pre-release)" != "true" ]; then
               echo "  ⏭️ Stable version - skipping"
               continue
             fi
@@ -117,7 +117,7 @@ jobs:
               continue
             fi
 
-            if [[ ! "$VERSION" =~ -(edge|rc) ]] && [[ ! "$VERSION" =~ (\.dev|rc)[0-9]+$ ]]; then
+            if [ "$(scripts/extract-version.sh "$sdk" --is-pre-release)" != "true" ]; then
               echo "  ⏭️ Stable version - skipping"
               continue
             fi

@@ -50,6 +50,7 @@ pub fn embed_modal(props: &EmbedModalProps) -> Html {
         MeasurementType::Latency => "latency",
         MeasurementType::Throughput => "throughput",
         MeasurementType::Distribution => "distribution",
+        MeasurementType::Tail => "latency",
     };
 
     let theme = if props.is_dark { "dark" } else { "light" };

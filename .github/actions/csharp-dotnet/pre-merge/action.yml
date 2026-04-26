@@ -98,7 +98,7 @@ runs:
           --coverage-output-format cobertura \
           --coverage-output coverage.cobertura.xml \
           --results-directory ./reports \
-          -- --report-trx
+          -- --report-trx --retry-failed-tests 3
       shell: bash
 
     - name: Collect container logs

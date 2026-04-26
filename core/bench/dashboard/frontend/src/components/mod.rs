@@ -20,6 +20,7 @@ pub mod chart;
 pub mod embed_modal;
 pub mod footer;
 pub mod layout;
+pub mod loader;
 pub mod selectors;
 pub mod theme;
 pub mod tooltips;

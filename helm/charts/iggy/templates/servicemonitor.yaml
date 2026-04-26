@@ -22,9 +22,9 @@ kind: ServiceMonitor
 metadata:
   labels:
     {{- include "iggy.labels" . | nindent 4 }}
-    {{- if .Values.server.serviceMonitor.additionalLabels }}
-    {{ toYaml .Values.server.serviceMonitor.additionalLabels }}
-    {{- end }}
+  {{- if .Values.server.serviceMonitor.additionalLabels }}
+    {{- toYaml .Values.server.serviceMonitor.additionalLabels | nindent 4 }}
+  {{- end }}
   name: {{ template "iggy.fullname" .  }}
   namespace: {{ .Release.Namespace }}
 spec:
