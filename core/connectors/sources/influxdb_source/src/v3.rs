@@ -227,29 +227,21 @@ pub(crate) struct PollResult {
 /// Normalize a raw timestamp from InfluxDB V3 JSONL into a cursor-safe RFC 3339 string.
 ///
 /// InfluxDB 3 Core returns timestamps without a timezone suffix and with nanosecond
-/// precision (e.g. `"2026-04-26T02:32:20.526360865"`). Two normalizations are applied:
+/// precision (e.g. `"2026-04-26T02:32:20.526360865"`). The only required fix is
+/// appending `"Z"` when no timezone suffix is present (InfluxDB always stores UTC).
 ///
-/// 1. Append `"Z"` when no timezone suffix is present (InfluxDB always stores UTC).
-/// 2. Truncate fractional seconds to milliseconds so the value round-trips cleanly
-///    through `validate_cursor` and SQL `WHERE time > '$cursor'` string literals.
-///
-/// Already-normalized RFC 3339 strings with ≤ms precision are returned unchanged.
+/// Full nanosecond precision is intentionally preserved — truncating to milliseconds
+/// would place the cursor BEFORE the actual row timestamps within the same millisecond,
+/// causing `WHERE time > '$cursor'` to re-deliver already-seen rows on subsequent polls.
+/// InfluxDB 3's DataFusion SQL engine handles RFC 3339 strings with any number of
+/// fractional digits in WHERE clause timestamp comparisons.
 fn normalize_v3_timestamp(ts: &str) -> String {
-    // Fast path: already valid RFC 3339 with timezone.
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
-        let dt_utc: DateTime<Utc> = dt.with_timezone(&Utc);
-        // Only reformat if there are sub-millisecond digits.
-        if dt_utc.timestamp_subsec_nanos().is_multiple_of(1_000_000) {
-            return ts.to_string(); // ≤ms precision already, return unchanged
-        }
-        return dt_utc.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+    // Fast path: already a valid RFC 3339 timestamp with timezone suffix.
+    if chrono::DateTime::parse_from_rfc3339(ts).is_ok() {
+        return ts.to_string();
     }
-    // Slow path: no timezone suffix — append "Z" and reformat to ms precision.
-    let with_z = format!("{ts}Z");
-    with_z
-        .parse::<DateTime<Utc>>()
-        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
-        .unwrap_or(with_z)
+    // Slow path: no timezone suffix — append "Z" to make it RFC 3339 compliant.
+    format!("{ts}Z")
 }
 
 /// Result of processing a batch of V3 rows into Iggy messages.
@@ -690,29 +682,30 @@ mod tests {
     }
 
     #[test]
-    fn normalize_no_tz_nanoseconds_appends_z_and_truncates() {
+    fn normalize_no_tz_nanoseconds_appends_z_only() {
         // InfluxDB 3 Core returns timestamps like this — 9 fractional digits, no Z.
+        // Full nanosecond precision must be preserved (not truncated to ms).
         let result = normalize_v3_timestamp("2026-04-26T02:32:20.526360865");
-        assert_eq!(result, "2026-04-26T02:32:20.526Z");
+        assert_eq!(result, "2026-04-26T02:32:20.526360865Z");
     }
 
     #[test]
     fn normalize_no_tz_milliseconds_appends_z() {
-        // No timezone suffix, but already ms precision.
+        // No timezone suffix, ms precision — just append Z.
         let result = normalize_v3_timestamp("2026-04-26T02:32:20.526");
         assert_eq!(result, "2026-04-26T02:32:20.526Z");
     }
 
     #[test]
-    fn normalize_rfc3339_sub_ms_precision_truncates() {
-        // Already has Z but has sub-millisecond precision — truncate.
+    fn normalize_rfc3339_sub_ms_precision_returned_unchanged() {
+        // Already valid RFC 3339 with Z and nanoseconds — returned as-is.
         let result = normalize_v3_timestamp("2026-04-26T02:32:20.526360865Z");
-        assert_eq!(result, "2026-04-26T02:32:20.526Z");
+        assert_eq!(result, "2026-04-26T02:32:20.526360865Z");
     }
 
     #[test]
     fn normalize_invalid_returns_with_z_appended() {
-        // If the string is unparsable even with Z appended, return the Z-appended form.
+        // Unparseable string — append Z and return (validate_cursor will reject it later).
         let result = normalize_v3_timestamp("not-a-timestamp");
         assert_eq!(result, "not-a-timestampZ");
     }
@@ -720,6 +713,7 @@ mod tests {
     #[test]
     fn process_rows_accepts_influxdb3_no_tz_timestamps() {
         // Regression test: process_rows must not return Err when timestamps lack Z suffix.
+        // Full nanosecond precision must be preserved so the cursor is exact.
         let rows = vec![
             row(&[("time", "2026-04-26T02:32:20.526360865"), ("val", "1")]),
             row(&[("time", "2026-04-26T02:32:21.000000000"), ("val", "2")]),
@@ -729,8 +723,28 @@ mod tests {
         assert_eq!(result.messages.len(), 2);
         assert_eq!(
             result.max_cursor.as_deref(),
-            Some("2026-04-26T02:32:21.000Z")
+            Some("2026-04-26T02:32:21.000000000Z")
         );
+    }
+
+    #[test]
+    fn process_rows_sub_ms_timestamps_have_distinct_cursors() {
+        // Regression: rows within the same millisecond must NOT get the same ms cursor,
+        // which would cause re-delivery. Each row's nanosecond cursor must be preserved.
+        let rows = vec![
+            row(&[("time", "2026-04-26T02:32:20.526360000"), ("val", "a")]),
+            row(&[("time", "2026-04-26T02:32:20.526361000"), ("val", "b")]),
+            row(&[("time", "2026-04-26T02:32:20.526362000"), ("val", "c")]),
+        ];
+        let c = ctx("2026-04-26T02:32:19.000Z", 0);
+        let result = process_rows(&rows, &c).expect("should succeed");
+        // max_cursor must be the latest nanosecond timestamp (row 3), not a truncated ms.
+        assert_eq!(
+            result.max_cursor.as_deref(),
+            Some("2026-04-26T02:32:20.526362000Z")
+        );
+        // Only row 3 is at max_cursor.
+        assert_eq!(result.rows_at_max_cursor, 1);
     }
 }
 
