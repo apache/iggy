@@ -61,7 +61,7 @@ const _: () = {
 ///
 /// Returns `IggyError::TcpError` if the write fails.
 #[allow(clippy::future_not_send)]
-pub async fn write_message<S: AsyncWriteExt + Unpin>(
+pub async fn write_message<S: AsyncWriteExt>(
     stream: &mut S,
     message: Message<GenericHeader>,
 ) -> Result<(), IggyError> {
@@ -90,7 +90,7 @@ pub async fn write_message<S: AsyncWriteExt + Unpin>(
 /// Returns `IggyError::TcpError` on I/O errors.
 /// Returns `IggyError::InvalidCommand` if the header fails validation.
 #[allow(clippy::future_not_send)]
-pub async fn read_message<S: AsyncReadExt + Unpin>(
+pub async fn read_message<S: AsyncReadExt>(
     stream: &mut S,
     max_message_size: usize,
 ) -> Result<Message<GenericHeader>, IggyError> {

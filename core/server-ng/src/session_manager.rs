@@ -23,7 +23,7 @@
 //! Each connection goes through: `connect → login → register → bound`.
 //!
 //! The [`SessionManager`] is the server-side counterpart of the SDK's
-//! session lifecycle. It does **not** own the [`ClientTable`]. That lives
+//! session lifecycle. It does **not** own the `ClientTable`. That lives
 //! in the consensus layer. This module tracks the binding between a
 //! transport connection and the consensus-level `(client_id, session)` pair.
 
