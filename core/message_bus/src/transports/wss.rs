@@ -29,7 +29,7 @@
 //!
 //! [`WssTransportConn::run`] runs in five phases:
 //!
-//! 1. Capture `raw_fd`, split TCP into owned read / write halves.
+//! 1. Capture `shared_fd`, split TCP into owned read / write halves.
 //! 2. Build a `transports::tls::TlsDriver` (server or client by role)
 //!    and drive the rustls handshake to completion.
 //! 3. Run the WebSocket HTTP-Upgrade exchange over the TLS plaintext
@@ -83,6 +83,7 @@ use super::{ActorContext, TransportConn};
 use crate::lifecycle::{BusReceiver, Shutdown, ShutdownToken};
 use async_channel::{Receiver, Sender, bounded};
 use compio::buf::BufResult;
+use compio::driver::ToSharedFd;
 use compio::io::{AsyncRead, AsyncWrite};
 use compio::net::{OwnedReadHalf, OwnedWriteHalf, TcpStream};
 use futures::FutureExt;
@@ -90,7 +91,6 @@ use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
 use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_binary_protocol::{GenericHeader, Message};
 use rustls::pki_types::ServerName;
-use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -179,7 +179,7 @@ impl WssTransportConn {
 impl TransportConn for WssTransportConn {
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn run(self, ctx: ActorContext) {
-        let raw_fd = self.stream.as_raw_fd();
+        let shared_fd = self.stream.to_shared_fd();
         let drain_budget = self.drain_budget;
         let role = self.role;
         let max_batch = ctx.max_batch;
@@ -319,7 +319,7 @@ impl TransportConn for WssTransportConn {
             reader: reader_watch,
             writer: writer_watch,
             writer_tx: dummy_writer_event_sender(),
-            raw_fd,
+            shared_fd,
         };
         // Drop our own writer_tx so the writer's `recv` returns Err once
         // the reader's clone is also gone. The dummy channel inside

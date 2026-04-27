@@ -71,6 +71,7 @@
 
 use crate::framing::MAX_MESSAGE_SIZE;
 use async_channel::{Receiver, Sender};
+use compio::driver::SharedFd;
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::{OwnedReadHalf, OwnedWriteHalf, TcpStream};
 use compio::runtime::JoinHandle;
@@ -86,7 +87,7 @@ use rustls::unbuffered::{
 };
 use std::cell::{Cell, RefCell};
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -448,8 +449,8 @@ impl TlsDriver {
     /// latency once the orchestrator also drops its clone.
     ///
     /// Returns the two `JoinHandle`s so the orchestrator can install
-    /// them on a [`TlsConnHandles`] alongside the captured `RawFd` and
-    /// the `Sender` clone it retained.
+    /// them on a [`TlsConnHandles`] alongside the captured `SharedFd`
+    /// and the `Sender` clone it retained.
     pub(in crate::transports) fn spawn_tasks(
         self,
         read_half: OwnedReadHalf<TcpStream>,
@@ -1131,23 +1132,28 @@ fn try_take_frame(plaintext: &mut Vec<u8>) -> Result<Option<Message<GenericHeade
 }
 
 /// Bundle of per-connection control surfaces returned by the
-/// orchestrator-side spawn path. `raw_fd` is captured pre-`into_split`
-/// (`RawFd` is `Copy`, no ownership tangle) and is the only mechanism to
-/// wake a reader blocked on `read.await` without reaching into the
-/// task's owned read half.
+/// orchestrator-side spawn path. `shared_fd` is a refcounted clone of
+/// the `SharedFd<socket2::Socket>` that backs the `TcpStream` and is
+/// the only mechanism to wake a reader blocked on `read.await` without
+/// reaching into the task's owned read half.
+///
+/// The clone keeps the kernel fd open until shutdown; both spawned
+/// halves still hold their own clones via `OwnedReadHalf` /
+/// `OwnedWriteHalf`, so a stale `shared_fd` here cannot outlive a
+/// closed kernel fd.
 pub(in crate::transports) struct TlsConnHandles {
     pub(in crate::transports) reader: TaskHandle,
     pub(in crate::transports) writer: TaskHandle,
     pub(in crate::transports) writer_tx: Sender<WriterEvent>,
-    pub(in crate::transports) raw_fd: RawFd,
+    pub(in crate::transports) shared_fd: SharedFd<socket2::Socket>,
 }
 
 /// Cooperative shutdown of a `(reader, writer)` task pair.
 ///
 /// Sequence (from `designs/tls-shutdown-protocol.md`):
-/// 1. `libc::shutdown(raw_fd, SHUT_RD)` wakes the reader's pending
-///    `read` SQE with `Ok(0)`. Reader exits and drops its
-///    `writer_tx` clone.
+/// 1. `libc::shutdown(shared_fd.as_raw_fd(), SHUT_RD)` wakes the
+///    reader's pending `read` SQE with `Ok(0)`. Reader exits and drops
+///    its `writer_tx` clone.
 /// 2. Drop the orchestrator's `writer_tx` clone. Once the reader's
 ///    clone is also gone, the writer's `recv` returns `Err`, falling
 ///    into the cooperative shutdown body (`close_notify` + flush +
@@ -1162,20 +1168,21 @@ pub(in crate::transports) struct TlsConnHandles {
 ///
 /// # Safety
 ///
-/// `libc::shutdown` is `unsafe`. The fd is guaranteed open while
-/// either task holds its owned half (`compio_net::TcpStream::into_split`
-/// distributes a `SharedFd<socket2::Socket>` whose refcount keeps the
-/// kernel fd alive). Both `JoinHandle`s are still live at call time,
-/// so at least one half — and therefore the fd — survives.
+/// `libc::shutdown` is `unsafe`. The orchestrator holds a
+/// `SharedFd<socket2::Socket>` clone in `handles.shared_fd`; both
+/// owned halves hold their own clones via `compio_net::OwnedReadHalf`
+/// / `OwnedWriteHalf`. The shared refcount keeps the kernel fd alive
+/// for the duration of this helper, so the syscall sees an open fd.
 #[allow(clippy::future_not_send)] // single-threaded compio runtime
 pub(in crate::transports) async fn shutdown(handles: TlsConnHandles, drain_budget: Duration) {
     // Step 1: wake reader.
-    // SAFETY: `raw_fd` was captured from a still-live `TcpStream`
-    // before `into_split`. The `SharedFd` in both owned halves keeps
-    // the kernel fd open at least until both tasks complete; both
-    // `JoinHandle`s are held in `handles`, so the fd is still valid.
+    // SAFETY: `shared_fd` is a refcounted clone obtained from the
+    // still-live `TcpStream` before `into_split`. The matching clones
+    // in both owned halves keep the kernel fd open at least until both
+    // tasks complete; the orchestrator's clone in `handles.shared_fd`
+    // independently keeps it open across this syscall.
     unsafe {
-        libc::shutdown(handles.raw_fd, libc::SHUT_RD);
+        libc::shutdown(handles.shared_fd.as_raw_fd(), libc::SHUT_RD);
     }
 
     // Step 2: signal cooperative writer shutdown by dropping the
@@ -1231,7 +1238,6 @@ mod tests {
     use iggy_binary_protocol::Command2;
     use rustls::RootCertStore;
     use std::net::SocketAddr;
-    use std::os::fd::AsRawFd;
     use std::sync::OnceLock;
 
     fn ensure_provider() {
@@ -1290,8 +1296,8 @@ mod tests {
         let client_cfg = client_config_trusting(&cert_chain);
 
         let (client_stream, server_stream) = connected_pair().await;
-        let client_fd = client_stream.as_raw_fd();
-        let server_fd = server_stream.as_raw_fd();
+        let client_fd = compio::driver::ToSharedFd::to_shared_fd(&client_stream);
+        let server_fd = compio::driver::ToSharedFd::to_shared_fd(&server_stream);
         let (mut client_read, mut client_write) = client_stream.into_split();
         let (mut server_read, mut server_write) = server_stream.into_split();
 
@@ -1328,13 +1334,13 @@ mod tests {
                 driver: server_driver,
                 read_half: server_read,
                 write_half: server_write,
-                raw_fd: server_fd,
+                shared_fd: server_fd,
             },
             client: PostHandshake {
                 driver: client_driver,
                 read_half: client_read,
                 write_half: client_write,
-                raw_fd: client_fd,
+                shared_fd: client_fd,
             },
         }
     }
@@ -1348,7 +1354,7 @@ mod tests {
         driver: TlsDriver,
         read_half: OwnedReadHalf<CompioTcpStream>,
         write_half: OwnedWriteHalf<CompioTcpStream>,
-        raw_fd: RawFd,
+        shared_fd: SharedFd<socket2::Socket>,
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -1406,7 +1412,7 @@ mod tests {
                 reader,
                 writer,
                 writer_tx,
-                raw_fd: post.raw_fd,
+                shared_fd: post.shared_fd,
             },
         }
     }
@@ -1680,13 +1686,18 @@ mod tests {
 
         // Drop the client side entirely BEFORE spawning server tasks
         // so the FIN reaches the server reader's first `read.await`.
+        // Be explicit about every field so the captured `SharedFd`
+        // releases its Arc reference and the kernel fd actually closes.
         let PostHandshake {
             read_half,
             write_half,
-            ..
+            shared_fd,
+            driver,
         } = pair.client;
+        drop(driver);
         drop(read_half);
         drop(write_half);
+        drop(shared_fd);
 
         let server = spawn_pair(pair.server);
 

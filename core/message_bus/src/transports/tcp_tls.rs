@@ -74,10 +74,10 @@ use super::tls::{TlsConnHandles, TlsDriver, TlsRole, WriterEvent, shutdown as tl
 use super::{ActorContext, TransportConn};
 use crate::lifecycle::{BusReceiver, Shutdown, ShutdownToken};
 use async_channel::{Sender, bounded};
+use compio::driver::ToSharedFd;
 use compio::net::TcpStream;
 use futures::FutureExt;
 use rustls::pki_types::ServerName;
-use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -153,7 +153,7 @@ impl TcpTlsTransportConn {
 impl TransportConn for TcpTlsTransportConn {
     #[allow(clippy::future_not_send)]
     async fn run(self, ctx: ActorContext) {
-        let raw_fd = self.stream.as_raw_fd();
+        let shared_fd = self.stream.to_shared_fd();
         let drain_budget = self.drain_budget;
         let role = self.role;
         let max_batch = ctx.max_batch;
@@ -245,7 +245,7 @@ impl TransportConn for TcpTlsTransportConn {
             reader: reader_watch,
             writer: writer_watch,
             writer_tx,
-            raw_fd,
+            shared_fd,
         };
         tls_shutdown(handles, drain_budget).await;
     }
