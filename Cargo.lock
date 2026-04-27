@@ -11292,7 +11292,6 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-opentelemetry",
- "tracing-subscriber",
  "ulid",
  "uuid",
  "vergen-git2",
