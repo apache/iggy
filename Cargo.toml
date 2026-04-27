@@ -91,7 +91,7 @@ bench-dashboard-shared = { path = "core/bench/dashboard/shared" }
 bench-report = { path = "core/bench/report" }
 bench-runner = { path = "core/bench/runner" }
 bit-set = "0.10.0"
-blake3 = "1.8.4"
+blake3 = "1.8.5"
 bon = "3.9.1"
 byte-unit = { version = "5.2.0", default-features = false, features = ["serde", "byte", "std"] }
 bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
@@ -99,7 +99,7 @@ bytes = "1.11.1"
 charming = "0.6.0"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive", "wrap_help"] }
-clap_complete = "4.6.2"
+clap_complete = "4.6.3"
 clock = { path = "core/clock" }
 colored = "3.1.1"
 comfy-table = { version = "7.2.2", default-features = false }
@@ -194,7 +194,7 @@ mongodb = { version = "3.6.0", features = ["rustls-tls"] }
 nix = { version = "0.31.2", features = ["feature", "fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 notify = "8.2.0"
-octocrab = "0.49.7"
+octocrab = "0.49.9"
 once_cell = "1.21.4"
 opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["log"] }
@@ -234,7 +234,7 @@ rand_xoshiro = "0.8.0"
 rayon = "1.12.0"
 rcgen = "0.14.7"
 regex = "1.12.3"
-reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
 reqwest-middleware = { version = "0.5.1", features = ["json", "query"] }
 reqwest-retry = "0.9.1"
 reqwest-tracing = "0.7.0"
@@ -313,7 +313,7 @@ web-sys = { version = "0.3", features = [
 webpki-roots = "1.0.7"
 yew = { version = "0.23", features = ["csr"] }
 yew-router = "0.20"
-zip = { version = "8.5.1", default-features = false, features = ["deflate"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = true
