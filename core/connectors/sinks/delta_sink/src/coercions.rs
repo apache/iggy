@@ -95,14 +95,14 @@ pub(crate) fn coerce(value: &mut Value, coercion_tree: &CoercionTree) -> Result<
     if let Some(context) = value.as_object_mut() {
         for (field_name, coercion) in coercion_tree.root.iter() {
             if let Some(value) = context.get_mut(field_name) {
-                apply_coercion(value, coercion)?;
+                apply_coercion(value, coercion, field_name)?;
             }
         }
     }
     Ok(())
 }
 
-fn apply_coercion(value: &mut Value, node: &CoercionNode) -> Result<(), String> {
+fn apply_coercion(value: &mut Value, node: &CoercionNode, path: &str) -> Result<(), String> {
     match node {
         CoercionNode::Coercion(Coercion::ToString) => {
             if !value.is_null() && !value.is_string() {
@@ -111,38 +111,39 @@ fn apply_coercion(value: &mut Value, node: &CoercionNode) -> Result<(), String> 
         }
         CoercionNode::Coercion(Coercion::ToTimestamp) => {
             if let Some(as_str) = value.as_str() {
-                *value = string_to_timestamp(as_str)?;
+                *value = string_to_timestamp(as_str, path)?;
             } else if value.is_i64() || value.is_u64() {
                 // Already epoch microseconds — valid timestamp representation, pass through.
             }
         }
         CoercionNode::Tree(tree) => {
             for (name, node) in tree.root.iter() {
+                let child_path = format!("{path}.{name}");
                 let fields = value.as_object_mut();
                 if let Some(fields) = fields
                     && let Some(value) = fields.get_mut(name)
                 {
-                    apply_coercion(value, node)?;
+                    apply_coercion(value, node, &child_path)?;
                 }
             }
         }
         CoercionNode::ArrayPrimitive(coercion) => {
-            let values = value.as_array_mut();
-            if let Some(values) = values {
+            if let Some(values) = value.as_array_mut() {
                 let node = CoercionNode::Coercion(coercion.clone());
-                for value in values {
-                    apply_coercion(value, &node)?;
+                for (i, value) in values.iter_mut().enumerate() {
+                    apply_coercion(value, &node, &format!("{path}[{i}]"))?;
                 }
             }
         }
         CoercionNode::ArrayTree(tree) => {
             if let Some(values) = value.as_array_mut() {
-                for value in values {
+                for (i, value) in values.iter_mut().enumerate() {
                     for (name, node) in tree.root.iter() {
+                        let child_path = format!("{path}[{i}].{name}");
                         if let Some(fields) = value.as_object_mut()
                             && let Some(field_value) = fields.get_mut(name)
                         {
-                            apply_coercion(field_value, node)?;
+                            apply_coercion(field_value, node, &child_path)?;
                         }
                     }
                 }
@@ -152,7 +153,7 @@ fn apply_coercion(value: &mut Value, node: &CoercionNode) -> Result<(), String> 
     Ok(())
 }
 
-fn string_to_timestamp(string: &str) -> Result<Value, String> {
+fn string_to_timestamp(string: &str, path: &str) -> Result<Value, String> {
     // Try strict RFC 3339 / ISO 8601 with T separator first.
     if let Ok(dt) = DateTime::<Utc>::from_str(string) {
         return Ok(Value::Number(dt.timestamp_micros().into()));
@@ -167,7 +168,7 @@ fn string_to_timestamp(string: &str) -> Result<Value, String> {
         return Ok(Value::Number(ndt.and_utc().timestamp_micros().into()));
     }
 
-    Err(format!("cannot parse \"{string}\" as a timestamp"))
+    Err(format!("field \"{path}\": cannot parse \"{string}\" as a timestamp"))
 }
 
 #[cfg(test)]
@@ -178,20 +179,20 @@ mod tests {
 
     #[test]
     fn test_string_to_timestamp_valid() {
-        assert!(string_to_timestamp("2010-01-01T22:11:58Z").is_ok());
+        assert!(string_to_timestamp("2010-01-01T22:11:58Z", "field").is_ok());
         // exceeds nanos size
-        assert!(string_to_timestamp("2400-01-01T22:11:58Z").is_ok());
+        assert!(string_to_timestamp("2400-01-01T22:11:58Z", "field").is_ok());
         // Arrow also accepts ' ' as date/time separator
-        assert!(string_to_timestamp("2021-11-11 22:11:58").is_ok());
-        assert!(string_to_timestamp("2021-11-11 22:11:58.123456").is_ok());
+        assert!(string_to_timestamp("2021-11-11 22:11:58", "field").is_ok());
+        assert!(string_to_timestamp("2021-11-11 22:11:58.123456", "field").is_ok());
     }
 
     #[test]
     fn test_string_to_timestamp_invalid() {
-        assert!(string_to_timestamp("not a date").is_err());
-        assert!(string_to_timestamp("").is_err());
-        assert!(string_to_timestamp("2021-13-01T00:00:00Z").is_err());
-        assert!(string_to_timestamp("1636668718000000").is_err());
+        assert!(string_to_timestamp("not a date", "field").is_err());
+        assert!(string_to_timestamp("", "field").is_err());
+        assert!(string_to_timestamp("2021-13-01T00:00:00Z", "field").is_err());
+        assert!(string_to_timestamp("1636668718000000", "field").is_err());
     }
 
     static SCHEMA: LazyLock<Value> = LazyLock::new(|| {
@@ -616,5 +617,62 @@ mod tests {
         coerce(&mut value, &tree).unwrap();
 
         assert_eq!(value["level1_timestamp"], json!(epoch_micros));
+    }
+
+    #[test]
+    fn test_error_path_top_level() {
+        let delta_schema: DeltaSchema = serde_json::from_value(SCHEMA.clone()).unwrap();
+        let tree = create_coercion_tree(&delta_schema);
+
+        let mut value = json!({ "level1_timestamp": "not-a-date" });
+        let err = coerce(&mut value, &tree).unwrap_err();
+        assert!(
+            err.contains("\"level1_timestamp\""),
+            "expected field name in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_error_path_nested_struct() {
+        let delta_schema: DeltaSchema = serde_json::from_value(SCHEMA.clone()).unwrap();
+        let tree = create_coercion_tree(&delta_schema);
+
+        let mut value = json!({ "level2": { "level2_timestamp": "not-a-date" } });
+        let err = coerce(&mut value, &tree).unwrap_err();
+        assert!(
+            err.contains("\"level2.level2_timestamp\""),
+            "expected dotted path in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_error_path_array_primitive() {
+        let delta_schema: DeltaSchema = serde_json::from_value(SCHEMA.clone()).unwrap();
+        let tree = create_coercion_tree(&delta_schema);
+
+        let mut value = json!({ "array_timestamp": ["2021-11-11T22:11:58Z", "not-a-date"] });
+        let err = coerce(&mut value, &tree).unwrap_err();
+        assert!(
+            err.contains("\"array_timestamp[1]\""),
+            "expected indexed path in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_error_path_array_struct() {
+        let delta_schema: DeltaSchema = serde_json::from_value(SCHEMA.clone()).unwrap();
+        let tree = create_coercion_tree(&delta_schema);
+
+        let mut value = json!({
+            "array_struct": [
+                { "level2_timestamp": "2021-11-11T22:11:58Z" },
+                { "level2_timestamp": "not-a-date" },
+            ]
+        });
+        let err = coerce(&mut value, &tree).unwrap_err();
+        assert!(
+            err.contains("\"array_struct[1].level2_timestamp\""),
+            "expected indexed dotted path in error, got: {err}"
+        );
     }
 }
