@@ -40,9 +40,9 @@
 //! - `Documents/silverhand/iggy/message_bus/transport-plan/designs/tls-shutdown-protocol.md`
 //!   (P9-T2.5 shutdown sequence)
 
-// P9-T2a: handshake driver only; consumers (reader/writer tasks +
-// transports) land in P9-T2b and P9-T7/T8. Suppress dead_code on the
-// module until the next commit wires it into a transport.
+// P9-T2b: handshake driver + steady-state reader/writer + cooperative
+// shutdown helper. Transport-level consumers (TCP-TLS, WSS) land in
+// P9-T7 / P9-T8; suppress dead_code on the module until then.
 #[allow(dead_code)]
 pub(super) mod driver;
 
