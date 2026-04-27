@@ -43,18 +43,18 @@ repos:
       - id: markdownlint
         name: markdownlint
         entry: ./scripts/ci/markdownlint.sh
-        args: ["--fix", "--staged"]
+        args: ["--fix"]
         language: system
         types: [markdown]
-        pass_filenames: false
+        pass_filenames: true
 
       - id: shellcheck
         name: shellcheck
         entry: ./scripts/ci/shellcheck.sh
-        args: ["--fix", "--staged"]
+        args: ["--fix"]
         language: system
         types: [shell]
-        pass_filenames: false
+        pass_filenames: true
 
       - id: license-headers
         name: license headers
