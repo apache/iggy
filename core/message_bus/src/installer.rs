@@ -289,22 +289,31 @@ pub fn install_replica_conn<C: TransportConn>(
     let token_for_transport = Rc::clone(&install_token);
     let notified_transport = Rc::clone(&notified);
     let transport_handle = compio::runtime::spawn(async move {
+        // Scopeguard so registry eviction + connection-lost notification fire
+        // on PANIC as well as clean exit. compio's `spawn` wraps the future
+        // with `AssertUnwindSafe(future).catch_unwind()` which silently
+        // swallows panics; without this guard a panicking transport would
+        // leak its registry slot and `notify_connection_lost` would never
+        // fire, leaving the bus convinced the peer is still up until a
+        // higher-layer timeout fallback notices.
+        let _cleanup = scopeguard::guard((), |()| {
+            if aborted_transport.get() || bus_for_transport.is_shutting_down() {
+                return;
+            }
+            let Some(token) = token_for_transport.get() else {
+                return;
+            };
+            if !bus_for_transport
+                .replicas()
+                .remove_if_token_matches(peer_id, token)
+            {
+                return;
+            }
+            if !notified_transport.replace(true) {
+                bus_for_transport.notify_connection_lost(peer_id);
+            }
+        });
         conn.run(ctx).await;
-        if aborted_transport.get() || bus_for_transport.is_shutting_down() {
-            return;
-        }
-        let Some(token) = token_for_transport.get() else {
-            return;
-        };
-        if !bus_for_transport
-            .replicas()
-            .remove_if_token_matches(peer_id, token)
-        {
-            return;
-        }
-        if !notified_transport.replace(true) {
-            bus_for_transport.notify_connection_lost(peer_id);
-        }
     });
 
     let bus_for_dispatch = Rc::clone(bus);
@@ -632,16 +641,24 @@ pub fn install_client_conn<C: TransportConn>(
     let aborted_transport = Rc::clone(&install_aborted);
     let token_for_transport = Rc::clone(&install_token);
     let transport_handle = compio::runtime::spawn(async move {
+        // Scopeguard so the registry slot is evicted on PANIC as well as
+        // clean exit. compio's `spawn` wraps the future with
+        // `AssertUnwindSafe(future).catch_unwind()` which silently swallows
+        // panics; without this guard a panicking client transport would
+        // leak its slot and the next reconnect from the same client id
+        // would be rejected as a duplicate.
+        let _cleanup = scopeguard::guard((), |()| {
+            if aborted_transport.get() || bus_for_transport.is_shutting_down() {
+                return;
+            }
+            let Some(token) = token_for_transport.get() else {
+                return;
+            };
+            bus_for_transport
+                .clients()
+                .remove_if_token_matches(client_id, token);
+        });
         conn.run(ctx).await;
-        if aborted_transport.get() || bus_for_transport.is_shutting_down() {
-            return;
-        }
-        let Some(token) = token_for_transport.get() else {
-            return;
-        };
-        bus_for_transport
-            .clients()
-            .remove_if_token_matches(client_id, token);
     });
 
     let bus_for_dispatch = Rc::clone(bus);

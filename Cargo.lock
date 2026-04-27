@@ -7900,6 +7900,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "scopeguard",
  "socket2 0.6.3",
  "tempfile",
  "thiserror 2.0.18",
