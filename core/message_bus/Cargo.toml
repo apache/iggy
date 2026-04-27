@@ -31,8 +31,10 @@ publish = false
 [dependencies]
 async-channel = { workspace = true }
 blake3 = { workspace = true }
+bytes = { workspace = true }
 compio = { workspace = true }
 compio-quic = { workspace = true }
+compio-ws = { workspace = true }
 futures = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
@@ -42,6 +44,9 @@ rustls = { workspace = true }
 socket2 = { workspace = true, features = ["all"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Pinned to the major compio-ws 0.3.1 wraps (it does not re-export Message),
+# so our send/receive sites use the same Message enum compio-ws expects.
+tungstenite = "=0.28.0"
 
 [dev-dependencies]
 rcgen = { workspace = true }

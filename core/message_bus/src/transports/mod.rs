@@ -67,6 +67,7 @@
 
 pub mod quic;
 pub mod tcp;
+pub mod ws;
 
 // Only `Conn` and `Writer` have crate-internal callers today
 // (`installer.rs` wraps the dialed/accepted stream in a `TcpTransportConn`;
