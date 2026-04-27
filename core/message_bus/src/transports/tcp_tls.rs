@@ -70,7 +70,7 @@
 //! merged-channel-close path to propagate to the writer for clean
 //! `close_notify` emission.
 
-use super::tls::{TlsConnHandles, TlsDriver, WriterEvent, shutdown as tls_shutdown};
+use super::tls::{TlsConnHandles, TlsDriver, TlsRole, WriterEvent, shutdown as tls_shutdown};
 use super::{ActorContext, TransportConn};
 use crate::lifecycle::{BusReceiver, Shutdown, ShutdownToken};
 use async_channel::{Sender, bounded};
@@ -92,27 +92,6 @@ use tracing::warn;
 /// available without coupling the bus-level config to the transport's
 /// constructor.
 const DEFAULT_DRAIN_BUDGET: Duration = Duration::from_secs(5);
-
-/// Local-end role on a TLS connection. Determines whether the
-/// `TlsDriver` is built in server or client mode.
-pub enum TlsRole {
-    /// Server side: drives the rustls server state machine against the
-    /// supplied [`rustls::ServerConfig`]. Constructed via
-    /// [`TcpTlsTransportConn::new_server`].
-    Server(Arc<rustls::ServerConfig>),
-    /// Client side: drives the rustls client state machine against the
-    /// supplied [`rustls::ClientConfig`] + a pre-validated server name.
-    /// Constructed via [`TcpTlsTransportConn::new_client`].
-    Client {
-        /// Client-role rustls configuration.
-        config: Arc<rustls::ClientConfig>,
-        /// Server name presented in SNI and validated against the leaf
-        /// certificate's SANs / CN. Owned `'static` because rustls
-        /// retains it for the lifetime of the underlying
-        /// `UnbufferedClientConnection`.
-        server_name: ServerName<'static>,
-    },
-}
 
 /// In-process TCP-TLS transport: a [`TcpStream`] paired with a
 /// role-specific rustls configuration.

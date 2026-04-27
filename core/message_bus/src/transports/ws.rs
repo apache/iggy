@@ -119,7 +119,7 @@ const READ_FILL_CHUNK: usize = 128 * 1024;
 /// Maximum WS frame header length per RFC 6455 §5.2 (2 base bytes +
 /// 8 extended length bytes + 4 mask bytes). Sized for a per-frame
 /// scratch [`Vec<u8>`] reused across the writer's hot loop.
-const WS_HEADER_MAX: usize = 14;
+pub(in crate::transports) const WS_HEADER_MAX: usize = 14;
 
 /// Inbound WS listener.
 ///
@@ -166,7 +166,7 @@ impl TransportListener for WsTransportListener {
 /// - **Client** writes masked (random per-frame mask), expects inbound
 ///   unmasked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Role {
+pub(in crate::transports) enum Role {
     Server,
     Client,
 }
@@ -283,7 +283,7 @@ enum ControlFrame {
 
 /// Reader-task local representation of one parsed WS frame.
 #[derive(Debug)]
-enum InboundFrame {
+pub(in crate::transports) enum InboundFrame {
     Binary(Vec<u8>),
     Ping(Vec<u8>),
     /// Server-initiated keepalive reply; reader silently ignores.
@@ -297,7 +297,7 @@ enum InboundFrame {
 /// payload fields exist for diagnostic logging only.
 #[derive(Debug)]
 #[allow(dead_code)]
-enum FramingError {
+pub(in crate::transports) enum FramingError {
     /// Frame's mask bit conflicts with the local role (server got
     /// unmasked client frame, or client got masked server frame).
     UnexpectedMask,
@@ -315,7 +315,7 @@ enum FramingError {
 /// 4-byte XOR cycle per RFC 6455 §5.3. Re-implemented in tree because
 /// tungstenite's `apply_mask` is `pub(crate)`. No SIMD; profile if mask
 /// throughput ever becomes a hot path.
-fn apply_mask(buf: &mut [u8], mask: [u8; 4]) {
+pub(in crate::transports) fn apply_mask(buf: &mut [u8], mask: [u8; 4]) {
     for (i, byte) in buf.iter_mut().enumerate() {
         *byte ^= mask[i & 3];
     }
@@ -325,7 +325,7 @@ fn apply_mask(buf: &mut [u8], mask: [u8; 4]) {
 /// Returns `Ok(Some(frame))` on a complete frame (bytes consumed),
 /// `Ok(None)` if more bytes are needed (accumulator unchanged), or
 /// `Err` on a protocol violation.
-fn parse_one_frame(
+pub(in crate::transports) fn parse_one_frame(
     accumulator: &mut Vec<u8>,
     role: Role,
 ) -> Result<Option<InboundFrame>, FramingError> {
@@ -386,7 +386,9 @@ fn parse_one_frame(
 /// Reuses the framing invariant (I3): `[256 B header][optional body]`
 /// where `body_len = header.size - HEADER_SIZE`. The WS layer guarantees
 /// a single message per binary frame (FIN=1).
-fn decode_consensus_frame(body: &[u8]) -> Result<Message<GenericHeader>, FrameDecodeError> {
+pub(in crate::transports) fn decode_consensus_frame(
+    body: &[u8],
+) -> Result<Message<GenericHeader>, FrameDecodeError> {
     if body.len() < iggy_binary_protocol::HEADER_SIZE {
         return Err(FrameDecodeError::BadHeader);
     }
@@ -411,7 +413,7 @@ fn decode_consensus_frame(body: &[u8]) -> Result<Message<GenericHeader>, FrameDe
 }
 
 #[derive(Debug)]
-enum FrameDecodeError {
+pub(in crate::transports) enum FrameDecodeError {
     BadHeader,
     BadSize,
 }
@@ -648,7 +650,10 @@ async fn write_control(
     r
 }
 
-const fn build_header(opcode: OpCode, mask: Option<[u8; 4]>) -> FrameHeader {
+pub(in crate::transports) const fn build_header(
+    opcode: OpCode,
+    mask: Option<[u8; 4]>,
+) -> FrameHeader {
     FrameHeader {
         is_final: true,
         rsv1: false,
@@ -662,7 +667,11 @@ const fn build_header(opcode: OpCode, mask: Option<[u8; 4]>) -> FrameHeader {
 /// Format a [`FrameHeader`] into `out`. Tungstenite's
 /// [`FrameHeader::format`] only fails on `Write::write_all` errors;
 /// `Vec<u8>::write_all` is infallible.
-fn format_header(header: &FrameHeader, payload_len: u64, out: &mut Vec<u8>) {
+pub(in crate::transports) fn format_header(
+    header: &FrameHeader,
+    payload_len: u64,
+    out: &mut Vec<u8>,
+) {
     header
         .format(payload_len, out)
         .expect("FrameHeader::format on Vec<u8> is infallible");

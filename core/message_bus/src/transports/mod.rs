@@ -64,6 +64,7 @@ pub mod tcp;
 pub mod tcp_tls;
 pub mod tls;
 pub mod ws;
+pub mod wss;
 
 use crate::lifecycle::{BusReceiver, ShutdownToken};
 use async_channel::Sender;

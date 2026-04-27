@@ -51,12 +51,34 @@ pub(super) mod driver;
 // to `crate::transports` at their declaration sites; the re-export
 // matches that scope.
 pub(in crate::transports) use driver::{
-    DriveError, TlsConnHandles, TlsDriver, WriterEvent, shutdown,
+    DriveError, TlsConnHandles, TlsDriver, TlsState, WriterEvent, append_incoming, drain_inbound,
+    encrypt_app_data, flush_outgoing, queue_close_notify, shutdown,
 };
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use std::io::{self, BufReader};
 use std::path::Path;
+use std::sync::Arc;
+
+/// Local-end role on a TLS connection. Determines whether the
+/// `TlsDriver` is built in server or client mode and is shared by
+/// the in-process TCP-TLS and WSS transports.
+pub enum TlsRole {
+    /// Server side: drives the rustls server state machine against the
+    /// supplied [`rustls::ServerConfig`].
+    Server(Arc<rustls::ServerConfig>),
+    /// Client side: drives the rustls client state machine against the
+    /// supplied [`rustls::ClientConfig`] + a pre-validated server name.
+    Client {
+        /// Client-role rustls configuration.
+        config: Arc<rustls::ClientConfig>,
+        /// Server name presented in SNI and validated against the leaf
+        /// certificate's SANs / CN. Owned `'static` because rustls
+        /// retains it for the lifetime of the underlying
+        /// `UnbufferedClientConnection`.
+        server_name: ServerName<'static>,
+    },
+}
 
 /// Server-side TLS credentials: a certificate chain and the matching
 /// private key, both in DER form.

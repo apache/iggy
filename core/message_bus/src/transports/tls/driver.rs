@@ -586,7 +586,10 @@ fn encode_into_buf<Data>(
 
 /// Append peer-supplied bytes into `incoming_tls`, rejecting any
 /// growth past [`TLS_BUFFER_CAP`].
-fn append_incoming(state: &TlsState, bytes: &[u8]) -> Result<(), DriveError> {
+pub(in crate::transports) fn append_incoming(
+    state: &TlsState,
+    bytes: &[u8],
+) -> Result<(), DriveError> {
     let mut incoming = state.incoming_tls.borrow_mut();
     let new_len = incoming.len().saturating_add(bytes.len());
     if new_len > TLS_BUFFER_CAP {
@@ -603,7 +606,7 @@ fn append_incoming(state: &TlsState, bytes: &[u8]) -> Result<(), DriveError> {
 /// brackets a single `.await` on the wire write, then the empty Vec
 /// is returned to the state for re-use.
 #[allow(clippy::future_not_send)] // single-threaded compio runtime
-async fn flush_outgoing(
+pub(in crate::transports) async fn flush_outgoing(
     state: &TlsState,
     write_half: &mut OwnedWriteHalf<TcpStream>,
 ) -> Result<(), DriveError> {
@@ -766,13 +769,13 @@ pub(in crate::transports) async fn writer_task(
 }
 
 /// Per-iteration outcome from [`drain_inbound`].
-struct DrainOutcome {
+pub(in crate::transports) struct DrainOutcome {
     /// True if rustls produced bytes that need to leave the wire (a
     /// handshake response, alert, or `KeyUpdate` response). The reader
     /// signals the writer rather than touching `write_half` itself.
-    flush_needed: bool,
+    pub(in crate::transports) flush_needed: bool,
     /// True if rustls reached `PeerClosed` / `Closed`.
-    peer_closed: bool,
+    pub(in crate::transports) peer_closed: bool,
 }
 
 /// Drain post-handshake state-machine progress: copy plaintext from
@@ -783,7 +786,10 @@ struct DrainOutcome {
 /// Synchronous. Holds `RefCell` borrows on `state.conn`,
 /// `state.incoming_tls`, and `state.outgoing_tls`; drops them all
 /// before returning.
-fn drain_inbound(state: &TlsState, plaintext: &mut Vec<u8>) -> Result<DrainOutcome, DriveError> {
+pub(in crate::transports) fn drain_inbound(
+    state: &TlsState,
+    plaintext: &mut Vec<u8>,
+) -> Result<DrainOutcome, DriveError> {
     let mut conn = state.conn.borrow_mut();
     let mut incoming = state.incoming_tls.borrow_mut();
     let mut outgoing = state.outgoing_tls.borrow_mut();
@@ -902,7 +908,10 @@ fn drain_step<Data>(
 /// plaintext cap (16 KiB) internally, so a `MAX_MESSAGE_SIZE` payload
 /// produces ~4096 records in one call. The output is bounded by
 /// [`TLS_BUFFER_CAP`].
-fn encrypt_app_data(state: &TlsState, app_data: &[u8]) -> Result<(), DriveError> {
+pub(in crate::transports) fn encrypt_app_data(
+    state: &TlsState,
+    app_data: &[u8],
+) -> Result<(), DriveError> {
     let mut conn = state.conn.borrow_mut();
     let mut outgoing = state.outgoing_tls.borrow_mut();
 
@@ -1012,7 +1021,7 @@ fn do_encrypt_into_buf<Data>(
 /// Best-effort: if the connection is no longer in `WriteTraffic` (peer
 /// already closed, encryptor exhausted, etc.) the call is a noop per
 /// the shutdown-protocol design.
-fn queue_close_notify(state: &TlsState) -> Result<(), DriveError> {
+pub(in crate::transports) fn queue_close_notify(state: &TlsState) -> Result<(), DriveError> {
     let mut conn = state.conn.borrow_mut();
     let mut outgoing = state.outgoing_tls.borrow_mut();
 
