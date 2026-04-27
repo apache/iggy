@@ -1834,4 +1834,102 @@ mod tests {
         assert!(accum.is_empty());
         assert!(matches!(try_take_frame(&mut accum), Ok(None)));
     }
+
+    /// Static check: no `.borrow*()` call may be followed by an
+    /// `.await` on the same logical statement in this driver. The
+    /// hand-rolled split-task pattern only stays sound if every
+    /// `RefCell` borrow on `TlsState` is dropped before any async
+    /// yield (`driver.rs:54-60`); a single refactor that holds a
+    /// borrow across `.await` would cause a `BorrowMutError` panic
+    /// the moment the sibling task touches the same cell.
+    ///
+    /// Heuristic: load `driver.rs` at compile time, strip line and
+    /// block comments, then for every line containing `.borrow(` or
+    /// `.borrow_mut(` assert no later position on the same line
+    /// contains `.await`. Catches the single-line refactor footgun
+    /// (`state.conn.borrow_mut().some_async_op().await`) and the
+    /// chained pattern. Does not catch the multi-statement form (a
+    /// stored borrow consumed across an explicit `.await` two lines
+    /// later); those are filtered out by code review on the
+    /// synchronous-helper boundaries documented in the module
+    /// rustdoc.
+    ///
+    /// If this test ever flakes by detecting a literal in a doc
+    /// comment or string, extend the strip pass; do not relax the
+    /// assertion.
+    #[test]
+    fn no_refcell_borrow_across_await_in_driver_source() {
+        const SRC: &str = include_str!("driver.rs");
+        let stripped = strip_comments_and_strings(SRC);
+        for (line_no_zero, line) in stripped.lines().enumerate() {
+            let line_no = line_no_zero + 1;
+            let mut search = line;
+            while let Some(rel_borrow) = find_borrow_call(search) {
+                let after_borrow = &search[rel_borrow..];
+                assert!(
+                    !after_borrow.contains(".await"),
+                    "driver.rs:{line_no}: `.borrow*()` precedes `.await` on the same line; \
+                     RefCell borrow held across an async yield breaks I14's \
+                     no-borrow-across-await invariant. Refactor so the borrow drops \
+                     before the await (extract a sync helper)."
+                );
+                search = &after_borrow[".borrow".len()..];
+            }
+        }
+    }
+
+    /// Drop `//` line comments and `"..."` string literals so the
+    /// pattern check above does not flag prose containing the words
+    /// `borrow` and `await` adjacent to one another. Block comments
+    /// (`/* ... */`) and raw strings are not used in this file so the
+    /// pass stays simple.
+    fn strip_comments_and_strings(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        for line in src.lines() {
+            let mut buf = String::new();
+            let mut chars = line.chars().peekable();
+            let mut in_string = false;
+            let mut prev = '\0';
+            while let Some(c) = chars.next() {
+                if in_string {
+                    if c == '"' && prev != '\\' {
+                        in_string = false;
+                    }
+                    buf.push(' ');
+                } else if c == '/' && chars.peek() == Some(&'/') {
+                    break;
+                } else {
+                    if c == '"' && prev != '\\' {
+                        in_string = true;
+                    }
+                    buf.push(c);
+                }
+                prev = c;
+            }
+            out.push_str(&buf);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Return the byte offset in `s` where `.borrow(` or `.borrow_mut(`
+    /// starts, if either is present. Skips bare `borrow` identifiers
+    /// (e.g. parameter names) by requiring the leading `.`.
+    fn find_borrow_call(s: &str) -> Option<usize> {
+        let mut i = 0;
+        while i < s.len() {
+            let rest = &s[i..];
+            if let Some(rel) = rest.find(".borrow") {
+                let abs = i + rel;
+                let tail = &s[abs + ".borrow".len()..];
+                if tail.starts_with('(') || tail.starts_with("_mut(") {
+                    return Some(abs);
+                }
+                i = abs + ".borrow".len();
+            } else {
+                return None;
+            }
+        }
+        None
+    }
 }
