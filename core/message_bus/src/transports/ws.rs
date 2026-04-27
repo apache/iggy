@@ -41,23 +41,26 @@
 //! precludes a `select!`-cancelling read + write race on a shared
 //! stream.
 //!
-//! [`WsTransportConn::into_split`] therefore unwraps the post-handshake
+//! [`TransportConn::run`] therefore unwraps the post-handshake
 //! `WebSocketStream<TcpStream>` to the bare `TcpStream`, splits it into
 //! `(OwnedReadHalf, OwnedWriteHalf)`, and spawns:
 //!
 //! - **reader task**: drains bytes from `OwnedReadHalf` into a persistent
 //!   accumulator, parses WS frames via [`tungstenite::protocol::frame::FrameHeader`],
-//!   pushes [`Message<GenericHeader>`] frames to the inbound queue,
+//!   pushes [`Message<GenericHeader>`] frames to `ActorContext::in_tx`,
 //!   forwards Ping payloads to the writer via the control channel.
-//! - **writer task**: pulls outbound consensus frames + control replies
-//!   (Pong, Close), encodes them with the appropriate WS framing
-//!   (server unmasked, client masked per RFC 6455), writes to
-//!   `OwnedWriteHalf`.
+//! - **writer task**: drains [`ActorContext::rx`] for outbound consensus
+//!   frames + control replies (Pong, Close), encodes them with the
+//!   appropriate WS framing (server unmasked, client masked per RFC 6455),
+//!   writes to `OwnedWriteHalf`.
 //!
 //! Reader and writer share no `&mut` state, so a parked read never
-//! blocks an outbound send. Per-connection [`Shutdown`] coordinates
-//! teardown: either task triggers it on EOF / I/O error / framing
-//! violation, the other observes via [`ShutdownToken::wait`] and exits.
+//! blocks an outbound send. A WS-internal [`Shutdown`] coordinates
+//! teardown across the pair: either task triggers it on EOF / I/O error
+//! / framing violation, the other observes via [`ShutdownToken::wait`]
+//! and exits. A small bridge task forwards `ActorContext::shutdown`
+//! firings into the internal token so bus / per-conn cancellation
+//! reaches both halves identically.
 //!
 //! # Zero-copy on the server-side outbound path
 //!
@@ -71,15 +74,15 @@
 //! # Post-handshake leftover bytes
 //!
 //! RFC 6455 §4.1 forbids clients sending data frames before receiving
-//! the 101 response. Defensively, [`WsTransportConn::into_split`] reads
-//! any bytes already buffered in the `compio_io::compat::SyncStream`
-//! (via [`std::io::BufRead::fill_buf`]) before unwrapping to the bare
-//! `TcpStream`, and seeds the reader's accumulator with them. Expected
-//! to be empty in production traffic; non-empty case logged at debug.
+//! the 101 response. Defensively, the unwrap path reads any bytes
+//! already buffered in the `compio_io::compat::SyncStream` (via
+//! [`std::io::BufRead::fill_buf`]) before dropping it, and seeds the
+//! reader's accumulator with them. Expected to be empty in production
+//! traffic; non-empty case logged at debug.
 
-use super::{TransportConn, TransportListener, TransportReader, TransportWriter};
+use super::{ActorContext, TransportConn, TransportListener};
 use crate::framing;
-use crate::lifecycle::{Shutdown, ShutdownToken};
+use crate::lifecycle::{BusReceiver, Shutdown, ShutdownToken};
 use async_channel::{Receiver, Sender, bounded};
 use bytes::Bytes;
 use compio::BufResult;
@@ -91,7 +94,6 @@ use futures::FutureExt;
 use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
 use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_binary_protocol::{GenericHeader, Message};
-use iggy_common::IggyError;
 use std::io::{self, BufRead, Cursor};
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -103,15 +105,6 @@ use tungstenite::protocol::frame::coding::{Control, Data, OpCode};
 /// trailing version digits when the wire format changes (matches the
 /// QUIC ALPN constant in `transports/quic.rs`).
 pub const WS_SUBPROTOCOL: &str = "iggy.consensus.v1";
-
-/// Per-connection inbound queue depth. Bounded so an idle reader cannot
-/// let memory grow unboundedly under a chatty peer; mirrors the bus's
-/// per-peer outbound queue convention.
-const INBOUND_QUEUE_CAPACITY: usize = 256;
-
-/// Per-connection outbound queue depth. Same shape as the inbound side;
-/// the per-peer writer task already enforces backpressure upstream.
-const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 
 /// Reader -> writer control channel depth. Pong replies + Close are
 /// rare under nominal traffic; a small bound keeps a chatty peer's
@@ -179,8 +172,8 @@ enum Role {
 }
 
 /// A single WS connection holding the bidirectional [`WebSocketStream`]
-/// until [`Self::into_split`] unwraps it to the bare [`TcpStream`] and
-/// hands the read / write halves to per-task actors.
+/// until [`TransportConn::run`] unwraps it to the bare [`TcpStream`]
+/// and hands the read / write halves to per-task actors.
 pub struct WsTransportConn {
     stream: WebSocketStream<TcpStream>,
     role: Role,
@@ -212,16 +205,25 @@ impl WsTransportConn {
 }
 
 impl TransportConn for WsTransportConn {
-    type Reader = WsTransportReader;
-    type Writer = WsTransportWriter;
-
-    fn into_split(self) -> (Self::Reader, Self::Writer) {
-        let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(INBOUND_QUEUE_CAPACITY);
-        let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(OUTBOUND_QUEUE_CAPACITY);
+    #[allow(clippy::future_not_send)]
+    async fn run(self, ctx: ActorContext) {
         let (control_tx, control_rx) = bounded::<ControlFrame>(CONTROL_QUEUE_CAPACITY);
         let (shutdown, shutdown_token_reader) = Shutdown::new();
         let shutdown = Rc::new(shutdown);
         let shutdown_token_writer = shutdown_token_reader.clone();
+
+        // Bridge external (bus / per-conn) shutdown into the WS-internal
+        // token so reader and writer wake on either signal. The bridge
+        // task self-terminates on first fire; a natural-EOF run leaves
+        // it parked until bus shutdown ultimately fires the external
+        // token.
+        let ext_token = ctx.shutdown.clone();
+        let bridge_shutdown = Rc::clone(&shutdown);
+        compio::runtime::spawn(async move {
+            ext_token.wait().await;
+            bridge_shutdown.trigger();
+        })
+        .detach();
 
         // Unwrap layers: WebSocketStream -> WebSocket -> SyncStream -> TcpStream.
         // Recover any post-handshake bytes from the SyncStream's read buffer
@@ -233,7 +235,7 @@ impl TransportConn for WsTransportConn {
         let leftover: Vec<u8> = match sync_stream.fill_buf() {
             Ok(buf) if !buf.is_empty() => {
                 debug!(
-                    "WS into_split: {} leftover bytes in SyncStream buffer post-handshake",
+                    "WS run: {} leftover bytes in SyncStream buffer post-handshake",
                     buf.len()
                 );
                 buf.to_vec()
@@ -245,31 +247,27 @@ impl TransportConn for WsTransportConn {
 
         let role = self.role;
         let reader_shutdown = Rc::clone(&shutdown);
-        compio::runtime::spawn(reader_task(
+        let reader_handle = compio::runtime::spawn(reader_task(
             read_half,
             leftover,
-            in_tx,
+            ctx.in_tx,
             control_tx,
             reader_shutdown,
             shutdown_token_reader,
             role,
-        ))
-        .detach();
+        ));
         let writer_shutdown = Rc::clone(&shutdown);
-        compio::runtime::spawn(writer_task(
+        let writer_handle = compio::runtime::spawn(writer_task(
             write_half,
-            out_rx,
+            ctx.rx,
             control_rx,
             writer_shutdown,
             shutdown_token_writer,
             role,
-        ))
-        .detach();
+        ));
 
-        (
-            WsTransportReader { rx: in_rx },
-            WsTransportWriter { tx: out_tx },
-        )
+        let _ = reader_handle.await;
+        let _ = writer_handle.await;
     }
 }
 
@@ -509,7 +507,7 @@ async fn reader_task(
 #[allow(clippy::future_not_send)]
 async fn writer_task(
     mut write_half: OwnedWriteHalf<TcpStream>,
-    out_rx: Receiver<Frozen<MESSAGE_ALIGN>>,
+    out_rx: BusReceiver,
     control_rx: Receiver<ControlFrame>,
     shutdown: Rc<Shutdown>,
     shutdown_token: ShutdownToken,
@@ -670,50 +668,6 @@ fn format_header(header: &FrameHeader, payload_len: u64, out: &mut Vec<u8>) {
         .expect("FrameHeader::format on Vec<u8> is infallible");
 }
 
-/// Read half. Polls the reader task's inbound queue.
-pub struct WsTransportReader {
-    rx: Receiver<Message<GenericHeader>>,
-}
-
-impl TransportReader for WsTransportReader {
-    #[allow(clippy::future_not_send)]
-    async fn read_message(
-        &mut self,
-        _max_message_size: usize,
-    ) -> Result<Message<GenericHeader>, IggyError> {
-        // Bound check happens inside [`parse_one_frame`] (against
-        // [`framing::MAX_MESSAGE_SIZE`]) and inside [`decode_consensus_frame`]
-        // (against the build-time max). The per-call override exists for
-        // parity with the trait surface; runtime override plumbing lands
-        // when a runtime-configurable cap is needed.
-        self.rx
-            .recv()
-            .await
-            .map_err(|_| IggyError::ConnectionClosed)
-    }
-}
-
-/// Write half. Pushes frames into the writer task's outbound queue.
-pub struct WsTransportWriter {
-    tx: Sender<Frozen<MESSAGE_ALIGN>>,
-}
-
-impl TransportWriter for WsTransportWriter {
-    #[allow(clippy::future_not_send)]
-    async fn send_batch(&mut self, batch: &mut Vec<Frozen<MESSAGE_ALIGN>>) -> io::Result<()> {
-        // Drain in order; one queue push per frame. Atomic-or-error
-        // contract holds because the writer task writes each frame
-        // before pulling the next from the queue.
-        for buf in batch.drain(..) {
-            self.tx
-                .send(buf)
-                .await
-                .map_err(|_| io::Error::other("WS writer queue closed"))?;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,6 +695,33 @@ mod tests {
             .into_frozen()
     }
 
+    /// Spawn `conn.run(ctx)` with fresh channels and shutdown; return
+    /// the test-side handles.
+    #[allow(clippy::future_not_send)]
+    fn drive(
+        conn: WsTransportConn,
+    ) -> (
+        Sender<Frozen<MESSAGE_ALIGN>>,
+        Receiver<Message<GenericHeader>>,
+        Shutdown,
+        compio::runtime::JoinHandle<()>,
+    ) {
+        let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(16);
+        let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(16);
+        let (shutdown, token) = Shutdown::new();
+        let ctx = ActorContext {
+            in_tx,
+            rx: out_rx,
+            shutdown: token,
+            max_batch: 16,
+            max_message_size: framing::MAX_MESSAGE_SIZE,
+            label: "test",
+            peer: "test".to_owned(),
+        };
+        let handle = compio::runtime::spawn(async move { conn.run(ctx).await });
+        (out_tx, in_rx, shutdown, handle)
+    }
+
     #[compio::test]
     #[allow(clippy::future_not_send)]
     async fn loopback_round_trip_three_frames() {
@@ -750,19 +731,12 @@ mod tests {
 
         let server_task = compio::runtime::spawn(async move {
             let (conn, _peer) = ws_listener.accept().await.expect("accept");
-            let (mut reader, _writer) = conn.into_split();
-            let a = reader
-                .read_message(framing::MAX_MESSAGE_SIZE)
-                .await
-                .unwrap();
-            let b = reader
-                .read_message(framing::MAX_MESSAGE_SIZE)
-                .await
-                .unwrap();
-            let c = reader
-                .read_message(framing::MAX_MESSAGE_SIZE)
-                .await
-                .unwrap();
+            let (_out_tx, in_rx, shutdown, handle) = drive(conn);
+            let a = in_rx.recv().await.unwrap();
+            let b = in_rx.recv().await.unwrap();
+            let c = in_rx.recv().await.unwrap();
+            shutdown.trigger();
+            let _ = handle.await;
             (a.header().command, b.header().command, c.header().command)
         });
 
@@ -771,21 +745,19 @@ mod tests {
         let (ws_client, _resp) = compio_ws::client_async(url, client_tcp)
             .await
             .expect("ws handshake");
-        let conn = WsTransportConn::new_client(ws_client);
-        let (_r, mut w) = conn.into_split();
+        let (out_tx, _in_rx, shutdown, handle) = drive(WsTransportConn::new_client(ws_client));
 
-        let mut batch = vec![
-            header_only(Command2::Ping),
-            header_only(Command2::Prepare),
-            header_only(Command2::Request),
-        ];
-        w.send_batch(&mut batch).await.expect("send_batch");
-        assert!(batch.is_empty(), "Vec must be drained on success");
+        out_tx.send(header_only(Command2::Ping)).await.unwrap();
+        out_tx.send(header_only(Command2::Prepare)).await.unwrap();
+        out_tx.send(header_only(Command2::Request)).await.unwrap();
 
         let (a, b, c) = server_task.await.unwrap();
         assert_eq!(a, Command2::Ping);
         assert_eq!(b, Command2::Prepare);
         assert_eq!(c, Command2::Request);
+
+        shutdown.trigger();
+        let _ = handle.await;
     }
 
     #[compio::test]
@@ -797,8 +769,10 @@ mod tests {
 
         let server_task = compio::runtime::spawn(async move {
             let (conn, _peer) = ws_listener.accept().await.expect("accept");
-            let (mut reader, _writer) = conn.into_split();
-            reader.read_message(framing::MAX_MESSAGE_SIZE).await
+            let (_out_tx, in_rx, _shutdown, handle) = drive(conn);
+            let res = in_rx.recv().await;
+            let _ = handle.await;
+            res
         });
 
         let client_tcp = TcpStream::connect(server_addr).await.unwrap();
@@ -814,9 +788,10 @@ mod tests {
             .send(tungstenite::Message::Binary(Bytes::from(buf)))
             .await
             .unwrap();
-        // Server's reader closes; queue closes, surfacing as ConnectionClosed.
+        // Server's reader closes; in_tx drops, in_rx.recv resolves to
+        // Err — the connection-closed signal under the new run shape.
         let res = server_task.await.unwrap();
-        assert!(matches!(res, Err(IggyError::ConnectionClosed)));
+        assert!(res.is_err());
     }
 
     /// Full bidirectional round-trip: client sends one frame, server
@@ -832,14 +807,13 @@ mod tests {
 
         let server_task = compio::runtime::spawn(async move {
             let (conn, _peer) = ws_listener.accept().await.expect("accept");
-            let (mut reader, mut writer) = conn.into_split();
-            let req = reader
-                .read_message(framing::MAX_MESSAGE_SIZE)
-                .await
-                .expect("server read");
+            let (out_tx, in_rx, shutdown, handle) = drive(conn);
+            let req = in_rx.recv().await.expect("server read");
             assert_eq!(req.header().command, Command2::Request);
-            let mut batch = vec![header_only(Command2::Reply)];
-            writer.send_batch(&mut batch).await.expect("server reply");
+            out_tx.send(header_only(Command2::Reply)).await.unwrap();
+            // Drain any further inbound to avoid racing with the test.
+            shutdown.trigger();
+            let _ = handle.await;
         });
 
         let client_tcp = TcpStream::connect(server_addr).await.unwrap();
@@ -847,24 +821,19 @@ mod tests {
         let (ws_client, _resp) = compio_ws::client_async(url, client_tcp)
             .await
             .expect("ws handshake");
-        let (mut client_reader, mut client_writer) =
-            WsTransportConn::new_client(ws_client).into_split();
+        let (out_tx, in_rx, shutdown, handle) = drive(WsTransportConn::new_client(ws_client));
 
-        let mut batch = vec![header_only(Command2::Request)];
-        client_writer
-            .send_batch(&mut batch)
+        out_tx.send(header_only(Command2::Request)).await.unwrap();
+
+        let reply = compio::time::timeout(Duration::from_secs(2), in_rx.recv())
             .await
-            .expect("client send");
-
-        let reply = compio::time::timeout(
-            Duration::from_secs(2),
-            client_reader.read_message(framing::MAX_MESSAGE_SIZE),
-        )
-        .await
-        .expect("client must receive reply within 2 s")
-        .expect("reply frame");
+            .expect("client must receive reply within 2 s")
+            .expect("reply frame");
         assert_eq!(reply.header().command, Command2::Reply);
         server_task.await.unwrap();
+
+        shutdown.trigger();
+        let _ = handle.await;
     }
 
     /// Verify a 16 MiB body round-trips intact through both reader and
@@ -881,8 +850,11 @@ mod tests {
 
         let server_task = compio::runtime::spawn(async move {
             let (conn, _peer) = ws_listener.accept().await.expect("accept");
-            let (mut reader, _writer) = conn.into_split();
-            reader.read_message(framing::MAX_MESSAGE_SIZE).await
+            let (_out_tx, in_rx, shutdown, handle) = drive(conn);
+            let msg = in_rx.recv().await.expect("server read");
+            shutdown.trigger();
+            let _ = handle.await;
+            msg
         });
 
         let client_tcp = TcpStream::connect(server_addr).await.unwrap();
@@ -890,17 +862,21 @@ mod tests {
         let (ws_client, _resp) = compio_ws::client_async(url, client_tcp)
             .await
             .expect("ws handshake");
-        let (_r, mut w) = WsTransportConn::new_client(ws_client).into_split();
-        let mut batch = vec![padded(Command2::Request, total)];
-        w.send_batch(&mut batch).await.expect("send");
+        let (out_tx, _in_rx, shutdown, handle) = drive(WsTransportConn::new_client(ws_client));
+        out_tx
+            .send(padded(Command2::Request, total))
+            .await
+            .expect("send");
 
         let msg = compio::time::timeout(Duration::from_secs(5), server_task)
             .await
             .expect("server task within 5 s")
-            .unwrap()
-            .expect("msg");
+            .unwrap();
         assert_eq!(msg.header().command, Command2::Request);
         assert_eq!(msg.header().size as usize, total);
+
+        shutdown.trigger();
+        let _ = handle.await;
     }
 
     /// Apply-mask round-trips a payload back to itself.
@@ -987,8 +963,8 @@ mod tests {
         assert!(buf.is_empty());
     }
 
-    /// Peer-initiated Close on the server-side reader surfaces as
-    /// `ConnectionClosed` on the inbound queue.
+    /// Peer-initiated Close on the server-side reader surfaces as an
+    /// inbound queue closure under the new run shape.
     #[compio::test]
     #[allow(clippy::future_not_send)]
     async fn peer_initiated_close_drains_inbound_queue() {
@@ -998,8 +974,10 @@ mod tests {
 
         let server_task = compio::runtime::spawn(async move {
             let (conn, _peer) = ws_listener.accept().await.expect("accept");
-            let (mut reader, _writer) = conn.into_split();
-            reader.read_message(framing::MAX_MESSAGE_SIZE).await
+            let (_out_tx, in_rx, _shutdown, handle) = drive(conn);
+            let res = in_rx.recv().await;
+            let _ = handle.await;
+            res
         });
 
         let client_tcp = TcpStream::connect(server_addr).await.unwrap();
@@ -1014,6 +992,6 @@ mod tests {
             .await
             .expect("server task within 2 s")
             .unwrap();
-        assert!(matches!(res, Err(IggyError::ConnectionClosed)));
+        assert!(res.is_err());
     }
 }

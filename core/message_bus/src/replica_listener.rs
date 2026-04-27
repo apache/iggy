@@ -23,7 +23,7 @@
 //! QUIC, or HTTP paths here. The VSR chain-hash safety proof
 //! (`last_prepare_checksum` in `core/consensus/src/plane_helpers.rs`),
 //! the fd-delegation path (`F_DUPFD_CLOEXEC` needs a dupable plaintext
-//! fd), the `writev` batching in `writer_task.rs`, and the single-digit
+//! fd), the `writev` batching inside the TCP transport, and the single-digit
 //! RTT assumptions used by the view-change timer all rest on a FIFO
 //! byte stream between a bounded set of replicas on a trusted LAN. A
 //! datagram-oriented or gateway-terminated transport violates one or

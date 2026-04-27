@@ -35,9 +35,9 @@
 //! # Zero-copy
 //!
 //! `compio_quic::SendStream::write<T: IoBuf>` accepts
-//! `Frozen<MESSAGE_ALIGN>` directly; `QuicTransportWriter::send_batch`
-//! loops one `write` per frame (QUIC has no `sendmmsg` analog). Per-message
-//! syscalls are the documented trade-off versus the TCP `writev` path; small
+//! `Frozen<MESSAGE_ALIGN>` directly; the writer task loops one `write`
+//! per frame (QUIC has no `sendmmsg` analog). Per-message syscalls are
+//! the documented trade-off versus the TCP `writev` path; small
 //! high-RPS workloads stay on TCP. See plan §4 risks.
 //!
 //! # 0-RTT
@@ -48,18 +48,17 @@
 //! future per-command 0-RTT enablement requires an audit per
 //! `transport-plan/designs/quic-0rtt-audit-template.md` (P4-T5).
 
-use super::{TransportConn, TransportListener, TransportReader, TransportWriter};
+use super::{ActorContext, TransportConn, TransportListener};
 use crate::framing;
+use crate::lifecycle::{BusReceiver, ShutdownToken};
 use compio::BufResult;
 use compio::io::AsyncWrite;
 use compio_quic::{
     Connection, Endpoint, Incoming, RecvStream, SendStream, VarInt, congestion,
     crypto::rustls::QuicServerConfig,
 };
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
+use futures::FutureExt;
 use iggy_binary_protocol::{GenericHeader, Message};
-use iggy_common::IggyError;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -221,9 +220,8 @@ async fn accept_one(incoming: Incoming) -> io::Result<Option<(QuicTransportConn,
 
 /// A single QUIC connection plus its first bidirectional stream.
 ///
-/// The owned `Connection` handle is retained on the writer half so
-/// graceful shutdown can fire `Connection::close(QUIC_SHUTDOWN, _)`
-/// independent of stream drop order.
+/// The owned `Connection` handle is retained so graceful shutdown can
+/// fire `Connection::close(QUIC_SHUTDOWN, _)` after the writer drains.
 pub struct QuicTransportConn {
     connection: Connection,
     streams: (SendStream, RecvStream),
@@ -246,9 +244,7 @@ impl QuicTransportConn {
     /// already-accepted connection + first bidi pair to
     /// [`crate::installer::install_client_quic_conn`] (which then wraps
     /// them in a fresh `QuicTransportConn` and dispatches via the
-    /// generic install path). [`TransportConn::into_split`] cannot be
-    /// used at that boundary because the install path needs the raw
-    /// tuple, not the split halves.
+    /// generic install path).
     #[must_use]
     pub fn into_parts(self) -> (Connection, (SendStream, RecvStream)) {
         (self.connection, self.streams)
@@ -256,72 +252,106 @@ impl QuicTransportConn {
 }
 
 impl TransportConn for QuicTransportConn {
-    type Reader = QuicTransportReader;
-    type Writer = QuicTransportWriter;
-
-    fn into_split(self) -> (Self::Reader, Self::Writer) {
+    #[allow(clippy::future_not_send)]
+    async fn run(self, ctx: ActorContext) {
         let (send, recv) = self.streams;
-        (
-            QuicTransportReader { recv },
-            QuicTransportWriter {
-                send,
-                connection: self.connection,
-            },
-        )
+        let connection = self.connection;
+        let ActorContext {
+            in_tx,
+            rx,
+            shutdown,
+            max_batch: _,
+            max_message_size,
+            label,
+            peer,
+        } = ctx;
+        let reader_shutdown = shutdown.clone();
+        let writer_shutdown = shutdown;
+        let reader_peer = peer.clone();
+        let reader_label = label;
+        let reader_handle = compio::runtime::spawn(reader_task(
+            recv,
+            in_tx,
+            reader_shutdown,
+            max_message_size,
+            reader_label,
+            reader_peer,
+        ));
+        let writer_handle =
+            compio::runtime::spawn(writer_task(send, rx, writer_shutdown, label, peer));
+        let _ = reader_handle.await;
+        let _ = writer_handle.await;
+        connection.close(VarInt::from_u32(QUIC_SHUTDOWN), b"shutdown");
     }
 }
 
-/// Read half. Decodes one framed `Message<GenericHeader>` per call by
-/// reusing [`framing::read_message`] against the [`RecvStream`].
-pub struct QuicTransportReader {
-    recv: RecvStream,
-}
-
-impl TransportReader for QuicTransportReader {
-    #[allow(clippy::future_not_send)]
-    async fn read_message(
-        &mut self,
-        max_message_size: usize,
-    ) -> Result<Message<GenericHeader>, IggyError> {
-        framing::read_message(&mut self.recv, max_message_size).await
-    }
-}
-
-/// Write half. One [`SendStream::write`] per frame; the inner
-/// [`Connection`] handle is retained so graceful shutdown can issue
-/// `connection.close(QUIC_SHUTDOWN, _)` after the writer task drains.
-pub struct QuicTransportWriter {
-    send: SendStream,
-    connection: Connection,
-}
-
-impl QuicTransportWriter {
-    /// Borrow the underlying connection (for stats, graceful close).
-    #[must_use]
-    pub const fn connection(&self) -> &Connection {
-        &self.connection
-    }
-}
-
-impl TransportWriter for QuicTransportWriter {
-    #[allow(clippy::future_not_send)]
-    async fn send_batch(&mut self, batch: &mut Vec<Frozen<MESSAGE_ALIGN>>) -> io::Result<()> {
-        // Drain in order; one write per frame. compio-quic's
-        // SendStream::write takes T: IoBuf and Frozen<MESSAGE_ALIGN>
-        // implements IoBuf (binary_protocol::consensus::iobuf), so the
-        // hand-off is zero-copy. No batched syscall (no sendmmsg on
-        // QUIC); see plan §4 risks.
-        for buf in batch.drain(..) {
-            let BufResult(result, _frozen) = self.send.write(buf).await;
-            result.map_err(|e| io::Error::other(format!("QUIC send failed: {e}")))?;
+#[allow(clippy::future_not_send)]
+async fn reader_task(
+    mut recv: RecvStream,
+    in_tx: async_channel::Sender<Message<GenericHeader>>,
+    shutdown: ShutdownToken,
+    max_message_size: usize,
+    label: &'static str,
+    peer: String,
+) {
+    let mut shutdown_fut = Box::pin(shutdown.wait().fuse());
+    loop {
+        let read_fut = framing::read_message(&mut recv, max_message_size);
+        let result = futures::select! {
+            () = shutdown_fut.as_mut() => {
+                debug!(%label, %peer, "quic reader: shutdown observed");
+                return;
+            }
+            res = read_fut.fuse() => res,
+        };
+        match result {
+            Ok(msg) => {
+                if in_tx.send(msg).await.is_err() {
+                    debug!(%label, %peer, "quic reader: inbound queue dropped");
+                    return;
+                }
+            }
+            Err(e) => {
+                debug!(%label, %peer, "quic reader: read error: {e:?}");
+                return;
+            }
         }
-        // Flush the QUIC frame onto the wire before returning so the
-        // batch's atomic-or-error contract (TransportWriter doc) holds:
-        // a partial flush on cancellation must not advertise success.
-        self.send
-            .flush()
-            .await
-            .map_err(|e| io::Error::other(format!("QUIC flush failed: {e}")))
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn writer_task(
+    mut send: SendStream,
+    rx: BusReceiver,
+    shutdown: ShutdownToken,
+    label: &'static str,
+    peer: String,
+) {
+    let mut shutdown_fut = Box::pin(shutdown.wait().fuse());
+    loop {
+        let frozen = futures::select! {
+            () = shutdown_fut.as_mut() => {
+                debug!(%label, %peer, "quic writer: shutdown observed");
+                return;
+            }
+            msg = rx.recv().fuse() => {
+                let Ok(m) = msg else {
+                    debug!(%label, %peer, "quic writer: channel closed");
+                    return;
+                };
+                m
+            }
+        };
+
+        let BufResult(result, _frozen) = send.write(frozen).await;
+        if let Err(e) = result {
+            debug!(%label, %peer, "quic writer: write failed: {e}");
+            return;
+        }
+        if let Err(e) = send.flush().await {
+            debug!(%label, %peer, "quic writer: flush failed: {e}");
+            return;
+        }
     }
 }
 
@@ -353,9 +383,14 @@ pub fn server_config_with_cert(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::Shutdown;
+    use async_channel::bounded;
     use compio_quic::ClientBuilder;
+    use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
+    use iggy_binary_protocol::consensus::iobuf::Frozen;
     use iggy_binary_protocol::{Command2, HEADER_SIZE};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::time::Duration;
 
     fn install_crypto_provider() {
         // Idempotent. Tests in the same process race on
@@ -402,6 +437,33 @@ mod tests {
         builder.bind("127.0.0.1:0").await.expect("client bind")
     }
 
+    /// Spawn `conn.run(ctx)` with fresh channels; return the test-side
+    /// handles.
+    #[allow(clippy::future_not_send)]
+    fn drive(
+        conn: QuicTransportConn,
+    ) -> (
+        async_channel::Sender<Frozen<MESSAGE_ALIGN>>,
+        async_channel::Receiver<Message<GenericHeader>>,
+        Shutdown,
+        compio::runtime::JoinHandle<()>,
+    ) {
+        let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(16);
+        let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(16);
+        let (shutdown, token) = Shutdown::new();
+        let ctx = ActorContext {
+            in_tx,
+            rx: out_rx,
+            shutdown: token,
+            max_batch: 16,
+            max_message_size: framing::MAX_MESSAGE_SIZE,
+            label: "test",
+            peer: "test".to_owned(),
+        };
+        let handle = compio::runtime::spawn(async move { conn.run(ctx).await });
+        (out_tx, in_rx, shutdown, handle)
+    }
+
     #[compio::test]
     #[allow(clippy::future_not_send)]
     async fn loopback_round_trip_three_frames() {
@@ -413,19 +475,12 @@ mod tests {
         let listener = QuicTransportListener::new(server);
         let server_task = compio::runtime::spawn(async move {
             let (conn, _peer) = listener.accept().await.expect("accept");
-            let (mut reader, _writer) = conn.into_split();
-            let a = reader
-                .read_message(framing::MAX_MESSAGE_SIZE)
-                .await
-                .unwrap();
-            let b = reader
-                .read_message(framing::MAX_MESSAGE_SIZE)
-                .await
-                .unwrap();
-            let c = reader
-                .read_message(framing::MAX_MESSAGE_SIZE)
-                .await
-                .unwrap();
+            let (_out_tx, in_rx, shutdown, handle) = drive(conn);
+            let a = in_rx.recv().await.unwrap();
+            let b = in_rx.recv().await.unwrap();
+            let c = in_rx.recv().await.unwrap();
+            shutdown.trigger();
+            let _ = handle.await;
             (a.header().command, b.header().command, c.header().command)
         });
 
@@ -436,25 +491,27 @@ mod tests {
         let connection = connecting.await.expect("client handshake");
         let (send, recv) = connection.open_bi_wait().await.expect("open_bi");
         let conn = QuicTransportConn::new(connection, (send, recv));
-        let (_r, mut w) = conn.into_split();
+        let (out_tx, _in_rx, shutdown, handle) = drive(conn);
 
-        let mut batch = vec![
-            header_only(Command2::Ping),
-            header_only(Command2::Prepare),
-            header_only(Command2::Request),
-        ];
-        w.send_batch(&mut batch).await.expect("send_batch");
-        assert!(batch.is_empty(), "Vec must be drained on success");
+        out_tx.send(header_only(Command2::Ping)).await.unwrap();
+        out_tx.send(header_only(Command2::Prepare)).await.unwrap();
+        out_tx.send(header_only(Command2::Request)).await.unwrap();
 
-        let (a, b, c) = server_task.await.unwrap();
+        let (a, b, c) = compio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server task within 5s")
+            .unwrap();
         assert_eq!(a, Command2::Ping);
         assert_eq!(b, Command2::Prepare);
         assert_eq!(c, Command2::Request);
+
+        shutdown.trigger();
+        let _ = handle.await;
     }
 
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn read_message_reports_oversize_via_trait() {
+    async fn read_message_reports_oversize_via_run() {
         install_crypto_provider();
         let (cert, key) = self_signed();
         let server = server_endpoint(cert.clone(), key).await;
@@ -463,8 +520,11 @@ mod tests {
         let listener = QuicTransportListener::new(server);
         let server_task = compio::runtime::spawn(async move {
             let (conn, _peer) = listener.accept().await.expect("accept");
-            let (mut reader, _writer) = conn.into_split();
-            reader.read_message(framing::MAX_MESSAGE_SIZE).await
+            let (_out_tx, in_rx, shutdown, handle) = drive(conn);
+            let res = in_rx.recv().await;
+            shutdown.trigger();
+            let _ = handle.await;
+            res
         });
 
         let client = client_endpoint(cert).await;
@@ -485,8 +545,12 @@ mod tests {
         drop(send); // signal end-of-stream so reader sees the framed bytes
         drop(recv);
 
-        let res = server_task.await.unwrap();
-        assert!(matches!(res, Err(IggyError::InvalidCommand)));
+        let res = compio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server task within 5s")
+            .unwrap();
+        // Framing error inside reader_task closes in_tx; recv resolves to Err.
+        assert!(res.is_err());
     }
 
     #[test]

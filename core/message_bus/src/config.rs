@@ -49,7 +49,7 @@ pub const IOV_MAX_LIMIT: usize = 512;
 /// Aggregated runtime configuration for an `IggyMessageBus` instance.
 ///
 /// All fields map onto constants that previously lived inline across
-/// `writer_task`, `framing`, `socket_opts`, `installer`, `connector`,
+/// `transports::tcp`, `framing`, `socket_opts`, `installer`, `connector`,
 /// and `lifecycle::connection_registry`. [`Default`] returns the prior
 /// hardcoded values so existing call sites (tests, single-shard
 /// simulators) can migrate without behaviour change.

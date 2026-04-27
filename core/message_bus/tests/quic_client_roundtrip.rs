@@ -21,17 +21,19 @@
 
 mod common;
 
+use async_channel::bounded;
 use common::{header_only, install_quic_clients_locally, loopback};
 use compio_quic::{ClientBuilder, Endpoint};
 use iggy_binary_protocol::Command2;
 use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
 use iggy_binary_protocol::consensus::iobuf::Frozen;
+use iggy_binary_protocol::{GenericHeader, Message};
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener_quic::{bind, run};
 use message_bus::framing;
 use message_bus::transports::quic::{QuicTransportConn, server_config_with_cert};
-use message_bus::transports::{TransportConn, TransportReader, TransportWriter};
-use message_bus::{IggyMessageBus, MessageBus};
+use message_bus::transports::{ActorContext, TransportConn};
+use message_bus::{IggyMessageBus, MessageBus, Shutdown};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::rc::Rc;
 use std::time::Duration;
@@ -97,24 +99,34 @@ async fn request_reply_round_trip() {
     let connection = connecting.await.expect("client handshake");
     let (send, recv) = connection.open_bi_wait().await.expect("open_bi");
 
-    // Reuse the existing QuicTransportConn split for client-side framing.
+    // Drive the client side of the QUIC conn through `TransportConn::run`.
+    let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(8);
+    let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(8);
+    let (client_shutdown, client_token) = Shutdown::new();
+    let ctx = ActorContext {
+        in_tx,
+        rx: out_rx,
+        shutdown: client_token,
+        max_batch: 16,
+        max_message_size: framing::MAX_MESSAGE_SIZE,
+        label: "test-client",
+        peer: "test-client".to_owned(),
+    };
     let conn = QuicTransportConn::new(connection, (send, recv));
-    let (mut reader, mut writer) = conn.into_split();
+    let client_handle = compio::runtime::spawn(async move { conn.run(ctx).await });
 
-    // Send a Request as a single-frame batch via the writer's atomic
-    // send_batch (mirrors the production hot path).
     let request = header_only(Command2::Request, 42, 0).into_frozen();
-    let mut batch: Vec<Frozen<MESSAGE_ALIGN>> = vec![request];
-    writer.send_batch(&mut batch).await.expect("client send");
-    assert!(batch.is_empty(), "send_batch must drain the Vec");
+    out_tx.send(request).await.expect("client send");
 
-    // Read the Reply on the RecvStream.
-    let reply = reader
-        .read_message(framing::MAX_MESSAGE_SIZE)
+    let reply = compio::time::timeout(Duration::from_secs(5), in_rx.recv())
         .await
-        .expect("client read");
+        .expect("client must receive reply within 5 s")
+        .expect("reply frame");
     assert_eq!(reply.header().command, Command2::Reply);
     assert_eq!(reply.header().cluster, 42);
+
+    client_shutdown.trigger();
+    let _ = client_handle.await;
 
     let outcome = bus.shutdown(Duration::from_secs(2)).await;
     assert_eq!(

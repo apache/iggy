@@ -53,9 +53,10 @@ const _: () = {
 /// Write a consensus message to a stream. Zero-copy: the message's owned
 /// buffer is handed straight to `io_uring` as a `Frozen`.
 ///
-/// Used by the handshake and framing test paths. Hot-path bus traffic goes
-/// through [`crate::writer_task`] which batches many messages into a single
-/// `writev` instead.
+/// Used by the handshake and framing test paths. Hot-path bus traffic
+/// goes through the per-transport writer task (see
+/// [`crate::transports::tcp`]) which batches many messages into a
+/// single `writev` instead.
 ///
 /// # Errors
 ///

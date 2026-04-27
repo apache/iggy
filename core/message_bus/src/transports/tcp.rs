@@ -15,32 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! TCP impls of the [`super`] transport traits.
+//! TCP impl of the [`super::TransportConn`] / [`super::TransportListener`]
+//! traits.
 //!
-//! Behavior-preserving wrappers around `compio::net::TcpListener`,
-//! `compio::net::TcpStream`, and the split halves. The hot path on
-//! `TcpTransportWriter::send_batch` is identical to
-//! [`crate::writer_task::run`]'s inner `write_vectored_all` call: one
-//! syscall per batch, zero intermediate copies of `Frozen`.
-//!
-//! Callers that need listener / dialer ergonomics (socket options,
-//! keepalive, directional accept rules) should continue to use the
-//! free functions in [`crate::replica_listener`] and
-//! [`crate::client_listener`]; this module is the minimal trait
-//! adapter, not a replacement for those call sites. Integration with
-//! `installer::install_*_stream` lands in P1-T3.
+//! Behavior-preserving wrappers around `compio::net::TcpListener` and
+//! `compio::net::TcpStream`. `TcpTransportConn::run` splits the stream
+//! into owned read / write halves, spawns a reader task that calls
+//! [`framing::read_message`] and forwards each decoded frame to
+//! `ActorContext::in_tx`, and a writer task that drains
+//! `ActorContext::rx`, batches up to `max_batch` frames per syscall, and
+//! emits them via `compio::io::AsyncWriteExt::write_vectored_all` (one
+//! syscall per batch, zero intermediate copies of `Frozen`).
 
-use super::{TransportConn, TransportListener, TransportReader, TransportWriter};
+use super::{ActorContext, TransportConn, TransportListener};
 use crate::framing;
+use crate::lifecycle::BusMessage;
 use compio::io::AsyncWriteExt;
 use compio::net::{OwnedReadHalf, OwnedWriteHalf, TcpListener, TcpStream};
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
-use iggy_binary_protocol::{GenericHeader, Message};
-use iggy_common::IggyError;
+use futures::FutureExt;
 use std::io;
 use std::mem;
 use std::net::SocketAddr;
+use tracing::{debug, error, trace};
 
 /// Inbound TCP listener wrapper.
 ///
@@ -83,8 +79,8 @@ impl TransportListener for TcpTransportListener {
 ///
 /// Produced by [`TcpTransportListener::accept`] or by wrapping the
 /// result of a `TcpStream::connect` on the dialer path. Takes ownership
-/// of the stream; [`Self::into_split`] transfers that ownership into
-/// the read and write halves bound to the per-connection tasks.
+/// of the stream; [`TransportConn::run`] consumes it and drives both
+/// reader and writer tasks internally.
 pub(crate) struct TcpTransportConn {
     stream: TcpStream,
 }
@@ -97,86 +93,150 @@ impl TcpTransportConn {
 }
 
 impl TransportConn for TcpTransportConn {
-    type Reader = TcpTransportReader;
-    type Writer = TcpTransportWriter;
-
-    fn into_split(self) -> (Self::Reader, Self::Writer) {
+    #[allow(clippy::future_not_send)]
+    async fn run(self, ctx: ActorContext) {
         let (read_half, write_half) = self.stream.into_split();
-        (
-            TcpTransportReader { inner: read_half },
-            TcpTransportWriter { inner: write_half },
-        )
+        let ActorContext {
+            in_tx,
+            rx,
+            shutdown,
+            max_batch,
+            max_message_size,
+            label,
+            peer,
+        } = ctx;
+        let reader_shutdown = shutdown.clone();
+        let writer_shutdown = shutdown;
+        let reader_peer = peer.clone();
+        let reader_handle = compio::runtime::spawn(reader_loop(
+            read_half,
+            in_tx,
+            reader_shutdown,
+            max_message_size,
+            label,
+            reader_peer,
+        ));
+        let writer_handle = compio::runtime::spawn(writer_loop(
+            write_half,
+            rx,
+            writer_shutdown,
+            max_batch,
+            label,
+            peer,
+        ));
+        let _ = reader_handle.await;
+        let _ = writer_handle.await;
     }
 }
 
-/// Read half bound to the per-connection reader task.
-///
-/// [`TransportReader::read_message`] delegates to
-/// [`framing::read_message`]; the two paths share the same header
-/// decode, bounds check, and zero-copy `Owned<MESSAGE_ALIGN>`
-/// allocation strategy.
-pub(crate) struct TcpTransportReader {
-    inner: OwnedReadHalf<TcpStream>,
-}
-
-impl TcpTransportReader {
-    #[must_use]
-    #[allow(dead_code)]
-    pub(crate) const fn new(inner: OwnedReadHalf<TcpStream>) -> Self {
-        Self { inner }
+/// Read framed consensus messages off the wire and forward each to
+/// [`ActorContext::in_tx`]. Exits on EOF, framing error, send-side
+/// closure, or shutdown.
+#[allow(clippy::future_not_send)]
+async fn reader_loop(
+    mut read_half: OwnedReadHalf<TcpStream>,
+    in_tx: async_channel::Sender<
+        iggy_binary_protocol::Message<iggy_binary_protocol::GenericHeader>,
+    >,
+    shutdown: crate::lifecycle::ShutdownToken,
+    max_message_size: usize,
+    label: &'static str,
+    peer: String,
+) {
+    let mut shutdown_fut = Box::pin(shutdown.wait().fuse());
+    loop {
+        let read_fut = framing::read_message(&mut read_half, max_message_size);
+        let result = futures::select! {
+            () = shutdown_fut.as_mut() => {
+                debug!(%label, %peer, "tcp reader: shutdown observed");
+                return;
+            }
+            res = read_fut.fuse() => res,
+        };
+        match result {
+            Ok(msg) => {
+                if in_tx.send(msg).await.is_err() {
+                    debug!(%label, %peer, "tcp reader: inbound queue dropped");
+                    return;
+                }
+            }
+            Err(e) => {
+                debug!(%label, %peer, "tcp reader: read error: {e:?}");
+                return;
+            }
+        }
     }
 }
 
-impl TransportReader for TcpTransportReader {
-    #[allow(clippy::future_not_send)]
-    async fn read_message(
-        &mut self,
-        max_message_size: usize,
-    ) -> Result<Message<GenericHeader>, IggyError> {
-        framing::read_message(&mut self.inner, max_message_size).await
-    }
-}
+/// Drain [`ActorContext::rx`], coalesce up to `max_batch` frames into a
+/// single `writev_all` syscall, exit on shutdown, channel close, or
+/// write error.
+#[allow(clippy::future_not_send)]
+async fn writer_loop(
+    mut write_half: OwnedWriteHalf<TcpStream>,
+    rx: crate::lifecycle::BusReceiver,
+    shutdown: crate::lifecycle::ShutdownToken,
+    max_batch: usize,
+    label: &'static str,
+    peer: String,
+) {
+    let mut batch: Vec<BusMessage> = Vec::with_capacity(max_batch);
+    let mut shutdown_fut = Box::pin(shutdown.wait().fuse());
 
-/// Write half bound to the per-connection writer-batch task.
-///
-/// [`TransportWriter::send_batch`] calls
-/// [`compio::io::AsyncWriteExt::write_vectored_all`] exactly once per
-/// invocation. The caller (e.g. [`crate::writer_task::run`]) is
-/// responsible for capping the batch size to
-/// `max_batch <= IOV_MAX / 2 = 512`; this impl does not enforce a cap
-/// because the Vec is already drained by the caller's admission
-/// control.
-pub(crate) struct TcpTransportWriter {
-    inner: OwnedWriteHalf<TcpStream>,
-}
+    loop {
+        let first = futures::select! {
+            () = shutdown_fut.as_mut() => {
+                debug!(%label, %peer, "tcp writer: shutdown observed");
+                return;
+            }
+            msg = rx.recv().fuse() => {
+                if let Ok(m) = msg {
+                    m
+                } else {
+                    debug!(%label, %peer, "tcp writer: channel closed");
+                    return;
+                }
+            }
+        };
 
-impl TcpTransportWriter {
-    #[must_use]
-    pub(crate) const fn new(inner: OwnedWriteHalf<TcpStream>) -> Self {
-        Self { inner }
-    }
-}
+        batch.push(first);
+        while batch.len() < max_batch {
+            match rx.try_recv() {
+                Ok(m) => batch.push(m),
+                Err(_) => break,
+            }
+        }
 
-impl TransportWriter for TcpTransportWriter {
-    #[allow(clippy::future_not_send)]
-    async fn send_batch(&mut self, batch: &mut Vec<Frozen<MESSAGE_ALIGN>>) -> io::Result<()> {
-        // `write_vectored_all` consumes the Vec via compio's `IoVectoredBuf`
-        // surface and returns it through `BufResult` so we can reuse the
-        // allocation. Take the inner Vec, hand it to the kernel, put the
-        // (now-empty) returned Vec back into the caller's slot.
-        let owned = mem::take(batch);
-        let compio::BufResult(result, mut returned) = self.inner.write_vectored_all(owned).await;
+        let drained = batch.len();
+        trace!(%label, %peer, batch = drained, "writev batch");
+
+        let owned = mem::take(&mut batch);
+        let compio::BufResult(result, mut returned) = write_half.write_vectored_all(owned).await;
         returned.clear();
-        *batch = returned;
-        result
+        batch = returned;
+
+        if let Err(e) = result {
+            error!(
+                %label,
+                %peer,
+                error = ?e,
+                batch_len = drained,
+                "tcp writer: writev failed, dropping batch"
+            );
+            return;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::Shutdown;
+    use async_channel::bounded;
+    use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
     use iggy_binary_protocol::consensus::iobuf::Frozen;
-    use iggy_binary_protocol::{Command2, HEADER_SIZE};
+    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, Message};
+    use std::time::Duration;
 
     #[allow(clippy::cast_possible_truncation)]
     fn header_only(command: Command2) -> Frozen<MESSAGE_ALIGN> {
@@ -199,6 +259,31 @@ mod tests {
         (client_res.unwrap(), server)
     }
 
+    #[allow(clippy::future_not_send)]
+    fn drive(
+        conn: TcpTransportConn,
+    ) -> (
+        async_channel::Sender<Frozen<MESSAGE_ALIGN>>,
+        async_channel::Receiver<Message<GenericHeader>>,
+        Shutdown,
+        compio::runtime::JoinHandle<()>,
+    ) {
+        let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(16);
+        let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(16);
+        let (shutdown, token) = Shutdown::new();
+        let ctx = ActorContext {
+            in_tx,
+            rx: out_rx,
+            shutdown: token,
+            max_batch: 16,
+            max_message_size: framing::MAX_MESSAGE_SIZE,
+            label: "test",
+            peer: "test".to_owned(),
+        };
+        let handle = compio::runtime::spawn(async move { conn.run(ctx).await });
+        (out_tx, in_rx, shutdown, handle)
+    }
+
     #[compio::test]
     #[allow(clippy::future_not_send)]
     async fn listener_accept_yields_conn() {
@@ -214,64 +299,56 @@ mod tests {
 
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn send_batch_writes_all_and_drains_vec() {
+    async fn run_pumps_three_frames_through_writev() {
         let (client, server) = local_pair().await;
-        let client_conn = TcpTransportConn::new(client);
-        let (_client_read, mut client_write) = client_conn.into_split();
+        let (client_out, _client_in, client_shutdown, client_handle) =
+            drive(TcpTransportConn::new(client));
+        let (_server_out, server_in, server_shutdown, server_handle) =
+            drive(TcpTransportConn::new(server));
 
-        let server_conn = TcpTransportConn::new(server);
-        let (mut server_read, _server_write) = server_conn.into_split();
+        for cmd in [Command2::Ping, Command2::Prepare, Command2::Request] {
+            client_out.send(header_only(cmd)).await.unwrap();
+        }
 
-        let mut batch = vec![
-            header_only(Command2::Ping),
-            header_only(Command2::Prepare),
-            header_only(Command2::Request),
-        ];
-        client_write
-            .send_batch(&mut batch)
-            .await
-            .expect("send_batch");
-        assert!(batch.is_empty(), "Vec must be drained on success");
-        assert!(batch.capacity() >= 3, "allocation must be reused");
-
-        // Verify all three frames land intact in order.
-        let a = server_read
-            .read_message(framing::MAX_MESSAGE_SIZE)
-            .await
-            .unwrap();
-        let b = server_read
-            .read_message(framing::MAX_MESSAGE_SIZE)
-            .await
-            .unwrap();
-        let c = server_read
-            .read_message(framing::MAX_MESSAGE_SIZE)
-            .await
-            .unwrap();
+        let recv_with_timeout = |rx: &async_channel::Receiver<Message<GenericHeader>>| {
+            let rx = rx.clone();
+            async move {
+                compio::time::timeout(Duration::from_secs(2), rx.recv())
+                    .await
+                    .expect("recv within 2s")
+                    .expect("ok")
+            }
+        };
+        let a = recv_with_timeout(&server_in).await;
+        let b = recv_with_timeout(&server_in).await;
+        let c = recv_with_timeout(&server_in).await;
         assert_eq!(a.header().command, Command2::Ping);
         assert_eq!(b.header().command, Command2::Prepare);
         assert_eq!(c.header().command, Command2::Request);
+
+        client_shutdown.trigger();
+        server_shutdown.trigger();
+        let _ = client_handle.await;
+        let _ = server_handle.await;
     }
 
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn send_batch_empty_is_noop() {
+    async fn run_exits_on_shutdown_signal() {
         let (client, _server) = local_pair().await;
-        let (_r, mut w) = TcpTransportConn::new(client).into_split();
-        let mut batch: Vec<Frozen<MESSAGE_ALIGN>> = Vec::with_capacity(8);
-        w.send_batch(&mut batch).await.expect("empty batch ok");
-        assert!(batch.is_empty());
+        let (_out_tx, _in_rx, shutdown, handle) = drive(TcpTransportConn::new(client));
+        shutdown.trigger();
+        let res = compio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(res.is_ok(), "run must exit within 2s of shutdown");
     }
 
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn read_message_reports_oversize_via_trait() {
-        use compio::io::AsyncWriteExt;
+    async fn run_reports_oversize_frame_and_exits() {
         let (mut client, server) = local_pair().await;
-        let (mut r, _w) = TcpTransportConn::new(server).into_split();
+        let (_out, server_in, server_shutdown, server_handle) =
+            drive(TcpTransportConn::new(server));
 
-        // Hand-craft a header with a bogus oversize `size` field; the
-        // trait surface must surface the same `InvalidCommand` error the
-        // framing path does.
         let mut buf = vec![0u8; HEADER_SIZE];
         let bogus = u32::try_from(framing::MAX_MESSAGE_SIZE + 1)
             .unwrap_or(u32::MAX)
@@ -279,7 +356,16 @@ mod tests {
         buf[48..52].copy_from_slice(&bogus);
         client.write_all(buf).await.0.unwrap();
 
-        let res = r.read_message(framing::MAX_MESSAGE_SIZE).await;
-        assert!(matches!(res, Err(IggyError::InvalidCommand)));
+        let recv = compio::time::timeout(Duration::from_secs(2), server_in.recv()).await;
+        assert!(
+            recv.is_ok(),
+            "in_rx should close within 2s on framing error"
+        );
+        assert!(
+            recv.unwrap().is_err(),
+            "framing error tears the reader down and closes in_tx"
+        );
+        server_shutdown.trigger();
+        let _ = server_handle.await;
     }
 }

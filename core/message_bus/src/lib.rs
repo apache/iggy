@@ -53,9 +53,10 @@
 //!   [`send_to_replica`](IggyMessageBus::send_to_replica) return
 //!   `Ready` on first poll. Consensus code relies on this for
 //!   reentrancy reasoning; any `.await` in the body breaks it.
-//! - [`writer_task`] coalesces up to `max_batch = 256`
+//! - The TCP transport's writer task coalesces up to `max_batch = 256`
 //!   `Frozen<MESSAGE_ALIGN>` into one `write_vectored_all`. Don't
-//!   introduce per-message syscalls or per-message encryption.
+//!   introduce per-message syscalls or per-message encryption on the
+//!   plaintext TCP plane.
 //! - fd-delegation ([`fd_transfer`]) is TCP-only. TLS / QUIC
 //!   connections have no dupable plaintext fd, so shard 0 terminates
 //!   and forwards `Frozen<MESSAGE_ALIGN>` over the existing
@@ -66,13 +67,13 @@
 //! # Transport abstraction
 //!
 //! [`transports`] defines the trait surface every wire plane sits
-//! behind: [`transports::TransportListener`],
-//! [`transports::TransportConn`], [`transports::TransportReader`],
-//! [`transports::TransportWriter`]. TCP is the only production impl
-//! (see [`transports::tcp`]); [`installer::install_replica_conn`] /
-//! [`installer::install_client_conn`] and
-//! [`writer_task::run_transport`] are generic over it so WS / QUIC
-//! plug in behind the same registry, fencing, and batching logic.
+//! behind: [`transports::TransportListener`] and
+//! [`transports::TransportConn`] with its single
+//! [`transports::TransportConn::run`] entry point.
+//! [`installer::install_replica_conn`] /
+//! [`installer::install_client_conn`] are generic over it so TCP, WS,
+//! QUIC, and the upcoming TLS transports plug in behind the same
+//! registry, fencing, and dispatch logic.
 //!
 //! The full invariant list and the transport-plan design notes live
 //! under `Documents/silverhand/iggy/message_bus/transport-plan/`.
@@ -94,7 +95,6 @@ pub mod replica_io;
 pub mod replica_listener;
 pub(crate) mod socket_opts;
 pub mod transports;
-pub mod writer_task;
 
 pub use config::{IOV_MAX_LIMIT, MessageBusConfig};
 pub use error::SendError;
@@ -258,7 +258,8 @@ pub trait MessageBus {
 ///   on `Full` (returned as [`SendError::Backpressure`]) are recovered by
 ///   VSR retransmission.
 /// - The per-connection writer task batches up to `config.max_batch` messages into
-///   a single `writev` syscall via [`writer_task::run`].
+///   a single `writev` syscall on the plaintext TCP plane (see
+///   [`transports::tcp`]).
 ///
 /// Interior mutability via `RefCell` / `Cell` is sound because compio is a
 /// single-threaded runtime: no other task can execute while we hold a borrow.

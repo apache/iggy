@@ -36,16 +36,18 @@
 
 mod common;
 
+use async_channel::bounded;
 use common::{header_only, install_ws_clients_locally, loopback};
 use compio::net::TcpStream;
 use iggy_binary_protocol::Command2;
 use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
 use iggy_binary_protocol::consensus::iobuf::Frozen;
+use iggy_binary_protocol::{GenericHeader, Message};
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener_ws::{bind, run};
 use message_bus::transports::ws::{WS_SUBPROTOCOL, WsTransportConn};
-use message_bus::transports::{TransportConn, TransportReader, TransportWriter};
-use message_bus::{IggyMessageBus, MessageBus, framing};
+use message_bus::transports::{ActorContext, TransportConn};
+use message_bus::{IggyMessageBus, MessageBus, Shutdown, framing};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -88,24 +90,35 @@ async fn handshake_succeeds_and_round_trip_completes() {
         .await
         .expect("ws handshake");
 
+    // Drive the client side of the WS conn through the unified
+    // `TransportConn::run` shape: spawn the actor, push outbound
+    // requests through `out_tx`, observe inbound replies on `in_rx`.
+    let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(8);
+    let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(8);
+    let (client_shutdown, client_token) = Shutdown::new();
+    let ctx = ActorContext {
+        in_tx,
+        rx: out_rx,
+        shutdown: client_token,
+        max_batch: 16,
+        max_message_size: framing::MAX_MESSAGE_SIZE,
+        label: "test-client",
+        peer: "test-client".to_owned(),
+    };
     let conn = WsTransportConn::new_client(ws_client);
-    let (mut reader, mut writer) = conn.into_split();
+    let client_handle = compio::runtime::spawn(async move { conn.run(ctx).await });
 
     let request = header_only(Command2::Request, 42, 0).into_frozen();
-    let mut batch: Vec<Frozen<MESSAGE_ALIGN>> = vec![request];
-    writer.send_batch(&mut batch).await.expect("client send");
-    assert!(batch.is_empty(), "send_batch must drain the Vec");
+    out_tx.send(request).await.expect("client send");
 
-    // Read the server's Reply off the WS reader within 2 s.
-    let reply = compio::time::timeout(
-        Duration::from_secs(2),
-        reader.read_message(framing::MAX_MESSAGE_SIZE),
-    )
-    .await
-    .expect("client must receive reply within 2 s")
-    .expect("reply frame");
+    let reply = compio::time::timeout(Duration::from_secs(2), in_rx.recv())
+        .await
+        .expect("client must receive reply within 2 s")
+        .expect("reply frame");
     assert_eq!(reply.header().command, Command2::Reply);
 
+    client_shutdown.trigger();
+    let _ = client_handle.await;
     bus.shutdown(Duration::from_secs(2)).await;
 }
 

@@ -30,12 +30,14 @@ use crate::lifecycle::{InstanceToken, RejectedRegistration, Shutdown};
 use crate::replica_listener::MessageHandler;
 use crate::socket_opts::{apply_keepalive_for_connection, apply_nodelay_for_connection};
 use crate::transports::quic::QuicTransportConn;
+use crate::transports::tcp::TcpTransportConn;
 use crate::transports::ws::WsTransportConn;
-use crate::transports::{TcpTransportConn, TransportConn, TransportReader};
+use crate::transports::{ActorContext, TransportConn};
 use crate::{IggyMessageBus, lifecycle::ShutdownToken};
+use async_channel::Receiver;
 use compio::net::TcpStream;
 use futures::FutureExt;
-use iggy_binary_protocol::Command2;
+use iggy_binary_protocol::{Command2, GenericHeader, Message};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -209,13 +211,14 @@ pub fn install_replica_conn<C: TransportConn>(
         return;
     }
 
-    let (read_half, write_half) = conn.into_split();
     let (tx, rx) = async_channel::bounded(bus.peer_queue_capacity());
+    let (in_tx, in_rx) =
+        async_channel::bounded::<Message<GenericHeader>>(bus.peer_queue_capacity());
 
     // Writer and reader both observe abnormal close and used to fire
     // `notify_connection_lost` twice per disconnect, causing shard 0 to
     // broadcast two `ReplicaMappingClear` rounds and churn the mapping.
-    // Shared one-shot guard: whichever half exits first wins.
+    // Shared one-shot guard: whichever post-loop runs first wins.
     let notified = Rc::new(Cell::new(false));
     // If the registry insert below races with a concurrent install for
     // the same peer id and loses, both spawned halves must skip their
@@ -234,97 +237,119 @@ pub fn install_replica_conn<C: TransportConn>(
     // reinstall would otherwise evict the new slot.
     let install_token: Rc<Cell<Option<InstanceToken>>> = Rc::new(Cell::new(None));
 
-    // Per-connection shutdown used to kick the reader off its
+    // Per-connection shutdown used to kick the transport off its
     // `io_uring` read SQE when the registry insert below loses a race.
     // The bus-wide token cannot be triggered here (it would tear down
-    // every other connection); closing the writer's sender also does not
-    // reach a reader blocked on `framing::read_message`. The `Shutdown`
-    // is moved into the registry entry on success so its `Sender` survives
-    // the connection's lifetime: dropping the `Shutdown` would close the
-    // broadcast channel and falsely wake the reader's `select!` arm.
-    // On insert race the loser receives the `Shutdown` back via
-    // `RejectedRegistration` and triggers it before draining the orphan
-    // tasks.
+    // every other connection); closing the bus-side outbound sender
+    // also does not reach a reader blocked on
+    // [`framing::read_message`]. The `Shutdown` is moved into the
+    // registry entry on success so its `Sender` survives the
+    // connection's lifetime: dropping the `Shutdown` would close the
+    // broadcast channel and falsely wake the `ShutdownToken`'s
+    // listeners. On insert race the loser receives the `Shutdown` back
+    // via `RejectedRegistration` and triggers it before draining the
+    // orphan tasks.
     let (conn_shutdown, conn_token) = Shutdown::new();
 
-    let writer_token = bus.token();
-    let bus_for_writer = Rc::clone(bus);
-    let writer_label = format!("{peer_id}");
-    let notified_writer = Rc::clone(&notified);
-    let aborted_writer = Rc::clone(&install_aborted);
-    let token_for_writer = Rc::clone(&install_token);
-    let max_batch = bus.config().max_batch;
-    let writer_handle = compio::runtime::spawn(async move {
-        crate::writer_task::run_transport(
-            rx,
-            write_half,
-            writer_token,
-            "replica",
-            writer_label,
-            max_batch,
-        )
-        .await;
-        if aborted_writer.get() || bus_for_writer.is_shutting_down() {
+    // The transport observes a single [`ShutdownToken`] in its
+    // `ActorContext`; bridge the bus-wide token and the per-connection
+    // token onto a fresh fused token so either firing wakes the
+    // transport's reader off `io_uring`. The bridge task self-terminates
+    // on first fire; on a clean run it parks until bus shutdown, when
+    // the bus-wide token guarantees a fire.
+    let bus_token_for_bridge = bus.token();
+    let conn_token_for_bridge = conn_token.clone();
+    let (transport_shutdown, transport_token) = Shutdown::new();
+    let bridge_handle = compio::runtime::spawn(async move {
+        futures::select! {
+            () = bus_token_for_bridge.wait().fuse() => {}
+            () = conn_token_for_bridge.wait().fuse() => {}
+        }
+        transport_shutdown.trigger();
+    });
+    bus.track_background(bridge_handle);
+
+    let label: &'static str = "replica";
+    let peer_fmt = format!("{peer_id}");
+    let ctx = ActorContext {
+        in_tx,
+        rx,
+        shutdown: transport_token,
+        max_batch: bus.config().max_batch,
+        max_message_size: bus.config().max_message_size,
+        label,
+        peer: peer_fmt,
+    };
+
+    let bus_for_transport = Rc::clone(bus);
+    let aborted_transport = Rc::clone(&install_aborted);
+    let token_for_transport = Rc::clone(&install_token);
+    let notified_transport = Rc::clone(&notified);
+    let transport_handle = compio::runtime::spawn(async move {
+        conn.run(ctx).await;
+        if aborted_transport.get() || bus_for_transport.is_shutting_down() {
             return;
         }
-        let Some(token) = token_for_writer.get() else {
+        let Some(token) = token_for_transport.get() else {
             return;
         };
-        if !bus_for_writer
+        if !bus_for_transport
             .replicas()
             .remove_if_token_matches(peer_id, token)
         {
             return;
         }
-        if !notified_writer.replace(true) {
-            bus_for_writer.notify_connection_lost(peer_id);
+        if !notified_transport.replace(true) {
+            bus_for_transport.notify_connection_lost(peer_id);
         }
     });
 
-    let bus_for_reader = Rc::clone(bus);
-    let read_token = bus.token();
-    let notified_reader = Rc::clone(&notified);
-    let aborted_reader = Rc::clone(&install_aborted);
-    let token_for_reader = Rc::clone(&install_token);
+    let bus_for_dispatch = Rc::clone(bus);
+    let bus_token_dispatch = bus.token();
+    let conn_token_dispatch = conn_token;
+    let aborted_dispatch = Rc::clone(&install_aborted);
+    let token_for_dispatch = Rc::clone(&install_token);
+    let notified_dispatch = Rc::clone(&notified);
     let close_peer_timeout = bus.config().close_peer_timeout;
-    let max_message_size = bus.config().max_message_size;
-    let reader_handle = compio::runtime::spawn(async move {
-        replica_read_loop(
+    let dispatch_handle = compio::runtime::spawn(async move {
+        replica_dispatch_loop(
             peer_id,
-            read_half,
+            in_rx,
             &on_message,
-            &read_token,
-            &conn_token,
-            &aborted_reader,
-            max_message_size,
+            &bus_token_dispatch,
+            &conn_token_dispatch,
+            &aborted_dispatch,
         )
         .await;
-        if aborted_reader.get() {
+        if aborted_dispatch.get() {
             debug!(
                 replica = peer_id,
                 "aborted replica install: skipping post-loop cleanup"
             );
             return;
         }
-        if !read_token.is_triggered() {
-            let Some(token) = token_for_reader.get() else {
+        if !bus_token_dispatch.is_triggered() {
+            let Some(token) = token_for_dispatch.get() else {
                 return;
             };
-            let closed = bus_for_reader
+            let closed = bus_for_dispatch
                 .replicas()
                 .close_peer_if_token_matches(peer_id, token, close_peer_timeout)
                 .await;
-            if closed && !notified_reader.replace(true) {
-                bus_for_reader.notify_connection_lost(peer_id);
+            if closed && !notified_dispatch.replace(true) {
+                bus_for_dispatch.notify_connection_lost(peer_id);
             }
         }
         info!(replica = peer_id, "peer replica disconnected");
     });
 
-    match bus
-        .replicas()
-        .insert(peer_id, tx, writer_handle, reader_handle, conn_shutdown)
-    {
+    match bus.replicas().insert(
+        peer_id,
+        tx,
+        transport_handle,
+        dispatch_handle,
+        conn_shutdown,
+    ) {
         Ok(token) => {
             install_token.set(Some(token));
         }
@@ -334,14 +359,14 @@ pub fn install_replica_conn<C: TransportConn>(
             install_aborted.set(true);
             warn!(replica = peer_id, "replica registry insert raced");
             // `drain_rejected_registration` triggers the per-connection
-            // shutdown (returned with `rejected`) to wake the reader off
-            // its `io_uring` read SQE, then awaits writer / reader
-            // handles. `compio::runtime::JoinHandle::drop` only detaches,
-            // so without this drain the reader would outlive the race on
-            // a half-open socket until peer EOF. Hand the handle to
-            // `track_background` so `IggyMessageBus::shutdown` awaits the
-            // drain before returning - `.detach()` would orphan it and
-            // leak the half-closed socket across shutdown.
+            // shutdown (returned with `rejected`) to wake the transport
+            // off its `io_uring` read SQE, then awaits transport /
+            // dispatch handles. `compio::runtime::JoinHandle::drop` only
+            // detaches, so without this drain the reader would outlive
+            // the race on a half-open socket until peer EOF. Hand the
+            // handle to `track_background` so `IggyMessageBus::shutdown`
+            // awaits the drain before returning - `.detach()` would
+            // orphan it and leak the half-closed socket across shutdown.
             let drain_handle =
                 compio::runtime::spawn(drain_rejected_registration(rejected, close_peer_timeout));
             bus.track_background(drain_handle);
@@ -450,8 +475,9 @@ pub fn install_client_conn<C: TransportConn>(
     conn: C,
     on_request: RequestHandler,
 ) {
-    let (read_half, write_half) = conn.into_split();
     let (tx, rx) = async_channel::bounded(bus.peer_queue_capacity());
+    let (in_tx, in_rx) =
+        async_channel::bounded::<Message<GenericHeader>>(bus.peer_queue_capacity());
 
     // If the registry insert below loses a race for `client_id`, the
     // losing reader must NOT invoke `on_request` (it would route
@@ -467,62 +493,76 @@ pub fn install_client_conn<C: TransportConn>(
     // the replica installer for the full rationale.
     let (conn_shutdown, conn_token) = Shutdown::new();
 
-    let writer_token = bus.token();
-    let bus_for_writer = Rc::clone(bus);
-    let writer_label = format!("{client_id:#034x}");
-    let aborted_writer = Rc::clone(&install_aborted);
-    let token_for_writer = Rc::clone(&install_token);
-    let max_batch = bus.config().max_batch;
-    let writer_handle = compio::runtime::spawn(async move {
-        crate::writer_task::run_transport(
-            rx,
-            write_half,
-            writer_token,
-            "client",
-            writer_label,
-            max_batch,
-        )
-        .await;
-        if aborted_writer.get() || bus_for_writer.is_shutting_down() {
+    // Bridge bus-wide + per-connection shutdown into the single
+    // `ActorContext::shutdown` token consumed by the transport.
+    let bus_token_for_bridge = bus.token();
+    let conn_token_for_bridge = conn_token.clone();
+    let (transport_shutdown, transport_token) = Shutdown::new();
+    let bridge_handle = compio::runtime::spawn(async move {
+        futures::select! {
+            () = bus_token_for_bridge.wait().fuse() => {}
+            () = conn_token_for_bridge.wait().fuse() => {}
+        }
+        transport_shutdown.trigger();
+    });
+    bus.track_background(bridge_handle);
+
+    let label: &'static str = "client";
+    let peer_fmt = format!("{client_id:#034x}");
+    let ctx = ActorContext {
+        in_tx,
+        rx,
+        shutdown: transport_token,
+        max_batch: bus.config().max_batch,
+        max_message_size: bus.config().max_message_size,
+        label,
+        peer: peer_fmt,
+    };
+
+    let bus_for_transport = Rc::clone(bus);
+    let aborted_transport = Rc::clone(&install_aborted);
+    let token_for_transport = Rc::clone(&install_token);
+    let transport_handle = compio::runtime::spawn(async move {
+        conn.run(ctx).await;
+        if aborted_transport.get() || bus_for_transport.is_shutting_down() {
             return;
         }
-        let Some(token) = token_for_writer.get() else {
+        let Some(token) = token_for_transport.get() else {
             return;
         };
-        bus_for_writer
+        bus_for_transport
             .clients()
             .remove_if_token_matches(client_id, token);
     });
 
-    let bus_for_reader = Rc::clone(bus);
-    let read_token = bus.token();
-    let aborted_reader = Rc::clone(&install_aborted);
-    let token_for_reader = Rc::clone(&install_token);
+    let bus_for_dispatch = Rc::clone(bus);
+    let bus_token_dispatch = bus.token();
+    let conn_token_dispatch = conn_token;
+    let aborted_dispatch = Rc::clone(&install_aborted);
+    let token_for_dispatch = Rc::clone(&install_token);
     let close_peer_timeout = bus.config().close_peer_timeout;
-    let max_message_size = bus.config().max_message_size;
-    let reader_handle = compio::runtime::spawn(async move {
-        client_read_loop(
+    let dispatch_handle = compio::runtime::spawn(async move {
+        client_dispatch_loop(
             client_id,
-            read_half,
+            in_rx,
             &on_request,
-            &read_token,
-            &conn_token,
-            &aborted_reader,
-            max_message_size,
+            &bus_token_dispatch,
+            &conn_token_dispatch,
+            &aborted_dispatch,
         )
         .await;
-        if aborted_reader.get() {
+        if aborted_dispatch.get() {
             debug!(
                 client = client_id,
                 "aborted client install: skipping post-loop cleanup"
             );
             return;
         }
-        if !read_token.is_triggered() {
-            let Some(token) = token_for_reader.get() else {
+        if !bus_token_dispatch.is_triggered() {
+            let Some(token) = token_for_dispatch.get() else {
                 return;
             };
-            bus_for_reader
+            bus_for_dispatch
                 .clients()
                 .close_peer_if_token_matches(client_id, token, close_peer_timeout)
                 .await;
@@ -530,10 +570,13 @@ pub fn install_client_conn<C: TransportConn>(
         info!(client = client_id, "consensus client disconnected");
     });
 
-    match bus
-        .clients()
-        .insert(client_id, tx, writer_handle, reader_handle, conn_shutdown)
-    {
+    match bus.clients().insert(
+        client_id,
+        tx,
+        transport_handle,
+        dispatch_handle,
+        conn_shutdown,
+    ) {
         Ok(token) => {
             install_token.set(Some(token));
         }
@@ -559,22 +602,23 @@ pub fn install_client_conn<C: TransportConn>(
     }
 }
 
-/// Drive a losing-insert's writer + reader [`JoinHandle`]s to completion
-/// (or force-cancel at the deadline).
+/// Drive a losing-insert's transport + dispatch [`JoinHandle`]s to
+/// completion (or force-cancel at the deadline).
 ///
 /// The winning entry must never be touched here; `install_aborted` has
 /// already told both tasks to skip post-loop cleanup. Closing the
-/// sender wakes the writer; triggering the per-connection shutdown
-/// wakes the reader off its `io_uring` read SQE without waiting for
-/// peer EOF. Awaiting both handles with `close_peer_timeout` budget
-/// guarantees the reader cannot outlive the race on a half-open
-/// socket. `compio::runtime::JoinHandle::drop` detaches, so letting
-/// the handles go out of scope would leak the tasks.
+/// sender wakes the transport's writer; triggering the per-connection
+/// shutdown wakes the transport's reader off its `io_uring` read SQE
+/// without waiting for peer EOF. Awaiting both handles with
+/// `close_peer_timeout` budget guarantees neither task can outlive the
+/// race on a half-open socket. `compio::runtime::JoinHandle::drop`
+/// detaches, so letting the handles go out of scope would leak the
+/// tasks.
 ///
-/// Both handles share a single `timeout` budget: after the writer returns
-/// (or is cancelled) the reader only gets the remaining time. Two
-/// independent full-timeout awaits would let a stuck loser occupy up to
-/// `2 * timeout` of shutdown wall-clock on its own.
+/// Both handles share a single `timeout` budget: after the transport
+/// returns (or is cancelled) the dispatch only gets the remaining time.
+/// Two independent full-timeout awaits would let a stuck loser occupy
+/// up to `2 * timeout` of shutdown wall-clock on its own.
 #[allow(clippy::future_not_send)]
 async fn drain_rejected_registration(rejected: RejectedRegistration, timeout: Duration) {
     let RejectedRegistration {
@@ -593,110 +637,104 @@ async fn drain_rejected_registration(rejected: RejectedRegistration, timeout: Du
     }
 }
 
-/// Read loop for a delegated replica connection. Identical to the
-/// `replica_listener` version but kept here to avoid cross-module coupling.
+/// Dispatch loop for a delegated replica connection. Pulls inbound
+/// consensus messages from the transport's per-connection inbound
+/// channel and hands each off to the bus-installed handler.
 ///
 /// `aborted` is set by the installer when the registry insert loses a
-/// duplicate-replica-id race. The loop checks it before dispatching each
-/// message so the losing reader can never invoke `on_message` with the
-/// replica id owned by the winning install — otherwise two physical peers
-/// would feed the same VSR slot and break replication safety.
+/// duplicate-replica-id race. The loop checks it before dispatching
+/// each message so the losing dispatcher can never invoke `on_message`
+/// with the replica id owned by the winning install — otherwise two
+/// physical peers would feed the same VSR slot and break replication
+/// safety.
 ///
-/// `conn_token` is a per-connection shutdown the installer triggers from
-/// the insert-race path: it wakes the reader off its `io_uring` read SQE
-/// immediately rather than waiting for peer EOF.
+/// `conn_token` is a per-connection shutdown the installer triggers
+/// from the insert-race path; alongside the bus-wide token, both wake
+/// this loop without waiting for the transport to drop its
+/// `Sender<Message>`.
 #[allow(clippy::future_not_send)]
-async fn replica_read_loop<R: TransportReader>(
+async fn replica_dispatch_loop(
     replica_id: u8,
-    mut read_half: R,
+    in_rx: Receiver<Message<GenericHeader>>,
     on_message: &MessageHandler,
     token: &ShutdownToken,
     conn_token: &ShutdownToken,
     aborted: &Cell<bool>,
-    max_message_size: usize,
 ) {
     loop {
         futures::select! {
             () = token.wait().fuse() => {
-                debug!(replica = replica_id, "replica read loop shutting down");
+                debug!(replica = replica_id, "replica dispatch loop shutting down");
                 return;
             }
             () = conn_token.wait().fuse() => {
-                debug!(replica = replica_id, "replica read loop aborted by per-connection shutdown");
+                debug!(replica = replica_id, "replica dispatch loop aborted by per-connection shutdown");
                 return;
             }
-            result = read_half.read_message(max_message_size).fuse() => {
-                match result {
-                    Ok(msg) => {
-                        if aborted.get() {
-                            return;
-                        }
-                        on_message(replica_id, msg);
-                    }
-                    Err(e) => {
-                        debug!(replica = replica_id, "read error: {e}");
-                        return;
-                    }
+            result = in_rx.recv().fuse() => {
+                let Ok(msg) = result else {
+                    debug!(replica = replica_id, "replica dispatch: inbound queue closed");
+                    return;
+                };
+                if aborted.get() {
+                    return;
                 }
+                on_message(replica_id, msg);
             }
         }
     }
 }
 
-/// Read loop for a delegated client connection. Rejects any command other
-/// than `Request` (the client side of the consensus protocol only speaks
-/// request/reply).
+/// Dispatch loop for a delegated client connection. Rejects any command
+/// other than `Request` (the client side of the consensus protocol only
+/// speaks request/reply).
 ///
 /// `aborted` is set by the installer when the registry insert loses a
 /// duplicate-client-id race. The loop checks it before dispatching each
-/// request so the losing reader can never invoke `on_request` with the
-/// client id owned by the winning install.
+/// request so the losing dispatcher can never invoke `on_request` with
+/// the client id owned by the winning install.
 ///
-/// `conn_token` is a per-connection shutdown the installer triggers from
-/// the insert-race path: it wakes the reader off its `io_uring` read SQE
-/// immediately rather than waiting for peer EOF.
+/// `conn_token` is a per-connection shutdown the installer triggers
+/// from the insert-race path; alongside the bus-wide token, both wake
+/// this loop without waiting for the transport to drop its
+/// `Sender<Message>`.
 #[allow(clippy::future_not_send)]
-async fn client_read_loop<R: TransportReader>(
+async fn client_dispatch_loop(
     client_id: u128,
-    mut read_half: R,
+    in_rx: Receiver<Message<GenericHeader>>,
     on_request: &RequestHandler,
     token: &ShutdownToken,
     conn_token: &ShutdownToken,
     aborted: &Cell<bool>,
-    max_message_size: usize,
 ) {
     loop {
         futures::select! {
             () = token.wait().fuse() => {
-                debug!(client = client_id, "client read loop shutting down");
+                debug!(client = client_id, "client dispatch loop shutting down");
                 return;
             }
             () = conn_token.wait().fuse() => {
-                debug!(client = client_id, "client read loop aborted by per-connection shutdown");
+                debug!(client = client_id, "client dispatch loop aborted by per-connection shutdown");
                 return;
             }
-            result = read_half.read_message(max_message_size).fuse() => {
-                match result {
-                    Ok(msg) => {
-                        if aborted.get() {
-                            return;
-                        }
-                        let cmd = msg.header().command;
-                        if cmd != Command2::Request {
-                            warn!(
-                                client = client_id,
-                                ?cmd,
-                                "unexpected command from client, expected Request"
-                            );
-                            continue;
-                        }
-                        on_request(client_id, msg);
-                    }
-                    Err(e) => {
-                        debug!(client = client_id, "client read error: {e}");
-                        return;
-                    }
+            result = in_rx.recv().fuse() => {
+                let Ok(msg) = result else {
+                    debug!(client = client_id, "client dispatch: inbound queue closed");
+                    return;
+                };
+                if aborted.get() {
+                    return;
                 }
+                let cmd = msg.header().command;
+                if cmd != Command2::Request {
+                    warn!(
+                        client = client_id,
+                        ?cmd,
+                        "unexpected command from client, expected Request"
+                    );
+                    continue;
+                }
+                on_request(client_id, msg);
             }
         }
     }

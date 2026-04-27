@@ -21,14 +21,12 @@
 //!
 //! - [`TransportListener`] binds a local address and yields inbound
 //!   [`TransportConn`]s on `accept`.
-//! - [`TransportConn`] is a single byte-oriented connection; it splits
-//!   into a [`TransportReader`] and a [`TransportWriter`] that move into
-//!   independent compio tasks (reader loop, writer-batch task).
-//! - [`TransportReader`] reads one framed `Message<GenericHeader>` per
-//!   call.
-//! - [`TransportWriter`] sends a batch of `Frozen<MESSAGE_ALIGN>`
-//!   atomically in a single `writev` (TCP) or per-transport analog
-//!   (framed binary for WS, one STREAM per message for QUIC).
+//! - [`TransportConn`] is a single byte-oriented connection. Each
+//!   transport owns its own internal task topology behind a single
+//!   [`TransportConn::run`] entry point that consumes the connection,
+//!   pushes inbound consensus frames into [`ActorContext::in_tx`], and
+//!   drains outbound frames from [`ActorContext::rx`] until the bus tears
+//!   the connection down.
 //!
 //! # Invariants the trait surface must preserve
 //!
@@ -36,53 +34,39 @@
 //!   [`MessageBus::send_to_client`](crate::MessageBus::send_to_client) /
 //!   [`send_to_replica`](crate::MessageBus::send_to_replica), which push
 //!   onto a bounded `async_channel` and return `Ready` on the first
-//!   poll. The single yield point in the wire path lives inside
-//!   [`TransportWriter::send_batch`], invoked by the per-peer writer
-//!   task. Consensus code relies on this for reentrancy reasoning.
-//! - **Batch atomicity** (I4): `send_batch` either writes every buffer
-//!   in the batch or returns an error; no partial success is exposed.
-//!   TCP satisfies this via `compio::io::AsyncWriteExt::write_vectored_all`;
-//!   WS/QUIC impls loop internally until the batch lands or fail.
-//! - **Zero-copy `Frozen` ownership** (I8): the batch is handed to the
-//!   kernel without intermediate copies. Impls MUST NOT clone
-//!   `Frozen<MESSAGE_ALIGN>` or materialize a `Vec<u8>` on the hot
-//!   path.
+//!   poll. The single yield point in the wire path lives inside the
+//!   transport's `run` body, invoked by the per-peer task.
+//! - **Batch atomicity** (I4): a TCP-plane writer drains the per-peer
+//!   `BusReceiver` into one `writev` per batch; per-frame transports
+//!   (WS, QUIC, TLS) loop internally until the batch lands or fail the
+//!   whole batch and exit.
+//! - **Zero-copy `Frozen` ownership** (I8): outbound frames are handed to
+//!   the kernel without intermediate copies on plaintext TCP. WS / QUIC
+//!   / TLS planes pay structural copies in their record layers; see the
+//!   per-transport module rustdoc.
 //!
 //! # Design notes
 //!
-//! - Associated types (not trait objects): keep the hot path
-//!   monomorphic. A `dyn TransportConn` surface can be introduced later
-//!   if a config-time transport selector needs runtime polymorphism.
-//! - `'static` bound on [`TransportConn`], [`TransportReader`], and
-//!   [`TransportWriter`]: the halves are moved into
-//!   `compio::runtime::spawn`'d tasks, which require owned data.
+//! - `'static` bound on [`TransportConn`]: the conn is moved into a
+//!   `compio::runtime::spawn`'d task by the installer, which requires
+//!   owned data.
 //! - fd-delegation (`F_DUPFD_CLOEXEC`) stays TCP-only and lives outside
 //!   this trait (see [`crate::fd_transfer`]). Other transports terminate
 //!   on shard 0 and forward `Frozen<MESSAGE_ALIGN>` over the inter-shard
 //!   flume via [`crate::ShardForwardFn`].
 //!
-//! The TCP impl lives in `transports/tcp.rs` (P1-T2). Phase 2+ transports
-//! plug in behind the same surface; see
-//! `Documents/silverhand/iggy/message_bus/transport-plan/`.
+//! Per-transport impls live in `transports/{tcp,ws,quic,tls}.rs`; see
+//! `Documents/silverhand/iggy/message_bus/transport-plan/` for the phase
+//! breakdown.
 
 pub mod quic;
 pub mod tcp;
 pub mod tls;
 pub mod ws;
 
-// Only `Conn` and `Writer` have crate-internal callers today
-// (`installer.rs` wraps the dialed/accepted stream in a `TcpTransportConn`;
-// `writer_task.rs` wraps the owned write half in a `TcpTransportWriter`).
-// `TcpTransportListener` and `TcpTransportReader` stay reachable via the
-// `tcp` submodule and exist primarily so the trait surface compiles
-// end-to-end against a real impl; future WSS / QUIC listeners drop in
-// alongside without touching call sites.
-pub(crate) use tcp::{TcpTransportConn, TcpTransportWriter};
-
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
+use crate::lifecycle::{BusReceiver, ShutdownToken};
+use async_channel::Sender;
 use iggy_binary_protocol::{GenericHeader, Message};
-use iggy_common::IggyError;
 use std::io;
 use std::net::SocketAddr;
 
@@ -109,129 +93,68 @@ pub trait TransportListener {
     async fn accept(&self) -> io::Result<(Self::Conn, SocketAddr)>;
 }
 
+/// Per-connection runtime context the bus hands to [`TransportConn::run`].
+///
+/// The transport is the single producer for `in_tx` (inbound framed
+/// messages) and the single consumer of `rx` (outbound consensus frames
+/// scheduled by the bus's `send_to_*` path). `shutdown` is a fused
+/// signal merged from the bus-wide shutdown and the per-connection
+/// shutdown that the installer triggers on insert-race; either firing
+/// must wake any blocked I/O the transport holds.
+pub struct ActorContext {
+    /// Inbound channel: the transport pushes one decoded
+    /// [`Message<GenericHeader>`] per received frame. The receiver side
+    /// is owned by the installer's dispatch task, which forwards each
+    /// message to the bus's per-plane handler (`MessageHandler` /
+    /// `RequestHandler`).
+    pub in_tx: Sender<Message<GenericHeader>>,
+    /// Outbound channel: the bus's `send_to_*` path pushes `Frozen`
+    /// frames into the matching `Sender`; the transport drains here.
+    pub rx: BusReceiver,
+    /// Cooperative cancellation. Fires on bus shutdown OR on
+    /// per-connection shutdown (insert race); the transport must
+    /// observe it on every blocking await on the wire.
+    pub shutdown: ShutdownToken,
+    /// Maximum number of `BusMessage` entries coalesced into a single
+    /// transport-level write. Capped at `IOV_MAX / 2` on plaintext TCP
+    /// so the worst-case writev stays inside the syscall limit.
+    pub max_batch: usize,
+    /// Wire-level cap on a single framed message, in bytes. The
+    /// transport rejects undersize / oversize frames and tears the
+    /// connection down.
+    pub max_message_size: usize,
+    /// Plane label for tracing (`"replica"` or `"client"`). Static so
+    /// tracing macros can format without an allocation.
+    pub label: &'static str,
+    /// Peer identifier for tracing (replica id as decimal, client id as
+    /// `0x..` hex). Owned `String` because client ids serialize to 34
+    /// chars and replicas to ≤ 3 chars; the cost is one allocation per
+    /// installed connection.
+    pub peer: String,
+}
+
 /// Single-connection handle produced by [`TransportListener::accept`]
 /// or by a transport-specific dialer (`TcpStream::connect`, etc.).
 ///
-/// `'static` so the reader and writer halves can move into spawned
-/// compio tasks.
+/// `'static` so the conn can move into a `compio::runtime::spawn`'d
+/// task.
+#[allow(async_fn_in_trait)]
 pub trait TransportConn: 'static {
-    /// Read half moved into the per-connection reader task.
-    type Reader: TransportReader;
-    /// Write half moved into the per-connection writer-batch task.
-    type Writer: TransportWriter;
-
-    /// Split the connection into independently-owned halves.
+    /// Take ownership of the connection, drive its internal reader and
+    /// writer tasks until shutdown, EOF, or an unrecoverable I/O error.
     ///
-    /// Mirrors [`compio::net::TcpStream::into_split`] on TCP. WS and
-    /// QUIC impls map onto their own half-splits or stream wrappers.
-    fn into_split(self) -> (Self::Reader, Self::Writer);
-}
-
-/// Read half. Produces one framed [`Message<GenericHeader>`] per call.
-///
-/// `'static` so the half can be moved into a `compio::runtime::spawn`'d
-/// task. `Unpin` is NOT required at the trait level: TCP impls satisfy it
-/// trivially via `OwnedReadHalf<TcpStream>`, and a future
-/// `compio-quic::RecvStream` impl that is not `Unpin` can pin internally
-/// without forcing every other impl to `Box::pin`.
-#[allow(async_fn_in_trait)]
-pub trait TransportReader: 'static {
-    /// Read the next `GenericHeader`-framed message off the wire.
+    /// The transport must:
     ///
-    /// Validates the 256 B header and bounds the total frame size to
-    /// `max_message_size`. TCP delegates to
-    /// [`crate::framing::read_message`]; WS wraps the single binary
-    /// frame; QUIC consumes one STREAM worth of bytes.
+    /// - Push every decoded inbound frame into [`ActorContext::in_tx`]
+    ///   in order.
+    /// - Drain [`ActorContext::rx`] FIFO and write each batch to the
+    ///   wire atomically (or fail the batch and exit).
+    /// - Observe [`ActorContext::shutdown`] on every blocking await so
+    ///   the bus's tear-down completes within the configured drain
+    ///   budget.
     ///
-    /// # Errors
-    ///
-    /// - [`IggyError::ConnectionClosed`] on clean EOF.
-    /// - [`IggyError::TcpError`] on transport I/O faults.
-    /// - [`IggyError::InvalidCommand`] on framing violations (bad size
-    ///   field, total frame exceeding `max_message_size`, header decode
-    ///   failure).
-    async fn read_message(
-        &mut self,
-        max_message_size: usize,
-    ) -> Result<Message<GenericHeader>, IggyError>;
-}
-
-/// Write half. Atomic-or-error batched writer.
-///
-/// `'static` so the half can be moved into a `compio::runtime::spawn`'d
-/// task. `Unpin` is NOT required at the trait level (see
-/// [`TransportReader`] for the rationale).
-#[allow(async_fn_in_trait)]
-pub trait TransportWriter: 'static {
-    /// Send every buffer in `batch` atomically.
-    ///
-    /// On success the Vec is drained (empty on return); the same
-    /// allocation is reused by the writer loop on the next iteration,
-    /// so impls must not free it. On error the buffers may or may not
-    /// have partially landed on the wire; the caller MUST treat a
-    /// failed batch as lost data and drop the connection. VSR
-    /// retransmits via the WAL.
-    ///
-    /// TCP implements this via
-    /// [`compio::io::AsyncWriteExt::write_vectored_all`] on the owned
-    /// write half, with `max_batch <= IOV_MAX / 2 = 512`. WS/QUIC impls
-    /// loop internally until every buffer lands or fail the whole
-    /// batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`io::Error`] on transport faults. No partial-success
-    /// variant is exposed.
-    async fn send_batch(&mut self, batch: &mut Vec<Frozen<MESSAGE_ALIGN>>) -> io::Result<()>;
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-mod tests {
-    //! Compile-only stubs that exercise each trait's associated-type
-    //! plumbing and method signatures. Method bodies `unimplemented!()`
-    //! so every compile-time obligation (bounds, lifetimes, `'static`)
-    //! is enforced without needing a runtime harness.
-    use super::{TransportConn, TransportListener, TransportReader, TransportWriter};
-    use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-    use iggy_binary_protocol::consensus::iobuf::Frozen;
-    use iggy_binary_protocol::{GenericHeader, Message};
-    use iggy_common::IggyError;
-    use std::io;
-    use std::net::SocketAddr;
-
-    struct StubReader;
-    struct StubWriter;
-    struct StubConn;
-    struct StubListener;
-
-    impl TransportReader for StubReader {
-        async fn read_message(
-            &mut self,
-            _max_message_size: usize,
-        ) -> Result<Message<GenericHeader>, IggyError> {
-            unimplemented!()
-        }
-    }
-
-    impl TransportWriter for StubWriter {
-        async fn send_batch(&mut self, _batch: &mut Vec<Frozen<MESSAGE_ALIGN>>) -> io::Result<()> {
-            unimplemented!()
-        }
-    }
-
-    impl TransportConn for StubConn {
-        type Reader = StubReader;
-        type Writer = StubWriter;
-        fn into_split(self) -> (Self::Reader, Self::Writer) {
-            unimplemented!()
-        }
-    }
-
-    impl TransportListener for StubListener {
-        type Conn = StubConn;
-        async fn accept(&self) -> io::Result<(Self::Conn, SocketAddr)> {
-            unimplemented!()
-        }
-    }
+    /// Returns when the connection has terminated. Errors are logged
+    /// internally; the join handle's `Result<()>` is the bus's only
+    /// signal that the conn ended.
+    async fn run(self, ctx: ActorContext);
 }
