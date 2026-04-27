@@ -105,6 +105,7 @@ pub use lifecycle::{
     BusMessage, BusReceiver, BusSender, ConnectionRegistry, DrainOutcome, RejectedRegistration,
     ReplicaRegistry, Shutdown, ShutdownToken,
 };
+pub use transports::tls::TlsServerCredentials;
 
 use auth::ReplicaNonceRing;
 use compio::runtime::JoinHandle;

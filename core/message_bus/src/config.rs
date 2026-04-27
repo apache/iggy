@@ -33,6 +33,7 @@
 //! [`crate::auth_config`] at process start and threaded as an
 //! `Rc<dyn TokenSource>` into [`crate::replica_io::start_on_shard_zero`].
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 /// Hard upper bound on `max_batch`, in iovecs.
@@ -87,6 +88,31 @@ pub struct MessageBusConfig {
     /// Timeout for per-peer close drain (flush writer, tear down
     /// reader) before force-cancellation.
     pub close_peer_timeout: Duration,
+
+    /// Optional TCP-TLS client listener address. `None` keeps the plane
+    /// unbound; bootstrap callers (`replica_io::start_on_shard_zero`)
+    /// surface listener-address resolution one layer up. Pairs with
+    /// out-of-band [`crate::transports::tls::TlsServerCredentials`] (not
+    /// on this struct because credentials have a different lifecycle:
+    /// boot-time PEM load, no `Clone` in debug traces).
+    pub tcp_tls_listen_addr: Option<SocketAddr>,
+
+    /// Optional WSS client listener address. Same `None` semantics as
+    /// [`Self::tcp_tls_listen_addr`].
+    pub wss_listen_addr: Option<SocketAddr>,
+
+    /// Cooperative-shutdown drain budget for the TLS-family transports
+    /// (`transports::tcp_tls`, `transports::wss`). Threaded into
+    /// `TcpTlsTransportConn::with_drain_budget` /
+    /// `WssTransportConn::with_drain_budget` by the install entries
+    /// (`installer::install_client_tls_stream` /
+    /// `installer::install_client_wss_stream`).
+    ///
+    /// Bounds how long the cooperative TLS shutdown helper waits for the
+    /// writer task to emit `close_notify` + `SHUT_WR` after the merged
+    /// channel closes. Plaintext TCP / WS / QUIC planes have no TLS
+    /// shutdown phase and ignore this knob.
+    pub tls_drain_budget: Duration,
 }
 
 impl Default for MessageBusConfig {
@@ -105,6 +131,9 @@ impl Default for MessageBusConfig {
             keepalive_interval: Duration::from_secs(5),
             keepalive_retries: 3,
             close_peer_timeout: Duration::from_secs(2),
+            tcp_tls_listen_addr: None,
+            wss_listen_addr: None,
+            tls_drain_budget: Duration::from_secs(5),
         }
     }
 }

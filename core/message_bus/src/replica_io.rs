@@ -41,9 +41,11 @@ use crate::auth::TokenSource;
 use crate::connector::start as start_connector;
 use crate::replica_listener::{bind as bind_replica_listener, run as run_replica_listener};
 use crate::transports::quic::server_config_with_cert;
+use crate::transports::tls::TlsServerCredentials;
 use crate::{
-    AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedWsClientFn, IggyMessageBus,
-    client_listener, client_listener_quic, client_listener_ws,
+    AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
+    AcceptedWsClientFn, AcceptedWssClientFn, IggyMessageBus, client_listener, client_listener_quic,
+    client_listener_tls, client_listener_ws, client_listener_wss,
 };
 
 /// QUIC server credentials passed by the bootstrap layer.
@@ -59,27 +61,29 @@ pub struct QuicServerCredentials {
 
 /// Bound addresses returned to shard 0 after the listeners come up.
 ///
-/// `ws` and `quic` are populated only when the corresponding
-/// `start_on_shard_zero` parameters are `Some`; an unconfigured plane
-/// stays `None`.
+/// `ws`, `quic`, `tcp_tls`, and `wss` are populated only when the
+/// corresponding `start_on_shard_zero` parameters are `Some`; an
+/// unconfigured plane stays `None`.
 #[derive(Debug, Clone)]
 pub struct BoundPlanes {
     pub replica: SocketAddr,
     pub client: SocketAddr,
     pub ws: Option<SocketAddr>,
     pub quic: Option<SocketAddr>,
+    pub tcp_tls: Option<SocketAddr>,
+    pub wss: Option<SocketAddr>,
 }
 
-/// Boot-time check: every TCP listener address must occupy a distinct
-/// `(ip, port)` slot.
+/// Boot-time check: every TCP-family listener address must occupy a
+/// distinct `(ip, port)` slot.
 ///
-/// TCP listeners (`replica`, `client`, `ws`) all share the TCP port
-/// space, so any pair sharing `(ip, port)` is a bind-time conflict.
-/// The QUIC listener binds a UDP socket: it occupies a separate port
-/// namespace and is allowed to share a port with any TCP listener (a
-/// common operator choice for "QUIC on 443 over UDP, HTTPS on 443 over
-/// TCP"). UDP-vs-UDP conflicts are not possible today because QUIC is
-/// the only UDP listener.
+/// TCP-family listeners (`replica`, `client`, `ws`, `tcp_tls`, `wss`)
+/// share the TCP port space, so any pair sharing `(ip, port)` is a
+/// bind-time conflict. The QUIC listener binds a UDP socket: it
+/// occupies a separate port namespace and is allowed to share a port
+/// with any TCP-family listener (a common operator choice for "QUIC
+/// on 443 over UDP, HTTPS on 443 over TCP"). UDP-vs-UDP conflicts are
+/// not possible today because QUIC is the only UDP listener.
 ///
 /// # Panics
 ///
@@ -92,11 +96,15 @@ pub fn assert_listen_addrs_distinct(
     client: SocketAddr,
     ws: Option<SocketAddr>,
     _quic: Option<SocketAddr>,
+    tcp_tls: Option<SocketAddr>,
+    wss: Option<SocketAddr>,
 ) {
-    let tcp_slots: [(&str, Option<SocketAddr>); 3] = [
+    let tcp_slots: [(&str, Option<SocketAddr>); 5] = [
         ("replica", Some(replica)),
         ("client", Some(client)),
         ("ws", ws),
+        ("tcp_tls", tcp_tls),
+        ("wss", wss),
     ];
     for i in 0..tcp_slots.len() {
         for j in (i + 1)..tcp_slots.len() {
@@ -116,31 +124,46 @@ pub fn assert_listen_addrs_distinct(
 }
 
 /// Bind the replica + client listeners on shard 0 and start the
-/// outbound replica connector. Optionally bind WS and QUIC client
-/// listeners alongside. Non-zero shards early-return `Ok(None)`.
+/// outbound replica connector.
+///
+/// Optionally bind WS, QUIC, TCP-TLS, and WSS client listeners
+/// alongside. Non-zero shards early-return `Ok(None)`.
 ///
 /// Each accepted / dialed connection is handed to the supplied
 /// delegate callback. The TCP callbacks (`on_accepted_replica`,
 /// `on_accepted_client`) and the WS callback (`on_accepted_ws_client`)
-/// are responsible for the dup-fd + inter-shard send. The QUIC
-/// callback (`on_accepted_quic_client`) installs locally on shard 0
-/// (QUIC has no cross-shard handover).
+/// are responsible for the dup-fd + inter-shard send. The QUIC,
+/// TCP-TLS, and WSS callbacks
+/// (`on_accepted_quic_client` / `on_accepted_tcp_tls_client` /
+/// `on_accepted_wss_client`) install locally on shard 0; those planes
+/// have no cross-shard handover (QUIC by transport design, TLS-family
+/// per invariant I5's TLS clause).
 ///
 /// `ws_listen_addr` / `on_accepted_ws_client` are paired: if either is
 /// `Some`, both must be. Same for the QUIC trio
-/// (`quic_listen_addr` / `quic_credentials` / `on_accepted_quic_client`).
+/// (`quic_listen_addr` / `quic_credentials` / `on_accepted_quic_client`)
+/// and for the TCP-TLS / WSS trios
+/// (`*_listen_addr` / `*_credentials` / `on_accepted_*_client`).
 ///
 /// # Panics
 ///
 /// Panics on TCP-family `(ip, port)` overlap among the populated
-/// `replica`, `client`, `ws` slots — see
+/// `replica`, `client`, `ws`, `tcp_tls`, `wss` slots — see
 /// [`assert_listen_addrs_distinct`].
 ///
 /// # Errors
 ///
-/// Returns `IggyError::CannotBindToSocket` if any listener bind fails.
-#[allow(clippy::future_not_send)]
-#[allow(clippy::too_many_arguments)]
+/// Returns `IggyError::CannotBindToSocket` if any listener bind fails;
+/// `IggyError::InvalidConfiguration` if any of the
+/// listen-addr / credentials / callback trios is partially populated;
+/// `IggyError::IoError` if a TLS-family server config cannot be built
+/// from the supplied credentials.
+#[allow(
+    clippy::future_not_send,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::similar_names
+)]
 pub async fn start_on_shard_zero(
     bus: &Rc<IggyMessageBus>,
     replica_listen_addr: SocketAddr,
@@ -148,6 +171,10 @@ pub async fn start_on_shard_zero(
     ws_listen_addr: Option<SocketAddr>,
     quic_listen_addr: Option<SocketAddr>,
     quic_credentials: Option<QuicServerCredentials>,
+    tcp_tls_listen_addr: Option<SocketAddr>,
+    tcp_tls_credentials: Option<TlsServerCredentials>,
+    wss_listen_addr: Option<SocketAddr>,
+    wss_credentials: Option<TlsServerCredentials>,
     cluster_id: u128,
     self_id: u8,
     replica_count: u8,
@@ -156,6 +183,8 @@ pub async fn start_on_shard_zero(
     on_accepted_client: AcceptedClientFn,
     on_accepted_ws_client: Option<AcceptedWsClientFn>,
     on_accepted_quic_client: Option<AcceptedQuicClientFn>,
+    on_accepted_tcp_tls_client: Option<AcceptedTlsClientFn>,
+    on_accepted_wss_client: Option<AcceptedWssClientFn>,
     reconnect_period: Duration,
     token_source: Rc<dyn TokenSource>,
 ) -> Result<Option<BoundPlanes>, IggyError> {
@@ -168,6 +197,8 @@ pub async fn start_on_shard_zero(
         client_listen_addr,
         ws_listen_addr,
         quic_listen_addr,
+        tcp_tls_listen_addr,
+        wss_listen_addr,
     );
 
     let (replica_listener, replica_bound) = bind_replica_listener(replica_listen_addr).await?;
@@ -234,6 +265,46 @@ pub async fn start_on_shard_zero(
         }
     };
 
+    let tcp_tls_bound = match (
+        tcp_tls_listen_addr,
+        tcp_tls_credentials,
+        on_accepted_tcp_tls_client,
+    ) {
+        (Some(addr), Some(creds), Some(on_accepted_tls)) => {
+            let (listener, server_config, tls_bound) =
+                client_listener_tls::bind(addr, creds).await?;
+            let token_for_tls = bus.token();
+            let tls_handle = compio::runtime::spawn(async move {
+                client_listener_tls::run(listener, server_config, token_for_tls, on_accepted_tls)
+                    .await;
+            });
+            bus.track_background(tls_handle);
+            Some(tls_bound)
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(IggyError::InvalidConfiguration);
+        }
+    };
+
+    let wss_bound = match (wss_listen_addr, wss_credentials, on_accepted_wss_client) {
+        (Some(addr), Some(creds), Some(on_accepted_wss)) => {
+            let (listener, server_config, wss_bound) =
+                client_listener_wss::bind(addr, creds).await?;
+            let token_for_wss = bus.token();
+            let wss_handle = compio::runtime::spawn(async move {
+                client_listener_wss::run(listener, server_config, token_for_wss, on_accepted_wss)
+                    .await;
+            });
+            bus.track_background(wss_handle);
+            Some(wss_bound)
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(IggyError::InvalidConfiguration);
+        }
+    };
+
     start_connector(
         bus,
         cluster_id,
@@ -250,16 +321,18 @@ pub async fn start_on_shard_zero(
         client: client_bound,
         ws: ws_bound,
         quic: quic_bound,
+        tcp_tls: tcp_tls_bound,
+        wss: wss_bound,
     }))
 }
 
 /// [`start_on_shard_zero`] defaulting `reconnect_period` to the bus's
 /// [`crate::MessageBusConfig::reconnect_period`].
 ///
-/// Leaves the WS + QUIC listener slots unconfigured (`None`).
-/// Convenience entry for TCP-only deployments and existing tests;
-/// prefer the full [`start_on_shard_zero`] in production where WS /
-/// QUIC come from `core/server-ng`'s config.
+/// Leaves the WS, QUIC, TCP-TLS, and WSS listener slots unconfigured
+/// (`None`). Convenience entry for TCP-only deployments and existing
+/// tests; prefer the full [`start_on_shard_zero`] in production where
+/// the optional planes come from `core/server-ng`'s config.
 ///
 /// # Errors
 ///
@@ -286,12 +359,18 @@ pub async fn start_on_shard_zero_default(
         None,
         None,
         None,
+        None,
+        None,
+        None,
+        None,
         cluster_id,
         self_id,
         replica_count,
         peers,
         on_accepted_replica,
         on_accepted_client,
+        None,
+        None,
         None,
         None,
         reconnect_period,
@@ -310,41 +389,115 @@ mod tests {
 
     #[test]
     fn distinct_addrs_pass() {
-        assert_listen_addrs_distinct(addr(9090), addr(8090), Some(addr(8092)), Some(addr(8080)));
+        assert_listen_addrs_distinct(
+            addr(9090),
+            addr(8090),
+            Some(addr(8092)),
+            Some(addr(8080)),
+            Some(addr(8093)),
+            Some(addr(8094)),
+        );
     }
 
     #[test]
     fn ws_unset_passes() {
-        assert_listen_addrs_distinct(addr(9090), addr(8090), None, Some(addr(8080)));
+        assert_listen_addrs_distinct(addr(9090), addr(8090), None, Some(addr(8080)), None, None);
     }
 
     #[test]
     fn quic_shares_port_with_tcp_replica_ok() {
         // QUIC on UDP and replica on TCP can share a port (separate
         // kernel namespaces). Operator choice "443 on TCP and UDP".
-        assert_listen_addrs_distinct(addr(443), addr(8090), Some(addr(8092)), Some(addr(443)));
+        assert_listen_addrs_distinct(
+            addr(443),
+            addr(8090),
+            Some(addr(8092)),
+            Some(addr(443)),
+            None,
+            None,
+        );
     }
 
     #[test]
     fn quic_shares_port_with_tcp_client_ok() {
-        assert_listen_addrs_distinct(addr(9090), addr(443), Some(addr(8092)), Some(addr(443)));
+        assert_listen_addrs_distinct(
+            addr(9090),
+            addr(443),
+            Some(addr(8092)),
+            Some(addr(443)),
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    fn quic_shares_port_with_tcp_tls_ok() {
+        // QUIC's UDP namespace is also disjoint from the TLS-family
+        // TCP listeners; "443 over UDP for QUIC + 443 over TCP for
+        // TCP-TLS / WSS" is a valid co-location.
+        assert_listen_addrs_distinct(
+            addr(9090),
+            addr(8090),
+            None,
+            Some(addr(443)),
+            Some(addr(443)),
+            None,
+        );
     }
 
     #[test]
     #[should_panic(expected = "listener address conflict: replica and client")]
     fn replica_client_overlap_panics() {
-        assert_listen_addrs_distinct(addr(8090), addr(8090), Some(addr(8092)), None);
+        assert_listen_addrs_distinct(addr(8090), addr(8090), Some(addr(8092)), None, None, None);
     }
 
     #[test]
     #[should_panic(expected = "listener address conflict: replica and ws")]
     fn replica_ws_overlap_panics() {
-        assert_listen_addrs_distinct(addr(9090), addr(8090), Some(addr(9090)), None);
+        assert_listen_addrs_distinct(addr(9090), addr(8090), Some(addr(9090)), None, None, None);
     }
 
     #[test]
     #[should_panic(expected = "listener address conflict: client and ws")]
     fn client_ws_overlap_panics() {
-        assert_listen_addrs_distinct(addr(9090), addr(8090), Some(addr(8090)), None);
+        assert_listen_addrs_distinct(addr(9090), addr(8090), Some(addr(8090)), None, None, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "listener address conflict: client and tcp_tls")]
+    fn client_tcp_tls_overlap_panics() {
+        assert_listen_addrs_distinct(addr(9090), addr(8090), None, None, Some(addr(8090)), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "listener address conflict: ws and wss")]
+    fn ws_wss_overlap_panics() {
+        assert_listen_addrs_distinct(
+            addr(9090),
+            addr(8090),
+            Some(addr(8092)),
+            None,
+            None,
+            Some(addr(8092)),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "listener address conflict: tcp_tls and wss")]
+    fn tcp_tls_wss_overlap_panics() {
+        assert_listen_addrs_distinct(
+            addr(9090),
+            addr(8090),
+            None,
+            None,
+            Some(addr(8093)),
+            Some(addr(8093)),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "listener address conflict: replica and tcp_tls")]
+    fn replica_tcp_tls_overlap_panics() {
+        assert_listen_addrs_distinct(addr(9090), addr(8090), None, None, Some(addr(9090)), None);
     }
 }

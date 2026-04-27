@@ -490,7 +490,7 @@ pub fn install_client_tls_stream(
     install_client_conn(
         bus,
         client_id,
-        TcpTlsTransportConn::new_server(stream, config),
+        TcpTlsTransportConn::new_server(stream, config).with_drain_budget(cfg.tls_drain_budget),
         on_request,
     );
 }
@@ -541,7 +541,7 @@ pub fn install_client_wss_stream(
     install_client_conn(
         bus,
         client_id,
-        WssTransportConn::new_server(stream, config),
+        WssTransportConn::new_server(stream, config).with_drain_budget(cfg.tls_drain_budget),
         on_request,
     );
 }
