@@ -31,7 +31,9 @@ use crate::replica_listener::MessageHandler;
 use crate::socket_opts::{apply_keepalive_for_connection, apply_nodelay_for_connection};
 use crate::transports::quic::QuicTransportConn;
 use crate::transports::tcp::TcpTransportConn;
+use crate::transports::tcp_tls::TcpTlsTransportConn;
 use crate::transports::ws::WsTransportConn;
+use crate::transports::wss::WssTransportConn;
 use crate::transports::{ActorContext, TransportConn};
 use crate::{IggyMessageBus, lifecycle::ShutdownToken};
 use async_channel::Receiver;
@@ -40,6 +42,7 @@ use futures::FutureExt;
 use iggy_binary_protocol::{Command2, GenericHeader, Message};
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -433,6 +436,112 @@ pub fn install_client_quic_conn(
         bus,
         client_id,
         QuicTransportConn::new(connection, streams),
+        on_request,
+    );
+}
+
+/// TCP-TLS entry point for client installs.
+///
+/// Wraps a freshly accepted plaintext [`TcpStream`] (TLS handshake has
+/// NOT run yet) plus the shared [`Arc<rustls::ServerConfig>`] in a
+/// [`TcpTlsTransportConn`] and delegates to the existing generic
+/// [`install_client_conn`]. The rustls handshake then runs inside the
+/// transport's `run` body on the per-connection install task, so a slow
+/// or malicious peer never blocks the listener accept loop.
+///
+/// `TCP_NODELAY` + `SO_KEEPALIVE` apply to the underlying TCP socket
+/// before the handshake starts, matching [`install_client_stream`]'s
+/// plaintext behaviour. Linux does not propagate these from the listener
+/// to accepted sockets, so toggling here is required.
+///
+/// TCP-TLS is shard-0 terminal: the rustls `UnbufferedConnection` state
+/// machine is non-serialisable and tied to the local task; pre-handshake
+/// the fd is plain TCP and could in principle be dup'd to another shard,
+/// but the receiving shard would then have to re-handshake against
+/// shard-0-resident key material — losing the point of the cross-shard
+/// handover. Both reasons compose into invariant I5's TLS-family clause
+/// (formalised in P9-T13).
+#[allow(clippy::future_not_send)]
+pub fn install_client_tls_stream(
+    bus: &Rc<IggyMessageBus>,
+    client_id: u128,
+    stream: TcpStream,
+    config: Arc<rustls::ServerConfig>,
+    on_request: RequestHandler,
+) {
+    let cfg = bus.config();
+    if let Err(e) = apply_keepalive_for_connection(
+        &stream,
+        cfg.keepalive_idle,
+        cfg.keepalive_interval,
+        cfg.keepalive_retries,
+    ) {
+        warn!(
+            client = client_id,
+            "keepalive failed on accepted TLS client fd: {e}"
+        );
+    }
+    if let Err(e) = apply_nodelay_for_connection(&stream) {
+        warn!(
+            client = client_id,
+            "nodelay failed on accepted TLS client fd: {e}"
+        );
+    }
+    install_client_conn(
+        bus,
+        client_id,
+        TcpTlsTransportConn::new_server(stream, config),
+        on_request,
+    );
+}
+
+/// WSS entry point for client installs.
+///
+/// Wraps a freshly accepted plaintext [`TcpStream`] (neither the TLS
+/// handshake nor the WS HTTP-Upgrade has run yet) plus the shared
+/// [`Arc<rustls::ServerConfig>`] in a [`WssTransportConn`] and delegates
+/// to the existing generic [`install_client_conn`]. Both handshakes
+/// then run inside the transport's `run` body on the per-connection
+/// install task. Subprotocol enforcement (`iggy.consensus.v1`) lives
+/// inside that body and returns HTTP 400 on missing or wrong
+/// `Sec-WebSocket-Protocol`; the install path stays thin.
+///
+/// Socket options (`TCP_NODELAY` + `SO_KEEPALIVE`) apply pre-handshake
+/// for symmetry with [`install_client_tls_stream`].
+///
+/// WSS is shard-0 terminal for the same reasons as the TCP-TLS plane;
+/// see [`install_client_tls_stream`] for the rustls non-serialisability
+/// argument and the TLS-family clause of invariant I5.
+#[allow(clippy::future_not_send)]
+pub fn install_client_wss_stream(
+    bus: &Rc<IggyMessageBus>,
+    client_id: u128,
+    stream: TcpStream,
+    config: Arc<rustls::ServerConfig>,
+    on_request: RequestHandler,
+) {
+    let cfg = bus.config();
+    if let Err(e) = apply_keepalive_for_connection(
+        &stream,
+        cfg.keepalive_idle,
+        cfg.keepalive_interval,
+        cfg.keepalive_retries,
+    ) {
+        warn!(
+            client = client_id,
+            "keepalive failed on accepted WSS client fd: {e}"
+        );
+    }
+    if let Err(e) = apply_nodelay_for_connection(&stream) {
+        warn!(
+            client = client_id,
+            "nodelay failed on accepted WSS client fd: {e}"
+        );
+    }
+    install_client_conn(
+        bus,
+        client_id,
+        WssTransportConn::new_server(stream, config),
         on_request,
     );
 }

@@ -32,8 +32,8 @@ use message_bus::auth::{StaticSharedSecret, TokenSource};
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica_listener::MessageHandler;
 use message_bus::{
-    AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedWsClientFn, IggyMessageBus,
-    fd_transfer, installer,
+    AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
+    AcceptedWsClientFn, AcceptedWssClientFn, IggyMessageBus, fd_transfer, installer,
 };
 use std::cell::Cell;
 use std::net::SocketAddr;
@@ -144,5 +144,43 @@ pub fn install_ws_clients_locally(
         let fd = fd_transfer::dup_fd(&stream).expect("dup_fd");
         drop(stream);
         bus.install_client_ws_fd(fd, client_id, on_request.clone());
+    })
+}
+
+/// Build an [`AcceptedTlsClientFn`] that mints a local client id and
+/// installs the accepted TCP-TLS stream directly on the given bus. The
+/// install path drives the rustls handshake on its own task, mirroring
+/// the production shard-0 coordinator.
+#[must_use]
+pub fn install_tls_clients_locally(
+    bus: Rc<IggyMessageBus>,
+    on_request: RequestHandler,
+) -> AcceptedTlsClientFn {
+    let counter: Rc<Cell<u128>> = Rc::new(Cell::new(1));
+    let shard_id = u128::from(bus.shard_id());
+    Rc::new(move |stream, config| {
+        let seq = counter.get();
+        counter.set(seq.wrapping_add(1));
+        let client_id = (shard_id << 112) | seq;
+        installer::install_client_tls_stream(&bus, client_id, stream, config, on_request.clone());
+    })
+}
+
+/// Build an [`AcceptedWssClientFn`] that mints a local client id and
+/// installs the accepted WSS stream directly on the given bus. The
+/// install path drives both the rustls handshake and the WS HTTP-Upgrade
+/// (with subprotocol enforcement) inside the transport's `run` body.
+#[must_use]
+pub fn install_wss_clients_locally(
+    bus: Rc<IggyMessageBus>,
+    on_request: RequestHandler,
+) -> AcceptedWssClientFn {
+    let counter: Rc<Cell<u128>> = Rc::new(Cell::new(1));
+    let shard_id = u128::from(bus.shard_id());
+    Rc::new(move |stream, config| {
+        let seq = counter.get();
+        counter.set(seq.wrapping_add(1));
+        let client_id = (shard_id << 112) | seq;
+        installer::install_client_wss_stream(&bus, client_id, stream, config, on_request.clone());
     })
 }

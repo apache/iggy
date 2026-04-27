@@ -83,7 +83,9 @@ pub mod auth_config;
 pub mod cache;
 pub mod client_listener;
 pub mod client_listener_quic;
+pub mod client_listener_tls;
 pub mod client_listener_ws;
+pub mod client_listener_wss;
 pub mod config;
 pub mod connector;
 mod error;
@@ -185,6 +187,47 @@ pub type AcceptedQuicClientFn = std::rc::Rc<
 /// preserves invariant I5 (fd-delegation is TCP-only) because the
 /// shipped fd is plain TCP at ship-time.
 pub type AcceptedWsClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream)>;
+
+/// Callback invoked on every accepted SDK TCP-TLS client connection.
+///
+/// Fires after shard 0's TCP-TLS listener accepts a raw TCP socket.
+/// Neither the rustls handshake nor any application-layer work has run
+/// yet — the listener stays cheap so a slow handshake on one peer cannot
+/// block subsequent accepts. The callback receives the raw stream plus
+/// a clone of the shared [`std::sync::Arc<rustls::ServerConfig>`] built
+/// at bind time, mints a `client_id`, and calls
+/// [`installer::install_client_tls_stream`]; the install path drives the
+/// rustls handshake on its own task before forwarding the connection to
+/// [`installer::install_client_conn`].
+///
+/// TCP-TLS stays shard-0 terminal (per `INVARIANTS.md` I5's TLS-family
+/// clause amended in P9-T13): the rustls `UnbufferedConnection` state
+/// machine is non-serialisable and tied to the local task, and the
+/// pre-handshake fd would have to re-handshake on the receiving shard,
+/// losing the point of fd-delegation.
+pub type AcceptedTlsClientFn =
+    std::rc::Rc<dyn Fn(compio::net::TcpStream, std::sync::Arc<rustls::ServerConfig>)>;
+
+/// Callback invoked on every accepted SDK WSS (WebSocket-over-TLS)
+/// client connection.
+///
+/// Fires after shard 0's WSS listener accepts a raw TCP socket. Neither
+/// the rustls handshake nor the WebSocket HTTP-Upgrade has run yet — the
+/// listener stays cheap so neither handshake on one peer can block
+/// subsequent accepts. The callback receives the raw stream plus a clone
+/// of the shared [`std::sync::Arc<rustls::ServerConfig>`] built at bind
+/// time, mints a `client_id`, and calls
+/// [`installer::install_client_wss_stream`]; the install path drives
+/// both handshakes on its own task before forwarding the connection to
+/// [`installer::install_client_conn`].
+///
+/// Subprotocol enforcement (`iggy.consensus.v1`) lives inside the `run`
+/// body of [`transports::wss::WssTransportConn`] — the in-tree HTTP
+/// upgrade dance returns HTTP 400 on missing or wrong
+/// `Sec-WebSocket-Protocol`. WSS stays shard-0 terminal for the same
+/// reasons as the TCP-TLS plane.
+pub type AcceptedWssClientFn =
+    std::rc::Rc<dyn Fn(compio::net::TcpStream, std::sync::Arc<rustls::ServerConfig>)>;
 
 /// Notifier fired when a delegated replica connection dies.
 ///
