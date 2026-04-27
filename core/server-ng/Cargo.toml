@@ -36,28 +36,20 @@ ignored = [
     "axum-server",
     "bytes",
     "chrono",
-    "clap",
-    "compio",
-    "configs",
     "ctrlc",
     "cyper",
     "cyper-axum",
     "dashmap",
-    "dotenvy",
     "err_trail",
     "error_set",
     "figlet-rs",
     "flume",
     "fs2",
-    "futures",
     "hash32",
     "human-repr",
     "hwlocality",
-    "iggy_binary_protocol",
-    "iggy_common",
     "jsonwebtoken",
     "left-right",
-    "metadata",
     "mimalloc",
     "mime_guess",
     "nix",
@@ -75,7 +67,6 @@ ignored = [
     "rust-embed",
     "rustls",
     "rustls-pemfile",
-    "secrecy",
     "send_wrapper",
     "serde",
     "slab",
@@ -83,8 +74,6 @@ ignored = [
     "strum",
     "sysinfo",
     "tempfile",
-    "thiserror",
-    "toml",
     "tower-http",
     "tracing-appender",
     "tracing-opentelemetry",
@@ -134,8 +123,8 @@ iggy_common = { workspace = true }
 journal = { workspace = true }
 jsonwebtoken = { workspace = true }
 left-right = { workspace = true }
-metadata = { workspace = true }
 message_bus = { workspace = true }
+metadata = { workspace = true }
 mimalloc = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
 nix = { workspace = true }
@@ -157,6 +146,8 @@ rustls-pemfile = { workspace = true }
 secrecy = { workspace = true }
 send_wrapper = { workspace = true }
 serde = { workspace = true }
+server = { workspace = true }
+shard = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true }
 strum = { workspace = true }
@@ -165,12 +156,9 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true }
-server = { workspace = true }
-shard = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
 uuid = { workspace = true }
 
