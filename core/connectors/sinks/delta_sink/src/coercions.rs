@@ -168,7 +168,9 @@ fn string_to_timestamp(string: &str, path: &str) -> Result<Value, String> {
         return Ok(Value::Number(ndt.and_utc().timestamp_micros().into()));
     }
 
-    Err(format!("field \"{path}\": cannot parse \"{string}\" as a timestamp"))
+    Err(format!(
+        "field \"{path}\": cannot parse \"{string}\" as a timestamp"
+    ))
 }
 
 #[cfg(test)]

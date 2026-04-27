@@ -39,7 +39,10 @@ pub(crate) fn build_storage_options(
                 .as_ref()
                 .ok_or_else(|| Error::InitError("S3 backend requires 'aws_s3_region'".into()))?;
 
-            opts.insert("AWS_ACCESS_KEY_ID".into(), access_key.expose_secret().to_owned());
+            opts.insert(
+                "AWS_ACCESS_KEY_ID".into(),
+                access_key.expose_secret().to_owned(),
+            );
             opts.insert(
                 "AWS_SECRET_ACCESS_KEY".into(),
                 secret_key.expose_secret().to_owned(),
