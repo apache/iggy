@@ -433,7 +433,12 @@ pub fn install_client_ws_stream(
     stream: compio_ws::WebSocketStream<TcpStream>,
     on_request: RequestHandler,
 ) {
-    install_client_conn(bus, client_id, WsTransportConn::new(stream), on_request);
+    install_client_conn(
+        bus,
+        client_id,
+        WsTransportConn::new_server(stream),
+        on_request,
+    );
 }
 
 /// Install a pre-wrapped client connection on the bus. Generic over
