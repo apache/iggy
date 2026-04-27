@@ -238,6 +238,21 @@ impl QuicTransportConn {
             streams,
         }
     }
+
+    /// Deconstruct into the raw `(Connection, (SendStream, RecvStream))`
+    /// tuple, mirror of [`Self::new`].
+    ///
+    /// `client_listener_quic::run` uses this to hand the
+    /// already-accepted connection + first bidi pair to
+    /// [`crate::installer::install_client_quic_conn`] (which then wraps
+    /// them in a fresh `QuicTransportConn` and dispatches via the
+    /// generic install path). [`TransportConn::into_split`] cannot be
+    /// used at that boundary because the install path needs the raw
+    /// tuple, not the split halves.
+    #[must_use]
+    pub fn into_parts(self) -> (Connection, (SendStream, RecvStream)) {
+        (self.connection, self.streams)
+    }
 }
 
 impl TransportConn for QuicTransportConn {

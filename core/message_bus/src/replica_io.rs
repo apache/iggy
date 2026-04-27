@@ -83,7 +83,7 @@ pub fn assert_listen_addrs_distinct(
             if let (Some(a), Some(b)) = (a, b)
                 && a == b
             {
-                panic!("listener address conflict: {a_name} and {b_name} both bind to {a}",);
+                panic!("listener address conflict: {a_name} and {b_name} both bind to {a}");
             }
         }
     }
