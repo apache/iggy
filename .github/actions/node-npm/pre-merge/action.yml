@@ -92,8 +92,13 @@ runs:
       id: iggy
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
+      with:
+        # Node e2e asserts full cluster metadata (2 nodes from
+        # config.toml's [[cluster.nodes]] list), so cluster mode must be
+        # on. --replica-id picks the current node out of that list.
+        replica-id: "0"
       env:
-        IGGY_CLUSTER_ENABLED: true
+        IGGY_CLUSTER_ENABLED: "true"
 
     - name: E2E tests
       if: inputs.task == 'e2e'

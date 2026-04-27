@@ -448,8 +448,7 @@ impl IggyMessagesBatchMut {
         &self,
         absolute_start_offset: u64,
     ) -> Result<(), IggyError> {
-        let mut current_offset = absolute_start_offset;
-        for message in self.iter() {
+        for (current_offset, message) in (absolute_start_offset..).zip(self.iter()) {
             let calculated_checksum = message.calculate_checksum();
             let actual_checksum = message.header().checksum();
             let offset = message.header().offset();
@@ -463,7 +462,6 @@ impl IggyMessagesBatchMut {
                     offset,
                 ));
             }
-            current_offset += 1;
         }
         Ok(())
     }

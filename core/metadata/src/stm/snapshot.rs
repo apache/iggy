@@ -296,8 +296,8 @@ macro_rules! impl_fill_restore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stm::stream::{StatsSnapshot, StreamSnapshot};
-    use iggy_common::IggyTimestamp;
+    use crate::stm::stream::{PartitionSnapshot, StatsSnapshot, StreamSnapshot, TopicSnapshot};
+    use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
 
     #[test]
     fn test_metadata_snapshot_roundtrip() {
@@ -329,7 +329,29 @@ mod tests {
                         messages_count: 50,
                         segments_count: 2,
                     },
-                    topics: vec![],
+                    topics: vec![(
+                        0,
+                        TopicSnapshot {
+                            id: 0,
+                            name: "topic".to_string(),
+                            created_at: ts,
+                            replication_factor: 1,
+                            message_expiry: IggyExpiry::default(),
+                            compression_algorithm: CompressionAlgorithm::default(),
+                            max_topic_size: MaxTopicSize::default(),
+                            stats: StatsSnapshot {
+                                size_bytes: 256,
+                                messages_count: 12,
+                                segments_count: 1,
+                            },
+                            partitions: vec![PartitionSnapshot {
+                                id: 0,
+                                consensus_group_id: 33,
+                                created_at: ts,
+                            }],
+                            round_robin_counter: 0,
+                        },
+                    )],
                 },
             )],
         });
@@ -351,7 +373,10 @@ mod tests {
         assert_eq!(stream.stats.size_bytes, 1024);
         assert_eq!(stream.stats.messages_count, 50);
         assert_eq!(stream.stats.segments_count, 2);
-        assert_eq!(stream.topics.len(), 0);
+        assert_eq!(stream.topics.len(), 1);
+        let (_, topic) = &stream.topics[0];
+        assert_eq!(topic.partitions.len(), 1);
+        assert_eq!(topic.partitions[0].consensus_group_id, 33);
     }
 
     #[test]

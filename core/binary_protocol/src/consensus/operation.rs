@@ -22,8 +22,19 @@ use bytemuck::{CheckedBitPattern, NoUninit};
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, NoUninit, CheckedBitPattern)]
 #[repr(u8)]
 pub enum Operation {
+    /// The value 0 is reserved to prevent a spurious zero from being
+    /// interpreted as a valid operation.
     #[default]
     Reserved = 0,
+
+    /// Register a client session with the cluster. Goes through the same
+    /// consensus pipeline (prepare/replicate/commit) as normal operations
+    /// but skips state machine dispatch at commit time, the metadata
+    /// plane calls `commit_register` directly. Session number = commit op.
+    Register = 1,
+    // Internal metadata operations (journal / replica-only)
+    CreateTopicWithAssignments = 64,
+    CreatePartitionsWithAssignments = 65,
 
     // Metadata operations (shard 0)
     CreateStream = 128,
@@ -57,10 +68,25 @@ pub enum Operation {
 }
 
 impl Operation {
+    pub const INTERNAL_START: u8 = Self::CreateTopicWithAssignments as u8;
+    pub const METADATA_START: u8 = Self::CreateStream as u8;
+    pub const PARTITION_START: u8 = Self::SendMessages as u8;
+
+    /// Internal-only operations reserved for replica / journal use.
+    #[must_use]
+    #[inline]
+    pub const fn is_internal(&self) -> bool {
+        (*self as u8) >= Self::INTERNAL_START && (*self as u8) < Self::METADATA_START
+    }
+
     /// Metadata / control-plane operations handled by shard 0.
     #[must_use]
     #[inline]
     pub const fn is_metadata(&self) -> bool {
+        if self.is_internal() {
+            return true;
+        }
+
         matches!(
             self,
             Self::CreateStream
@@ -85,17 +111,26 @@ impl Operation {
         )
     }
 
+    /// VSR protocol-level operations that go through consensus but skip
+    /// state machine dispatch at commit time.
+    #[must_use]
+    #[inline]
+    pub const fn is_vsr_reserved(&self) -> bool {
+        matches!(self, Self::Reserved | Self::Register)
+    }
+
     /// Data-plane operations routed to the shard owning the partition.
     #[must_use]
     #[inline]
     pub const fn is_partition(&self) -> bool {
-        matches!(
-            self,
-            Self::SendMessages
-                | Self::StoreConsumerOffset
-                | Self::DeleteConsumerOffset
-                | Self::DeleteSegments
-        )
+        matches!(self, Self::DeleteSegments) || (*self as u8) >= Self::PARTITION_START
+    }
+
+    /// Operations clients are allowed to send directly.
+    #[must_use]
+    #[inline]
+    pub const fn is_client_allowed(&self) -> bool {
+        !matches!(self, Self::Reserved) && !self.is_internal()
     }
 
     /// Bidirectional mapping: `Operation` -> client command code.
@@ -104,7 +139,10 @@ impl Operation {
     #[must_use]
     pub const fn to_command_code(&self) -> Option<u32> {
         match self {
-            Self::Reserved => None,
+            Self::Reserved
+            | Self::Register
+            | Self::CreateTopicWithAssignments
+            | Self::CreatePartitionsWithAssignments => None,
             Self::CreateStream
             | Self::UpdateStream
             | Self::DeleteStream
@@ -188,8 +226,27 @@ mod tests {
     }
 
     #[test]
-    fn reserved_has_no_code() {
+    fn vsr_reserved_have_no_code() {
         assert_eq!(Operation::Reserved.to_command_code(), None);
+        assert_eq!(Operation::Register.to_command_code(), None);
+    }
+
+    #[test]
+    fn vsr_reserved_classification() {
+        assert!(Operation::Reserved.is_vsr_reserved());
+        assert!(Operation::Register.is_vsr_reserved());
+        assert!(!Operation::CreateStream.is_vsr_reserved());
+        assert!(!Operation::SendMessages.is_vsr_reserved());
+        assert!(!Operation::Register.is_metadata());
+        assert!(!Operation::Register.is_partition());
+        assert_eq!(
+            Operation::CreateTopicWithAssignments.to_command_code(),
+            None
+        );
+        assert_eq!(
+            Operation::CreatePartitionsWithAssignments.to_command_code(),
+            None
+        );
     }
 
     #[test]
@@ -203,8 +260,12 @@ mod tests {
 
     #[test]
     fn metadata_vs_partition() {
+        assert!(Operation::CreateTopicWithAssignments.is_internal());
+        assert!(Operation::CreateTopicWithAssignments.is_metadata());
+        assert!(!Operation::CreateTopicWithAssignments.is_client_allowed());
         assert!(Operation::CreateStream.is_metadata());
         assert!(!Operation::CreateStream.is_partition());
+        assert!(Operation::CreateStream.is_client_allowed());
         assert!(Operation::SendMessages.is_partition());
         assert!(!Operation::SendMessages.is_metadata());
         assert!(Operation::DeleteSegments.is_partition());
