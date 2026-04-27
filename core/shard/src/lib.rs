@@ -199,6 +199,15 @@ pub enum ShardFramePayload {
     /// owning shard. The receiving shard wraps the fd and installs client
     /// reader / writer tasks locally. The owning shard is encoded in the top
     /// 16 bits of `client_id`.
+    ///
+    /// QUIC + WS clients deliberately do NOT get an analog variant: the
+    /// inter-shard channel requires `Send` payloads, and `compio_quic::
+    /// Connection` / `compio_ws::WebSocketStream<TcpStream>` are both
+    /// `!Send` (they hold compio `Rc<...>` driver state). Shard 0
+    /// therefore terminates QUIC + WS locally and uses the existing
+    /// `ForwardClientSend` / `Consensus` variants for outbound + inbound
+    /// traffic respectively. See `core/message_bus/CLAUDE.md` plane
+    /// split section.
     ClientConnectionSetup { fd: DupedFd, client_id: u128 },
     /// Shard 0 broadcasts the owner for a replica to every shard so each
     /// bus' `send_to_replica` slow path can route through the correct owner.

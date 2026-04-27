@@ -29,6 +29,8 @@ use crate::fd_transfer::{self, DupedFd};
 use crate::lifecycle::{InstanceToken, RejectedRegistration, Shutdown};
 use crate::replica_listener::MessageHandler;
 use crate::socket_opts::{apply_keepalive_for_connection, apply_nodelay_for_connection};
+use crate::transports::quic::QuicTransportConn;
+use crate::transports::ws::WsTransportConn;
 use crate::transports::{TcpTransportConn, TransportConn, TransportReader};
 use crate::{IggyMessageBus, lifecycle::ShutdownToken};
 use compio::net::TcpStream;
@@ -316,6 +318,62 @@ pub fn install_client_stream(
         );
     }
     install_client_conn(bus, client_id, TcpTransportConn::new(stream), on_request);
+}
+
+/// QUIC entry point for client installs.
+///
+/// Wraps the [`compio_quic::Connection`] and its first bidirectional
+/// `(SendStream, RecvStream)` pair (already accepted by shard 0 via
+/// `Connection::accept_bi().await` so the install path never
+/// re-handshakes) in a [`QuicTransportConn`] and delegates to the
+/// existing generic [`install_client_conn`].
+///
+/// No socket-options analog runs here: QUIC keepalive lives in
+/// [`compio_quic::TransportConfig::keep_alive_interval`] set at endpoint
+/// construction time. The connection is encrypted end-to-end and there
+/// is no plaintext fd to dup, which is why this never crosses an
+/// inter-shard channel: shard 0 owns the QUIC `Endpoint`, terminates
+/// every connection locally, and uses the existing
+/// `ForwardClientSend` / `Consensus` shard-frame variants for outbound
+/// + inbound traffic respectively.
+#[allow(clippy::future_not_send)]
+pub fn install_client_quic_conn(
+    bus: &Rc<IggyMessageBus>,
+    client_id: u128,
+    connection: compio_quic::Connection,
+    streams: (compio_quic::SendStream, compio_quic::RecvStream),
+    on_request: RequestHandler,
+) {
+    install_client_conn(
+        bus,
+        client_id,
+        QuicTransportConn::new(connection, streams),
+        on_request,
+    );
+}
+
+/// WebSocket entry point for client installs.
+///
+/// Wraps a post-upgrade [`compio_ws::WebSocketStream`] in a
+/// [`WsTransportConn`] and delegates to the existing generic
+/// [`install_client_conn`]. The HTTP-Upgrade handshake has already been
+/// driven on shard 0; the install path never re-runs it.
+///
+/// Like QUIC, this never crosses an inter-shard channel:
+/// `WebSocketStream<TcpStream>` is `!Send` (it holds compio `Rc<...>`
+/// driver state) so shard 0 terminates locally and uses the existing
+/// `ForwardClientSend` / `Consensus` variants. The post-upgrade socket
+/// IS still a raw TCP fd, but compio-ws has no "rebuild from fd" API
+/// and re-attaching the tungstenite state machine across shards would
+/// lose protocol invariants the dispatcher already enforced.
+#[allow(clippy::future_not_send)]
+pub fn install_client_ws_stream(
+    bus: &Rc<IggyMessageBus>,
+    client_id: u128,
+    stream: compio_ws::WebSocketStream<TcpStream>,
+    on_request: RequestHandler,
+) {
+    install_client_conn(bus, client_id, WsTransportConn::new(stream), on_request);
 }
 
 /// Install a pre-wrapped client connection on the bus. Generic over
