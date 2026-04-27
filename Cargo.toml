@@ -119,6 +119,7 @@ compio-buf = "0.8.1"
 # Pin compio-driver >= 0.11.2 to fix musl compilation (compio-rs/compio#668)
 compio-driver = "0.11.4"
 compio-quic = "=0.7.2"
+compio-ws = "=0.3.1"
 configs = { path = "core/configs", version = "0.1.0" }
 configs_derive = { path = "core/configs_derive", version = "0.1.0" }
 consensus = { path = "core/consensus" }

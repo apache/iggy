@@ -7010,8 +7010,10 @@ version = "0.1.0"
 dependencies = [
  "async-channel",
  "blake3",
+ "bytes",
  "compio",
  "compio-quic",
+ "compio-ws",
  "futures",
  "iggy_binary_protocol",
  "iggy_common",
@@ -7023,6 +7025,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "tungstenite 0.28.0",
 ]
 
 [[package]]
