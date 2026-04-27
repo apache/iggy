@@ -87,6 +87,7 @@ use async_channel::{Receiver, Sender, bounded};
 use bytes::Bytes;
 use compio::BufResult;
 use compio::buf::IntoInner;
+use compio::driver::{SharedFd, ToSharedFd};
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::{OwnedReadHalf, OwnedWriteHalf, TcpListener, TcpStream};
 use compio_ws::WebSocketStream;
@@ -96,6 +97,7 @@ use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_binary_protocol::{GenericHeader, Message};
 use std::io::{self, BufRead, Cursor};
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use tracing::{debug, warn};
 use tungstenite::protocol::frame::FrameHeader;
@@ -243,7 +245,16 @@ impl TransportConn for WsTransportConn {
             _ => Vec::new(),
         };
         let tcp = sync_stream.into_inner();
+        let shared_fd = tcp.to_shared_fd();
         let (read_half, write_half) = tcp.into_split();
+
+        // Watchdog: when the WS-internal token fires, wake the reader's
+        // parked io_uring read SQE via `libc::shutdown(SHUT_RD)`. The
+        // reader has no `select!` over its TCP read (I14); the in-flight
+        // read returns `Ok(0)` naturally. On a natural-EOF run the
+        // watchdog stays parked until the bus-wide token ultimately fires
+        // (matches the bridge task pattern just above).
+        spawn_shutdown_watchdog(shared_fd, shutdown_token_reader.clone());
 
         let role = self.role;
         let reader_shutdown = Rc::clone(&shutdown);
@@ -253,7 +264,6 @@ impl TransportConn for WsTransportConn {
             ctx.in_tx,
             control_tx,
             reader_shutdown,
-            shutdown_token_reader,
             role,
         ));
         let writer_shutdown = Rc::clone(&shutdown);
@@ -269,6 +279,34 @@ impl TransportConn for WsTransportConn {
         let _ = reader_handle.await;
         let _ = writer_handle.await;
     }
+}
+
+/// Spawn a detached watchdog that calls `libc::shutdown(fd, SHUT_RD)`
+/// when `shutdown_token` fires. Wakes the reader's parked `io_uring`
+/// read SQE without `select!`-ing over the read itself (I14). On a
+/// natural-EOF run the watchdog stays parked until the bus-wide token
+/// ultimately fires; the resulting `libc::shutdown` on a closed socket
+/// is benign (returns ENOTCONN). Mirrors the
+/// [`super::tls::driver::shutdown`] pattern.
+#[allow(clippy::future_not_send)]
+fn spawn_shutdown_watchdog(shared_fd: SharedFd<socket2::Socket>, shutdown_token: ShutdownToken) {
+    compio::runtime::spawn(async move {
+        shutdown_token.wait().await;
+        // SAFETY: `shared_fd` is a refcounted clone obtained from the
+        // still-live `TcpStream` before `into_split`; the matching
+        // clones in both owned halves keep the kernel fd open. The
+        // watchdog's clone independently keeps it open across this
+        // syscall.
+        let raw_fd = shared_fd.as_raw_fd();
+        let rc = unsafe { libc::shutdown(raw_fd, libc::SHUT_RD) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ENOTCONN) {
+                debug!(error = ?err, "WS watchdog: SHUT_RD returned");
+            }
+        }
+    })
+    .detach();
 }
 
 /// Reader -> writer signal: outstanding control work the writer must
@@ -425,7 +463,6 @@ async fn reader_task(
     in_tx: Sender<Message<GenericHeader>>,
     control_tx: Sender<ControlFrame>,
     shutdown: Rc<Shutdown>,
-    shutdown_token: ShutdownToken,
     role: Role,
 ) {
     let mut accumulator: Vec<u8> = initial;
@@ -475,21 +512,15 @@ async fn reader_task(
             }
         }
 
-        // Need more bytes. Race the read against the shutdown token so a
-        // peer that goes silent does not pin the task across graceful
-        // shutdown. compio TcpStream reads use IoBuf; cancellation
-        // (drop of the future) is supported and leaks the buffer until
-        // the kernel completes the SQE.
+        // No `select!` over a TCP read on a still-alive connection
+        // (I14). Cooperative shutdown comes from the watchdog spawned in
+        // `run`, which calls `libc::shutdown(SHUT_RD)` on token fire and
+        // makes this read return `Ok(0)` naturally. compio io_uring
+        // reads are NOT cancel-safe under future drop, so a `select!`
+        // here would risk losing kernel-already-DMA'd bytes if any
+        // sibling arm fired in steady state.
         let buf: Vec<u8> = Vec::with_capacity(READ_FILL_CHUNK);
-        let read_fut = read_half.read(buf);
-        let outcome = futures::select_biased! {
-            () = shutdown_token.wait().fuse() => {
-                debug!("WS reader: shutdown observed during fill, exiting");
-                return;
-            }
-            BufResult(result, buf) = read_fut.fuse() => (result, buf),
-        };
-        let (result, buf) = outcome;
+        let BufResult(result, buf) = read_half.read(buf).await;
         match result {
             Ok(0) => {
                 debug!("WS reader: TCP EOF");
