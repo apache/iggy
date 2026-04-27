@@ -7899,6 +7899,7 @@ dependencies = [
  "rand 0.10.1",
  "rcgen",
  "rustls",
+ "rustls-pemfile",
  "socket2 0.6.3",
  "tempfile",
  "thiserror 2.0.18",

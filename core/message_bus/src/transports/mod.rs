@@ -67,6 +67,7 @@
 
 pub mod quic;
 pub mod tcp;
+pub mod tls;
 pub mod ws;
 
 // Only `Conn` and `Writer` have crate-internal callers today

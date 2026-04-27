@@ -41,6 +41,7 @@ iggy_common = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
 rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 socket2 = { workspace = true, features = ["all"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
