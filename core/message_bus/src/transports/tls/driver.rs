@@ -94,7 +94,7 @@ use tracing::warn;
 
 /// `JoinHandle` returned for both reader and writer tasks. Aliased so
 /// the `spawn_tasks` and `TlsConnHandles` signatures stay readable.
-pub(super) type TaskHandle = JoinHandle<Result<(), DriveError>>;
+pub(in crate::transports) type TaskHandle = JoinHandle<Result<(), DriveError>>;
 
 /// Maximum TLS-record overhead per direction.
 ///
@@ -104,7 +104,7 @@ pub(super) type TaskHandle = JoinHandle<Result<(), DriveError>>;
 /// overhead, totalling ~88 KiB. 128 KiB rounds up with margin for any
 /// concurrent handshake-layer record (`KeyUpdate` request / response,
 /// alert) buffered alongside an in-flight application frame.
-pub(super) const TLS_RECORD_HEADROOM: usize = 128 * 1024;
+pub(in crate::transports) const TLS_RECORD_HEADROOM: usize = 128 * 1024;
 
 /// Capacity bound for `incoming_tls` and `outgoing_tls` per direction.
 ///
@@ -114,7 +114,7 @@ pub(super) const TLS_RECORD_HEADROOM: usize = 128 * 1024;
 /// encrypted form of one in-flight [`MAX_MESSAGE_SIZE`] application
 /// frame plus the per-record overhead captured by
 /// [`TLS_RECORD_HEADROOM`].
-pub(super) const TLS_BUFFER_CAP: usize = MAX_MESSAGE_SIZE + TLS_RECORD_HEADROOM;
+pub(in crate::transports) const TLS_BUFFER_CAP: usize = MAX_MESSAGE_SIZE + TLS_RECORD_HEADROOM;
 
 /// Read chunk size for ciphertext I/O during the handshake.
 ///
@@ -160,7 +160,7 @@ const ENCODE_GROW_HINT: usize = 2 * 1024;
 /// Variants name the rustls subsystem that produced the error so
 /// integration tests can assert on specific failure modes.
 #[derive(Debug, thiserror::Error)]
-pub(super) enum DriveError {
+pub(in crate::transports) enum DriveError {
     /// The peer's TLS implementation rejected our handshake or sent
     /// malformed records. Wraps the original `rustls::Error`.
     #[error("rustls: {0}")]
@@ -231,7 +231,7 @@ pub(super) enum DriveError {
 /// their inner `UnbufferedConnectionCommon`. We dispatch on the
 /// variant in a single helper ([`process_step`]) so the per-state
 /// match logic stays shared.
-pub(super) enum UnbufferedConnection {
+pub(in crate::transports) enum UnbufferedConnection {
     Server(UnbufferedServerConnection),
     Client(UnbufferedClientConnection),
 }
@@ -244,19 +244,19 @@ pub(super) enum UnbufferedConnection {
 /// signatures: [`flush_outgoing`] takes `&TlsState`, not a held
 /// borrow, and the caller may never hold `outgoing_tls.borrow_mut()`
 /// across the await inside it.
-pub(super) struct TlsState {
-    pub(super) conn: RefCell<UnbufferedConnection>,
-    pub(super) incoming_tls: RefCell<Vec<u8>>,
-    pub(super) outgoing_tls: RefCell<Vec<u8>>,
+pub(in crate::transports) struct TlsState {
+    pub(in crate::transports) conn: RefCell<UnbufferedConnection>,
+    pub(in crate::transports) incoming_tls: RefCell<Vec<u8>>,
+    pub(in crate::transports) outgoing_tls: RefCell<Vec<u8>>,
     /// Set by the reader once it observes `ConnectionState::PeerClosed`
     /// or `ConnectionState::Closed`. Reader exits the next loop
     /// iteration; writer drains its own queue then sends our
     /// `close_notify` (per shutdown-protocol design doc).
-    pub(super) peer_closed: Cell<bool>,
+    pub(in crate::transports) peer_closed: Cell<bool>,
     /// Set by the orchestrator's shutdown helper before signalling the
     /// halves. Causes the reader to exit on the next iteration even
     /// if no peer EOF arrives.
-    pub(super) shutdown: Cell<bool>,
+    pub(in crate::transports) shutdown: Cell<bool>,
 }
 
 impl TlsState {
@@ -276,8 +276,8 @@ impl TlsState {
 /// `Clone` is `Rc`-cheap; the handshake driver and the future
 /// reader / writer tasks all hold their own clone.
 #[derive(Clone)]
-pub(super) struct TlsDriver {
-    pub(super) state: Rc<TlsState>,
+pub(in crate::transports) struct TlsDriver {
+    pub(in crate::transports) state: Rc<TlsState>,
 }
 
 impl TlsDriver {
@@ -287,7 +287,9 @@ impl TlsDriver {
     ///
     /// Returns [`DriveError::Rustls`] if rustls rejects the config
     /// (e.g. no resolver, no cipher suites, etc.).
-    pub(super) fn new_server(config: Arc<rustls::ServerConfig>) -> Result<Self, DriveError> {
+    pub(in crate::transports) fn new_server(
+        config: Arc<rustls::ServerConfig>,
+    ) -> Result<Self, DriveError> {
         let conn = UnbufferedServerConnection::new(config)?;
         Ok(Self {
             state: Rc::new(TlsState::new(UnbufferedConnection::Server(conn))),
@@ -301,7 +303,7 @@ impl TlsDriver {
     ///
     /// Returns [`DriveError::Rustls`] if rustls rejects the config or
     /// server name.
-    pub(super) fn new_client(
+    pub(in crate::transports) fn new_client(
         config: Arc<rustls::ClientConfig>,
         server_name: ServerName<'static>,
     ) -> Result<Self, DriveError> {
@@ -331,7 +333,7 @@ impl TlsDriver {
     /// - [`DriveError::Rustls`], [`DriveError::Encode`], or
     ///   [`DriveError::Io`] for record-layer / I/O faults.
     #[allow(clippy::future_not_send)] // single-threaded compio runtime
-    pub(super) async fn drive_handshake(
+    pub(in crate::transports) async fn drive_handshake(
         &self,
         read_half: &mut OwnedReadHalf<TcpStream>,
         write_half: &mut OwnedWriteHalf<TcpStream>,
@@ -454,7 +456,7 @@ impl TlsDriver {
     /// Returns the two `JoinHandle`s so the orchestrator can install
     /// them on a [`TlsConnHandles`] alongside the captured `RawFd` and
     /// the `Sender` clone it retained.
-    pub(super) fn spawn_tasks(
+    pub(in crate::transports) fn spawn_tasks(
         self,
         read_half: OwnedReadHalf<TcpStream>,
         write_half: OwnedWriteHalf<TcpStream>,
@@ -637,7 +639,7 @@ async fn flush_outgoing(
 /// the writer body free of `select!`: closing the channel (orchestrator
 /// drops its [`Sender`] and reader drops its clone on exit) is the sole
 /// cooperative-shutdown signal.
-pub(super) enum WriterEvent {
+pub(in crate::transports) enum WriterEvent {
     /// Outbound application-layer message to encrypt and send.
     Out(Frozen<MESSAGE_ALIGN>),
     /// Reader signalled `outgoing_tls` has bytes to flush — handshake
@@ -664,7 +666,7 @@ pub(super) enum WriterEvent {
 /// cooperative-shutdown wakeup latency once the orchestrator also
 /// drops its clone.
 #[allow(clippy::future_not_send)] // single-threaded compio runtime
-pub(super) async fn reader_task(
+pub(in crate::transports) async fn reader_task(
     mut read_half: OwnedReadHalf<TcpStream>,
     in_tx: Sender<Message<GenericHeader>>,
     state: Rc<TlsState>,
@@ -731,7 +733,7 @@ pub(super) async fn reader_task(
 /// No `select!`. Each step is sequential; `RefCell` borrows are
 /// confined to synchronous helpers.
 #[allow(clippy::future_not_send)] // single-threaded compio runtime
-pub(super) async fn writer_task(
+pub(in crate::transports) async fn writer_task(
     mut write_half: OwnedWriteHalf<TcpStream>,
     rx: Receiver<WriterEvent>,
     state: Rc<TlsState>,
@@ -1120,11 +1122,11 @@ fn try_take_frame(plaintext: &mut Vec<u8>) -> Result<Option<Message<GenericHeade
 /// (`RawFd` is `Copy`, no ownership tangle) and is the only mechanism to
 /// wake a reader blocked on `read.await` without reaching into the
 /// task's owned read half.
-pub(super) struct TlsConnHandles {
-    pub(super) reader: TaskHandle,
-    pub(super) writer: TaskHandle,
-    pub(super) writer_tx: Sender<WriterEvent>,
-    pub(super) raw_fd: RawFd,
+pub(in crate::transports) struct TlsConnHandles {
+    pub(in crate::transports) reader: TaskHandle,
+    pub(in crate::transports) writer: TaskHandle,
+    pub(in crate::transports) writer_tx: Sender<WriterEvent>,
+    pub(in crate::transports) raw_fd: RawFd,
 }
 
 /// Cooperative shutdown of a `(reader, writer)` task pair.
@@ -1153,7 +1155,7 @@ pub(super) struct TlsConnHandles {
 /// kernel fd alive). Both `JoinHandle`s are still live at call time,
 /// so at least one half — and therefore the fd — survives.
 #[allow(clippy::future_not_send)] // single-threaded compio runtime
-pub(super) async fn shutdown(handles: TlsConnHandles, drain_budget: Duration) {
+pub(in crate::transports) async fn shutdown(handles: TlsConnHandles, drain_budget: Duration) {
     // Step 1: wake reader.
     // SAFETY: `raw_fd` was captured from a still-live `TcpStream`
     // before `into_split`. The `SharedFd` in both owned halves keeps

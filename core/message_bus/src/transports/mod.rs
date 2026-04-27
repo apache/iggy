@@ -61,6 +61,7 @@
 
 pub mod quic;
 pub mod tcp;
+pub mod tcp_tls;
 pub mod tls;
 pub mod ws;
 

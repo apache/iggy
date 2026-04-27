@@ -41,10 +41,18 @@
 //!   (P9-T2.5 shutdown sequence)
 
 // P9-T2b: handshake driver + steady-state reader/writer + cooperative
-// shutdown helper. Transport-level consumers (TCP-TLS, WSS) land in
-// P9-T7 / P9-T8; suppress dead_code on the module until then.
-#[allow(dead_code)]
+// shutdown helper. P9-T7 (TCP-TLS) consumes the surface re-exported
+// below; P9-T8 (WSS) layers on top.
 pub(super) mod driver;
+
+// Re-export the driver's transport-private surface at the `tls`
+// module so sibling transports (`tcp_tls`, upcoming `wss`) can name
+// them without reaching into `tls::driver` directly. Items are scoped
+// to `crate::transports` at their declaration sites; the re-export
+// matches that scope.
+pub(in crate::transports) use driver::{
+    DriveError, TlsConnHandles, TlsDriver, WriterEvent, shutdown,
+};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::{self, BufReader};
