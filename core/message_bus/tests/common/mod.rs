@@ -27,11 +27,13 @@
 #![allow(dead_code)] // each test binary uses a subset
 
 use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, Message};
+use message_bus::ConnectionInstaller;
 use message_bus::auth::{StaticSharedSecret, TokenSource};
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica_listener::MessageHandler;
 use message_bus::{
-    AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, IggyMessageBus, installer,
+    AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedWsClientFn, IggyMessageBus,
+    fd_transfer, installer,
 };
 use std::cell::Cell;
 use std::net::SocketAddr;
@@ -118,5 +120,29 @@ pub fn install_quic_clients_locally(
             streams,
             on_request.clone(),
         );
+    })
+}
+
+/// Build an [`AcceptedWsClientFn`] that mints a local client id, dups
+/// the accepted fd (mirroring the production cross-shard fd-ship
+/// path), and hands it to [`ConnectionInstaller::install_client_ws_fd`]
+/// on the given bus. Single-shard tests bypass the inter-shard
+/// channel by dup'ing locally; the install path runs `accept_hdr_async`,
+/// the subprotocol callback, and `install_client_ws_stream` exactly as
+/// the production owning-shard router would.
+#[must_use]
+pub fn install_ws_clients_locally(
+    bus: Rc<IggyMessageBus>,
+    on_request: RequestHandler,
+) -> AcceptedWsClientFn {
+    let counter: Rc<Cell<u128>> = Rc::new(Cell::new(1));
+    let shard_id = u128::from(bus.shard_id());
+    Rc::new(move |stream| {
+        let seq = counter.get();
+        counter.set(seq.wrapping_add(1));
+        let client_id = (shard_id << 112) | seq;
+        let fd = fd_transfer::dup_fd(&stream).expect("dup_fd");
+        drop(stream);
+        bus.install_client_ws_fd(fd, client_id, on_request.clone());
     })
 }

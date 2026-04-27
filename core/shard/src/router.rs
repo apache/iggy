@@ -317,6 +317,16 @@ where
                 self.bus
                     .install_client_fd(fd, client_id, self.on_client_request.clone());
             }
+            crate::ShardFramePayload::ClientWsConnectionSetup { fd, client_id } => {
+                tracing::info!(
+                    shard = self.id,
+                    client_id,
+                    raw_fd = fd.as_raw_fd(),
+                    "installing delegated WS client fd (pre-upgrade)"
+                );
+                self.bus
+                    .install_client_ws_fd(fd, client_id, self.on_client_request.clone());
+            }
             crate::ShardFramePayload::ReplicaMappingUpdate {
                 replica_id,
                 owning_shard,
