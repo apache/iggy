@@ -229,6 +229,38 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
         Ok(client_id)
     }
 
+    /// Ship a WebSocket client's pre-upgrade TCP connection to the next
+    /// round-robin target shard.
+    ///
+    /// Identical wire path to [`Self::delegate_client`] but ships
+    /// [`ShardFramePayload::ClientWsConnectionSetup`] so the receiving
+    /// shard runs `compio_ws::accept_hdr_async` (HTTP-Upgrade +
+    /// `iggy.consensus.v1` subprotocol enforcement) before installing
+    /// the connection. The fd at ship-time is plain TCP; the WS state
+    /// machine only materialises post-upgrade on the owning shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `dup(2)` fails or the target shard's inbox
+    /// refuses the setup frame.
+    pub fn delegate_ws_client(&self, stream: TcpStream) -> Result<u128, SendError> {
+        let target = self.next_client_target();
+        let client_id = self.mint_client_id(target);
+
+        let fd = fd_transfer::dup_fd(&stream).map_err(SendError::DupFailed)?;
+        let setup = ShardFramePayload::ClientWsConnectionSetup { fd, client_id };
+        if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
+            warn!(
+                client_id,
+                target, "delegate_ws_client try_send failed: {e:?}"
+            );
+            return Err(SendError::RoutingFailed(target));
+        }
+
+        drop(stream);
+        Ok(client_id)
+    }
+
     /// Broadcast a `ReplicaMappingClear` to every shard. Used by the
     /// `ConnectionLost` handler before the next `delegate_replica` runs.
     pub fn broadcast_mapping_clear(&self, replica_id: u8) {

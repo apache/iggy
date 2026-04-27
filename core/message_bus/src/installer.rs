@@ -62,6 +62,15 @@ pub trait ConnectionInstaller {
     /// encoded in the top 16 bits of `client_id`.
     fn install_client_fd(&self, fd: DupedFd, client_id: u128, on_request: RequestHandler);
 
+    /// Same for an SDK WebSocket client's pre-upgrade TCP fd. The
+    /// receiving shard wraps the fd, runs `compio_ws::accept_hdr_async`
+    /// with the iggy.consensus.v1 subprotocol callback to drive the
+    /// HTTP-Upgrade handshake, then installs WS reader / writer tasks
+    /// via [`install_client_ws_stream`] on success. On handshake
+    /// failure (e.g. wrong / missing subprotocol) the fd is closed by
+    /// dropping the wrapping `TcpStream`.
+    fn install_client_ws_fd(&self, fd: DupedFd, client_id: u128, on_request: RequestHandler);
+
     /// Update the replica -> owning shard mapping used by the `send_to_replica`
     /// slow path on non-owning shards.
     fn set_shard_mapping(&self, replica: u8, owning_shard: u16);
@@ -82,6 +91,24 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
         install_client_stream(self, client_id, stream, on_request);
     }
 
+    fn install_client_ws_fd(&self, fd: DupedFd, client_id: u128, on_request: RequestHandler) {
+        let stream = fd_transfer::wrap_duped_fd(fd);
+        let bus = Self::clone(self);
+        let handle = compio::runtime::spawn(async move {
+            match compio_ws::accept_hdr_async(stream, ws_subprotocol_callback).await {
+                Ok(ws) => {
+                    if !bus.is_shutting_down() {
+                        install_client_ws_stream(&bus, client_id, ws, on_request);
+                    }
+                }
+                Err(e) => {
+                    warn!(client_id, "WS upgrade failed: {e}");
+                }
+            }
+        });
+        self.track_background(handle);
+    }
+
     fn set_shard_mapping(&self, replica: u8, owning_shard: u16) {
         IggyMessageBus::set_shard_mapping(self, replica, owning_shard);
     }
@@ -89,6 +116,39 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
     fn remove_shard_mapping(&self, replica: u8) {
         IggyMessageBus::remove_shard_mapping(self, replica);
     }
+}
+
+/// HTTP-Upgrade callback for the WS client plane.
+///
+/// Inspects `Sec-WebSocket-Protocol`. Accepts only the exact value
+/// [`crate::transports::ws::WS_SUBPROTOCOL`] (`iggy.consensus.v1`); any
+/// other value (or absence) yields HTTP 400 with a body naming the
+/// expected subprotocol. The accepted value is mirrored back on the
+/// response so the negotiated subprotocol is unambiguous to the
+/// client.
+#[allow(clippy::result_large_err)] // tungstenite-defined Callback signature; not on hot path
+fn ws_subprotocol_callback(
+    req: &tungstenite::handshake::server::Request,
+    mut resp: tungstenite::handshake::server::Response,
+) -> Result<tungstenite::handshake::server::Response, tungstenite::handshake::server::ErrorResponse>
+{
+    let want = crate::transports::ws::WS_SUBPROTOCOL.as_bytes();
+    let proto = req
+        .headers()
+        .get(tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL);
+    if proto.is_some_and(|hv| hv.as_bytes() == want) {
+        resp.headers_mut().insert(
+            tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL,
+            tungstenite::http::HeaderValue::from_static(crate::transports::ws::WS_SUBPROTOCOL),
+        );
+        return Ok(resp);
+    }
+    let mut err = tungstenite::http::Response::new(Some(format!(
+        "missing or wrong subprotocol; expected {}",
+        crate::transports::ws::WS_SUBPROTOCOL
+    )));
+    *err.status_mut() = tungstenite::http::StatusCode::BAD_REQUEST;
+    Err(err)
 }
 
 /// TCP entry point: apply socket options (keepalive, `TCP_NODELAY`) on

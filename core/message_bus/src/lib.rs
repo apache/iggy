@@ -82,6 +82,7 @@ pub mod auth_config;
 pub mod cache;
 pub mod client_listener;
 pub mod client_listener_quic;
+pub mod client_listener_ws;
 pub mod config;
 pub mod connector;
 mod error;
