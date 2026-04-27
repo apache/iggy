@@ -40,6 +40,12 @@
 //! - `Documents/silverhand/iggy/message_bus/transport-plan/designs/tls-shutdown-protocol.md`
 //!   (P9-T2.5 shutdown sequence)
 
+// P9-T2a: handshake driver only; consumers (reader/writer tasks +
+// transports) land in P9-T2b and P9-T7/T8. Suppress dead_code on the
+// module until the next commit wires it into a transport.
+#[allow(dead_code)]
+pub(super) mod driver;
+
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::{self, BufReader};
 use std::path::Path;
