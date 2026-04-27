@@ -311,57 +311,42 @@ fn build_cluster_envs(
 
     envs.insert("IGGY_CLUSTER_ENABLED".to_string(), "true".to_string());
     envs.insert("IGGY_CLUSTER_NAME".to_string(), cluster_name.to_string());
-    envs.insert(
-        "IGGY_CLUSTER_NODE_CURRENT_NAME".to_string(),
-        format!("node-{}", node_index),
-    );
-    envs.insert(
-        "IGGY_CLUSTER_NODE_CURRENT_IP".to_string(),
-        loopback.to_string(),
-    );
+    // Node identity is supplied via `--replica-id` on the command line by
+    // ServerHandle::spawn; every cluster env var emitted here is identical
+    // across all spawned servers.
+    let _ = node_index;
 
-    // Add other nodes' addresses
-    let mut other_index = 0;
+    // Emit the full roster at cluster.nodes[*]. Every node sees the same
+    // list; the per-node --replica-id CLI flag picks which entry is self.
     for (i, addrs) in all_addrs.iter().enumerate() {
-        if i == node_index {
-            continue;
-        }
-
-        envs.insert(
-            format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_NAME"),
-            format!("node-{i}"),
-        );
-        envs.insert(
-            format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_IP"),
-            loopback.to_string(),
-        );
+        envs.insert(format!("IGGY_CLUSTER_NODES_{i}_NAME"), format!("node-{i}"));
+        envs.insert(format!("IGGY_CLUSTER_NODES_{i}_IP"), loopback.to_string());
+        envs.insert(format!("IGGY_CLUSTER_NODES_{i}_REPLICA_ID"), i.to_string());
 
         if let Some(tcp) = addrs.tcp {
             envs.insert(
-                format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_PORTS_TCP"),
+                format!("IGGY_CLUSTER_NODES_{i}_PORTS_TCP"),
                 tcp.port().to_string(),
             );
         }
         if let Some(http) = addrs.http {
             envs.insert(
-                format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_PORTS_HTTP"),
+                format!("IGGY_CLUSTER_NODES_{i}_PORTS_HTTP"),
                 http.port().to_string(),
             );
         }
         if let Some(quic) = addrs.quic {
             envs.insert(
-                format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_PORTS_QUIC"),
+                format!("IGGY_CLUSTER_NODES_{i}_PORTS_QUIC"),
                 quic.port().to_string(),
             );
         }
         if let Some(websocket) = addrs.websocket {
             envs.insert(
-                format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_PORTS_WEBSOCKET"),
+                format!("IGGY_CLUSTER_NODES_{i}_PORTS_WEBSOCKET"),
                 websocket.port().to_string(),
             );
         }
-
-        other_index += 1;
     }
 
     envs

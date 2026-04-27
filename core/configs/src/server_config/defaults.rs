@@ -16,8 +16,7 @@
  * under the License.
  */
 
-use super::cluster::CurrentNodeConfig;
-use super::cluster::{ClusterConfig, NodeConfig, OtherNodeConfig, TransportPorts};
+use super::cluster::{ClusterConfig, ClusterNodeConfig, TransportPorts};
 use super::http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig};
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use super::server::{
@@ -572,31 +571,38 @@ impl Default for ClusterConfig {
         ClusterConfig {
             enabled: SERVER_CONFIG.cluster.enabled,
             name: SERVER_CONFIG.cluster.name.parse().unwrap(),
-            node: NodeConfig::default(),
-        }
-    }
-}
-
-impl Default for NodeConfig {
-    fn default() -> NodeConfig {
-        NodeConfig {
-            current: CurrentNodeConfig {
-                name: SERVER_CONFIG.cluster.node.current.name.parse().unwrap(),
-                ip: SERVER_CONFIG.cluster.node.current.ip.parse().unwrap(),
-            },
-            others: SERVER_CONFIG
+            nodes: SERVER_CONFIG
                 .cluster
-                .node
-                .others
+                .nodes
                 .iter()
-                .map(|other| OtherNodeConfig {
-                    name: other.name.parse().unwrap(),
-                    ip: other.ip.parse().unwrap(),
+                .map(|node| ClusterNodeConfig {
+                    name: node.name.parse().unwrap(),
+                    ip: node.ip.parse().unwrap(),
+                    replica_id: u8::try_from(node.replica_id).expect(
+                        "static_toml replica_id must fit in u8 (0..=255); \
+                         fix core/server/config.toml",
+                    ),
                     ports: TransportPorts {
-                        tcp: Some(other.ports.tcp as u16),
-                        quic: Some(other.ports.quic as u16),
-                        http: Some(other.ports.http as u16),
-                        websocket: Some(other.ports.websocket as u16),
+                        tcp: Some(u16::try_from(node.ports.tcp).expect(
+                            "static_toml cluster.nodes.ports.tcp must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
+                        quic: Some(u16::try_from(node.ports.quic).expect(
+                            "static_toml cluster.nodes.ports.quic must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
+                        http: Some(u16::try_from(node.ports.http).expect(
+                            "static_toml cluster.nodes.ports.http must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
+                        websocket: Some(u16::try_from(node.ports.websocket).expect(
+                            "static_toml cluster.nodes.ports.websocket must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
+                        tcp_replica: Some(u16::try_from(node.ports.tcp_replica).expect(
+                            "static_toml cluster.nodes.ports.tcp_replica must fit in u16 (0..=65535); \
+                             fix core/server/config.toml",
+                        )),
                     },
                 })
                 .collect(),

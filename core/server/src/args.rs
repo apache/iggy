@@ -120,4 +120,20 @@ pub struct Args {
     ///   IGGY_TCP_ADDRESS=127.0.0.1:8091 iggy-server --follower  # Follower on port 8091
     #[arg(long, default_value_t = false, verbatim_doc_comment)]
     pub follower: bool,
+
+    /// Identifies this node within `cluster.nodes` by its replica ID.
+    ///
+    /// Required when `cluster.enabled = true`. The value must match exactly
+    /// one `cluster.nodes[*].replica_id` entry in the loaded configuration;
+    /// that entry describes the current node, and all other entries are
+    /// treated as remote peers.
+    ///
+    /// Supplying the identity on the command line lets operators ship a
+    /// single byte-identical `config.toml` to every node in the cluster
+    /// and differ only in this CLI flag.
+    ///
+    /// Examples:
+    ///   iggy-server --replica-id 0                       # This node is replica 0
+    #[arg(long, verbatim_doc_comment)]
+    pub replica_id: Option<u8>,
 }

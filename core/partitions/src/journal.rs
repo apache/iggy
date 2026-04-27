@@ -65,6 +65,29 @@ where
     fn get(&self, query: &Self::Query) -> impl Future<Output = Option<PollQueryResult<4096>>>;
 }
 
+/// In-memory only partition journal storage. Non-durable.
+///
+/// # Warning — development storage only
+///
+/// This storage backs the `Journal` trait with a plain `Vec<JournalBuffer>`
+/// inside an `UnsafeCell`. Writes never hit disk, nothing is `fsync`ed, and
+/// every entry is lost on process exit.
+///
+/// That property breaks VSR invariants in two visible ways once a cluster
+/// is running real workloads:
+///
+/// - `VsrAction::RetransmitPrepares` (see `shard::IggyShard::apply_actions`)
+///   reads from this journal. After a node restart the journal is empty, so
+///   the retransmit is a silent no-op and peers waiting on the missing ops
+///   stall until a view change kicks in.
+/// - A restarting replica that rejoins the cluster cannot replay its WAL
+///   to catch up; it looks to peers like a pristine empty node claiming
+///   the replica slot.
+///
+/// These are safe for single-process tests, the simulator, and local dev
+/// workloads. They are NOT safe for any multi-process or restart-sensitive
+/// deployment. Use a disk-backed `Storage` implementation before serving
+/// production cluster traffic.
 #[derive(Debug, Default)]
 pub struct PartitionJournalMemStorage {
     entries: UnsafeCell<Vec<JournalBuffer>>,
@@ -541,4 +564,51 @@ fn push_selected_batch_fragments(
 
     *last_matching_offset = Some(selection.last_matching_offset);
     *matched_messages += selection.matched_messages;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_binary_protocol::{Command2, HEADER_SIZE, Message};
+    use journal::Journal;
+
+    fn build_prepare(op: u64, size: usize) -> Message<PrepareHeader> {
+        Message::<PrepareHeader>::new(size).transmute_header(|_, h: &mut PrepareHeader| {
+            h.command = Command2::Prepare;
+            h.op = op;
+            h.size = u32::try_from(size).expect("size fits in u32");
+        })
+    }
+
+    #[compio::test]
+    async fn entry_round_trips_bytes_for_retransmit() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+
+        let payload_size = HEADER_SIZE + 64;
+        let prepare = build_prepare(3, payload_size);
+        let expected_bytes = prepare.as_slice().to_vec();
+        let frozen = prepare.into_frozen();
+
+        journal.append(frozen).await.expect("append");
+
+        let header = journal.header_by_op(3).expect("header for op 3");
+        let entry = journal
+            .entry(&header)
+            .await
+            .expect("entry for op 3 must exist");
+
+        assert_eq!(
+            entry.as_slice(),
+            expected_bytes.as_slice(),
+            "retransmit path must read back the exact bytes that were appended; \
+             cloning the returned Frozen is the sole payload copy"
+        );
+
+        let cloned = entry.clone();
+        assert_eq!(
+            cloned.as_slice(),
+            entry.as_slice(),
+            "cloning a journal entry must yield identical bytes (refcount bump, not deep copy)"
+        );
+    }
 }
