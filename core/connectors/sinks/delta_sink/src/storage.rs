@@ -39,7 +39,7 @@ pub(crate) fn build_storage_options(
                 .as_ref()
                 .ok_or_else(|| Error::InitError("S3 backend requires 'aws_s3_region'".into()))?;
 
-            opts.insert("AWS_ACCESS_KEY_ID".into(), access_key.clone());
+            opts.insert("AWS_ACCESS_KEY_ID".into(), access_key.expose_secret().to_owned());
             opts.insert(
                 "AWS_SECRET_ACCESS_KEY".into(),
                 secret_key.expose_secret().to_owned(),
@@ -137,7 +137,7 @@ mod tests {
     fn s3_config() -> DeltaSinkConfig {
         DeltaSinkConfig {
             storage_backend_type: Some(StorageBackendType::S3),
-            aws_s3_access_key: Some("AKID".into()),
+            aws_s3_access_key: Some("AKID".to_string().into()),
             aws_s3_secret_key: Some("SECRET".to_string().into()),
             aws_s3_region: Some("us-east-1".into()),
             aws_s3_endpoint_url: Some("http://localhost:9000".into()),

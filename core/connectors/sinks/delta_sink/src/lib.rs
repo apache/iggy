@@ -61,7 +61,7 @@ pub struct DeltaSinkConfig {
 
     // AWS S3
     #[serde(default)]
-    pub aws_s3_access_key: Option<String>,
+    pub aws_s3_access_key: Option<SecretString>,
     #[serde(default)]
     pub aws_s3_secret_key: Option<SecretString>,
     #[serde(default)]
