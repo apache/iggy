@@ -65,6 +65,7 @@
 //! plug in behind the same surface; see
 //! `Documents/silverhand/iggy/message_bus/transport-plan/`.
 
+pub mod quic;
 pub mod tcp;
 
 // Only `Conn` and `Writer` have crate-internal callers today
