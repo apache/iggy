@@ -81,8 +81,5 @@ public record GlobalCliArgs(
         if (totalData == 0 && messageBatches <= 0) {
             throw new BenchmarkException("--message-batches must be greater than 0.");
         }
-        if (totalData > 0 && messageBatches > 0) {
-            throw new BenchmarkException("--message-batches and --total-data are mutually exclusive.");
-        }
     }
 }

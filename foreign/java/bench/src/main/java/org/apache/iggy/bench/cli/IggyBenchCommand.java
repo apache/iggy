@@ -21,6 +21,7 @@ package org.apache.iggy.bench.cli;
 
 import picocli.CommandLine.Command;
 import picocli.CommandLine.ExitCode;
+import picocli.CommandLine.ArgGroup;
 import picocli.CommandLine.Model.CommandSpec;
 import picocli.CommandLine.Option;
 import picocli.CommandLine.Spec;
@@ -33,7 +34,6 @@ import java.util.concurrent.Callable;
         subcommands = {PinnedProducerCommand.class},
         description = "Benchmark CLI for the Apache Iggy Java SDK.")
 public final class IggyBenchCommand implements Callable<Integer> {
-
     @Option(
             names = {"--message-size", "-m"},
             defaultValue = "1000",
@@ -46,17 +46,8 @@ public final class IggyBenchCommand implements Callable<Integer> {
             description = "Messages per batch.")
     private int messagesPerBatch = 1000;
 
-    @Option(
-            names = {"--message-batches", "-b"},
-            defaultValue = "1000",
-            description = "Number of message batches.")
-    private int messageBatches = 1000;
-
-    @Option(
-            names = {"--total-data", "-T"},
-            defaultValue = "0",
-            description = "Total data volume in bytes.")
-    private long totalData;
+    @ArgGroup(exclusive = true, multiplicity = "0..1")
+    private DataLimitOptions dataLimitOptions;
 
     @Option(
             names = {"--rate-limit", "-r"},
@@ -115,11 +106,17 @@ public final class IggyBenchCommand implements Callable<Integer> {
     }
 
     public int messageBatches() {
-        return messageBatches;
+        if (dataLimitOptions == null || dataLimitOptions.messageBatches == null) {
+            return 1000;
+        }
+        return dataLimitOptions.messageBatches;
     }
 
     public long totalData() {
-        return totalData;
+        if (dataLimitOptions == null || dataLimitOptions.totalData == null) {
+            return 0L;
+        }
+        return dataLimitOptions.totalData;
     }
 
     public long rateLimit() {
@@ -148,5 +145,18 @@ public final class IggyBenchCommand implements Callable<Integer> {
 
     public boolean reuseStreams() {
         return reuseStreams;
+    }
+
+    private static final class DataLimitOptions {
+
+        @Option(
+                names = {"--message-batches", "-b"},
+                description = "Number of message batches. Defaults to 1000 when --total-data is not specified.")
+        private Integer messageBatches;
+
+        @Option(
+                names = {"--total-data", "-T"},
+                description = "Total data volume in bytes.")
+        private Long totalData;
     }
 }
