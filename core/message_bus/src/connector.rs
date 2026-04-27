@@ -44,7 +44,7 @@ use tracing::{debug, info, warn};
 ///
 /// Equivalent to `MessageBusConfig::default().reconnect_period`; exposed
 /// as a named const for test / bench ergonomics. Kept in sync with the
-/// [`MessageBusConfig::default`] impl. Remove once the configs-crate
+/// `MessageBusConfig::default` impl. Remove once the configs-crate
 /// migration lands and bootstrap always reads the period from
 /// `ServerConfig`.
 pub const DEFAULT_RECONNECT_PERIOD: Duration = Duration::from_secs(5);
