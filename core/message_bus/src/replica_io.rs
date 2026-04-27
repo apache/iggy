@@ -48,6 +48,47 @@ pub struct BoundPlanes {
     pub client: SocketAddr,
 }
 
+/// Boot-time check: every TCP listener address must occupy a distinct
+/// `(ip, port)` slot.
+///
+/// TCP listeners (`replica`, `client`, `ws`) all share the TCP port
+/// space, so any pair sharing `(ip, port)` is a bind-time conflict.
+/// The QUIC listener binds a UDP socket: it occupies a separate port
+/// namespace and is allowed to share a port with any TCP listener (a
+/// common operator choice for "QUIC on 443 over UDP, HTTPS on 443 over
+/// TCP"). UDP-vs-UDP conflicts are not possible today because QUIC is
+/// the only UDP listener.
+///
+/// # Panics
+///
+/// Panics with a message naming the conflicting pair. Boot-time
+/// validation; surfaces operator misconfiguration loudly rather than
+/// letting one listener silently lose a `EADDRINUSE` race against
+/// another.
+pub fn assert_listen_addrs_distinct(
+    replica: SocketAddr,
+    client: SocketAddr,
+    ws: Option<SocketAddr>,
+    _quic: Option<SocketAddr>,
+) {
+    let tcp_slots: [(&str, Option<SocketAddr>); 3] = [
+        ("replica", Some(replica)),
+        ("client", Some(client)),
+        ("ws", ws),
+    ];
+    for i in 0..tcp_slots.len() {
+        for j in (i + 1)..tcp_slots.len() {
+            let (a_name, a) = tcp_slots[i];
+            let (b_name, b) = tcp_slots[j];
+            if let (Some(a), Some(b)) = (a, b)
+                && a == b
+            {
+                panic!("listener address conflict: {a_name} and {b_name} both bind to {a}",);
+            }
+        }
+    }
+}
+
 /// Bind the replica + client listeners on shard 0 and start the outbound
 /// replica connector. Non-zero shards early-return `Ok(None)`.
 ///
@@ -160,4 +201,53 @@ pub async fn start_on_shard_zero_default(
         token_source,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(port: u16) -> SocketAddr {
+        format!("127.0.0.1:{port}").parse().unwrap()
+    }
+
+    #[test]
+    fn distinct_addrs_pass() {
+        assert_listen_addrs_distinct(addr(9090), addr(8090), Some(addr(8092)), Some(addr(8080)));
+    }
+
+    #[test]
+    fn ws_unset_passes() {
+        assert_listen_addrs_distinct(addr(9090), addr(8090), None, Some(addr(8080)));
+    }
+
+    #[test]
+    fn quic_shares_port_with_tcp_replica_ok() {
+        // QUIC on UDP and replica on TCP can share a port (separate
+        // kernel namespaces). Operator choice "443 on TCP and UDP".
+        assert_listen_addrs_distinct(addr(443), addr(8090), Some(addr(8092)), Some(addr(443)));
+    }
+
+    #[test]
+    fn quic_shares_port_with_tcp_client_ok() {
+        assert_listen_addrs_distinct(addr(9090), addr(443), Some(addr(8092)), Some(addr(443)));
+    }
+
+    #[test]
+    #[should_panic(expected = "listener address conflict: replica and client")]
+    fn replica_client_overlap_panics() {
+        assert_listen_addrs_distinct(addr(8090), addr(8090), Some(addr(8092)), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "listener address conflict: replica and ws")]
+    fn replica_ws_overlap_panics() {
+        assert_listen_addrs_distinct(addr(9090), addr(8090), Some(addr(9090)), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "listener address conflict: client and ws")]
+    fn client_ws_overlap_panics() {
+        assert_listen_addrs_distinct(addr(9090), addr(8090), Some(addr(8090)), None);
+    }
 }
