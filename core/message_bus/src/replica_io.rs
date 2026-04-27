@@ -35,17 +35,39 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use iggy_common::IggyError;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::auth::TokenSource;
 use crate::connector::start as start_connector;
 use crate::replica_listener::{bind as bind_replica_listener, run as run_replica_listener};
-use crate::{AcceptedClientFn, AcceptedReplicaFn, IggyMessageBus, client_listener};
+use crate::transports::quic::server_config_with_cert;
+use crate::{
+    AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedWsClientFn, IggyMessageBus,
+    client_listener, client_listener_quic, client_listener_ws,
+};
+
+/// QUIC server credentials passed by the bootstrap layer.
+///
+/// The cert chain is the leaf-first sequence rustls expects; the key
+/// is the server's private key in DER form. Tests use rcgen to mint a
+/// throwaway pair; production callers load real PKI material via
+/// `core/server-ng`'s `[quic.certificate]` config section.
+pub struct QuicServerCredentials {
+    pub cert_chain: Vec<CertificateDer<'static>>,
+    pub key_der: PrivateKeyDer<'static>,
+}
 
 /// Bound addresses returned to shard 0 after the listeners come up.
-#[derive(Debug, Clone, Copy)]
+///
+/// `ws` and `quic` are populated only when the corresponding
+/// `start_on_shard_zero` parameters are `Some`; an unconfigured plane
+/// stays `None`.
+#[derive(Debug, Clone)]
 pub struct BoundPlanes {
     pub replica: SocketAddr,
     pub client: SocketAddr,
+    pub ws: Option<SocketAddr>,
+    pub quic: Option<SocketAddr>,
 }
 
 /// Boot-time check: every TCP listener address must occupy a distinct
@@ -80,8 +102,12 @@ pub fn assert_listen_addrs_distinct(
         for j in (i + 1)..tcp_slots.len() {
             let (a_name, a) = tcp_slots[i];
             let (b_name, b) = tcp_slots[j];
+            // Port 0 means "OS-assigned"; two slots at port 0 receive
+            // distinct kernel ports at bind time, so they don't
+            // conflict. Tests rely on this for loopback fixtures.
             if let (Some(a), Some(b)) = (a, b)
                 && a == b
+                && a.port() != 0
             {
                 panic!("listener address conflict: {a_name} and {b_name} both bind to {a}");
             }
@@ -89,35 +115,60 @@ pub fn assert_listen_addrs_distinct(
     }
 }
 
-/// Bind the replica + client listeners on shard 0 and start the outbound
-/// replica connector. Non-zero shards early-return `Ok(None)`.
+/// Bind the replica + client listeners on shard 0 and start the
+/// outbound replica connector. Optionally bind WS and QUIC client
+/// listeners alongside. Non-zero shards early-return `Ok(None)`.
 ///
-/// Each accepted / dialed TCP stream is handed to the supplied delegate
-/// callback: `on_accepted_replica` for inbound replicas and for freshly
-/// dialed higher-id peers; `on_accepted_client` for SDK client accepts.
-/// The callbacks are responsible for the dup-fd + inter-shard send.
+/// Each accepted / dialed connection is handed to the supplied
+/// delegate callback. The TCP callbacks (`on_accepted_replica`,
+/// `on_accepted_client`) and the WS callback (`on_accepted_ws_client`)
+/// are responsible for the dup-fd + inter-shard send. The QUIC
+/// callback (`on_accepted_quic_client`) installs locally on shard 0
+/// (QUIC has no cross-shard handover).
+///
+/// `ws_listen_addr` / `on_accepted_ws_client` are paired: if either is
+/// `Some`, both must be. Same for the QUIC trio
+/// (`quic_listen_addr` / `quic_credentials` / `on_accepted_quic_client`).
+///
+/// # Panics
+///
+/// Panics on TCP-family `(ip, port)` overlap among the populated
+/// `replica`, `client`, `ws` slots — see
+/// [`assert_listen_addrs_distinct`].
 ///
 /// # Errors
 ///
-/// Returns `IggyError::CannotBindToSocket` if either listener bind fails.
+/// Returns `IggyError::CannotBindToSocket` if any listener bind fails.
 #[allow(clippy::future_not_send)]
 #[allow(clippy::too_many_arguments)]
 pub async fn start_on_shard_zero(
     bus: &Rc<IggyMessageBus>,
     replica_listen_addr: SocketAddr,
     client_listen_addr: SocketAddr,
+    ws_listen_addr: Option<SocketAddr>,
+    quic_listen_addr: Option<SocketAddr>,
+    quic_credentials: Option<QuicServerCredentials>,
     cluster_id: u128,
     self_id: u8,
     replica_count: u8,
     peers: Vec<(u8, SocketAddr)>,
     on_accepted_replica: AcceptedReplicaFn,
     on_accepted_client: AcceptedClientFn,
+    on_accepted_ws_client: Option<AcceptedWsClientFn>,
+    on_accepted_quic_client: Option<AcceptedQuicClientFn>,
     reconnect_period: Duration,
     token_source: Rc<dyn TokenSource>,
 ) -> Result<Option<BoundPlanes>, IggyError> {
     if bus.shard_id() != 0 {
         return Ok(None);
     }
+
+    assert_listen_addrs_distinct(
+        replica_listen_addr,
+        client_listen_addr,
+        ws_listen_addr,
+        quic_listen_addr,
+    );
 
     let (replica_listener, replica_bound) = bind_replica_listener(replica_listen_addr).await?;
     let (clients_listener, client_bound) = client_listener::bind(client_listen_addr).await?;
@@ -149,6 +200,40 @@ pub async fn start_on_shard_zero(
     });
     bus.track_background(client_handle);
 
+    let ws_bound = match (ws_listen_addr, on_accepted_ws_client) {
+        (Some(addr), Some(on_accepted_ws)) => {
+            let (ws_listener, ws_bound) = client_listener_ws::bind(addr).await?;
+            let token_for_ws = bus.token();
+            let ws_handle = compio::runtime::spawn(async move {
+                client_listener_ws::run(ws_listener, token_for_ws, on_accepted_ws).await;
+            });
+            bus.track_background(ws_handle);
+            Some(ws_bound)
+        }
+        (None, None) => None,
+        _ => {
+            return Err(IggyError::InvalidConfiguration);
+        }
+    };
+
+    let quic_bound = match (quic_listen_addr, quic_credentials, on_accepted_quic_client) {
+        (Some(addr), Some(creds), Some(on_accepted_quic)) => {
+            let server_config = server_config_with_cert(creds.cert_chain, creds.key_der)
+                .map_err(|e| IggyError::IoError(format!("QUIC server config build failed: {e}")))?;
+            let (endpoint, quic_bound) = client_listener_quic::bind(addr, server_config).await?;
+            let token_for_quic = bus.token();
+            let quic_handle = compio::runtime::spawn(async move {
+                client_listener_quic::run(endpoint, token_for_quic, on_accepted_quic).await;
+            });
+            bus.track_background(quic_handle);
+            Some(quic_bound)
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(IggyError::InvalidConfiguration);
+        }
+    };
+
     start_connector(
         bus,
         cluster_id,
@@ -163,11 +248,18 @@ pub async fn start_on_shard_zero(
     Ok(Some(BoundPlanes {
         replica: replica_bound,
         client: client_bound,
+        ws: ws_bound,
+        quic: quic_bound,
     }))
 }
 
 /// [`start_on_shard_zero`] defaulting `reconnect_period` to the bus's
 /// [`crate::MessageBusConfig::reconnect_period`].
+///
+/// Leaves the WS + QUIC listener slots unconfigured (`None`).
+/// Convenience entry for TCP-only deployments and existing tests;
+/// prefer the full [`start_on_shard_zero`] in production where WS /
+/// QUIC come from `core/server-ng`'s config.
 ///
 /// # Errors
 ///
@@ -191,12 +283,17 @@ pub async fn start_on_shard_zero_default(
         bus,
         replica_listen_addr,
         client_listen_addr,
+        None,
+        None,
+        None,
         cluster_id,
         self_id,
         replica_count,
         peers,
         on_accepted_replica,
         on_accepted_client,
+        None,
+        None,
         reconnect_period,
         token_source,
     )
