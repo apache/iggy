@@ -785,7 +785,6 @@ async fn reader_task(
             let _ = writer_tx.try_send(WssWriterEvent::FlushTls);
         }
         if outcome.peer_closed {
-            state.peer_closed.set(true);
             return Ok(());
         }
     }

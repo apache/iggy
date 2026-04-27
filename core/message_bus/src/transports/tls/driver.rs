@@ -248,11 +248,6 @@ pub(in crate::transports) struct TlsState {
     pub(in crate::transports) conn: RefCell<UnbufferedConnection>,
     pub(in crate::transports) incoming_tls: RefCell<Vec<u8>>,
     pub(in crate::transports) outgoing_tls: RefCell<Vec<u8>>,
-    /// Set by the reader once it observes `ConnectionState::PeerClosed`
-    /// or `ConnectionState::Closed`. Reader exits the next loop
-    /// iteration; writer drains its own queue then sends our
-    /// `close_notify` (per shutdown-protocol design doc).
-    pub(in crate::transports) peer_closed: Cell<bool>,
     /// Set by the orchestrator's shutdown helper before signalling the
     /// halves. Causes the reader to exit on the next iteration even
     /// if no peer EOF arrives.
@@ -265,7 +260,6 @@ impl TlsState {
             conn: RefCell::new(conn),
             incoming_tls: RefCell::new(Vec::with_capacity(HANDSHAKE_READ_CHUNK)),
             outgoing_tls: RefCell::new(Vec::with_capacity(OUTGOING_TLS_INITIAL)),
-            peer_closed: Cell::new(false),
             shutdown: Cell::new(false),
         }
     }
@@ -660,10 +654,21 @@ pub(in crate::transports) enum WriterEvent {
 /// Exit conditions:
 /// - `read` returns `Ok(0)` (peer FIN or `libc::shutdown(SHUT_RD)`).
 /// - `state.shutdown.get()` becomes `true`.
-/// - rustls reports `PeerClosed` / `Closed`; sets
-///   `state.peer_closed.set(true)`.
+/// - rustls reports `PeerClosed` / `Closed`.
 /// - `in_tx` send fails (orchestrator dropped the inbound receiver —
 ///   client gone).
+///
+/// The bus does not distinguish a clean close from a TCP truncation
+/// (peer drops connection without `close_notify`). TLS authenticates
+/// every record; a truncation that drops the trailing `close_notify`
+/// will still corrupt no in-flight frame, and a truncation that splits
+/// a frame fails the framing check downstream. RFC 8446 §6.1 calls out
+/// that distinction; if a future operational need surfaces it (e.g. an
+/// IDS counter for unclean closes), wire a `MessageBusMetric::TlsTruncated`
+/// counter that increments when this loop exits with a `Ok(0)` from
+/// `read_half.read` and rustls has not reached `PeerClosed` first. The
+/// signal is currently dropped as a deliberate trade-off (see CLAUDE.md
+/// "TLS driver design").
 ///
 /// On exit, the local `writer_tx` clone drops, halving the writer's
 /// cooperative-shutdown wakeup latency once the orchestrator also
@@ -710,7 +715,6 @@ pub(in crate::transports) async fn reader_task(
         }
 
         if outcome.peer_closed {
-            state.peer_closed.set(true);
             return Ok(());
         }
     }
@@ -1620,12 +1624,11 @@ mod tests {
         shutdown(server.handles, Duration::from_secs(5)).await;
     }
 
-    /// Peer queues `close_notify`; reader sees `PeerClosed`, sets the
-    /// flag, and exits.
+    /// Peer queues `close_notify`; reader sees `PeerClosed` and exits,
+    /// dropping `in_tx` so the inbound channel observes the close.
     #[compio::test]
     async fn peer_close_notify_observed() {
         let pair = handshaken_pair().await;
-        let server_state = Rc::clone(&pair.server.driver.state);
         let client = spawn_pair(pair.client);
         let server = spawn_pair(pair.server);
 
@@ -1638,10 +1641,6 @@ mod tests {
         // Err once the reader exits and drops in_tx.
         let drained = server.inbound.recv().await;
         assert!(drained.is_err(), "inbound channel must close on peer close");
-        assert!(
-            server_state.peer_closed.get(),
-            "server state must flag peer_closed after client close_notify"
-        );
 
         drop(server.outbound);
         shutdown(server.handles, Duration::from_secs(5)).await;
