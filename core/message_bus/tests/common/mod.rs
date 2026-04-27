@@ -30,7 +30,9 @@ use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, Message};
 use message_bus::auth::{StaticSharedSecret, TokenSource};
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica_listener::MessageHandler;
-use message_bus::{AcceptedClientFn, AcceptedReplicaFn, IggyMessageBus, installer};
+use message_bus::{
+    AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, IggyMessageBus, installer,
+};
 use std::cell::Cell;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -92,5 +94,29 @@ pub fn install_clients_locally(
         counter.set(seq.wrapping_add(1));
         let client_id = (shard_id << 112) | seq;
         installer::install_client_stream(&bus, client_id, stream, on_request.clone());
+    })
+}
+
+/// Build an [`AcceptedQuicClientFn`] that mints a local client id and
+/// installs the QUIC connection directly on the given bus. Mirror of
+/// [`install_clients_locally`] for the QUIC plane.
+#[must_use]
+pub fn install_quic_clients_locally(
+    bus: Rc<IggyMessageBus>,
+    on_request: RequestHandler,
+) -> AcceptedQuicClientFn {
+    let counter: Rc<Cell<u128>> = Rc::new(Cell::new(1));
+    let shard_id = u128::from(bus.shard_id());
+    Rc::new(move |connection, streams| {
+        let seq = counter.get();
+        counter.set(seq.wrapping_add(1));
+        let client_id = (shard_id << 112) | seq;
+        installer::install_client_quic_conn(
+            &bus,
+            client_id,
+            connection,
+            streams,
+            on_request.clone(),
+        );
     })
 }

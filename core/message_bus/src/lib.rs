@@ -81,6 +81,7 @@ pub mod auth;
 pub mod auth_config;
 pub mod cache;
 pub mod client_listener;
+pub mod client_listener_quic;
 pub mod config;
 pub mod connector;
 mod error;
@@ -156,6 +157,33 @@ pub type AcceptedReplicaFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, u8)>;
 /// Takes ownership of the accepted stream and is responsible for minting /
 /// assigning the client id as part of its delegation policy.
 pub type AcceptedClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream)>;
+
+/// Callback invoked on every accepted SDK QUIC client connection.
+///
+/// Fires after shard 0's QUIC listener drives the handshake to
+/// completion AND accepts the first bidirectional stream pair, so the
+/// callback receives a ready-for-traffic [`compio_quic::Connection`]
+/// plus its `(SendStream, RecvStream)` pair. The callback mints a
+/// client id, then calls [`installer::install_client_quic_conn`] on
+/// the local bus.
+///
+/// QUIC stays shard-0 terminal (per `INVARIANTS.md` I6 and the
+/// non-serialisable nature of `quinn-proto::Connection` state); no
+/// cross-shard handover analog exists for this plane.
+pub type AcceptedQuicClientFn = std::rc::Rc<
+    dyn Fn(compio_quic::Connection, (compio_quic::SendStream, compio_quic::RecvStream)),
+>;
+
+/// Callback invoked on every accepted SDK WebSocket client connection.
+///
+/// Fires after shard 0's WS listener accepts a raw TCP socket. The
+/// HTTP-Upgrade handshake has NOT run yet; the callback hands the
+/// raw stream off to the owning shard via inter-shard fd-shipping
+/// (`ShardFramePayload::ClientWsConnectionSetup`). The owning shard
+/// runs the upgrade and the subprotocol check locally. This shape
+/// preserves invariant I5 (fd-delegation is TCP-only) because the
+/// shipped fd is plain TCP at ship-time.
+pub type AcceptedWsClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream)>;
 
 /// Notifier fired when a delegated replica connection dies.
 ///
