@@ -38,13 +38,13 @@ public final class IggyBenchCommand implements Callable<Integer> {
             names = {"--message-size", "-m"},
             defaultValue = "1000",
             description = "Message size in bytes.")
-    private int messageSize = 1000;
+    private int messageSize;
 
     @Option(
             names = {"--messages-per-batch", "-P"},
             defaultValue = "1000",
             description = "Messages per batch.")
-    private int messagesPerBatch = 1000;
+    private int messagesPerBatch;
 
     @ArgGroup(exclusive = true, multiplicity = "0..1")
     private DataLimitOptions dataLimitOptions;
@@ -65,25 +65,25 @@ public final class IggyBenchCommand implements Callable<Integer> {
             names = {"--sampling-time", "-t"},
             defaultValue = "10",
             description = "Sampling time in milliseconds.")
-    private long samplingTimeMs = 10L;
+    private long samplingTimeMs;
 
     @Option(
             names = {"--moving-average-window", "-W"},
             defaultValue = "20",
             description = "Moving average window size.")
-    private int movingAverageWindow = 20;
+    private int movingAverageWindow;
 
     @Option(
             names = {"--username", "-u"},
             defaultValue = "iggy",
             description = "Server username.")
-    private String username = "iggy";
+    private String username;
 
     @Option(
             names = {"--password", "-p"},
             defaultValue = "iggy",
             description = "Server password.")
-    private String password = "iggy";
+    private String password;
 
     @Option(names = "--reuse-streams", defaultValue = "false", description = "Reuse existing benchmark streams.")
     private boolean reuseStreams;

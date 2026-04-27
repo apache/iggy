@@ -28,8 +28,6 @@ public final class IggyBench {
 
     public static void main(String[] args) {
         var exitCode = new CommandLine(new IggyBenchCommand()).execute(args);
-        if (exitCode != 0) {
-            System.exit(exitCode);
-        }
+        System.exit(exitCode);
     }
 }
