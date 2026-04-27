@@ -20,10 +20,10 @@
 //! Runs only on shard 0. The accept loop performs no protocol work
 //! beyond `TcpListener::accept`: every accepted stream is handed
 //! verbatim to the supplied callback, which dups the fd and ships a
-//! [`ShardFramePayload::ClientWsConnectionSetup`] frame to the
+//! `ShardFramePayload::ClientWsConnectionSetup` frame to the
 //! round-robin-selected target shard. The HTTP-Upgrade handshake (and
 //! the `iggy.consensus.v1` subprotocol enforcement) runs on the owning
-//! shard inside [`crate::installer::install_client_ws_fd`].
+//! shard inside [`crate::ConnectionInstaller::install_client_ws_fd`].
 //!
 //! The fd at ship-time is plain TCP; invariant I5 (fd-delegation is
 //! TCP-only) holds. The WS state machine only materialises after the
