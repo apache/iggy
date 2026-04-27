@@ -976,6 +976,30 @@ fn step_to_encrypt<Data>(
 
 /// Encrypt `app_data` into `outgoing[start..]`, growing the buffer up
 /// to [`TLS_BUFFER_CAP`] on `InsufficientSize`.
+///
+/// Uses `Vec::reserve_exact + Vec::set_len` so the encrypt slice is
+/// presented to rustls without first being zeroed: `WriteTraffic::encrypt`
+/// fully overwrites the slice before returning `Ok(written)` (rustls
+/// 0.23.39 `tls13.rs:228-253` contractually populates every byte of
+/// the requested record), so the prior `outgoing.resize(grow_to, 0)`
+/// memset was wasted bandwidth on the encrypt hot path. On
+/// `Err(InsufficientSize)` rustls writes nothing (contractual), and
+/// the `set_len` is rewound to `start` before the next attempt; on
+/// other `Err` the same rewind happens before returning.
+///
+/// # Safety invariants the unsafe blocks rely on
+///
+/// - `set_len(grow_to)` is only invoked after `reserve_exact(grow_to -
+///   start)` has confirmed capacity, so the new length stays inside
+///   the allocation.
+/// - The slice `&mut outgoing[start..]` is handed to `wt.encrypt`,
+///   which only writes (never reads) into it before returning. The
+///   slice is treated as `MaybeUninit` until `wt.encrypt` returns
+///   `Ok(written)`; the subsequent `set_len(start + written)` exposes
+///   only the populated prefix.
+/// - On any error the buffer is rewound via `set_len(start)`, so the
+///   caller never sees a `len > start` view of partially-uninit
+///   bytes, and the eventual `Vec` drop never reads them.
 fn do_encrypt_into_buf<Data>(
     wt: &mut WriteTraffic<'_, Data>,
     app_data: &[u8],
@@ -993,28 +1017,59 @@ fn do_encrypt_into_buf<Data>(
             max: TLS_BUFFER_CAP,
         });
     }
-    outgoing.resize(grow_to, 0);
+    outgoing.reserve_exact(grow_to - start);
+    // SAFETY: capacity reserved above is `>= grow_to - start`; the
+    // exposed slice is only written by `wt.encrypt` before being
+    // truncated.
+    unsafe {
+        outgoing.set_len(grow_to);
+    }
 
     loop {
         match wt.encrypt(app_data, &mut outgoing[start..]) {
             Ok(written) => {
-                outgoing.truncate(start + written);
+                debug_assert!(
+                    written <= grow_to - start,
+                    "rustls encrypt wrote past the requested slice",
+                );
+                // SAFETY: `start + written <= grow_to <= capacity`; the
+                // bytes in `start..start + written` are populated per
+                // rustls's encrypt contract.
+                unsafe {
+                    outgoing.set_len(start + written);
+                }
                 return Ok(());
             }
             Err(EncryptError::InsufficientSize(InsufficientSizeError { required_size })) => {
                 let needed = start.saturating_add(required_size);
+                // SAFETY: encrypt returned `Err`, so per rustls's
+                // contract no bytes of `outgoing[start..grow_to]` were
+                // written; rewind the length so the next iteration's
+                // `reserve_exact + set_len` sees a clean prefix.
+                unsafe {
+                    outgoing.set_len(start);
+                }
                 if needed > TLS_BUFFER_CAP {
-                    outgoing.truncate(start);
                     return Err(DriveError::BufferCapExceeded {
                         required: needed,
                         max: TLS_BUFFER_CAP,
                     });
                 }
                 grow_to = needed;
-                outgoing.resize(grow_to, 0);
+                outgoing.reserve_exact(grow_to - start);
+                // SAFETY: capacity reserved this iteration is
+                // `>= grow_to - start`; same write-only invariant as
+                // above.
+                unsafe {
+                    outgoing.set_len(grow_to);
+                }
             }
             Err(other) => {
-                outgoing.truncate(start);
+                // SAFETY: same rationale as the `InsufficientSize`
+                // arm; rustls wrote nothing on a non-`Ok` return.
+                unsafe {
+                    outgoing.set_len(start);
+                }
                 return Err(DriveError::Encrypt(other));
             }
         }
