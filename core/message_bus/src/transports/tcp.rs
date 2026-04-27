@@ -30,12 +30,14 @@
 use super::{ActorContext, TransportConn, TransportListener};
 use crate::framing;
 use crate::lifecycle::BusMessage;
+use compio::driver::{SharedFd, ToSharedFd};
 use compio::io::AsyncWriteExt;
 use compio::net::{OwnedReadHalf, OwnedWriteHalf, TcpListener, TcpStream};
 use futures::FutureExt;
 use std::io;
 use std::mem;
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 use tracing::{debug, error, trace};
 
 /// Inbound TCP listener wrapper.
@@ -95,6 +97,12 @@ impl TcpTransportConn {
 impl TransportConn for TcpTransportConn {
     #[allow(clippy::future_not_send)]
     async fn run(self, ctx: ActorContext) {
+        // Capture a refcounted fd handle BEFORE `into_split` so the
+        // shutdown watchdog can wake the reader's parked io_uring read
+        // SQE via `libc::shutdown(SHUT_RD)`. No `select!` over a TCP
+        // read on a still-alive connection (I14): the in-flight read
+        // returns `Ok(0)` naturally rather than being cancelled.
+        let shared_fd = self.stream.to_shared_fd();
         let (read_half, write_half) = self.stream.into_split();
         let ActorContext {
             in_tx,
@@ -105,13 +113,14 @@ impl TransportConn for TcpTransportConn {
             label,
             peer,
         } = ctx;
-        let reader_shutdown = shutdown.clone();
+
+        spawn_shutdown_watchdog(shared_fd, shutdown.clone(), label, peer.clone());
+
         let writer_shutdown = shutdown;
         let reader_peer = peer.clone();
         let reader_handle = compio::runtime::spawn(reader_loop(
             read_half,
             in_tx,
-            reader_shutdown,
             max_message_size,
             label,
             reader_peer,
@@ -129,31 +138,65 @@ impl TransportConn for TcpTransportConn {
     }
 }
 
+/// Spawn a detached watchdog that calls `libc::shutdown(fd, SHUT_RD)`
+/// when the shutdown token fires. The reader's pending `io_uring`
+/// read SQE then completes with `Ok(0)`, the reader observes EOF, and the
+/// reader loop exits without ever sitting inside a `select!` over a
+/// TCP read.
+///
+/// On a natural-EOF run (peer closed first) the watchdog stays parked
+/// until the bus-wide shutdown token ultimately fires; the resulting
+/// `libc::shutdown` on a fd whose socket is already closed is benign
+/// (returns ENOTCONN). Mirrors the `transports::tls::driver` shutdown
+/// pattern so all TCP-family transports converge on one model.
+#[allow(clippy::future_not_send)]
+fn spawn_shutdown_watchdog(
+    shared_fd: SharedFd<socket2::Socket>,
+    shutdown: crate::lifecycle::ShutdownToken,
+    label: &'static str,
+    peer: String,
+) {
+    compio::runtime::spawn(async move {
+        shutdown.wait().await;
+        // SAFETY: `shared_fd` is a refcounted clone obtained from the
+        // still-live `TcpStream` before `into_split`; the matching
+        // clones in both owned halves keep the kernel fd open. The
+        // watchdog's clone independently keeps it open across this
+        // syscall.
+        let raw_fd = shared_fd.as_raw_fd();
+        let rc = unsafe { libc::shutdown(raw_fd, libc::SHUT_RD) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            // ENOTCONN is expected when the peer closed first.
+            if err.raw_os_error() != Some(libc::ENOTCONN) {
+                debug!(%label, %peer, error = ?err, "tcp watchdog: SHUT_RD returned");
+            }
+        }
+    })
+    .detach();
+}
+
 /// Read framed consensus messages off the wire and forward each to
-/// [`ActorContext::in_tx`]. Exits on EOF, framing error, send-side
-/// closure, or shutdown.
+/// [`ActorContext::in_tx`]. Exits on EOF, framing error, or send-side
+/// closure.
+///
+/// No `select!` over the TCP read (I14). Cooperative shutdown is
+/// delivered via [`spawn_shutdown_watchdog`], which calls
+/// `libc::shutdown(SHUT_RD)` when the bus token fires; the in-flight
+/// read returns `Ok(0)` and `framing::read_message` surfaces it as an
+/// EOF error on the next iteration.
 #[allow(clippy::future_not_send)]
 async fn reader_loop(
     mut read_half: OwnedReadHalf<TcpStream>,
     in_tx: async_channel::Sender<
         iggy_binary_protocol::Message<iggy_binary_protocol::GenericHeader>,
     >,
-    shutdown: crate::lifecycle::ShutdownToken,
     max_message_size: usize,
     label: &'static str,
     peer: String,
 ) {
-    let mut shutdown_fut = Box::pin(shutdown.wait().fuse());
     loop {
-        let read_fut = framing::read_message(&mut read_half, max_message_size);
-        let result = futures::select! {
-            () = shutdown_fut.as_mut() => {
-                debug!(%label, %peer, "tcp reader: shutdown observed");
-                return;
-            }
-            res = read_fut.fuse() => res,
-        };
-        match result {
+        match framing::read_message(&mut read_half, max_message_size).await {
             Ok(msg) => {
                 if in_tx.send(msg).await.is_err() {
                     debug!(%label, %peer, "tcp reader: inbound queue dropped");
