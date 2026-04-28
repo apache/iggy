@@ -42,6 +42,20 @@
 mod command;
 mod error;
 mod header;
+// iobuf was moved here verbatim from the former `core/iobuf` crate. Its
+// implementation is intentionally untouched for rc2; the existing lints
+// predate the move and are tracked as tech debt for a 0.9.x cleanup pass.
+#[allow(
+    private_interfaces,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::return_self_not_must_use,
+    clippy::missing_const_for_fn,
+    clippy::non_send_fields_in_send_ty,
+    clippy::use_self
+)]
+pub mod iobuf;
 pub mod message;
 mod operation;
 
@@ -52,7 +66,7 @@ pub use header::{
     PrepareOkHeader, ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
 pub use message::{
-    ConsensusMessage, FragmentedBacking, Message, MessageBacking, MessageBag, MutableBacking,
-    RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
+    ConsensusMessage, FragmentedBacking, MESSAGE_ALIGN, Message, MessageBacking, MessageBag,
+    MutableBacking, RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
 };
 pub use operation::Operation;

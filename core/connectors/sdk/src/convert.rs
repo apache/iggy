@@ -50,3 +50,117 @@ pub fn owned_value_to_serde_json(value: &simd_json::OwnedValue) -> serde_json::V
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use simd_json::{OwnedValue, StaticNode};
+
+    #[test]
+    fn test_null() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::Null)),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn test_bool() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::Bool(true))),
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::Bool(false))),
+            serde_json::Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_i64() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::I64(-42))),
+            serde_json::json!(-42)
+        );
+    }
+
+    #[test]
+    fn test_u64() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::U64(100))),
+            serde_json::json!(100)
+        );
+    }
+
+    #[test]
+    fn test_f64_finite() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(1.5))),
+            serde_json::json!(1.5)
+        );
+    }
+
+    #[test]
+    fn test_f64_nan_maps_to_null() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(f64::NAN))),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn test_f64_infinity_maps_to_null() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(f64::INFINITY))),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::Static(StaticNode::F64(f64::NEG_INFINITY))),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn test_string() {
+        assert_eq!(
+            owned_value_to_serde_json(&OwnedValue::String("hello".into())),
+            serde_json::Value::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_array() {
+        let input = OwnedValue::Array(Box::new(vec![
+            OwnedValue::Static(StaticNode::Null),
+            OwnedValue::Static(StaticNode::Bool(true)),
+        ]));
+        assert_eq!(
+            owned_value_to_serde_json(&input),
+            serde_json::json!([null, true])
+        );
+    }
+
+    #[test]
+    fn test_object() {
+        let mut obj = simd_json::owned::Object::new();
+        obj.insert("k".into(), OwnedValue::Static(StaticNode::I64(1)));
+        let input = OwnedValue::Object(Box::new(obj));
+        assert_eq!(
+            owned_value_to_serde_json(&input),
+            serde_json::json!({"k": 1})
+        );
+    }
+
+    #[test]
+    fn test_nested_object() {
+        let mut inner = simd_json::owned::Object::new();
+        inner.insert("b".into(), OwnedValue::String("v".into()));
+        let mut outer = simd_json::owned::Object::new();
+        outer.insert("a".into(), OwnedValue::Object(Box::new(inner)));
+        let input = OwnedValue::Object(Box::new(outer));
+        assert_eq!(
+            owned_value_to_serde_json(&input),
+            serde_json::json!({"a": {"b": "v"}})
+        );
+    }
+}

@@ -21,6 +21,7 @@ use integration::harness::TestBinaryError;
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
+use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -101,9 +102,11 @@ impl InfluxDbContainer {
         let container: ContainerAsync<GenericImage> =
             GenericImage::new(INFLUXDB_IMAGE, INFLUXDB_TAG)
                 .with_exposed_port(INFLUXDB_PORT.tcp())
-                // "Listening" appears in stdout before the HTTP API is ready on
-                // aarch64/Apple Silicon; we add a real /ping probe below.
-                .with_wait_for(WaitFor::message_on_stdout("Listening"))
+                .with_wait_for(WaitFor::http(
+                    HttpWaitStrategy::new("/ping")
+                        .with_port(INFLUXDB_PORT.tcp())
+                        .with_expected_status_code(204u16),
+                ))
                 .with_mapped_port(0, INFLUXDB_PORT.tcp())
                 .with_env_var("DOCKER_INFLUXDB_INIT_MODE", "setup")
                 .with_env_var("DOCKER_INFLUXDB_INIT_USERNAME", INFLUXDB_USERNAME)

@@ -85,6 +85,10 @@ pub struct IggyShard {
     pub(crate) client_manager: ClientManager,
     pub(crate) metrics: Metrics,
     pub(crate) is_follower: bool,
+    /// Index into `config.cluster.nodes` that describes this running node.
+    /// `Some` only when cluster mode is enabled; validated at bootstrap to
+    /// match exactly one entry in the nodes list.
+    pub(crate) current_replica_id: Option<u8>,
     pub messages_receiver: Cell<Option<Receiver<ShardFrame>>>,
     pub(crate) stop_receiver: StopReceiver,
     pub(crate) is_shutting_down: AtomicBool,

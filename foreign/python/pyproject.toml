@@ -72,8 +72,8 @@ include = [
 [project.optional-dependencies]
 # Core testing dependencies
 testing = [
-    "pytest>=7.0,<9.0",
-    "pytest-asyncio>=0.21.0,<1.0",
+    "pytest>=9.0.3,<10.0",
+    "pytest-asyncio>=0.24.0,<2.0",
     "pytest-cov>=4.0,<7.0",
     "pytest-xdist>=3.0,<4.0",
     "pytest-timeout>=2.0,<3.0",
@@ -93,8 +93,8 @@ dev = [
 
 # All dependencies for full development setup
 all = [
-    "pytest>=7.0,<9.0",
-    "pytest-asyncio>=0.21.0,<1.0",
+    "pytest>=9.0.3,<10.0",
+    "pytest-asyncio>=0.24.0,<2.0",
     "pytest-cov>=4.0,<7.0",
     "pytest-xdist>=3.0,<4.0",
     "pytest-timeout>=2.0,<3.0",

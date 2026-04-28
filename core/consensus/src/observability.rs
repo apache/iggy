@@ -19,6 +19,7 @@ use crate::{Pipeline, PipelineEntry, Status, VsrAction, VsrConsensus};
 use iggy_binary_protocol::Operation;
 use iggy_common::sharding::IggyNamespace;
 use message_bus::MessageBus;
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaneKind {
@@ -375,6 +376,235 @@ pub trait StructuredSimEvent {
     fn emit(&self, sim_event: SimEventKind);
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionDiagEvent<'a> {
+    pub replica: ReplicaLogContext,
+    pub message: &'static str,
+    pub operation: Option<Operation>,
+    pub op: Option<u64>,
+    pub prepare_checksum: Option<u128>,
+    pub reason: Option<&'a str>,
+    pub error: Option<Cow<'a, str>>,
+}
+
+impl<'a> PartitionDiagEvent<'a> {
+    #[must_use]
+    pub const fn new(replica: ReplicaLogContext, message: &'static str) -> Self {
+        Self {
+            replica,
+            message,
+            operation: None,
+            op: None,
+            prepare_checksum: None,
+            reason: None,
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_operation(mut self, operation: Operation) -> Self {
+        self.operation = Some(operation);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_op(mut self, op: u64) -> Self {
+        self.op = Some(op);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_prepare_checksum(mut self, prepare_checksum: u128) -> Self {
+        self.prepare_checksum = Some(prepare_checksum);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_reason(mut self, reason: &'a str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    #[must_use]
+    pub fn with_error<E>(mut self, error: E) -> Self
+    where
+        E: Into<Cow<'a, str>>,
+    {
+        self.error = Some(error.into());
+        self
+    }
+}
+
+pub fn emit_partition_diag(level: tracing::Level, event: &PartitionDiagEvent<'_>) {
+    match level {
+        tracing::Level::ERROR => emit_partition_diag_error(event),
+        tracing::Level::WARN => emit_partition_diag_warn(event),
+        tracing::Level::INFO => emit_partition_diag_info(event),
+        tracing::Level::DEBUG => emit_partition_diag_debug(event),
+        tracing::Level::TRACE => emit_partition_diag_trace(event),
+    }
+}
+
+fn emit_partition_diag_error(event: &PartitionDiagEvent<'_>) {
+    let ctx = event.replica;
+    let operation = event.operation.map_or("", operation_as_str);
+    let op = event.op.unwrap_or_default();
+    let prepare_checksum = event.prepare_checksum.unwrap_or_default();
+    let reason = event.reason.unwrap_or("");
+    let error = event.error.as_deref().unwrap_or("");
+
+    tracing::event!(
+        target: "iggy.partitions.diag",
+        tracing::Level::ERROR,
+        plane = ctx.plane.as_str(),
+        cluster_id = ctx.cluster_id,
+        replica_id = ctx.replica_id,
+        namespace_raw = ctx.namespace.raw,
+        stream_id = namespace_component(ctx.namespace.stream_id),
+        topic_id = namespace_component(ctx.namespace.topic_id),
+        partition_id = namespace_component(ctx.namespace.partition_id),
+        view = ctx.view,
+        log_view = ctx.log_view,
+        commit = ctx.commit,
+        status = status_as_str(ctx.status),
+        role = ctx.role.as_str(),
+        operation,
+        op,
+        prepare_checksum,
+        reason,
+        error,
+        message = event.message,
+    );
+}
+
+fn emit_partition_diag_warn(event: &PartitionDiagEvent<'_>) {
+    let ctx = event.replica;
+    let operation = event.operation.map_or("", operation_as_str);
+    let op = event.op.unwrap_or_default();
+    let prepare_checksum = event.prepare_checksum.unwrap_or_default();
+    let reason = event.reason.unwrap_or("");
+    let error = event.error.as_deref().unwrap_or("");
+
+    tracing::event!(
+        target: "iggy.partitions.diag",
+        tracing::Level::WARN,
+        plane = ctx.plane.as_str(),
+        cluster_id = ctx.cluster_id,
+        replica_id = ctx.replica_id,
+        namespace_raw = ctx.namespace.raw,
+        stream_id = namespace_component(ctx.namespace.stream_id),
+        topic_id = namespace_component(ctx.namespace.topic_id),
+        partition_id = namespace_component(ctx.namespace.partition_id),
+        view = ctx.view,
+        log_view = ctx.log_view,
+        commit = ctx.commit,
+        status = status_as_str(ctx.status),
+        role = ctx.role.as_str(),
+        operation,
+        op,
+        prepare_checksum,
+        reason,
+        error,
+        message = event.message,
+    );
+}
+
+fn emit_partition_diag_info(event: &PartitionDiagEvent<'_>) {
+    let ctx = event.replica;
+    let operation = event.operation.map_or("", operation_as_str);
+    let op = event.op.unwrap_or_default();
+    let prepare_checksum = event.prepare_checksum.unwrap_or_default();
+    let reason = event.reason.unwrap_or("");
+    let error = event.error.as_deref().unwrap_or("");
+
+    tracing::event!(
+        target: "iggy.partitions.diag",
+        tracing::Level::INFO,
+        plane = ctx.plane.as_str(),
+        cluster_id = ctx.cluster_id,
+        replica_id = ctx.replica_id,
+        namespace_raw = ctx.namespace.raw,
+        stream_id = namespace_component(ctx.namespace.stream_id),
+        topic_id = namespace_component(ctx.namespace.topic_id),
+        partition_id = namespace_component(ctx.namespace.partition_id),
+        view = ctx.view,
+        log_view = ctx.log_view,
+        commit = ctx.commit,
+        status = status_as_str(ctx.status),
+        role = ctx.role.as_str(),
+        operation,
+        op,
+        prepare_checksum,
+        reason,
+        error,
+        message = event.message,
+    );
+}
+
+fn emit_partition_diag_debug(event: &PartitionDiagEvent<'_>) {
+    let ctx = event.replica;
+    let operation = event.operation.map_or("", operation_as_str);
+    let op = event.op.unwrap_or_default();
+    let prepare_checksum = event.prepare_checksum.unwrap_or_default();
+    let reason = event.reason.unwrap_or("");
+    let error = event.error.as_deref().unwrap_or("");
+
+    tracing::event!(
+        target: "iggy.partitions.diag",
+        tracing::Level::DEBUG,
+        plane = ctx.plane.as_str(),
+        cluster_id = ctx.cluster_id,
+        replica_id = ctx.replica_id,
+        namespace_raw = ctx.namespace.raw,
+        stream_id = namespace_component(ctx.namespace.stream_id),
+        topic_id = namespace_component(ctx.namespace.topic_id),
+        partition_id = namespace_component(ctx.namespace.partition_id),
+        view = ctx.view,
+        log_view = ctx.log_view,
+        commit = ctx.commit,
+        status = status_as_str(ctx.status),
+        role = ctx.role.as_str(),
+        operation,
+        op,
+        prepare_checksum,
+        reason,
+        error,
+        message = event.message,
+    );
+}
+
+fn emit_partition_diag_trace(event: &PartitionDiagEvent<'_>) {
+    let ctx = event.replica;
+    let operation = event.operation.map_or("", operation_as_str);
+    let op = event.op.unwrap_or_default();
+    let prepare_checksum = event.prepare_checksum.unwrap_or_default();
+    let reason = event.reason.unwrap_or("");
+    let error = event.error.as_deref().unwrap_or("");
+
+    tracing::event!(
+        target: "iggy.partitions.diag",
+        tracing::Level::TRACE,
+        plane = ctx.plane.as_str(),
+        cluster_id = ctx.cluster_id,
+        replica_id = ctx.replica_id,
+        namespace_raw = ctx.namespace.raw,
+        stream_id = namespace_component(ctx.namespace.stream_id),
+        topic_id = namespace_component(ctx.namespace.topic_id),
+        partition_id = namespace_component(ctx.namespace.partition_id),
+        view = ctx.view,
+        log_view = ctx.log_view,
+        commit = ctx.commit,
+        status = status_as_str(ctx.status),
+        role = ctx.role.as_str(),
+        operation,
+        op,
+        prepare_checksum,
+        reason,
+        error,
+        message = event.message,
+    );
+}
+
 #[must_use]
 pub const fn status_as_str(status: Status) -> &'static str {
     match status {
@@ -388,6 +618,8 @@ pub const fn status_as_str(status: Status) -> &'static str {
 pub const fn operation_as_str(operation: Operation) -> &'static str {
     match operation {
         Operation::Reserved => "reserved",
+        Operation::CreateTopicWithAssignments => "create_topic_with_assignments",
+        Operation::CreatePartitionsWithAssignments => "create_partitions_with_assignments",
         Operation::CreateStream => "create_stream",
         Operation::UpdateStream => "update_stream",
         Operation::DeleteStream => "delete_stream",
@@ -408,8 +640,10 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::UpdatePermissions => "update_permissions",
         Operation::CreatePersonalAccessToken => "create_personal_access_token",
         Operation::DeletePersonalAccessToken => "delete_personal_access_token",
+        Operation::Register => "register",
         Operation::SendMessages => "send_messages",
         Operation::StoreConsumerOffset => "store_consumer_offset",
+        Operation::DeleteConsumerOffset => "delete_consumer_offset",
     }
 }
 

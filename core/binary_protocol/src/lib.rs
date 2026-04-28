@@ -76,12 +76,13 @@ pub use consensus::{
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;
-pub use framing::{RequestFrame, ResponseFrame, STATUS_OK};
+pub use framing::{RequestFrame, RequestFrame2, ResponseFrame, ResponseFrame2, STATUS_OK};
 pub use message_view::{
     WireMessageIterator, WireMessageIteratorMut, WireMessageView, WireMessageViewMut,
 };
 pub use primitives::consumer::WireConsumer;
 pub use primitives::identifier::{MAX_WIRE_NAME_LENGTH, WireIdentifier, WireName};
+pub use primitives::partition_assignment::CreatedPartitionAssignment;
 pub use primitives::partitioning::{MAX_MESSAGES_KEY_LENGTH, WirePartitioning};
 pub use primitives::permissions::{
     WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
