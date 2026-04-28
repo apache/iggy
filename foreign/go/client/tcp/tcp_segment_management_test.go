@@ -30,7 +30,9 @@ import (
 
 func TestIggyTcpClient_DeleteSegments(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
+	defer func() {
+		_ = clientConn.Close()
+	}()
 
 	streamId, _ := iggcon.NewIdentifier("stream")
 	topicId, _ := iggcon.NewIdentifier(uint32(1))
@@ -48,7 +50,9 @@ func TestIggyTcpClient_DeleteSegments(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		defer serverConn.Close()
+		defer func() {
+			_ = serverConn.Close()
+		}()
 
 		header := make([]byte, 8)
 		if _, err := io.ReadFull(serverConn, header); err != nil {
