@@ -21,6 +21,7 @@ extern crate self as configs;
 
 mod configs_impl;
 mod server_config;
+mod server_ng_config;
 pub use configs_derive::ConfigEnv;
 pub use configs_impl::{
     ConfigEnvMappings, ConfigProvider, ConfigurationError, ConfigurationType, EnvVarMapping,
@@ -30,3 +31,4 @@ pub use server_config::{
     COMPONENT, cache_indexes, cluster, defaults, displays, http, quic, server, sharding, system,
     tcp, validators, websocket,
 };
+pub use server_ng_config::{COMPONENT_NG, message_bus, server_ng};
