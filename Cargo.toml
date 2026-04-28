@@ -256,6 +256,7 @@ serde_yaml_ng = "0.10.0"
 serial_test = "3.4.0"
 server = { path = "core/server" }
 server-ng = { path = "core/server-ng" }
+shard = { path = "core/shard" }
 simd-json = { version = "0.17.0", features = ["serde_impl"] }
 slab = "0.4.12"
 smallvec = "1.15"

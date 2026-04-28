@@ -19,8 +19,9 @@
 
 use super::quic::{QuicCertificateConfig, QuicConfig};
 use super::server::{
-    ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MessagesMaintenanceConfig,
-    TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
+    ConsumerGroupConfig, DataMaintenanceConfig, ExtraConfig, HeartbeatConfig,
+    MessagesMaintenanceConfig, NamespaceConfig, TelemetryConfig, TelemetryLogsConfig,
+    TelemetryTracesConfig,
 };
 use super::system::MessageDeduplicationConfig;
 use super::{
@@ -156,9 +157,10 @@ impl Display for ServerConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ consumer_group: {}, data_maintenance: {}, message_saver: {}, heartbeat: {}, system: {}, quic: {}, tcp: {}, http: {}, telemetry: {} }}",
+            "{{ consumer_group: {}, data_maintenance: {}, extra: {}, message_saver: {}, heartbeat: {}, system: {}, quic: {}, tcp: {}, http: {}, telemetry: {} }}",
             self.consumer_group,
             self.data_maintenance,
+            self.extra,
             self.message_saver,
             self.heartbeat,
             self.system,
@@ -166,6 +168,22 @@ impl Display for ServerConfig {
             self.tcp,
             self.http,
             self.telemetry
+        )
+    }
+}
+
+impl Display for ExtraConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{ namespace: {} }}", self.namespace)
+    }
+}
+
+impl Display for NamespaceConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ max_streams: {}, max_topics: {}, max_partitions: {} }}",
+            self.max_streams, self.max_topics, self.max_partitions
         )
     }
 }

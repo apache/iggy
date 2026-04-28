@@ -49,6 +49,47 @@ pub const PARTITION_MASK: u64 = (1u64 << PARTITION_BITS) - 1;
 pub const TOPIC_MASK: u64 = (1u64 << TOPIC_BITS) - 1;
 pub const STREAM_MASK: u64 = (1u64 << STREAM_BITS) - 1;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceCapacityError {
+    ZeroStreams,
+    ZeroTopics,
+    ZeroPartitions,
+    ExceedsU64 {
+        required_bits: u32,
+    },
+    ExceedsLayout {
+        stream_bits: u32,
+        topic_bits: u32,
+        partition_bits: u32,
+    },
+}
+
+impl std::fmt::Display for NamespaceCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroStreams => write!(f, "max_streams must be greater than 0"),
+            Self::ZeroTopics => write!(f, "max_topics must be greater than 0"),
+            Self::ZeroPartitions => write!(f, "max_partitions must be greater than 0"),
+            Self::ExceedsU64 { required_bits } => write!(
+                f,
+                "namespace capacity requires {required_bits} bits, which does not fit in u64"
+            ),
+            Self::ExceedsLayout {
+                stream_bits,
+                topic_bits,
+                partition_bits,
+            } => write!(
+                f,
+                "namespace capacity requires stream/topic/partition bits of \
+                 {stream_bits}/{topic_bits}/{partition_bits}, but IggyNamespace supports \
+                 {STREAM_BITS}/{TOPIC_BITS}/{PARTITION_BITS}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NamespaceCapacityError {}
+
 /// Packed namespace identifier for shard assignment.
 ///
 /// Encodes stream_id (12 bits), topic_id (12 bits), and partition_id (20 bits)
@@ -88,5 +129,82 @@ impl IggyNamespace {
             | ((topic as u64) & TOPIC_MASK) << TOPIC_SHIFT
             | ((partition as u64) & PARTITION_MASK) << PARTITION_SHIFT;
         Self(value)
+    }
+
+    pub fn validate_capacity(
+        max_streams: usize,
+        max_topics: usize,
+        max_partitions: usize,
+    ) -> Result<(), NamespaceCapacityError> {
+        let stream_bits = if max_streams == 0 {
+            return Err(NamespaceCapacityError::ZeroStreams);
+        } else {
+            bits_required((max_streams - 1) as u64)
+        };
+        let topic_bits = if max_topics == 0 {
+            return Err(NamespaceCapacityError::ZeroTopics);
+        } else {
+            bits_required((max_topics - 1) as u64)
+        };
+        let partition_bits = if max_partitions == 0 {
+            return Err(NamespaceCapacityError::ZeroPartitions);
+        } else {
+            bits_required((max_partitions - 1) as u64)
+        };
+
+        let required_bits = stream_bits
+            .checked_add(topic_bits)
+            .and_then(|bits| bits.checked_add(partition_bits))
+            .ok_or(NamespaceCapacityError::ExceedsU64 {
+                required_bits: u32::MAX,
+            })?;
+        if required_bits > u64::BITS {
+            return Err(NamespaceCapacityError::ExceedsU64 { required_bits });
+        }
+
+        if stream_bits > STREAM_BITS || topic_bits > TOPIC_BITS || partition_bits > PARTITION_BITS {
+            return Err(NamespaceCapacityError::ExceedsLayout {
+                stream_bits,
+                topic_bits,
+                partition_bits,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS, NamespaceCapacityError};
+
+    #[test]
+    fn validates_default_namespace_capacity() {
+        assert!(IggyNamespace::validate_capacity(MAX_STREAMS, MAX_TOPICS, MAX_PARTITIONS).is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_capacity_values() {
+        assert_eq!(
+            IggyNamespace::validate_capacity(0, MAX_TOPICS, MAX_PARTITIONS),
+            Err(NamespaceCapacityError::ZeroStreams)
+        );
+        assert_eq!(
+            IggyNamespace::validate_capacity(MAX_STREAMS, 0, MAX_PARTITIONS),
+            Err(NamespaceCapacityError::ZeroTopics)
+        );
+        assert_eq!(
+            IggyNamespace::validate_capacity(MAX_STREAMS, MAX_TOPICS, 0),
+            Err(NamespaceCapacityError::ZeroPartitions)
+        );
+    }
+
+    #[test]
+    fn rejects_capacity_that_exceeds_current_layout() {
+        let err = IggyNamespace::validate_capacity(MAX_STREAMS + 1, MAX_TOPICS, MAX_PARTITIONS);
+        assert!(matches!(
+            err,
+            Err(NamespaceCapacityError::ExceedsLayout { .. })
+        ));
     }
 }

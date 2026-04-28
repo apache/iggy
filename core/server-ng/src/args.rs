@@ -17,10 +17,20 @@
  * under the License.
  */
 
-#![allow(clippy::future_not_send)]
+use clap::Parser;
 
-pub mod bootstrap;
-pub mod config_writer;
-pub mod login_register;
-pub mod server_error;
-pub mod session_manager;
+#[derive(Parser, Debug)]
+#[command(
+    author = "Apache Iggy (Incubating)",
+    version,
+    about = "Apache Iggy server-ng",
+    long_about = "Apache Iggy server-ng\n\nUse --replica-id <N> together with a shared cluster config to run one binary per cluster node."
+)]
+pub struct Args {
+    /// Identifies this node within `cluster.nodes` by its replica ID.
+    ///
+    /// Required when `cluster.enabled = true`. The value must match exactly
+    /// one `cluster.nodes[*].replica_id` entry in the loaded configuration.
+    #[arg(long, verbatim_doc_comment)]
+    pub replica_id: Option<u8>,
+}
