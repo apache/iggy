@@ -54,3 +54,11 @@ func TestSerialize_DeleteSegments(t *testing.T) {
 		t.Errorf("Test case failed. \nExpected:\t%v\nGot:\t\t%v", expected, serialized)
 	}
 }
+
+func TestDeleteSegments_Code(t *testing.T) {
+	request := DeleteSegments{}
+
+	if request.Code() != DeleteSegmentsCode {
+		t.Errorf("Expected command code %v, got %v", DeleteSegmentsCode, request.Code())
+	}
+}

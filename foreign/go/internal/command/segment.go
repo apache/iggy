@@ -35,24 +35,12 @@ func (d *DeleteSegments) Code() Code {
 }
 
 func (d *DeleteSegments) MarshalBinary() ([]byte, error) {
-	streamIdBytes, err := d.StreamId.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	topicIdBytes, err := d.TopicId.MarshalBinary()
+	bytes, err := iggcon.MarshalIdentifiers(d.StreamId, d.TopicId)
 	if err != nil {
 		return nil, err
 	}
 
-	bytes := make([]byte, len(streamIdBytes)+len(topicIdBytes)+8)
-	position := 0
-	copy(bytes[position:], streamIdBytes)
-	position += len(streamIdBytes)
-	copy(bytes[position:], topicIdBytes)
-	position += len(topicIdBytes)
-	binary.LittleEndian.PutUint32(bytes[position:position+4], d.PartitionId)
-	position += 4
-	binary.LittleEndian.PutUint32(bytes[position:position+4], d.SegmentsCount)
-
+	bytes = binary.LittleEndian.AppendUint32(bytes, d.PartitionId)
+	bytes = binary.LittleEndian.AppendUint32(bytes, d.SegmentsCount)
 	return bytes, nil
 }
