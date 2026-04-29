@@ -45,6 +45,42 @@ class CompressionAlgorithm final {
     std::string algorithm_;
 };
 
+class SnapshotCompression final {
+  public:
+    static SnapshotCompression stored() { return SnapshotCompression("stored"); }
+    static SnapshotCompression deflated() { return SnapshotCompression("deflated"); }
+    static SnapshotCompression bzip2() { return SnapshotCompression("bzip2"); }
+    static SnapshotCompression zstd() { return SnapshotCompression("zstd"); }
+    static SnapshotCompression lzma() { return SnapshotCompression("lzma"); }
+    static SnapshotCompression xz() { return SnapshotCompression("xz"); }
+
+    std::string_view snapshot_compression_value() const { return snapshot_compression_; }
+
+  private:
+    explicit SnapshotCompression(std::string snapshot_compression)
+        : snapshot_compression_(std::move(snapshot_compression)) {}
+
+    std::string snapshot_compression_;
+};
+
+class SnapshotType final {
+  public:
+    static SnapshotType filesystem_overview() { return SnapshotType("filesystem_overview"); }
+    static SnapshotType process_list() { return SnapshotType("process_list"); }
+    static SnapshotType resource_usage() { return SnapshotType("resource_usage"); }
+    static SnapshotType test() { return SnapshotType("test"); }
+    static SnapshotType server_logs() { return SnapshotType("server_logs"); }
+    static SnapshotType server_config() { return SnapshotType("server_config"); }
+    static SnapshotType all() { return SnapshotType("all"); }
+
+    std::string_view snapshot_type_value() const { return snapshot_type_; }
+
+  private:
+    explicit SnapshotType(std::string snapshot_type) : snapshot_type_(std::move(snapshot_type)) {}
+
+    std::string snapshot_type_;
+};
+
 class Expiry final {
   public:
     static Expiry server_default() { return Expiry("server_default", 0); }
