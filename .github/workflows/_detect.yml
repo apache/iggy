@@ -66,7 +66,7 @@ jobs:
       examples_matrix: ${{ steps.mk.outputs.examples_matrix }}
       other_matrix: ${{ steps.mk.outputs.other_matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -91,7 +91,7 @@ jobs:
 
       - name: Build matrices
         id: mk
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const componentsJson = `${{ steps.config.outputs.components }}`;
