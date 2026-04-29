@@ -68,6 +68,7 @@ async fn main() -> Result<(), DataProducerError> {
 
     let mut rng = rand::rng();
     let mut batches_count = 0;
+    let mut total_msg = 0;
     while batches_count < 100 {
         let records_count = rng.sample(Uniform::new(100u32, 500).unwrap());
         let messages = (0..records_count)
@@ -77,10 +78,12 @@ async fn main() -> Result<(), DataProducerError> {
             .collect::<Vec<_>>();
         producer.send(messages).await?;
         info!("Sent {records_count} messages");
+        total_msg += records_count;
         batches_count += 1;
     }
 
     info!("Reached maximum batches count");
+    info!("Produced {total_msg} messages.");
     Ok(())
 }
 
