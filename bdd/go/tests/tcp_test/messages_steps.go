@@ -19,6 +19,7 @@ package tcp_test
 
 import (
 	"bytes"
+	"context"
 	"reflect"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -45,6 +46,7 @@ func itShouldSuccessfullyPublishMessages(streamId uint32, topicId uint32, messag
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	result, err := client.PollMessages(
+		context.Background(),
 		streamIdentifier,
 		topicIdentifier,
 		iggcon.NewSingleConsumer(randomU32Identifier()),

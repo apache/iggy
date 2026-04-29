@@ -121,8 +121,8 @@ func serverTypeFromPort(port uint16) string {
 	}
 }
 
-func verifyLeaderInMetadata(client iggcon.Client) (*iggcon.ClusterNode, error) {
-	metadata, err := client.GetClusterMetadata()
+func verifyLeaderInMetadata(ctx context.Context, client iggcon.Client) (*iggcon.ClusterNode, error) {
+	metadata, err := client.GetClusterMetadata(ctx)
 	if err != nil {
 		if isClusteringUnavailable(err) {
 			// Clustering not enabled, this is OK
@@ -142,7 +142,7 @@ func verifyLeaderInMetadata(client iggcon.Client) (*iggcon.ClusterNode, error) {
 	return nil, nil
 }
 
-func verifyClientConnection(client iggcon.Client, expectedPort uint16) (string, error) {
+func verifyClientConnection(ctx context.Context, client iggcon.Client, expectedPort uint16) (string, error) {
 	connInfo := client.GetConnectionInfo()
 
 	expectedSuffix := fmt.Sprintf(":%d", expectedPort)
@@ -155,7 +155,7 @@ func verifyClientConnection(client iggcon.Client, expectedPort uint16) (string, 
 	}
 
 	// Verify client can communicate
-	if err := client.Ping(); err != nil {
+	if err := client.Ping(ctx); err != nil {
 		return "", fmt.Errorf("client cannot ping server: %w", err)
 	}
 
@@ -324,7 +324,7 @@ func (s leaderSteps) whenAuthenticateRoot(ctx context.Context) error {
 		if !ok {
 			return fmt.Errorf("client %s should be created", name)
 		}
-		if _, err := cli.LoginUser(defaultRootUsername, defaultRootPassword); err != nil {
+		if _, err := cli.LoginUser(ctx, defaultRootUsername, defaultRootPassword); err != nil {
 			return err
 		}
 		// Small delay between multiple authentications to avoid race conditions
@@ -342,7 +342,7 @@ func (s leaderSteps) whenCreateStream(ctx context.Context, streamName string) er
 		return errors.New("client should be available")
 	}
 
-	stream, err := cli.CreateStream(streamName)
+	stream, err := cli.CreateStream(ctx, streamName)
 	if err != nil {
 		return err
 	}
@@ -368,10 +368,10 @@ func (s leaderSteps) thenVerifyClientPort(ctx context.Context, expectedPort uint
 		return errors.New("client should exist")
 	}
 
-	if _, err := verifyClientConnection(cli, expectedPort); err != nil {
+	if _, err := verifyClientConnection(ctx, cli, expectedPort); err != nil {
 		return err
 	}
-	leader, err := verifyLeaderInMetadata(cli)
+	leader, err := verifyLeaderInMetadata(ctx, cli)
 	if err != nil {
 		return err
 	}
@@ -390,10 +390,10 @@ func (s leaderSteps) thenVerifyNamedClientPort(ctx context.Context, clientName s
 		return fmt.Errorf("client %s should exist", clientName)
 	}
 
-	if _, err := verifyClientConnection(cli, port); err != nil {
+	if _, err := verifyClientConnection(ctx, cli, port); err != nil {
 		return fmt.Errorf("client %s connection should succeed: %w", clientName, err)
 	}
-	leader, err := verifyLeaderInMetadata(cli)
+	leader, err := verifyLeaderInMetadata(ctx, cli)
 	if err != nil {
 		return err
 	}
@@ -421,7 +421,7 @@ func (s leaderSteps) thenConnectionRemains(ctx context.Context, port uint16) err
 		return errors.New("client should exist")
 	}
 
-	if _, err := verifyClientConnection(cli, port); err != nil {
+	if _, err := verifyClientConnection(ctx, cli, port); err != nil {
 		return fmt.Errorf("should remain on original port: %w", err)
 	}
 	if c.TestState.RedirectionOccurred {
@@ -437,7 +437,7 @@ func (s leaderSteps) thenConnectWithoutRedirection(ctx context.Context) error {
 	if !ok {
 		return errors.New("client should exist")
 	}
-	if err := cli.Ping(); err != nil {
+	if err := cli.Ping(ctx); err != nil {
 		return fmt.Errorf("client should be able to ping server: %v", err)
 	}
 	if c.TestState.RedirectionOccurred {
@@ -460,18 +460,18 @@ func (s leaderSteps) thenBothUseSameServer(ctx context.Context) error {
 	if a.GetConnectionInfo().ServerAddress != b.GetConnectionInfo().ServerAddress {
 		return errors.New("both clients should be connected to the same server")
 	}
-	if err := a.Ping(); err != nil {
+	if err := a.Ping(ctx); err != nil {
 		return errors.New("client A should be able to ping")
 	}
-	if err := b.Ping(); err != nil {
+	if err := b.Ping(ctx); err != nil {
 		return errors.New("client B should be able to ping")
 	}
 
-	leaderA, err := verifyLeaderInMetadata(a)
+	leaderA, err := verifyLeaderInMetadata(ctx, a)
 	if err != nil {
 		return err
 	}
-	leaderB, err := verifyLeaderInMetadata(b)
+	leaderB, err := verifyLeaderInMetadata(ctx, b)
 	if err != nil {
 		return err
 	}

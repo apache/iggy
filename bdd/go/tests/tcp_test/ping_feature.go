@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -25,7 +27,7 @@ var _ = ginkgo.Describe("PING FEATURE:", func() {
 	ginkgo.When("User is logged in", func() {
 		ginkgo.Context("and tries to ping server", func() {
 			client := createAuthorizedConnection()
-			err := client.Ping()
+			err := client.Ping(context.Background())
 
 			itShouldNotReturnError(err)
 		})
@@ -34,7 +36,7 @@ var _ = ginkgo.Describe("PING FEATURE:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to ping server", func() {
 			client := createClient()
-			err := client.Ping()
+			err := client.Ping(context.Background())
 
 			itShouldNotReturnError(err)
 		})

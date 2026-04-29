@@ -18,6 +18,7 @@
 package tcp_test
 
 import (
+	"context"
 	"math"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -38,6 +39,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.UpdateTopic(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				newName,
@@ -59,6 +61,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topic2Identifier, _ := iggcon.NewIdentifier(topic2Id)
 			err := client.UpdateTopic(
+				context.Background(),
 				streamIdentifier,
 				topic2Identifier,
 				topic1Name,
@@ -74,6 +77,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			client := createAuthorizedConnection()
 			replicationFactor := uint8(1)
 			err := client.UpdateTopic(
+				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
 				createRandomString(128),
@@ -92,6 +96,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			replicationFactor := uint8(1)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.UpdateTopic(
+				context.Background(),
 				streamIdentifier,
 				randomU32Identifier(),
 				createRandomString(128),
@@ -112,6 +117,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.UpdateTopic(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				createRandomString(256),
@@ -127,7 +133,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to update stream", func() {
 			client := createClient()
-			err := client.UpdateStream(randomU32Identifier(), createRandomString(128))
+			err := client.UpdateStream(context.Background(), randomU32Identifier(), createRandomString(128))
 
 			itShouldReturnUnauthenticatedError(err)
 		})

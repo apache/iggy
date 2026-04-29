@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/onsi/ginkgo/v2"
 )
@@ -33,7 +35,7 @@ var _ = ginkgo.Describe("GET ALL CONSUMER GROUPS:", func() {
 			groupId, name := successfullyCreateConsumer(streamId, topicId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
-			groups, err := client.GetConsumerGroups(streamIdentifier, topicIdentifier)
+			groups, err := client.GetConsumerGroups(context.Background(), streamIdentifier, topicIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldContainSpecificConsumer(groupId, name, groups)
@@ -43,7 +45,7 @@ var _ = ginkgo.Describe("GET ALL CONSUMER GROUPS:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to get all consumer groups", func() {
 			client := createClient()
-			_, err := client.GetConsumerGroups(randomU32Identifier(), randomU32Identifier())
+			_, err := client.GetConsumerGroups(context.Background(), randomU32Identifier(), randomU32Identifier())
 
 			itShouldReturnUnauthenticatedError(err)
 		})

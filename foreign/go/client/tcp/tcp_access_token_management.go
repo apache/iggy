@@ -18,13 +18,15 @@
 package tcp
 
 import (
+	"context"
+
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
-func (c *IggyTcpClient) CreatePersonalAccessToken(name string, expiry uint32) (*iggcon.RawPersonalAccessToken, error) {
-	buffer, err := c.do(&command.CreatePersonalAccessToken{
+func (c *IggyTcpClient) CreatePersonalAccessToken(ctx context.Context, name string, expiry uint32) (*iggcon.RawPersonalAccessToken, error) {
+	buffer, err := c.do(ctx, &command.CreatePersonalAccessToken{
 		Name:   name,
 		Expiry: expiry,
 	})
@@ -35,15 +37,15 @@ func (c *IggyTcpClient) CreatePersonalAccessToken(name string, expiry uint32) (*
 	return binaryserialization.DeserializeAccessToken(buffer)
 }
 
-func (c *IggyTcpClient) DeletePersonalAccessToken(name string) error {
-	_, err := c.do(&command.DeletePersonalAccessToken{
+func (c *IggyTcpClient) DeletePersonalAccessToken(ctx context.Context, name string) error {
+	_, err := c.do(ctx, &command.DeletePersonalAccessToken{
 		Name: name,
 	})
 	return err
 }
 
-func (c *IggyTcpClient) GetPersonalAccessTokens() ([]iggcon.PersonalAccessTokenInfo, error) {
-	buffer, err := c.do(&command.GetPersonalAccessTokens{})
+func (c *IggyTcpClient) GetPersonalAccessTokens(ctx context.Context) ([]iggcon.PersonalAccessTokenInfo, error) {
+	buffer, err := c.do(ctx, &command.GetPersonalAccessTokens{})
 	if err != nil {
 		return nil, err
 	}

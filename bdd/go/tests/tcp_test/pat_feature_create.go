@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -26,7 +28,7 @@ var _ = ginkgo.Describe("CREATE PAT:", func() {
 		ginkgo.Context("tries to create PAT with correct data", func() {
 			client := createAuthorizedConnection()
 			name := createRandomString(16)
-			response, err := client.CreatePersonalAccessToken(name, 0)
+			response, err := client.CreatePersonalAccessToken(context.Background(), name, 0)
 
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyCreateAccessToken(name, client)
@@ -37,7 +39,7 @@ var _ = ginkgo.Describe("CREATE PAT:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to create PAT", func() {
 			client := createClient()
-			_, err := client.CreatePersonalAccessToken(createRandomString(16), 0)
+			_, err := client.CreatePersonalAccessToken(context.Background(), createRandomString(16), 0)
 			itShouldReturnUnauthenticatedError(err)
 		})
 	})

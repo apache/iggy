@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -28,7 +30,7 @@ var _ = ginkgo.Describe("GET ALL STREAMS:", func() {
 			client := createAuthorizedConnection()
 			streamId, name := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
-			streams, err := client.GetStreams()
+			streams, err := client.GetStreams(context.Background())
 
 			itShouldNotReturnError(err)
 			itShouldContainSpecificStream(streamId, name, streams)
@@ -38,7 +40,7 @@ var _ = ginkgo.Describe("GET ALL STREAMS:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to get all streams", func() {
 			client := createClient()
-			_, err := client.GetStreams()
+			_, err := client.GetStreams(context.Background())
 
 			itShouldReturnUnauthenticatedError(err)
 		})

@@ -18,12 +18,14 @@
 package tcp
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
-func (c *IggyTcpClient) GetClusterMetadata() (*iggcon.ClusterMetadata, error) {
-	response, err := c.do(&command.GetClusterMetadata{})
+func (c *IggyTcpClient) GetClusterMetadata(ctx context.Context) (*iggcon.ClusterMetadata, error) {
+	response, err := c.do(ctx, &command.GetClusterMetadata{})
 	if err != nil {
 		return nil, err
 	}

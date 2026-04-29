@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -28,7 +30,7 @@ var _ = ginkgo.Describe("DELETE PAT:", func() {
 			name := createRandomString(16)
 			token := successfullyCreateAccessToken(name, client)
 
-			err := client.DeletePersonalAccessToken(name)
+			err := client.DeletePersonalAccessToken(context.Background(), name)
 
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyDeleteAccessToken(token, client)
@@ -38,7 +40,7 @@ var _ = ginkgo.Describe("DELETE PAT:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to delete PAT", func() {
 			client := createClient()
-			err := client.DeletePersonalAccessToken(createRandomString(16))
+			err := client.DeletePersonalAccessToken(context.Background(), createRandomString(16))
 			itShouldReturnUnauthenticatedError(err)
 		})
 	})

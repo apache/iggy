@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 )
@@ -26,7 +28,7 @@ var _ = ginkgo.Describe("STAT FEATURE:", func() {
 	ginkgo.When("user is logged in", func() {
 		ginkgo.Context("and tries to log with correct data", func() {
 			client := createAuthorizedConnection()
-			stats, err := client.GetStats()
+			stats, err := client.GetStats(context.Background())
 
 			itShouldNotReturnError(err)
 			ginkgo.It("should return stats", func() {

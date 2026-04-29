@@ -18,6 +18,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net"
@@ -52,18 +53,19 @@ func main() {
 	}()
 
 	log.Printf("Connecting to server at %s", serverAddr)
-	_, err = cli.LoginUser(common.DefaultRootUsername, common.DefaultRootPassword)
+	ctx := context.Background()
+	_, err = cli.LoginUser(ctx, common.DefaultRootUsername, common.DefaultRootPassword)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	err = consumeMessages(cli)
+	err = consumeMessages(ctx, cli)
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func consumeMessages(client iggcon.Client) error {
+func consumeMessages(ctx context.Context, client iggcon.Client) error {
 	interval := 500 * time.Millisecond
 	log.Printf(
 		"Messages will be consumed from stream: %d, topic: %d, partition: %d with interval %s.",
@@ -84,6 +86,7 @@ func consumeMessages(client iggcon.Client) error {
 		topicIdentifier, _ := iggcon.NewIdentifier(TopicID)
 		pollMessages, err := client.
 			PollMessages(
+				ctx,
 				streamIdentifier,
 				topicIdentifier,
 				consumer,
@@ -98,7 +101,11 @@ func consumeMessages(client iggcon.Client) error {
 
 		if len(pollMessages.Messages) == 0 {
 			log.Println("No messages found.")
-			time.Sleep(interval)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(interval):
+			}
 			continue
 		}
 
@@ -110,7 +117,11 @@ func consumeMessages(client iggcon.Client) error {
 			}
 		}
 		consumedBatches++
-		time.Sleep(interval)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(interval):
+		}
 	}
 }
 

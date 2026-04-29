@@ -18,6 +18,7 @@
 package tcp
 
 import (
+	"context"
 	"time"
 
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
@@ -27,8 +28,8 @@ import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
-func (c *IggyTcpClient) LoginUser(username string, password string) (*iggcon.IdentityInfo, error) {
-	buffer, err := c.do(&command.LoginUser{
+func (c *IggyTcpClient) LoginUser(ctx context.Context, username string, password string) (*iggcon.IdentityInfo, error) {
+	buffer, err := c.do(ctx, &command.LoginUser{
 		Username: username,
 		Password: password,
 	})
@@ -37,7 +38,7 @@ func (c *IggyTcpClient) LoginUser(username string, password string) (*iggcon.Ide
 	}
 
 	identity := binaryserialization.DeserializeLogInResponse(buffer)
-	shouldRedirect, err := c.HandleLeaderRedirection()
+	shouldRedirect, err := c.HandleLeaderRedirection(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -45,13 +46,13 @@ func (c *IggyTcpClient) LoginUser(username string, password string) (*iggcon.Ide
 		if err = c.connect(); err != nil {
 			return nil, err
 		}
-		return c.LoginUser(username, password)
+		return c.LoginUser(ctx, username, password)
 	}
 	return identity, nil
 }
 
-func (c *IggyTcpClient) LoginWithPersonalAccessToken(token string) (*iggcon.IdentityInfo, error) {
-	buffer, err := c.do(&command.LoginWithPersonalAccessToken{
+func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token string) (*iggcon.IdentityInfo, error) {
+	buffer, err := c.do(ctx, &command.LoginWithPersonalAccessToken{
 		Token: token,
 	})
 	if err != nil {
@@ -59,7 +60,7 @@ func (c *IggyTcpClient) LoginWithPersonalAccessToken(token string) (*iggcon.Iden
 	}
 
 	identity := binaryserialization.DeserializeLogInResponse(buffer)
-	shouldRedirect, err := c.HandleLeaderRedirection()
+	shouldRedirect, err := c.HandleLeaderRedirection(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -67,23 +68,24 @@ func (c *IggyTcpClient) LoginWithPersonalAccessToken(token string) (*iggcon.Iden
 		if err = c.connect(); err != nil {
 			return nil, err
 		}
-		return c.LoginWithPersonalAccessToken(token)
+		return c.LoginWithPersonalAccessToken(ctx, token)
 	}
 	return identity, nil
 }
 
-func (c *IggyTcpClient) LogoutUser() error {
-	_, err := c.do(&command.LogoutUser{})
+func (c *IggyTcpClient) LogoutUser(ctx context.Context) error {
+	_, err := c.do(ctx, &command.LogoutUser{})
 	return err
 }
 
-func (c *IggyTcpClient) HandleLeaderRedirection() (bool, error) {
+func (c *IggyTcpClient) HandleLeaderRedirection(ctx context.Context) (bool, error) {
 	// Clone current address
 	c.mtx.Lock()
 	currentAddress := c.currentServerAddress
 	c.mtx.Unlock()
 
 	leaderAddress, err := util.CheckAndRedirectToLeader(
+		ctx,
 		c,
 		currentAddress,
 		iggcon.Tcp,

@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
@@ -35,7 +37,7 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			groupIdentifier, _ := iggcon.NewIdentifier(groupId)
-			group, err := client.GetConsumerGroup(streamIdentifier, topicIdentifier, groupIdentifier)
+			group, err := client.GetConsumerGroup(context.Background(), streamIdentifier, topicIdentifier, groupIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldReturnSpecificConsumer(groupId, name, &group.ConsumerGroup)
@@ -45,6 +47,7 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 			client := createAuthorizedConnection()
 
 			_, err := client.GetConsumerGroup(
+				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
 				randomU32Identifier(),
@@ -59,6 +62,7 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			_, err := client.GetConsumerGroup(
+				context.Background(),
 				streamIdentifier,
 				randomU32Identifier(),
 				randomU32Identifier(),
@@ -75,6 +79,7 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			_, err := client.GetConsumerGroup(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				randomU32Identifier(),

@@ -18,6 +18,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -54,23 +55,26 @@ func main() {
 	}()
 
 	log.Printf("Connecting to server at %s", serverAddr)
-	if _, err := cli.LoginUser(common.DefaultRootUsername, common.DefaultRootPassword); err != nil {
+
+	ctx := context.Background()
+	if _, err := cli.LoginUser(ctx, common.DefaultRootUsername, common.DefaultRootPassword); err != nil {
 		log.Fatalf("Login failed: %v", err)
 	}
-	initSystem(cli)
-	if err := produceMessages(cli); err != nil {
+	initSystem(ctx, cli)
+	if err := produceMessages(ctx, cli); err != nil {
 		log.Fatalf("Producing messages failed: %v", err)
 	}
 }
 
-func initSystem(client iggcon.Client) {
-	if _, err := client.CreateStream("sample-stream"); err != nil {
+func initSystem(ctx context.Context, client iggcon.Client) {
+	if _, err := client.CreateStream(ctx, "sample-stream"); err != nil {
 		log.Printf("WARN: Stream already exists or error: %v", err)
 	}
 	log.Println("Stream was created.")
 
 	streamIdentifier, _ := iggcon.NewIdentifier(StreamId)
 	if _, err := client.CreateTopic(
+		ctx,
 		streamIdentifier,
 		"sample-topic",
 		1,
@@ -83,7 +87,7 @@ func initSystem(client iggcon.Client) {
 	log.Println("Topic was created.")
 }
 
-func produceMessages(client iggcon.Client) error {
+func produceMessages(ctx context.Context, client iggcon.Client) error {
 	interval := 500 * time.Millisecond
 	log.Printf(
 		"Messages will be sent to stream: %d, topic: %d, partition: %d with interval %s.",
@@ -115,6 +119,7 @@ func produceMessages(client iggcon.Client) error {
 		streamIdentifier, _ := iggcon.NewIdentifier(StreamId)
 		topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
 		if err := client.SendMessages(
+			ctx,
 			streamIdentifier,
 			topicIdentifier,
 			partitioning,

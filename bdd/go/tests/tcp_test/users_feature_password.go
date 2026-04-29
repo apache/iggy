@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/onsi/ginkgo/v2"
 )
@@ -30,6 +32,7 @@ var _ = ginkgo.Describe("CHANGE PASSWORD:", func() {
 			username := createRandomStringWithPrefix("ch_p_", 16)
 			password := "oldPassword"
 			_, err := client.CreateUser(
+				context.Background(),
 				username,
 				password,
 				iggcon.Active,
@@ -51,7 +54,7 @@ var _ = ginkgo.Describe("CHANGE PASSWORD:", func() {
 			identifier, _ := iggcon.NewIdentifier(username)
 			defer deleteUserAfterTests(identifier, client)
 
-			err = client.ChangePassword(identifier, password, "newPassword")
+			err = client.ChangePassword(context.Background(), identifier, password, "newPassword")
 
 			itShouldNotReturnError(err)
 			//itShouldBePossibleToLogInWithCredentials(createRequest.Username, request.NewPassword)
@@ -63,6 +66,7 @@ var _ = ginkgo.Describe("CHANGE PASSWORD:", func() {
 			client := createClient()
 
 			err := client.UpdatePermissions(
+				context.Background(),
 				randomU32Identifier(),
 				&iggcon.Permissions{
 					Global: iggcon.GlobalPermissions{
