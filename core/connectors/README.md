@@ -82,6 +82,7 @@ Each sink should have its own, custom configuration, which is passed along with 
 - **Iceberg Sink** - writes data to Apache Iceberg tables via REST catalog
 - **PostgreSQL Sink** - stores messages in PostgreSQL database tables
 - **Quickwit Sink** - indexes messages in Quickwit search engine
+- **S3 Sink** - writes messages to Amazon S3 and S3-compatible stores (MinIO, R2, B2, DO Spaces)
 - **Stdout Sink** - prints messages to standard output (useful for debugging/development)
 
 ## Source
