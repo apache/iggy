@@ -28,11 +28,11 @@ When(
   async function (
     this: TestWorld,
     name: string,
-    streamId: number,
+    _streamId: number,
     partitionCount: number
   ) {
     this.topic = await this.client.topic.create({
-      name, streamId, partitionCount, compressionAlgorithm: 1
+      name, streamId: this.stream.id, partitionCount, compressionAlgorithm: 1
     });
 
   }
