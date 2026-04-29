@@ -17,10 +17,11 @@
 
 use crate::{RUNTIME, ffi};
 use iggy::prelude::{
-    Client as IggyConnectionClient, CompressionAlgorithm as RustCompressionAlgorithm,
-    ConsumerGroupClient, Identifier as RustIdentifier, IggyClient as RustIggyClient,
+    Client as IggyConnectionClient, CompressionAlgorithm as RustCompressionAlgorithm, Consumer,
+    ConsumerGroupClient, ConsumerKind, Identifier as RustIdentifier, IggyClient as RustIggyClient,
     IggyClientBuilder as RustIggyClientBuilder, IggyError, IggyExpiry as RustIggyExpiry,
-    MaxTopicSize as RustMaxTopicSize, PartitionClient, StreamClient, TopicClient, UserClient,
+    IggyMessage, IggyTimestamp, MaxTopicSize as RustMaxTopicSize, MessageClient, PartitionClient,
+    Partitioning, PollingStrategy, StreamClient, TopicClient, UserClient,
 };
 use std::str::FromStr;
 use std::sync::Arc;
@@ -70,6 +71,17 @@ impl Client {
                 .await
                 .map_err(|error| format!("Could not connect: {error}"))?;
             Ok(())
+        })
+    }
+
+    pub fn get_streams(&self) -> Result<Vec<ffi::Stream>, String> {
+        RUNTIME.block_on(async {
+            let streams = self
+                .inner
+                .get_streams()
+                .await
+                .map_err(|error| format!("Could not get streams: {error}"))?;
+            Ok(streams.into_iter().map(ffi::Stream::from).collect())
         })
     }
 
@@ -126,6 +138,132 @@ impl Client {
     //         Ok(())
     //     })
     // }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_messages(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partitioning_kind: String,
+        partitioning_value: Vec<u8>,
+        messages: Vec<ffi::Message>,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not send messages: {error}"))?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not send messages: {error}"))?;
+
+        let partitioning = match partitioning_kind.as_str() {
+            "balanced" => Partitioning::balanced(),
+            "partition_id" => {
+                if partitioning_value.len() < 4 {
+                    return Err(
+                        "Could not send messages: partition_id requires 4 bytes".to_string()
+                    );
+                }
+                let id = u32::from_le_bytes(partitioning_value[..4].try_into().map_err(|_| {
+                    "Could not send messages: invalid partition_id value".to_string()
+                })?);
+                Partitioning::partition_id(id)
+            }
+            "messages_key" => Partitioning::messages_key(&partitioning_value).map_err(|error| {
+                format!("Could not send messages: invalid messages key: {error}")
+            })?,
+            _ => {
+                return Err(format!(
+                    "Could not send messages: invalid partitioning kind: {partitioning_kind}"
+                ));
+            }
+        };
+
+        let mut iggy_messages: Vec<IggyMessage> = messages
+            .into_iter()
+            .map(IggyMessage::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .send_messages(
+                    &rust_stream_id,
+                    &rust_topic_id,
+                    &partitioning,
+                    &mut iggy_messages,
+                )
+                .await
+                .map_err(|error| format!("Could not send messages: {error}"))?;
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn poll_messages(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        partition_id: u32,
+        consumer_kind: String,
+        consumer_id: ffi::Identifier,
+        polling_strategy_kind: String,
+        polling_strategy_value: u64,
+        count: u32,
+        auto_commit: bool,
+    ) -> Result<ffi::PolledMessages, String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id)
+            .map_err(|error| format!("Could not poll messages: {error}"))?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id)
+            .map_err(|error| format!("Could not poll messages: {error}"))?;
+        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
+            .map_err(|error| format!("Could not poll messages: {error}"))?;
+
+        let consumer = Consumer {
+            kind: match consumer_kind.as_str() {
+                "consumer" => ConsumerKind::Consumer,
+                "consumer_group" => ConsumerKind::ConsumerGroup,
+                _ => {
+                    return Err(format!(
+                        "Could not poll messages: invalid consumer kind: {consumer_kind}"
+                    ));
+                }
+            },
+            id: rust_consumer_id,
+        };
+
+        let strategy = match polling_strategy_kind.as_str() {
+            "offset" => PollingStrategy::offset(polling_strategy_value),
+            "timestamp" => PollingStrategy::timestamp(IggyTimestamp::from(polling_strategy_value)),
+            "first" => PollingStrategy::first(),
+            "last" => PollingStrategy::last(),
+            "next" => PollingStrategy::next(),
+            _ => {
+                return Err(format!(
+                    "Could not poll messages: invalid polling strategy: {polling_strategy_kind}"
+                ));
+            }
+        };
+
+        let opt_partition = if partition_id == u32::MAX {
+            None
+        } else {
+            Some(partition_id)
+        };
+
+        RUNTIME.block_on(async {
+            let polled = self
+                .inner
+                .poll_messages(
+                    &rust_stream_id,
+                    &rust_topic_id,
+                    opt_partition,
+                    &consumer,
+                    &strategy,
+                    count,
+                    auto_commit,
+                )
+                .await
+                .map_err(|error| format!("Could not poll messages: {error}"))?;
+            Ok(ffi::PolledMessages::from(polled))
+        })
+    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
@@ -372,6 +510,66 @@ impl Client {
                 .map_err(|error| {
                     format!(
                         "Could not delete consumer group '{}' for topic '{}' on stream '{}': {error}",
+                        rust_group_id, rust_topic_id, rust_stream_id
+                    )
+                })?;
+            Ok(())
+        })
+    }
+
+    pub fn join_consumer_group(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        group_id: ffi::Identifier,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
+            format!("Could not join consumer group: invalid stream identifier: {error}")
+        })?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id).map_err(|error| {
+            format!("Could not join consumer group: invalid topic identifier: {error}")
+        })?;
+        let rust_group_id = RustIdentifier::try_from(group_id).map_err(|error| {
+            format!("Could not join consumer group: invalid group identifier: {error}")
+        })?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .join_consumer_group(&rust_stream_id, &rust_topic_id, &rust_group_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not join consumer group '{}' for topic '{}' on stream '{}': {error}",
+                        rust_group_id, rust_topic_id, rust_stream_id
+                    )
+                })?;
+            Ok(())
+        })
+    }
+
+    pub fn leave_consumer_group(
+        &self,
+        stream_id: ffi::Identifier,
+        topic_id: ffi::Identifier,
+        group_id: ffi::Identifier,
+    ) -> Result<(), String> {
+        let rust_stream_id = RustIdentifier::try_from(stream_id).map_err(|error| {
+            format!("Could not leave consumer group: invalid stream identifier: {error}")
+        })?;
+        let rust_topic_id = RustIdentifier::try_from(topic_id).map_err(|error| {
+            format!("Could not leave consumer group: invalid topic identifier: {error}")
+        })?;
+        let rust_group_id = RustIdentifier::try_from(group_id).map_err(|error| {
+            format!("Could not leave consumer group: invalid group identifier: {error}")
+        })?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .leave_consumer_group(&rust_stream_id, &rust_topic_id, &rust_group_id)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Could not leave consumer group '{}' for topic '{}' on stream '{}': {error}",
                         rust_group_id, rust_topic_id, rust_stream_id
                     )
                 })?;

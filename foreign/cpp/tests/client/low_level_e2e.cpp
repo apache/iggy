@@ -16,6 +16,7 @@
 // under the License.
 
 // TODO(slbotbm): create fixture for setup/teardown.
+// TODO(slbotbm): Add tests for join_consumer_group() and leave_consumer_group()
 
 #include <string>
 

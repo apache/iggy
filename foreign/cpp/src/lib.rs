@@ -17,6 +17,7 @@
 mod client;
 mod consumer_group;
 mod identifier;
+mod messages;
 mod stream;
 mod topic;
 
@@ -51,6 +52,36 @@ mod ffi {
         partitions_count: u32,
     }
 
+    struct Stream {
+        id: u32,
+        created_at: u64,
+        name: String,
+        size_bytes: u64,
+        messages_count: u64,
+        topics_count: u32,
+    }
+
+    struct Message {
+        checksum: u64,
+        id_lo: u64,
+        id_hi: u64,
+        offset: u64,
+        timestamp: u64,
+        origin_timestamp: u64,
+        user_headers_length: u32,
+        payload_length: u32,
+        reserved: u64,
+        payload: Vec<u8>,
+        user_headers: Vec<u8>,
+    }
+
+    struct PolledMessages {
+        partition_id: u32,
+        current_offset: u64,
+        count: u32,
+        messages: Vec<Message>,
+    }
+
     struct StreamDetails {
         id: u32,
         created_at: u64,
@@ -83,6 +114,7 @@ mod ffi {
         fn login_user(self: &Client, username: String, password: String) -> Result<()>;
         fn connect(self: &Client) -> Result<()>;
         fn create_stream(self: &Client, stream_name: String) -> Result<()>;
+        fn get_streams(self: &Client) -> Result<Vec<Stream>>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(self: &Client, stream_id: Identifier) -> Result<()>;
         // fn purge_stream(&self, stream_id: Identifier) -> Result<()>;
@@ -128,6 +160,44 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             group_id: Identifier,
+        ) -> Result<()>;
+        fn join_consumer_group(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            group_id: Identifier,
+        ) -> Result<()>;
+        fn leave_consumer_group(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            group_id: Identifier,
+        ) -> Result<()>;
+
+        #[allow(clippy::too_many_arguments)]
+        fn poll_messages(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partition_id: u32,
+            consumer_kind: String,
+            consumer_id: Identifier,
+            polling_strategy_kind: String,
+            polling_strategy_value: u64,
+            count: u32,
+            auto_commit: bool,
+        ) -> Result<PolledMessages>;
+
+        fn new_message(self: &mut Message, payload: Vec<u8>);
+
+        #[allow(clippy::too_many_arguments)]
+        fn send_messages(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            partitioning_kind: String,
+            partitioning_value: Vec<u8>,
+            messages: Vec<Message>,
         ) -> Result<()>;
 
         unsafe fn delete_connection(client: *mut Client) -> Result<()>;
