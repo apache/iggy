@@ -170,6 +170,19 @@ async fn write_data(
         })
         .collect();
 
+    if let Some(first) = msgs.first()
+        && looks_like_envelope(first)
+    {
+        error!(
+            "Incoming JSON appears to be wrapped in a source envelope \
+             (detected 'table_name' + 'data' fields). The Iceberg sink \
+             expects flat JSON matching the target table schema. Add an \
+             'unwrap_envelope' transform with field = \"data\" to your \
+             connector config to extract the inner payload."
+        );
+        return Err(Error::InvalidRecord);
+    }
+
     let cursor = JsonArrowReader::new(msgs.as_slice());
     let reader = ReaderBuilder::new(Arc::new(
         schema_to_arrow_schema(&table.metadata().current_schema().clone()).map_err(|err| {
@@ -228,6 +241,13 @@ async fn write_data(
         Error::InvalidRecord
     })?;
     Ok(())
+}
+
+fn looks_like_envelope(value: &simd_json::OwnedValue) -> bool {
+    let simd_json::OwnedValue::Object(obj) = value else {
+        return false;
+    };
+    obj.contains_key("table_name") && obj.contains_key("data")
 }
 
 #[async_trait]
