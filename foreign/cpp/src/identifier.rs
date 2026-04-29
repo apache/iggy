@@ -67,14 +67,14 @@ impl TryFrom<ffi::Identifier> for RustIdentifier {
 // preserves the C++ ABI used by every test and downstream binding.
 #[allow(clippy::wrong_self_convention)]
 impl ffi::Identifier {
-    pub fn from_string(&mut self, id: String) -> Result<(), String> {
+    pub fn set_string(&mut self, id: String) -> Result<(), String> {
         *self = RustIdentifier::named(&id)
             .map(ffi::Identifier::from)
             .map_err(|error| format!("Could not create string identifier: {error}"))?;
         Ok(())
     }
 
-    pub fn from_numeric(&mut self, id: u32) -> Result<(), String> {
+    pub fn set_numeric(&mut self, id: u32) -> Result<(), String> {
         *self = RustIdentifier::numeric(id)
             .map(ffi::Identifier::from)
             .map_err(|error| format!("Could not create numeric identifier: {error}"))?;

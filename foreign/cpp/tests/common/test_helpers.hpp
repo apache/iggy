@@ -20,19 +20,20 @@
 #pragma once
 
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 
 #include "lib.rs.h"
 
 inline iggy::ffi::Identifier make_string_identifier(const std::string &value) {
     iggy::ffi::Identifier identifier;
-    identifier.from_string(value);
+    identifier.set_string(value);
     return identifier;
 }
 
 inline iggy::ffi::Identifier make_numeric_identifier(const std::uint32_t value) {
     iggy::ffi::Identifier identifier;
-    identifier.from_numeric(value);
+    identifier.set_numeric(value);
     return identifier;
 }
 
@@ -58,4 +59,10 @@ inline rust::Vec<std::uint8_t> partition_id_bytes(std::uint32_t id) {
     v.push_back(static_cast<std::uint8_t>((id >> 16) & 0xFF));
     v.push_back(static_cast<std::uint8_t>((id >> 24) & 0xFF));
     return v;
-}
+    inline rust::Vec<rust::String> make_snapshot_types(std::initializer_list<const char *> values) {
+        rust::Vec<rust::String> snapshot_types;
+        for (const auto value : values) {
+            snapshot_types.push_back(value);
+        }
+        return snapshot_types;
+    }
