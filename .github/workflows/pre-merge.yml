@@ -199,7 +199,7 @@ jobs:
     steps:
       - name: Get job execution times
         id: times
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const jobs = await github.rest.actions.listJobsForWorkflowRun({

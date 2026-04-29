@@ -47,7 +47,7 @@ jobs:
       crates_to_publish: ${{ steps.check.outputs.crates_to_publish }}
       sdks_to_publish: ${{ steps.check.outputs.sdks_to_publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
