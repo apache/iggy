@@ -72,6 +72,34 @@ services:
     volumes:
       - iggy-influxdb-source-data:/var/lib/influxdb2
 
+  # InfluxDB 3.x instance for sink V3 tests (native /api/v3/* endpoints)
+  influxdb3-sink:
+    image: influxdb:3-core
+    container_name: iggy-test-influxdb3-sink
+    ports:
+      - "8188:8181"
+    command: ["influxdb3", "serve", "--node-id", "node-sink", "--object-store", "memory", "--without-auth"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8181/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # InfluxDB 3.x instance for source V3 tests
+  influxdb3-source:
+    image: influxdb:3-core
+    container_name: iggy-test-influxdb3-source
+    ports:
+      - "8189:8181"
+    command: ["influxdb3", "serve", "--node-id", "node-source", "--object-store", "memory", "--without-auth"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8181/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
 volumes:
   iggy-influxdb-data:
   iggy-influxdb-source-data:

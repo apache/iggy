@@ -23,8 +23,9 @@ use super::container::{
     ENV_SINK_INCLUDE_STREAM_TAG, ENV_SINK_INCLUDE_TOPIC_TAG, ENV_SINK_ORG, ENV_SINK_PATH,
     ENV_SINK_PAYLOAD_FORMAT, ENV_SINK_PRECISION, ENV_SINK_STREAMS_0_CONSUMER_GROUP,
     ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM, ENV_SINK_STREAMS_0_TOPICS,
-    ENV_SINK_TOKEN, ENV_SINK_URL, HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, INFLUXDB_BUCKET,
-    INFLUXDB_ORG, INFLUXDB_TOKEN, InfluxDbContainer, InfluxDbOps, create_http_client,
+    ENV_SINK_TOKEN, ENV_SINK_URL, ENV_SINK_VERSION, HEALTH_CHECK_ATTEMPTS,
+    HEALTH_CHECK_INTERVAL_MS, INFLUXDB_BUCKET, INFLUXDB_ORG, INFLUXDB_TOKEN, InfluxDbContainer,
+    InfluxDbOps, create_http_client,
 };
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
@@ -143,6 +144,7 @@ impl TestFixture for InfluxDbSinkFixture {
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         let mut envs = HashMap::new();
+        envs.insert(ENV_SINK_VERSION.to_string(), "v2".to_string());
         envs.insert(ENV_SINK_URL.to_string(), self.container.base_url.clone());
         envs.insert(ENV_SINK_ORG.to_string(), INFLUXDB_ORG.to_string());
         envs.insert(ENV_SINK_TOKEN.to_string(), INFLUXDB_TOKEN.to_string());

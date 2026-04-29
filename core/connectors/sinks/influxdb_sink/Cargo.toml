@@ -29,9 +29,6 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 publish = false
 
-[package.metadata.cargo-machete]
-ignored = ["dashmap", "once_cell", "futures"]
-
 [lib]
 crate-type = ["cdylib", "lib"]
 
@@ -39,11 +36,8 @@ crate-type = ["cdylib", "lib"]
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-dashmap = { workspace = true }
-futures = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
-once_cell = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 secrecy = { workspace = true }
@@ -52,3 +46,7 @@ serde_json = { workspace = true }
 simd-json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+toml = { workspace = true }

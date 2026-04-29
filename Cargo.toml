@@ -161,7 +161,7 @@ governor = "0.10.4"
 harness_derive = { path = "core/harness_derive" }
 hash32 = "1.0.0"
 hostname = "0.4.2"
-http = "1"
+http = "1.4.0"
 human-repr = "1.1.0"
 humantime = "2.3.0"
 hwlocality = "1.0.0-alpha.12"
@@ -183,7 +183,7 @@ left-right = "0.11"
 lending-iterator = "0.1.7"
 libc = "0.2.186"
 log = "0.4.29"
-lz4_flex = "0.13.0"
+lz4_flex = "0.12.1"
 message_bus = { path = "core/message_bus" }
 metadata = { path = "core/metadata" }
 mimalloc = "0.1"

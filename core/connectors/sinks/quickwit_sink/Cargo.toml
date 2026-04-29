@@ -44,4 +44,5 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_yaml_ng = { workspace = true }
 simd-json = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }

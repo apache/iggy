@@ -32,6 +32,7 @@ poll_interval = "5ms"
 consumer_group = "influxdb_sink"
 
 [plugin_config]
+version = "v2"
 url = "http://localhost:8086"
 org = "iggy"
 bucket = "events"
