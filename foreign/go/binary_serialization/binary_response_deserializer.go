@@ -555,24 +555,22 @@ func MapClientInfo(payload []byte, position int) (iggcon.ClientInfo, int) {
 
 func DeserializeClient(payload []byte) *iggcon.ClientInfoDetails {
 	clientInfo, position := MapClientInfo(payload, 0)
-	consumerGroups := make([]iggcon.ConsumerGroupInfo, clientInfo.ConsumerGroupsCount)
-	length := len(payload)
+	consumerGroups := make([]iggcon.ConsumerGroupInfo, 0, clientInfo.ConsumerGroupsCount)
 
-	for position < length {
-		for i := uint32(0); i < clientInfo.ConsumerGroupsCount; i++ {
-			streamId := binary.LittleEndian.Uint32(payload[position : position+4])
-			topicId := binary.LittleEndian.Uint32(payload[position+4 : position+8])
-			groupId := binary.LittleEndian.Uint32(payload[position+8 : position+12])
+	for i := uint32(0); i < clientInfo.ConsumerGroupsCount; i++ {
+		streamId := binary.LittleEndian.Uint32(payload[position : position+4])
+		topicId := binary.LittleEndian.Uint32(payload[position+4 : position+8])
+		groupId := binary.LittleEndian.Uint32(payload[position+8 : position+12])
 
-			consumerGroup := iggcon.ConsumerGroupInfo{
-				StreamId: streamId,
-				TopicId:  topicId,
-				GroupId:  groupId,
-			}
-			consumerGroups = append(consumerGroups, consumerGroup)
-			position += 12
+		consumerGroup := iggcon.ConsumerGroupInfo{
+			StreamId: streamId,
+			TopicId:  topicId,
+			GroupId:  groupId,
 		}
+		consumerGroups = append(consumerGroups, consumerGroup)
+		position += 12
 	}
+
 	return &iggcon.ClientInfoDetails{
 		ClientInfo:     clientInfo,
 		ConsumerGroups: consumerGroups,

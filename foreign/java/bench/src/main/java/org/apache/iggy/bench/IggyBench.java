@@ -17,18 +17,17 @@
  * under the License.
  */
 
-extern crate self as configs;
+package org.apache.iggy.bench;
 
-mod configs_impl;
-mod server_config;
-mod server_ng_config;
-pub use configs_derive::ConfigEnv;
-pub use configs_impl::{
-    ConfigEnvMappings, ConfigProvider, ConfigurationError, ConfigurationType, EnvVarMapping,
-    FileConfigProvider, TypedEnvProvider, parse_env_value_to_json,
-};
-pub use server_config::{
-    COMPONENT, cache_indexes, cluster, defaults, displays, http, quic, server, sharding, system,
-    tcp, validators, websocket,
-};
-pub use server_ng_config::{COMPONENT_NG, message_bus, server_ng};
+import org.apache.iggy.bench.cli.IggyBenchCommand;
+import picocli.CommandLine;
+
+public final class IggyBench {
+
+    private IggyBench() {}
+
+    public static void main(String[] args) {
+        var exitCode = new CommandLine(new IggyBenchCommand()).execute(args);
+        System.exit(exitCode);
+    }
+}
