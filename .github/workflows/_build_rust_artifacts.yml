@@ -85,7 +85,7 @@ jobs:
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.commit || github.sha }}
 
@@ -106,7 +106,7 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "22"
 
@@ -176,7 +176,7 @@ jobs:
 
       - name: Upload artifact
         if: inputs.upload_artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.target }}
           path: ${{ steps.pkg.outputs.tarball }}
@@ -203,7 +203,7 @@ jobs:
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.commit || github.sha }}
 
@@ -256,7 +256,7 @@ jobs:
 
       - name: Upload artifact
         if: inputs.upload_artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: connector-plugins-${{ matrix.target }}
           path: ${{ steps.pkg.outputs.tarball }}
@@ -271,7 +271,7 @@ jobs:
     outputs:
       artifact_name: ${{ steps.output.outputs.artifact_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.commit || github.sha }}
 
@@ -282,7 +282,7 @@ jobs:
           echo "server_version=$(scripts/extract-version.sh rust-server)" >> "$GITHUB_OUTPUT"
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: "*-unknown-linux-*"
           path: dist
@@ -326,7 +326,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload combined artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rust-artifacts-all
           path: dist

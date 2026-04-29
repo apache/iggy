@@ -43,14 +43,14 @@ runs:
   using: "composite"
   steps:
     - name: Setup Go toolchain
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v6
       with:
         go-version: ${{ inputs.go-version }}
         cache: ${{ inputs.read-cache == 'true' }}
 
     - name: Setup additional Go module cache
       if: inputs.read-cache == 'true'
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: |
           ~/go/pkg/mod
@@ -61,7 +61,7 @@ runs:
 
     - name: Setup golangci-lint cache
       if: inputs.read-cache == 'true'
-      uses: actions/cache@v4
+      uses: actions/cache@v5
       with:
         path: ~/.cache/golangci-lint
         key: golangci-lint-${{ runner.os }}-${{ hashFiles('**/go.sum') }}

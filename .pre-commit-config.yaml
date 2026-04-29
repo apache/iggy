@@ -43,18 +43,18 @@ repos:
       - id: markdownlint
         name: markdownlint
         entry: ./scripts/ci/markdownlint.sh
-        args: ["--fix", "--staged"]
+        args: ["--fix"]
         language: system
         types: [markdown]
-        pass_filenames: false
+        pass_filenames: true
 
       - id: shellcheck
         name: shellcheck
         entry: ./scripts/ci/shellcheck.sh
-        args: ["--fix", "--staged"]
+        args: ["--fix"]
         language: system
         types: [shell]
-        pass_filenames: false
+        pass_filenames: true
 
       - id: license-headers
         name: license headers
@@ -106,25 +106,25 @@ repos:
       - id: trailing-whitespace
         name: trailing whitespace
         entry: ./scripts/ci/trailing-whitespace.sh
-        args: ["--fix", "--staged"]
+        args: ["--fix"]
         language: system
         types: [text]
-        pass_filenames: false
+        pass_filenames: true
 
       - id: trailing-newline
         name: trailing newline
         entry: ./scripts/ci/trailing-newline.sh
-        args: ["--fix", "--staged"]
+        args: ["--fix"]
         language: system
         types: [text]
-        pass_filenames: false
+        pass_filenames: true
 
       - id: binary-artifacts
         name: binary artifacts
         entry: ./scripts/ci/binary-artifacts.sh
-        args: ["--check", "--staged"]
+        args: ["--check"]
         language: system
-        pass_filenames: false
+        pass_filenames: true
 
       - id: typos
         name: typos (spelling check)
@@ -132,15 +132,15 @@ repos:
         args: [ "-w" ]
         language: system
         types: [ text ]
-        pass_filenames: false
+        pass_filenames: true
 
       - id: taplo
         name: taplo (TOML format)
         entry: ./scripts/ci/taplo.sh
-        args: ["--fix", "--staged"]
+        args: ["--fix"]
         language: system
         types: [toml]
-        pass_filenames: false
+        pass_filenames: true
 
   # Rust
   - repo: local

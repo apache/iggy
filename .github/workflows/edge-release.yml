@@ -50,7 +50,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Get server version
         id: meta
@@ -60,7 +60,7 @@ jobs:
           echo "server_version=${server_version}" >> "$GITHUB_OUTPUT"
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: rust-artifacts-all
           path: ./artifacts
@@ -75,7 +75,7 @@ jobs:
           fi
 
       - name: Create edge pre-release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: edge
           name: edge
