@@ -23,6 +23,7 @@ mod filter_fields;
 pub mod flatbuffer_convert;
 pub mod json;
 pub mod proto_convert;
+mod unwrap_envelope;
 mod update_fields;
 use crate::{DecodedMessage, Error, TopicMetadata};
 pub use add_fields::{AddFields, AddFieldsConfig, Field as AddField};
@@ -38,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use simd_json::OwnedValue;
 use std::sync::Arc;
 use strum_macros::{Display, IntoStaticStr};
+pub use unwrap_envelope::{UnwrapEnvelope, UnwrapEnvelopeConfig};
 pub use update_fields::{Field as UpdateField, UpdateCondition, UpdateFields, UpdateFieldsConfig};
 
 /// The value of a field, either static or computed at runtime
@@ -89,6 +91,7 @@ pub enum TransformType {
     ProtoConvert,
     FlatBufferConvert,
     AvroConvert,
+    UnwrapEnvelope,
 }
 
 pub fn from_config(
@@ -130,6 +133,11 @@ pub fn from_config(
             let cfg: AvroConvertConfig =
                 serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
             Ok(Arc::new(AvroConvert::new(cfg)))
+        }
+        TransformType::UnwrapEnvelope => {
+            let cfg: UnwrapEnvelopeConfig =
+                serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
+            Ok(Arc::new(UnwrapEnvelope::new(cfg)))
         }
     }
 }
