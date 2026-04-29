@@ -667,7 +667,10 @@ where
                 message
             };
 
-            if message.header().operation == Operation::DeleteConsumerOffset {
+            if matches!(
+                message.header().operation,
+                Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2
+            ) {
                 match Self::parse_consumer_offset_request(message.header().operation, &message)
                     .and_then(|(kind, consumer_id, _)| {
                         self.ensure_consumer_offset_exists(kind, consumer_id)
@@ -680,7 +683,7 @@ where
                                 ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
                                 "rejecting delete_consumer_offset for missing offset",
                             )
-                            .with_operation(Operation::DeleteConsumerOffset)
+                            .with_operation(message.header().operation)
                             .with_error(error.to_string()),
                         );
                         return;
@@ -972,7 +975,10 @@ where
                 );
                 Ok(())
             }
-            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
+            Operation::StoreConsumerOffset
+            | Operation::DeleteConsumerOffset
+            | Operation::StoreConsumerOffset2
+            | Operation::DeleteConsumerOffset2 => {
                 let (kind, consumer_id, offset) =
                     Self::parse_staged_consumer_offset_commit(header.operation, &message)?;
                 let write_lock = self.write_lock.clone();
@@ -995,7 +1001,7 @@ where
                     .map_err(|_| IggyError::CannotAppendMessage)?;
 
                 match header.operation {
-                    Operation::StoreConsumerOffset => {
+                    Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
                         self.stage_consumer_offset_upsert(
                             header.op,
                             kind,
@@ -1003,7 +1009,7 @@ where
                             offset.expect("store_consumer_offset must include offset"),
                         );
                     }
-                    Operation::DeleteConsumerOffset => {
+                    Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
                         self.stage_consumer_offset_delete(header.op, kind, consumer_id)?;
                     }
                     _ => unreachable!(),
@@ -1331,7 +1337,10 @@ where
                 }
                 !*failed_commit
             }
-            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
+            Operation::StoreConsumerOffset
+            | Operation::DeleteConsumerOffset
+            | Operation::StoreConsumerOffset2
+            | Operation::DeleteConsumerOffset2 => {
                 self.commit_consumer_offset_entry(prepare_header, failed_commit)
                     .await
             }
@@ -1410,7 +1419,7 @@ where
             })?;
         let kind = ConsumerKind::from_code(consumer_kind)?;
         match operation {
-            Operation::StoreConsumerOffset => {
+            Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
                 let offset =
                     body.get(5..13)
                         .ok_or(IggyError::InvalidCommand)
@@ -1421,7 +1430,9 @@ where
                         })?;
                 Ok((kind, consumer_id, Some(offset)))
             }
-            Operation::DeleteConsumerOffset => Ok((kind, consumer_id, None)),
+            Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
+                Ok((kind, consumer_id, None))
+            }
             _ => Err(IggyError::InvalidCommand),
         }
     }

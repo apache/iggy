@@ -19,7 +19,7 @@ use bytes::Bytes;
 use iggy_binary_protocol::consensus::iobuf::Owned;
 use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
 use iggy_binary_protocol::{
-    Message, Operation, RequestHeader, WireEncode, WireIdentifier, WireName,
+    AckLevel, Message, Operation, RequestHeader, WireEncode, WireIdentifier, WireName,
 };
 use iggy_common::send_messages2::{
     IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned,
@@ -179,6 +179,44 @@ impl SimClient {
         payload.extend_from_slice(&consumer_id.to_le_bytes());
 
         self.build_request_with_namespace(Operation::DeleteConsumerOffset, &payload, namespace)
+    }
+
+    /// v2 of `store_consumer_offset` carrying an explicit `AckLevel` byte.
+    ///
+    /// Only the simulator emits this opcode today; the partitions plane
+    /// accepts it alongside v1. The ack byte is reserved for future
+    /// cluster-side commit-timing semantics.
+    pub fn store_consumer_offset_v2(
+        &self,
+        namespace: IggyNamespace,
+        consumer_kind: u8,
+        consumer_id: u32,
+        offset: u64,
+        ack: AckLevel,
+    ) -> Message<RequestHeader> {
+        let mut payload = Vec::with_capacity(14);
+        payload.push(consumer_kind);
+        payload.extend_from_slice(&consumer_id.to_le_bytes());
+        payload.extend_from_slice(&offset.to_le_bytes());
+        payload.push(ack.as_u8());
+
+        self.build_request_with_namespace(Operation::StoreConsumerOffset2, &payload, namespace)
+    }
+
+    /// v2 of `delete_consumer_offset` carrying an explicit `AckLevel` byte.
+    pub fn delete_consumer_offset_v2(
+        &self,
+        namespace: IggyNamespace,
+        consumer_kind: u8,
+        consumer_id: u32,
+        ack: AckLevel,
+    ) -> Message<RequestHeader> {
+        let mut payload = Vec::with_capacity(6);
+        payload.push(consumer_kind);
+        payload.extend_from_slice(&consumer_id.to_le_bytes());
+        payload.push(ack.as_u8());
+
+        self.build_request_with_namespace(Operation::DeleteConsumerOffset2, &payload, namespace)
     }
 
     #[allow(clippy::cast_possible_truncation)]
