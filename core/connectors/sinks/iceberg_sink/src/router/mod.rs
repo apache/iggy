@@ -178,7 +178,7 @@ async fn write_data(
                 table.metadata().uuid(),
                 err
             );
-            Error::InvalidRecord
+            Error::SchemaMismatch(err.to_string())
         })?,
     ))
     .build(cursor)
@@ -197,13 +197,13 @@ async fn write_data(
         })?;
         writer.write(batch_data).await.map_err(|err| {
             error!("Error while writing record batch: {}", err);
-            Error::InvalidRecord
+            Error::WriteFailure(err.to_string())
         })?;
     }
 
     let data_files = writer.close().await.map_err(|err| {
         error!("Error while writing data records to Parquet file: {}", err);
-        Error::InvalidRecord
+        Error::WriteFailure(err.to_string())
     })?;
 
     let table_commit = Transaction::new(table);
@@ -216,7 +216,7 @@ async fn write_data(
             table.metadata().uuid(),
             err
         );
-        Error::InvalidRecord
+        Error::CatalogError(err.to_string())
     })?;
 
     let _table = tx.commit(catalog).await.map_err(|err| {
@@ -225,7 +225,7 @@ async fn write_data(
             table.metadata().uuid(),
             err
         );
-        Error::InvalidRecord
+        Error::CatalogError(err.to_string())
     })?;
     Ok(())
 }
