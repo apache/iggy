@@ -83,6 +83,7 @@ mod ffi {
 
     struct ClientInfo {
         client_id: u32,
+        has_user_id: bool,
         user_id: u32,
         address: String,
         transport: String,
@@ -91,6 +92,7 @@ mod ffi {
 
     struct ClientInfoDetails {
         client_id: u32,
+        has_user_id: bool,
         user_id: u32,
         address: String,
         transport: String,
@@ -131,6 +133,7 @@ mod ffi {
         os_version: String,
         kernel_version: String,
         iggy_server_version: String,
+        has_server_semver: bool,
         iggy_server_semver: u32,
         cache_metrics: Vec<CacheMetricEntry>,
         threads_count: u32,
@@ -207,7 +210,7 @@ mod ffi {
         unsafe fn delete_connection(client: *mut Client) -> Result<()>;
 
         // Identifier functions
-        fn from_string(self: &mut Identifier, id: String) -> Result<()>;
-        fn from_numeric(self: &mut Identifier, id: u32) -> Result<()>;
+        fn set_string(self: &mut Identifier, id: String) -> Result<()>;
+        fn set_numeric(self: &mut Identifier, id: u32) -> Result<()>;
     }
 }

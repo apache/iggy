@@ -168,7 +168,7 @@ TEST(LowLevelE2E_Client, GetStatsBeforeLoginThrows) {
     client = nullptr;
 }
 
-// TODO(slbotbm-this PR): add a test to create some streams, topics, partitions, and segments, send messages, and create
+// TODO(slbotbmR): add a test to create some streams, topics, partitions, and segments, send messages, and create
 // consumer groups and verify it.
 TEST(LowLevelE2E_Client, GetStatsReturnsServerStats) {
     RecordProperty("description",
@@ -202,9 +202,7 @@ TEST(LowLevelE2E_Client, GetStatsReturnsServerStats) {
         EXPECT_FALSE(static_cast<std::string>(empty_stats.os_version).empty());
         EXPECT_FALSE(static_cast<std::string>(empty_stats.kernel_version).empty());
         EXPECT_FALSE(static_cast<std::string>(empty_stats.iggy_server_version).empty());
-        EXPECT_TRUE(empty_stats.iggy_server_semver == std::numeric_limits<std::uint32_t>::max() ||
-                    empty_stats.iggy_server_semver > 0u);
-        EXPECT_GE(empty_stats.cache_metrics.size(), 0u);
+        EXPECT_TRUE(!empty_stats.has_server_semver || empty_stats.iggy_server_semver > 0u);
         EXPECT_EQ(empty_stats.streams_count, 0u);
         EXPECT_EQ(empty_stats.topics_count, 0u);
         EXPECT_EQ(empty_stats.partitions_count, 0u);
@@ -326,6 +324,7 @@ TEST(LowLevelE2E_Client, GetStatsIsStableAcrossBackToBackCalls) {
               static_cast<std::string>(first_stats.kernel_version));
     EXPECT_EQ(static_cast<std::string>(second_stats.iggy_server_version),
               static_cast<std::string>(first_stats.iggy_server_version));
+    EXPECT_EQ(second_stats.has_server_semver, first_stats.has_server_semver);
     EXPECT_EQ(second_stats.iggy_server_semver, first_stats.iggy_server_semver);
     EXPECT_EQ(second_stats.clients_count, first_stats.clients_count);
     EXPECT_EQ(second_stats.streams_count, first_stats.streams_count);
@@ -351,7 +350,7 @@ TEST(LowLevelE2E_Client, GetMeBeforeLoginThrows) {
     client = nullptr;
 }
 
-// TODO(slbotbm-this PR): add additional validation for get_me after merging join_consumer_group PR.
+// TODO(slbotbm): add additional validation for get_me after merging join_consumer_group PR.
 TEST(LowLevelE2E_Client, GetMeReturnsCurrentClientDetails) {
     RecordProperty("description", "Returns the current authenticated client details.");
     iggy::ffi::Client *client = login_to_server();
@@ -360,7 +359,7 @@ TEST(LowLevelE2E_Client, GetMeReturnsCurrentClientDetails) {
     ASSERT_NO_THROW({
         const auto me = client->get_me();
         EXPECT_NE(me.client_id, 0u);
-        EXPECT_NE(me.user_id, std::numeric_limits<std::uint32_t>::max());
+        EXPECT_TRUE(me.has_user_id);
         EXPECT_FALSE(static_cast<std::string>(me.address).empty());
         EXPECT_EQ(static_cast<std::string>(me.transport), "TCP");
         EXPECT_EQ(me.consumer_groups_count, 0u);
@@ -384,7 +383,10 @@ TEST(LowLevelE2E_Client, GetMeIsStableAcrossBackToBackCalls) {
     });
 
     EXPECT_NE(first_me.client_id, 0u);
+    EXPECT_TRUE(first_me.has_user_id);
+    EXPECT_TRUE(second_me.has_user_id);
     EXPECT_EQ(second_me.client_id, first_me.client_id);
+    EXPECT_EQ(second_me.has_user_id, first_me.has_user_id);
     EXPECT_EQ(second_me.user_id, first_me.user_id);
     EXPECT_EQ(static_cast<std::string>(second_me.address), static_cast<std::string>(first_me.address));
     EXPECT_EQ(static_cast<std::string>(first_me.transport), "TCP");
@@ -415,7 +417,10 @@ TEST(LowLevelE2E_Client, GetMeReturnsDistinctClientIdsForDifferentSessions) {
 
     EXPECT_NE(first_me.client_id, 0u);
     EXPECT_NE(second_me.client_id, 0u);
+    EXPECT_TRUE(first_me.has_user_id);
+    EXPECT_TRUE(second_me.has_user_id);
     EXPECT_NE(second_me.client_id, first_me.client_id);
+    EXPECT_EQ(second_me.has_user_id, first_me.has_user_id);
     EXPECT_EQ(second_me.user_id, first_me.user_id);
     EXPECT_EQ(static_cast<std::string>(first_me.transport), "TCP");
     EXPECT_EQ(static_cast<std::string>(second_me.transport), "TCP");
@@ -435,7 +440,7 @@ TEST(LowLevelE2E_Client, GetMeReturnsValidDetailsAfterReconnect) {
     iggy::ffi::ClientInfoDetails first_me{};
     ASSERT_NO_THROW({ first_me = first_client->get_me(); });
     EXPECT_NE(first_me.client_id, 0u);
-    EXPECT_NE(first_me.user_id, std::numeric_limits<std::uint32_t>::max());
+    EXPECT_TRUE(first_me.has_user_id);
 
     ASSERT_NO_THROW(iggy::ffi::delete_connection(first_client));
     first_client = nullptr;
@@ -446,7 +451,8 @@ TEST(LowLevelE2E_Client, GetMeReturnsValidDetailsAfterReconnect) {
     iggy::ffi::ClientInfoDetails second_me{};
     ASSERT_NO_THROW({ second_me = second_client->get_me(); });
     EXPECT_NE(second_me.client_id, 0u);
-    EXPECT_NE(second_me.user_id, std::numeric_limits<std::uint32_t>::max());
+    EXPECT_TRUE(second_me.has_user_id);
+    EXPECT_EQ(second_me.has_user_id, first_me.has_user_id);
     EXPECT_EQ(second_me.user_id, first_me.user_id);
     EXPECT_EQ(static_cast<std::string>(first_me.transport), "TCP");
     EXPECT_EQ(static_cast<std::string>(second_me.transport), "TCP");
@@ -501,7 +507,10 @@ TEST(LowLevelE2E_Client, GetClientReturnsDetailsForMatchingClientId) {
     });
 
     EXPECT_NE(current_client.client_id, 0u);
+    EXPECT_TRUE(current_client.has_user_id);
+    EXPECT_TRUE(looked_up_client.has_user_id);
     EXPECT_EQ(looked_up_client.client_id, current_client.client_id);
+    EXPECT_EQ(looked_up_client.has_user_id, current_client.has_user_id);
     EXPECT_EQ(looked_up_client.user_id, current_client.user_id);
     EXPECT_EQ(static_cast<std::string>(looked_up_client.address), static_cast<std::string>(current_client.address));
     EXPECT_EQ(static_cast<std::string>(looked_up_client.transport), "TCP");
@@ -528,8 +537,13 @@ TEST(LowLevelE2E_Client, GetClientIsStableAcrossBackToBackCalls) {
     });
 
     EXPECT_NE(current_client.client_id, 0u);
+    EXPECT_TRUE(current_client.has_user_id);
+    EXPECT_TRUE(first_lookup.has_user_id);
+    EXPECT_TRUE(second_lookup.has_user_id);
     EXPECT_EQ(first_lookup.client_id, current_client.client_id);
     EXPECT_EQ(second_lookup.client_id, first_lookup.client_id);
+    EXPECT_EQ(first_lookup.has_user_id, current_client.has_user_id);
+    EXPECT_EQ(second_lookup.has_user_id, first_lookup.has_user_id);
     EXPECT_EQ(second_lookup.user_id, first_lookup.user_id);
     EXPECT_EQ(static_cast<std::string>(second_lookup.address), static_cast<std::string>(first_lookup.address));
     EXPECT_EQ(static_cast<std::string>(first_lookup.transport), "TCP");
@@ -582,6 +596,7 @@ TEST(LowLevelE2E_Client, GetClientsReturnsActiveClientSessions) {
 
         if (client.client_id == first_me.client_id) {
             found_first = true;
+            EXPECT_EQ(client.has_user_id, first_me.has_user_id);
             EXPECT_EQ(client.user_id, first_me.user_id);
             EXPECT_EQ(static_cast<std::string>(client.address), static_cast<std::string>(first_me.address));
             EXPECT_EQ(client.consumer_groups_count, first_me.consumer_groups_count);
@@ -589,6 +604,7 @@ TEST(LowLevelE2E_Client, GetClientsReturnsActiveClientSessions) {
 
         if (client.client_id == second_me.client_id) {
             found_second = true;
+            EXPECT_EQ(client.has_user_id, second_me.has_user_id);
             EXPECT_EQ(client.user_id, second_me.user_id);
             EXPECT_EQ(static_cast<std::string>(client.address), static_cast<std::string>(second_me.address));
             EXPECT_EQ(client.consumer_groups_count, second_me.consumer_groups_count);
@@ -627,6 +643,7 @@ TEST(LowLevelE2E_Client, GetClientsIsStableAcrossBackToBackCalls) {
             }
 
             found_match = true;
+            EXPECT_EQ(second_entry.has_user_id, first_entry.has_user_id);
             EXPECT_EQ(second_entry.user_id, first_entry.user_id);
             EXPECT_EQ(static_cast<std::string>(second_entry.address), static_cast<std::string>(first_entry.address));
             EXPECT_EQ(static_cast<std::string>(second_entry.transport),
@@ -660,6 +677,7 @@ TEST(LowLevelE2E_Client, GetClientsMatchesGetClientForReturnedIds) {
         ASSERT_NO_THROW({ details = first_client->get_client(client.client_id); });
 
         EXPECT_EQ(details.client_id, client.client_id);
+        EXPECT_EQ(details.has_user_id, client.has_user_id);
         EXPECT_EQ(details.user_id, client.user_id);
         EXPECT_EQ(static_cast<std::string>(details.address), static_cast<std::string>(client.address));
         EXPECT_EQ(static_cast<std::string>(details.transport), static_cast<std::string>(client.transport));
@@ -706,6 +724,7 @@ TEST(LowLevelE2E_Client, GetClientsReflectsAdditionalSession) {
         }
 
         found_after = true;
+        EXPECT_EQ(client.has_user_id, second_me.has_user_id);
         EXPECT_EQ(client.user_id, second_me.user_id);
         EXPECT_EQ(static_cast<std::string>(client.address), static_cast<std::string>(second_me.address));
         EXPECT_EQ(static_cast<std::string>(client.transport), "TCP");
@@ -766,14 +785,10 @@ TEST(LowLevelE2E_Client, SnapshotBeforeLoginThrows) {
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
     ASSERT_NE(client, nullptr);
 
-    rust::Vec<rust::String> snapshot_types_before_connect;
-    snapshot_types_before_connect.push_back("test");
-    ASSERT_THROW(client->snapshot("deflated", std::move(snapshot_types_before_connect)), std::exception);
+    ASSERT_THROW(client->snapshot("deflated", make_snapshot_types({"test"})), std::exception);
 
     ASSERT_NO_THROW(client->connect());
-    rust::Vec<rust::String> snapshot_types_before_login;
-    snapshot_types_before_login.push_back("test");
-    ASSERT_THROW(client->snapshot("deflated", std::move(snapshot_types_before_login)), std::exception);
+    ASSERT_THROW(client->snapshot("deflated", make_snapshot_types({"test"})), std::exception);
 
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
     client = nullptr;
@@ -784,25 +799,33 @@ TEST(LowLevelE2E_Client, SnapshotAllCombinedWithOtherTypeThrows) {
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
 
-    rust::Vec<rust::String> snapshot_types;
-    snapshot_types.push_back("all");
-    snapshot_types.push_back("test");
+    ASSERT_THROW(client->snapshot("deflated", make_snapshot_types({"all", "test"})), std::exception);
 
-    ASSERT_THROW(client->snapshot("deflated", std::move(snapshot_types)), std::exception);
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    client = nullptr;
+}
+
+TEST(LowLevelE2E_Client, SnapshotReturnsNonEmptyBytes) {
+    RecordProperty("description", "Returns a non-empty snapshot for a valid compression and snapshot type.");
+    iggy::ffi::Client *client = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    rust::Vec<std::uint8_t> snapshot_bytes;
+    ASSERT_NO_THROW({ snapshot_bytes = client->snapshot("deflated", make_snapshot_types({"test"})); });
+    EXPECT_FALSE(snapshot_bytes.empty());
 
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
     client = nullptr;
 }
 
 TEST(LowLevelE2E_Client, SnapshotWithInvalidCompressionThrows) {
-    RecordProperty("description", "Rejects invalid snapshot compression values in the wrapper before sending.");
+    RecordProperty("description",
+                   "Rejects empty or invalid snapshot compression values in the wrapper before sending.");
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
 
-    rust::Vec<rust::String> snapshot_types;
-    snapshot_types.push_back("test");
-
-    ASSERT_THROW(client->snapshot("invalid-compression", std::move(snapshot_types)), std::exception);
+    ASSERT_THROW(client->snapshot("", make_snapshot_types({"test"})), std::exception);
+    ASSERT_THROW(client->snapshot("invalid-compression", make_snapshot_types({"test"})), std::exception);
 
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
     client = nullptr;
@@ -813,10 +836,7 @@ TEST(LowLevelE2E_Client, SnapshotWithInvalidSnapshotTypeThrows) {
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
 
-    rust::Vec<rust::String> snapshot_types;
-    snapshot_types.push_back("not-a-real-type");
-
-    ASSERT_THROW(client->snapshot("deflated", std::move(snapshot_types)), std::exception);
+    ASSERT_THROW(client->snapshot("deflated", make_snapshot_types({"not-a-real-type"})), std::exception);
 
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
     client = nullptr;

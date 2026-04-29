@@ -20,19 +20,20 @@
 #pragma once
 
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 
 #include "lib.rs.h"
 
 inline iggy::ffi::Identifier make_string_identifier(const std::string &value) {
     iggy::ffi::Identifier identifier;
-    identifier.from_string(value);
+    identifier.set_string(value);
     return identifier;
 }
 
 inline iggy::ffi::Identifier make_numeric_identifier(const std::uint32_t value) {
     iggy::ffi::Identifier identifier;
-    identifier.from_numeric(value);
+    identifier.set_numeric(value);
     return identifier;
 }
 
@@ -41,4 +42,12 @@ inline iggy::ffi::Client *login_to_server() {
     client->connect();
     client->login_user("iggy", "iggy");
     return client;
+}
+
+inline rust::Vec<rust::String> make_snapshot_types(std::initializer_list<const char *> values) {
+    rust::Vec<rust::String> snapshot_types;
+    for (const auto value : values) {
+        snapshot_types.push_back(value);
+    }
+    return snapshot_types;
 }
