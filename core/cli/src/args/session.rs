@@ -16,11 +16,18 @@
  * under the License.
  */
 
-mod common;
+use clap::Subcommand;
 
-mod test_context_applied;
-mod test_context_create_command;
-mod test_context_delete_command;
-mod test_context_list_command;
-mod test_context_show_command;
-mod test_context_use_command;
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum SessionAction {
+    /// Show current login session status
+    ///
+    /// Displays whether you have an active login session and which
+    /// server it is connected to. This checks the local credential
+    /// store without contacting the server.
+    ///
+    /// Examples
+    ///  iggy session status
+    #[clap(verbatim_doc_comment, visible_alias = "s")]
+    Status,
+}

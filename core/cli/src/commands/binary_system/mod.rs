@@ -21,5 +21,6 @@ pub mod logout;
 pub mod me;
 pub mod ping;
 pub mod session;
+pub mod session_status;
 pub mod snapshot;
 pub mod stats;
