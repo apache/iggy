@@ -49,6 +49,7 @@ spotbugs = "4.9.8"
 
 # Config
 typesafe-config = "1.4.5"
+picocli = "4.7.7"
 
 # Build plugins
 spotless = "8.1.0"
@@ -102,6 +103,7 @@ spotbugs-annotations = { module = "com.github.spotbugs:spotbugs-annotations", ve
 
 # Config
 typesafe-config = { module = "com.typesafe:config", version.ref = "typesafe-config" }
+picocli = { module = "info.picocli:picocli", version.ref = "picocli" }
 
 [bundles]
 testing = ["junit-jupiter", "junit-platform-launcher", "assertj-core"]

@@ -17,20 +17,24 @@
  * under the License.
  */
 
-rootProject.name = "iggy-java-sdk"
+plugins {
+    id("iggy.java-application-conventions")
+}
 
-include("iggy")
-project(":iggy").projectDir = file("java-sdk")
+application {
+    mainClass = "org.apache.iggy.bench.IggyBench"
 
-include("iggy-bench")
-project(":iggy-bench").projectDir = file("bench")
+    // -Xms2g starts the JVM heap at 2 GB.
+    // -Xmx2g caps the JVM heap at 2 GB.
+    // -XX:+UseG1GC pins the garbage collector across runs.
+    // -XX:+AlwaysPreTouch commits heap pages up front to reduce benchmark jitter.
+    applicationDefaultJvmArgs = listOf("-Xms2g", "-Xmx2g", "-XX:+UseG1GC", "-XX:+AlwaysPreTouch")
+}
 
-// External processors - Stream processing integrations
-include("iggy-connector-library")
-project(":iggy-connector-library").projectDir = file("external-processors/iggy-connector-flink/iggy-connector-library")
+dependencies {
+    implementation(project(":iggy"))
+    implementation(libs.picocli)
+    implementation(libs.slf4j.api)
 
-include("iggy-flink-examples")
-project(":iggy-flink-examples").projectDir = file("external-processors/iggy-connector-flink/iggy-flink-examples")
-
-include("iggy-connector-pinot")
-project(":iggy-connector-pinot").projectDir = file("external-processors/iggy-connector-pinot")
+    runtimeOnly(libs.logback.classic)
+}

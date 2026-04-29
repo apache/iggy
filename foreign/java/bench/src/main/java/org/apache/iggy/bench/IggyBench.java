@@ -17,20 +17,17 @@
  * under the License.
  */
 
-rootProject.name = "iggy-java-sdk"
+package org.apache.iggy.bench;
 
-include("iggy")
-project(":iggy").projectDir = file("java-sdk")
+import org.apache.iggy.bench.cli.IggyBenchCommand;
+import picocli.CommandLine;
 
-include("iggy-bench")
-project(":iggy-bench").projectDir = file("bench")
+public final class IggyBench {
 
-// External processors - Stream processing integrations
-include("iggy-connector-library")
-project(":iggy-connector-library").projectDir = file("external-processors/iggy-connector-flink/iggy-connector-library")
+    private IggyBench() {}
 
-include("iggy-flink-examples")
-project(":iggy-flink-examples").projectDir = file("external-processors/iggy-connector-flink/iggy-flink-examples")
-
-include("iggy-connector-pinot")
-project(":iggy-connector-pinot").projectDir = file("external-processors/iggy-connector-pinot")
+    public static void main(String[] args) {
+        var exitCode = new CommandLine(new IggyBenchCommand()).execute(args);
+        System.exit(exitCode);
+    }
+}
