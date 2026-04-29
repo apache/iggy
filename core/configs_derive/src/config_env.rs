@@ -24,12 +24,15 @@ use syn::{DeriveInput, Generics, Ident, Type};
 
 /// Maximum number of array elements to generate env var mappings for.
 ///
-/// For `Vec<T>` fields, mappings are generated for indices 0 through 9 (e.g.,
-/// `FIELD_0_NAME`, `FIELD_1_NAME`, ..., `FIELD_9_NAME`). Environment variables
-/// for indices beyond this limit are silently ignored.
+/// For `Vec<T>` fields, mappings are generated for indices 0 through 255
+/// (e.g., `FIELD_0_NAME`, ..., `FIELD_255_NAME`). Environment variables for
+/// indices beyond this limit are silently ignored.
 ///
-/// This limit is sufficient for all known Iggy configuration arrays.
-const MAX_ARRAY_ELEMENTS: usize = 10;
+/// The ceiling mirrors `cluster.nodes` (the only known Vec<nested>
+/// configuration surface), which the validator allows up to 255 replicas.
+/// Keeping the two in sync means every node index reachable by the validator
+/// is also reachable by env overrides.
+const MAX_ARRAY_ELEMENTS: usize = 256;
 
 /// Container-level attributes for `#[config_env(...)]`
 #[derive(Debug, FromDeriveInput)]

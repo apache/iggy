@@ -422,7 +422,7 @@ impl IggyBenchArgs {
                 self.consumers()
             ),
             BenchmarkKindCommand::EndToEndProducingConsumer(_) => {
-                format!("{} producing consumers", self.producers(),)
+                format!("{} producing consumers", self.producers())
             }
             BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => {
                 format!(

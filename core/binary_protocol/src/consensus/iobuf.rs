@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use aligned_vec::{AVec, ConstAlign};
+use compio_buf::{IoBuf, IoBufMut, ReserveError, ReserveExactError, SetLen};
+use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut, RangeBounds};
 use std::ptr::NonNull;
 use std::slice;
 use std::sync::atomic::{AtomicUsize, Ordering, fence};
-
-use aligned_vec::{AVec, ConstAlign};
-use compio_buf::IoBuf;
 
 #[derive(Debug, Clone)]
 pub struct Owned<const ALIGN: usize = 4096> {
@@ -91,6 +91,16 @@ impl<const ALIGN: usize> Owned<ALIGN> {
         Self { inner }
     }
 
+    /// Allocate a buffer with `capacity` reserved bytes and `len == 0`.
+    /// Intended for use with compio's [`IoBufMut`] read path: the caller
+    /// hands the `Owned` to `read_exact`, which fills it in-place and
+    /// advances the length via [`SetLen::set_len`].
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: AVec::with_capacity(ALIGN, capacity),
+        }
+    }
+
     pub fn copy_from_slice(data: &[u8]) -> Self {
         let mut inner: AVec<u8, ConstAlign<ALIGN>> = AVec::new(ALIGN);
         inner.extend_from_slice(data);
@@ -130,6 +140,54 @@ impl<const ALIGN: usize> Owned<ALIGN> {
         };
 
         (prefix, tail)
+    }
+}
+
+// SAFETY contract for the compio IO buf impls below:
+// * `as_init` returns the initialized prefix (len bytes).
+// * `as_uninit` returns the full allocation up to capacity; compio writes
+//   bytes into it during reads and THEN calls `SetLen::set_len` to advance
+//   the initialized region, which is exactly what `AVec::set_len` expects.
+// * `buf_capacity` is the AVec capacity, not the initialized length.
+impl<const ALIGN: usize> IoBuf for Owned<ALIGN> {
+    fn as_init(&self) -> &[u8] {
+        self.inner.as_slice()
+    }
+}
+
+impl<const ALIGN: usize> IoBufMut for Owned<ALIGN> {
+    fn as_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
+        let cap = self.inner.capacity();
+        let ptr = self.inner.as_mut_ptr().cast::<MaybeUninit<u8>>();
+        unsafe { slice::from_raw_parts_mut(ptr, cap) }
+    }
+
+    fn buf_capacity(&mut self) -> usize {
+        self.inner.capacity()
+    }
+
+    fn reserve(&mut self, len: usize) -> Result<(), ReserveError> {
+        // `reserve(additional)` contract: capacity >= current_len + additional
+        // after the call. `AVec::reserve` matches this contract exactly.
+        if self.inner.capacity() - self.inner.len() >= len {
+            return Ok(());
+        }
+        self.inner.reserve(len);
+        Ok(())
+    }
+
+    fn reserve_exact(&mut self, len: usize) -> Result<(), ReserveExactError> {
+        if self.inner.capacity() - self.inner.len() >= len {
+            return Ok(());
+        }
+        self.inner.reserve_exact(len);
+        Ok(())
+    }
+}
+
+impl<const ALIGN: usize> SetLen for Owned<ALIGN> {
+    unsafe fn set_len(&mut self, len: usize) {
+        unsafe { self.inner.set_len(len) };
     }
 }
 
