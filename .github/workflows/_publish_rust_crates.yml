@@ -91,7 +91,7 @@ jobs:
           echo "✅ Downloaded latest copy script from master"
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # No `|| github.sha` fallback: the `Resolve commit` step below
           # requires an explicit, non-empty `inputs.commit` so the tag step
