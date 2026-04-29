@@ -280,7 +280,7 @@ impl QuicClientBuilder {
 
     /// Builds the parent `IggyClient` with QUIC configuration.
     pub fn build(self) -> Result<IggyClient, IggyError> {
-        let client = QuicClient::create(Arc::new(self.config.build()))?;
+        let client = QuicClient::create(Arc::new(self.config.build()?))?;
         let client = self
             .parent_builder
             .with_client(ClientWrapper::Quic(client))
@@ -316,7 +316,7 @@ impl HttpClientBuilder {
 
     /// Builds the parent `IggyClient` with HTTP configuration.
     pub fn build(self) -> Result<IggyClient, IggyError> {
-        let client = HttpClient::create(Arc::new(self.config.build()))?;
+        let client = HttpClient::create(Arc::new(self.config.build()?))?;
         let client = self
             .parent_builder
             .with_client(ClientWrapper::Http(client))

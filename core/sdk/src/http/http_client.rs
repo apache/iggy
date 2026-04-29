@@ -266,11 +266,7 @@ impl HttpClient {
 
     /// Create a new HTTP client for interacting with the Iggy API using the provided configuration.
     pub fn create(config: Arc<HttpClientConfig>) -> Result<Self, IggyError> {
-        let api_url = Url::parse(&config.api_url);
-        if api_url.is_err() {
-            return Err(IggyError::CannotParseUrl);
-        }
-        let api_url = api_url.unwrap();
+        let api_url = Url::parse(&config.api_url).map_err(|_| IggyError::CannotParseUrl)?;
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(config.retries);
         let client = ClientBuilder::new(reqwest::Client::new())
             .with(TracingMiddleware::<SpanBackendWithUrl>::new())
