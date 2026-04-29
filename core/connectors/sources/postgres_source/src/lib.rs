@@ -495,7 +495,7 @@ impl PostgresSource {
                         continue;
                     }
 
-                    let value = self.extract_column_value(&row, i)?;
+                    let value = extract_column_value(&row, i)?;
                     data.insert(column_name.clone(), value.clone());
 
                     if column.name() == tracking_column {
@@ -885,124 +885,131 @@ impl PostgresSource {
             }
         }
     }
+}
 
-    fn extract_column_value(
-        &self,
-        row: &sqlx::postgres::PgRow,
-        column_index: usize,
-    ) -> Result<serde_json::Value, Error> {
-        let column = &row.columns()[column_index];
-        let type_name = column.type_info().name();
+fn extract_column_value(
+    row: &sqlx::postgres::PgRow,
+    column_index: usize,
+) -> Result<serde_json::Value, Error> {
+    let column = &row.columns()[column_index];
+    let type_name = column.type_info().name();
 
-        match type_name {
-            "BOOL" => {
-                let value: Option<bool> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(serde_json::Value::Bool)
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "INT2" => {
-                let value: Option<i16> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(|v| serde_json::Value::from(v as i64))
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "INT4" => {
-                let value: Option<i32> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(|v| serde_json::Value::from(v as i64))
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "INT8" => {
-                let value: Option<i64> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(serde_json::Value::from)
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "FLOAT4" => {
-                let value: Option<f32> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(|v| serde_json::Value::from(v as f64))
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "FLOAT8" => {
-                let value: Option<f64> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(serde_json::Value::from)
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "NUMERIC" => {
-                let value: Option<String> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .map(serde_json::Value::from)
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "VARCHAR" | "TEXT" | "CHAR" => {
-                let value: Option<String> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(serde_json::Value::String)
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "TIMESTAMP" | "TIMESTAMPTZ" => {
-                let value: Option<DateTime<Utc>> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(|dt| serde_json::Value::String(dt.to_rfc3339()))
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "UUID" => {
-                let value: Option<Uuid> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(|u| serde_json::Value::String(u.to_string()))
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            "JSON" | "JSONB" => {
-                let value: Option<serde_json::Value> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value.unwrap_or(serde_json::Value::Null))
-            }
-            "BYTEA" => {
-                let value: Option<Vec<u8>> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(|bytes| {
-                        use base64::Engine;
-                        serde_json::Value::String(
-                            base64::engine::general_purpose::STANDARD.encode(&bytes),
-                        )
-                    })
-                    .unwrap_or(serde_json::Value::Null))
-            }
-            _ => {
-                let value: Option<String> = row
-                    .try_get(column_index)
-                    .map_err(|_| Error::InvalidRecord)?;
-                Ok(value
-                    .map(serde_json::Value::String)
-                    .unwrap_or(serde_json::Value::Null))
-            }
+    match type_name {
+        "BOOL" => {
+            let value: Option<bool> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::Bool)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "INT2" => {
+            let value: Option<i16> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|v| serde_json::Value::from(v as i64))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "INT4" => {
+            let value: Option<i32> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|v| serde_json::Value::from(v as i64))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "INT8" => {
+            let value: Option<i64> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "FLOAT4" => {
+            let value: Option<f32> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|v| serde_json::Value::from(v as f64))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "FLOAT8" => {
+            let value: Option<f64> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "NUMERIC" => {
+            let value: Option<String> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "DATE" => {
+            let value: Option<chrono::NaiveDate> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|d| serde_json::Value::String(d.to_string()))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "VARCHAR" | "TEXT" | "CHAR" | "BPCHAR" => {
+            let value: Option<String> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "TIMESTAMP" | "TIMESTAMPTZ" => {
+            let value: Option<DateTime<Utc>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|dt| serde_json::Value::String(dt.to_rfc3339()))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "UUID" => {
+            let value: Option<Uuid> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|u| serde_json::Value::String(u.to_string()))
+                .unwrap_or(serde_json::Value::Null))
+        }
+        "JSON" | "JSONB" => {
+            let value: Option<serde_json::Value> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value.unwrap_or(serde_json::Value::Null))
+        }
+        "BYTEA" => {
+            let value: Option<Vec<u8>> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(|bytes| {
+                    use base64::Engine;
+                    serde_json::Value::String(
+                        base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null))
+        }
+        _ => {
+            let value: Option<String> = row
+                .try_get(column_index)
+                .map_err(|_| Error::InvalidRecord)?;
+            Ok(value
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null))
         }
     }
 }
