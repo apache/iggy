@@ -583,3 +583,43 @@ enabled = false
 self_signed = true
 cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"
+
+# Message bus configuration.
+# Tunables for the inter-shard / inter-replica internal bus that ships
+# consensus traffic between replicas and SDK-client traffic between
+# shards. These knobs are consensus-liveness-critical (keepalive +
+# reconnect timers gate VSR view-change latency; max_batch gates
+# throughput under backpressure). Defaults match
+# core::message_bus::config::MessageBusConfig::default().
+[message_bus]
+# Maximum number of BusMessage entries coalesced into a single writev(2)
+# call. Hard upper bound: IOV_MAX/2 = 512 on Linux.
+max_batch = 256
+
+# Wire-level cap on a single framed message.
+max_message_size = "64 MiB"
+
+# Bound on the per-peer mpsc queue. The writer task drains; the
+# send_to_* path enqueues.
+peer_queue_capacity = 256
+
+# Interval between outbound reconnect attempts to peers with peer_id > self_id.
+reconnect_period = "5 s"
+
+# TCP keepalive tunables. See tcp(7).
+keepalive_idle = "10 s"
+keepalive_interval = "5 s"
+keepalive_retries = 3
+
+# Timeout for per-peer close drain (flush writer, tear down reader)
+# before force-cancellation.
+close_peer_timeout = "2 s"
+
+# Wall-clock bound on a single stream.shutdown() / ws.close() in the
+# safe-shutdown sequence of the TLS-family transports.
+close_grace = "2 s"
+
+# Optional listen addresses for the TLS-family transports. Comment out
+# to keep the plane unbound.
+# tcp_tls_listen_addr = "0.0.0.0:9443"
+# wss_listen_addr = "0.0.0.0:9444"
