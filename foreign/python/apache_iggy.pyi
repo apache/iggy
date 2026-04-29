@@ -259,6 +259,22 @@ class IggyClient:
 
         Returns Option of stream details or a PyRuntimeError on failure.
         """
+    def update_stream(
+        self, stream_id: builtins.str | builtins.int, name: builtins.str
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Updates a stream's name.
+
+        Returns Ok(()) on successful stream update or a PyRuntimeError on failure.
+        """
+    def delete_stream(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Deletes a stream by id.
+
+        Returns Ok(()) on successful stream deletion or a PyRuntimeError on failure.
+        """
     def create_topic(
         self,
         stream: builtins.str | builtins.int,

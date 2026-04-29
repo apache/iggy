@@ -272,3 +272,43 @@ def verify_last_message_match(context):
     last_polled_payload = last_polled.payload().decode("utf-8")
 
     assert last_polled_payload == context.last_sent_message
+
+
+@when(parsers.parse('I update the stream name to "{new_name}"'))
+def update_stream_name(context, new_name):
+    """Update the stream name"""
+
+    async def _update():
+        await context.client.update_stream(context.last_stream_id, new_name)
+        context.last_stream_name = new_name
+
+    asyncio.run(_update())
+
+
+@then(parsers.parse('the stream name should be updated to "{expected_name}"'))
+def verify_stream_name_updated(context, expected_name):
+    """Verify stream name was updated"""
+
+    async def _verify():
+        stream = await context.client.get_stream(context.last_stream_id)
+        assert stream is not None
+        assert stream.name == expected_name
+
+    asyncio.run(_verify())
+
+
+@when("I delete the stream")
+def delete_stream(context):
+    """Delete the stream"""
+
+    async def _delete():
+        await context.client.delete_stream(context.last_stream_id)
+        context.last_stream_id = None
+
+    asyncio.run(_delete())
+
+
+@then("the stream should be deleted successfully")
+def verify_stream_deleted(context):
+    """Verify stream was deleted"""
+    assert context.last_stream_id is None
