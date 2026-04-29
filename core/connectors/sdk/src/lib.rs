@@ -416,4 +416,16 @@ pub enum Error {
     /// failures so that circuit breakers are not tripped by bad data.
     #[error("Permanent HTTP error: {0}")]
     PermanentHttpError(String),
+    /// The source schema could not be mapped to the destination schema.
+    /// Indicates a table definition or configuration problem — not a data issue.
+    #[error("Schema mismatch: {0}")]
+    SchemaMismatch(String),
+    /// An I/O failure while writing data (e.g. Parquet serialization, file
+    /// writer close). Distinct from record-level validation errors.
+    #[error("Write failure: {0}")]
+    WriteFailure(String),
+    /// A catalog or transaction-level failure (e.g. applying or committing an
+    /// Iceberg transaction). Callers may retry on transient catalog outages.
+    #[error("Catalog error: {0}")]
+    CatalogError(String),
 }
