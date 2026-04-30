@@ -41,9 +41,7 @@ use tracing::warn;
 /// handshake starts, matching [`super::tcp::install_client_tcp`]'s
 /// plaintext behaviour. Linux does not propagate it from the listener
 /// to accepted sockets, so toggling here is required. `SO_KEEPALIVE`
-/// is intentionally NOT set; see `crate::socket_opts` and the
-/// `[message_bus]` schema rationale at
-/// `core/configs/src/server_ng_config/message_bus.rs:49-52`.
+/// is intentionally NOT set; see [`crate::socket_opts`].
 ///
 /// TCP-TLS is shard-0 terminal: the rustls connection state machine
 /// is non-serialisable and tied to the local task; pre-handshake the

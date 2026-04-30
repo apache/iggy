@@ -45,13 +45,11 @@ use tracing::{debug, error, info};
 
 /// Bind the WS pre-upgrade TCP listener and return the bound address.
 ///
-/// Mirrors [`crate::client_listener::tcp::bind`] in shape (`TCP_NODELAY`
-/// on by default; `SO_KEEPALIVE` intentionally NOT set, see
-/// `crate::socket_opts` and the `[message_bus]` schema rationale at
-/// `core/configs/src/server_ng_config/message_bus.rs:49-52`). The
-/// receiving shard re-applies socket options on the dup'd fd via the
-/// existing client-install path, so kernel-level options propagate
-/// end-to-end.
+/// Mirrors [`crate::client_listener::tcp::bind`] in shape: `TCP_NODELAY`
+/// on by default; `SO_KEEPALIVE` intentionally NOT set (see
+/// [`crate::socket_opts`]). The receiving shard re-applies socket
+/// options on the dup'd fd via the existing client-install path, so
+/// kernel-level options propagate end-to-end.
 ///
 /// # Errors
 ///

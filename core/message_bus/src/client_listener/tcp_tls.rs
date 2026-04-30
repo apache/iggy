@@ -58,11 +58,11 @@ use tracing::{debug, error, info};
 /// Like the WS pre-upgrade listener, `TCP_NODELAY` is applied at bind
 /// time; the install path re-applies on every accepted stream because
 /// Linux does not propagate listener options to accepted sockets.
-/// `SO_KEEPALIVE` is intentionally NOT set: see
-/// `crate::socket_opts` and the `[message_bus]` schema rationale at
-/// `core/configs/src/server_ng_config/message_bus.rs:49-52` (SDK
-/// clients manage their own keepalive policy; replica<->replica
-/// liveness is observed by VSR heartbeats).
+/// `SO_KEEPALIVE` is intentionally NOT set (see
+/// [`crate::socket_opts`]): SDK clients manage their own keepalive
+/// policy at the application layer and replica<->replica liveness is
+/// observed by VSR heartbeats, so the kernel timer would only race the
+/// app-level signal.
 ///
 /// # Errors
 ///
