@@ -55,6 +55,18 @@
 //! deploy the replica port on a trusted network boundary
 //! (cluster-local VPC, private subnet, overlay) if wire confidentiality
 //! is required.
+//
+// TODO(F3-auth): commit c9f5aeb4a deleted the prior replica-plane
+// authn (BLAKE3-keyed MAC over `GenericHeader.reserved_command[0..57]`
+// + per-peer nonce ring under `auth/`, ~900 LOC) without mention in
+// the commit body. Pre-PR the inbound `Ping` was MAC-verified before
+// the registry insert; post-PR only `cluster_id` + directional rule
+// gate the connection. `LOGIN_REPLICA` (referenced above as the
+// promised mitigation) does not exist anywhere in the tree. Until it
+// lands, an attacker on the trusted-LAN boundary can forge `Ping`
+// frames that key the registry and drive consensus traffic. Restore
+// transport-layer MAC, or land `LOGIN_REPLICA`, before relying on
+// network-boundary trust alone.
 
 use crate::framing;
 use crate::lifecycle::ShutdownToken;
