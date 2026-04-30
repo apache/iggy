@@ -36,11 +36,14 @@
 //!   onto a bounded `async_channel` and return `Ready` on the first
 //!   poll. The single yield point in the wire path lives inside the
 //!   transport's `run` body, invoked by the per-peer task.
-//! - **Batch atomicity**: a TCP-plane writer drains the per-peer
-//!   `BusReceiver` into one `writev` per batch. Per-frame transports
-//!   (WS, QUIC, TLS) do NOT batch: each iteration of their pump pulls
-//!   one `BusMessage` from the receiver and writes it independently;
-//!   any write failure tears the connection down.
+//! - **Batch ordering**: a TCP-plane writer drains the per-peer
+//!   `BusReceiver` into a single `writev` per batch. The kernel may
+//!   short-write the iovec set (so `writev` is not atomic), but FIFO
+//!   order across the batch is preserved and any short or failed write
+//!   tears the connection down rather than retrying on a half-written
+//!   batch. Per-frame transports (WS, QUIC, TLS) do NOT batch: each
+//!   pump iteration pulls one `BusMessage` from the receiver and writes
+//!   it independently; any write failure tears the connection down.
 //! - **Zero-copy `Frozen` ownership**: outbound frames are handed to
 //!   the kernel without intermediate copies on plaintext TCP. WS / QUIC
 //!   / TLS planes pay structural copies in their record layers; see the
@@ -159,7 +162,9 @@ pub trait TransportConn: 'static {
     /// - Push every decoded inbound frame into [`ActorContext::in_tx`]
     ///   in order.
     /// - Drain [`ActorContext::rx`] FIFO and write each batch to the
-    ///   wire atomically (or fail the batch and exit).
+    ///   wire preserving that order; any short or failed write must
+    ///   tear the connection down rather than continue on a partially
+    ///   written batch.
     /// - Observe [`ActorContext::shutdown`] on every blocking await so
     ///   the bus's tear-down completes within the configured drain
     ///   budget.

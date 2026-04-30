@@ -113,9 +113,11 @@ pub(in crate::transports) fn decode_consensus_frame(
     {
         return Err(FrameDecodeError::BadSize);
     }
-    // Aligned MESSAGE_ALIGN backing memory is required by the
-    // `Message<GenericHeader>` invariant; the WS payload is a plain byte
-    // slice with no alignment guarantee, so this is a one-time copy.
+    // `Message<GenericHeader>` requires `MESSAGE_ALIGN`-aligned backing
+    // memory; the alignment exists so storage-path reads can land
+    // straight into io_uring O_DIRECT buffers without a bounce copy. WS
+    // payloads have no alignment guarantee, so the only way to satisfy
+    // the invariant is one allocate-and-copy here.
     let owned =
         iggy_binary_protocol::consensus::iobuf::Owned::<MESSAGE_ALIGN>::copy_from_slice(body);
     Message::<GenericHeader>::try_from(owned).map_err(|_| FrameDecodeError::BadHeader)

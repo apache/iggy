@@ -346,6 +346,20 @@ impl TransportConn for QuicTransportConn {
     }
 }
 
+/// Drain inbound consensus frames from `recv` until shutdown or a
+/// read error.
+///
+/// # Cancel-safety
+///
+/// The `select!` arm that wakes on `shutdown` drops a parked
+/// [`crate::framing::read_message`] future. `read_message` is not
+/// cancel-safe across multi-read frames: bytes already pulled into the
+/// in-flight `Owned<MESSAGE_ALIGN>` are lost with the dropped frame and
+/// the stream has already advanced past them. The reader treats this
+/// loss as terminal and exits, which the writer's scopeguard turns into
+/// a clean per-connection close. Reads that complete in a single poll
+/// (full header + body already buffered by the QUIC stack) are
+/// unaffected.
 #[allow(clippy::future_not_send)]
 async fn reader_task(
     mut recv: RecvStream,
