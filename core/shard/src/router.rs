@@ -189,8 +189,8 @@ where
         //   looked up via the [`ShardsTable`].
         // - Consensus control-plane (`StartViewChange`, `DoViewChange`,
         //   `StartView`, `Commit`) carries a raw `u64` consensus namespace;
-        //   hash-route it the same way partitions are looked up so every
-        //   node agrees on the owning shard.
+        //   route it via a deterministic hash function so every node agrees
+        //   on the owning shard without consulting the partitions table.
         let target = if operation.is_metadata() {
             0
         } else if operation.is_partition() {
@@ -305,17 +305,27 @@ where
                     "installing delegated replica fd"
                 );
                 self.bus
-                    .install_replica_fd(fd, replica_id, self.on_replica_message.clone());
+                    .install_replica_tcp_fd(fd, replica_id, self.on_replica_message.clone());
             }
-            crate::ShardFramePayload::ClientConnectionSetup { fd, client_id } => {
+            crate::ShardFramePayload::ClientConnectionSetup { fd, meta } => {
                 tracing::info!(
                     shard = self.id,
-                    client_id,
+                    client_id = meta.client_id,
                     raw_fd = fd.as_raw_fd(),
                     "installing delegated client fd"
                 );
                 self.bus
-                    .install_client_fd(fd, client_id, self.on_client_request.clone());
+                    .install_client_fd(fd, meta, self.on_client_request.clone());
+            }
+            crate::ShardFramePayload::ClientWsConnectionSetup { fd, meta } => {
+                tracing::info!(
+                    shard = self.id,
+                    client_id = meta.client_id,
+                    raw_fd = fd.as_raw_fd(),
+                    "installing delegated WS client fd (pre-upgrade)"
+                );
+                self.bus
+                    .install_client_ws_fd(fd, meta, self.on_client_request.clone());
             }
             crate::ShardFramePayload::ReplicaMappingUpdate {
                 replica_id,

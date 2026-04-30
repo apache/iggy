@@ -587,8 +587,7 @@ key_file = "core/certs/iggy_key.pem"
 # Message bus configuration.
 # Tunables for the inter-shard / inter-replica internal bus that ships
 # consensus traffic between replicas and SDK-client traffic between
-# shards. These knobs are consensus-liveness-critical (keepalive +
-# reconnect timers gate VSR view-change latency; max_batch gates
+# shards. These knobs are consensus-liveness-critical (max_batch gates
 # throughput under backpressure). Defaults match
 # core::message_bus::config::MessageBusConfig::default().
 [message_bus]
@@ -606,11 +605,6 @@ peer_queue_capacity = 256
 # Interval between outbound reconnect attempts to peers with peer_id > self_id.
 reconnect_period = "5 s"
 
-# TCP keepalive tunables. See tcp(7).
-keepalive_idle = "10 s"
-keepalive_interval = "5 s"
-keepalive_retries = 3
-
 # Timeout for per-peer close drain (flush writer, tear down reader)
 # before force-cancellation.
 close_peer_timeout = "2 s"
@@ -619,7 +613,32 @@ close_peer_timeout = "2 s"
 # safe-shutdown sequence of the TLS-family transports.
 close_grace = "2 s"
 
-# Optional listen addresses for the TLS-family transports. Comment out
-# to keep the plane unbound.
-# tcp_tls_listen_addr = "0.0.0.0:9443"
-# wss_listen_addr = "0.0.0.0:9444"
+# Wall-clock bound on a single connection's handshake phase. Threaded
+# into compio::time::timeout(handshake_grace, ...) at each accept site
+# (TCP-TLS rustls accept, WS HTTP-Upgrade, WSS combined TLS+WS, QUIC
+# connecting.await + accept_bi.await) so a slowloris peer cannot pin
+# per-conn channels + registry slot + spawned task indefinitely.
+handshake_grace = "10 s"
+
+# WebSocket frame-layer tunables for the bus's WS / WSS install path.
+# Distinct from the legacy [websocket] listener tuning: the bus owns
+# its own ceilings because the bus plane carries SDK-client traffic
+# with cardinality and burst characteristics distinct from the legacy
+# listener. Each `ws_*_size` knob is optional; commenting it out keeps
+# the tungstenite default. Folded once into a tungstenite::WebSocketConfig
+# at bus construction.
+#
+# Hard upper bound on a single inbound WebSocket message
+# (post-fragment-reassembly).
+# ws_max_message_size = "64 MiB"
+#
+# Hard upper bound on a single inbound WebSocket frame
+# (pre-fragment-reassembly).
+# ws_max_frame_size = "16 MiB"
+#
+# Target buffer size for batched WebSocket writes before flush.
+# ws_write_buffer_size = "128 KiB"
+#
+# Whether to accept unmasked frames from clients in violation of
+# RFC 6455 client-to-server framing rules. Strict (false) by default.
+ws_accept_unmasked_frames = false

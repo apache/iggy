@@ -24,7 +24,7 @@ mod common;
 use common::{install_replicas_locally, loopback};
 use message_bus::IggyMessageBus;
 use message_bus::connector::start as start_connector;
-use message_bus::replica_listener::{MessageHandler, bind, run};
+use message_bus::replica::listener::{MessageHandler, bind, run};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -60,6 +60,7 @@ async fn periodic_retry_picks_up_late_listener() {
             2,
             accept_delegate,
             message_bus::framing::MAX_MESSAGE_SIZE,
+            Duration::from_secs(10),
         )
         .await;
     });
