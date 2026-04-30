@@ -473,6 +473,7 @@ async fn run_pump(tls: &mut TlsStream<TcpStream>, ctx: ActorContext) {
 
     let mut shutdown_fut = Box::pin(shutdown.wait().fuse());
     let mut state = TlsPumpState::new();
+    let mut batch: Vec<BusMessage> = Vec::with_capacity(max_batch);
 
     loop {
         let action = {
@@ -505,7 +506,6 @@ async fn run_pump(tls: &mut TlsStream<TcpStream>, ctx: ActorContext) {
                 // record per `write_all` call; coalescing the flush
                 // turns N record-with-AEAD-tag emissions into one
                 // wakeup of the underlying TCP writer.
-                let mut batch: Vec<BusMessage> = Vec::with_capacity(max_batch);
                 batch.push(first);
                 while batch.len() < max_batch {
                     match rx.try_recv() {
@@ -514,7 +514,7 @@ async fn run_pump(tls: &mut TlsStream<TcpStream>, ctx: ActorContext) {
                     }
                 }
                 let drained = batch.len();
-                for msg in batch {
+                for msg in batch.drain(..) {
                     let len = msg.buf_len();
                     let compio::BufResult(result, _) = tls.write_all(msg).await;
                     if let Err(e) = result {

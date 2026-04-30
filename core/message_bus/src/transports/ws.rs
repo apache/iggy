@@ -189,6 +189,7 @@ async fn run_pump(ws: &mut WebSocketStream<TcpStream>, ctx: ActorContext) {
         ..
     } = ctx;
     let mut shutdown_fut = Box::pin(shutdown.wait().fuse());
+    let mut batch: Vec<BusMessage> = Vec::with_capacity(max_batch);
 
     loop {
         let action = {
@@ -218,7 +219,6 @@ async fn run_pump(ws: &mut WebSocketStream<TcpStream>, ctx: ActorContext) {
                 // tungstenite buffers each `send` into its outbound
                 // queue; a single trailing `flush` shrinks N writev
                 // syscalls to 1 per drain.
-                let mut batch: Vec<BusMessage> = Vec::with_capacity(max_batch);
                 batch.push(first);
                 while batch.len() < max_batch {
                     match rx.try_recv() {
@@ -227,7 +227,7 @@ async fn run_pump(ws: &mut WebSocketStream<TcpStream>, ctx: ActorContext) {
                     }
                 }
                 let drained = batch.len();
-                for msg in batch {
+                for msg in batch.drain(..) {
                     if let Err(e) = ws.send(WsMessage::Binary(Bytes::from_owner(msg))).await {
                         warn!(%label, %peer, error = ?e, batch_len = drained, "ws writer: send failed");
                         return;

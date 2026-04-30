@@ -330,6 +330,7 @@ async fn run_pump(ws: &mut WebSocketStream<TlsStream<TcpStream>>, ctx: ActorCont
         ..
     } = ctx;
     let mut shutdown_fut = Box::pin(shutdown.wait().fuse());
+    let mut batch: Vec<BusMessage> = Vec::with_capacity(max_batch);
 
     loop {
         let action = {
@@ -359,7 +360,6 @@ async fn run_pump(ws: &mut WebSocketStream<TlsStream<TcpStream>>, ctx: ActorCont
                 // Each tungstenite `send` is one Binary frame; coalescing
                 // the flush turns N TLS records into one writer wakeup
                 // and avoids per-frame AEAD-tag amplification.
-                let mut batch: Vec<BusMessage> = Vec::with_capacity(max_batch);
                 batch.push(first);
                 while batch.len() < max_batch {
                     match rx.try_recv() {
@@ -368,7 +368,7 @@ async fn run_pump(ws: &mut WebSocketStream<TlsStream<TcpStream>>, ctx: ActorCont
                     }
                 }
                 let drained = batch.len();
-                for msg in batch {
+                for msg in batch.drain(..) {
                     if let Err(e) = ws.send(WsMessage::Binary(Bytes::from_owner(msg))).await {
                         warn!(%label, %peer, error = ?e, batch_len = drained, "wss writer: send failed");
                         return;
