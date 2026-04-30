@@ -195,6 +195,15 @@ type Client interface {
 		partitionsCount uint32,
 	) error
 
+	// DeleteSegments deletes N segments from a topic partition by stream and topic unique IDs or names.
+	// Authentication is required, and the permission to manage the partitions.
+	DeleteSegments(
+		streamId Identifier,
+		topicId Identifier,
+		partitionId uint32,
+		segmentsCount uint32,
+	) error
+
 	// GetUser get the info about a specific user by unique ID or username.
 	// Authentication is required, and the permission to read the users, unless the provided user ID is the same as the authenticated user.
 	GetUser(identifier Identifier) (*UserInfoDetails, error)
