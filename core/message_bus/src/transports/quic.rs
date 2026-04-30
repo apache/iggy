@@ -53,12 +53,13 @@
 //! idempotence audit before being turned on.
 
 use super::{ActorContext, TransportConn, TransportListener};
+use crate::config::QuicTuning;
 use crate::framing;
 use crate::lifecycle::{BusReceiver, FusedShutdown};
 use compio::BufResult;
 use compio::io::AsyncWriteExt;
 use compio_quic::{
-    Connection, Endpoint, Incoming, RecvStream, SendStream, VarInt, congestion,
+    Connection, Endpoint, IdleTimeout, Incoming, RecvStream, SendStream, VarInt, congestion,
     crypto::rustls::QuicServerConfig,
 };
 use futures::FutureExt;
@@ -76,21 +77,6 @@ pub const QUIC_AUTH_FAILED: u32 = 0x1002;
 pub const QUIC_SHUTDOWN: u32 = 0x1003;
 pub const QUIC_PROTOCOL_VIOLATION: u32 = 0x1004;
 
-/// Idle-timeout default for client-plane connections. Override at
-/// endpoint construction time if the operator needs a tighter or looser
-/// liveness budget.
-const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Keepalive interval default. One third of [`DEFAULT_IDLE_TIMEOUT`] so
-/// up to two consecutive keepalives can be lost before the idle timer
-/// closes the connection.
-const DEFAULT_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Stream / receive / send window default. Matches
-/// `MessageBusConfig::default().max_message_size = 64 MiB` so a single
-/// in-flight max-size frame fits without head-of-line wait.
-const DEFAULT_WINDOW: u32 = 64 * 1024 * 1024;
-
 /// Default wall-clock bound on `accept_handshake`. Mirrors
 /// [`crate::MessageBusConfig::handshake_grace`]; consumed by the
 /// trait-impl `accept` path which has no plumbing for caller config.
@@ -99,31 +85,50 @@ const DEFAULT_WINDOW: u32 = 64 * 1024 * 1024;
 /// `MessageBusConfig::handshake_grace` directly.
 const DEFAULT_HANDSHAKE_GRACE: Duration = Duration::from_secs(10);
 
-/// Build a [`compio_quic::TransportConfig`] tuned for the SDK-client plane.
+/// Build a [`compio_quic::TransportConfig`] from a runtime
+/// [`QuicTuning`] derived from the schema's `[quic]` block.
 ///
-/// Defaults: 1 bidi stream per peer, 30 s idle timeout, CUBIC congestion,
-/// 64 MiB send/receive windows.
+/// Architectural invariants the bus enforces here regardless of the
+/// schema (so a misconfigured operator config cannot break the
+/// SDK-client plane):
+///
+/// - Exactly one bidirectional stream per peer carries every consensus
+///   frame; `tuning.max_concurrent_bidi_streams` clamps to a `u32`
+///   `VarInt` at conversion time but the bus opens only one stream.
+/// - Zero unidirectional streams (no datagram traffic on this plane).
+/// - CUBIC congestion controller (no scheme-level switch yet exposed
+///   to operators).
+///
+/// `keep_alive_interval` and `max_idle_timeout` follow the legacy
+/// QUIC server's convention: a `Duration::ZERO` means *disabled* and
+/// the corresponding quinn knob is left at quinn's own default.
 ///
 /// # Panics
 ///
-/// Panics only if `DEFAULT_IDLE_TIMEOUT` is changed to a value outside
-/// quinn-proto's `IdleTimeout` range (its `TryFrom<Duration>` rejects
-/// values above `VarInt::MAX_U64` ms). 30 s is well inside the range.
+/// Panics if `tuning.max_idle_timeout` is non-zero but outside
+/// quinn-proto's `IdleTimeout` range (`TryFrom<Duration>` rejects
+/// values above `VarInt::MAX_U64` ms, i.e. ~292 years). Schema
+/// validation rejects values that large.
 #[must_use]
-pub fn default_transport_config() -> compio_quic::TransportConfig {
+pub fn transport_config_from(tuning: &QuicTuning) -> compio_quic::TransportConfig {
     let mut cfg = compio_quic::TransportConfig::default();
-    cfg.max_concurrent_bidi_streams(VarInt::from_u32(1))
+    cfg.max_concurrent_bidi_streams(VarInt::from_u32(tuning.max_concurrent_bidi_streams))
         .max_concurrent_uni_streams(VarInt::from_u32(0))
-        .stream_receive_window(VarInt::from_u32(DEFAULT_WINDOW))
-        .receive_window(VarInt::from_u32(DEFAULT_WINDOW))
-        .send_window(u64::from(DEFAULT_WINDOW))
-        .max_idle_timeout(Some(
-            DEFAULT_IDLE_TIMEOUT
-                .try_into()
-                .expect("30 s fits in IdleTimeout"),
-        ))
-        .keep_alive_interval(Some(DEFAULT_KEEP_ALIVE_INTERVAL))
+        .stream_receive_window(VarInt::from_u32(tuning.receive_window))
+        .receive_window(VarInt::from_u32(tuning.receive_window))
+        .send_window(tuning.send_window)
+        .initial_mtu(tuning.initial_mtu)
+        .datagram_send_buffer_size(tuning.datagram_send_buffer_size)
         .congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
+
+    if !tuning.max_idle_timeout.is_zero() {
+        let idle = IdleTimeout::try_from(tuning.max_idle_timeout)
+            .expect("quic.max_idle_timeout fits in quinn IdleTimeout (validated by schema)");
+        cfg.max_idle_timeout(Some(idle));
+    }
+    if !tuning.keep_alive_interval.is_zero() {
+        cfg.keep_alive_interval(Some(tuning.keep_alive_interval));
+    }
     cfg
 }
 
@@ -148,7 +153,7 @@ impl QuicTransportListener {
     ///
     /// Caller is responsible for the [`Endpoint`]'s
     /// [`compio_quic::ServerConfig`] crypto material and
-    /// [`default_transport_config`] hookup.
+    /// [`transport_config_from`] hookup.
     #[must_use]
     pub const fn new(endpoint: Endpoint) -> Self {
         Self { endpoint }
@@ -441,12 +446,13 @@ async fn writer_task(
     }
 }
 
-/// Build a [`compio_quic::ServerConfig`] from a single cert + key pair.
+/// Build a [`compio_quic::ServerConfig`] from a cert chain + key pair
+/// plus the bus's runtime [`QuicTuning`].
 ///
-/// Applies the bus-tuned [`default_transport_config`] and disables
-/// 0-RTT; otherwise inherits upstream defaults including
-/// `migration: true`. No ALPN is advertised; protocol-version
-/// validation lives in the LOGIN command on the caller (server-ng).
+/// Applies [`transport_config_from`] and disables 0-RTT; otherwise
+/// inherits upstream defaults including `migration: true`. No ALPN is
+/// advertised; protocol-version validation lives in the LOGIN command
+/// on the caller (server-ng).
 ///
 /// # Errors
 ///
@@ -454,6 +460,7 @@ async fn writer_task(
 pub fn server_config_with_cert(
     cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
     key_der: rustls::pki_types::PrivateKeyDer<'static>,
+    tuning: &QuicTuning,
 ) -> Result<compio_quic::ServerConfig, rustls::Error> {
     let mut rustls_cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -462,7 +469,7 @@ pub fn server_config_with_cert(
     let crypto = QuicServerConfig::try_from(rustls_cfg)
         .map_err(|e| rustls::Error::General(format!("QUIC crypto: {e}")))?;
     let mut server_cfg = compio_quic::ServerConfig::with_crypto(Arc::new(crypto));
-    server_cfg.transport_config(Arc::new(default_transport_config()));
+    server_cfg.transport_config(Arc::new(transport_config_from(tuning)));
     Ok(server_cfg)
 }
 
@@ -508,7 +515,8 @@ mod tests {
         cert: CertificateDer<'static>,
         key: PrivateKeyDer<'static>,
     ) -> Endpoint {
-        let server_cfg = server_config_with_cert(vec![cert], key).expect("server config");
+        let server_cfg = server_config_with_cert(vec![cert], key, &QuicTuning::default())
+            .expect("server config");
         Endpoint::server("127.0.0.1:0", server_cfg)
             .await
             .expect("bind")
@@ -641,9 +649,23 @@ mod tests {
     }
 
     #[test]
-    fn default_transport_config_caps_streams_at_one() {
+    fn transport_config_from_default_builds() {
         // Lightweight smoke: confirm the helper builds without panicking
-        // and the underlying defaults are reachable.
-        let _cfg = default_transport_config();
+        // when handed the built-in default tuning.
+        let _cfg = transport_config_from(&QuicTuning::default());
+    }
+
+    #[test]
+    fn transport_config_from_zero_durations_skips_quinn_knobs() {
+        // Zero values must be treated as "disabled" so the bus does
+        // not push `Duration::ZERO` into quinn's IdleTimeout (which
+        // would set a 0 ms idle timer and tear every connection down
+        // immediately).
+        let tuning = QuicTuning {
+            keep_alive_interval: Duration::ZERO,
+            max_idle_timeout: Duration::ZERO,
+            ..QuicTuning::default()
+        };
+        let _cfg = transport_config_from(&tuning);
     }
 }

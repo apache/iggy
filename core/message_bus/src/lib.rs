@@ -87,7 +87,7 @@ pub mod replica;
 pub(crate) mod socket_opts;
 pub mod transports;
 
-pub use config::{IOV_MAX_LIMIT, MessageBusConfig, WebSocketConfig};
+pub use config::{IOV_MAX_LIMIT, MessageBusConfig, QuicTuning, WebSocketConfig};
 pub use error::SendError;
 pub use installer::ConnectionInstaller;
 pub use installer::conn_info::{

@@ -44,6 +44,53 @@ pub use compio::ws::tungstenite::protocol::WebSocketConfig;
 use configs::server_ng::ServerNgConfig;
 use std::time::Duration;
 
+/// Pre-converted QUIC transport tuning derived from
+/// [`ServerNgConfig::quic`](configs::ng_quic::QuicConfig).
+///
+/// Threaded into [`crate::transports::quic::transport_config_from`] at
+/// every bind site so the schema's `[quic]` block actually drives
+/// `quinn-proto`'s `TransportConfig`. Hot paths read these fields
+/// directly without per-bind `IggyDuration` / `IggyByteSize`
+/// conversion.
+///
+/// `keep_alive_interval` and `max_idle_timeout` follow the legacy
+/// QUIC server's convention: a zero `Duration` means *disabled* and
+/// the corresponding quinn knob is left unset.
+///
+/// Hardcoded knobs the bus does NOT expose: `max_concurrent_uni_streams = 0`
+/// and the CUBIC congestion controller. Both are architectural
+/// invariants of the SDK-client plane (single bidi stream per peer,
+/// no datagram or unidirectional traffic).
+#[derive(Debug, Clone)]
+pub struct QuicTuning {
+    /// Maximum number of concurrent bidirectional streams per
+    /// connection. The bus opens exactly one per peer; setting this
+    /// above 1 just preallocates unused quinn-proto state.
+    pub max_concurrent_bidi_streams: u32,
+
+    /// Buffer size handed to quinn's outbound datagram queue, in
+    /// bytes.
+    pub datagram_send_buffer_size: usize,
+
+    /// Initial path MTU advertised to the peer, in bytes.
+    pub initial_mtu: u16,
+
+    /// Send-flow control window per connection, in bytes.
+    pub send_window: u64,
+
+    /// Receive-flow control window per connection, in bytes.
+    pub receive_window: u32,
+
+    /// Interval between QUIC keep-alive PINGs. `Duration::ZERO`
+    /// disables keep-alive; the connection then relies entirely on
+    /// [`Self::max_idle_timeout`] for liveness.
+    pub keep_alive_interval: Duration,
+
+    /// Idle timeout after which quinn closes the connection.
+    /// `Duration::ZERO` disables the timer (not recommended).
+    pub max_idle_timeout: Duration,
+}
+
 /// Hard upper bound on `max_batch`, in iovecs.
 ///
 /// Linux's `IOV_MAX` is 1024 (`/usr/include/bits/uio_lim.h`). Future WS
@@ -126,6 +173,10 @@ pub struct MessageBusConfig {
     /// vendored `tungstenite` so callers do not need a direct dep on
     /// `compio_ws` to construct or pattern-match this field.
     pub ws_config: WebSocketConfig,
+
+    /// QUIC transport tuning, pre-converted from
+    /// [`ServerNgConfig::quic`](configs::ng_quic::QuicConfig) at boot.
+    pub quic: QuicTuning,
 }
 
 impl From<&ServerNgConfig> for MessageBusConfig {
@@ -141,6 +192,54 @@ impl From<&ServerNgConfig> for MessageBusConfig {
             close_grace: bus.close_grace.get_duration(),
             handshake_grace: bus.handshake_grace.get_duration(),
             ws_config: build_ws_config(bus),
+            quic: build_quic_tuning(&cfg.quic),
+        }
+    }
+}
+
+/// Convert the schema's [`configs::ng_quic::QuicConfig`]
+/// (`IggyByteSize` / `IggyDuration` typed) into the runtime
+/// [`QuicTuning`] (plain integer / `Duration` fields).
+///
+/// `expect`s rely on the schema validator (and the embedded default
+/// TOML) keeping byte-size and stream-count fields inside
+/// `quinn-proto`'s `VarInt` range. On supported targets `usize::MAX`
+/// covers anything operators write into the schema, so the conversion
+/// only fails for genuinely impossible inputs.
+fn build_quic_tuning(quic: &configs::ng_quic::QuicConfig) -> QuicTuning {
+    QuicTuning {
+        max_concurrent_bidi_streams: u32::try_from(quic.max_concurrent_bidi_streams)
+            .expect("quic.max_concurrent_bidi_streams fits in u32"),
+        datagram_send_buffer_size: usize::try_from(quic.datagram_send_buffer_size.as_bytes_u64())
+            .expect("quic.datagram_send_buffer_size fits usize on supported targets"),
+        initial_mtu: u16::try_from(quic.initial_mtu.as_bytes_u64())
+            .expect("quic.initial_mtu fits in u16"),
+        send_window: quic.send_window.as_bytes_u64(),
+        receive_window: u32::try_from(quic.receive_window.as_bytes_u64())
+            .expect("quic.receive_window fits in u32 (quinn VarInt accepts u32)"),
+        keep_alive_interval: quic.keep_alive_interval.get_duration(),
+        max_idle_timeout: quic.max_idle_timeout.get_duration(),
+    }
+}
+
+impl Default for QuicTuning {
+    /// Mirrors the `[quic]` defaults in
+    /// `core/server-ng/config.toml`: 64 MiB send/receive windows,
+    /// 30 s idle timeout, 10 s keep-alive, 8 KiB initial MTU, 100 KB
+    /// datagram send buffer, single bidi stream per peer.
+    ///
+    /// Intended for tests and direct callers; production builds
+    /// derive the field from [`ServerNgConfig`] so the values stay in
+    /// lock-step with the on-disk schema.
+    fn default() -> Self {
+        Self {
+            max_concurrent_bidi_streams: 1,
+            datagram_send_buffer_size: 100 * 1024,
+            initial_mtu: 8 * 1024,
+            send_window: 64 * 1024 * 1024,
+            receive_window: 64 * 1024 * 1024,
+            keep_alive_interval: Duration::from_secs(10),
+            max_idle_timeout: Duration::from_secs(30),
         }
     }
 }

@@ -248,8 +248,11 @@ pub async fn start_on_shard_zero(
 
     let quic_bound = match (quic_listen_addr, quic_credentials, on_accepted_quic_client) {
         (Some(addr), Some(creds), Some(on_accepted_quic)) => {
-            let server_config = server_config_with_cert(creds.cert_chain, creds.key_der)
-                .map_err(|e| IggyError::IoError(format!("QUIC server config build failed: {e}")))?;
+            let server_config =
+                server_config_with_cert(creds.cert_chain, creds.key_der, &bus.config().quic)
+                    .map_err(|e| {
+                        IggyError::IoError(format!("QUIC server config build failed: {e}"))
+                    })?;
             let (endpoint, quic_bound) = client_listener::quic::bind(addr, server_config).await?;
             let token_for_quic = bus.token();
             let handshake_grace = bus.config().handshake_grace;
