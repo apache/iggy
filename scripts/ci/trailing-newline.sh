@@ -20,7 +20,7 @@ set -euo pipefail
 
 # Default values
 MODE="check"
-FILE_MODE="staged"
+FILE_MODE="all"
 FILES=()
 
 # Parse arguments
@@ -34,10 +34,6 @@ while [[ $# -gt 0 ]]; do
       MODE="fix"
       shift
       ;;
-    --staged)
-      FILE_MODE="staged"
-      shift
-      ;;
     --ci)
       FILE_MODE="ci"
       shift
@@ -47,16 +43,15 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --help|-h)
-      echo "Usage: $0 [--check|--fix] [--staged|--ci|--all] [files...]"
+      echo "Usage: $0 [--check|--fix] [--ci|--all] [files...]"
       echo ""
       echo "Modes:"
       echo "  --check   Check for missing trailing newlines (default)"
       echo "  --fix     Add trailing newlines to files"
       echo ""
       echo "File selection:"
-      echo "  --staged  Check staged files (default, for git hooks)"
       echo "  --ci      Check files changed in PR (for CI)"
-      echo "  --all     Check all tracked files"
+      echo "  --all     Check all tracked files (default)"
       echo "  [files]   Check specific files"
       exit 0
       ;;
@@ -76,10 +71,6 @@ done
 # Get files to check based on mode
 get_files() {
   case "$FILE_MODE" in
-    staged)
-      # Get staged files for git hooks
-      git diff --cached --name-only --diff-filter=ACM
-      ;;
     ci)
       # Get files changed in PR for CI
       if [ -n "${GITHUB_BASE_REF:-}" ]; then
@@ -90,8 +81,8 @@ get_files() {
         # Generic CI - compare with HEAD~1
         git diff --name-only --diff-filter=ACM HEAD~1
       else
-        # Fallback to staged files
-        git diff --cached --name-only --diff-filter=ACM
+        # Local fallback: check all tracked files
+        git ls-files
       fi
       ;;
     all)
