@@ -26,7 +26,7 @@ use async_channel::Receiver;
 use common::{header_only, install_replicas_locally, loopback};
 use iggy_binary_protocol::Command2;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
-use message_bus::replica_listener::{MessageHandler, bind, run};
+use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus};
 use std::rc::Rc;
 use std::time::Duration;
@@ -55,6 +55,7 @@ async fn two_replicas_exchange_prepare_and_ack() {
             2,
             accept_delegate_1,
             message_bus::framing::MAX_MESSAGE_SIZE,
+            Duration::from_secs(10),
         )
         .await;
     });

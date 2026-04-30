@@ -119,6 +119,8 @@ compio = { version = "0.18.0", features = [
 compio-buf = "0.8.1"
 # Pin compio-driver >= 0.11.2 to fix musl compilation (compio-rs/compio#668)
 compio-driver = "0.11.4"
+compio-quic = "=0.7.2"
+compio-ws = "=0.3.1"
 configs = { path = "core/configs", version = "0.1.0" }
 configs_derive = { path = "core/configs_derive", version = "0.1.0" }
 consensus = { path = "core/consensus" }
@@ -247,6 +249,7 @@ rust-embed = "8.11.0"
 rust-s3 = { version = "0.37.1", default-features = false, features = ["tokio-rustls-tls", "tags"] }
 rustls = { version = "0.23.39", features = ["ring"] }
 rustls-pemfile = "2.2.0"
+scopeguard = "1.2.0"
 secrecy = { version = "0.10", features = ["serde"] }
 send_wrapper = "0.6.0"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
@@ -279,7 +282,7 @@ testcontainers-modules = { version = "0.15.0", features = ["postgres", "http_wai
 thiserror = "2.0.18"
 tokio = { version = "1.52.1", features = ["full"] }
 tokio-rustls = "0.26.4"
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7.18", features = ["compat"] }
 toml = "1.1.2"
 tower-http = { version = "0.6.8", features = ["add-extension", "cors", "trace"] }
@@ -292,7 +295,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
     "ansi",
 ] }
 trait-variant = "0.1.2"
-tungstenite = "0.29.0"
+tungstenite = "0.28.0"
 twox-hash = { version = "2.1.2", features = ["xxhash32"] }
 ulid = "1.2.1"
 ureq = "3.3"
