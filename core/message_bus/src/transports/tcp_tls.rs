@@ -42,11 +42,14 @@
 //! already in flight.
 //!
 //! On bus shutdown the task exits the loop and drives the shutdown
-//! sequence: `flush()` + `compio::time::timeout(close_grace,
-//! stream.shutdown())`. `TlsStream::shutdown` sends `close_notify` and
-//! the underlying TCP `SHUT_WR`; the peer reciprocates and our reader
-//! observes EOF on the next `read` (which never fires because we exited
-//! the loop already).
+//! sequence: `flush()` + `stream.shutdown()`, both wrapped in a single
+//! `compio::time::timeout(close_grace, ...)`. A stalled flush counts
+//! against the same wall-clock budget as the shutdown step, so a
+//! peer that refuses to drain ciphertext cannot stretch close beyond
+//! `close_grace`. `TlsStream::shutdown` sends `close_notify` and the
+//! underlying TCP `SHUT_WR`; the peer reciprocates and our reader
+//! observes EOF on the next `read` (which never fires because we
+//! exited the loop already).
 //!
 //! # Frozen ownership
 //!
@@ -554,12 +557,16 @@ async fn run_pump(tls: &mut TlsStream<TcpStream>, ctx: ActorContext) {
     }
 }
 
-/// Bounded-grace cooperative close: flush any rustls-buffered ciphertext,
-/// then issue a single `TlsStream::shutdown` capped by `close_grace`.
+/// Bounded-grace cooperative close: flush any rustls-buffered
+/// ciphertext, then issue a `TlsStream::shutdown`, with both steps
+/// sharing one `close_grace` budget.
 ///
 /// Shutdown is a transaction - no `select!` racing against the token.
-/// On timeout we drop the stream regardless; the OS sends RST and the peer
-/// sees an unclean close - accepted degraded close.
+/// A stalled `flush` (peer refusing to drain ciphertext) counts
+/// against the same wall-clock as the shutdown step, so close cannot
+/// be stretched beyond `close_grace`. On timeout we drop the stream
+/// regardless; the OS sends RST and the peer sees an unclean close,
+/// an accepted degraded close.
 #[allow(clippy::future_not_send)]
 async fn drive_close(
     tls: &mut TlsStream<TcpStream>,
@@ -567,18 +574,22 @@ async fn drive_close(
     label: &'static str,
     peer: &str,
 ) {
-    if let Err(e) = tls.flush().await {
-        debug!(%label, %peer, error = ?e, "tls close: flush error");
-    }
-    match compio::time::timeout(close_grace, tls.shutdown()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => debug!(%label, %peer, error = ?e, "tls close: shutdown error"),
-        Err(_) => warn!(
+    let result = compio::time::timeout(close_grace, async {
+        if let Err(e) = tls.flush().await {
+            debug!(%label, %peer, error = ?e, "tls close: flush error");
+        }
+        if let Err(e) = tls.shutdown().await {
+            debug!(%label, %peer, error = ?e, "tls close: shutdown error");
+        }
+    })
+    .await;
+    if result.is_err() {
+        warn!(
             %label,
             %peer,
             grace_ms = close_grace.as_millis(),
-            "tls close: shutdown timed out"
-        ),
+            "tls close: grace exceeded"
+        );
     }
 }
 
