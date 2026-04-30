@@ -368,6 +368,10 @@ async fn run_pump(ws: &mut WebSocketStream<TlsStream<TcpStream>>, ctx: ActorCont
                     }
                 }
                 let drained = batch.len();
+                // `drain(..)` consumes the batch in FIFO order while
+                // preserving the Vec's allocation for the next
+                // iteration; `into_iter()` would move the buffer out.
+                #[allow(clippy::iter_with_drain)]
                 for msg in batch.drain(..) {
                     if let Err(e) = ws.send(WsMessage::Binary(Bytes::from_owner(msg))).await {
                         warn!(%label, %peer, error = ?e, batch_len = drained, "wss writer: send failed");

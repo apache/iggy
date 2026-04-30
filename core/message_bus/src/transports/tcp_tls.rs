@@ -517,6 +517,10 @@ async fn run_pump(tls: &mut TlsStream<TcpStream>, ctx: ActorContext) {
                     }
                 }
                 let drained = batch.len();
+                // `drain(..)` consumes the batch in FIFO order while
+                // preserving the Vec's allocation for the next
+                // iteration; `into_iter()` would move the buffer out.
+                #[allow(clippy::iter_with_drain)]
                 for msg in batch.drain(..) {
                     let len = msg.buf_len();
                     let compio::BufResult(result, _) = tls.write_all(msg).await;
