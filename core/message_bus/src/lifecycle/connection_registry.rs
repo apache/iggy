@@ -219,6 +219,40 @@ where
         entries.get(&key).map(|entry| f(&entry.sender))
     }
 
+    /// Try to send `msg` to the per-peer queue, returning the message back
+    /// when no slot exists.
+    ///
+    /// Lets `send_to_*` skip the unconditional `Frozen::clone()` the
+    /// `with_sender` shape forced (closure consumes a clone, outer caller
+    /// retains the original for the slow path the borrow checker cannot
+    /// prove unreachable). The consuming variant moves `msg` into
+    /// `try_send` on the fast path; on no-slot the message is handed back
+    /// so the caller can route it via the slow path or drop it.
+    ///
+    /// Returns:
+    /// - `Ok(Ok(()))`: slot exists and the queue accepted `msg`.
+    /// - `Ok(Err(TrySendError))`: slot exists but `try_send` failed
+    ///   (`Full` or `Closed`); the inner error carries `msg` back per
+    ///   `async_channel`'s contract.
+    /// - `Err(msg)`: no slot for `key`; `msg` returned to the caller.
+    ///
+    /// # Errors
+    ///
+    /// The outer `Err(msg)` reports that no entry exists for `key`. The
+    /// inner `Err(TrySendError)` reports that the entry's queue is full
+    /// or closed.
+    pub fn try_send_or_return(
+        &self,
+        key: K,
+        msg: BusMessage,
+    ) -> Result<Result<(), async_channel::TrySendError<BusMessage>>, BusMessage> {
+        let entries = self.entries.borrow();
+        match entries.get(&key) {
+            Some(entry) => Ok(entry.sender.try_send(msg)),
+            None => Err(msg),
+        }
+    }
+
     /// Register a new connection. Stores the producer side of the per-peer
     /// queue alongside the writer + reader task handles so graceful shutdown
     /// can drain everything.
@@ -285,6 +319,8 @@ where
     /// Unfenced: callers that need generation-safety must use
     /// [`remove_if_token_matches`](Self::remove_if_token_matches).
     pub fn remove(&self, key: K) -> bool {
+        // Dropping the Entry drops `_conn_shutdown`; see its rustdoc on
+        // `Entry` for why that wakes the reader and closes the channel.
         self.entries.borrow_mut().remove(&key).is_some()
     }
 
@@ -492,8 +528,8 @@ async fn drain_handle<K: Debug>(
 /// the right trade-off. Replicas are capped at 256 by the keyspace, and
 /// in practice the cluster has 3-7 replicas, so a fixed
 /// `[Option<Entry>; 256]` avoids every send-path lookup paying hash +
-/// bucket indirection. Storage is ~10 KB per bus, paid once at
-/// construction.
+/// bucket indirection. Storage is on the order of tens of KB per bus,
+/// paid once at construction.
 ///
 /// The API mirrors [`ConnectionRegistry`] exactly; `IggyMessageBus`
 /// swaps the backing type transparently to every existing call site.
@@ -549,6 +585,23 @@ impl ReplicaRegistry {
             .map(|entry| f(&entry.sender))
     }
 
+    /// See [`ConnectionRegistry::try_send_or_return`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`ConnectionRegistry::try_send_or_return`].
+    pub fn try_send_or_return(
+        &self,
+        key: u8,
+        msg: BusMessage,
+    ) -> Result<Result<(), async_channel::TrySendError<BusMessage>>, BusMessage> {
+        let slots = self.slots.borrow();
+        match slots[usize::from(key)].as_ref() {
+            Some(entry) => Ok(entry.sender.try_send(msg)),
+            None => Err(msg),
+        }
+    }
+
     /// See [`ConnectionRegistry::insert`].
     ///
     /// # Errors
@@ -587,6 +640,8 @@ impl ReplicaRegistry {
 
     /// See [`ConnectionRegistry::remove`].
     pub fn remove(&self, key: u8) -> bool {
+        // Dropping the Entry drops `_conn_shutdown`; see its rustdoc on
+        // `Entry` for why that wakes the reader and closes the channel.
         if self.slots.borrow_mut()[usize::from(key)].take().is_some() {
             self.len.set(self.len.get() - 1);
             true
@@ -627,11 +682,6 @@ impl ReplicaRegistry {
 
     /// See [`ConnectionRegistry::close_peer_if_token_matches`].
     ///
-    /// # Panics
-    ///
-    /// Cannot panic in practice: the `expect` after `slot.take()` is
-    /// guarded by a matching `slot.as_ref()` check under the same
-    /// single-threaded `RefCell` borrow.
     #[allow(clippy::future_not_send)]
     pub async fn close_peer_if_token_matches(
         &self,
@@ -642,12 +692,9 @@ impl ReplicaRegistry {
         let mut entry = {
             let mut slots = self.slots.borrow_mut();
             let slot = &mut slots[usize::from(key)];
-            if !slot.as_ref().is_some_and(|e| e.token == token) {
+            let Some(removed_entry) = slot.take_if(|e| e.token == token) else {
                 return false;
-            }
-            let removed_entry = slot
-                .take()
-                .expect("slot is Some: checked above under the same borrow");
+            };
             self.len.set(self.len.get() - 1);
             removed_entry
         };
@@ -1002,5 +1049,82 @@ mod tests {
             .await;
         assert!(closed);
         assert!(!reg.contains(2u8));
+    }
+
+    /// Fast-path: slot present, queue accepts. Verifies the consuming
+    /// `try_send_or_return` shape replaces `with_sender(_, |s| s.try_send(msg.clone()))`
+    /// without dropping behaviour.
+    #[compio::test]
+    async fn try_send_or_return_succeeds_when_slot_present() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        let (_shutdown, token) = Shutdown::new();
+        let (tx, rx) = async_channel::bounded(8);
+        let writer = spawn_dummy_writer(rx.clone());
+        let reader = spawn_dummy_reader(token);
+        reg.insert(1u8, tx, writer, reader, dummy_conn_shutdown())
+            .expect("insert ok");
+
+        let outer = reg.try_send_or_return(1u8, make_bus_msg());
+        assert!(matches!(outer, Ok(Ok(()))));
+        // Receiver drains the message; closing the writer's rx end via
+        // close_peer is not necessary for this assertion.
+        let received = rx.recv().await.expect("queue had message");
+        assert_eq!(received.len(), HEADER_SIZE);
+    }
+
+    /// No slot for `key`: the message is handed back to the caller so the
+    /// slow path (or no-op for clients) can decide what to do.
+    #[compio::test]
+    async fn try_send_or_return_returns_msg_when_slot_missing() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        let msg = make_bus_msg();
+        let original_len = msg.len();
+
+        let outcome = reg.try_send_or_return(99u8, msg);
+        let returned = outcome.expect_err("missing slot should return msg");
+        assert_eq!(returned.len(), original_len);
+    }
+
+    /// Slot present but queue full: inner `Err(TrySendError::Full(msg))` so
+    /// the caller can map to `SendError::Backpressure`.
+    #[compio::test]
+    async fn try_send_or_return_reports_full_when_queue_at_capacity() {
+        let reg: ConnectionRegistry<u8> = ConnectionRegistry::new();
+        let (_shutdown, token) = Shutdown::new();
+        // Capacity-1 queue, no draining receiver.
+        let (tx, rx) = async_channel::bounded(1);
+        // Spawn a no-op task that simply holds the receiver alive without
+        // recv-ing, so the queue stays full.
+        let writer = compio::runtime::spawn(async move {
+            let _keep = rx;
+            std::future::pending::<()>().await;
+        });
+        let reader = spawn_dummy_reader(token);
+        reg.insert(1u8, tx, writer, reader, dummy_conn_shutdown())
+            .expect("insert ok");
+
+        // Saturate the queue.
+        reg.try_send_or_return(1u8, make_bus_msg())
+            .expect("slot present")
+            .expect("first send accepted");
+        // Second send: slot present, queue full.
+        let outcome = reg
+            .try_send_or_return(1u8, make_bus_msg())
+            .expect("slot still present");
+        assert!(matches!(outcome, Err(async_channel::TrySendError::Full(_))));
+    }
+
+    /// Mirror of `try_send_or_return_returns_msg_when_slot_missing` for the
+    /// fixed-array `ReplicaRegistry`. Guards the slow-path forward in
+    /// `send_to_replica` against silent payload loss when no slot exists.
+    #[compio::test]
+    async fn replica_try_send_or_return_returns_msg_when_slot_missing() {
+        let reg = ReplicaRegistry::new();
+        let msg = make_bus_msg();
+        let original_len = msg.len();
+
+        let outcome = reg.try_send_or_return(7u8, msg);
+        let returned = outcome.expect_err("missing slot should return msg");
+        assert_eq!(returned.len(), original_len);
     }
 }

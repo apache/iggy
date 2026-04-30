@@ -27,6 +27,7 @@
 
 use async_channel::{Receiver, Sender};
 use futures::FutureExt;
+use futures::pin_mut;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -35,7 +36,13 @@ use std::time::Duration;
 ///
 /// Create via [`Shutdown::new`], hand out [`ShutdownToken`]s via [`ShutdownToken::clone`],
 /// and call [`Shutdown::trigger`] exactly once to stop everyone.
-#[derive(Debug)]
+///
+/// `Clone` is supported so the installer can hand one clone to the
+/// connection registry (which holds it as the per-conn trigger handle)
+/// and another to the writer task scopeguard. Both clones share the
+/// same `triggered` cell and `Sender`, so [`Shutdown::trigger`] is
+/// idempotent and safe to call from any clone.
+#[derive(Debug, Clone)]
 pub struct Shutdown {
     sender: Sender<()>,
     triggered: Rc<Cell<bool>>,
@@ -124,6 +131,62 @@ impl ShutdownToken {
     }
 }
 
+/// Two-source fused shutdown observer.
+///
+/// Used by transports that must wake on either the bus-wide shutdown OR a
+/// per-connection shutdown the installer triggers on insert-race. Carries
+/// both [`ShutdownToken`]s and resolves [`Self::wait`] when either fires.
+/// Cheap to clone (each clone is two `Rc<Cell<bool>>` clones).
+///
+/// Replaces an earlier design that spawned a per-connection bridge task to
+/// fan-in the two tokens onto a third [`Shutdown`]; folding the merge into
+/// the await site removes the spawn and the third channel without changing
+/// observable semantics.
+#[derive(Debug, Clone)]
+pub struct FusedShutdown {
+    bus: ShutdownToken,
+    conn: ShutdownToken,
+}
+
+impl FusedShutdown {
+    /// Pair the bus-wide token with a per-connection token.
+    #[must_use]
+    pub const fn new(bus: ShutdownToken, conn: ShutdownToken) -> Self {
+        Self { bus, conn }
+    }
+
+    /// Construct a fused token from a single source. Both halves alias the
+    /// same underlying signal; useful for unit tests that drive a transport
+    /// in isolation, with no installer to provide a per-connection token.
+    #[must_use]
+    pub fn single(token: ShutdownToken) -> Self {
+        Self {
+            bus: token.clone(),
+            conn: token,
+        }
+    }
+
+    /// O(1) non-blocking check. True once either source has been triggered.
+    #[must_use]
+    pub fn is_triggered(&self) -> bool {
+        self.bus.is_triggered() || self.conn.is_triggered()
+    }
+
+    /// Resolves the instant either source fires. Bus signal is preferred
+    /// when both are simultaneously ready (matches the installer's
+    /// shutdown-precedence convention).
+    #[allow(clippy::future_not_send)]
+    pub async fn wait(&self) {
+        let bus = self.bus.wait().fuse();
+        let conn = self.conn.wait().fuse();
+        pin_mut!(bus, conn);
+        futures::select_biased! {
+            () = bus => {}
+            () = conn => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +243,36 @@ mod tests {
         shutdown.trigger();
         let ok = sleeper.await.expect("task ok");
         assert!(!ok);
+    }
+
+    #[compio::test]
+    async fn fused_wait_resolves_when_bus_fires() {
+        let (bus, bus_token) = Shutdown::new();
+        let (_conn, conn_token) = Shutdown::new();
+        let fused = FusedShutdown::new(bus_token, conn_token);
+        assert!(!fused.is_triggered());
+        bus.trigger();
+        fused.wait().await;
+        assert!(fused.is_triggered());
+    }
+
+    #[compio::test]
+    async fn fused_wait_resolves_when_conn_fires() {
+        let (_bus, bus_token) = Shutdown::new();
+        let (conn, conn_token) = Shutdown::new();
+        let fused = FusedShutdown::new(bus_token, conn_token);
+        assert!(!fused.is_triggered());
+        conn.trigger();
+        fused.wait().await;
+        assert!(fused.is_triggered());
+    }
+
+    #[compio::test]
+    async fn fused_single_aliases_the_one_token() {
+        let (shutdown, token) = Shutdown::new();
+        let fused = FusedShutdown::single(token);
+        shutdown.trigger();
+        fused.wait().await;
+        assert!(fused.is_triggered());
     }
 }

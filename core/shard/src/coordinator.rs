@@ -43,9 +43,9 @@ use crate::config::CoordinatorConfig;
 use crate::{ShardFrame, ShardFramePayload, TaggedSender, assert_sender_ordering};
 use compio::net::TcpStream;
 use compio::runtime::JoinHandle;
-use message_bus::SendError;
-use message_bus::fd_transfer;
+use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::lifecycle::ShutdownToken;
+use message_bus::{SendError, fd_transfer};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
@@ -70,16 +70,41 @@ pub struct ShardZeroCoordinator<R: Send + 'static = ()> {
     client_rr: Cell<u16>,
     client_seq: Cell<u128>,
     /// Authoritative `replica_id -> owning_shard` view as understood by the
-    /// coordinator. Populated on successful `delegate_replica`, cleared by
-    /// [`forget_mapping`](Self::forget_mapping) when a replica dies. The
-    /// periodic refresh task re-broadcasts this snapshot so shards whose
-    /// inbox was full when the original `ReplicaMappingUpdate` was sent
-    /// recover their mapping on the next tick rather than staying silently
-    /// stale until the replica reconnects.
+    /// coordinator. Populated on successful `delegate_replica`, transitioned
+    /// to [`MappingSlot::Cleared`] by [`forget_mapping`](Self::forget_mapping)
+    /// when a replica dies. The periodic refresh task re-broadcasts this
+    /// snapshot so shards whose inbox was full when the original
+    /// `ReplicaMappingUpdate` or `ReplicaMappingClear` was sent recover on
+    /// the next tick rather than staying silently stale until the replica
+    /// reconnects.
     ///
-    /// Flat `[Option<u16>; 256]` to mirror `ReplicaRegistry` and avoid a
-    /// hash lookup on the refresh hot path. 512 bytes per coordinator.
-    mappings: RefCell<[Option<u16>; 256]>,
+    /// Three-state slot is what makes refresh complete: `Untouched` slots
+    /// emit nothing (the cluster never saw that replica id), `Active` slots
+    /// re-emit `ReplicaMappingUpdate`, and `Cleared` slots re-emit
+    /// `ReplicaMappingClear`. A two-state `Option<u16>` would silently lose
+    /// clears against shards whose inbox was full at clear-time.
+    ///
+    /// Flat `[MappingSlot; 256]` to mirror `ReplicaRegistry` and avoid a
+    /// hash lookup on the refresh hot path.
+    mappings: RefCell<[MappingSlot; 256]>,
+}
+
+/// Per-replica mapping state tracked by the coordinator.
+///
+/// `Cleared` is structurally distinct from `Untouched` so the refresh task
+/// can re-broadcast `ReplicaMappingClear` for replicas the cluster did once
+/// see but is no longer routing to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MappingSlot {
+    /// Coordinator has never delegated this replica id.
+    #[default]
+    Untouched,
+    /// Replica is connected and routed via `owning_shard`.
+    Active(u16),
+    /// Replica was once active and is now disconnected. Refresh re-broadcasts
+    /// a `ReplicaMappingClear` for this slot until a fresh `delegate_replica`
+    /// flips it back to `Active`.
+    Cleared,
 }
 
 impl<R: Send + 'static> ShardZeroCoordinator<R> {
@@ -109,7 +134,7 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
             replica_rr: Cell::new(0),
             client_rr: Cell::new(0),
             client_seq: Cell::new(1),
-            mappings: RefCell::new([None; 256]),
+            mappings: RefCell::new([MappingSlot::Untouched; 256]),
         }
     }
 
@@ -179,7 +204,7 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
         // BEFORE broadcasting: if `broadcast_mapping_update` drops a frame
         // on a full inbox, the periodic refresh task reads this snapshot
         // and re-broadcasts.
-        self.mappings.borrow_mut()[usize::from(replica_id)] = Some(target);
+        self.mappings.borrow_mut()[usize::from(replica_id)] = MappingSlot::Active(target);
         self.broadcast_mapping_update(replica_id, target);
 
         Ok(target)
@@ -211,17 +236,56 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
     ///
     /// # Errors
     ///
-    /// Returns an error when `dup(2)` fails or the target shard's inbox
-    /// refuses the setup frame.
+    /// Returns [`SendError::DupFailed`] if `stream.peer_addr()` lookup
+    /// fails or `dup(2)` fails. Returns [`SendError::RoutingFailed`]
+    /// when the target shard's inbox refuses the setup frame (full or
+    /// disconnected).
     pub fn delegate_client(&self, stream: TcpStream) -> Result<u128, SendError> {
         let target = self.next_client_target();
         let client_id = self.mint_client_id(target);
+        let peer_addr = stream.peer_addr().map_err(SendError::DupFailed)?;
 
         let fd = fd_transfer::dup_fd(&stream).map_err(SendError::DupFailed)?;
-        let setup = ShardFramePayload::ClientConnectionSetup { fd, client_id };
+        let meta = ClientConnMeta::new(client_id, peer_addr, ClientTransportKind::Tcp);
+        let setup = ShardFramePayload::ClientConnectionSetup { fd, meta };
         if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
             // The returned frame owns the `DupedFd` and closes it on drop.
             warn!(client_id, target, "delegate_client try_send failed: {e:?}");
+            return Err(SendError::RoutingFailed(target));
+        }
+
+        drop(stream);
+        Ok(client_id)
+    }
+
+    /// Ship a WebSocket client's pre-upgrade TCP connection to the next
+    /// round-robin target shard.
+    ///
+    /// Identical wire path to [`Self::delegate_client`] but ships
+    /// [`ShardFramePayload::ClientWsConnectionSetup`] so the receiving
+    /// shard runs `compio_ws::accept_async_with_config` before
+    /// installing the connection. The fd at ship-time is plain TCP;
+    /// the WS state machine only materialises post-upgrade on the
+    /// owning shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SendError::DupFailed`] if `stream.peer_addr()` lookup
+    /// fails or `dup(2)` fails. Returns [`SendError::RoutingFailed`]
+    /// when the target shard's inbox refuses the setup frame.
+    pub fn delegate_ws_client(&self, stream: TcpStream) -> Result<u128, SendError> {
+        let target = self.next_client_target();
+        let client_id = self.mint_client_id(target);
+        let peer_addr = stream.peer_addr().map_err(SendError::DupFailed)?;
+
+        let fd = fd_transfer::dup_fd(&stream).map_err(SendError::DupFailed)?;
+        let meta = ClientConnMeta::new(client_id, peer_addr, ClientTransportKind::Ws);
+        let setup = ShardFramePayload::ClientWsConnectionSetup { fd, meta };
+        if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
+            warn!(
+                client_id,
+                target, "delegate_ws_client try_send failed: {e:?}"
+            );
             return Err(SendError::RoutingFailed(target));
         }
 
@@ -235,48 +299,58 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
         crate::broadcast_mapping_clear(&self.senders, replica_id);
     }
 
-    /// Drop the coordinator's authoritative entry for `replica_id`, so
-    /// the periodic refresh task does not keep re-broadcasting the
-    /// mapping of a replica that has disconnected.
+    /// Transition the coordinator's authoritative entry for `replica_id`
+    /// to [`MappingSlot::Cleared`] so the periodic refresh task re-broadcasts
+    /// `ReplicaMappingClear` until a fresh delegation revives the slot. A
+    /// shard whose inbox was full at the original clear-time recovers on the
+    /// next refresh tick rather than retaining the stale `Active(owner)`
+    /// view forever.
     ///
     /// Call from shard 0's `ConnectionLost` handler paired with
     /// [`broadcast_mapping_clear`](Self::broadcast_mapping_clear).
     pub fn forget_mapping(&self, replica_id: u8) {
-        self.mappings.borrow_mut()[usize::from(replica_id)] = None;
+        self.mappings.borrow_mut()[usize::from(replica_id)] = MappingSlot::Cleared;
     }
 
     /// Re-broadcast every mapping the coordinator is tracking.
     ///
-    /// A `delegate_replica` broadcast is `try_send` best-effort: a shard
-    /// whose inbox was full at the moment of the original broadcast
-    /// permanently lost that mapping and `send_to_replica` on that shard
-    /// would return `ReplicaNotConnected` until the next reconnect sweep
-    /// reinstalled the peer. Periodic refresh covers that gap.
+    /// `delegate_replica` and `forget_mapping` broadcast their respective
+    /// `ReplicaMappingUpdate` / `ReplicaMappingClear` as best-effort
+    /// `try_send`: a shard whose inbox was full at the moment of the
+    /// original broadcast permanently lost the change. Without periodic
+    /// refresh, an `Update` miss leaves `send_to_replica` returning
+    /// `ReplicaNotConnected` until the peer reconnects, and a `Clear` miss
+    /// leaves a stale `owning_shard` view that misroutes traffic to a shard
+    /// that no longer holds the connection. This refresh closes both gaps.
     pub fn broadcast_mapping_snapshot(&self) {
-        // Collect into a small stack buffer to release the `RefCell`
-        // borrow before broadcasting (try_send is sync but the borrow is
-        // cheap to drop first for consistency with other mapping paths).
-        let snapshot: Vec<(u8, u16)> = self
-            .mappings
-            .borrow()
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, slot)| {
-                slot.map(|owner| {
-                    #[allow(clippy::cast_possible_truncation)]
-                    (idx as u8, owner)
-                })
-            })
-            .collect();
-        for (replica_id, owning_shard) in snapshot {
+        // Stage entries in scratch `Vec`s so the `RefCell` borrow is
+        // released before any `try_send` runs, matching the borrow
+        // discipline of the other mapping paths. Heap allocation is
+        // acceptable: this snapshot runs on a periodic refresh tick,
+        // not on the per-message hot path.
+        let mut updates: Vec<(u8, u16)> = Vec::new();
+        let mut clears: Vec<u8> = Vec::new();
+        for (idx, slot) in self.mappings.borrow().iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let replica_id = idx as u8;
+            match *slot {
+                MappingSlot::Active(owner) => updates.push((replica_id, owner)),
+                MappingSlot::Cleared => clears.push(replica_id),
+                MappingSlot::Untouched => {}
+            }
+        }
+        for (replica_id, owning_shard) in updates {
             self.broadcast_mapping_update(replica_id, owning_shard);
+        }
+        for replica_id in clears {
+            crate::broadcast_mapping_clear(&self.senders, replica_id);
         }
     }
 
-    /// Spawn a compio task that calls [`broadcast_mapping_snapshot`] every
-    /// `period` until `token` fires. Bootstrap is expected to track the
-    /// returned handle on the bus's background tasks so graceful shutdown
-    /// awaits it.
+    /// Spawn a compio task that calls [`Self::broadcast_mapping_snapshot`]
+    /// every `period` until `token` fires. Bootstrap is expected to track
+    /// the returned handle on the bus's background tasks so graceful
+    /// shutdown awaits it.
     pub fn spawn_refresh_task(
         self: &Rc<Self>,
         token: ShutdownToken,
@@ -514,8 +588,8 @@ mod tests {
 
         // Seed the coordinator's tracked mappings directly (delegate_replica
         // needs a real TCP fd; the snapshot path is orthogonal to dup).
-        coord.mappings.borrow_mut()[3] = Some(1);
-        coord.mappings.borrow_mut()[7] = Some(2);
+        coord.mappings.borrow_mut()[3] = MappingSlot::Active(1);
+        coord.mappings.borrow_mut()[7] = MappingSlot::Active(2);
 
         coord.broadcast_mapping_snapshot();
 
@@ -547,15 +621,91 @@ mod tests {
 
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn forget_mapping_prunes_entry_from_future_snapshots() {
+    async fn forget_mapping_transitions_slot_to_cleared_state() {
         let (senders, _receivers) = build_senders_with_rx(2);
         let coord = ShardZeroCoordinator::<()>::new(senders, 2, CoordinatorConfig::default());
 
-        coord.mappings.borrow_mut()[4] = Some(1);
-        coord.mappings.borrow_mut()[5] = Some(1);
+        coord.mappings.borrow_mut()[4] = MappingSlot::Active(1);
+        coord.mappings.borrow_mut()[5] = MappingSlot::Active(1);
         coord.forget_mapping(4);
 
-        assert!(coord.mappings.borrow()[4].is_none());
-        assert_eq!(coord.mappings.borrow()[5], Some(1));
+        assert_eq!(coord.mappings.borrow()[4], MappingSlot::Cleared);
+        assert_eq!(coord.mappings.borrow()[5], MappingSlot::Active(1));
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn snapshot_includes_clear_for_forgotten_slots() {
+        let (senders, receivers) = build_senders_with_rx(3);
+        let coord = Rc::new(ShardZeroCoordinator::<()>::new(
+            senders,
+            3,
+            CoordinatorConfig::default(),
+        ));
+
+        // Two live mappings + one slot that was previously delegated and is
+        // now forgotten. Refresh must rebroadcast a Clear for the forgotten
+        // slot so a shard that missed the original Clear (full inbox) can
+        // reconcile its stale Active view on the next tick.
+        coord.mappings.borrow_mut()[3] = MappingSlot::Active(1);
+        coord.mappings.borrow_mut()[7] = MappingSlot::Active(2);
+        coord.mappings.borrow_mut()[5] = MappingSlot::Cleared;
+
+        coord.broadcast_mapping_snapshot();
+
+        for (idx, rx) in receivers.iter().enumerate() {
+            let mut updates = std::collections::BTreeSet::new();
+            let mut clears = std::collections::BTreeSet::new();
+            for _ in 0..3 {
+                let frame = rx.recv().await.unwrap();
+                match frame.payload {
+                    ShardFramePayload::ReplicaMappingUpdate {
+                        replica_id,
+                        owning_shard,
+                    } => {
+                        updates.insert((replica_id, owning_shard));
+                    }
+                    ShardFramePayload::ReplicaMappingClear { replica_id } => {
+                        clears.insert(replica_id);
+                    }
+                    _ => panic!("shard {idx} expected mapping update or clear"),
+                }
+            }
+
+            let expected_updates: std::collections::BTreeSet<_> =
+                [(3u8, 1u16), (7u8, 2u16)].into_iter().collect();
+            let expected_clears: std::collections::BTreeSet<_> = std::iter::once(5u8).collect();
+            assert_eq!(
+                updates, expected_updates,
+                "shard {idx} did not receive both Update frames"
+            );
+            assert_eq!(
+                clears, expected_clears,
+                "shard {idx} did not receive a Clear for the forgotten slot"
+            );
+        }
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn snapshot_skips_untouched_slots() {
+        let (senders, receivers) = build_senders_with_rx(2);
+        let coord = Rc::new(ShardZeroCoordinator::<()>::new(
+            senders,
+            2,
+            CoordinatorConfig::default(),
+        ));
+
+        // No mappings populated: every slot is `Untouched`. Snapshot must
+        // be silent so the cluster does not pay 256 try_sends per shard per
+        // refresh tick when nothing has been delegated yet.
+        coord.broadcast_mapping_snapshot();
+
+        for (idx, rx) in receivers.iter().enumerate() {
+            assert!(
+                rx.try_recv().is_err(),
+                "shard {idx} should not receive any frame from an empty snapshot"
+            );
+        }
     }
 }
