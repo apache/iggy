@@ -37,11 +37,13 @@ use tracing::warn;
 /// transport's `run` body on the per-connection install task, so a slow
 /// or malicious peer never blocks the listener accept loop.
 ///
-/// `TCP_NODELAY` + `SO_KEEPALIVE` apply to the underlying TCP socket
-/// before the handshake starts, matching
-/// [`super::tcp::install_client_tcp`]'s plaintext behaviour. Linux
-/// does not propagate these from the listener to accepted sockets, so
-/// toggling here is required.
+/// `TCP_NODELAY` is applied to the underlying TCP socket before the
+/// handshake starts, matching [`super::tcp::install_client_tcp`]'s
+/// plaintext behaviour. Linux does not propagate it from the listener
+/// to accepted sockets, so toggling here is required. `SO_KEEPALIVE`
+/// is intentionally NOT set; see `crate::socket_opts` and the
+/// `[message_bus]` schema rationale at
+/// `core/configs/src/server_ng_config/message_bus.rs:49-52`.
 ///
 /// TCP-TLS is shard-0 terminal: the rustls connection state machine
 /// is non-serialisable and tied to the local task; pre-handshake the

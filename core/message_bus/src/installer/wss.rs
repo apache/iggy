@@ -39,8 +39,11 @@ use tracing::warn;
 /// negotiation: client identity is established post-handshake by the
 /// LOGIN command on the caller (server-ng).
 ///
-/// Socket options (`TCP_NODELAY` + `SO_KEEPALIVE`) apply pre-handshake
-/// for symmetry with [`super::tcp_tls::install_client_tcp_tls`].
+/// `TCP_NODELAY` is applied pre-handshake for symmetry with
+/// [`super::tcp_tls::install_client_tcp_tls`]. `SO_KEEPALIVE` is
+/// intentionally NOT set; see `crate::socket_opts` and the
+/// `[message_bus]` schema rationale at
+/// `core/configs/src/server_ng_config/message_bus.rs:49-52`.
 ///
 /// WSS is shard-0 terminal for the same reasons as the TCP-TLS plane;
 /// see [`super::tcp_tls::install_client_tcp_tls`] for the rustls
