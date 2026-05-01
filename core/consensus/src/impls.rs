@@ -1719,16 +1719,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[allow(clippy::future_not_send)]
     pub(crate) async fn send_or_loopback(&self, target: u8, message: Message<GenericHeader>)
     where
-        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        B: MessageBus,
     {
         if target == self.replica {
             self.push_loopback(message);
-        } else {
-            // TODO: Propagate send errors instead of panicking; requires bus error design.
-            self.message_bus
-                .send_to_replica(target, message)
-                .await
-                .unwrap();
+        } else if let Err(e) = self
+            .message_bus
+            .send_to_replica(target, message.into_frozen())
+            .await
+        {
+            tracing::warn!(
+                replica = self.replica,
+                target,
+                "send_or_loopback failed: {e}"
+            );
         }
     }
 

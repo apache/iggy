@@ -45,8 +45,12 @@ use std::mem::size_of;
 use std::path::Path;
 use tracing::{debug, error, warn};
 
-const fn freeze_client_reply(message: Message<GenericHeader>) -> Message<GenericHeader> {
-    message
+fn freeze_client_reply(
+    message: Message<GenericHeader>,
+) -> iggy_binary_protocol::consensus::iobuf::Frozen<
+    { iggy_binary_protocol::consensus::MESSAGE_ALIGN },
+> {
+    message.into_frozen()
 }
 
 pub trait StreamsFrontend {
@@ -306,7 +310,7 @@ where
 #[allow(clippy::future_not_send)]
 impl<B, J, S, M> Plane<VsrConsensus<B>> for IggyMetadata<VsrConsensus<B>, J, S, M>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
@@ -408,7 +412,7 @@ where
         #[allow(clippy::cast_possible_truncation)]
         let is_old_prepare = fence_old_prepare_by_commit(consensus, &header)
             || journal.handle().header(header.op as usize).is_some();
-        let message = if is_old_prepare {
+        if is_old_prepare {
             warn!(
                 target: "iggy.metadata.diag",
                 plane = "metadata",
@@ -419,10 +423,11 @@ where
                 operation = ?header.operation,
                 "received old prepare, skipping replication"
             );
-            message
-        } else {
-            self.replicate(message).await
-        };
+            // Old prepare: downstream already has it or will learn via a
+            // newer forward, so no chain-replicate either. Local WAL is
+            // also unaffected. Nothing more to do.
+            return;
+        }
 
         // TODO add assertions for valid state here.
 
@@ -456,6 +461,12 @@ where
         // Append to journal first. Sequencer and checksum are updated AFTER
         // successful append so a failed write doesn't leave consensus state
         // pointing at a phantom entry.
+        //
+        // Durability must land BEFORE any chain-replicate or PrepareOk:
+        // forwarding an un-persisted prepare would leave this replica's
+        // tail advertising an op its WAL does not hold, violating the
+        // VSR tail-ahead-of-head invariant; the hash-chain fence plus a
+        // view change would recover it but burn a view in the process.
         if let Err(e) = journal.handle().append(message.clone()).await {
             error!(
                 target: "iggy.metadata.diag",
@@ -468,6 +479,12 @@ where
             );
             return;
         }
+
+        // Now that the prepare is durable, chain-replicate to the next
+        // replica in the chain. `replicate` borrows `&message` and does
+        // its own freeze; this replica retains the message for the
+        // sequencer/checksum bookkeeping below.
+        self.replicate(&message).await;
 
         self.observe_prepare_runtime_state(&message);
         consensus.sequencer().set_sequence(header.op);
@@ -624,7 +641,7 @@ where
 
 impl<B, P, J, S, M> PlaneIdentity<VsrConsensus<B, P>> for IggyMetadata<VsrConsensus<B, P>, J, S, M>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
@@ -645,7 +662,7 @@ where
 
 impl<B, P, J, S, M> IggyMetadata<VsrConsensus<B, P>, J, S, M>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
@@ -778,8 +795,13 @@ where
     /// - Primary sends to first backup
     /// - Each backup forwards to the next
     /// - Stops when we would forward back to primary
+    ///
+    /// Caller must have already appended `message` to the local journal
+    /// before invoking this helper (VSR tail-ahead-of-head). Forwarding
+    /// an un-persisted prepare would leave downstream WALs with an op
+    /// this replica's journal does not hold.
     #[allow(clippy::future_not_send)]
-    async fn replicate(&self, message: Message<PrepareHeader>) -> Message<PrepareHeader> {
+    async fn replicate(&self, message: &Message<PrepareHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
@@ -790,10 +812,12 @@ where
         let idx = header.op as usize;
         assert_eq!(header.command, Command2::Prepare);
         assert!(
-            journal.handle().header(idx).is_none(),
-            "replicate: must not already have prepare"
+            journal.handle().header(idx).is_some(),
+            "replicate: prepare must be durable in local journal before chain-forward"
         );
-        replicate_to_next_in_chain(consensus, message).await
+        if let Err(e) = replicate_to_next_in_chain(consensus, message).await {
+            tracing::warn!(op = header.op, error = ?e, "chain replication failed");
+        }
     }
 
     // TODO: Implement jump_to_newer_op

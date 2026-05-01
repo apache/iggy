@@ -793,6 +793,13 @@ impl TestBinary for ServerHandle {
             command.arg("--follower");
         }
 
+        // `--replica-id` is the single identity input expected by the
+        // server when cluster mode is enabled; all other cluster config is
+        // byte-identical across nodes. Pass the harness's `server_id`
+        // unconditionally; bootstrap only validates it when
+        // `cluster.enabled=true`, so single-node tests see no effect.
+        command.arg("--replica-id").arg(self.server_id.to_string());
+
         let verbose = std::env::var(TEST_VERBOSITY_ENV_VAR).is_ok()
             || self.envs.contains_key(TEST_VERBOSITY_ENV_VAR);
 

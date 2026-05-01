@@ -37,8 +37,8 @@ use consensus::{
     request_preflight, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::consensus::iobuf::Frozen;
-use iggy_binary_protocol::{GenericHeader, PrepareOkHeader, RequestHeader};
 use iggy_binary_protocol::{Message, Operation, PrepareHeader};
+use iggy_binary_protocol::{PrepareOkHeader, RequestHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
     IggyByteSize, IggyError, IggyTimestamp, PartitionStats, PollingKind, SegmentStorage,
@@ -201,20 +201,32 @@ where
         self.consumer_offset_enforce_fsync = consumer_offset_enforce_fsync;
     }
 
-    pub(crate) async fn persist_and_stage_consumer_offset_upsert(
+    /// Stage a consumer offset upsert for the replicated op. The prepare
+    /// must already have been appended to `self.log.journal` by the caller
+    /// so `VsrAction::RetransmitPrepares` can recover it during a view
+    /// change. The on-disk offset table is NOT touched here: persist runs
+    /// from [`apply_staged_consumer_offset_commit`] at commit-time so a
+    /// view-change rollback of the in-memory pending entry also rolls
+    /// back the disk write (by never having performed it).
+    pub(crate) fn stage_consumer_offset_upsert(
         &mut self,
         op: u64,
         kind: ConsumerKind,
         consumer_id: u32,
         offset: u64,
-    ) -> Result<(), IggyError> {
+    ) {
         let pending = PendingConsumerOffsetCommit::upsert(kind, consumer_id, offset);
-        self.persist_consumer_offset_commit(pending).await?;
         self.pending_consumer_offset_commits.insert(op, pending);
-        Ok(())
     }
 
-    pub(crate) async fn persist_and_stage_consumer_offset_delete(
+    /// Stage a consumer offset delete for the replicated op. See
+    /// [`stage_consumer_offset_upsert`] for the ordering contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConsumerOffsetNotFound` if the consumer or group has no
+    /// existing on-disk / in-memory offset to delete.
+    pub(crate) fn stage_consumer_offset_delete(
         &mut self,
         op: u64,
         kind: ConsumerKind,
@@ -222,17 +234,29 @@ where
     ) -> Result<(), IggyError> {
         self.ensure_consumer_offset_exists(kind, consumer_id)?;
         let pending = PendingConsumerOffsetCommit::delete(kind, consumer_id);
-        self.persist_consumer_offset_commit(pending).await?;
         self.pending_consumer_offset_commits.insert(op, pending);
         Ok(())
     }
 
-    pub(crate) fn apply_staged_consumer_offset_commit(&mut self, op: u64) -> Result<(), IggyError> {
-        let pending = self
+    pub(crate) async fn apply_staged_consumer_offset_commit(
+        &mut self,
+        op: u64,
+    ) -> Result<(), IggyError> {
+        // Peek (copy) instead of remove: if `persist_consumer_offset_commit`
+        // fails (e.g. disk full, fd exhausted) the pending entry must remain
+        // stageable for retry on the next apply. Removing first would strand
+        // the op - not on disk AND not in memory.
+        let pending = *self
             .pending_consumer_offset_commits
-            .remove(&op)
+            .get(&op)
             .ok_or(IggyError::InvalidCommand)?;
+        // Persist to the on-disk offset table first so a crash after the
+        // in-memory apply cannot observe a readable offset that was not
+        // durably stored; the in-memory update is idempotent on replay
+        // because we look up by (kind, id).
+        self.persist_consumer_offset_commit(pending).await?;
         self.apply_consumer_offset_commit(pending)?;
+        self.pending_consumer_offset_commits.remove(&op);
         Ok(())
     }
 
@@ -571,7 +595,7 @@ where
 
 impl<B> IggyPartition<B>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
 {
     #[must_use]
     fn namespace(&self) -> IggyNamespace {
@@ -683,7 +707,7 @@ where
         self.on_replicate(prepare).await;
     }
 
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn on_replicate(&mut self, message: Message<PrepareHeader>) {
         self.clear_pending_consumer_offset_commits_if_view_changed();
         let header = *message.header();
@@ -708,26 +732,55 @@ where
             }
         };
         #[allow(clippy::cast_possible_truncation)]
-        let is_old_prepare = {
-            let consensus = self.consensus();
-            fence_old_prepare_by_commit(consensus, &header)
-                || self.log.journal().inner.header_by_op(header.op).is_some()
-        };
-        let message = if is_old_prepare {
+        let fenced_by_commit = fence_old_prepare_by_commit(self.consensus(), &header);
+        if fenced_by_commit {
             emit_partition_diag(
                 tracing::Level::WARN,
                 &PartitionDiagEvent::new(
                     self.diag_ctx(),
-                    "received old prepare, skipping replication",
+                    "received old prepare (<= commit_min), skipping replication",
                 )
                 .with_operation(header.operation)
                 .with_op(header.op),
             );
-            message
-        } else {
+            // Fenced by commit_min: we've already executed this op, the
+            // whole chain has it committed. Safe to drop entirely.
+            return;
+        }
+
+        let journal_holds_op = self.log.journal().inner.header_by_op(header.op).is_some();
+        if journal_holds_op {
+            // Retransmit after a downstream flap: our journal is durable
+            // but commit has not caught up, so we must re-forward to the
+            // next-in-chain and re-ACK so the primary's view of our state
+            // is consistent. Both downstream and primary are idempotent
+            // on duplicate (replica, op), so this is safe.
+            emit_partition_diag(
+                tracing::Level::DEBUG,
+                &PartitionDiagEvent::new(
+                    self.diag_ctx(),
+                    "journal already holds prepare, re-forwarding + re-acking",
+                )
+                .with_operation(header.operation)
+                .with_op(header.op),
+            );
+            let clone_for_forward = message.clone();
             let consensus = self.consensus();
-            replicate_to_next_in_chain(consensus, message).await
-        };
+            if let Err(error) = replicate_to_next_in_chain(consensus, &clone_for_forward).await {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        self.diag_ctx(),
+                        "failed to re-forward retransmitted prepare to next in chain",
+                    )
+                    .with_operation(header.operation)
+                    .with_op(header.op)
+                    .with_error(error.to_string()),
+                );
+            }
+            self.send_prepare_ok(&header).await;
+            return;
+        }
 
         if header.op != current_op + 1 {
             emit_partition_diag(
@@ -738,16 +791,45 @@ where
             );
             return;
         }
-        {
+        // Durability-before-ack: hold a clone for the chain-replicate so
+        // we can forward only AFTER `apply_replicated_operation` has
+        // persisted the prepare to our partition journal. Forwarding
+        // first would leave downstream replicas holding an op whose
+        // backing WAL entry this replica never wrote, violating VSR's
+        // tail-ahead-of-head invariant. The clone is cheap relative to
+        // the deep-copy `replicate_to_next_in_chain` already performs
+        // (see plane_helpers.rs) - both collapse to a couple of Arc
+        // refcount bumps in the common case.
+        let clone_for_forward = message.clone();
+        let replicated_result = self.apply_replicated_operation(message).await;
+        if replicated_result.is_ok() {
+            // Advance sequencer + checksum only after the journal append
+            // succeeded. A pre-advance on a failing apply would leave
+            // consensus claiming we hold op N while the journal has no
+            // entry, and any retransmit of N would be silently dropped
+            // as `is_old_prepare` (header.op <= current_sequence).
             let consensus = self.consensus();
             consensus.sequencer().set_sequence(header.op);
             consensus.set_last_prepare_checksum(header.checksum);
+            if let Err(error) = replicate_to_next_in_chain(consensus, &clone_for_forward).await {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        self.diag_ctx(),
+                        "failed to replicate prepare to next in chain",
+                    )
+                    .with_operation(header.operation)
+                    .with_op(header.op)
+                    .with_error(error.to_string()),
+                );
+            }
         }
-        let replicated_result = self.apply_replicated_operation(message).await;
 
         let commit = self.consensus.commit_max();
         if commit > previous_commit
-            && let Err(error) = self.apply_committed_consumer_offset_commits_up_to(commit)
+            && let Err(error) = self
+                .apply_committed_consumer_offset_commits_up_to(commit)
+                .await
         {
             emit_partition_diag(
                 tracing::Level::WARN,
@@ -895,19 +977,34 @@ where
                     Self::parse_staged_consumer_offset_commit(header.operation, &message)?;
                 let write_lock = self.write_lock.clone();
                 let _guard = write_lock.lock().await;
+
+                // Journal the prepare before staging so
+                // `VsrAction::RetransmitPrepares` can read this op back
+                // on a view change. Without the journal entry, the
+                // `header_by_op` lookup in `on_replicate` would miss,
+                // the gap check would drop the retransmit, and the
+                // primary's pipeline would wedge indefinitely. Skip
+                // the `journal.info` accounting: it counts SendMessages
+                // batches for segment-commit thresholds, which do not
+                // apply to offset ops.
+                self.log
+                    .journal()
+                    .inner
+                    .append(message.clone().into_frozen())
+                    .await
+                    .map_err(|_| IggyError::CannotAppendMessage)?;
+
                 match header.operation {
                     Operation::StoreConsumerOffset => {
-                        self.persist_and_stage_consumer_offset_upsert(
+                        self.stage_consumer_offset_upsert(
                             header.op,
                             kind,
                             consumer_id,
                             offset.expect("store_consumer_offset must include offset"),
-                        )
-                        .await?;
+                        );
                     }
                     Operation::DeleteConsumerOffset => {
-                        self.persist_and_stage_consumer_offset_delete(header.op, kind, consumer_id)
-                            .await?;
+                        self.stage_consumer_offset_delete(header.op, kind, consumer_id)?;
                     }
                     _ => unreachable!(),
                 }
@@ -922,7 +1019,7 @@ where
                     consumer_kind = ?kind,
                     consumer_id,
                     offset = ?offset,
-                    "replicated consumer offset persisted and staged"
+                    "replicated consumer offset journaled and staged"
                 );
                 Ok(())
             }
@@ -1133,7 +1230,7 @@ where
             );
 
             if send_client_replies {
-                let reply_buffers = reply.into_generic();
+                let reply_buffers = reply.into_generic().into_frozen();
                 emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
 
                 if let Err(error) = self
@@ -1329,7 +1426,7 @@ where
         }
     }
 
-    fn apply_committed_consumer_offset_commits_up_to(
+    async fn apply_committed_consumer_offset_commits_up_to(
         &mut self,
         commit: u64,
     ) -> Result<(), IggyError> {
@@ -1342,7 +1439,7 @@ where
         committed_ops.sort_unstable();
 
         for op in committed_ops {
-            self.apply_staged_consumer_offset_commit(op)?;
+            self.apply_staged_consumer_offset_commit(op).await?;
         }
 
         Ok(())
@@ -1356,7 +1453,10 @@ where
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
 
-        if let Err(error) = self.apply_staged_consumer_offset_commit(prepare_header.op) {
+        if let Err(error) = self
+            .apply_staged_consumer_offset_commit(prepare_header.op)
+            .await
+        {
             *failed_commit = true;
             warn!(
                 target: "iggy.partitions.diag",
@@ -1558,6 +1658,11 @@ where
     }
 
     async fn send_prepare_ok(&self, header: &PrepareHeader) {
+        // `VsrAction::RetransmitPrepares` reads from `self.log.journal`.
+        // Both `SendMessages` (via `append_send_messages_to_journal`) and
+        // consumer-offset ops (via `apply_replicated_operation`) append
+        // to that journal before `send_prepare_ok` fires, so every op
+        // that reaches here is journal-backed and ACKs as durable.
         send_prepare_ok_common(self.consensus(), header, Some(true)).await;
     }
 }
