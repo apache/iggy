@@ -559,6 +559,70 @@ mod tests {
 
     #[compio::test]
     #[allow(clippy::future_not_send)]
+    async fn delegate_client_ships_setup_with_meta_transport_tcp() {
+        let (senders, receivers) = build_senders_with_rx(4);
+        let coord = ShardZeroCoordinator::<()>::new(senders, 4, CoordinatorConfig::default());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = compio::runtime::spawn(async move { listener.accept().await.unwrap() });
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (_server, _peer_addr) = accept.await.unwrap();
+
+        let client_id = coord.delegate_client(client).expect("delegate ok");
+        let target = (client_id >> 112) as u16;
+        assert!(
+            (0..4).contains(&target),
+            "client target out of range; got {target}",
+        );
+
+        let setup_frame = receivers[target as usize].recv().await.unwrap();
+        match setup_frame.payload {
+            ShardFramePayload::ClientConnectionSetup { fd, meta } => {
+                assert_eq!(meta.client_id, client_id);
+                assert!(matches!(meta.transport, ClientTransportKind::Tcp));
+                drop(fd);
+            }
+            _ => panic!("expected ClientConnectionSetup variant"),
+        }
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn delegate_ws_client_ships_setup_with_meta_transport_ws() {
+        let (senders, receivers) = build_senders_with_rx(4);
+        let coord = ShardZeroCoordinator::<()>::new(senders, 4, CoordinatorConfig::default());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = compio::runtime::spawn(async move { listener.accept().await.unwrap() });
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (_server, _peer_addr) = accept.await.unwrap();
+
+        let client_id = coord.delegate_ws_client(client).expect("delegate ok");
+        let target = (client_id >> 112) as u16;
+        assert!(
+            (0..4).contains(&target),
+            "client target out of range; got {target}",
+        );
+
+        let setup_frame = receivers[target as usize].recv().await.unwrap();
+        match setup_frame.payload {
+            ShardFramePayload::ClientWsConnectionSetup { fd, meta } => {
+                assert_eq!(meta.client_id, client_id);
+                assert!(
+                    matches!(meta.transport, ClientTransportKind::Ws),
+                    "ws delegate must tag meta.transport = Ws, got {:?}",
+                    meta.transport,
+                );
+                drop(fd);
+            }
+            _ => panic!("expected ClientWsConnectionSetup variant"),
+        }
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
     async fn broadcast_mapping_clear_reaches_every_shard() {
         let (senders, receivers) = build_senders_with_rx(4);
         let coord = ShardZeroCoordinator::<()>::new(senders, 4, CoordinatorConfig::default());
