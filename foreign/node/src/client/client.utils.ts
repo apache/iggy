@@ -36,7 +36,7 @@ export const handleResponse = (r: Buffer) => {
   const length = r.readUint32LE(4);
   debug('<== handleResponse', { status, length });
   return {
-    status, length, data: r.subarray(8)
+    status, length, data: r.subarray(8, 8 + length)
   }
 };
 
