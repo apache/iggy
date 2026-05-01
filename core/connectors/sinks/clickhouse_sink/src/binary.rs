@@ -298,7 +298,7 @@ pub(crate) fn serialize_value(
                 error!("Unknown Enum16 value: {s}");
                 Error::InvalidRecord
             })?;
-            buf.extend_from_slice(&(*v as i16).to_le_bytes());
+            buf.extend_from_slice(&v.to_le_bytes());
         }
 
         // ── Composites ───────────────────────────────────────────────────────
