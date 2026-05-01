@@ -18,9 +18,10 @@
 //! Runtime tunables for the message bus.
 //!
 //! Single source of truth for these knobs is the on-disk schema
-//! [`configs::server_ng_config::ServerNgConfig`]. The bus consumes that
-//! schema at construction (see [`IggyMessageBus::with_config`]) and
-//! converts the schema-typed fields ([`IggyDuration`] / [`IggyByteSize`])
+//! [`configs::server_ng::ServerNgConfig`]. The bus consumes that
+//! schema at construction (see [`crate::IggyMessageBus::with_config`])
+//! and converts the schema-typed fields
+//! ([`iggy_common::IggyDuration`] / [`iggy_common::IggyByteSize`])
 //! into runtime types ([`Duration`] / `usize`) once, so hot paths read
 //! fields directly without per-call conversion.
 //!

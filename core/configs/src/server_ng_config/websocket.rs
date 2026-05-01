@@ -21,7 +21,7 @@
 //! Field shape mirrors the legacy [`crate::websocket::WebSocketConfig`]
 //! verbatim, including the `Option<String>` frame-tunable fields that
 //! the legacy server parses lazily into `IggyByteSize` inside
-//! [`Self::to_tungstenite_config`]. The fork lives in
+//! [`WebSocketConfig::to_tungstenite_config`]. The fork lives in
 //! `server_ng_config` so server-ng can evolve its WS frame surface
 //! (e.g. tighten the type to `Option<IggyByteSize>`) independently of
 //! the legacy server.

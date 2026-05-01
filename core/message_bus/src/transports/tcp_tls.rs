@@ -22,9 +22,9 @@
 //!
 //! Single-task model: one task owns the `TlsStream` and `select!`s over
 //! the bus shutdown token, the outbound mailbox, and a resumable
-//! framing read step. The framing accumulator lives on a [`TlsPumpState`]
+//! framing read step. The framing accumulator lives on a `TlsPumpState`
 //! local to the pump frame and is shared into the cancellable read
-//! future via [`SharedAcc`] (an `Rc<UnsafeCell<Owned<MESSAGE_ALIGN>>>`
+//! future via `SharedAcc` (an `Rc<UnsafeCell<Owned<MESSAGE_ALIGN>>>`
 //! wrapper). Cancellation drops the in-flight slice handle (one `Rc`
 //! clone) but the pump-side handle and the underlying allocation
 //! survive, so already-committed bytes are not lost across `select!`

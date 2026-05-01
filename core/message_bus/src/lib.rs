@@ -84,7 +84,8 @@ pub mod framing;
 pub mod installer;
 pub mod lifecycle;
 pub mod replica;
-pub(crate) mod socket_opts;
+#[doc(hidden)]
+pub mod socket_opts;
 pub mod transports;
 
 pub use config::{IOV_MAX_LIMIT, MessageBusConfig, QuicTuning, WebSocketConfig};
@@ -384,10 +385,10 @@ impl IggyMessageBus {
     ///
     /// Production constructor: takes a fully-validated
     /// [`ServerNgConfig`] and derives the runtime [`MessageBusConfig`]
-    /// internally. Field conversions ([`IggyDuration`] -> [`Duration`],
-    /// [`IggyByteSize`] -> `usize`, schema WS knobs -> tungstenite
-    /// [`WebSocketConfig`]) happen once here so hot paths read
-    /// pre-converted values.
+    /// internally. Field conversions ([`iggy_common::IggyDuration`] -> [`Duration`],
+    /// [`iggy_common::IggyByteSize`] -> `usize`, schema WS knobs ->
+    /// tungstenite [`WebSocketConfig`]) happen once here so hot paths
+    /// read pre-converted values.
     ///
     /// # Panics
     ///

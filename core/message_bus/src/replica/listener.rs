@@ -128,7 +128,7 @@ pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyErr
 /// accepted stream from that point on.
 ///
 /// Each [`TcpStream`] returned by `accept()` is handed to its own
-/// spawned task that runs the [`handshake_read`] under
+/// spawned task that runs the `handshake_read` step under
 /// [`compio::time::timeout(handshake_grace, ...)`]. Spawning per-incoming
 /// is load-bearing: a single hostile or merely slow peer would otherwise
 /// hold the entire replica accept loop behind its handshake `read` until
