@@ -169,6 +169,18 @@ async fn replica_panic_evicts_registry_and_notifies_loss() {
         outcome.force, 0,
         "ParkingConn must wake on shutdown without forced cancel",
     );
+    // Canonical post-shutdown leak gate for the bus's background-task
+    // tracking. `IggyMessageBus::shutdown` drains every handle in
+    // `track_background`'s vec; a leaked task or a missing cleanup
+    // path here surfaces as residue. Pinned in this representative
+    // panic-cleanup test rather than every test variant because all
+    // client transports funnel through `install_client_conn`, so the
+    // shared cleanup invariant trips here first.
+    assert_eq!(
+        bus.background_tasks_len(),
+        0,
+        "background_tasks vec must be empty post-shutdown",
+    );
 }
 
 #[compio::test]

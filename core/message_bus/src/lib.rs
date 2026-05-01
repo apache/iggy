@@ -608,6 +608,20 @@ impl IggyMessageBus {
         tasks.push(handle);
     }
 
+    /// Number of background-task handles currently retained by the bus.
+    ///
+    /// Test-only accessor: lets integration tests pin the
+    /// reap-on-push invariant in `track_background` without exposing
+    /// the underlying `RefCell<Vec<JoinHandle<()>>>` to production
+    /// callers. A long-running bus is expected to keep this number
+    /// bounded under sustained accept traffic; a leak shows up here as
+    /// monotonic growth proportional to total accepts.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn background_tasks_len(&self) -> usize {
+        self.background_tasks.borrow().len()
+    }
+
     /// Trigger the root shutdown and drain everything with the given
     /// deadline.
     ///
@@ -890,7 +904,36 @@ mod tests {
         let h2 = compio::runtime::spawn(async {});
         bus.track_background(h1);
         bus.track_background(h2);
-        assert_eq!(bus.background_tasks.borrow().len(), 2);
+        assert_eq!(bus.background_tasks_len(), 2);
+    }
+
+    /// Reap invariant: `track_background` drops finished handles before
+    /// pushing the new one, so an accept-loop that fires N times over
+    /// the bus's lifetime does NOT accumulate N retained handles. This
+    /// pins the leak fix in `installer::install_client_ws_fd` (one
+    /// upgrade task per WS connect) without needing an end-to-end WS
+    /// roundtrip.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn track_background_reaps_finished_handles_on_push() {
+        let bus = IggyMessageBus::new(0);
+
+        for _ in 0..32 {
+            let h = compio::runtime::spawn(async {});
+            // Drive the runtime so the spawned task can complete before
+            // we register the next one.
+            compio::runtime::time::sleep(std::time::Duration::from_millis(1)).await;
+            bus.track_background(h);
+        }
+
+        // The most recently pushed handle is the only one that may not
+        // yet be finished; everything before it had a chance to complete
+        // and the reap on each push should have dropped them.
+        let remaining = bus.background_tasks_len();
+        assert!(
+            remaining <= 1,
+            "track_background did not reap finished handles; retained {remaining} of 32 spawns",
+        );
     }
 
     #[test]
