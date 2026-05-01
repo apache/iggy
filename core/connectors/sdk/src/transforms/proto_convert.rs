@@ -471,6 +471,15 @@ impl ProtoConvert {
                     Err(Error::InvalidPayloadType)
                 }
             }
+            Schema::Avro => {
+                // Convert protobuf to raw bytes first, then wrap as Avro
+                let raw_payload = self.protobuf_to_raw(payload)?;
+                if let Payload::Raw(data) = raw_payload {
+                    Ok(Payload::Avro(data))
+                } else {
+                    Err(Error::InvalidPayloadType)
+                }
+            }
         }
     }
 
@@ -483,6 +492,14 @@ impl ProtoConvert {
             Schema::FlatBuffer => {
                 // Convert FlatBuffer to raw bytes first, then to protobuf
                 if let Payload::FlatBuffer(data) = payload {
+                    self.raw_to_protobuf(Payload::Raw(data))
+                } else {
+                    Err(Error::InvalidPayloadType)
+                }
+            }
+            Schema::Avro => {
+                // Convert Avro to raw bytes first, then to protobuf
+                if let Payload::Avro(data) = payload {
                     self.raw_to_protobuf(Payload::Raw(data))
                 } else {
                     Err(Error::InvalidPayloadType)
