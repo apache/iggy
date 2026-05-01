@@ -222,11 +222,14 @@ address = "127.0.0.1:8080"
 # preallocated quinn-proto state.
 max_concurrent_bidi_streams = 1
 
-# Size of the buffer for sending datagrams in QUIC.
-datagram_send_buffer_size = "100 KB"
+# Size of the buffer for sending datagrams in QUIC. Binary-aligned to
+# match QuicTuning::default() (102_400 bytes) and the rest of this [quic]
+# block, which uses MiB throughout (`send_window`, `receive_window`).
+datagram_send_buffer_size = "100 KiB"
 
-# Initial Maximum Transmission Unit (MTU) for QUIC connections.
-initial_mtu = "8 KB"
+# Initial Maximum Transmission Unit (MTU) for QUIC connections. Binary
+# units for the same reason as `datagram_send_buffer_size`.
+initial_mtu = "8 KiB"
 
 # Send-flow window per connection. Sized to fit a single max-size
 # framed message (`message_bus.max_message_size`) without

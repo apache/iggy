@@ -234,7 +234,7 @@ fn build_quic_tuning(quic: &configs::ng_quic::QuicConfig) -> QuicTuning {
 impl Default for QuicTuning {
     /// Mirrors the `[quic]` defaults in
     /// `core/server-ng/config.toml`: 64 MiB send/receive windows,
-    /// 30 s idle timeout, 10 s keep-alive, 8 KiB initial MTU, 100 KB
+    /// 30 s idle timeout, 10 s keep-alive, 8 KiB initial MTU, 100 KiB
     /// datagram send buffer, single bidi stream per peer.
     ///
     /// Intended for tests and direct callers; production builds
@@ -285,5 +285,41 @@ fn byte_size_to_usize(sz: iggy_common::IggyByteSize) -> usize {
 impl Default for MessageBusConfig {
     fn default() -> Self {
         Self::from(&ServerNgConfig::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `QuicTuning::default()` carries hand-coded literals that must
+    /// match the schema-derived path through
+    /// `From<&ServerNgConfig> for MessageBusConfig`. If the embedded
+    /// TOML or the literals drift, every test that uses
+    /// `QuicTuning::default()` (e.g. `quic_client_roundtrip`) silently
+    /// observes different bytes than production. Pin both sides here.
+    #[test]
+    fn quic_tuning_default_matches_schema() {
+        let schema_quic = MessageBusConfig::from(&ServerNgConfig::default()).quic;
+        let literal = QuicTuning::default();
+
+        assert_eq!(
+            schema_quic.max_concurrent_bidi_streams,
+            literal.max_concurrent_bidi_streams
+        );
+        assert_eq!(
+            schema_quic.datagram_send_buffer_size, literal.datagram_send_buffer_size,
+            "schema datagram_send_buffer_size {} bytes vs literal {} bytes",
+            schema_quic.datagram_send_buffer_size, literal.datagram_send_buffer_size
+        );
+        assert_eq!(
+            schema_quic.initial_mtu, literal.initial_mtu,
+            "schema initial_mtu {} bytes vs literal {} bytes",
+            schema_quic.initial_mtu, literal.initial_mtu
+        );
+        assert_eq!(schema_quic.send_window, literal.send_window);
+        assert_eq!(schema_quic.receive_window, literal.receive_window);
+        assert_eq!(schema_quic.keep_alive_interval, literal.keep_alive_interval);
+        assert_eq!(schema_quic.max_idle_timeout, literal.max_idle_timeout);
     }
 }
