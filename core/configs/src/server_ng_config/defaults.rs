@@ -150,12 +150,22 @@ impl Default for TcpTlsConfig {
 impl Default for TcpSocketConfig {
     fn default() -> TcpSocketConfig {
         TcpSocketConfig {
-            override_defaults: false,
-            recv_buffer_size: IggyByteSize::from(100_000_u64),
-            send_buffer_size: IggyByteSize::from(100_000_u64),
-            keepalive: false,
-            nodelay: false,
-            linger: IggyDuration::new(Duration::new(0, 0)),
+            override_defaults: SERVER_NG_CONFIG.tcp.socket.override_defaults,
+            recv_buffer_size: SERVER_NG_CONFIG
+                .tcp
+                .socket
+                .recv_buffer_size
+                .parse()
+                .unwrap(),
+            send_buffer_size: SERVER_NG_CONFIG
+                .tcp
+                .socket
+                .send_buffer_size
+                .parse()
+                .unwrap(),
+            keepalive: SERVER_NG_CONFIG.tcp.socket.keepalive,
+            nodelay: SERVER_NG_CONFIG.tcp.socket.nodelay,
+            linger: SERVER_NG_CONFIG.tcp.socket.linger.parse().unwrap(),
         }
     }
 }
@@ -189,22 +199,24 @@ impl Default for WebSocketTlsConfig {
 
 impl Default for MessageBusConfig {
     fn default() -> MessageBusConfig {
-        // Keep these literals in lock-step with the `[message_bus]`
-        // block in `core/server-ng/config.toml`. The unit test
-        // `message_bus::tests::default_validates` proves the values
-        // survive `Validatable::validate`.
+        // Read every field from the embedded TOML so the Default impl
+        // and the on-disk schema cannot drift. Sibling impls in this
+        // file follow the same pattern. The `ws_*_size` knobs are
+        // optional in the schema (commented-out by default), so they
+        // map to `None` here when absent.
+        let bus = &SERVER_NG_CONFIG.message_bus;
         MessageBusConfig {
-            max_batch: 256,
-            max_message_size: IggyByteSize::from(64_u64 * 1024 * 1024),
-            peer_queue_capacity: 256,
-            reconnect_period: "5 s".parse().expect("'5 s' parses as IggyDuration"),
-            close_peer_timeout: "2 s".parse().expect("'2 s' parses as IggyDuration"),
-            close_grace: "2 s".parse().expect("'2 s' parses as IggyDuration"),
-            handshake_grace: "10 s".parse().expect("'10 s' parses as IggyDuration"),
+            max_batch: bus.max_batch as usize,
+            max_message_size: bus.max_message_size.parse().unwrap(),
+            peer_queue_capacity: bus.peer_queue_capacity as usize,
+            reconnect_period: bus.reconnect_period.parse().unwrap(),
+            close_peer_timeout: bus.close_peer_timeout.parse().unwrap(),
+            close_grace: bus.close_grace.parse().unwrap(),
+            handshake_grace: bus.handshake_grace.parse().unwrap(),
             ws_max_message_size: None,
             ws_max_frame_size: None,
             ws_write_buffer_size: None,
-            ws_accept_unmasked_frames: false,
+            ws_accept_unmasked_frames: bus.ws_accept_unmasked_frames,
         }
     }
 }
