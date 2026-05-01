@@ -589,10 +589,23 @@ impl IggyMessageBus {
     /// Register a background task (accept loop, reconnect periodic) so
     /// [`shutdown`](Self::shutdown) can await it.
     ///
-    /// The tracking vec grows during shutdown too. `shutdown` drains it in
-    /// a loop until empty, so a task pushed mid-shutdown is still awaited.
+    /// Reaps already-finished handles before pushing the new one so the
+    /// vec stays bounded under sustained traffic. Without the reap a
+    /// long-running bus accumulates one handle per spawn site over its
+    /// lifetime (the most visible source today is the per-WS-connect
+    /// upgrade task in `installer::install_client_ws_fd`). Dropping a
+    /// finished `compio::runtime::JoinHandle` is a no-op (the task has
+    /// already completed); compio's runtime is single-threaded so
+    /// `is_finished` cannot flip between the predicate evaluation and
+    /// the drop inside the same `retain`.
+    ///
+    /// The tracking vec grows during shutdown too. `shutdown` drains it
+    /// in a loop until empty, so a task pushed mid-shutdown is still
+    /// awaited.
     pub fn track_background(&self, handle: JoinHandle<()>) {
-        self.background_tasks.borrow_mut().push(handle);
+        let mut tasks = self.background_tasks.borrow_mut();
+        tasks.retain(|h| !h.is_finished());
+        tasks.push(handle);
     }
 
     /// Trigger the root shutdown and drain everything with the given
