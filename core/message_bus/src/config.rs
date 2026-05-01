@@ -221,10 +221,10 @@ impl From<&ServerNgConfig> for MessageBusConfig {
 /// (`IggyByteSize` / `IggyDuration` typed) into the runtime
 /// [`QuicTuning`] (plain integer / `Duration` fields).
 ///
-/// Range invariants (each numeric field fits its target type, MTU
-/// >= 1200, `receive_window` <= `u32::MAX`, `send_window` within quinn's
-/// `VarInt` cap) are enforced by `QuicConfig::validate()`. The
-/// `unwrap_or_else` arms below are still bounded saturations that keep
+/// Range invariants (each numeric field fits its target type, MTU at
+/// least 1200, `receive_window` within `u32::MAX`, `send_window` within
+/// quinn's `VarInt` cap) are enforced by `QuicConfig::validate()`. The
+/// `unwrap_or` arms below are still bounded saturations that keep
 /// the build unconditionally infallible if a future caller skips
 /// validation in dev / test code.
 fn build_quic_tuning(quic: &configs::ng_quic::QuicConfig) -> QuicTuning {

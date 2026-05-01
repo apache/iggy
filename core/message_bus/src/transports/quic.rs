@@ -709,7 +709,7 @@ mod tests {
     /// `run`'s joint drain timeout consumes. The full timeout-bound
     /// behaviour is exercised end-to-end by the existing
     /// `request_reply_round_trip` (which goes through the default
-    /// close_grace path); deterministic wedge testing of the elapsed
+    /// `close_grace` path); deterministic wedge testing of the elapsed
     /// arm requires a non-cancel-safe QUIC read state that cannot be
     /// reliably constructed in-process.
     #[test]

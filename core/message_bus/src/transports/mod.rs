@@ -55,6 +55,7 @@
 //!       and writes each `BusMessage` with a separate
 //!       `SendStream::write_all` call; quinn coalesces at the datagram
 //!       layer.
+//!
 //!   In all four cases, any write failure tears the connection down.
 //! - **Zero-copy `Frozen` ownership**: outbound frames are handed to
 //!   the kernel without intermediate copies on plaintext TCP. WS / QUIC

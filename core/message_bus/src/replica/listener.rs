@@ -57,7 +57,7 @@
 //! Until `LOGIN_REPLICA` lands and re-establishes per-peer mutual
 //! authentication, operators MUST deploy the replica port on a trusted
 //! L2 boundary (cluster-local VPC, dedicated private subnet, encrypted
-//! overlay such as WireGuard, or an air-gapped management network).
+//! overlay such as `WireGuard`, or an air-gapped management network).
 //! Treating "no public exposure of the replica port" as the only gate
 //! is the supported configuration; do NOT assume any authentication
 //! beyond that boundary.
