@@ -350,10 +350,9 @@ TEST(LowLevelE2E_Stream, GetStreamsFieldsVerification) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("field-verify-message-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("field-verify-message-" + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
