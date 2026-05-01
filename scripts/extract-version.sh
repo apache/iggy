@@ -69,6 +69,8 @@ NC='\033[0m'
 # Check for required tools
 if ! command -v yq &> /dev/null; then
     echo "Error: yq is required but not installed" >&2
+    echo "Install with: brew install yq" >&2
+    echo "Or download from: https://github.com/mikefarah/yq/releases" >&2
     exit 1
 fi
 

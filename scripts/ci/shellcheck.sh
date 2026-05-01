@@ -20,36 +20,49 @@
 
 set -euo pipefail
 
-# Parse arguments
 MODE="check"
-if [ $# -gt 0 ]; then
+FILE_MODE="all"
+FILES=()
+
+# Accept mode flags plus optional file paths. In pre-commit, matching staged
+# shell files are passed as positional arguments.
+while [[ $# -gt 0 ]]; do
   case "$1" in
     --check)
       MODE="check"
+      shift
       ;;
     --fix)
       MODE="fix"
+      shift
       ;;
-    *)
-      echo "Usage: $0 [--check|--fix]"
-      echo "  --check  Check shell scripts for issues (default)"
-      echo "  --fix    Show detailed suggestions for fixes"
+    --staged)
+      FILE_MODE="staged"
+      shift
+      ;;
+    --all)
+      FILE_MODE="all"
+      shift
+      ;;
+    --help|-h)
+      echo "Usage: $0 [--check|--fix] [--staged|--all] [files...]"
+      echo "  --check   Check shell scripts for issues (default)"
+      echo "  --fix     Show detailed suggestions for fixes"
+      echo "  --staged  Check staged shell scripts"
+      echo "  --all     Check all shell scripts (default)"
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1"
+      echo "Use --help for usage information"
       exit 1
       ;;
+    *)
+      FILES+=("$1")
+      shift
+      ;;
   esac
-fi
-
-# Check if shellcheck is installed
-if ! command -v shellcheck &> /dev/null; then
-  echo "❌ shellcheck command not found"
-  echo "💡 Install it using:"
-  echo "   • Ubuntu/Debian: sudo apt-get install shellcheck"
-  echo "   • macOS: brew install shellcheck"
-  echo "   • Or visit: https://www.shellcheck.net/"
-  exit 1
-fi
-
-echo "shellcheck version: $(shellcheck --version)"
+done
 
 # Get repository root
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -75,6 +88,38 @@ for path in "${EXCLUDE_PATHS[@]}"; do
   FIND_EXCLUDE_ARGS+=("-not" "-path" "$path")
 done
 
+# Keep --staged for manual runs; pre-commit normally passes matching staged
+# files directly through pass_filenames.
+if [ ${#FILES[@]} -eq 0 ] && [ "$FILE_MODE" = "staged" ]; then
+  while IFS= read -r script; do
+    if [ ! -f "$script" ]; then
+      continue
+    fi
+
+    # Match normal .sh files and executable scripts with shell shebangs.
+    if [[ "$script" == *.sh ]] || head -n 1 "$script" | grep -qE '^#!.*[^[:alnum:]_](bash|dash|ksh|zsh|sh)([[:space:]]|$)'; then
+      FILES+=("$script")
+    fi
+  done < <(git diff --cached --name-only --diff-filter=ACM)
+
+  if [ ${#FILES[@]} -eq 0 ]; then
+    echo "✅ No staged shell scripts to check"
+    exit 0
+  fi
+fi
+
+# Check if shellcheck is installed
+if ! command -v shellcheck &> /dev/null; then
+  echo "❌ shellcheck command not found"
+  echo "💡 Install it using:"
+  echo "   • Ubuntu/Debian: sudo apt-get install shellcheck"
+  echo "   • macOS: brew install shellcheck"
+  echo "   • Or visit: https://www.shellcheck.net/"
+  exit 1
+fi
+
+echo "shellcheck version: $(shellcheck --version)"
+
 if [ "$MODE" = "fix" ]; then
   echo "🔧 Running shellcheck with detailed suggestions..."
   echo ""
@@ -82,15 +127,27 @@ if [ "$MODE" = "fix" ]; then
   echo "Please review the suggestions below and fix issues manually."
   echo ""
 
-  # Run with detailed format
   FAILED=0
-  while IFS= read -r -d '' script; do
-    echo "Checking: $script"
-    if ! shellcheck -x -f gcc "$script"; then
-      FAILED=1
-    fi
-    echo ""
-  done < <(find . -type f -name "*.sh" "${FIND_EXCLUDE_ARGS[@]}" -print0)
+  # Use staged or explicitly provided files when present; otherwise keep the
+  # historical full-repository behavior for CI/manual all-file checks.
+  if [ ${#FILES[@]} -gt 0 ]; then
+    for script in "${FILES[@]}"; do
+      [ -f "$script" ] || continue
+      echo "Checking: $script"
+      if ! shellcheck -x -f gcc "$script"; then
+        FAILED=1
+      fi
+      echo ""
+    done
+  else
+    while IFS= read -r -d '' script; do
+      echo "Checking: $script"
+      if ! shellcheck -x -f gcc "$script"; then
+        FAILED=1
+      fi
+      echo ""
+    done < <(find . -type f -name "*.sh" "${FIND_EXCLUDE_ARGS[@]}" -print0)
+  fi
 
   if [ $FAILED -eq 1 ]; then
     echo "❌ Found issues in shell scripts"
@@ -102,8 +159,18 @@ if [ "$MODE" = "fix" ]; then
 else
   echo "🔍 Checking shell scripts..."
 
-  # Run shellcheck on all shell scripts (checks all severities: error, warning, info, style)
-  if find . -type f -name "*.sh" "${FIND_EXCLUDE_ARGS[@]}" -exec shellcheck -x {} +; then
+  # Use staged or explicitly provided files when present; otherwise keep the
+  # historical full-repository behavior for CI/manual all-file checks.
+  if [ ${#FILES[@]} -gt 0 ]; then
+    if shellcheck -x "${FILES[@]}"; then
+      echo "✅ All shell scripts passed shellcheck"
+    else
+      echo ""
+      echo "❌ Shellcheck found issues in shell scripts"
+      echo "💡 Run '$0 --fix' to see detailed suggestions"
+      exit 1
+    fi
+  elif find . -type f -name "*.sh" "${FIND_EXCLUDE_ARGS[@]}" -exec shellcheck -x {} +; then
     echo "✅ All shell scripts passed shellcheck"
   else
     echo ""

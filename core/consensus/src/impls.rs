@@ -331,17 +331,15 @@ impl LocalPipeline {
 
         // Verify prepare queue hash chain
         if let Some(head) = self.prepare_queue.front() {
-            let mut expected_op = head.header.op;
             let mut expected_parent = head.header.parent;
 
-            for entry in &self.prepare_queue {
+            for (expected_op, entry) in (head.header.op..).zip(self.prepare_queue.iter()) {
                 let header = &entry.header;
 
                 assert_eq!(header.op, expected_op, "ops must be sequential");
                 assert_eq!(header.parent, expected_parent, "must be hash-chained");
 
                 expected_parent = header.checksum;
-                expected_op += 1;
             }
         }
     }
@@ -1721,16 +1719,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[allow(clippy::future_not_send)]
     pub(crate) async fn send_or_loopback(&self, target: u8, message: Message<GenericHeader>)
     where
-        B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+        B: MessageBus,
     {
         if target == self.replica {
             self.push_loopback(message);
-        } else {
-            // TODO: Propagate send errors instead of panicking; requires bus error design.
-            self.message_bus
-                .send_to_replica(target, message)
-                .await
-                .unwrap();
+        } else if let Err(e) = self
+            .message_bus
+            .send_to_replica(target, message.into_frozen())
+            .await
+        {
+            tracing::warn!(
+                replica = self.replica,
+                target,
+                "send_or_loopback failed: {e}"
+            );
         }
     }
 

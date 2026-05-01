@@ -18,6 +18,7 @@
  */
 
 mod clickhouse;
+mod delta;
 mod elasticsearch;
 mod http;
 mod iceberg;
@@ -30,6 +31,7 @@ mod wiremock;
 pub use clickhouse::{
     ClickHouseSinkFixture, ClickHouseSinkRowBinaryFixture, ClickHouseSinkStringFixture,
 };
+pub use delta::{DeltaFixture, DeltaS3Fixture};
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use http::{
     HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture,

@@ -66,7 +66,7 @@ pub use header::{
     PrepareOkHeader, ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
 pub use message::{
-    ConsensusMessage, FragmentedBacking, Message, MessageBacking, MessageBag, MutableBacking,
-    RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
+    ConsensusMessage, FragmentedBacking, MESSAGE_ALIGN, Message, MessageBacking, MessageBag,
+    MutableBacking, RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
 };
 pub use operation::Operation;

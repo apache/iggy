@@ -539,33 +539,28 @@ enabled = false
 # This prevents accidental cross-cluster communication.
 name = "iggy-cluster"
 
-# Current node configuration
-[cluster.node.current]
-# Name of this node - must be unique across all nodes in the cluster
-# The node will use its configured transport addresses (tcp.address, quic.address, etc.)
+# Full roster of cluster members. Byte-identical on every node. The running
+# node's identity is resolved at launch from the '--replica-id <N>' CLI
+# flag, which selects the entry in this list that describes the current
+# node. All other entries are remote peers.
+[[cluster.nodes]]
 name = "iggy-node-1"
-# IP address that other nodes should use to connect to this node
 ip = "127.0.0.1"
+replica_id = 0
+ports = { tcp = 8090, quic = 8080, http = 3000, websocket = 8070, tcp_replica = 9090 }
 
-# Other nodes in the cluster
-# Each field in 'ports' is optional. If omitted, the current node's configured port will be used.
-# This is useful when all nodes use the same ports but different IPs, or when only some ports differ.
-[[cluster.node.others]]
+[[cluster.nodes]]
 name = "iggy-node-2"
 ip = "127.0.0.1"
-ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093 }
+replica_id = 1
+ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 9091 }
 
-# [[cluster.node.others]]
+# Example additional node (commented out):
+# [[cluster.nodes]]
 # name = "iggy-node-3"
 # ip = "192.168.1.100"
-# # Only some ports specified, others will use defaults from current node
-# ports = { tcp = 8092, http = 3002 }
-
-# Example with all default ports (uses current node's configured ports):
-# [[cluster.node.others]]
-# name = "iggy-node-4"
-# ip = "192.168.1.101"
-# ports = {}  # Empty ports - all will use current node's defaults
+# replica_id = 2
+# ports = { tcp = 8092, http = 3002, tcp_replica = 9092 }
 
 # Sharding configuration
 [system.sharding]
@@ -588,3 +583,43 @@ enabled = false
 self_signed = true
 cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"
+
+# Message bus configuration.
+# Tunables for the inter-shard / inter-replica internal bus that ships
+# consensus traffic between replicas and SDK-client traffic between
+# shards. These knobs are consensus-liveness-critical (keepalive +
+# reconnect timers gate VSR view-change latency; max_batch gates
+# throughput under backpressure). Defaults match
+# core::message_bus::config::MessageBusConfig::default().
+[message_bus]
+# Maximum number of BusMessage entries coalesced into a single writev(2)
+# call. Hard upper bound: IOV_MAX/2 = 512 on Linux.
+max_batch = 256
+
+# Wire-level cap on a single framed message.
+max_message_size = "64 MiB"
+
+# Bound on the per-peer mpsc queue. The writer task drains; the
+# send_to_* path enqueues.
+peer_queue_capacity = 256
+
+# Interval between outbound reconnect attempts to peers with peer_id > self_id.
+reconnect_period = "5 s"
+
+# TCP keepalive tunables. See tcp(7).
+keepalive_idle = "10 s"
+keepalive_interval = "5 s"
+keepalive_retries = 3
+
+# Timeout for per-peer close drain (flush writer, tear down reader)
+# before force-cancellation.
+close_peer_timeout = "2 s"
+
+# Wall-clock bound on a single stream.shutdown() / ws.close() in the
+# safe-shutdown sequence of the TLS-family transports.
+close_grace = "2 s"
+
+# Optional listen addresses for the TLS-family transports. Comment out
+# to keep the plane unbound.
+# tcp_tls_listen_addr = "0.0.0.0:9443"
+# wss_listen_addr = "0.0.0.0:9444"

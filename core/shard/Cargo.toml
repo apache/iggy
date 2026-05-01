@@ -23,6 +23,7 @@ publish = false
 
 [dependencies]
 bytes = { workspace = true }
+compio = { workspace = true }
 consensus = { path = "../consensus" }
 crossfire = { workspace = true }
 futures = { workspace = true }

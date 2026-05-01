@@ -63,6 +63,13 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+if ! command -v uv >/dev/null 2>&1; then
+    echo -e "${RED}Error: uv is required but not installed${NC}"
+    echo -e "${YELLOW}Install with: curl -LsSf https://astral.sh/uv/install.sh | sh${NC}"
+    echo -e "${YELLOW}Or use: brew install uv${NC}"
+    exit 127
+fi
+
 PYTHON_DIRS=(
     "foreign/python"
     "bdd/python"
