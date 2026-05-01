@@ -6573,8 +6573,8 @@ dependencies = [
  "simd-json",
  "tokio",
  "tracing",
- ]
- 
+]
+
 [[package]]
 name = "iggy_connector_delta_sink"
 version = "0.1.0"
