@@ -65,16 +65,19 @@
 //!   socket can complete the framing handshake and submit a `LOGIN`
 //!   attempt. Operators that need link-level authentication must
 //!   front the listener with mTLS or a network policy boundary.
-//! - **TCP-TLS / WSS** — server-side TLS only by default
-//!   ([`crate::transports::tls`] builds a `ServerConfig` with
-//!   `with_no_client_auth`). Operator-supplied
-//!   [`rustls::ServerConfig`] may opt into client certs by replacing
-//!   that builder; the listener does not impose a policy of its own.
-//! - **QUIC** — TLS 1.3 handshake gated by the same
-//!   [`rustls::ServerConfig`] semantics as TCP-TLS, plus ALPN
-//!   negotiation enforced by `compio_quic::ServerConfig` on the
-//!   operator-provided value. 0-RTT data is structurally rejected by
-//!   the transport layer (see [`crate::transports::quic`]).
+//! - **TCP-TLS / WSS** — server-side TLS only. The listener accepts
+//!   `TlsServerCredentials` (cert chain plus key) and builds a
+//!   `rustls::ServerConfig` internally with `with_no_client_auth`;
+//!   client-cert mTLS is not exposed through the current `bind` API.
+//!   Operators needing mTLS must front the listener with a TLS
+//!   terminator that enforces it, or extend the bus to accept a
+//!   pre-built `Arc<rustls::ServerConfig>`.
+//! - **QUIC** — TLS 1.3 handshake gated by a `rustls::ServerConfig`
+//!   built the same way as TCP-TLS / WSS (no client auth). No ALPN is
+//!   advertised; protocol-version validation lives in the
+//!   application-level `LOGIN` command on the caller. 0-RTT data is
+//!   structurally rejected by the transport layer (see
+//!   [`crate::transports::quic`]).
 //!
 //! This split is intentional. Adding a pre-`LOGIN` gate would either
 //! duplicate state across the transport and dispatcher (drift hazard)

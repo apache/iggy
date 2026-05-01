@@ -151,9 +151,12 @@ impl TcpTlsTransportConn {
         }
     }
 
-    /// Override the wall-clock bound on `TlsStream::shutdown` (the
-    /// `close_notify` + TCP `SHUT_WR` step). Intended for tests; the
-    /// installer plumbs `MessageBusConfig::close_grace` in production.
+    /// Override the wall-clock bound that covers the full close
+    /// sequence: a final `flush()` of the rustls write buffer followed
+    /// by `TlsStream::shutdown()` (which emits `close_notify` and then
+    /// performs the TCP `SHUT_WR`). Both steps share this single budget.
+    /// Intended for tests; the installer plumbs
+    /// `MessageBusConfig::close_grace` in production.
     #[must_use]
     pub const fn with_close_grace(mut self, close_grace: Duration) -> Self {
         self.close_grace = close_grace;

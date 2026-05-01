@@ -36,14 +36,26 @@
 //!   onto a bounded `async_channel` and return `Ready` on the first
 //!   poll. The single yield point in the wire path lives inside the
 //!   transport's `run` body, invoked by the per-peer task.
-//! - **Batch ordering**: a TCP-plane writer drains the per-peer
-//!   `BusReceiver` into a single `writev` per batch. The kernel may
-//!   short-write the iovec set (so `writev` is not atomic), but FIFO
-//!   order across the batch is preserved and any short or failed write
-//!   tears the connection down rather than retrying on a half-written
-//!   batch. Per-frame transports (WS, QUIC, TLS) do NOT batch: each
-//!   pump iteration pulls one `BusMessage` from the receiver and writes
-//!   it independently; any write failure tears the connection down.
+//! - **Batch ordering**: each transport drains the per-peer
+//!   `BusReceiver` in FIFO order, but the dispatch shape differs:
+//!     * **TCP (vectored batch)** assembles up to `max_batch` frames
+//!       into one `write_vectored_all` call. The kernel may short-write
+//!       the iovec set (so `writev` is not atomic), but FIFO order
+//!       across the batch is preserved and any short or failed write
+//!       tears the connection down rather than retrying on a
+//!       half-written batch.
+//!     * **TCP-TLS, WS, WSS (drain-and-flush)** drain the same
+//!       `max_batch` window into a `Vec<BusMessage>` and then write
+//!       each frame through the per-record API (`AsyncWriteExt::write_all`
+//!       for TLS, `WebSocketStream::send` for WS / WSS) followed by ONE
+//!       trailing `flush()` per batch. This avoids per-frame TCP/TLS
+//!       record overhead while staying inside the per-record API
+//!       constraints of those transports.
+//!     * **QUIC (per-frame)** uses one bidirectional stream per peer
+//!       and writes each `BusMessage` with a separate
+//!       `SendStream::write_all` call; quinn coalesces at the datagram
+//!       layer.
+//!   In all four cases, any write failure tears the connection down.
 //! - **Zero-copy `Frozen` ownership**: outbound frames are handed to
 //!   the kernel without intermediate copies on plaintext TCP. WS / QUIC
 //!   / TLS planes pay structural copies in their record layers; see the

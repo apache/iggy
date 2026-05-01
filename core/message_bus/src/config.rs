@@ -24,10 +24,15 @@
 //! into runtime types ([`Duration`] / `usize`) once, so hot paths read
 //! fields directly without per-call conversion.
 //!
-//! The WebSocket frame-layer config lives under `[websocket]` in the
-//! schema (single source for both the server's WS listener tuning and
-//! the bus's WS install path); the bus pulls
-//! `cfg.websocket.to_tungstenite_config()` here.
+//! The WebSocket frame-layer config the bus consumes lives under the
+//! `[message_bus]` block (`ws_max_message_size`, `ws_max_frame_size`,
+//! `ws_write_buffer_size`, `ws_accept_unmasked_frames`). The schema's
+//! separate `[websocket]` block configures the legacy WS listener and
+//! is not read by the bus; the bus owns its own WS ceiling because the
+//! SDK-client plane has different cardinality and burst characteristics
+//! than the legacy listener (see `configs::server_ng_config::message_bus`).
+//! [`From<&ServerNgConfig> for MessageBusConfig`](MessageBusConfig)
+//! builds [`WebSocketConfig`] from those fields once at boot.
 //!
 //! Liveness detection is NOT done via TCP keepalive on the bus: SDK
 //! clients manage their own keepalive policy at the application layer,
@@ -166,8 +171,11 @@ pub struct MessageBusConfig {
     /// frame size, max message size, accept-unmasked-frames flag).
     /// Threaded into `compio_ws::accept_async_with_config` on the WS
     /// install path and into `WssTransportConn::ws_handshake` for WSS.
-    /// Built once at boot from `cfg.websocket.to_tungstenite_config()`
-    /// in the [`From<&ServerNgConfig>`] impl below.
+    /// Built once at boot by `build_ws_config` (see the
+    /// [`From<&ServerNgConfig> for MessageBusConfig`](MessageBusConfig) impl below)
+    /// from the bus-owned `ws_*` fields under `[message_bus]`. The
+    /// schema's `[websocket]` block is intentionally NOT consulted
+    /// here; see this module's preamble for the rationale.
     ///
     /// The [`WebSocketConfig`] type is re-exported from `compio_ws`'s
     /// vendored `tungstenite` so callers do not need a direct dep on
