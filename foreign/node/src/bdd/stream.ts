@@ -19,14 +19,11 @@
 
 
 import assert from 'node:assert/strict';
-import { Given, When, Then } from "@cucumber/cucumber";
+import { After, Given, When, Then } from "@cucumber/cucumber";
 import type { TestWorld } from './world.js';
 
 Given('I have no streams in the system', async function (this: TestWorld) {
-  const streams = await this.client.stream.list();
-  for (const s of streams) {
-    await this.client.stream.delete({ streamId: s.id });
-  }
+  assert.deepEqual([], await this.client.stream.list());
 });
 
 When(
@@ -56,3 +53,10 @@ Then(
   }
 );
 
+After(async function (this: TestWorld) {
+    if (!this.client) return;
+    const streams = await this.client.stream.list();
+    for (const s of streams) {
+        await this.client.stream.delete({ streamId: s.id });
+    }
+});
