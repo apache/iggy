@@ -40,21 +40,38 @@
 //! only dials peers with strictly greater ids and only accepts inbound
 //! from peers with strictly lower ids. No race, no tiebreaker.
 //!
-//! # Auth
+//! # Trust boundary (regression vs prior MAC)
 //!
-//! The `Ping` frame announces the dialing replica's id in plaintext;
-//! the bus uses it to key the registry but does NOT validate replica
-//! identity at the transport layer. Mirrors the SDK-client plane: the
-//! connection always succeeds, identity is established post-handshake
-//! by the caller (`server-ng`) via the future `LOGIN_REPLICA` command
-//! that carries the cluster's shared secret. Until that command
-//! succeeds the caller MUST treat the replica as unauthenticated and
-//! refuse to honor consensus messages from it.
+//! The current listener has NO transport-layer authentication. The
+//! `Ping` frame announces the dialing replica's id in plaintext; the
+//! bus uses it to key the registry and to enforce the directional rule
+//! (only inbound from peers with strictly lower ids), but cannot
+//! cryptographically verify the announced id. This is a hard regression
+//! versus the previous BLAKE3-keyed MAC over `Ping::reserved_command`
+//! bytes paired with a per-peer nonce ring (see TODO at the end of this
+//! module preamble). An attacker on the wire who learns the cluster id
+//! can register as any peer with a smaller replica id and feed forged
+//! consensus traffic until `server-ng` rejects it at the application
+//! layer.
 //!
-//! TLS / encryption is NOT provided here: operators still need to
-//! deploy the replica port on a trusted network boundary
-//! (cluster-local VPC, private subnet, overlay) if wire confidentiality
-//! is required.
+//! Until `LOGIN_REPLICA` lands and re-establishes per-peer mutual
+//! authentication, operators MUST deploy the replica port on a trusted
+//! L2 boundary (cluster-local VPC, dedicated private subnet, encrypted
+//! overlay such as WireGuard, or an air-gapped management network).
+//! Treating "no public exposure of the replica port" as the only gate
+//! is the supported configuration; do NOT assume any authentication
+//! beyond that boundary.
+//!
+//! Identity is established post-handshake by the caller (`server-ng`)
+//! via the future `LOGIN_REPLICA` command that carries the cluster's
+//! shared secret. Until that command succeeds the caller MUST treat the
+//! replica as unauthenticated and refuse to honor consensus messages
+//! from it.
+//!
+//! TLS / encryption is NOT provided here: the trusted-boundary
+//! deployment requirement above implicitly assumes the operator
+//! supplies link-level confidentiality (VPC-level encryption, overlay
+//! tunnel, or physical isolation).
 //
 // TODO(hubcio): the prior BLAKE3-keyed MAC over the `Ping` frame's
 // `reserved_command` bytes plus the per-peer nonce ring used to gate
