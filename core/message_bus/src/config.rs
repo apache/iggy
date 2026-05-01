@@ -221,22 +221,21 @@ impl From<&ServerNgConfig> for MessageBusConfig {
 /// (`IggyByteSize` / `IggyDuration` typed) into the runtime
 /// [`QuicTuning`] (plain integer / `Duration` fields).
 ///
-/// `expect`s rely on the schema validator (and the embedded default
-/// TOML) keeping byte-size and stream-count fields inside
-/// `quinn-proto`'s `VarInt` range. On supported targets `usize::MAX`
-/// covers anything operators write into the schema, so the conversion
-/// only fails for genuinely impossible inputs.
+/// Range invariants (each numeric field fits its target type, MTU
+/// >= 1200, `receive_window` <= `u32::MAX`, `send_window` within quinn's
+/// `VarInt` cap) are enforced by `QuicConfig::validate()`. The
+/// `unwrap_or_else` arms below are still bounded saturations that keep
+/// the build unconditionally infallible if a future caller skips
+/// validation in dev / test code.
 fn build_quic_tuning(quic: &configs::ng_quic::QuicConfig) -> QuicTuning {
     QuicTuning {
         max_concurrent_bidi_streams: u32::try_from(quic.max_concurrent_bidi_streams)
-            .expect("quic.max_concurrent_bidi_streams fits in u32"),
+            .unwrap_or(u32::MAX),
         datagram_send_buffer_size: usize::try_from(quic.datagram_send_buffer_size.as_bytes_u64())
-            .expect("quic.datagram_send_buffer_size fits usize on supported targets"),
-        initial_mtu: u16::try_from(quic.initial_mtu.as_bytes_u64())
-            .expect("quic.initial_mtu fits in u16"),
+            .unwrap_or(usize::MAX),
+        initial_mtu: u16::try_from(quic.initial_mtu.as_bytes_u64()).unwrap_or(u16::MAX),
         send_window: quic.send_window.as_bytes_u64(),
-        receive_window: u32::try_from(quic.receive_window.as_bytes_u64())
-            .expect("quic.receive_window fits in u32 (quinn VarInt accepts u32)"),
+        receive_window: u32::try_from(quic.receive_window.as_bytes_u64()).unwrap_or(u32::MAX),
         keep_alive_interval: quic.keep_alive_interval.get_duration(),
         max_idle_timeout: quic.max_idle_timeout.get_duration(),
     }
