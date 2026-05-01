@@ -31,7 +31,9 @@ bytes = "1.11.1"
 cxx = "1.0.194"
 iggy = { path = "../../core/sdk" }
 iggy_common = { path = "../../core/common" }
-tokio = { version = "1.49.0", features = ["rt-multi-thread"] }
+# Explicitly enable the runtime + I/O drivers required by `Runtime::enable_all()` in lib.rs.
+# Listing the features here insulates this crate from upstream SDK feature changes.
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 
 [build-dependencies]
 cxx-build = "1.0.194"

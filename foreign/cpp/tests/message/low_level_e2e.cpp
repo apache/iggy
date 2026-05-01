@@ -36,10 +36,9 @@ TEST(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("test message " + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("test message " + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
 
@@ -49,6 +48,7 @@ TEST(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
                                         make_numeric_identifier(1), "offset", 0, 100, false);
 
+    ASSERT_EQ(polled.partition_id, 0u) << "Polled partition_id mismatches the partition we sent to";
     ASSERT_EQ(polled.count, 10u);
     ASSERT_EQ(polled.messages.size(), 10u);
     for (std::uint32_t i = 0; i < 10; i++) {
@@ -73,9 +73,8 @@ TEST(LowLevelE2E_Message, PollMessagesVerifyMessageIds) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
-    iggy::ffi::Message msg;
-    msg.new_message(to_payload("id-test-message"));
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    auto msg  = iggy::ffi::make_message(to_payload("id-test-message"));
     msg.id_lo = 42;
     msg.id_hi = 0;
     messages.push_back(std::move(msg));
@@ -122,9 +121,8 @@ TEST(LowLevelE2E_Message, SendMessagesBeforeLoginThrows) {
     ASSERT_NE(client, nullptr);
     ASSERT_NO_THROW(client->connect());
 
-    rust::Vec<iggy::ffi::Message> messages;
-    iggy::ffi::Message msg;
-    msg.new_message(to_payload("should-fail"));
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    auto msg = iggy::ffi::make_message(to_payload("should-fail"));
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(1), make_numeric_identifier(1), "partition_id",
@@ -139,9 +137,8 @@ TEST(LowLevelE2E_Message, SendMessagesWithInvalidStreamId) {
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
 
-    rust::Vec<iggy::ffi::Message> messages;
-    iggy::ffi::Message msg;
-    msg.new_message(to_payload("test"));
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    auto msg = iggy::ffi::make_message(to_payload("test"));
     messages.push_back(std::move(msg));
 
     iggy::ffi::Identifier invalid_id;
@@ -160,9 +157,8 @@ TEST(LowLevelE2E_Message, SendMessagesToNonExistentStream) {
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
 
-    rust::Vec<iggy::ffi::Message> messages;
-    iggy::ffi::Message msg;
-    msg.new_message(to_payload("test"));
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    auto msg = iggy::ffi::make_message(to_payload("test"));
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_string_identifier("nonexistent-stream-12345"), make_numeric_identifier(0),
@@ -183,9 +179,8 @@ TEST(LowLevelE2E_Message, SendMessagesWithInvalidPartitioningKind) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
-    iggy::ffi::Message msg;
-    msg.new_message(to_payload("test"));
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    auto msg = iggy::ffi::make_message(to_payload("test"));
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "invalid_kind",
@@ -207,9 +202,8 @@ TEST(LowLevelE2E_Message, SendMessagesWithInvalidPartitioningValue) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
-    iggy::ffi::Message msg;
-    msg.new_message(to_payload("test"));
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    auto msg = iggy::ffi::make_message(to_payload("test"));
     messages.push_back(std::move(msg));
 
     rust::Vec<std::uint8_t> short_bytes;
@@ -236,10 +230,9 @@ TEST(LowLevelE2E_Message, SendMessagesToSpecificPartitionVerified) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 3, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("partition-test-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("partition-test-" + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
 
@@ -248,10 +241,12 @@ TEST(LowLevelE2E_Message, SendMessagesToSpecificPartitionVerified) {
 
     auto polled_part0 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
                                               "consumer", make_numeric_identifier(1), "offset", 0, 100, false);
+    ASSERT_EQ(polled_part0.partition_id, 0u);
     ASSERT_EQ(polled_part0.count, 5u);
 
     auto polled_part1 = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 1,
                                               "consumer", make_numeric_identifier(1), "offset", 0, 100, false);
+    ASSERT_EQ(polled_part1.partition_id, 1u);
     ASSERT_EQ(polled_part1.count, 0u);
 
     client->delete_stream(make_numeric_identifier(stream.id));
@@ -269,7 +264,7 @@ TEST(LowLevelE2E_Message, SendEmptyMessageVectorThrows) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> empty_messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> empty_messages;
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
                                        partition_id_bytes(0), std::move(empty_messages)),
@@ -290,10 +285,9 @@ TEST(LowLevelE2E_Message, SendMessageWithEmptyPayloadThrows) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
-    iggy::ffi::Message msg;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     rust::Vec<std::uint8_t> empty_payload;
-    msg.new_message(std::move(empty_payload));
+    auto msg = iggy::ffi::make_message(std::move(empty_payload));
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -315,14 +309,17 @@ TEST(LowLevelE2E_Message, SendMessageWithOversizedPayloadThrows) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
+    // Build a payload one byte over the SDK's max payload size (64 MB). Pre-reserve to avoid
+    // millions of capacity-growth reallocations on the rust::Vec.
+    constexpr std::uint32_t kOversizedPayloadBytes = 64'000'001u;
     rust::Vec<std::uint8_t> oversized_payload;
-    for (std::uint32_t i = 0; i < 64000001u; i++) {
+    oversized_payload.reserve_total(kOversizedPayloadBytes);
+    for (std::uint32_t i = 0; i < kOversizedPayloadBytes; i++) {
         oversized_payload.push_back(0x41);
     }
 
-    rust::Vec<iggy::ffi::Message> messages;
-    iggy::ffi::Message msg;
-    msg.new_message(std::move(oversized_payload));
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    auto msg = iggy::ffi::make_message(std::move(oversized_payload));
     messages.push_back(std::move(msg));
 
     ASSERT_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -344,10 +341,9 @@ TEST(LowLevelE2E_Message, SendMessagesPreservesOrder) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 50; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("order-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("order-" + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
 
@@ -380,10 +376,9 @@ TEST(LowLevelE2E_Message, SendMessagesWithDuplicateIds) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 3; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("dup-id-msg-" + std::to_string(i)));
+        auto msg  = iggy::ffi::make_message(to_payload("dup-id-msg-" + std::to_string(i)));
         msg.id_lo = 99;
         msg.id_hi = 0;
         messages.push_back(std::move(msg));
@@ -428,22 +423,18 @@ TEST(LowLevelE2E_Message, SendMessagesWithVariousPayloads) {
     payload_binary.push_back(0xBE);
     payload_binary.push_back(0xEF);
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
 
-    iggy::ffi::Message msg0;
-    msg0.new_message(to_payload("simple ascii"));
+    auto msg0 = iggy::ffi::make_message(to_payload("simple ascii"));
     messages.push_back(std::move(msg0));
 
-    iggy::ffi::Message msg1;
-    msg1.new_message(std::move(payload_null));
+    auto msg1 = iggy::ffi::make_message(std::move(payload_null));
     messages.push_back(std::move(msg1));
 
-    iggy::ffi::Message msg2;
-    msg2.new_message(to_payload("héllo wörld"));
+    auto msg2 = iggy::ffi::make_message(to_payload("héllo wörld"));
     messages.push_back(std::move(msg2));
 
-    iggy::ffi::Message msg3;
-    msg3.new_message(std::move(payload_binary));
+    auto msg3 = iggy::ffi::make_message(std::move(payload_binary));
     messages.push_back(std::move(msg3));
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -567,10 +558,9 @@ TEST(LowLevelE2E_Message, PollMessagesCountLessThanAvailable) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
 
@@ -598,10 +588,9 @@ TEST(LowLevelE2E_Message, PollMessagesWithLargeOffset) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
 
@@ -629,10 +618,9 @@ TEST(LowLevelE2E_Message, PollMessagesFirstStrategy) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
 
@@ -667,10 +655,9 @@ TEST(LowLevelE2E_Message, PollMessagesLastStrategy) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
 
@@ -706,10 +693,9 @@ TEST(LowLevelE2E_Message, PollMessagesNextStrategyNoAutoCommit) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
 
@@ -751,10 +737,9 @@ TEST(LowLevelE2E_Message, PollMessagesNextStrategyAutoCommit) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
 
@@ -802,10 +787,9 @@ TEST(LowLevelE2E_Message, PollMessagesConsumerIdIndependence) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
 
@@ -839,19 +823,17 @@ TEST(LowLevelE2E_Message, PollMessagesMultipleSendsThenPollOrder) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> batch1;
+    rust::Vec<iggy::ffi::IggyMessageToSend> batch1;
     for (std::uint32_t i = 0; i < 5; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("batch1-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("batch1-" + std::to_string(i)));
         batch1.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
                           partition_id_bytes(0), std::move(batch1));
 
-    rust::Vec<iggy::ffi::Message> batch2;
+    rust::Vec<iggy::ffi::IggyMessageToSend> batch2;
     for (std::uint32_t i = 0; i < 5; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("batch2-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("batch2-" + std::to_string(i)));
         batch2.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -891,10 +873,9 @@ TEST(LowLevelE2E_Message, PollMessagesMultipleCustomIds) {
                          "server_default");
 
     const std::uint64_t id_values[] = {100, 200, 300, 400, 500};
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("msg-" + std::to_string(i)));
+        auto msg  = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
         msg.id_lo = id_values[i];
         msg.id_hi = 0;
         messages.push_back(std::move(msg));
@@ -927,9 +908,8 @@ TEST(LowLevelE2E_Message, PollMessagesAfterStreamDeletedThrows) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
-    iggy::ffi::Message msg;
-    msg.new_message(to_payload("test"));
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    auto msg = iggy::ffi::make_message(to_payload("test"));
     messages.push_back(std::move(msg));
 
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -995,10 +975,9 @@ TEST(LowLevelE2E_Message, PollMessagesWithoutSpecifyingPartition) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("msg-" + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -1007,6 +986,9 @@ TEST(LowLevelE2E_Message, PollMessagesWithoutSpecifyingPartition) {
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), UINT32_MAX,
                                         "consumer", make_numeric_identifier(1), "offset", 0, 100, false);
 
+    // The Rust side maps UINT32_MAX to None, so the server picks a partition. With a single
+    // partition topic that should always be partition 0.
+    ASSERT_EQ(polled.partition_id, 0u) << "u32::MAX sentinel did not map to None — partition_id sentinel regression?";
     ASSERT_EQ(polled.count, 5u);
     ASSERT_EQ(polled.messages.size(), 5u);
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -1031,10 +1013,9 @@ TEST(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> batch1;
+    rust::Vec<iggy::ffi::IggyMessageToSend> batch1;
     for (std::uint32_t i = 0; i < 5; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("batch1-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("batch1-" + std::to_string(i)));
         batch1.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -1042,10 +1023,9 @@ TEST(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    rust::Vec<iggy::ffi::Message> batch2;
+    rust::Vec<iggy::ffi::IggyMessageToSend> batch2;
     for (std::uint32_t i = 0; i < 5; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("batch2-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("batch2-" + std::to_string(i)));
         batch2.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -1055,21 +1035,29 @@ TEST(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
                                      make_numeric_identifier(1), "offset", 0, 100, false);
     ASSERT_EQ(all.count, 10u);
 
-    std::uint64_t batch2_timestamp = all.messages[5].timestamp;
-    ASSERT_GT(batch2_timestamp, all.messages[0].timestamp);
+    // IggyTimestamp::now() is microsecond-resolution and we slept 100ms between batches; a gap
+    // smaller than half that window means the test has degraded into a tautology on busy CI.
+    constexpr std::uint64_t kMinTimestampGapMicros = 50'000;
+    std::uint64_t batch1_timestamp                 = all.messages[0].timestamp;
+    std::uint64_t batch2_timestamp                 = all.messages[5].timestamp;
+    ASSERT_GT(batch2_timestamp, batch1_timestamp);
+    ASSERT_GE(batch2_timestamp - batch1_timestamp, kMinTimestampGapMicros)
+        << "Timestamp gap collapsed (" << (batch2_timestamp - batch1_timestamp)
+        << "us) — test no longer exercises timestamp filtering";
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
                                         make_numeric_identifier(2), "timestamp", batch2_timestamp, 100, false);
 
     ASSERT_GE(polled.count, 5u);
+    // The server contract is `timestamp >= polling_strategy_value`. If a batch1 message lands on
+    // exactly the same microsecond as batch2's first message, the count can legitimately exceed 5,
+    // so verify by prefix rather than indexing each message against `batch2-N`.
     for (std::size_t i = 0; i < polled.messages.size(); i++) {
         EXPECT_GE(polled.messages[i].timestamp, batch2_timestamp)
             << "Message at index " << i << " has earlier timestamp";
-    }
-    for (std::size_t i = 0; i < polled.messages.size(); i++) {
-        std::string expected = "batch2-" + std::to_string(i);
         std::string actual(polled.messages[i].payload.begin(), polled.messages[i].payload.end());
-        EXPECT_EQ(actual, expected) << "Payload mismatch at index " << i;
+        EXPECT_TRUE(actual.rfind("batch1-", 0) == 0 || actual.rfind("batch2-", 0) == 0)
+            << "Polled message at index " << i << " has unexpected payload: " << actual;
     }
 
     client->delete_stream(make_numeric_identifier(stream.id));
@@ -1088,10 +1076,9 @@ TEST(LowLevelE2E_Message, PollMessagesMonotonicOffsets) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 20; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("mono-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("mono-" + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
@@ -1129,10 +1116,9 @@ TEST(LowLevelE2E_Message, SendMessagesLargeBatch) {
     client->create_topic(make_numeric_identifier(stream.id), "test-topic", 1, "none", 0, "never_expire", 0,
                          "server_default");
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 1000; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("batch-msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("batch-msg-" + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
 
@@ -1156,9 +1142,8 @@ TEST(LowLevelE2E_Message, SendMessagesWithInvalidTopicIdThrows) {
     iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
 
-    rust::Vec<iggy::ffi::Message> messages;
-    iggy::ffi::Message msg;
-    msg.new_message(to_payload("test"));
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    auto msg = iggy::ffi::make_message(to_payload("test"));
     messages.push_back(std::move(msg));
 
     iggy::ffi::Identifier invalid_id;
@@ -1234,10 +1219,9 @@ TEST(LowLevelE2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
                                                        make_numeric_identifier(group.id));
     ASSERT_EQ(group_after_join.members_count, 1u);
 
-    rust::Vec<iggy::ffi::Message> messages;
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
-        iggy::ffi::Message msg;
-        msg.new_message(to_payload("cg-msg-" + std::to_string(i)));
+        auto msg = iggy::ffi::make_message(to_payload("cg-msg-" + std::to_string(i)));
         messages.push_back(std::move(msg));
     }
     client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",

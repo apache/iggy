@@ -19,32 +19,24 @@ use crate::ffi;
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage as RustIggyMessage, PolledMessages as RustPolledMessages};
 
-impl ffi::Message {
-    pub fn new_message(&mut self, payload: Vec<u8>) {
-        let payload_length = payload.len() as u32;
-        *self = Self {
-            checksum: 0,
-            id_lo: 0,
-            id_hi: 0,
-            offset: 0,
-            timestamp: 0,
-            origin_timestamp: 0,
-            user_headers_length: 0,
-            payload_length,
-            reserved: 0,
-            payload,
-            user_headers: Vec::new(),
-        };
+pub fn make_message(payload: Vec<u8>) -> ffi::IggyMessageToSend {
+    ffi::IggyMessageToSend {
+        id_lo: 0,
+        id_hi: 0,
+        payload,
+        user_headers: Vec::new(),
     }
 }
 
-impl From<RustIggyMessage> for ffi::Message {
+impl From<RustIggyMessage> for ffi::IggyMessagePolled {
     fn from(m: RustIggyMessage) -> Self {
-        let id = m.header.id;
-        ffi::Message {
+        let id_bytes = m.header.id.to_le_bytes();
+        let id_lo = u64::from_le_bytes(id_bytes[0..8].try_into().unwrap());
+        let id_hi = u64::from_le_bytes(id_bytes[8..16].try_into().unwrap());
+        ffi::IggyMessagePolled {
             checksum: m.header.checksum,
-            id_lo: id as u64,
-            id_hi: (id >> 64) as u64,
+            id_lo,
+            id_hi,
             offset: m.header.offset,
             timestamp: m.header.timestamp,
             origin_timestamp: m.header.origin_timestamp,
@@ -57,18 +49,23 @@ impl From<RustIggyMessage> for ffi::Message {
     }
 }
 
-impl TryFrom<ffi::Message> for RustIggyMessage {
+impl TryFrom<ffi::IggyMessageToSend> for RustIggyMessage {
     type Error = String;
 
-    fn try_from(m: ffi::Message) -> Result<Self, Self::Error> {
+    fn try_from(m: ffi::IggyMessageToSend) -> Result<Self, Self::Error> {
+        if !m.user_headers.is_empty() {
+            return Err(
+                "Could not convert message: user_headers are not yet supported in the C++ SDK"
+                    .to_string(),
+            );
+        }
         let id = ((m.id_hi as u128) << 64) | (m.id_lo as u128);
         let payload = Bytes::from(m.payload);
-        let msg = if id > 0 {
-            RustIggyMessage::builder().id(id).payload(payload).build()
-        } else {
-            RustIggyMessage::builder().payload(payload).build()
-        };
-        msg.map_err(|error| format!("Could not convert message: {error}"))
+        RustIggyMessage::builder()
+            .id(id)
+            .payload(payload)
+            .build()
+            .map_err(|error| format!("Could not convert message: {error}"))
     }
 }
 
@@ -78,7 +75,11 @@ impl From<RustPolledMessages> for ffi::PolledMessages {
             partition_id: p.partition_id,
             current_offset: p.current_offset,
             count: p.count,
-            messages: p.messages.into_iter().map(ffi::Message::from).collect(),
+            messages: p
+                .messages
+                .into_iter()
+                .map(ffi::IggyMessagePolled::from)
+                .collect(),
         }
     }
 }
