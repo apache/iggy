@@ -37,6 +37,18 @@
 //! bytes to caller memory; bytes already in rustls's queue stay there
 //! for the next iteration.
 //!
+//! That property is library-version-sensitive: a future minor bump of
+//! `futures-rustls` could change `Stream::poll_read`'s buffering
+//! contract and silently break the pump. Two guards keep the invariant
+//! load-bearing: (a) `compio = "=0.18.0"` is exact-pinned in the
+//! workspace `Cargo.toml`, freezing the transitive `futures-rustls`
+//! version; (b) the `tcp_tls_cancel_safe` integration test
+//! (`core/message_bus/tests/tcp_tls_cancel_safe.rs`) empirically
+//! reasserts the property in CI as a counterpart to the plaintext-TCP
+//! `cancel_unsafe` test. If either tripwire fires after a dependency
+//! bump, the cancel-safety chain must be re-audited before the bump is
+//! merged.
+//!
 //! Writes are run to completion outside any `select!`; the shutdown
 //! token signals the *start* of close, never cancels a write that is
 //! already in flight.

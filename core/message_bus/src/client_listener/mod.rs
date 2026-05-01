@@ -47,6 +47,40 @@
 //!   `bind(SocketAddr, compio_quic::ServerConfig) -> (Endpoint, SocketAddr)`.
 //!   Single UDP socket demuxes to per-connection `quinn-proto`
 //!   state; no plaintext fd to hand cross-shard.
+//!
+//! # Authentication boundary
+//!
+//! The accept loops here are deliberately authentication-agnostic.
+//! They establish a transport channel and hand the connection to the
+//! installer; they never inspect application bytes. Authentication is
+//! enforced at exactly one place per connection: the application-level
+//! `LOGIN` command, which the dispatcher receives as the first
+//! [`crate::Message`] on the in-channel returned by the installer.
+//! Until `LOGIN` succeeds, the dispatcher must treat the connection as
+//! anonymous and refuse all other commands.
+//!
+//! Per-transport gating that runs *before* `LOGIN`:
+//!
+//! - **plain TCP / WS** — none. Anyone who can reach the listener
+//!   socket can complete the framing handshake and submit a `LOGIN`
+//!   attempt. Operators that need link-level authentication must
+//!   front the listener with mTLS or a network policy boundary.
+//! - **TCP-TLS / WSS** — server-side TLS only by default
+//!   ([`crate::transports::tls`] builds a `ServerConfig` with
+//!   `with_no_client_auth`). Operator-supplied
+//!   [`rustls::ServerConfig`] may opt into client certs by replacing
+//!   that builder; the listener does not impose a policy of its own.
+//! - **QUIC** — TLS 1.3 handshake gated by the same
+//!   [`rustls::ServerConfig`] semantics as TCP-TLS, plus ALPN
+//!   negotiation enforced by `compio_quic::ServerConfig` on the
+//!   operator-provided value. 0-RTT data is structurally rejected by
+//!   the transport layer (see [`crate::transports::quic`]).
+//!
+//! This split is intentional. Adding a pre-`LOGIN` gate would either
+//! duplicate state across the transport and dispatcher (drift hazard)
+//! or force every transport to parse application frames (layering
+//! violation). DoS-shaped abuse is bounded instead by handshake-grace
+//! timeouts and the bus-wide [`crate::installer`] backpressure budget.
 
 use crate::{GenericHeader, Message};
 use std::rc::Rc;
