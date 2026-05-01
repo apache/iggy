@@ -468,11 +468,14 @@ async fn read_step(
 /// token signals the *start* of close, never cancels an in-flight
 /// write.
 ///
-/// # F10 (WS / WSS) is unaffected by this fix
+/// # WebSocket transports do not share this resumable shape
 ///
-/// The WebSocket variant of this hazard requires an analogous resumable
-/// shape; it is upstream-blocked on `compio_ws 0.4`'s `split` plus
-/// `next_item` API and is tracked as a known limitation.
+/// The `ws` and `wss` pumps in [`crate::transports::ws`] and
+/// [`crate::transports::wss`] cannot adopt the same accumulator pattern:
+/// `compio_ws::WebSocketStream` does not yet expose a split reader plus
+/// `next_item` API, so a cancellation mid-frame loses the partial frame.
+/// That limitation is a separate concern from the TLS pump's safety
+/// invariants and is tracked under `transports/ws.rs`.
 #[allow(clippy::future_not_send)]
 async fn run_pump(tls: &mut TlsStream<TcpStream>, ctx: ActorContext) {
     let ActorContext {
