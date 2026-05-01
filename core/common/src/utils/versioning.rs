@@ -36,23 +36,17 @@ pub struct SemanticVersion {
 /// - If the string is empty
 /// - If the string contains non-digit characters
 const fn const_parse_u32_range(bytes: &[u8], start: usize, end: usize) -> u32 {
-    if start >= end {
-        panic!("Cannot parse empty range as u32");
-    }
+    assert!(start < end, "Cannot parse empty range as u32");
 
     let mut result = 0u32;
     let mut i = start;
 
-    if bytes.is_empty() {
-        panic!("Can not parse empty string as u32");
-    }
+    assert!(!bytes.is_empty(), "End index out of bounds");
 
     while i < end {
         let byte = bytes[i];
 
-        if !byte.is_ascii_digit() {
-            panic!("Invalid digit in version number");
-        }
+        assert!(byte.is_ascii_digit(), "Invalid digit in version number");
 
         // ASCII '0' - '9' to 0-9
         let digit = bytes[i] - b'0';
@@ -95,12 +89,11 @@ const fn find_byte_pos_or_len(bytes: &[u8], target: u8) -> usize {
 const fn const_str_slice(s: &str, start: usize, end: usize) -> &str {
     let bytes = s.as_bytes();
 
-    if start > end {
-        panic!("Start index must be less than or equal to end index");
-    }
-    if end > bytes.len() {
-        panic!("End index out of bounds");
-    }
+    assert!(
+        start <= end,
+        "Start index must be less than or equal to end index"
+    );
+    assert!(end <= bytes.len(), "End index out of bounds");
 
     // SAFETY: Creating a slice within the bound of original byte slice.
     let slice = unsafe { core::slice::from_raw_parts(bytes.as_ptr().add(start), end - start) };

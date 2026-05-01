@@ -129,11 +129,10 @@ pub async fn create_directories(config: &SystemConfig) -> Result<(), IggyError> 
 pub fn create_root_user() -> User {
     let mut username = env::var(IGGY_ROOT_USERNAME_ENV);
     let mut password = env::var(IGGY_ROOT_PASSWORD_ENV);
-    if (username.is_ok() && password.is_err()) || (username.is_err() && password.is_ok()) {
-        panic!(
-            "When providing the custom root user credentials, both username and password must be set."
-        );
-    }
+    assert!(
+        !((username.is_ok() && password.is_err()) || (username.is_err() && password.is_ok())),
+        "When providing the custom root user credentials, both username and password must be set."
+    );
     if username.is_ok() && password.is_ok() {
         info!("Using the custom root user credentials.");
     } else {
@@ -146,21 +145,26 @@ pub fn create_root_user() -> User {
 
     let username = username.expect("Root username is not set.");
     let password = password.expect("Root password is not set.");
-    if username.is_empty() || password.is_empty() {
-        panic!("Root user credentials are not set.");
-    }
-    if username.len() < MIN_USERNAME_LENGTH {
-        panic!("Root username is too short.");
-    }
-    if username.len() > MAX_USERNAME_LENGTH {
-        panic!("Root username is too long.");
-    }
-    if password.len() < MIN_PASSWORD_LENGTH {
-        panic!("Root password is too short.");
-    }
-    if password.len() > MAX_PASSWORD_LENGTH {
-        panic!("Root password is too long.");
-    }
+    assert!(
+        !username.is_empty() && !password.is_empty(),
+        "Root user credentials cannot be empty."
+    );
+    assert!(
+        username.len() >= MIN_USERNAME_LENGTH,
+        "Root username is too short."
+    );
+    assert!(
+        username.len() <= MAX_USERNAME_LENGTH,
+        "Root username is too long."
+    );
+    assert!(
+        password.len() >= MIN_PASSWORD_LENGTH,
+        "Root password is too short."
+    );
+    assert!(
+        password.len() <= MAX_PASSWORD_LENGTH,
+        "Root password is too long."
+    );
 
     User::root(&username, &password)
 }

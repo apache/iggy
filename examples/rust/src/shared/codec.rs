@@ -102,9 +102,10 @@ impl Codec {
                     .read_to_end(&mut decompressed_data)
                     .expect("Cannot decode payload using Lz4.");
 
-                if bytes_read > MAX_PAYLOAD_SIZE as usize {
-                    panic!("Decompressed message exceeds MAX_PAYLOAD_SIZE!")
-                }
+                assert!(
+                    bytes_read <= MAX_PAYLOAD_SIZE as usize,
+                    "Decompressed message exceeds MAX_PAYLOAD_SIZE!"
+                );
                 decompressed_data
             }
         }
