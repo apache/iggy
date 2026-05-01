@@ -33,6 +33,7 @@ members = [
     "core/configs_derive",
     "core/connectors/runtime",
     "core/connectors/sdk",
+    "core/connectors/sinks/delta_sink",
     "core/connectors/sinks/elasticsearch_sink",
     "core/connectors/sinks/http_sink",
     "core/connectors/sinks/iceberg_sink",
@@ -133,6 +134,7 @@ cyper = { version = "0.8.3", features = ["rustls"], default-features = false }
 cyper-axum = { version = "0.8.0" }
 darling = "0.23"
 dashmap = "6.1.0"
+deltalake = { version = "0.32.0", features = ["azure", "gcs", "s3"] }
 derive-new = "0.7.0"
 derive_builder = "0.20.2"
 derive_more = { version = "2.1.1", features = ["full"] }
@@ -295,6 +297,7 @@ tungstenite = "0.29.0"
 twox-hash = { version = "2.1.2", features = ["xxhash32"] }
 ulid = "1.2.1"
 ureq = "3.3"
+url = "2.5.8"
 uuid = { version = "1.23.1", features = ["v4", "v7", "fast-rng", "serde", "zerocopy"] }
 vergen-git2 = { version = "9.1.0", features = ["build", "cargo", "rustc", "si"] }
 walkdir = "2.5.0"
