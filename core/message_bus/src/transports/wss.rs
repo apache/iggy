@@ -65,6 +65,7 @@ use super::ws::decode_consensus_frame;
 use super::{ActorContext, TransportConn};
 use crate::lifecycle::BusMessage;
 use bytes::Bytes;
+use compio::io::AsyncWrite;
 use compio::net::TcpStream;
 use compio::tls::{TlsAcceptor, TlsConnector, TlsStream};
 use compio::ws::tungstenite::{self, Message as WsMessage, protocol::WebSocketConfig};
@@ -429,14 +430,21 @@ async fn drive_close(
     label: &'static str,
     peer: &str,
 ) {
-    // WebSocketStream::close sends a Close frame; flush drains
-    // tungstenite's write buffer to the wire. Dropping the stream after
-    // closes the inner TLS layer (no explicit close_notify; WS Close is
-    // already a protocol-level shutdown signal accepted as a degraded
-    // TLS close).
+    // Three-step close: send the WS Close frame, drain tungstenite's
+    // write buffer, then drive the inner TLS layer's shutdown
+    // (close_notify + TCP `SHUT_WR`). Symmetric with `tcp_tls::drive_close`.
+    // RFC 8446 §6.1 treats a missing `close_notify` as a truncation
+    // hazard; relying on `WebSocketStream`'s Drop to tear down the TLS
+    // half silently elides it. `WebSocketStream::get_mut` returns a
+    // mutable borrow of the inner `TlsStream` without consuming the WS
+    // wrapper, so the WS layer's Drop still runs after `drive_close`
+    // returns. All three steps share a single `close_grace` budget;
+    // mid-elapse the function returns early and Drop closes whatever
+    // remains.
     if compio::time::timeout(close_grace, async {
         let _ = ws.close(None).await;
         let _ = ws.flush().await;
+        let _ = ws.get_mut().shutdown().await;
     })
     .await
     .is_err()
