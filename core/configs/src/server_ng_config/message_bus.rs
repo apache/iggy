@@ -193,6 +193,52 @@ impl Validatable<ConfigurationError> for MessageBusConfig {
             eprintln!("{COMPONENT_NG} message_bus.handshake_grace must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        if self.close_grace.as_micros() == 0 {
+            eprintln!("{COMPONENT_NG} message_bus.close_grace must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.close_peer_timeout.as_micros() == 0 {
+            eprintln!("{COMPONENT_NG} message_bus.close_peer_timeout must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.reconnect_period.as_micros() == 0 {
+            eprintln!("{COMPONENT_NG} message_bus.reconnect_period must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        // WS frame chain: ws_max_frame_size <= ws_max_message_size <=
+        // max_message_size. The `Option<...>` knobs only enforce a ceiling
+        // when present; an absent value defers to tungstenite's default
+        // (which is itself <= 64 MiB and so satisfies the chain in practice).
+        if let (Some(frame), Some(message)) = (self.ws_max_frame_size, self.ws_max_message_size)
+            && frame.as_bytes_u64() > message.as_bytes_u64()
+        {
+            eprintln!(
+                "{COMPONENT_NG} message_bus.ws_max_frame_size ({}) exceeds ws_max_message_size ({})",
+                frame.as_bytes_u64(),
+                message.as_bytes_u64()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if let Some(message) = self.ws_max_message_size
+            && message.as_bytes_u64() > self.max_message_size.as_bytes_u64()
+        {
+            eprintln!(
+                "{COMPONENT_NG} message_bus.ws_max_message_size ({}) exceeds max_message_size ({})",
+                message.as_bytes_u64(),
+                self.max_message_size.as_bytes_u64()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if let Some(frame) = self.ws_max_frame_size
+            && frame.as_bytes_u64() > self.max_message_size.as_bytes_u64()
+        {
+            eprintln!(
+                "{COMPONENT_NG} message_bus.ws_max_frame_size ({}) exceeds max_message_size ({})",
+                frame.as_bytes_u64(),
+                self.max_message_size.as_bytes_u64()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         Ok(())
     }
 }
@@ -253,5 +299,59 @@ mod tests {
     #[test]
     fn iov_max_limit_matches_runtime_crate() {
         assert_eq!(IOV_MAX_LIMIT_NG, 512);
+    }
+
+    #[test]
+    fn rejects_zero_close_grace() {
+        let mut c = baseline();
+        c.close_grace = IggyDuration::from(std::time::Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_close_peer_timeout() {
+        let mut c = baseline();
+        c.close_peer_timeout = IggyDuration::from(std::time::Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_reconnect_period() {
+        let mut c = baseline();
+        c.reconnect_period = IggyDuration::from(std::time::Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_ws_frame_size_above_ws_message_size() {
+        let mut c = baseline();
+        c.ws_max_message_size = Some(IggyByteSize::from(1024_u64));
+        c.ws_max_frame_size = Some(IggyByteSize::from(2048_u64));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_ws_message_size_above_bus_max_message_size() {
+        let mut c = baseline();
+        c.max_message_size = IggyByteSize::from(1024_u64);
+        c.ws_max_message_size = Some(IggyByteSize::from(2048_u64));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_ws_frame_size_above_bus_max_message_size() {
+        let mut c = baseline();
+        c.max_message_size = IggyByteSize::from(1024_u64);
+        c.ws_max_frame_size = Some(IggyByteSize::from(2048_u64));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_ws_chain_in_ascending_order() {
+        let mut c = baseline();
+        c.max_message_size = IggyByteSize::from(64_u64 * 1024 * 1024);
+        c.ws_max_message_size = Some(IggyByteSize::from(32_u64 * 1024 * 1024));
+        c.ws_max_frame_size = Some(IggyByteSize::from(16_u64 * 1024 * 1024));
+        assert!(c.validate().is_ok());
     }
 }

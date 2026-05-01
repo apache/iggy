@@ -191,6 +191,17 @@ pub struct MessageBusConfig {
 impl From<&ServerNgConfig> for MessageBusConfig {
     fn from(cfg: &ServerNgConfig) -> Self {
         let bus = &cfg.message_bus;
+        // Production load goes through `ServerNgConfig::validate()`, which
+        // already exercises `bus.validate()`. This debug-assert catches
+        // direct callers (tests, simulators) that build a `ServerNgConfig`
+        // by hand and forget to validate before converting.
+        debug_assert!(
+            <configs::message_bus::MessageBusConfig as iggy_common::Validatable<
+                configs::ConfigurationError,
+            >>::validate(bus)
+            .is_ok(),
+            "MessageBusConfig::from(&ServerNgConfig) called on an unvalidated bus config",
+        );
         Self {
             max_batch: bus.max_batch,
             max_message_size: usize::try_from(bus.max_message_size.as_bytes_u64())
