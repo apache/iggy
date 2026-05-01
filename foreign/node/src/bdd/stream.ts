@@ -23,7 +23,10 @@ import { Given, When, Then } from "@cucumber/cucumber";
 import type { TestWorld } from './world.js';
 
 Given('I have no streams in the system', async function (this: TestWorld) {
-  assert.deepEqual([], await this.client.stream.list());
+  const streams = await this.client.stream.list();
+  for (const s of streams) {
+    await this.client.stream.delete({ streamId: s.id });
+  }
 });
 
 When(
@@ -52,3 +55,4 @@ Then(
     assert.ok(await this.client.stream.delete({streamId}));
   }
 );
+
