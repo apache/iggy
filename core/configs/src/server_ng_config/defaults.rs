@@ -41,9 +41,7 @@ use crate::server_config::server::{
     PersonalAccessTokenConfig, TelemetryConfig,
 };
 use crate::server_config::system::SystemConfig;
-use iggy_common::{IggyByteSize, IggyDuration};
 use std::sync::Arc;
-use std::time::Duration;
 
 static_toml::static_toml! {
     // static_toml resolves relative to CARGO_MANIFEST_DIR (core/configs/).

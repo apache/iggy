@@ -54,10 +54,11 @@ pub fn install_client_quic(
     on_request: RequestHandler,
 ) {
     let (connection, streams) = accepted.into_parts();
+    let close_grace = bus.config().close_grace;
     install_client_conn(
         bus,
         meta,
-        QuicTransportConn::new(connection, streams),
+        QuicTransportConn::new(connection, streams).with_close_grace(close_grace),
         on_request,
     );
 }
