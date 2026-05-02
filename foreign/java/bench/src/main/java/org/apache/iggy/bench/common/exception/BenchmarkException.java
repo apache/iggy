@@ -17,7 +17,7 @@
  * under the License.
  */
 
-package org.apache.iggy.bench.exception;
+package org.apache.iggy.bench.common.exception;
 
 public class BenchmarkException extends RuntimeException {
 

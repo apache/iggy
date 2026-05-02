@@ -17,8 +17,25 @@
  * under the License.
  */
 
-package org.apache.iggy.bench.models.provision;
+package org.apache.iggy.bench.common.enums;
 
-import java.util.List;
+public enum ActorKind {
+    PRODUCER("producer"),
+    CONSUMER("consumer"),
+    PRODUCING_CONSUMER("producing_consumer");
 
-public record ProvisionedResources(List<String> streamNames, List<String> topicNames) {}
+    private final String value;
+
+    ActorKind(String value) {
+        this.value = value;
+    }
+
+    public String value() {
+        return value;
+    }
+
+    @Override
+    public String toString() {
+        return value;
+    }
+}
