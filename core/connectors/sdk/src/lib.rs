@@ -417,7 +417,7 @@ pub enum Error {
     #[error("Permanent HTTP error: {0}")]
     PermanentHttpError(String),
     /// The source schema could not be mapped to the destination schema.
-    /// Indicates a table definition or configuration problem — not a data issue.
+    /// Indicates a table definition or configuration problem
     #[error("Schema mismatch: {0}")]
     SchemaMismatch(String),
     /// An I/O failure while writing data (e.g. Parquet serialization, file
