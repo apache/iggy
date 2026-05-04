@@ -518,7 +518,7 @@ mod tests {
     use compio_quic::ClientBuilder;
     use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
     use iggy_binary_protocol::consensus::iobuf::Frozen;
-    use iggy_binary_protocol::{Command2, HEADER_SIZE};
+    use iggy_binary_protocol::{Command2, HEADER_SIZE, SIZE_FIELD_OFFSET};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use std::time::Duration;
 
@@ -664,12 +664,12 @@ mod tests {
             .expect("connect");
         let connection = connecting.await.expect("handshake");
         let (mut send, recv) = connection.open_bi_wait().await.expect("open_bi");
-        // Bogus oversize size field at offset 48.
+        // Bogus oversize size field at SIZE_FIELD_OFFSET.
         let mut buf = vec![0u8; HEADER_SIZE];
         let bogus = u32::try_from(framing::MAX_MESSAGE_SIZE + 1)
             .unwrap_or(u32::MAX)
             .to_le_bytes();
-        buf[48..52].copy_from_slice(&bogus);
+        buf[SIZE_FIELD_OFFSET..SIZE_FIELD_OFFSET + 4].copy_from_slice(&bogus);
         let BufResult(result, _) = send.write(buf).await;
         result.expect("write");
         send.flush().await.expect("flush");

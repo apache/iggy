@@ -80,7 +80,7 @@ use compio::ws::WebSocketStream;
 use compio::ws::tungstenite::{self, Message as WsMessage};
 use futures::FutureExt;
 use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::{GenericHeader, Message};
+use iggy_binary_protocol::{GenericHeader, Message, read_size_field};
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -107,11 +107,7 @@ pub(in crate::transports) fn decode_consensus_frame(
     if body.len() < iggy_binary_protocol::HEADER_SIZE {
         return Err(FrameDecodeError::BadHeader);
     }
-    let total_size = u32::from_le_bytes(
-        body[48..52]
-            .try_into()
-            .map_err(|_| FrameDecodeError::BadHeader)?,
-    ) as usize;
+    let total_size = read_size_field(body).ok_or(FrameDecodeError::BadHeader)? as usize;
     if !(iggy_binary_protocol::HEADER_SIZE..=max_message_size).contains(&total_size)
         || total_size != body.len()
     {

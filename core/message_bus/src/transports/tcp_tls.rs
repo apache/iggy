@@ -84,7 +84,7 @@ use compio::tls::{TlsAcceptor, TlsConnector, TlsStream};
 use futures::FutureExt;
 use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
 use iggy_binary_protocol::consensus::iobuf::Owned;
-use iggy_binary_protocol::{GenericHeader, HEADER_SIZE, Message};
+use iggy_binary_protocol::{GenericHeader, HEADER_SIZE, Message, read_size_field};
 use iggy_common::IggyError;
 use rustls::pki_types::ServerName;
 use std::cell::UnsafeCell;
@@ -416,11 +416,7 @@ async fn read_step(
     // frame or grow the accumulator for the body.
     if !state.have_header && new_filled >= HEADER_SIZE {
         let bytes = state.acc.as_init();
-        let total_size = u32::from_le_bytes(
-            bytes[48..52]
-                .try_into()
-                .map_err(|_| IggyError::InvalidCommand)?,
-        ) as usize;
+        let total_size = read_size_field(bytes).ok_or(IggyError::InvalidCommand)? as usize;
         if !(HEADER_SIZE..=max_message_size).contains(&total_size) {
             return Err(IggyError::InvalidCommand);
         }

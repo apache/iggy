@@ -294,7 +294,7 @@ mod tests {
     use async_channel::bounded;
     use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
     use iggy_binary_protocol::consensus::iobuf::Frozen;
-    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, Message};
+    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, Message, SIZE_FIELD_OFFSET};
     use std::time::Duration;
 
     #[allow(clippy::cast_possible_truncation)]
@@ -413,7 +413,7 @@ mod tests {
         let bogus = u32::try_from(framing::MAX_MESSAGE_SIZE + 1)
             .unwrap_or(u32::MAX)
             .to_le_bytes();
-        buf[48..52].copy_from_slice(&bogus);
+        buf[SIZE_FIELD_OFFSET..SIZE_FIELD_OFFSET + 4].copy_from_slice(&bogus);
         client.write_all(buf).await.0.unwrap();
 
         let recv = compio::time::timeout(Duration::from_secs(2), server_in.recv()).await;
