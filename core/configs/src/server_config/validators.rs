@@ -20,8 +20,7 @@
 use super::COMPONENT;
 use super::cluster::ClusterConfig;
 use super::server::{
-    DataMaintenanceConfig, ExtraConfig, MessageSaverConfig, MessagesMaintenanceConfig,
-    NamespaceConfig, TelemetryConfig,
+    DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, TelemetryConfig,
 };
 use super::server::{MemoryPoolConfig, PersonalAccessTokenConfig, ServerConfig};
 use super::sharding::{CpuAllocation, ShardingConfig};
@@ -33,7 +32,6 @@ use iggy_common::CompressionAlgorithm;
 use iggy_common::IggyExpiry;
 use iggy_common::MaxTopicSize;
 use iggy_common::Validatable;
-use iggy_common::sharding::IggyNamespace;
 use std::thread::available_parallelism;
 use tracing::warn;
 
@@ -78,9 +76,6 @@ impl Validatable<ConfigurationError> for ServerConfig {
                     "{COMPONENT} (error: {e}) - failed to validate personal access token config"
                 )
             })?;
-        self.extra.validate().error(|e: &ConfigurationError| {
-            format!("{COMPONENT} (error: {e}) - failed to validate extra config")
-        })?;
         self.system
             .segment
             .validate()
@@ -165,26 +160,6 @@ impl Validatable<ConfigurationError> for ServerConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for ExtraConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        self.namespace.validate().error(|e: &ConfigurationError| {
-            format!("{COMPONENT} (error: {e}) - failed to validate namespace config")
-        })?;
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for NamespaceConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        IggyNamespace::validate_capacity(self.max_streams, self.max_topics, self.max_partitions)
-            .map_err(|error| {
-                eprintln!("extra.namespace is invalid: {error}");
-                ConfigurationError::InvalidConfigurationValue
-            })?;
         Ok(())
     }
 }
