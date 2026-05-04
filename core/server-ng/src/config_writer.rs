@@ -20,7 +20,7 @@
 use crate::server_error::ServerNgError;
 use compio::fs::OpenOptions;
 use compio::io::AsyncWriteAtExt;
-use configs::server::ServerConfig;
+use configs::server_ng::ServerNgConfig;
 use std::net::SocketAddr;
 
 /// Write the runtime `current_config.toml` file with the effective bound ports.
@@ -30,7 +30,7 @@ use std::net::SocketAddr;
 /// Returns an error if the config cannot be serialized or if the runtime
 /// config file cannot be written and synced.
 pub async fn write_current_config(
-    config: &ServerConfig,
+    config: &ServerNgConfig,
     current_replica_id: Option<u8>,
     bound_tcp: Option<SocketAddr>,
     bound_replica: Option<SocketAddr>,

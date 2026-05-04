@@ -20,7 +20,7 @@ use super::cluster::{ClusterConfig, ClusterNodeConfig, TransportPorts};
 use super::http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig};
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use super::server::{
-    ConsumerGroupConfig, DataMaintenanceConfig, ExtraConfig, HeartbeatConfig, MemoryPoolConfig,
+    ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig,
     MessageSaverConfig, MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig,
     PersonalAccessTokenConfig, ServerConfig, TelemetryConfig, TelemetryLogsConfig,
     TelemetryTracesConfig,
@@ -49,7 +49,6 @@ impl Default for ServerConfig {
         ServerConfig {
             consumer_group: ConsumerGroupConfig::default(),
             data_maintenance: DataMaintenanceConfig::default(),
-            extra: ExtraConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             message_saver: MessageSaverConfig::default(),
             personal_access_token: PersonalAccessTokenConfig::default(),

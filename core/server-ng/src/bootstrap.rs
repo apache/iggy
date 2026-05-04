@@ -19,7 +19,7 @@
 
 use crate::config_writer::write_current_config;
 use crate::server_error::ServerNgError;
-use configs::server::ServerConfig;
+use configs::server_ng::ServerNgConfig;
 use consensus::{LocalPipeline, PartitionsHandle, Sequencer, VsrConsensus};
 use iggy_binary_protocol::RequestHeader;
 use iggy_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
@@ -31,11 +31,10 @@ use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
 use message_bus::client_listener::{self, RequestHandler};
 use message_bus::installer;
-use message_bus::replica_io;
-use message_bus::replica_listener::MessageHandler;
-use message_bus::{
-    AcceptedClientFn, AcceptedReplicaFn, IggyMessageBus, connector, replica_listener,
-};
+use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
+use message_bus::replica::io as replica_io;
+use message_bus::replica::listener::{self as replica_listener, MessageHandler};
+use message_bus::{AcceptedClientFn, AcceptedReplicaFn, IggyMessageBus, connector};
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
@@ -70,7 +69,6 @@ const CLUSTER_ID: u128 = 1;
 const SHARD_ID: u16 = 0;
 const SHARD_REPLICA_ID: u8 = 0;
 const SHARD_NAME: &str = "server-ng-shard-0";
-const DEFAULT_CONFIG_PATH: &str = "core/server-ng/config.toml";
 const SHARD_INBOX_CAPACITY: usize = 1024;
 
 type ServerNgMuxStateMachine = MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>;
@@ -101,7 +99,7 @@ struct TcpTopology {
 pub trait RunServerNg {
     fn run(
         &self,
-        config: &ServerConfig,
+        config: &ServerNgConfig,
         current_replica_id: Option<u8>,
     ) -> impl Future<Output = Result<(), ServerNgError>>;
 }
@@ -115,7 +113,7 @@ impl RunServerNg for Rc<ServerNgShard> {
     /// addresses cannot be resolved from config.
     async fn run(
         &self,
-        config: &ServerConfig,
+        config: &ServerNgConfig,
         current_replica_id: Option<u8>,
     ) -> Result<(), ServerNgError> {
         let topology = resolve_tcp_topology(config, current_replica_id)?;
@@ -156,8 +154,8 @@ impl RunServerNg for Rc<ServerNgShard> {
 ///
 /// Returns an error if config loading, directory preparation, or logging
 /// setup fails.
-pub async fn load_config(logging: &mut Logging) -> Result<ServerConfig, ServerNgError> {
-    let config = ServerConfig::load_with_path(DEFAULT_CONFIG_PATH, include_str!("../config.toml"))
+pub async fn load_config(logging: &mut Logging) -> Result<ServerNgConfig, ServerNgError> {
+    let config = ServerNgConfig::load()
         .await
         .map_err(ServerNgError::Config)?;
     // TODO: decouple directory bootstrap from the `server` crate.
@@ -182,11 +180,11 @@ pub async fn load_config(logging: &mut Logging) -> Result<ServerConfig, ServerNg
 /// Returns an error if metadata recovery, consensus restoration, or
 /// partition hydration fails.
 pub async fn bootstrap(
-    config: &ServerConfig,
+    config: &ServerNgConfig,
     current_replica_id: Option<u8>,
 ) -> Result<Rc<ServerNgShard>, ServerNgError> {
     let topology = resolve_tcp_topology(config, current_replica_id)?;
-    let bus = Rc::new(IggyMessageBus::new(SHARD_ID));
+    let bus = Rc::new(IggyMessageBus::with_config(SHARD_ID, config));
     let recovered = recover::<ServerNgMuxStateMachine>(Path::new(&config.system.path))
         .await
         .map_err(ServerNgError::MetadataRecovery)?;
@@ -249,7 +247,7 @@ fn restore_metadata_consensus(
 }
 
 async fn build_single_shard(
-    config: &ServerConfig,
+    config: &ServerNgConfig,
     topology: &TcpTopology,
     metadata: ServerNgMetadata,
     bus: Rc<IggyMessageBus>,
@@ -351,7 +349,7 @@ async fn build_single_shard(
 }
 
 const fn validate_recovered_namespace(
-    config: &ServerConfig,
+    config: &ServerNgConfig,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
@@ -375,7 +373,7 @@ const fn validate_recovered_namespace(
 }
 
 async fn load_partition(
-    config: &ServerConfig,
+    config: &ServerNgConfig,
     namespace: IggyNamespace,
     topic_stats: Arc<TopicStats>,
     partition_metadata: &Partition,
@@ -456,7 +454,7 @@ async fn load_partition(
 
 async fn hydrate_partition_log(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
-    config: &ServerConfig,
+    config: &ServerNgConfig,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
@@ -581,7 +579,7 @@ async fn load_segment_max_timestamp(
 
 fn configure_consumer_offsets(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
-    config: &ServerConfig,
+    config: &ServerNgConfig,
     namespace: IggyNamespace,
     current_offset: u64,
 ) {
@@ -635,7 +633,7 @@ fn configure_consumer_offsets(
 
 async fn ensure_initial_segment(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
-    config: &ServerConfig,
+    config: &ServerNgConfig,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
@@ -700,7 +698,7 @@ async fn ensure_initial_segment(
 }
 
 fn resolve_tcp_topology(
-    config: &ServerConfig,
+    config: &ServerNgConfig,
     current_replica_id: Option<u8>,
 ) -> Result<TcpTopology, ServerNgError> {
     let default_client_addr = parse_socket_addr("tcp.address", &config.tcp.address)?;
@@ -778,7 +776,7 @@ fn resolve_tcp_topology(
 
 async fn start_tcp_runtime(
     shard: &Rc<ServerNgShard>,
-    config: &ServerConfig,
+    config: &ServerNgConfig,
     topology: &TcpTopology,
     accepted_replica: AcceptedReplicaFn,
     accepted_client: AcceptedClientFn,
@@ -799,7 +797,7 @@ async fn start_tcp_runtime(
 
 async fn start_cluster_tcp_runtime(
     shard: &Rc<ServerNgShard>,
-    config: &ServerConfig,
+    config: &ServerNgConfig,
     topology: &TcpTopology,
     accepted_replica: AcceptedReplicaFn,
     accepted_client: AcceptedClientFn,
@@ -844,6 +842,7 @@ async fn start_cluster_tcp_runtime(
         .map_err(ServerNgError::StartTcpListeners)?;
     let token = shard.bus.token();
     let max_message_size = shard.bus.config().max_message_size;
+    let handshake_grace = shard.bus.config().handshake_grace;
     let self_replica_id = topology.self_replica_id;
     let replica_count = topology.replica_count;
     let accepted_replica_for_listener = accepted_replica.clone();
@@ -856,6 +855,7 @@ async fn start_cluster_tcp_runtime(
             replica_count,
             accepted_replica_for_listener,
             max_message_size,
+            handshake_grace,
         )
         .await;
     });
@@ -888,7 +888,7 @@ async fn start_cluster_tcp_runtime(
 
 async fn start_single_node_tcp_runtime(
     shard: &Rc<ServerNgShard>,
-    config: &ServerConfig,
+    config: &ServerNgConfig,
     topology: &TcpTopology,
     accepted_client: AcceptedClientFn,
 ) -> Result<(), ServerNgError> {
@@ -897,12 +897,12 @@ async fn start_single_node_tcp_runtime(
         return Ok(());
     }
 
-    let (listener, bound_addr) = client_listener::bind(topology.client_listen_addr)
+    let (listener, bound_addr) = client_listener::tcp::bind(topology.client_listen_addr)
         .await
         .map_err(ServerNgError::StartTcpListeners)?;
     let token = shard.bus.token();
     let client_handle = compio::runtime::spawn(async move {
-        client_listener::run(listener, token, accepted_client).await;
+        client_listener::tcp::run(listener, token, accepted_client).await;
     });
     shard.bus.track_background(client_handle);
     write_current_config(
@@ -989,7 +989,7 @@ fn make_local_replica_accept_fn(
 ) -> AcceptedReplicaFn {
     let bus = Rc::clone(bus);
     Rc::new(move |stream, peer_id| {
-        installer::install_replica_stream(&bus, peer_id, stream, on_message.clone());
+        installer::install_replica_tcp(&bus, peer_id, stream, on_message.clone());
     })
 }
 
@@ -1004,7 +1004,15 @@ fn make_local_client_accept_fn(
         let seq = counter.get();
         counter.set(seq.wrapping_add(1));
         let client_id = (shard_id << 112) | seq;
-        installer::install_client_stream(&bus, client_id, stream, on_request.clone());
+        let peer_addr = match stream.peer_addr() {
+            Ok(peer_addr) => peer_addr,
+            Err(error) => {
+                warn!(client_id, error = %error, "dropping accepted client with unknown peer address");
+                return;
+            }
+        };
+        let meta = ClientConnMeta::new(client_id, peer_addr, ClientTransportKind::Tcp);
+        installer::install_client_tcp(&bus, meta, stream, on_request.clone());
     })
 }
 

@@ -28,9 +28,10 @@
 //! net.
 
 use super::COMPONENT_NG;
-use super::server_ng::ServerNgConfig;
+use super::server_ng::{ExtraConfig, NamespaceConfig, ServerNgConfig};
 use crate::ConfigurationError;
 use err_trail::ErrContext;
+use iggy_common::sharding::IggyNamespace;
 use iggy_common::{IggyExpiry, MaxTopicSize, Validatable};
 
 impl Validatable<ConfigurationError> for ServerNgConfig {
@@ -53,6 +54,9 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
                     "{COMPONENT_NG} (error: {e}) - failed to validate personal access token config"
                 )
             })?;
+        self.extra.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT_NG} (error: {e}) - failed to validate extra config")
+        })?;
         self.system
             .segment
             .validate()
@@ -129,6 +133,26 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
             format!("{COMPONENT_NG} (error: {e}) - failed to validate quic config")
         })?;
 
+        Ok(())
+    }
+}
+
+impl Validatable<ConfigurationError> for ExtraConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
+        self.namespace.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT_NG} (error: {e}) - failed to validate namespace config")
+        })?;
+        Ok(())
+    }
+}
+
+impl Validatable<ConfigurationError> for NamespaceConfig {
+    fn validate(&self) -> Result<(), ConfigurationError> {
+        IggyNamespace::validate_capacity(self.max_streams, self.max_topics, self.max_partitions)
+            .map_err(|error| {
+                eprintln!("extra.namespace is invalid: {error}");
+                ConfigurationError::InvalidConfigurationValue
+            })?;
         Ok(())
     }
 }
