@@ -6814,6 +6814,7 @@ name = "iggy_connector_sdk"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "apache-avro",
  "async-trait",
  "base64 0.22.1",
  "dashmap",
