@@ -76,8 +76,14 @@ pub enum ServerNgError {
         #[source]
         source: iggy_common::IggyError,
     },
-    #[error("failed to start server-ng TCP listeners")]
-    StartTcpListeners(#[source] iggy_common::IggyError),
+    #[error("failed to load {transport} listener credentials")]
+    ListenerCredentials {
+        transport: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to start server-ng listeners")]
+    StartListeners(#[source] iggy_common::IggyError),
     #[error(
         "failed to initialize messages writer for stream {stream_id}, topic {topic_id}, partition {partition_id}"
     )]

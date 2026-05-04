@@ -34,14 +34,23 @@ pub async fn write_current_config(
     current_replica_id: Option<u8>,
     bound_tcp: Option<SocketAddr>,
     bound_replica: Option<SocketAddr>,
+    bound_tcp_tls: Option<SocketAddr>,
+    bound_quic: Option<SocketAddr>,
+    bound_websocket: Option<SocketAddr>,
 ) -> Result<(), ServerNgError> {
     let mut current_config = config.clone();
 
-    if let Some(bound_tcp) = bound_tcp {
+    if let Some(bound_client_tcp) = bound_tcp_tls.or(bound_tcp) {
         // Keep parity with the current server binary: integration harnesses
         // read `tcp.address` from `runtime/current_config.toml` to discover
         // the actual port chosen by the OS when binding to port 0.
-        current_config.tcp.address = bound_tcp.to_string();
+        current_config.tcp.address = bound_client_tcp.to_string();
+    }
+    if let Some(bound_quic) = bound_quic {
+        current_config.quic.address = bound_quic.to_string();
+    }
+    if let Some(bound_websocket) = bound_websocket {
+        current_config.websocket.address = bound_websocket.to_string();
     }
 
     if current_config.cluster.enabled
@@ -53,11 +62,17 @@ pub async fn write_current_config(
             .iter_mut()
             .find(|node| node.replica_id == replica_id)
             .ok_or(ServerNgError::ClusterNodeNotFound { replica_id })?;
-        if let Some(bound_tcp) = bound_tcp {
-            node.ports.tcp = Some(bound_tcp.port());
+        if let Some(bound_client_tcp) = bound_tcp_tls.or(bound_tcp) {
+            node.ports.tcp = Some(bound_client_tcp.port());
         }
         if let Some(bound_replica) = bound_replica {
             node.ports.tcp_replica = Some(bound_replica.port());
+        }
+        if let Some(bound_quic) = bound_quic {
+            node.ports.quic = Some(bound_quic.port());
+        }
+        if let Some(bound_websocket) = bound_websocket {
+            node.ports.websocket = Some(bound_websocket.port());
         }
     }
 

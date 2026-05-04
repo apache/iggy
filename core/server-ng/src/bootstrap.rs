@@ -30,11 +30,20 @@ use iggy_common::{
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
 use message_bus::client_listener::{self, RequestHandler};
+use message_bus::fd_transfer;
 use message_bus::installer;
+use message_bus::installer::ConnectionInstaller;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::io as replica_io;
 use message_bus::replica::listener::{self as replica_listener, MessageHandler};
-use message_bus::{AcceptedClientFn, AcceptedReplicaFn, IggyMessageBus, connector};
+use message_bus::transports::quic::server_config_with_cert;
+use message_bus::transports::tls::{
+    TlsServerCredentials, install_default_crypto_provider, load_pem, self_signed_for_loopback,
+};
+use message_bus::{
+    AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
+    AcceptedWsClientFn, IggyMessageBus, connector,
+};
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
@@ -93,7 +102,25 @@ struct TcpTopology {
     replica_count: u8,
     client_listen_addr: SocketAddr,
     replica_listen_addr: Option<SocketAddr>,
+    ws_listen_addr: Option<SocketAddr>,
+    quic_listen_addr: Option<SocketAddr>,
+    tcp_tls_listen_addr: Option<SocketAddr>,
     peers: Vec<(u8, SocketAddr)>,
+}
+
+struct LocalClientAcceptFns {
+    tcp: AcceptedClientFn,
+    ws: AcceptedWsClientFn,
+    quic: AcceptedQuicClientFn,
+    tcp_tls: AcceptedTlsClientFn,
+}
+
+#[derive(Default)]
+struct BoundClientListeners {
+    tcp: Option<SocketAddr>,
+    tcp_tls: Option<SocketAddr>,
+    ws: Option<SocketAddr>,
+    quic: Option<SocketAddr>,
 }
 
 pub trait RunServerNg {
@@ -127,7 +154,7 @@ impl RunServerNg for Rc<ServerNgShard> {
         let on_replica_message = make_replica_message_handler(self);
         let on_client_request = make_client_request_handler(self);
         let accepted_replica = make_local_replica_accept_fn(&self.bus, on_replica_message);
-        let accepted_client = make_local_client_accept_fn(&self.bus, on_client_request);
+        let accepted_client = make_local_client_accept_fns(&self.bus, on_client_request);
 
         info!(
             shard = self.id,
@@ -702,6 +729,13 @@ fn resolve_tcp_topology(
     current_replica_id: Option<u8>,
 ) -> Result<TcpTopology, ServerNgError> {
     let default_client_addr = parse_socket_addr("tcp.address", &config.tcp.address)?;
+    let default_ws_addr = resolve_optional_listener_addr(
+        config.websocket.enabled,
+        "websocket.address",
+        &config.websocket.address,
+    )?;
+    let default_quic_addr =
+        resolve_optional_listener_addr(config.quic.enabled, "quic.address", &config.quic.address)?;
     if !config.cluster.enabled {
         return Ok(TcpTopology {
             // Keep parity with the current server binary and the integration
@@ -710,7 +744,10 @@ fn resolve_tcp_topology(
             self_replica_id: SHARD_REPLICA_ID,
             replica_count: 1,
             client_listen_addr: default_client_addr,
-            replica_listen_addr: None,
+            replica_listen_addr: Some(SocketAddr::new(default_client_addr.ip(), 0)),
+            ws_listen_addr: default_ws_addr,
+            quic_listen_addr: default_quic_addr,
+            tcp_tls_listen_addr: config.tcp.tls.enabled.then_some(default_client_addr),
             peers: Vec::new(),
         });
     }
@@ -730,12 +767,12 @@ fn resolve_tcp_topology(
             count: config.cluster.nodes.len(),
         }
     })?;
-    let client_port = self_node
-        .ports
-        .tcp
-        .unwrap_or_else(|| default_client_addr.port());
-    let client_listen_addr =
-        socket_addr_from_parts("cluster.nodes[*].ports.tcp", &self_node.ip, client_port)?;
+    let (client_listen_addr, ws_listen_addr, quic_listen_addr) = resolve_cluster_client_addrs(
+        self_node,
+        default_client_addr,
+        default_ws_addr,
+        default_quic_addr,
+    )?;
     let replica_port =
         self_node
             .ports
@@ -748,8 +785,77 @@ fn resolve_tcp_topology(
         &self_node.ip,
         replica_port,
     )?);
-    let mut peers = Vec::with_capacity(config.cluster.nodes.len().saturating_sub(1));
-    for node in &config.cluster.nodes {
+    let peers = resolve_cluster_replica_peers(&config.cluster.nodes, self_replica_id)?;
+
+    Ok(TcpTopology {
+        self_replica_id,
+        replica_count,
+        client_listen_addr,
+        replica_listen_addr,
+        ws_listen_addr,
+        quic_listen_addr,
+        tcp_tls_listen_addr: config.tcp.tls.enabled.then_some(client_listen_addr),
+        peers,
+    })
+}
+
+fn resolve_optional_listener_addr(
+    enabled: bool,
+    context: &'static str,
+    address: &str,
+) -> Result<Option<SocketAddr>, ServerNgError> {
+    if enabled {
+        return Ok(Some(parse_socket_addr(context, address)?));
+    }
+    Ok(None)
+}
+
+fn resolve_cluster_client_addrs(
+    self_node: &configs::cluster::ClusterNodeConfig,
+    default_client_addr: SocketAddr,
+    default_ws_addr: Option<SocketAddr>,
+    default_quic_addr: Option<SocketAddr>,
+) -> Result<(SocketAddr, Option<SocketAddr>, Option<SocketAddr>), ServerNgError> {
+    let client_port = self_node
+        .ports
+        .tcp
+        .unwrap_or_else(|| default_client_addr.port());
+    let client_listen_addr =
+        socket_addr_from_parts("cluster.nodes[*].ports.tcp", &self_node.ip, client_port)?;
+    let ws_listen_addr = resolve_cluster_optional_addr(
+        self_node,
+        "cluster.nodes[*].ports.websocket",
+        default_ws_addr,
+        |ports| ports.websocket,
+    )?;
+    let quic_listen_addr = resolve_cluster_optional_addr(
+        self_node,
+        "cluster.nodes[*].ports.quic",
+        default_quic_addr,
+        |ports| ports.quic,
+    )?;
+    Ok((client_listen_addr, ws_listen_addr, quic_listen_addr))
+}
+
+fn resolve_cluster_optional_addr(
+    self_node: &configs::cluster::ClusterNodeConfig,
+    context: &'static str,
+    default_addr: Option<SocketAddr>,
+    port_selector: impl Fn(&configs::cluster::TransportPorts) -> Option<u16>,
+) -> Result<Option<SocketAddr>, ServerNgError> {
+    let Some(default_addr) = default_addr else {
+        return Ok(None);
+    };
+    let port = port_selector(&self_node.ports).unwrap_or_else(|| default_addr.port());
+    socket_addr_from_parts(context, &self_node.ip, port).map(Some)
+}
+
+fn resolve_cluster_replica_peers(
+    nodes: &[configs::cluster::ClusterNodeConfig],
+    self_replica_id: u8,
+) -> Result<Vec<(u8, SocketAddr)>, ServerNgError> {
+    let mut peers = Vec::with_capacity(nodes.len().saturating_sub(1));
+    for node in nodes {
         if node.replica_id == self_replica_id {
             continue;
         }
@@ -764,14 +870,7 @@ fn resolve_tcp_topology(
             socket_addr_from_parts("cluster.nodes[*].ports.tcp_replica", &node.ip, replica_port)?,
         ));
     }
-
-    Ok(TcpTopology {
-        self_replica_id,
-        replica_count,
-        client_listen_addr,
-        replica_listen_addr,
-        peers,
-    })
+    Ok(peers)
 }
 
 async fn start_tcp_runtime(
@@ -779,144 +878,187 @@ async fn start_tcp_runtime(
     config: &ServerNgConfig,
     topology: &TcpTopology,
     accepted_replica: AcceptedReplicaFn,
-    accepted_client: AcceptedClientFn,
+    accepted_clients: LocalClientAcceptFns,
 ) -> Result<(), ServerNgError> {
-    if config.cluster.enabled {
-        return start_cluster_tcp_runtime(
-            shard,
-            config,
-            topology,
-            accepted_replica,
-            accepted_client,
-        )
-        .await;
+    if config.tcp.enabled && !config.tcp.tls.enabled {
+        return start_via_replica_io(shard, config, topology, accepted_replica, accepted_clients)
+            .await;
     }
 
-    start_single_node_tcp_runtime(shard, config, topology, accepted_client).await
+    start_manual_runtime(shard, config, topology, accepted_replica, accepted_clients).await
 }
 
-async fn start_cluster_tcp_runtime(
+async fn start_via_replica_io(
     shard: &Rc<ServerNgShard>,
     config: &ServerNgConfig,
     topology: &TcpTopology,
     accepted_replica: AcceptedReplicaFn,
-    accepted_client: AcceptedClientFn,
+    accepted_clients: LocalClientAcceptFns,
 ) -> Result<(), ServerNgError> {
     let replica_addr = topology
         .replica_listen_addr
-        .expect("cluster-enabled topology must include replica listener address");
-    if config.tcp.enabled {
-        let bound = replica_io::start_on_shard_zero_default(
-            &shard.bus,
-            replica_addr,
-            topology.client_listen_addr,
-            CLUSTER_ID,
-            topology.self_replica_id,
-            topology.replica_count,
-            topology.peers.clone(),
-            accepted_replica,
-            accepted_client,
-        )
-        .await
-        .map_err(ServerNgError::StartTcpListeners)?;
-        if let Some(bound) = bound {
-            write_current_config(
-                config,
-                Some(topology.self_replica_id),
-                Some(bound.client),
-                Some(bound.replica),
-            )
-            .await?;
-            info!(
-                shard = shard.id,
-                client = %bound.client,
-                replica = %bound.replica,
-                "server-ng TCP listeners started"
-            );
-        }
-        return Ok(());
-    }
+        .expect("topology must include replica listener address");
+    let quic_credentials = topology
+        .quic_listen_addr
+        .is_some()
+        .then(|| load_quic_server_credentials(config))
+        .transpose()?;
+    let tcp_tls_credentials = topology
+        .tcp_tls_listen_addr
+        .is_some()
+        .then(|| load_tcp_tls_server_credentials(config))
+        .transpose()?;
 
-    let (replica_listener, bound_addr) = replica_listener::bind(replica_addr)
-        .await
-        .map_err(ServerNgError::StartTcpListeners)?;
-    let token = shard.bus.token();
-    let max_message_size = shard.bus.config().max_message_size;
-    let handshake_grace = shard.bus.config().handshake_grace;
-    let self_replica_id = topology.self_replica_id;
-    let replica_count = topology.replica_count;
-    let accepted_replica_for_listener = accepted_replica.clone();
-    let replica_handle = compio::runtime::spawn(async move {
-        replica_listener::run(
-            replica_listener,
-            token,
-            CLUSTER_ID,
-            self_replica_id,
-            replica_count,
-            accepted_replica_for_listener,
-            max_message_size,
-            handshake_grace,
-        )
-        .await;
-    });
-    shard.bus.track_background(replica_handle);
-    connector::start(
+    let LocalClientAcceptFns {
+        tcp,
+        ws,
+        quic,
+        tcp_tls,
+    } = accepted_clients;
+
+    let bound = replica_io::start_on_shard_zero(
         &shard.bus,
+        replica_addr,
+        topology.client_listen_addr,
+        topology.ws_listen_addr,
+        topology.quic_listen_addr,
+        quic_credentials,
+        topology.tcp_tls_listen_addr,
+        tcp_tls_credentials,
+        None,
+        None,
         CLUSTER_ID,
         topology.self_replica_id,
+        topology.replica_count,
         topology.peers.clone(),
         accepted_replica,
+        tcp,
+        topology.ws_listen_addr.map(|_| ws),
+        topology.quic_listen_addr.map(|_| quic),
+        topology.tcp_tls_listen_addr.map(|_| tcp_tls),
+        None,
         shard.bus.config().reconnect_period,
     )
-    .await;
+    .await
+    .map_err(ServerNgError::StartListeners)?;
+    let Some(bound) = bound else {
+        return Ok(());
+    };
+
     write_current_config(
         config,
         Some(topology.self_replica_id),
-        None,
-        Some(bound_addr),
+        Some(bound.client),
+        config.cluster.enabled.then_some(bound.replica),
+        bound.tcp_tls,
+        bound.quic,
+        bound.ws,
     )
     .await?;
-    info!(
-        shard = shard.id,
-        replica = %bound_addr,
-        "server-ng replica TCP listener started"
-    );
-    warn!("TCP client listener is disabled by config; only replica TCP is running");
+    if config.cluster.enabled {
+        info!(
+            shard = shard.id,
+            replica = %bound.replica,
+            tcp = %bound.client,
+            tcp_tls = ?bound.tcp_tls,
+            ws = ?bound.ws,
+            quic = ?bound.quic,
+            "server-ng listeners started"
+        );
+    } else {
+        info!(
+            shard = shard.id,
+            tcp = %bound.client,
+            tcp_tls = ?bound.tcp_tls,
+            ws = ?bound.ws,
+            quic = ?bound.quic,
+            "server-ng client listeners started"
+        );
+    }
 
     Ok(())
 }
 
-async fn start_single_node_tcp_runtime(
+async fn start_manual_runtime(
     shard: &Rc<ServerNgShard>,
     config: &ServerNgConfig,
     topology: &TcpTopology,
-    accepted_client: AcceptedClientFn,
+    accepted_replica: AcceptedReplicaFn,
+    accepted_clients: LocalClientAcceptFns,
 ) -> Result<(), ServerNgError> {
-    if !config.tcp.enabled {
-        warn!("TCP listener is disabled by config");
-        return Ok(());
-    }
+    let bound_replica = if config.cluster.enabled {
+        let replica_addr = topology
+            .replica_listen_addr
+            .expect("cluster-enabled topology must include replica listener address");
+        let (replica_listener, bound_addr) = replica_listener::bind(replica_addr)
+            .await
+            .map_err(ServerNgError::StartListeners)?;
+        let token = shard.bus.token();
+        let max_message_size = shard.bus.config().max_message_size;
+        let handshake_grace = shard.bus.config().handshake_grace;
+        let self_replica_id = topology.self_replica_id;
+        let replica_count = topology.replica_count;
+        let accepted_replica_for_listener = accepted_replica.clone();
+        let replica_handle = compio::runtime::spawn(async move {
+            replica_listener::run(
+                replica_listener,
+                token,
+                CLUSTER_ID,
+                self_replica_id,
+                replica_count,
+                accepted_replica_for_listener,
+                max_message_size,
+                handshake_grace,
+            )
+            .await;
+        });
+        shard.bus.track_background(replica_handle);
+        connector::start(
+            &shard.bus,
+            CLUSTER_ID,
+            topology.self_replica_id,
+            topology.peers.clone(),
+            accepted_replica,
+            shard.bus.config().reconnect_period,
+        )
+        .await;
+        Some(bound_addr)
+    } else {
+        None
+    };
 
-    let (listener, bound_addr) = client_listener::tcp::bind(topology.client_listen_addr)
-        .await
-        .map_err(ServerNgError::StartTcpListeners)?;
-    let token = shard.bus.token();
-    let client_handle = compio::runtime::spawn(async move {
-        client_listener::tcp::run(listener, token, accepted_client).await;
-    });
-    shard.bus.track_background(client_handle);
+    let bound_clients = start_client_listeners(shard, config, topology, &accepted_clients).await?;
     write_current_config(
         config,
         Some(topology.self_replica_id),
-        Some(bound_addr),
-        None,
+        bound_clients.tcp,
+        bound_replica,
+        bound_clients.tcp_tls,
+        bound_clients.quic,
+        bound_clients.ws,
     )
     .await?;
-    info!(
-        shard = shard.id,
-        client = %bound_addr,
-        "server-ng TCP client listener started"
-    );
+
+    if config.cluster.enabled {
+        info!(
+            shard = shard.id,
+            replica = ?bound_replica,
+            tcp = ?bound_clients.tcp,
+            tcp_tls = ?bound_clients.tcp_tls,
+            ws = ?bound_clients.ws,
+            quic = ?bound_clients.quic,
+            "server-ng listeners started"
+        );
+    } else {
+        info!(
+            shard = shard.id,
+            tcp = ?bound_clients.tcp,
+            tcp_tls = ?bound_clients.tcp_tls,
+            ws = ?bound_clients.ws,
+            quic = ?bound_clients.quic,
+            "server-ng client listeners started"
+        );
+    }
 
     Ok(())
 }
@@ -993,26 +1135,249 @@ fn make_local_replica_accept_fn(
     })
 }
 
-fn make_local_client_accept_fn(
+fn make_local_client_accept_fns(
     bus: &Rc<IggyMessageBus>,
     on_request: RequestHandler,
-) -> AcceptedClientFn {
-    let bus = Rc::clone(bus);
+) -> LocalClientAcceptFns {
+    let tcp_bus = Rc::clone(bus);
+    let ws_bus = Rc::clone(bus);
+    let quic_bus = Rc::clone(bus);
+    let tcp_tls_bus = Rc::clone(bus);
+    let tcp_request = on_request.clone();
+    let ws_request = on_request.clone();
+    let quic_request = on_request.clone();
+    let tcp_tls_request = on_request;
     let counter = Rc::new(Cell::new(1_u128));
     let shard_id = u128::from(bus.shard_id());
-    Rc::new(move |stream| {
-        let seq = counter.get();
-        counter.set(seq.wrapping_add(1));
-        let client_id = (shard_id << 112) | seq;
-        let peer_addr = match stream.peer_addr() {
-            Ok(peer_addr) => peer_addr,
+
+    let tcp_counter = Rc::clone(&counter);
+    let tcp = Rc::new(move |stream| {
+        let Some(meta) = client_meta_from_stream(
+            &stream,
+            tcp_counter.as_ref(),
+            shard_id,
+            ClientTransportKind::Tcp,
+        ) else {
+            return;
+        };
+        installer::install_client_tcp(&tcp_bus, meta, stream, tcp_request.clone());
+    });
+
+    let ws_counter = Rc::clone(&counter);
+    let ws = Rc::new(move |stream| {
+        let Some(meta) = client_meta_from_stream(
+            &stream,
+            ws_counter.as_ref(),
+            shard_id,
+            ClientTransportKind::Ws,
+        ) else {
+            return;
+        };
+        let fd = match fd_transfer::dup_fd(&stream) {
+            Ok(fd) => fd,
             Err(error) => {
-                warn!(client_id, error = %error, "dropping accepted client with unknown peer address");
+                warn!(
+                    client_id = meta.client_id,
+                    error = %error,
+                    "dropping accepted websocket client after fd duplication failure"
+                );
                 return;
             }
         };
-        let meta = ClientConnMeta::new(client_id, peer_addr, ClientTransportKind::Tcp);
-        installer::install_client_tcp(&bus, meta, stream, on_request.clone());
+        ws_bus.install_client_ws_fd(fd, meta, ws_request.clone());
+    });
+
+    let quic_counter = Rc::clone(&counter);
+    let quic = Rc::new(move |accepted: message_bus::AcceptedQuicConn| {
+        let meta = mint_client_meta(
+            quic_counter.as_ref(),
+            shard_id,
+            accepted.peer_addr(),
+            ClientTransportKind::Quic,
+        );
+        installer::install_client_quic(&quic_bus, meta, accepted, quic_request.clone());
+    });
+
+    let tcp_tls_counter = Rc::clone(&counter);
+    let tcp_tls = Rc::new(move |stream, tls_config| {
+        let Some(meta) = client_meta_from_stream(
+            &stream,
+            tcp_tls_counter.as_ref(),
+            shard_id,
+            ClientTransportKind::TcpTls,
+        ) else {
+            return;
+        };
+        installer::install_client_tcp_tls(
+            &tcp_tls_bus,
+            meta,
+            stream,
+            tls_config,
+            tcp_tls_request.clone(),
+        );
+    });
+
+    LocalClientAcceptFns {
+        tcp,
+        ws,
+        quic,
+        tcp_tls,
+    }
+}
+
+fn client_meta_from_stream(
+    stream: &compio::net::TcpStream,
+    counter: &Cell<u128>,
+    shard_id: u128,
+    transport: ClientTransportKind,
+) -> Option<ClientConnMeta> {
+    let peer_addr = match stream.peer_addr() {
+        Ok(peer_addr) => peer_addr,
+        Err(error) => {
+            let client_id = preview_client_id(counter, shard_id);
+            warn!(client_id, error = %error, "dropping accepted client with unknown peer address");
+            return None;
+        }
+    };
+    Some(mint_client_meta(counter, shard_id, peer_addr, transport))
+}
+
+const fn preview_client_id(counter: &Cell<u128>, shard_id: u128) -> u128 {
+    (shard_id << 112) | counter.get()
+}
+
+fn mint_client_meta(
+    counter: &Cell<u128>,
+    shard_id: u128,
+    peer_addr: SocketAddr,
+    transport: ClientTransportKind,
+) -> ClientConnMeta {
+    let seq = counter.get();
+    counter.set(seq.wrapping_add(1));
+    ClientConnMeta::new((shard_id << 112) | seq, peer_addr, transport)
+}
+
+async fn start_client_listeners(
+    shard: &Rc<ServerNgShard>,
+    config: &ServerNgConfig,
+    topology: &TcpTopology,
+    accepted_clients: &LocalClientAcceptFns,
+) -> Result<BoundClientListeners, ServerNgError> {
+    let mut bound = BoundClientListeners::default();
+
+    if config.tcp.enabled && !config.tcp.tls.enabled {
+        let (listener, bound_addr) = client_listener::tcp::bind(topology.client_listen_addr)
+            .await
+            .map_err(ServerNgError::StartListeners)?;
+        let token = shard.bus.token();
+        let accepted_client = accepted_clients.tcp.clone();
+        let client_handle = compio::runtime::spawn(async move {
+            client_listener::tcp::run(listener, token, accepted_client).await;
+        });
+        shard.bus.track_background(client_handle);
+        bound.tcp = Some(bound_addr);
+    }
+
+    if let Some(ws_addr) = topology.ws_listen_addr {
+        let (listener, bound_addr) = client_listener::ws::bind(ws_addr)
+            .await
+            .map_err(ServerNgError::StartListeners)?;
+        let token = shard.bus.token();
+        let accepted_ws = accepted_clients.ws.clone();
+        let ws_handle = compio::runtime::spawn(async move {
+            client_listener::ws::run(listener, token, accepted_ws).await;
+        });
+        shard.bus.track_background(ws_handle);
+        bound.ws = Some(bound_addr);
+    }
+
+    if let Some(quic_addr) = topology.quic_listen_addr {
+        install_default_crypto_provider();
+        let credentials = load_quic_server_credentials(config)?;
+        let server_config = server_config_with_cert(
+            credentials.cert_chain,
+            credentials.key_der,
+            &shard.bus.config().quic,
+        )
+        .map_err(|e| {
+            ServerNgError::StartListeners(iggy_common::IggyError::IoError(format!(
+                "QUIC server config build failed: {e}"
+            )))
+        })?;
+        let (endpoint, bound_addr) = client_listener::quic::bind(quic_addr, server_config)
+            .await
+            .map_err(ServerNgError::StartListeners)?;
+        let token = shard.bus.token();
+        let handshake_grace = shard.bus.config().handshake_grace;
+        let accepted_quic = accepted_clients.quic.clone();
+        let quic_handle = compio::runtime::spawn(async move {
+            client_listener::quic::run(endpoint, token, accepted_quic, handshake_grace).await;
+        });
+        shard.bus.track_background(quic_handle);
+        bound.quic = Some(bound_addr);
+    }
+
+    if config.tcp.enabled && config.tcp.tls.enabled {
+        let credentials = load_tcp_tls_server_credentials(config)?;
+        let (listener, tls_config, bound_addr) =
+            client_listener::tcp_tls::bind(topology.client_listen_addr, credentials)
+                .await
+                .map_err(ServerNgError::StartListeners)?;
+        let token = shard.bus.token();
+        let accepted_tls = accepted_clients.tcp_tls.clone();
+        let tls_handle = compio::runtime::spawn(async move {
+            client_listener::tcp_tls::run(listener, tls_config, token, accepted_tls).await;
+        });
+        shard.bus.track_background(tls_handle);
+        bound.tcp_tls = Some(bound_addr);
+    }
+
+    Ok(bound)
+}
+
+fn load_tcp_tls_server_credentials(
+    config: &ServerNgConfig,
+) -> Result<TlsServerCredentials, ServerNgError> {
+    let tls = &config.tcp.tls;
+    if tls.self_signed && !Path::new(&tls.cert_file).exists() {
+        return Ok(self_signed_for_loopback());
+    }
+
+    load_pem(Path::new(&tls.cert_file), Path::new(&tls.key_file)).map_err(|source| {
+        ServerNgError::ListenerCredentials {
+            transport: "tcp.tls",
+            source,
+        }
+    })
+}
+
+fn load_quic_server_credentials(
+    config: &ServerNgConfig,
+) -> Result<replica_io::QuicServerCredentials, ServerNgError> {
+    let certificate = &config.quic.certificate;
+    if certificate.self_signed {
+        let (cert_chain, key_der) = iggy_common::generate_self_signed_certificate("localhost")
+            .map_err(|error| ServerNgError::ListenerCredentials {
+                transport: "quic",
+                source: std::io::Error::other(error.to_string()),
+            })?;
+        return Ok(replica_io::QuicServerCredentials {
+            cert_chain,
+            key_der,
+        });
+    }
+
+    let credentials = load_pem(
+        Path::new(&certificate.cert_file),
+        Path::new(&certificate.key_file),
+    )
+    .map_err(|source| ServerNgError::ListenerCredentials {
+        transport: "quic",
+        source,
+    })?;
+    Ok(replica_io::QuicServerCredentials {
+        cert_chain: credentials.cert_chain,
+        key_der: credentials.key_der,
     })
 }
 
