@@ -97,6 +97,7 @@ jobs:
             ci
             cli
             clock
+            common
             connector
             connectors
             cpp
@@ -113,6 +114,7 @@ jobs:
             journal
             js
             mcp
+            node
             partitions
             proc
             pr_template
