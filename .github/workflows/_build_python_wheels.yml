@@ -69,7 +69,7 @@ jobs:
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.commit }}
 
@@ -80,7 +80,7 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -105,7 +105,7 @@ jobs:
 
       - name: Upload wheels
         if: inputs.upload_artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-linux-${{ matrix.target }}-${{ matrix.manylinux }}
           path: foreign/python/dist
@@ -124,7 +124,7 @@ jobs:
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.commit }}
 
@@ -135,7 +135,7 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -149,7 +149,7 @@ jobs:
 
       - name: Upload wheels
         if: inputs.upload_artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-macos-${{ matrix.target }}
           path: foreign/python/dist
@@ -167,7 +167,7 @@ jobs:
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.commit }}
 
@@ -179,7 +179,7 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           architecture: x64
@@ -194,7 +194,7 @@ jobs:
 
       - name: Upload wheels
         if: inputs.upload_artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-windows-x64
           path: foreign/python/dist
@@ -210,7 +210,7 @@ jobs:
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.commit }}
 
@@ -229,7 +229,7 @@ jobs:
 
       - name: Upload sdist
         if: inputs.upload_artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-sdist
           path: foreign/python/dist
@@ -244,7 +244,7 @@ jobs:
       artifact_name: ${{ steps.output.outputs.artifact_name }}
     steps:
       - name: Download all wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           merge-multiple: true
@@ -276,7 +276,7 @@ jobs:
           echo "**Total wheels built:** $(ls -1 dist/*.whl | wc -l)" >> $GITHUB_STEP_SUMMARY
 
       - name: Upload combined artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-wheels-all
           path: dist

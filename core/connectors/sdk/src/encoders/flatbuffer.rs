@@ -238,6 +238,7 @@ impl StreamEncoder for FlatBufferStreamEncoder {
             Payload::Raw(data) => self.encode_raw_to_flatbuffer(data),
             Payload::FlatBuffer(data) => Ok(data),
             Payload::Proto(text) => self.encode_text_to_flatbuffer(text),
+            Payload::Avro(data) => self.encode_raw_to_flatbuffer(data),
         }
     }
 }

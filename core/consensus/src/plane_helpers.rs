@@ -21,10 +21,8 @@ use crate::{
     Status, VsrConsensus,
 };
 use iggy_binary_protocol::consensus::iobuf::Owned;
-use iggy_binary_protocol::{
-    Command2, GenericHeader, Message, PrepareHeader, PrepareOkHeader, ReplyHeader,
-};
-use message_bus::MessageBus;
+use iggy_binary_protocol::{Command2, Message, PrepareHeader, PrepareOkHeader, ReplyHeader};
+use message_bus::{MessageBus, SendError};
 use std::ops::AsyncFnOnce;
 
 // TODO: Rework all of those helpers, once the boundaries are more clear and we have a better picture of the commonalities between all of the planes.
@@ -43,7 +41,7 @@ pub async fn request_preflight<B, P>(
     request: u64,
 ) -> Option<Notify>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     let status = consensus
@@ -55,7 +53,7 @@ where
             // Best-effort resend, client may have disconnected.
             let _ = consensus
                 .message_bus()
-                .send_to_client(client_id, cached_reply.into_generic())
+                .send_to_client(client_id, cached_reply.into_generic().into_frozen())
                 .await;
             None
         }
@@ -86,7 +84,7 @@ pub async fn register_preflight<B, P>(
     client_id: u128,
 ) -> Option<Notify>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     let status = consensus.client_table().borrow().check_register(client_id);
@@ -154,7 +152,7 @@ pub const fn fence_old_prepare_by_commit<B, P>(
     header: &PrepareHeader,
 ) -> bool
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     header.op <= consensus.commit_min()
@@ -162,18 +160,25 @@ where
 
 /// Shared chain-replication forwarding to the next replica.
 ///
+/// Borrows the message, makes a deep copy for the wire, and lets the caller
+/// retain ownership for journal append.
+///
+/// # Errors
+///
+/// Returns `SendError` if the bus fails to deliver to the next replica.
+/// Callers decide error policy (VSR retransmits from WAL via prepare timeout).
+///
 /// # Panics
 /// - If `header.command` is not `Command2::Prepare`.
 /// - If `header.op <= consensus.commit_min()`.
 /// - If the computed next replica equals self.
-/// - If the message bus send fails.
 #[allow(clippy::future_not_send)]
 pub async fn replicate_to_next_in_chain<B, P>(
     consensus: &VsrConsensus<B, P>,
-    message: Message<PrepareHeader>,
-) -> Message<PrepareHeader>
+    message: &Message<PrepareHeader>,
+) -> Result<(), SendError>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     let header = *message.header();
@@ -185,20 +190,18 @@ where
     let primary = consensus.primary_index(header.view);
 
     if next == primary {
-        return message;
+        return Ok(());
     }
 
     assert_ne!(next, consensus.replica());
 
-    // TODO: Propagate send error instead of panicking; requires bus error design.
-    let returned = consensus
-        .message_bus()
-        .send_to_replica(next, message.into_generic())
-        .await
-        .unwrap();
-    returned
-        .try_into_typed()
-        .expect("replica send must return the same prepare message")
+    // Chain replication to the next replica is N=1, so the freeze-once
+    // trick does not apply: the caller has already appended `message` to
+    // its local journal (durability-before-ack) and kept a reference for
+    // this forward, so we deep_copy a fresh Frozen here. Future refactor
+    // could freeze once and share the backing with the journal path.
+    let frozen = message.deep_copy().into_generic().into_frozen();
+    consensus.message_bus().send_to_replica(next, frozen).await
 }
 
 /// Shared preflight checks for `on_replicate`.
@@ -216,7 +219,7 @@ pub fn replicate_preflight<B, P>(
     header: &PrepareHeader,
 ) -> Result<u64, IgnoreReason>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     assert_eq!(header.command, Command2::Prepare);
@@ -249,7 +252,7 @@ where
 /// normal status.
 pub fn ack_preflight<B, P>(consensus: &VsrConsensus<B, P>) -> Result<(), IgnoreReason>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     if !consensus.is_primary() {
@@ -274,7 +277,7 @@ pub fn ack_quorum_reached<B, P>(
     ack: &PrepareOkHeader,
 ) -> bool
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     if !matches!(
@@ -314,7 +317,7 @@ where
 /// If `head()` returns `Some` but `pop()` returns `None` (unreachable).
 pub fn drain_committable_prefix<B, P>(consensus: &VsrConsensus<B, P>) -> Vec<PipelineEntry>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     let commit = consensus.commit_max();
@@ -346,7 +349,7 @@ pub fn build_reply_message<B, P>(
     body: bytes::Bytes,
 ) -> Message<ReplyHeader>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     let header_size = std::mem::size_of::<ReplyHeader>();
@@ -417,7 +420,7 @@ pub async fn send_prepare_ok<B, P>(
     header: &PrepareHeader,
     is_persisted: Option<bool>,
 ) where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     assert_eq!(header.command, Command2::Prepare);
@@ -476,47 +479,28 @@ pub async fn send_prepare_ok<B, P>(
 mod tests {
     use super::*;
     use crate::{Consensus, LocalPipeline};
-    use iggy_common::IggyError;
+    use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
+    use iggy_binary_protocol::consensus::iobuf::Frozen;
+    use message_bus::SendError;
 
     #[derive(Debug, Default)]
     struct NoopBus;
 
     impl MessageBus for NoopBus {
-        type Client = u128;
-        type Replica = u8;
-        type Data = Message<GenericHeader>;
-        type Sender = ();
-
-        fn add_client(&mut self, _client: Self::Client, _sender: Self::Sender) -> bool {
-            true
-        }
-
-        fn remove_client(&mut self, _client: Self::Client) -> bool {
-            true
-        }
-
-        fn add_replica(&mut self, _replica: Self::Replica) -> bool {
-            true
-        }
-
-        fn remove_replica(&mut self, _replica: Self::Replica) -> bool {
-            true
-        }
-
         async fn send_to_client(
             &self,
-            _client_id: Self::Client,
-            data: Self::Data,
-        ) -> Result<Self::Data, IggyError> {
-            Ok(data)
+            _client_id: u128,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            Ok(())
         }
 
         async fn send_to_replica(
             &self,
-            _replica: Self::Replica,
-            data: Self::Data,
-        ) -> Result<Self::Data, IggyError> {
-            Ok(data)
+            _replica: u8,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            Ok(())
         }
     }
 
@@ -681,7 +665,7 @@ mod tests {
     }
 
     struct SpyBus {
-        sent: std::cell::RefCell<Vec<(u8, Message<GenericHeader>)>>,
+        sent: std::cell::RefCell<Vec<(u8, Frozen<MESSAGE_ALIGN>)>>,
     }
 
     impl SpyBus {
@@ -694,39 +678,20 @@ mod tests {
 
     #[allow(clippy::future_not_send)]
     impl MessageBus for SpyBus {
-        type Client = u128;
-        type Replica = u8;
-        type Data = Message<GenericHeader>;
-        type Sender = ();
-
-        fn add_client(&mut self, _client: Self::Client, _sender: Self::Sender) -> bool {
-            true
-        }
-        fn remove_client(&mut self, _client: Self::Client) -> bool {
-            true
-        }
-        fn add_replica(&mut self, _replica: Self::Replica) -> bool {
-            true
-        }
-        fn remove_replica(&mut self, _replica: Self::Replica) -> bool {
-            true
-        }
         async fn send_to_client(
             &self,
-            _client_id: Self::Client,
-            data: Self::Data,
-        ) -> Result<Self::Data, IggyError> {
-            Ok(data)
+            _client_id: u128,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            Ok(())
         }
         async fn send_to_replica(
             &self,
-            replica: Self::Replica,
-            data: Self::Data,
-        ) -> Result<Self::Data, IggyError> {
-            let stored = data.deep_copy();
-            let returned = data.deep_copy();
-            self.sent.borrow_mut().push((replica, stored));
-            Ok(returned)
+            replica: u8,
+            data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), SendError> {
+            self.sent.borrow_mut().push((replica, data));
+            Ok(())
         }
     }
 

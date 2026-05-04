@@ -23,6 +23,8 @@ pub enum AppRoute {
     Home,
     #[at("/benchmarks/:uuid")]
     Benchmark { uuid: String },
+    #[at("/compare/:left/:right")]
+    Compare { left: String, right: String },
     #[not_found]
     #[at("/404")]
     NotFound,

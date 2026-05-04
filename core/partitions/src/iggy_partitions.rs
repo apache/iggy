@@ -21,8 +21,7 @@ use crate::IggyPartition;
 use crate::types::PartitionsConfig;
 use consensus::{Consensus, Plane, PlaneIdentity, VsrConsensus};
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, GenericHeader, Message, PrepareHeader, PrepareOkHeader,
-    RequestHeader,
+    Command2, ConsensusHeader, PrepareHeader, PrepareOkHeader, RequestHeader,
 };
 use iggy_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 use message_bus::MessageBus;
@@ -193,7 +192,7 @@ where
 
 impl<B> Plane<VsrConsensus<B>> for IggyPartitions<B>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
 {
     async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let namespace = IggyNamespace::from_raw(message.header().namespace);
@@ -246,7 +245,7 @@ where
 
 impl<B> PlaneIdentity<VsrConsensus<B>> for IggyPartitions<B>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
 {
     fn is_applicable<H>(&self, message: &<VsrConsensus<B> as Consensus>::Message<H>) -> bool
     where

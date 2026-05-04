@@ -17,6 +17,7 @@
  * under the License.
  */
 
+mod delta;
 mod elasticsearch;
 mod http;
 mod iceberg;
@@ -26,6 +27,7 @@ mod postgres;
 mod quickwit;
 mod wiremock;
 
+pub use delta::{DeltaFixture, DeltaS3Fixture};
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use http::{
     HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture,
