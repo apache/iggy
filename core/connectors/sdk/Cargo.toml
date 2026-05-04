@@ -38,6 +38,7 @@ api = ["strum"]
 
 [dependencies]
 anyhow = { workspace = true }
+apache-avro = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 dashmap = { workspace = true }

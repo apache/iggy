@@ -31,4 +31,6 @@ pub use server_config::{
     COMPONENT, cache_indexes, cluster, defaults, displays, http, quic, server, sharding, system,
     tcp, validators, websocket,
 };
-pub use server_ng_config::{COMPONENT_NG, message_bus, server_ng};
+pub use server_ng_config::{
+    COMPONENT_NG, message_bus, quic as ng_quic, server_ng, tcp as ng_tcp, websocket as ng_websocket,
+};

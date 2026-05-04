@@ -63,7 +63,8 @@ pub use command::Command2;
 pub use error::ConsensusError;
 pub use header::{
     CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader, HEADER_SIZE, PrepareHeader,
-    PrepareOkHeader, ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
+    PrepareOkHeader, ReplyHeader, RequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader,
+    StartViewHeader, read_size_field,
 };
 pub use message::{
     ConsensusMessage, FragmentedBacking, MESSAGE_ALIGN, Message, MessageBacking, MessageBag,

@@ -71,8 +71,8 @@ pub use consensus::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, ConsensusMessage, DoViewChangeHeader,
     FragmentedBacking, GenericHeader, HEADER_SIZE, Message, MessageBacking, MessageBag,
     MutableBacking, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader, RequestBacking,
-    RequestBackingKind, RequestHeader, ResponseBacking, ResponseBackingKind, StartViewChangeHeader,
-    StartViewHeader,
+    RequestBackingKind, RequestHeader, ResponseBacking, ResponseBackingKind, SIZE_FIELD_OFFSET,
+    StartViewChangeHeader, StartViewHeader, read_size_field,
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;
