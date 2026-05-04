@@ -73,7 +73,6 @@
 //! explicit Pong send required.
 
 use super::{ActorContext, TransportConn};
-use crate::framing;
 use crate::lifecycle::BusMessage;
 use bytes::Bytes;
 use compio::net::TcpStream;
@@ -97,8 +96,13 @@ pub(in crate::transports) enum FrameDecodeError {
 
 /// Decode one consensus `Message<GenericHeader>` from a raw WS Binary
 /// payload. Reused by [`super::wss`] over the TLS-protected channel.
+///
+/// `max_message_size` is the per-bus wire cap threaded through
+/// [`ActorContext::max_message_size`]; an operator-lowered limit must
+/// reject the same way TCP/QUIC paths do (see `framing::read_message`).
 pub(in crate::transports) fn decode_consensus_frame(
     body: &[u8],
+    max_message_size: usize,
 ) -> Result<Message<GenericHeader>, FrameDecodeError> {
     if body.len() < iggy_binary_protocol::HEADER_SIZE {
         return Err(FrameDecodeError::BadHeader);
@@ -108,7 +112,7 @@ pub(in crate::transports) fn decode_consensus_frame(
             .try_into()
             .map_err(|_| FrameDecodeError::BadHeader)?,
     ) as usize;
-    if !(iggy_binary_protocol::HEADER_SIZE..=framing::MAX_MESSAGE_SIZE).contains(&total_size)
+    if !(iggy_binary_protocol::HEADER_SIZE..=max_message_size).contains(&total_size)
         || total_size != body.len()
     {
         return Err(FrameDecodeError::BadSize);
@@ -186,6 +190,7 @@ async fn run_pump(ws: &mut WebSocketStream<TcpStream>, ctx: ActorContext) {
         rx,
         shutdown,
         max_batch,
+        max_message_size,
         label,
         peer,
         ..
@@ -245,18 +250,20 @@ async fn run_pump(ws: &mut WebSocketStream<TcpStream>, ctx: ActorContext) {
                 }
             }
             PumpAction::Recv(Ok(msg)) => match msg {
-                WsMessage::Binary(bytes) => match decode_consensus_frame(&bytes) {
-                    Ok(frame) => {
-                        if in_tx.send(frame).await.is_err() {
-                            debug!(%label, %peer, "ws reader: inbound queue dropped");
+                WsMessage::Binary(bytes) => {
+                    match decode_consensus_frame(&bytes, max_message_size) {
+                        Ok(frame) => {
+                            if in_tx.send(frame).await.is_err() {
+                                debug!(%label, %peer, "ws reader: inbound queue dropped");
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(%label, %peer, error = ?e, "ws reader: bad consensus frame");
                             return;
                         }
                     }
-                    Err(e) => {
-                        warn!(%label, %peer, error = ?e, "ws reader: bad consensus frame");
-                        return;
-                    }
-                },
+                }
                 WsMessage::Ping(_) | WsMessage::Pong(_) => {
                     // Tungstenite queues an auto-Pong for inbound Pings;
                     // `compio_ws::WebSocketStream::read` flushes before
@@ -363,6 +370,19 @@ mod tests {
         Shutdown,
         compio::runtime::JoinHandle<()>,
     ) {
+        drive_with_cap(conn, framing::MAX_MESSAGE_SIZE)
+    }
+
+    #[allow(clippy::future_not_send)]
+    fn drive_with_cap(
+        conn: WsTransportConn,
+        max_message_size: usize,
+    ) -> (
+        Sender<Frozen<MESSAGE_ALIGN>>,
+        Receiver<Message<GenericHeader>>,
+        Shutdown,
+        compio::runtime::JoinHandle<()>,
+    ) {
         let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(16);
         let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(16);
         let (shutdown, token) = Shutdown::new();
@@ -372,7 +392,7 @@ mod tests {
             shutdown: crate::lifecycle::FusedShutdown::single(token),
             conn_shutdown: shutdown.clone(),
             max_batch: 16,
-            max_message_size: framing::MAX_MESSAGE_SIZE,
+            max_message_size,
             label: "test",
             peer: "test".to_owned(),
         };
@@ -444,6 +464,42 @@ mod tests {
         client_shutdown.trigger();
         let _ = compio::time::timeout(Duration::from_secs(10), server_handle).await;
         let _ = compio::time::timeout(Duration::from_secs(10), client_handle).await;
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn ws_rejects_oversize_against_custom_cap() {
+        const CUSTOM_CAP: usize = HEADER_SIZE + 1024;
+        const OVER_CAP: usize = HEADER_SIZE + 64 * 1024;
+
+        let (client_ws, server_ws) = ws_pair().await;
+        let server_conn = WsTransportConn::new_server(server_ws);
+        let client_conn = WsTransportConn::new_client(client_ws);
+
+        let (_server_out, server_in, _server_shutdown, server_handle) =
+            drive_with_cap(server_conn, CUSTOM_CAP);
+        let (client_out, _client_in, _client_shutdown, client_handle) =
+            drive_with_cap(client_conn, framing::MAX_MESSAGE_SIZE);
+
+        client_out
+            .send(padded(Command2::Request, OVER_CAP))
+            .await
+            .expect("client send oversize");
+
+        // Decode rejection tears the server pump down; join must complete
+        // within the grace window and no frame must surface to in_rx.
+        let join_res = compio::time::timeout(Duration::from_secs(5), server_handle).await;
+        assert!(
+            join_res.is_ok(),
+            "server pump must exit on frame above max_message_size"
+        );
+        let recv_res = compio::time::timeout(Duration::from_millis(50), server_in.recv()).await;
+        assert!(
+            recv_res.is_err() || recv_res.expect("timeout outer").is_err(),
+            "no frame should surface above the configured cap"
+        );
+
+        let _ = compio::time::timeout(Duration::from_secs(2), client_handle).await;
     }
 
     #[compio::test]
