@@ -6,11 +6,11 @@
   </picture>
 </div>
 
-# Go SDK for Iggy
+# iggy_binary_protocol
 
-Official Go client SDK for [Apache Iggy](https://iggy.apache.org) message streaming.
+[![Crate](https://img.shields.io/crates/v/iggy_binary_protocol?logo=rust&style=flat-square)](https://crates.io/crates/iggy_binary_protocol)
 
-The client currently supports TCP protocols with blocking implementation.
+Wire protocol types and codec for the [Apache Iggy](https://iggy.apache.org) binary protocol, shared between server and SDK. This crate is an internal building block. Most users should depend on the [`iggy`](https://crates.io/crates/iggy) SDK crate instead.
 
 > Apache Iggy (Incubating) is an effort undergoing incubation at the Apache Software Foundation (ASF), sponsored by the Apache Incubator PMC.
 >
@@ -18,16 +18,12 @@ The client currently supports TCP protocols with blocking implementation.
 >
 > While incubation status is not necessarily a reflection of the completeness or stability of the code, it does indicate that the project has yet to be fully endorsed by the ASF.
 
-## Installation
+## Links
 
-```bash
-go get github.com/apache/iggy/foreign/go
-```
+- [Project website](https://iggy.apache.org)
+- [GitHub repository](https://github.com/apache/iggy)
+- [Iggy SDK on crates.io](https://crates.io/crates/iggy)
 
-## Contributing
+## License
 
-Before creating a pull request, please run [golangci-lint](https://golangci-lint.run/welcome/quick-start/) and fix any reported lint issues:
-
-```shell
-golangci-lint run
-```
+Licensed under the Apache License, Version 2.0. See [LICENSE](https://github.com/apache/iggy/blob/master/LICENSE).
