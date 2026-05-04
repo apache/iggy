@@ -215,9 +215,12 @@ pub async fn bootstrap(
     let recovered = recover::<ServerNgMuxStateMachine>(Path::new(&config.system.path))
         .await
         .map_err(ServerNgError::MetadataRecovery)?;
-    let restored_op = recovered
-        .last_applied_op
-        .unwrap_or_else(|| recovered.snapshot.sequence_number());
+    let restored_op = recovered.last_applied_op.unwrap_or_else(|| {
+        recovered
+            .snapshot
+            .as_ref()
+            .map_or(0, IggySnapshot::sequence_number)
+    });
 
     let metadata = ServerNgMetadata::new(
         Some(restore_metadata_consensus(
@@ -228,7 +231,7 @@ pub async fn bootstrap(
             Rc::clone(&bus),
         )),
         Some(recovered.journal),
-        Some(recovered.snapshot),
+        recovered.snapshot,
         recovered.mux_stm,
         Some(PathBuf::from(&config.system.path)),
     );
