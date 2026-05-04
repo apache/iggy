@@ -3,9 +3,9 @@
 </p>
 <div align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://benchmarks.iggy.apache.org/assets/iggy-light.svg">
-    <source media="(prefers-color-scheme: light)" srcset="https://benchmarks.iggy.apache.org/assets/iggy-dark.svg">
-    <img alt="Apache Iggy" src="https://benchmarks.iggy.apache.org/assets/iggy-dark.svg" width="400">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/apache/iggy/refs/heads/master/assets/logo/SVG/iggy-apache-color-darkbg.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/apache/iggy/refs/heads/master/assets/logo/SVG/iggy-apache-color-lightbg.svg">
+    <img alt="Apache Iggy" src="https://raw.githubusercontent.com/apache/iggy/refs/heads/master/assets/logo/SVG/iggy-apache-color-lightbg.svg" width="400">
   </picture>
 </div>
 
