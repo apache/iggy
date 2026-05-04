@@ -157,7 +157,7 @@ func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMes
 			}
 			payloadSlice, err = s2.Decode(nil, payloadSlice)
 			if err != nil {
-				return nil, fmt.Errorf("iggy: failed to decode s2 payload: %w", err)
+				return nil, fmt.Errorf("failed to decode s2 payload: %w", err)
 			}
 		}
 
