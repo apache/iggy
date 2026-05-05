@@ -21,6 +21,18 @@
 filter = 'package(integration) and test(cli::system::test_cli_session_scenario::should_be_successful)'
 threads-required = "num-cpus"
 
+# Doris testcontainer must bind host:8040 1:1 (FE→BE 307 redirects to
+# 127.0.0.1:8040; BE's priority_networks pins the advertise address) and the
+# all-in-one image is heavy enough that running it alongside other
+# container-backed tests (e.g. elasticsearch) starves their startup timers.
+# threads-required = "num-cpus" forces each doris test to run alone, matching
+# the existing pattern used elsewhere in this file. The longer slow-timeout
+# accounts for cold container boot (~60-90s on Linux CI) plus the test body.
+[[profile.default.overrides]]
+filter = 'package(integration) and test(/connectors::doris::/)'
+threads-required = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 [profile.default]
 slow-timeout = { period = "30s", terminate-after = 4 }
 
