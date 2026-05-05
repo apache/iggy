@@ -37,6 +37,42 @@ impl ShowContextCmd {
         Self { context_name }
     }
 
+    fn add_opt_str(table: &mut Table, label: &str, value: &Option<String>) {
+        if let Some(ref v) = *value {
+            table.add_row(vec![label, v]);
+        }
+    }
+
+    fn add_opt_bool(table: &mut Table, label: &str, value: Option<bool>) {
+        if let Some(v) = value {
+            table.add_row(vec![label, &v.to_string()]);
+        }
+    }
+
+    fn add_opt_u16(table: &mut Table, label: &str, value: Option<u16>) {
+        if let Some(v) = value {
+            table.add_row(vec![label, &v.to_string()]);
+        }
+    }
+
+    fn add_opt_u32(table: &mut Table, label: &str, value: Option<u32>) {
+        if let Some(v) = value {
+            table.add_row(vec![label, &v.to_string()]);
+        }
+    }
+
+    fn add_opt_u64(table: &mut Table, label: &str, value: Option<u64>) {
+        if let Some(v) = value {
+            table.add_row(vec![label, &v.to_string()]);
+        }
+    }
+
+    fn add_masked(table: &mut Table, label: &str, value: &Option<String>) {
+        if value.is_some() {
+            table.add_row(vec![label, MASKED_VALUE]);
+        }
+    }
+
     fn build_table(name: &str, is_active: bool, config: &ContextConfig) -> Table {
         let mut table = Table::new();
         table.set_header(vec!["Property", "Value"]);
@@ -48,32 +84,110 @@ impl ShowContextCmd {
         };
         table.add_row(vec!["Name", &display_name]);
 
-        if let Some(ref transport) = config.iggy.transport {
-            table.add_row(vec!["Transport", transport]);
-        }
-        if let Some(ref addr) = config.iggy.tcp_server_address {
-            table.add_row(vec!["TCP Server Address", addr]);
-        }
-        if let Some(ref url) = config.iggy.http_api_url {
-            table.add_row(vec!["HTTP API URL", url]);
-        }
-        if let Some(ref addr) = config.iggy.quic_server_address {
-            table.add_row(vec!["QUIC Server Address", addr]);
-        }
-        if let Some(tls) = config.iggy.tcp_tls_enabled {
-            table.add_row(vec!["TCP TLS Enabled", &tls.to_string()]);
-        }
+        let iggy = &config.iggy;
+
+        Self::add_opt_str(&mut table, "Transport", &iggy.transport);
+        Self::add_masked(&mut table, "Encryption Key", &iggy.encryption_key);
+        Self::add_opt_str(
+            &mut table,
+            "Credentials Username",
+            &iggy.credentials_username,
+        );
+        Self::add_masked(
+            &mut table,
+            "Credentials Password",
+            &iggy.credentials_password,
+        );
+
+        Self::add_opt_str(&mut table, "HTTP API URL", &iggy.http_api_url);
+        Self::add_opt_u32(&mut table, "HTTP Retries", iggy.http_retries);
+
+        Self::add_opt_str(&mut table, "TCP Server Address", &iggy.tcp_server_address);
+        Self::add_opt_u32(
+            &mut table,
+            "TCP Reconnection Max Retries",
+            iggy.tcp_reconnection_max_retries,
+        );
+        Self::add_opt_str(
+            &mut table,
+            "TCP Reconnection Interval",
+            &iggy.tcp_reconnection_interval,
+        );
+        Self::add_opt_bool(&mut table, "TCP TLS Enabled", iggy.tcp_tls_enabled);
+        Self::add_opt_str(&mut table, "TCP TLS Domain", &iggy.tcp_tls_domain);
+
+        Self::add_opt_str(&mut table, "QUIC Client Address", &iggy.quic_client_address);
+        Self::add_opt_str(&mut table, "QUIC Server Address", &iggy.quic_server_address);
+        Self::add_opt_str(&mut table, "QUIC Server Name", &iggy.quic_server_name);
+        Self::add_opt_u32(
+            &mut table,
+            "QUIC Reconnection Max Retries",
+            iggy.quic_reconnection_max_retries,
+        );
+        Self::add_opt_str(
+            &mut table,
+            "QUIC Reconnection Interval",
+            &iggy.quic_reconnection_interval,
+        );
+        Self::add_opt_u64(
+            &mut table,
+            "QUIC Max Concurrent Bidi Streams",
+            iggy.quic_max_concurrent_bidi_streams,
+        );
+        Self::add_opt_u64(
+            &mut table,
+            "QUIC Datagram Send Buffer Size",
+            iggy.quic_datagram_send_buffer_size,
+        );
+        Self::add_opt_u16(&mut table, "QUIC Initial MTU", iggy.quic_initial_mtu);
+        Self::add_opt_u64(&mut table, "QUIC Send Window", iggy.quic_send_window);
+        Self::add_opt_u64(&mut table, "QUIC Receive Window", iggy.quic_receive_window);
+        Self::add_opt_u64(
+            &mut table,
+            "QUIC Response Buffer Size",
+            iggy.quic_response_buffer_size,
+        );
+        Self::add_opt_u64(
+            &mut table,
+            "QUIC Keep Alive Interval",
+            iggy.quic_keep_alive_interval,
+        );
+        Self::add_opt_u64(
+            &mut table,
+            "QUIC Max Idle Timeout",
+            iggy.quic_max_idle_timeout,
+        );
+        Self::add_opt_bool(
+            &mut table,
+            "QUIC Validate Certificate",
+            iggy.quic_validate_certificate,
+        );
+
+        Self::add_opt_str(
+            &mut table,
+            "WebSocket Server Address",
+            &iggy.websocket_server_address,
+        );
+        Self::add_opt_u32(
+            &mut table,
+            "WebSocket Reconnection Max Retries",
+            iggy.websocket_reconnection_max_retries,
+        );
+        Self::add_opt_str(
+            &mut table,
+            "WebSocket Reconnection Interval",
+            &iggy.websocket_reconnection_interval,
+        );
+
         if let Some(ref username) = config.username {
             table.add_row(vec!["Username", username]);
         }
-        if config.password.is_some() {
-            table.add_row(vec!["Password", MASKED_VALUE]);
-        }
-        if config.token.is_some() {
-            table.add_row(vec!["Token", MASKED_VALUE]);
-        }
-        if let Some(ref token_name) = config.token_name {
-            table.add_row(vec!["Token Name", token_name]);
+        Self::add_masked(&mut table, "Password", &config.password);
+        Self::add_masked(&mut table, "Token", &config.token);
+        Self::add_opt_str(&mut table, "Token Name", &config.token_name);
+
+        for (key, value) in &config.extra {
+            table.add_row(vec![key.as_str(), &value.to_string()]);
         }
 
         table
@@ -83,7 +197,8 @@ impl ShowContextCmd {
 #[async_trait]
 impl CliCommand for ShowContextCmd {
     fn explain(&self) -> String {
-        format!("show context \"{}\"", self.context_name)
+        let context_name = &self.context_name;
+        format!("show context {context_name}")
     }
 
     fn login_required(&self) -> bool {
@@ -110,5 +225,28 @@ impl CliCommand for ShowContextCmd {
         event!(target: PRINT_TARGET, Level::INFO, "{table}");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_return_explain_message() {
+        let cmd = ShowContextCmd::new("production".to_string());
+        assert_eq!(cmd.explain(), "show context production");
+    }
+
+    #[test]
+    fn should_not_require_login() {
+        let cmd = ShowContextCmd::new("test".to_string());
+        assert!(!cmd.login_required());
+    }
+
+    #[test]
+    fn should_not_require_connection() {
+        let cmd = ShowContextCmd::new("test".to_string());
+        assert!(!cmd.connection_required());
     }
 }

@@ -26,6 +26,10 @@ pub(crate) enum SessionAction {
     /// server it is connected to. This checks the local credential
     /// store without contacting the server.
     ///
+    /// Note: only checks whether a token exists in the keyring.
+    /// A stale or expired token will still report as active.
+    /// Use 'iggy me' to verify the session is valid server-side.
+    ///
     /// Examples
     ///  iggy session status
     #[clap(verbatim_doc_comment, visible_alias = "s")]

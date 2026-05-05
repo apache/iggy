@@ -56,15 +56,38 @@ impl CliCommand for SessionStatusCmd {
         let mut table = Table::new();
         table.set_header(vec!["Property", "Value"]);
         table.add_row(vec!["Server Address", server_address]);
-
-        if is_active {
-            table.add_row(vec!["Session Active", "Yes"]);
+        let active = if is_active {
+            "Yes (token presence only, freshness not verified)"
         } else {
-            table.add_row(vec!["Session Active", "No"]);
-        }
+            "No"
+        };
+        table.add_row(vec!["Session Active", active]);
 
         event!(target: PRINT_TARGET, Level::INFO, "{table}");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_return_explain_message() {
+        let cmd = SessionStatusCmd::new("127.0.0.1:8090".to_string());
+        assert_eq!(cmd.explain(), "session status command");
+    }
+
+    #[test]
+    fn should_not_require_login() {
+        let cmd = SessionStatusCmd::new("127.0.0.1:8090".to_string());
+        assert!(!cmd.login_required());
+    }
+
+    #[test]
+    fn should_not_require_connection() {
+        let cmd = SessionStatusCmd::new("127.0.0.1:8090".to_string());
+        assert!(!cmd.connection_required());
     }
 }

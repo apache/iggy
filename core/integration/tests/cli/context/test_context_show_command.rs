@@ -34,19 +34,19 @@ use super::common::TestIggyContext;
 struct TestContextShowCmd {
     test_iggy_context: TestIggyContext,
     context_to_show: String,
-    expected_fields: Vec<(String, String)>,
+    expected_rows: Vec<String>,
 }
 
 impl TestContextShowCmd {
     fn new(
         test_iggy_context: TestIggyContext,
         context_to_show: String,
-        expected_fields: Vec<(String, String)>,
+        expected_rows: Vec<String>,
     ) -> Self {
         Self {
             test_iggy_context,
             context_to_show,
-            expected_fields,
+            expected_rows,
         }
     }
 }
@@ -72,10 +72,8 @@ impl IggyCmdTestCase for TestContextShowCmd {
     fn verify_command(&self, command_state: Assert) {
         let mut command_state = command_state.success();
 
-        for (key, value) in &self.expected_fields {
-            command_state = command_state
-                .stdout(contains(key.as_str()))
-                .stdout(contains(value.as_str()));
+        for row in &self.expected_rows {
+            command_state = command_state.stdout(contains(row.as_str()));
         }
     }
 
@@ -113,15 +111,12 @@ pub async fn should_show_context_with_all_fields() {
             ),
             "production".to_string(),
             vec![
-                ("Name".to_string(), "production".to_string()),
-                ("Transport".to_string(), "tcp".to_string()),
-                (
-                    "TCP Server Address".to_string(),
-                    "10.0.0.1:8090".to_string(),
-                ),
-                ("TCP TLS Enabled".to_string(), "true".to_string()),
-                ("Username".to_string(), "admin".to_string()),
-                ("Password".to_string(), "********".to_string()),
+                "| Name               | production".to_string(),
+                "| Transport          | tcp".to_string(),
+                "| TCP Server Address | 10.0.0.1:8090".to_string(),
+                "| TCP TLS Enabled    | true".to_string(),
+                "| Username           | admin".to_string(),
+                "| Password           | ********".to_string(),
             ],
         ))
         .await;
@@ -137,7 +132,7 @@ pub async fn should_show_default_context() {
         .execute_test(TestContextShowCmd::new(
             TestIggyContext::new(None, None),
             "default".to_string(),
-            vec![("Name".to_string(), "default*".to_string())],
+            vec!["| Name | default*".to_string()],
         ))
         .await;
 }
@@ -158,7 +153,7 @@ pub async fn should_show_active_context_with_asterisk() {
                 Some("dev".to_string()),
             ),
             "dev".to_string(),
-            vec![("Name".to_string(), "dev*".to_string())],
+            vec!["| Name | dev*".to_string()],
         ))
         .await;
 }
