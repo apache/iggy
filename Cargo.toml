@@ -129,7 +129,7 @@ console-subscriber = "0.5.0"
 crossbeam = "0.8.4"
 crossfire = "3.1.7"
 csv = "1.4.0"
-ctor = "0.10.1"
+ctor = "1.0.1"
 ctrlc = { version = "3.5", features = ["termination"] }
 cucumber = "0.23"
 cyper = { version = "0.8.3", features = ["rustls"], default-features = false }
