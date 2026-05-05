@@ -50,7 +50,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Get server version
         id: meta
@@ -60,7 +60,7 @@ jobs:
           echo "server_version=${server_version}" >> "$GITHUB_OUTPUT"
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: rust-artifacts-all
           path: ./artifacts
@@ -75,7 +75,7 @@ jobs:
           fi
 
       - name: Create edge pre-release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: edge
           name: edge
@@ -87,6 +87,12 @@ jobs:
             Rolling edge build of Apache Iggy binaries and connector plugins.
 
             **This release is automatically updated on every push to master.**
+
+            > Apache Iggy (Incubating) is an effort undergoing incubation at the Apache Software Foundation (ASF), sponsored by the Apache Incubator PMC.
+            >
+            > Incubation is required of all newly accepted projects until a further review indicates that the infrastructure, communications, and decision making process have stabilized in a manner consistent with other successful ASF projects.
+            >
+            > While incubation status is not necessarily a reflection of the completeness or stability of the code, it does indicate that the project has yet to be fully endorsed by the ASF.
 
             ## Binaries included
             - `iggy-server` - The server binary
@@ -120,4 +126,4 @@ jobs:
             - Server version: ${{ steps.meta.outputs.server_version }}
             - Commit: ${{ github.sha }}
 
-            **Not an official ASF release** - for development/testing only.
+            **Not an official ASF release.** Edge builds are for development/testing only.

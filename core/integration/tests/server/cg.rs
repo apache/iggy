@@ -24,10 +24,9 @@ use crate::server::scenarios::{
 use integration::iggy_harness;
 
 // Consumer group scenarios do not support HTTP (stateful operations).
-// TODO: Add QUIC support.
 
 #[iggy_harness(
-    test_client_transport = [Tcp, WebSocket],
+    test_client_transport = [Tcp, WebSocket, Quic],
     server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
 )]
 async fn join(harness: &TestHarness) {
@@ -35,7 +34,7 @@ async fn join(harness: &TestHarness) {
 }
 
 #[iggy_harness(
-    test_client_transport = [Tcp, WebSocket],
+    test_client_transport = [Tcp, WebSocket, Quic],
     server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
 )]
 async fn single_client(harness: &TestHarness) {
@@ -43,7 +42,7 @@ async fn single_client(harness: &TestHarness) {
 }
 
 #[iggy_harness(
-    test_client_transport = [Tcp, WebSocket],
+    test_client_transport = [Tcp, WebSocket, Quic],
     server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
 )]
 async fn multiple_clients(harness: &TestHarness) {
@@ -51,7 +50,7 @@ async fn multiple_clients(harness: &TestHarness) {
 }
 
 #[iggy_harness(
-    test_client_transport = [Tcp, WebSocket],
+    test_client_transport = [Tcp, WebSocket, Quic],
     server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
 )]
 async fn auto_commit_reconnection(harness: &TestHarness) {
@@ -59,7 +58,7 @@ async fn auto_commit_reconnection(harness: &TestHarness) {
 }
 
 #[iggy_harness(
-    test_client_transport = [Tcp, WebSocket],
+    test_client_transport = [Tcp, WebSocket, Quic],
     server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
 )]
 async fn new_messages_after_restart(harness: &TestHarness) {
@@ -67,7 +66,7 @@ async fn new_messages_after_restart(harness: &TestHarness) {
 }
 
 #[iggy_harness(
-    test_client_transport = [Tcp, WebSocket],
+    test_client_transport = [Tcp, WebSocket, Quic],
     server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
 )]
 async fn offset_cleanup(harness: &TestHarness) {

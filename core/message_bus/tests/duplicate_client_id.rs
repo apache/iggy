@@ -23,13 +23,13 @@
 
 mod common;
 
-use common::{header_only, loopback};
+use common::{header_only, loopback, test_client_meta};
 use compio::net::{TcpListener, TcpStream};
 use iggy_binary_protocol::Command2;
-use message_bus::IggyMessageBus;
 use message_bus::client_listener::RequestHandler;
 use message_bus::framing::write_message;
-use message_bus::installer::install_client_stream;
+use message_bus::installer::install_client_tcp;
+use message_bus::{ClientTransportKind, IggyMessageBus};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -55,14 +55,24 @@ async fn duplicate_install_drops_second_fd_without_panic() {
 
     let client_id: u128 = 0x42;
     let first = loopback_pair().await;
-    install_client_stream(&bus, client_id, first, on_request.clone());
+    install_client_tcp(
+        &bus,
+        test_client_meta(client_id, ClientTransportKind::Tcp),
+        first,
+        on_request.clone(),
+    );
     assert!(bus.clients().contains(client_id));
     assert_eq!(bus.clients().len(), 1);
 
     // Collision: same client_id, second stream. Must not panic, must not
     // double-register.
     let second = loopback_pair().await;
-    install_client_stream(&bus, client_id, second, on_request);
+    install_client_tcp(
+        &bus,
+        test_client_meta(client_id, ClientTransportKind::Tcp),
+        second,
+        on_request,
+    );
     assert!(bus.clients().contains(client_id));
     assert_eq!(
         bus.clients().len(),
@@ -97,7 +107,7 @@ async fn orphan_reader_from_losing_install_does_not_invoke_on_request() {
     // install must NOT route inbound requests via `on_request`: the
     // registry entry that `client_id` keys is the winner's, so anything
     // forwarded through the winner's entry would land on the wrong
-    // consensus path. The aborted flag set in `install_client_stream` on
+    // consensus path. The aborted flag set in `install_client_tcp` on
     // `AlreadyRegistered` stops the read loop before it dispatches.
     let bus = Rc::new(IggyMessageBus::new(0));
 
@@ -113,14 +123,24 @@ async fn orphan_reader_from_losing_install_does_not_invoke_on_request() {
 
     // First install wins the slot.
     let (first_local, _first_peer) = loopback_peer_pair().await;
-    install_client_stream(&bus, client_id, first_local, on_request.clone());
+    install_client_tcp(
+        &bus,
+        test_client_meta(client_id, ClientTransportKind::Tcp),
+        first_local,
+        on_request.clone(),
+    );
     assert!(bus.clients().contains(client_id));
 
     // Second install loses the `AlreadyRegistered` race. Its spawned
     // reader is holding `second_local`'s read half; we drive that reader
     // by writing a `Request` frame from `second_peer`.
     let (second_local, mut second_peer) = loopback_peer_pair().await;
-    install_client_stream(&bus, client_id, second_local, on_request);
+    install_client_tcp(
+        &bus,
+        test_client_meta(client_id, ClientTransportKind::Tcp),
+        second_local,
+        on_request,
+    );
 
     // Push a valid Request frame down the orphan reader's wire. Before
     // the fix, the orphan would call `on_request(client_id, msg)` and
@@ -175,7 +195,12 @@ async fn losing_install_drains_well_before_close_peer_timeout() {
 
     let client_id: u128 = 0x00c0_ffee;
     let (first_local, _first_peer) = loopback_peer_pair().await;
-    install_client_stream(&bus, client_id, first_local, on_request.clone());
+    install_client_tcp(
+        &bus,
+        test_client_meta(client_id, ClientTransportKind::Tcp),
+        first_local,
+        on_request.clone(),
+    );
     assert!(bus.clients().contains(client_id));
 
     // Race: second install loses the slot. The peer never sends EOF,
@@ -183,7 +208,12 @@ async fn losing_install_drains_well_before_close_peer_timeout() {
     // per-connection shutdown trigger inside drain_rejected_registration.
     let (second_local, _second_peer) = loopback_peer_pair().await;
     let start = Instant::now();
-    install_client_stream(&bus, client_id, second_local, on_request);
+    install_client_tcp(
+        &bus,
+        test_client_meta(client_id, ClientTransportKind::Tcp),
+        second_local,
+        on_request,
+    );
     // Yield once so the spawned drain task gets to poll. Even with the
     // bus's default close_peer_timeout (5 s), we expect the drain to
     // resolve in low double-digit milliseconds.

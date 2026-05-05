@@ -23,7 +23,7 @@ mod common;
 use common::{header_only, install_replicas_locally, loopback};
 use iggy_binary_protocol::Command2;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
-use message_bus::replica_listener::{MessageHandler, bind, run};
+use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -57,6 +57,7 @@ async fn writer_batches_pipelined_sends_in_order() {
             2,
             accept_1,
             message_bus::framing::MAX_MESSAGE_SIZE,
+            Duration::from_secs(10),
         )
         .await;
     });

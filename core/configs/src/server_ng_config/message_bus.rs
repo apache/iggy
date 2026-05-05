@@ -19,17 +19,37 @@
 
 //! On-disk schema for the inter-shard / inter-replica message bus.
 //!
-//! Mirrors the runtime `core::message_bus::config::MessageBusConfig`
-//! field-for-field, but uses configs-crate idioms:
+//! Mirrors the runtime `core::message_bus::config::MessageBusConfig`,
+//! using configs-crate idioms:
 //!
 //! - `Duration` -> [`IggyDuration`] (DisplayFromStr-serde, `"5 s"` syntax)
 //! - `usize` / `u32` -> kept as the underlying integer type
-//! - `Option<SocketAddr>` -> `Option<String>` parsed at validate-time
-//! - WebSocket frame-layer tunables (`compio_ws::WebSocketConfig`) are
-//!   NOT part of this section; they live under `[websocket]` (the
-//!   existing [`super::super::server_config::websocket::WebSocketConfig`]).
-//!   The future wiring PR builds the runtime `WebSocketConfig` from that
-//!   section and feeds it into the bus at construction.
+//!
+//! Transport-section concerns the bus does NOT own:
+//!
+//! - TCP-TLS / WSS listen addresses derive from `[tcp]` + `[tcp.tls]`
+//!   and `[websocket]` + `[websocket.tls]` respectively. The future
+//!   wiring PR populates the bus's runtime listen-addr inputs from
+//!   those sections at bootstrap.
+//!
+//! Tunables the bus owns directly:
+//!
+//! - Bus-internal abstractions the operator does not see anywhere else
+//!   in the schema (batch sizing, per-peer queue depth, close-grace,
+//!   reconnect period, handshake-grace).
+//! - WebSocket frame-layer tunables for the bus's WS / WSS install
+//!   path (`ws_max_message_size`, `ws_max_frame_size`,
+//!   `ws_write_buffer_size`, `ws_accept_unmasked_frames`). The bus
+//!   plane carries SDK-client traffic with cardinality and burst
+//!   characteristics distinct from the legacy `[websocket]` listener,
+//!   so the bus owns its own frame-layer ceiling rather than aliasing
+//!   the listener's. The runtime conversion folds these into a
+//!   `tungstenite::WebSocketConfig` once at bus construction.
+//!
+//! Liveness detection is NOT done via TCP keepalive on the bus: SDK
+//! clients manage their own keepalive policy; replica<->replica
+//! liveness is observed by VSR heartbeats. No keepalive knobs live in
+//! this section.
 //!
 //! Construction of the runtime type from this struct happens in the
 //! follow-up PR that wires `core/server-ng` to call
@@ -41,7 +61,6 @@ use configs::ConfigEnv;
 use iggy_common::{IggyByteSize, IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
-use std::net::SocketAddr;
 
 /// Hard upper bound on [`MessageBusConfig::max_batch`], in iovecs.
 ///
@@ -82,21 +101,6 @@ pub struct MessageBusConfig {
     #[serde_as(as = "DisplayFromStr")]
     pub reconnect_period: IggyDuration,
 
-    /// TCP keepalive idle timer. See `tcp(7)` `TCP_KEEPIDLE`.
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub keepalive_idle: IggyDuration,
-
-    /// TCP keepalive probe interval. See `tcp(7)` `TCP_KEEPINTVL`.
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub keepalive_interval: IggyDuration,
-
-    /// TCP keepalive retry count. See `tcp(7)` `TCP_KEEPCNT`. Combined
-    /// with idle + interval this gates the half-open connection
-    /// detection window that VSR view-change timers must accommodate.
-    pub keepalive_retries: u32,
-
     /// Timeout for per-peer close drain (flush writer, tear down
     /// reader) before force-cancellation.
     #[config_env(leaf)]
@@ -112,17 +116,56 @@ pub struct MessageBusConfig {
     #[serde_as(as = "DisplayFromStr")]
     pub close_grace: IggyDuration,
 
-    /// Optional TCP-TLS client listener address in `host:port` form.
-    /// `None` keeps the plane unbound. Resolved to [`SocketAddr`] by
-    /// [`Validatable::validate`].
-    #[serde(default)]
-    pub tcp_tls_listen_addr: Option<String>,
+    /// Wall-clock bound on a single connection's handshake phase: the
+    /// rustls accept (TCP-TLS), the WS HTTP-Upgrade (plain WS), the
+    /// combined TLS + WS handshakes (WSS, sharing one budget end-to-end),
+    /// and the QUIC `connecting.await` + first `accept_bi.await` pair.
+    /// Threaded into `compio::time::timeout(handshake_grace, ...)` at
+    /// each handshake site so a slowloris peer cannot pin per-conn
+    /// channels + registry slot + spawned task indefinitely.
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    pub handshake_grace: IggyDuration,
 
-    /// Optional WSS client listener address in `host:port` form.
-    /// `None` keeps the plane unbound. Resolved to [`SocketAddr`] by
-    /// [`Validatable::validate`].
+    /// Hard upper bound on a single inbound WebSocket message
+    /// (post-fragment-reassembly). `None` keeps the tungstenite
+    /// default (currently 64 MiB). Threaded into
+    /// `tungstenite::WebSocketConfig::max_message_size` at bus
+    /// construction. Distinct from [`Self::max_message_size`], which
+    /// caps a single framed bus payload regardless of transport.
+    #[config_env(leaf)]
     #[serde(default)]
-    pub wss_listen_addr: Option<String>,
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub ws_max_message_size: Option<IggyByteSize>,
+
+    /// Hard upper bound on a single inbound WebSocket frame
+    /// (pre-fragment-reassembly). `None` keeps the tungstenite default
+    /// (currently 16 MiB). Threaded into
+    /// `tungstenite::WebSocketConfig::max_frame_size` at bus
+    /// construction.
+    #[config_env(leaf)]
+    #[serde(default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub ws_max_frame_size: Option<IggyByteSize>,
+
+    /// Target buffer size for batched WebSocket writes before tungstenite
+    /// flushes. `None` keeps the tungstenite default. Threaded into
+    /// `tungstenite::WebSocketConfig::write_buffer_size` at bus
+    /// construction.
+    #[config_env(leaf)]
+    #[serde(default)]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub ws_write_buffer_size: Option<IggyByteSize>,
+
+    /// Whether the bus accepts unmasked frames from clients in violation
+    /// of RFC 6455 client-to-server framing rules. Default `false`
+    /// (strict). Set to `true` only for non-browser test clients that
+    /// emit unmasked frames; production deployments leave this at
+    /// `false`. Threaded into
+    /// `tungstenite::WebSocketConfig::accept_unmasked_frames` at bus
+    /// construction.
+    #[serde(default)]
+    pub ws_accept_unmasked_frames: bool,
 }
 
 impl Validatable<ConfigurationError> for MessageBusConfig {
@@ -146,23 +189,55 @@ impl Validatable<ConfigurationError> for MessageBusConfig {
             eprintln!("{COMPONENT_NG} message_bus.max_message_size must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
-        if self.keepalive_retries == 0 {
-            eprintln!("{COMPONENT_NG} message_bus.keepalive_retries must be > 0");
+        if self.handshake_grace.as_micros() == 0 {
+            eprintln!("{COMPONENT_NG} message_bus.handshake_grace must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
-        // Resolve optional listen addrs eagerly so a typo fails at boot,
-        // not at first connect.
-        if let Some(s) = &self.tcp_tls_listen_addr {
-            s.parse::<SocketAddr>().map_err(|e| {
-                eprintln!("{COMPONENT_NG} message_bus.tcp_tls_listen_addr '{s}' is invalid: {e}");
-                ConfigurationError::InvalidConfigurationValue
-            })?;
+        if self.close_grace.as_micros() == 0 {
+            eprintln!("{COMPONENT_NG} message_bus.close_grace must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
-        if let Some(s) = &self.wss_listen_addr {
-            s.parse::<SocketAddr>().map_err(|e| {
-                eprintln!("{COMPONENT_NG} message_bus.wss_listen_addr '{s}' is invalid: {e}");
-                ConfigurationError::InvalidConfigurationValue
-            })?;
+        if self.close_peer_timeout.as_micros() == 0 {
+            eprintln!("{COMPONENT_NG} message_bus.close_peer_timeout must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.reconnect_period.as_micros() == 0 {
+            eprintln!("{COMPONENT_NG} message_bus.reconnect_period must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        // WS frame chain: ws_max_frame_size <= ws_max_message_size <=
+        // max_message_size. The `Option<...>` knobs only enforce a ceiling
+        // when present; an absent value defers to tungstenite's default
+        // (which is itself <= 64 MiB and so satisfies the chain in practice).
+        if let (Some(frame), Some(message)) = (self.ws_max_frame_size, self.ws_max_message_size)
+            && frame.as_bytes_u64() > message.as_bytes_u64()
+        {
+            eprintln!(
+                "{COMPONENT_NG} message_bus.ws_max_frame_size ({}) exceeds ws_max_message_size ({})",
+                frame.as_bytes_u64(),
+                message.as_bytes_u64()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if let Some(message) = self.ws_max_message_size
+            && message.as_bytes_u64() > self.max_message_size.as_bytes_u64()
+        {
+            eprintln!(
+                "{COMPONENT_NG} message_bus.ws_max_message_size ({}) exceeds max_message_size ({})",
+                message.as_bytes_u64(),
+                self.max_message_size.as_bytes_u64()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if let Some(frame) = self.ws_max_frame_size
+            && frame.as_bytes_u64() > self.max_message_size.as_bytes_u64()
+        {
+            eprintln!(
+                "{COMPONENT_NG} message_bus.ws_max_frame_size ({}) exceeds max_message_size ({})",
+                frame.as_bytes_u64(),
+                self.max_message_size.as_bytes_u64()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
         }
         Ok(())
     }
@@ -216,35 +291,6 @@ mod tests {
         assert!(c.validate().is_err());
     }
 
-    #[test]
-    fn rejects_zero_keepalive_retries() {
-        let mut c = baseline();
-        c.keepalive_retries = 0;
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_invalid_tcp_tls_listen_addr() {
-        let mut c = baseline();
-        c.tcp_tls_listen_addr = Some("not-a-socket-addr".to_string());
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn rejects_invalid_wss_listen_addr() {
-        let mut c = baseline();
-        c.wss_listen_addr = Some("nope".to_string());
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn accepts_valid_listen_addrs() {
-        let mut c = baseline();
-        c.tcp_tls_listen_addr = Some("0.0.0.0:9443".to_string());
-        c.wss_listen_addr = Some("127.0.0.1:9444".to_string());
-        c.validate().expect("valid listen addrs accepted");
-    }
-
     /// Tripwire: pins the local copy of `IOV_MAX_LIMIT` against the
     /// runtime crate's value. If `core/message_bus` ever bumps its
     /// `IOV_MAX_LIMIT`, this test fails the configs build until the
@@ -253,5 +299,59 @@ mod tests {
     #[test]
     fn iov_max_limit_matches_runtime_crate() {
         assert_eq!(IOV_MAX_LIMIT_NG, 512);
+    }
+
+    #[test]
+    fn rejects_zero_close_grace() {
+        let mut c = baseline();
+        c.close_grace = IggyDuration::from(std::time::Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_close_peer_timeout() {
+        let mut c = baseline();
+        c.close_peer_timeout = IggyDuration::from(std::time::Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_reconnect_period() {
+        let mut c = baseline();
+        c.reconnect_period = IggyDuration::from(std::time::Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_ws_frame_size_above_ws_message_size() {
+        let mut c = baseline();
+        c.ws_max_message_size = Some(IggyByteSize::from(1024_u64));
+        c.ws_max_frame_size = Some(IggyByteSize::from(2048_u64));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_ws_message_size_above_bus_max_message_size() {
+        let mut c = baseline();
+        c.max_message_size = IggyByteSize::from(1024_u64);
+        c.ws_max_message_size = Some(IggyByteSize::from(2048_u64));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_ws_frame_size_above_bus_max_message_size() {
+        let mut c = baseline();
+        c.max_message_size = IggyByteSize::from(1024_u64);
+        c.ws_max_frame_size = Some(IggyByteSize::from(2048_u64));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_ws_chain_in_ascending_order() {
+        let mut c = baseline();
+        c.max_message_size = IggyByteSize::from(64_u64 * 1024 * 1024);
+        c.ws_max_message_size = Some(IggyByteSize::from(32_u64 * 1024 * 1024));
+        c.ws_max_frame_size = Some(IggyByteSize::from(16_u64 * 1024 * 1024));
+        assert!(c.validate().is_ok());
     }
 }
