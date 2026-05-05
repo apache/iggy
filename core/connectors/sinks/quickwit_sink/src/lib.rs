@@ -119,60 +119,29 @@ impl QuickwitSink {
         );
         info!("Ingesting messages for index: {}...", self.index_id);
         let messages_count = messages.len();
-        let body = messages
+        let messages = messages
             .into_iter()
             .filter_map(|record| simd_json::to_string(&record).ok())
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Quickwit may return 404 "index not found" for a brief window
-        // immediately after index creation (the index isn't fully registered
-        // yet). Retry a few times with a short backoff before giving up.
-        const MAX_INGEST_RETRIES: u32 = 5;
-        const INGEST_RETRY_DELAY_MS: u64 = 500;
-
-        for attempt in 0..=MAX_INGEST_RETRIES {
-            let response = self
-                .client
-                .post(&url)
-                .body(body.clone())
-                .send()
-                .await
-                .map_err(|error| {
-                    error!(
-                        "Failed to send HTTP request to ingest messages for index: {}. {error}",
-                        self.index_id
-                    );
-                    Error::HttpRequestFailed(error.to_string())
-                })?;
-
-            let status = response.status();
-            if status.is_success() {
-                info!(
-                    "Ingested {messages_count} messages for index: {}",
+        let response = self
+            .client
+            .post(&url)
+            .body(messages)
+            .send()
+            .await
+            .map_err(|error| {
+                error!(
+                    "Failed to send HTTP request to ingest messages for index: {}. {error}",
                     self.index_id
                 );
-                return Ok(());
-            }
+                Error::HttpRequestFailed(error.to_string())
+            })?;
 
+        if !response.status().is_success() {
+            let status = response.status();
             let text = response.text().await.unwrap_or_default();
-
-            // Treat 404 "index not found" as transient right after creation.
-            if status == reqwest::StatusCode::NOT_FOUND
-                && text.contains("not found")
-                && attempt < MAX_INGEST_RETRIES
-            {
-                warn!(
-                    "Index {} not ready yet (attempt {}/{}), retrying in {}ms…",
-                    self.index_id,
-                    attempt + 1,
-                    MAX_INGEST_RETRIES,
-                    INGEST_RETRY_DELAY_MS,
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(INGEST_RETRY_DELAY_MS)).await;
-                continue;
-            }
-
             error!(
                 "Received an invalid HTTP response when ingesting messages for index: {}. Status code: {status}, reason: {text}",
                 self.index_id
@@ -182,10 +151,11 @@ impl QuickwitSink {
             )));
         }
 
-        Err(Error::HttpRequestFailed(format!(
-            "Index {} still not available after {MAX_INGEST_RETRIES} retries",
+        info!(
+            "Ingested {messages_count} messages for index: {}",
             self.index_id
-        )))
+        );
+        Ok(())
     }
 }
 
