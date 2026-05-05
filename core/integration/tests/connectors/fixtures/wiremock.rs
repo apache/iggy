@@ -77,19 +77,12 @@ impl WireMockContainer {
                 message: format!("Failed to get host: {e}"),
             })?;
 
-        let ports = container
-            .ports()
+        let host_port = container
+            .get_host_port_ipv4(WIREMOCK_PORT)
             .await
             .map_err(|e| TestBinaryError::FixtureSetup {
                 fixture_type: "WireMockContainer".to_string(),
-                message: format!("Failed to get ports: {e}"),
-            })?;
-        let host_port = ports
-            .map_to_host_port_ipv4(WIREMOCK_PORT)
-            .or_else(|| ports.map_to_host_port_ipv6(WIREMOCK_PORT))
-            .ok_or_else(|| TestBinaryError::FixtureSetup {
-                fixture_type: "WireMockContainer".to_string(),
-                message: "No mapping for WireMock port".to_string(),
+                message: format!("Failed to get port: {e}"),
             })?;
 
         let base_url = format!("http://{host}:{host_port}");
