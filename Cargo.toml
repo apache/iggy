@@ -34,6 +34,7 @@ members = [
     "core/connectors/runtime",
     "core/connectors/sdk",
     "core/connectors/sinks/delta_sink",
+    "core/connectors/sinks/doris_sink",
     "core/connectors/sinks/elasticsearch_sink",
     "core/connectors/sinks/http_sink",
     "core/connectors/sinks/iceberg_sink",
@@ -268,6 +269,7 @@ socket2 = "0.6.3"
 sqlx = { version = "0.8.6", features = [
     "runtime-tokio-rustls",
     "postgres",
+    "mysql",
     "chrono",
     "uuid",
     "json",

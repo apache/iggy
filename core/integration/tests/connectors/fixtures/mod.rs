@@ -18,6 +18,7 @@
  */
 
 mod delta;
+mod doris;
 mod elasticsearch;
 mod http;
 mod iceberg;
@@ -28,6 +29,10 @@ mod quickwit;
 mod wiremock;
 
 pub use delta::{DeltaFixture, DeltaS3Fixture};
+pub use doris::{
+    DorisOps, DorisSinkColumnsMappingFixture, DorisSinkFixture, DorisSinkMaxFilterRatioFixture,
+    DorisSinkPreCreatedFixture,
+};
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use http::{
     HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture,
