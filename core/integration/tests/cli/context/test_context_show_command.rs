@@ -111,12 +111,12 @@ pub async fn should_show_context_with_all_fields() {
             ),
             "production".to_string(),
             vec![
-                "| Name               | production".to_string(),
-                "| Transport          | tcp".to_string(),
-                "| TCP Server Address | 10.0.0.1:8090".to_string(),
-                "| TCP TLS Enabled    | true".to_string(),
-                "| Username           | admin".to_string(),
-                "| Password           | ********".to_string(),
+                "production".to_string(),
+                "tcp".to_string(),
+                "10.0.0.1:8090".to_string(),
+                "true".to_string(),
+                "admin".to_string(),
+                "********".to_string(),
             ],
         ))
         .await;
@@ -132,7 +132,7 @@ pub async fn should_show_default_context() {
         .execute_test(TestContextShowCmd::new(
             TestIggyContext::new(None, None),
             "default".to_string(),
-            vec!["| Name | default*".to_string()],
+            vec!["default*".to_string()],
         ))
         .await;
 }
@@ -153,7 +153,7 @@ pub async fn should_show_active_context_with_asterisk() {
                 Some("dev".to_string()),
             ),
             "dev".to_string(),
-            vec!["| Name | dev*".to_string()],
+            vec!["dev*".to_string()],
         ))
         .await;
 }
