@@ -6790,7 +6790,6 @@ dependencies = [
  "serde",
  "serde_yaml_ng",
  "simd-json",
- "tokio",
  "tracing",
 ]
 
