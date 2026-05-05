@@ -296,7 +296,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
     "ansi",
 ] }
 trait-variant = "0.1.2"
-tungstenite = "0.28.0"
+tungstenite = "0.29.0"
 twox-hash = { version = "2.1.2", features = ["xxhash32"] }
 ulid = "1.2.1"
 ureq = "3.3"

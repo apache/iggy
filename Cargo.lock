@@ -2852,7 +2852,7 @@ dependencies = [
  "compio-log",
  "compio-net",
  "compio-tls",
- "tungstenite",
+ "tungstenite 0.28.0",
 ]
 
 [[package]]
@@ -2901,7 +2901,7 @@ dependencies = [
  "static-toml",
  "strum 0.28.0",
  "tracing",
- "tungstenite",
+ "tungstenite 0.29.0",
 ]
 
 [[package]]
@@ -6550,7 +6550,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "tungstenite",
+ "tungstenite 0.29.0",
  "twox-hash",
  "ulid",
  "uuid",
@@ -12529,7 +12529,7 @@ dependencies = [
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",
- "tungstenite",
+ "tungstenite 0.28.0",
  "webpki-roots 0.26.11",
 ]
 
@@ -12897,6 +12897,22 @@ dependencies = [
  "sha1 0.10.6",
  "thiserror 2.0.18",
  "utf-8",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http 1.4.0",
+ "httparse",
+ "log",
+ "rand 0.9.4",
+ "sha1 0.10.6",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
