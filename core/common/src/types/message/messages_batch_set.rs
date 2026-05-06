@@ -335,12 +335,12 @@ impl Index<usize> for IggyMessagesBatchSet {
     ///
     /// Panics if the index is out of bounds (>= total number of messages)
     fn index(&self, index: usize) -> &Self::Output {
-        if index >= self.count as usize {
-            panic!(
-                "Index out of bounds: the len is {} but the index is {}",
-                self.count, index
-            );
-        }
+        assert!(
+            index < self.count as usize,
+            "Index out of bounds: the len is {} but the index is {}",
+            self.count,
+            index
+        );
 
         let mut seen_messages = 0;
 
