@@ -32,7 +32,7 @@ pub enum RuntimeError {
     #[error("Failed to serialize headers")]
     FailedToSerializeHeaders,
     #[error(
-        "Sink connector with ID: {plugin_id} failed to consume {messages_count} messages from stream: {stream}, topic: {topic}, partition: {partition_id}, current offset: {current_offset}, schema: {schema}, status: {status}"
+        "Sink connector with ID: {plugin_id} failed to consume {processed_count} processed messages from stream: {stream}, topic: {topic}, partition: {partition_id}, current offset: {current_offset}, schema: {schema}, status: {status}"
     )]
     SinkConsumeFailed {
         plugin_id: u32,
@@ -42,7 +42,7 @@ pub enum RuntimeError {
         partition_id: u32,
         current_offset: u64,
         schema: String,
-        messages_count: usize,
+        processed_count: usize,
     },
     #[error("Connector SDK error")]
     ConnectorSdkError(#[from] iggy_connector_sdk::Error),

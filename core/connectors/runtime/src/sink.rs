@@ -600,7 +600,7 @@ async fn process_messages(
             partition_id: messages_metadata.partition_id,
             current_offset: messages_metadata.current_offset,
             schema: messages_metadata.schema.to_string(),
-            messages_count: processed_count,
+            processed_count,
         });
     }
 
@@ -683,7 +683,7 @@ mod tests {
                 partition_id: 1,
                 current_offset: 0,
                 schema,
-                messages_count: 1
+                processed_count: 1
             }) if stream == "stream" && topic == "topic" && schema == "raw"
         ));
     }
