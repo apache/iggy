@@ -20,7 +20,7 @@
 package org.apache.iggy.bench.common.enums;
 
 public enum TransportKind {
-    TCP("tcp");
+    TCP("tcp"),
     HTTP("http");
 
     private final String value;

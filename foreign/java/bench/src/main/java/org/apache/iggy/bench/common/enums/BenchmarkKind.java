@@ -20,7 +20,7 @@
 package org.apache.iggy.bench.common.enums;
 
 public enum BenchmarkKind {
-    PINNED_PRODUCER("pinned_producer");
+    PINNED_PRODUCER("pinned_producer"),
     PINNED_CONSUMER("pinned_consumer"),
     PINNED_PRODUCER_AND_CONSUMER("pinned_producer_and_consumer"),
     BALANCED_PRODUCER("balanced_producer"),
