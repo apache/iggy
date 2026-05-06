@@ -31,6 +31,19 @@ pub enum RuntimeError {
     FailedToSerializeRawMessages,
     #[error("Failed to serialize headers")]
     FailedToSerializeHeaders,
+    #[error(
+        "Sink connector with ID: {plugin_id} failed to consume {processed_count} processed messages from stream: {stream}, topic: {topic}, partition: {partition_id}, current offset: {current_offset}, schema: {schema}, status: {status}"
+    )]
+    SinkConsumeFailed {
+        plugin_id: u32,
+        status: i32,
+        stream: String,
+        topic: String,
+        partition_id: u32,
+        current_offset: u64,
+        schema: String,
+        processed_count: usize,
+    },
     #[error("Connector SDK error")]
     ConnectorSdkError(#[from] iggy_connector_sdk::Error),
     #[error("Iggy client error")]
@@ -75,6 +88,7 @@ impl RuntimeError {
             RuntimeError::MissingIggyCredentials => "invalid_configuration",
             RuntimeError::InvalidConfiguration(_) => "invalid_configuration",
             RuntimeError::HttpRequestFailed(_) => "http_request_failed",
+            RuntimeError::SinkConsumeFailed { .. } => "sink_consume_failed",
             RuntimeError::TokenFileNotFound(_) => "invalid_configuration",
             RuntimeError::TokenFileReadError(_, _) => "invalid_configuration",
             RuntimeError::TokenFileEmpty(_) => "invalid_configuration",

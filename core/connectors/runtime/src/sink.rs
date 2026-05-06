@@ -594,7 +594,7 @@ async fn process_messages(
         RuntimeError::FailedToSerializeRawMessages
     })?;
 
-    (consume)(
+    let status = (consume)(
         plugin_id,
         topic_meta.as_ptr(),
         topic_meta.len(),
@@ -603,6 +603,100 @@ async fn process_messages(
         messages.as_ptr(),
         messages.len(),
     );
+    if status != 0 {
+        return Err(RuntimeError::SinkConsumeFailed {
+            plugin_id,
+            status,
+            stream: topic_metadata.stream.clone(),
+            topic: topic_metadata.topic.clone(),
+            partition_id: messages_metadata.partition_id,
+            current_offset: messages_metadata.current_offset,
+            schema: messages_metadata.schema.to_string(),
+            processed_count,
+        });
+    }
 
     Ok(processed_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy::prelude::IggyMessageHeader;
+    use iggy_connector_sdk::{Error, Payload, Schema};
+
+    struct TestDecoder;
+
+    impl StreamDecoder for TestDecoder {
+        fn schema(&self) -> Schema {
+            Schema::Raw
+        }
+
+        fn decode(&self, payload: Vec<u8>) -> Result<Payload, Error> {
+            Ok(Payload::Raw(payload))
+        }
+    }
+
+    extern "C" fn failing_consume(
+        _plugin_id: u32,
+        _topic_meta_ptr: *const u8,
+        _topic_meta_len: usize,
+        _messages_meta_ptr: *const u8,
+        _messages_meta_len: usize,
+        _messages_ptr: *const u8,
+        _messages_len: usize,
+    ) -> i32 {
+        1
+    }
+
+    #[tokio::test]
+    async fn process_messages_returns_error_when_consume_callback_fails() {
+        let plugin_id = 42;
+        let consume: ConsumeCallback = failing_consume;
+        let decoder: Arc<dyn StreamDecoder> = Arc::new(TestDecoder);
+        let result = process_messages(
+            plugin_id,
+            MessagesMetadata {
+                partition_id: 1,
+                current_offset: 0,
+                schema: Schema::Raw,
+            },
+            &TopicMetadata {
+                stream: "stream".to_string(),
+                topic: "topic".to_string(),
+            },
+            vec![IggyMessage {
+                header: IggyMessageHeader {
+                    checksum: 1,
+                    id: 2,
+                    offset: 0,
+                    timestamp: 3,
+                    origin_timestamp: 4,
+                    user_headers_length: 0,
+                    payload_length: 7,
+                    reserved: 0,
+                },
+                payload: "payload".into(),
+                user_headers: None,
+            }],
+            &consume,
+            &Vec::new(),
+            &decoder,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::SinkConsumeFailed {
+                plugin_id: 42,
+                status: 1,
+                stream,
+                topic,
+                partition_id: 1,
+                current_offset: 0,
+                schema,
+                processed_count: 1
+            }) if stream == "stream" && topic == "topic" && schema == "raw"
+        ));
+    }
 }

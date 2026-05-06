@@ -786,7 +786,7 @@ cargo test -p integration --test connectors -- http_sink
 
 ## Delivery Semantics
 
-All retry logic lives inside `consume()`. The connector runtime invokes `consume()` via an FFI callback that returns an `i32` status code. The runtime does not inspect this return value (see `process_messages()` in `runtime/src/sink.rs`), so errors logged by the sink are not propagated to the runtime's retry or alerting mechanisms. Additionally, consumer group offsets are committed before processing ([runtime issue #1](#known-limitations)). This means:
+All retry logic lives inside `consume()`. The connector runtime invokes `consume()` via an FFI callback that returns an `i32` status code. A non-zero return value is treated as a processing error by `process_messages()` in `runtime/src/sink.rs`, stopping the sink task and surfacing the failure to the runtime. Additionally, consumer group offsets are committed before processing ([runtime issue #1](#known-limitations)). This means:
 
 - Failed messages are **not retried by the runtime** — only by the sink's internal retry loop
 - Messages are committed **before delivery** — a crash after commit but before delivery loses messages
@@ -795,9 +795,9 @@ The effective delivery guarantee is **at-most-once** at the runtime level. The s
 
 ## Known Limitations
 
-1. **Runtime ignores `consume()` status**: The connector runtime invokes `consume()` via an FFI callback returning `i32`. The `process_messages()` function in `runtime/src/sink.rs` does not inspect the return value. Errors are logged internally by the sink but do not trigger runtime-level retry or alerting. ([#2927](https://github.com/apache/iggy/issues/2927))
+1. **No runtime retry after `consume()` failure**: The connector runtime now treats a non-zero `consume()` FFI status as a processing error, but the failed batch is not retried by the runtime. ([#2927](https://github.com/apache/iggy/issues/2927))
 
-2. **Offsets committed before processing**: The `PollingMessages` auto-commit strategy commits consumer group offsets before `consume()` is called. Combined with limitation 1, at-least-once delivery is not achievable. ([#2928](https://github.com/apache/iggy/issues/2928))
+2. **Offsets committed before processing**: The `PollingMessages` auto-commit strategy commits consumer group offsets before `consume()` is called. Because a failed batch is already committed, at-least-once delivery is not achievable. ([#2928](https://github.com/apache/iggy/issues/2928))
 
 3. **`Retry-After` header not used for backoff**: The `reqwest-middleware` retry layer uses computed exponential backoff. `Retry-After` headers are logged as warnings but do not influence retry timing.
 
