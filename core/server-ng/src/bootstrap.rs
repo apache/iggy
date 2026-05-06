@@ -476,7 +476,7 @@ async fn load_partition(
         .any(|segment| segment.size > IggyByteSize::default());
     partition.stats.set_current_offset(current_offset);
 
-    configure_consumer_offsets(&mut partition, config, namespace, current_offset);
+    configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
     ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
 
     Ok(partition)
@@ -500,6 +500,17 @@ async fn hydrate_partition_log(
         .zip(loaded_log.storages().iter().cloned())
         .enumerate()
     {
+        validate_recovered_segment(
+            stream_id,
+            topic_id,
+            partition_id,
+            segment,
+            &storage,
+            loaded_log
+                .indexes()
+                .get(segment_index)
+                .and_then(|indexes| indexes.as_ref()),
+        )?;
         let max_timestamp = match loaded_log
             .indexes()
             .get(segment_index)
@@ -560,6 +571,34 @@ async fn hydrate_partition_log(
     Ok(())
 }
 
+fn validate_recovered_segment(
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+    segment: &iggy_common::Segment,
+    storage: &iggy_common::SegmentStorage,
+    indexes: Option<&server::streaming::segments::IggyIndexesMut>,
+) -> Result<(), ServerNgError> {
+    let messages_size_bytes = storage
+        .messages_reader
+        .as_ref()
+        .map_or(0, |reader| u64::from(reader.file_size()));
+    let indexed_size_bytes = indexes.map_or(0, |indexes| u64::from(indexes.messages_size()));
+    if messages_size_bytes == indexed_size_bytes {
+        return Ok(());
+    }
+
+    Err(ServerNgError::RecoveredSegmentSizeDivergence {
+        stream_id,
+        topic_id,
+        partition_id,
+        start_offset: segment.start_offset,
+        end_offset: segment.end_offset,
+        messages_size_bytes,
+        indexed_size_bytes,
+    })
+}
+
 fn convert_segment(segment: &iggy_common::Segment, max_timestamp: u64) -> Segment {
     Segment {
         sealed: segment.sealed,
@@ -612,7 +651,7 @@ fn configure_consumer_offsets(
     config: &ServerNgConfig,
     namespace: IggyNamespace,
     current_offset: u64,
-) {
+) -> Result<(), ServerNgError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
@@ -631,8 +670,17 @@ fn configure_consumer_offsets(
     {
         let guard = consumer_offsets.pin();
         for offset in loaded_consumer_offsets {
-            if offset.offset.load(Ordering::Relaxed) > current_offset {
-                offset.offset.store(current_offset, Ordering::Relaxed);
+            let recovered_offset = offset.offset.load(Ordering::Relaxed);
+            if recovered_offset > current_offset {
+                return Err(ServerNgError::RecoveredConsumerOffsetOutOfBounds {
+                    consumer_kind: "consumer",
+                    consumer_id: offset.consumer_id as usize,
+                    offset: recovered_offset,
+                    current_offset,
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                });
             }
             guard.insert(offset.consumer_id as usize, offset);
         }
@@ -645,8 +693,17 @@ fn configure_consumer_offsets(
     {
         let guard = consumer_group_offsets.pin();
         for (group_id, offset) in loaded_group_offsets {
-            if offset.offset.load(Ordering::Relaxed) > current_offset {
-                offset.offset.store(current_offset, Ordering::Relaxed);
+            let recovered_offset = offset.offset.load(Ordering::Relaxed);
+            if recovered_offset > current_offset {
+                return Err(ServerNgError::RecoveredConsumerOffsetOutOfBounds {
+                    consumer_kind: "consumer group",
+                    consumer_id: group_id.0,
+                    offset: recovered_offset,
+                    current_offset,
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                });
             }
             guard.insert(group_id, offset);
         }
@@ -659,6 +716,7 @@ fn configure_consumer_offsets(
         consumer_group_offsets,
         config.system.partition.enforce_fsync,
     );
+    Ok(())
 }
 
 async fn ensure_initial_segment(
@@ -740,6 +798,12 @@ fn resolve_tcp_topology(
     let default_quic_addr =
         resolve_optional_listener_addr(config.quic.enabled, "quic.address", &config.quic.address)?;
     if !config.cluster.enabled {
+        if let Some(replica_id) = current_replica_id {
+            warn!(
+                replica_id,
+                "cluster is disabled, ignoring --replica-id for single-node server-ng startup"
+            );
+        }
         return Ok(TcpTopology {
             // Keep parity with the current server binary and the integration
             // harness: `--replica-id` may be passed unconditionally, but in

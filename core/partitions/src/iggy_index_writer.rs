@@ -43,14 +43,19 @@ impl IggyIndexWriter {
         file_exists: bool,
     ) -> Result<Self, IggyError> {
         let mut opts = OpenOptions::new();
-        opts.create(true).write(true);
+        opts.write(true);
+        if !file_exists {
+            opts.create(true);
+        }
         let file = opts
             .open(file_path)
             .await
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {
-            let _ = file.sync_all().await;
+            file.sync_all()
+                .await
+                .map_err(|_| IggyError::CannotWriteToFile)?;
 
             let actual_index_size = file
                 .metadata()

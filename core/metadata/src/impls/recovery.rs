@@ -135,7 +135,10 @@ where
     )
     .await?;
 
-    // 4. Replay journal entries after snapshot
+    // 4. Replay journal entries after snapshot.
+    // Intentional fail-fast for now: if replay hits a bad entry, recovery
+    // aborts and the operator must repair or truncate the WAL before the
+    // node can boot again.
     let headers_to_replay = journal.iter_headers_from(replay_from);
 
     let mut last_applied_op: Option<u64> = None;
