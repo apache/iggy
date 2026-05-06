@@ -38,12 +38,8 @@ while [[ $# -gt 0 ]]; do
       FILE_MODE="ci"
       shift
       ;;
-    --all)
-      FILE_MODE="all"
-      shift
-      ;;
     --help|-h)
-      echo "Usage: $0 [--check|--fix] [--ci|--all] [files...]"
+      echo "Usage: $0 [--check|--fix] [--ci] [files...]"
       echo ""
       echo "Modes:"
       echo "  --check   Check TOML formatting (default)"
@@ -51,7 +47,6 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "File selection:"
       echo "  --ci      Check files changed in PR (for CI)"
-      echo "  --all     Check all TOML files (default)"
       echo "  [files]   Check specific files"
       exit 0
       ;;
@@ -92,23 +87,13 @@ get_files() {
         # Generic CI - compare with HEAD~1
         git diff --name-only --diff-filter=ACM HEAD~1 -- '*.toml'
       else
-        # Local fallback: check all TOML files
-        find . -name '*.toml' \
-          -not -path './target/*' \
-          -not -path './node_modules/*' \
-          -not -path './.git/*' \
-          -not -path './venv/*' \
-          -type f
+        # Local fallback: check all tracked TOML files
+        git ls-files -- '*.toml'
       fi
       ;;
     all)
       # Get all TOML files (excluding common build directories)
-      find . -name '*.toml' \
-        -not -path './target/*' \
-        -not -path './node_modules/*' \
-        -not -path './.git/*' \
-        -not -path './venv/*' \
-        -type f
+      git ls-files -- '*.toml'
       ;;
   esac
 }

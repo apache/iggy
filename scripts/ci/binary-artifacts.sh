@@ -47,16 +47,11 @@ while [[ $# -gt 0 ]]; do
       FILE_MODE="ci"
       shift
       ;;
-    --all)
-      FILE_MODE="all"
-      shift
-      ;;
     --help|-h)
-      echo "Usage: $0 [--check] [--ci|--all] [files...]"
+      echo "Usage: $0 [--check] [--ci] [files...]"
       echo ""
       echo "File selection:"
       echo "  --ci      Check files changed in PR (for CI)"
-      echo "  --all     Check all tracked files (default)"
       echo "  [files]   Check specific files"
       exit 0
       ;;

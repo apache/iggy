@@ -35,14 +35,10 @@ while [[ $# -gt 0 ]]; do
       MODE="fix"
       shift
       ;;
-    --all)
-      shift
-      ;;
     --help|-h)
-      echo "Usage: $0 [--check|--fix] [--all] [files...]"
+      echo "Usage: $0 [--check|--fix] [files...]"
       echo "  --check   Check shell scripts for issues (default)"
       echo "  --fix     Show detailed suggestions for fixes"
-      echo "  --all     Check all shell scripts (default)"
       exit 0
       ;;
     -*)
