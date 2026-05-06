@@ -1,0 +1,50 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "s3"
+enabled = true
+version = 0
+name = "S3 sink"
+path = "../../target/release/libiggy_connector_s3_sink"
+verbose = false
+
+[[streams]]
+stream = "application_logs"
+topics = ["api_requests", "errors"]
+schema = "json"
+batch_length = 1000
+poll_interval = "100ms"
+consumer_group = "s3_sink"
+
+[plugin_config]
+bucket = "my-data-lake"
+prefix = "iggy/raw"
+region = "us-east-1"
+# endpoint = "http://localhost:9000"       # uncomment for MinIO / S3-compatible stores
+# access_key_id = "minioadmin"             # omit to use env vars / instance profile
+# secret_access_key = "minioadmin"         # omit to use env vars / instance profile
+path_template = "{stream}/{topic}/{date}/{hour}"
+file_rotation = "size"
+max_file_size = "8MiB"
+# max_messages_per_file = 10000            # used when file_rotation = "messages"
+output_format = "json_lines"
+include_metadata = true
+include_headers = true
+max_retries = 3
+retry_delay = "1s"
+# path_style = true                        # auto-enabled when endpoint is set (for MinIO)

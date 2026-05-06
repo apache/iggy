@@ -108,6 +108,7 @@ jobs:
             - `iggy_connector_postgres_source`
             - `iggy_connector_quickwit_sink`
             - `iggy_connector_random_source`
+            - `iggy_connector_s3_sink`
             - `iggy_connector_stdout_sink`
 
             ## Downloads
