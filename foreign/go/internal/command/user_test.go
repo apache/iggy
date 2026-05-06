@@ -25,6 +25,29 @@ import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
+// Helper to create test permissions with only global permissions
+func createTestGlobalPermissions(all bool) iggcon.GlobalPermissions {
+	return iggcon.GlobalPermissions{
+		ManageServers: all,
+		ReadServers:   all,
+		ManageUsers:   all,
+		ReadUsers:     all,
+		ManageStreams: all,
+		ReadStreams:   all,
+		ManageTopics:  all,
+		ReadTopics:    all,
+		PollMessages:  all,
+		SendMessages:  all,
+	}
+}
+
+func createTestPermissions(global iggcon.GlobalPermissions) *iggcon.Permissions {
+	return &iggcon.Permissions{
+		Global:  global,
+		Streams: nil, // Simple case: no stream-specific permissions
+	}
+}
+
 func TestSerialize_CreateUser_NilPermissions(t *testing.T) {
 	request := CreateUser{
 		Username: "u",
@@ -205,5 +228,310 @@ func TestSerialize_UpdatePermissions_WithPermissions(t *testing.T) {
 
 	if !bytes.Equal(serialized[pos:], permBytes) {
 		t.Errorf("permissions payload mismatch")
+	}
+}
+
+// TestSerialize_CreateUser_WithPermissions_ActiveStatus tests CreateUser with permissions and Active status
+func TestSerialize_CreateUser_WithPermissions_ActiveStatus(t *testing.T) {
+	globalPerms := createTestGlobalPermissions(true)
+	permissions := createTestPermissions(globalPerms)
+
+	cmd := CreateUser{
+		Username:    "admin",
+		Password:    "secret",
+		Status:      iggcon.Active,
+		Permissions: permissions,
+	}
+
+	serialized, err := cmd.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Failed to serialize CreateUser: %v", err)
+	}
+
+	expected := []byte{
+		0x05,                         // Username length = 5
+		0x61, 0x64, 0x6D, 0x69, 0x6E, // "admin"
+		0x06,                               // Password length = 6
+		0x73, 0x65, 0x63, 0x72, 0x65, 0x74, // "secret"
+		0x01,                   // Status = Active (1)
+		0x01,                   // Has permissions = 1
+		0x0B, 0x00, 0x00, 0x00, // Permissions length = 11
+		// Global permissions (10 bytes) - all true
+		0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+		0x00, // No stream-specific permissions
+	}
+
+	if !bytes.Equal(serialized, expected) {
+		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	}
+}
+
+// TestSerialize_CreateUser_InactiveStatus tests CreateUser with Inactive status
+func TestSerialize_CreateUser_InactiveStatus(t *testing.T) {
+	cmd := CreateUser{
+		Username:    "inactive_user",
+		Password:    "pwd",
+		Status:      iggcon.Inactive,
+		Permissions: nil,
+	}
+
+	serialized, err := cmd.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Failed to serialize CreateUser with inactive status: %v", err)
+	}
+
+	expected := []byte{
+		0x0D,                                                                         // Username length = 13
+		0x69, 0x6E, 0x61, 0x63, 0x74, 0x69, 0x76, 0x65, 0x5F, 0x75, 0x73, 0x65, 0x72, // "inactive_user"
+		0x03,             // Password length = 3
+		0x70, 0x77, 0x64, // "pwd"
+		0x02, // Status = Inactive (2)
+		0x00, // Has permissions = 0
+	}
+
+	if !bytes.Equal(serialized, expected) {
+		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	}
+}
+
+// TestSerialize_CreateUser_EmptyCredentials tests edge case with empty username/password
+func TestSerialize_CreateUser_EmptyCredentials(t *testing.T) {
+	cmd := CreateUser{
+		Username:    "",
+		Password:    "",
+		Status:      iggcon.Active,
+		Permissions: nil,
+	}
+
+	serialized, err := cmd.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Failed to serialize CreateUser with empty credentials: %v", err)
+	}
+
+	expected := []byte{
+		0x00, // Username length = 0
+		0x00, // Password length = 0
+		0x01, // Status = Active (1)
+		0x00, // Has permissions = 0
+	}
+
+	if !bytes.Equal(serialized, expected) {
+		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	}
+}
+
+// TestSerialize_CreateUser_PartialPermissions tests with partial global permissions
+func TestSerialize_CreateUser_PartialPermissions(t *testing.T) {
+	globalPerms := iggcon.GlobalPermissions{
+		ManageServers: true,
+		ReadServers:   true,
+		ManageUsers:   false,
+		ReadUsers:     true,
+		ManageStreams: false,
+		ReadStreams:   true,
+		ManageTopics:  false,
+		ReadTopics:    true,
+		PollMessages:  true,
+		SendMessages:  false,
+	}
+	permissions := createTestPermissions(globalPerms)
+
+	cmd := CreateUser{
+		Username:    "user",
+		Password:    "pass",
+		Status:      iggcon.Active,
+		Permissions: permissions,
+	}
+
+	serialized, err := cmd.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Failed to serialize CreateUser with partial permissions: %v", err)
+	}
+
+	expected := []byte{
+		0x04,                   // Username length = 4
+		0x75, 0x73, 0x65, 0x72, // "user"
+		0x04,                   // Password length = 4
+		0x70, 0x61, 0x73, 0x73, // "pass"
+		0x01,                   // Status = Active (1)
+		0x01,                   // Has permissions = 1
+		0x0B, 0x00, 0x00, 0x00, // Permissions length = 11
+		// Global permissions: 1,1,0,1,0,1,0,1,1,0
+		0x01, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00,
+		0x00, // No stream-specific permissions
+	}
+
+	if !bytes.Equal(serialized, expected) {
+		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	}
+}
+
+// TestSerialize_GetUsers tests GetUsers serialization (empty)
+func TestSerialize_GetUsers(t *testing.T) {
+	cmd := GetUsers{}
+
+	serialized, err := cmd.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Failed to serialize GetUsers: %v", err)
+	}
+
+	expected := []byte{} // Empty byte array
+
+	if !bytes.Equal(serialized, expected) {
+		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	}
+}
+
+// TestSerialize_GetUser_NumericId tests GetUser with numeric identifier
+func TestSerialize_GetUser_NumericId(t *testing.T) {
+	userId, _ := iggcon.NewIdentifier(uint32(123))
+
+	cmd := GetUser{
+		Id: userId,
+	}
+
+	serialized, err := cmd.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Failed to serialize GetUser with numeric ID: %v", err)
+	}
+
+	expected := []byte{
+		0x01,                   // Kind = NumericId
+		0x04,                   // Length = 4
+		0x7B, 0x00, 0x00, 0x00, // Value = 123
+	}
+
+	if !bytes.Equal(serialized, expected) {
+		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	}
+}
+
+// TestSerialize_GetUser_StringId tests GetUser with string identifier
+func TestSerialize_GetUser_StringId(t *testing.T) {
+	userId, _ := iggcon.NewIdentifier("admin")
+
+	cmd := GetUser{
+		Id: userId,
+	}
+
+	serialized, err := cmd.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Failed to serialize GetUser with string ID: %v", err)
+	}
+
+	expected := []byte{
+		0x02,                         // Kind = StringId
+		0x05,                         // Length = 5
+		0x61, 0x64, 0x6D, 0x69, 0x6E, // "admin"
+	}
+
+	if !bytes.Equal(serialized, expected) {
+		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	}
+}
+
+// TestSerialize_ChangePassword tests ChangePassword serialization
+func TestSerialize_ChangePassword(t *testing.T) {
+	userId, _ := iggcon.NewIdentifier(uint32(1))
+
+	cmd := ChangePassword{
+		UserID:          userId,
+		CurrentPassword: "old_pass",
+		NewPassword:     "new_pass",
+	}
+
+	serialized, err := cmd.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Failed to serialize ChangePassword: %v", err)
+	}
+
+	expected := []byte{
+		0x01,                   // UserId Kind = NumericId
+		0x04,                   // UserId Length = 4
+		0x01, 0x00, 0x00, 0x00, // UserId Value = 1
+		0x08,                                           // CurrentPassword length = 8
+		0x6F, 0x6C, 0x64, 0x5F, 0x70, 0x61, 0x73, 0x73, // "old_pass"
+		0x08,                                           // NewPassword length = 8
+		0x6E, 0x65, 0x77, 0x5F, 0x70, 0x61, 0x73, 0x73, // "new_pass"
+	}
+
+	if !bytes.Equal(serialized, expected) {
+		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	}
+}
+
+// TestSerialize_ChangePassword_EmptyPasswords tests edge case with empty passwords
+func TestSerialize_ChangePassword_EmptyPasswords(t *testing.T) {
+	userId, _ := iggcon.NewIdentifier("admin")
+
+	cmd := ChangePassword{
+		UserID:          userId,
+		CurrentPassword: "",
+		NewPassword:     "",
+	}
+
+	serialized, err := cmd.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Failed to serialize ChangePassword with empty passwords: %v", err)
+	}
+
+	expected := []byte{
+		0x02,                         // UserId Kind = StringId
+		0x05,                         // UserId Length = 5
+		0x61, 0x64, 0x6D, 0x69, 0x6E, // "admin"
+		0x00, // CurrentPassword length = 0
+		0x00, // NewPassword length = 0
+	}
+
+	if !bytes.Equal(serialized, expected) {
+		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	}
+}
+
+// TestSerialize_DeleteUser_NumericId tests DeleteUser with numeric identifier
+func TestSerialize_DeleteUser_NumericId(t *testing.T) {
+	userId, _ := iggcon.NewIdentifier(uint32(999))
+
+	cmd := DeleteUser{
+		Id: userId,
+	}
+
+	serialized, err := cmd.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Failed to serialize DeleteUser with numeric ID: %v", err)
+	}
+
+	expected := []byte{
+		0x01,                   // Kind = NumericId
+		0x04,                   // Length = 4
+		0xE7, 0x03, 0x00, 0x00, // Value = 999
+	}
+
+	if !bytes.Equal(serialized, expected) {
+		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	}
+}
+
+// TestSerialize_DeleteUser_StringId tests DeleteUser with string identifier
+func TestSerialize_DeleteUser_StringId(t *testing.T) {
+	userId, _ := iggcon.NewIdentifier("test_user")
+
+	cmd := DeleteUser{
+		Id: userId,
+	}
+
+	serialized, err := cmd.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Failed to serialize DeleteUser with string ID: %v", err)
+	}
+
+	expected := []byte{
+		0x02,                                                 // Kind = StringId
+		0x09,                                                 // Length = 9
+		0x74, 0x65, 0x73, 0x74, 0x5F, 0x75, 0x73, 0x65, 0x72, // "test_user"
+	}
+
+	if !bytes.Equal(serialized, expected) {
+		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
 	}
 }
