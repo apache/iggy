@@ -16,9 +16,13 @@
 // under the License.
 
 pub mod delete_consumer_offset;
+pub mod delete_consumer_offset_2;
 pub mod get_consumer_offset;
 pub mod store_consumer_offset;
+pub mod store_consumer_offset_2;
 
 pub use delete_consumer_offset::DeleteConsumerOffsetRequest;
+pub use delete_consumer_offset_2::DeleteConsumerOffset2Request;
 pub use get_consumer_offset::GetConsumerOffsetRequest;
 pub use store_consumer_offset::StoreConsumerOffsetRequest;
+pub use store_consumer_offset_2::StoreConsumerOffset2Request;
