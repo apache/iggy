@@ -18,14 +18,16 @@
 package tcp
 
 import (
+	"context"
+
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
-func (c *IggyTcpClient) GetStreams() ([]iggcon.Stream, error) {
-	buffer, err := c.do(&command.GetStreams{})
+func (c *IggyTcpClient) GetStreams(ctx context.Context) ([]iggcon.Stream, error) {
+	buffer, err := c.do(ctx, &command.GetStreams{})
 	if err != nil {
 		return nil, err
 	}
@@ -33,8 +35,8 @@ func (c *IggyTcpClient) GetStreams() ([]iggcon.Stream, error) {
 	return binaryserialization.DeserializeStreams(buffer), nil
 }
 
-func (c *IggyTcpClient) GetStream(streamId iggcon.Identifier) (*iggcon.StreamDetails, error) {
-	buffer, err := c.do(&command.GetStream{
+func (c *IggyTcpClient) GetStream(ctx context.Context, streamId iggcon.Identifier) (*iggcon.StreamDetails, error) {
+	buffer, err := c.do(ctx, &command.GetStream{
 		StreamId: streamId,
 	})
 	if err != nil {
@@ -52,11 +54,11 @@ func (c *IggyTcpClient) GetStream(streamId iggcon.Identifier) (*iggcon.StreamDet
 	return stream, nil
 }
 
-func (c *IggyTcpClient) CreateStream(name string) (*iggcon.StreamDetails, error) {
+func (c *IggyTcpClient) CreateStream(ctx context.Context, name string) (*iggcon.StreamDetails, error) {
 	if len(name) == 0 || MaxStringLength < len(name) {
 		return nil, ierror.ErrInvalidStreamName
 	}
-	buffer, err := c.do(&command.CreateStream{Name: name})
+	buffer, err := c.do(ctx, &command.CreateStream{Name: name})
 	if err != nil {
 		return nil, err
 	}
@@ -68,15 +70,15 @@ func (c *IggyTcpClient) CreateStream(name string) (*iggcon.StreamDetails, error)
 	return stream, err
 }
 
-func (c *IggyTcpClient) UpdateStream(streamId iggcon.Identifier, name string) error {
+func (c *IggyTcpClient) UpdateStream(ctx context.Context, streamId iggcon.Identifier, name string) error {
 	if len(name) > MaxStringLength || len(name) == 0 {
 		return ierror.ErrInvalidStreamName
 	}
-	_, err := c.do(&command.UpdateStream{StreamId: streamId, Name: name})
+	_, err := c.do(ctx, &command.UpdateStream{StreamId: streamId, Name: name})
 	return err
 }
 
-func (c *IggyTcpClient) DeleteStream(id iggcon.Identifier) error {
-	_, err := c.do(&command.DeleteStream{StreamId: id})
+func (c *IggyTcpClient) DeleteStream(ctx context.Context, id iggcon.Identifier) error {
+	_, err := c.do(ctx, &command.DeleteStream{StreamId: id})
 	return err
 }

@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
@@ -39,6 +41,7 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 			groupIdentifier, _ := iggcon.NewIdentifier(groupId)
 
 			joinErr := client.JoinConsumerGroup(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				groupIdentifier,
@@ -48,6 +51,7 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 			partitionId := uint32(1)
 
 			offset, err := client.GetConsumerOffset(
+				context.Background(),
 				consumer,
 				streamIdentifier,
 				topicIdentifier,
@@ -77,6 +81,7 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 
 			messages := createDefaultMessages()
 			sendErr := client.SendMessages(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				iggcon.PartitionId(partitionId),
@@ -84,6 +89,7 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 			)
 
 			storeErr := client.StoreConsumerOffset(
+				context.Background(),
 				consumer,
 				streamIdentifier,
 				topicIdentifier,
@@ -92,6 +98,7 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 			)
 
 			offset, getErr := client.GetConsumerOffset(
+				context.Background(),
 				consumer,
 				streamIdentifier,
 				topicIdentifier,
@@ -116,6 +123,7 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 			groupIdentifier, _ := iggcon.NewIdentifier(groupId)
 
 			joinErr := client.JoinConsumerGroup(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				groupIdentifier,
@@ -127,6 +135,7 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 			// Don't store any offset - we want to test that a new consumer group has no stored offset
 
 			storedOffset, getErr := client.GetConsumerOffset(
+				context.Background(),
 				consumer,
 				streamIdentifier,
 				topicIdentifier,
@@ -150,6 +159,7 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 			partitionId := uint32(1)
 
 			offset, err := client.GetConsumerOffset(
+				context.Background(),
 				consumer,
 				streamIdentifier,
 				topicIdentifier,
@@ -166,6 +176,7 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 			partitionId := uint32(1)
 
 			offset, err := client.GetConsumerOffset(
+				context.Background(),
 				consumer,
 				randomU32Identifier(),
 				randomU32Identifier(),
@@ -184,6 +195,7 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 			partitionId := uint32(1)
 
 			_, err := client.GetConsumerOffset(
+				context.Background(),
 				consumer,
 				randomU32Identifier(),
 				randomU32Identifier(),

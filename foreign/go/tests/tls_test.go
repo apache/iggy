@@ -164,7 +164,7 @@ func TestTCPTLSConnection_WithCA_Success(t *testing.T) {
 	require.NoError(t, err, "Failed to create TLS client")
 	defer func() { _ = cli.Close() }()
 
-	_, err = cli.LoginUser(defaultUsername, defaultPassword)
+	_, err = cli.LoginUser(context.Background(), defaultUsername, defaultPassword)
 	require.NoError(t, err, "Login should succeed over TLS")
 }
 
@@ -189,7 +189,7 @@ func TestTCPTLSConnection_WithoutTLS_Failure(t *testing.T) {
 
 	if err == nil && cli != nil {
 		defer func() { _ = cli.Close() }()
-		_, err = cli.LoginUser(defaultUsername, defaultPassword)
+		_, err = cli.LoginUser(context.Background(), defaultUsername, defaultPassword)
 	}
 
 	assert.Error(t, err, "Connection/login should fail when TLS is required but not used")
@@ -220,21 +220,22 @@ func TestTCPTLSConnection_MessageFlow_Success(t *testing.T) {
 	require.NoError(t, err, "Failed to create TLS client")
 	defer func() { _ = cli.Close() }()
 
-	_, err = cli.LoginUser(defaultUsername, defaultPassword)
+	_, err = cli.LoginUser(context.Background(), defaultUsername, defaultPassword)
 	require.NoError(t, err, "Login should succeed")
 
 	streamName := "tls-test-stream"
-	_, err = cli.CreateStream(streamName)
+	_, err = cli.CreateStream(context.Background(), streamName)
 	require.NoError(t, err, "Failed to create stream")
 
 	defer func() {
 		streamIdentifier, _ := iggcon.NewIdentifier(streamName)
-		_ = cli.DeleteStream(streamIdentifier)
+		_ = cli.DeleteStream(context.Background(), streamIdentifier)
 	}()
 
 	topicName := "tls-test-topic"
 	streamIdentifier, _ := iggcon.NewIdentifier(streamName)
 	_, err = cli.CreateTopic(
+		context.Background(),
 		streamIdentifier,
 		topicName,
 		1, // partitionCount
@@ -256,12 +257,13 @@ func TestTCPTLSConnection_MessageFlow_Success(t *testing.T) {
 	topicIdentifier, _ := iggcon.NewIdentifier(topicName)
 	partitionID := uint32(0)
 	partitioning := iggcon.PartitionId(partitionID)
-	err = cli.SendMessages(streamIdentifier, topicIdentifier, partitioning, messages)
+	err = cli.SendMessages(context.Background(), streamIdentifier, topicIdentifier, partitioning, messages)
 	require.NoError(t, err, "Failed to send messages over TLS")
 
 	consumer := iggcon.DefaultConsumer()
 	offset := uint64(0)
 	pollMessages, err := cli.PollMessages(
+		context.Background(),
 		streamIdentifier,
 		topicIdentifier,
 		consumer,

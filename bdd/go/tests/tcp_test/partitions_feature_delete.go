@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
@@ -35,6 +37,7 @@ var _ = ginkgo.Describe("DELETE PARTITION:", func() {
 			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			partitionsCount := uint32(1)
 			err := client.DeletePartitions(
+				context.Background(),
 				streamIdentifier,
 				topicIdentifier,
 				1,
@@ -47,6 +50,7 @@ var _ = ginkgo.Describe("DELETE PARTITION:", func() {
 		ginkgo.Context("and tries to delete partitions for a non existing stream", func() {
 			client := createAuthorizedConnection()
 			err := client.DeletePartitions(
+				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
 				10,
@@ -61,6 +65,7 @@ var _ = ginkgo.Describe("DELETE PARTITION:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.DeletePartitions(
+				context.Background(),
 				streamIdentifier,
 				randomU32Identifier(),
 				10,
@@ -74,6 +79,7 @@ var _ = ginkgo.Describe("DELETE PARTITION:", func() {
 		ginkgo.Context("and tries to delete partitions", func() {
 			client := createClient()
 			err := client.DeletePartitions(
+				context.Background(),
 				randomU32Identifier(),
 				randomU32Identifier(),
 				10,

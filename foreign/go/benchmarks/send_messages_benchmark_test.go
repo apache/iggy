@@ -18,6 +18,7 @@
 package benchmarks
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -52,7 +53,7 @@ func BenchmarkSendMessage(b *testing.B) {
 		if err != nil {
 			panic("COULD NOT CREATE MESSAGE STREAM")
 		}
-		_, err = cli.LoginUser("iggy", "iggy")
+		_, err = cli.LoginUser(context.Background(), "iggy", "iggy")
 		if err != nil {
 			panic("COULD NOT LOG IN")
 		}
@@ -105,16 +106,17 @@ func BenchmarkSendMessage(b *testing.B) {
 
 func ensureInfrastructureIsInitialized(cli iggcon.Client, streamId uint32) error {
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
-	if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
-		_, streamErr = cli.CreateStream("benchmark" + fmt.Sprint(streamId))
+	if _, streamErr := cli.GetStream(context.Background(), streamIdentifier); streamErr != nil {
+		_, streamErr = cli.CreateStream(context.Background(), "benchmark"+fmt.Sprint(streamId))
 		if streamErr != nil {
 			panic(streamErr)
 		}
 	}
 
 	topicIdentifier, _ := iggcon.NewIdentifier(uint32(0))
-	if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
+	if _, topicErr := cli.GetTopic(context.Background(), streamIdentifier, topicIdentifier); topicErr != nil {
 		_, topicErr = cli.CreateTopic(
+			context.Background(),
 			streamIdentifier,
 			"benchmark",
 			1,
@@ -133,7 +135,7 @@ func ensureInfrastructureIsInitialized(cli iggcon.Client, streamId uint32) error
 
 func cleanupInfrastructure(cli iggcon.Client, streamId uint32) error {
 	streamIdent, _ := iggcon.NewIdentifier(streamId)
-	return cli.DeleteStream(streamIdent)
+	return cli.DeleteStream(context.Background(), streamIdent)
 }
 
 // CreateMessages creates messages with random payloads.
@@ -169,6 +171,7 @@ func SendMessage(cli iggcon.Client, producerNumber, messagesCount, messagesBatch
 		startTime := time.Now()
 		topicIdentifier, _ := iggcon.NewIdentifier(uint32(topicId))
 		_ = cli.SendMessages(
+			context.Background(),
 			streamId,
 			topicIdentifier,
 			iggcon.PartitionId(1),

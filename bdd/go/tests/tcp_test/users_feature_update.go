@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/onsi/ginkgo/v2"
 )
@@ -32,6 +34,7 @@ var _ = ginkgo.Describe("UPDATE USER:", func() {
 
 			username := createRandomString(16)
 			err := client.UpdateUser(
+				context.Background(),
 				identifier,
 				&username,
 				nil,
@@ -48,6 +51,7 @@ var _ = ginkgo.Describe("UPDATE USER:", func() {
 
 			username := createRandomString(16)
 			err := client.UpdateUser(
+				context.Background(),
 				randomU32Identifier(),
 				&username,
 				nil,

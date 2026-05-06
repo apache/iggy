@@ -72,11 +72,11 @@ func (s basicMessagingSteps) givenAuthenticationAsRoot(ctx context.Context) erro
 	if err != nil {
 		return fmt.Errorf("error creating client: %w", err)
 	}
-	if err = cli.Ping(); err != nil {
+	if err = cli.Ping(ctx); err != nil {
 		return fmt.Errorf("error pinging client: %w", err)
 	}
 
-	if _, err = cli.LoginUser("iggy", "iggy"); err != nil {
+	if _, err = cli.LoginUser(ctx, "iggy", "iggy"); err != nil {
 		return fmt.Errorf("error logging in: %v", err)
 	}
 
@@ -99,7 +99,7 @@ func (s basicMessagingSteps) whenSendMessages(
 	streamIdentifier, _ := iggcon.NewIdentifier(streamID)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicID)
 	partitioning := iggcon.PartitionId(partitionID)
-	if err = c.client.SendMessages(streamIdentifier, topicIdentifier, partitioning, messages); err != nil {
+	if err = c.client.SendMessages(ctx, streamIdentifier, topicIdentifier, partitioning, messages); err != nil {
 		return fmt.Errorf("failed to sending messages: %w", err)
 	}
 
@@ -133,6 +133,7 @@ func (s basicMessagingSteps) whenPollMessages(
 	topicIdentifier, _ := iggcon.NewIdentifier(topicID)
 	uint32PartitionID := partitionID
 	polledMessages, err := c.client.PollMessages(
+		ctx,
 		streamIdentifier,
 		topicIdentifier,
 		consumer,
@@ -211,7 +212,7 @@ func (s basicMessagingSteps) thenLastPolledMessageMatchesSent(ctx context.Contex
 
 func (s basicMessagingSteps) givenNoStreams(ctx context.Context) error {
 	client := getBasicMessagingCtx(ctx).client
-	streams, err := client.GetStreams()
+	streams, err := client.GetStreams(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get streams: %w", err)
 	}
@@ -225,7 +226,7 @@ func (s basicMessagingSteps) givenNoStreams(ctx context.Context) error {
 
 func (s basicMessagingSteps) whenCreateStream(ctx context.Context, streamName string) error {
 	c := getBasicMessagingCtx(ctx)
-	stream, err := c.client.CreateStream(streamName)
+	stream, err := c.client.CreateStream(ctx, streamName)
 	if err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
 	}
@@ -257,6 +258,7 @@ func (s basicMessagingSteps) whenCreateTopic(ctx context.Context,
 	c := getBasicMessagingCtx(ctx)
 	streamIdentifier, _ := iggcon.NewIdentifier(streamID)
 	topic, err := c.client.CreateTopic(
+		ctx,
 		streamIdentifier,
 		topicName,
 		partitionsCount,

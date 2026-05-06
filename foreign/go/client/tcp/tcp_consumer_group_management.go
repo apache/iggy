@@ -18,14 +18,16 @@
 package tcp
 
 import (
+	"context"
+
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 )
 
-func (c *IggyTcpClient) GetConsumerGroups(streamId, topicId iggcon.Identifier) ([]iggcon.ConsumerGroup, error) {
-	buffer, err := c.do(&command.GetConsumerGroups{
+func (c *IggyTcpClient) GetConsumerGroups(ctx context.Context, streamId, topicId iggcon.Identifier) ([]iggcon.ConsumerGroup, error) {
+	buffer, err := c.do(ctx, &command.GetConsumerGroups{
 		StreamId: streamId,
 		TopicId:  topicId,
 	})
@@ -36,8 +38,8 @@ func (c *IggyTcpClient) GetConsumerGroups(streamId, topicId iggcon.Identifier) (
 	return binaryserialization.DeserializeConsumerGroups(buffer), err
 }
 
-func (c *IggyTcpClient) GetConsumerGroup(streamId, topicId, groupId iggcon.Identifier) (*iggcon.ConsumerGroupDetails, error) {
-	buffer, err := c.do(&command.GetConsumerGroup{
+func (c *IggyTcpClient) GetConsumerGroup(ctx context.Context, streamId, topicId, groupId iggcon.Identifier) (*iggcon.ConsumerGroupDetails, error) {
+	buffer, err := c.do(ctx, &command.GetConsumerGroup{
 		TopicPath: command.TopicPath{
 			StreamId: streamId,
 			TopicId:  topicId,
@@ -55,11 +57,11 @@ func (c *IggyTcpClient) GetConsumerGroup(streamId, topicId, groupId iggcon.Ident
 	return consumerGroupDetails, err
 }
 
-func (c *IggyTcpClient) CreateConsumerGroup(streamId iggcon.Identifier, topicId iggcon.Identifier, name string) (*iggcon.ConsumerGroupDetails, error) {
+func (c *IggyTcpClient) CreateConsumerGroup(ctx context.Context, streamId iggcon.Identifier, topicId iggcon.Identifier, name string) (*iggcon.ConsumerGroupDetails, error) {
 	if MaxStringLength < len(name) || len(name) == 0 {
 		return nil, ierror.ErrInvalidConsumerGroupName
 	}
-	buffer, err := c.do(&command.CreateConsumerGroup{
+	buffer, err := c.do(ctx, &command.CreateConsumerGroup{
 		TopicPath: command.TopicPath{
 			StreamId: streamId,
 			TopicId:  topicId,
@@ -73,8 +75,8 @@ func (c *IggyTcpClient) CreateConsumerGroup(streamId iggcon.Identifier, topicId 
 	return consumerGroup, err
 }
 
-func (c *IggyTcpClient) DeleteConsumerGroup(streamId iggcon.Identifier, topicId iggcon.Identifier, groupId iggcon.Identifier) error {
-	_, err := c.do(&command.DeleteConsumerGroup{
+func (c *IggyTcpClient) DeleteConsumerGroup(ctx context.Context, streamId iggcon.Identifier, topicId iggcon.Identifier, groupId iggcon.Identifier) error {
+	_, err := c.do(ctx, &command.DeleteConsumerGroup{
 		TopicPath: command.TopicPath{
 			StreamId: streamId,
 			TopicId:  topicId,
@@ -84,8 +86,8 @@ func (c *IggyTcpClient) DeleteConsumerGroup(streamId iggcon.Identifier, topicId 
 	return err
 }
 
-func (c *IggyTcpClient) JoinConsumerGroup(streamId iggcon.Identifier, topicId iggcon.Identifier, groupId iggcon.Identifier) error {
-	_, err := c.do(&command.JoinConsumerGroup{
+func (c *IggyTcpClient) JoinConsumerGroup(ctx context.Context, streamId iggcon.Identifier, topicId iggcon.Identifier, groupId iggcon.Identifier) error {
+	_, err := c.do(ctx, &command.JoinConsumerGroup{
 		TopicPath: command.TopicPath{
 			StreamId: streamId,
 			TopicId:  topicId,
@@ -95,8 +97,8 @@ func (c *IggyTcpClient) JoinConsumerGroup(streamId iggcon.Identifier, topicId ig
 	return err
 }
 
-func (c *IggyTcpClient) LeaveConsumerGroup(streamId iggcon.Identifier, topicId iggcon.Identifier, groupId iggcon.Identifier) error {
-	_, err := c.do(&command.LeaveConsumerGroup{
+func (c *IggyTcpClient) LeaveConsumerGroup(ctx context.Context, streamId iggcon.Identifier, topicId iggcon.Identifier, groupId iggcon.Identifier) error {
+	_, err := c.do(ctx, &command.LeaveConsumerGroup{
 		TopicPath: command.TopicPath{
 			StreamId: streamId,
 			TopicId:  topicId,

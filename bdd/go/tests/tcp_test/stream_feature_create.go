@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
 )
@@ -28,7 +30,7 @@ var _ = ginkgo.Describe("CREATE STREAM:", func() {
 			client := createAuthorizedConnection()
 			name := createRandomString(32)
 
-			stream, err := client.CreateStream(name)
+			stream, err := client.CreateStream(context.Background(), name)
 			defer deleteStreamAfterTests(stream.Id, client)
 
 			itShouldNotReturnError(err)
@@ -39,13 +41,13 @@ var _ = ginkgo.Describe("CREATE STREAM:", func() {
 			client := createAuthorizedConnection()
 			name := createRandomString(32)
 
-			stream, err := client.CreateStream(name)
+			stream, err := client.CreateStream(context.Background(), name)
 			defer deleteStreamAfterTests(stream.Id, client)
 
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyCreateStream(stream.Id, name, client)
 
-			_, err = client.CreateStream(name)
+			_, err = client.CreateStream(context.Background(), name)
 
 			itShouldReturnSpecificError(err, ierror.ErrStreamNameAlreadyExists)
 		})
@@ -54,7 +56,7 @@ var _ = ginkgo.Describe("CREATE STREAM:", func() {
 			client := createAuthorizedConnection()
 			name := createRandomString(256)
 
-			_, err := client.CreateStream(name)
+			_, err := client.CreateStream(context.Background(), name)
 
 			itShouldReturnSpecificError(err, ierror.ErrInvalidStreamName)
 		})
@@ -63,7 +65,7 @@ var _ = ginkgo.Describe("CREATE STREAM:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to create stream", func() {
 			client := createClient()
-			_, err := client.CreateStream(createRandomString(32))
+			_, err := client.CreateStream(context.Background(), createRandomString(32))
 
 			itShouldReturnUnauthenticatedError(err)
 		})

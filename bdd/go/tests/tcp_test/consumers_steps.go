@@ -18,6 +18,7 @@
 package tcp_test
 
 import (
+	"context"
 	"fmt"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -32,6 +33,7 @@ func successfullyCreateConsumer(streamId uint32, topicId uint32, cli iggcon.Clie
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	group, err := cli.CreateConsumerGroup(
+		context.Background(),
 		streamIdentifier,
 		topicIdentifier,
 		name)
@@ -46,6 +48,7 @@ func successfullyJoinConsumer(streamId uint32, topicId uint32, groupId uint32, c
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
 	err := client.JoinConsumerGroup(
+		context.Background(),
 		streamIdentifier,
 		topicIdentifier,
 		groupIdentifier,
@@ -100,7 +103,7 @@ func itShouldSuccessfullyCreateConsumer(streamId uint32, topicId uint32, groupId
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
-	consumer, err := client.GetConsumerGroup(streamIdentifier, topicIdentifier, groupIdentifier)
+	consumer, err := client.GetConsumerGroup(context.Background(), streamIdentifier, topicIdentifier, groupIdentifier)
 	ginkgo.It("should create consumer with id "+string(rune(groupId)), func() {
 		gomega.Expect(consumer).NotTo(gomega.BeNil())
 		gomega.Expect(consumer.Id).To(gomega.Equal(groupId))
@@ -117,7 +120,7 @@ func itShouldSuccessfullyDeletedConsumer(streamId uint32, topicId uint32, groupI
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
-	consumer, err := client.GetConsumerGroup(streamIdentifier, topicIdentifier, groupIdentifier)
+	consumer, err := client.GetConsumerGroup(context.Background(), streamIdentifier, topicIdentifier, groupIdentifier)
 	itShouldReturnSpecificError(err, ierror.ErrConsumerGroupIdNotFound)
 	ginkgo.It("should not return consumer", func() {
 		gomega.Expect(consumer).To(gomega.BeNil())
@@ -128,7 +131,7 @@ func itShouldSuccessfullyJoinConsumer(streamId uint32, topicId uint32, groupId u
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
-	consumer, err := client.GetConsumerGroup(streamIdentifier, topicIdentifier, groupIdentifier)
+	consumer, err := client.GetConsumerGroup(context.Background(), streamIdentifier, topicIdentifier, groupIdentifier)
 
 	ginkgo.It("should join consumer with id "+string(rune(groupId)), func() {
 		gomega.Expect(consumer).NotTo(gomega.BeNil())
@@ -148,7 +151,7 @@ func itShouldSuccessfullyLeaveConsumer(streamId uint32, topicId uint32, groupId 
 	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
-	consumer, err := client.GetConsumerGroup(streamIdentifier, topicIdentifier, groupIdentifier)
+	consumer, err := client.GetConsumerGroup(context.Background(), streamIdentifier, topicIdentifier, groupIdentifier)
 	ginkgo.It("should leave consumer with id "+string(rune(groupId)), func() {
 		gomega.Expect(consumer).NotTo(gomega.BeNil())
 		gomega.Expect(consumer.MembersCount).To(gomega.Equal(uint32(0)))

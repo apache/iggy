@@ -18,6 +18,8 @@
 package tcp_test
 
 import (
+	"context"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
@@ -30,7 +32,7 @@ var _ = ginkgo.Describe("DELETE STREAM:", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
-			err := client.DeleteStream(streamIdentifier)
+			err := client.DeleteStream(context.Background(), streamIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyDeleteStream(streamId, client)
@@ -39,7 +41,7 @@ var _ = ginkgo.Describe("DELETE STREAM:", func() {
 		ginkgo.Context("and tries to delete non-existing stream", func() {
 			client := createAuthorizedConnection()
 
-			err := client.DeleteStream(randomU32Identifier())
+			err := client.DeleteStream(context.Background(), randomU32Identifier())
 
 			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
@@ -48,7 +50,7 @@ var _ = ginkgo.Describe("DELETE STREAM:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to delete stream", func() {
 			client := createClient()
-			err := client.DeleteStream(randomU32Identifier())
+			err := client.DeleteStream(context.Background(), randomU32Identifier())
 
 			itShouldReturnUnauthenticatedError(err)
 		})

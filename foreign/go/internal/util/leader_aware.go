@@ -18,6 +18,7 @@
 package util
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -29,10 +30,10 @@ import (
 
 // CheckAndRedirectToLeader queries the client for cluster metadata and returns
 // an address to redirect to (empty string means no redirection needed).
-func CheckAndRedirectToLeader(c iggcon.Client, currentAddress string, transport iggcon.Protocol) (string, error) {
+func CheckAndRedirectToLeader(ctx context.Context, c iggcon.Client, currentAddress string, transport iggcon.Protocol) (string, error) {
 	log.Println("Checking cluster metadata for leader detection")
 
-	meta, err := c.GetClusterMetadata()
+	meta, err := c.GetClusterMetadata(ctx)
 	if err != nil {
 		log.Printf("Failed to get cluster metadata: %v, connection will continue on server node %s\n", err, currentAddress)
 		return "", nil
