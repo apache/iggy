@@ -30,12 +30,12 @@ set -euo pipefail
 #   - WebAssembly modules, compiled Java classes, .NET assemblies
 #
 # Runs in two contexts:
-#   pre-commit hook  -- checks staged files   (--check --staged)
+#   pre-commit hook  -- checks filenames passed by pre-commit (--check files...)
 #   CI workflow      -- checks PR diff files  (--check --ci)
 #
 # Exit codes: 0 = clean, 1 = binary artifacts found or error.
 
-FILE_MODE="staged"
+FILE_MODE="all"
 FILES=()
 
 while [[ $# -gt 0 ]]; do
@@ -43,25 +43,15 @@ while [[ $# -gt 0 ]]; do
     --check)
       shift
       ;;
-    --staged)
-      FILE_MODE="staged"
-      shift
-      ;;
     --ci)
       FILE_MODE="ci"
       shift
       ;;
-    --all)
-      FILE_MODE="all"
-      shift
-      ;;
     --help|-h)
-      echo "Usage: $0 [--check] [--staged|--ci|--all] [files...]"
+      echo "Usage: $0 [--check] [--ci] [files...]"
       echo ""
       echo "File selection:"
-      echo "  --staged  Check staged files (default, for git hooks)"
       echo "  --ci      Check files changed in PR (for CI)"
-      echo "  --all     Check all tracked files"
       echo "  [files]   Check specific files"
       exit 0
       ;;
@@ -79,9 +69,6 @@ done
 
 get_files() {
   case "$FILE_MODE" in
-    staged)
-      git diff --cached --name-only --diff-filter=ACM
-      ;;
     ci)
       if [ -n "${GITHUB_BASE_REF:-}" ]; then
         git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF}:${GITHUB_BASE_REF}" 2>/dev/null || true
@@ -89,7 +76,7 @@ get_files() {
       elif [ -n "${CI:-}" ]; then
         git diff --name-only --diff-filter=ACM HEAD~1
       else
-        git diff --cached --name-only --diff-filter=ACM
+        git ls-files
       fi
       ;;
     all)

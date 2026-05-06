@@ -21,7 +21,6 @@
 set -euo pipefail
 
 MODE="check"
-FILE_MODE="all"
 FILES=()
 
 # Accept mode flags plus optional file paths. In pre-commit, matching staged
@@ -36,20 +35,10 @@ while [[ $# -gt 0 ]]; do
       MODE="fix"
       shift
       ;;
-    --staged)
-      FILE_MODE="staged"
-      shift
-      ;;
-    --all)
-      FILE_MODE="all"
-      shift
-      ;;
     --help|-h)
-      echo "Usage: $0 [--check|--fix] [--staged|--all] [files...]"
+      echo "Usage: $0 [--check|--fix] [files...]"
       echo "  --check   Check shell scripts for issues (default)"
       echo "  --fix     Show detailed suggestions for fixes"
-      echo "  --staged  Check staged shell scripts"
-      echo "  --all     Check all shell scripts (default)"
       exit 0
       ;;
     -*)
@@ -87,26 +76,6 @@ FIND_EXCLUDE_ARGS=()
 for path in "${EXCLUDE_PATHS[@]}"; do
   FIND_EXCLUDE_ARGS+=("-not" "-path" "$path")
 done
-
-# Keep --staged for manual runs; pre-commit normally passes matching staged
-# files directly through pass_filenames.
-if [ ${#FILES[@]} -eq 0 ] && [ "$FILE_MODE" = "staged" ]; then
-  while IFS= read -r script; do
-    if [ ! -f "$script" ]; then
-      continue
-    fi
-
-    # Match normal .sh files and executable scripts with shell shebangs.
-    if [[ "$script" == *.sh ]] || head -n 1 "$script" | grep -qE '^#!.*[^[:alnum:]_](bash|dash|ksh|zsh|sh)([[:space:]]|$)'; then
-      FILES+=("$script")
-    fi
-  done < <(git diff --cached --name-only --diff-filter=ACM)
-
-  if [ ${#FILES[@]} -eq 0 ]; then
-    echo "✅ No staged shell scripts to check"
-    exit 0
-  fi
-fi
 
 # Check if shellcheck is installed
 if ! command -v shellcheck &> /dev/null; then

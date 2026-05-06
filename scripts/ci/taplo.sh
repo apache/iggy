@@ -20,7 +20,7 @@ set -euo pipefail
 
 # Default values
 MODE="check"
-FILE_MODE="staged"
+FILE_MODE="all"
 FILES=()
 
 # Parse arguments
@@ -34,29 +34,19 @@ while [[ $# -gt 0 ]]; do
       MODE="fix"
       shift
       ;;
-    --staged)
-      FILE_MODE="staged"
-      shift
-      ;;
     --ci)
       FILE_MODE="ci"
       shift
       ;;
-    --all)
-      FILE_MODE="all"
-      shift
-      ;;
     --help|-h)
-      echo "Usage: $0 [--check|--fix] [--staged|--ci|--all] [files...]"
+      echo "Usage: $0 [--check|--fix] [--ci] [files...]"
       echo ""
       echo "Modes:"
       echo "  --check   Check TOML formatting (default)"
       echo "  --fix     Format TOML files"
       echo ""
       echo "File selection:"
-      echo "  --staged  Check staged files (default, for git hooks)"
       echo "  --ci      Check files changed in PR (for CI)"
-      echo "  --all     Check all TOML files"
       echo "  [files]   Check specific files"
       exit 0
       ;;
@@ -87,10 +77,6 @@ fi
 # Get files to check based on mode
 get_files() {
   case "$FILE_MODE" in
-    staged)
-      # Get staged TOML files for git hooks
-      git diff --cached --name-only --diff-filter=ACM -- '*.toml'
-      ;;
     ci)
       # Get TOML files changed in PR for CI
       if [ -n "${GITHUB_BASE_REF:-}" ]; then
@@ -101,18 +87,13 @@ get_files() {
         # Generic CI - compare with HEAD~1
         git diff --name-only --diff-filter=ACM HEAD~1 -- '*.toml'
       else
-        # Fallback to staged files
-        git diff --cached --name-only --diff-filter=ACM -- '*.toml'
+        # Local fallback: check all tracked TOML files
+        git ls-files -- '*.toml'
       fi
       ;;
     all)
       # Get all TOML files (excluding common build directories)
-      find . -name '*.toml' \
-        -not -path './target/*' \
-        -not -path './node_modules/*' \
-        -not -path './.git/*' \
-        -not -path './venv/*' \
-        -type f
+      git ls-files -- '*.toml'
       ;;
   esac
 }
