@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_common::{
     ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
-    QuicConnectionStringOptions, TransportProtocol,
+    QuicConnectionStringOptions, TransportProtocol, validate_server_address,
 };
 use quinn::crypto::rustls::QuicClientConfig as QuinnQuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, VarInt};
@@ -164,6 +164,8 @@ impl QuicClient {
 
     /// Create a new QUIC client for the provided configuration.
     pub fn create(config: Arc<QuicClientConfig>) -> Result<Self, IggyError> {
+        validate_server_address(&config.server_address)?;
+
         let resolved_addr = config
             .server_address
             .to_socket_addrs()
@@ -962,5 +964,16 @@ mod tests {
 
         let client = client.unwrap();
         assert_eq!(client.config.server_address, "localhost:1234");
+    }
+
+    #[test]
+    fn should_fail_create_with_invalid_server_address_even_without_builder() {
+        let config = Arc::new(QuicClientConfig {
+            server_address: "127.0.0.1".to_string(),
+            ..Default::default()
+        });
+
+        let client = QuicClient::create(config);
+        assert!(client.is_err());
     }
 }

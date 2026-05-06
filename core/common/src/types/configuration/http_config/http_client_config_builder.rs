@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::HttpClientConfig;
+use crate::{HttpClientConfig, IggyError, utils::net::validate_api_url};
 
 /// The builder for the `HttpClientConfig` configuration.
 /// Allows configuring the HTTP client with custom settings or using defaults:
@@ -52,7 +52,44 @@ impl HttpClientConfigBuilder {
     }
 
     /// Builds the `HttpClientConfig` instance.
-    pub fn build(self) -> HttpClientConfig {
-        self.config
+    pub fn build(mut self) -> Result<HttpClientConfig, IggyError> {
+        self.config.api_url = self.config.api_url.trim().to_owned();
+        validate_api_url(&self.config.api_url)?;
+
+        Ok(self.config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_should_trim_and_validate_api_url() {
+        let config = HttpClientConfigBuilder::default()
+            .with_api_url(" http://127.0.0.1:3000 ".to_string())
+            .build()
+            .expect("expected valid HTTP API URL");
+
+        assert_eq!(config.api_url, "http://127.0.0.1:3000");
+    }
+
+    #[test]
+    fn build_should_trim_whitespace_before_validation() {
+        let config = HttpClientConfigBuilder::default()
+            .with_api_url("\n\thttp://localhost:8080 \t".to_string())
+            .build()
+            .expect("expected build() to trim before validation");
+
+        assert_eq!(config.api_url, "http://localhost:8080");
+    }
+
+    #[test]
+    fn build_should_fail_for_invalid_api_url() {
+        let result = HttpClientConfigBuilder::default()
+            .with_api_url("http://127.0.0.1:0".to_string())
+            .build();
+
+        assert!(result.is_err());
     }
 }

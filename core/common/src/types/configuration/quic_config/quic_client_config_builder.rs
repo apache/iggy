@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::{AutoLogin, IggyDuration, QuicClientConfig};
+use crate::{AutoLogin, IggyDuration, IggyError, QuicClientConfig, validate_server_address};
 
 /// Builder for the QUIC client configuration.
 ///
@@ -154,7 +154,44 @@ impl QuicClientConfigBuilder {
     }
 
     /// Finalizes the builder and returns the `QuicClientConfig`.
-    pub fn build(self) -> QuicClientConfig {
-        self.config
+    pub fn build(mut self) -> Result<QuicClientConfig, IggyError> {
+        self.config.server_address = self.config.server_address.trim().to_owned();
+        validate_server_address(&self.config.server_address)?;
+
+        Ok(self.config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_should_trim_and_validate_server_address() {
+        let config = QuicClientConfigBuilder::default()
+            .with_server_address(" 127.0.0.1:8080 ".to_string())
+            .build()
+            .expect("expected valid QUIC server address");
+
+        assert_eq!(config.server_address, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn build_should_trim_whitespace_before_validation() {
+        let config = QuicClientConfigBuilder::default()
+            .with_server_address("\n\tlocalhost:8080 \t".to_string())
+            .build()
+            .expect("expected build() to trim before validation");
+
+        assert_eq!(config.server_address, "localhost:8080");
+    }
+
+    #[test]
+    fn build_should_fail_for_invalid_server_address() {
+        let result = QuicClientConfigBuilder::default()
+            .with_server_address("127.0.0.1".to_string())
+            .build();
+
+        assert!(result.is_err());
     }
 }

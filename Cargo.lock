@@ -6572,6 +6572,7 @@ dependencies = [
  "tungstenite",
  "twox-hash",
  "ulid",
+ "url",
  "uuid",
 ]
 
