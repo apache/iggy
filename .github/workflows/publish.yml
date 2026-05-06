@@ -235,9 +235,25 @@ jobs:
           echo "Commit details:"
           git log -1 --pretty=format:"  Author: %an <%ae>%n  Date: %ad%n  Subject: %s" "$COMMIT"
 
+  validate-licenses:
+    name: Validate third-party licenses (release gate)
+    needs: validate
+    runs-on: ubuntu-latest
+    # Re-runs the same per-artifact validation that pre-merge enforces,
+    # against the resolved release commit. Tags can point at commits
+    # older than the pre-merge gate, or be created via direct push that
+    # bypassed PR review, so a release-time gate is required to keep the
+    # policy contract intact. Composite action is shared with
+    # .github/workflows/_common.yml.
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+      - uses: ./.github/actions/utils/validate-third-party-licenses
+
   plan:
     name: Build publish plan
-    needs: validate
+    needs: [validate, validate-licenses]
     if: needs.validate.outputs.has_targets == 'true'
     runs-on: ubuntu-latest
     outputs:
@@ -1294,6 +1310,7 @@ jobs:
     needs:
       [
         validate,
+        validate-licenses,
         plan,
         check-tags,
         build-python-wheels,

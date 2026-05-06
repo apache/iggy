@@ -12,6 +12,5 @@ node_modules/
 *.log
 docker-compose.yml
 Dockerfile
-LICENSE
 makefile
 README.md

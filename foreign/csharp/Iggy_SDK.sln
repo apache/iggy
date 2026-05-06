@@ -12,7 +12,6 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Iggy_SDK.Tests.Integration"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "SolutionFolder", "SolutionFolder", "{3A9B7D3B-EFA9-4652-A647-C72F84616114}"
 	ProjectSection(SolutionItems) = preProject
-		DEPENDENCIES.md = DEPENDENCIES.md
 		Directory.Packages.props = Directory.Packages.props
 		LICENSE = LICENSE
 		NOTICE = NOTICE
