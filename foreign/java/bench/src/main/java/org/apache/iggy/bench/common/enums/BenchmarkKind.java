@@ -21,13 +21,13 @@ package org.apache.iggy.bench.common.enums;
 
 public enum BenchmarkKind {
     PINNED_PRODUCER("pinned_producer");
-    // PINNED_CONSUMER("pinned_consumer"),
-    // PINNED_PRODUCER_AND_CONSUMER("pinned_producer_and_consumer"),
-    // BALANCED_PRODUCER("balanced_producer"),
-    // BALANCED_CONSUMER_GROUP("balanced_consumer_group"),
-    // BALANCED_PRODUCER_AND_CONSUMER_GROUP("balanced_producer_and_consumer_group"),
-    // END_TO_END_PRODUCING_CONSUMER("end_to_end_producing_consumer"),
-    // END_TO_END_PRODUCING_CONSUMER_GROUP("end_to_end_producing_consumer_group");
+    PINNED_CONSUMER("pinned_consumer"),
+    PINNED_PRODUCER_AND_CONSUMER("pinned_producer_and_consumer"),
+    BALANCED_PRODUCER("balanced_producer"),
+    BALANCED_CONSUMER_GROUP("balanced_consumer_group"),
+    BALANCED_PRODUCER_AND_CONSUMER_GROUP("balanced_producer_and_consumer_group"),
+    END_TO_END_PRODUCING_CONSUMER("end_to_end_producing_consumer"),
+    END_TO_END_PRODUCING_CONSUMER_GROUP("end_to_end_producing_consumer_group");
 
     private final String value;
 
