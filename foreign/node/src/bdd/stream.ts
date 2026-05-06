@@ -19,7 +19,7 @@
 
 
 import assert from 'node:assert/strict';
-import { After, Given, When, Then } from "@cucumber/cucumber";
+import { Given, When, Then } from "@cucumber/cucumber";
 import type { TestWorld } from './world.js';
 
 Given('I have no streams in the system', async function (this: TestWorld) {
@@ -52,11 +52,3 @@ Then(
     assert.ok(await this.client.stream.delete({streamId}));
   }
 );
-
-After(async function (this: TestWorld) {
-    if (!this.client) return;
-    const streams = await this.client.stream.list();
-    for (const s of streams) {
-        await this.client.stream.delete({ streamId: s.id });
-    }
-});

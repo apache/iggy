@@ -34,15 +34,15 @@ When(
   async function (
     this: TestWorld,
     msgCount: number,
-    _streamId: number,
-    _topicId: number,
+    streamId: number,
+    topicId: number,
     partitionId: number,
   ) {
     this.sendMessages = generateTestMessages(msgCount);
     assert.ok(
       await this.client.message.send({
-        streamId: this.stream.id,
-        topicId: this.topic.id,
+        streamId,
+        topicId,
         messages: this.sendMessages,
         partition: Partitioning.PartitionId(partitionId),
       }),
@@ -56,14 +56,14 @@ When(
   "I poll messages from stream {int}, topic {int}, partition {int} starting from offset {int}",
   async function (
     this: TestWorld,
-    _streamId: number,
-    _topicId: number,
+    streamId: number,
+    topicId: number,
     partitionId: number,
     offset: number,
   ) {
     const pollReq = {
-      streamId: this.stream.id,
-      topicId: this.topic.id,
+      streamId,
+      topicId,
       consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Offset(BigInt(offset)),
