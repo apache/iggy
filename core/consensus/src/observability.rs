@@ -644,6 +644,8 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::SendMessages => "send_messages",
         Operation::StoreConsumerOffset => "store_consumer_offset",
         Operation::DeleteConsumerOffset => "delete_consumer_offset",
+        Operation::StoreConsumerOffset2 => "store_consumer_offset_2",
+        Operation::DeleteConsumerOffset2 => "delete_consumer_offset_2",
     }
 }
 

@@ -39,7 +39,8 @@ use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
-use message_bus::replica_listener::MessageHandler;
+use message_bus::installer::conn_info::ClientConnMeta;
+use message_bus::replica::listener::MessageHandler;
 use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
@@ -185,6 +186,7 @@ fn assert_sender_ordering<R: Send + 'static>(senders: &[TaggedSender<R>]) {
 }
 
 /// Payload carried by a [`ShardFrame`].
+#[non_exhaustive]
 pub enum ShardFramePayload {
     /// A consensus protocol message routed between shards.
     Consensus(Message<GenericHeader>),
@@ -198,8 +200,27 @@ pub enum ShardFramePayload {
     /// Shard 0 distributes an inbound SDK client TCP connection fd to the
     /// owning shard. The receiving shard wraps the fd and installs client
     /// reader / writer tasks locally. The owning shard is encoded in the top
-    /// 16 bits of `client_id`.
-    ClientConnectionSetup { fd: DupedFd, client_id: u128 },
+    /// 16 bits of `meta.client_id`.
+    ClientConnectionSetup { fd: DupedFd, meta: ClientConnMeta },
+    /// Shard 0 distributes an inbound SDK WebSocket client's pre-upgrade
+    /// TCP connection fd to the owning shard. The HTTP-Upgrade handshake
+    /// has NOT run yet at this point: the fd is plain TCP, the dup is
+    /// safe (cross-shard fd-delegation only happens for plain TCP), and
+    /// `compio_ws::WebSocketStream<TcpStream>`'s `!Send` constraint
+    /// (compio `Rc<...>` driver state, post-upgrade) does not apply.
+    /// The receiving shard wraps the fd, runs `compio_ws::accept_async`,
+    /// then installs client reader / writer tasks locally via
+    /// `message_bus::installer::install_client_ws_fd`. Owning shard is
+    /// encoded in the top 16 bits of `meta.client_id`.
+    ///
+    /// QUIC clients deliberately do NOT get an analog variant: a
+    /// `compio_quic::Endpoint` binds one UDP socket and demuxes incoming
+    /// packets to per-connection `quinn-proto::Connection` objects by
+    /// Connection ID. Per-connection TLS / packet-number / congestion
+    /// state is non-serialisable and tied to the endpoint's reactor.
+    /// Shard 0 therefore terminates QUIC locally and uses the existing
+    /// `ForwardClientSend` variant for outbound traffic.
+    ClientWsConnectionSetup { fd: DupedFd, meta: ClientConnMeta },
     /// Shard 0 broadcasts the owner for a replica to every shard so each
     /// bus' `send_to_replica` slow path can route through the correct owner.
     ReplicaMappingUpdate { replica_id: u8, owning_shard: u16 },

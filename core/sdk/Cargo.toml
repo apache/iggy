@@ -26,7 +26,7 @@ categories = ["command-line-utilities", "database", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
-readme = "../../README.md"
+readme = "README.md"
 
 [dependencies]
 async-broadcast = { workspace = true }
@@ -52,7 +52,6 @@ tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
 trait-variant = { workspace = true }
-tungstenite = { workspace = true }
 webpki-roots = { workspace = true }
 
 [dev-dependencies]

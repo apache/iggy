@@ -23,7 +23,7 @@
 //! Each connection goes through: `connect → login → register → bound`.
 //!
 //! The [`SessionManager`] is the server-side counterpart of the SDK's
-//! session lifecycle. It does **not** own the [`ClientTable`]. That lives
+//! session lifecycle. It does **not** own the `ClientTable`. That lives
 //! in the consensus layer. This module tracks the binding between a
 //! transport connection and the consensus-level `(client_id, session)` pair.
 
@@ -65,9 +65,10 @@ pub struct Connection {
 
 /// Bridges transport connections to consensus sessions.
 ///
-/// Thread-safe: intended to be shared across connection handler tasks.
-/// Uses interior mutability via the caller's synchronization (single-threaded
-/// shard model like the rest of iggy's server-ng).
+/// NOT thread-safe: each shard owns one `SessionManager` on its
+/// single-threaded compio runtime, the same way the rest of server-ng
+/// is structured. All mutators take `&mut self`; the type carries no
+/// internal locking.
 ///
 /// ## Invariants
 ///

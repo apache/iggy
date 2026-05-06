@@ -401,6 +401,14 @@ impl HttpSink {
                 serde_json::to_value(encoded)
                     .map_err(|e| Error::Serialization(format!("EncodedPayload: {}", e)))
             }
+            Payload::Avro(bytes) => {
+                let encoded = EncodedPayload {
+                    data: general_purpose::STANDARD.encode(&bytes),
+                    iggy_payload_encoding: ENCODING_BASE64,
+                };
+                serde_json::to_value(encoded)
+                    .map_err(|e| Error::Serialization(format!("EncodedPayload: {}", e)))
+            }
         }
     }
 

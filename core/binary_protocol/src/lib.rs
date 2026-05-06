@@ -71,8 +71,8 @@ pub use consensus::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, ConsensusMessage, DoViewChangeHeader,
     FragmentedBacking, GenericHeader, HEADER_SIZE, Message, MessageBacking, MessageBag,
     MutableBacking, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader, RequestBacking,
-    RequestBackingKind, RequestHeader, ResponseBacking, ResponseBackingKind, StartViewChangeHeader,
-    StartViewHeader,
+    RequestBackingKind, RequestHeader, ResponseBacking, ResponseBackingKind, SIZE_FIELD_OFFSET,
+    StartViewChangeHeader, StartViewHeader, read_size_field,
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;
@@ -80,6 +80,7 @@ pub use framing::{RequestFrame, RequestFrame2, ResponseFrame, ResponseFrame2, ST
 pub use message_view::{
     WireMessageIterator, WireMessageIteratorMut, WireMessageView, WireMessageViewMut,
 };
+pub use primitives::ack_level::AckLevel;
 pub use primitives::consumer::WireConsumer;
 pub use primitives::identifier::{MAX_WIRE_NAME_LENGTH, WireIdentifier, WireName};
 pub use primitives::partition_assignment::CreatedPartitionAssignment;

@@ -54,7 +54,7 @@
   "devDependencies": {
     "@commitlint/cli": "20.1.0",
     "@commitlint/config-conventional": "20.0.0",
-    "@cucumber/cucumber": "12.2.0",
+    "@cucumber/cucumber": "12.8.2",
     "@swc-node/register": "1.11.1",
     "@types/debug": "4.1.12",
     "@types/node": "24.10.1",
