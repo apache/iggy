@@ -30,7 +30,7 @@ func (c *IggyTcpClient) GetStreams() ([]iggcon.Stream, error) {
 		return nil, err
 	}
 
-	return binaryserialization.DeserializeStreams(buffer), nil
+	return binaryserialization.DeserializeStreams(buffer)
 }
 
 func (c *IggyTcpClient) GetStream(streamId iggcon.Identifier) (*iggcon.StreamDetails, error) {
