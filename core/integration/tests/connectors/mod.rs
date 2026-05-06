@@ -19,6 +19,7 @@
 
 mod api;
 mod delta;
+mod doris;
 mod elasticsearch;
 mod fixtures;
 mod http;
