@@ -18,8 +18,8 @@
  */
 
 use crate::IggyError;
-use reqwest::Url;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use url::Url;
 
 /// Validates that `addr` is syntactically a valid `host:port` string.
 /// Does NOT perform DNS resolution.
@@ -143,7 +143,11 @@ pub fn validate_api_url(addr: &str) -> Result<(), IggyError> {
         _ => return Err(IggyError::InvalidApiUrl(addr.to_string())),
     }
 
-    if api_url.host_str().is_none() || api_url.port().is_none() {
+    if api_url.host_str().is_none() || api_url.port_or_known_default().is_none() {
+        return Err(IggyError::InvalidApiUrl(addr.to_string()));
+    }
+
+    if api_url.port() == Some(0) {
         return Err(IggyError::InvalidApiUrl(addr.to_string()));
     }
 
@@ -349,10 +353,12 @@ mod tests {
     fn validate_api_url_accepts_http_with_host_and_port() {
         assert!(validate_api_url("http://127.0.0.1:3000").is_ok());
         assert!(validate_api_url("http://localhost:8080").is_ok());
+        assert!(validate_api_url("http://example.com:80").is_ok());
     }
 
     #[test]
     fn validate_api_url_accepts_https_with_host_and_port() {
+        assert!(validate_api_url("https://example.com:443").is_ok());
         assert!(validate_api_url("https://example.com:8443").is_ok());
         assert!(validate_api_url("https://api.example.com:8443").is_ok());
     }
@@ -370,15 +376,21 @@ mod tests {
     }
 
     #[test]
+    fn validate_api_url_rejects_port_zero() {
+        assert!(validate_api_url("http://example.com:0").is_err());
+        assert!(validate_api_url("https://127.0.0.1:0").is_err());
+    }
+
+    #[test]
     fn validate_api_url_rejects_missing_host() {
         assert!(validate_api_url("http://:3000").is_err());
         assert!(validate_api_url("https://:443").is_err());
     }
 
     #[test]
-    fn validate_api_url_rejects_missing_port() {
-        assert!(validate_api_url("http://example.com").is_err());
-        assert!(validate_api_url("https://127.0.0.1").is_err());
+    fn validate_api_url_accepts_implicit_default_port() {
+        assert!(validate_api_url("http://example.com").is_ok());
+        assert!(validate_api_url("https://127.0.0.1").is_ok());
     }
 
     #[test]

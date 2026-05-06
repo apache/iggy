@@ -86,7 +86,7 @@ pub enum IggyError {
     InvalidIpAddress(String, String) = 35,
     #[error("Http error {0}")]
     HttpError(String) = 36,
-    #[error("Invalid Api Url: {0}")]
+    #[error("Invalid API URL: {0}")]
     InvalidApiUrl(String) = 37,
     #[error("Unauthenticated")]
     Unauthenticated = 40,

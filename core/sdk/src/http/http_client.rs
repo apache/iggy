@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     ConnectionString, ConnectionStringUtils, DiagnosticEvent, HttpConnectionStringOptions,
-    IdentityInfo, TransportProtocol,
+    IdentityInfo, TransportProtocol, validate_api_url,
 };
 use reqwest::{Response, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
@@ -266,6 +266,7 @@ impl HttpClient {
 
     /// Create a new HTTP client for interacting with the Iggy API using the provided configuration.
     pub fn create(config: Arc<HttpClientConfig>) -> Result<Self, IggyError> {
+        validate_api_url(&config.api_url)?;
         let api_url = Url::parse(&config.api_url).map_err(|_| IggyError::CannotParseUrl)?;
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(config.retries);
         let client = ClientBuilder::new(reqwest::Client::new())
@@ -532,5 +533,16 @@ mod tests {
             http_client.as_ref().unwrap().heartbeat_interval,
             IggyDuration::from_str("5s").unwrap()
         );
+    }
+
+    #[test]
+    fn should_fail_create_with_invalid_api_url_even_without_builder() {
+        let config = Arc::new(HttpClientConfig {
+            api_url: "http://127.0.0.1:0".to_string(),
+            ..Default::default()
+        });
+
+        let http_client = HttpClient::create(config);
+        assert!(http_client.is_err());
     }
 }
