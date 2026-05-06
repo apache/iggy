@@ -790,11 +790,19 @@ internal static class BinaryMapper
             {
                 Hits = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 12)..(position + 20)]),
                 Misses = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 20)..(position + 28)]),
-                HitRatio = BinaryPrimitives.ReadSingleLittleEndian(payload[(position + 28)..(position + 36)])
+                HitRatio = BinaryPrimitives.ReadSingleLittleEndian(payload[(position + 28)..(position + 32)])
             };
 
             cacheMetricsList.Add(cacheMetricsKey, cacheMetrics);
+            position += 32;
         }
+
+        var threadsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+        position += 4;
+        var freeDiskSpace = BinaryPrimitives.ReadUInt64LittleEndian(payload[position..(position + 8)]);
+        position += 8;
+        var totalDiskSpace = BinaryPrimitives.ReadUInt64LittleEndian(payload[position..(position + 8)]);
+        position += 8;
 
         return new StatsResponse
         {
@@ -822,7 +830,10 @@ internal static class BinaryMapper
             MessagesSizeBytes = totalSizeBytes,
             IggyServerVersion = iggyVersion,
             IggyServerSemver = iggySemVersion,
-            CacheMetrics = cacheMetricsList
+            CacheMetrics = cacheMetricsList,
+            ThreadsCount = threadsCount,
+            FreeDiskSpace = freeDiskSpace,
+            TotalDiskSpace = totalDiskSpace
         };
     }
 
