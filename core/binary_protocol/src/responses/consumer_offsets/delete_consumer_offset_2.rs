@@ -15,15 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod delete_consumer_offset;
-mod delete_consumer_offset_2;
-pub mod get_consumer_offset;
-mod store_consumer_offset;
-mod store_consumer_offset_2;
-
-pub use super::EmptyResponse;
-pub use delete_consumer_offset::DeleteConsumerOffsetResponse;
-pub use delete_consumer_offset_2::DeleteConsumerOffset2Response;
-pub use get_consumer_offset::ConsumerOffsetResponse;
-pub use store_consumer_offset::StoreConsumerOffsetResponse;
-pub use store_consumer_offset_2::StoreConsumerOffset2Response;
+/// `DeleteConsumerOffset2` response is empty.
+pub type DeleteConsumerOffset2Response = super::EmptyResponse;
