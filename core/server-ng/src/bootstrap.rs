@@ -511,6 +511,17 @@ async fn hydrate_partition_log(
         .zip(loaded_log.storages().iter().cloned())
         .enumerate()
     {
+        validate_recovered_segment(
+            stream_id,
+            topic_id,
+            partition_id,
+            segment,
+            &storage,
+            loaded_log
+                .indexes()
+                .get(segment_index)
+                .and_then(|indexes| indexes.as_ref()),
+        )?;
         let max_timestamp = match loaded_log
             .indexes()
             .get(segment_index)
@@ -579,6 +590,34 @@ async fn hydrate_partition_log(
     }
 
     Ok(())
+}
+
+fn validate_recovered_segment(
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+    segment: &iggy_common::Segment,
+    storage: &iggy_common::SegmentStorage,
+    indexes: Option<&server::streaming::segments::IggyIndexesMut>,
+) -> Result<(), ServerNgError> {
+    let messages_size_bytes = storage
+        .messages_reader
+        .as_ref()
+        .map_or(0, |reader| u64::from(reader.file_size()));
+    let indexed_size_bytes = indexes.map_or(0, |indexes| u64::from(indexes.messages_size()));
+    if messages_size_bytes == indexed_size_bytes {
+        return Ok(());
+    }
+
+    Err(ServerNgError::RecoveredSegmentSizeDivergence {
+        stream_id,
+        topic_id,
+        partition_id,
+        start_offset: segment.start_offset,
+        end_offset: segment.end_offset,
+        messages_size_bytes,
+        indexed_size_bytes,
+    })
 }
 
 fn convert_segment(segment: &iggy_common::Segment, max_timestamp: u64) -> Segment {
