@@ -18,7 +18,6 @@
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
-using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
@@ -111,8 +110,8 @@ public class SystemTests
         await tcpClient.CreateTopicAsync(Identifier.String(streamName), "first_topic", 2);
         var secondTopic = await tcpClient.CreateTopicAsync(Identifier.String(streamName), "second_topic", 2);
 
-        var consumerGroup = await tcpClient.CreateConsumerGroupAsync(
-            Identifier.String(streamName), Identifier.String("second_topic"), "test_consumer_group");
+        var consumerGroup = await tcpClient.CreateConsumerGroupAsync(Identifier.String(streamName),
+            Identifier.String("second_topic"), "test_consumer_group");
         await tcpClient.JoinConsumerGroupAsync(Identifier.String(streamName),
             Identifier.String("second_topic"), Identifier.String("test_consumer_group"));
         var me = await tcpClient.GetMeAsync();
@@ -167,6 +166,11 @@ public class SystemTests
         response.KernelVersion.ShouldNotBeNullOrEmpty();
         response.IggyServerVersion.ShouldNotBeNullOrEmpty();
         response.IggyServerSemver.ShouldNotBe(0u);
+        response.ThreadsCount.ShouldBeGreaterThanOrEqualTo(1u);
+        response.TotalDiskSpace.ShouldBeGreaterThan(0u);
+        response.FreeDiskSpace.ShouldBeGreaterThan(0u);
+        response.FreeDiskSpace.ShouldBeGreaterThan(0u);
+        response.FreeDiskSpace.ShouldBeLessThanOrEqualTo(response.TotalDiskSpace);
     }
 
     [Test]
@@ -184,8 +188,7 @@ public class SystemTests
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        var snapshot = await client.GetSnapshotAsync(
-            SnapshotCompression.Deflated,
+        var snapshot = await client.GetSnapshotAsync(SnapshotCompression.Deflated,
             [SystemSnapshotType.Test]);
 
         snapshot.ShouldNotBeNull();

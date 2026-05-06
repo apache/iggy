@@ -158,4 +158,21 @@ public sealed class StatsResponse
     ///     Cache metrics per partition
     /// </summary>
     public Dictionary<CacheMetricsKey, CacheMetrics> CacheMetrics { get; init; } = [];
+
+    /// <summary>
+    ///     Number of threads in the server process.
+    /// </summary>
+    public uint ThreadsCount { get; init; }
+
+    /// <summary>
+    ///     Available (free) disk space for the data directory.
+    /// </summary>
+    [JsonConverter(typeof(SizeConverter))]
+    public ulong FreeDiskSpace { get; init; }
+
+    /// <summary>
+    ///     Total disk space for the data directory.
+    /// </summary>
+    [JsonConverter(typeof(SizeConverter))]
+    public ulong TotalDiskSpace { get; init; }
 }
