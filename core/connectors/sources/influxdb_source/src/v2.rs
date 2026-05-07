@@ -57,6 +57,8 @@ fn build_query(
 /// is stuck at the same timestamp for many consecutive polls (analogous to
 /// V3's `stuck_batch_cap_factor`).
 const MAX_SKIP_INFLATION_FACTOR: u64 = 10;
+const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
+
 
 /// Render the final Flux query by substituting `$cursor` and `$limit`.
 ///
@@ -210,7 +212,7 @@ pub(crate) async fn run_query(
     let base = config.url.trim_end_matches('/');
     let (url, body) = build_query(base, &query, Some(&config.org))?;
 
-    let response = client
+    let mut response = client
         .post(url)
         .header("Authorization", auth)
         .header("Content-Type", "application/json")
@@ -222,10 +224,33 @@ pub(crate) async fn run_query(
 
     let status = response.status();
     if status.is_success() {
-        return response
-            .text()
+        // Stream chunk-by-chunk with a hard byte cap to mirror the V3 path and
+        // prevent OOM when MAX_SKIP_INFLATION_FACTOR inflates the effective batch.
+        if response
+            .content_length()
+            .is_some_and(|n| n as usize > MAX_RESPONSE_BODY_BYTES)
+        {
+            return Err(Error::Storage(format!(
+                "InfluxDB V2 response body exceeds {MAX_RESPONSE_BODY_BYTES} byte cap; \
+                 reduce batch_size to avoid OOM"
+            )));
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| Error::Storage(format!("Failed to read V2 response: {e}")));
+            .map_err(|e| Error::Storage(format!("Failed to read V2 response: {e}")))?
+        {
+            buf.extend_from_slice(&chunk);
+            if buf.len() > MAX_RESPONSE_BODY_BYTES {
+                return Err(Error::Storage(format!(
+                    "InfluxDB V2 response body exceeded {MAX_RESPONSE_BODY_BYTES} byte cap \
+                     while streaming; reduce batch_size to avoid OOM"
+                )));
+            }
+        }
+        return String::from_utf8(buf)
+            .map_err(|e| Error::Storage(format!("V2 response body is not valid UTF-8: {e}")));
     }
 
     let body_text = response

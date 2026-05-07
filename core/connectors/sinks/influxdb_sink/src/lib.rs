@@ -516,19 +516,22 @@ impl InfluxDbSink {
 
         match self.payload_format {
             PayloadFormat::Json => {
-                // simd_json is used here (not serde_json) because this is the hot path:
-                // every message in every batch passes through this branch. The ~2× throughput
-                // gain is measurable at batch sizes ≥ 100. The source uses serde_json since
-                // its serialization path runs once per poll, not once per message.
+                // simd_json::to_string applies SIMD only on the *parse* path, not
+                // the serialize path — no throughput advantage over serde_json here.
+                // The Json variant is kept for API compatibility; the hot path goes
+                // through the fallback branch for non-Json payloads.
                 let compact = match &message.payload {
-                    iggy_connector_sdk::Payload::Json(value) => simd_json::to_string(value)
-                        .map_err(|e| {
+                    iggy_connector_sdk::Payload::Json(value) => {
+                        serde_json::to_string(value).map_err(|e| {
                             Error::CannotStoreData(format!("JSON serialization failed: {e}"))
-                        })?,
+                        })?
+                    }
                     _ => {
                         let bytes = message.payload.try_to_bytes().map_err(|e| {
                             Error::CannotStoreData(format!("Payload conversion failed: {e}"))
                         })?;
+                        // Parse to validate and normalize (compact) the JSON;
+                        // preserves correct output for pretty-printed inputs.
                         let value: serde_json::Value =
                             serde_json::from_slice(&bytes).map_err(|e| {
                                 Error::CannotStoreData(format!("Payload is not valid JSON: {e}"))
@@ -565,6 +568,14 @@ impl InfluxDbSink {
         }
 
         let base_micros = if message.timestamp == 0 {
+            // timestamp == 0 is treated as "not set" — the iggy server overwrites
+            // the header timestamp on ingest, so live traffic never reaches here.
+            // This path fires only for externally-imported data stamped at UNIX_EPOCH.
+            warn!(
+                "sink ID: {} — message offset={} has timestamp=0 (Unix epoch or unset); \
+                 substituting current wall-clock time",
+                self.id, message.offset
+            );
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()

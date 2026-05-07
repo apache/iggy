@@ -189,14 +189,29 @@ fn build_payload(
         };
     }
 
-    // V3 rows carry typed serde_json::Values — clone directly, no parse_scalar needed.
-    // When include_metadata=false, exclude the cursor column (timestamp).
-    let json_row: serde_json::Map<_, _> = row
-        .iter()
-        .filter(|(k, _)| include_metadata || k.as_str() != cursor_field)
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    serde_json::to_vec(&json_row)
+    // Serialize directly from borrowed references — avoids O(fields) String+Value
+    // clones that the collect-into-Map approach required at high batch sizes.
+    struct RowView<'a> {
+        row: &'a Row,
+        cursor_field: &'a str,
+        include_metadata: bool,
+    }
+    impl serde::Serialize for RowView<'_> {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeMap;
+            let entries: Vec<_> = self
+                .row
+                .iter()
+                .filter(|(k, _)| self.include_metadata || k.as_str() != self.cursor_field)
+                .collect();
+            let mut map = s.serialize_map(Some(entries.len()))?;
+            for (k, v) in &entries {
+                map.serialize_entry(k, v)?;
+            }
+            map.end()
+        }
+    }
+    serde_json::to_vec(&RowView { row, cursor_field, include_metadata })
         .map_err(|e| Error::Serialization(format!("JSON serialization failed: {e}")))
 }
 
@@ -249,12 +264,9 @@ fn normalize_v3_timestamp(ts: &str) -> String {
 pub(crate) struct RowProcessingResult {
     pub messages: Vec<ProducedMessage>,
     pub max_cursor: Option<String>,
-    /// `true` when every row's `cursor_field` value equals `current_cursor`.
-    /// Combined with `rows.len() >= effective_batch`, this signals a stuck batch:
-    /// all returned rows are at the current cursor, meaning the cursor cannot
-    /// advance with `> cursor` semantics.
-    pub all_at_cursor: bool,
-    /// Count of rows whose cursor == max_cursor (for tiebreaker offset).
+    /// Count of rows whose cursor == max_cursor.
+    /// Used for stuck-batch detection: if this equals effective_batch, the cursor
+    /// cannot advance and the batch size must be inflated.
     pub rows_at_max_cursor: u64,
 }
 
@@ -273,9 +285,9 @@ pub(crate) fn process_rows(
     let mut messages = Vec::with_capacity(rows.len());
     let mut max_cursor: Option<String> = None;
     let mut max_cursor_parsed: Option<DateTime<Utc>> = None; // cache parsed form
-    // Starts true for non-empty batches; flipped to false as soon as any row
-    // either has a different cursor value or has no cursor field at all.
-    let mut all_at_cursor = !rows.is_empty();
+    // Counted inline to avoid a second pass over rows (which would also
+    // re-call normalize_v3_timestamp for each row — extra allocations).
+    let mut rows_at_max_cursor = 0u64;
     // Generate the base UUID once per poll; derive per-message IDs by addition.
     // This is O(1) PRNG calls per batch instead of O(n), measurable at batch ≥ 100.
     let id_base = Uuid::new_v4().as_u128();
@@ -283,19 +295,21 @@ pub(crate) fn process_rows(
         if let Some(raw_cv) = row.get(ctx.cursor_field).and_then(|v| v.as_str()) {
             let cv_owned = normalize_v3_timestamp(raw_cv);
             let cv = cv_owned.as_str();
-            if !timestamps_equal(cv, ctx.current_cursor) {
-                all_at_cursor = false;
-            }
             validate_cursor(cv)?;
             let cv_parsed = cv.parse::<DateTime<Utc>>().ok();
             match (cv_parsed, max_cursor_parsed) {
                 (Some(new_dt), Some(cur_dt)) if new_dt > cur_dt => {
                     max_cursor = Some(cv.to_string());
                     max_cursor_parsed = Some(new_dt);
+                    rows_at_max_cursor = 1;
+                }
+                (Some(new_dt), Some(cur_dt)) if new_dt == cur_dt => {
+                    rows_at_max_cursor += 1;
                 }
                 (Some(new_dt), None) => {
                     max_cursor = Some(cv.to_string());
                     max_cursor_parsed = Some(new_dt);
+                    rows_at_max_cursor = 1;
                 }
                 (None, _) if max_cursor_parsed.is_none() => {
                     // Unparsable cursor — still track it (string fallback) if no
@@ -304,8 +318,6 @@ pub(crate) fn process_rows(
                 }
                 _ => {}
             }
-        } else {
-            all_at_cursor = false;
         }
 
         let payload = build_payload(
@@ -325,17 +337,6 @@ pub(crate) fn process_rows(
         });
     }
 
-    let rows_at_max_cursor = rows
-        .iter()
-        .filter(|r| {
-            max_cursor.as_deref().is_some_and(|mc| {
-                r.get(ctx.cursor_field)
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|cv| normalize_v3_timestamp(cv) == mc)
-            })
-        })
-        .count() as u64;
-
     if !rows.is_empty() && max_cursor.is_none() {
         return Err(Error::InvalidRecordValue(format!(
             "No '{}' field found in any returned row — cursor cannot advance; \
@@ -348,7 +349,6 @@ pub(crate) fn process_rows(
     Ok(RowProcessingResult {
         messages,
         max_cursor,
-        all_at_cursor,
         rows_at_max_cursor,
     })
 }
@@ -406,9 +406,12 @@ pub(crate) async fn poll(
 
     let result = process_rows(&rows, &ctx)?;
 
-    // Stuck-timestamp detection: if every row is at the current cursor
-    // and the batch was full, inflate and request more next time.
-    let stuck = result.all_at_cursor && rows.len() >= effective_batch as usize;
+    // Stuck-timestamp detection: if the number of rows sharing the max cursor
+    // equals the effective batch size, the cursor cannot advance — inflate.
+    // Using rows_at_max_cursor (not all_at_cursor) works correctly with the
+    // default strict `> '$cursor'` semantics: those rows are NEVER at the
+    // input cursor, so all_at_cursor is permanently false under strict >.
+    let stuck = result.rows_at_max_cursor >= effective_batch as u64;
 
     if stuck {
         return match next_stuck_batch_size(effective_batch, base_batch, cap_factor) {
@@ -440,13 +443,18 @@ pub(crate) async fn poll(
                     "InfluxDB V3 source — stuck-timestamp cap reached at batch size {effective_batch}; \
                      tripping circuit breaker to prevent an infinite loop"
                 );
+                // Reset effective_batch_size to base so the next poll after the
+                // circuit-breaker cool-down restarts from the configured batch size
+                // rather than re-entering at cap and immediately re-tripping.
+                // Do NOT update last_timestamp_row_offset on the trip path — no
+                // messages were emitted, so the offset tiebreaker is unchanged.
                 Ok(PollResult {
                     messages: vec![],
                     new_state: V3State {
                         last_timestamp: state.last_timestamp.clone(),
                         processed_rows: state.processed_rows,
-                        effective_batch_size: effective_batch,
-                        last_timestamp_row_offset: result.rows_at_max_cursor,
+                        effective_batch_size: base_batch,
+                        last_timestamp_row_offset: state.last_timestamp_row_offset,
                     },
                     schema: Schema::Json,
                     trip_circuit_breaker: true,
@@ -530,10 +538,7 @@ mod tests {
         let result = process_rows(&[], &ctx(T1, 1000)).unwrap();
         assert!(result.messages.is_empty());
         assert!(result.max_cursor.is_none());
-        assert!(
-            !result.all_at_cursor,
-            "empty slice must not be all_at_cursor"
-        );
+        assert_eq!(result.rows_at_max_cursor, 0, "empty slice has no rows at max cursor");
     }
 
     #[test]
@@ -633,26 +638,29 @@ mod tests {
         assert_eq!(result.messages.len(), 1);
     }
 
-    // ── all_at_cursor / stuck-batch ───────────────────────────────────────────
+    // ── rows_at_max_cursor / stuck-batch ─────────────────────────────────────
 
     #[test]
-    fn process_rows_all_at_cursor_true_when_all_rows_match() {
+    fn process_rows_rows_at_max_cursor_counts_rows_sharing_max_timestamp() {
+        // Two rows at T1: both equal max_cursor → rows_at_max_cursor = 2.
         let rows = vec![row(&[("time", T1)]), row(&[("time", T1)])];
         let result = process_rows(&rows, &ctx(T1, 1000)).unwrap();
-        assert!(result.all_at_cursor);
+        assert_eq!(result.rows_at_max_cursor, 2);
     }
 
     #[test]
-    fn process_rows_all_at_cursor_false_when_any_row_advances() {
+    fn process_rows_rows_at_max_cursor_resets_when_cursor_advances() {
+        // T1 then T2: max_cursor = T2, only 1 row at T2 → rows_at_max_cursor = 1.
         let rows = vec![row(&[("time", T1)]), row(&[("time", T2)])];
         let result = process_rows(&rows, &ctx(T1, 1000)).unwrap();
-        assert!(!result.all_at_cursor);
+        assert_eq!(result.rows_at_max_cursor, 1);
+        assert_eq!(result.max_cursor.as_deref(), Some(T2));
     }
 
     #[test]
-    fn process_rows_all_at_cursor_false_for_empty_slice() {
+    fn process_rows_rows_at_max_cursor_zero_for_empty_slice() {
         let result = process_rows(&[], &ctx(T1, 1000)).unwrap();
-        assert!(!result.all_at_cursor);
+        assert_eq!(result.rows_at_max_cursor, 0);
     }
 
     // ── next_stuck_batch_size ────────────────────────────────────────────────
@@ -790,7 +798,7 @@ mod http_tests {
             url: url.to_string(),
             db: "test_db".to_string(),
             token: SecretString::from("test_token"),
-            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit".to_string(),
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset".to_string(),
             poll_interval: None,
             batch_size: Some(10),
             cursor_field: None,

@@ -77,7 +77,7 @@ argon2 = "0.5.3"
 arrow = "57.3.0"
 arrow-array = "57.3.0"
 arrow-json = "57.3.0"
-assert_cmd = "2.2.1"
+assert_cmd = "2.2.0"
 async-broadcast = "0.7.2"
 async-channel = "2.5.0"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }

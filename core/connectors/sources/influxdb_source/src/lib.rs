@@ -228,19 +228,45 @@ impl Source for InfluxDbSource {
             ));
         }
 
+        // V3 stuck-batch inflation writes last_timestamp_row_offset to state and
+        // passes it as `$offset` on the next poll so already-seen rows at the same
+        // timestamp are skipped. If the query template lacks `$offset`, apply_query_params
+        // silently no-ops and the same head rows are re-fetched and re-emitted on
+        // every poll — duplicate delivery with no error.
+        if let InfluxDbSourceConfig::V3(cfg) = &self.config {
+            let cap = cfg
+                .stuck_batch_cap_factor
+                .unwrap_or(v3::DEFAULT_STUCK_CAP_FACTOR);
+            if cap > 0 && !cfg.query.contains("$offset") {
+                return Err(Error::InvalidConfigValue(
+                    "V3 source query must contain the '$offset' placeholder when \
+                     stuck_batch_cap_factor > 0 (the default). Add \
+                     'OFFSET $offset' to your query to prevent duplicate delivery \
+                     during stuck-batch inflation. Example: \
+                     \"WHERE time > '$cursor' LIMIT $limit OFFSET $offset\""
+                        .into(),
+                ));
+            }
+        }
+
         // Skip-N dedup for V2 requires rows to arrive sorted by time. If the Flux
-        // query lacks an explicit sort, InfluxDB may return rows in storage order,
-        // causing the dedup to skip the wrong rows silently.
+        // query uses `>=` semantics (inclusive cursor) without an explicit sort,
+        // InfluxDB may return rows in storage order, causing skip-N to silently
+        // skip the wrong rows and produce incorrect output. Hard-error so operators
+        // don't discover this only after data loss. Queries using strict `>` do not
+        // need skip-N and are not affected.
         if let InfluxDbSourceConfig::V2(cfg) = &self.config
+            && cfg.query.contains(">=")
             && !query_has_sort_call(&cfg.query)
         {
-            warn!(
-                "{CONNECTOR_NAME} ID: {}: V2 query does not appear to contain \
-                 `|> sort(columns: [\"_time\"])`. Skip-N dedup relies on stable \
-                 row ordering; out-of-order Flux results will silently deliver \
-                 the wrong rows. Add `|> sort(columns: [\"_time\"])` to your query.",
+            return Err(Error::InvalidConfigValue(format!(
+                "{CONNECTOR_NAME} ID: {}: V2 query uses '>=' (inclusive cursor) but does \
+                 not contain `|> sort(columns: [\"_time\"])`. Skip-N dedup is \
+                 order-dependent; without sorting, InfluxDB may return rows in storage \
+                 order and the wrong rows will be silently skipped. \
+                 Add `|> sort(columns: [\"_time\"])` before `|> limit(...)` in your query.",
                 self.id
-            );
+            )));
         }
 
         if let InfluxDbSourceConfig::V2(_) = &self.config
@@ -533,9 +559,17 @@ fn apply_v2_cursor_advance(
     if let Some(ref new_cursor) = max_cursor {
         let should_advance = match state.last_timestamp.as_deref() {
             None => true,
-            Some(old) => old
-                .parse::<DateTime<Utc>>()
-                .is_ok_and(|dt| is_timestamp_after(new_cursor, dt)),
+            Some(old) => match old.parse::<DateTime<Utc>>() {
+                Ok(dt) => is_timestamp_after(new_cursor, dt),
+                Err(e) => {
+                    error!(
+                        "V2 source: persisted cursor {old:?} failed RFC 3339 parse ({e}); \
+                         cannot advance cursor — connector state may be corrupt. \
+                         Clear or migrate the connector state to recover."
+                    );
+                    false
+                }
+            },
         };
         if should_advance {
             state.last_timestamp = Some(new_cursor.clone());
@@ -587,7 +621,7 @@ mod tests {
             url: "http://localhost:8181".to_string(),
             db: "test_db".to_string(),
             token: SecretString::from("test_token"),
-            query: "SELECT time, val FROM tbl WHERE time > '$cursor' ORDER BY time LIMIT $limit"
+            query: "SELECT time, val FROM tbl WHERE time > '$cursor' ORDER BY time LIMIT $limit OFFSET $offset"
                 .to_string(),
             poll_interval: Some("1s".to_string()),
             batch_size: Some(100),
@@ -776,6 +810,114 @@ mod tests {
         // None + skipped=3 → correction
         apply_v2_cursor_advance(&mut state, None, 0, 3);
         assert_eq!(state.cursor_row_count, 3);
+    }
+
+    #[tokio::test]
+    async fn open_v3_rejects_query_without_offset_when_stuck_cap_active() {
+        // Default stuck_batch_cap_factor is 10 (> 0), so any V3 query without
+        // '$offset' must be rejected at open() to prevent duplicate delivery.
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "db".to_string(),
+            token: SecretString::from("t"),
+            // deliberately missing $offset
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: None, // uses default (10 > 0)
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "expected InvalidConfigValue when $offset missing in V3 query, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_v3_accepts_query_with_offset_placeholder() {
+        // A query with $offset (and a URL that fails health check) must NOT be
+        // rejected for the offset reason — it must proceed to the connectivity check.
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "db".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset"
+                .to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        // Must NOT be InvalidConfigValue for the offset reason; connectivity fails instead.
+        assert!(
+            !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("$offset")),
+            "open() must not reject a query that contains $offset; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_v3_with_zero_stuck_cap_skips_offset_check() {
+        // stuck_batch_cap_factor = 0 disables the stuck-cap feature; $offset is
+        // not required because no inflation will ever happen.
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "db".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: Some(0), // explicitly disabled
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("$offset")),
+            "open() must not check $offset when stuck_batch_cap_factor=0; got {err:?}"
+        );
     }
 
     #[tokio::test]
