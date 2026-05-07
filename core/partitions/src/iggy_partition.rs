@@ -945,14 +945,26 @@ where
             return;
         }
 
-        if header.op != current_op + 1 {
-            emit_partition_diag(
-                tracing::Level::WARN,
-                &PartitionDiagEvent::new(self.diag_ctx(), "dropping out-of-order prepare (gap)")
+        // Backup gap check; primary sequencer pre-advanced by
+        // push_prepare_entry. See metadata::on_replicate.
+        if self.consensus().is_follower() {
+            if header.op != current_op + 1 {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        self.diag_ctx(),
+                        "dropping out-of-order prepare (gap)",
+                    )
                     .with_operation(header.operation)
                     .with_op(header.op),
+                );
+                return;
+            }
+        } else {
+            debug_assert_eq!(
+                header.op, current_op,
+                "primary: sequencer pre-advance broken"
             );
-            return;
         }
         // Durability-before-ack: clone for chain-replicate, forward only
         // AFTER apply_replicated_operation persists. Forward-first would

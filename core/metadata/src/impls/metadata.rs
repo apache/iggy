@@ -487,19 +487,27 @@ where
             return;
         }
 
-        // TODO: Restore hard assert_eq!(header.op, current_op + 1) once message repair
-        // is implemented. Without repair, the network can deliver prepares out of order
-        // and the replica has no way to request the missing ones.
-        if header.op != current_op + 1 {
-            warn!(
-                target: "iggy.metadata.diag",
-                plane = "metadata",
-                replica_id = consensus.replica(),
-                op = header.op,
-                expected = current_op + 1,
-                "on_replicate: dropping out-of-order prepare (gap)"
+        // Backup: gap check (op == current_op + 1).
+        // Primary: sequencer pre-advanced by push_prepare_entry (guards
+        // sibling on_request races during journal.append await).
+        // TODO: hard assert for backups once message repair lands.
+        if consensus.is_follower() {
+            if header.op != current_op + 1 {
+                warn!(
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    op = header.op,
+                    expected = current_op + 1,
+                    "on_replicate: dropping out-of-order prepare (gap)"
+                );
+                return;
+            }
+        } else {
+            debug_assert_eq!(
+                header.op, current_op,
+                "primary: sequencer pre-advance broken"
             );
-            return;
         }
 
         // Journal append first; sequencer + checksum after successful append
