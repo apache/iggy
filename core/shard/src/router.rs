@@ -89,18 +89,17 @@ where
         let target = if operation.is_metadata() {
             0
         } else if operation.is_partition() {
-            self.shards_table
-                .shard_for(partition_namespace)
-                .unwrap_or_else(|| {
-                    tracing::warn!(
-                        shard = self.id,
-                        stream = partition_namespace.stream_id(),
-                        topic = partition_namespace.topic_id(),
-                        partition = partition_namespace.partition_id(),
-                        "namespace not found in shards_table, falling back to shard 0"
-                    );
-                    0
-                })
+            let Some(target) = self.shards_table.shard_for(partition_namespace) else {
+                tracing::error!(
+                    shard = self.id,
+                    stream = partition_namespace.stream_id(),
+                    topic = partition_namespace.topic_id(),
+                    partition = partition_namespace.partition_id(),
+                    "namespace not found in shards_table, dropping message"
+                );
+                return;
+            };
+            target
         } else {
             // View-change / Commit messages carry an opaque u64 consensus
             // namespace (not an `IggyNamespace`). Hash it with the same
@@ -196,16 +195,11 @@ where
         } else if operation.is_partition() {
             self.shards_table
                 .shard_for(partition_namespace)
-                .unwrap_or_else(|| {
-                    tracing::warn!(
-                        shard = self.id,
-                        stream = partition_namespace.stream_id(),
-                        topic = partition_namespace.topic_id(),
-                        partition = partition_namespace.partition_id(),
-                        "namespace not found in shards_table, falling back to shard 0"
-                    );
-                    0
-                })
+                .ok_or_else(|| {
+                    ConsensusError::InvalidField(format!(
+                        "namespace {raw_namespace} is not registered in shards_table"
+                    ))
+                })?
         } else {
             #[allow(clippy::cast_lossless)]
             let shard_count = u32::try_from(self.senders.len()).unwrap_or(u32::MAX);
@@ -259,12 +253,16 @@ where
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
+        let mut loopback_buf = Vec::new();
         loop {
             futures::select! {
                 _ = stop.recv().fuse() => break,
                 frame = self.inbox.recv().fuse() => {
                     match frame {
-                        Ok(frame) => self.process_frame(frame).await,
+                        Ok(frame) => {
+                            self.process_frame(frame).await;
+                            self.process_loopback(&mut loopback_buf).await;
+                        }
                         Err(_) => break,
                     }
                 }
@@ -274,6 +272,7 @@ where
         // Drain remaining frames so in-flight requests get a response.
         while let Ok(frame) = self.inbox.try_recv() {
             self.process_frame(frame).await;
+            self.process_loopback(&mut loopback_buf).await;
         }
     }
 

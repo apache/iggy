@@ -26,7 +26,7 @@
 
 use super::message_bus::MessageBusConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
-use super::server_ng::ServerNgConfig;
+use super::server_ng::{ExtraConfig, NamespaceConfig, ServerNgConfig};
 use super::tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig};
 use std::fmt::{Display, Formatter};
 
@@ -34,10 +34,12 @@ impl Display for ServerNgConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ consumer_group: {}, data_maintenance: {}, message_saver: {}, heartbeat: {}, \
-             system: {}, quic: {}, tcp: {}, http: {}, telemetry: {}, message_bus: {} }}",
+            "{{ consumer_group: {}, data_maintenance: {}, extra: {}, message_saver: {}, \
+             heartbeat: {}, system: {}, quic: {}, tcp: {}, http: {}, telemetry: {}, \
+             message_bus: {} }}",
             self.consumer_group,
             self.data_maintenance,
+            self.extra,
             self.message_saver,
             self.heartbeat,
             self.system,
@@ -70,6 +72,22 @@ impl Display for MessageBusConfig {
             self.ws_max_frame_size,
             self.ws_write_buffer_size,
             self.ws_accept_unmasked_frames,
+        )
+    }
+}
+
+impl Display for ExtraConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{ namespace: {} }}", self.namespace)
+    }
+}
+
+impl Display for NamespaceConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ max_streams: {}, max_topics: {}, max_partitions: {} }}",
+            self.max_streams, self.max_topics, self.max_partitions
         )
     }
 }

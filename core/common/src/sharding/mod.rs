@@ -22,8 +22,9 @@ mod shard_id;
 
 pub use local_idx::LocalIdx;
 pub use namespace::{
-    IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS, PARTITION_BITS, PARTITION_MASK,
-    PARTITION_SHIFT, STREAM_BITS, STREAM_MASK, STREAM_SHIFT, TOPIC_BITS, TOPIC_MASK, TOPIC_SHIFT,
+    IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS, NamespaceCapacityError, PARTITION_BITS,
+    PARTITION_MASK, PARTITION_SHIFT, STREAM_BITS, STREAM_MASK, STREAM_SHIFT, TOPIC_BITS,
+    TOPIC_MASK, TOPIC_SHIFT,
 };
 pub use partition_location::PartitionLocation;
 pub use shard_id::ShardId;

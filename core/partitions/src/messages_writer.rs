@@ -38,6 +38,11 @@ pub struct MessagesWriter {
 }
 
 impl MessagesWriter {
+    /// Creates a messages writer backed by the segment file at `file_path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be opened, synchronized, or queried for metadata.
     pub async fn new(
         file_path: &str,
         messages_size_bytes: Rc<AtomicU64>,
@@ -45,17 +50,19 @@ impl MessagesWriter {
         file_exists: bool,
     ) -> Result<Self, IggyError> {
         let mut opts = OpenOptions::new();
-        opts.create(true).write(true);
+        opts.write(true);
+        if !file_exists {
+            opts.create(true);
+        }
         let file = opts
             .open(file_path)
             .await
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {
-            let _ = file
-                .sync_all()
+            file.sync_all()
                 .await
-                .map_err(|_| IggyError::CannotWriteToFile);
+                .map_err(|_| IggyError::CannotWriteToFile)?;
 
             let actual_messages_size = file
                 .metadata()
@@ -74,6 +81,11 @@ impl MessagesWriter {
         })
     }
 
+    /// Appends a batch of frozen message buffers to the segment file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any chunk cannot be written or synced to disk.
     pub async fn save_frozen_batches<const ALIGN: usize>(
         &self,
         buffers: &[Frozen<ALIGN>],
@@ -97,10 +109,16 @@ impl MessagesWriter {
         Ok(IggyByteSize::from(messages_size))
     }
 
+    #[must_use]
     pub fn path(&self) -> String {
         self.file_path.clone()
     }
 
+    /// Flushes buffered segment file contents to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be synchronized.
     pub async fn fsync(&self) -> Result<(), IggyError> {
         self.file
             .sync_all()
