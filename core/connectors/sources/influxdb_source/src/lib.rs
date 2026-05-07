@@ -856,8 +856,7 @@ mod tests {
             url: "http://localhost:18181".to_string(),
             db: "db".to_string(),
             token: SecretString::from("t"),
-            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset"
-                .to_string(),
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset".to_string(),
             poll_interval: None,
             batch_size: None,
             cursor_field: None,

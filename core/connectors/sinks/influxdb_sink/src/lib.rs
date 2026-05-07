@@ -521,11 +521,10 @@ impl InfluxDbSink {
                 // The Json variant is kept for API compatibility; the hot path goes
                 // through the fallback branch for non-Json payloads.
                 let compact = match &message.payload {
-                    iggy_connector_sdk::Payload::Json(value) => {
-                        serde_json::to_string(value).map_err(|e| {
+                    iggy_connector_sdk::Payload::Json(value) => serde_json::to_string(value)
+                        .map_err(|e| {
                             Error::CannotStoreData(format!("JSON serialization failed: {e}"))
-                        })?
-                    }
+                        })?,
                     _ => {
                         let bytes = message.payload.try_to_bytes().map_err(|e| {
                             Error::CannotStoreData(format!("Payload conversion failed: {e}"))

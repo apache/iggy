@@ -27,7 +27,7 @@
 
 use crate::common::{
     DEFAULT_V3_CURSOR_FIELD, PayloadFormat, Row, RowContext, V3SourceConfig, V3State,
-    apply_query_params, is_timestamp_after, parse_jsonl_rows, timestamps_equal, validate_cursor,
+    apply_query_params, is_timestamp_after, parse_jsonl_rows, validate_cursor,
 };
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
@@ -211,8 +211,12 @@ fn build_payload(
             map.end()
         }
     }
-    serde_json::to_vec(&RowView { row, cursor_field, include_metadata })
-        .map_err(|e| Error::Serialization(format!("JSON serialization failed: {e}")))
+    serde_json::to_vec(&RowView {
+        row,
+        cursor_field,
+        include_metadata,
+    })
+    .map_err(|e| Error::Serialization(format!("JSON serialization failed: {e}")))
 }
 
 /// Compute the next effective batch size when the batch is stuck.
@@ -538,7 +542,10 @@ mod tests {
         let result = process_rows(&[], &ctx(T1, 1000)).unwrap();
         assert!(result.messages.is_empty());
         assert!(result.max_cursor.is_none());
-        assert_eq!(result.rows_at_max_cursor, 0, "empty slice has no rows at max cursor");
+        assert_eq!(
+            result.rows_at_max_cursor, 0,
+            "empty slice has no rows at max cursor"
+        );
     }
 
     #[test]

@@ -426,29 +426,6 @@ pub fn is_timestamp_after(a: &str, b_parsed: DateTime<Utc>) -> bool {
     }
 }
 
-/// Return `true` if timestamps `a` and `b` represent the same instant,
-/// regardless of timezone format differences.
-///
-/// Raw string equality is wrong here: `"2024-01-01T00:00:00Z"` and
-/// `"2024-01-01T00:00:00+00:00"` are the same instant but differ lexically.
-/// This causes `all_at_cursor` to flip `false` incorrectly for one poll round,
-/// producing duplicate delivery that self-heals next poll once the cursor
-/// string is overwritten.
-///
-/// Falls back to string equality if either value fails to parse — conservative,
-/// avoids a false "not equal" that would produce unnecessary duplicates.
-pub(crate) fn timestamps_equal(a: &str, b: &str) -> bool {
-    match (a.parse::<DateTime<Utc>>(), b.parse::<DateTime<Utc>>()) {
-        (Ok(dt_a), Ok(dt_b)) => dt_a == dt_b,
-        _ => {
-            warn!(
-                "timestamps_equal: could not parse timestamps as RFC 3339 \
-                 ({a:?} vs {b:?}); falling back to string equality"
-            );
-            a == b
-        }
-    }
-}
 // ── Scalar parsing ────────────────────────────────────────────────────────────
 
 /// Parse a string value from InfluxDB into the most specific JSON scalar type.
@@ -1048,13 +1025,5 @@ query   = "SELECT 1"
         assert_eq!(out, "SELECT $unknown FROM t");
     }
 
-    // ── timestamps_equal fallback ────────────────────────────────────────────
 
-    #[test]
-    fn timestamps_equal_fallback_on_unparsable_string() {
-        // When either side is not a valid RFC 3339 timestamp the function
-        // falls back to string equality rather than returning an incorrect result.
-        assert!(timestamps_equal("abc", "abc"));
-        assert!(!timestamps_equal("abc", "xyz"));
-    }
 }

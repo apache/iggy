@@ -59,7 +59,6 @@ fn build_query(
 const MAX_SKIP_INFLATION_FACTOR: u64 = 10;
 const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 
-
 /// Render the final Flux query by substituting `$cursor` and `$limit`.
 ///
 /// The limit is inflated by `already_seen` (rows at the current cursor
