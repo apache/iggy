@@ -125,6 +125,10 @@ impl Validatable<ConfigurationError> for ServerNgConfig {
                 format!("{COMPONENT_NG} (error: {e}) - failed to validate message_bus config")
             })?;
 
+        self.quic.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT_NG} (error: {e}) - failed to validate quic config")
+        })?;
+
         Ok(())
     }
 }

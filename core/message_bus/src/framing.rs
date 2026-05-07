@@ -26,8 +26,9 @@ use compio::buf::{IntoInner, IoBuf, IoBufMut};
 use compio::io::{AsyncReadExt, AsyncWriteExt};
 use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
 use iggy_binary_protocol::consensus::iobuf::Owned;
-use iggy_binary_protocol::{GenericHeader, HEADER_SIZE, Message};
+use iggy_binary_protocol::{GenericHeader, HEADER_SIZE, Message, read_size_field};
 use iggy_common::IggyError;
+use tracing::error;
 
 /// Default hard ceiling on a single wire frame. Frames above this are
 /// almost certainly a protocol violation or a malicious peer; we drop
@@ -39,28 +40,19 @@ use iggy_common::IggyError;
 /// `IggyMessageBus` in scope (e.g. standalone handshake helpers).
 pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
-// Guards the `header_buf[48..52]` size-field decode below. If `GenericHeader`'s
-// layout ever shifts, this trips at compile time before the runtime read
-// parses garbage.
-const _: () = {
-    assert!(
-        std::mem::offset_of!(GenericHeader, size) == 48,
-        "framing::read_message hardcodes size offset 48; GenericHeader layout changed",
-    );
-};
-
 /// Write a consensus message to a stream. Zero-copy: the message's owned
 /// buffer is handed straight to `io_uring` as a `Frozen`.
 ///
-/// Used by the handshake and framing test paths. Hot-path bus traffic goes
-/// through [`crate::writer_task`] which batches many messages into a single
-/// `writev` instead.
+/// Used by the handshake and framing test paths. Hot-path bus traffic
+/// goes through the per-transport writer task (see
+/// [`crate::transports::tcp`]) which batches many messages into a
+/// single `writev` instead.
 ///
 /// # Errors
 ///
 /// Returns `IggyError::TcpError` if the write fails.
 #[allow(clippy::future_not_send)]
-pub async fn write_message<S: AsyncWriteExt + Unpin>(
+pub async fn write_message<S: AsyncWriteExt>(
     stream: &mut S,
     message: Message<GenericHeader>,
 ) -> Result<(), IggyError> {
@@ -83,13 +75,27 @@ pub async fn write_message<S: AsyncWriteExt + Unpin>(
 /// into the first `HEADER_SIZE` bytes, then the body is read into the tail
 /// of the same buffer. No intermediate reassembly copy.
 ///
+/// # Cancel-safety
+///
+/// **Not cancel-safe across multi-read frames.** Internally calls
+/// `AsyncReadExt::read_exact`, whose loop holds committed bytes in the
+/// caller's `Owned<MESSAGE_ALIGN>` across awaits. If the future is
+/// dropped after one inner read returned bytes but before the next
+/// completes, those bytes are lost with the dropped frame and the
+/// stream has already advanced past them. Callers in cancellable
+/// contexts (e.g. `select!`) must accept the resulting framing error
+/// and tear the connection down.
+///
+/// See `tcp_tls::run_pump` rustdoc and TODO for the resumable-framing
+/// fix path.
+///
 /// # Errors
 ///
 /// Returns `IggyError::ConnectionClosed` on EOF.
 /// Returns `IggyError::TcpError` on I/O errors.
 /// Returns `IggyError::InvalidCommand` if the header fails validation.
 #[allow(clippy::future_not_send)]
-pub async fn read_message<S: AsyncReadExt + Unpin>(
+pub async fn read_message<S: AsyncReadExt>(
     stream: &mut S,
     max_message_size: usize,
 ) -> Result<Message<GenericHeader>, IggyError> {
@@ -100,11 +106,7 @@ pub async fn read_message<S: AsyncReadExt + Unpin>(
     let BufResult(result, owned) = stream.read_exact(owned).await;
     result.map_err(|e| to_read_error(&e))?;
 
-    let total_size = u32::from_le_bytes(
-        owned.as_slice()[48..52]
-            .try_into()
-            .map_err(|_| IggyError::InvalidCommand)?,
-    ) as usize;
+    let total_size = read_size_field(owned.as_slice()).ok_or(IggyError::InvalidCommand)? as usize;
 
     if !(HEADER_SIZE..=max_message_size).contains(&total_size) {
         return Err(IggyError::InvalidCommand);
@@ -121,12 +123,28 @@ pub async fn read_message<S: AsyncReadExt + Unpin>(
     // (`Owned::with_capacity(HEADER_SIZE)` plus one in-place realloc of
     // the backing AVec). Zero memcpys of the data.
     let mut owned = owned;
-    // Propagate any underlying reservation failure. `Owned::reserve_exact`
-    // is infallible today, but the `IoBufMut` contract allows an `Err`
-    // (e.g. capacity overflow, unsupported buffer kind) and silently
-    // ignoring it would leave `owned` at header-only capacity, causing the
-    // subsequent `read_exact` to read into an ungrown buffer.
-    IoBufMut::reserve_exact(&mut owned, body_size).map_err(|_| IggyError::TcpError)?;
+    // The `.map_err` arm is unreachable today: `Owned<MESSAGE_ALIGN>` is
+    // the only `IoBufMut` ever fed here, and its `reserve_exact` impl
+    // returns `Ok(())` unconditionally (`AVec::reserve_exact` panics on
+    // alloc failure rather than returning `Err`, so an OOM aborts the
+    // process before this site ever sees a `Result::Err`).
+    //
+    // We still propagate the result rather than `unwrap`-ing: the
+    // `IoBufMut` trait surface defines `NotSupported`, `ReserveFailed`,
+    // and `ExactSizeMismatch` variants for other buffer impls, and
+    // silently ignoring an `Err` would leave `owned` at header-only
+    // capacity and the subsequent `read_exact` would read into an
+    // ungrown buffer. No `IggyError::OutOfMemory` variant exists today;
+    // `TcpError` is the closest bucket. If a fallible buffer ever
+    // replaces `Owned` here, swap to `try_reserve_exact` plus a
+    // dedicated error variant.
+    IoBufMut::reserve_exact(&mut owned, body_size).map_err(|e| {
+        error!(
+            ?e,
+            body_size, "framing reserve_exact failed; dropping connection"
+        );
+        IggyError::TcpError
+    })?;
     let BufResult(result, slice) = stream
         .read_exact(owned.slice(HEADER_SIZE..total_size))
         .await;
@@ -148,7 +166,7 @@ fn to_read_error(e: &std::io::Error) -> IggyError {
 mod tests {
     use super::*;
     use compio::net::{TcpListener, TcpStream};
-    use iggy_binary_protocol::Command2;
+    use iggy_binary_protocol::{Command2, SIZE_FIELD_OFFSET};
 
     #[allow(clippy::cast_possible_truncation)]
     fn make_header_only(command: Command2) -> Message<GenericHeader> {
@@ -190,7 +208,7 @@ mod tests {
         let bogus = u32::try_from(MAX_MESSAGE_SIZE + 1)
             .unwrap_or(u32::MAX)
             .to_le_bytes();
-        buf[48..52].copy_from_slice(&bogus);
+        buf[SIZE_FIELD_OFFSET..SIZE_FIELD_OFFSET + 4].copy_from_slice(&bogus);
         a.write_all(buf).await.0.unwrap();
 
         let res = read_message(&mut b, MAX_MESSAGE_SIZE).await;
@@ -205,7 +223,7 @@ mod tests {
 
         let mut buf = vec![0u8; HEADER_SIZE];
         let undersize = u32::try_from(HEADER_SIZE - 1).unwrap();
-        buf[48..52].copy_from_slice(&undersize.to_le_bytes());
+        buf[SIZE_FIELD_OFFSET..SIZE_FIELD_OFFSET + 4].copy_from_slice(&undersize.to_le_bytes());
         a.write_all(buf).await.0.unwrap();
 
         let res = read_message(&mut b, MAX_MESSAGE_SIZE).await;

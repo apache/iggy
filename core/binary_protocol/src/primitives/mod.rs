@@ -17,6 +17,7 @@
 
 //! Shared wire primitives reused across request and response types.
 
+pub mod ack_level;
 pub mod consumer;
 pub mod identifier;
 pub mod partition_assignment;

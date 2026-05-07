@@ -139,6 +139,16 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
         ) {
             continue;
         }
+        // v2 consumer-offset ops are registered in the dispatch table for the
+        // consensus/simulator pathway but are not wired into the legacy binary
+        // server's dispatch. They'll move into server-ng alongside the rest of
+        // the v2 surface; re-enable these codes here once that lands.
+        if matches!(
+            code,
+            STORE_CONSUMER_OFFSET_2_CODE | DELETE_CONSUMER_OFFSET_2_CODE
+        ) {
+            continue;
+        }
 
         // ================================================================
         // REQUIRES AUTH

@@ -32,8 +32,11 @@
 pub mod defaults;
 pub mod displays;
 pub mod message_bus;
+pub mod quic;
 pub mod server_ng;
+pub mod tcp;
 pub mod validators;
+pub mod websocket;
 
 /// Component tag used in error messages for the server-ng config surface.
 /// Mirrors [`crate::COMPONENT`] (`"CONFIG"`).
