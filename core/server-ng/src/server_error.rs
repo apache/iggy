@@ -56,16 +56,16 @@ pub enum ServerNgError {
     #[error("cluster node for replica {replica_id} is missing tcp_replica port")]
     ClusterReplicaPortMissing { replica_id: u8 },
     #[error(
-        "recovered segment for stream {stream_id}, topic {topic_id}, partition {partition_id} at start_offset {start_offset} has message/index divergence (messages_size={messages_size_bytes}, indexed_size={indexed_size_bytes}, end_offset={end_offset})"
+        "failed to load persisted {consumer_kind} offsets for stream {stream_id}, topic {topic_id}, partition {partition_id} from {path}"
     )]
-    RecoveredSegmentSizeDivergence {
+    ConsumerOffsetsLoad {
+        consumer_kind: &'static str,
         stream_id: usize,
         topic_id: usize,
         partition_id: usize,
-        start_offset: u64,
-        end_offset: u64,
-        messages_size_bytes: u64,
-        indexed_size_bytes: u64,
+        path: String,
+        #[source]
+        source: Box<iggy_common::IggyError>,
     },
     #[error(
         "recovered {consumer_kind} offset {offset} for id {consumer_id} exceeds current_offset {current_offset} in stream {stream_id}, topic {topic_id}, partition {partition_id}"

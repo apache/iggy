@@ -24,7 +24,7 @@ use consensus::{LocalPipeline, PartitionsHandle, Sequencer, VsrConsensus};
 use iggy_binary_protocol::RequestHeader;
 use iggy_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use iggy_common::{
-    ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, PartitionStats, TopicStats,
+    ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, PartitionStats, TopicStats,
     sharding::LocalIdx, variadic,
 };
 use journal::Journal;
@@ -267,10 +267,12 @@ fn restore_metadata_consensus(
 
     consensus.init();
     consensus.sequencer().set_sequence(restored_op);
+    // Known gap: clustered bootstrap does not yet persist a durable commit
+    // watermark. Until that exists, recovery assumes the not-yet-supported
+    // case where replicas are not rejoining with divergent commit state.
     consensus.restore_commit_state(restored_op, restored_op);
     if let Some(header) = last_header {
         consensus.set_last_prepare_checksum(header.checksum);
-        consensus.set_log_view(header.view);
     }
 
     consensus
@@ -500,17 +502,6 @@ async fn hydrate_partition_log(
         .zip(loaded_log.storages().iter().cloned())
         .enumerate()
     {
-        validate_recovered_segment(
-            stream_id,
-            topic_id,
-            partition_id,
-            segment,
-            &storage,
-            loaded_log
-                .indexes()
-                .get(segment_index)
-                .and_then(|indexes| indexes.as_ref()),
-        )?;
         let max_timestamp = match loaded_log
             .indexes()
             .get(segment_index)
@@ -569,34 +560,6 @@ async fn hydrate_partition_log(
     }
 
     Ok(())
-}
-
-fn validate_recovered_segment(
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-    segment: &iggy_common::Segment,
-    storage: &iggy_common::SegmentStorage,
-    indexes: Option<&server::streaming::segments::IggyIndexesMut>,
-) -> Result<(), ServerNgError> {
-    let messages_size_bytes = storage
-        .messages_reader
-        .as_ref()
-        .map_or(0, |reader| u64::from(reader.file_size()));
-    let indexed_size_bytes = indexes.map_or(0, |indexes| u64::from(indexes.messages_size()));
-    if messages_size_bytes == indexed_size_bytes {
-        return Ok(());
-    }
-
-    Err(ServerNgError::RecoveredSegmentSizeDivergence {
-        stream_id,
-        topic_id,
-        partition_id,
-        start_offset: segment.start_offset,
-        end_offset: segment.end_offset,
-        messages_size_bytes,
-        indexed_size_bytes,
-    })
 }
 
 fn convert_segment(segment: &iggy_common::Segment, max_timestamp: u64) -> Segment {
@@ -664,8 +627,13 @@ fn configure_consumer_offsets(
             .system
             .get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
 
-    // TODO: decouple consumer offset loading from the `server` crate.
-    let loaded_consumer_offsets = load_consumer_offsets(&consumer_offsets_path).unwrap_or_default();
+    let loaded_consumer_offsets = load_partition_consumer_offsets(
+        &consumer_offsets_path,
+        "consumer",
+        stream_id,
+        topic_id,
+        partition_id,
+    )?;
     let consumer_offsets = ConsumerOffsets::with_capacity(loaded_consumer_offsets.len());
     {
         let guard = consumer_offsets.pin();
@@ -686,9 +654,12 @@ fn configure_consumer_offsets(
         }
     }
 
-    // TODO: decouple consumer group offset loading from the `server` crate.
-    let loaded_group_offsets =
-        load_consumer_group_offsets(&consumer_group_offsets_path).unwrap_or_default();
+    let loaded_group_offsets = load_partition_consumer_group_offsets(
+        &consumer_group_offsets_path,
+        stream_id,
+        topic_id,
+        partition_id,
+    )?;
     let consumer_group_offsets = ConsumerGroupOffsets::with_capacity(loaded_group_offsets.len());
     {
         let guard = consumer_group_offsets.pin();
@@ -717,6 +688,61 @@ fn configure_consumer_offsets(
         config.system.partition.enforce_fsync,
     );
     Ok(())
+}
+
+fn load_partition_consumer_offsets(
+    path: &str,
+    consumer_kind: &'static str,
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+) -> Result<Vec<iggy_common::ConsumerOffset>, ServerNgError> {
+    if !Path::new(path).exists() {
+        return Ok(Vec::new());
+    }
+
+    load_consumer_offsets(path).or_else(|source| {
+        if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
+        {
+            return Ok(Vec::new());
+        }
+
+        Err(ServerNgError::ConsumerOffsetsLoad {
+            consumer_kind,
+            stream_id,
+            topic_id,
+            partition_id,
+            path: path.to_string(),
+            source: Box::new(source),
+        })
+    })
+}
+
+fn load_partition_consumer_group_offsets(
+    path: &str,
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+) -> Result<Vec<(iggy_common::ConsumerGroupId, iggy_common::ConsumerOffset)>, ServerNgError> {
+    if !Path::new(path).exists() {
+        return Ok(Vec::new());
+    }
+
+    load_consumer_group_offsets(path).or_else(|source| {
+        if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
+        {
+            return Ok(Vec::new());
+        }
+
+        Err(ServerNgError::ConsumerOffsetsLoad {
+            consumer_kind: "consumer group",
+            stream_id,
+            topic_id,
+            partition_id,
+            path: path.to_string(),
+            source: Box::new(source),
+        })
+    })
 }
 
 async fn ensure_initial_segment(

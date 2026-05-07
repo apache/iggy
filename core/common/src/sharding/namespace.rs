@@ -21,6 +21,8 @@
 // |    STREAM_BITS |    TOPIC_BITS  | PARTITION_BITS |  (64 - total)  |
 // +----------------+----------------+----------------+----------------+
 
+use thiserror::Error;
+
 pub const MAX_STREAMS: usize = 4096;
 pub const MAX_TOPICS: usize = 4096;
 pub const MAX_PARTITIONS: usize = 1_000_000;
@@ -49,46 +51,25 @@ pub const PARTITION_MASK: u64 = (1u64 << PARTITION_BITS) - 1;
 pub const TOPIC_MASK: u64 = (1u64 << TOPIC_BITS) - 1;
 pub const STREAM_MASK: u64 = (1u64 << STREAM_BITS) - 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum NamespaceCapacityError {
+    #[error("max_streams must be greater than 0")]
     ZeroStreams,
+    #[error("max_topics must be greater than 0")]
     ZeroTopics,
+    #[error("max_partitions must be greater than 0")]
     ZeroPartitions,
-    ExceedsU64 {
-        required_bits: u32,
-    },
+    #[error("namespace capacity requires {required_bits} bits, which does not fit in u64")]
+    ExceedsU64 { required_bits: u32 },
+    #[error(
+        "namespace capacity requires stream/topic/partition bits of {stream_bits}/{topic_bits}/{partition_bits}, but IggyNamespace supports {STREAM_BITS}/{TOPIC_BITS}/{PARTITION_BITS}"
+    )]
     ExceedsLayout {
         stream_bits: u32,
         topic_bits: u32,
         partition_bits: u32,
     },
 }
-
-impl std::fmt::Display for NamespaceCapacityError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ZeroStreams => write!(f, "max_streams must be greater than 0"),
-            Self::ZeroTopics => write!(f, "max_topics must be greater than 0"),
-            Self::ZeroPartitions => write!(f, "max_partitions must be greater than 0"),
-            Self::ExceedsU64 { required_bits } => write!(
-                f,
-                "namespace capacity requires {required_bits} bits, which does not fit in u64"
-            ),
-            Self::ExceedsLayout {
-                stream_bits,
-                topic_bits,
-                partition_bits,
-            } => write!(
-                f,
-                "namespace capacity requires stream/topic/partition bits of \
-                 {stream_bits}/{topic_bits}/{partition_bits}, but IggyNamespace supports \
-                 {STREAM_BITS}/{TOPIC_BITS}/{PARTITION_BITS}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for NamespaceCapacityError {}
 
 /// Packed namespace identifier for shard assignment.
 ///
