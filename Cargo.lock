@@ -11264,7 +11264,6 @@ dependencies = [
  "async_zip",
  "axum",
  "axum-server",
- "bytemuck",
  "bytes",
  "chrono",
  "clap",
