@@ -38,11 +38,9 @@
 //! drop + new()           - on disconnect/crash, create a fresh session
 //! ```
 //!
-//! A `ConsensusSession` is **not reusable** across connections. On disconnect
-//! or crash, drop it and create a new one. This generates a fresh `client_id`
-//! and avoids ambiguous re-register semantics (TigerBeetle requires a fresh
-//! client_id per process). The old session stays in the server's `ClientTable`
-//! until evicted.
+//! `ConsensusSession` is **not reusable**: on disconnect/crash drop and
+//! recreate. New `client_id` avoids ambiguous re-register; old entry
+//! stays in server `ClientTable` until evicted.
 
 /// Consensus-level session state.
 ///

@@ -25,6 +25,9 @@ pub trait Project<T, C: Consensus> {
 
 pub trait Pipeline {
     type Entry;
+    /// Accepted-but-not-yet-prepared client request. For `LocalPipeline`,
+    /// `RequestEntry` wrapping `Message<RequestHeader>`.
+    type Request;
 
     fn push(&mut self, entry: Self::Entry);
 
@@ -40,6 +43,8 @@ pub trait Pipeline {
 
     fn head(&self) -> Option<&Self::Entry>;
 
+    /// True iff prepare queue is full. Callers route to
+    /// [`Self::push_request`] on `true`.
     fn is_full(&self) -> bool;
 
     fn is_empty(&self) -> bool;
@@ -47,6 +52,39 @@ pub trait Pipeline {
     fn len(&self) -> usize;
 
     fn verify(&self);
+
+    /// True iff either queue carries `client_id`. Used by metadata-plane
+    /// preflight for in-flight dedup. Partition plane is at-least-once
+    /// and skips. Default `false`; falls through to slot dedup in
+    /// `check_request`.
+    fn has_message_from_client(&self, _client_id: u128) -> bool {
+        false
+    }
+
+    /// Drop reply senders on every entry; receivers wake `Canceled`.
+    /// View-change reset uses this to unblock awaiters while preserving
+    /// pipeline for DVC reconciliation.
+    fn cancel_all_subscribers(&mut self) {}
+
+    /// Drop `request_queue`, preserve `prepare_queue` (DVC reconciliation).
+    /// Stale primary-era requests must not outlive the transition;
+    /// clients re-send via read-timeout.
+    fn clear_request_queue(&mut self) {}
+
+    /// Buffer a request behind a full prepare queue.
+    ///
+    /// # Errors
+    /// `Err(request)` if request queue full (or no queue — default impl).
+    /// Caller drops; client retries.
+    fn push_request(&mut self, request: Self::Request) -> Result<(), Self::Request> {
+        Err(request)
+    }
+
+    /// Pop request-queue head. Called when a prepare commits and frees
+    /// a slot. Default `None` (no queue).
+    fn pop_request(&mut self) -> Option<Self::Request> {
+        None
+    }
 }
 
 pub type RequestMessage<C> = <C as Consensus>::Message<<C as Consensus>::RequestHeader>;
@@ -104,7 +142,10 @@ where
 }
 
 pub mod client_table;
-pub use client_table::ClientTable;
+pub use client_table::{CachedReply, ClientTable};
+// One-shot per `PipelineEntry` for in-process commit awaiters.
+pub(crate) mod oneshot;
+pub use oneshot::{Canceled, Receiver};
 
 mod impls;
 pub use impls::*;
@@ -112,6 +153,8 @@ mod plane_mux;
 pub use plane_mux::*;
 mod plane_helpers;
 pub use plane_helpers::*;
+mod metadata_helpers;
+pub use metadata_helpers::*;
 mod observability;
 pub use observability::*;
 

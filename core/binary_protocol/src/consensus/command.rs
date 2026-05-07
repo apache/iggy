@@ -39,6 +39,7 @@ pub enum Command2 {
     StartViewChange = 10,
     DoViewChange = 11,
     StartView = 12,
+    Eviction = 13,
 }
 
 // SAFETY: Command2 is #[repr(u8)] with no padding bytes.
@@ -49,7 +50,7 @@ unsafe impl CheckedBitPattern for Command2 {
     type Bits = u8;
 
     fn is_valid_bit_pattern(bits: &u8) -> bool {
-        *bits <= 12
+        *bits <= 13
     }
 }
 

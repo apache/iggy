@@ -68,7 +68,6 @@ impl<T: Ready> ReadyQueue<T> {
     }
 
     /// Reset the queue, removing all items but retaining the allocation.
-    /// Matches `TigerBeetle`'s `reset()` which sets `items.len = 0`.
     pub fn clear(&mut self) {
         self.items.clear();
     }

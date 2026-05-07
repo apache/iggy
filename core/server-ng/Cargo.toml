@@ -116,6 +116,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
+consensus = { workspace = true }
 ctrlc = { workspace = true }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }
@@ -131,8 +132,10 @@ hash32 = { workspace = true }
 human-repr = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+journal = { workspace = true }
 jsonwebtoken = { workspace = true }
 left-right = { workspace = true }
+message_bus = { workspace = true }
 metadata = { workspace = true }
 mimalloc = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }

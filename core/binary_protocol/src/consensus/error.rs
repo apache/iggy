@@ -61,4 +61,7 @@ pub enum ConsensusError {
 
     #[error("invalid bit pattern in header (enum discriminant out of range)")]
     InvalidBitPattern,
+
+    #[error("client-bound command {0:?} cannot be dispatched on inbound path")]
+    ClientBoundCommand(Command2),
 }
