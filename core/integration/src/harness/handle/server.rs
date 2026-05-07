@@ -93,6 +93,14 @@ impl std::fmt::Debug for ServerHandle {
 }
 
 impl ServerHandle {
+    fn launched_binary(&self) -> String {
+        if let Some(path) = &self.config.executable_path {
+            path.clone()
+        } else {
+            "iggy-server".to_string()
+        }
+    }
+
     pub fn tcp_addr(&self) -> Option<SocketAddr> {
         self.addrs.tcp
     }
@@ -402,7 +410,7 @@ impl ServerHandle {
             {
                 let (stdout, stderr) = self.collect_logs();
                 return Err(TestBinaryError::ProcessCrashed {
-                    binary: "iggy-server".to_string(),
+                    binary: self.launched_binary(),
                     exit_code: status.code(),
                     stdout,
                     stderr,
@@ -427,7 +435,7 @@ impl ServerHandle {
         }
 
         Err(TestBinaryError::StartupTimeout {
-            binary: "iggy-server".to_string(),
+            binary: self.launched_binary(),
             timeout_secs: MAX_PORT_WAIT_DURATION_S,
         })
     }
@@ -776,11 +784,20 @@ impl TestBinary for ServerHandle {
         }
 
         #[allow(deprecated)]
+        let launched_binary = self.launched_binary();
         let mut command = if let Some(ref path) = self.config.executable_path {
-            Command::new(path)
+            let path_ref = Path::new(path);
+            if path_ref.components().count() == 1 && !path_ref.exists() {
+                Command::cargo_bin(path).map_err(|e| TestBinaryError::ProcessSpawn {
+                    binary: launched_binary.clone(),
+                    source: std::io::Error::other(e.to_string()),
+                })?
+            } else {
+                Command::new(path)
+            }
         } else {
             Command::cargo_bin("iggy-server").map_err(|e| TestBinaryError::ProcessSpawn {
-                binary: "iggy-server".to_string(),
+                binary: launched_binary.clone(),
                 source: std::io::Error::other(e.to_string()),
             })?
         };
@@ -829,7 +846,7 @@ impl TestBinary for ServerHandle {
         }
 
         let child = command.spawn().map_err(|e| TestBinaryError::ProcessSpawn {
-            binary: "iggy-server".to_string(),
+            binary: launched_binary,
             source: e,
         })?;
         self.child_handle = Some(child);

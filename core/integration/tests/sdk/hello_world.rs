@@ -16,5 +16,14 @@
  * under the License.
  */
 
-mod hello_world;
-mod producer;
+use iggy::prelude::*;
+use integration::iggy_harness;
+
+#[iggy_harness(
+    test_client_transport = [Tcp, Quic, WebSocket],
+    server(executable_path = "iggy-server-ng")
+)]
+async fn hello_world(harness: &TestHarness) {
+    let client = harness.root_client().await.unwrap();
+    client.ping().await.unwrap();
+}
