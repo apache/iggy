@@ -22,8 +22,8 @@ use super::container::{
     ENV_SOURCE_PATH, ENV_SOURCE_PAYLOAD_COLUMN, ENV_SOURCE_PAYLOAD_FORMAT,
     ENV_SOURCE_POLL_INTERVAL, ENV_SOURCE_QUERY, ENV_SOURCE_STREAMS_0_SCHEMA,
     ENV_SOURCE_STREAMS_0_STREAM, ENV_SOURCE_STREAMS_0_TOPIC, ENV_SOURCE_TOKEN, ENV_SOURCE_URL,
-    HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, INFLUXDB_BUCKET, INFLUXDB_ORG, INFLUXDB_TOKEN,
-    InfluxDbContainer, InfluxDbOps, create_http_client,
+    ENV_SOURCE_VERSION, HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, INFLUXDB_BUCKET,
+    INFLUXDB_ORG, INFLUXDB_TOKEN, InfluxDbContainer, InfluxDbOps, create_http_client,
 };
 use async_trait::async_trait;
 use integration::harness::{TestBinaryError, TestFixture};
@@ -129,6 +129,7 @@ impl TestFixture for InfluxDbSourceFixture {
         };
 
         let mut envs = HashMap::new();
+        envs.insert(ENV_SOURCE_VERSION.to_string(), "v2".to_string());
         envs.insert(ENV_SOURCE_URL.to_string(), self.container.base_url.clone());
         envs.insert(ENV_SOURCE_ORG.to_string(), INFLUXDB_ORG.to_string());
         envs.insert(ENV_SOURCE_TOKEN.to_string(), INFLUXDB_TOKEN.to_string());

@@ -18,11 +18,16 @@
  */
 
 pub mod container;
+pub mod container_v3;
 pub mod sink;
+pub mod sink_v3;
 pub mod source;
+pub mod source_v3;
 
 pub use sink::{
     InfluxDbSinkBase64Fixture, InfluxDbSinkFixture, InfluxDbSinkNoMetadataFixture,
     InfluxDbSinkNsPrecisionFixture, InfluxDbSinkTextFixture,
 };
+pub use sink_v3::InfluxDb3SinkFixture;
 pub use source::{InfluxDbSourceFixture, InfluxDbSourceRawFixture, InfluxDbSourceTextFixture};
+pub use source_v3::InfluxDb3SourceFixture;

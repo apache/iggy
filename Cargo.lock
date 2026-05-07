@@ -6678,20 +6678,18 @@ name = "iggy_connector_influxdb_sink"
 version = "0.4.0"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "bytes",
- "dashmap",
- "futures",
  "iggy_common",
  "iggy_connector_sdk",
- "once_cell",
  "reqwest 0.13.3",
  "reqwest-middleware",
  "secrecy",
  "serde",
  "serde_json",
- "simd-json",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
 ]
 
@@ -6700,10 +6698,11 @@ name = "iggy_connector_influxdb_source"
 version = "0.4.0"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
+ "chrono",
  "csv",
  "dashmap",
- "futures",
  "iggy_common",
  "iggy_connector_sdk",
  "once_cell",
@@ -6713,7 +6712,9 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "simd-json",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
  "uuid",
 ]
@@ -6870,7 +6871,7 @@ dependencies = [
  "futures-util",
  "iggy",
  "iggy_common",
- "lz4_flex 0.13.0",
+ "lz4_flex 0.12.1",
  "rand 0.10.1",
  "serde",
  "serde_json",
