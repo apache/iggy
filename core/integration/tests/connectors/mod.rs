@@ -18,6 +18,7 @@
  */
 
 mod api;
+mod clickhouse;
 mod delta;
 mod elasticsearch;
 mod fixtures;

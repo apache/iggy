@@ -17,6 +17,7 @@
  * under the License.
  */
 
+mod clickhouse;
 mod delta;
 mod elasticsearch;
 mod http;
@@ -27,6 +28,9 @@ mod postgres;
 mod quickwit;
 mod wiremock;
 
+pub use clickhouse::{
+    ClickHouseSinkFixture, ClickHouseSinkRowBinaryFixture, ClickHouseSinkStringFixture,
+};
 pub use delta::{DeltaFixture, DeltaS3Fixture};
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use http::{
