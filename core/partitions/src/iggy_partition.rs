@@ -34,7 +34,7 @@ use consensus::{
     ack_quorum_reached, build_reply_from_request, build_reply_message, drain_committable_prefix,
     emit_namespace_progress_event, emit_partition_diag, emit_sim_event,
     fence_old_prepare_by_commit, replicate_preflight, replicate_to_next_in_chain,
-    request_preflight, send_prepare_ok as send_prepare_ok_common,
+    send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_binary_protocol::{AckLevel, Message, Operation, PrepareHeader};
@@ -57,7 +57,10 @@ use tracing::{debug, warn};
 
 // This struct aliases in terms of the code contained the `LocalPartition from `core/server/src/streaming/partitions/local_partition.rs`.
 //
-// TODO: Fix op deduplication once we move to a consensus-per-partition design.
+// Note: there is no per-client write dedup at the partition plane.
+// `SendMessages` retries are at-least-once and may commit multiple times.
+// Consumers handle duplicate messages via `iggy_common::MessageDeduplicator`
+// (message-id based) if they care.
 #[derive(Debug)]
 pub struct IggyPartition<B = IggyMessageBus>
 where
@@ -375,8 +378,9 @@ where
         Ok(())
     }
 
-    /// `AckLevel::NoAck` fast path: persist, apply, cache + send reply, no
-    /// replication. Single-replica durability.
+    /// `AckLevel::NoAck` fast path: persist, apply, send reply, no
+    /// replication. Single-replica durability. No reply cache: partition
+    /// plane is at-least-once; session lifecycle lives on metadata.
     #[allow(clippy::future_not_send)]
     async fn apply_consumer_offset_no_ack(
         &self,
@@ -410,23 +414,6 @@ where
         }
 
         let reply = build_reply_from_request(&self.consensus, &request_header, bytes::Bytes::new());
-        let session = self
-            .consensus
-            .client_table()
-            .borrow()
-            .get_session(request_header.client)
-            .unwrap_or_else(|| {
-                panic!(
-                    "apply_consumer_offset_no_ack: client {} not registered",
-                    request_header.client
-                )
-            });
-        self.consensus.client_table().borrow_mut().commit_reply(
-            request_header.client,
-            session,
-            reply.clone(),
-        );
-
         let reply_buffers = reply.into_generic().into_frozen();
         if let Err(error) = self
             .consensus
@@ -683,7 +670,12 @@ where
         IggyNamespace::from_raw(self.consensus.namespace())
     }
 
-    /// Handles a client request for this partition and turns it into a prepare.
+    /// Project a client request into a prepare.
+    ///
+    /// At-least-once: no per-client dedup. `SendMessages` retry -> fresh
+    /// prepare, may re-commit at new offset. Consumers handle dedup
+    /// (message key / content / producer-id+seq). Session lifecycle +
+    /// eviction live on metadata plane.
     ///
     /// # Panics
     /// Panics if called when this partition's consensus instance is not the
@@ -693,28 +685,7 @@ where
         self.clear_pending_consumer_offset_commits_if_view_changed();
         let namespace = IggyNamespace::from_raw(message.header().namespace);
         let client_id = message.header().client;
-        let session = message.header().session;
         let request = message.header().request;
-
-        // TODO: Add a bounded request queue instead of dropping here.
-        // When the prepare queue (8 max) is full, buffer incoming requests
-        // in a request queue. On commit, pop the next request from the
-        // request queue and begin preparing it. Only drop when both queues
-        // are full.
-        {
-            let consensus = self.consensus();
-            if consensus.pipeline().borrow().is_full() {
-                emit_partition_diag(
-                    tracing::Level::WARN,
-                    &PartitionDiagEvent::new(
-                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
-                        "on_request: pipeline full, dropping request",
-                    )
-                    .with_operation(message.header().operation),
-                );
-                return;
-            }
-        }
 
         let disposition = {
             let consensus = self.consensus();
@@ -795,13 +766,6 @@ where
                 return;
             }
 
-            if request_preflight(consensus, client_id, session, request)
-                .await
-                .is_none()
-            {
-                return;
-            }
-
             assert!(!consensus.is_follower(), "on_request: primary only");
             assert!(consensus.is_normal(), "on_request: status must be normal");
             assert!(!consensus.is_syncing(), "on_request: must not be syncing");
@@ -820,6 +784,26 @@ where
                     offset,
                 }
             } else {
+                // Two-queue: prepare slot -> project+replicate; prepare full +
+                // request room -> buffer; both full -> drop+warn (client retries
+                // via read-timeout).
+                if consensus.pipeline().borrow().is_full() {
+                    let push_result = consensus
+                        .pipeline()
+                        .borrow_mut()
+                        .push_request(consensus::RequestEntry::new(message));
+                    if push_result.is_err() {
+                        emit_partition_diag(
+                            tracing::Level::WARN,
+                            &PartitionDiagEvent::new(
+                                ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                                "on_request: prepare and request queues both full, dropping",
+                            ),
+                        );
+                    }
+                    return;
+                }
+
                 let prepare = message.project(consensus);
                 consensus.verify_pipeline();
                 consensus.pipeline_message(PlaneKind::Partitions, &prepare);
@@ -838,6 +822,52 @@ where
                 self.apply_consumer_offset_no_ack(request_header, kind, consumer_id, offset)
                     .await;
             }
+        }
+    }
+
+    /// Promote up to `slots_freed` buffered requests into prepares post-commit.
+    ///
+    /// No preflight: partition plane is at-least-once with no `ClientTable`
+    /// dedup. Buffered `SendMessages` retry commits at fresh offset; consumers
+    /// dedup by message key / content / producer-id+seq.
+    ///
+    /// Per-iteration `is_primary && is_normal && !is_syncing` asserts inlined
+    /// (closure form's `&consensus` borrow conflicts with `&mut self`). Guards
+    /// against view-change-reset flipping status across `on_replicate` await.
+    ///
+    /// View-change safety: `reset_view_change_state` calls
+    /// [`crate::Pipeline::clear_request_queue`]; resumed loop breaks via
+    /// `else { break }`.
+    ///
+    /// # Panics
+    /// On mid-iteration status flip. Reachable only if `clear_request_queue`
+    /// is bypassed at view-change reset.
+    #[allow(clippy::future_not_send)]
+    pub async fn drain_request_queue_into_prepares(&mut self, slots_freed: usize) {
+        for _ in 0..slots_freed {
+            let req = self.consensus().pipeline().borrow_mut().pop_request();
+            let Some(req) = req else { break };
+
+            let prepare = {
+                let consensus = self.consensus();
+                assert!(
+                    !consensus.is_follower(),
+                    "drain_request_queue_into_prepares: primary only"
+                );
+                assert!(
+                    consensus.is_normal(),
+                    "drain_request_queue_into_prepares: status must be normal"
+                );
+                assert!(
+                    !consensus.is_syncing(),
+                    "drain_request_queue_into_prepares: must not be syncing"
+                );
+                let prepare = req.message.project(consensus);
+                consensus.verify_pipeline();
+                consensus.pipeline_message(PlaneKind::Partitions, &prepare);
+                prepare
+            };
+            self.on_replicate(prepare).await;
         }
     }
 
@@ -884,11 +914,10 @@ where
 
         let journal_holds_op = self.log.journal().inner.header_by_op(header.op).is_some();
         if journal_holds_op {
-            // Retransmit after a downstream flap: our journal is durable
-            // but commit has not caught up, so we must re-forward to the
-            // next-in-chain and re-ACK so the primary's view of our state
-            // is consistent. Both downstream and primary are idempotent
-            // on duplicate (replica, op), so this is safe.
+            // Retransmit after downstream flap: durable here but commit
+            // hasn't caught up. Re-forward + re-ACK so primary's view of
+            // us is consistent. Both downstream and primary are idempotent
+            // on duplicate (replica, op).
             emit_partition_diag(
                 tracing::Level::DEBUG,
                 &PartitionDiagEvent::new(
@@ -925,23 +954,17 @@ where
             );
             return;
         }
-        // Durability-before-ack: hold a clone for the chain-replicate so
-        // we can forward only AFTER `apply_replicated_operation` has
-        // persisted the prepare to our partition journal. Forwarding
-        // first would leave downstream replicas holding an op whose
-        // backing WAL entry this replica never wrote, violating VSR's
-        // tail-ahead-of-head invariant. The clone is cheap relative to
-        // the deep-copy `replicate_to_next_in_chain` already performs
-        // (see plane_helpers.rs) - both collapse to a couple of Arc
-        // refcount bumps in the common case.
+        // Durability-before-ack: clone for chain-replicate, forward only
+        // AFTER apply_replicated_operation persists. Forward-first would
+        // give downstream an op whose WAL entry we never wrote, that violates
+        // tail-ahead-of-head. Clone is cheap (Arc bumps in common case).
         let clone_for_forward = message.clone();
         let replicated_result = self.apply_replicated_operation(message).await;
         if replicated_result.is_ok() {
-            // Advance sequencer + checksum only after the journal append
-            // succeeded. A pre-advance on a failing apply would leave
-            // consensus claiming we hold op N while the journal has no
-            // entry, and any retransmit of N would be silently dropped
-            // as `is_old_prepare` (header.op <= current_sequence).
+            // Advance sequencer + checksum after journal append. Pre-advance
+            // on failing apply would leave consensus claiming op N while
+            // journal has nothing; retransmit of N would silently drop as
+            // is_old_prepare (header.op <= current_sequence).
             let consensus = self.consensus();
             consensus.sequencer().set_sequence(header.op);
             consensus.set_last_prepare_checksum(header.checksum);
@@ -1285,6 +1308,7 @@ where
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle_committed_entries(
         &mut self,
         drained: Vec<PipelineEntry>,
@@ -1293,6 +1317,7 @@ where
     ) {
         let replica_id = self.consensus.replica();
         let namespace_raw = self.consensus.namespace();
+        let drained_count = drained.len();
         if let (Some(first), Some(last)) = (drained.first(), drained.last()) {
             debug!(
                 target: "iggy.partitions.diag",
@@ -1300,7 +1325,7 @@ where
                 replica_id,
                 first_op = first.header.op,
                 last_op = last.header.op,
-                drained_count = drained.len(),
+                drained_count,
                 "draining committed partition ops"
             );
         }
@@ -1309,11 +1334,8 @@ where
         let committed_visible_offsets = self.resolve_committed_visible_offsets(&drained).await;
         let mut messages_committed = false;
 
-        for PipelineEntry {
-            header: prepare_header,
-            ..
-        } in drained
-        {
+        for mut entry in drained {
+            let prepare_header = entry.header;
             if !self
                 .commit_partition_entry(
                     prepare_header,
@@ -1324,7 +1346,20 @@ where
                 )
                 .await
             {
-                continue;
+                // Local commit failed but cluster committed (op came from
+                // drain_committable_prefix). Replica diverged, can't serve
+                // reads.
+                //
+                // `continue` is unsafe: failed op popped, commit_min not
+                // advanced; next advance_commit_min(op+1) would assert
+                // op+1 == commit_min + 1, panics cryptically.
+                //
+                // Fatal: better to suicide than serve stale or panic later.
+                // Operator restarts; recovery+repair re-syncs.
+                panic!(
+                    "partition local commit failed at op={} ({:?}): replica is divergent from cluster commit; restart required",
+                    prepare_header.op, prepare_header.operation
+                );
             }
 
             self.consensus.advance_commit_min(prepare_header.op);
@@ -1346,26 +1381,18 @@ where
                 pipeline_depth,
             );
 
-            // Cache reply in client_table (both primary and backups) to
-            // preserve idempotency/dedup across view changes. Only the
-            // primary actually sends the reply to the client.
-            let reply = build_reply_message(&self.consensus, &prepare_header, bytes::Bytes::new());
-            let session = self
-                .consensus
-                .client_table()
-                .borrow()
-                .get_session(prepare_header.client)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "handle_committed_entries: client {} not registered",
-                        prepare_header.client
-                    )
-                });
-            self.consensus.client_table().borrow_mut().commit_reply(
-                prepare_header.client,
-                session,
-                reply.clone(),
-            );
+            // No reply cache: at-least-once means retries re-commit at new
+            // offsets. Only primary delivers replies; backups just advance
+            // commit. Session lifecycle is metadata-only.
+            let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
+
+            // TODO: no production caller yet. Partition has no in-process
+            // subscriber (only metadata uses pipeline_message_with_subscriber);
+            // wired for forward-compat. Fired AFTER local commit (slot-first
+            // ordering analog). Dropped receiver ignored.
+            if let Some(sender) = entry.take_reply_sender() {
+                let _ = sender.send(reply.clone());
+            }
 
             if send_client_replies {
                 let reply_buffers = reply.into_generic().into_frozen();
@@ -1399,6 +1426,10 @@ where
                 "partition failed local commit handling for one or more ops"
             );
         }
+
+        // Each commit frees one prepare slot, promote up to drained_count
+        // buffered requests so the pipeline stays busy.
+        self.drain_request_queue_into_prepares(drained_count).await;
     }
 
     async fn resolve_committed_visible_offsets(
