@@ -43,7 +43,7 @@ use tracing::error;
 /// object and `has_default` is true the DEFAULT prefix byte (`0x01`) is
 /// written and the column value is skipped. When a column is absent but has no
 /// default and is not Nullable this is an error.
-pub fn serialize_row(
+pub(crate) fn serialize_row(
     value: &OwnedValue,
     columns: &[Column],
     buf: &mut Vec<u8>,
@@ -378,7 +378,7 @@ pub(crate) fn serialize_value(
 // ─── Low-level helpers ────────────────────────────────────────────────────────
 
 /// Write a ClickHouse-style unsigned LEB128 varint (7 bits per byte, MSB = continuation).
-pub fn write_varint(mut n: u64, buf: &mut Vec<u8>) {
+pub(crate) fn write_varint(mut n: u64, buf: &mut Vec<u8>) {
     loop {
         let byte = (n & 0x7F) as u8;
         n >>= 7;

@@ -18,7 +18,8 @@
 
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{Error, sink_connector};
-use serde::{Deserialize, Serialize};
+use secrecy::{ExposeSecret, SecretString};
+use serde::Deserialize;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -38,12 +39,12 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_RETRY_DELAY: &str = "1s";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ClickHouseSinkConfig {
     pub url: String,
     pub database: Option<String>,
     pub username: Option<String>,
-    pub password: Option<String>,
+    pub password: Option<SecretString>,
     pub table: String,
     /// "json_each_row" (default), "row_binary", or "string"
     pub insert_format: Option<String>,
@@ -161,7 +162,11 @@ impl ClickHouseSink {
     }
 
     pub fn password(&self) -> &str {
-        self.config.password.as_deref().unwrap_or(DEFAULT_PASSWORD)
+        self.config
+            .password
+            .as_ref()
+            .map(|s| s.expose_secret().as_ref())
+            .unwrap_or(DEFAULT_PASSWORD)
     }
 
     pub fn timeout(&self) -> Duration {

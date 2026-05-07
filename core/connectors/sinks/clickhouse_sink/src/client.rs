@@ -41,7 +41,7 @@ const KEY_HEADER: &str = "X-ClickHouse-Key";
 /// Thin wrapper around `reqwest::Client` pre-configured for a ClickHouse
 /// endpoint.
 #[derive(Debug)]
-pub struct ClickHouseClient {
+pub(crate) struct ClickHouseClient {
     inner: reqwest::Client,
     base_url: String,
     database: String,

@@ -161,4 +161,4 @@ string_format = "csv"
 
 The connector retries failed inserts up to `max_retries` times with a fixed delay of `retry_delay` between attempts. The delay is applied as-is on each attempt (not exponential backoff). Non-retryable errors fail immediately.
 
-On shutdown the connector logs the total number of messages processed and errors encountered.
+On shutdown the connector logs the total number of messages processed.
