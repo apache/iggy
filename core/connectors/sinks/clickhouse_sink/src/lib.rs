@@ -165,7 +165,7 @@ impl ClickHouseSink {
         self.config
             .password
             .as_ref()
-            .map(|s| s.expose_secret().as_ref())
+            .map(|s| s.expose_secret())
             .unwrap_or(DEFAULT_PASSWORD)
     }
 
