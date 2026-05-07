@@ -44,7 +44,10 @@ pub(crate) fn build_json_body(messages: &[ConsumedMessage]) -> Vec<u8> {
                 }
             }
             _ => {
-                warn!("JSONEachRow mode: skipping unsupported payload type at offset {}", msg.offset);
+                warn!(
+                    "JSONEachRow mode: skipping unsupported payload type at offset {}",
+                    msg.offset
+                );
             }
         }
     }
@@ -64,7 +67,10 @@ pub(crate) fn build_row_binary_body(
                 crate::binary::serialize_row(value, schema, &mut buf)?;
             }
             _ => {
-                warn!("RowBinary mode: skipping unsupported payload type at offset {}", msg.offset);
+                warn!(
+                    "RowBinary mode: skipping unsupported payload type at offset {}",
+                    msg.offset
+                );
             }
         }
     }
@@ -88,13 +94,15 @@ pub(crate) fn build_string_body(
                 }
             }
             _ => {
-                warn!("String passthrough mode: skipping unsupported payload type at offset {}", msg.offset);
+                warn!(
+                    "String passthrough mode: skipping unsupported payload type at offset {}",
+                    msg.offset
+                );
             }
         }
     }
     buf
 }
-
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
