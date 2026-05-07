@@ -43,12 +43,8 @@ pub(crate) fn build_json_body(messages: &[ConsumedMessage]) -> Vec<u8> {
                     warn!("Failed to serialise JSON payload at offset {}", msg.offset);
                 }
             }
-            other => {
-                warn!(
-                    "JSONEachRow mode: skipping unsupported payload type {:?} at offset {}",
-                    payload_type_name(other),
-                    msg.offset
-                );
+            _ => {
+                warn!("JSONEachRow mode: skipping unsupported payload type at offset {}", msg.offset);
             }
         }
     }
@@ -67,12 +63,8 @@ pub(crate) fn build_row_binary_body(
             Payload::Json(value) => {
                 crate::binary::serialize_row(value, schema, &mut buf)?;
             }
-            other => {
-                warn!(
-                    "RowBinary mode: skipping unsupported payload type {:?} at offset {}",
-                    payload_type_name(other),
-                    msg.offset
-                );
+            _ => {
+                warn!("RowBinary mode: skipping unsupported payload type at offset {}", msg.offset);
             }
         }
     }
@@ -95,27 +87,14 @@ pub(crate) fn build_string_body(
                     buf.push(b'\n');
                 }
             }
-            other => {
-                warn!(
-                    "String passthrough mode: skipping unsupported payload type {:?} at offset {}",
-                    payload_type_name(other),
-                    msg.offset
-                );
+            _ => {
+                warn!("String passthrough mode: skipping unsupported payload type at offset {}", msg.offset);
             }
         }
     }
     buf
 }
 
-fn payload_type_name(p: &Payload) -> &'static str {
-    match p {
-        Payload::Json(_) => "Json",
-        Payload::Raw(_) => "Raw",
-        Payload::Text(_) => "Text",
-        Payload::Proto(_) => "Proto",
-        Payload::FlatBuffer(_) => "FlatBuffer",
-    }
-}
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
