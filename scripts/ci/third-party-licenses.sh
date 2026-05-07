@@ -121,6 +121,7 @@ cleanup() {
   [[ -n "$TMP_OUT" && -f "$TMP_OUT" ]] && rm -f "$TMP_OUT"
   [[ -n "$NODE_FMT_FILE" && -f "$NODE_FMT_FILE" ]] && rm -f "$NODE_FMT_FILE"
   [[ -n "$NODE_JSON_FILE" && -f "$NODE_JSON_FILE" ]] && rm -f "$NODE_JSON_FILE"
+  return 0
 }
 trap cleanup EXIT
 
