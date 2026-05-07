@@ -32,6 +32,7 @@ publish = false
 bit-set = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
+futures-core = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 message_bus = { workspace = true }

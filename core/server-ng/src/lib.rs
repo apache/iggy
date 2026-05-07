@@ -18,4 +18,5 @@
  */
 
 pub mod login_register;
+pub mod register_submitter;
 pub mod session_manager;

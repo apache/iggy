@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::client_table::ClientTable;
+use crate::oneshot::{self, Receiver, Sender};
 use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
 use crate::{
     AckLogEvent, Consensus, ControlActionLogEvent, DvcQuorumArray, IgnoreReason, Pipeline,
@@ -26,7 +26,7 @@ use crate::{
 use bit_set::BitSet;
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, Message, PrepareHeader,
-    PrepareOkHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
+    PrepareOkHeader, ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
@@ -84,6 +84,10 @@ impl Sequencer for LocalSequencer {
 /// Maximum number of prepares that can be in-flight in the pipeline.
 pub const PIPELINE_PREPARE_QUEUE_MAX: usize = 8;
 
+/// Max accepted-but-not-yet-prepared requests buffered behind a full
+/// prepare queue. Beyond this, requests drop and the client retries.
+pub const PIPELINE_REQUEST_QUEUE_MAX: usize = 64;
+
 /// Maximum number of replicas in a cluster.
 pub const REPLICAS_MAX: usize = 32;
 
@@ -98,16 +102,46 @@ pub struct PipelineEntry {
     pub ok_from_replicas: BitSet<u32>,
     /// Whether we've received a quorum of `prepare_ok` messages.
     pub ok_quorum_received: bool,
+    /// In-process reply subscriber. `None` = network path (`message_bus`);
+    /// `Some` = in-server awaiter. Set by [`Self::with_subscriber`], taken
+    /// by commit handler via [`Self::take_reply_sender`]. Drop wakes
+    /// receiver with `Canceled` (view-change reset, eviction, commit fail).
+    pub(crate) reply_sender: Option<Sender<Message<ReplyHeader>>>,
 }
 
 impl PipelineEntry {
+    /// Entry without subscriber (network path).
     #[must_use]
     pub fn new(header: PrepareHeader) -> Self {
         Self {
             header,
             ok_from_replicas: BitSet::with_capacity(REPLICAS_MAX),
             ok_quorum_received: false,
+            reply_sender: None,
         }
+    }
+
+    /// Entry paired with a fresh receiver, wakes when this prepare commits.
+    ///
+    /// # Returns
+    /// `(entry, receiver)`. Receiver resolves with reply, or `Err(Canceled)`
+    /// if entry drops before commit.
+    #[must_use]
+    pub fn with_subscriber(header: PrepareHeader) -> (Self, Receiver<Message<ReplyHeader>>) {
+        let (sender, receiver) = oneshot::channel();
+        let entry = Self {
+            header,
+            ok_from_replicas: BitSet::with_capacity(REPLICAS_MAX),
+            ok_quorum_received: false,
+            reply_sender: Some(sender),
+        };
+        (entry, receiver)
+    }
+
+    /// Take reply sender; caller fires after slot update (slot-first ordering).
+    /// Idempotent: subsequent calls return `None`.
+    pub const fn take_reply_sender(&mut self) -> Option<Sender<Message<ReplyHeader>>> {
+        self.reply_sender.take()
     }
 
     /// Record a `prepare_ok` from the given replica.
@@ -130,11 +164,14 @@ impl PipelineEntry {
     }
 }
 
-/// A request message waiting to be prepared.
+/// Accepted request waiting in `request_queue` for a prepare slot.
+#[derive(Debug)]
 pub struct RequestEntry {
     pub message: Message<RequestHeader>,
-    /// Timestamp when the request was received (for ordering/timeout).
-    pub received_at: i64, //TODO figure the correct way to do this
+    // TODO: populate from monotonic clock at push, promote to `pub` for
+    // age-based filtering. Currently `0`; `pub(crate)` blocks sort-on-stub.
+    #[allow(dead_code)]
+    pub(crate) received_at: i64,
 }
 
 impl RequestEntry {
@@ -142,15 +179,18 @@ impl RequestEntry {
     pub const fn new(message: Message<RequestHeader>) -> Self {
         Self {
             message,
-            received_at: 0, //TODO figure the correct way to do this
+            received_at: 0,
         }
     }
 }
 
+/// Two-queue pipeline: in-flight prepares + buffered requests.
 #[derive(Debug)]
 pub struct LocalPipeline {
-    /// Messages being prepared (uncommitted and being replicated).
+    /// Uncommitted prepares; cap [`PIPELINE_PREPARE_QUEUE_MAX`].
     prepare_queue: VecDeque<PipelineEntry>,
+    /// Requests awaiting a prepare slot; cap [`PIPELINE_REQUEST_QUEUE_MAX`].
+    request_queue: VecDeque<RequestEntry>,
 }
 
 impl Default for LocalPipeline {
@@ -164,6 +204,7 @@ impl LocalPipeline {
     pub fn new() -> Self {
         Self {
             prepare_queue: VecDeque::with_capacity(PIPELINE_PREPARE_QUEUE_MAX),
+            request_queue: VecDeque::with_capacity(PIPELINE_REQUEST_QUEUE_MAX),
         }
     }
 
@@ -177,7 +218,40 @@ impl LocalPipeline {
         self.prepare_queue.len() >= PIPELINE_PREPARE_QUEUE_MAX
     }
 
-    /// Returns true if prepare queue is full.
+    #[must_use]
+    pub fn request_queue_len(&self) -> usize {
+        self.request_queue.len()
+    }
+
+    #[must_use]
+    pub fn request_queue_full(&self) -> bool {
+        self.request_queue.len() >= PIPELINE_REQUEST_QUEUE_MAX
+    }
+
+    #[must_use]
+    pub fn request_queue_is_empty(&self) -> bool {
+        self.request_queue.is_empty()
+    }
+
+    /// Buffer a request behind a full prepare queue.
+    ///
+    /// # Errors
+    /// `Err(entry)` if request queue also full; caller drops, client retries.
+    pub fn push_request(&mut self, entry: RequestEntry) -> Result<(), RequestEntry> {
+        if self.request_queue_full() {
+            return Err(entry);
+        }
+        self.request_queue.push_back(entry);
+        Ok(())
+    }
+
+    /// Pop request-queue head. Called when a prepare commits and frees a slot.
+    pub fn pop_request(&mut self) -> Option<RequestEntry> {
+        self.request_queue.pop_front()
+    }
+
+    /// True iff `prepare_queue` is full (NOT including `request_queue`).
+    /// Callers branch on this between direct push and [`Self::push_request`].
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.prepare_queue_full()
@@ -185,7 +259,7 @@ impl LocalPipeline {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.prepare_queue.is_empty()
+        self.prepare_queue.is_empty() && self.request_queue.is_empty()
     }
 
     /// Push a new entry to the pipeline.
@@ -312,13 +386,15 @@ impl LocalPipeline {
         self.prepare_queue.front()
     }
 
-    /// Search `prepare_queue` for a message from the given client.
-    ///
-    /// If there are multiple messages (possible in `prepare_queue` after view change),
-    /// returns the latest one.
+    /// True if either queue holds a message from `client`. Used by preflights
+    /// for in-progress dedup; request_queue-only entries still count.
     #[must_use]
     pub fn has_message_from_client(&self, client: u128) -> bool {
         self.prepare_queue.iter().any(|p| p.header.client == client)
+            || self
+                .request_queue
+                .iter()
+                .any(|r| r.message.header().client == client)
     }
 
     /// Verify pipeline invariants.
@@ -328,6 +404,7 @@ impl LocalPipeline {
     pub fn verify(&self) {
         // Check capacity limits
         assert!(self.prepare_queue.len() <= PIPELINE_PREPARE_QUEUE_MAX);
+        assert!(self.request_queue.len() <= PIPELINE_REQUEST_QUEUE_MAX);
 
         // Verify prepare queue hash chain
         if let Some(head) = self.prepare_queue.front() {
@@ -344,14 +421,38 @@ impl LocalPipeline {
         }
     }
 
-    /// Clear prepare queue.
+    /// Clear both queues at view-change completion. New primary rebuilds
+    /// prepares from journal; clients retry dropped requests via read-timeout.
     pub fn clear(&mut self) {
         self.prepare_queue.clear();
+        self.request_queue.clear();
+    }
+
+    /// Drop reply senders on all prepare entries; receivers wake with
+    /// `Canceled`. Prepares survive (DVC log reconciliation), cleared at
+    /// view-change *completion*. `request_queue` untouched, see
+    /// [`Self::clear_request_queue`].
+    pub fn cancel_all_subscribers(&mut self) {
+        for entry in &mut self.prepare_queue {
+            entry.reply_sender.take();
+        }
+    }
+
+    /// Drop `request_queue` only; preserve `prepare_queue`. View-change reset.
+    ///
+    /// # Safety
+    /// Without this, stale primary-era requests survive into the next view.
+    /// If `drain_request_queue_into_prepares` fires pre-completion, those
+    /// requests project via `pipeline_prepare_common`, which asserts
+    /// `is_primary() && is_normal()` and panics the shard pump.
+    pub fn clear_request_queue(&mut self) {
+        self.request_queue.clear();
     }
 }
 
 impl Pipeline for LocalPipeline {
     type Entry = PipelineEntry;
+    type Request = RequestEntry;
 
     fn push(&mut self, entry: Self::Entry) {
         Self::push(self, entry);
@@ -395,6 +496,26 @@ impl Pipeline for LocalPipeline {
 
     fn verify(&self) {
         Self::verify(self);
+    }
+
+    fn has_message_from_client(&self, client_id: u128) -> bool {
+        Self::has_message_from_client(self, client_id)
+    }
+
+    fn cancel_all_subscribers(&mut self) {
+        Self::cancel_all_subscribers(self);
+    }
+
+    fn clear_request_queue(&mut self) {
+        Self::clear_request_queue(self);
+    }
+
+    fn push_request(&mut self, request: Self::Request) -> Result<(), Self::Request> {
+        Self::push_request(self, request)
+    }
+
+    fn pop_request(&mut self) -> Option<Self::Request> {
+        Self::pop_request(self)
     }
 }
 
@@ -551,9 +672,6 @@ where
     /// Monotonic timestamp from the most recent accepted commit heartbeat.
     /// Old/replayed commit messages with a lower timestamp are ignored.
     heartbeat_timestamp: Cell<u64>,
-
-    /// VSR client-table for duplicate detection and reply caching.
-    client_table: RefCell<ClientTable>,
 }
 
 impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
@@ -600,7 +718,6 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             sent_own_do_view_change: Cell::new(false),
             timeouts: RefCell::new(TimeoutManager::new(timeout_seed)),
             heartbeat_timestamp: Cell::new(0),
-            client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
         }
     }
 
@@ -724,9 +841,79 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         &mut self.pipeline
     }
 
-    #[must_use]
-    pub const fn client_table(&self) -> &RefCell<ClientTable> {
-        &self.client_table
+    /// Push a pre-built [`PipelineEntry`]; start prepare timeout if idle.
+    ///
+    /// Shared by [`Consensus::pipeline_message`] (no subscriber) and
+    /// [`Self::pipeline_message_with_subscriber`] (in-band receiver). The
+    /// only difference is whether the entry carries `reply_sender`;
+    /// everything else (sim event, timeout, primary assertion) is here.
+    fn push_prepare_entry(
+        &self,
+        plane: PlaneKind,
+        message: &Message<PrepareHeader>,
+        entry: PipelineEntry,
+    ) {
+        assert!(self.is_primary(), "only primary can pipeline messages");
+
+        let mut pipeline = self.pipeline.borrow_mut();
+        pipeline.push(entry);
+        let pipeline_depth = pipeline.len();
+        drop(pipeline);
+
+        let header = message.header();
+
+        // Atomically advance sequencer + last_prepare_checksum with the
+        // push. Without this, a sibling on_request that runs while on_replicate
+        // awaits journal.append would project a duplicate op + parent.
+        // The late set in on_replicate (metadata.rs / iggy_partition.rs) is
+        // idempotent on primary and still needed on backup.
+        self.sequencer.set_sequence(header.op);
+        self.set_last_prepare_checksum(header.checksum);
+
+        emit_sim_event(
+            SimEventKind::PrepareQueued,
+            &PrepareLogEvent {
+                replica: ReplicaLogContext::from_consensus(self, plane),
+                op: header.op,
+                parent_checksum: header.parent,
+                prepare_checksum: header.checksum,
+                client_id: header.client,
+                request_id: header.request,
+                operation: header.operation,
+                pipeline_depth,
+            },
+        );
+
+        // Start (not reset) prepare timeout: an already-ticking timer must not
+        // be pushed out by every new request. Drives retransmit on missing acks.
+        let mut timeouts = self.timeouts.borrow_mut();
+        if !timeouts.is_ticking(TimeoutKind::Prepare) {
+            timeouts.start(TimeoutKind::Prepare);
+        }
+    }
+
+    /// Push `message` with in-band reply subscriber.
+    ///
+    /// Like [`Consensus::pipeline_message`], but entry is built via
+    /// [`PipelineEntry::with_subscriber`]; caller gets a [`Receiver`] that
+    /// wakes via `take_reply_sender().send(reply)` from the commit handler
+    /// (or `Canceled` on view-change reset / entry drop).
+    ///
+    /// In-process producers (e.g. `IggyMetadata::submit_register_in_process`)
+    /// use this to learn their own prepare's commit without `send_to_client`.
+    /// Additive: wire reply still fires (`commit_register`/`commit_reply`),
+    /// so wire SDK + in-process awaiter both see the same reply.
+    ///
+    /// # Panics
+    /// If not primary (mirrors [`Consensus::pipeline_message`]).
+    pub fn pipeline_message_with_subscriber(
+        &self,
+        plane: PlaneKind,
+        message: &Message<PrepareHeader>,
+    ) -> Receiver<Message<ReplyHeader>> {
+        let (entry, receiver) = PipelineEntry::with_subscriber(*message.header());
+        self.push_prepare_entry(plane, message, entry);
+        receiver
     }
 
     #[must_use]
@@ -791,19 +978,28 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.do_view_change_quorum.set(false);
     }
 
-    /// Reset all view change state when transitioning to a new view.
+    /// Reset view-change state on view transition.
     ///
-    /// Clears the loopback queue: stale `PrepareOks` from the old view
-    /// reference pipeline entries that no longer exist, so processing
-    /// them would be a no-op (`handle_prepare_ok` ignores unknown ops).
-    /// The primary does not require its own self-ack for quorum.
+    /// - Clear loopback (stale `PrepareOks` would no-op).
+    /// - Cancel subscribers (awaiters wake with `Canceled`).
+    /// - Drop `request_queue` (buffered requests have no DVC role).
+    ///
+    /// `prepare_queue` survives here for DVC log reconciliation; cleared
+    /// at view-change *completion*.
+    ///
+    /// # Safety
+    /// `request_queue` clear required: a future broadening of
+    /// `drain_request_queue_into_prepares` could project stale entries
+    /// via `pipeline_prepare_common`, which panics on non-normal status.
     pub(crate) fn reset_view_change_state(&self) {
         self.reset_svc_quorum();
         self.reset_dvc_quorum();
         self.sent_own_start_view_change.set(false);
         self.sent_own_do_view_change.set(false);
         self.loopback_queue.borrow_mut().clear();
-        self.client_table.borrow_mut().clear_pending();
+        let mut pipeline = self.pipeline.borrow_mut();
+        pipeline.cancel_all_subscribers();
+        pipeline.clear_request_queue();
     }
 
     /// Process one tick. Call this periodically (e.g., every 10ms).
@@ -1395,6 +1591,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
+        // Skip equal-view SV with old op.
+        // Already in this view; re-running reset_view_change_state would
+        // cancel subscribers (waking register awaiters Canceled) and clear
+        // pipeline for nothing. log_view (not self.view) tracks last-normal view.
+        if msg_view == self.log_view.get() && msg_op < self.sequencer.current_sequence() {
+            return Vec::new();
+        }
+
         // We shouldn't process our own StartView
         if from_replica == self.replica {
             return Vec::new();
@@ -1410,13 +1614,10 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // Stale pipeline entries from the old view must be discarded
         self.pipeline.borrow_mut().clear();
 
-        // TODO: TigerBeetle's StartView message carries uncommitted op headers,
-        // allowing the backup to install them into the WAL and set op to a
-        // WAL-verified value. We don't carry headers yet, so we blindly trust
-        // msg_op. This is correct for truncation (sequencer > msg_op) but wrong
-        // when the backup is behind (sequencer < msg_op) — the gap between the
-        // WAL and msg_op becomes unreachable without message repair. Fix by
-        // either carrying headers in StartView or implementing message repair.
+        // TODO: StartView should carry uncommitted headers so backup installs
+        // into WAL and sets op WAL-verified. Today we trust msg_op, correct
+        // for truncation (sequencer > msg_op) but wrong when behind
+        // (sequencer < msg_op): gap is unreachable without message repair.
         self.sequencer.set_sequence(msg_op);
 
         // Update timeouts for normal backup operation
@@ -1435,8 +1636,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             &ReplicaLogContext::from_consensus(self, plane),
         );
 
+        // CommitJournal so backup applies inherited ops to client_table now,
+        // mirroring `complete_view_change_as_primary`. Without this, the
+        // table lags until the next Commit heartbeat / Prepare, a
+        // promoted-resigned-re-elected primary running register_preflight
+        // in that window observes incomplete state.
+        let mut actions = Vec::new();
+        actions.push(VsrAction::CommitJournal);
+
         if msg_commit < msg_op {
-            let action = VsrAction::SendPrepareOk {
+            let send_prepare_ok = VsrAction::SendPrepareOk {
                 view: msg_view,
                 from_op: msg_commit + 1,
                 to_op: msg_op,
@@ -1447,13 +1656,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 SimEventKind::ControlMessageScheduled,
                 &ControlActionLogEvent::from_vsr_action(
                     ReplicaLogContext::from_consensus(self, plane),
-                    &action,
+                    &send_prepare_ok,
                 ),
             );
-            vec![action]
-        } else {
-            Vec::new()
+            actions.push(send_prepare_ok);
         }
+        actions
     }
 
     /// Handle a `Commit` (heartbeat) message from the primary.
@@ -1486,7 +1694,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         // TODO: Once connection-level peer verification is added promote
-        // this to an assert — the network layer would guarantee the sender
+        // this to an assert, the network layer would guarantee the sender
         // matches header.replica.
         if header.replica != self.primary_index(header.view) {
             return false;
@@ -1532,9 +1740,18 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.advance_commit_max(max_commit);
         self.sequencer.set_sequence(new_op);
 
-        // Stale pipeline entries from the old view are invalid in the new view.
-        // Log reconciliation replays from the journal, not the pipeline.
-        self.pipeline.borrow_mut().clear();
+        // Stale pipeline entries are invalid in new view; reconciliation
+        // replays from journal.
+        //
+        // Cancel BEFORE clear: relying on Sender::Drop is correct today
+        // (drop → Canceled), but a future refactor that moves senders
+        // out-of-band could silently lose the wake-up. Explicit cancel
+        // pins the contract.
+        {
+            let mut pipeline = self.pipeline.borrow_mut();
+            pipeline.cancel_all_subscribers();
+            pipeline.clear();
+        }
         // Stale PrepareOk messages from the old view must not leak into the new view.
         // `reset_view_change_state` handles this for view-number advances (SVC/DVC/SV),
         // but this path fires within the current view after DVC quorum -- so we clear
@@ -1825,35 +2042,7 @@ where
     // so that WAL persistence can happen between pipeline insertion
     // and ack recording.
     fn pipeline_message(&self, plane: PlaneKind, message: &Self::Message<Self::ReplicateHeader>) {
-        assert!(self.is_primary(), "only primary can pipeline messages");
-
-        let mut pipeline = self.pipeline.borrow_mut();
-        pipeline.push(PipelineEntry::new(*message.header()));
-        let pipeline_depth = pipeline.len();
-        drop(pipeline);
-
-        let header = message.header();
-        emit_sim_event(
-            SimEventKind::PrepareQueued,
-            &PrepareLogEvent {
-                replica: ReplicaLogContext::from_consensus(self, plane),
-                op: header.op,
-                parent_checksum: header.parent,
-                prepare_checksum: header.checksum,
-                client_id: header.client,
-                request_id: header.request,
-                operation: header.operation,
-                pipeline_depth,
-            },
-        );
-
-        // Start the prepare timeout so the primary retransmits if backups
-        // don't ack in time. It is only started (not reset) so that an
-        // already-ticking timeout is not pushed out by every new request.
-        let mut timeouts = self.timeouts.borrow_mut();
-        if !timeouts.is_ticking(TimeoutKind::Prepare) {
-            timeouts.start(TimeoutKind::Prepare);
-        }
+        self.push_prepare_entry(plane, message, PipelineEntry::new(*message.header()));
     }
 
     fn verify_pipeline(&self) {
@@ -1872,5 +2061,240 @@ where
     fn is_syncing(&self) -> bool {
         // TODO: for now return false. we have to add syncing related setup to VsrConsensus to make this work.
         false
+    }
+}
+
+#[cfg(test)]
+mod request_queue_tests {
+    use super::*;
+    use iggy_binary_protocol::{Command2, Operation};
+
+    fn make_request(client: u128, request_num: u64) -> Message<RequestHeader> {
+        let header_size = std::mem::size_of::<RequestHeader>();
+        let mut msg = Message::<RequestHeader>::new(header_size);
+        let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
+            &mut msg.as_mut_slice()[..header_size],
+        )
+        .expect("zeroed bytes are valid");
+        *header = RequestHeader {
+            command: Command2::Request,
+            client,
+            session: 1,
+            request: request_num,
+            operation: Operation::SendMessages,
+            ..RequestHeader::default()
+        };
+        msg
+    }
+
+    #[test]
+    fn push_request_buffers_when_prepare_queue_full() {
+        let mut pipeline = LocalPipeline::new();
+        // Buffer one with empty prepare queue.
+        let entry = RequestEntry::new(make_request(1, 1));
+        pipeline.push_request(entry).expect("request queue empty");
+        assert_eq!(pipeline.request_queue_len(), 1);
+        assert!(!pipeline.request_queue_full());
+        // Symmetric drain.
+        let popped = pipeline.pop_request().expect("just-pushed entry");
+        assert_eq!(popped.message.header().client, 1);
+        assert_eq!(popped.message.header().request, 1);
+        assert_eq!(pipeline.request_queue_len(), 0);
+    }
+
+    #[test]
+    fn push_request_returns_err_when_queue_full() {
+        let mut pipeline = LocalPipeline::new();
+        for i in 0..PIPELINE_REQUEST_QUEUE_MAX {
+            let entry = RequestEntry::new(make_request(i as u128 + 1, 1));
+            pipeline
+                .push_request(entry)
+                .expect("under capacity must succeed");
+        }
+        assert!(pipeline.request_queue_full());
+
+        // Over capacity: entry returned as Err.
+        let overflow = RequestEntry::new(make_request(0xFFFF, 1));
+        let err = pipeline
+            .push_request(overflow)
+            .expect_err("over capacity must reject");
+        assert_eq!(err.message.header().client, 0xFFFF);
+    }
+
+    #[test]
+    fn has_message_from_client_scans_both_queues() {
+        let mut pipeline = LocalPipeline::new();
+
+        // Push only into request queue.
+        pipeline
+            .push_request(RequestEntry::new(make_request(0xCAFE, 1)))
+            .expect("request queue empty");
+
+        // Both queues scanned.
+        assert!(pipeline.has_message_from_client(0xCAFE));
+        assert!(!pipeline.has_message_from_client(0xBEEF));
+    }
+
+    // pipeline.clear() must clear both queues, old-view buffered requests
+    // must not leak into new view.
+    #[test]
+    fn clear_drops_both_queues() {
+        let mut pipeline = LocalPipeline::new();
+        pipeline
+            .push_request(RequestEntry::new(make_request(1, 1)))
+            .unwrap();
+        pipeline
+            .push_request(RequestEntry::new(make_request(2, 1)))
+            .unwrap();
+        assert_eq!(pipeline.request_queue_len(), 2);
+
+        pipeline.clear();
+        assert!(pipeline.request_queue_is_empty());
+        assert!(pipeline.is_empty());
+    }
+
+    // View-change *reset* drops request_queue, preserves prepare_queue
+    // for DVC log reconciliation. Wired in `reset_view_change_state` via
+    // `cancel_all_subscribers` + `clear_request_queue`.
+    #[test]
+    fn clear_request_queue_drops_only_request_queue() {
+        let mut pipeline = LocalPipeline::new();
+
+        // Two requests buffered, one prepare in flight.
+        pipeline
+            .push_request(RequestEntry::new(make_request(1, 1)))
+            .unwrap();
+        pipeline
+            .push_request(RequestEntry::new(make_request(2, 1)))
+            .unwrap();
+        let prepare_header = PrepareHeader {
+            op: 7,
+            ..PrepareHeader::default()
+        };
+        pipeline.push(PipelineEntry::new(prepare_header));
+        assert_eq!(pipeline.request_queue_len(), 2);
+        assert_eq!(pipeline.prepare_count(), 1);
+
+        pipeline.clear_request_queue();
+
+        assert!(
+            pipeline.request_queue_is_empty(),
+            "request queue must be drained at view-change reset"
+        );
+        assert_eq!(
+            pipeline.prepare_count(),
+            1,
+            "prepare queue must survive view-change reset for DVC log reconciliation"
+        );
+        let head = pipeline
+            .prepare_head()
+            .expect("prepare must still be there");
+        assert_eq!(head.header.op, 7);
+    }
+
+    // is_full() tracks ONLY prepare_queue, splits "backpressure" signal
+    // from "drop the request" signal.
+    #[test]
+    fn is_full_tracks_only_prepare_queue() {
+        let mut pipeline = LocalPipeline::new();
+        // Full request queue must not flip is_full.
+        for i in 0..PIPELINE_REQUEST_QUEUE_MAX {
+            pipeline
+                .push_request(RequestEntry::new(make_request(i as u128 + 1, 1)))
+                .unwrap();
+        }
+        assert!(pipeline.request_queue_full());
+        assert!(
+            !pipeline.is_full(),
+            "request queue full does not imply is_full"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pipeline_entry_tests {
+    //! Pin `PipelineEntry::reply_sender` lifecycle relied on by metadata +
+    //! partition commit handlers.
+    //!
+    //! Contract: commit caller takes sender after slot update, fires reply.
+    //! Reverting to header-destructure (the original bug) would wake every
+    //! subscriber `Canceled` even on happy path. Tests pin both halves.
+
+    use super::*;
+    use iggy_binary_protocol::{Command2, Message, ReplyHeader};
+
+    fn make_reply(client: u128, request: u64) -> Message<ReplyHeader> {
+        let header_size = std::mem::size_of::<ReplyHeader>();
+        let mut msg = Message::<ReplyHeader>::new(header_size);
+        let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
+            &mut msg.as_mut_slice()[..header_size],
+        )
+        .expect("zeroed bytes are valid");
+        *header = ReplyHeader {
+            command: Command2::Reply,
+            client,
+            request,
+            ..ReplyHeader::default()
+        };
+        msg
+    }
+
+    /// Happy path: take sender, fire reply.
+    #[test]
+    fn with_subscriber_take_and_send_delivers_reply() {
+        let header = PrepareHeader::default();
+        let (mut entry, receiver) = PipelineEntry::with_subscriber(header);
+
+        let sender = entry
+            .take_reply_sender()
+            .expect("with_subscriber entry must hold a sender");
+        let reply = make_reply(0xCAFE, 7);
+        sender.send(reply).ok();
+
+        let delivered = futures::executor::block_on(receiver)
+            .expect("receiver must resolve to the reply, not Canceled");
+        assert_eq!(delivered.header().client, 0xCAFE);
+        assert_eq!(delivered.header().request, 7);
+    }
+
+    /// Pre-fix bug: dropping entry without firing sender cancels receiver.
+    /// What `for entry in drained { let header = entry.header; ... }` did.
+    /// Regression marker for any refactor that loses the explicit fire.
+    #[test]
+    fn drop_entry_without_take_yields_canceled() {
+        let header = PrepareHeader::default();
+        let (entry, receiver) = PipelineEntry::with_subscriber(header);
+
+        // Exactly what the buggy commit path did via destructure-with-`..`.
+        drop(entry);
+
+        let outcome = futures::executor::block_on(receiver);
+        assert!(
+            outcome.is_err(),
+            "dropped sender must wake receiver Canceled (distinguishes \
+             'consensus reset' from 'reply delivered')"
+        );
+    }
+
+    /// `take_reply_sender` idempotent: later calls return `None`, no panic.
+    #[test]
+    fn take_reply_sender_is_idempotent() {
+        let header = PrepareHeader::default();
+        let (mut entry, _receiver) = PipelineEntry::with_subscriber(header);
+
+        assert!(entry.take_reply_sender().is_some(), "first take wins");
+        assert!(
+            entry.take_reply_sender().is_none(),
+            "subsequent takes return None"
+        );
+    }
+
+    /// `new()` (no subscriber) → `take_reply_sender()` returns `None`.
+    /// Commit handler's `if let Some(_) = ...` relies on this.
+    #[test]
+    fn new_entry_has_no_sender() {
+        let header = PrepareHeader::default();
+        let mut entry = PipelineEntry::new(header);
+        assert!(entry.take_reply_sender().is_none());
     }
 }

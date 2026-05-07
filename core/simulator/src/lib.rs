@@ -26,8 +26,7 @@ pub mod replica;
 use bus::SimOutbox;
 use client::SimClient;
 use consensus::PartitionsHandle;
-use iggy_binary_protocol::consensus::iobuf::Owned;
-use iggy_binary_protocol::{Command2, GenericHeader, Message, Operation, ReplyHeader};
+use iggy_binary_protocol::{GenericHeader, Message, ReplyHeader};
 use iggy_common::IggyError;
 use iggy_common::sharding::IggyNamespace;
 use network::Network;
@@ -36,27 +35,6 @@ use partitions::{Partition, PartitionOffsets, PollQueryResult, PollingArgs, Poll
 use replica::{Replica, new_replica};
 use std::collections::HashSet;
 use std::sync::Arc;
-
-/// Build a minimal `ReplyHeader` message for a Register operation.
-///
-/// Used to seed partition-level client tables, which don't yet receive
-/// Register through the network protocol.
-#[allow(clippy::cast_possible_truncation)]
-fn build_register_reply(client_id: u128, session: u64) -> Message<ReplyHeader> {
-    let header_size = std::mem::size_of::<ReplyHeader>();
-    let header = ReplyHeader {
-        command: Command2::Reply,
-        operation: Operation::Register,
-        size: header_size as u32,
-        client: client_id,
-        commit: session,
-        request: 0,
-        ..Default::default()
-    };
-    let header_bytes = bytemuck::bytes_of(&header);
-    Message::try_from(Owned::<4096>::copy_from_slice(header_bytes))
-        .expect("register reply must be valid")
-}
 
 pub struct Simulator {
     /// All replicas, indexed by replica id. Always fully populated — crashed
@@ -259,28 +237,9 @@ impl Simulator {
         );
         client.bind_session(session);
 
-        // Seed the partition consensus client tables on all live replicas.
-        // The partition plane doesn't route Register operations yet, so we
-        // do it directly to match what the full server will do once the
-        // partition-level registration is wired up. With per-partition
-        // consensus, every partition's client_table needs the entry.
-        for (i, replica) in self.replicas.iter().enumerate() {
-            if self.crashed.contains(&(i as u8)) {
-                continue;
-            }
-            let partitions = replica.plane.partitions();
-            let namespaces: Vec<_> = partitions.namespaces().copied().collect();
-            for ns in namespaces {
-                if let Some(partition) = partitions.get_by_ns(&ns) {
-                    let reply = build_register_reply(client.client_id(), session);
-                    partition
-                        .consensus()
-                        .client_table()
-                        .borrow_mut()
-                        .commit_register(client.client_id(), reply);
-                }
-            }
-        }
+        // Partition has no `client_table`: at-least-once, no per-client
+        // dedup. Consumers dedup via message id / content / producer-id+seq.
+        // Sessions/dedup/eviction live on metadata only (IggyMetadata).
     }
 
     /// Crash a replica: disable its network links and discard its outbox.
@@ -483,6 +442,130 @@ mod tests {
         assert!(
             got_reply_after,
             "expected reply from new primary after view change"
+        );
+    }
+
+    /// Failover-then-retry under at-least-once: `SendMessages` retry on
+    /// new primary re-executes; consumers dedup if they care.
+    ///
+    /// 1. Primary commits op N, replies.
+    /// 2. Primary crashes.
+    /// 3. Backup promotes via view change.
+    /// 4. Client retries SAME `(client, session, request)` on new primary.
+    ///    No partition-plane dedup -> flows through, commits at op M > N.
+    ///
+    /// Retry reply MUST carry higher `commit` op (re-execution proof, not
+    /// dedup). Duplicate payload now at two offsets; consumers dedup by
+    /// key / content if they need at-most-once-per-payload.
+    #[test]
+    fn failover_retry_re_executes_under_at_least_once() {
+        iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 5;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            ..packet::PacketSimulatorOptions::default()
+        };
+
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+        let ns = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns);
+        sim.register_client_with_primary(&client);
+
+        // Same `(client, session, request)` for replay; mirrors SDK's
+        // connection-loss retry.
+        let original_req = client.send_messages(ns, &[b"failover-test"]);
+        let replay_req = original_req.deep_copy();
+        let original_request_id = original_req.header().request;
+
+        sim.submit_request(client_id, 0, original_req.into_generic());
+
+        let mut original_reply: Option<Message<ReplyHeader>> = None;
+        for _ in 0..200 {
+            let replies = sim.step();
+            if !replies.is_empty() {
+                original_reply = Some(replies[0].deep_copy());
+                break;
+            }
+        }
+        let original_reply = original_reply.expect("commit reply must arrive before primary crash");
+        let original_commit_op = original_reply.header().commit;
+        assert_eq!(
+            original_reply.header().request,
+            original_request_id,
+            "sanity: original reply must echo the request id"
+        );
+
+        // Crash primary. Real-world: TCP buffer might have lost reply
+        // before ack , same retry path.
+        sim.replica_crash(0);
+
+        // Steps for view change across 4 survivors.
+        for _ in 0..800 {
+            sim.step();
+        }
+
+        // Find new primary via any live replica.
+        let live = &sim.replicas[1];
+        let live_consensus = live
+            .plane
+            .partitions()
+            .get_by_ns(&ns)
+            .expect("partition must exist on a live replica")
+            .consensus();
+        assert!(
+            live_consensus.view() > 0,
+            "view must have advanced past the crashed primary"
+        );
+        let new_primary_idx = live_consensus.primary_index(live_consensus.view());
+        assert_ne!(
+            new_primary_idx, 0,
+            "new primary must not be the crashed replica"
+        );
+
+        // Replay SAME request to new primary. No dedup -> re-execution.
+        sim.submit_request(client_id, new_primary_idx, replay_req.into_generic());
+
+        let mut retry_reply: Option<Message<ReplyHeader>> = None;
+        for _ in 0..200 {
+            let replies = sim.step();
+            if !replies.is_empty() {
+                retry_reply = Some(replies[0].deep_copy());
+                break;
+            }
+        }
+        let retry_reply = retry_reply.expect(
+            "reply must arrive after retry , new primary re-commits as \
+             fresh prepare (at-least-once)",
+        );
+
+        // At-least-once: same request id (correlation), HIGHER commit op
+        // (re-execution). No dedup absorbs the retry.
+        assert_eq!(
+            retry_reply.header().request,
+            original_request_id,
+            "retry's reply must correlate to the request id"
+        );
+        assert!(
+            retry_reply.header().commit > original_commit_op,
+            "retry must re-execute (commit op > original={original_commit_op}, got {})",
+            retry_reply.header().commit
+        );
+        assert_eq!(
+            retry_reply.header().client,
+            client_id,
+            "retry must echo original client_id"
         );
     }
 

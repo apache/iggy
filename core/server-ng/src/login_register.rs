@@ -17,71 +17,74 @@
  * under the License.
  */
 
-//! Combined login + register handler for server-ng.
+//! Combined login + register handler.
 //!
-//! One client-facing command, two internal phases:
-//! 1. Verify credentials locally (Argon2). NOT through consensus
-//! 2. Submit `Operation::Register` through consensus. All replicas create `ClientTable` entry
+//! One client command, two phases:
+//! 1. Local credential verify (Argon2). Not consensus.
+//! 2. `Operation::Register` through consensus -> `ClientTable` entry on all replicas.
 //!
-//! The handler is trait-based so it can be tested via mocking.
+//! Trait-based for mocking.
 
 use crate::session_manager::{SessionError, SessionManager};
+use iggy_binary_protocol::EvictionReason;
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
+use metadata::RegisterSubmitError;
 use secrecy::ExposeSecret;
 
-/// Credential verification abstraction.
-///
-/// The real implementation delegates to the shard's metadata user store
-/// and Argon2 password hashing. Test implementations return fixed results.
+/// Credential verifier. Real impl: metadata user store + Argon2.
 pub trait CredentialVerifier {
-    /// Verify username/password. Returns `user_id` on success.
+    /// Verify username/password. Returns `user_id`.
     ///
     /// # Errors
-    /// Returns `LoginRegisterError` if credentials are invalid.
+    /// `LoginRegisterError` on invalid credentials.
     fn verify(&self, username: &str, password: &str) -> Result<u32, LoginRegisterError>;
 }
 
-/// Personal access token verification abstraction.
-///
-/// The real implementation looks up the PAT by hash in the user store,
-/// checks expiry, and returns the owning user's ID.
+/// PAT verifier. Real impl: hash lookup + expiry check.
 pub trait TokenVerifier {
-    /// Verify a personal access token. Returns `user_id` on success.
+    /// Verify PAT. Returns `user_id`.
     ///
     /// # Errors
-    /// Returns `LoginRegisterError` if the token is invalid or expired.
+    /// `LoginRegisterError` on invalid/expired token.
     fn verify_token(&self, token: &str) -> Result<u32, LoginRegisterError>;
 }
 
-/// Consensus register submission abstraction.
+/// Submit `Register` through consensus.
 ///
-/// The real implementation builds a `RequestHeader { operation: Register }`,
-/// calls `check_register` on the `ClientTable`, submits through the consensus
-/// pipeline, and awaits the `Notify` for commit. Returns the session number
-/// (commit op number).
+/// # Runtime
+/// `Future` is **not `Send`**. Production
+/// ([`crate::register_submitter::IggyRegisterSubmitter`]) wraps
+/// `IggyMetadata::submit_register_in_process`, whose state is `RefCell`/`Cell`
+/// on single-threaded `compio`. Multi-threaded embedders need a shim or
+/// custom transport; constraining `Send` would tax every call site.
+///
+/// # Failures
+/// Transient (pipeline-full, view-change cancel, primary-not-caught-up,
+/// in-flight register) MUST eventually be absorbed via bounded retry. Until
+/// then they surface as [`LoginRegisterError::Transient`] → `NotEvictable`,
+/// so network can't ship a wire-terminal `Eviction` for a recoverable
+/// failure. SDK read-timeout replays.
+///
+/// Terminal → [`EvictionReason`] in `EvictionHeader`; SDK invokes its
+/// eviction callback and stops.
 pub trait RegisterSubmitter {
-    /// Submit a register for `client_id` through consensus and await commit.
-    /// Returns the session number.
+    /// Submit register for `client_id`, await commit. Returns session number.
     ///
     /// # Errors
-    /// Returns `LoginRegisterError` if consensus fails or pipeline is full.
+    /// Only genuinely terminal failures. Transients absorbed silently per contract.
     fn submit_register(
         &self,
         client_id: u128,
     ) -> impl std::future::Future<Output = Result<u64, LoginRegisterError>> + '_;
 }
 
-/// Handle a combined login + register request (username/password).
-///
-/// 1. Validates input
-/// 2. Verifies credentials locally (no consensus)
-/// 3. Submits `Register` through consensus.
-/// 4. Returns `user_id` + `session`
+/// Handle login + register (username/password).
+/// Validate -> local credential verify → Register through consensus →
+/// `user_id` + `session`.
 ///
 /// # Errors
-/// Returns `LoginRegisterError` on auth failure, consensus failure, or
-/// session state errors.
+/// Auth, consensus, or session state error.
 #[allow(clippy::future_not_send)]
 pub async fn handle_login_register<V: CredentialVerifier, R: RegisterSubmitter>(
     request: &LoginRegisterRequest,
@@ -94,7 +97,7 @@ pub async fn handle_login_register<V: CredentialVerifier, R: RegisterSubmitter>(
         return Err(LoginRegisterError::InvalidClientId);
     }
 
-    // Phase 1: Local credential verification (NOT replicated).
+    // Phase 1: local verify (not replicated).
     let user_id = verifier.verify(request.username.as_str(), request.password.expose_secret())?;
 
     // Phase 2: Register through consensus.
@@ -108,14 +111,10 @@ pub async fn handle_login_register<V: CredentialVerifier, R: RegisterSubmitter>(
     .await
 }
 
-/// Handle a combined login + register request (personal access token).
-///
-/// Same two-phase flow as [`handle_login_register`], but Phase 1 verifies
-/// a personal access token instead of username/password.
+/// PAT variant of [`handle_login_register`]; Phase 1 verifies token.
 ///
 /// # Errors
-/// Returns `LoginRegisterError` on token failure, consensus failure, or
-/// session state errors.
+/// Token, consensus, or session state error.
 #[allow(clippy::future_not_send)]
 pub async fn handle_login_register_with_pat<T: TokenVerifier, R: RegisterSubmitter>(
     request: &LoginRegisterWithPatRequest,
@@ -128,10 +127,10 @@ pub async fn handle_login_register_with_pat<T: TokenVerifier, R: RegisterSubmitt
         return Err(LoginRegisterError::InvalidClientId);
     }
 
-    // Phase 1: Token verification (local, not replicated).
+    // Phase 1: token verify (local, not replicated).
     let user_id = token_verifier.verify_token(request.token.expose_secret())?;
 
-    // Phase 2: Register through consensus (shared).
+    // Phase 2: Register through consensus.
     complete_register(
         request.client_id,
         user_id,
@@ -142,10 +141,7 @@ pub async fn handle_login_register_with_pat<T: TokenVerifier, R: RegisterSubmitt
     .await
 }
 
-/// Phase 2 - transition session state and register through consensus.
-///
-/// Called by both password and PAT handlers after their respective Phase 1
-/// credential verification succeeds.
+/// Phase 2: transition session state, submit Register. Shared by password + PAT handlers.
 #[allow(clippy::future_not_send)]
 async fn complete_register<R: RegisterSubmitter>(
     client_id: u128,
@@ -159,12 +155,11 @@ async fn complete_register<R: RegisterSubmitter>(
         .login(connection_id, user_id)
         .map_err(LoginRegisterError::Session)?;
 
-    // Submit Register through consensus.
+    // Submit Register.
     let session = match submitter.submit_register(client_id).await {
         Ok(session) => session,
         Err(e) => {
-            // Rollback: Authenticated -> Connected so the client can retry
-            // the full login+register on the same connection.
+            // Rollback Authenticated -> Connected so client can retry full flow.
             let _ = session_manager.reset_to_connected(connection_id);
             return Err(e);
         }
@@ -178,15 +173,30 @@ async fn complete_register<R: RegisterSubmitter>(
     Ok(LoginRegisterResponse { user_id, session })
 }
 
+/// Login/register failure.
+///
+/// Most variants -> [`EvictionReason`] (via [`TryFrom<&LoginRegisterError>`]).
+/// Two variants are `NotEvictable`:
+/// - [`LoginRegisterError::InvalidClientId`], see variant doc.
+/// - [`LoginRegisterError::Transient`], recoverable; SDK read-timeout replays.
+///
+/// `#[non_exhaustive]`: external matchers need a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LoginRegisterError {
+    /// `client_id == 0` (reserved sentinel). No frame can address it
+    /// ([`EvictionHeader::validate`] rejects); silent close.
+    /// `TryFrom` -> `Err(NotEvictable)`.
+    ///
+    /// [`EvictionHeader::validate`]: iggy_binary_protocol::EvictionHeader
     InvalidClientId,
     InvalidCredentials,
     InvalidToken,
     UserInactive,
     Session(SessionError),
-    PipelineFull,
-    ConsensusFailed(String),
+    /// Recoverable consensus failure. Caller rolls back to `Connected`;
+    /// SDK read-timeout replays. `TryFrom` -> `Err(NotEvictable)`.
+    Transient(RegisterSubmitError),
 }
 
 impl std::fmt::Display for LoginRegisterError {
@@ -197,18 +207,66 @@ impl std::fmt::Display for LoginRegisterError {
             Self::InvalidToken => write!(f, "invalid or expired personal access token"),
             Self::UserInactive => write!(f, "user account is inactive"),
             Self::Session(e) => write!(f, "session error: {e}"),
-            Self::PipelineFull => write!(f, "consensus pipeline full, try again later"),
-            Self::ConsensusFailed(msg) => write!(f, "consensus failed: {msg}"),
+            Self::Transient(e) => write!(f, "transient consensus failure: {e}"),
         }
     }
 }
 
 impl std::error::Error for LoginRegisterError {}
 
+/// `TryFrom<&LoginRegisterError>` for [`EvictionReason`] returns this when
+/// no wire mapping exists. Caller closes silently / lets client retry.
+///
+/// - `InvalidClientId`: `client_id == 0`, no addressable client.
+/// - `Transient`: wire-terminal Eviction would contradict the absorb-silently
+///   contract; failure is recoverable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotEvictable;
+
+impl std::fmt::Display for NotEvictable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("error has no wireable EvictionReason; close connection silently")
+    }
+}
+
+impl std::error::Error for NotEvictable {}
+
+/// **No production caller yet**, pins the contract for the eventual
+/// wire-eviction dispatcher: `try_from(&err)` -> on `Ok(reason)` build
+/// [`iggy_binary_protocol::EvictionHeader`] via
+/// [`consensus::build_eviction_message`] and ship+close; on `NotEvictable`
+/// close silently.
+///
+/// `#[non_exhaustive]` + this exhaustive match force every future
+/// `LoginRegisterError` through compile-time triage.
+impl TryFrom<&LoginRegisterError> for EvictionReason {
+    type Error = NotEvictable;
+
+    // Per-variant arms (not `A | B`), so each carries its own NotEvictable
+    // reason. Distinct cases (no addressable client_id vs recoverable);
+    // merging would lose docs.
+    #[allow(clippy::match_same_arms)]
+    fn try_from(err: &LoginRegisterError) -> Result<Self, Self::Error> {
+        Ok(match err {
+            // No client_id to address,  close silently. See variant doc.
+            LoginRegisterError::InvalidClientId => return Err(NotEvictable),
+            // Recoverable: caller rolls back to Connected; SDK retries.
+            // Wire Eviction would erase a recoverable session.
+            LoginRegisterError::Transient(_) => return Err(NotEvictable),
+            LoginRegisterError::InvalidCredentials => Self::InvalidCredentials,
+            LoginRegisterError::InvalidToken => Self::InvalidToken,
+            LoginRegisterError::UserInactive => Self::UserInactive,
+            LoginRegisterError::Session(_) => Self::SessionError,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session_manager::SessionManager;
+    use consensus::{EvictionContext, build_eviction_message};
+    use iggy_binary_protocol::{Command2, ConsensusHeader, HEADER_SIZE};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn addr(port: u16) -> SocketAddr {
@@ -240,12 +298,11 @@ mod tests {
         async fn submit_register(&self, _client_id: u128) -> Result<u64, LoginRegisterError> {
             match &self.session {
                 Ok(s) => Ok(*s),
-                Err(LoginRegisterError::PipelineFull) => Err(LoginRegisterError::PipelineFull),
-                Err(LoginRegisterError::ConsensusFailed(msg)) => {
-                    Err(LoginRegisterError::ConsensusFailed(msg.clone()))
+                Err(LoginRegisterError::Transient(e)) => {
+                    Err(LoginRegisterError::Transient(e.clone()))
                 }
-                _ => Err(LoginRegisterError::ConsensusFailed(
-                    "mock error".to_string(),
+                _ => Err(LoginRegisterError::Transient(
+                    RegisterSubmitError::PipelineFull,
                 )),
             }
         }
@@ -314,7 +371,9 @@ mod tests {
             let conn = mgr.add_connection(addr(5000));
             let verifier = MockVerifier { result: Ok(42) };
             let submitter = MockSubmitter {
-                session: Err(LoginRegisterError::PipelineFull),
+                session: Err(LoginRegisterError::Transient(
+                    RegisterSubmitError::PipelineFull,
+                )),
             };
             let req = make_request(0xDEAD);
 
@@ -322,10 +381,10 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            assert!(matches!(err, LoginRegisterError::PipelineFull));
+            assert!(matches!(err, LoginRegisterError::Transient(_)));
             assert!(mgr.get_session(conn).is_none());
 
-            // Connection rolled back to Connected. Retry.
+            // Rolled back to Connected; retry succeeds.
             let submitter_ok = MockSubmitter { session: Ok(100) };
             let resp = handle_login_register(&req, &verifier, &submitter_ok, &mut mgr, conn)
                 .await
@@ -351,6 +410,70 @@ mod tests {
 
             assert!(matches!(err, LoginRegisterError::InvalidClientId));
         });
+    }
+
+    #[test]
+    fn login_register_error_maps_to_eviction_reason() {
+        let cases: &[(LoginRegisterError, EvictionReason)] = &[
+            (
+                LoginRegisterError::InvalidCredentials,
+                EvictionReason::InvalidCredentials,
+            ),
+            (
+                LoginRegisterError::InvalidToken,
+                EvictionReason::InvalidToken,
+            ),
+            (
+                LoginRegisterError::UserInactive,
+                EvictionReason::UserInactive,
+            ),
+            (
+                LoginRegisterError::Session(SessionError::ConnectionNotFound(0)),
+                EvictionReason::SessionError,
+            ),
+        ];
+        for (err, expected) in cases {
+            let mapped = EvictionReason::try_from(err).expect("variant should be wireable");
+            assert_eq!(mapped, *expected, "mapping for {err:?}");
+        }
+    }
+
+    // Transient must NOT be wireable, point of the variant. Callers rely
+    // on NotEvictable to roll back instead of shipping a terminal frame.
+    #[test]
+    fn transient_is_not_evictable() {
+        let err = LoginRegisterError::Transient(RegisterSubmitError::PipelineFull);
+        let mapped = EvictionReason::try_from(&err);
+        assert_eq!(mapped, Err(NotEvictable));
+    }
+
+    // InvalidClientId: client_id == 0 cannot address a frame, caller
+    // must handle Err path (silent close).
+    #[test]
+    fn invalid_client_id_is_not_evictable() {
+        let err = LoginRegisterError::InvalidClientId;
+        let mapped = EvictionReason::try_from(&err);
+        assert_eq!(mapped, Err(NotEvictable));
+    }
+
+    #[test]
+    fn build_eviction_message_carries_typed_reason() {
+        let ctx = EvictionContext {
+            cluster: 7,
+            view: 3,
+            replica: 1,
+        };
+        let msg = build_eviction_message(ctx, 0xCAFE, EvictionReason::SessionError);
+        let header = msg.header();
+        assert_eq!(header.command, Command2::Eviction);
+        assert_eq!(header.cluster, 7);
+        assert_eq!(header.view, 3);
+        assert_eq!(header.replica, 1);
+        assert_eq!(header.client, 0xCAFE);
+        assert_eq!(header.reason, EvictionReason::SessionError);
+        assert_eq!(header.size as usize, HEADER_SIZE);
+        // validate accepts.
+        assert!(header.validate().is_ok());
     }
 
     // PAT tests
@@ -425,7 +548,9 @@ mod tests {
             let conn = mgr.add_connection(addr(5000));
             let verifier = MockTokenVerifier { result: Ok(42) };
             let submitter = MockSubmitter {
-                session: Err(LoginRegisterError::PipelineFull),
+                session: Err(LoginRegisterError::Transient(
+                    RegisterSubmitError::PipelineFull,
+                )),
             };
             let req = make_pat_request(0xDEAD);
 
@@ -433,10 +558,10 @@ mod tests {
                 .await
                 .unwrap_err();
 
-            assert!(matches!(err, LoginRegisterError::PipelineFull));
+            assert!(matches!(err, LoginRegisterError::Transient(_)));
             assert!(mgr.get_session(conn).is_none());
 
-            // Connection rolled back to Connected. Retry.
+            // Rolled back to Connected; retry succeeds.
             let submitter_ok = MockSubmitter { session: Ok(100) };
             let resp =
                 handle_login_register_with_pat(&req, &verifier, &submitter_ok, &mut mgr, conn)
