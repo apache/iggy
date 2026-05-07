@@ -106,7 +106,7 @@ impl TestFixture for InfluxDb3SourceFixture {
         let sql_query = "SELECT * FROM sensor_readings \
              WHERE time > '$cursor' \
              ORDER BY time \
-             LIMIT $limit"
+             LIMIT $limit OFFSET $offset"
             .to_string();
 
         let mut envs = HashMap::new();

@@ -1024,6 +1024,4 @@ query   = "SELECT 1"
         let out = apply_query_params(tmpl, "T", "10", "0");
         assert_eq!(out, "SELECT $unknown FROM t");
     }
-
-
 }
