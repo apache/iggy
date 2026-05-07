@@ -24,10 +24,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ServerNgError {
+    #[error(transparent)]
+    Iggy(Box<iggy_common::IggyError>),
     #[error("failed to load server-ng config")]
     Config(#[source] configs::ConfigurationError),
-    #[error("failed to prepare server-ng directories")]
-    CreateDirectories(#[source] iggy_common::IggyError),
     #[error("failed to serialize current server-ng config")]
     CurrentConfigSerialize(#[source] toml::ser::Error),
     #[error("failed to write current server-ng config at {path}")]
@@ -90,62 +90,16 @@ pub enum ServerNgError {
         max_topics: usize,
         max_partitions: usize,
     },
-    #[error(
-        "failed to load partition log for stream {stream_id}, topic {topic_id}, partition {partition_id}"
-    )]
-    PartitionLogLoad {
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        #[source]
-        source: iggy_common::IggyError,
-    },
     #[error("failed to load {transport} listener credentials")]
     ListenerCredentials {
         transport: &'static str,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to start server-ng listeners")]
-    StartListeners(#[source] iggy_common::IggyError),
-    #[error(
-        "failed to initialize messages writer for stream {stream_id}, topic {topic_id}, partition {partition_id}"
-    )]
-    MessagesWriterInit {
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        #[source]
-        source: iggy_common::IggyError,
-    },
-    #[error(
-        "failed to initialize index writer for stream {stream_id}, topic {topic_id}, partition {partition_id}"
-    )]
-    IndexWriterInit {
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        #[source]
-        source: iggy_common::IggyError,
-    },
-    #[error(
-        "failed to load segment indexes for stream {stream_id}, topic {topic_id}, partition {partition_id}"
-    )]
-    SegmentIndexesLoad {
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        #[source]
-        source: iggy_common::IggyError,
-    },
-    #[error(
-        "failed to create initial segment storage for stream {stream_id}, topic {topic_id}, partition {partition_id}"
-    )]
-    InitialSegmentStorage {
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        #[source]
-        source: iggy_common::IggyError,
-    },
+}
+
+impl From<iggy_common::IggyError> for ServerNgError {
+    fn from(source: iggy_common::IggyError) -> Self {
+        Self::Iggy(Box::new(source))
+    }
 }
