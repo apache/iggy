@@ -154,21 +154,12 @@ jobs:
       - name: Check Apache license headers
         run: ./scripts/ci/license-headers.sh --check
 
-  license-list:
-    name: Check licenses list
+  third-party-licenses:
+    name: Validate third-party licenses
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
-      - name: Setup Rust toolchain
-        uses: ./.github/actions/utils/setup-rust-with-cache
-        with:
-          read-cache: "false"
-
-      - name: Install cargo-license
-        run: cargo install cargo-license
-
-      - run: ./scripts/ci/licenses-list.sh --check
+      - uses: ./.github/actions/utils/validate-third-party-licenses
 
   markdown:
     name: Markdown lint
@@ -280,7 +271,7 @@ jobs:
         version-consistency,
         pr-title,
         license-headers,
-        license-list,
+        third-party-licenses,
         markdown,
         shellcheck,
         trailing-whitespace,
@@ -320,7 +311,7 @@ jobs:
           PYTHON_VERSIONS="${{ needs.python-versions.result }}"
           VERSION_CONSISTENCY="${{ needs.version-consistency.result }}"
           LICENSE_HEADERS="${{ needs.license-headers.result }}"
-          LICENSE_LIST="${{ needs.license-list.result }}"
+          THIRD_PARTY_LICENSES="${{ needs.third-party-licenses.result }}"
           MARKDOWN="${{ needs.markdown.result }}"
 
           if [ "$RUST_VERSIONS" = "success" ]; then
@@ -355,12 +346,12 @@ jobs:
             echo "| ⏭️ License Headers | $LICENSE_HEADERS | Check skipped |" >> $GITHUB_STEP_SUMMARY
           fi
 
-          if [ "$LICENSE_LIST" = "success" ]; then
-            echo "| ✅ License List | success | Dependencies licenses validated |" >> $GITHUB_STEP_SUMMARY
-          elif [ "$LICENSE_LIST" = "failure" ]; then
-            echo "| ❌ License List | failure | License list needs update |" >> $GITHUB_STEP_SUMMARY
+          if [ "$THIRD_PARTY_LICENSES" = "success" ]; then
+            echo "| ✅ Third-Party Licenses | success | All deps in about.toml accept list |" >> $GITHUB_STEP_SUMMARY
+          elif [ "$THIRD_PARTY_LICENSES" = "failure" ]; then
+            echo "| ❌ Third-Party Licenses | failure | Disallowed license detected (see job log) |" >> $GITHUB_STEP_SUMMARY
           else
-            echo "| ⏭️ License List | $LICENSE_LIST | Check skipped |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⏭️ Third-Party Licenses | $THIRD_PARTY_LICENSES | Check skipped |" >> $GITHUB_STEP_SUMMARY
           fi
 
           if [ "$MARKDOWN" = "success" ]; then

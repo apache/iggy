@@ -1,0 +1,79 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Run the per-artifact third-party license validation matrix that ASF
+# release policy requires for convenience binaries (Docker images, PyPI
+# wheels). Single source of truth shared by the pre-merge gate
+# (.github/workflows/_common.yml) and the release gate
+# (.github/workflows/publish.yml). Adding a new convenience artifact
+# means adding ONE step here, never two.
+
+name: validate-third-party-licenses
+description: Validate every published artifact's bundled third-party licenses against the ASF accept list.
+inputs:
+  node-version:
+    description: "Node.js version used by the npm path"
+    required: false
+    default: "23"
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Setup Rust with cache
+      uses: ./.github/actions/utils/setup-rust-with-cache
+      with:
+        read-cache: "false"
+
+    - name: Install cargo-about
+      shell: bash
+      run: |
+        TARGET="$(uname -m)-unknown-linux-musl"
+        curl -sSfL "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz" \
+          | tar -xz -C "$HOME/.cargo/bin" --strip-components=1 \
+              "cargo-about-0.9.0-${TARGET}/cargo-about"
+
+    - name: Validate apache/iggy bundle (server + CLI + embedded web)
+      shell: bash
+      run: ./scripts/ci/third-party-licenses.sh --validate
+           --manifest core/server/Cargo.toml
+           --manifest core/cli/Cargo.toml
+           --manifest web
+
+    - name: Validate iggy-mcp bundle
+      shell: bash
+      run: ./scripts/ci/third-party-licenses.sh --validate --manifest core/ai/mcp/Cargo.toml
+
+    - name: Validate iggy-bench-dashboard bundle
+      shell: bash
+      run: ./scripts/ci/third-party-licenses.sh --validate --manifest core/bench/dashboard/server/Cargo.toml
+
+    - name: Validate iggy-connect bundle
+      shell: bash
+      run: ./scripts/ci/third-party-licenses.sh --validate --manifest core/connectors/runtime/Cargo.toml
+
+    - name: Validate Python wheel bundle
+      shell: bash
+      run: ./scripts/ci/third-party-licenses.sh --validate --manifest foreign/python/Cargo.toml
+
+    - name: Validate web UI bundle
+      shell: bash
+      run: ./scripts/ci/third-party-licenses.sh --validate --manifest web

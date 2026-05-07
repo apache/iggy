@@ -46,7 +46,7 @@ ARG LIBC=musl
 ARG IGGY_CI_BUILD
 ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
-RUN apk add --no-cache zig make autoconf automake libtool pkgconfig hwloc-dev xz-dev xz-static nodejs npm && \
+RUN apk add --no-cache bash curl tar zig make autoconf automake libtool pkgconfig hwloc-dev xz-dev xz-static nodejs npm && \
     cargo install cargo-zigbuild --locked && \
     rustup target add \
     x86_64-unknown-linux-musl \
@@ -102,6 +102,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
     cp /app/target/${RUST_TARGET}/release/iggy /app/iggy; \
     fi
 
+# Generate third-party license manifest. Required by ASF release policy:
+# convenience binaries that statically link third-party code MUST include
+# the full license text of every bundled crate inside the artifact.
+RUN TARGET="$(uname -m)-unknown-linux-musl" && \
+    curl -sSfL "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz" \
+      | tar -xz -C /usr/local/bin --strip-components=1 "cargo-about-0.9.0-${TARGET}/cargo-about" && \
+    ./scripts/ci/third-party-licenses.sh --generate \
+      --manifest core/server/Cargo.toml \
+      --manifest core/cli/Cargo.toml \
+      --manifest web \
+      --output /app/LICENSE-binary
+
 # ── prebuilt path (FAST) ──────────────────────────────────────────────────────
 FROM debian:trixie-slim AS prebuilt
 WORKDIR /out
@@ -110,6 +122,24 @@ ARG PREBUILT_IGGY_CLI
 COPY ${PREBUILT_IGGY_SERVER} /out/iggy-server
 COPY ${PREBUILT_IGGY_CLI}    /out/iggy
 RUN chmod +x /out/iggy-server /out/iggy
+
+# Generate LICENSE-binary for the prebuilt path. The prebuilt binaries are
+# built externally from this same Cargo.lock, so the manifest accurately
+# reflects what is statically linked into the image. iggy-server embeds
+# the compiled web UI (see core/server/build.rs), so the manifest must
+# also enumerate the web npm production dependencies.
+FROM --platform=$BUILDPLATFORM chef AS license-gen
+RUN apk add --no-cache bash curl tar nodejs npm
+COPY . .
+RUN cd web && npm ci --omit=dev --prefer-offline --no-audit
+RUN TARGET="$(uname -m)-unknown-linux-musl" && \
+    curl -sSfL "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz" \
+      | tar -xz -C /usr/local/bin --strip-components=1 "cargo-about-0.9.0-${TARGET}/cargo-about" && \
+    ./scripts/ci/third-party-licenses.sh --generate \
+      --manifest core/server/Cargo.toml \
+      --manifest core/cli/Cargo.toml \
+      --manifest web \
+      --output /app/LICENSE-binary
 
 # ── final images ──────────────────────────────────────────────────────────────
 FROM debian:trixie-slim AS runtime-prebuilt
@@ -122,8 +152,10 @@ RUN apt-get update && apt-get install -y \
     libudev-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=prebuilt /out/iggy-server /usr/local/bin/iggy-server
-COPY --from=prebuilt /out/iggy        /usr/local/bin/iggy
+COPY --from=prebuilt    /out/iggy-server                /usr/local/bin/iggy-server
+COPY --from=prebuilt    /out/iggy                       /usr/local/bin/iggy
+COPY --from=license-gen /app/LICENSE-binary             /usr/share/doc/iggy/LICENSE-binary
+COPY LICENSE NOTICE /usr/share/doc/iggy/
 RUN echo "═══════════════════════════════════════════════════════════════" && \
     echo "                    IGGY SERVER BUILD SUMMARY                  " && \
     echo "═══════════════════════════════════════════════════════════════" && \
@@ -152,6 +184,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/iggy-server /usr/local/bin/iggy-server
 COPY --from=builder /app/iggy        /usr/local/bin/iggy
+COPY --from=builder /app/LICENSE-binary /usr/share/doc/iggy/LICENSE-binary
+COPY LICENSE NOTICE /usr/share/doc/iggy/
 RUN echo "═══════════════════════════════════════════════════════════════" && \
     echo "                    IGGY SERVER BUILD SUMMARY                  " && \
     echo "═══════════════════════════════════════════════════════════════" && \
