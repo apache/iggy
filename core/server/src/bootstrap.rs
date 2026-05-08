@@ -200,26 +200,50 @@ pub fn resolve_persister(enforce_fsync: bool) -> Arc<PersisterKind> {
 
 /// Construct the `ObjectStorage` backend selected by `[system.storage]`.
 ///
-/// In Phase 1a (this commit) the function exists as the wiring seam for
-/// later phases but has no production consumers — both `kind = "fs"` and
-/// `kind = "object"` resolve to [`CompioFsStorage`]. Phase 1b adds the
-/// real `S3Storage` and switches the `Object` arm to it (behind the
-/// `object-storage` cargo feature).
-pub fn resolve_object_storage(
+/// `kind = "fs"` always returns [`CompioFsStorage`]. `kind = "object"`
+/// returns an `S3Storage` when the `object-storage` cargo feature is on,
+/// else logs a warning and falls back to fs. Async because S3 credential
+/// resolution may make HTTP calls (container credentials, IRSA).
+///
+/// Phases 2+ start consuming the returned `Rc<dyn ObjectStorage>` from
+/// `SystemStorage` / persistence sites; until then the value is unused.
+pub async fn resolve_object_storage(
     config: &SystemConfig,
 ) -> Rc<dyn crate::streaming::storage::object_store::ObjectStorage> {
     use crate::streaming::storage::object_store::CompioFsStorage;
     match config.storage.kind {
         crate::configs::system::StorageKind::Fs => Rc::new(CompioFsStorage),
-        crate::configs::system::StorageKind::Object => {
-            tracing::warn!(
-                "system.storage.kind = \"object\" selected, but Phase 1a only ships the \
-                 abstraction seam — falling back to local filesystem until Phase 1b lands \
-                 the S3 backend."
+        crate::configs::system::StorageKind::Object => resolve_object_backend(config).await,
+    }
+}
+
+#[cfg(feature = "object-storage")]
+async fn resolve_object_backend(
+    config: &SystemConfig,
+) -> Rc<dyn crate::streaming::storage::object_store::ObjectStorage> {
+    use crate::streaming::storage::object_store::{CompioFsStorage, S3Storage};
+    match S3Storage::from_config(&config.storage.object).await {
+        Ok(s3) => Rc::new(s3),
+        Err(e) => {
+            tracing::error!(
+                "Failed to construct S3Storage from [system.storage.object]: {e:?}; \
+                 falling back to local filesystem.",
             );
             Rc::new(CompioFsStorage)
         }
     }
+}
+
+#[cfg(not(feature = "object-storage"))]
+async fn resolve_object_backend(
+    _config: &SystemConfig,
+) -> Rc<dyn crate::streaming::storage::object_store::ObjectStorage> {
+    use crate::streaming::storage::object_store::CompioFsStorage;
+    tracing::warn!(
+        "system.storage.kind = \"object\" but the `object-storage` cargo feature \
+         is not enabled in this build; falling back to local filesystem.",
+    );
+    Rc::new(CompioFsStorage)
 }
 
 pub async fn update_system_info(

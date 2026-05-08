@@ -110,6 +110,15 @@ fn print_ascii_art(text: &str) {
 
 #[instrument(skip_all, name = "trace_start_server")]
 fn main() -> Result<(), ServerError> {
+    // rustls 0.23 requires a process-wide default CryptoProvider before
+    // any TLS code runs. The transport TLS listeners install one lazily,
+    // but S3Storage (Phase 1b+) reaches for TLS at boot via cyper, so the
+    // provider must already be present. Idempotent — `install_default`
+    // returns Err if a provider is already present, which we discard.
+    #[cfg(feature = "object-storage")]
+    {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
     let rt = match compio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
