@@ -18,7 +18,7 @@
 
 use crate::common::global_context::GlobalContext;
 use cucumber::{given, then, when};
-use iggy::prelude::StreamClient;
+use iggy::prelude::{Identifier, StreamClient};
 
 #[given("I have no streams in the system")]
 pub async fn given_no_streams(world: &mut GlobalContext) {
@@ -62,5 +62,50 @@ pub async fn then_stream_has_name(world: &mut GlobalContext, expected_name: Stri
     assert_eq!(
         stream_name, &expected_name,
         "Stream should have expected name"
+    );
+}
+
+#[when(regex = r#"^I update the stream name to "([^"]*)"$"#)]
+pub async fn when_update_stream_name(world: &mut GlobalContext, new_name: String) {
+    let client = world.client.as_ref().expect("Client should be available");
+    let stream_id = world.last_stream_id.expect("Stream should exist");
+    let identifier = Identifier::numeric(stream_id).unwrap();
+    client
+        .update_stream(&identifier, &new_name)
+        .await
+        .expect("Should be able to update stream");
+    world.last_stream_name = Some(new_name);
+}
+
+#[then(regex = r#"^the stream name should be updated to "([^"]*)"$"#)]
+pub async fn then_stream_name_updated(world: &mut GlobalContext, expected_name: String) {
+    let client = world.client.as_ref().expect("Client should be available");
+    let stream_id = world.last_stream_id.expect("Stream should exist");
+    let identifier = Identifier::numeric(stream_id).unwrap();
+    let stream = client
+        .get_stream(&identifier)
+        .await
+        .expect("Should be able to get stream")
+        .expect("Stream should exist");
+    assert_eq!(stream.name, expected_name, "Stream name should be updated");
+}
+
+#[when("I delete the stream")]
+pub async fn when_delete_stream(world: &mut GlobalContext) {
+    let client = world.client.as_ref().expect("Client should be available");
+    let stream_id = world.last_stream_id.expect("Stream should exist");
+    let identifier = Identifier::numeric(stream_id).unwrap();
+    client
+        .delete_stream(&identifier)
+        .await
+        .expect("Should be able to delete stream");
+    world.last_stream_id = None;
+}
+
+#[then("the stream should be deleted successfully")]
+pub async fn then_stream_deleted_successfully(world: &mut GlobalContext) {
+    assert!(
+        world.last_stream_id.is_none(),
+        "Stream should have been deleted"
     );
 }
