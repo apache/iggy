@@ -28,6 +28,8 @@ use iggy_common::{CompressionAlgorithm, IggyDuration};
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
+use std::fmt::{Display, Formatter};
+use std::str::FromStr;
 
 pub const INDEX_EXTENSION: &str = "index";
 pub const LOG_EXTENSION: &str = "log";
@@ -49,6 +51,87 @@ pub struct SystemConfig {
     pub recovery: RecoveryConfig,
     pub memory_pool: MemoryPoolConfig,
     pub sharding: ShardingConfig,
+    pub storage: StorageConfig,
+}
+
+/// Backend selection for the storage subsystem.
+///
+/// `Fs` (default) preserves the current local-disk behavior. `Object`
+/// routes per-partition data through an `ObjectStorage` implementation
+/// (S3 in Phase 1b). The S3 backend ships behind the `object-storage`
+/// cargo feature.
+#[serde_as]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
+pub struct StorageConfig {
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    pub kind: StorageKind,
+    pub object: ObjectStorageConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StorageKind {
+    #[default]
+    Fs,
+    Object,
+}
+
+impl FromStr for StorageKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "fs" => Ok(Self::Fs),
+            "object" => Ok(Self::Object),
+            other => Err(format!(
+                "unknown storage.kind '{other}' — expected 'fs' or 'object'",
+            )),
+        }
+    }
+}
+
+impl Display for StorageKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fs => f.write_str("fs"),
+            Self::Object => f.write_str("object"),
+        }
+    }
+}
+
+/// S3-compatible object storage parameters.
+///
+/// Most fields are ignored when `kind = "fs"`. Credentials may also be
+/// supplied via the standard AWS env vars (`AWS_ACCESS_KEY_ID`,
+/// `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) or via `profile`
+/// (which uses the AWS credential file resolution chain). Phase 1b
+/// wires the actual S3 client behind the `object-storage` feature.
+#[serde_as]
+#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
+pub struct ObjectStorageConfig {
+    /// Currently only `"s3"`. Reserved for future backends.
+    pub service: String,
+    pub bucket: String,
+    pub region: String,
+    /// Empty string = AWS default endpoint. Set this for MinIO / R2 /
+    /// GCS-S3-compat / etc.
+    pub endpoint: String,
+    /// Key prefix prepended to every object operation. Useful for sharing
+    /// a bucket across deployments.
+    pub prefix: String,
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    pub multipart_part_size: IggyByteSize,
+    /// When `true` (default), producer ack waits for the upload of the
+    /// part containing the message. When `false`, ack happens as soon
+    /// as bytes land in the in-memory buffer; not safe for production.
+    pub ack_after_upload: bool,
+    #[config_env(secret)]
+    pub access_key_id: String,
+    #[config_env(secret)]
+    pub secret_access_key: String,
+    #[config_env(secret)]
+    pub profile: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]

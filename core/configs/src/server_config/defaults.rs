@@ -28,8 +28,9 @@ use super::server::{
 use super::sharding::ShardingConfig;
 use super::system::{
     BackupConfig, CompatibilityConfig, CompressionConfig, EncryptionConfig, LoggingConfig,
-    MessageDeduplicationConfig, PartitionConfig, RecoveryConfig, RuntimeConfig, SegmentConfig,
-    StateConfig, StreamConfig, SystemConfig, TopicConfig,
+    MessageDeduplicationConfig, ObjectStorageConfig, PartitionConfig, RecoveryConfig,
+    RuntimeConfig, SegmentConfig, StateConfig, StorageConfig, StreamConfig, SystemConfig,
+    TopicConfig,
 };
 use super::tcp::TcpSocketConfig;
 use super::tcp::{TcpConfig, TcpTlsConfig};
@@ -338,6 +339,62 @@ impl Default for SystemConfig {
             recovery: RecoveryConfig::default(),
             memory_pool: MemoryPoolConfig::default(),
             sharding: ShardingConfig::default(),
+            storage: StorageConfig::default(),
+        }
+    }
+}
+
+impl Default for StorageConfig {
+    fn default() -> StorageConfig {
+        StorageConfig {
+            kind: SERVER_CONFIG
+                .system
+                .storage
+                .kind
+                .parse()
+                .expect("invalid system.storage.kind"),
+            object: ObjectStorageConfig::default(),
+        }
+    }
+}
+
+impl Default for ObjectStorageConfig {
+    fn default() -> ObjectStorageConfig {
+        ObjectStorageConfig {
+            service: SERVER_CONFIG.system.storage.object.service.parse().unwrap(),
+            bucket: SERVER_CONFIG.system.storage.object.bucket.parse().unwrap(),
+            region: SERVER_CONFIG.system.storage.object.region.parse().unwrap(),
+            endpoint: SERVER_CONFIG
+                .system
+                .storage
+                .object
+                .endpoint
+                .parse()
+                .unwrap(),
+            prefix: SERVER_CONFIG.system.storage.object.prefix.parse().unwrap(),
+            multipart_part_size: SERVER_CONFIG
+                .system
+                .storage
+                .object
+                .multipart_part_size
+                .parse()
+                .expect("invalid system.storage.object.multipart_part_size"),
+            ack_after_upload: SERVER_CONFIG.system.storage.object.ack_after_upload,
+            access_key_id: SERVER_CONFIG
+                .system
+                .storage
+                .object
+                .access_key_id
+                .parse()
+                .unwrap(),
+            secret_access_key: SERVER_CONFIG
+                .system
+                .storage
+                .object
+                .secret_access_key
+                .parse()
+                .unwrap(),
+            profile: SERVER_CONFIG.system.storage.object.profile.parse().unwrap(),
         }
     }
 }

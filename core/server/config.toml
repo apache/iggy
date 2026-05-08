@@ -579,6 +579,57 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 
 # replica_id = 2
 # ports = { tcp = 8092, http = 3002 }
 
+# Storage backend configuration.
+#
+# Selects between local-filesystem persistence (default) and an S3-compatible
+# object-storage backend. The S3 backend ships behind the `object-storage`
+# cargo feature; phases 2+ of the milestone progressively migrate persistence
+# subsystems onto the trait. With `kind = "fs"`, the existing on-disk paths
+# are unchanged and the [system.storage.object] block below is ignored.
+[system.storage]
+# "fs"     — local filesystem (current default; behavior unchanged)
+# "object" — route through ObjectStorage (S3-compatible)
+kind = "fs"
+
+# S3-compatible object-storage parameters. Only consulted when kind = "object".
+[system.storage.object]
+# Currently only "s3" is recognized. Reserved for future backends.
+service = "s3"
+# Bucket name. For AWS, must already exist in the configured region.
+bucket = ""
+# AWS region (or region label your S3-compatible endpoint expects).
+region = "us-east-1"
+# Custom endpoint for MinIO / R2 / Tigris / GCS-S3-compat. Empty = AWS default.
+# Example: "https://s3.us-east-1.amazonaws.com"
+#          "http://localhost:9000" (MinIO)
+endpoint = ""
+# Optional key prefix prepended to every object operation. Useful for sharing
+# a bucket across deployments. No trailing slash needed.
+prefix = ""
+# Multipart upload part size. AWS S3 minimum is 5 MiB except the final part;
+# this value is enforced >= 5 MiB at config-load time.
+multipart_part_size = "8 MiB"
+# When true (recommended for production), producer ack waits for the part
+# upload to return success. When false, ack from in-memory buffer; data loss
+# on crash before next flush is possible. Document loudly if you set false.
+ack_after_upload = true
+# Credentials. Resolved at startup following a subset of the standard AWS
+# credential provider chain (priority order):
+#   1. Inline access_key_id + secret_access_key below.
+#   2. AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (+ optional AWS_SESSION_TOKEN) env.
+#   3. AWS_CONTAINER_CREDENTIALS_FULL_URI / RELATIVE_URI — covers ECS task roles
+#      and EKS Pod Identity.
+#   4. AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE — covers EKS IRSA via STS
+#      AssumeRoleWithWebIdentity.
+# EC2 IMDSv2 is not supported in Phase 1. Credentials do not auto-refresh
+# in Phase 1; long-running pods using short-lived creds need to be restarted
+# before the credentials expire. Phase 9 hardening adds refresh.
+#
+# Inline values are masked in logs but still get persisted in this file.
+access_key_id = ""
+secret_access_key = ""
+profile = ""
+
 # Sharding configuration
 [system.sharding]
 # CPU allocation - controls the number of shards and their CPU affinity.

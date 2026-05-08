@@ -16,6 +16,8 @@
  * under the License.
  */
 
+pub mod object_store;
+
 use super::persistence::persister::PersisterKind;
 use crate::configs::system::SystemConfig;
 use crate::shard::system::storage::FileSystemInfoStorage;

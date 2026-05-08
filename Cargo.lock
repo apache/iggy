@@ -11187,6 +11187,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "async-channel",
+ "async-trait",
  "async_zip",
  "axum",
  "axum-server",

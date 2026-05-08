@@ -27,8 +27,8 @@ use super::{
     http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig},
     server::{MessageSaverConfig, ServerConfig},
     system::{
-        CompressionConfig, EncryptionConfig, LoggingConfig, PartitionConfig, SegmentConfig,
-        StateConfig, StreamConfig, SystemConfig, TopicConfig,
+        CompressionConfig, EncryptionConfig, LoggingConfig, ObjectStorageConfig, PartitionConfig,
+        SegmentConfig, StateConfig, StorageConfig, StreamConfig, SystemConfig, TopicConfig,
     },
     tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig},
 };
@@ -351,7 +351,7 @@ impl Display for SystemConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ path: {}, logging: {}, stream: {}, topic: {}, partition: {}, segment: {}, encryption: {}, state: {} }}",
+            "{{ path: {}, logging: {}, stream: {}, topic: {}, partition: {}, segment: {}, encryption: {}, state: {}, storage: {} }}",
             self.path,
             self.logging,
             self.stream,
@@ -360,6 +360,36 @@ impl Display for SystemConfig {
             self.segment,
             self.encryption,
             self.state,
+            self.storage,
+        )
+    }
+}
+
+impl Display for StorageConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{ kind: {}, object: {} }}", self.kind, self.object)
+    }
+}
+
+impl Display for ObjectStorageConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // Credentials intentionally omitted; ObjectStorageConfig uses
+        // #[config_env(secret)] on those fields and they are masked in
+        // every observability path.
+        write!(
+            f,
+            "{{ service: {}, bucket: {}, region: {}, endpoint: {}, prefix: {}, multipart_part_size: {}, ack_after_upload: {} }}",
+            self.service,
+            self.bucket,
+            self.region,
+            if self.endpoint.is_empty() {
+                "<aws-default>"
+            } else {
+                self.endpoint.as_str()
+            },
+            self.prefix,
+            self.multipart_part_size,
+            self.ack_after_upload,
         )
     }
 }

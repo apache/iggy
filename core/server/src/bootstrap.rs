@@ -61,7 +61,7 @@ use iggy_common::{
     },
 };
 use slab::Slab;
-use std::{env, path::Path, sync::Arc};
+use std::{env, path::Path, rc::Rc, sync::Arc};
 use tracing::{info, warn};
 
 pub fn create_shard_connections(
@@ -195,6 +195,30 @@ pub fn resolve_persister(enforce_fsync: bool) -> Arc<PersisterKind> {
     match enforce_fsync {
         true => Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister)),
         false => Arc::new(PersisterKind::File(FilePersister)),
+    }
+}
+
+/// Construct the `ObjectStorage` backend selected by `[system.storage]`.
+///
+/// In Phase 1a (this commit) the function exists as the wiring seam for
+/// later phases but has no production consumers — both `kind = "fs"` and
+/// `kind = "object"` resolve to [`CompioFsStorage`]. Phase 1b adds the
+/// real `S3Storage` and switches the `Object` arm to it (behind the
+/// `object-storage` cargo feature).
+pub fn resolve_object_storage(
+    config: &SystemConfig,
+) -> Rc<dyn crate::streaming::storage::object_store::ObjectStorage> {
+    use crate::streaming::storage::object_store::CompioFsStorage;
+    match config.storage.kind {
+        crate::configs::system::StorageKind::Fs => Rc::new(CompioFsStorage),
+        crate::configs::system::StorageKind::Object => {
+            tracing::warn!(
+                "system.storage.kind = \"object\" selected, but Phase 1a only ships the \
+                 abstraction seam — falling back to local filesystem until Phase 1b lands \
+                 the S3 backend."
+            );
+            Rc::new(CompioFsStorage)
+        }
     }
 }
 
