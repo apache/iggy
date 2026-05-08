@@ -573,6 +573,23 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 
 # replica_id = 2
 # ports = { tcp = 8092, http = 3002, tcp_replica = 9092 }
 
+# Storage backend configuration. See core/server/config.toml for the full
+# documented version; the same shape applies here.
+[system.storage]
+kind = "fs"
+
+[system.storage.object]
+service = "s3"
+bucket = ""
+region = "us-east-1"
+endpoint = ""
+prefix = ""
+multipart_part_size = "8 MiB"
+ack_after_upload = true
+access_key_id = ""
+secret_access_key = ""
+profile = ""
+
 # Sharding configuration
 [system.sharding]
 # CPU allocation - controls the number of shards and their CPU affinity.

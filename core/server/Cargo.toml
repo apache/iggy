@@ -37,6 +37,11 @@ default = ["mimalloc", "iggy-web"]
 disable-mimalloc = []
 mimalloc = ["dep:mimalloc"]
 iggy-web = ["dep:rust-embed", "dep:mime_guess"]
+# S3-compatible object-storage backend (Phase 1b+ of the S3 milestone).
+# When enabled, kind = "object" in [system.storage] activates a compio-native
+# S3 client (rusty-s3 + cyper + rustls). Default off so fs-only deployments
+# don't pull the dependency tree.
+object-storage = ["dep:rusty-s3", "dep:url"]
 
 [dependencies]
 ahash = { workspace = true }
@@ -87,6 +92,7 @@ rolling-file = { workspace = true }
 rust-embed = { workspace = true, optional = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+rusty-s3 = { workspace = true, optional = true }
 secrecy = { workspace = true }
 send_wrapper = { workspace = true }
 serde = { workspace = true }
@@ -104,6 +110,7 @@ tracing-appender = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
+url = { workspace = true, optional = true }
 uuid = { workspace = true }
 
 [target.'cfg(not(target_env = "musl"))'.dependencies]

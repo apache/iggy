@@ -7900,6 +7900,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "md-5"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
+dependencies = [
+ "cfg-if",
+ "digest 0.11.2",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8120,7 +8130,7 @@ dependencies = [
  "hickory-resolver",
  "hmac 0.12.1",
  "macro_magic",
- "md-5",
+ "md-5 0.10.6",
  "mongocrypt",
  "mongodb-internal-macros",
  "pbkdf2",
@@ -8525,7 +8535,7 @@ dependencies = [
  "humantime",
  "hyper",
  "itertools 0.14.0",
- "md-5",
+ "md-5 0.10.6",
  "parking_lot",
  "percent-encoding",
  "quick-xml 0.39.2",
@@ -8634,7 +8644,7 @@ dependencies = [
  "http-body 1.0.1",
  "jiff",
  "log",
- "md-5",
+ "md-5 0.10.6",
  "percent-encoding",
  "quick-xml 0.38.4",
  "reqsign",
@@ -10753,6 +10763,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
+name = "rusty-s3"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15ec4851cde7bd44c6b1dbd7e68f70ac50f9dec29bb1f1ffd69426578af02d6b"
+dependencies = [
+ "base64 0.22.1",
+ "hmac 0.13.0",
+ "jiff",
+ "md-5 0.11.0",
+ "percent-encoding",
+ "quick-xml 0.39.2",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "rustybuzz"
 version = "0.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11232,6 +11261,7 @@ dependencies = [
  "rust-embed",
  "rustls",
  "rustls-pemfile",
+ "rusty-s3",
  "secrecy",
  "send_wrapper",
  "serde",
@@ -11249,6 +11279,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "ulid",
+ "url",
  "uuid",
  "vergen-git2",
 ]
@@ -11776,7 +11807,7 @@ dependencies = [
  "hmac 0.12.1",
  "itoa",
  "log",
- "md-5",
+ "md-5 0.10.6",
  "memchr",
  "once_cell",
  "percent-encoding",
@@ -11817,7 +11848,7 @@ dependencies = [
  "home",
  "itoa",
  "log",
- "md-5",
+ "md-5 0.10.6",
  "memchr",
  "once_cell",
  "rand 0.8.6",
