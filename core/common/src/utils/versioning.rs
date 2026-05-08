@@ -41,7 +41,7 @@ const fn const_parse_u32_range(bytes: &[u8], start: usize, end: usize) -> u32 {
     let mut result = 0u32;
     let mut i = start;
 
-    assert!(!bytes.is_empty(), "End index out of bounds");
+    assert!(!bytes.is_empty(), "Can not parse empty string as u32");
 
     while i < end {
         let byte = bytes[i];

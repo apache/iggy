@@ -129,8 +129,9 @@ pub async fn create_directories(config: &SystemConfig) -> Result<(), IggyError> 
 pub fn create_root_user() -> User {
     let mut username = env::var(IGGY_ROOT_USERNAME_ENV);
     let mut password = env::var(IGGY_ROOT_PASSWORD_ENV);
-    assert!(
-        !((username.is_ok() && password.is_err()) || (username.is_err() && password.is_ok())),
+    assert_eq!(
+        username.is_ok(),
+        password.is_ok(),
         "When providing the custom root user credentials, both username and password must be set."
     );
     if username.is_ok() && password.is_ok() {
