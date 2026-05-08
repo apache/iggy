@@ -75,6 +75,72 @@ mod ffi {
         members: Vec<ConsumerGroupMember>,
     }
 
+    struct ConsumerGroupInfo {
+        stream_id: u32,
+        topic_id: u32,
+        group_id: u32,
+    }
+
+    struct ClientInfo {
+        client_id: u32,
+        has_user_id: bool,
+        user_id: u32,
+        address: String,
+        transport: String,
+        consumer_groups_count: u32,
+    }
+
+    struct ClientInfoDetails {
+        client_id: u32,
+        has_user_id: bool,
+        user_id: u32,
+        address: String,
+        transport: String,
+        consumer_groups_count: u32,
+        consumer_groups: Vec<ConsumerGroupInfo>,
+    }
+
+    struct CacheMetricEntry {
+        stream_id: u32,
+        topic_id: u32,
+        partition_id: u32,
+        hits: u64,
+        misses: u64,
+        hit_ratio: f32,
+    }
+
+    struct Stats {
+        process_id: u32,
+        cpu_usage: f32,
+        total_cpu_usage: f32,
+        memory_usage: u64,
+        total_memory: u64,
+        available_memory: u64,
+        run_time: u64,
+        start_time: u64,
+        read_bytes: u64,
+        written_bytes: u64,
+        messages_size_bytes: u64,
+        streams_count: u32,
+        topics_count: u32,
+        partitions_count: u32,
+        segments_count: u32,
+        messages_count: u64,
+        clients_count: u32,
+        consumer_groups_count: u32,
+        hostname: String,
+        os_name: String,
+        os_version: String,
+        kernel_version: String,
+        iggy_server_version: String,
+        has_server_semver: bool,
+        iggy_server_semver: u32,
+        cache_metrics: Vec<CacheMetricEntry>,
+        threads_count: u32,
+        free_disk_space: u64,
+        total_disk_space: u64,
+    }
+
     extern "Rust" {
         type Client;
 
@@ -129,11 +195,22 @@ mod ffi {
             topic_id: Identifier,
             group_id: Identifier,
         ) -> Result<()>;
+        fn get_stats(self: &Client) -> Result<Stats>;
+        fn get_me(self: &Client) -> Result<ClientInfoDetails>;
+        fn get_client(self: &Client, client_id: u32) -> Result<ClientInfoDetails>;
+        fn get_clients(self: &Client) -> Result<Vec<ClientInfo>>;
+        fn ping(self: &Client) -> Result<()>;
+        fn heartbeat_interval(self: &Client) -> u64;
+        fn snapshot(
+            self: &Client,
+            snapshot_compression: String,
+            snapshot_types: Vec<String>,
+        ) -> Result<Vec<u8>>;
 
         unsafe fn delete_connection(client: *mut Client) -> Result<()>;
 
         // Identifier functions
-        fn from_string(self: &mut Identifier, id: String) -> Result<()>;
-        fn from_numeric(self: &mut Identifier, id: u32) -> Result<()>;
+        fn set_string(self: &mut Identifier, id: String) -> Result<()>;
+        fn set_numeric(self: &mut Identifier, id: u32) -> Result<()>;
     }
 }
