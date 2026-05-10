@@ -37,6 +37,7 @@ default = ["mimalloc", "iggy-web"]
 disable-mimalloc = []
 mimalloc = ["dep:mimalloc"]
 iggy-web = ["dep:rust-embed", "dep:mime_guess"]
+systemd = ["dep:sd-notify"]
 
 [dependencies]
 ahash = { workspace = true }
@@ -84,6 +85,7 @@ ringbuffer = { workspace = true }
 rmp-serde = { workspace = true }
 rolling-file = { workspace = true }
 rust-embed = { workspace = true, optional = true }
+sd-notify = { workspace = true, optional = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 secrecy = { workspace = true }

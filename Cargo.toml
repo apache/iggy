@@ -252,6 +252,7 @@ rust-s3 = { version = "0.37.2", default-features = false, features = ["tokio-rus
 rustls = { version = "0.23.40", features = ["ring"] }
 rustls-pemfile = "2.2.0"
 scopeguard = "1.2.0"
+sd-notify = "0.5"
 secrecy = { version = "0.10", features = ["serde"] }
 send_wrapper = "0.6.0"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
