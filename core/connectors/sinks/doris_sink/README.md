@@ -78,7 +78,7 @@ timeout_secs = 30
 - **`label_keep_max_second`.** Idempotent replay relies on Doris retaining each label for at least as long as it could take the Iggy runtime to redrive a failed batch. The Doris default is 3 days, which is conservative. If you set this lower on the Doris side, make sure your runtime retry budget fits inside the window — once a label expires, a replay re-loads instead of deduping, producing duplicate rows.
 - **Filtered-row alerts.** When Doris reports `number_filtered_rows > 0`, the connector emits a `warn!`. This is your signal that upstream message shapes have drifted from the table schema; alert on it.
 
-## Limitations (v1)
+## Limitations (todo)
 
 - JSON payload only. CSV and raw-text payloads are not supported yet.
 - HTTP Basic auth only.
