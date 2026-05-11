@@ -31,9 +31,10 @@ use iggy::prelude::{
     AutoCommit, AutoCommitWhen, IggyClient, IggyConsumer, IggyDuration, IggyMessage,
     PollingStrategy,
 };
+use iggy_connector_sdk::decoders::avro::{AvroConfig, AvroStreamDecoder};
 use iggy_connector_sdk::{
-    DecodedMessage, MessagesMetadata, RawMessage, RawMessages, ReceivedMessage, StreamDecoder,
-    TopicMetadata, sink::ConsumeCallback, transforms::Transform,
+    DecodedMessage, MessagesMetadata, RawMessage, RawMessages, ReceivedMessage, Schema,
+    StreamDecoder, TopicMetadata, sink::ConsumeCallback, transforms::Transform,
 };
 use std::{
     collections::HashMap,
@@ -426,12 +427,23 @@ pub(crate) async fn setup_sink_consumers(
                 .batch_length(batch_length)
                 .build();
             consumer.init().await?;
-            consumers.push((
-                consumer,
-                stream.schema.decoder(),
-                batch_length,
-                transforms.clone(),
-            ));
+            let decoder: Arc<dyn StreamDecoder> = match stream.schema {
+                Schema::Avro => {
+                    let config = AvroConfig {
+                        schema_json: stream.avro_schema_json.clone(),
+                        schema_path: stream.avro_schema_path.clone(),
+                        ..AvroConfig::default()
+                    };
+                    Arc::new(AvroStreamDecoder::try_new(config).map_err(|error| {
+                        RuntimeError::InvalidConfiguration(format!(
+                            "Failed to create Avro decoder for stream '{}': {error}",
+                            stream.stream
+                        ))
+                    })?)
+                }
+                other => other.decoder(),
+            };
+            consumers.push((consumer, decoder, batch_length, transforms.clone()));
         }
     }
     Ok(consumers)

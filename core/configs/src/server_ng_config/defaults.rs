@@ -19,33 +19,34 @@
 
 //! `Default` impls for the server-ng config surface.
 //!
-//! Section sub-types are reused verbatim from the legacy server config;
-//! their existing `Default` impls (declared in [`crate::defaults`]) read
-//! from `core/server/config.toml` via `static_toml!`. This file
-//! delegates to those impls for every reused section, so drift between
-//! the two TOMLs is intentionally absorbed at the `server-ng` consumer
-//! level (the wiring PR will read `core/server-ng/config.toml`
-//! end-to-end through [`super::server_ng::ServerNgConfig::load`] and
-//! overrides will take effect there).
-//!
-//! Only [`MessageBusConfig`] needs its own `Default` because no legacy
-//! section maps to it. The defaults are hardcoded to match
-//! `core::message_bus::config::MessageBusConfig::default()` byte-for-byte.
+//! Sections that fork (`tcp`, `websocket`, `quic`, `message_bus`) have
+//! their own `Default` impls here, sourced from
+//! `core/server-ng/config.toml` via [`SERVER_NG_CONFIG`]. Sections that
+//! still reuse legacy types (`http`, `cluster`, `system`, `telemetry`,
+//! `consumer_group`, `data_maintenance`, `message_saver`,
+//! `personal_access_token`, `heartbeat`) delegate to the legacy
+//! `Default` impls; overrides land at the consumer level once
+//! [`super::server_ng::ServerNgConfig::load`] is wired into server-ng's
+//! bootstrap.
 
 use super::message_bus::MessageBusConfig;
+use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use super::server_ng::ServerNgConfig;
+use super::tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig};
+use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
 use crate::server_config::cluster::ClusterConfig;
 use crate::server_config::http::HttpConfig;
-use crate::server_config::quic::QuicConfig;
 use crate::server_config::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig,
     PersonalAccessTokenConfig, TelemetryConfig,
 };
 use crate::server_config::system::SystemConfig;
-use crate::server_config::tcp::TcpConfig;
-use crate::server_config::websocket::WebSocketConfig;
-use iggy_common::IggyByteSize;
 use std::sync::Arc;
+
+static_toml::static_toml! {
+    // static_toml resolves relative to CARGO_MANIFEST_DIR (core/configs/).
+    pub static SERVER_NG_CONFIG = include_toml!("../server-ng/config.toml");
+}
 
 impl Default for ServerNgConfig {
     fn default() -> ServerNgConfig {
@@ -67,28 +68,153 @@ impl Default for ServerNgConfig {
     }
 }
 
+impl Default for QuicConfig {
+    fn default() -> QuicConfig {
+        QuicConfig {
+            enabled: SERVER_NG_CONFIG.quic.enabled,
+            address: SERVER_NG_CONFIG.quic.address.parse().unwrap(),
+            max_concurrent_bidi_streams: SERVER_NG_CONFIG.quic.max_concurrent_bidi_streams as u64,
+            datagram_send_buffer_size: SERVER_NG_CONFIG
+                .quic
+                .datagram_send_buffer_size
+                .parse()
+                .unwrap(),
+            initial_mtu: SERVER_NG_CONFIG.quic.initial_mtu.parse().unwrap(),
+            send_window: SERVER_NG_CONFIG.quic.send_window.parse().unwrap(),
+            receive_window: SERVER_NG_CONFIG.quic.receive_window.parse().unwrap(),
+            keep_alive_interval: SERVER_NG_CONFIG.quic.keep_alive_interval.parse().unwrap(),
+            max_idle_timeout: SERVER_NG_CONFIG.quic.max_idle_timeout.parse().unwrap(),
+            certificate: QuicCertificateConfig::default(),
+            socket: QuicSocketConfig::default(),
+        }
+    }
+}
+
+impl Default for QuicSocketConfig {
+    fn default() -> QuicSocketConfig {
+        QuicSocketConfig {
+            override_defaults: SERVER_NG_CONFIG.quic.socket.override_defaults,
+            recv_buffer_size: SERVER_NG_CONFIG
+                .quic
+                .socket
+                .recv_buffer_size
+                .parse()
+                .unwrap(),
+            send_buffer_size: SERVER_NG_CONFIG
+                .quic
+                .socket
+                .send_buffer_size
+                .parse()
+                .unwrap(),
+            keepalive: SERVER_NG_CONFIG.quic.socket.keepalive,
+        }
+    }
+}
+
+impl Default for QuicCertificateConfig {
+    fn default() -> QuicCertificateConfig {
+        QuicCertificateConfig {
+            self_signed: SERVER_NG_CONFIG.quic.certificate.self_signed,
+            cert_file: SERVER_NG_CONFIG.quic.certificate.cert_file.parse().unwrap(),
+            key_file: SERVER_NG_CONFIG.quic.certificate.key_file.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for TcpConfig {
+    fn default() -> TcpConfig {
+        TcpConfig {
+            enabled: SERVER_NG_CONFIG.tcp.enabled,
+            address: SERVER_NG_CONFIG.tcp.address.parse().unwrap(),
+            ipv6: SERVER_NG_CONFIG.tcp.ipv_6,
+            tls: TcpTlsConfig::default(),
+            socket: TcpSocketConfig::default(),
+            socket_migration: SERVER_NG_CONFIG.tcp.socket_migration,
+        }
+    }
+}
+
+impl Default for TcpTlsConfig {
+    fn default() -> TcpTlsConfig {
+        TcpTlsConfig {
+            enabled: SERVER_NG_CONFIG.tcp.tls.enabled,
+            self_signed: SERVER_NG_CONFIG.tcp.tls.self_signed,
+            cert_file: SERVER_NG_CONFIG.tcp.tls.cert_file.parse().unwrap(),
+            key_file: SERVER_NG_CONFIG.tcp.tls.key_file.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for TcpSocketConfig {
+    fn default() -> TcpSocketConfig {
+        TcpSocketConfig {
+            override_defaults: SERVER_NG_CONFIG.tcp.socket.override_defaults,
+            recv_buffer_size: SERVER_NG_CONFIG
+                .tcp
+                .socket
+                .recv_buffer_size
+                .parse()
+                .unwrap(),
+            send_buffer_size: SERVER_NG_CONFIG
+                .tcp
+                .socket
+                .send_buffer_size
+                .parse()
+                .unwrap(),
+            keepalive: SERVER_NG_CONFIG.tcp.socket.keepalive,
+            nodelay: SERVER_NG_CONFIG.tcp.socket.nodelay,
+            linger: SERVER_NG_CONFIG.tcp.socket.linger.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> WebSocketConfig {
+        WebSocketConfig {
+            enabled: SERVER_NG_CONFIG.websocket.enabled,
+            address: SERVER_NG_CONFIG.websocket.address.parse().unwrap(),
+            read_buffer_size: None,
+            write_buffer_size: None,
+            max_write_buffer_size: None,
+            max_message_size: None,
+            max_frame_size: None,
+            accept_unmasked_frames: false,
+            tls: WebSocketTlsConfig::default(),
+        }
+    }
+}
+
+impl Default for WebSocketTlsConfig {
+    fn default() -> WebSocketTlsConfig {
+        WebSocketTlsConfig {
+            enabled: SERVER_NG_CONFIG.websocket.tls.enabled,
+            self_signed: SERVER_NG_CONFIG.websocket.tls.self_signed,
+            cert_file: SERVER_NG_CONFIG.websocket.tls.cert_file.parse().unwrap(),
+            key_file: SERVER_NG_CONFIG.websocket.tls.key_file.parse().unwrap(),
+        }
+    }
+}
+
 impl Default for MessageBusConfig {
     fn default() -> MessageBusConfig {
-        // Keep these literals in lock-step with
-        // `core::message_bus::config::MessageBusConfig::default()` and
-        // with the `[message_bus]` block in
-        // `core/server-ng/config.toml`. The unit test
-        // `message_bus::tests::default_validates` proves the values
-        // survive `Validatable::validate`; a future PR may wire a
-        // round-trip test against the embedded TOML once
-        // `ServerNgConfig::load` is exercised end-to-end.
+        // Read every field from the embedded TOML so the Default impl
+        // and the on-disk schema cannot drift. Sibling impls in this
+        // file follow the same pattern. The `ws_*_size` knobs are
+        // optional in the schema (commented-out by default), so they
+        // map to `None` here when absent.
+        let bus = &SERVER_NG_CONFIG.message_bus;
         MessageBusConfig {
-            max_batch: 256,
-            max_message_size: IggyByteSize::from(64_u64 * 1024 * 1024),
-            peer_queue_capacity: 256,
-            reconnect_period: "5 s".parse().expect("'5 s' parses as IggyDuration"),
-            keepalive_idle: "10 s".parse().expect("'10 s' parses as IggyDuration"),
-            keepalive_interval: "5 s".parse().expect("'5 s' parses as IggyDuration"),
-            keepalive_retries: 3,
-            close_peer_timeout: "2 s".parse().expect("'2 s' parses as IggyDuration"),
-            close_grace: "2 s".parse().expect("'2 s' parses as IggyDuration"),
-            tcp_tls_listen_addr: None,
-            wss_listen_addr: None,
+            max_batch: bus.max_batch as usize,
+            max_message_size: bus.max_message_size.parse().unwrap(),
+            peer_queue_capacity: bus.peer_queue_capacity as usize,
+            reconnect_period: bus.reconnect_period.parse().unwrap(),
+            close_peer_timeout: bus.close_peer_timeout.parse().unwrap(),
+            close_grace: bus.close_grace.parse().unwrap(),
+            handshake_grace: bus.handshake_grace.parse().unwrap(),
+            ws_max_message_size: None,
+            ws_max_frame_size: None,
+            ws_write_buffer_size: None,
+            ws_accept_unmasked_frames: bus.ws_accept_unmasked_frames,
         }
     }
 }

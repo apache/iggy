@@ -45,6 +45,9 @@ use crate::args::{
 #[cfg(feature = "login-session")]
 use crate::args::system::LoginArgs;
 
+#[cfg(feature = "login-session")]
+use crate::args::session::SessionAction;
+
 use self::user::UserAction;
 
 pub(crate) mod client;
@@ -62,6 +65,9 @@ pub(crate) mod stream;
 pub(crate) mod system;
 pub(crate) mod topic;
 pub(crate) mod user;
+
+#[cfg(feature = "login-session")]
+pub(crate) mod session;
 
 static CARGO_BIN_NAME: &str = env!("CARGO_BIN_NAME");
 static CARGO_PKG_HOMEPAGE: &str = env!("CARGO_PKG_HOMEPAGE");
@@ -206,6 +212,10 @@ pub(crate) enum Command {
     /// execute any command that requires authentication.
     #[clap(verbatim_doc_comment, visible_alias = "lo")]
     Logout,
+    #[cfg(feature = "login-session")]
+    /// login session operations
+    #[command(subcommand, visible_alias = "sess")]
+    Session(SessionAction),
 }
 
 impl IggyConsoleArgs {

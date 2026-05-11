@@ -15,6 +15,65 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Shard-local message bus with two wire planes.
+//!
+//! # Plane split
+//!
+//! - **Replica plane (TCP forever)**: VSR consensus traffic between
+//!   replicas. Implemented in [`replica::listener`], [`connector`], and
+//!   [`replica::io`]. Datagram or gateway-terminated transports are NOT
+//!   supported here and never will be — see
+//!   `replica::listener`'s module docs for the rationale.
+//! - **SDK-client plane**: ephemeral client connections. Available
+//!   transports: TCP, TCP-TLS, WebSocket, WSS, QUIC. Each request
+//!   carries a `(client: u128, request: u64)` pair in `RequestHeader`;
+//!   downstream consumers in `core/server-ng` are free to use it for
+//!   tracing, idempotency, or correlation.
+//!
+//! # Auth
+//!
+//! Neither plane is authenticated at the bus layer. Both connect first
+//! and let the caller (`core/server-ng`) gate command access via
+//! application-level LOGIN commands:
+//!
+//! - SDK-client plane: `LOGIN_USER` / `LOGIN_WITH_PERSONAL_ACCESS_TOKEN`,
+//!   pre-LOGIN allowlist `PING`, `LOGIN_USER`, `LOGIN_WITH_PAT`.
+//! - Replica plane: a future `LOGIN_REPLICA` command carries the
+//!   cluster's shared secret. Until that command succeeds the caller
+//!   MUST NOT honor consensus messages from the connection. The
+//!   `Ping` frame at connect time announces `replica_id` and
+//!   `cluster_id` (the listener checks `cluster_id` matches the local
+//!   cluster and uses `replica_id` to key its registry); it carries
+//!   no MAC.
+//!
+//! # Invariants worth naming
+//!
+//! - [`send_to_client`](IggyMessageBus::send_to_client) and
+//!   [`send_to_replica`](IggyMessageBus::send_to_replica) return
+//!   `Ready` on first poll. Consensus code relies on this for
+//!   reentrancy reasoning; any `.await` in the body breaks it.
+//! - The TCP transport's writer task coalesces up to
+//!   `MessageBusConfig::max_batch` (default 256) `Frozen<MESSAGE_ALIGN>`
+//!   into one `write_vectored_all`. Don't introduce per-message
+//!   syscalls or per-message encryption on the plaintext TCP plane.
+//! - fd-delegation ([`fd_transfer`]) is TCP-only. TLS / QUIC
+//!   connections have no dupable plaintext fd, so shard 0 terminates
+//!   and forwards `Frozen<MESSAGE_ALIGN>` over the existing
+//!   inter-shard flume.
+//! - 0-RTT stays disabled by default on any future QUIC path. Per-
+//!   command opt-in requires a checked-in idempotence audit.
+//!
+//! # Transport abstraction
+//!
+//! [`transports`] defines the trait surface every wire plane sits
+//! behind: [`transports::TransportListener`] and
+//! [`transports::TransportConn`] with its single
+//! [`transports::TransportConn::run`] entry point.
+//! [`installer::install_replica_conn`] /
+//! [`installer::install_client_conn`] are generic over it so every
+//! transport (TCP, TCP-TLS, WS, WSS, QUIC) plugs in behind the same
+//! registry, fencing, and dispatch logic.
+
 pub mod cache;
 pub mod client_listener;
 pub mod config;
@@ -24,26 +83,31 @@ pub mod fd_transfer;
 pub mod framing;
 pub mod installer;
 pub mod lifecycle;
-pub mod replica_io;
-pub mod replica_listener;
-pub(crate) mod socket_opts;
+pub mod replica;
+#[doc(hidden)]
+pub mod socket_opts;
 pub mod transports;
-pub mod writer_task;
 
-pub use config::MessageBusConfig;
+pub use config::{IOV_MAX_LIMIT, MessageBusConfig, QuicTuning, WebSocketConfig};
 pub use error::SendError;
 pub use installer::ConnectionInstaller;
-pub use lifecycle::{
-    BusMessage, BusReceiver, BusSender, ConnectionRegistry, DrainOutcome, RejectedRegistration,
-    ReplicaRegistry, Shutdown, ShutdownToken,
+pub use installer::conn_info::{
+    ClientConnMeta, ClientTransportKind, QuicConnectionInfo, TlsConnectionInfo, WsUpgradeInfo,
 };
+pub use lifecycle::{
+    BusMessage, BusReceiver, BusSender, ConnectionRegistry, DrainOutcome, FusedShutdown,
+    RejectedRegistration, ReplicaRegistry, Shutdown, ShutdownToken,
+};
+pub use transports::tls::TlsServerCredentials;
 
 use compio::runtime::JoinHandle;
+use configs::server_ng::ServerNgConfig;
 use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
 use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_binary_protocol::{GenericHeader, Message};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 
 /// Callback for forwarding a consensus message to a remote shard.
@@ -66,8 +130,11 @@ pub type ShardForwardFn = Box<dyn Fn(u16, Frozen<MESSAGE_ALIGN>) -> Result<(), S
 /// Fired by the replica listener / outbound connector. The callback decides
 /// whether to install the stream locally or ship it to another shard; this
 /// crate does not need to care about that policy. Takes ownership of the
-/// `TcpStream`; the replica id has already been validated against the
-/// cluster config.
+/// `TcpStream`. On the inbound (listener) path the replica id has been
+/// validated against `replica_count`, the local `cluster_id`, and the
+/// directional rule (peer id strictly less than this replica's id). On
+/// the outbound (connector) path the dialer trusts the configured peer
+/// list and the callback receives the pre-configured peer id.
 pub type AcceptedReplicaFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, u8)>;
 
 /// Callback invoked on every accepted SDK client connection.
@@ -75,6 +142,119 @@ pub type AcceptedReplicaFn = std::rc::Rc<dyn Fn(compio::net::TcpStream, u8)>;
 /// Takes ownership of the accepted stream and is responsible for minting /
 /// assigning the client id as part of its delegation policy.
 pub type AcceptedClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream)>;
+
+/// Owned bundle of a fully-handshaked QUIC client connection plus its
+/// first accepted bidirectional stream pair.
+///
+/// Wraps the three `compio_quic` types that previously appeared in
+/// [`AcceptedQuicClientFn`]'s signature so the bus's public API does
+/// not parameterise on `compio_quic`'s exposed types. A future
+/// `compio_quic` version bump that renames or restructures
+/// `Connection` / `SendStream` / `RecvStream` no longer constitutes a
+/// SemVer-major change for `iggy_message_bus`.
+pub struct AcceptedQuicConn {
+    connection: compio_quic::Connection,
+    streams: (compio_quic::SendStream, compio_quic::RecvStream),
+}
+
+impl AcceptedQuicConn {
+    /// Bundle a freshly-accepted QUIC connection and its first
+    /// bidirectional stream pair.
+    #[must_use]
+    pub const fn new(
+        connection: compio_quic::Connection,
+        streams: (compio_quic::SendStream, compio_quic::RecvStream),
+    ) -> Self {
+        Self {
+            connection,
+            streams,
+        }
+    }
+
+    /// Unbundle into the underlying `compio_quic` types.
+    ///
+    /// `pub(crate)` by design: external callers receive an
+    /// [`AcceptedQuicConn`] from [`AcceptedQuicClientFn`] and forward
+    /// it straight to [`installer::install_client_quic`], which calls
+    /// this helper internally. Keeping it crate-private holds
+    /// `compio_quic`'s concrete types out of the bus's public `SemVer`
+    /// surface so a `compio_quic` version bump does not constitute a
+    /// `SemVer`-major change for `iggy_message_bus`.
+    #[must_use]
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        compio_quic::Connection,
+        (compio_quic::SendStream, compio_quic::RecvStream),
+    ) {
+        (self.connection, self.streams)
+    }
+}
+
+/// Callback invoked on every accepted SDK QUIC client connection.
+///
+/// Fires after shard 0's QUIC listener drives the handshake to
+/// completion AND accepts the first bidirectional stream pair, so the
+/// callback receives a ready-for-traffic [`AcceptedQuicConn`]. The
+/// callback mints a client id and forwards the conn straight into
+/// [`installer::install_client_quic`] on the local bus, which unwraps
+/// internally; no caller-side `into_parts` is needed (and the helper
+/// is `pub(crate)` for that reason).
+///
+/// QUIC stays shard-0 terminal: shard 0 owns the
+/// `compio_quic::Endpoint`, which demuxes incoming UDP packets to
+/// in-flight connections by Connection ID, and `quinn-proto`
+/// per-connection TLS / packet-number / congestion state is not
+/// serialisable. No cross-shard handover analog exists for this plane.
+pub type AcceptedQuicClientFn = std::rc::Rc<dyn Fn(AcceptedQuicConn)>;
+
+/// Callback invoked on every accepted SDK WebSocket client connection.
+///
+/// Fires after shard 0's WS listener accepts a raw TCP socket. The
+/// HTTP-Upgrade handshake has NOT run yet; the callback hands the
+/// raw stream off to the owning shard via inter-shard fd-shipping
+/// (`ShardFramePayload::ClientWsConnectionSetup`). The owning shard
+/// runs the upgrade locally; no subprotocol is negotiated. The
+/// shipped fd is plain TCP at ship-time, so fd-delegation (which
+/// requires a dupable plaintext fd) stays well-defined.
+pub type AcceptedWsClientFn = std::rc::Rc<dyn Fn(compio::net::TcpStream)>;
+
+/// Callback invoked on every accepted SDK TCP-TLS client connection.
+///
+/// Fires after shard 0's TCP-TLS listener accepts a raw TCP socket.
+/// Neither the rustls handshake nor any application-layer work has run
+/// yet — the listener stays cheap so a slow handshake on one peer cannot
+/// block subsequent accepts. The callback receives the raw stream plus
+/// a clone of the shared [`std::sync::Arc<rustls::ServerConfig>`] built
+/// at bind time, mints a `client_id`, and calls
+/// [`installer::install_client_tcp_tls`]; the install path drives the
+/// rustls handshake on its own task before forwarding the connection to
+/// [`installer::install_client_conn`].
+///
+/// TCP-TLS stays shard-0 terminal: rustls's connection state machine
+/// is tied to the local task and not serialisable, and the
+/// pre-handshake fd would have to re-handshake on the receiving shard,
+/// losing the point of fd-delegation.
+pub type AcceptedTlsClientFn =
+    std::rc::Rc<dyn Fn(compio::net::TcpStream, std::sync::Arc<rustls::ServerConfig>)>;
+
+/// Callback invoked on every accepted SDK WSS (WebSocket-over-TLS)
+/// client connection.
+///
+/// Fires after shard 0's WSS listener accepts a raw TCP socket. Neither
+/// the rustls handshake nor the WebSocket HTTP-Upgrade has run yet — the
+/// listener stays cheap so neither handshake on one peer can block
+/// subsequent accepts. The callback receives the raw stream plus a clone
+/// of the shared [`std::sync::Arc<rustls::ServerConfig>`] built at bind
+/// time, mints a `client_id`, and calls
+/// [`installer::install_client_wss`]; the install path drives
+/// both handshakes on its own task before forwarding the connection to
+/// [`installer::install_client_conn`].
+///
+/// No subprotocol negotiation is performed. WSS stays shard-0 terminal
+/// for the same reasons as the TCP-TLS plane.
+pub type AcceptedWssClientFn =
+    std::rc::Rc<dyn Fn(compio::net::TcpStream, std::sync::Arc<rustls::ServerConfig>)>;
 
 /// Notifier fired when a delegated replica connection dies.
 ///
@@ -145,7 +325,8 @@ pub trait MessageBus {
 ///   on `Full` (returned as [`SendError::Backpressure`]) are recovered by
 ///   VSR retransmission.
 /// - The per-connection writer task batches up to `config.max_batch` messages into
-///   a single `writev` syscall via [`writer_task::run`].
+///   a single `writev` syscall on the plaintext TCP plane (see
+///   [`transports::tcp`]).
 ///
 /// Interior mutability via `RefCell` / `Cell` is sound because compio is a
 /// single-threaded runtime: no other task can execute while we hold a borrow.
@@ -172,17 +353,22 @@ pub struct IggyMessageBus {
     /// when they exit abnormally. `None` when running without a shard-0
     /// coordinator (single-shard deployments and tests).
     connection_lost_fn: RefCell<Option<ConnectionLostFn>>,
+    /// Per-connection metadata exposed to the caller via
+    /// [`Self::client_meta`]. Populated by the install path on
+    /// successful registry insert; removed on connection teardown.
+    client_meta: RefCell<ahash::AHashMap<u128, Rc<ClientConnMeta>>>,
 }
 
 impl IggyMessageBus {
-    /// Construct a bus with [`MessageBusConfig::default`] tunables.
+    /// Construct a bus with default tunables (derived from
+    /// [`ServerNgConfig::default`]).
     #[must_use]
     pub fn new(shard_id: u16) -> Self {
-        Self::with_config(shard_id, MessageBusConfig::default())
+        Self::with_tunables(shard_id, MessageBusConfig::default())
     }
 
     /// Construct a bus with a custom per-peer queue capacity; all other
-    /// tunables fall back to [`MessageBusConfig::default`].
+    /// tunables fall back to defaults.
     ///
     /// Tuning knob for tests and benchmarks. Production should use
     /// [`with_config`](Self::with_config).
@@ -192,12 +378,46 @@ impl IggyMessageBus {
             peer_queue_capacity,
             ..MessageBusConfig::default()
         };
-        Self::with_config(shard_id, cfg)
+        Self::with_tunables(shard_id, cfg)
     }
 
-    /// Construct a bus with the given [`MessageBusConfig`].
+    /// Construct a bus from the validated server-ng schema.
+    ///
+    /// Production constructor: takes a fully-validated
+    /// [`ServerNgConfig`] and derives the runtime [`MessageBusConfig`]
+    /// internally. Field conversions ([`iggy_common::IggyDuration`] -> [`Duration`],
+    /// [`iggy_common::IggyByteSize`] -> `usize`, schema WS knobs ->
+    /// tungstenite [`WebSocketConfig`]) happen once here so hot paths
+    /// read pre-converted values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cfg.message_bus.max_batch == 0` or
+    /// `cfg.message_bus.max_batch > IOV_MAX_LIMIT`. Boot-time validation;
+    /// surfaces operator misconfiguration loudly rather than letting
+    /// every `writev` fail silently with `EMSGSIZE` once traffic starts.
     #[must_use]
-    pub fn with_config(shard_id: u16, config: MessageBusConfig) -> Self {
+    pub fn with_config(shard_id: u16, cfg: &ServerNgConfig) -> Self {
+        Self::with_tunables(shard_id, MessageBusConfig::from(cfg))
+    }
+
+    /// Construct a bus from already-derived runtime tunables.
+    ///
+    /// Used by the public constructors above and by tests that need to
+    /// patch a single field on the derived [`MessageBusConfig`] without
+    /// round-tripping through [`ServerNgConfig`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.max_batch == 0` or
+    /// `config.max_batch > IOV_MAX_LIMIT`.
+    #[must_use]
+    pub fn with_tunables(shard_id: u16, config: MessageBusConfig) -> Self {
+        assert!(
+            config.max_batch > 0 && config.max_batch <= IOV_MAX_LIMIT,
+            "MessageBusConfig::max_batch must be in 1..={IOV_MAX_LIMIT} (writev IOV_MAX/2 cap); got {}",
+            config.max_batch,
+        );
         let (shutdown, token) = Shutdown::new();
         Self {
             shard_id,
@@ -211,7 +431,25 @@ impl IggyMessageBus {
             replica_forward_fn: RefCell::new(None),
             client_forward_fn: RefCell::new(None),
             connection_lost_fn: RefCell::new(None),
+            client_meta: RefCell::new(ahash::AHashMap::new()),
         }
+    }
+
+    /// Look up the per-connection metadata recorded for `client_id`.
+    ///
+    /// Returns `None` if the client never connected on this bus or if
+    /// its connection has already been torn down.
+    #[must_use]
+    pub fn client_meta(&self, client_id: u128) -> Option<Rc<ClientConnMeta>> {
+        self.client_meta.borrow().get(&client_id).map(Rc::clone)
+    }
+
+    pub(crate) fn insert_client_meta(&self, meta: Rc<ClientConnMeta>) {
+        self.client_meta.borrow_mut().insert(meta.client_id, meta);
+    }
+
+    pub(crate) fn remove_client_meta(&self, client_id: u128) {
+        self.client_meta.borrow_mut().remove(&client_id);
     }
 
     /// Install the notifier used by delegated replica connections to tell
@@ -221,8 +459,18 @@ impl IggyMessageBus {
     }
 
     /// Invoke the registered connection-lost notifier, if any.
+    ///
+    /// Clones the `Rc` out of the `RefCell` borrow before invoking the
+    /// closure so the closure body is free to call
+    /// [`Self::set_connection_lost_fn`] (which takes a `borrow_mut`)
+    /// without tripping the runtime borrow check.
     pub(crate) fn notify_connection_lost(&self, replica_id: u8) {
-        if let Some(f) = self.connection_lost_fn.borrow().as_ref() {
+        let cb = self
+            .connection_lost_fn
+            .borrow()
+            .as_ref()
+            .map(std::rc::Rc::clone);
+        if let Some(f) = cb {
             f(replica_id);
         }
     }
@@ -341,10 +589,37 @@ impl IggyMessageBus {
     /// Register a background task (accept loop, reconnect periodic) so
     /// [`shutdown`](Self::shutdown) can await it.
     ///
-    /// The tracking vec grows during shutdown too. `shutdown` drains it in
-    /// a loop until empty, so a task pushed mid-shutdown is still awaited.
+    /// Reaps already-finished handles before pushing the new one so the
+    /// vec stays bounded under sustained traffic. Without the reap a
+    /// long-running bus accumulates one handle per spawn site over its
+    /// lifetime (the most visible source today is the per-WS-connect
+    /// upgrade task in `installer::install_client_ws_fd`). Dropping a
+    /// finished `compio::runtime::JoinHandle` is a no-op (the task has
+    /// already completed); compio's runtime is single-threaded so
+    /// `is_finished` cannot flip between the predicate evaluation and
+    /// the drop inside the same `retain`.
+    ///
+    /// The tracking vec grows during shutdown too. `shutdown` drains it
+    /// in a loop until empty, so a task pushed mid-shutdown is still
+    /// awaited.
     pub fn track_background(&self, handle: JoinHandle<()>) {
-        self.background_tasks.borrow_mut().push(handle);
+        let mut tasks = self.background_tasks.borrow_mut();
+        tasks.retain(|h| !h.is_finished());
+        tasks.push(handle);
+    }
+
+    /// Number of background-task handles currently retained by the bus.
+    ///
+    /// Test-only accessor: lets integration tests pin the
+    /// reap-on-push invariant in `track_background` without exposing
+    /// the underlying `RefCell<Vec<JoinHandle<()>>>` to production
+    /// callers. A long-running bus is expected to keep this number
+    /// bounded under sustained accept traffic; a leak shows up here as
+    /// monotonic growth proportional to total accepts.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn background_tasks_len(&self) -> usize {
+        self.background_tasks.borrow().len()
     }
 
     /// Trigger the root shutdown and drain everything with the given
@@ -446,13 +721,14 @@ impl MessageBus for IggyMessageBus {
         // Owning shard is encoded in the top 16 bits of client_id.
         let owning_shard = client_id_owning_shard(client_id);
         if owning_shard == self.shard_id {
-            if let Some(result) = self
-                .clients
-                .with_sender(client_id, |s| s.try_send(message.clone()))
-            {
-                return result.map_err(map_try_send_err);
-            }
-            return Err(SendError::ClientNotFound(client_id));
+            // Fast path: move `message` straight into `try_send`. On no-slot
+            // the registry hands it back; we drop it and surface
+            // ClientNotFound (matches prior behaviour: SendError did not
+            // preserve payload either).
+            return match self.clients.try_send_or_return(client_id, message) {
+                Ok(send_result) => send_result.map_err(map_try_send_err),
+                Err(_msg) => Err(SendError::ClientNotFound(client_id)),
+            };
         }
         let forward = self.client_forward_fn.borrow();
         let forward = forward
@@ -469,13 +745,13 @@ impl MessageBus for IggyMessageBus {
         if self.is_shutting_down() {
             return Err(SendError::BusShuttingDown);
         }
-        // Fast path: this shard owns a connection to the replica.
-        if let Some(result) = self
-            .replicas
-            .with_sender(replica, |s| s.try_send(message.clone()))
-        {
-            return result.map_err(map_try_send_err);
-        }
+        // Fast path: this shard owns a connection to the replica. On no-slot
+        // the registry returns the message unchanged so the slow path can
+        // forward it via the inter-shard channel without a wasted clone.
+        let message = match self.replicas.try_send_or_return(replica, message) {
+            Ok(send_result) => return send_result.map_err(map_try_send_err),
+            Err(message) => message,
+        };
         // Slow path: route via the inter-shard channel to the owning shard.
         let owning_shard = self
             .shard_mapping
@@ -628,7 +904,83 @@ mod tests {
         let h2 = compio::runtime::spawn(async {});
         bus.track_background(h1);
         bus.track_background(h2);
-        assert_eq!(bus.background_tasks.borrow().len(), 2);
+        assert_eq!(bus.background_tasks_len(), 2);
+    }
+
+    /// Reap invariant: `track_background` drops finished handles before
+    /// pushing the new one, so an accept-loop that fires N times over
+    /// the bus's lifetime does NOT accumulate N retained handles. This
+    /// pins the leak fix in `installer::install_client_ws_fd` (one
+    /// upgrade task per WS connect) without needing an end-to-end WS
+    /// roundtrip.
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn track_background_reaps_finished_handles_on_push() {
+        let bus = IggyMessageBus::new(0);
+
+        for _ in 0..32 {
+            let h = compio::runtime::spawn(async {});
+            // Drive the runtime so the spawned task can complete before
+            // we register the next one.
+            compio::runtime::time::sleep(std::time::Duration::from_millis(1)).await;
+            bus.track_background(h);
+        }
+
+        // The most recently pushed handle is the only one that may not
+        // yet be finished; everything before it had a chance to complete
+        // and the reap on each push should have dropped them.
+        let remaining = bus.background_tasks_len();
+        assert!(
+            remaining <= 1,
+            "track_background did not reap finished handles; retained {remaining} of 32 spawns",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "MessageBusConfig::max_batch must be in")]
+    fn max_batch_oversize_rejected() {
+        let cfg = MessageBusConfig {
+            max_batch: 4096,
+            ..MessageBusConfig::default()
+        };
+        let _ = IggyMessageBus::with_tunables(0, cfg);
+    }
+
+    #[test]
+    #[should_panic(expected = "MessageBusConfig::max_batch must be in")]
+    fn max_batch_zero_rejected() {
+        let cfg = MessageBusConfig {
+            max_batch: 0,
+            ..MessageBusConfig::default()
+        };
+        let _ = IggyMessageBus::with_tunables(0, cfg);
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn notify_connection_lost_handles_reentrant_install() {
+        // Closure swaps itself out via `set_connection_lost_fn`, which
+        // calls `borrow_mut`. The pre-fix code held a `Ref` across the
+        // closure invocation and panicked here.
+        let bus = std::rc::Rc::new(IggyMessageBus::new(0));
+        let bus_for_closure = bus.clone();
+        let counter: std::rc::Rc<std::cell::Cell<u8>> = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter_inner = counter.clone();
+        let cb: ConnectionLostFn = std::rc::Rc::new(move |_replica: u8| {
+            counter_inner.set(counter_inner.get() + 1);
+            // Reentrant install: replace the closure mid-invoke.
+            let counter_replacement = counter_inner.clone();
+            bus_for_closure.set_connection_lost_fn(std::rc::Rc::new(move |_| {
+                counter_replacement.set(counter_replacement.get() + 10);
+            }));
+        });
+        bus.set_connection_lost_fn(cb);
+
+        bus.notify_connection_lost(1); // first closure runs (+1) and swaps
+        assert_eq!(counter.get(), 1);
+
+        bus.notify_connection_lost(1); // second closure runs (+10)
+        assert_eq!(counter.get(), 11);
     }
 
     #[compio::test]

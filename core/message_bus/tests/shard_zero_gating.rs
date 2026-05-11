@@ -15,18 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `replica_io::start_on_shard_zero` only wires TCP I/O when the bus runs
+//! `replica::io::start_on_shard_zero` only wires TCP I/O when the bus runs
 //! on shard 0. Non-zero shards keep a working bus instance but never bind
 //! a listener, never dial peers, and never register background tasks.
 
 mod common;
 
-use common::{install_clients_locally, install_replicas_locally, loopback};
-use message_bus::IggyMessageBus;
+use common::{
+    install_clients_locally, install_quic_clients_locally, install_replicas_locally,
+    install_tls_clients_locally, install_ws_clients_locally, install_wss_clients_locally, loopback,
+};
+use iggy_common::IggyError;
 use message_bus::client_listener::RequestHandler;
 use message_bus::connector::DEFAULT_RECONNECT_PERIOD;
-use message_bus::replica_io::start_on_shard_zero;
-use message_bus::replica_listener::{MessageHandler, bind, run};
+use message_bus::replica::io::{QuicServerCredentials, start_on_shard_zero};
+use message_bus::replica::listener::{MessageHandler, bind, run};
+use message_bus::transports::tls::self_signed_for_loopback;
+use message_bus::{IggyMessageBus, TlsServerCredentials};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
@@ -51,6 +57,7 @@ async fn shard_zero_binds_listener_and_starts_connector() {
             2,
             peer_accept,
             message_bus::framing::MAX_MESSAGE_SIZE,
+            Duration::from_secs(10),
         )
         .await;
     });
@@ -69,12 +76,23 @@ async fn shard_zero_binds_listener_and_starts_connector() {
         &bus_zero,
         loopback(),
         loopback(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
         CLUSTER,
         0,
         2,
         vec![(1u8, peer_addr)],
         accepted_replica,
         accepted_client,
+        None,
+        None,
+        None,
+        None,
         DEFAULT_RECONNECT_PERIOD,
     )
     .await
@@ -120,12 +138,23 @@ async fn non_zero_shard_skips_io() {
         &bus_one,
         loopback(),
         loopback(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
         CLUSTER,
         1,
         2,
         vec![(0u8, dead_peer)],
         accepted_replica,
         accepted_client,
+        None,
+        None,
+        None,
+        None,
         DEFAULT_RECONNECT_PERIOD,
     )
     .await
@@ -149,4 +178,183 @@ async fn non_zero_shard_skips_io() {
         drained.background_force, 0,
         "helper must not register any background tasks on non-zero shards"
     );
+}
+
+fn self_signed() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("rcgen");
+    let cert_der = CertificateDer::from(cert.cert);
+    let key_der: PrivateKeyDer<'static> =
+        PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into();
+    (cert_der, key_der)
+}
+
+#[compio::test]
+async fn shard_zero_binds_all_six_planes_when_configured() {
+    // Idempotent across same-process retries.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let bus_zero = Rc::new(IggyMessageBus::new(0));
+    let on_message: MessageHandler = Rc::new(|_, _| {});
+    let on_request: RequestHandler = Rc::new(|_, _| {});
+    let accepted_replica = install_replicas_locally(bus_zero.clone(), on_message.clone());
+    let accepted_client = install_clients_locally(bus_zero.clone(), on_request.clone());
+    let accepted_ws = install_ws_clients_locally(bus_zero.clone(), on_request.clone());
+    let accepted_quic = install_quic_clients_locally(bus_zero.clone(), on_request.clone());
+    let accepted_tls = install_tls_clients_locally(bus_zero.clone(), on_request.clone());
+    let accepted_wss = install_wss_clients_locally(bus_zero.clone(), on_request);
+
+    let (cert, key) = self_signed();
+    let quic_creds = QuicServerCredentials {
+        cert_chain: vec![cert],
+        key_der: key,
+    };
+    let tls_creds = self_signed_for_loopback();
+    let wss_creds = self_signed_for_loopback();
+
+    let bound = start_on_shard_zero(
+        &bus_zero,
+        loopback(),
+        loopback(),
+        Some(loopback()),
+        Some(loopback()),
+        Some(quic_creds),
+        Some(loopback()),
+        Some(tls_creds),
+        Some(loopback()),
+        Some(wss_creds),
+        CLUSTER,
+        0,
+        1,
+        vec![],
+        accepted_replica,
+        accepted_client,
+        Some(accepted_ws),
+        Some(accepted_quic),
+        Some(accepted_tls),
+        Some(accepted_wss),
+        DEFAULT_RECONNECT_PERIOD,
+    )
+    .await
+    .expect("start_on_shard_zero must succeed");
+
+    let bound = bound.expect("shard 0 must return bound listeners");
+    assert_ne!(bound.replica.port(), 0, "replica must bind a port");
+    assert_ne!(bound.client.port(), 0, "client must bind a port");
+    let ws = bound.ws.expect("ws plane must be bound");
+    let quic = bound.quic.expect("quic plane must be bound");
+    let tcp_tls = bound.tcp_tls.expect("tcp_tls plane must be bound");
+    let wss = bound.wss.expect("wss plane must be bound");
+    assert_ne!(ws.port(), 0, "ws must bind a port");
+    assert_ne!(quic.port(), 0, "quic must bind a port");
+    assert_ne!(tcp_tls.port(), 0, "tcp_tls must bind a port");
+    assert_ne!(wss.port(), 0, "wss must bind a port");
+
+    // Ports must be pairwise distinct on the TCP-family slots.
+    let tcp_ports = [
+        bound.replica.port(),
+        bound.client.port(),
+        ws.port(),
+        tcp_tls.port(),
+        wss.port(),
+    ];
+    for i in 0..tcp_ports.len() {
+        for j in (i + 1)..tcp_ports.len() {
+            assert_ne!(
+                tcp_ports[i], tcp_ports[j],
+                "TCP-family listeners must use distinct ports",
+            );
+        }
+    }
+
+    bus_zero.shutdown(Duration::from_secs(2)).await;
+}
+
+#[compio::test]
+async fn tcp_tls_listen_addr_without_credentials_rejected() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let bus_zero = Rc::new(IggyMessageBus::new(0));
+    let on_message: MessageHandler = Rc::new(|_, _| {});
+    let on_request: RequestHandler = Rc::new(|_, _| {});
+    let accepted_replica = install_replicas_locally(bus_zero.clone(), on_message);
+    let accepted_client = install_clients_locally(bus_zero.clone(), on_request.clone());
+    let accepted_tls = install_tls_clients_locally(bus_zero.clone(), on_request);
+
+    let err = start_on_shard_zero(
+        &bus_zero,
+        loopback(),
+        loopback(),
+        None,
+        None,
+        None,
+        Some(loopback()),
+        None,
+        None,
+        None,
+        CLUSTER,
+        0,
+        1,
+        vec![],
+        accepted_replica,
+        accepted_client,
+        None,
+        None,
+        Some(accepted_tls),
+        None,
+        DEFAULT_RECONNECT_PERIOD,
+    )
+    .await
+    .expect_err("partial TCP-TLS trio must reject");
+    assert!(matches!(err, IggyError::InvalidConfiguration));
+
+    bus_zero.shutdown(Duration::from_secs(2)).await;
+}
+
+#[compio::test]
+async fn wss_listen_addr_without_credentials_rejected() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let bus_zero = Rc::new(IggyMessageBus::new(0));
+    let on_message: MessageHandler = Rc::new(|_, _| {});
+    let on_request: RequestHandler = Rc::new(|_, _| {});
+    let accepted_replica = install_replicas_locally(bus_zero.clone(), on_message);
+    let accepted_client = install_clients_locally(bus_zero.clone(), on_request.clone());
+    let accepted_wss = install_wss_clients_locally(bus_zero.clone(), on_request);
+
+    let err = start_on_shard_zero(
+        &bus_zero,
+        loopback(),
+        loopback(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(loopback()),
+        None,
+        CLUSTER,
+        0,
+        1,
+        vec![],
+        accepted_replica,
+        accepted_client,
+        None,
+        None,
+        None,
+        Some(accepted_wss),
+        DEFAULT_RECONNECT_PERIOD,
+    )
+    .await
+    .expect_err("partial WSS trio must reject");
+    assert!(matches!(err, IggyError::InvalidConfiguration));
+
+    bus_zero.shutdown(Duration::from_secs(2)).await;
+}
+
+/// Smoke test for `TlsServerCredentials` re-export at the crate root —
+/// keeps a real callee for the type alias so it doesn't decay into a
+/// dead re-export.
+#[allow(dead_code)]
+fn _credentials_type_is_reexported() -> TlsServerCredentials {
+    self_signed_for_loopback()
 }

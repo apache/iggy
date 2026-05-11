@@ -33,6 +33,7 @@ use thiserror::Error;
 /// - `*ForwardFailed` — the forward fn rejected the frame (inter-shard
 ///   queue full, shutdown, etc.).
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SendError {
     #[error("client {0} not found in local registry")]
     ClientNotFound(u128),

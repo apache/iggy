@@ -15,6 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Apache Iggy (Incubating) is an effort undergoing incubation at the Apache
+# Software Foundation (ASF), sponsored by the Apache Incubator PMC.
+#
+# Incubation is required of all newly accepted projects until a further review
+# indicates that the infrastructure, communications, and decision making
+# process have stabilized in a manner consistent with other successful ASF
+# projects.
+#
+# While incubation status is not necessarily a reflection of the completeness
+# or stability of the code, it does indicate that the project has yet to be
+# fully endorsed by the ASF.
+
 ARG RUST_VERSION=1.95
 ARG ALPINE_VERSION=3.22
 
@@ -33,7 +45,7 @@ ARG LIBC=glibc
 ARG IGGY_CI_BUILD
 ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
-RUN apk add --no-cache zig make autoconf automake libtool pkgconfig hwloc-dev xz-dev xz-static && \
+RUN apk add --no-cache bash curl tar zig make autoconf automake libtool pkgconfig hwloc-dev xz-dev xz-static && \
     cargo install cargo-zigbuild --locked && \
     rustup target add \
     x86_64-unknown-linux-musl \
@@ -91,11 +103,25 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
     fi
 
 #
+# Generate third-party license manifest. Required by ASF release policy:
+# convenience binaries that statically link third-party code MUST include
+# the full license text of every bundled crate inside the artifact.
+#
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM}-${LIBC} \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-${TARGETPLATFORM}-${LIBC} \
+    TARGET="$(uname -m)-unknown-linux-musl" && \
+    curl -sSfL "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz" \
+      | tar -xz -C /usr/local/bin --strip-components=1 "cargo-about-0.9.0-${TARGET}/cargo-about" && \
+    ./scripts/ci/third-party-licenses.sh --generate --manifest core/connectors/runtime/Cargo.toml --output /app/LICENSE-binary
+
+#
 # Final runtime - Debian trixie Slim
 #
 FROM debian:trixie-slim AS runtime
 WORKDIR /app
 
 COPY --from=builder /app/iggy-connectors /usr/local/bin/iggy-connectors
+COPY --from=builder /app/LICENSE-binary /usr/share/doc/iggy-connect/LICENSE-binary
+COPY LICENSE NOTICE /usr/share/doc/iggy-connect/
 
 ENTRYPOINT ["iggy-connectors"]

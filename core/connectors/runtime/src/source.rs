@@ -24,8 +24,9 @@ use iggy::prelude::{
     DirectConfig, HeaderKey, HeaderValue, IggyClient, IggyDuration, IggyError, IggyMessage,
     IggyProducer,
 };
+use iggy_connector_sdk::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
 use iggy_connector_sdk::{
-    ConnectorState, DecodedMessage, Error, ProducedMessages, StreamEncoder, TopicMetadata,
+    ConnectorState, DecodedMessage, Error, ProducedMessages, Schema, StreamEncoder, TopicMetadata,
     source::HandleCallback, transforms::Transform,
 };
 use once_cell::sync::Lazy;
@@ -259,7 +260,23 @@ pub(crate) async fn setup_source_producer(
             )
             .build();
         producer.init().await?;
-        last_encoder = Some(stream.schema.encoder());
+        let encoder: Arc<dyn StreamEncoder> = match stream.schema {
+            Schema::Avro => {
+                let config = AvroEncoderConfig {
+                    schema_json: stream.avro_schema_json.clone(),
+                    schema_path: stream.avro_schema_path.clone(),
+                    ..AvroEncoderConfig::default()
+                };
+                Arc::new(AvroStreamEncoder::try_new(config).map_err(|error| {
+                    RuntimeError::InvalidConfiguration(format!(
+                        "Failed to create Avro encoder for stream '{}': {error}",
+                        stream.stream
+                    ))
+                })?)
+            }
+            other => other.encoder(),
+        };
+        last_encoder = Some(encoder);
         last_producer = Some(producer);
     }
 

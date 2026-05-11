@@ -19,17 +19,17 @@
 
 use super::COMPONENT_NG;
 use super::message_bus::MessageBusConfig;
+use super::quic::QuicConfig;
+use super::tcp::TcpConfig;
+use super::websocket::WebSocketConfig;
 use crate::ConfigurationError;
 use crate::server_config::cluster::ClusterConfig;
 use crate::server_config::http::HttpConfig;
-use crate::server_config::quic::QuicConfig;
 use crate::server_config::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig,
     PersonalAccessTokenConfig, TelemetryConfig,
 };
 use crate::server_config::system::SystemConfig;
-use crate::server_config::tcp::TcpConfig;
-use crate::server_config::websocket::WebSocketConfig;
 use configs::{ConfigEnv, ConfigEnvMappings, ConfigProvider, FileConfigProvider, TypedEnvProvider};
 use err_trail::ErrContext;
 use figment::providers::{Format, Toml};
@@ -173,9 +173,6 @@ mod tests {
         // Spot-check: defaults match the runtime crate's invariants.
         assert_eq!(cfg.message_bus.max_batch, 256);
         assert_eq!(cfg.message_bus.peer_queue_capacity, 256);
-        assert_eq!(cfg.message_bus.keepalive_retries, 3);
-        assert!(cfg.message_bus.tcp_tls_listen_addr.is_none());
-        assert!(cfg.message_bus.wss_listen_addr.is_none());
     }
 
     #[test]
