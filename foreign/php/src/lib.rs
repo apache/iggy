@@ -1,0 +1,60 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+pub mod async_client;
+pub mod async_consumer;
+pub mod client;
+pub mod consumer;
+pub mod identifier;
+pub mod iterator;
+pub mod receive_message;
+pub mod send_message;
+pub mod stream;
+pub mod topic;
+
+use ext_php_rs::prelude::*;
+
+use crate::async_client::IggyAsyncClient;
+use crate::async_consumer::{IggyAsyncConsumer, IggyAsyncReceiveMessageIterator};
+use crate::client::IggyClient;
+use crate::consumer::{AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer};
+use crate::iterator::ReceiveMessageIterator;
+use crate::receive_message::{PollingStrategy, ReceiveMessage};
+use crate::send_message::SendMessage;
+use crate::stream::StreamDetails;
+use crate::topic::TopicDetails;
+
+#[php_module]
+pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
+    module
+        .request_shutdown_function(crate::async_client::request_shutdown)
+        .class::<IggyClient>()
+        .class::<IggyAsyncClient>()
+        .class::<IggyAsyncConsumer>()
+        .class::<IggyAsyncReceiveMessageIterator>()
+        .class::<IggyConsumer>()
+        .class::<AutoCommit>()
+        .class::<AutoCommitWhen>()
+        .class::<AutoCommitAfter>()
+        .class::<ReceiveMessageIterator>()
+        .class::<PollingStrategy>()
+        .class::<ReceiveMessage>()
+        .class::<SendMessage>()
+        .class::<StreamDetails>()
+        .class::<TopicDetails>()
+}

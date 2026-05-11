@@ -78,6 +78,19 @@ jobs:
     secrets:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
+  # PHP SDK
+  test-php:
+    name: PHP • ${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.php_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.php_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
   # Node SDK
   test-node:
     name: Node • ${{ matrix.task }}
@@ -194,7 +207,7 @@ jobs:
   status:
     name: CI Status
     runs-on: ubuntu-latest
-    needs: [common, detect, test-rust, test-python, test-node, test-go, test-java, test-csharp, test-cpp, test-bdd, test-examples, test-other]
+    needs: [common, detect, test-rust, test-python, test-php, test-node, test-go, test-java, test-csharp, test-cpp, test-bdd, test-examples, test-other]
     if: always()
     steps:
       - name: Get job execution times

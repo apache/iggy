@@ -1,0 +1,13 @@
+{
+    "name": "apache/iggy-php",
+    "description": "PHP extension bindings for Apache Iggy.",
+    "license": "Apache-2.0",
+    "type": "library",
+    "require-dev": {
+        "amphp/amp": "^3.0",
+        "revolt/event-loop": "^1.0"
+    },
+    "scripts": {
+        "test": "php tests/run.php"
+    }
+}

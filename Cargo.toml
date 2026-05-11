@@ -61,7 +61,7 @@ members = [
     "core/tools",
     "examples/rust",
 ]
-exclude = ["foreign/cpp", "foreign/python"]
+exclude = ["foreign/cpp", "foreign/php", "foreign/python"]
 resolver = "2"
 
 [workspace.dependencies]
