@@ -254,11 +254,15 @@ async fn given_replayed_label_should_dedupe(harness: &TestHarness, fixture: Dori
     assert_eq!(row_before, message_count as i64);
 
     // Replay the same offsets => same label => Doris dedupes server-side.
-    let label = format!(
-        "iggy_test-{}-{}-0-0-{}",
-        sanitize(seeds::names::STREAM),
-        sanitize(seeds::names::TOPIC),
-        message_count - 1,
+    // Reuse the connector's own `build_label` so the test cannot drift from
+    // the production label format.
+    let label = iggy_connector_doris_sink::build_label(
+        "iggy_test",
+        seeds::names::STREAM,
+        seeds::names::TOPIC,
+        0,
+        0,
+        (message_count - 1) as u64,
     );
 
     let body = serde_json::to_vec(&test_messages).expect("serialize replay body");
@@ -484,15 +488,3 @@ async fn given_columns_config_should_apply_derived_expression(
     );
 }
 
-fn sanitize(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}

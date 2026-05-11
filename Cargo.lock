@@ -6602,7 +6602,9 @@ name = "iggy_connector_doris_sink"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64",
+ "blake3",
+ "bytes",
  "iggy_connector_sdk",
  "reqwest 0.13.3",
  "secrecy",
@@ -7080,6 +7082,7 @@ dependencies = [
  "iggy-cli",
  "iggy_binary_protocol",
  "iggy_common",
+ "iggy_connector_doris_sink",
  "iggy_connector_sdk",
  "jsonwebtoken",
  "keyring",

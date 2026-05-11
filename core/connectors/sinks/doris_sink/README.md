@@ -11,14 +11,14 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 ## How it works
 
 1. For each batch of messages, the connector serializes the JSON payloads into a JSON array.
-2. It computes a deterministic Stream Load `label` of the form `{label_prefix}-{stream}-{topic}-{partition}-{first_offset}-{last_offset}`. Doris dedupes loads by label inside its `label_keep_max_second` window, so a replayed batch (after restart, retry, etc.) is silently absorbed instead of producing duplicates.
-3. It `PUT`s the batch to `{fe_url}/api/{database}/{table}/_stream_load` with HTTP Basic auth and the headers `format: json`, `strip_outer_array: true`, `label: <label>`.
+2. It computes a deterministic Stream Load `label` of the form `{label_prefix}-{stream}_{hash8}-{topic}_{hash8}-{partition}-{first_offset}-{last_offset}`. Each variable-length segment carries a 32-bit blake3 hash of the raw name so that names which sanitize to the same string (e.g. `events.v1` vs `events_v1`) cannot collide. The total label is bounded under Doris's 128-char cap regardless of input length. Doris dedupes loads by label inside its `label_keep_max_second` window, so a replayed batch (after restart, retry, etc.) is silently absorbed instead of producing duplicates.
+3. It `PUT`s the batch to `{fe_url}/api/{database}/{table}/_stream_load` with HTTP Basic auth and the headers `Expect: 100-continue`, `format: json`, `strip_outer_array: true`, `label: <label>`. (`Expect: 100-continue` lets Doris reject auth/4xx failures before the connector uploads the whole body — important for large batches and required if a reverse proxy sits in front of Doris.)
 4. The Doris frontend (FE) responds with a `307 Temporary Redirect` to a backend (BE). The connector follows the redirect manually so that the `Authorization` header is preserved across the hop (`reqwest`'s default policy strips it on cross-host redirects).
 5. The HTTP body is parsed as JSON and the `Status` field decides the outcome:
    - `Success` → batch accepted.
    - `Label Already Exists` → idempotent replay, treated as success.
-   - `Publish Timeout` or HTTP `5xx` → transient error (`Error::CannotStoreData`); the runtime can retry.
-   - `Fail` or HTTP `4xx` → permanent error (`Error::PermanentHttpError`); retrying is not useful.
+   - `Publish Timeout` or HTTP `5xx`/`408`/`429` → transient error (`Error::CannotStoreData`); the runtime can retry.
+   - `Fail`, any other `4xx`, or an unparseable response body → permanent error (`Error::PermanentHttpError`); retrying is not useful.
 
 ## Configuration
 
@@ -65,6 +65,17 @@ label_prefix = "iggy"
 batch_size = 1000
 timeout_secs = 30
 ```
+
+## Security notes
+
+- **Use `https://` in production.** The connector accepts `http://` URLs and logs a `warn!` when `fe_url` points at a non-loopback host over plain HTTP, but it does not refuse. Over `http://`, the HTTP Basic credentials travel in cleartext.
+- **Trust boundary on the FE.** The connector intentionally preserves the `Authorization` header across the FE → BE 307 redirect (reqwest would otherwise strip it on cross-host redirects). A compromised or MITM'd FE could exfiltrate credentials by responding with `Location: http://attacker/`. The `http://` warning above is the primary mitigation; deploy Doris over TLS in hostile networks.
+- **`columns` and `where` are SQL-expression pass-throughs.** Whatever you put in those config fields is forwarded verbatim to Doris's Stream Load and evaluated as a SQL expression. Keep this config trusted.
+
+## Operational guidance
+
+- **`label_keep_max_second`.** Idempotent replay relies on Doris retaining each label for at least as long as it could take the Iggy runtime to redrive a failed batch. The Doris default is 3 days, which is conservative. If you set this lower on the Doris side, make sure your runtime retry budget fits inside the window — once a label expires, a replay re-loads instead of deduping, producing duplicate rows.
+- **Filtered-row alerts.** When Doris reports `number_filtered_rows > 0`, the connector emits a `warn!`. This is your signal that upstream message shapes have drifted from the table schema; alert on it.
 
 ## Limitations (v1)
 
