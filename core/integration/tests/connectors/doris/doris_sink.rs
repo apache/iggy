@@ -487,4 +487,3 @@ async fn given_columns_config_should_apply_derived_expression(
         "expected calculated = count + 1 per row (delta sum = {message_count}), got {delta}"
     );
 }
-

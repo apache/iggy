@@ -320,7 +320,7 @@ fn truncate_for_log(s: &str, max_bytes: usize) -> String {
 }
 
 fn parse_stream_load_response(body: &str) -> Result<StreamLoadResponse, Error> {
-    // An unparseable 200-OK body is almost always a Doris bug, a proxy that
+    // An unparsable 200-OK body is almost always a Doris bug, a proxy that
     // injected HTML, or a future schema change — none of those are cured by
     // retrying the same bytes. Default to permanent so the runtime DLQs the
     // batch instead of looping forever.
@@ -755,7 +755,7 @@ mod tests {
 
     #[test]
     fn parse_stream_load_response_rejects_garbage_as_permanent() {
-        // An unparseable body must surface as PermanentHttpError so the
+        // An unparsable body must surface as PermanentHttpError so the
         // runtime DLQs the batch instead of retrying the same garbage forever.
         let body = "not json";
         assert!(matches!(

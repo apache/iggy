@@ -12,14 +12,17 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 ## How it works
 
 1. For each batch of messages, the connector serializes the JSON payloads into a JSON array.
-2. It computes a deterministic Stream Load `label` of the form `{label_prefix}-{stream}_{hash8}-{topic}_{hash8}-{partition}-{first_offset}-{last_offset}`. Each variable-length segment carries a 32-bit blake3 hash of the raw name so that names which sanitize to the same string (e.g. `events.v1` vs `events_v1`) cannot collide. The total label is bounded under Doris's 128-char cap regardless of input length. Doris dedupes loads by label inside its `label_keep_max_second` window, so a replayed batch (after restart, retry, etc.) is silently absorbed instead of producing duplicates.
+2. It computes a deterministic Stream Load `label` of the form `{label_prefix}-{stream}_{hash8}-{topic}_{hash8}-{partition}-{first_offset}-{last_offset}`.
+   - Each variable-length segment carries a 32-bit blake3 hash of the raw name, so names that sanitize to the same string (e.g. `events.v1` vs `events_v1`) cannot collide.
+   - The total label is bounded under Doris's 128-char cap regardless of input length.
+   - Doris dedupes loads by label inside its `label_keep_max_second` window, so a replayed batch (after restart, retry, etc.) is silently absorbed instead of producing duplicates.
 3. It `PUT`s the batch to `{fe_url}/api/{database}/{table}/_stream_load` with HTTP Basic auth and the headers `Expect: 100-continue`, `format: json`, `strip_outer_array: true`, `label: <label>`. (`Expect: 100-continue` lets Doris reject auth/4xx failures before the connector uploads the whole body — important for large batches and required if a reverse proxy sits in front of Doris.)
 4. The Doris frontend (FE) responds with a `307 Temporary Redirect` to a backend (BE). The connector follows the redirect manually so that the `Authorization` header is preserved across the hop (`reqwest`'s default policy strips it on cross-host redirects). `308 Permanent Redirect` is also followed as a defensive measure; redirects beyond a hard cap of 5 are rejected as `HttpRequestFailed`.
 5. The HTTP body is parsed as JSON and the `Status` field decides the outcome:
    - `Success` → batch accepted.
    - `Label Already Exists` → idempotent replay, treated as success.
    - `Publish Timeout` or HTTP `5xx`/`408`/`429` → transient error (`Error::CannotStoreData`); the runtime can retry.
-   - `Fail`, any other `4xx`, or an unparseable response body → permanent error (`Error::PermanentHttpError`); retrying is not useful.
+   - `Fail`, any other `4xx`, or an unparsable response body → permanent error (`Error::PermanentHttpError`); retrying is not useful.
 
 ## Configuration
 

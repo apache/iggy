@@ -47,10 +47,10 @@ iggy = { workspace = true }
 iggy-cli = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
-iggy_connector_sdk = { workspace = true, features = ["api"] }
 # Path-dep only so the Doris integration test can reuse the connector's pure
 # `build_label` function — keeping the test and production label format in lock-step.
 iggy_connector_doris_sink = { path = "../connectors/sinks/doris_sink" }
+iggy_connector_sdk = { workspace = true, features = ["api"] }
 jsonwebtoken = { workspace = true }
 keyring = { workspace = true }
 lazy_static = { workspace = true }
