@@ -21,10 +21,9 @@ use iggy::prelude::{
     ConsumerGroupClient, Identifier as RustIdentifier, IggyClient as RustIggyClient,
     IggyClientBuilder as RustIggyClientBuilder, IggyError, IggyExpiry as RustIggyExpiry,
     IggyMessage, IggyTimestamp, MaxTopicSize as RustMaxTopicSize, MessageClient, PartitionClient,
-    Partitioning, PollingStrategy, StreamClient, TopicClient, UserClient,
-    MaxTopicSize as RustMaxTopicSize, PartitionClient,
-    SnapshotCompression as RustSnapshotCompression, StreamClient, SystemClient as RustSystemClient,
-    SystemSnapshotType as RustSystemSnapshotType, TopicClient, UserClient,
+    Partitioning, PollingStrategy, SnapshotCompression as RustSnapshotCompression, StreamClient,
+    SystemClient as RustSystemClient, SystemSnapshotType as RustSystemSnapshotType, TopicClient,
+    UserClient,
 };
 use iggy_common::{
     CacheMetrics as RustCacheMetrics, CacheMetricsKey as RustCacheMetricsKey,
@@ -658,6 +657,10 @@ impl Client {
                         rust_group_id, rust_topic_id, rust_stream_id
                     )
                 })?;
+            Ok(())
+        })
+    }
+
     pub fn get_stats(&self) -> Result<ffi::Stats, String> {
         RUNTIME.block_on(async {
             let stats = self
@@ -740,6 +743,9 @@ impl Client {
                     )
                 })?;
             Ok(())
+        })
+    }
+
     pub fn heartbeat_interval(&self) -> u64 {
         // The upstream client exposes this config-derived value via an async API,
         // so the synchronous C++ wrapper reads it by blocking on the runtime.

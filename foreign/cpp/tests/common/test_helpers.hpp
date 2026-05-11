@@ -59,10 +59,12 @@ inline rust::Vec<std::uint8_t> partition_id_bytes(std::uint32_t id) {
     v.push_back(static_cast<std::uint8_t>((id >> 16) & 0xFF));
     v.push_back(static_cast<std::uint8_t>((id >> 24) & 0xFF));
     return v;
-    inline rust::Vec<rust::String> make_snapshot_types(std::initializer_list<const char *> values) {
-        rust::Vec<rust::String> snapshot_types;
-        for (const auto value : values) {
-            snapshot_types.push_back(value);
-        }
-        return snapshot_types;
+}
+
+inline rust::Vec<rust::String> make_snapshot_types(std::initializer_list<const char *> values) {
+    rust::Vec<rust::String> snapshot_types;
+    for (const auto value : values) {
+        snapshot_types.push_back(value);
     }
+    return snapshot_types;
+}
