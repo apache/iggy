@@ -77,7 +77,7 @@ argon2 = "0.5.3"
 arrow = "57.3.0"
 arrow-array = "57.3.0"
 arrow-json = "57.3.0"
-assert_cmd = "2.2.1"
+assert_cmd = "2.2.2"
 async-broadcast = "0.7.2"
 async-channel = "2.5.0"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
@@ -100,7 +100,7 @@ bytes = "1.11.1"
 charming = "0.6.0"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive", "wrap_help"] }
-clap_complete = "4.6.3"
+clap_complete = "4.6.5"
 clock = { path = "core/clock" }
 colored = "3.1.1"
 comfy-table = { version = "7.2.2", default-features = false }
@@ -129,7 +129,7 @@ console-subscriber = "0.5.0"
 crossbeam = "0.8.4"
 crossfire = "3.1.10"
 csv = "1.4.0"
-ctor = "1.0.4"
+ctor = "1.0.5"
 ctrlc = { version = "3.5", features = ["termination"] }
 cucumber = "0.23"
 cyper = { version = "0.8.3", features = ["rustls"], default-features = false }
@@ -152,7 +152,7 @@ err_trail = { version = "0.11.0", features = ["tracing"] }
 error_set = "0.9.1"
 figlet-rs = "1.0.0"
 figment = { version = "0.10.19", features = ["toml", "env"] }
-file-operation = "0.8.19"
+file-operation = "0.8.20"
 flatbuffers = "25.12.19"
 flume = "0.12.0"
 fs2 = "0.4.3"
@@ -180,14 +180,14 @@ iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.3.0" }
 integration = { path = "core/integration" }
 journal = { path = "core/journal" }
 js-sys = "0.3"
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "vendored"] }
 lazy_static = "1.5.0"
 left-right = "0.11"
 lending-iterator = "0.1.7"
 libc = "0.2.186"
 log = "0.4.29"
-lz4_flex = "0.13.0"
+lz4_flex = "0.13.1"
 message_bus = { path = "core/message_bus" }
 metadata = { path = "core/metadata" }
 mimalloc = "0.1"
@@ -195,7 +195,7 @@ mime_guess = "2.0"
 mockall = "0.14.0"
 moka = { version = "0.12.15", features = ["future"] }
 mongodb = { version = "3.6.0", features = ["rustls-tls"] }
-nix = { version = "0.31.2", features = ["feature", "fs", "resource", "sched"] }
+nix = { version = "0.31.3", features = ["feature", "fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 notify = "8.2.0"
 octocrab = "0.50.0"
@@ -236,7 +236,7 @@ quote = "1"
 rand = "0.10.1"
 rand_xoshiro = "0.8.0"
 rayon = "1.12.0"
-rcgen = "0.14.7"
+rcgen = "0.14.8"
 regex = "1.12.3"
 reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls"] }
 reqwest-middleware = { version = "0.5.1", features = ["json", "query"] }
@@ -256,7 +256,7 @@ secrecy = { version = "0.10", features = ["serde"] }
 send_wrapper = "0.6.0"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.149"
-serde_with = { version = "3.19.0", features = ["base64", "macros"] }
+serde_with = { version = "3.20.0", features = ["base64", "macros"] }
 serde_yaml_ng = "0.10.0"
 serial_test = "3.4.0"
 server = { path = "core/server" }
@@ -276,7 +276,7 @@ static-toml = "1.3.0"
 strum = { version = "0.28.0", features = ["derive"] }
 strum_macros = "0.28.0"
 syn = { version = "2", features = ["full", "extra-traits"] }
-sysinfo = "0.39.0"
+sysinfo = "0.39.1"
 tempfile = "3.27.0"
 terminal_size = { version = "0.4.4" }
 test-case = "3.3.1"
