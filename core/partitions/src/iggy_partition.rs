@@ -31,13 +31,13 @@ use crate::{
 use consensus::{
     CommitLogEvent, Consensus, PartitionDiagEvent, Pipeline, PipelineEntry, PlaneKind, Project,
     ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
-    ack_quorum_reached, build_reply_message, drain_committable_prefix,
+    ack_quorum_reached, build_reply_from_request, build_reply_message, drain_committable_prefix,
     emit_namespace_progress_event, emit_partition_diag, emit_sim_event,
     fence_old_prepare_by_commit, replicate_preflight, replicate_to_next_in_chain,
     request_preflight, send_prepare_ok as send_prepare_ok_common,
 };
 use iggy_binary_protocol::consensus::iobuf::Frozen;
-use iggy_binary_protocol::{Message, Operation, PrepareHeader};
+use iggy_binary_protocol::{AckLevel, Message, Operation, PrepareHeader};
 use iggy_binary_protocol::{PrepareOkHeader, RequestHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
@@ -81,6 +81,19 @@ where
     consumer_offset_enforce_fsync: bool,
     pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
     observed_view: u32,
+}
+
+/// Post-preflight dispatch in `on_request`: replicate via VSR or take the
+/// `NoAck` leader-local fast path. `RequestHeader` is boxed to avoid the
+/// 277-byte inline variant tripping clippy's `large_enum_variant`.
+enum Disposition {
+    Replicate(Message<PrepareHeader>),
+    NoAck {
+        request_header: Box<RequestHeader>,
+        kind: ConsumerKind,
+        consumer_id: u32,
+        offset: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -362,6 +375,74 @@ where
         Ok(())
     }
 
+    /// `AckLevel::NoAck` fast path: persist, apply, cache + send reply, no
+    /// replication. Single-replica durability.
+    #[allow(clippy::future_not_send)]
+    async fn apply_consumer_offset_no_ack(
+        &self,
+        request_header: Box<RequestHeader>,
+        kind: ConsumerKind,
+        consumer_id: u32,
+        offset: Option<u64>,
+    ) {
+        let pending = offset.map_or_else(
+            || PendingConsumerOffsetCommit::delete(kind, consumer_id),
+            |value| PendingConsumerOffsetCommit::upsert(kind, consumer_id, value),
+        );
+
+        if let Err(error) = self.persist_consumer_offset_commit(pending).await {
+            emit_partition_diag(
+                tracing::Level::WARN,
+                &PartitionDiagEvent::new(self.diag_ctx(), "no_ack offset persist failed")
+                    .with_operation(request_header.operation)
+                    .with_error(error.to_string()),
+            );
+            return;
+        }
+        if let Err(error) = self.apply_consumer_offset_commit(pending) {
+            emit_partition_diag(
+                tracing::Level::WARN,
+                &PartitionDiagEvent::new(self.diag_ctx(), "no_ack offset apply failed")
+                    .with_operation(request_header.operation)
+                    .with_error(error.to_string()),
+            );
+            return;
+        }
+
+        let reply = build_reply_from_request(&self.consensus, &request_header, bytes::Bytes::new());
+        let session = self
+            .consensus
+            .client_table()
+            .borrow()
+            .get_session(request_header.client)
+            .unwrap_or_else(|| {
+                panic!(
+                    "apply_consumer_offset_no_ack: client {} not registered",
+                    request_header.client
+                )
+            });
+        self.consensus.client_table().borrow_mut().commit_reply(
+            request_header.client,
+            session,
+            reply.clone(),
+        );
+
+        let reply_buffers = reply.into_generic().into_frozen();
+        if let Err(error) = self
+            .consensus
+            .message_bus()
+            .send_to_client(request_header.client, reply_buffers)
+            .await
+        {
+            emit_partition_diag(
+                tracing::Level::WARN,
+                &PartitionDiagEvent::new(self.diag_ctx(), "no_ack reply send failed")
+                    .with_operation(request_header.operation)
+                    .with_error(error.to_string()),
+            );
+        }
+    }
+
     fn persisted_offset_path(&self, kind: ConsumerKind, consumer_id: u32) -> Option<String> {
         match kind {
             ConsumerKind::Consumer => self
@@ -607,7 +688,7 @@ where
     /// # Panics
     /// Panics if called when this partition's consensus instance is not the
     /// primary, is not in normal status, or is currently syncing.
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn on_request(&mut self, message: Message<RequestHeader>) {
         self.clear_pending_consumer_offset_commits_if_view_changed();
         let namespace = IggyNamespace::from_raw(message.header().namespace);
@@ -635,7 +716,7 @@ where
             }
         }
 
-        let prepare = {
+        let disposition = {
             let consensus = self.consensus();
             emit_sim_event(
                 SimEventKind::ClientRequestReceived,
@@ -667,25 +748,51 @@ where
                 message
             };
 
-            if message.header().operation == Operation::DeleteConsumerOffset {
-                match Self::parse_consumer_offset_request(message.header().operation, &message)
-                    .and_then(|(kind, consumer_id, _)| {
-                        self.ensure_consumer_offset_exists(kind, consumer_id)
-                    }) {
-                    Ok(()) => {}
-                    Err(error) => {
-                        emit_partition_diag(
-                            tracing::Level::WARN,
-                            &PartitionDiagEvent::new(
-                                ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
-                                "rejecting delete_consumer_offset for missing offset",
-                            )
-                            .with_operation(Operation::DeleteConsumerOffset)
-                            .with_error(error.to_string()),
-                        );
-                        return;
+            // Parse once for both the delete-existence check and AckLevel dispatch.
+            let consumer_offset = match message.header().operation {
+                Operation::StoreConsumerOffset
+                | Operation::StoreConsumerOffset2
+                | Operation::DeleteConsumerOffset
+                | Operation::DeleteConsumerOffset2 => {
+                    match Self::parse_consumer_offset_request(message.header().operation, &message)
+                    {
+                        Ok(parsed) => Some(parsed),
+                        Err(error) => {
+                            emit_partition_diag(
+                                tracing::Level::WARN,
+                                &PartitionDiagEvent::new(
+                                    ReplicaLogContext::from_consensus(
+                                        consensus,
+                                        PlaneKind::Partitions,
+                                    ),
+                                    "failed to parse consumer offset request",
+                                )
+                                .with_operation(message.header().operation)
+                                .with_error(error.to_string()),
+                            );
+                            return;
+                        }
                     }
                 }
+                _ => None,
+            };
+
+            if matches!(
+                message.header().operation,
+                Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2
+            ) && let Some((kind, consumer_id, _, _)) = consumer_offset
+                && let Err(error) = self.ensure_consumer_offset_exists(kind, consumer_id)
+            {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                        "rejecting delete_consumer_offset for missing offset",
+                    )
+                    .with_operation(message.header().operation)
+                    .with_error(error.to_string()),
+                );
+                return;
             }
 
             if request_preflight(consensus, client_id, session, request)
@@ -699,12 +806,39 @@ where
             assert!(consensus.is_normal(), "on_request: status must be normal");
             assert!(!consensus.is_syncing(), "on_request: must not be syncing");
 
-            let prepare = message.project(consensus);
-            consensus.verify_pipeline();
-            consensus.pipeline_message(PlaneKind::Partitions, &prepare);
-            prepare
+            // NoAck v2 -> fast path. Quorum + v1 -> VSR pipeline.
+            if let Some((kind, consumer_id, offset, AckLevel::NoAck)) = consumer_offset
+                && matches!(
+                    message.header().operation,
+                    Operation::StoreConsumerOffset2 | Operation::DeleteConsumerOffset2,
+                )
+            {
+                Disposition::NoAck {
+                    request_header: Box::new(*message.header()),
+                    kind,
+                    consumer_id,
+                    offset,
+                }
+            } else {
+                let prepare = message.project(consensus);
+                consensus.verify_pipeline();
+                consensus.pipeline_message(PlaneKind::Partitions, &prepare);
+                Disposition::Replicate(prepare)
+            }
         };
-        self.on_replicate(prepare).await;
+
+        match disposition {
+            Disposition::Replicate(prepare) => self.on_replicate(prepare).await,
+            Disposition::NoAck {
+                request_header,
+                kind,
+                consumer_id,
+                offset,
+            } => {
+                self.apply_consumer_offset_no_ack(request_header, kind, consumer_id, offset)
+                    .await;
+            }
+        }
     }
 
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -972,8 +1106,12 @@ where
                 );
                 Ok(())
             }
-            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
-                let (kind, consumer_id, offset) =
+            Operation::StoreConsumerOffset
+            | Operation::DeleteConsumerOffset
+            | Operation::StoreConsumerOffset2
+            | Operation::DeleteConsumerOffset2 => {
+                // Replicated path is Quorum-only by construction; ack ignored.
+                let (kind, consumer_id, offset, _ack) =
                     Self::parse_staged_consumer_offset_commit(header.operation, &message)?;
                 let write_lock = self.write_lock.clone();
                 let _guard = write_lock.lock().await;
@@ -995,7 +1133,7 @@ where
                     .map_err(|_| IggyError::CannotAppendMessage)?;
 
                 match header.operation {
-                    Operation::StoreConsumerOffset => {
+                    Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
                         self.stage_consumer_offset_upsert(
                             header.op,
                             kind,
@@ -1003,7 +1141,7 @@ where
                             offset.expect("store_consumer_offset must include offset"),
                         );
                     }
-                    Operation::DeleteConsumerOffset => {
+                    Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
                         self.stage_consumer_offset_delete(header.op, kind, consumer_id)?;
                     }
                     _ => unreachable!(),
@@ -1331,7 +1469,10 @@ where
                 }
                 !*failed_commit
             }
-            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
+            Operation::StoreConsumerOffset
+            | Operation::DeleteConsumerOffset
+            | Operation::StoreConsumerOffset2
+            | Operation::DeleteConsumerOffset2 => {
                 self.commit_consumer_offset_entry(prepare_header, failed_commit)
                     .await
             }
@@ -1372,7 +1513,7 @@ where
     fn parse_consumer_offset_request(
         operation: Operation,
         message: &Message<RequestHeader>,
-    ) -> Result<(ConsumerKind, u32, Option<u64>), IggyError> {
+    ) -> Result<(ConsumerKind, u32, Option<u64>, AckLevel), IggyError> {
         let total_size =
             usize::try_from(message.header().size).map_err(|_| IggyError::InvalidCommand)?;
         let body = message
@@ -1385,7 +1526,7 @@ where
     fn parse_staged_consumer_offset_commit(
         operation: Operation,
         message: &Message<PrepareHeader>,
-    ) -> Result<(ConsumerKind, u32, Option<u64>), IggyError> {
+    ) -> Result<(ConsumerKind, u32, Option<u64>, AckLevel), IggyError> {
         let total_size =
             usize::try_from(message.header().size).map_err(|_| IggyError::InvalidCommand)?;
         let body = message
@@ -1398,7 +1539,7 @@ where
     fn parse_consumer_offset_payload(
         operation: Operation,
         body: &[u8],
-    ) -> Result<(ConsumerKind, u32, Option<u64>), IggyError> {
+    ) -> Result<(ConsumerKind, u32, Option<u64>, AckLevel), IggyError> {
         let consumer_kind = *body.first().ok_or(IggyError::InvalidCommand)?;
         let consumer_id = body
             .get(1..5)
@@ -1409,8 +1550,10 @@ where
                     .map_err(|_| IggyError::InvalidCommand)
             })?;
         let kind = ConsumerKind::from_code(consumer_kind)?;
+        // v1 implicitly Quorum. v2 trailing ack byte validated; unknown
+        // discriminants rejected so malformed wire bytes fail fast.
         match operation {
-            Operation::StoreConsumerOffset => {
+            Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
                 let offset =
                     body.get(5..13)
                         .ok_or(IggyError::InvalidCommand)
@@ -1419,9 +1562,23 @@ where
                                 .map(u64::from_le_bytes)
                                 .map_err(|_| IggyError::InvalidCommand)
                         })?;
-                Ok((kind, consumer_id, Some(offset)))
+                let ack = if matches!(operation, Operation::StoreConsumerOffset2) {
+                    let ack_byte = *body.get(13).ok_or(IggyError::InvalidCommand)?;
+                    AckLevel::from_code(ack_byte).map_err(|_| IggyError::InvalidCommand)?
+                } else {
+                    AckLevel::Quorum
+                };
+                Ok((kind, consumer_id, Some(offset), ack))
             }
-            Operation::DeleteConsumerOffset => Ok((kind, consumer_id, None)),
+            Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
+                let ack = if matches!(operation, Operation::DeleteConsumerOffset2) {
+                    let ack_byte = *body.get(5).ok_or(IggyError::InvalidCommand)?;
+                    AckLevel::from_code(ack_byte).map_err(|_| IggyError::InvalidCommand)?
+                } else {
+                    AckLevel::Quorum
+                };
+                Ok((kind, consumer_id, None, ack))
+            }
             _ => Err(IggyError::InvalidCommand),
         }
     }

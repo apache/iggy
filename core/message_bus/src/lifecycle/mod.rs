@@ -19,7 +19,7 @@
 //!
 //! A root cancellation token and a keyed connection registry. Intentionally
 //! narrow: these are the only two abstractions we need to drive graceful
-//! shutdown for the TCP path (IGGY-99).
+//! shutdown across every transport plane (TCP, TCP-TLS, WS, WSS, QUIC).
 
 pub mod connection_registry;
 pub mod shutdown;
@@ -28,4 +28,4 @@ pub use connection_registry::{
     BusMessage, BusReceiver, BusSender, ConnectionRegistry, DrainOutcome, InstanceToken,
     RejectedRegistration, ReplicaRegistry,
 };
-pub use shutdown::{Shutdown, ShutdownToken};
+pub use shutdown::{FusedShutdown, Shutdown, ShutdownToken};

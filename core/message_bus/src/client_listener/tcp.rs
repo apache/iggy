@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! TCP listener for consensus-protocol SDK clients.
+//! TCP listener for SDK clients.
 //!
 //! Runs only on shard 0. Every accepted connection is handed to an
 //! `on_accepted` callback supplied by the shard bootstrap, which mints a
@@ -26,19 +26,13 @@
 //! The owning shard's router handler wraps the duplicated fd and installs
 //! writer + reader tasks via [`crate::installer`].
 
+use crate::AcceptedClientFn;
 use crate::lifecycle::ShutdownToken;
-use crate::{AcceptedClientFn, GenericHeader, Message};
 use compio::net::{SocketOpts, TcpListener};
 use futures::FutureExt;
 use iggy_common::IggyError;
 use std::net::SocketAddr;
-use std::rc::Rc;
 use tracing::{debug, error, info};
-
-/// Callback preserved for the owning-shard install path in
-/// [`crate::installer`]. Dispatches `(client_id, request_message)` into the
-/// shard's consensus pipeline.
-pub type RequestHandler = Rc<dyn Fn(u128, Message<GenericHeader>)>;
 
 /// Bind the listener and return the bound address without starting the
 /// accept loop. Useful for tests that need the port before driving traffic.
@@ -51,7 +45,7 @@ pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyErr
     // `SO_REUSEPORT` intentionally not set: only shard 0 binds the client
     // listener. The shard-0 coordinator round-robins accepts to owning
     // shards via `ShardFramePayload::ClientConnectionSetup`.
-    let opts = SocketOpts::new().nodelay(true).keepalive(true);
+    let opts = SocketOpts::new().nodelay(true);
     let listener = TcpListener::bind_with_options(addr, &opts)
         .await
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
@@ -71,14 +65,14 @@ pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyErr
 #[allow(clippy::future_not_send)]
 pub async fn run(listener: TcpListener, token: ShutdownToken, on_accepted: AcceptedClientFn) {
     info!(
-        "Consensus client listener accepting on {:?}",
+        "Client listener (TCP) accepting on {:?}",
         listener.local_addr().ok()
     );
 
     loop {
         futures::select! {
             () = token.wait().fuse() => {
-                debug!("Consensus client listener shutting down");
+                debug!("Client listener (TCP) shutting down");
                 break;
             }
             result = listener.accept().fuse() => {
@@ -88,7 +82,7 @@ pub async fn run(listener: TcpListener, token: ShutdownToken, on_accepted: Accep
                         on_accepted(stream);
                     }
                     Err(e) => {
-                        error!("Consensus client listener accept failed: {e}");
+                        error!("Client listener (TCP) accept failed: {e}");
                     }
                 }
             }
