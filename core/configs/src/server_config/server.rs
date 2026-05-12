@@ -183,9 +183,21 @@ impl ServerConfig {
     ///
     /// Uses compile-time generated env var mappings for unambiguous resolution.
     pub async fn load() -> Result<ServerConfig, ConfigurationError> {
+        Self::load_with_path(
+            DEFAULT_CONFIG_PATH,
+            include_str!("../../../server/config.toml"),
+        )
+        .await
+    }
+
+    pub async fn load_with_path(
+        default_config_path: &str,
+        default_config: &'static str,
+    ) -> Result<ServerConfig, ConfigurationError> {
         let config_path =
-            env::var("IGGY_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
-        let config_provider = ServerConfig::config_provider(&config_path);
+            env::var("IGGY_CONFIG_PATH").unwrap_or_else(|_| default_config_path.to_string());
+        let config_provider =
+            ServerConfig::config_provider_with_default(&config_path, default_config);
         let server_config: ServerConfig =
             config_provider
                 .load_config()
@@ -203,7 +215,15 @@ impl ServerConfig {
 
     /// Create a config provider using compile-time generated env var mappings.
     pub fn config_provider(config_path: &str) -> FileConfigProvider<ServerConfigEnvProvider> {
-        let default_config = Toml::string(include_str!("../../../server/config.toml"));
+        Self::config_provider_with_default(config_path, include_str!("../../../server/config.toml"))
+    }
+
+    /// Create a config provider using compile-time generated env var mappings.
+    pub fn config_provider_with_default(
+        config_path: &str,
+        default_config: &'static str,
+    ) -> FileConfigProvider<ServerConfigEnvProvider> {
+        let default_config = Toml::string(default_config);
         FileConfigProvider::new(
             config_path.to_string(),
             ServerConfigEnvProvider::default(),
