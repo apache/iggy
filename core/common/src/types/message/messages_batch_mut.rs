@@ -819,13 +819,12 @@ impl Index<usize> for IggyMessagesBatchMut {
     type Output = [u8];
 
     fn index(&self, index: usize) -> &Self::Output {
-        if index >= self.count() as usize {
-            panic!(
-                "Index out of bounds: the len is {} but the index is {}",
-                self.count(),
-                index
-            );
-        }
+        assert!(
+            index < self.count() as usize,
+            "Index out of bounds: the len is {} but the index is {}",
+            self.count(),
+            index
+        );
 
         let (start, end) = self
             .get_message_boundaries(index)

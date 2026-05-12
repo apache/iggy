@@ -44,7 +44,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use crate::connector::start as start_connector;
 use crate::replica::listener::{bind as bind_replica_listener, run as run_replica_listener};
 use crate::transports::quic::server_config_with_cert;
-use crate::transports::tls::TlsServerCredentials;
+use crate::transports::tls::{TlsServerCredentials, install_default_crypto_provider};
 use crate::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
     AcceptedWsClientFn, AcceptedWssClientFn, IggyMessageBus, client_listener,
@@ -191,6 +191,10 @@ pub async fn start_on_shard_zero(
 ) -> Result<Option<BoundPlanes>, IggyError> {
     if bus.shard_id() != 0 {
         return Ok(None);
+    }
+
+    if quic_listen_addr.is_some() || tcp_tls_listen_addr.is_some() || wss_listen_addr.is_some() {
+        install_default_crypto_provider();
     }
 
     assert_listen_addrs_distinct(

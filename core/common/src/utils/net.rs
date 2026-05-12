@@ -19,6 +19,7 @@
 
 use crate::IggyError;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use url::Url;
 
 /// Validates that `addr` is syntactically a valid `host:port` string.
 /// Does NOT perform DNS resolution.
@@ -120,6 +121,46 @@ fn is_valid_host(host: &str) -> bool {
 
     // Otherwise, validate as hostname
     is_valid_hostname(host)
+}
+
+/// Validates that `addr` is a strict HTTP(S) API base URL in the format
+/// `scheme://host:port`.
+///
+/// Accepted formats:
+/// - `http://hostname:port` / `https://hostname:port`
+/// - `http://ipv4:port` / `https://ipv4:port`
+/// - `http://[ipv6]:port` / `https://[ipv6]:port`
+///
+/// Rejected formats:
+/// - Schemes other than `http` and `https`
+/// - Missing host or missing explicit port
+/// - URLs with additional components beyond `scheme://host:port`,
+///   such as userinfo (`user:pass@`), path, query string, or fragment.
+pub fn validate_api_url(addr: &str) -> Result<(), IggyError> {
+    let api_url = Url::parse(addr).map_err(|_| IggyError::CannotParseUrl)?;
+    match api_url.scheme() {
+        "http" | "https" => {}
+        _ => return Err(IggyError::InvalidApiUrl(addr.to_string())),
+    }
+
+    if api_url.host_str().is_none() || api_url.port_or_known_default().is_none() {
+        return Err(IggyError::InvalidApiUrl(addr.to_string()));
+    }
+
+    if api_url.port() == Some(0) {
+        return Err(IggyError::InvalidApiUrl(addr.to_string()));
+    }
+
+    if !api_url.username().is_empty()
+        || api_url.password().is_some()
+        || api_url.path() != "/"
+        || api_url.query().is_some()
+        || api_url.fragment().is_some()
+    {
+        return Err(IggyError::InvalidApiUrl(addr.to_string()));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -306,5 +347,65 @@ mod tests {
     fn invalid_ipv4_address_should_fail() {
         assert!(validate_server_address("256.1.1.1:8090").is_err());
         assert!(validate_server_address("192.168.1:8090").is_err());
+    }
+
+    #[test]
+    fn validate_api_url_accepts_http_with_host_and_port() {
+        assert!(validate_api_url("http://127.0.0.1:3000").is_ok());
+        assert!(validate_api_url("http://localhost:8080").is_ok());
+        assert!(validate_api_url("http://example.com:80").is_ok());
+    }
+
+    #[test]
+    fn validate_api_url_accepts_https_with_host_and_port() {
+        assert!(validate_api_url("https://example.com:443").is_ok());
+        assert!(validate_api_url("https://example.com:8443").is_ok());
+        assert!(validate_api_url("https://api.example.com:8443").is_ok());
+    }
+
+    #[test]
+    fn validate_api_url_accepts_ipv6_host_with_port() {
+        assert!(validate_api_url("http://[::1]:3000").is_ok());
+        assert!(validate_api_url("https://[2001:db8::1]:9443").is_ok());
+    }
+
+    #[test]
+    fn validate_api_url_rejects_non_http_schemes() {
+        assert!(validate_api_url("ftp://example.com:21").is_err());
+        assert!(validate_api_url("ws://example.com:8080").is_err());
+    }
+
+    #[test]
+    fn validate_api_url_rejects_port_zero() {
+        assert!(validate_api_url("http://example.com:0").is_err());
+        assert!(validate_api_url("https://127.0.0.1:0").is_err());
+    }
+
+    #[test]
+    fn validate_api_url_rejects_missing_host() {
+        assert!(validate_api_url("http://:3000").is_err());
+        assert!(validate_api_url("https://:443").is_err());
+    }
+
+    #[test]
+    fn validate_api_url_accepts_implicit_default_port() {
+        assert!(validate_api_url("http://example.com").is_ok());
+        assert!(validate_api_url("https://127.0.0.1").is_ok());
+    }
+
+    #[test]
+    fn validate_api_url_rejects_additional_url_parts() {
+        assert!(validate_api_url("http://user@example.com:3000").is_err());
+        assert!(validate_api_url("http://user:pass@example.com:3000").is_err());
+        assert!(validate_api_url("http://example.com:3000/api").is_err());
+        assert!(validate_api_url("http://example.com:3000?foo=bar").is_err());
+        assert!(validate_api_url("http://example.com:3000#section").is_err());
+    }
+
+    #[test]
+    fn validate_api_url_rejects_non_url_values() {
+        assert!(validate_api_url("localhost:3000").is_err());
+        assert!(validate_api_url("/api/v1").is_err());
+        assert!(validate_api_url("").is_err());
     }
 }
