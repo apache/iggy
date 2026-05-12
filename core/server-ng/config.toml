@@ -126,6 +126,12 @@ decoding_secret = ""
 # `false` means the secret is in plain text.
 use_base64_secret = false
 
+# Trusted issuers for A2A (Application-to-Application) authentication
+[[http.jwt.trusted_issuers]]
+issuer = "test-issuer"
+jwks_url = "http://127.0.0.1:8081/.well-known/jwks.json"
+audience = "iggy.apache.org"
+
 # Metrics configuration for HTTP.
 [http.metrics]
 # Enable or disable the metrics endpoint.
@@ -653,3 +659,8 @@ handshake_grace = "10 s"
 # Whether to accept unmasked frames from clients in violation of
 # RFC 6455 client-to-server framing rules. Strict (false) by default.
 ws_accept_unmasked_frames = false
+
+[extra.namespace]
+max_streams = 4096
+max_topics = 4096
+max_partitions = 1_000_000
