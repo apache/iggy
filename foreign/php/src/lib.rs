@@ -16,8 +16,6 @@
  * under the License.
  */
 
-pub mod async_client;
-pub mod async_consumer;
 pub mod client;
 pub mod consumer;
 pub mod identifier;
@@ -29,8 +27,6 @@ pub mod topic;
 
 use ext_php_rs::prelude::*;
 
-use crate::async_client::IggyAsyncClient;
-use crate::async_consumer::{IggyAsyncConsumer, IggyAsyncReceiveMessageIterator};
 use crate::client::IggyClient;
 use crate::consumer::{AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer};
 use crate::iterator::ReceiveMessageIterator;
@@ -42,11 +38,7 @@ use crate::topic::TopicDetails;
 #[php_module]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     module
-        .request_shutdown_function(crate::async_client::request_shutdown)
         .class::<IggyClient>()
-        .class::<IggyAsyncClient>()
-        .class::<IggyAsyncConsumer>()
-        .class::<IggyAsyncReceiveMessageIterator>()
         .class::<IggyConsumer>()
         .class::<AutoCommit>()
         .class::<AutoCommitWhen>()

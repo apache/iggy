@@ -22,7 +22,6 @@
 declare(strict_types=1);
 
 require __DIR__ . '/bootstrap.php';
-require __DIR__ . '/IggyAsyncSdkTest.php';
 require __DIR__ . '/IggySdkTest.php';
 require __DIR__ . '/TlsTest.php';
 
@@ -33,7 +32,7 @@ if (!extension_loaded('iggy-php')) {
 }
 
 $filter = $argv[1] ?? null;
-$classes = [IggySdkTest::class, IggyAsyncSdkTest::class, TlsTest::class];
+$classes = [IggySdkTest::class, TlsTest::class];
 $passed = 0;
 $skipped = 0;
 $failed = 0;

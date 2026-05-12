@@ -207,7 +207,7 @@ components:
       - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "foreign/php/**"
-    tasks: ["build", "test"]
+    tasks: ["lint", "test", "build"]
 
   sdk-node:
     depends_on:

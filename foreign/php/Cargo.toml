@@ -33,7 +33,6 @@ bytes = "1.11.1"
 futures = "0.3.32"
 ext-php-rs = "0.15.13"
 iggy = { path = "../../core/sdk", version = "0.10.0" }
-php-tokio = { git = "https://github.com/danog/php-tokio.git", tag = "0.1.11" }
 tokio = "1.50.0"
 
 [profile.release]

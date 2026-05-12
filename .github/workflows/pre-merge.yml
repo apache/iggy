@@ -285,6 +285,7 @@ jobs:
             // Set outputs for each component
             const rust = findJobInfo('Rust •');
             const python = findJobInfo('Python •');
+            const php = findJobInfo('PHP •');
             const node = findJobInfo('Node •');
             const go = findJobInfo('Go •');
             const java = findJobInfo('Java •');
@@ -305,6 +306,7 @@ jobs:
             // Output formatted durations
             core.setOutput('rust_time', formatJobDuration(rust));
             core.setOutput('python_time', formatJobDuration(python));
+            core.setOutput('php_time', formatJobDuration(php));
             core.setOutput('node_time', formatJobDuration(node));
             core.setOutput('go_time', formatJobDuration(go));
             core.setOutput('java_time', formatJobDuration(java));
@@ -395,6 +397,7 @@ jobs:
           # Language/component tests
           rust_status=$(format_status "${{ needs.test-rust.result }}" "${{ steps.times.outputs.rust_time }}")
           python_status=$(format_status "${{ needs.test-python.result }}" "${{ steps.times.outputs.python_time }}")
+          php_status=$(format_status "${{ needs.test-php.result }}" "${{ steps.times.outputs.php_time }}")
           node_status=$(format_status "${{ needs.test-node.result }}" "${{ steps.times.outputs.node_time }}")
           go_status=$(format_status "${{ needs.test-go.result }}" "${{ steps.times.outputs.go_time }}")
           java_status=$(format_status "${{ needs.test-java.result }}" "${{ steps.times.outputs.java_time }}")
@@ -406,6 +409,7 @@ jobs:
 
           echo "| 🦀 Rust | $rust_status | ${{ steps.times.outputs.rust_time }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 🐍 Python | $python_status | ${{ steps.times.outputs.python_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🐘 PHP | $php_status | ${{ steps.times.outputs.php_time }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 🟢 Node | $node_status | ${{ steps.times.outputs.node_time }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 🐹 Go | $go_status | ${{ steps.times.outputs.go_time }} |" >> $GITHUB_STEP_SUMMARY
           echo "| ☕ Java | $java_status | ${{ steps.times.outputs.java_time }} |" >> $GITHUB_STEP_SUMMARY
@@ -422,6 +426,7 @@ jobs:
              [[ "${{ needs.detect.result }}" == "failure" ]] || \
              [[ "${{ needs.test-rust.result }}" == "failure" ]] || \
              [[ "${{ needs.test-python.result }}" == "failure" ]] || \
+             [[ "${{ needs.test-php.result }}" == "failure" ]] || \
              [[ "${{ needs.test-node.result }}" == "failure" ]] || \
              [[ "${{ needs.test-go.result }}" == "failure" ]] || \
              [[ "${{ needs.test-java.result }}" == "failure" ]] || \
@@ -437,6 +442,7 @@ jobs:
                [[ "${{ needs.detect.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-rust.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-python.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.test-php.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-node.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-go.result }}" == "cancelled" ]] || \
                [[ "${{ needs.test-java.result }}" == "cancelled" ]] || \

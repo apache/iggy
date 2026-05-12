@@ -35,4 +35,10 @@ echo "Server is ready."
 
 mkdir -p test-results
 
-php tests/run.php "$@"
+PHP_BIN="${PHP:-php}"
+PHP_ARGS=()
+if [ -n "${IGGY_PHP_EXTENSION:-}" ]; then
+    PHP_ARGS+=("-d" "extension=${IGGY_PHP_EXTENSION}")
+fi
+
+"${PHP_BIN}" "${PHP_ARGS[@]}" tests/run.php "$@"

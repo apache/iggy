@@ -19,7 +19,6 @@ FROM rust:1.95-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    composer \
     curl \
     git \
     clang \
@@ -41,8 +40,8 @@ WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
 COPY core/ ./core/
 
-COPY foreign/php/Cargo.toml foreign/php/Cargo.lock ./foreign/php/
-COPY foreign/php/composer.json foreign/php/composer.lock ./foreign/php/
+COPY foreign/php/Cargo.toml ./foreign/php/
+COPY foreign/php/composer.json ./foreign/php/
 COPY foreign/php/README.md foreign/php/LICENSE foreign/php/NOTICE ./foreign/php/
 COPY foreign/php/.cargo/ ./foreign/php/.cargo/
 COPY foreign/php/src/ ./foreign/php/src/
@@ -51,7 +50,6 @@ COPY foreign/php/scripts/ ./foreign/php/scripts/
 
 WORKDIR /workspace/foreign/php
 
-RUN composer install --no-interaction --no-progress --prefer-dist
 RUN cargo install cargo-php --locked
 RUN cargo php install --release --yes
 RUN chmod +x ./scripts/test.sh
