@@ -20,17 +20,17 @@ using System.Security.Cryptography;
 namespace Apache.Iggy.Encryption;
 
 /// <summary>
-/// AES-256-GCM based message encryptor for secure message encryption/decryption.
-/// Uses AES-GCM (Galois/Counter Mode) which provides both confidentiality and authenticity.
+///     AES-256-GCM based message encryptor for secure message encryption/decryption.
+///     Uses AES-GCM (Galois/Counter Mode) which provides both confidentiality and authenticity.
 /// </summary>
 public sealed class AesMessageEncryptor : IMessageEncryptor
 {
-    private readonly byte[] _key;
     private const int NonceSize = 12; // 96 bits - recommended for GCM
     private const int TagSize = 16; // 128 bits authentication tag
+    private readonly byte[] _key;
 
     /// <summary>
-    /// Creates a new AES message encryptor with the specified key.
+    ///     Creates a new AES message encryptor with the specified key.
     /// </summary>
     /// <param name="key">The encryption key. Must be 16, 24, or 32 bytes for AES-128, AES-192, or AES-256 respectively.</param>
     /// <exception cref="ArgumentException">Thrown when key length is invalid</exception>
@@ -38,41 +38,20 @@ public sealed class AesMessageEncryptor : IMessageEncryptor
     {
         if (key.Length != 16 && key.Length != 24 && key.Length != 32)
         {
-            throw new ArgumentException("Key must be 16, 24, or 32 bytes for AES-128, AES-192, or AES-256", nameof(key));
+            throw new ArgumentException("Key must be 16, 24, or 32 bytes for AES-128, AES-192, or AES-256",
+                nameof(key));
         }
 
         _key = key;
     }
 
     /// <summary>
-    /// Creates a new AES-256 message encryptor with the specified base64-encoded key.
-    /// </summary>
-    /// <param name="base64Key">The base64-encoded encryption key</param>
-    /// <returns>A new AesMessageEncryptor instance</returns>
-    public static AesMessageEncryptor FromBase64Key(string base64Key)
-    {
-        return new AesMessageEncryptor(Convert.FromBase64String(base64Key));
-    }
-
-    /// <summary>
-    /// Generates a new random AES-256 key.
-    /// </summary>
-    /// <returns>A 32-byte random key suitable for AES-256</returns>
-    public static byte[] GenerateKey()
-    {
-        var key = new byte[32];
-        using var rng = RandomNumberGenerator.Create();
-        rng.GetBytes(key);
-        return key;
-    }
-
-    /// <summary>
-    /// Encrypts the provided plain data using AES-GCM.
-    /// Format: [12-byte nonce][encrypted data][16-byte authentication tag]
+    ///     Encrypts the provided plain data using AES-GCM.
+    ///     Format: [12-byte nonce][encrypted data][16-byte authentication tag]
     /// </summary>
     /// <param name="plainData">The plain data to encrypt</param>
     /// <returns>The encrypted data with nonce and tag</returns>
-    public byte[] Encrypt(byte[] plainData)
+    public byte[] Encrypt(Span<byte> plainData)
     {
         using var aesGcm = new AesGcm(_key, TagSize);
 
@@ -94,14 +73,14 @@ public sealed class AesMessageEncryptor : IMessageEncryptor
     }
 
     /// <summary>
-    /// Decrypts the provided encrypted data using AES-GCM.
-    /// Expected format: [12-byte nonce][encrypted data][16-byte authentication tag]
+    ///     Decrypts the provided encrypted data using AES-GCM.
+    ///     Expected format: [12-byte nonce][encrypted data][16-byte authentication tag]
     /// </summary>
     /// <param name="encryptedData">The encrypted data with nonce and tag</param>
     /// <returns>The decrypted plain data</returns>
     /// <exception cref="ArgumentException">Thrown when encrypted data format is invalid</exception>
     /// <exception cref="CryptographicException">Thrown when decryption or authentication fails</exception>
-    public byte[] Decrypt(byte[] encryptedData)
+    public byte[] Decrypt(ReadOnlySpan<byte> encryptedData)
     {
         if (encryptedData.Length < NonceSize + TagSize)
         {
@@ -111,18 +90,40 @@ public sealed class AesMessageEncryptor : IMessageEncryptor
         using var aesGcm = new AesGcm(_key, TagSize);
 
         // Extract nonce, ciphertext, and tag
-        var nonce = new byte[NonceSize];
-        var tag = new byte[TagSize];
+        Span<byte> nonce = stackalloc byte[NonceSize];
+        Span<byte> tag = stackalloc byte[TagSize];
         var ciphertextLength = encryptedData.Length - NonceSize - TagSize;
-        var ciphertext = new byte[ciphertextLength];
+        Span<byte> ciphertext = stackalloc byte[ciphertextLength];
 
-        Buffer.BlockCopy(encryptedData, 0, nonce, 0, NonceSize);
-        Buffer.BlockCopy(encryptedData, NonceSize, ciphertext, 0, ciphertextLength);
-        Buffer.BlockCopy(encryptedData, NonceSize + ciphertextLength, tag, 0, TagSize);
+        encryptedData[..NonceSize].CopyTo(nonce);
+        encryptedData.Slice(NonceSize, ciphertextLength).CopyTo(ciphertext);
+        encryptedData.Slice(NonceSize + ciphertextLength, TagSize).CopyTo(tag);
 
         var plaintext = new byte[ciphertextLength];
         aesGcm.Decrypt(nonce, ciphertext, tag, plaintext);
 
         return plaintext;
+    }
+
+    /// <summary>
+    ///     Creates a new AES-256 message encryptor with the specified base64-encoded key.
+    /// </summary>
+    /// <param name="base64Key">The base64-encoded encryption key</param>
+    /// <returns>A new AesMessageEncryptor instance</returns>
+    public static AesMessageEncryptor FromBase64Key(string base64Key)
+    {
+        return new AesMessageEncryptor(Convert.FromBase64String(base64Key));
+    }
+
+    /// <summary>
+    ///     Generates a new random AES-256 key.
+    /// </summary>
+    /// <returns>A 32-byte random key suitable for AES-256</returns>
+    public static byte[] GenerateKey()
+    {
+        var key = new byte[32];
+        using var rng = RandomNumberGenerator.Create();
+        rng.GetBytes(key);
+        return key;
     }
 }

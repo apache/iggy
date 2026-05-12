@@ -1,4 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
+﻿// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,36 +15,38 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text.Json.Serialization;
 using Apache.Iggy.Headers;
-using Apache.Iggy.JsonConverters;
 using Apache.Iggy.Mappers;
 using Apache.Iggy.Messages;
 
 namespace Apache.Iggy.Contracts;
 
 /// <summary>
-///     Response from the server containing a message payload.
+///     Response containing rented payload and raw header memory.
+///     The payload and raw headers are only valid while the owning <see cref="PolledMessagesRental" /> is alive.
 /// </summary>
-[JsonConverter(typeof(MessageResponseConverter))]
-public sealed class MessageResponse
+public sealed class RentedMessageResponse
 {
-    private byte[]? _rawUserHeaders;
     private Dictionary<HeaderKey, HeaderValue>? _userHeaders;
     private bool _userHeadersInitialized;
 
     /// <summary>
     ///     Message header.
     /// </summary>
-    public required MessageHeader Header { get; set; }
+    public required MessageHeader Header { get; init; }
 
     /// <summary>
-    ///     Message payload.
+    ///     Message payload backed by rented memory.
     /// </summary>
-    public required byte[] Payload { get; set; } = [];
+    public required ReadOnlyMemory<byte> Payload { get; init; }
 
     /// <summary>
-    ///     Headers defined by the user.
+    ///     Raw user header bytes backed by rented memory.
+    /// </summary>
+    public ReadOnlyMemory<byte> RawUserHeaders { get; init; }
+
+    /// <summary>
+    ///     Parsed user headers. Parsed lazily and cached on first access.
     /// </summary>
     public Dictionary<HeaderKey, HeaderValue>? UserHeaders
     {
@@ -52,44 +54,17 @@ public sealed class MessageResponse
         {
             if (!_userHeadersInitialized)
             {
-                _userHeaders = _rawUserHeaders is { Length: > 0 }
-                    ? BinaryMapper.TryMapHeaders(_rawUserHeaders)
-                    : null;
+                _userHeaders = RawUserHeaders.IsEmpty
+                    ? null
+                    : BinaryMapper.TryMapHeaders(RawUserHeaders.Span);
                 _userHeadersInitialized = true;
             }
 
             return _userHeaders;
         }
-        set
+        init
         {
             _userHeaders = value;
-            _userHeadersInitialized = true;
-        }
-    }
-
-    /// <summary>
-    ///     Raw user header bytes before deserialization.
-    ///     Used internally for decrypting encrypted headers.
-    /// </summary>
-    [JsonIgnore]
-    internal byte[]? RawUserHeaders
-    {
-        get => _rawUserHeaders;
-        set
-        {
-            _rawUserHeaders = value;
-            _userHeaders = null;
-            _userHeadersInitialized = false;
-        }
-    }
-
-    internal void ParseUserHeaders()
-    {
-        if (!_userHeadersInitialized)
-        {
-            _userHeaders = _rawUserHeaders is { Length: > 0 }
-                ? BinaryMapper.TryMapHeaders(_rawUserHeaders)
-                : null;
             _userHeadersInitialized = true;
         }
     }

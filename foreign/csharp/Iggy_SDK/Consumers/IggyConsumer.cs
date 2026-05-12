@@ -50,6 +50,9 @@ public partial class IggyConsumer : IAsyncDisposable
     private volatile bool _joinedConsumerGroup;
     private long _lastPolledAtMs;
 
+    /// <summary>Whether this consumer has been initialized via <see cref="InitAsync" />.</summary>
+    protected bool IsInitialized => _isInitialized;
+
     /// <summary>
     ///     Initializes a new instance of the <see cref="IggyConsumer" /> class
     /// </summary>
@@ -112,7 +115,6 @@ public partial class IggyConsumer : IAsyncDisposable
         _consumerErrorEvents.Clear();
         _pollingSemaphore.Dispose();
         _connectionStateSemaphore.Dispose();
-
     }
 
     /// <summary>
@@ -187,7 +189,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
             if (_config.AutoCommitMode == AutoCommitMode.AfterReceive)
             {
-                await StoreOffsetAsync(message.CurrentOffset, message.PartitionId, ct);
+                await StoreOffsetAsync(message.CurrentOffset, message.PartitionId, false, ct);
             }
         } while (!ct.IsCancellationRequested);
     }
@@ -198,10 +200,17 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     /// <param name="offset">The offset to store</param>
     /// <param name="partitionId">The partition ID</param>
+    /// <param name="resetLastPooled"></param>
     /// <param name="ct">Cancellation token</param>
-    public async Task StoreOffsetAsync(ulong offset, uint partitionId, CancellationToken ct = default)
+    public async Task StoreOffsetAsync(ulong offset, uint partitionId, bool resetLastPooled = false,
+        CancellationToken ct = default)
     {
         await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId, ct);
+
+        if (resetLastPooled)
+        {
+            _lastPolledOffset[(int)partitionId] = offset;
+        }
     }
 
     /// <summary>
@@ -362,7 +371,7 @@ public partial class IggyConsumer : IAsyncDisposable
             {
                 _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
                     lastPolledPartitionOffset, messages.PartitionId);
-                await StoreOffsetAsync(lastPolledPartitionOffset, (uint)messages.PartitionId, ct);
+                await StoreOffsetAsync(lastPolledPartitionOffset, (uint)messages.PartitionId, false, ct);
             }
 
             if (messages.Messages.Count == 0)

@@ -21,7 +21,8 @@ namespace Apache.Iggy.Consumers;
 ///     Interface for deserializing message payloads from byte arrays to type T.
 ///     <para>
 ///         No type constraints are enforced on T to provide maximum flexibility.
-///         Implementations are responsible for ensuring that the provided byte data can be properly deserialized to the target type.
+///         Implementations are responsible for ensuring that the provided byte data can be properly deserialized to the
+///         target type.
 ///     </para>
 /// </summary>
 /// <typeparam name="T">
@@ -37,18 +38,13 @@ namespace Apache.Iggy.Consumers;
 public interface IDeserializer<out T>
 {
     /// <summary>
-    ///     Deserializes a byte array into an instance of type T.
+    ///     Deserializes a read-only memory into an instance of type T. Callers may pass a <c>byte[]</c> directly
+    ///     thanks to the implicit conversion to <see cref="ReadOnlyMemory{T}" />.
     /// </summary>
-    /// <param name="data">The byte array containing the serialized data to deserialize.</param>
+    /// <param name="data">
+    ///     Read-only memory containing the serialized data. The implementation MUST NOT retain a reference to
+    ///     the span after returning.
+    /// </param>
     /// <returns>An instance of type T representing the deserialized data.</returns>
-    /// <exception cref="System.FormatException">
-    ///     Thrown when the data format is invalid and cannot be deserialized.
-    /// </exception>
-    /// <exception cref="System.ArgumentException">
-    ///     Thrown when the data cannot be deserialized due to invalid content or structure.
-    /// </exception>
-    /// <exception cref="System.InvalidOperationException">
-    ///     Thrown when the deserialization operation fails due to state issues.
-    /// </exception>
-    T Deserialize(byte[] data);
+    T Deserialize(ReadOnlyMemory<byte> data);
 }

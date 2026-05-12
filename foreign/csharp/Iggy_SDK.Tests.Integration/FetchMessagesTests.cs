@@ -139,6 +139,36 @@ public class FetchMessagesTests
         }
     }
 
+    [Test]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task PollMessages_WithHeaders_Should_AutoParseUserHeadersFromRaw(Protocol protocol)
+    {
+        var (client, streamName) = await CreateStreamWithMessages(protocol);
+
+        var response = await client.PollMessagesAsync(new MessageFetchRequest
+        {
+            Count = 1,
+            AutoCommit = true,
+            Consumer = Consumer.New(2),
+            PartitionId = 0,
+            PollingStrategy = PollingStrategy.First(),
+            StreamId = Identifier.String(streamName),
+            TopicId = Identifier.String(HeadersTopicName)
+        });
+
+        response.Messages.Count.ShouldBe(1);
+        var msg = response.Messages[0];
+
+        Dictionary<HeaderKey, HeaderValue>? parsed = msg.UserHeaders;
+        parsed.ShouldNotBeNull();
+        parsed!.Count.ShouldBe(2);
+        parsed[HeaderKey.FromString("header1")].ToString().ShouldBe("value1");
+        parsed[HeaderKey.FromString("header2")].ToInt32().ShouldBe(14);
+
+        Dictionary<HeaderKey, HeaderValue>? second = msg.UserHeaders;
+        second.ShouldBeSameAs(parsed);
+    }
+
     private static Message[] CreateMessagesWithoutHeader(int count)
     {
         var messages = new List<Message>();

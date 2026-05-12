@@ -46,6 +46,7 @@ public sealed class TcpMessageStream : IIggyClient
     private readonly EventAggregator<ConnectionStateChangedEventArgs> _connectionEvents;
     private readonly SemaphoreSlim _connectionSemaphore;
     private readonly ILogger<TcpMessageStream> _logger;
+    private readonly byte[] _responseHeaderBuffer = new byte[BufferSizes.EXPECTED_RESPONSE_SIZE];
     private readonly SemaphoreSlim _sendingSemaphore;
     private string _currentAddress = string.Empty;
     private X509Certificate2Collection _customCaStore = [];
@@ -102,14 +103,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_STREAM_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             throw new InvalidResponseException("Received empty response while trying to create stream.");
         }
 
-        return BinaryMapper.MapStream(responseBuffer);
+        return BinaryMapper.MapStream(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -119,14 +120,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_STREAM_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        return BinaryMapper.MapStream(responseBuffer);
+        return BinaryMapper.MapStream(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -136,14 +137,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_STREAMS_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return [];
         }
 
-        return BinaryMapper.MapStreams(responseBuffer);
+        return BinaryMapper.MapStreams(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -153,7 +154,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.UPDATE_STREAM_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -163,7 +164,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.PURGE_STREAM_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -173,7 +174,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_STREAM_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -184,14 +185,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_TOPICS_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return [];
         }
 
-        return BinaryMapper.MapTopics(responseBuffer);
+        return BinaryMapper.MapTopics(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -202,14 +203,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_TOPIC_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        return BinaryMapper.MapTopic(responseBuffer);
+        return BinaryMapper.MapTopic(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -223,14 +224,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_TOPIC_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        return BinaryMapper.MapTopic(responseBuffer);
+        return BinaryMapper.MapTopic(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -245,7 +246,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.UPDATE_TOPIC_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -255,7 +256,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_TOPIC_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -265,7 +266,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.PURGE_TOPIC_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
 
@@ -289,7 +290,7 @@ public sealed class TcpMessageStream : IIggyClient
             TcpMessageStreamHelpers.CreatePayload(payloadBuffer.Memory.Span[..payloadBufferSize],
                 messageBuffer.Memory.Span[..messageBufferSize], CommandCodes.SEND_MESSAGES_CODE);
 
-            await SendWithResponseAsync(payloadBuffer.Memory[..payloadBufferSize].ToArray(), token);
+            await SendAckAsync(payloadBuffer.Memory[..payloadBufferSize], token);
         }
         finally
         {
@@ -307,7 +308,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.FLUSH_UNSAVED_BUFFER_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -315,19 +316,36 @@ public sealed class TcpMessageStream : IIggyClient
         Consumer consumer,
         PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
     {
+        using var rental = await PollMessagesRentedAsync(streamId, topicId, partitionId, consumer, pollingStrategy,
+            count, autoCommit, token);
+        return BinaryMapper.MaterializeMessages(rental);
+    }
+
+    /// <inheritdoc />
+    public async Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId,
+        uint? partitionId,
+        Consumer consumer,
+        PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
+    {
         var messageBufferSize = CalculateMessageBufferSize(streamId, topicId, consumer);
         var payloadBufferSize = CalculatePayloadBufferSize(messageBufferSize);
-        var message = new byte[messageBufferSize];
-        var payload = new byte[payloadBufferSize];
+        var payload = ArrayPool<byte>.Shared.Rent(payloadBufferSize);
 
-        TcpContracts.GetMessages(message.AsSpan()[..messageBufferSize], consumer, streamId,
-            topicId, pollingStrategy, count, autoCommit, partitionId);
-        TcpMessageStreamHelpers.CreatePayload(payload, message.AsSpan()[..messageBufferSize],
-            CommandCodes.POLL_MESSAGES_CODE);
+        try
+        {
+            TcpContracts.GetMessages(payload.AsSpan().Slice(8, messageBufferSize), consumer, streamId,
+                topicId, pollingStrategy, count, autoCommit, partitionId);
+            BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan()[..4], messageBufferSize + 4);
+            BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan()[4..8], CommandCodes.POLL_MESSAGES_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
-
-        return BinaryMapper.MapMessages(responseBuffer);
+            IMemoryOwner<byte> responseBuffer
+                = await SendWithResponseAsync(payload.AsMemory(0, payloadBufferSize), token);
+            return BinaryMapper.MapRentedMessages(responseBuffer);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(payload);
+        }
     }
 
     /// <inheritdoc />
@@ -338,7 +356,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.STORE_CONSUMER_OFFSET_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -349,14 +367,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CONSUMER_OFFSET_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        return BinaryMapper.MapOffsets(responseBuffer);
+        return BinaryMapper.MapOffsets(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -367,7 +385,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_CONSUMER_OFFSET_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -379,14 +397,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CONSUMER_GROUPS_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return [];
         }
 
-        return BinaryMapper.MapConsumerGroups(responseBuffer);
+        return BinaryMapper.MapConsumerGroups(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -397,14 +415,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CONSUMER_GROUP_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        return BinaryMapper.MapConsumerGroup(responseBuffer);
+        return BinaryMapper.MapConsumerGroup(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -415,14 +433,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_CONSUMER_GROUP_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        return BinaryMapper.MapConsumerGroup(responseBuffer);
+        return BinaryMapper.MapConsumerGroup(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -433,7 +451,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_CONSUMER_GROUP_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -444,7 +462,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.JOIN_CONSUMER_GROUP_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -455,7 +473,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LEAVE_CONSUMER_GROUP_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -466,7 +484,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_PARTITIONS_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -477,7 +495,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_PARTITIONS_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -488,7 +506,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_SEGMENTS_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -498,14 +516,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_ME_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        return BinaryMapper.MapClient(responseBuffer);
+        return BinaryMapper.MapClient(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -515,14 +533,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_STATS_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        return BinaryMapper.MapStats(responseBuffer);
+        return BinaryMapper.MapStats(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -532,14 +550,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CLUSTER_METADATA_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        return BinaryMapper.MapClusterMetadata(responseBuffer);
+        return BinaryMapper.MapClusterMetadata(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -549,7 +567,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.PING_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -560,7 +578,9 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_SNAPSHOT_CODE);
 
-        return await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> result = await SendWithResponseAsync(payload, token);
+
+        return result.Memory.Span.ToArray();
     }
 
     /// <inheritdoc />
@@ -598,14 +618,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CLIENTS_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return [];
         }
 
-        return BinaryMapper.MapClients(responseBuffer);
+        return BinaryMapper.MapClients(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -615,14 +635,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CLIENT_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        return BinaryMapper.MapClient(responseBuffer);
+        return BinaryMapper.MapClient(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -632,14 +652,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_USER_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        return BinaryMapper.MapUser(responseBuffer);
+        return BinaryMapper.MapUser(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -649,14 +669,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_USERS_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return [];
         }
 
-        return BinaryMapper.MapUsers(responseBuffer);
+        return BinaryMapper.MapUsers(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -667,14 +687,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_USER_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        return BinaryMapper.MapUser(responseBuffer);
+        return BinaryMapper.MapUser(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -684,7 +704,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_USER_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -695,7 +715,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.UPDATE_USER_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -706,7 +726,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.UPDATE_PERMISSIONS_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -717,7 +737,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CHANGE_PASSWORD_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -734,14 +754,14 @@ public sealed class TcpMessageStream : IIggyClient
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGIN_USER_CODE);
 
         SetConnectionStateAsync(ConnectionState.Authenticating);
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length <= 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..responseBuffer.Length]);
+        var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.Memory.Span[..responseBuffer.Memory.Length]);
         SetConnectionStateAsync(ConnectionState.Authenticated);
 
         if (await RedirectAsync(token))
@@ -761,7 +781,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGOUT_USER_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -772,14 +792,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_PERSONAL_ACCESS_TOKENS_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return [];
         }
 
-        return BinaryMapper.MapPersonalAccessTokens(responseBuffer);
+        return BinaryMapper.MapPersonalAccessTokens(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -790,14 +810,14 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_PERSONAL_ACCESS_TOKEN_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
 
-        if (responseBuffer.Length == 0)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        return BinaryMapper.MapRawPersonalAccessToken(responseBuffer);
+        return BinaryMapper.MapRawPersonalAccessToken(responseBuffer.Memory.Span);
     }
 
     /// <inheritdoc />
@@ -807,7 +827,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_PERSONAL_ACCESS_TOKEN_CODE);
 
-        await SendWithResponseAsync(payload, token);
+        await SendAckAsync(payload, token);
     }
 
     /// <inheritdoc />
@@ -818,14 +838,14 @@ public sealed class TcpMessageStream : IIggyClient
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE);
 
         SetConnectionStateAsync(ConnectionState.Authenticating);
-        var responseBuffer = await SendWithResponseAsync(payload, ct);
+        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, ct);
 
-        if (responseBuffer.Length <= 1)
+        if (responseBuffer.Memory.Length == 0)
         {
             return null;
         }
 
-        var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..4]);
+        var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.Memory.Span[..4]);
 
         SetConnectionStateAsync(ConnectionState.Authenticated);
 
@@ -968,7 +988,13 @@ public sealed class TcpMessageStream : IIggyClient
         return new TcpConnectionStream(sslStream);
     }
 
-    private async Task<byte[]> SendWithResponseAsync(byte[] payload, CancellationToken token = default)
+    private async Task SendAckAsync(ReadOnlyMemory<byte> payload, CancellationToken token = default)
+    {
+        using IMemoryOwner<byte> _ = await SendWithResponseAsync(payload, token);
+    }
+
+    private async Task<IMemoryOwner<byte>> SendWithResponseAsync(ReadOnlyMemory<byte> payload,
+        CancellationToken token = default)
     {
         try
         {
@@ -988,7 +1014,8 @@ public sealed class TcpMessageStream : IIggyClient
         }
     }
 
-    private async Task<byte[]> HandleReconnectionAsync(byte[] payload, CancellationToken token)
+    private async Task<IMemoryOwner<byte>> HandleReconnectionAsync(ReadOnlyMemory<byte> payload,
+        CancellationToken token)
     {
         var currentTime = DateTimeOffset.UtcNow;
         await _connectionSemaphore.WaitAsync(token);
@@ -1018,27 +1045,27 @@ public sealed class TcpMessageStream : IIggyClient
         }
     }
 
-    private async Task<byte[]> SendRawAsync(byte[] payload, CancellationToken token)
+    private async Task<IMemoryOwner<byte>> SendRawAsync(ReadOnlyMemory<byte> payload, CancellationToken token)
     {
         if (_state is ConnectionState.Disconnected or ConnectionState.Connecting)
         {
             throw new NotConnectedException();
         }
 
+        await _sendingSemaphore.WaitAsync(token);
+
         try
         {
-            await _sendingSemaphore.WaitAsync(token);
             await _stream.SendAsync(payload, token);
             await _stream.FlushAsync(token);
 
             // Read the 8-byte header (4 bytes status + 4 bytes length)
-            var buffer = new byte[BufferSizes.EXPECTED_RESPONSE_SIZE];
             var totalRead = 0;
             while (totalRead < BufferSizes.EXPECTED_RESPONSE_SIZE)
             {
                 var readBytes
                     = await _stream.ReadAsync(
-                        buffer.AsMemory(totalRead, BufferSizes.EXPECTED_RESPONSE_SIZE - totalRead),
+                        _responseHeaderBuffer.AsMemory(totalRead, BufferSizes.EXPECTED_RESPONSE_SIZE - totalRead),
                         token);
                 if (readBytes == 0)
                 {
@@ -1048,7 +1075,7 @@ public sealed class TcpMessageStream : IIggyClient
                 totalRead += readBytes;
             }
 
-            var response = TcpMessageStreamHelpers.GetResponseLengthAndStatus(buffer);
+            var response = TcpMessageStreamHelpers.GetResponseLengthAndStatus(_responseHeaderBuffer);
 
             if (response.Status != 0)
             {
@@ -1077,21 +1104,31 @@ public sealed class TcpMessageStream : IIggyClient
 
             if (response.Length == 0)
             {
-                return [];
+                return EmptyMemoryOwner.Instance;
             }
 
-            var responseBuffer = new byte[response.Length];
-            totalRead = 0;
-            while (totalRead < response.Length)
+            var responseBuffer = ArrayPoolHelper.Rent(response.Length);
+            try
             {
-                var readBytes = await _stream.ReadAsync(responseBuffer.AsMemory(totalRead, response.Length - totalRead),
-                    token);
-                if (readBytes == 0)
+                totalRead = 0;
+                while (totalRead < response.Length)
                 {
-                    throw new IggyZeroBytesException();
-                }
+                    var readBytes
+                        = await _stream.ReadAsync(responseBuffer.Memory.Slice(totalRead, response.Length - totalRead),
+                            token);
 
-                totalRead += readBytes;
+                    if (readBytes == 0)
+                    {
+                        throw new IggyZeroBytesException();
+                    }
+
+                    totalRead += readBytes;
+                }
+            }
+            catch
+            {
+                responseBuffer.Dispose();
+                throw;
             }
 
             return responseBuffer;
@@ -1235,5 +1272,46 @@ public sealed class TcpMessageStream : IIggyClient
         _stream.Close();
         SetConnectionStateAsync(ConnectionState.Disconnected);
         return true;
+    }
+
+    internal sealed class EmptyMemoryOwner : IMemoryOwner<byte>
+    {
+        public static readonly EmptyMemoryOwner Instance = new();
+
+        private EmptyMemoryOwner()
+        {
+        }
+
+        public Memory<byte> Memory => Memory<byte>.Empty;
+
+        public void Dispose()
+        {
+        }
+    }
+}
+
+internal static class ArrayPoolHelper
+{
+    public static SlicedMemoryOwner Rent(int minimumLength)
+    {
+        return new SlicedMemoryOwner(minimumLength);
+    }
+
+    internal sealed class SlicedMemoryOwner(int minimumLength) : IMemoryOwner<byte>
+    {
+        private readonly byte[] _value = ArrayPool<byte>.Shared.Rent(minimumLength);
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            ArrayPool<byte>.Shared.Return(_value);
+        }
+
+        public Memory<byte> Memory => _value.AsMemory()[..minimumLength];
     }
 }

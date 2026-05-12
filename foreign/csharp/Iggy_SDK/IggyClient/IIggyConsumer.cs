@@ -47,6 +47,18 @@ public interface IIggyConsumer
         CancellationToken token = default);
 
     /// <summary>
+    ///     Polls messages from a specified topic and partition while renting the payload buffers from a shared pool
+    ///     instead of copying them into byte arrays.
+    /// </summary>
+    /// <remarks>
+    ///     The returned rental must be disposed when the caller is done reading the payload and raw header memory.
+    ///     Payload and raw header slices are invalidated once the rental is disposed.
+    /// </remarks>
+    Task<PolledMessagesRental> PollMessagesRentedAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,
+        CancellationToken token = default);
+
+    /// <summary>
     ///     Polls messages from a specified topic using a pre-constructed request.
     /// </summary>
     /// <remarks>
@@ -58,6 +70,16 @@ public interface IIggyConsumer
     Task<PolledMessages> PollMessagesAsync(MessageFetchRequest request, CancellationToken token = default)
     {
         return PollMessagesAsync(request.StreamId, request.TopicId, request.PartitionId, request.Consumer,
+            request.PollingStrategy, request.Count, request.AutoCommit, token);
+    }
+
+    /// <summary>
+    ///     Polls messages from a specified topic using a pre-constructed request while renting the payload buffers
+    ///     from a shared pool.
+    /// </summary>
+    Task<PolledMessagesRental> PollMessagesRentedAsync(MessageFetchRequest request, CancellationToken token = default)
+    {
+        return PollMessagesRentedAsync(request.StreamId, request.TopicId, request.PartitionId, request.Consumer,
             request.PollingStrategy, request.Count, request.AutoCommit, token);
     }
 }
