@@ -66,8 +66,8 @@ tracing = { workspace = true }
 tungstenite = { workspace = true }
 twox-hash = { workspace = true }
 ulid = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
-
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 

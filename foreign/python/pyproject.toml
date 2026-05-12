@@ -55,6 +55,12 @@ classifiers = [
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+# LICENSE-binary enumerates the statically-linked Rust crates
+# bundled into the wheel by maturin/PyO3. Generated at build time by
+# `scripts/ci/third-party-licenses.sh --generate --manifest foreign/python/Cargo.toml --output foreign/python/LICENSE-binary`
+# (foreign/python is excluded from the workspace, so cargo-about must be
+# pointed at this Cargo.toml explicitly). File is .gitignored; the wheel
+# build pipeline must generate it before invoking maturin.
 include = [
     { path = "LICENSE", format = [
         "sdist",
@@ -62,6 +68,9 @@ include = [
     ] },
     { path = "NOTICE", format = [
         "sdist",
+        "wheel",
+    ] },
+    { path = "LICENSE-binary", format = [
         "wheel",
     ] },
     { path = "apache_iggy.pyi", format = [

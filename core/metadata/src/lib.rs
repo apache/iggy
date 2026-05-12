@@ -21,8 +21,6 @@ pub mod impls;
 pub mod permissioner;
 pub mod stm;
 
-mod stats;
-
 // Re-export IggyMetadata for use in other modules
 pub use impls::metadata::IggyMetadata;
 
