@@ -623,7 +623,7 @@ impl IggyMessageBus {
     /// callers. A long-running bus is expected to keep this number
     /// bounded under sustained accept traffic; a leak shows up here as
     /// monotonic growth proportional to total accepts.
-    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
     #[must_use]
     pub fn background_tasks_len(&self) -> usize {
         self.background_tasks.borrow().len()
