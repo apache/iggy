@@ -22,9 +22,15 @@ services:
       dockerfile: core/server/Dockerfile
       args:
         PROFILE: debug
+    command: ["--fresh", "--with-default-root-credentials"]
     container_name: iggy-server-php-test
     security_opt:
       - seccomp:unconfined
+    environment:
+      - IGGY_HTTP_ADDRESS=0.0.0.0:3000
+      - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_QUIC_ADDRESS=0.0.0.0:8080
+      - IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8092
     networks:
       - php-test-network
     ports:
@@ -32,7 +38,7 @@ services:
       - "8080:8080"
       - "8090:8090"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/stats"]
+      test: ["CMD", "/usr/local/bin/iggy", "--tcp-server-address", "127.0.0.1:8090", "ping"]
       interval: 5s
       timeout: 5s
       retries: 12
