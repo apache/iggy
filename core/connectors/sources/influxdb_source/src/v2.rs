@@ -378,18 +378,50 @@ pub(crate) struct RowProcessingResult {
     pub skipped: u64,
 }
 
-/// Convert a slice of V2 query rows into Iggy messages.
+/// Converts a slice of V2 query rows into Iggy messages.
 ///
-/// Skips the first `already_seen` rows whose cursor value equals the current
-/// cursor — these were delivered in the previous batch and re-appear because
-/// V2's `>= $cursor` query semantics are inclusive. All other rows become
-/// messages with unique UUIDs and timestamps set to `ctx.now_micros`.
+/// ## Cursor semantics and deduplication
 ///
-/// `already_seen` is a separate parameter rather than a `RowContext` field
-/// because it is V2-specific: V3 uses strict `> cursor` semantics and never
-/// needs to skip rows. Adding it to `RowContext` would require V3's
-/// `process_rows` to accept a field it never uses, or require a separate context
-/// type just for V2.
+/// InfluxDB V2 Flux queries use `>= $cursor` (inclusive), so the first batch after
+/// a cursor advance will re-include any rows whose timestamp equals the new cursor.
+/// `already_seen` is the count of such rows delivered in the previous batch; this
+/// function skips exactly that many leading rows that match `ctx.current_cursor`,
+/// preventing duplicate delivery across batch boundaries.
+///
+/// `already_seen` is a separate parameter rather than part of [`RowContext`] because
+/// it is V2-specific: V3 uses strict `> cursor` and never needs to skip rows.
+///
+/// ## Cursor tracking
+///
+/// Each row's cursor field is compared as a timestamp. The highest timestamp seen
+/// among emitted rows becomes `max_cursor` in the result. `rows_at_max_cursor`
+/// counts how many emitted rows share that timestamp — the caller uses this to
+/// detect when a batch is stuck (all rows share the same timestamp and fill the
+/// entire batch), at which point the effective batch size is inflated.
+///
+/// Rows that are missing the cursor field still produce messages; they do not
+/// contribute to cursor tracking and are excluded from skip logic.
+///
+/// ## Message identity
+///
+/// A single random UUID is generated per call; per-message IDs are derived by
+/// adding the message's position to that base, keeping PRNG work O(1) per batch.
+///
+/// ## Parameters
+///
+/// - `rows`: Rows returned by the Flux query for this poll.
+/// - `ctx`: Shared context (cursor field name, current cursor value, payload config,
+///   wall-clock time in microseconds).
+/// - `already_seen`: Number of rows at `ctx.current_cursor` to skip — rows already
+///   delivered in the previous batch that the `>=` query re-included.
+///
+/// ## Returns
+///
+/// A [`RowProcessingResult`] containing:
+/// - `messages`: One [`ProducedMessage`] per non-skipped row.
+/// - `max_cursor`: Highest cursor timestamp seen among emitted rows, if any.
+/// - `rows_at_max_cursor`: Count of emitted rows sharing `max_cursor`.
+/// - `skipped`: Number of rows skipped due to `already_seen` deduplication.
 pub(crate) fn process_rows(
     rows: &[Row],
     ctx: &RowContext<'_>,

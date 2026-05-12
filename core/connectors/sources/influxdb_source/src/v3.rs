@@ -254,13 +254,12 @@ pub(crate) struct PollResult {
 /// causing `WHERE time > '$cursor'` to re-deliver already-seen rows on subsequent polls.
 /// InfluxDB 3's DataFusion SQL engine handles RFC 3339 strings with any number of
 /// fractional digits in WHERE clause timestamp comparisons.
-fn normalize_v3_timestamp(ts: &str) -> String {
-    // Fast path: already a valid RFC 3339 timestamp with timezone suffix.
+fn normalize_v3_timestamp(ts: &str) -> std::borrow::Cow<'_, str> {
     if chrono::DateTime::parse_from_rfc3339(ts).is_ok() {
-        return ts.to_string();
+        std::borrow::Cow::Borrowed(ts)  // Zero allocation
+    } else {
+        std::borrow::Cow::Owned(format!("{ts}Z"))
     }
-    // Slow path: no timezone suffix — append "Z" to make it RFC 3339 compliant.
-    format!("{ts}Z")
 }
 
 /// Result of processing a batch of V3 rows into Iggy messages.
@@ -274,14 +273,58 @@ pub(crate) struct RowProcessingResult {
     pub rows_at_max_cursor: u64,
 }
 
-/// Convert a slice of V3 query rows into Iggy messages.
+/// Converts a slice of V3 query rows into Iggy messages.
 ///
-/// Also detects whether all rows share the same cursor value as `ctx.current_cursor`
-/// (the `all_at_cursor` flag). The caller uses this together with batch fullness
-/// to decide whether to inflate the batch size for the next poll.
+/// ## Cursor semantics
 ///
-/// Unlike V2, V3 uses strict `> cursor` semantics, so there is no row-skipping.
-/// All rows in the slice are emitted as messages.
+/// InfluxDB V3 queries use strict `WHERE time > '$cursor'` semantics, so every row
+/// in the slice is strictly after the current cursor. No row-skipping or deduplication
+/// is needed — unlike V2's inclusive `>= $cursor` query.
+///
+/// ## Timestamp normalization
+///
+/// InfluxDB 3 Core returns timestamps without a timezone suffix and with nanosecond
+/// precision (e.g. `"2026-04-26T02:32:20.526360865"`). Each cursor value is passed
+/// through [`normalize_v3_timestamp`] before parsing, which appends `"Z"` when no
+/// timezone designator is present. Full nanosecond precision is preserved — truncating
+/// to milliseconds would shift the cursor before rows that share a millisecond
+/// boundary, causing re-delivery on the next poll.
+///
+/// ## Cursor tracking and stuck-batch detection
+///
+/// The highest timestamp seen across the batch becomes `max_cursor` in the result.
+/// `rows_at_max_cursor` counts how many rows share that timestamp, computed in a
+/// single pass with no extra allocations. The caller uses
+/// `rows_at_max_cursor >= effective_batch_size` as the stuck-batch signal: when a
+/// group of rows all carry the same timestamp and fill the entire batch, the cursor
+/// cannot advance further, so the effective batch size is doubled (up to
+/// `stuck_batch_cap_factor × base_batch_size`) to read past the tied rows.
+///
+/// ## Error conditions
+///
+/// - Any row whose cursor field value fails [`validate_cursor`] is an immediate error.
+/// - If the batch is non-empty but *no* row contains the cursor field, an error is
+///   returned — the cursor cannot advance and the connector would re-deliver the same
+///   rows indefinitely. Individual rows that merely lack the cursor field (while at
+///   least one other row has it) still produce messages without error.
+///
+/// ## Message identity
+///
+/// A single random UUID is generated per call; per-message IDs are derived by
+/// adding the message's position to that base, keeping PRNG work O(1) per batch.
+///
+/// ## Parameters
+///
+/// - `rows`: Rows returned by the SQL query for this poll (already filtered by `> cursor`).
+/// - `ctx`: Shared context (cursor field name, current cursor value, payload config,
+///   wall-clock time in microseconds).
+///
+/// ## Returns
+///
+/// A [`RowProcessingResult`] containing:
+/// - `messages`: One [`ProducedMessage`] per row.
+/// - `max_cursor`: Highest cursor timestamp seen, if any row had a parsable cursor field.
+/// - `rows_at_max_cursor`: Count of rows sharing `max_cursor`; used for stuck-batch detection.
 pub(crate) fn process_rows(
     rows: &[Row],
     ctx: &RowContext<'_>,
@@ -298,7 +341,7 @@ pub(crate) fn process_rows(
     for row in rows.iter() {
         if let Some(raw_cv) = row.get(ctx.cursor_field).and_then(|v| v.as_str()) {
             let cv_owned = normalize_v3_timestamp(raw_cv);
-            let cv = cv_owned.as_str();
+            let cv: &str = &cv_owned;
             validate_cursor(cv)?;
             let cv_parsed = cv.parse::<DateTime<Utc>>().ok();
             match (cv_parsed, max_cursor_parsed) {
