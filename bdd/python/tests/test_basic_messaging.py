@@ -297,12 +297,12 @@ def verify_stream_name_updated(context, expected_name):
     asyncio.run(_verify())
 
 
-@when("I delete the stream")
-def delete_stream(context):
-    """Delete the stream"""
+@when(parsers.parse('I delete the stream with name "{name}"'))
+def delete_stream(context, name):
+    """Delete the stream by name"""
 
     async def _delete():
-        await context.client.delete_stream(context.last_stream_id)
+        await context.client.delete_stream(name)
         context.last_stream_id = None
 
     asyncio.run(_delete())

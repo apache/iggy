@@ -214,12 +214,10 @@ public class BasicMessagingOperationsSteps
         _context.CreatedStream!.Name.ShouldBe(expectedName);
     }
 
-    [When(@"I delete the stream")]
-    public async Task WhenIDeleteTheStream()
+    [When(@"I delete the stream with name ""(.*)""")]
+    public async Task WhenIDeleteTheStream(string name)
     {
-        _context.CreatedStream.ShouldNotBeNull();
-        await _context.IggyClient.DeleteStreamAsync(
-            Identifier.Numeric(_context.CreatedStream!.Id));
+        await _context.IggyClient.DeleteStreamAsync(Identifier.String(name));
         _context.CreatedStream = null;
     }
 

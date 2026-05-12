@@ -24,6 +24,7 @@ import io.cucumber.java.en.Then;
 import io.cucumber.java.en.When;
 import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
+import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
@@ -223,9 +224,9 @@ public class BasicMessagingSteps {
         assertEquals(expectedName, stream.get().name(), "Stream name should be updated");
     }
 
-    @When("I delete the stream")
-    public void deleteStream() {
-        getClient().streams().deleteStream(context.lastStreamId);
+    @When("I delete the stream with name {string}")
+    public void deleteStream(String name) {
+        getClient().streams().deleteStream(StreamId.of(name));
         context.lastStreamId = null;
     }
 

@@ -90,11 +90,10 @@ pub async fn then_stream_name_updated(world: &mut GlobalContext, expected_name: 
     assert_eq!(stream.name, expected_name, "Stream name should be updated");
 }
 
-#[when("I delete the stream")]
-pub async fn when_delete_stream(world: &mut GlobalContext) {
+#[when(regex = r#"^I delete the stream with name "([^"]*)"$"#)]
+pub async fn when_delete_stream(world: &mut GlobalContext, name: String) {
     let client = world.client.as_ref().expect("Client should be available");
-    let stream_id = world.last_stream_id.expect("Stream should exist");
-    let identifier = Identifier::numeric(stream_id).unwrap();
+    let identifier = Identifier::named(&name).expect("Stream name should be valid");
     client
         .delete_stream(&identifier)
         .await

@@ -66,9 +66,9 @@ Then(
 );
 
 When(
-  'I delete the stream',
-  async function (this: TestWorld) {
-    assert.ok(await this.client.stream.delete({ streamId: this.stream.id }));
+  'I delete the stream with name {string}',
+  async function (this: TestWorld, name: string) {
+    assert.ok(await this.client.stream.delete({ streamId: name }));
   }
 );
 

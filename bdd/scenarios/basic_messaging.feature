@@ -47,5 +47,5 @@ Feature: Basic Messaging Operations
     When I update the stream name to "test-stream-updated"
     Then the stream name should be updated to "test-stream-updated"
 
-    When I delete the stream
+    When I delete the stream with name "test-stream-updated"
     Then the stream should be deleted successfully
