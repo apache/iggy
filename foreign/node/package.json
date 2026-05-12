@@ -28,7 +28,9 @@
     "dist/**/*.d.ts",
     "dist/index.d.ts",
     "!dist/bdd/",
-    "!dist/examples/"
+    "!dist/examples/",
+    "LICENSE",
+    "NOTICE"
   ],
   "types": "dist/index.d.ts",
   "main": "dist/index.js",

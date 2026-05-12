@@ -1,0 +1,91 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# cargo-about configuration for Apache Iggy.
+#
+# Used by `scripts/ci/third-party-licenses.sh` to render a
+# LICENSE-binary manifest that is bundled into convenience binary
+# artifacts (Docker images, PyPI wheels). Source releases do NOT bundle
+# third-party code, so the manifest is generated at build time only and is
+# .gitignored.
+#
+# License IDs accepted by ASF policy for redistribution.
+# See https://www.apache.org/legal/resolved.html
+#
+# Category A (explicitly listed on resolved.html, OK to bundle):
+#   Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, BSD-3-Clause-Clear,
+#   ISC, Zlib, Unicode-3.0, Unicode-DFS-2016, CC0-1.0, OpenSSL,
+#   BSL-1.0, NCSA
+#
+# Category B (binary-only, requires labelling per resolved.html):
+#   MPL-2.0
+#
+# NOT on resolved.html, but accepted as Category-A-equivalent by
+# precedent in apache/iceberg-rust, apache/opendal, apache/paimon-rust
+# deny.toml allow lists:
+#   bzip2-1.0.6
+#       BSD-derived. Pulled in by libbz2-rs-sys (runtime). Allowed in
+#       apache/iceberg-rust, apache/paimon-rust; used directly by
+#       apache/datafusion as a workspace dep.
+#   Apache-2.0 WITH LLVM-exception
+#       Apache-2.0 plus the LLVM exception broadening downstream-binary
+#       grants. Pulled in by target-lexicon via the pyo3 build chain
+#       reachable from foreign/python. Allowed in apache/iceberg-rust
+#       and apache/datafusion deny.toml.
+#   CDLA-Permissive-2.0 (scoped exception, not in general accept list)
+#       Permissive open-data license. Pulled in only by webpki-roots
+#       and webpki-root-certs (Mozilla CA bundle data). Crate-scoped
+#       exception below mirrors apache/opendal and apache/paimon-rust.
+#       apache/iceberg-rust accepts globally; we follow the more
+#       conservative scoped pattern.
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSD-3-Clause-Clear",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+    "BSL-1.0",
+    "NCSA",
+    "bzip2-1.0.6",
+]
+
+# Skip dev-dependencies and build-dependencies; neither is shipped in
+# the convenience binary. Build-deps run only during compilation, so
+# their code never lands in the artifact. Excluding them keeps the
+# manifest focused on what the user actually receives, and forces a
+# new build-only license to surface in CI rather than silently
+# expanding the accept list.
+ignore-dev-dependencies = true
+ignore-build-dependencies = true
+ignore-transitive-dependencies = false
+
+# Per-crate license overrides. Each entry permits the listed license
+# only for that specific crate, not the workspace as a whole.
+
+[webpki-roots]
+accepted = ["CDLA-Permissive-2.0"]
+
+[webpki-root-certs]
+accepted = ["CDLA-Permissive-2.0"]
