@@ -228,38 +228,34 @@ internal static class BinaryMapper
         var readBytes = 4 + 8 + 1 + 1 + usernameLength;
 
         return (new UserResponse
-            {
-                Id = id,
-                CreatedAt = createdAt,
-                Status = userStatus,
-                Username = username
-            },
+        {
+            Id = id,
+            CreatedAt = createdAt,
+            Status = userStatus,
+            Username = username
+        },
             readBytes);
     }
 
     internal static ClientResponse MapClient(ReadOnlySpan<byte> payload)
     {
         var (response, position) = MapClientInfo(payload, 0);
-        var consumerGroups = new List<ConsumerGroupInfo>();
-        var length = payload.Length;
+        var consumerGroups = new List<ConsumerGroupInfo>(response.ConsumerGroupsCount);
 
-        while (position < length)
+        for (var i = 0; i < response.ConsumerGroupsCount; i++)
         {
-            for (var i = 0; i < response.ConsumerGroupsCount; i++)
-            {
-                var streamId = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
-                var topicId = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 4)..(position + 8)]);
-                var consumerGroupId = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 8)..(position + 12)]);
-                var consumerGroup
-                    = new ConsumerGroupInfo
-                    {
-                        StreamId = streamId,
-                        TopicId = topicId,
-                        GroupId = consumerGroupId
-                    };
-                consumerGroups.Add(consumerGroup);
-                position += 12;
-            }
+            var streamId = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
+            var topicId = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 4)..(position + 8)]);
+            var consumerGroupId = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 8)..(position + 12)]);
+            var consumerGroup
+                = new ConsumerGroupInfo
+                {
+                    StreamId = streamId,
+                    TopicId = topicId,
+                    GroupId = consumerGroupId
+                };
+            consumerGroups.Add(consumerGroup);
+            position += 12;
         }
 
         return new ClientResponse
@@ -335,19 +331,6 @@ internal static class BinaryMapper
             StoredOffset = offset,
             PartitionId = partitionId
         };
-    }
-
-    internal static PolledMessagesRental MapRentedMessages(IMemoryOwner<byte> payloadOwner)
-    {
-        try
-        {
-            return MapRentedMessages(payloadOwner.Memory, payloadOwner);
-        }
-        catch
-        {
-            payloadOwner.Dispose();
-            throw;
-        }
     }
 
     internal static PolledMessagesRental MapRentedMessages(ReadOnlyMemory<byte> payload,
@@ -953,11 +936,11 @@ internal static class BinaryMapper
         }
 
         return (new ConsumerGroupMember
-            {
-                Id = id,
-                PartitionsCount = partitionsCount,
-                Partitions = partitions
-            },
+        {
+            Id = id,
+            PartitionsCount = partitionsCount,
+            Partitions = partitions
+        },
             8 + partitionsCount * 4);
     }
 

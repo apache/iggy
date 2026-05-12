@@ -1,4 +1,4 @@
-﻿// Licensed to the Apache Software Foundation (ASF) under one
+// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -58,14 +58,5 @@ public sealed class PolledMessagesRental : IDisposable
         }
 
         _owner.Dispose();
-        GC.SuppressFinalize(this);
-    }
-
-    /// <summary>
-    ///     Finalizer fallback that returns the buffer to the pool if the caller forgot to dispose.
-    /// </summary>
-    ~PolledMessagesRental()
-    {
-        Dispose();
     }
 }

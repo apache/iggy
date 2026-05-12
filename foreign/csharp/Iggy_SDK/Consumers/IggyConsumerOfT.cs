@@ -31,8 +31,8 @@ namespace Apache.Iggy.Consumers;
 /// <typeparam name="T">The type to deserialize message payloads to</typeparam>
 public class IggyConsumer<T> : IggyConsumer
 {
-    private readonly Channel<DeserializedMessage<T>> _deserializedChannel =
-        Channel.CreateUnbounded<DeserializedMessage<T>>();
+    private readonly Channel<ReceivedMessage<T>> _deserializedChannel =
+        Channel.CreateUnbounded<ReceivedMessage<T>>();
 
     private readonly IggyConsumerConfig<T> _typedConfig;
     private readonly ILogger<IggyConsumer<T>> _typedLogger;
@@ -51,57 +51,6 @@ public class IggyConsumer<T> : IggyConsumer
     }
 
     /// <summary>
-    ///     Receives and deserializes messages from the consumer
-    /// </summary>
-    /// <param name="ct">Cancellation token</param>
-    /// <returns>Async enumerable of deserialized messages with status</returns>
-    public async IAsyncEnumerable<ReceivedMessage<T>> ReceiveDeserializedAsync(
-        [EnumeratorCancellation] CancellationToken ct = default)
-    {
-        await foreach (var message in ReceiveAsync(ct))
-        {
-            if (message.Status != MessageStatus.Success)
-            {
-                yield return new ReceivedMessage<T>
-                {
-                    Data = default,
-                    Message = message.Message,
-                    CurrentOffset = message.CurrentOffset,
-                    PartitionId = message.PartitionId,
-                    Status = message.Status,
-                    Error = message.Error
-                };
-                continue;
-            }
-
-            T? deserializedPayload = default;
-            Exception? deserializationError = null;
-            var status = MessageStatus.Success;
-
-            try
-            {
-                deserializedPayload = Deserialize(message.Message.Payload);
-            }
-            catch (Exception ex)
-            {
-                _typedLogger.LogError(ex, "Failed to deserialize message at offset {Offset}", message.CurrentOffset);
-                status = MessageStatus.DeserializationFailed;
-                deserializationError = ex;
-            }
-
-            yield return new ReceivedMessage<T>
-            {
-                Data = deserializedPayload,
-                Message = message.Message,
-                CurrentOffset = message.CurrentOffset,
-                PartitionId = message.PartitionId,
-                Status = status,
-                Error = deserializationError
-            };
-        }
-    }
-
-    /// <summary>
     ///     Receives and deserializes messages via the rented poll path. Each polled batch is deserialized
     ///     in full before any message is yielded — the rented buffer is returned immediately after
     ///     deserialization, independently of how fast the caller iterates. The caller does not need to
@@ -109,7 +58,7 @@ public class IggyConsumer<T> : IggyConsumer
     /// </summary>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>Async enumerable of deserialized messages with status.</returns>
-    public async IAsyncEnumerable<DeserializedMessage<T>> ReceiveRentedDeserializedAsync(
+    public async IAsyncEnumerable<ReceivedMessage<T>> ReceiveDeserializedAsync(
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         if (!IsInitialized)
@@ -119,7 +68,7 @@ public class IggyConsumer<T> : IggyConsumer
 
         do
         {
-            if (!_deserializedChannel.Reader.TryRead(out DeserializedMessage<T>? message))
+            if (!_deserializedChannel.Reader.TryRead(out ReceivedMessage<T>? message))
             {
                 await PollRentedMessagesAsync(ct);
                 continue;
@@ -164,7 +113,7 @@ public class IggyConsumer<T> : IggyConsumer
             }
         }
 
-        var deserialized = new DeserializedMessage<T>
+        var deserialized = new ReceivedMessage<T>
         {
             Data = data,
             Header = message.Header,

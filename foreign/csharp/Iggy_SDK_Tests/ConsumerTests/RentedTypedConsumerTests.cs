@@ -1,4 +1,4 @@
-﻿// Licensed to the Apache Software Foundation (ASF) under one
+// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -28,7 +28,7 @@ namespace Apache.Iggy.Tests.ConsumerTests;
 public class RentedTypedConsumerTests
 {
     [Fact]
-    public async Task ReceiveRentedDeserializedAsync_Should_YieldDeserialized_AndReturnBuffer()
+    public async Task ReceiveDeserializedAsync_Should_YieldDeserialized_AndReturnBuffer()
     {
         var owner = new RentedConsumerTests.TrackingMemoryOwner(1024);
         IReadOnlyList<RentedMessageResponse> messages = RentedConsumerTests.BuildMessages(owner, 3);
@@ -46,9 +46,9 @@ public class RentedTypedConsumerTests
         await consumer.InitAsync(TestContext.Current.CancellationToken);
 
         var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        var got = new List<DeserializedMessage<string>>();
-        await using (IAsyncEnumerator<DeserializedMessage<string>> e = consumer
-                         .ReceiveRentedDeserializedAsync(cts.Token)
+        var got = new List<ReceivedMessage<string>>();
+        await using (IAsyncEnumerator<ReceivedMessage<string>> e = consumer
+                         .ReceiveDeserializedAsync(cts.Token)
                          .GetAsyncEnumerator(TestContext.Current.CancellationToken))
         {
             for (var i = 0; i < 3; i++)
@@ -74,7 +74,7 @@ public class RentedTypedConsumerTests
     }
 
     [Fact]
-    public async Task ReceiveRentedDeserializedAsync_Should_ReleaseEntireBatch_BeforeFirstYield()
+    public async Task ReceiveDeserializedAsync_Should_ReleaseEntireBatch_BeforeFirstYield()
     {
         var owner = new RentedConsumerTests.TrackingMemoryOwner(1024);
         IReadOnlyList<RentedMessageResponse> messages = RentedConsumerTests.BuildMessages(owner, 3);
@@ -92,7 +92,7 @@ public class RentedTypedConsumerTests
         await consumer.InitAsync(TestContext.Current.CancellationToken);
 
         var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        await using IAsyncEnumerator<DeserializedMessage<string>> e = consumer.ReceiveRentedDeserializedAsync(cts.Token)
+        await using IAsyncEnumerator<ReceivedMessage<string>> e = consumer.ReceiveDeserializedAsync(cts.Token)
             .GetAsyncEnumerator(TestContext.Current.CancellationToken);
 
         Assert.True(await e.MoveNextAsync());
@@ -130,9 +130,9 @@ public class RentedTypedConsumerTests
         await consumer.InitAsync(TestContext.Current.CancellationToken);
 
         var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        DeserializedMessage<string>? got = null;
-        await using (IAsyncEnumerator<DeserializedMessage<string>> e = consumer
-                         .ReceiveRentedDeserializedAsync(cts.Token)
+        ReceivedMessage<string>? got = null;
+        await using (IAsyncEnumerator<ReceivedMessage<string>> e = consumer
+                         .ReceiveDeserializedAsync(cts.Token)
                          .GetAsyncEnumerator(TestContext.Current.CancellationToken))
         {
             Assert.True(await e.MoveNextAsync());

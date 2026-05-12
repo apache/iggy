@@ -1,4 +1,4 @@
-﻿// Licensed to the Apache Software Foundation (ASF) under one
+// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -161,13 +161,13 @@ public partial class IggyConsumer
                 {
                     try
                     {
-                        var decryptedPayload = _config.MessageEncryptor.Decrypt(message.Payload.Span);
+                        var decryptedPayload = _config.MessageEncryptor.Decrypt(message.Payload.ToArray());
 
                         Dictionary<HeaderKey, HeaderValue>? decryptedHeaders = null;
                         if (!message.RawUserHeaders.IsEmpty)
                         {
                             var decryptedHeaderBytes =
-                                _config.MessageEncryptor.Decrypt(message.RawUserHeaders.Span);
+                                _config.MessageEncryptor.Decrypt(message.RawUserHeaders.ToArray());
                             decryptedHeaders = BinaryMapper.MapHeaders(decryptedHeaderBytes);
                         }
 

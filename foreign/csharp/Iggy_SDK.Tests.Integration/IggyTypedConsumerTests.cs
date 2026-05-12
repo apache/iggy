@@ -1,4 +1,4 @@
-﻿// Licensed to the Apache Software Foundation (ASF) under one
+// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -36,7 +36,7 @@ public class IggyTypedConsumerTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task ReceiveRentedDeserializedAsync_Should_YieldMessages_WithCorrectData(Protocol protocol)
+    public async Task ReceiveDeserializedAsync_Should_YieldMessages_WithCorrectData(Protocol protocol)
     {
         var client = protocol == Protocol.Tcp
             ? await Fixture.CreateTcpClient()
@@ -50,10 +50,10 @@ public class IggyTypedConsumerTests
 
         await consumer.InitAsync();
 
-        var received = new List<DeserializedMessage<string>>();
+        var received = new List<ReceivedMessage<string>>();
         var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
-        await foreach (DeserializedMessage<string> msg in consumer.ReceiveRentedDeserializedAsync(cts.Token))
+        await foreach (ReceivedMessage<string> msg in consumer.ReceiveDeserializedAsync(cts.Token))
         {
             msg.ShouldNotBeNull();
             msg.Status.ShouldBe(MessageStatus.Success);
@@ -74,7 +74,7 @@ public class IggyTypedConsumerTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task ReceiveRentedDeserializedAsync_WithoutInit_Should_Throw_ConsumerNotInitializedException(
+    public async Task ReceiveDeserializedAsync_WithoutInit_Should_Throw_ConsumerNotInitializedException(
         Protocol protocol)
     {
         var client = protocol == Protocol.Tcp
@@ -89,7 +89,7 @@ public class IggyTypedConsumerTests
 
         await Should.ThrowAsync<ConsumerNotInitializedException>(async () =>
         {
-            await foreach (DeserializedMessage<string> _ in consumer.ReceiveRentedDeserializedAsync())
+            await foreach (ReceivedMessage<string> _ in consumer.ReceiveDeserializedAsync())
             {
             }
         });
@@ -99,7 +99,7 @@ public class IggyTypedConsumerTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task ReceiveRentedDeserializedAsync_WithAutoCommitAfterReceive_Should_StoreOffset(Protocol protocol)
+    public async Task ReceiveDeserializedAsync_WithAutoCommitAfterReceive_Should_StoreOffset(Protocol protocol)
     {
         var client = protocol == Protocol.Tcp
             ? await Fixture.CreateTcpClient()
@@ -117,7 +117,7 @@ public class IggyTypedConsumerTests
         var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         var count = 0;
 
-        await foreach (DeserializedMessage<string> _ in consumer.ReceiveRentedDeserializedAsync(cts.Token))
+        await foreach (ReceivedMessage<string> _ in consumer.ReceiveDeserializedAsync(cts.Token))
         {
             count++;
             if (count >= 5)
@@ -139,7 +139,7 @@ public class IggyTypedConsumerTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task ReceiveRentedDeserializedAsync_WithFailingDeserializer_Should_YieldDeserializationFailed(
+    public async Task ReceiveDeserializedAsync_WithFailingDeserializer_Should_YieldDeserializationFailed(
         Protocol protocol)
     {
         var client = protocol == Protocol.Tcp
@@ -156,7 +156,7 @@ public class IggyTypedConsumerTests
 
         var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
-        await foreach (DeserializedMessage<string> msg in consumer.ReceiveRentedDeserializedAsync(cts.Token))
+        await foreach (ReceivedMessage<string> msg in consumer.ReceiveDeserializedAsync(cts.Token))
         {
             msg.Status.ShouldBe(MessageStatus.DeserializationFailed);
             msg.Data.ShouldBeNull();
@@ -170,7 +170,7 @@ public class IggyTypedConsumerTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task ReceiveRentedDeserializedAsync_Should_StopCleanly_OnCancellation(Protocol protocol)
+    public async Task ReceiveDeserializedAsync_Should_StopCleanly_OnCancellation(Protocol protocol)
     {
         var client = protocol == Protocol.Tcp
             ? await Fixture.CreateTcpClient()
@@ -190,7 +190,7 @@ public class IggyTypedConsumerTests
         {
             try
             {
-                await foreach (DeserializedMessage<string> _ in consumer.ReceiveRentedDeserializedAsync(cts.Token))
+                await foreach (ReceivedMessage<string> _ in consumer.ReceiveDeserializedAsync(cts.Token))
                 {
                 }
             }

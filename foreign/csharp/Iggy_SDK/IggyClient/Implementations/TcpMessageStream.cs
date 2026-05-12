@@ -330,7 +330,8 @@ public sealed class TcpMessageStream : IIggyClient
         var messageBufferSize = CalculateMessageBufferSize(streamId, topicId, consumer);
         var payloadBufferSize = CalculatePayloadBufferSize(messageBufferSize);
         var payload = ArrayPool<byte>.Shared.Rent(payloadBufferSize);
-
+        IMemoryOwner<byte>? responseBuffer = null;
+        
         try
         {
             TcpContracts.GetMessages(payload.AsSpan().Slice(8, messageBufferSize), consumer, streamId,
@@ -338,9 +339,13 @@ public sealed class TcpMessageStream : IIggyClient
             BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan()[..4], messageBufferSize + 4);
             BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan()[4..8], CommandCodes.POLL_MESSAGES_CODE);
 
-            IMemoryOwner<byte> responseBuffer
-                = await SendWithResponseAsync(payload.AsMemory(0, payloadBufferSize), token);
-            return BinaryMapper.MapRentedMessages(responseBuffer);
+            responseBuffer = await SendWithResponseAsync(payload.AsMemory(0, payloadBufferSize), token);
+            return BinaryMapper.MapRentedMessages(responseBuffer.Memory, responseBuffer);
+        }
+        catch
+        {
+            responseBuffer?.Dispose();
+            throw;
         }
         finally
         {
@@ -1085,12 +1090,13 @@ public sealed class TcpMessageStream : IIggyClient
                         $"Invalid response status code: {response.Status}");
                 }
 
-                var errorBuffer = new byte[response.Length];
+                
+                using var errorBuffer = ArrayPoolHelper.Rent(response.Length);
                 totalRead = 0;
                 while (totalRead < response.Length)
                 {
                     var readBytes
-                        = await _stream.ReadAsync(errorBuffer.AsMemory(totalRead, response.Length - totalRead), token);
+                        = await _stream.ReadAsync(errorBuffer.Memory.Slice(totalRead, response.Length - totalRead), token);
                     if (readBytes == 0)
                     {
                         throw new IggyZeroBytesException();
@@ -1099,7 +1105,7 @@ public sealed class TcpMessageStream : IIggyClient
                     totalRead += readBytes;
                 }
 
-                throw new InvalidResponseException(Encoding.UTF8.GetString(errorBuffer));
+                throw new InvalidResponseException(Encoding.UTF8.GetString(errorBuffer.Memory.Span));
             }
 
             if (response.Length == 0)
@@ -1301,8 +1307,11 @@ internal static class ArrayPoolHelper
     {
         private readonly byte[] _value = ArrayPool<byte>.Shared.Rent(minimumLength);
         private int _disposed;
-
-        public void Dispose()
+        
+        public Memory<byte> Memory => _value.AsMemory()[..minimumLength];
+        
+        
+        private void Dispose(bool suppressFinalize)
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
             {
@@ -1310,8 +1319,20 @@ internal static class ArrayPoolHelper
             }
 
             ArrayPool<byte>.Shared.Return(_value);
+            if (suppressFinalize)
+            {
+                GC.SuppressFinalize(this);
+            }
         }
-
-        public Memory<byte> Memory => _value.AsMemory()[..minimumLength];
+        
+        ~SlicedMemoryOwner()
+        {
+            Dispose(false);
+        }
+        
+        public void Dispose()
+        {
+            Dispose(true);
+        }
     }
 }
