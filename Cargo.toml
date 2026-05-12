@@ -200,7 +200,7 @@ nonzero_lit = "0.1.2"
 notify = "8.2.0"
 octocrab = "0.50.0"
 once_cell = "1.21.4"
-opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
+opentelemetry = { version = "0.32.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.31.1", features = ["log"] }
 opentelemetry-otlp = { version = "0.31.1", features = [
     "logs",
