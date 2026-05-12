@@ -23,6 +23,9 @@ import { uuidv7, uuidv4 } from "uuidv7";
 import { SEND_MESSAGES, type SendMessages } from "./send-messages.command.js";
 import { HeaderValue, HeaderKeyFactory } from "./header.utils.js";
 
+const SUCCESS = 0;
+const ERROR = 1;
+
 describe("SendMessages", () => {
   describe("serialize", () => {
     const t1 = {
@@ -158,5 +161,26 @@ describe("SendMessages", () => {
       };
       assert.doesNotThrow(() => SEND_MESSAGES.serialize(t));
     });
+  });
+
+  describe('deserialize', () => {
+
+    it('returns true when status is SUCCESS with empty data', () => {
+      const r = { status: SUCCESS, length: 0, data: Buffer.alloc(0) };
+      assert.equal(SEND_MESSAGES.deserialize(r), true);
+    });
+
+    it('returns true when status is SUCCESS with non-empty server payload', () => {
+      // SendMessages server response includes data (e.g. partition/offset info).
+      // The deserializer must accept non-empty data unlike deserializeVoidResponse.
+      const r = { status: SUCCESS, length: 4, data: Buffer.from([1, 2, 3, 4]) };
+      assert.equal(SEND_MESSAGES.deserialize(r), true);
+    });
+
+    it('returns false when status is an error code', () => {
+      const r = { status: ERROR, length: 0, data: Buffer.alloc(0) };
+      assert.equal(SEND_MESSAGES.deserialize(r), false);
+    });
+
   });
 });

@@ -40,3 +40,5 @@ foreign/node/.npm
 *.out
 go.work
 core/bench/dashboard/frontend/dist
+LICENSE-binary
+**/LICENSE-binary
