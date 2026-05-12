@@ -98,7 +98,7 @@ runs:
           echo "PHP extension was not produced"
           exit 1
         fi
-        echo "IGGY_PHP_EXTENSION=$(realpath "$extension")" >> "$GITHUB_ENV"
+        echo "PHP_IGGY_EXTENSION=$(realpath "$extension")" >> "$GITHUB_ENV"
         ls -lh "$extension"
 
     - name: Start Iggy server

@@ -37,8 +37,8 @@ mkdir -p test-results
 
 PHP_BIN="${PHP:-php}"
 PHP_ARGS=()
-if [ -n "${IGGY_PHP_EXTENSION:-}" ]; then
-    PHP_ARGS+=("-d" "extension=${IGGY_PHP_EXTENSION}")
+if [ -n "${PHP_IGGY_EXTENSION:-}" ]; then
+    PHP_ARGS+=("-d" "extension=${PHP_IGGY_EXTENSION}")
 fi
 
 "${PHP_BIN}" "${PHP_ARGS[@]}" tests/run.php "$@"
