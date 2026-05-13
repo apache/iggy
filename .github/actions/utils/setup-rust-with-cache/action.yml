@@ -58,7 +58,9 @@ runs:
       shell: bash
 
     - name: Setup Rust toolchain
-      run: rustup show
+      run: |
+        rustup show
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       shell: bash
 
     - name: Setup Rust cache
