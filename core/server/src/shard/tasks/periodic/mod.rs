@@ -23,6 +23,8 @@ mod message_saver;
 mod personal_access_token_cleaner;
 mod revocation_timeout;
 mod sysinfo_printer;
+#[cfg(feature = "systemd")]
+mod systemd_watchdog;
 
 pub use heartbeat_verifier::spawn_heartbeat_verifier;
 pub use jwt_token_cleaner::spawn_jwt_token_cleaner;
@@ -31,3 +33,5 @@ pub use message_saver::spawn_message_saver;
 pub use personal_access_token_cleaner::spawn_personal_access_token_cleaner;
 pub use revocation_timeout::spawn_revocation_timeout_checker;
 pub use sysinfo_printer::spawn_sysinfo_printer;
+#[cfg(feature = "systemd")]
+pub use systemd_watchdog::spawn_systemd_watchdog;
