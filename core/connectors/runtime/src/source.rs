@@ -88,8 +88,14 @@ pub async fn init(
             Err(error) => {
                 let message = format!("Failed to resolve plugin path: {error}");
                 error!("Source: {name} ({key}) - {message}");
-                failed_plugins.push(build_failed_plugin(
-                    plugin_id, &key, &name, &config, message,
+                failed_plugins.push(FailedPlugin::new(
+                    plugin_id,
+                    &key,
+                    &name,
+                    &config.path,
+                    config.plugin_config_format,
+                    config.enabled,
+                    message,
                 ));
                 continue;
             }
@@ -107,8 +113,14 @@ pub async fn init(
                 Err(error) => {
                     let message = format!("Failed to load source state: {error}");
                     error!("Source: {name} ({key}) - {message}");
-                    failed_plugins.push(build_failed_plugin(
-                        plugin_id, &key, &name, &config, message,
+                    failed_plugins.push(FailedPlugin::new(
+                        plugin_id,
+                        &key,
+                        &name,
+                        &config.path,
+                        config.plugin_config_format,
+                        config.enabled,
+                        message,
                     ));
                     continue;
                 }
@@ -121,8 +133,14 @@ pub async fn init(
                 Err(error) => {
                     let message = format!("Failed to load source container from {path}: {error}");
                     error!("Source: {name} ({key}) - {message}");
-                    failed_plugins.push(build_failed_plugin(
-                        plugin_id, &key, &name, &config, message,
+                    failed_plugins.push(FailedPlugin::new(
+                        plugin_id,
+                        &key,
+                        &name,
+                        &config.path,
+                        config.plugin_config_format,
+                        config.enabled,
+                        message,
                     ));
                     continue;
                 }
@@ -211,24 +229,6 @@ pub async fn init(
     }
 
     Ok((source_connectors, failed_plugins))
-}
-
-fn build_failed_plugin(
-    id: u32,
-    key: &str,
-    name: &str,
-    config: &SourceConfig,
-    error: String,
-) -> FailedPlugin {
-    FailedPlugin {
-        id,
-        key: key.to_owned(),
-        name: name.to_owned(),
-        path: config.path.clone(),
-        config_format: config.plugin_config_format,
-        error,
-        enabled: config.enabled,
-    }
 }
 
 fn get_plugin_version(container: &Container<SourceApi>) -> String {

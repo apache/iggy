@@ -77,8 +77,14 @@ pub async fn init(
             Err(error) => {
                 let message = format!("Failed to resolve plugin path: {error}");
                 error!("Sink: {name} ({key}) - {message}");
-                failed_plugins.push(build_failed_plugin(
-                    plugin_id, &key, &name, &config, message,
+                failed_plugins.push(FailedPlugin::new(
+                    plugin_id,
+                    &key,
+                    &name,
+                    &config.path,
+                    config.plugin_config_format,
+                    config.enabled,
+                    message,
                 ));
                 continue;
             }
@@ -95,8 +101,14 @@ pub async fn init(
                 Err(error) => {
                     let message = format!("Failed to load sink container from {path}: {error}");
                     error!("Sink: {name} ({key}) - {message}");
-                    failed_plugins.push(build_failed_plugin(
-                        plugin_id, &key, &name, &config, message,
+                    failed_plugins.push(FailedPlugin::new(
+                        plugin_id,
+                        &key,
+                        &name,
+                        &config.path,
+                        config.plugin_config_format,
+                        config.enabled,
+                        message,
                     ));
                     continue;
                 }
@@ -188,24 +200,6 @@ pub async fn init(
     }
 
     Ok((sink_connectors, failed_plugins))
-}
-
-fn build_failed_plugin(
-    id: u32,
-    key: &str,
-    name: &str,
-    config: &SinkConfig,
-    error: String,
-) -> FailedPlugin {
-    FailedPlugin {
-        id,
-        key: key.to_owned(),
-        name: name.to_owned(),
-        path: config.path.clone(),
-        config_format: config.plugin_config_format,
-        error,
-        enabled: config.enabled,
-    }
 }
 
 pub fn consume(

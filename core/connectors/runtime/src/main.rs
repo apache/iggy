@@ -475,6 +475,28 @@ pub(crate) struct FailedPlugin {
     pub enabled: bool,
 }
 
+impl FailedPlugin {
+    pub(crate) fn new(
+        id: u32,
+        key: &str,
+        name: &str,
+        path: &str,
+        config_format: Option<ConfigFormat>,
+        enabled: bool,
+        error: String,
+    ) -> Self {
+        Self {
+            id,
+            key: key.to_owned(),
+            name: name.to_owned(),
+            path: path.to_owned(),
+            config_format,
+            error,
+            enabled,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
