@@ -6480,6 +6480,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "rmcp",
+ "sd-notify",
  "serde",
  "serde_json",
  "socket2 0.6.3",
@@ -6487,6 +6488,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tower-http",
  "tracing",
  "tracing-opentelemetry",
@@ -10906,6 +10908,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "sd-notify"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e4ef7359e694bfaf1dd27a30f9d760b54c00dfae9f19bd0c05a39bc9128fe76"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "sdd"
 version = "3.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11284,6 +11295,7 @@ dependencies = [
  "rust-embed",
  "rustls",
  "rustls-pemfile",
+ "sd-notify",
  "secrecy",
  "send_wrapper",
  "serde",
