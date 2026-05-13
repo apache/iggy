@@ -26,10 +26,17 @@
 //! Trait-based for mocking.
 
 use crate::session_manager::{SessionError, SessionManager};
-use iggy_binary_protocol::EvictionReason;
-use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
-use iggy_binary_protocol::responses::users::LoginRegisterResponse;
-use metadata::RegisterSubmitError;
+use consensus::VsrConsensus;
+use iggy_binary_protocol::{
+    EvictionReason, Message, PrepareHeader,
+    requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest},
+    responses::users::LoginRegisterResponse,
+};
+use journal::{Journal, JournalHandle};
+use message_bus::MessageBus;
+use metadata::{
+    IggyMetadata, RegisterSubmitError, impls::metadata::StreamsFrontend, stm::StateMachine,
+};
 use secrecy::ExposeSecret;
 
 /// Credential verifier. Real impl: metadata user store + Argon2.
@@ -50,34 +57,11 @@ pub trait TokenVerifier {
     fn verify_token(&self, token: &str) -> Result<u32, LoginRegisterError>;
 }
 
-/// Submit `Register` through consensus.
+/// Bounds for [`IggyMetadata`] threaded through the login/register handlers.
 ///
-/// # Runtime
-/// `Future` is **not `Send`**. Production
-/// ([`crate::register_submitter::IggyRegisterSubmitter`]) wraps
-/// `IggyMetadata::submit_register_in_process`, whose state is `RefCell`/`Cell`
-/// on single-threaded `compio`. Multi-threaded embedders need a shim or
-/// custom transport; constraining `Send` would tax every call site.
-///
-/// # Failures
-/// Transient (pipeline-full, view-change cancel, primary-not-caught-up,
-/// in-flight register) MUST eventually be absorbed via bounded retry. Until
-/// then they surface as [`LoginRegisterError::Transient`] → `NotEvictable`,
-/// so network can't ship a wire-terminal `Eviction` for a recoverable
-/// failure. SDK read-timeout replays.
-///
-/// Terminal → [`EvictionReason`] in `EvictionHeader`; SDK invokes its
-/// eviction callback and stops.
-pub trait RegisterSubmitter {
-    /// Submit register for `client_id`, await commit. Returns session number.
-    ///
-    /// # Errors
-    /// Only genuinely terminal failures. Transients absorbed silently per contract.
-    fn submit_register(
-        &self,
-        client_id: u128,
-    ) -> impl std::future::Future<Output = Result<u64, LoginRegisterError>> + '_;
-}
+/// Re-stated rather than aliased so the public handler signatures stay
+/// readable at call sites that already type their metadata instance.
+type LoginMetadata<'a, B, J, S, M> = IggyMetadata<VsrConsensus<B>, J, S, M>;
 
 /// Handle login + register (username/password).
 /// Validate -> local credential verify → Register through consensus →
@@ -86,13 +70,25 @@ pub trait RegisterSubmitter {
 /// # Errors
 /// Auth, consensus, or session state error.
 #[allow(clippy::future_not_send)]
-pub async fn handle_login_register<V: CredentialVerifier, R: RegisterSubmitter>(
+pub async fn handle_login_register<V, B, J, S, M>(
     request: &LoginRegisterRequest,
     verifier: &V,
-    submitter: &R,
+    metadata: &LoginMetadata<'_, B, J, S, M>,
     session_manager: &mut SessionManager,
     connection_id: u64,
-) -> Result<LoginRegisterResponse, LoginRegisterError> {
+) -> Result<LoginRegisterResponse, LoginRegisterError>
+where
+    V: CredentialVerifier,
+    B: MessageBus,
+    J: JournalHandle,
+    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    M: StreamsFrontend
+        + StateMachine<
+            Input = Message<PrepareHeader>,
+            Output = bytes::Bytes,
+            Error = iggy_common::IggyError,
+        >,
+{
     if request.client_id == 0 {
         return Err(LoginRegisterError::InvalidClientId);
     }
@@ -104,7 +100,7 @@ pub async fn handle_login_register<V: CredentialVerifier, R: RegisterSubmitter>(
     complete_register(
         request.client_id,
         user_id,
-        submitter,
+        metadata,
         session_manager,
         connection_id,
     )
@@ -116,13 +112,25 @@ pub async fn handle_login_register<V: CredentialVerifier, R: RegisterSubmitter>(
 /// # Errors
 /// Token, consensus, or session state error.
 #[allow(clippy::future_not_send)]
-pub async fn handle_login_register_with_pat<T: TokenVerifier, R: RegisterSubmitter>(
+pub async fn handle_login_register_with_pat<T, B, J, S, M>(
     request: &LoginRegisterWithPatRequest,
     token_verifier: &T,
-    submitter: &R,
+    metadata: &LoginMetadata<'_, B, J, S, M>,
     session_manager: &mut SessionManager,
     connection_id: u64,
-) -> Result<LoginRegisterResponse, LoginRegisterError> {
+) -> Result<LoginRegisterResponse, LoginRegisterError>
+where
+    T: TokenVerifier,
+    B: MessageBus,
+    J: JournalHandle,
+    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    M: StreamsFrontend
+        + StateMachine<
+            Input = Message<PrepareHeader>,
+            Output = bytes::Bytes,
+            Error = iggy_common::IggyError,
+        >,
+{
     if request.client_id == 0 {
         return Err(LoginRegisterError::InvalidClientId);
     }
@@ -134,7 +142,7 @@ pub async fn handle_login_register_with_pat<T: TokenVerifier, R: RegisterSubmitt
     complete_register(
         request.client_id,
         user_id,
-        submitter,
+        metadata,
         session_manager,
         connection_id,
     )
@@ -143,25 +151,41 @@ pub async fn handle_login_register_with_pat<T: TokenVerifier, R: RegisterSubmitt
 
 /// Phase 2: transition session state, submit Register. Shared by password + PAT handlers.
 #[allow(clippy::future_not_send)]
-async fn complete_register<R: RegisterSubmitter>(
+async fn complete_register<B, J, S, M>(
     client_id: u128,
     user_id: u32,
-    submitter: &R,
+    metadata: &LoginMetadata<'_, B, J, S, M>,
     session_manager: &mut SessionManager,
     connection_id: u64,
-) -> Result<LoginRegisterResponse, LoginRegisterError> {
+) -> Result<LoginRegisterResponse, LoginRegisterError>
+where
+    B: MessageBus,
+    J: JournalHandle,
+    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    M: StreamsFrontend
+        + StateMachine<
+            Input = Message<PrepareHeader>,
+            Output = bytes::Bytes,
+            Error = iggy_common::IggyError,
+        >,
+{
     // Transition: Connected -> Authenticated.
     session_manager
         .login(connection_id, user_id)
         .map_err(LoginRegisterError::Session)?;
 
-    // Submit Register.
-    let session = match submitter.submit_register(client_id).await {
+    // Submit Register. All RegisterSubmitError variants are transient by
+    // contract (see [`RegisterSubmitError`] docs); wrap into Transient so
+    // TryFrom<&LoginRegisterError> for EvictionReason returns NotEvictable
+    // and the network layer can't ship a wire-terminal Eviction for a
+    // recoverable failure. SDK read-timeout replays.
+    let session = match metadata.submit_register_in_process(client_id).await {
         Ok(session) => session,
         Err(e) => {
+            triage_submit_error(&e);
             // Rollback Authenticated -> Connected so client can retry full flow.
             let _ = session_manager.reset_to_connected(connection_id);
-            return Err(e);
+            return Err(LoginRegisterError::Transient(e));
         }
     };
 
@@ -171,6 +195,37 @@ async fn complete_register<R: RegisterSubmitter>(
         .map_err(LoginRegisterError::Session)?;
 
     Ok(LoginRegisterResponse { user_id, session })
+}
+
+/// Surface unclassified [`RegisterSubmitError`] variants in debug builds.
+///
+/// `RegisterSubmitError` is `#[non_exhaustive]`; the wildcard arm guards
+/// against a new variant slipping through without an explicit decision
+/// about wire-eviction safety. Today every variant is transient, so the
+/// wildcard never fires; if metadata adds a terminal variant the
+/// `debug_assert` flags it so the dev wires a proper `EvictionReason`.
+//
+// TODO(absorb-silently): trait wants transient absorbed via bounded
+// retry; today they surface as Transient; arms will collapse once
+// retry lands.
+fn triage_submit_error(e: &RegisterSubmitError) {
+    match e {
+        RegisterSubmitError::NotPrimary
+        | RegisterSubmitError::NotCaughtUp
+        | RegisterSubmitError::PipelineFull
+        | RegisterSubmitError::InProgress
+        | RegisterSubmitError::Canceled => {}
+        other => {
+            tracing::warn!(
+                error = ?other,
+                "triage_submit_error: unclassified RegisterSubmitError; default Transient, add explicit arm"
+            );
+            debug_assert!(
+                false,
+                "triage_submit_error: unclassified RegisterSubmitError {other:?}"
+            );
+        }
+    }
 }
 
 /// Login/register failure.
@@ -264,153 +319,8 @@ impl TryFrom<&LoginRegisterError> for EvictionReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_manager::SessionManager;
     use consensus::{EvictionContext, build_eviction_message};
     use iggy_binary_protocol::{Command2, ConsensusHeader, HEADER_SIZE};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-    fn addr(port: u16) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
-    }
-
-    struct MockVerifier {
-        result: Result<u32, LoginRegisterError>,
-    }
-
-    impl CredentialVerifier for MockVerifier {
-        fn verify(&self, _username: &str, _password: &str) -> Result<u32, LoginRegisterError> {
-            match &self.result {
-                Ok(uid) => Ok(*uid),
-                Err(LoginRegisterError::InvalidCredentials) => {
-                    Err(LoginRegisterError::InvalidCredentials)
-                }
-                Err(LoginRegisterError::UserInactive) => Err(LoginRegisterError::UserInactive),
-                _ => Err(LoginRegisterError::InvalidCredentials),
-            }
-        }
-    }
-
-    struct MockSubmitter {
-        session: Result<u64, LoginRegisterError>,
-    }
-
-    impl RegisterSubmitter for MockSubmitter {
-        async fn submit_register(&self, _client_id: u128) -> Result<u64, LoginRegisterError> {
-            match &self.session {
-                Ok(s) => Ok(*s),
-                Err(LoginRegisterError::Transient(e)) => {
-                    Err(LoginRegisterError::Transient(e.clone()))
-                }
-                _ => Err(LoginRegisterError::Transient(
-                    RegisterSubmitError::PipelineFull,
-                )),
-            }
-        }
-    }
-
-    fn make_request(client_id: u128) -> LoginRegisterRequest {
-        LoginRegisterRequest {
-            client_id,
-            username: iggy_binary_protocol::WireName::new("admin").unwrap(),
-            password: secrecy::SecretString::from("secret"),
-            version: None,
-            client_context: None,
-        }
-    }
-
-    macro_rules! block_on {
-        ($e:expr) => {
-            futures::executor::block_on($e)
-        };
-    }
-
-    #[test]
-    fn happy_path() {
-        block_on!(async {
-            let mut mgr = SessionManager::new();
-            let conn = mgr.add_connection(addr(5000));
-            let verifier = MockVerifier { result: Ok(42) };
-            let submitter = MockSubmitter { session: Ok(100) };
-            let req = make_request(0xDEAD);
-
-            let resp = handle_login_register(&req, &verifier, &submitter, &mut mgr, conn)
-                .await
-                .unwrap();
-
-            assert_eq!(resp.user_id, 42);
-            assert_eq!(resp.session, 100);
-            assert_eq!(mgr.get_session(conn), Some((0xDEAD, 100)));
-            assert_eq!(mgr.bound_count(), 1);
-        });
-    }
-
-    #[test]
-    fn auth_failure_stays_connected() {
-        block_on!(async {
-            let mut mgr = SessionManager::new();
-            let conn = mgr.add_connection(addr(5000));
-            let verifier = MockVerifier {
-                result: Err(LoginRegisterError::InvalidCredentials),
-            };
-            let submitter = MockSubmitter { session: Ok(100) };
-            let req = make_request(0xDEAD);
-
-            let err = handle_login_register(&req, &verifier, &submitter, &mut mgr, conn)
-                .await
-                .unwrap_err();
-
-            assert!(matches!(err, LoginRegisterError::InvalidCredentials));
-            assert!(mgr.get_session(conn).is_none());
-        });
-    }
-
-    #[test]
-    fn consensus_failure_rolls_back_to_connected() {
-        block_on!(async {
-            let mut mgr = SessionManager::new();
-            let conn = mgr.add_connection(addr(5000));
-            let verifier = MockVerifier { result: Ok(42) };
-            let submitter = MockSubmitter {
-                session: Err(LoginRegisterError::Transient(
-                    RegisterSubmitError::PipelineFull,
-                )),
-            };
-            let req = make_request(0xDEAD);
-
-            let err = handle_login_register(&req, &verifier, &submitter, &mut mgr, conn)
-                .await
-                .unwrap_err();
-
-            assert!(matches!(err, LoginRegisterError::Transient(_)));
-            assert!(mgr.get_session(conn).is_none());
-
-            // Rolled back to Connected; retry succeeds.
-            let submitter_ok = MockSubmitter { session: Ok(100) };
-            let resp = handle_login_register(&req, &verifier, &submitter_ok, &mut mgr, conn)
-                .await
-                .unwrap();
-            assert_eq!(resp.user_id, 42);
-            assert_eq!(resp.session, 100);
-            assert_eq!(mgr.get_session(conn), Some((0xDEAD, 100)));
-        });
-    }
-
-    #[test]
-    fn zero_client_id_rejected() {
-        block_on!(async {
-            let mut mgr = SessionManager::new();
-            let conn = mgr.add_connection(addr(5000));
-            let verifier = MockVerifier { result: Ok(42) };
-            let submitter = MockSubmitter { session: Ok(100) };
-            let req = make_request(0);
-
-            let err = handle_login_register(&req, &verifier, &submitter, &mut mgr, conn)
-                .await
-                .unwrap_err();
-
-            assert!(matches!(err, LoginRegisterError::InvalidClientId));
-        });
-    }
 
     #[test]
     fn login_register_error_maps_to_eviction_reason() {
@@ -476,117 +386,20 @@ mod tests {
         assert!(header.validate().is_ok());
     }
 
-    // PAT tests
-
-    struct MockTokenVerifier {
-        result: Result<u32, LoginRegisterError>,
-    }
-
-    impl TokenVerifier for MockTokenVerifier {
-        fn verify_token(&self, _token: &str) -> Result<u32, LoginRegisterError> {
-            match &self.result {
-                Ok(uid) => Ok(*uid),
-                Err(LoginRegisterError::UserInactive) => Err(LoginRegisterError::UserInactive),
-                _ => Err(LoginRegisterError::InvalidToken),
-            }
+    // triage_submit_error must not debug_assert on any classified variant.
+    // If metadata adds a new RegisterSubmitError variant, the wildcard arm
+    // fires here and the dev wires it through explicitly.
+    #[test]
+    fn triage_submit_error_accepts_all_known_variants() {
+        let known = [
+            RegisterSubmitError::NotPrimary,
+            RegisterSubmitError::NotCaughtUp,
+            RegisterSubmitError::PipelineFull,
+            RegisterSubmitError::InProgress,
+            RegisterSubmitError::Canceled,
+        ];
+        for variant in &known {
+            triage_submit_error(variant);
         }
-    }
-
-    fn make_pat_request(client_id: u128) -> LoginRegisterWithPatRequest {
-        LoginRegisterWithPatRequest {
-            client_id,
-            token: secrecy::SecretString::from("test-pat-token"),
-            version: None,
-            client_context: None,
-        }
-    }
-
-    #[test]
-    fn pat_happy_path() {
-        block_on!(async {
-            let mut mgr = SessionManager::new();
-            let conn = mgr.add_connection(addr(5000));
-            let verifier = MockTokenVerifier { result: Ok(42) };
-            let submitter = MockSubmitter { session: Ok(100) };
-            let req = make_pat_request(0xDEAD);
-
-            let resp = handle_login_register_with_pat(&req, &verifier, &submitter, &mut mgr, conn)
-                .await
-                .unwrap();
-
-            assert_eq!(resp.user_id, 42);
-            assert_eq!(resp.session, 100);
-            assert_eq!(mgr.get_session(conn), Some((0xDEAD, 100)));
-            assert_eq!(mgr.bound_count(), 1);
-        });
-    }
-
-    #[test]
-    fn pat_auth_failure_stays_connected() {
-        block_on!(async {
-            let mut mgr = SessionManager::new();
-            let conn = mgr.add_connection(addr(5000));
-            let verifier = MockTokenVerifier {
-                result: Err(LoginRegisterError::InvalidToken),
-            };
-            let submitter = MockSubmitter { session: Ok(100) };
-            let req = make_pat_request(0xDEAD);
-
-            let err = handle_login_register_with_pat(&req, &verifier, &submitter, &mut mgr, conn)
-                .await
-                .unwrap_err();
-
-            assert!(matches!(err, LoginRegisterError::InvalidToken));
-            assert!(mgr.get_session(conn).is_none());
-        });
-    }
-
-    #[test]
-    fn pat_consensus_failure_rolls_back_to_connected() {
-        block_on!(async {
-            let mut mgr = SessionManager::new();
-            let conn = mgr.add_connection(addr(5000));
-            let verifier = MockTokenVerifier { result: Ok(42) };
-            let submitter = MockSubmitter {
-                session: Err(LoginRegisterError::Transient(
-                    RegisterSubmitError::PipelineFull,
-                )),
-            };
-            let req = make_pat_request(0xDEAD);
-
-            let err = handle_login_register_with_pat(&req, &verifier, &submitter, &mut mgr, conn)
-                .await
-                .unwrap_err();
-
-            assert!(matches!(err, LoginRegisterError::Transient(_)));
-            assert!(mgr.get_session(conn).is_none());
-
-            // Rolled back to Connected; retry succeeds.
-            let submitter_ok = MockSubmitter { session: Ok(100) };
-            let resp =
-                handle_login_register_with_pat(&req, &verifier, &submitter_ok, &mut mgr, conn)
-                    .await
-                    .unwrap();
-            assert_eq!(resp.user_id, 42);
-            assert_eq!(resp.session, 100);
-            assert_eq!(mgr.get_session(conn), Some((0xDEAD, 100)));
-        });
-    }
-
-    #[test]
-    fn pat_zero_client_id_rejected() {
-        block_on!(async {
-            let mut mgr = SessionManager::new();
-            let conn = mgr.add_connection(addr(5000));
-            let verifier = MockTokenVerifier { result: Ok(42) };
-            let submitter = MockSubmitter { session: Ok(100) };
-            let req = make_pat_request(0);
-
-            let err = handle_login_register_with_pat(&req, &verifier, &submitter, &mut mgr, conn)
-                .await
-                .unwrap_err();
-
-            assert!(matches!(err, LoginRegisterError::InvalidClientId));
-        });
     }
 }

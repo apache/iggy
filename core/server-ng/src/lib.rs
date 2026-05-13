@@ -22,6 +22,5 @@
 pub mod bootstrap;
 pub mod config_writer;
 pub mod login_register;
-pub mod register_submitter;
 pub mod server_error;
 pub mod session_manager;

@@ -266,7 +266,7 @@ impl<M> SnapshotCoordinator<M> {
 }
 
 /// Failures for [`IggyMetadata::submit_register_in_process`]. All transient;
-/// production `IggyRegisterSubmitter` maps every variant to
+/// the login/register handler wraps every variant in
 /// `LoginRegisterError::Transient` so SDK read-timeout replays.
 //
 // TODO(pipeline-backpressure, canceled-retry): absorb-silently loop will
