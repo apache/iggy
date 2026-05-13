@@ -19,6 +19,8 @@
 use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
 use crate::prelude::Client;
 use crate::prelude::TcpClientConfig;
+#[cfg(feature = "vsr")]
+use crate::session::ConsensusSession;
 use crate::tcp::tcp_connection_stream::TcpConnectionStream;
 use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
 use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
@@ -27,9 +29,10 @@ use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
-    IggyDuration, IggyError, IggyErrorDiscriminants, IggyTimestamp, TcpConnectionStringOptions,
-    TransportProtocol,
+    IggyDuration, IggyError, IggyTimestamp, TcpConnectionStringOptions, TransportProtocol,
 };
+#[cfg(not(feature = "vsr"))]
+use iggy_common::IggyErrorDiscriminants;
 use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use secrecy::ExposeSecret;
@@ -42,7 +45,9 @@ use tokio::time::sleep;
 use tokio_rustls::{TlsConnector, TlsStream};
 use tracing::{error, info, trace, warn};
 
+#[cfg(not(feature = "vsr"))]
 const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
+#[cfg(not(feature = "vsr"))]
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
 const NAME: &str = "Iggy";
 
@@ -58,6 +63,8 @@ pub struct TcpClient {
     pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
     leader_redirection_state: Mutex<LeaderRedirectionState>,
     pub(crate) current_server_address: Mutex<String>,
+    #[cfg(feature = "vsr")]
+    consensus_session: Arc<Mutex<ConsensusSession>>,
 }
 
 impl Default for TcpClient {
@@ -144,6 +151,32 @@ impl BinaryTransport for TcpClient {
     fn get_heartbeat_interval(&self) -> IggyDuration {
         self.config.heartbeat_interval
     }
+
+    #[cfg(feature = "vsr")]
+    async fn get_vsr_client_id(&self) -> Result<u128, IggyError> {
+        Ok(self.consensus_session.lock().await.client_id())
+    }
+
+    #[cfg(feature = "vsr")]
+    async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
+        if session == 0 {
+            return Err(IggyError::InvalidConfiguration);
+        }
+
+        let mut consensus_session = self.consensus_session.lock().await;
+        if consensus_session.is_bound() {
+            return Err(IggyError::InvalidConfiguration);
+        }
+
+        consensus_session.bind(session);
+        Ok(())
+    }
+
+    #[cfg(feature = "vsr")]
+    async fn reset_vsr_session(&self) -> Result<(), IggyError> {
+        *self.consensus_session.lock().await = ConsensusSession::new();
+        Ok(())
+    }
 }
 
 impl BinaryClient for TcpClient {}
@@ -203,9 +236,12 @@ impl TcpClient {
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
+            #[cfg(feature = "vsr")]
+            consensus_session: Arc::new(Mutex::new(ConsensusSession::new())),
         })
     }
 
+    #[cfg(not(feature = "vsr"))]
     async fn handle_response(
         status: u32,
         length: u32,
@@ -510,6 +546,8 @@ impl TcpClient {
         info!("{NAME} client: {client_address} is disconnecting from server...");
         self.set_state(ClientState::Disconnected).await;
         self.stream.lock().await.take();
+        #[cfg(feature = "vsr")]
+        self.reset_vsr_session().await?;
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
         info!("{NAME} client: {client_address} has disconnected from server at: {now}.");
@@ -527,6 +565,8 @@ impl TcpClient {
         if let Some(mut stream) = stream {
             stream.shutdown().await?;
         }
+        #[cfg(feature = "vsr")]
+        self.reset_vsr_session().await?;
         self.set_state(ClientState::Shutdown).await;
         self.publish_event(DiagnosticEvent::Shutdown).await;
         info!("{NAME} TCP client: {client_address} has been shutdown.");
@@ -551,43 +591,103 @@ impl TcpClient {
         }
 
         let stream = self.stream.clone();
+        #[cfg(feature = "vsr")]
+        let consensus_session = self.consensus_session.clone();
         // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
         tokio::spawn(async move {
             let mut stream = stream.lock().await;
             if let Some(stream) = stream.as_mut() {
+                #[cfg(feature = "vsr")]
+                let request = {
+                    let mut consensus_session = consensus_session.lock().await;
+                    crate::vsr::encode_request(&mut consensus_session, code, &payload)?
+                };
+                #[cfg(not(feature = "vsr"))]
                 let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
+                #[cfg(feature = "vsr")]
+                trace!(
+                    "Sending a TCP VSR request of size {} with code: {code}",
+                    request.len()
+                );
+                #[cfg(not(feature = "vsr"))]
                 trace!("Sending a TCP request of size {payload_length} with code: {code}");
+                #[cfg(feature = "vsr")]
+                stream.write(&request).await?;
+                #[cfg(not(feature = "vsr"))]
                 stream.write(&(payload_length as u32).to_le_bytes()).await?;
+                #[cfg(not(feature = "vsr"))]
                 stream.write(&code.to_le_bytes()).await?;
+                #[cfg(not(feature = "vsr"))]
                 stream.write(&payload).await?;
                 stream.flush().await?;
                 trace!("Sent a TCP request with code: {code}, waiting for a response...");
-                let mut response_buffer = [0u8; RESPONSE_INITIAL_BYTES_LENGTH];
-                let read_bytes = stream.read(&mut response_buffer).await.map_err(|error| {
-                    error!(
-                        "Failed to read response for TCP request with code: {code}: {error}",
-                        code = code,
-                        error = error
-                    );
-                    IggyError::Disconnected
-                })?;
+                #[cfg(feature = "vsr")]
+                {
+                    let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
+                    let read_bytes = stream.read(&mut response_header).await.map_err(|error| {
+                        error!(
+                            "Failed to read VSR response header for TCP request with code: {code}: {error}",
+                            code = code,
+                            error = error
+                        );
+                        IggyError::Disconnected
+                    })?;
 
-                if read_bytes != RESPONSE_INITIAL_BYTES_LENGTH {
-                    error!("Received an invalid or empty response.");
-                    return Err(IggyError::EmptyResponse);
+                    if read_bytes != iggy_binary_protocol::HEADER_SIZE {
+                        error!("Received an invalid or empty VSR response header.");
+                        return Err(IggyError::EmptyResponse);
+                    }
+
+                    let response_size = crate::vsr::response_size(&response_header)?;
+                    let mut response = BytesMut::with_capacity(response_size);
+                    response.put_slice(&response_header);
+
+                    if response_size > iggy_binary_protocol::HEADER_SIZE {
+                        let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
+                        let mut body = vec![0u8; body_size];
+                        stream.read(&mut body).await.map_err(|error| {
+                            error!(
+                                "Failed to read VSR response body for TCP request with code: {code}: {error}",
+                                code = code,
+                                error = error
+                            );
+                            IggyError::Disconnected
+                        })?;
+                        response.put_slice(&body);
+                    }
+
+                    return crate::vsr::decode_response(&response.freeze());
                 }
 
-                let status = u32::from_le_bytes(
-                    response_buffer[..4]
-                        .try_into()
-                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
-                );
-                let length = u32::from_le_bytes(
-                    response_buffer[4..]
-                        .try_into()
-                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
-                );
-                return TcpClient::handle_response(status, length, stream).await;
+                #[cfg(not(feature = "vsr"))]
+                {
+                    let mut response_buffer = [0u8; RESPONSE_INITIAL_BYTES_LENGTH];
+                    let read_bytes = stream.read(&mut response_buffer).await.map_err(|error| {
+                        error!(
+                            "Failed to read response for TCP request with code: {code}: {error}",
+                            code = code,
+                            error = error
+                        );
+                        IggyError::Disconnected
+                    })?;
+
+                    if read_bytes != RESPONSE_INITIAL_BYTES_LENGTH {
+                        error!("Received an invalid or empty response.");
+                        return Err(IggyError::EmptyResponse);
+                    }
+
+                    let status = u32::from_le_bytes(
+                        response_buffer[..4]
+                            .try_into()
+                            .map_err(|_| IggyError::InvalidNumberEncoding)?,
+                    );
+                    let length = u32::from_le_bytes(
+                        response_buffer[4..]
+                            .try_into()
+                            .map_err(|_| IggyError::InvalidNumberEncoding)?,
+                    );
+                    return TcpClient::handle_response(status, length, stream).await;
+                }
             }
 
             error!("Cannot send data. Client is not connected.");

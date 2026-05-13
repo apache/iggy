@@ -17,6 +17,8 @@
  */
 
 use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
+#[cfg(feature = "vsr")]
+use crate::session::ConsensusSession;
 use crate::websocket::websocket_connection_stream::WebSocketConnectionStream;
 use crate::websocket::websocket_stream_kind::WebSocketStreamKind;
 use crate::websocket::websocket_tls_connection_stream::WebSocketTlsConnectionStream;
@@ -28,9 +30,10 @@ use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
-    IggyError, IggyErrorDiscriminants, IggyTimestamp, WebSocketClientConfig,
-    WebSocketConnectionStringOptions,
+    IggyError, IggyTimestamp, WebSocketClientConfig, WebSocketConnectionStringOptions,
 };
+#[cfg(not(feature = "vsr"))]
+use iggy_common::IggyErrorDiscriminants;
 use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use secrecy::ExposeSecret;
 use std::net::SocketAddr;
@@ -44,7 +47,9 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, error, info, trace, warn};
 
+#[cfg(not(feature = "vsr"))]
 const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
+#[cfg(not(feature = "vsr"))]
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
 const NAME: &str = "WebSocket";
 
@@ -58,6 +63,8 @@ pub struct WebSocketClient {
     pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
     leader_redirection_state: Mutex<LeaderRedirectionState>,
     pub(crate) current_server_address: Mutex<String>,
+    #[cfg(feature = "vsr")]
+    consensus_session: Arc<Mutex<ConsensusSession>>,
 }
 
 impl Default for WebSocketClient {
@@ -145,6 +152,32 @@ impl BinaryTransport for WebSocketClient {
     fn get_heartbeat_interval(&self) -> IggyDuration {
         self.config.heartbeat_interval
     }
+
+    #[cfg(feature = "vsr")]
+    async fn get_vsr_client_id(&self) -> Result<u128, IggyError> {
+        Ok(self.consensus_session.lock().await.client_id())
+    }
+
+    #[cfg(feature = "vsr")]
+    async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
+        if session == 0 {
+            return Err(IggyError::InvalidConfiguration);
+        }
+
+        let mut consensus_session = self.consensus_session.lock().await;
+        if consensus_session.is_bound() {
+            return Err(IggyError::InvalidConfiguration);
+        }
+
+        consensus_session.bind(session);
+        Ok(())
+    }
+
+    #[cfg(feature = "vsr")]
+    async fn reset_vsr_session(&self) -> Result<(), IggyError> {
+        *self.consensus_session.lock().await = ConsensusSession::new();
+        Ok(())
+    }
 }
 
 impl BinaryClient for WebSocketClient {}
@@ -163,6 +196,8 @@ impl WebSocketClient {
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
+            #[cfg(feature = "vsr")]
+            consensus_session: Arc::new(Mutex::new(ConsensusSession::new())),
         })
     }
 
@@ -520,6 +555,8 @@ impl WebSocketClient {
         self.set_state(ClientState::Disconnected).await;
 
         self.stream.lock().await.take();
+        #[cfg(feature = "vsr")]
+        self.reset_vsr_session().await?;
 
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
@@ -542,6 +579,8 @@ impl WebSocketClient {
             let _ = stream.shutdown().await;
         }
 
+        #[cfg(feature = "vsr")]
+        self.reset_vsr_session().await?;
         self.set_state(ClientState::Shutdown).await;
         self.publish_event(DiagnosticEvent::Shutdown).await;
         info!("{NAME} client: {client_address} has been shutdown.");
@@ -571,10 +610,20 @@ impl WebSocketClient {
             IggyError::NotConnected
         })?;
 
+        #[cfg(feature = "vsr")]
+        let request = {
+            let mut consensus_session = self.consensus_session.lock().await;
+            crate::vsr::encode_request(&mut consensus_session, code, &payload)?
+        };
+        #[cfg(not(feature = "vsr"))]
         let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
+        #[cfg(not(feature = "vsr"))]
         let mut request = BytesMut::with_capacity(4 + REQUEST_INITIAL_BYTES_LENGTH + payload.len());
+        #[cfg(not(feature = "vsr"))]
         request.put_u32_le(payload_length as u32);
+        #[cfg(not(feature = "vsr"))]
         request.put_u32_le(code);
+        #[cfg(not(feature = "vsr"))]
         request.put_slice(&payload);
 
         trace!(
@@ -586,61 +635,82 @@ impl WebSocketClient {
         stream.write(&request).await?;
         stream.flush().await?;
 
-        let mut response_initial_buffer = vec![0u8; RESPONSE_INITIAL_BYTES_LENGTH];
-        stream.read(&mut response_initial_buffer).await?;
+        #[cfg(feature = "vsr")]
+        {
+            let mut response_header = vec![0u8; iggy_binary_protocol::HEADER_SIZE];
+            stream.read(&mut response_header).await?;
 
-        let status = u32::from_le_bytes([
-            response_initial_buffer[0],
-            response_initial_buffer[1],
-            response_initial_buffer[2],
-            response_initial_buffer[3],
-        ]);
+            let response_size = crate::vsr::response_size(&response_header)?;
+            let mut response = BytesMut::with_capacity(response_size);
+            response.put_slice(&response_header);
 
-        let length = u32::from_le_bytes([
-            response_initial_buffer[4],
-            response_initial_buffer[5],
-            response_initial_buffer[6],
-            response_initial_buffer[7],
-        ]) as usize;
-
-        trace!(
-            "Received {NAME} response status: {}, length: {} bytes",
-            status, length
-        );
-
-        if status != 0 {
-            // TEMP: See https://github.com/apache/iggy/pull/604 for context.
-            if status == IggyErrorDiscriminants::TopicNameAlreadyExists as u32
-                || status == IggyErrorDiscriminants::StreamNameAlreadyExists as u32
-                || status == IggyErrorDiscriminants::UserAlreadyExists as u32
-                || status == IggyErrorDiscriminants::PersonalAccessTokenAlreadyExists as u32
-                || status == IggyErrorDiscriminants::ConsumerGroupNameAlreadyExists as u32
-            {
-                debug!(
-                    "Received a server resource already exists response: {} ({})",
-                    status,
-                    IggyError::from_code_as_string(status)
-                )
-            } else {
-                error!(
-                    "Received an invalid response with status: {} ({}).",
-                    status,
-                    IggyError::from_code_as_string(status),
-                );
+            if response_size > iggy_binary_protocol::HEADER_SIZE {
+                let mut response_body = vec![0u8; response_size - iggy_binary_protocol::HEADER_SIZE];
+                stream.read(&mut response_body).await?;
+                response.put_slice(&response_body);
             }
 
-            return Err(IggyError::from_code(status));
+            return crate::vsr::decode_response(&response.freeze());
         }
 
-        if length == 0 {
-            return Ok(Bytes::new());
+        #[cfg(not(feature = "vsr"))]
+        {
+            let mut response_initial_buffer = vec![0u8; RESPONSE_INITIAL_BYTES_LENGTH];
+            stream.read(&mut response_initial_buffer).await?;
+
+            let status = u32::from_le_bytes([
+                response_initial_buffer[0],
+                response_initial_buffer[1],
+                response_initial_buffer[2],
+                response_initial_buffer[3],
+            ]);
+
+            let length = u32::from_le_bytes([
+                response_initial_buffer[4],
+                response_initial_buffer[5],
+                response_initial_buffer[6],
+                response_initial_buffer[7],
+            ]) as usize;
+
+            trace!(
+                "Received {NAME} response status: {}, length: {} bytes",
+                status, length
+            );
+
+            if status != 0 {
+                // TEMP: See https://github.com/apache/iggy/pull/604 for context.
+                if status == IggyErrorDiscriminants::TopicNameAlreadyExists as u32
+                    || status == IggyErrorDiscriminants::StreamNameAlreadyExists as u32
+                    || status == IggyErrorDiscriminants::UserAlreadyExists as u32
+                    || status == IggyErrorDiscriminants::PersonalAccessTokenAlreadyExists as u32
+                    || status == IggyErrorDiscriminants::ConsumerGroupNameAlreadyExists as u32
+                {
+                    debug!(
+                        "Received a server resource already exists response: {} ({})",
+                        status,
+                        IggyError::from_code_as_string(status)
+                    )
+                } else {
+                    error!(
+                        "Received an invalid response with status: {} ({}).",
+                        status,
+                        IggyError::from_code_as_string(status),
+                    );
+                }
+
+                return Err(IggyError::from_code(status));
+            }
+
+            if length == 0 {
+                return Ok(Bytes::new());
+            }
+
+            let mut response_buffer = vec![0u8; length];
+            stream.read(&mut response_buffer).await?;
+
+            trace!("Received {NAME} response payload, size: {} bytes", length);
+            Ok(Bytes::from(response_buffer))
         }
-
-        let mut response_buffer = vec![0u8; length];
-        stream.read(&mut response_buffer).await?;
-
-        trace!("Received {NAME} response payload, size: {} bytes", length);
-        Ok(Bytes::from(response_buffer))
     }
 }
 

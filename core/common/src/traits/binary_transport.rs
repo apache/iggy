@@ -29,4 +29,19 @@ pub trait BinaryTransport {
     async fn publish_event(&self, event: DiagnosticEvent);
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>;
     fn get_heartbeat_interval(&self) -> IggyDuration;
+
+    #[cfg(feature = "vsr")]
+    async fn get_vsr_client_id(&self) -> Result<u128, IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
+
+    #[cfg(feature = "vsr")]
+    async fn bind_vsr_session(&self, _session: u64) -> Result<(), IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
+
+    #[cfg(feature = "vsr")]
+    async fn reset_vsr_session(&self) -> Result<(), IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
 }

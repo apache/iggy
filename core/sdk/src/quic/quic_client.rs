@@ -18,6 +18,8 @@
 
 use crate::leader_aware::{LeaderRedirectionState, check_and_redirect_to_leader};
 use crate::prelude::AutoLogin;
+#[cfg(feature = "vsr")]
+use crate::session::ConsensusSession;
 use iggy_common::{BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient};
 
 use crate::prelude::{IggyDuration, IggyError, IggyTimestamp, QuicClientConfig};
@@ -41,7 +43,9 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{error, info, trace, warn};
 
+#[cfg(not(feature = "vsr"))]
 const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
+#[cfg(not(feature = "vsr"))]
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
 const NAME: &str = "Iggy";
 
@@ -56,6 +60,8 @@ pub struct QuicClient {
     pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
     leader_redirection_state: Mutex<LeaderRedirectionState>,
     pub(crate) current_server_address: Mutex<String>,
+    #[cfg(feature = "vsr")]
+    consensus_session: Arc<Mutex<ConsensusSession>>,
 }
 
 unsafe impl Send for QuicClient {}
@@ -139,6 +145,32 @@ impl BinaryTransport for QuicClient {
     fn get_heartbeat_interval(&self) -> IggyDuration {
         self.config.heartbeat_interval
     }
+
+    #[cfg(feature = "vsr")]
+    async fn get_vsr_client_id(&self) -> Result<u128, IggyError> {
+        Ok(self.consensus_session.lock().await.client_id())
+    }
+
+    #[cfg(feature = "vsr")]
+    async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError> {
+        if session == 0 {
+            return Err(IggyError::InvalidConfiguration);
+        }
+
+        let mut consensus_session = self.consensus_session.lock().await;
+        if consensus_session.is_bound() {
+            return Err(IggyError::InvalidConfiguration);
+        }
+
+        consensus_session.bind(session);
+        Ok(())
+    }
+
+    #[cfg(feature = "vsr")]
+    async fn reset_vsr_session(&self) -> Result<(), IggyError> {
+        *self.consensus_session.lock().await = ConsensusSession::new();
+        Ok(())
+    }
 }
 
 impl BinaryClient for QuicClient {}
@@ -205,6 +237,8 @@ impl QuicClient {
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
+            #[cfg(feature = "vsr")]
+            consensus_session: Arc::new(Mutex::new(ConsensusSession::new())),
         })
     }
 
@@ -234,34 +268,43 @@ impl QuicClient {
             return Err(IggyError::EmptyResponse);
         }
 
-        let status = u32::from_le_bytes(
-            buffer[..4]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        if status != 0 {
-            error!(
-                "Received an invalid response with status: {} ({}).",
-                status,
-                IggyError::from_code_as_string(status)
+        #[cfg(feature = "vsr")]
+        {
+            return crate::vsr::decode_response(&buffer);
+        }
+
+        #[cfg(not(feature = "vsr"))]
+        {
+            let status = u32::from_le_bytes(
+                buffer[..4]
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
             );
+            if status != 0 {
+                error!(
+                    "Received an invalid response with status: {} ({}).",
+                    status,
+                    IggyError::from_code_as_string(status)
+                );
 
-            return Err(IggyError::from_code(status));
+                return Err(IggyError::from_code(status));
+            }
+
+            let length = u32::from_le_bytes(
+                buffer[4..RESPONSE_INITIAL_BYTES_LENGTH]
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
+            );
+            trace!("Status: OK. Response length: {}", length);
+            if length <= 1 {
+                return Ok(Bytes::new());
+            }
+
+            Ok(Bytes::copy_from_slice(
+                &buffer[RESPONSE_INITIAL_BYTES_LENGTH
+                    ..RESPONSE_INITIAL_BYTES_LENGTH + length as usize],
+            ))
         }
-
-        let length = u32::from_le_bytes(
-            buffer[4..RESPONSE_INITIAL_BYTES_LENGTH]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        trace!("Status: OK. Response length: {}", length);
-        if length <= 1 {
-            return Ok(Bytes::new());
-        }
-
-        Ok(Bytes::copy_from_slice(
-            &buffer[RESPONSE_INITIAL_BYTES_LENGTH..RESPONSE_INITIAL_BYTES_LENGTH + length as usize],
-        ))
     }
 
     async fn connect(&self) -> Result<(), IggyError> {
@@ -469,6 +512,8 @@ impl QuicClient {
         }
 
         self.endpoint.wait_idle().await;
+        #[cfg(feature = "vsr")]
+        self.reset_vsr_session().await?;
         self.set_state(ClientState::Shutdown).await;
         self.publish_event(DiagnosticEvent::Shutdown).await;
         info!("{NAME} QUIC client has been shutdown.");
@@ -487,6 +532,8 @@ impl QuicClient {
         self.set_state(ClientState::Disconnected).await;
         self.connection.lock().await.take();
         self.endpoint.wait_idle().await;
+        #[cfg(feature = "vsr")]
+        self.reset_vsr_session().await?;
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
         info!(
@@ -521,26 +568,42 @@ impl QuicClient {
 
         let connection = self.connection.clone();
         let response_buffer_size = self.config.response_buffer_size;
+        #[cfg(feature = "vsr")]
+        let consensus_session = self.consensus_session.clone();
         // SAFETY: we run code holding the `connection` lock in a task so we can't be cancelled while holding the lock.
         tokio::spawn(async move {
             let connection = connection.lock().await;
             if let Some(connection) = connection.as_ref() {
+                #[cfg(feature = "vsr")]
+                let request = {
+                    let mut consensus_session = consensus_session.lock().await;
+                    crate::vsr::encode_request(&mut consensus_session, code, &payload)?
+                };
+                #[cfg(not(feature = "vsr"))]
                 let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
                 let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
                     error!("Failed to open a bidirectional stream: {error}");
                     IggyError::QuicError
                 })?;
                 trace!("Sending a QUIC request with code: {code}");
+                #[cfg(feature = "vsr")]
+                send.write_all(&request).await.map_err(|error| {
+                    error!("Failed to write VSR request: {error}");
+                    IggyError::QuicError
+                })?;
+                #[cfg(not(feature = "vsr"))]
                 send.write_all(&(payload_length as u32).to_le_bytes())
                     .await
                     .map_err(|error| {
                         error!("Failed to write payload length: {error}");
                         IggyError::QuicError
                     })?;
+                #[cfg(not(feature = "vsr"))]
                 send.write_all(&code.to_le_bytes()).await.map_err(|error| {
                     error!("Failed to write payload code: {error}");
                     IggyError::QuicError
                 })?;
+                #[cfg(not(feature = "vsr"))]
                 send.write_all(&payload).await.map_err(|error| {
                     error!("Failed to write payload: {error}");
                     IggyError::QuicError

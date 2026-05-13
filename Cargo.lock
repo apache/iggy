@@ -6300,11 +6300,13 @@ dependencies = [
  "async-dropper",
  "async-trait",
  "bon",
+ "bytemuck",
  "bytes",
  "dashmap",
  "flume 0.12.0",
  "futures",
  "futures-util",
+ "iggy_binary_protocol",
  "iggy_common",
  "mockall",
  "quinn",
@@ -7078,6 +7080,16 @@ dependencies = [
  "uuid",
  "wiremock",
  "zip 8.6.0",
+]
+
+[[package]]
+name = "integration-vsr"
+version = "0.0.1"
+dependencies = [
+ "iggy",
+ "integration",
+ "serial_test",
+ "tokio",
 ]
 
 [[package]]
