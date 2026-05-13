@@ -256,7 +256,7 @@ pub(crate) struct PollResult {
 /// fractional digits in WHERE clause timestamp comparisons.
 fn normalize_v3_timestamp(ts: &str) -> std::borrow::Cow<'_, str> {
     if chrono::DateTime::parse_from_rfc3339(ts).is_ok() {
-        std::borrow::Cow::Borrowed(ts)  // Zero allocation
+        std::borrow::Cow::Borrowed(ts) // Zero allocation
     } else {
         std::borrow::Cow::Owned(format!("{ts}Z"))
     }
