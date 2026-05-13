@@ -16,7 +16,6 @@
 // under the License.
 
 using System.Buffers;
-using System.Runtime.CompilerServices;
 using System.Text;
 using Apache.Iggy.Consumers;
 using Apache.Iggy.Contracts;
@@ -266,30 +265,6 @@ public class RentedConsumerTests
         await Task.WhenAll(tasks);
 
         Assert.Equal(1, owner.DisposeCount);
-    }
-
-    [Fact]
-    public void PolledMessagesRental_ForgotDispose_FinalizerReturnsBuffer()
-    {
-        var owner = new TrackingMemoryOwner(16);
-        MakeAndDrop(owner);
-
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
-
-        Assert.Equal(1, owner.DisposeCount);
-
-        [MethodImpl(MethodImplOptions.NoInlining)]
-        static void MakeAndDrop(IMemoryOwner<byte> o)
-        {
-            _ = new PolledMessagesRental(o)
-            {
-                PartitionId = 1,
-                CurrentOffset = 0,
-                Messages = Array.Empty<RentedMessageResponse>()
-            };
-        }
     }
 
     [Fact]

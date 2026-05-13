@@ -331,7 +331,7 @@ public sealed class TcpMessageStream : IIggyClient
         var payloadBufferSize = CalculatePayloadBufferSize(messageBufferSize);
         var payload = ArrayPool<byte>.Shared.Rent(payloadBufferSize);
         IMemoryOwner<byte>? responseBuffer = null;
-        
+
         try
         {
             TcpContracts.GetMessages(payload.AsSpan().Slice(8, messageBufferSize), consumer, streamId,
@@ -1090,7 +1090,7 @@ public sealed class TcpMessageStream : IIggyClient
                         $"Invalid response status code: {response.Status}");
                 }
 
-                
+
                 using var errorBuffer = ArrayPoolHelper.Rent(response.Length);
                 totalRead = 0;
                 while (totalRead < response.Length)
@@ -1307,10 +1307,9 @@ internal static class ArrayPoolHelper
     {
         private readonly byte[] _value = ArrayPool<byte>.Shared.Rent(minimumLength);
         private int _disposed;
-        
+
         public Memory<byte> Memory => _value.AsMemory()[..minimumLength];
-        
-        
+
         private void Dispose(bool suppressFinalize)
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -1324,12 +1323,12 @@ internal static class ArrayPoolHelper
                 GC.SuppressFinalize(this);
             }
         }
-        
+
         ~SlicedMemoryOwner()
         {
             Dispose(false);
         }
-        
+
         public void Dispose()
         {
             Dispose(true);
