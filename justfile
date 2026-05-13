@@ -75,11 +75,5 @@ licenses-fix:
 licenses-check:
   ./scripts/ci/license-headers.sh --check
 
-licenses-list-check:
-  ./scripts/ci/licenses-list.sh --check
-
-licenses-list-fix:
-  ./scripts/ci/licenses-list.sh --fix
-
 markdownlint:
   markdownlint '**/*.md' --ignore-path .gitignore

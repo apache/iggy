@@ -42,8 +42,8 @@
         <None Include="../LICENSE" Pack="true" PackagePath="">
             <Link>Properties/LICENSE</Link>
         </None>
-        <None Include="../DEPENDENCIES.md">
-            <Link>Properties\DEPENDENCIES.md</Link>
+        <None Include="../NOTICE" Pack="true" PackagePath="">
+            <Link>Properties/NOTICE</Link>
         </None>
     </ItemGroup>
 

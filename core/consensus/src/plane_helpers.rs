@@ -21,7 +21,9 @@ use crate::{
     Status, VsrConsensus,
 };
 use iggy_binary_protocol::consensus::iobuf::Owned;
-use iggy_binary_protocol::{Command2, Message, PrepareHeader, PrepareOkHeader, ReplyHeader};
+use iggy_binary_protocol::{
+    Command2, Message, PrepareHeader, PrepareOkHeader, ReplyHeader, RequestHeader,
+};
 use message_bus::{MessageBus, SendError};
 use std::ops::AsyncFnOnce;
 
@@ -388,6 +390,60 @@ where
 
     // TODO: Remove this copy once replies stop round-tripping through `Bytes`
     // and the binary protocol uses `Owned` end-to-end.
+    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
+        .expect("reply buffer must contain a valid reply message")
+}
+
+/// Reply for fast paths that skip the VSR pipeline (e.g. `AckLevel::NoAck`).
+///
+/// Stamps `op` and `commit` with `commit_max` — monotonic, so
+/// `ClientTable::commit_reply` regression checks always pass.
+///
+/// # Panics
+/// If the constructed message buffer is not valid.
+#[allow(clippy::needless_pass_by_value, clippy::cast_possible_truncation)]
+pub fn build_reply_from_request<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    request_header: &RequestHeader,
+    body: bytes::Bytes,
+) -> Message<ReplyHeader>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let header_size = std::mem::size_of::<ReplyHeader>();
+    let total_size = header_size + body.len();
+    let mut buffer = bytes::BytesMut::zeroed(total_size);
+
+    let commit = consensus.commit_max();
+    let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(&mut buffer[..header_size])
+        .expect("zeroed bytes are valid");
+    *header = ReplyHeader {
+        checksum: 0,
+        checksum_body: 0,
+        cluster: consensus.cluster(),
+        size: total_size as u32,
+        view: consensus.view(),
+        release: 0,
+        command: Command2::Reply,
+        replica: consensus.replica(),
+        reserved_frame: [0; 66],
+        request_checksum: request_header.request_checksum,
+        context: 0,
+        client: request_header.client,
+        op: commit,
+        commit,
+        timestamp: request_header.timestamp,
+        request: request_header.request,
+        operation: request_header.operation,
+        namespace: request_header.namespace,
+        ..Default::default()
+    };
+
+    if !body.is_empty() {
+        buffer[header_size..].copy_from_slice(&body);
+    }
+
     Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
         .expect("reply buffer must contain a valid reply message")
 }

@@ -51,6 +51,7 @@ Commands:
   context          context operations [aliases: ctx]
   login            login to Iggy server [aliases: li]
   logout           logout from Iggy server [aliases: lo]
+  session          login session operations [aliases: sess]
   help             Print this message or the help of the given subcommand(s)
 
 Options:

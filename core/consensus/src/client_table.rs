@@ -430,8 +430,8 @@ impl ClientTable {
             if let Some(entry) = slot {
                 let commit = entry.reply.header().commit;
                 let should_evict = match evictee {
-                    None => true,
                     Some((_, min_commit)) => commit < min_commit,
+                    None => true,
                 };
                 if should_evict {
                     evictee = Some((idx, commit));
