@@ -59,6 +59,13 @@ runs:
 
     - name: Setup Rust toolchain
       run: |
+        # macOS runners provision Rust via the Homebrew `rustup` formula, which
+        # installs only `rustup-init` plus brew shims that resolve back to it in
+        # installer mode - so `cargo` errors out and ~/.cargo/bin has no proxies.
+        # Run rustup-init once to generate the real cargo/rustc proxies.
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          rustup-init -y --no-modify-path --default-toolchain none
+        fi
         rustup show
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       shell: bash
