@@ -75,7 +75,7 @@ pub async fn handle_login_register<V, B, J, S, M>(
     verifier: &V,
     metadata: &LoginMetadata<'_, B, J, S, M>,
     session_manager: &mut SessionManager,
-    connection_id: u64,
+    connection_id: u128,
 ) -> Result<LoginRegisterResponse, LoginRegisterError>
 where
     V: CredentialVerifier,
@@ -117,7 +117,7 @@ pub async fn handle_login_register_with_pat<T, B, J, S, M>(
     token_verifier: &T,
     metadata: &LoginMetadata<'_, B, J, S, M>,
     session_manager: &mut SessionManager,
-    connection_id: u64,
+    connection_id: u128,
 ) -> Result<LoginRegisterResponse, LoginRegisterError>
 where
     T: TokenVerifier,
@@ -156,7 +156,7 @@ async fn complete_register<B, J, S, M>(
     user_id: u32,
     metadata: &LoginMetadata<'_, B, J, S, M>,
     session_manager: &mut SessionManager,
-    connection_id: u64,
+    connection_id: u128,
 ) -> Result<LoginRegisterResponse, LoginRegisterError>
 where
     B: MessageBus,

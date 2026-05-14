@@ -429,6 +429,8 @@ async fn reader_task(
             }
             Err(e) => {
                 debug!(%label, %peer, "quic reader: read error: {e:?}");
+                let _keep_in_tx_alive = &in_tx;
+                shutdown_fut.await;
                 return;
             }
         }

@@ -18,14 +18,21 @@
  */
 
 use crate::config_writer::write_current_config;
+use crate::login_register::LoginRegisterError;
 use crate::server_error::ServerNgError;
+use crate::session_manager::SessionManager;
+use bytes::Bytes;
 use configs::server_ng::ServerNgConfig;
 use consensus::{LocalPipeline, PartitionsHandle, Sequencer, VsrConsensus};
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
+use iggy_binary_protocol::responses::users::LoginRegisterResponse;
+use iggy_binary_protocol::{
+    Command2, Message, Operation, ReplyHeader, RequestHeader, WireDecode, WireEncode,
+};
 use iggy_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use iggy_common::{
-    ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, PartitionStats, TopicStats,
-    sharding::LocalIdx, variadic,
+    ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, IggyTimestamp, PartitionStats,
+    PersonalAccessToken, TopicStats, UserStatus, sharding::LocalIdx, variadic,
 };
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
@@ -42,7 +49,7 @@ use message_bus::transports::tls::{
 };
 use message_bus::{
     AcceptedClientFn, AcceptedQuicClientFn, AcceptedReplicaFn, AcceptedTlsClientFn,
-    AcceptedWsClientFn, IggyMessageBus, connector,
+    AcceptedWsClientFn, IggyMessageBus, MessageBus, connector,
 };
 use metadata::IggyMetadata;
 use metadata::MuxStateMachine;
@@ -56,10 +63,13 @@ use partitions::{
     IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig, Segment,
 };
 // TODO: decouple bootstrap/storage helpers and logging from the `server` crate.
+use secrecy::ExposeSecret;
 use server::bootstrap::create_directories;
 use server::log::logger::Logging;
 use server::streaming::partitions::storage::{load_consumer_group_offsets, load_consumer_offsets};
 use server::streaming::segments::storage::create_segment_storage;
+use server::streaming::users::user::User as LegacyUser;
+use server::streaming::utils::crypto;
 use shard::builder::IggyShardBuilder;
 use shard::shards_table::PapayaShardsTable;
 use shard::{
@@ -220,6 +230,7 @@ pub async fn bootstrap(
     let recovered = recover::<ServerNgMuxStateMachine>(Path::new(&config.system.path))
         .await
         .map_err(ServerNgError::MetadataRecovery)?;
+    ensure_default_root_user(&recovered.mux_stm);
     let restored_op = recovered.last_applied_op.unwrap_or_else(|| {
         recovered
             .snapshot
@@ -1257,19 +1268,14 @@ fn make_replica_message_handler(shard: &Rc<ServerNgShard>) -> MessageHandler {
 
 fn make_client_request_handler(shard: &Rc<ServerNgShard>) -> RequestHandler {
     let shard = Rc::clone(shard);
+    let sessions = Rc::new(RefCell::new(SessionManager::new()));
     Rc::new(move |client_id, message| {
-        let request = match message.try_into_typed::<RequestHeader>() {
-            Ok(request) => request,
-            Err(error) => {
-                warn!(client_id, error = %error, "dropping client request with invalid header");
-                return;
-            }
-        };
-        let request = request.transmute_header(|header, new_header: &mut RequestHeader| {
-            *new_header = header;
-            new_header.client = client_id;
-        });
-        shard.dispatch(request.into_generic());
+        let shard = Rc::clone(&shard);
+        let sessions = Rc::clone(&sessions);
+        compio::runtime::spawn(async move {
+            handle_client_request(&shard, &sessions, client_id, message).await;
+        })
+        .detach();
     })
 }
 
@@ -1284,23 +1290,322 @@ fn make_deferred_replica_message_handler(shard_handle: &ServerNgShardHandle) -> 
 
 fn make_deferred_client_request_handler(shard_handle: &ServerNgShardHandle) -> RequestHandler {
     let shard_handle = Rc::clone(shard_handle);
+    let sessions = Rc::new(RefCell::new(SessionManager::new()));
     Rc::new(move |client_id, message| {
-        let Some(shard) = upgrade_shard_handle(&shard_handle) else {
+        let shard_handle = Rc::clone(&shard_handle);
+        let sessions = Rc::clone(&sessions);
+        compio::runtime::spawn(async move {
+            let Some(shard) = upgrade_shard_handle(&shard_handle) else {
+                return;
+            };
+            handle_client_request(&shard, &sessions, client_id, message).await;
+        })
+        .detach();
+    })
+}
+
+#[allow(clippy::future_not_send)]
+async fn handle_client_request(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+    message: Message<iggy_binary_protocol::GenericHeader>,
+) {
+    let request = match message.try_into_typed::<RequestHeader>() {
+        Ok(request) => request,
+        Err(error) => {
+            warn!(
+                transport_client_id,
+                error = %error,
+                "dropping client request with invalid header"
+            );
             return;
-        };
-        let request = match message.try_into_typed::<RequestHeader>() {
-            Ok(request) => request,
-            Err(error) => {
-                warn!(client_id, error = %error, "dropping client request with invalid header");
+        }
+    };
+
+    ensure_transport_connection(shard, sessions, transport_client_id);
+
+    let header = *request.header();
+    if header.operation == Operation::Register && header.session == 0 && header.request == 0 {
+        handle_login_register_request(shard, sessions, transport_client_id, request).await;
+        return;
+    }
+
+    let bound = sessions.borrow().get_session(transport_client_id);
+    let request = request.transmute_header(|header, new_header: &mut RequestHeader| {
+        *new_header = header;
+        new_header.client = transport_client_id;
+        if let Some((bound_client_id, bound_session)) = bound {
+            new_header.client = bound_client_id;
+            new_header.session = bound_session;
+        }
+    });
+    shard.dispatch(request.into_generic());
+}
+
+fn ensure_transport_connection(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+) {
+    let Some(meta) = shard.bus.client_meta(transport_client_id) else {
+        return;
+    };
+    sessions
+        .borrow_mut()
+        .ensure_connection(transport_client_id, meta.peer_addr);
+}
+
+#[allow(clippy::future_not_send)]
+async fn handle_login_register_request(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+    request: Message<RequestHeader>,
+) {
+    let body = request_body(&request);
+    let vsr_client_id = request.header().client;
+
+    if let Ok(wire_request) = LoginRegisterRequest::decode_from(body) {
+        match verify_login_credentials(
+            shard,
+            wire_request.username.as_str(),
+            wire_request.password.expose_secret(),
+        ) {
+            Ok(user_id) => {
+                if let Err(error) = complete_login_register(
+                    shard,
+                    sessions,
+                    transport_client_id,
+                    vsr_client_id,
+                    request.header(),
+                    user_id,
+                )
+                .await
+                {
+                    warn!(transport_client_id, error = %error, "login/register failed");
+                }
                 return;
             }
+            Err(LoginRegisterError::InvalidCredentials) => {}
+            Err(error) => {
+                warn!(transport_client_id, error = %error, "login/register failed");
+                return;
+            }
+        }
+    }
+
+    if let Ok(wire_request) = LoginRegisterWithPatRequest::decode_from(body) {
+        match verify_pat_credentials(shard, wire_request.token.expose_secret()) {
+            Ok(user_id) => {
+                if let Err(error) = complete_login_register(
+                    shard,
+                    sessions,
+                    transport_client_id,
+                    vsr_client_id,
+                    request.header(),
+                    user_id,
+                )
+                .await
+                {
+                    warn!(
+                        transport_client_id,
+                        error = %error,
+                        "login/register with PAT failed"
+                    );
+                }
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    "login/register with PAT failed"
+                );
+                return;
+            }
+        }
+    }
+
+    warn!(
+        transport_client_id,
+        "dropping register request with unsupported payload shape"
+    );
+}
+
+fn request_body(request: &Message<RequestHeader>) -> &[u8] {
+    &request.as_slice()[std::mem::size_of::<RequestHeader>()..request.header().size as usize]
+}
+
+fn verify_login_credentials(
+    shard: &Rc<ServerNgShard>,
+    username: &str,
+    password: &str,
+) -> Result<u32, LoginRegisterError> {
+    shard.plane.inner().0.mux_stm.inner().0.read(|users| {
+        let Some((_, user_id)) = users
+            .index
+            .iter()
+            .find(|(name, _)| name.as_ref() == username)
+        else {
+            return Err(LoginRegisterError::InvalidCredentials);
         };
-        let request = request.transmute_header(|header, new_header: &mut RequestHeader| {
-            *new_header = header;
-            new_header.client = client_id;
-        });
-        shard.dispatch(request.into_generic());
+        let Some(user) = users.items.get(*user_id as usize) else {
+            return Err(LoginRegisterError::InvalidCredentials);
+        };
+        if user.status != UserStatus::Active {
+            return Err(LoginRegisterError::UserInactive);
+        }
+        if !crypto::verify_password(password, user.password_hash.as_ref()) {
+            return Err(LoginRegisterError::InvalidCredentials);
+        }
+        Ok(user.id)
     })
+}
+
+fn verify_pat_credentials(
+    shard: &Rc<ServerNgShard>,
+    token: &str,
+) -> Result<u32, LoginRegisterError> {
+    let token_hash = PersonalAccessToken::hash_token(token);
+    let now = IggyTimestamp::now();
+    shard.plane.inner().0.mux_stm.inner().0.read(|users| {
+        let Some((user_id, pat)) =
+            users
+                .personal_access_tokens
+                .iter()
+                .find_map(|(user_id, tokens)| {
+                    tokens
+                        .values()
+                        .find(|pat| pat.token.as_ref() == token_hash)
+                        .map(|pat| (*user_id, pat))
+                })
+        else {
+            return Err(LoginRegisterError::InvalidToken);
+        };
+        if pat.is_expired(now) {
+            return Err(LoginRegisterError::InvalidToken);
+        }
+        let Some(user) = users.items.get(user_id as usize) else {
+            return Err(LoginRegisterError::InvalidToken);
+        };
+        if user.status != UserStatus::Active {
+            return Err(LoginRegisterError::UserInactive);
+        }
+        Ok(user.id)
+    })
+}
+
+#[allow(clippy::future_not_send)]
+async fn complete_login_register(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+    vsr_client_id: u128,
+    request_header: &RequestHeader,
+    user_id: u32,
+) -> Result<(), LoginRegisterError> {
+    if let Some((_, session)) = sessions.borrow().get_session(transport_client_id) {
+        let response = LoginRegisterResponse { user_id, session }.to_bytes();
+        let reply = build_login_register_reply(request_header, vsr_client_id, session, &response);
+        let _ = shard
+            .bus
+            .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+            .await;
+        return Ok(());
+    }
+
+    {
+        let mut sessions = sessions.borrow_mut();
+        sessions
+            .login(transport_client_id, user_id)
+            .map_err(LoginRegisterError::Session)?;
+    }
+
+    let session = match shard
+        .plane
+        .inner()
+        .0
+        .submit_register_in_process(vsr_client_id)
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = sessions
+                .borrow_mut()
+                .reset_to_connected(transport_client_id);
+            return Err(LoginRegisterError::Transient(error));
+        }
+    };
+
+    {
+        let mut sessions = sessions.borrow_mut();
+        sessions
+            .bind_session(transport_client_id, vsr_client_id, session)
+            .map_err(LoginRegisterError::Session)?;
+    }
+
+    let response = LoginRegisterResponse { user_id, session }.to_bytes();
+    let reply = build_login_register_reply(request_header, vsr_client_id, session, &response);
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            error = %error,
+            "failed to send login/register reply"
+        );
+    }
+
+    Ok(())
+}
+
+fn ensure_default_root_user(mux_stm: &ServerNgMuxStateMachine) {
+    if !mux_stm.inner().0.read(|users| users.items.is_empty()) {
+        return;
+    }
+
+    let LegacyUser {
+        username, password, ..
+    } = server::bootstrap::create_root_user();
+    mux_stm.inner().0.ensure_root_user(&username, &password);
+}
+
+fn build_login_register_reply(
+    request_header: &RequestHeader,
+    client_id: u128,
+    session: u64,
+    body: &Bytes,
+) -> Message<ReplyHeader> {
+    let total_size = std::mem::size_of::<ReplyHeader>() + body.len();
+    let mut reply = Message::<ReplyHeader>::new(total_size);
+    let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
+        &mut reply.as_mut_slice()[..std::mem::size_of::<ReplyHeader>()],
+    )
+    .expect("zeroed bytes are valid");
+    *header = ReplyHeader {
+        cluster: request_header.cluster,
+        size: total_size as u32,
+        view: request_header.view,
+        release: request_header.release,
+        command: Command2::Reply,
+        replica: request_header.replica,
+        request_checksum: request_header.request_checksum,
+        client: client_id,
+        op: session,
+        commit: session,
+        timestamp: request_header.timestamp,
+        request: request_header.request,
+        operation: request_header.operation,
+        namespace: request_header.namespace,
+        ..Default::default()
+    };
+    if !body.is_empty() {
+        reply.as_mut_slice()[std::mem::size_of::<ReplyHeader>()..total_size].copy_from_slice(body);
+    }
+    reply
 }
 
 fn upgrade_shard_handle(shard_handle: &ServerNgShardHandle) -> Option<Rc<ServerNgShard>> {

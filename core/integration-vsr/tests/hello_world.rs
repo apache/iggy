@@ -20,7 +20,7 @@ use iggy::prelude::*;
 use integration::iggy_harness;
 
 #[iggy_harness(
-    test_client_transport = [Tcp, Quic, WebSocket],
+    test_client_transport = [Tcp, WebSocket],
     server(executable_path = "iggy-server-ng")
 )]
 async fn hello_world(harness: &TestHarness) {

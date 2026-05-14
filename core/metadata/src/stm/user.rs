@@ -21,7 +21,7 @@ use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
 use bytes::Bytes;
-use iggy_binary_protocol::WireIdentifier;
+use iggy_binary_protocol::primitives::permissions::{WireGlobalPermissions, WirePermissions};
 use iggy_binary_protocol::requests::personal_access_tokens::{
     CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
 };
@@ -29,6 +29,7 @@ use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
     UpdateUserRequest,
 };
+use iggy_binary_protocol::{WireIdentifier, WireName};
 use iggy_common::{
     GlobalPermissions, IggyExpiry, IggyTimestamp, Permissions, PersonalAccessToken,
     StreamPermissions, UserId, UserStatus,
@@ -118,6 +119,45 @@ impl UsersInner {
             }
             WireIdentifier::String(name) => self.index.get(name.as_str()).map(|&id| id as usize),
         }
+    }
+}
+
+impl Users {
+    #[must_use]
+    pub fn read<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&UsersInner) -> R,
+    {
+        self.inner.read(f)
+    }
+
+    pub fn ensure_root_user(&self, username: &str, password_hash: &str) {
+        if self.read(|users| !users.items.is_empty()) {
+            return;
+        }
+
+        let username = WireName::new(username).expect("root username must be valid");
+        self.inner
+            .do_apply(UsersCommand::CreateUser(CreateUserRequest {
+                username,
+                password: password_hash.to_string(),
+                status: UserStatus::Active.as_code(),
+                permissions: Some(WirePermissions {
+                    global: WireGlobalPermissions {
+                        manage_servers: true,
+                        read_servers: true,
+                        manage_users: true,
+                        read_users: true,
+                        manage_streams: true,
+                        read_streams: true,
+                        manage_topics: true,
+                        read_topics: true,
+                        poll_messages: true,
+                        send_messages: true,
+                    },
+                    streams: Vec::new(),
+                }),
+            }));
     }
 }
 

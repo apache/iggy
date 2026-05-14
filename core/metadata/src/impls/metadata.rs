@@ -696,6 +696,10 @@ where
                     let _ = sender.send(reply.clone());
                 }
 
+                if prepare_header.operation == Operation::Register {
+                    continue;
+                }
+
                 let generic_reply = reply.into_generic();
                 let reply_buffers = freeze_client_reply(generic_reply);
                 emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
@@ -842,6 +846,14 @@ where
             "submit_register_in_process: gate flipped between check and dispatch"
         );
         self.on_replicate(prepare).await;
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        for message in loopback {
+            let prepare_ok: Message<PrepareOkHeader> = message
+                .try_into_typed()
+                .expect("metadata loopback queue must only contain PrepareOk messages");
+            self.on_ack(prepare_ok).await;
+        }
 
         match receiver.await {
             Ok(reply) => Ok(reply.header().commit),

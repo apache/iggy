@@ -77,11 +77,11 @@ pub struct Connection {
 ///   per consensus session). If a client reconnects with the same `client_id`,
 ///   the old connection must be evicted first.
 pub struct SessionManager {
-    connections: HashMap<u64, Connection>,
+    connections: HashMap<u128, Connection>,
     /// Reverse index: `client_id` → `connection_id` for fast lookup when
     /// a consensus reply arrives and needs routing to the right connection.
-    client_to_connection: HashMap<u128, u64>,
-    next_connection_id: u64,
+    client_to_connection: HashMap<u128, u128>,
+    next_connection_id: u128,
 }
 
 impl SessionManager {
@@ -98,12 +98,12 @@ impl SessionManager {
     ///
     /// # Panics
     /// Panics if the connection ID counter overflows `u64::MAX`.
-    pub fn add_connection(&mut self, address: SocketAddr) -> u64 {
+    pub fn add_connection(&mut self, address: SocketAddr) -> u128 {
         let id = self.next_connection_id;
         self.next_connection_id = self
             .next_connection_id
             .checked_add(1)
-            .expect("connection ID overflow (u64::MAX connections without restart)");
+            .expect("connection ID overflow (u128::MAX connections without restart)");
         self.connections.insert(
             id,
             Connection {
@@ -114,8 +114,15 @@ impl SessionManager {
         id
     }
 
+    pub fn ensure_connection(&mut self, connection_id: u128, address: SocketAddr) {
+        self.connections.entry(connection_id).or_insert(Connection {
+            address,
+            state: ConnectionState::Connected,
+        });
+    }
+
     /// Remove a connection (disconnect). Cleans up the reverse index if bound.
-    pub fn remove_connection(&mut self, connection_id: u64) {
+    pub fn remove_connection(&mut self, connection_id: u128) {
         if let Some(conn) = self.connections.remove(&connection_id)
             && let ConnectionState::Bound { client_id, .. } = conn.state
         {
@@ -127,7 +134,7 @@ impl SessionManager {
     ///
     /// # Errors
     /// Returns `Err` if the connection doesn't exist or isn't in `Connected` state.
-    pub fn login(&mut self, connection_id: u64, user_id: u32) -> Result<(), SessionError> {
+    pub fn login(&mut self, connection_id: u128, user_id: u32) -> Result<(), SessionError> {
         let conn = self
             .connections
             .get_mut(&connection_id)
@@ -153,7 +160,7 @@ impl SessionManager {
     ///
     /// # Errors
     /// Returns `Err` if the connection doesn't exist or isn't `Authenticated`.
-    pub fn reset_to_connected(&mut self, connection_id: u64) -> Result<(), SessionError> {
+    pub fn reset_to_connected(&mut self, connection_id: u128) -> Result<(), SessionError> {
         let conn = self
             .connections
             .get_mut(&connection_id)
@@ -188,7 +195,7 @@ impl SessionManager {
     /// (impossible in single-threaded use).
     pub fn bind_session(
         &mut self,
-        connection_id: u64,
+        connection_id: u128,
         client_id: u128,
         session: u64,
     ) -> Result<(), SessionError> {
@@ -227,7 +234,7 @@ impl SessionManager {
     ///
     /// Returns `(client_id, session)` if the connection is `Bound`, `None` otherwise.
     #[must_use]
-    pub fn get_session(&self, connection_id: u64) -> Option<(u128, u64)> {
+    pub fn get_session(&self, connection_id: u128) -> Option<(u128, u64)> {
         let conn = self.connections.get(&connection_id)?;
         match conn.state {
             ConnectionState::Bound {
@@ -239,13 +246,13 @@ impl SessionManager {
 
     /// Look up the connection ID for a client (for routing consensus replies).
     #[must_use]
-    pub fn connection_for_client(&self, client_id: u128) -> Option<u64> {
+    pub fn connection_for_client(&self, client_id: u128) -> Option<u128> {
         self.client_to_connection.get(&client_id).copied()
     }
 
     /// Get connection metadata.
     #[must_use]
-    pub fn get_connection(&self, connection_id: u64) -> Option<&Connection> {
+    pub fn get_connection(&self, connection_id: u128) -> Option<&Connection> {
         self.connections.get(&connection_id)
     }
 
@@ -270,9 +277,9 @@ impl Default for SessionManager {
 
 #[derive(Debug)]
 pub enum SessionError {
-    ConnectionNotFound(u64),
+    ConnectionNotFound(u128),
     InvalidTransition {
-        connection_id: u64,
+        connection_id: u128,
         from: &'static str,
         to: &'static str,
     },
