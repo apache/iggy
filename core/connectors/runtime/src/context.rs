@@ -21,7 +21,7 @@ use crate::configs::runtime::ConnectorsRuntimeConfig;
 use crate::metrics::Metrics;
 use crate::stream::IggyClients;
 use crate::{
-    SinkConnectorWrapper, SourceConnectorWrapper,
+    FailedPlugin, SinkConnectorWrapper, SourceConnectorWrapper,
     manager::{
         sink::{SinkDetails, SinkInfo, SinkManager},
         source::{SourceDetails, SourceInfo, SourceManager},
@@ -54,13 +54,20 @@ pub fn init(
     sources_config: &HashMap<String, SourceConfig>,
     sink_wrappers: &[SinkConnectorWrapper],
     source_wrappers: &[SourceConnectorWrapper],
+    failed_sinks: &[FailedPlugin],
+    failed_sources: &[FailedPlugin],
     config_provider: Box<dyn ConnectorsConfigProvider>,
     iggy_clients: Arc<IggyClients>,
     state_path: String,
 ) -> RuntimeContext {
     let metrics = Arc::new(Metrics::init());
-    let sinks = SinkManager::new(map_sinks(sinks_config, sink_wrappers));
-    let sources = SourceManager::new(map_sources(sources_config, source_wrappers));
+    let mut sink_details = map_sinks(sinks_config, sink_wrappers);
+    sink_details.extend(map_failed_sinks(sinks_config, failed_sinks));
+    let mut source_details = map_sources(sources_config, source_wrappers);
+    source_details.extend(map_failed_sources(sources_config, failed_sources));
+
+    let sinks = SinkManager::new(sink_details);
+    let sources = SourceManager::new(source_details);
 
     metrics.set_sinks_total(sinks_config.len() as u32);
     metrics.set_sources_total(sources_config.len() as u32);
@@ -164,6 +171,71 @@ fn map_sources(
                 restart_guard: Arc::new(Mutex::new(())),
             });
         }
+    }
+    sources
+}
+
+const UNKNOWN_PLUGIN_VERSION: &str = "unknown";
+
+fn map_failed_sinks(
+    sinks_config: &HashMap<String, SinkConfig>,
+    failed: &[FailedPlugin],
+) -> Vec<SinkDetails> {
+    let mut sinks = Vec::with_capacity(failed.len());
+    for plugin in failed {
+        let Some(config) = sinks_config.get(&plugin.key) else {
+            error!("Missing sink config for failed plugin: {}", plugin.key);
+            continue;
+        };
+        sinks.push(SinkDetails {
+            info: SinkInfo {
+                id: plugin.id,
+                key: plugin.key.clone(),
+                name: plugin.name.clone(),
+                path: plugin.path.clone(),
+                version: UNKNOWN_PLUGIN_VERSION.to_owned(),
+                enabled: plugin.enabled,
+                status: ConnectorStatus::Error,
+                last_error: Some(ConnectorError::new(&plugin.error)),
+                plugin_config_format: plugin.config_format,
+            },
+            config: config.clone(),
+            shutdown_tx: None,
+            task_handles: vec![],
+            container: None,
+            restart_guard: Arc::new(Mutex::new(())),
+        });
+    }
+    sinks
+}
+
+fn map_failed_sources(
+    sources_config: &HashMap<String, SourceConfig>,
+    failed: &[FailedPlugin],
+) -> Vec<SourceDetails> {
+    let mut sources = Vec::with_capacity(failed.len());
+    for plugin in failed {
+        let Some(config) = sources_config.get(&plugin.key) else {
+            error!("Missing source config for failed plugin: {}", plugin.key);
+            continue;
+        };
+        sources.push(SourceDetails {
+            info: SourceInfo {
+                id: plugin.id,
+                key: plugin.key.clone(),
+                name: plugin.name.clone(),
+                path: plugin.path.clone(),
+                version: UNKNOWN_PLUGIN_VERSION.to_owned(),
+                enabled: plugin.enabled,
+                status: ConnectorStatus::Error,
+                last_error: Some(ConnectorError::new(&plugin.error)),
+                plugin_config_format: plugin.config_format,
+            },
+            config: config.clone(),
+            handler_tasks: vec![],
+            container: None,
+            restart_guard: Arc::new(Mutex::new(())),
+        });
     }
     sources
 }
