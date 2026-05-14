@@ -78,6 +78,10 @@ include = [
     ] },
 ]
 
+[tool.uv]
+exclude-newer = "7 days"
+exclude-newer-package = { urllib3 = false, pyrefly = false }
+
 [project.optional-dependencies]
 # Core testing dependencies
 testing = [
@@ -97,6 +101,7 @@ dev = [
     "black>=23.0,<27.0",
     "isort>=5.12.0,<6.0",
     "mypy>=1.5.0,<2.0",
+    "pyrefly>=1.0.0,<2.0",
     "ruff>=0.1.0,<1.0",
 ]
 
@@ -113,8 +118,16 @@ all = [
     "black>=23.0,<27.0",
     "isort>=5.12.0,<6.0",
     "mypy>=1.5.0,<2.0",
+    "pyrefly>=1.0.0,<2.0",
     "ruff>=0.1.0,<1.0",
 ]
+
+[tool.pyrefly]
+python-version = "3.10.0"
+preset = "legacy"
+project-includes = ["tests", "apache_iggy.pyi"]
+disable-search-path-heuristics = true
+search-path = ["."]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -83,6 +83,10 @@ runs:
         echo "Running mypy on SDK..."
         uv run mypy --explicit-package-bases "$DIR_SDK"
         echo "mypy version: $(uv run mypy --version)"
+
+        echo "Running pyrefly on SDK..."
+        uv run pyrefly check
+        echo "pyrefly version: $(uv run pyrefly --version)"
       shell: bash
 
     - name: Build Python wheel with coverage instrumentation

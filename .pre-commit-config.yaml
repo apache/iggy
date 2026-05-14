@@ -87,6 +87,20 @@ repos:
         files: ^(foreign|bdd|examples)/python/(pyproject\.toml|uv\.lock)$
         pass_filenames: false
 
+      - id: uv-audit
+        name: uv audit (python dependencies)
+        entry: ./scripts/ci/uv-audit.sh
+        language: system
+        files: ^(foreign|bdd|examples)/python/(pyproject\.toml|uv\.lock)$
+        pass_filenames: false
+
+      - id: pyrefly
+        name: pyrefly (python sdk)
+        entry: ./scripts/ci/pyrefly-check.sh
+        language: system
+        files: ^foreign/python/(tests/.*\.py|apache_iggy\.pyi|pyproject\.toml)$
+        pass_filenames: false
+
       - id: version-consistency
         name: version consistency
         entry: ./scripts/extract-version.sh
