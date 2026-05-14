@@ -60,7 +60,7 @@
   "overrides": {
     "cookie": "^0.7.0",
     "valibot": "^1.2.0",
-    "devalue": "^5.6.4",
+    "devalue": "^5.8.1",
     "flatted": "^3.4.2",
     "effect": "^3.20.0",
     "picomatch": "^4.0.4"
