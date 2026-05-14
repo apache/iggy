@@ -157,6 +157,7 @@ flatbuffers = "25.12.19"
 flume = "0.12.0"
 fs2 = "0.4.3"
 futures = "0.3.32"
+futures-core = { version = "0.3.32", default-features = false }
 futures-util = "0.3.32"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 git2 = { version = "0.20.4", default-features = false, features = ["vendored-libgit2"] }
@@ -172,11 +173,11 @@ hwlocality = "1.0.0-alpha.12"
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-storage-opendal = "0.9.1"
-iggy = { path = "core/sdk", version = "0.10.0" }
-iggy-cli = { path = "core/cli", version = "0.13.0" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.0" }
-iggy_common = { path = "core/common", version = "0.10.0" }
-iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.3.0" }
+iggy = { path = "core/sdk", version = "0.10.1-edge.1" }
+iggy-cli = { path = "core/cli", version = "0.13.1-edge.1" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.1-edge.1" }
+iggy_common = { path = "core/common", version = "0.10.1-edge.1" }
+iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.3.1-edge.1" }
 integration = { path = "core/integration" }
 journal = { path = "core/journal" }
 js-sys = "0.3"
@@ -252,6 +253,7 @@ rust-s3 = { version = "0.37.2", default-features = false, features = ["tokio-rus
 rustls = { version = "0.23.40", features = ["ring"] }
 rustls-pemfile = "2.2.0"
 scopeguard = "1.2.0"
+sd-notify = "0.5"
 secrecy = { version = "0.10", features = ["serde"] }
 send_wrapper = "0.6.0"
 serde = { version = "1.0.228", features = ["derive", "rc"] }

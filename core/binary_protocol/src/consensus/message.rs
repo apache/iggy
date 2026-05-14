@@ -552,6 +552,11 @@ where
                 let msg = unsafe { Message::<CommitHeader>::from_backing_unchecked(backing) };
                 Ok(Self::Commit(msg))
             }
+            // Reply / Eviction are server-to-client frames; they do not
+            // appear on the inbound dispatch path.
+            Command2::Reply | Command2::Eviction => {
+                Err(ConsensusError::ClientBoundCommand(command))
+            }
             other => Err(ConsensusError::InvalidCommand {
                 expected: Command2::Reserved,
                 found: other,
