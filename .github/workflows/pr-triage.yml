@@ -30,10 +30,12 @@ name: PR Triage
 # Auth gate:
 #   /request-review, /ready  -> org MEMBER / repo COLLABORATOR/OWNER, or PR author
 #   /author                  -> org MEMBER / repo COLLABORATOR/OWNER only
+#   changes_requested review -> CONTRIBUTOR / MEMBER / COLLABORATOR / OWNER
 #
 # Review state (pull_request_review.submitted):
-#   A changes_requested review by a committer acts as an implicit
-#   /author. An explicit command in the review body overrides it.
+#   A changes_requested review by a prior contributor (CONTRIBUTOR or
+#   above, never a bot) acts as an implicit /author. An explicit command
+#   in the review body overrides it.
 #
 # Feedback:
 #   On issue_comment commands the workflow reacts on the comment: +1 when
@@ -43,7 +45,10 @@ name: PR Triage
 #   have no comment to react to and stay log-only.
 #
 # Lifecycle (pull_request_target):
-#   opened (non-draft)     -> add S-waiting-on-review (only if no S-* present)
+#   opened (non-draft)     -> add S-waiting-on-review (only if no S-* present);
+#                             unless the author has repo write access, post
+#                             a one-time welcome comment listing the triage
+#                             commands (marker-guarded, best-effort)
 #   ready_for_review       -> add S-waiting-on-review (only if no S-* present)
 #   converted_to_draft     -> remove both S-* labels
 #   closed (merged or not) -> remove both S-* labels
@@ -110,7 +115,30 @@ jobs:
             const LABEL_REVIEW = 'S-waiting-on-review';
             const LABEL_AUTHOR = 'S-waiting-on-author';
             const COMMITTER_ASSOCS = new Set(['MEMBER', 'COLLABORATOR', 'OWNER']);
+            // Wider gate for the implicit changes_requested -> author
+            // flip: a formal "Request changes" review is a deliberate,
+            // attributable action, so any prior contributor can drive
+            // it, not just committers. Derived from COMMITTER_ASSOCS so
+            // the two cannot drift. Bots are excluded separately.
+            const REVIEW_AUTHOR_ASSOCS = new Set(['CONTRIBUTOR', ...COMMITTER_ASSOCS]);
             const prNumber = Number(process.env.PR_NUMBER);
+
+            // Welcome comment posted once when a non-draft PR is opened.
+            // The leading HTML marker is invisible in rendered Markdown
+            // and is what postWelcomeOnce scans for to stay idempotent.
+            const WELCOME_MARKER = '<!-- iggy-pr-triage-welcome -->';
+            const WELCOME_BODY = [
+              WELCOME_MARKER,
+              'Thanks for the pull request. It is now waiting for review, labeled `S-waiting-on-review`.',
+              '',
+              'You can update that label as the review goes back and forth, with slash commands - each on its own line, in a regular PR comment (not an inline review reply):',
+              '',
+              '- `/ready` - mark it `S-waiting-on-review` again, after addressing feedback',
+              '- `/author` - mark it `S-waiting-on-author` (maintainers only)',
+              '- `/request-review @user ...` - request reviewers (`@user` or `@org/team`)',
+              '',
+              'See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md#pr-triage-commands) for details.',
+            ].join('\n');
 
             // Retry transient GitHub API failures so a single 502 cannot
             // abort a command. This matters most inside setLabels: a
@@ -227,6 +255,58 @@ jobs:
               }
             };
 
+            // True when `login` has push (write) access to this repo --
+            // the core team, by repo/team/org grant combined. On an org
+            // repo, author_association cannot answer this: it reports
+            // MEMBER for every org member, not just repo writers, so the
+            // collaborator-permission endpoint is the only accurate
+            // signal. On failure return false -- a stray welcome on a
+            // maintainer PR is harmless, a missing one on a contributor
+            // PR defeats the feature.
+            const hasWriteAccess = async (login) => {
+              try {
+                const { data } = await withRetry(() =>
+                  github.rest.repos.getCollaboratorPermissionLevel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    username: login,
+                  }), `getCollaboratorPermissionLevel ${login}`);
+                return data.permission === 'write' || data.permission === 'admin';
+              } catch (e) {
+                core.warning(`write-access check failed for ${login}: ${e.message}`);
+                return false;
+              }
+            };
+
+            // Post WELCOME_BODY once on PR open. Best-effort: a failed
+            // post must never fail the run or block labeling, the same
+            // contract as react()/reply(). Idempotent via a listComments
+            // scan for WELCOME_MARKER, so a manual workflow re-run does
+            // not double-post.
+            const postWelcomeOnce = async () => {
+              try {
+                const existing = await withRetry(() => github.rest.issues.listComments({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  per_page: 100,
+                }), 'listComments');
+                if (existing.data.some(c => c.body && c.body.includes(WELCOME_MARKER))) {
+                  core.info('welcome: already posted, skipping');
+                  return;
+                }
+                await withRetry(() => github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: WELCOME_BODY,
+                }), 'welcome createComment');
+                core.info('welcome: posted');
+              } catch (e) {
+                core.warning(`welcome comment failed: ${e.message}`);
+              }
+            };
+
             // ----- pull_request_target lifecycle -----
             if (context.eventName === 'pull_request_target') {
               const action = context.payload.action;
@@ -250,6 +330,19 @@ jobs:
                 if (pr.draft) {
                   core.info('lifecycle: draft PR, no label');
                   return;
+                }
+                // Welcome comment only on the initial non-draft open,
+                // and only for authors without repo write access -- the
+                // core team already knows the triage commands, the
+                // comment is contributor onboarding. ready_for_review is
+                // excluded: a PR opened as a draft and later marked ready
+                // gets no welcome, keeping scope at "non-draft open".
+                if (action === 'opened') {
+                  if (await hasWriteAccess(pr.user.login)) {
+                    core.info(`welcome: skipped, ${pr.user.login} has write access`);
+                  } else {
+                    await postWelcomeOnce();
+                  }
                 }
                 // Read live labels rather than the webhook-frozen
                 // pr.labels — a comment-driven /author or /ready may have
@@ -289,10 +382,10 @@ jobs:
             const body = process.env.COMMENT_BODY || '';
 
             // A changes_requested review is an implicit /author: the ball
-            // is back with the author. Same committer-only gate as the
-            // /author command (checked below, once isCommitter is known).
-            // An explicit command in the review body still takes
-            // precedence. payload.review is absent for issue_comment.
+            // is back with the author. Gated by REVIEW_AUTHOR_ASSOCS
+            // (checked below) -- wider than the /author command. An
+            // explicit command in the review body still takes precedence.
+            // payload.review is absent for issue_comment.
             const reviewState = context.payload.review?.state;
             const reviewWantsAuthor = reviewState === 'changes_requested';
 
@@ -317,6 +410,9 @@ jobs:
             // self-flip review state.
             const isBot = /\[bot\]$/.test(commentAuthor);
             const isCommitter = COMMITTER_ASSOCS.has(commentAssoc) && !isBot;
+            // Permitted to drive the implicit changes_requested flip;
+            // see REVIEW_AUTHOR_ASSOCS.
+            const isReviewFlipper = REVIEW_AUTHOR_ASSOCS.has(commentAssoc) && !isBot;
 
             // Live state read. payload.issue.state is the webhook-frozen
             // value at delivery; comment-while-open + close-arriving-later
@@ -465,11 +561,13 @@ jobs:
 
             // Implicit /author from a changes_requested review. Skipped
             // when the review body already carried an explicit /ready or
-            // /author — the command wins. Same committer-only gate as the
-            // /author command.
+            // /author -- the command wins. Wider gate than the /author
+            // command: any prior contributor, not just committers (see
+            // REVIEW_AUTHOR_ASSOCS).
             if (reviewWantsAuthor && !sawReady && !sawAuthor) {
-              if (!isCommitter) {
-                core.info(`review changes_requested: ignored, ${commentAuthor} not a committer`);
+              if (!isReviewFlipper) {
+                core.info(`review changes_requested: ignored, ` +
+                          `${commentAuthor} (${commentAssoc}) not permitted`);
               } else {
                 await setLabels(LABEL_AUTHOR, LABEL_REVIEW);
                 core.info(`review changes_requested: ${LABEL_AUTHOR} <- ${LABEL_REVIEW}`);
