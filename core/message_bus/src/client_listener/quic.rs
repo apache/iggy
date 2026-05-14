@@ -41,10 +41,12 @@
 use crate::lifecycle::ShutdownToken;
 use crate::transports::quic::{QuicTransportListener, accept_handshake};
 use crate::{AcceptedQuicClientFn, AcceptedQuicConn};
+use compio::net::UdpSocket;
 use compio::runtime::JoinHandle;
-use compio_quic::{Endpoint, ServerConfig};
+use compio_quic::{Endpoint, EndpointConfig, ServerConfig};
 use futures::FutureExt;
 use iggy_common::IggyError;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tracing::{debug, error, info};
@@ -63,9 +65,31 @@ pub async fn bind(
     addr: SocketAddr,
     server_config: ServerConfig,
 ) -> Result<(Endpoint, SocketAddr), IggyError> {
-    let endpoint = Endpoint::server(addr, server_config)
-        .await
+    // QUIC remains shard-0 terminal; this only enables coexistence with the
+    // harness's placeholder UDP socket during process startup.
+    //
+    // TODO: remove `SO_REUSEPORT` again once the integration harness stops
+    // holding placeholder reservation sockets open across child startup.
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|e| IggyError::IoError(e.to_string()))?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|e| IggyError::IoError(e.to_string()))?;
+    #[cfg(unix)]
+    socket
+        .set_reuse_port(true)
+        .map_err(|e| IggyError::IoError(e.to_string()))?;
+    socket
+        .bind(&addr.into())
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| IggyError::IoError(e.to_string()))?;
+
+    let std_socket: std::net::UdpSocket = socket.into();
+    let socket = UdpSocket::from_std(std_socket).map_err(|e| IggyError::IoError(e.to_string()))?;
+    let endpoint = Endpoint::new(socket, EndpointConfig::default(), Some(server_config), None)
+        .map_err(|e| IggyError::IoError(e.to_string()))?;
     let actual = endpoint
         .local_addr()
         .map_err(|e| IggyError::IoError(e.to_string()))?;

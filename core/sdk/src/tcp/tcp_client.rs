@@ -27,12 +27,12 @@ use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
+#[cfg(not(feature = "vsr"))]
+use iggy_common::IggyErrorDiscriminants;
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
     IggyDuration, IggyError, IggyTimestamp, TcpConnectionStringOptions, TransportProtocol,
 };
-#[cfg(not(feature = "vsr"))]
-use iggy_common::IggyErrorDiscriminants;
 use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use secrecy::ExposeSecret;

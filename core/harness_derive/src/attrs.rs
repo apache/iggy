@@ -637,8 +637,7 @@ mod tests {
 
     #[test]
     fn parse_server_executable_path() {
-        let attrs: IggyTestAttrs =
-            syn::parse_quote!(server(executable_path = "iggy-server-ng"));
+        let attrs: IggyTestAttrs = syn::parse_quote!(server(executable_path = "iggy-server-ng"));
         assert_eq!(
             attrs.server.executable_path.as_deref(),
             Some("iggy-server-ng")

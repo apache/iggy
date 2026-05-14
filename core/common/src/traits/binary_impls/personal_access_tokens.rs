@@ -25,27 +25,28 @@ use crate::{
 };
 use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
-use iggy_binary_protocol::codes::{
-    CREATE_PERSONAL_ACCESS_TOKEN_CODE, DELETE_PERSONAL_ACCESS_TOKEN_CODE,
-    GET_PERSONAL_ACCESS_TOKENS_CODE,
-};
 #[cfg(feature = "vsr")]
 use iggy_binary_protocol::codes::LOGIN_REGISTER_WITH_PAT_CODE;
 #[cfg(not(feature = "vsr"))]
 use iggy_binary_protocol::codes::LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE;
-use iggy_binary_protocol::requests::personal_access_tokens::{
-    CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, GetPersonalAccessTokensRequest,
+use iggy_binary_protocol::codes::{
+    CREATE_PERSONAL_ACCESS_TOKEN_CODE, DELETE_PERSONAL_ACCESS_TOKEN_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE,
 };
 #[cfg(not(feature = "vsr"))]
 use iggy_binary_protocol::requests::personal_access_tokens::LoginWithPersonalAccessTokenRequest;
+use iggy_binary_protocol::requests::personal_access_tokens::{
+    CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
+    GetPersonalAccessTokensRequest,
+};
 #[cfg(feature = "vsr")]
 use iggy_binary_protocol::requests::users::LoginRegisterWithPatRequest;
 use iggy_binary_protocol::responses::personal_access_tokens::create_personal_access_token::RawPersonalAccessTokenResponse;
 use iggy_binary_protocol::responses::personal_access_tokens::get_personal_access_tokens::GetPersonalAccessTokensResponse;
-#[cfg(not(feature = "vsr"))]
-use iggy_binary_protocol::responses::users::login_user::IdentityResponse;
 #[cfg(feature = "vsr")]
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
+#[cfg(not(feature = "vsr"))]
+use iggy_binary_protocol::responses::users::login_user::IdentityResponse;
 #[cfg(feature = "vsr")]
 use secrecy::SecretString;
 

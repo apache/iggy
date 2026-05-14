@@ -28,12 +28,12 @@ use crate::prelude::Client;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
+#[cfg(not(feature = "vsr"))]
+use iggy_common::IggyErrorDiscriminants;
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
     IggyError, IggyTimestamp, WebSocketClientConfig, WebSocketConnectionStringOptions,
 };
-#[cfg(not(feature = "vsr"))]
-use iggy_common::IggyErrorDiscriminants;
 use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use secrecy::ExposeSecret;
 use std::net::SocketAddr;
@@ -645,7 +645,8 @@ impl WebSocketClient {
             response.put_slice(&response_header);
 
             if response_size > iggy_binary_protocol::HEADER_SIZE {
-                let mut response_body = vec![0u8; response_size - iggy_binary_protocol::HEADER_SIZE];
+                let mut response_body =
+                    vec![0u8; response_size - iggy_binary_protocol::HEADER_SIZE];
                 stream.read(&mut response_body).await?;
                 response.put_slice(&response_body);
             }

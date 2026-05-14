@@ -47,7 +47,8 @@ pub(crate) fn encode_request(
             (Operation::Register, session.register_request_id(), 0)
         }
         _ => {
-            let operation = Operation::from_command_code(code).ok_or(IggyError::FeatureUnavailable)?;
+            let operation =
+                Operation::from_command_code(code).ok_or(IggyError::FeatureUnavailable)?;
             let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
             (operation, session.next_request_id(), session_id)
         }
@@ -117,19 +118,17 @@ fn namespace_for_request(
             if payload.len() < 4 {
                 return Err(IggyError::InvalidCommand);
             }
-            let metadata_length =
-                u32::from_le_bytes(payload[..4].try_into().map_err(|_| IggyError::InvalidNumberEncoding)?)
-                    as usize;
+            let metadata_length = u32::from_le_bytes(
+                payload[..4]
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
+            ) as usize;
             if payload.len() < 4 + metadata_length {
                 return Err(IggyError::InvalidCommand);
             }
             let header = SendMessagesHeader::decode_from(&payload[4..4 + metadata_length])
                 .map_err(|_| IggyError::InvalidCommand)?;
-            namespace_from_partitioning(
-                &header.stream_id,
-                &header.topic_id,
-                &header.partitioning,
-            )?
+            namespace_from_partitioning(&header.stream_id, &header.topic_id, &header.partitioning)?
         }
         STORE_CONSUMER_OFFSET_CODE => {
             let request = StoreConsumerOffsetRequest::decode_from(payload)
