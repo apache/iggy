@@ -115,7 +115,6 @@ error_set = { workspace = true }
 figlet-rs = { workspace = true }
 flume = { workspace = true }
 fs2 = { workspace = true }
-futures = { workspace = true }
 hash32 = { workspace = true }
 human-repr = { workspace = true }
 iggy_binary_protocol = { workspace = true }

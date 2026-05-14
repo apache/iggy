@@ -17,8 +17,8 @@
 
 [package]
 name = "iggy_connector_influxdb_source"
-version = "0.4.0"
-description = "Iggy InfluxDB source connector supporting V2 (Flux) and V3 (SQL) queries"
+version = "0.4.1-edge.1"
+description = "Iggy InfluxDB source connector for polling Flux query results"
 edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming", "influxdb", "source"]
