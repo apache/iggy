@@ -156,7 +156,7 @@ async fn main() -> Result<(), RuntimeError> {
         connectors_config.sinks().len()
     );
     let sources_config = connectors_config.sources();
-    let sources = source::init(
+    let (sources, failed_sources) = source::init(
         sources_config.clone(),
         &iggy_clients.producer,
         &config.state.path,
@@ -164,7 +164,7 @@ async fn main() -> Result<(), RuntimeError> {
     .await?;
 
     let sinks_config = connectors_config.sinks();
-    let sinks = sink::init(sinks_config.clone(), &iggy_clients.consumer).await?;
+    let (sinks, failed_sinks) = sink::init(sinks_config.clone(), &iggy_clients.consumer).await?;
 
     let mut sink_wrappers = vec![];
     let mut sink_containers_by_key: HashMap<String, Arc<Container<SinkApi>>> = HashMap::new();
@@ -200,6 +200,8 @@ async fn main() -> Result<(), RuntimeError> {
         sources_config,
         &sink_wrappers,
         &source_wrappers,
+        &failed_sinks,
+        &failed_sources,
         connectors_config_provider,
         iggy_clients.clone(),
         config.state.path.clone(),
@@ -457,6 +459,42 @@ struct SourceConnectorProducer {
 struct SourceConnectorWrapper {
     callback: HandleCallback,
     plugins: Vec<SourceConnectorPlugin>,
+}
+
+/// Records a connector that failed before its FFI container could be loaded
+/// (path resolution, dlopen, or pre-container setup). Surfaced to the runtime
+/// API/health view as `ConnectorStatus::Error` so one bad config does not hide
+/// the connector or block healthy peers from running.
+pub(crate) struct FailedPlugin {
+    pub id: u32,
+    pub key: String,
+    pub name: String,
+    pub path: String,
+    pub config_format: Option<ConfigFormat>,
+    pub error: String,
+    pub enabled: bool,
+}
+
+impl FailedPlugin {
+    pub(crate) fn new(
+        id: u32,
+        key: &str,
+        name: &str,
+        path: &str,
+        config_format: Option<ConfigFormat>,
+        enabled: bool,
+        error: String,
+    ) -> Self {
+        Self {
+            id,
+            key: key.to_owned(),
+            name: name.to_owned(),
+            path: path.to_owned(),
+            config_format,
+            error,
+            enabled,
+        }
+    }
 }
 
 #[cfg(test)]

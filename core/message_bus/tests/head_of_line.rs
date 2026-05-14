@@ -29,7 +29,7 @@ use common::{header_only, install_replicas_locally, loopback};
 use compio::net::TcpListener;
 use iggy_binary_protocol::Command2;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
-use message_bus::replica_listener::{MessageHandler, bind, run};
+use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus, SendError};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -58,6 +58,7 @@ async fn slow_peer_does_not_block_other_peers() {
             3,
             accept_a,
             message_bus::framing::MAX_MESSAGE_SIZE,
+            Duration::from_secs(10),
         )
         .await;
     });

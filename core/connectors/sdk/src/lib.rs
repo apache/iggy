@@ -20,12 +20,12 @@
 use async_trait::async_trait;
 use base64::{self, Engine};
 use decoders::{
-    flatbuffer::FlatBufferStreamDecoder, json::JsonStreamDecoder, proto::ProtoStreamDecoder,
-    raw::RawStreamDecoder, text::TextStreamDecoder,
+    avro::AvroStreamDecoder, flatbuffer::FlatBufferStreamDecoder, json::JsonStreamDecoder,
+    proto::ProtoStreamDecoder, raw::RawStreamDecoder, text::TextStreamDecoder,
 };
 use encoders::{
-    flatbuffer::FlatBufferStreamEncoder, json::JsonStreamEncoder, proto::ProtoStreamEncoder,
-    raw::RawStreamEncoder, text::TextStreamEncoder,
+    avro::AvroStreamEncoder, flatbuffer::FlatBufferStreamEncoder, json::JsonStreamEncoder,
+    proto::ProtoStreamEncoder, raw::RawStreamEncoder, text::TextStreamEncoder,
 };
 use iggy::prelude::{HeaderKey, HeaderValue};
 use once_cell::sync::OnceCell;
@@ -144,6 +144,7 @@ pub enum Payload {
     Text(String),
     Proto(String),
     FlatBuffer(Vec<u8>),
+    Avro(Vec<u8>),
 }
 
 impl Payload {
@@ -157,6 +158,7 @@ impl Payload {
             Payload::Text(text) => Ok(text.into_bytes()),
             Payload::Proto(text) => Ok(text.into_bytes()),
             Payload::FlatBuffer(value) => Ok(value),
+            Payload::Avro(value) => Ok(value),
         }
     }
 
@@ -185,6 +187,7 @@ impl Payload {
             Payload::Text(text) => Ok(text.as_bytes().to_vec()),
             Payload::Proto(text) => Ok(text.as_bytes().to_vec()),
             Payload::FlatBuffer(value) => Ok(value.clone()),
+            Payload::Avro(value) => Ok(value.clone()),
         }
     }
 }
@@ -201,6 +204,7 @@ impl std::fmt::Display for Payload {
             Payload::Text(text) => write!(f, "Text({text})"),
             Payload::Proto(text) => write!(f, "Proto({text})"),
             Payload::FlatBuffer(value) => write!(f, "FlatBuffer({} bytes)", value.len()),
+            Payload::Avro(value) => write!(f, "Avro({} bytes)", value.len()),
         }
     }
 }
@@ -222,6 +226,8 @@ pub enum Schema {
     Proto,
     #[strum(to_string = "flatbuffer")]
     FlatBuffer,
+    #[strum(to_string = "avro")]
+    Avro,
 }
 
 impl Schema {
@@ -245,6 +251,7 @@ impl Schema {
                 Err(_) => Ok(Payload::Raw(value)),
             },
             Schema::FlatBuffer => Ok(Payload::FlatBuffer(value)),
+            Schema::Avro => Ok(Payload::Avro(value)),
         }
     }
 
@@ -255,6 +262,7 @@ impl Schema {
             Schema::Text => Arc::new(TextStreamDecoder),
             Schema::Proto => Arc::new(ProtoStreamDecoder::default()),
             Schema::FlatBuffer => Arc::new(FlatBufferStreamDecoder::default()),
+            Schema::Avro => Arc::new(AvroStreamDecoder::default()),
         }
     }
 
@@ -265,6 +273,7 @@ impl Schema {
             Schema::Text => Arc::new(TextStreamEncoder),
             Schema::Proto => Arc::new(ProtoStreamEncoder::default()),
             Schema::FlatBuffer => Arc::new(FlatBufferStreamEncoder::default()),
+            Schema::Avro => Arc::new(AvroStreamEncoder::default()),
         }
     }
 }

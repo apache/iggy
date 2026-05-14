@@ -7,6 +7,7 @@
         <IsPackable>false</IsPackable>
         <AssemblyName>Apache.Iggy.Tests.BDD</AssemblyName>
         <RootNamespace>Apache.Iggy.Tests.BDD</RootNamespace>
+        <ReqnrollUseIntermediateOutputPathForCodeBehind>true</ReqnrollUseIntermediateOutputPathForCodeBehind>
     </PropertyGroup>
 
     <PropertyGroup>
@@ -34,10 +35,12 @@
     </ItemGroup>
 
     <ItemGroup>
-        <Content Include="..\..\..\bdd\scenarios\basic_messaging.feature">
+        <ReqnrollFeatureFile Include="..\..\..\bdd\scenarios\basic_messaging.feature">
             <Link>Features\basic_messaging.feature</Link>
-            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-        </Content>
+        </ReqnrollFeatureFile>
+        <ReqnrollFeatureFile Include="..\..\..\bdd\scenarios\leader_redirection.feature">
+            <Link>Features\leader_redirection.feature</Link>
+        </ReqnrollFeatureFile>
     </ItemGroup>
 
     <ItemGroup>

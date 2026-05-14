@@ -16,7 +16,21 @@
 // under the License.
 
 use crate::ffi;
+use iggy::prelude::Stream as RustStream;
 use iggy::prelude::StreamDetails as RustStreamDetails;
+
+impl From<RustStream> for ffi::Stream {
+    fn from(s: RustStream) -> Self {
+        ffi::Stream {
+            id: s.id,
+            created_at: s.created_at.as_micros(),
+            name: s.name,
+            size_bytes: s.size.as_bytes_u64(),
+            messages_count: s.messages_count,
+            topics_count: s.topics_count,
+        }
+    }
+}
 
 impl From<RustStreamDetails> for ffi::StreamDetails {
     fn from(stream: RustStreamDetails) -> Self {

@@ -44,7 +44,7 @@ use journal::JournalHandle;
 use message_bus::MessageBus;
 use message_bus::client_listener::RequestHandler;
 use message_bus::lifecycle::ShutdownToken;
-use message_bus::replica_listener::MessageHandler;
+use message_bus::replica::listener::MessageHandler;
 use metadata::IggyMetadata;
 use metadata::stm::StateMachine;
 use partitions::IggyPartitions;
@@ -142,8 +142,9 @@ where
     /// # Panics
     ///
     /// Panics if `senders` is not in canonical order
-    /// (`senders[i].shard_id() != i`) or, on shard 0, if `senders.len()`
-    /// does not fit in `u16`. Both are bootstrap programming errors.
+    /// (`senders[i].shard_id() != i`) or if `senders.len()` does not
+    /// fit in `u16`. Both are bootstrap programming errors and the
+    /// `u16` overflow check fires on every shard, not only shard 0.
     pub fn build(self) -> BuiltShard<B, MJ, S, M, T, R> {
         let is_shard_zero = self.identity.id == 0;
 

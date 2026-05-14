@@ -18,16 +18,21 @@
 //! Outbound replica connector.
 //!
 //! Runs only on shard 0. For each peer replica with `peer_id > self_id` the
-//! connector dials at startup and re-dials on a periodic sweep. On a
-//! successful `Ping` handshake the accepted stream is handed to the
-//! `on_dialed` callback supplied by the shard bootstrap, which duplicates
-//! the fd and ships it to the owning shard via the inter-shard channel
+//! connector dials at startup and re-dials on a periodic sweep. After a
+//! successful TCP connect the connector sends a plaintext `Ping` frame
+//! announcing this replica's id and `cluster_id` and hands the stream
+//! to the `on_dialed` callback supplied by the shard bootstrap, which
+//! duplicates the fd and ships it to the owning shard via the
+//! inter-shard channel
 //! (see `shard::coordinator::ShardZeroCoordinator`).
+//!
+//! No transport-level authentication: the future `LOGIN_REPLICA`
+//! command in the caller (`server-ng`) carries the cluster shared
+//! secret post-connect.
 
 use crate::IggyMessageBus;
 use crate::framing;
 use crate::lifecycle::ShutdownToken;
-use crate::socket_opts::apply_keepalive_for_connection;
 use crate::{AcceptedReplicaFn, GenericHeader, Message};
 use compio::net::TcpStream;
 use iggy_binary_protocol::{Command2, HEADER_SIZE};
@@ -41,7 +46,7 @@ use tracing::{debug, info, warn};
 ///
 /// Equivalent to `MessageBusConfig::default().reconnect_period`; exposed
 /// as a named const for test / bench ergonomics. Kept in sync with the
-/// [`MessageBusConfig::default`] impl. Remove once the configs-crate
+/// `MessageBusConfig::default` impl. Remove once the configs-crate
 /// migration lands and bootstrap always reads the period from
 /// `ServerConfig`.
 pub const DEFAULT_RECONNECT_PERIOD: Duration = Duration::from_secs(5);
@@ -95,9 +100,11 @@ async fn connect_all(
         // connection lives on shard 0; `owning_shard` covers multi-shard
         // deployments where the fd was delegated to a peer shard but the
         // mapping broadcast reached shard 0. Either hit means a previous
-        // sweep (or the inbound listener) already installed this peer and
-        // we must not dial again - redialing would tear down the live
-        // socket via the `AlreadyRegistered` race and flap the mapping.
+        // sweep (or the inbound listener) already installed this peer.
+        // Redialing wastes a TCP round-trip; the live entry stays intact
+        // (the loser of the registry insert race in `install_replica_conn`
+        // gets `RejectedRegistration` back and tears DOWN ITS OWN orphan
+        // tasks via `drain_rejected_registration`, never the winner's).
         if bus.replicas().contains(peer_id) || bus.owning_shard(peer_id).is_some() {
             debug!(
                 replica = peer_id,
@@ -105,7 +112,7 @@ async fn connect_all(
             );
             continue;
         }
-        connect_one(bus, cluster_id, self_id, peer_id, addr, on_dialed).await;
+        connect_one(cluster_id, self_id, peer_id, addr, on_dialed).await;
     }
 }
 
@@ -125,12 +132,12 @@ async fn periodic_reconnect(
     debug!("replica reconnect periodic task exiting");
 }
 
-/// Dial a single peer, send the `Ping` handshake, and hand the stream to
-/// `on_dialed` on success. Dial / handshake failures are logged and
-/// swallowed; VSR tolerates missing peers and the periodic sweep retries.
+/// Dial a single peer, send the plaintext `Ping` frame, and hand the
+/// stream to `on_dialed` on success. Dial / write failures are logged
+/// and swallowed; VSR tolerates missing peers and the periodic sweep
+/// retries.
 #[allow(clippy::future_not_send)]
 async fn connect_one(
-    bus: &Rc<IggyMessageBus>,
     cluster_id: u128,
     self_id: u8,
     peer_id: u8,
@@ -147,18 +154,6 @@ async fn connect_one(
     if let Err(e) = stream.set_nodelay(true) {
         debug!(replica = peer_id, %addr, "set_nodelay failed: {e}");
     }
-    let cfg = bus.config();
-    if let Err(e) = apply_keepalive_for_connection(
-        &stream,
-        cfg.keepalive_idle,
-        cfg.keepalive_interval,
-        cfg.keepalive_retries,
-    ) {
-        warn!(
-            replica = peer_id, %addr,
-            "failed to configure TCP keepalive on outbound socket: {e}"
-        );
-    }
 
     let ping = build_ping_message(cluster_id, self_id);
     if let Err(e) = framing::write_message(&mut stream, ping).await {
@@ -170,7 +165,9 @@ async fn connect_one(
     on_dialed(stream, peer_id);
 }
 
-/// Build a Ping handshake message identifying our replica id.
+/// Build a plaintext `Ping` frame announcing this replica's id and
+/// `cluster_id`. No nonce, no timestamp, no MAC: cluster-secret
+/// validation moves to the future `LOGIN_REPLICA` command in the caller.
 fn build_ping_message(cluster_id: u128, replica_id: u8) -> Message<GenericHeader> {
     #[allow(clippy::cast_possible_truncation)]
     Message::<GenericHeader>::new(size_of::<GenericHeader>()).transmute_header(

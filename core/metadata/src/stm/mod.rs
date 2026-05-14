@@ -250,6 +250,12 @@ macro_rules! define_state {
                     left_right.into()
                 }
             }
+
+            impl Default for $state {
+                fn default() -> Self {
+                    [<$state Inner>]::new().into()
+                }
+            }
         }
     };
 }

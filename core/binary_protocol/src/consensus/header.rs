@@ -25,6 +25,31 @@ use std::mem::offset_of;
 
 pub const HEADER_SIZE: usize = 256;
 
+/// Byte offset of [`GenericHeader::size`] within the on-wire header.
+///
+/// Single source of truth for transports that decode the size field
+/// before constructing the typed header (WS Binary frames, streaming
+/// TLS pumps that need the total length to size their accumulator).
+/// The `const _: ()` block on [`GenericHeader`] re-asserts the field
+/// offset matches this constant, so layout drift trips the build
+/// before any caller reads the wrong bytes.
+pub const SIZE_FIELD_OFFSET: usize = 48;
+
+/// Read the four-byte little-endian size field at
+/// [`SIZE_FIELD_OFFSET`] from a wire header buffer.
+///
+/// Returns `None` if `header` is shorter than `SIZE_FIELD_OFFSET + 4`;
+/// callers that already validated `header.len() >= HEADER_SIZE` are
+/// safe but should still propagate the `Option` rather than `unwrap`.
+#[inline]
+#[must_use]
+pub fn read_size_field(header: &[u8]) -> Option<u32> {
+    header
+        .get(SIZE_FIELD_OFFSET..SIZE_FIELD_OFFSET + 4)
+        .and_then(|s| s.try_into().ok())
+        .map(u32::from_le_bytes)
+}
+
 /// Trait implemented by all consensus header types.
 ///
 /// Every header is exactly [`HEADER_SIZE`] bytes, `#[repr(C)]`, and supports
@@ -59,6 +84,10 @@ pub struct GenericHeader {
 }
 const _: () = {
     assert!(size_of::<GenericHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(GenericHeader, size) == SIZE_FIELD_OFFSET,
+        "GenericHeader.size offset drifted; transports decode wrong bytes",
+    );
     assert!(
         offset_of!(GenericHeader, reserved_command)
             == offset_of!(GenericHeader, reserved_frame) + size_of::<[u8; 66]>()

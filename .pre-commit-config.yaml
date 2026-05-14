@@ -63,14 +63,6 @@ repos:
         language: system
         pass_filenames: false
 
-      - id: licenses-list
-        name: licenses list
-        entry: ./scripts/ci/licenses-list.sh
-        args: ["--fix"]
-        language: system
-        files: ^Cargo\.lock$
-        pass_filenames: false
-
       - id: rust-version-sync
         name: rust version sync
         entry: ./scripts/ci/sync-rust-version.sh

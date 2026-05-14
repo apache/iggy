@@ -60,6 +60,17 @@ pub(crate) enum ContextAction {
     ///  iggy context delete production
     #[clap(verbatim_doc_comment, visible_alias = "d")]
     Delete(ContextDeleteArgs),
+
+    /// Show details of a specific context
+    ///
+    /// Displays the full configuration of a named context including
+    /// transport, server addresses, TLS settings, and credentials.
+    ///
+    /// Examples
+    ///  iggy context show default
+    ///  iggy context show production
+    #[clap(verbatim_doc_comment, visible_alias = "s")]
+    Show(ContextShowArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -144,6 +155,13 @@ impl From<ContextCreateArgs> for ContextConfig {
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ContextDeleteArgs {
     /// Name of the context to delete
+    #[arg(value_parser = clap::value_parser!(String))]
+    pub(crate) context_name: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ContextShowArgs {
+    /// Name of the context to show
     #[arg(value_parser = clap::value_parser!(String))]
     pub(crate) context_name: String,
 }
