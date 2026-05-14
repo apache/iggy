@@ -37,6 +37,7 @@ namespace Apache.Iggy.Consumers;
 public partial class IggyConsumer : IAsyncDisposable
 {
     private readonly Channel<ReceivedMessage> _channel;
+    private readonly Channel<ReceivedRentedMessage> _rentedChannel;
     private readonly IIggyClient _client;
     private readonly IggyConsumerConfig _config;
     private readonly SemaphoreSlim _connectionStateSemaphore = new(1, 1);
@@ -66,6 +67,8 @@ public partial class IggyConsumer : IAsyncDisposable
         _logger = loggerFactory.CreateLogger<IggyConsumer>();
 
         _channel = Channel.CreateBounded<ReceivedMessage>(new BoundedChannelOptions((int)config.BatchSize * 2));
+        _rentedChannel
+            = Channel.CreateBounded<ReceivedRentedMessage>(new BoundedChannelOptions((int)config.BatchSize * 2));
         _consumerErrorEvents = new EventAggregator<ConsumerErrorEventArgs>(loggerFactory);
     }
 
@@ -200,14 +203,14 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     /// <param name="offset">The offset to store</param>
     /// <param name="partitionId">The partition ID</param>
-    /// <param name="resetLastPooled"></param>
+    /// <param name="resetLastPolled"></param>
     /// <param name="ct">Cancellation token</param>
-    public async Task StoreOffsetAsync(ulong offset, uint partitionId, bool resetLastPooled = false,
+    public async Task StoreOffsetAsync(ulong offset, uint partitionId, bool resetLastPolled = false,
         CancellationToken ct = default)
     {
         await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId, ct);
 
-        if (resetLastPooled)
+        if (resetLastPolled)
         {
             _lastPolledOffset[(int)partitionId] = offset;
         }

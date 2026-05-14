@@ -29,8 +29,6 @@ namespace Apache.Iggy.Consumers;
 
 public partial class IggyConsumer
 {
-    private readonly Channel<ReceivedRentedMessage> _rentedChannel = Channel.CreateUnbounded<ReceivedRentedMessage>();
-
     /// <summary>
     ///     Receives messages asynchronously as an async stream of rented messages. Each yielded
     ///     <see cref="ReceivedRentedMessage" /> shares its underlying pooled buffer with the other messages from the
@@ -157,6 +155,7 @@ public partial class IggyConsumer
                 var status = MessageStatus.Success;
                 Exception? error = null;
 
+                // TODO: fix encryption allocations by moving it to IggyClient
                 if (_config.MessageEncryptor != null)
                 {
                     try

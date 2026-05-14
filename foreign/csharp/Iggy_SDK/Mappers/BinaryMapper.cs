@@ -420,11 +420,6 @@ internal static class BinaryMapper
 
     internal static PolledMessages MaterializeMessages(PolledMessagesRental rental)
     {
-        if (rental.Messages.Count == 0 && rental.PartitionId == 0 && rental.CurrentOffset == 0)
-        {
-            return PolledMessages.Empty;
-        }
-
         var messages = new List<MessageResponse>(rental.Messages.Count);
         foreach (var message in rental.Messages)
         {

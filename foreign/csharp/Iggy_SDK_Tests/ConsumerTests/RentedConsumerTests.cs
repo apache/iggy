@@ -184,24 +184,6 @@ public class RentedConsumerTests
     }
 
     [Fact]
-    public void RentedBatchHandle_Release_BeyondAcquired_Throws()
-    {
-        var owner = new TrackingMemoryOwner(16);
-        var rental = new PolledMessagesRental(owner)
-        {
-            PartitionId = 1,
-            CurrentOffset = 0,
-            Messages = Array.Empty<RentedMessageResponse>()
-        };
-        var handle = new RentedBatchHandle(rental);
-
-        handle.Release(); // releases self-ref -> 0 -> disposes rental
-        Assert.Equal(1, owner.DisposeCount);
-
-        Assert.Throws<InvalidOperationException>(() => handle.Release());
-    }
-
-    [Fact]
     public void RentedBatchHandle_AcquireRelease_Balanced_DisposesOnce()
     {
         var owner = new TrackingMemoryOwner(16);

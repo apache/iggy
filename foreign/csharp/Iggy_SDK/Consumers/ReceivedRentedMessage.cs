@@ -114,13 +114,9 @@ public sealed class RentedBatchHandle : IDisposable
     public void Release()
     {
         var remaining = Interlocked.Decrement(ref _refCount);
-        if (remaining == 0)
+        if (remaining <= 0)
         {
             _rental.Dispose();
-        }
-        else if (remaining < 0)
-        {
-            throw new InvalidOperationException("RentedBatchHandle released more times than acquired.");
         }
     }
 }
