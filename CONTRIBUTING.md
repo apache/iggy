@@ -163,9 +163,11 @@ for review".
 ### Review state
 
 Submitting a review with "Request changes" is treated as an implicit
-`/author`: the PR moves to `S-waiting-on-author`. Only maintainers can
-trigger this, the same as the `/author` command. If your review body also
-contains an explicit `/ready` or `/author`, that command wins.
+`/author`: the PR moves to `S-waiting-on-author`. Anyone GitHub recognizes
+as a repo contributor or above can trigger this - a wider set than the
+`/author` command, which stays maintainer-only, since a formal "Request
+changes" review is a deliberate, attributable action. If your review body
+also contains an explicit `/ready` or `/author`, that command wins.
 
 ### Tips
 
