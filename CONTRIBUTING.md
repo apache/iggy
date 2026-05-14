@@ -132,8 +132,8 @@ together. For `/ready` and `/author`, the last one wins, so `/ready` then
 ### Typical flow
 
 1. You open a PR. CODEOWNERS pings `@apache/iggy-committers` automatically.
-2. A maintainer reviews. If they want changes, they comment `/author` and
-   the PR moves to your queue.
+2. A maintainer reviews. Submitting a "Request changes" review moves the
+   PR to your queue automatically; they can also comment `/author`.
 3. You push fixes, then comment `/ready`. The PR moves back to the review
    queue.
 4. Either side can comment `/request-review @somebody` to pull in a
@@ -160,6 +160,13 @@ Drafts are skipped by the automatic labelling, but `/ready` and `/author`
 still work on drafts if you want to signal intent before clicking "Ready
 for review".
 
+### Review state
+
+Submitting a review with "Request changes" is treated as an implicit
+`/author`: the PR moves to `S-waiting-on-author`. Only maintainers can
+trigger this, the same as the `/author` command. If your review body also
+contains an explicit `/ready` or `/author`, that command wins.
+
 ### Tips
 
 - **One comment per command burst.** To request several reviewers at once,
@@ -176,10 +183,16 @@ for review".
 
 ### When something goes wrong
 
-The workflow never comments back. If your command didn't seem to do
-anything, open the PR's "Checks" or "Actions" tab and look at the
-`PR Triage` run for the comment you posted. The run log says exactly what
-it saw and why (no permission, unknown user, etc.).
+The workflow reacts on your comment so you get quick feedback: a 👍 means
+a command was applied, a 😕 means a command was recognized but you lacked
+permission to run it. A failed `/request-review` also posts a one-line
+reply naming the handles GitHub rejected. Commands posted in a review body
+(rather than a normal comment) cannot be reacted to, so they stay
+log-only.
+
+For the full story, open the PR's "Checks" or "Actions" tab and look at
+the `PR Triage` run for the comment you posted. The run log says exactly
+what it saw and why (no permission, unknown user, etc.).
 
 ### Examples
 

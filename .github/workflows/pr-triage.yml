@@ -20,7 +20,7 @@ name: PR Triage
 # Comment-driven PR triage and lifecycle labels. Inspired by
 # rust-lang/triagebot UX.
 #
-# Comment commands (parsed line-by-line in PR comments):
+# Comment commands (parsed line-by-line in PR comments and review bodies):
 #   /request-review @u [@u2 ...]   — request review from one or more
 #                                    @users or @org/teams; the command may
 #                                    also repeat across lines
@@ -31,6 +31,17 @@ name: PR Triage
 #   /request-review, /ready  -> org MEMBER / repo COLLABORATOR/OWNER, or PR author
 #   /author                  -> org MEMBER / repo COLLABORATOR/OWNER only
 #
+# Review state (pull_request_review.submitted):
+#   A changes_requested review by a committer acts as an implicit
+#   /author. An explicit command in the review body overrides it.
+#
+# Feedback:
+#   On issue_comment commands the workflow reacts on the comment: +1 when
+#   something was applied, "confused" when a recognized command was
+#   rejected for lack of permission. A failed /request-review posts a
+#   one-line reply naming the rejected handles. Review-triggered actions
+#   have no comment to react to and stay log-only.
+#
 # Lifecycle (pull_request_target):
 #   opened (non-draft)     -> add S-waiting-on-review (only if no S-* present)
 #   ready_for_review       -> add S-waiting-on-review (only if no S-* present)
@@ -38,19 +49,24 @@ name: PR Triage
 #   closed (merged or not) -> remove both S-* labels
 #
 # SECURITY:
-# - issue_comment.created and pull_request_target are the ONLY triggers.
+# - issue_comment.created, pull_request_review.submitted and
+#   pull_request_target are the ONLY triggers.
 # - No actions/checkout of any ref. PR-controlled code is never executed.
 # - The default GITHUB_TOKEN is never written to outputs, env files, or
 #   passed to user-supplied programs. The workflow only calls the GitHub
 #   REST API via actions/github-script.
-# - pull_request_target is used so fork-PR labels can be applied with the
-#   base-repo's write token. This is safe because we never run fork code:
-#   no checkout, no exec of PR contents, no token export. See
+# - pull_request_target and pull_request_review run the base-repo workflow
+#   with a write token so fork-PR labels can be applied. This is safe
+#   because we never run fork code: no checkout, no exec of PR contents,
+#   no token export. The review body is treated as untrusted text, parsed
+#   only by the command regex. See
 #   https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
 
 on:
   issue_comment:
     types: [created]
+  pull_request_review:
+    types: [submitted]
   pull_request_target:
     types: [opened, ready_for_review, converted_to_draft, closed]
 
@@ -76,6 +92,7 @@ jobs:
   triage:
     if: |
       (github.event_name == 'issue_comment' && github.event.issue.pull_request != null)
+      || github.event_name == 'pull_request_review'
       || github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -83,9 +100,10 @@ jobs:
       - name: Dispatch
         uses: actions/github-script@v9
         env:
-          COMMENT_BODY: ${{ github.event.comment.body }}
-          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
-          COMMENT_ASSOC: ${{ github.event.comment.author_association }}
+          COMMENT_BODY: ${{ github.event.comment.body || github.event.review.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login || github.event.review.user.login }}
+          COMMENT_ASSOC: ${{ github.event.comment.author_association || github.event.review.author_association }}
+          COMMENT_ID: ${{ github.event.comment.id }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
         with:
           script: |
@@ -94,16 +112,47 @@ jobs:
             const COMMITTER_ASSOCS = new Set(['MEMBER', 'COLLABORATOR', 'OWNER']);
             const prNumber = Number(process.env.PR_NUMBER);
 
+            // Retry transient GitHub API failures so a single 502 cannot
+            // abort a command. This matters most inside setLabels: a
+            // remove that throws skips the paired add, and an add that
+            // throws after the remove leaves the PR label-less — both
+            // are states the lifecycle hooks never re-enter. Transient =
+            // 5xx, 429, or a network error with no HTTP status. Anything
+            // else (404, 403, 422) is not retried and surfaces to the
+            // caller unchanged.
+            const withRetry = async (fn, label) => {
+              const delays = [500, 1500, 4000];
+              for (let attempt = 0; ; attempt++) {
+                try {
+                  return await fn();
+                } catch (e) {
+                  const s = e.status;
+                  const transient = s === undefined || s === 429
+                                 || (s >= 500 && s < 600);
+                  if (!transient || attempt >= delays.length) throw e;
+                  core.warning(`${label}: transient failure ` +
+                    `(${s ?? e.code ?? 'network'}), retry ` +
+                    `${attempt + 1}/${delays.length} in ${delays[attempt]}ms`);
+                  await new Promise(r => setTimeout(r, delays[attempt]));
+                }
+              }
+            };
+
+            // Returns true if a label was actually deleted, false if the
+            // label was already absent (404). Callers use this to decide
+            // whether a rollback re-add is warranted.
             const removeLabelIfPresent = async (name) => {
               try {
-                await github.rest.issues.removeLabel({
+                await withRetry(() => github.rest.issues.removeLabel({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: prNumber,
                   name,
-                });
+                }), `removeLabel ${name}`);
+                return true;
               } catch (e) {
                 if (e.status !== 404) throw e;
+                return false;
               }
             };
 
@@ -114,31 +163,67 @@ jobs:
               // both-labels state never gets cleaned up). Remove-first is
               // strictly safer than add-first under crash mid-op.
               //
-              // Transient 5xx on the add half would leave the PR in a
-              // label-less limbo that lifecycle hooks don't re-enter (they
-              // only fire on opened/ready_for_review). On add failure
-              // re-add the removed label to restore the prior single-label
-              // state, then surface the original error.
-              await removeLabelIfPresent(remove);
+              // Both calls go through withRetry, so only a non-transient
+              // error or an outage outlasting the retry budget reaches
+              // these catch blocks. On add failure re-add the removed
+              // label to restore the prior single-label state -- but only
+              // when the remove actually deleted one. If `remove` was
+              // already absent (PR had neither S-* label), re-adding it
+              // would fabricate a label the PR never carried.
+              const removed = await removeLabelIfPresent(remove);
               try {
-                await github.rest.issues.addLabels({
+                await withRetry(() => github.rest.issues.addLabels({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: prNumber,
                   labels: [add],
-                });
+                }), `addLabels ${add}`);
               } catch (e) {
-                try {
-                  await github.rest.issues.addLabels({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    issue_number: prNumber,
-                    labels: [remove],
-                  });
-                } catch (rollbackErr) {
-                  core.warning(`setLabels rollback failed: ${rollbackErr.message}`);
+                if (removed) {
+                  try {
+                    await withRetry(() => github.rest.issues.addLabels({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: prNumber,
+                      labels: [remove],
+                    }), `addLabels rollback ${remove}`);
+                  } catch (rollbackErr) {
+                    core.warning(`setLabels rollback failed: ${rollbackErr.message}`);
+                  }
                 }
                 throw e;
+              }
+            };
+
+            // Best-effort commenter feedback. A failed reaction or reply
+            // must never fail the run, so each swallows its own errors.
+            // Reactions exist only for issue comments — review-triggered
+            // commands have no comment to react to, so commentId is null
+            // and react() is a no-op.
+            const commentId = Number(process.env.COMMENT_ID) || null;
+            const react = async (content) => {
+              if (!commentId) return;
+              try {
+                await withRetry(() => github.rest.reactions.createForIssueComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: commentId,
+                  content,
+                }), `react ${content}`);
+              } catch (e) {
+                core.warning(`reaction ${content} failed: ${e.message}`);
+              }
+            };
+            const reply = async (text) => {
+              try {
+                await withRetry(() => github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: text,
+                }), 'createComment');
+              } catch (e) {
+                core.warning(`reply failed: ${e.message}`);
               }
             };
 
@@ -169,12 +254,12 @@ jobs:
                 // Read live labels rather than the webhook-frozen
                 // pr.labels — a comment-driven /author or /ready may have
                 // landed between the lifecycle event and this run.
-                const live = await github.rest.issues.listLabelsOnIssue({
+                const live = await withRetry(() => github.rest.issues.listLabelsOnIssue({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: prNumber,
                   per_page: 100,
-                });
+                }), 'listLabelsOnIssue');
                 const liveNames = live.data.map(l => l.name);
                 const hasState = liveNames.includes(LABEL_REVIEW)
                               || liveNames.includes(LABEL_AUTHOR);
@@ -183,12 +268,12 @@ jobs:
                   core.info('lifecycle: S-* label already present, no change');
                   return;
                 }
-                await github.rest.issues.addLabels({
+                await withRetry(() => github.rest.issues.addLabels({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: prNumber,
                   labels: [LABEL_REVIEW],
-                });
+                }), `lifecycle addLabels ${LABEL_REVIEW}`);
                 core.info(`lifecycle: added ${LABEL_REVIEW}`);
                 return;
               }
@@ -197,18 +282,31 @@ jobs:
               return;
             }
 
-            // ----- issue_comment commands -----
+            // ----- issue_comment / pull_request_review commands -----
+            // Both event types feed the same path: COMMENT_BODY/_AUTHOR/
+            // _ASSOC resolve from github.event.comment or .review in the
+            // step env.
             const body = process.env.COMMENT_BODY || '';
 
-            // Skip everything if no command line is present. Avoids a
-            // pulls.get on every drive-by PR comment. Leading whitespace
-            // is tolerated so that "  /ready" matches the same way the
-            // line-by-line dispatch (which trims) does. The trailing
-            // `(?:\s|$)` rejects suffixed prose like `/ready-to-merge` —
-            // `\b` fires at hyphen/slash and would silently flip state.
+            // A changes_requested review is an implicit /author: the ball
+            // is back with the author. Same committer-only gate as the
+            // /author command (checked below, once isCommitter is known).
+            // An explicit command in the review body still takes
+            // precedence. payload.review is absent for issue_comment.
+            const reviewState = context.payload.review?.state;
+            const reviewWantsAuthor = reviewState === 'changes_requested';
+
+            // Skip everything if there is neither a command line nor an
+            // actionable review state. Avoids a pulls.get on every
+            // drive-by comment and every approve/comment-only review.
+            // Leading whitespace is tolerated so that "  /ready" matches
+            // the same way the line-by-line dispatch (which trims) does.
+            // The trailing `(?:\s|$)` rejects suffixed prose like
+            // `/ready-to-merge` — `\b` fires at hyphen/slash and would
+            // silently flip state.
             const COMMAND_RE = /^[ \t]*\/(request-review|ready|author)(?:\s|$)/m;
-            if (!COMMAND_RE.test(body)) {
-              core.info('no command in body, skipping');
+            if (!COMMAND_RE.test(body) && !reviewWantsAuthor) {
+              core.info('no command in body and no actionable review state, skipping');
               return;
             }
 
@@ -227,11 +325,11 @@ jobs:
             // single API call saved on the committer fast-path.
             let prData;
             try {
-              prData = await github.rest.pulls.get({
+              prData = await withRetry(() => github.rest.pulls.get({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 pull_number: prNumber,
-              });
+              }), 'pulls.get');
             } catch (e) {
               if (e.status === 404) {
                 core.info('PR not found (deleted or transferred), skipping');
@@ -255,6 +353,11 @@ jobs:
             let sawReassign = false;
             let sawReady = false;
             let sawAuthor = false;
+            // Outcome tracking for commenter feedback (see react() above).
+            // applied: at least one command took effect. denied: at least
+            // one recognized command was rejected for lack of permission.
+            let applied = false;
+            let denied = false;
 
             // /request-review handles accumulate across every matching line
             // (and every handle on a line); the requestReviewers call is
@@ -279,6 +382,7 @@ jobs:
                 sawReassign = true;
                 if (!(isCommitter || isPrAuthor)) {
                   core.info(`/request-review: ignored, ${commentAuthor} lacks permission`);
+                  denied = true;
                   continue;
                 }
                 const rest = (rr[1] || '').trim();
@@ -306,9 +410,11 @@ jobs:
                 sawReady = true;
                 if (!(isCommitter || isPrAuthor)) {
                   core.info(`/ready: ignored, ${commentAuthor} lacks permission`);
+                  denied = true;
                 } else {
                   await setLabels(LABEL_REVIEW, LABEL_AUTHOR);
                   core.info(`/ready: ${LABEL_REVIEW} <- ${LABEL_AUTHOR}`);
+                  applied = true;
                 }
                 continue;
               }
@@ -316,9 +422,11 @@ jobs:
                 sawAuthor = true;
                 if (!isCommitter) {
                   core.info(`/author: ignored, ${commentAuthor} not a committer`);
+                  denied = true;
                 } else {
                   await setLabels(LABEL_AUTHOR, LABEL_REVIEW);
                   core.info(`/author: ${LABEL_AUTHOR} <- ${LABEL_REVIEW}`);
+                  applied = true;
                 }
                 continue;
               }
@@ -334,18 +442,51 @@ jobs:
               if (teamReviewers.size > 0) params.team_reviewers = [...teamReviewers];
               const requested = [...reviewers, ...teamReviewers].join(', ');
               try {
-                await github.rest.pulls.requestReviewers(params);
+                await withRetry(
+                  () => github.rest.pulls.requestReviewers(params),
+                  'requestReviewers',
+                );
                 core.info(`/request-review: requested ${requested}`);
+                applied = true;
               } catch (e) {
-                // GitHub rejects the whole batch on a single bad handle
-                // (non-collaborator, unknown team) with one 422. Per-handle
-                // calls would isolate the failure but multiply API calls
-                // for a rare path; the run log names the rejected set and
-                // the commenter re-posts.
+                // Transient 5xx is retried by withRetry before reaching
+                // here. What lands in this catch is a non-transient
+                // failure — typically the 422 GitHub returns for the
+                // whole batch on a single bad handle (non-collaborator,
+                // unknown team). Surface it to the commenter; the run log
+                // also names the rejected set.
                 core.warning(`/request-review: failed to request [${requested}]: ${e.message}`);
+                const why = e.status === 422
+                  ? 'a handle is not a repo collaborator, or the team is unknown'
+                  : `GitHub API error (${e.status ?? 'network'})`;
+                await reply(`\`/request-review\`: could not request ${requested} — ${why}.`);
               }
             }
 
-            if (!sawReassign && !sawReady && !sawAuthor) {
+            // Implicit /author from a changes_requested review. Skipped
+            // when the review body already carried an explicit /ready or
+            // /author — the command wins. Same committer-only gate as the
+            // /author command.
+            if (reviewWantsAuthor && !sawReady && !sawAuthor) {
+              if (!isCommitter) {
+                core.info(`review changes_requested: ignored, ${commentAuthor} not a committer`);
+              } else {
+                await setLabels(LABEL_AUTHOR, LABEL_REVIEW);
+                core.info(`review changes_requested: ${LABEL_AUTHOR} <- ${LABEL_REVIEW}`);
+                applied = true;
+              }
+            }
+
+            if (!sawReassign && !sawReady && !sawAuthor && !reviewWantsAuthor) {
               core.info('no command matched');
+            }
+
+            // Commenter feedback. denied wins over applied: if any part of
+            // the comment was rejected the commenter should see it, even
+            // when another command in the same comment worked. react() is
+            // a no-op for review-triggered runs (no comment to react to).
+            if (denied) {
+              await react('confused');
+            } else if (applied) {
+              await react('+1');
             }
