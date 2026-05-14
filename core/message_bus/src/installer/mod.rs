@@ -55,7 +55,7 @@ use std::rc::Rc;
 use tracing::warn;
 
 /// Operations a shard needs to perform on its local bus when the router
-/// receives an inter-shard connection-setup or mapping frame.
+/// receives an inter-shard connection-setup frame.
 ///
 /// The production implementation is on `Rc<IggyMessageBus>`. The simulator
 /// does not exercise this path; if it ever does, add a no-op impl on
@@ -87,14 +87,6 @@ pub trait ConnectionInstaller {
     /// subprotocol negotiation: the caller (server-ng) gates command
     /// access via the LOGIN allowlist.
     fn install_client_ws_fd(&self, fd: DupedFd, meta: ClientConnMeta, on_request: RequestHandler);
-
-    /// Update the replica -> owning shard mapping used by the `send_to_replica`
-    /// slow path on non-owning shards.
-    fn set_shard_mapping(&self, replica: u8, owning_shard: u16);
-
-    /// Forget the replica -> owning shard mapping (e.g. after a connection
-    /// loss, before the next allocate).
-    fn remove_shard_mapping(&self, replica: u8);
 }
 
 impl ConnectionInstaller for Rc<IggyMessageBus> {
@@ -139,13 +131,5 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
             }
         });
         self.track_background(handle);
-    }
-
-    fn set_shard_mapping(&self, replica: u8, owning_shard: u16) {
-        IggyMessageBus::set_shard_mapping(self, replica, owning_shard);
-    }
-
-    fn remove_shard_mapping(&self, replica: u8) {
-        IggyMessageBus::remove_shard_mapping(self, replica);
     }
 }

@@ -325,8 +325,10 @@ impl Simulator {
         futures::executor::block_on(replica.on_message(message));
 
         let mut buf = Vec::new();
-        futures::executor::block_on(replica.process_loopback(&mut buf));
-        let loopback_count = futures::executor::block_on(replica.process_loopback(&mut buf));
+        let mut ns_scratch: Vec<IggyNamespace> = Vec::new();
+        futures::executor::block_on(replica.process_loopback(&mut buf, &mut ns_scratch));
+        let loopback_count =
+            futures::executor::block_on(replica.process_loopback(&mut buf, &mut ns_scratch));
         debug_assert_eq!(
             loopback_count, 0,
             "on_ack must not re-enqueue loopback messages"

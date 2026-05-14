@@ -77,24 +77,47 @@ pub fn install_replica_conn<C: TransportConn>(
         return;
     }
 
+    // Atomically claim cross-shard ownership before spawning any task.
+    // `mark_replica_owned` CAS-from-`OWNER_NONE` arbitrates parallel
+    // inbound installs that target different shards: the loser shard
+    // drops the fd here without ever touching the local registry, so
+    // there is no orphan post-loop and no need for
+    // `RejectedRegistration`-style drain on this path. The matching
+    // local-`replicas().contains` check above handles same-shard
+    // duplicates; same-shard reclaim during the previous install's
+    // post-loop clear window is accepted by `try_claim`'s
+    // `actual == shard_id` fallback (the live-registry guard in
+    // `notify_connection_lost` prevents the stale post-loop from
+    // clobbering the new entry).
+    if !bus.mark_replica_owned(peer_id) {
+        debug!(
+            replica = peer_id,
+            current_owner = ?bus.owning_shard(peer_id),
+            "replica already owned by a different shard, dropping delegated fd"
+        );
+        drop(conn);
+        return;
+    }
+
     let (tx, rx) = async_channel::bounded(bus.peer_queue_capacity());
     let (in_tx, in_rx) =
         async_channel::bounded::<Message<GenericHeader>>(bus.peer_queue_capacity());
 
     // Writer and reader both observe abnormal close and used to fire
-    // `notify_connection_lost` twice per disconnect, causing shard 0 to
-    // broadcast two `ReplicaMappingClear` rounds and churn the mapping.
+    // `notify_connection_lost` twice per disconnect, double-clearing the
+    // owner-table slot and double-firing any installed test callback.
     // Shared one-shot guard: whichever post-loop runs first wins.
     let notified = Rc::new(Cell::new(false));
     // If the registry insert below races with a concurrent install for
     // the same peer id and loses, both spawned halves must skip their
     // post-loop cleanup: the loser's `replicas().remove` /
     // `close_peer_if_token_matches` calls would no-op against the winner's
-    // generation token (so they can't evict the live entry), but
-    // `notify_connection_lost` has no token guard and would still broadcast
-    // a spurious mapping-clear round. `compio::runtime::JoinHandle::drop`
-    // does not cancel the spawned task, so we have to tell the tasks to
-    // stand down in-band.
+    // generation token (so they can't evict the live entry), and
+    // `notify_connection_lost` stands down whenever a live registry entry
+    // exists - but the loser also drives `replica_dispatch_loop`, which
+    // must never hand the winner's replica id to `on_message`.
+    // `compio::runtime::JoinHandle::drop` does not cancel the spawned
+    // task, so we have to tell the tasks to stand down in-band.
     let install_aborted = Rc::new(Cell::new(false));
 
     // Generation token published by the registry on a successful insert.
@@ -265,12 +288,23 @@ pub fn install_replica_conn<C: TransportConn>(
         conn_shutdown,
     ) {
         Ok(token) => {
+            // Owner-table slot was already claimed at the top of this
+            // function; nothing more to publish here. The matching
+            // CAS-clear runs from `IggyMessageBus::notify_connection_lost`
+            // on either of the post-loop guards firing.
             install_token.set(Some(token));
         }
         Err(rejected) => {
-            // Tell both halves to stand down: the winner's entry is live and
-            // must not be touched by this losing install.
+            // Defensive: on single-threaded compio there is no `.await`
+            // between the contains-check above and this insert, so a
+            // same-shard parallel install cannot interleave and this
+            // branch is unreachable. Kept as belt-and-suspenders in case
+            // a future refactor inserts an `.await` in the synchronous
+            // setup block: we own the owner-table slot from the CAS at
+            // the top, so unstamp it before draining the orphan to
+            // avoid an owner-table entry with no live registry.
             install_aborted.set(true);
+            let _ = bus.clear_replica_owned(peer_id);
             warn!(replica = peer_id, "replica registry insert raced");
             // `drain_rejected_registration` triggers the per-connection
             // shutdown (returned with `rejected`) to wake the transport
