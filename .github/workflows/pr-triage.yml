@@ -28,8 +28,8 @@ name: PR Triage
 #   /author                        — flip state to S-waiting-on-author
 #
 # Auth gate:
-#   /request-review, /ready  -> repo COLLABORATOR/OWNER, or PR author
-#   /author                  -> repo COLLABORATOR/OWNER only
+#   /request-review, /ready  -> org MEMBER / repo COLLABORATOR/OWNER, or PR author
+#   /author                  -> org MEMBER / repo COLLABORATOR/OWNER only
 #
 # Lifecycle (pull_request_target):
 #   opened (non-draft)     -> add S-waiting-on-review (only if no S-* present)
@@ -91,7 +91,7 @@ jobs:
           script: |
             const LABEL_REVIEW = 'S-waiting-on-review';
             const LABEL_AUTHOR = 'S-waiting-on-author';
-            const COMMITTER_ASSOCS = new Set(['COLLABORATOR', 'OWNER']);
+            const COMMITTER_ASSOCS = new Set(['MEMBER', 'COLLABORATOR', 'OWNER']);
             const prNumber = Number(process.env.PR_NUMBER);
 
             const removeLabelIfPresent = async (name) => {
