@@ -106,8 +106,11 @@ Keep subject under 72 chars. Use body for details if needed.
 
 You can move a PR around the review queue by posting a slash command in the
 PR conversation. The pattern is similar to `rust-lang/triagebot`. The
-machinery lives in [`./.github/workflows/pr-triage.yml`](./.github/workflows/pr-triage.yml)
-if you want to peek.
+machinery lives in
+[`./.github/workflows/pr-triage-apply.yml`](./.github/workflows/pr-triage-apply.yml)
+(with a read-only collector in
+[`./.github/workflows/pr-triage-collect.yml`](./.github/workflows/pr-triage-collect.yml)
+that hops the token-permission gap for fork PRs) if you want to peek.
 
 ### Commands
 
@@ -115,7 +118,7 @@ if you want to peek.
 | --- | --- | --- |
 | `/request-review @user-or-team ...` | the PR author or a maintainer | Requests review from one or more `@user` or `@org/team` handles |
 | `/ready` | the PR author or a maintainer | Marks the PR `S-waiting-on-review` |
-| `/author` | a maintainer | Marks the PR `S-waiting-on-author` |
+| `/author` | a maintainer, or any returning contributor (>=1 merged PR) | Marks the PR `S-waiting-on-author` |
 
 A "maintainer" here means someone with write access to apache/iggy
 (in practice, the `@apache/iggy-committers` team). Automated comments from
@@ -164,10 +167,9 @@ for review".
 
 Submitting a review with "Request changes" is treated as an implicit
 `/author`: the PR moves to `S-waiting-on-author`. Anyone GitHub recognizes
-as a repo contributor or above can trigger this - a wider set than the
-`/author` command, which stays maintainer-only, since a formal "Request
-changes" review is a deliberate, attributable action. If your review body
-also contains an explicit `/ready` or `/author`, that command wins.
+as a repo contributor or above can trigger this - the same set that can
+issue an explicit `/author`. If your review body also contains an explicit
+`/ready` or `/author`, that command wins.
 
 ### Tips
 
@@ -185,6 +187,11 @@ also contains an explicit `/ready` or `/author`, that command wins.
 
 ### When something goes wrong
 
+Commands take up to ~90s to apply: the read-only collector hands the
+event off to the write-capable apply workflow via an artifact, which
+adds latency on top of GitHub Actions scheduling. Wait for a reaction
+before re-issuing - duplicate commands can interleave.
+
 The workflow reacts on your comment so you get quick feedback: a 👍 means
 a command was applied, a 😕 means a command was recognized but you lacked
 permission to run it. A failed `/request-review` also posts a one-line
@@ -192,9 +199,14 @@ reply naming the handles GitHub rejected. Commands posted in a review body
 (rather than a normal comment) cannot be reacted to, so they stay
 log-only.
 
-For the full story, open the PR's "Checks" or "Actions" tab and look at
-the `PR Triage` run for the comment you posted. The run log says exactly
-what it saw and why (no permission, unknown user, etc.).
+If no reaction appears within a couple of minutes, the apply run likely
+failed. Open the repo's "Actions" tab and look at the `PR Triage Apply`
+run for the comment you posted - the run log says exactly what it saw
+and why (no permission, unknown user, transient API error, etc.). The
+`PR Triage Collect` run that appears on the PR's "Checks" tab is just
+the read-only event collector; the actual labelling happens in
+`PR Triage Apply`, which is triggered via `workflow_run` and is not
+attached to the PR's checks.
 
 ### Examples
 
