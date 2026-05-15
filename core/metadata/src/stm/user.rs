@@ -131,6 +131,11 @@ impl Users {
         self.inner.read(f)
     }
 
+    /// Ensures a root user exists in an empty user set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `username` is not a valid wire-format username.
     pub fn ensure_root_user(&self, username: &str, password_hash: &str) {
         if self.read(|users| !users.items.is_empty()) {
             return;

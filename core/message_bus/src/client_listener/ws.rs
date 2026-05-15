@@ -56,7 +56,7 @@ use tracing::{debug, error, info};
 ///
 /// Returns [`IggyError::CannotBindToSocket`] if the bind fails.
 #[allow(clippy::future_not_send)]
-pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyError> {
+pub fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyError> {
     let listener = bind_reusable_tcp_listener(addr)
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
     let actual = listener

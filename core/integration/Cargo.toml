@@ -26,6 +26,7 @@ publish = false
 # inside the docker containers. This is a temporary workaround (hopefully).
 [features]
 ci-qemu = []
+vsr = ["iggy/vsr"]
 
 [dependencies]
 assert_cmd = { workspace = true }

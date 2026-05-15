@@ -651,7 +651,7 @@ impl WebSocketClient {
                 response.put_slice(&response_body);
             }
 
-            return crate::vsr::decode_response(&response.freeze());
+            crate::vsr::decode_response(&response.freeze())
         }
 
         #[cfg(not(feature = "vsr"))]

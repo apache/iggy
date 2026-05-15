@@ -270,7 +270,7 @@ impl QuicClient {
 
         #[cfg(feature = "vsr")]
         {
-            return crate::vsr::decode_response(&buffer);
+            crate::vsr::decode_response(&buffer)
         }
 
         #[cfg(not(feature = "vsr"))]

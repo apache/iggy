@@ -83,7 +83,7 @@ async fn request_reply_round_trip() {
     let (cert, key) = self_signed();
     let server_cfg = server_config_with_cert(vec![cert.clone()], key, &QuicTuning::default())
         .expect("server config");
-    let (endpoint, server_addr) = bind(loopback(), server_cfg).await.expect("bind");
+    let (endpoint, server_addr) = bind(loopback(), server_cfg).expect("bind");
 
     let token = bus.token();
     let on_accepted = install_quic_clients_locally(bus.clone(), on_request);
@@ -160,7 +160,7 @@ async fn slow_handshake_does_not_block_subsequent_accept() {
     let (cert, key) = self_signed();
     let server_cfg = server_config_with_cert(vec![cert.clone()], key, &QuicTuning::default())
         .expect("server config");
-    let (endpoint, server_addr) = bind(loopback(), server_cfg).await.expect("bind");
+    let (endpoint, server_addr) = bind(loopback(), server_cfg).expect("bind");
 
     let token = bus.token();
     let on_accepted = install_quic_clients_locally(bus.clone(), on_request);

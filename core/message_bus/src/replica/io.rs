@@ -207,7 +207,7 @@ pub async fn start_on_shard_zero(
     );
 
     let (replica_listener, replica_bound) = bind_replica_listener(replica_listen_addr).await?;
-    let (clients_listener, client_bound) = client_listener::tcp::bind(client_listen_addr).await?;
+    let (clients_listener, client_bound) = client_listener::tcp::bind(client_listen_addr)?;
 
     let token_for_replica = bus.token();
     let on_accepted_replica_for_listener = on_accepted_replica.clone();
@@ -236,7 +236,7 @@ pub async fn start_on_shard_zero(
 
     let ws_bound = match (ws_listen_addr, on_accepted_ws_client) {
         (Some(addr), Some(on_accepted_ws)) => {
-            let (ws_listener, ws_bound) = client_listener::ws::bind(addr).await?;
+            let (ws_listener, ws_bound) = client_listener::ws::bind(addr)?;
             let token_for_ws = bus.token();
             let ws_handle = compio::runtime::spawn(async move {
                 client_listener::ws::run(ws_listener, token_for_ws, on_accepted_ws).await;
@@ -257,7 +257,7 @@ pub async fn start_on_shard_zero(
                     .map_err(|e| {
                         IggyError::IoError(format!("QUIC server config build failed: {e}"))
                     })?;
-            let (endpoint, quic_bound) = client_listener::quic::bind(addr, server_config).await?;
+            let (endpoint, quic_bound) = client_listener::quic::bind(addr, server_config)?;
             let token_for_quic = bus.token();
             let handshake_grace = bus.config().handshake_grace;
             let quic_handle = compio::runtime::spawn(async move {
@@ -285,7 +285,7 @@ pub async fn start_on_shard_zero(
     ) {
         (Some(addr), Some(creds), Some(on_accepted_tls)) => {
             let (listener, server_config, tls_bound) =
-                client_listener::tcp_tls::bind(addr, creds).await?;
+                client_listener::tcp_tls::bind(addr, creds)?;
             let token_for_tls = bus.token();
             let tls_handle = compio::runtime::spawn(async move {
                 client_listener::tcp_tls::run(
@@ -308,7 +308,7 @@ pub async fn start_on_shard_zero(
     let wss_bound = match (wss_listen_addr, wss_credentials, on_accepted_wss_client) {
         (Some(addr), Some(creds), Some(on_accepted_wss)) => {
             let (listener, server_config, wss_bound) =
-                client_listener::wss::bind(addr, creds).await?;
+                client_listener::wss::bind(addr, creds)?;
             let token_for_wss = bus.token();
             let wss_handle = compio::runtime::spawn(async move {
                 client_listener::wss::run(listener, server_config, token_for_wss, on_accepted_wss)

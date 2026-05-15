@@ -61,7 +61,7 @@ use tracing::{debug, error, info};
 ///
 /// Returns [`IggyError::CannotBindToSocket`] if the bind fails.
 #[allow(clippy::future_not_send)]
-pub async fn bind(
+pub fn bind(
     addr: SocketAddr,
     server_config: ServerConfig,
 ) -> Result<(Endpoint, SocketAddr), IggyError> {

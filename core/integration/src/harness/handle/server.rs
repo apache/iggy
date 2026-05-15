@@ -93,11 +93,23 @@ impl std::fmt::Debug for ServerHandle {
 }
 
 impl ServerHandle {
+    fn default_server_binary() -> &'static str {
+        #[cfg(feature = "vsr")]
+        {
+            "iggy-server-ng"
+        }
+
+        #[cfg(not(feature = "vsr"))]
+        {
+            "iggy-server"
+        }
+    }
+
     fn launched_binary(&self) -> String {
         if let Some(path) = &self.config.executable_path {
             path.clone()
         } else {
-            "iggy-server".to_string()
+            Self::default_server_binary().to_string()
         }
     }
 
@@ -796,16 +808,20 @@ impl TestBinary for ServerHandle {
                 Command::new(path)
             }
         } else {
-            Command::cargo_bin("iggy-server").map_err(|e| TestBinaryError::ProcessSpawn {
+            Command::cargo_bin(Self::default_server_binary()).map_err(|e| {
+                TestBinaryError::ProcessSpawn {
                 binary: launched_binary.clone(),
                 source: std::io::Error::other(e.to_string()),
+            }
             })?
         };
 
         command.env("IGGY_SYSTEM_PATH", data_path.display().to_string());
         command.envs(&self.envs);
 
-        // TODO(hubcio): Remove --follower flag when proper clustering is implemented
+        // Legacy clustering elects node 0 externally and requires explicit followers.
+        // VSR/server-ng elects its own primary and should see symmetric node startup.
+        #[cfg(not(feature = "vsr"))]
         if self.server_id > 0 {
             command.arg("--follower");
         }

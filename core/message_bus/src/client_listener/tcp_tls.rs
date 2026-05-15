@@ -71,7 +71,7 @@ use tracing::{debug, error, info};
 ///   from `credentials` (cert / key mismatch).
 /// - [`IggyError::CannotBindToSocket`] if the TCP bind fails.
 #[allow(clippy::future_not_send)]
-pub async fn bind(
+pub fn bind(
     addr: SocketAddr,
     credentials: TlsServerCredentials,
 ) -> Result<(TcpListener, Arc<rustls::ServerConfig>, SocketAddr), IggyError> {

@@ -1223,7 +1223,7 @@ async fn start_manual_runtime(
         None
     };
 
-    let bound_clients = start_client_listeners(shard, config, topology, &accepted_clients).await?;
+    let bound_clients = start_client_listeners(shard, config, topology, &accepted_clients)?;
     write_current_config(
         config,
         Some(topology.self_replica_id),
@@ -1505,7 +1505,13 @@ async fn complete_login_register(
     request_header: &RequestHeader,
     user_id: u32,
 ) -> Result<(), LoginRegisterError> {
-    if let Some((_, session)) = sessions.borrow().get_session(transport_client_id) {
+    let existing_session = {
+        let sessions = sessions.borrow();
+        sessions
+            .get_session(transport_client_id)
+            .map(|(_, session)| session)
+    };
+    if let Some(session) = existing_session {
         let response = LoginRegisterResponse { user_id, session }.to_bytes();
         let reply = build_login_register_reply(request_header, vsr_client_id, session, &response);
         let _ = shard
@@ -1581,13 +1587,14 @@ fn build_login_register_reply(
 ) -> Message<ReplyHeader> {
     let total_size = std::mem::size_of::<ReplyHeader>() + body.len();
     let mut reply = Message::<ReplyHeader>::new(total_size);
+    let header_size = u32::try_from(total_size).expect("reply size must fit into u32");
     let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
         &mut reply.as_mut_slice()[..std::mem::size_of::<ReplyHeader>()],
     )
     .expect("zeroed bytes are valid");
     *header = ReplyHeader {
         cluster: request_header.cluster,
-        size: total_size as u32,
+        size: header_size,
         view: request_header.view,
         release: request_header.release,
         command: Command2::Reply,
@@ -1747,7 +1754,7 @@ fn mint_client_meta(
     ClientConnMeta::new((shard_id << 112) | seq, peer_addr, transport)
 }
 
-async fn start_client_listeners(
+fn start_client_listeners(
     shard: &Rc<ServerNgShard>,
     config: &ServerNgConfig,
     topology: &TcpTopology,
@@ -1757,7 +1764,6 @@ async fn start_client_listeners(
 
     if config.tcp.enabled && !config.tcp.tls.enabled {
         let (listener, bound_addr) = client_listener::tcp::bind(topology.client_listen_addr)
-            .await
             .map_err(|source| {
                 error!(
                     addr = %topology.client_listen_addr,
@@ -1776,8 +1782,7 @@ async fn start_client_listeners(
     }
 
     if let Some(ws_addr) = topology.ws_listen_addr {
-        let (listener, bound_addr) =
-            client_listener::ws::bind(ws_addr).await.map_err(|source| {
+        let (listener, bound_addr) = client_listener::ws::bind(ws_addr).map_err(|source| {
                 error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
                 source
             })?;
@@ -1805,7 +1810,6 @@ async fn start_client_listeners(
             source
         })?;
         let (endpoint, bound_addr) = client_listener::quic::bind(quic_addr, server_config)
-            .await
             .map_err(|source| {
                 error!(addr = %quic_addr, error = %source, "failed to bind QUIC listener");
                 source
@@ -1824,7 +1828,6 @@ async fn start_client_listeners(
         let credentials = load_tcp_tls_server_credentials(config)?;
         let (listener, tls_config, bound_addr) =
             client_listener::tcp_tls::bind(topology.client_listen_addr, credentials)
-                .await
                 .map_err(|source| {
                     error!(
                         addr = %topology.client_listen_addr,
