@@ -22,7 +22,8 @@ mod common;
 
 use common::{install_clients_locally, loopback};
 use compio::net::TcpStream;
-use message_bus::client_listener::{RequestHandler, bind, run};
+use message_bus::client_listener::RequestHandler;
+use message_bus::client_listener::tcp::{bind, run};
 use message_bus::{IggyMessageBus, MessageBus, SendError};
 use std::rc::Rc;
 use std::time::Duration;

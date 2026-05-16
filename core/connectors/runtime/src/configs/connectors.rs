@@ -32,6 +32,7 @@ use iggy_connector_sdk::transforms::TransformType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Formatter;
+use std::path::PathBuf;
 use strum::Display;
 
 #[derive(
@@ -180,6 +181,9 @@ pub struct StreamConsumerConfig {
     pub topics: Vec<String>,
     #[config_env(leaf)]
     pub schema: Schema,
+    pub avro_schema_json: Option<String>,
+    #[config_env(leaf)]
+    pub avro_schema_path: Option<PathBuf>,
     pub batch_length: Option<u32>,
     pub poll_interval: Option<String>,
     pub consumer_group: Option<String>,
@@ -191,6 +195,9 @@ pub struct StreamProducerConfig {
     pub topic: String,
     #[config_env(leaf)]
     pub schema: Schema,
+    pub avro_schema_json: Option<String>,
+    #[config_env(leaf)]
+    pub avro_schema_path: Option<PathBuf>,
     pub batch_length: Option<u32>,
     pub linger_time: Option<String>,
 }
@@ -346,7 +353,7 @@ impl std::fmt::Display for StreamConsumerConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ stream: {}, topics: {}, schema: {:?}, batch_length: {:?}, poll_interval: {:?}, consumer_group: {:?} }}",
+            "{{ stream: {}, topics: {}, schema: {:?}, avro_schema_json: {:?}, avro_schema_path: {:?}, batch_length: {:?}, poll_interval: {:?}, consumer_group: {:?} }}",
             self.stream,
             self.topics
                 .iter()
@@ -354,6 +361,8 @@ impl std::fmt::Display for StreamConsumerConfig {
                 .collect::<Vec<&str>>()
                 .join(", "),
             self.schema,
+            self.avro_schema_json,
+            self.avro_schema_path,
             self.batch_length,
             self.poll_interval,
             self.consumer_group
@@ -365,8 +374,14 @@ impl std::fmt::Display for StreamProducerConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ stream: {}, topic: {}, schema: {:?}, batch_length: {:?}, linger_time: {:?} }}",
-            self.stream, self.topic, self.schema, self.batch_length, self.linger_time
+            "{{ stream: {}, topic: {}, schema: {:?}, avro_schema_json: {:?}, avro_schema_path: {:?}, batch_length: {:?}, linger_time: {:?} }}",
+            self.stream,
+            self.topic,
+            self.schema,
+            self.avro_schema_json,
+            self.avro_schema_path,
+            self.batch_length,
+            self.linger_time
         )
     }
 }

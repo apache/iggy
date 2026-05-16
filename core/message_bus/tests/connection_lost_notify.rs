@@ -25,7 +25,7 @@ mod common;
 use common::{install_replicas_locally, loopback};
 use message_bus::IggyMessageBus;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
-use message_bus::replica_listener::{MessageHandler, bind, run};
+use message_bus::replica::listener::{MessageHandler, bind, run};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -64,6 +64,7 @@ async fn connection_lost_fires_exactly_once_per_peer_disconnect() {
             2,
             accept_1,
             message_bus::framing::MAX_MESSAGE_SIZE,
+            Duration::from_secs(10),
         )
         .await;
     });

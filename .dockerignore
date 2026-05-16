@@ -11,7 +11,16 @@
 /licenses
 /local_data
 /performance_results
-/scripts
+# Selectively exclude scripts/ subdirs not needed in container builds.
+# scripts/ci/third-party-licenses.sh + render-node-licenses.mjs are
+# required by the convenience-binary Dockerfiles to render LICENSE-binary
+# at build time.
+/scripts/dashboard
+/scripts/performance
+/scripts/*.sh
+/scripts/ci/*
+!/scripts/ci/third-party-licenses.sh
+!/scripts/ci/render-node-licenses.mjs
 **/target
 /target
 !/target/debug/iggy
