@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// TODO(slbotbm): create fixture for setup/teardown.
-
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <initializer_list>
 #include <string>
+#include <vector>
+
+#include <gtest/gtest.h>
 
 #include "lib.rs.h"
 
@@ -35,13 +38,6 @@ inline iggy::ffi::Identifier make_numeric_identifier(const std::uint32_t value) 
     iggy::ffi::Identifier identifier;
     identifier.set_numeric(value);
     return identifier;
-}
-
-inline iggy::ffi::Client *login_to_server() {
-    iggy::ffi::Client *client = iggy::ffi::new_connection("");
-    client->connect();
-    client->login_user("iggy", "iggy");
-    return client;
 }
 
 inline rust::Vec<std::uint8_t> to_payload(const std::string &s) {
@@ -68,3 +64,103 @@ inline rust::Vec<rust::String> make_snapshot_types(std::initializer_list<const c
     }
     return snapshot_types;
 }
+class E2ETestFixture : public ::testing::Test {
+  public:
+    ~E2ETestFixture() { Cleanup(); }
+    void TearDown() override { Cleanup(); }
+
+  protected:
+    void TrackClient(iggy::ffi::Client *client) {
+        ASSERT_NE(client, nullptr);
+        clients_.push_back(client);
+    }
+
+    iggy::ffi::Client *GetLoggedOutClient() {
+        iggy::ffi::Client *client = nullptr;
+        ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+        ASSERT_NE(client, nullptr);
+        TrackClient(client);
+        return client;
+    }
+
+    iggy::ffi::Client *GetLoggedInClient() {
+        iggy::ffi::Client *client = GetLoggedOutClient();
+        ASSERT_NO_THROW(client->connect());
+        ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+        return client;
+    }
+
+    void TrackStream(const std::string &stream_name) { tracked_stream_names_.push_back(stream_name); }
+    void TrackStream(const std::uint32_t stream_id) { tracked_stream_ids_.push_back(stream_id); }
+
+    void DeleteClient(iggy::ffi::Client *&client) {
+        ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+        ForgetClient(client);
+        client = nullptr;
+    }
+
+    void Cleanup() {
+        CleanupStreams();
+        CleanupClients();
+    }
+
+  private:
+    void ForgetClient(iggy::ffi::Client *client) {
+        const auto found = std::find(clients_.begin(), clients_.end(), client);
+        if (found != clients_.end()) {
+            *found = nullptr;
+        }
+    }
+
+    void CleanupStreams() {
+        if (tracked_stream_names_.empty() && tracked_stream_ids_.empty()) {
+            return;
+        }
+
+        iggy::ffi::Client *cleanup_client = nullptr;
+        try {
+            cleanup_client = iggy::ffi::new_connection("");
+            cleanup_client->connect();
+            cleanup_client->login_user("iggy", "iggy");
+            for (const auto &stream_name : tracked_stream_names_) {
+                try {
+                    cleanup_client->delete_stream(make_string_identifier(stream_name));
+                } catch (const std::exception &) {
+                }
+            }
+            for (const auto stream_id : tracked_stream_ids_) {
+                try {
+                    cleanup_client->delete_stream(make_numeric_identifier(stream_id));
+                } catch (const std::exception &) {
+                }
+            }
+        } catch (const std::exception &e) {
+            ADD_FAILURE() << "Failed to clean up tracked streams: " << e.what();
+        }
+
+        try {
+            iggy::ffi::delete_connection(cleanup_client);
+        } catch (const std::exception &e) {
+            ADD_FAILURE() << "Failed to close cleanup client: " << e.what();
+        }
+
+        tracked_stream_names_.clear();
+        tracked_stream_ids_.clear();
+    }
+
+    void CleanupClients() {
+        for (iggy::ffi::Client *&client : clients_) {
+            try {
+                iggy::ffi::delete_connection(client);
+            } catch (const std::exception &e) {
+                ADD_FAILURE() << "Failed to clean up tracked client: " << e.what();
+            }
+            client = nullptr;
+        }
+        clients_.clear();
+    }
+
+    std::vector<iggy::ffi::Client *> clients_;
+    std::vector<std::string> tracked_stream_names_;
+    std::vector<std::uint32_t> tracked_stream_ids_;
+};

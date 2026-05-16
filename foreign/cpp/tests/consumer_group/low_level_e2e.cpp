@@ -25,14 +25,15 @@
 #include "lib.rs.h"
 #include "tests/common/test_helpers.hpp"
 
-TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupSucceeds) {
+TEST_F(E2ETestFixture, CreateConsumerGroupSucceeds) {
     RecordProperty("description", "Creates a consumer group successfully for an existing stream and topic.");
     const std::string stream_name = "client-create-group-happy-stream";
     const std::string topic_name  = "client-create-group-happy-topic";
     const std::string group_name  = "client-create-group-happy";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
 
@@ -44,16 +45,16 @@ TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupSucceeds) {
         ASSERT_TRUE(group.members.empty());
     });
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithInvalidIdentifiersThrows) {
+TEST_F(E2ETestFixture, CreateConsumerGroupWithInvalidIdentifiersThrows) {
     RecordProperty("description", "Rejects malformed stream and topic identifiers before creating a consumer group.");
     const std::string stream_name = "client-create-group-invalid-id-stream";
     const std::string topic_name  = "client-create-group-invalid-id-topic";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
 
@@ -74,18 +75,18 @@ TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithInvalidIdentifiersThrows)
                                                "client-create-group-invalid-topic-id"),
                  std::exception);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupOnNonExistentResourcesThrows) {
+TEST_F(E2ETestFixture, CreateConsumerGroupOnNonExistentResourcesThrows) {
     RecordProperty("description", "Rejects creating a consumer group on streams or topics that do not exist.");
     const std::string stream_name         = "client-create-group-missing-resource-stream";
     const std::string topic_name          = "client-create-group-missing-resource-topic";
     const std::string missing_stream_name = "client-create-group-missing-stream";
     const std::string missing_topic_name  = "client-create-group-missing-topic";
-    iggy::ffi::Client *client             = login_to_server();
+    iggy::ffi::Client *client             = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
 
@@ -98,17 +99,17 @@ TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupOnNonExistentResourcesThrows)
                                       "client-create-group-missing-topic-group"),
         std::exception);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupTwiceOnSameInputThrows) {
+TEST_F(E2ETestFixture, CreateConsumerGroupTwiceOnSameInputThrows) {
     RecordProperty("description", "Rejects creating the same consumer group twice for the same stream and topic.");
     const std::string stream_name = "client-create-group-duplicate-stream";
     const std::string topic_name  = "client-create-group-duplicate-topic";
     const std::string group_name  = "client-create-group-duplicate";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
@@ -118,18 +119,18 @@ TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupTwiceOnSameInputThrows) {
                                                group_name),
                  std::exception);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithNumericIdentifiersSucceeds) {
+TEST_F(E2ETestFixture, CreateConsumerGroupWithNumericIdentifiersSucceeds) {
     RecordProperty("description",
                    "Creates a consumer group successfully when stream and topic are addressed by numeric identifiers.");
     const std::string stream_name = "client-create-group-numeric-stream";
     const std::string topic_name  = "client-create-group-numeric-topic";
     const std::string group_name  = "client-create-group-numeric";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
 
@@ -145,16 +146,16 @@ TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithNumericIdentifiersSucceed
         ASSERT_TRUE(group.members.empty());
     });
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithInvalidNamesThrows) {
+TEST_F(E2ETestFixture, CreateConsumerGroupWithInvalidNamesThrows) {
     RecordProperty("description", "Rejects empty and overlong consumer group names.");
     const std::string stream_name = "client-create-group-invalid-name-stream";
     const std::string topic_name  = "client-create-group-invalid-name-topic";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
 
@@ -166,17 +167,17 @@ TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithInvalidNamesThrows) {
                      std::exception);
     }
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupAfterStreamDeletionThrows) {
+TEST_F(E2ETestFixture, CreateConsumerGroupAfterStreamDeletionThrows) {
     RecordProperty("description", "Rejects creating a consumer group after deleting the stream that owned the topic.");
     const std::string stream_name = "client-create-group-after-stream-delete-stream";
     const std::string topic_name  = "client-create-group-after-stream-delete-topic";
     const std::string group_name  = "client-create-group-after-stream-delete";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
@@ -185,27 +186,22 @@ TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupAfterStreamDeletionThrows) {
                                                group_name),
                  std::exception);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupBeforeLoginThrows) {
+TEST_F(E2ETestFixture, CreateConsumerGroupBeforeLoginThrows) {
     RecordProperty("description",
                    "Rejects creating a consumer group before connect, and after connect but before login.");
     const std::string stream_name = "client-create-group-before-login-stream";
     const std::string topic_name  = "client-create-group-before-login-topic";
     const std::string group_name  = "client-create-group-before-login";
 
-    iggy::ffi::Client *setup_client = login_to_server();
-    ASSERT_NE(setup_client, nullptr);
+    iggy::ffi::Client *setup_client = GetLoggedInClient();
     ASSERT_NO_THROW(setup_client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                                "server_default", 0, "server_default"));
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(setup_client));
-    setup_client = nullptr;
 
-    iggy::ffi::Client *unauthenticated_client = nullptr;
-    ASSERT_NO_THROW({ unauthenticated_client = iggy::ffi::new_connection(""); });
-    ASSERT_NE(unauthenticated_client, nullptr);
+    iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
 
     ASSERT_THROW(unauthenticated_client->create_consumer_group(make_string_identifier(stream_name),
                                                                make_string_identifier(topic_name), group_name),
@@ -214,19 +210,18 @@ TEST(LowLevelE2E_ConsumerGroup, CreateConsumerGroupBeforeLoginThrows) {
     ASSERT_THROW(unauthenticated_client->create_consumer_group(make_string_identifier(stream_name),
                                                                make_string_identifier(topic_name), group_name),
                  std::exception);
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(unauthenticated_client));
-    unauthenticated_client = nullptr;
 }
 
-TEST(LowLevelE2E_ConsumerGroup, GetConsumerGroupReturnsSameInfoAsCreateConsumerGroup) {
+TEST_F(E2ETestFixture, GetConsumerGroupReturnsSameInfoAsCreateConsumerGroup) {
     RecordProperty("description",
                    "Returns the same consumer group details from get_consumer_group as create_consumer_group.");
     const std::string stream_name = "client-get-group-happy-stream";
     const std::string topic_name  = "client-get-group-happy-topic";
     const std::string group_name  = "client-get-group-happy";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
 
@@ -241,28 +236,23 @@ TEST(LowLevelE2E_ConsumerGroup, GetConsumerGroupReturnsSameInfoAsCreateConsumerG
     ASSERT_EQ(fetched_group.members_count, created_group.members_count);
     ASSERT_EQ(fetched_group.members.size(), created_group.members.size());
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, GetConsumerGroupBeforeLoginThrows) {
+TEST_F(E2ETestFixture, GetConsumerGroupBeforeLoginThrows) {
     RecordProperty("description", "Rejects get_consumer_group before connect, and after connect but before login.");
     const std::string stream_name = "client-get-group-before-login-stream";
     const std::string topic_name  = "client-get-group-before-login-topic";
     const std::string group_name  = "client-get-group-before-login";
 
-    iggy::ffi::Client *setup_client = login_to_server();
-    ASSERT_NE(setup_client, nullptr);
+    iggy::ffi::Client *setup_client = GetLoggedInClient();
     ASSERT_NO_THROW(setup_client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                                "server_default", 0, "server_default"));
     ASSERT_NO_THROW(setup_client->create_consumer_group(make_string_identifier(stream_name),
                                                         make_string_identifier(topic_name), group_name));
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(setup_client));
-    setup_client = nullptr;
 
-    iggy::ffi::Client *unauthenticated_client = nullptr;
-    ASSERT_NO_THROW({ unauthenticated_client = iggy::ffi::new_connection(""); });
-    ASSERT_NE(unauthenticated_client, nullptr);
+    iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
 
     ASSERT_THROW(unauthenticated_client->get_consumer_group(make_string_identifier(stream_name),
                                                             make_string_identifier(topic_name),
@@ -273,18 +263,17 @@ TEST(LowLevelE2E_ConsumerGroup, GetConsumerGroupBeforeLoginThrows) {
                                                             make_string_identifier(topic_name),
                                                             make_string_identifier(group_name)),
                  std::exception);
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(unauthenticated_client));
-    unauthenticated_client = nullptr;
 }
 
-TEST(LowLevelE2E_ConsumerGroup, GetConsumerGroupWithInvalidIdentifiersThrows) {
+TEST_F(E2ETestFixture, GetConsumerGroupWithInvalidIdentifiersThrows) {
     RecordProperty("description", "Rejects get_consumer_group when the stream or topic identifier is invalid.");
     const std::string stream_name = "client-get-group-invalid-id-stream";
     const std::string topic_name  = "client-get-group-invalid-id-topic";
     const std::string group_name  = "client-get-group-invalid-id-group";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
@@ -297,10 +286,9 @@ TEST(LowLevelE2E_ConsumerGroup, GetConsumerGroupWithInvalidIdentifiersThrows) {
                                             make_string_identifier(group_name)),
                  std::exception);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, GetConsumerGroupOnNonExistentResourcesThrows) {
+TEST_F(E2ETestFixture, GetConsumerGroupOnNonExistentResourcesThrows) {
     RecordProperty("description", "Rejects get_consumer_group for streams, topics, or groups that do not exist.");
     const std::string stream_name         = "client-get-group-missing-resource-stream";
     const std::string topic_name          = "client-get-group-missing-resource-topic";
@@ -308,9 +296,10 @@ TEST(LowLevelE2E_ConsumerGroup, GetConsumerGroupOnNonExistentResourcesThrows) {
     const std::string missing_stream_name = "client-get-group-missing-stream";
     const std::string missing_topic_name  = "client-get-group-missing-topic";
     const std::string missing_group_name  = "client-get-group-missing-group";
-    iggy::ffi::Client *client             = login_to_server();
+    iggy::ffi::Client *client             = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
@@ -328,17 +317,17 @@ TEST(LowLevelE2E_ConsumerGroup, GetConsumerGroupOnNonExistentResourcesThrows) {
                                             make_string_identifier(missing_group_name)),
                  std::exception);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, GetConsumerGroupAfterStreamDeletionThrows) {
+TEST_F(E2ETestFixture, GetConsumerGroupAfterStreamDeletionThrows) {
     RecordProperty("description", "Rejects get_consumer_group after deleting the stream that owned the group.");
     const std::string stream_name = "client-get-group-after-stream-delete-stream";
     const std::string topic_name  = "client-get-group-after-stream-delete-topic";
     const std::string group_name  = "client-get-group-after-stream-delete";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
@@ -349,17 +338,17 @@ TEST(LowLevelE2E_ConsumerGroup, GetConsumerGroupAfterStreamDeletionThrows) {
                                             make_string_identifier(group_name)),
                  std::exception);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupSucceeds) {
+TEST_F(E2ETestFixture, DeleteConsumerGroupSucceeds) {
     RecordProperty("description", "Deletes an existing consumer group successfully.");
     const std::string stream_name = "client-delete-group-happy-stream";
     const std::string topic_name  = "client-delete-group-happy-topic";
     const std::string group_name  = "client-delete-group-happy";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
@@ -372,28 +361,23 @@ TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupSucceeds) {
                                             make_string_identifier(group_name)),
                  std::exception);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupBeforeLoginThrows) {
+TEST_F(E2ETestFixture, DeleteConsumerGroupBeforeLoginThrows) {
     RecordProperty("description", "Rejects delete_consumer_group before connect, and after connect but before login.");
     const std::string stream_name = "client-delete-group-before-login-stream";
     const std::string topic_name  = "client-delete-group-before-login-topic";
     const std::string group_name  = "client-delete-group-before-login";
 
-    iggy::ffi::Client *setup_client = login_to_server();
-    ASSERT_NE(setup_client, nullptr);
+    iggy::ffi::Client *setup_client = GetLoggedInClient();
     ASSERT_NO_THROW(setup_client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                                "server_default", 0, "server_default"));
     ASSERT_NO_THROW(setup_client->create_consumer_group(make_string_identifier(stream_name),
                                                         make_string_identifier(topic_name), group_name));
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(setup_client));
-    setup_client = nullptr;
 
-    iggy::ffi::Client *unauthenticated_client = nullptr;
-    ASSERT_NO_THROW({ unauthenticated_client = iggy::ffi::new_connection(""); });
-    ASSERT_NE(unauthenticated_client, nullptr);
+    iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
 
     ASSERT_THROW(unauthenticated_client->delete_consumer_group(make_string_identifier(stream_name),
                                                                make_string_identifier(topic_name),
@@ -404,19 +388,18 @@ TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupBeforeLoginThrows) {
                                                                make_string_identifier(topic_name),
                                                                make_string_identifier(group_name)),
                  std::exception);
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(unauthenticated_client));
-    unauthenticated_client = nullptr;
 }
 
-TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupWithInvalidIdentifiersThrows) {
+TEST_F(E2ETestFixture, DeleteConsumerGroupWithInvalidIdentifiersThrows) {
     RecordProperty("description",
                    "Rejects delete_consumer_group when the stream, topic, or group identifier is invalid.");
     const std::string stream_name = "client-delete-group-invalid-id-stream";
     const std::string topic_name  = "client-delete-group-invalid-id-topic";
     const std::string group_name  = "client-delete-group-invalid-id-group";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
@@ -437,10 +420,9 @@ TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupWithInvalidIdentifiersThrows)
                                                std::move(invalid_group_id)),
                  std::exception);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupOnNonExistentResourcesThrows) {
+TEST_F(E2ETestFixture, DeleteConsumerGroupOnNonExistentResourcesThrows) {
     RecordProperty("description", "Rejects delete_consumer_group for streams, topics, or groups that do not exist.");
     const std::string stream_name         = "client-delete-group-missing-resource-stream";
     const std::string topic_name          = "client-delete-group-missing-resource-topic";
@@ -448,9 +430,10 @@ TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupOnNonExistentResourcesThrows)
     const std::string missing_stream_name = "client-delete-group-missing-stream";
     const std::string missing_topic_name  = "client-delete-group-missing-topic";
     const std::string missing_group_name  = "client-delete-group-missing-group";
-    iggy::ffi::Client *client             = login_to_server();
+    iggy::ffi::Client *client             = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
@@ -468,17 +451,17 @@ TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupOnNonExistentResourcesThrows)
                                                make_string_identifier(missing_group_name)),
                  std::exception);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupTwiceThrows) {
+TEST_F(E2ETestFixture, DeleteConsumerGroupTwiceThrows) {
     RecordProperty("description", "Rejects deleting the same consumer group twice.");
     const std::string stream_name = "client-delete-group-twice-stream";
     const std::string topic_name  = "client-delete-group-twice-topic";
     const std::string group_name  = "client-delete-group-twice";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
@@ -490,19 +473,19 @@ TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupTwiceThrows) {
                                                make_string_identifier(group_name)),
                  std::exception);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupWithNumericIdentifiersSucceeds) {
+TEST_F(E2ETestFixture, DeleteConsumerGroupWithNumericIdentifiersSucceeds) {
     RecordProperty(
         "description",
         "Deletes a consumer group successfully when stream, topic, and group are addressed by numeric identifiers.");
     const std::string stream_name = "client-delete-group-numeric-stream";
     const std::string topic_name  = "client-delete-group-numeric-topic";
     const std::string group_name  = "client-delete-group-numeric";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
     const auto created_group  = client->create_consumer_group(make_string_identifier(stream_name),
@@ -517,18 +500,18 @@ TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupWithNumericIdentifiersSucceed
                                             make_string_identifier(group_name)),
                  std::exception);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupAfterStreamDeletionThrows) {
+TEST_F(E2ETestFixture, DeleteConsumerGroupAfterStreamDeletionThrows) {
     RecordProperty("description",
                    "Rejects delete_consumer_group after deleting the stream that owned the consumer group.");
     const std::string stream_name = "client-delete-group-after-stream-delete-stream";
     const std::string topic_name  = "client-delete-group-after-stream-delete-topic";
     const std::string group_name  = "client-delete-group-after-stream-delete";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
@@ -539,18 +522,18 @@ TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupAfterStreamDeletionThrows) {
                                                make_string_identifier(group_name)),
                  std::exception);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupAndRecreateWithSameNameSucceeds) {
+TEST_F(E2ETestFixture, DeleteConsumerGroupAndRecreateWithSameNameSucceeds) {
     RecordProperty("description",
                    "Allows recreating a consumer group with the same name after the previous group is deleted.");
     const std::string stream_name = "client-delete-group-recreate-stream";
     const std::string topic_name  = "client-delete-group-recreate-topic";
     const std::string group_name  = "client-delete-group-recreate";
-    iggy::ffi::Client *client     = login_to_server();
+    iggy::ffi::Client *client     = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
+    TrackStream(stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
 
@@ -567,6 +550,4 @@ TEST(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupAndRecreateWithSameNameSuccee
         ASSERT_EQ(recreated_group.members_count, 0);
         ASSERT_TRUE(recreated_group.members.empty());
     });
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
