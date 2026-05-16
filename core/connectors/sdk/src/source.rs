@@ -182,14 +182,20 @@ async fn handle_messages<T: Source>(
                 break;
             }
             messages = source.poll() => {
-                let Ok(messages) = messages else {
-                    error!("Failed to poll messages for source connector with ID: {plugin_id}");
-                    continue;
+                let messages = match messages {
+                    Ok(messages) => messages,
+                    Err(err) => {
+                        error!("Failed to poll messages for source connector with ID: {plugin_id}. {err}");
+                        continue;
+                    }
                 };
 
-                let Ok(messages) = postcard::to_allocvec(&messages) else {
-                    error!("Failed to serialize messages for source connector with ID: {plugin_id}");
-                    continue;
+                let messages = match postcard::to_allocvec(&messages) {
+                    Ok(messages) => messages,
+                    Err(err) => {
+                        error!("Failed to serialize messages for source connector with ID: {plugin_id}. {err}");
+                        continue;
+                    }
                 };
 
                 callback(plugin_id, messages.as_ptr(), messages.len());
