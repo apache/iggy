@@ -19,9 +19,9 @@
 // TODO(slbotbm): Add tests for join_consumer_group() and leave_consumer_group()
 
 #include <cstdint>
-#include <iostream>
 #include <limits>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 #include <gtest/gtest.h>
@@ -196,7 +196,7 @@ TEST(LowLevelE2E_Client, GetStatsReturnsServerStats) {
         EXPECT_NE(empty_stats.process_id, 0u);
         EXPECT_GT(empty_stats.threads_count, 0u);
         EXPECT_GT(empty_stats.total_memory, 0u);
-        EXPECT_GE(empty_stats.available_memory, 0u);
+        EXPECT_LE(empty_stats.available_memory, empty_stats.total_memory);
         EXPECT_GE(empty_stats.total_disk_space, empty_stats.free_disk_space);
         EXPECT_FALSE(static_cast<std::string>(empty_stats.hostname).empty());
         EXPECT_FALSE(static_cast<std::string>(empty_stats.os_name).empty());
@@ -204,10 +204,6 @@ TEST(LowLevelE2E_Client, GetStatsReturnsServerStats) {
         EXPECT_FALSE(static_cast<std::string>(empty_stats.kernel_version).empty());
         EXPECT_FALSE(static_cast<std::string>(empty_stats.iggy_server_version).empty());
         EXPECT_TRUE(!empty_stats.has_server_semver || empty_stats.iggy_server_semver > 0u);
-        EXPECT_EQ(empty_stats.streams_count, 0u);
-        EXPECT_EQ(empty_stats.topics_count, 0u);
-        EXPECT_EQ(empty_stats.partitions_count, 0u);
-        EXPECT_EQ(empty_stats.consumer_groups_count, 0u);
     });
 
     ASSERT_NO_THROW(client->create_stream(first_stream_name));
@@ -256,11 +252,11 @@ TEST(LowLevelE2E_Client, GetStatsReturnsServerStats) {
 
     ASSERT_NO_THROW({
         const auto stats = client->get_stats();
-        EXPECT_EQ(stats.streams_count, 2u);
-        EXPECT_EQ(stats.topics_count, expected_topics_count);
-        EXPECT_EQ(stats.partitions_count, expected_partitions_count);
-        EXPECT_EQ(stats.segments_count, expected_partitions_count);
-        EXPECT_EQ(stats.consumer_groups_count, 3u);
+        EXPECT_EQ(stats.streams_count, empty_stats.streams_count + 2u);
+        EXPECT_EQ(stats.topics_count, empty_stats.topics_count + expected_topics_count);
+        EXPECT_EQ(stats.partitions_count, empty_stats.partitions_count + expected_partitions_count);
+        EXPECT_EQ(stats.segments_count, empty_stats.segments_count + expected_partitions_count);
+        EXPECT_EQ(stats.consumer_groups_count, empty_stats.consumer_groups_count + 3u);
         EXPECT_EQ(stats.clients_count, empty_stats.clients_count + 2u);
         EXPECT_EQ(first_group.partitions_count, first_topic_partitions);
         EXPECT_EQ(second_group.partitions_count, second_topic_partitions);
@@ -276,11 +272,11 @@ TEST(LowLevelE2E_Client, GetStatsReturnsServerStats) {
 
     ASSERT_NO_THROW({
         const auto stats = client->get_stats();
-        EXPECT_EQ(stats.streams_count, 0u);
-        EXPECT_EQ(stats.topics_count, 0u);
-        EXPECT_EQ(stats.partitions_count, 0u);
-        EXPECT_EQ(stats.segments_count, 0u);
-        EXPECT_EQ(stats.consumer_groups_count, 0u);
+        EXPECT_EQ(stats.streams_count, empty_stats.streams_count);
+        EXPECT_EQ(stats.topics_count, empty_stats.topics_count);
+        EXPECT_EQ(stats.partitions_count, empty_stats.partitions_count);
+        EXPECT_EQ(stats.segments_count, empty_stats.segments_count);
+        EXPECT_EQ(stats.consumer_groups_count, empty_stats.consumer_groups_count);
     });
 
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
@@ -482,10 +478,23 @@ TEST(LowLevelE2E_Client, GetClientBeforeLoginThrows) {
 
 TEST(LowLevelE2E_Client, GetClientWithWrongClientIdThrows) {
     RecordProperty("description", "Rejects querying invalid or non-existent client ids.");
-    const std::uint32_t wrong_client_ids[] = {0u, std::numeric_limits<std::uint32_t>::max()};
-    iggy::ffi::Client *client              = login_to_server();
+    iggy::ffi::Client *client = login_to_server();
     ASSERT_NE(client, nullptr);
 
+    std::uint32_t non_existent_client_id = 1u;
+    ASSERT_NO_THROW({
+        const auto clients = client->get_clients();
+        std::unordered_set<std::uint32_t> client_ids;
+        for (const auto &entry : clients) {
+            client_ids.insert(entry.client_id);
+        }
+
+        while (client_ids.find(non_existent_client_id) != client_ids.end()) {
+            ++non_existent_client_id;
+        }
+    });
+
+    const std::uint32_t wrong_client_ids[] = {0u, non_existent_client_id};
     for (const std::uint32_t wrong_client_id : wrong_client_ids) {
         SCOPED_TRACE(wrong_client_id);
         ASSERT_THROW(client->get_client(wrong_client_id), std::exception);
@@ -755,12 +764,13 @@ TEST(LowLevelE2E_Client, PingSucceedsForNewConnection) {
 TEST(LowLevelE2E_Client, HeartbeatIntervalReturnsDefaultValueForNewConnection) {
     RecordProperty("description",
                    "Returns the default heartbeat interval in microseconds for a fresh unauthenticated client.");
-    iggy::ffi::Client *client = nullptr;
+    constexpr std::uint64_t default_heartbeat_micros = 5'000'000ull;
+    iggy::ffi::Client *client                        = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
     ASSERT_NE(client, nullptr);
 
     const auto heartbeat_interval = client->heartbeat_interval();
-    EXPECT_EQ(heartbeat_interval, 5'000'000u);
+    EXPECT_EQ(heartbeat_interval, default_heartbeat_micros);
 
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
     client = nullptr;
@@ -769,12 +779,13 @@ TEST(LowLevelE2E_Client, HeartbeatIntervalReturnsDefaultValueForNewConnection) {
 TEST(LowLevelE2E_Client, HeartbeatIntervalReturnsConfiguredValueFromConnectionString) {
     RecordProperty("description",
                    "Returns the configured heartbeat interval in microseconds from the connection string.");
-    iggy::ffi::Client *client = nullptr;
+    constexpr std::uint64_t configured_heartbeat_micros = 10'000'000ull;
+    iggy::ffi::Client *client                           = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection("iggy://iggy:iggy@127.0.0.1:8090?heartbeat_interval=10s"); });
     ASSERT_NE(client, nullptr);
 
     const auto heartbeat_interval = client->heartbeat_interval();
-    EXPECT_EQ(heartbeat_interval, 10'000'000u);
+    EXPECT_EQ(heartbeat_interval, configured_heartbeat_micros);
 
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
     client = nullptr;
