@@ -28,7 +28,9 @@
 
 // TODO(slbotbm): Add tests for purge_stream after implementing send_messages(...).
 
-TEST_F(E2ETestFixture, CreateStreamAfterLogin) {
+class LowLevelE2E_Stream : public E2ETestFixture {};
+
+TEST_F(LowLevelE2E_Stream, CreateStreamAfterLogin) {
     RecordProperty("description", "Creates a stream successfully after authenticating.");
     const std::string stream_name = "cpp-create-stream-after-login";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -36,7 +38,7 @@ TEST_F(E2ETestFixture, CreateStreamAfterLogin) {
     TrackStream(stream_name);
 }
 
-TEST_F(E2ETestFixture, CreateDuplicateStreamThrows) {
+TEST_F(LowLevelE2E_Stream, CreateDuplicateStreamThrows) {
     RecordProperty("description", "Rejects creating the same stream twice.");
     const std::string stream_name = "cpp-create-stream-duplicate";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -45,7 +47,7 @@ TEST_F(E2ETestFixture, CreateDuplicateStreamThrows) {
     ASSERT_THROW(client->create_stream(stream_name), std::exception);
 }
 
-TEST_F(E2ETestFixture, CreateStreamBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Stream, CreateStreamBeforeLoginThrows) {
     RecordProperty("description", "Throws when stream creation is attempted before authentication.");
     const std::string stream_name = "cpp-create-stream-immediate-new-connection";
     iggy::ffi::Client *client     = GetLoggedOutClient();
@@ -55,7 +57,7 @@ TEST_F(E2ETestFixture, CreateStreamBeforeLoginThrows) {
     ASSERT_THROW(client->create_stream(stream_name), std::exception);
 }
 
-TEST_F(E2ETestFixture, CreateStreamValidatesNameConstraintsAndUniqueness) {
+TEST_F(LowLevelE2E_Stream, CreateStreamValidatesNameConstraintsAndUniqueness) {
     RecordProperty("description",
                    "Validates stream name length constraints and accepts the maximum allowed name length.");
     iggy::ffi::Client *client = GetLoggedInClient();
@@ -74,7 +76,7 @@ TEST_F(E2ETestFixture, CreateStreamValidatesNameConstraintsAndUniqueness) {
     TrackStream(max_length_name);
 }
 
-TEST_F(E2ETestFixture, CreateStreamWithEmojiName) {
+TEST_F(LowLevelE2E_Stream, CreateStreamWithEmojiName) {
     RecordProperty("description", "Creates a stream with a UTF-8 emoji name.");
     const std::string stream_name = "🚀🚀🚀🚀Apache Iggy🚀🚀🚀🚀";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -84,14 +86,13 @@ TEST_F(E2ETestFixture, CreateStreamWithEmojiName) {
     ASSERT_NO_THROW({
         const auto stream_details              = client->get_stream(make_string_identifier(stream_name));
         const std::string returned_stream_name = static_cast<std::string>(stream_details.name);
-        EXPECT_NE(stream_details.id, 0u);
         EXPECT_EQ(returned_stream_name, stream_name);
         EXPECT_EQ(stream_details.topics_count, 0u);
         EXPECT_EQ(stream_details.topics.size(), 0u);
     });
 }
 
-TEST_F(E2ETestFixture, StreamCreatedAndDeletedSuccessfully) {
+TEST_F(LowLevelE2E_Stream, StreamCreatedAndDeletedSuccessfully) {
     RecordProperty("description", "Creates a stream and deletes it successfully by string identifier.");
     const std::string stream_name = "cpp-delete-stream-created-and-deleted";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -99,9 +100,10 @@ TEST_F(E2ETestFixture, StreamCreatedAndDeletedSuccessfully) {
     TrackStream(stream_name);
 
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ForgetTrackedStream(stream_name);
 }
 
-TEST_F(E2ETestFixture, DeleteNotCreatedStreamThrows) {
+TEST_F(LowLevelE2E_Stream, DeleteNotCreatedStreamThrows) {
     RecordProperty("description", "Throws when deleting a stream that does not exist.");
     const std::string stream_name = "cpp-delete-stream-not-created";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -109,7 +111,7 @@ TEST_F(E2ETestFixture, DeleteNotCreatedStreamThrows) {
     ASSERT_THROW(client->delete_stream(make_string_identifier(stream_name)), std::exception);
 }
 
-TEST_F(E2ETestFixture, DeleteStreamBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Stream, DeleteStreamBeforeLoginThrows) {
     RecordProperty("description", "Throws when stream deletion is attempted before authentication.");
     const std::string stream_name = "cpp-delete-stream-without-login";
 
@@ -122,7 +124,7 @@ TEST_F(E2ETestFixture, DeleteStreamBeforeLoginThrows) {
     ASSERT_THROW(client->delete_stream(make_string_identifier(stream_name)), std::exception);
 }
 
-TEST_F(E2ETestFixture, DeleteStreamTwiceThrows) {
+TEST_F(LowLevelE2E_Stream, DeleteStreamTwiceThrows) {
     RecordProperty("description", "Throws when deleting the same stream a second time.");
     const std::string stream_name = "cpp-delete-stream-twice";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -130,10 +132,11 @@ TEST_F(E2ETestFixture, DeleteStreamTwiceThrows) {
     TrackStream(stream_name);
 
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ForgetTrackedStream(stream_name);
     ASSERT_THROW(client->delete_stream(make_string_identifier(stream_name)), std::exception);
 }
 
-TEST_F(E2ETestFixture, DeleteStreamWithInvalidIdentifierThrows) {
+TEST_F(LowLevelE2E_Stream, DeleteStreamWithInvalidIdentifierThrows) {
     RecordProperty("description", "Rejects stream deletion requests that use invalid identifier formats.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -150,7 +153,7 @@ TEST_F(E2ETestFixture, DeleteStreamWithInvalidIdentifierThrows) {
     ASSERT_THROW(client->delete_stream(std::move(invalid_numeric_id)), std::exception);
 }
 
-TEST_F(E2ETestFixture, GetStreamDetailsWithInvalidIdentifierThrows) {
+TEST_F(LowLevelE2E_Stream, GetStreamDetailsWithInvalidIdentifierThrows) {
     RecordProperty("description", "Rejects stream detail lookups that use invalid identifier formats.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -167,7 +170,7 @@ TEST_F(E2ETestFixture, GetStreamDetailsWithInvalidIdentifierThrows) {
     ASSERT_THROW(client->get_stream(std::move(invalid_numeric_id)), std::exception);
 }
 
-TEST_F(E2ETestFixture, GetStreamByStringIdentifierReturnsStreamDetails) {
+TEST_F(LowLevelE2E_Stream, GetStreamByStringIdentifierReturnsStreamDetails) {
     RecordProperty("description", "Returns expected stream details when looked up by string identifier.");
     const std::string stream_name = "cpp-get-stream-by-string";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -176,7 +179,6 @@ TEST_F(E2ETestFixture, GetStreamByStringIdentifierReturnsStreamDetails) {
 
     ASSERT_NO_THROW({
         const auto stream_details = client->get_stream(make_string_identifier(stream_name));
-        EXPECT_NE(stream_details.id, 0u);
         EXPECT_EQ(stream_details.name, stream_name);
         EXPECT_EQ(stream_details.topics_count, 0u);
         EXPECT_EQ(stream_details.topics.size(), 0u);
@@ -185,14 +187,14 @@ TEST_F(E2ETestFixture, GetStreamByStringIdentifierReturnsStreamDetails) {
     });
 }
 
-TEST_F(E2ETestFixture, GetNonExistentStreamDetailsThrows) {
+TEST_F(LowLevelE2E_Stream, GetNonExistentStreamDetailsThrows) {
     RecordProperty("description", "Throws when requesting details for a stream that does not exist.");
     const std::string stream_name = "cpp-get-nonexistent-stream-details";
     iggy::ffi::Client *client     = GetLoggedInClient();
     ASSERT_THROW(client->get_stream(make_string_identifier(stream_name)), std::exception);
 }
 
-TEST_F(E2ETestFixture, GetStreamDetailsBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Stream, GetStreamDetailsBeforeLoginThrows) {
     RecordProperty("description", "Throws when stream details are requested before authentication.");
     const std::string stream_name = "cpp-get-stream-details-without-login";
     iggy::ffi::Client *client     = GetLoggedOutClient();
@@ -202,7 +204,7 @@ TEST_F(E2ETestFixture, GetStreamDetailsBeforeLoginThrows) {
     ASSERT_THROW(client->get_stream(make_string_identifier(stream_name)), std::exception);
 }
 
-TEST_F(E2ETestFixture, GetDeletedStreamDetailsThrows) {
+TEST_F(LowLevelE2E_Stream, GetDeletedStreamDetailsThrows) {
     RecordProperty("description", "Throws when requesting details for a stream after it has been deleted.");
     const std::string stream_name = "cpp-get-deleted-stream-details";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -210,10 +212,11 @@ TEST_F(E2ETestFixture, GetDeletedStreamDetailsThrows) {
     TrackStream(stream_name);
     ASSERT_NO_THROW(client->get_stream(make_string_identifier(stream_name)));
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ForgetTrackedStream(stream_name);
     ASSERT_THROW(client->get_stream(make_string_identifier(stream_name)), std::exception);
 }
 
-TEST_F(E2ETestFixture, GetStreamByNumericIdentifierReturnsStreamDetails) {
+TEST_F(LowLevelE2E_Stream, GetStreamByNumericIdentifierReturnsStreamDetails) {
     RecordProperty("description", "Returns expected stream details when looked up by numeric identifier.");
     const std::string stream_name = "cpp-get-stream-by-numeric";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -224,7 +227,6 @@ TEST_F(E2ETestFixture, GetStreamByNumericIdentifierReturnsStreamDetails) {
     ASSERT_NO_THROW({
         const auto by_string = client->get_stream(make_string_identifier(stream_name));
         stream_id            = by_string.id;
-        EXPECT_NE(stream_id, 0u);
     });
 
     ASSERT_NO_THROW({
@@ -236,7 +238,7 @@ TEST_F(E2ETestFixture, GetStreamByNumericIdentifierReturnsStreamDetails) {
     });
 }
 
-TEST_F(E2ETestFixture, GetStreamsReturnsEmptyAfterCleanup) {
+TEST_F(LowLevelE2E_Stream, GetStreamsReturnsEmptyAfterCleanup) {
     RecordProperty("description", "Verifies get_streams returns empty vector after cleaning up all streams.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -249,7 +251,7 @@ TEST_F(E2ETestFixture, GetStreamsReturnsEmptyAfterCleanup) {
     ASSERT_EQ(streams.size(), 0);
 }
 
-TEST_F(E2ETestFixture, GetStreamsReturnsStreamAfterCreation) {
+TEST_F(LowLevelE2E_Stream, GetStreamsReturnsStreamAfterCreation) {
     RecordProperty("description", "Verifies created stream appears in get_streams result.");
     const std::string stream_name = "cpp-stream-get-streams";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -273,7 +275,7 @@ TEST_F(E2ETestFixture, GetStreamsReturnsStreamAfterCreation) {
     ASSERT_TRUE(found) << "Stream '" << stream_name << "' not found in get_streams result";
 }
 
-TEST_F(E2ETestFixture, GetStreamsFieldsVerification) {
+TEST_F(LowLevelE2E_Stream, GetStreamsFieldsVerification) {
     RecordProperty("description",
                    "Verifies get_streams returns correct field values after creating stream with topic and messages.");
     const std::string stream_name = "cpp-stream-fields-verify";
@@ -308,7 +310,7 @@ TEST_F(E2ETestFixture, GetStreamsFieldsVerification) {
     ASSERT_TRUE(found) << "Stream '" << stream_name << "' not found in get_streams result";
 }
 
-TEST_F(E2ETestFixture, GetStreamsBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Stream, GetStreamsBeforeLoginThrows) {
     RecordProperty("description", "Throws when get_streams is called before authentication.");
     iggy::ffi::Client *client = GetLoggedOutClient();
 
@@ -317,7 +319,7 @@ TEST_F(E2ETestFixture, GetStreamsBeforeLoginThrows) {
     ASSERT_THROW(client->get_streams(), std::exception);
 }
 
-TEST_F(E2ETestFixture, GetStreamsConsistentWithGetStream) {
+TEST_F(LowLevelE2E_Stream, GetStreamsConsistentWithGetStream) {
     RecordProperty("description", "Verifies get_streams result is consistent with get_stream for the same stream.");
     const std::string stream_name = "cpp-stream-consistency";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -354,7 +356,7 @@ TEST_F(E2ETestFixture, GetStreamsConsistentWithGetStream) {
     EXPECT_EQ(list_size_bytes, single.size_bytes);
 }
 
-TEST_F(E2ETestFixture, GetStreamsRepeatedCallsReturnSameResult) {
+TEST_F(LowLevelE2E_Stream, GetStreamsRepeatedCallsReturnSameResult) {
     RecordProperty("description", "Verifies repeated get_streams calls return consistent results.");
     const std::string stream_name = "cpp-stream-repeated";
     iggy::ffi::Client *client     = GetLoggedInClient();

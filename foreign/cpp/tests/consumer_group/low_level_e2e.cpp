@@ -25,7 +25,9 @@
 #include "lib.rs.h"
 #include "tests/common/test_helpers.hpp"
 
-TEST_F(E2ETestFixture, CreateConsumerGroupSucceeds) {
+class LowLevelE2E_ConsumerGroup : public E2ETestFixture {};
+
+TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupSucceeds) {
     RecordProperty("description", "Creates a consumer group successfully for an existing stream and topic.");
     const std::string stream_name = "client-create-group-happy-stream";
     const std::string topic_name  = "client-create-group-happy-topic";
@@ -47,7 +49,7 @@ TEST_F(E2ETestFixture, CreateConsumerGroupSucceeds) {
 
 }
 
-TEST_F(E2ETestFixture, CreateConsumerGroupWithInvalidIdentifiersThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithInvalidIdentifiersThrows) {
     RecordProperty("description", "Rejects malformed stream and topic identifiers before creating a consumer group.");
     const std::string stream_name = "client-create-group-invalid-id-stream";
     const std::string topic_name  = "client-create-group-invalid-id-topic";
@@ -77,7 +79,7 @@ TEST_F(E2ETestFixture, CreateConsumerGroupWithInvalidIdentifiersThrows) {
 
 }
 
-TEST_F(E2ETestFixture, CreateConsumerGroupOnNonExistentResourcesThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupOnNonExistentResourcesThrows) {
     RecordProperty("description", "Rejects creating a consumer group on streams or topics that do not exist.");
     const std::string stream_name         = "client-create-group-missing-resource-stream";
     const std::string topic_name          = "client-create-group-missing-resource-topic";
@@ -101,7 +103,7 @@ TEST_F(E2ETestFixture, CreateConsumerGroupOnNonExistentResourcesThrows) {
 
 }
 
-TEST_F(E2ETestFixture, CreateConsumerGroupTwiceOnSameInputThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupTwiceOnSameInputThrows) {
     RecordProperty("description", "Rejects creating the same consumer group twice for the same stream and topic.");
     const std::string stream_name = "client-create-group-duplicate-stream";
     const std::string topic_name  = "client-create-group-duplicate-topic";
@@ -121,7 +123,7 @@ TEST_F(E2ETestFixture, CreateConsumerGroupTwiceOnSameInputThrows) {
 
 }
 
-TEST_F(E2ETestFixture, CreateConsumerGroupWithNumericIdentifiersSucceeds) {
+TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithNumericIdentifiersSucceeds) {
     RecordProperty("description",
                    "Creates a consumer group successfully when stream and topic are addressed by numeric identifiers.");
     const std::string stream_name = "client-create-group-numeric-stream";
@@ -148,7 +150,7 @@ TEST_F(E2ETestFixture, CreateConsumerGroupWithNumericIdentifiersSucceeds) {
 
 }
 
-TEST_F(E2ETestFixture, CreateConsumerGroupWithInvalidNamesThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithInvalidNamesThrows) {
     RecordProperty("description", "Rejects empty and overlong consumer group names.");
     const std::string stream_name = "client-create-group-invalid-name-stream";
     const std::string topic_name  = "client-create-group-invalid-name-topic";
@@ -169,7 +171,7 @@ TEST_F(E2ETestFixture, CreateConsumerGroupWithInvalidNamesThrows) {
 
 }
 
-TEST_F(E2ETestFixture, CreateConsumerGroupAfterStreamDeletionThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupAfterStreamDeletionThrows) {
     RecordProperty("description", "Rejects creating a consumer group after deleting the stream that owned the topic.");
     const std::string stream_name = "client-create-group-after-stream-delete-stream";
     const std::string topic_name  = "client-create-group-after-stream-delete-topic";
@@ -181,6 +183,7 @@ TEST_F(E2ETestFixture, CreateConsumerGroupAfterStreamDeletionThrows) {
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ForgetTrackedStream(stream_name);
 
     ASSERT_THROW(client->create_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
                                                group_name),
@@ -188,7 +191,7 @@ TEST_F(E2ETestFixture, CreateConsumerGroupAfterStreamDeletionThrows) {
 
 }
 
-TEST_F(E2ETestFixture, CreateConsumerGroupBeforeLoginThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupBeforeLoginThrows) {
     RecordProperty("description",
                    "Rejects creating a consumer group before connect, and after connect but before login.");
     const std::string stream_name = "client-create-group-before-login-stream";
@@ -212,7 +215,7 @@ TEST_F(E2ETestFixture, CreateConsumerGroupBeforeLoginThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, GetConsumerGroupReturnsSameInfoAsCreateConsumerGroup) {
+TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupReturnsSameInfoAsCreateConsumerGroup) {
     RecordProperty("description",
                    "Returns the same consumer group details from get_consumer_group as create_consumer_group.");
     const std::string stream_name = "client-get-group-happy-stream";
@@ -238,7 +241,7 @@ TEST_F(E2ETestFixture, GetConsumerGroupReturnsSameInfoAsCreateConsumerGroup) {
 
 }
 
-TEST_F(E2ETestFixture, GetConsumerGroupBeforeLoginThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupBeforeLoginThrows) {
     RecordProperty("description", "Rejects get_consumer_group before connect, and after connect but before login.");
     const std::string stream_name = "client-get-group-before-login-stream";
     const std::string topic_name  = "client-get-group-before-login-topic";
@@ -265,7 +268,7 @@ TEST_F(E2ETestFixture, GetConsumerGroupBeforeLoginThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, GetConsumerGroupWithInvalidIdentifiersThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupWithInvalidIdentifiersThrows) {
     RecordProperty("description", "Rejects get_consumer_group when the stream or topic identifier is invalid.");
     const std::string stream_name = "client-get-group-invalid-id-stream";
     const std::string topic_name  = "client-get-group-invalid-id-topic";
@@ -288,7 +291,7 @@ TEST_F(E2ETestFixture, GetConsumerGroupWithInvalidIdentifiersThrows) {
 
 }
 
-TEST_F(E2ETestFixture, GetConsumerGroupOnNonExistentResourcesThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupOnNonExistentResourcesThrows) {
     RecordProperty("description", "Rejects get_consumer_group for streams, topics, or groups that do not exist.");
     const std::string stream_name         = "client-get-group-missing-resource-stream";
     const std::string topic_name          = "client-get-group-missing-resource-topic";
@@ -319,7 +322,7 @@ TEST_F(E2ETestFixture, GetConsumerGroupOnNonExistentResourcesThrows) {
 
 }
 
-TEST_F(E2ETestFixture, GetConsumerGroupAfterStreamDeletionThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupAfterStreamDeletionThrows) {
     RecordProperty("description", "Rejects get_consumer_group after deleting the stream that owned the group.");
     const std::string stream_name = "client-get-group-after-stream-delete-stream";
     const std::string topic_name  = "client-get-group-after-stream-delete-topic";
@@ -333,6 +336,7 @@ TEST_F(E2ETestFixture, GetConsumerGroupAfterStreamDeletionThrows) {
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ForgetTrackedStream(stream_name);
 
     ASSERT_THROW(client->get_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
                                             make_string_identifier(group_name)),
@@ -340,7 +344,7 @@ TEST_F(E2ETestFixture, GetConsumerGroupAfterStreamDeletionThrows) {
 
 }
 
-TEST_F(E2ETestFixture, DeleteConsumerGroupSucceeds) {
+TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupSucceeds) {
     RecordProperty("description", "Deletes an existing consumer group successfully.");
     const std::string stream_name = "client-delete-group-happy-stream";
     const std::string topic_name  = "client-delete-group-happy-topic";
@@ -363,7 +367,7 @@ TEST_F(E2ETestFixture, DeleteConsumerGroupSucceeds) {
 
 }
 
-TEST_F(E2ETestFixture, DeleteConsumerGroupBeforeLoginThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupBeforeLoginThrows) {
     RecordProperty("description", "Rejects delete_consumer_group before connect, and after connect but before login.");
     const std::string stream_name = "client-delete-group-before-login-stream";
     const std::string topic_name  = "client-delete-group-before-login-topic";
@@ -390,7 +394,7 @@ TEST_F(E2ETestFixture, DeleteConsumerGroupBeforeLoginThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, DeleteConsumerGroupWithInvalidIdentifiersThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupWithInvalidIdentifiersThrows) {
     RecordProperty("description",
                    "Rejects delete_consumer_group when the stream, topic, or group identifier is invalid.");
     const std::string stream_name = "client-delete-group-invalid-id-stream";
@@ -422,7 +426,7 @@ TEST_F(E2ETestFixture, DeleteConsumerGroupWithInvalidIdentifiersThrows) {
 
 }
 
-TEST_F(E2ETestFixture, DeleteConsumerGroupOnNonExistentResourcesThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupOnNonExistentResourcesThrows) {
     RecordProperty("description", "Rejects delete_consumer_group for streams, topics, or groups that do not exist.");
     const std::string stream_name         = "client-delete-group-missing-resource-stream";
     const std::string topic_name          = "client-delete-group-missing-resource-topic";
@@ -453,7 +457,7 @@ TEST_F(E2ETestFixture, DeleteConsumerGroupOnNonExistentResourcesThrows) {
 
 }
 
-TEST_F(E2ETestFixture, DeleteConsumerGroupTwiceThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupTwiceThrows) {
     RecordProperty("description", "Rejects deleting the same consumer group twice.");
     const std::string stream_name = "client-delete-group-twice-stream";
     const std::string topic_name  = "client-delete-group-twice-topic";
@@ -475,7 +479,7 @@ TEST_F(E2ETestFixture, DeleteConsumerGroupTwiceThrows) {
 
 }
 
-TEST_F(E2ETestFixture, DeleteConsumerGroupWithNumericIdentifiersSucceeds) {
+TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupWithNumericIdentifiersSucceeds) {
     RecordProperty(
         "description",
         "Deletes a consumer group successfully when stream, topic, and group are addressed by numeric identifiers.");
@@ -502,7 +506,7 @@ TEST_F(E2ETestFixture, DeleteConsumerGroupWithNumericIdentifiersSucceeds) {
 
 }
 
-TEST_F(E2ETestFixture, DeleteConsumerGroupAfterStreamDeletionThrows) {
+TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupAfterStreamDeletionThrows) {
     RecordProperty("description",
                    "Rejects delete_consumer_group after deleting the stream that owned the consumer group.");
     const std::string stream_name = "client-delete-group-after-stream-delete-stream";
@@ -517,6 +521,7 @@ TEST_F(E2ETestFixture, DeleteConsumerGroupAfterStreamDeletionThrows) {
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ForgetTrackedStream(stream_name);
 
     ASSERT_THROW(client->delete_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
                                                make_string_identifier(group_name)),
@@ -524,7 +529,7 @@ TEST_F(E2ETestFixture, DeleteConsumerGroupAfterStreamDeletionThrows) {
 
 }
 
-TEST_F(E2ETestFixture, DeleteConsumerGroupAndRecreateWithSameNameSucceeds) {
+TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupAndRecreateWithSameNameSucceeds) {
     RecordProperty("description",
                    "Allows recreating a consumer group with the same name after the previous group is deleted.");
     const std::string stream_name = "client-delete-group-recreate-stream";

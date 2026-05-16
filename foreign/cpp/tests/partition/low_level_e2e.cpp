@@ -26,7 +26,9 @@
 #include "lib.rs.h"
 #include "tests/common/test_helpers.hpp"
 
-TEST_F(E2ETestFixture, CreatePartitionsSucceeds) {
+class LowLevelE2E_Partition : public E2ETestFixture {};
+
+TEST_F(LowLevelE2E_Partition, CreatePartitionsSucceeds) {
     RecordProperty("description", "Creates partitions for an existing topic and verifies the resulting count.");
     const std::string stream_name = "cpp-create-partitions-happy-path";
     const std::string topic_name  = "topic-create-partitions-happy-path";
@@ -48,7 +50,7 @@ TEST_F(E2ETestFixture, CreatePartitionsSucceeds) {
     });
 }
 
-TEST_F(E2ETestFixture, CreatePartitionsBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Partition, CreatePartitionsBeforeLoginThrows) {
     RecordProperty("description",
                    "Throws when create_partitions is called before connect, and after connect but before login.");
     const std::string stream_name = "cpp-create-partitions-before-login";
@@ -63,7 +65,7 @@ TEST_F(E2ETestFixture, CreatePartitionsBeforeLoginThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, CreatePartitionsOnNonExistentResourcesThrows) {
+TEST_F(LowLevelE2E_Partition, CreatePartitionsOnNonExistentResourcesThrows) {
     RecordProperty("description", "Throws when create_partitions is called for a stream or topic that does not exist.");
     const std::string stream_name         = "cpp-create-partitions-missing-resource-stream";
     const std::string topic_name          = "topic-create-partitions-missing-resource-topic";
@@ -85,7 +87,7 @@ TEST_F(E2ETestFixture, CreatePartitionsOnNonExistentResourcesThrows) {
         std::exception);
 }
 
-TEST_F(E2ETestFixture, CreatePartitionsWithInvalidIdentifiersThrows) {
+TEST_F(LowLevelE2E_Partition, CreatePartitionsWithInvalidIdentifiersThrows) {
     RecordProperty("description", "Rejects create_partitions requests that use invalid stream or topic identifiers.");
     const std::string stream_name = "cpp-create-partitions-invalid-identifier";
     const std::string topic_name  = "topic-create-partitions-invalid-identifier";
@@ -126,7 +128,7 @@ TEST_F(E2ETestFixture, CreatePartitionsWithInvalidIdentifiersThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, CreatePartitionsWithBoundaryPartitionsCountValues) {
+TEST_F(LowLevelE2E_Partition, CreatePartitionsWithBoundaryPartitionsCountValues) {
     RecordProperty("description",
                    "Accepts supported create_partitions counts and rejects values outside the allowed range.");
     const std::string stream_name = "cpp-create-partitions-boundary-values";
@@ -186,7 +188,7 @@ TEST_F(E2ETestFixture, CreatePartitionsWithBoundaryPartitionsCountValues) {
     });
 }
 
-TEST_F(E2ETestFixture, CreatePartitionsWithNumericIdentifiersSucceeds) {
+TEST_F(LowLevelE2E_Partition, CreatePartitionsWithNumericIdentifiersSucceeds) {
     RecordProperty("description",
                    "Creates partitions successfully when valid numeric stream and topic identifiers are used.");
     const std::string stream_name = "cpp-create-partitions-numeric-identifiers";
@@ -214,7 +216,7 @@ TEST_F(E2ETestFixture, CreatePartitionsWithNumericIdentifiersSucceeds) {
     });
 }
 
-TEST_F(E2ETestFixture, DeletePartitionsSucceeds) {
+TEST_F(LowLevelE2E_Partition, DeletePartitionsSucceeds) {
     RecordProperty("description", "Deletes partitions from an existing topic and verifies the resulting count.");
     const std::string stream_name = "cpp-delete-partitions-happy-path";
     const std::string topic_name  = "topic-delete-partitions-happy-path";
@@ -236,7 +238,7 @@ TEST_F(E2ETestFixture, DeletePartitionsSucceeds) {
     });
 }
 
-TEST_F(E2ETestFixture, DeleteMorePartitionsThanExistingThrows) {
+TEST_F(LowLevelE2E_Partition, DeleteMorePartitionsThanExistingThrows) {
     RecordProperty("description",
                    "Rejects delete_partitions counts outside the allowed range and counts greater than existing.");
     const std::string stream_name = "cpp-delete-partitions-boundary-values";
@@ -296,7 +298,7 @@ TEST_F(E2ETestFixture, DeleteMorePartitionsThanExistingThrows) {
     });
 }
 
-TEST_F(E2ETestFixture, DeletePartitionsBeforeCreatingAdditionalPartitionsSucceeds) {
+TEST_F(LowLevelE2E_Partition, DeletePartitionsBeforeCreatingAdditionalPartitionsSucceeds) {
     RecordProperty("description",
                    "Deletes partitions from the initial topic allocation without calling create_partitions first.");
     const std::string stream_name = "cpp-delete-partitions-before-create-partitions";
@@ -318,7 +320,7 @@ TEST_F(E2ETestFixture, DeletePartitionsBeforeCreatingAdditionalPartitionsSucceed
     });
 }
 
-TEST_F(E2ETestFixture, DeletePartitionsFromTopicWithZeroPartitionsThrows) {
+TEST_F(LowLevelE2E_Partition, DeletePartitionsFromTopicWithZeroPartitionsThrows) {
     RecordProperty("description",
                    "Throws when delete_partitions is called with count 1 for a topic that currently has 0 partitions.");
     const std::string stream_name = "cpp-delete-partitions-zero-existing-partitions";
@@ -342,7 +344,7 @@ TEST_F(E2ETestFixture, DeletePartitionsFromTopicWithZeroPartitionsThrows) {
     });
 }
 
-TEST_F(E2ETestFixture, DeletePartitionsBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Partition, DeletePartitionsBeforeLoginThrows) {
     RecordProperty("description",
                    "Throws when delete_partitions is called before connect, and after connect but before login.");
     const std::string stream_name = "cpp-delete-partitions-before-login";
@@ -357,7 +359,7 @@ TEST_F(E2ETestFixture, DeletePartitionsBeforeLoginThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, DeletePartitionsOnNonExistentResourcesThrows) {
+TEST_F(LowLevelE2E_Partition, DeletePartitionsOnNonExistentResourcesThrows) {
     RecordProperty("description", "Throws when delete_partitions is called for a stream or topic that does not exist.");
     const std::string stream_name         = "cpp-delete-partitions-missing-resource-stream";
     const std::string topic_name          = "topic-delete-partitions-missing-resource-topic";
@@ -379,7 +381,7 @@ TEST_F(E2ETestFixture, DeletePartitionsOnNonExistentResourcesThrows) {
         std::exception);
 }
 
-TEST_F(E2ETestFixture, DeletePartitionsWithInvalidIdentifiersThrows) {
+TEST_F(LowLevelE2E_Partition, DeletePartitionsWithInvalidIdentifiersThrows) {
     RecordProperty("description", "Rejects delete_partitions requests that use invalid stream or topic identifiers.");
     const std::string stream_name = "cpp-delete-partitions-invalid-identifier";
     const std::string topic_name  = "topic-delete-partitions-invalid-identifier";
@@ -420,7 +422,7 @@ TEST_F(E2ETestFixture, DeletePartitionsWithInvalidIdentifiersThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, DeletePartitionsTwiceForSameTopicSucceeds) {
+TEST_F(LowLevelE2E_Partition, DeletePartitionsTwiceForSameTopicSucceeds) {
     RecordProperty("description", "Allows delete_partitions to be called twice for the same stream and topic.");
     const std::string stream_name = "cpp-delete-partitions-twice-same-topic";
     const std::string topic_name  = "topic-delete-partitions-twice-same-topic";
@@ -444,7 +446,7 @@ TEST_F(E2ETestFixture, DeletePartitionsTwiceForSameTopicSucceeds) {
     });
 }
 
-TEST_F(E2ETestFixture, DeletePartitionsAfterStreamDeletionThrows) {
+TEST_F(LowLevelE2E_Partition, DeletePartitionsAfterStreamDeletionThrows) {
     RecordProperty("description", "Throws when delete_partitions is called after the stream has been deleted.");
     const std::string stream_name = "cpp-delete-partitions-after-stream-deletion";
     const std::string topic_name  = "topic-delete-partitions-after-stream-deletion";
@@ -460,6 +462,7 @@ TEST_F(E2ETestFixture, DeletePartitionsAfterStreamDeletionThrows) {
     ASSERT_EQ(stream_details.topics.size(), 1u);
 
     ASSERT_NO_THROW(client->delete_stream(make_numeric_identifier(stream_details.id)));
+    ForgetTrackedStream(stream_name);
 
     ASSERT_THROW(client->delete_partitions(make_numeric_identifier(stream_details.id),
                                            make_numeric_identifier(stream_details.topics[0].id), 1),

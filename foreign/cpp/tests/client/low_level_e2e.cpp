@@ -29,7 +29,9 @@
 #include "lib.rs.h"
 #include "tests/common/test_helpers.hpp"
 
-TEST_F(E2ETestFixture, ConnectAndLogin) {
+class LowLevelE2E_Client : public E2ETestFixture {};
+
+TEST_F(LowLevelE2E_Client, ConnectAndLogin) {
     RecordProperty("description", "Connects and logs in successfully using each supported connection string format.");
     const std::string username             = "iggy";
     const std::string password             = "iggy";
@@ -48,7 +50,7 @@ TEST_F(E2ETestFixture, ConnectAndLogin) {
     }
 }
 
-TEST_F(E2ETestFixture, NewConnectionWithMalformedConnectionStringsThrow) {
+TEST_F(LowLevelE2E_Client, NewConnectionWithMalformedConnectionStringsThrow) {
     RecordProperty("description", "Rejects malformed connection strings when creating a new client connection.");
     const std::string malformed_connection_strings[] = {
         "iggy+invalid://iggy:iggy@127.0.0.1:8090", "iggy+tcp://iggy:iggy@:8090",      "iggy+tcp://iggy:iggy@127.0.0.1",
@@ -62,7 +64,7 @@ TEST_F(E2ETestFixture, NewConnectionWithMalformedConnectionStringsThrow) {
     }
 }
 
-TEST_F(E2ETestFixture, LoginWithInvalidCredentialsThrows) {
+TEST_F(LowLevelE2E_Client, LoginWithInvalidCredentialsThrows) {
     RecordProperty("description", "Throws when authentication uses invalid credentials after connecting.");
     iggy::ffi::Client *client = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
@@ -73,7 +75,7 @@ TEST_F(E2ETestFixture, LoginWithInvalidCredentialsThrows) {
     ASSERT_THROW(client->login_user("biggy", "biggy"), std::exception);
 }
 
-TEST_F(E2ETestFixture, LoginTwiceWithDifferentCredentials) {
+TEST_F(LowLevelE2E_Client, LoginTwiceWithDifferentCredentials) {
     RecordProperty("description", "Rejects a second login attempt that switches to invalid credentials.");
     iggy::ffi::Client *client = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
@@ -85,7 +87,7 @@ TEST_F(E2ETestFixture, LoginTwiceWithDifferentCredentials) {
     ASSERT_THROW(client->login_user("biggy", "biggy"), std::exception);
 }
 
-TEST_F(E2ETestFixture, LogoutWithoutLogin) {
+TEST_F(LowLevelE2E_Client, LogoutWithoutLogin) {
     RecordProperty("description", "Allows deleting a new unauthenticated client without logging in.");
     iggy::ffi::Client *client = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
@@ -95,7 +97,7 @@ TEST_F(E2ETestFixture, LogoutWithoutLogin) {
     client = nullptr;
 }
 
-TEST_F(E2ETestFixture, DeleteWhileUnauthenticatedAfterFailedLogin) {
+TEST_F(LowLevelE2E_Client, DeleteWhileUnauthenticatedAfterFailedLogin) {
     RecordProperty("description", "Allows client cleanup after a failed login leaves the connection unauthenticated.");
     iggy::ffi::Client *client = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
@@ -107,7 +109,7 @@ TEST_F(E2ETestFixture, DeleteWhileUnauthenticatedAfterFailedLogin) {
     client = nullptr;
 }
 
-TEST_F(E2ETestFixture, LoginWithoutConnect) {
+TEST_F(LowLevelE2E_Client, LoginWithoutConnect) {
     RecordProperty("description", "Supports login without an explicit prior connect call.");
     iggy::ffi::Client *client = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
@@ -117,7 +119,7 @@ TEST_F(E2ETestFixture, LoginWithoutConnect) {
     ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
 }
 
-TEST_F(E2ETestFixture, ConnectWithoutLoginThenDelete) {
+TEST_F(LowLevelE2E_Client, ConnectWithoutLoginThenDelete) {
     RecordProperty("description", "Allows connecting without logging in and then deleting the client.");
     iggy::ffi::Client *client = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
@@ -128,7 +130,7 @@ TEST_F(E2ETestFixture, ConnectWithoutLoginThenDelete) {
     client = nullptr;
 }
 
-TEST_F(E2ETestFixture, RepeatedClientMethodCallsHaveStableBehavior) {
+TEST_F(LowLevelE2E_Client, RepeatedClientMethodCallsHaveStableBehavior) {
     RecordProperty("description",
                    "Keeps repeated connect, login, and delete calls stable across duplicate invocations.");
     iggy::ffi::Client *client = nullptr;
@@ -145,7 +147,7 @@ TEST_F(E2ETestFixture, RepeatedClientMethodCallsHaveStableBehavior) {
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST_F(E2ETestFixture, DeleteNullConnectionIsNoop) {
+TEST_F(LowLevelE2E_Client, DeleteNullConnectionIsNoop) {
     RecordProperty("description", "Treats deleting a null client pointer as a no-op.");
     iggy::ffi::Client *client = nullptr;
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));

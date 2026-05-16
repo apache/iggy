@@ -77,21 +77,38 @@ class E2ETestFixture : public ::testing::Test {
 
     iggy::ffi::Client *GetLoggedOutClient() {
         iggy::ffi::Client *client = nullptr;
-        ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
-        ASSERT_NE(client, nullptr);
+        EXPECT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+        EXPECT_NE(client, nullptr);
+        if (client == nullptr) {
+            return nullptr;
+        }
+
         TrackClient(client);
         return client;
     }
 
     iggy::ffi::Client *GetLoggedInClient() {
         iggy::ffi::Client *client = GetLoggedOutClient();
-        ASSERT_NO_THROW(client->connect());
-        ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+        if (client == nullptr) {
+            return nullptr;
+        }
+
+        EXPECT_NO_THROW(client->connect());
+        EXPECT_NO_THROW(client->login_user("iggy", "iggy"));
+
         return client;
     }
 
     void TrackStream(const std::string &stream_name) { tracked_stream_names_.push_back(stream_name); }
     void TrackStream(const std::uint32_t stream_id) { tracked_stream_ids_.push_back(stream_id); }
+    void ForgetTrackedStream(const std::string &stream_name) {
+        tracked_stream_names_.erase(
+            std::remove(tracked_stream_names_.begin(), tracked_stream_names_.end(), stream_name), tracked_stream_names_.end());
+    }
+    void ForgetTrackedStream(const std::uint32_t stream_id) {
+        tracked_stream_ids_.erase(std::remove(tracked_stream_ids_.begin(), tracked_stream_ids_.end(), stream_id),
+                                  tracked_stream_ids_.end());
+    }
 
     void DeleteClient(iggy::ffi::Client *&client) {
         ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
@@ -125,13 +142,15 @@ class E2ETestFixture : public ::testing::Test {
             for (const auto &stream_name : tracked_stream_names_) {
                 try {
                     cleanup_client->delete_stream(make_string_identifier(stream_name));
-                } catch (const std::exception &) {
+                } catch (const std::exception &e) {
+                    ADD_FAILURE() << "Failed to delete tracked stream by name '" << stream_name << "': " << e.what();
                 }
             }
             for (const auto stream_id : tracked_stream_ids_) {
                 try {
                     cleanup_client->delete_stream(make_numeric_identifier(stream_id));
-                } catch (const std::exception &) {
+                } catch (const std::exception &e) {
+                    ADD_FAILURE() << "Failed to delete tracked stream by id " << stream_id << ": " << e.what();
                 }
             }
         } catch (const std::exception &e) {
@@ -153,7 +172,7 @@ class E2ETestFixture : public ::testing::Test {
             try {
                 iggy::ffi::delete_connection(client);
             } catch (const std::exception &e) {
-                ADD_FAILURE() << "Failed to clean up tracked client: " << e.what();
+                ADD_FAILURE() << "Failed to delete tracked client " << client << ": " << e.what();
             }
             client = nullptr;
         }

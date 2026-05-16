@@ -31,7 +31,9 @@
 
 // TODO(slbotbm): Add tests for purge_topic after implementing send_messages(...).
 
-TEST_F(E2ETestFixture, CreateTopicWithAllOptionCombinations) {
+class LowLevelE2E_Topic : public E2ETestFixture {};
+
+TEST_F(LowLevelE2E_Topic, CreateTopicWithAllOptionCombinations) {
     RecordProperty("description",
                    "Creates topics across supported option combinations and verifies they are all returned.");
     const std::string stream_name = "cpp-create-topic-after-login";
@@ -90,7 +92,7 @@ TEST_F(E2ETestFixture, CreateTopicWithAllOptionCombinations) {
     });
 }
 
-TEST_F(E2ETestFixture, CreateTopicWithBoundaryPartitionsCountValues) {
+TEST_F(LowLevelE2E_Topic, CreateTopicWithBoundaryPartitionsCountValues) {
     RecordProperty("description", "Accepts boundary partition counts and rejects values above the supported maximum.");
     const std::string stream_name = "cpp-create-topic-boundary-partitions";
 
@@ -121,7 +123,7 @@ TEST_F(E2ETestFixture, CreateTopicWithBoundaryPartitionsCountValues) {
     EXPECT_EQ(topic_partitions["topic-partitions-1000"], 1000u);
 }
 
-TEST_F(E2ETestFixture, CreateTopicWithInvalidNamesThrows) {
+TEST_F(LowLevelE2E_Topic, CreateTopicWithInvalidNamesThrows) {
     RecordProperty("description", "Rejects invalid topic names and accepts the maximum allowed name length.");
     const std::string stream_name = "cpp-create-topic-invalid-names";
 
@@ -146,7 +148,7 @@ TEST_F(E2ETestFixture, CreateTopicWithInvalidNamesThrows) {
                                          "server_default", 0, "server_default"));
 }
 
-TEST_F(E2ETestFixture, CreateDuplicateTopicThrows) {
+TEST_F(LowLevelE2E_Topic, CreateDuplicateTopicThrows) {
     RecordProperty("description", "Rejects creating a duplicate topic within the same stream.");
     const std::string stream_name = "cpp-create-duplicate-topic";
     const std::string topic_name  = "topic-duplicate";
@@ -162,7 +164,7 @@ TEST_F(E2ETestFixture, CreateDuplicateTopicThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, CreateSameTopicNameInDifferentStreamsSucceeds) {
+TEST_F(LowLevelE2E_Topic, CreateSameTopicNameInDifferentStreamsSucceeds) {
     RecordProperty("description", "Allows the same topic name to be created in different streams.");
     const std::string first_stream_name  = "cpp-create-topic-same-name-stream-a";
     const std::string second_stream_name = "cpp-create-topic-same-name-stream-b";
@@ -181,7 +183,7 @@ TEST_F(E2ETestFixture, CreateSameTopicNameInDifferentStreamsSucceeds) {
                                          "server_default", 0, "server_default"));
 }
 
-TEST_F(E2ETestFixture, CreateTopicWithInvalidOptionsThrows) {
+TEST_F(LowLevelE2E_Topic, CreateTopicWithInvalidOptionsThrows) {
     RecordProperty("description", "Rejects topic creation requests that use invalid option values.");
     const std::string stream_name = "cpp-create-topic-invalid-options";
 
@@ -201,7 +203,7 @@ TEST_F(E2ETestFixture, CreateTopicWithInvalidOptionsThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, CreateTopicWithMaxTopicSizeBelowSegmentSizeThrows) {
+TEST_F(LowLevelE2E_Topic, CreateTopicWithMaxTopicSizeBelowSegmentSizeThrows) {
     RecordProperty("description",
                    "Rejects topic creation when the maximum topic size is smaller than the segment size.");
     const std::string stream_name = "cpp-create-topic-below-segment-size";
@@ -215,7 +217,7 @@ TEST_F(E2ETestFixture, CreateTopicWithMaxTopicSizeBelowSegmentSizeThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, CreateTopicOnNonExistentStreamThrows) {
+TEST_F(LowLevelE2E_Topic, CreateTopicOnNonExistentStreamThrows) {
     RecordProperty("description", "Throws when creating a topic on a stream that does not exist.");
     const std::string stream_name = "cpp-create-topic-non-existent-stream";
 
@@ -226,7 +228,7 @@ TEST_F(E2ETestFixture, CreateTopicOnNonExistentStreamThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, CreateTopicAfterStreamDeletionThrows) {
+TEST_F(LowLevelE2E_Topic, CreateTopicAfterStreamDeletionThrows) {
     RecordProperty("description", "Throws when creating a topic after its stream has been deleted.");
     const std::string stream_name = "cpp-create-topic-after-stream-deletion";
 
@@ -235,13 +237,14 @@ TEST_F(E2ETestFixture, CreateTopicAfterStreamDeletionThrows) {
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ForgetTrackedStream(stream_name);
 
     ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), "topic-after-stream-deletion", 1, "none", 0,
                                       "server_default", 0, "server_default"),
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, CreateTopicWithInvalidStreamIdentifierThrows) {
+TEST_F(LowLevelE2E_Topic, CreateTopicWithInvalidStreamIdentifierThrows) {
     RecordProperty("description", "Rejects topic creation requests that use invalid stream identifier formats.");
     const std::string stream_name = "cpp-create-topic-invalid-stream-identifier";
 
@@ -267,7 +270,7 @@ TEST_F(E2ETestFixture, CreateTopicWithInvalidStreamIdentifierThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, CreateTopicBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Topic, CreateTopicBeforeLoginThrows) {
     RecordProperty("description", "Throws when topic creation is attempted from an unauthenticated client.");
     const std::string stream_name = "cpp-create-topic-before-login";
     const std::string topic_name  = "topic-before-login";

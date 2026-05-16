@@ -25,7 +25,9 @@
 #include "lib.rs.h"
 #include "tests/common/test_helpers.hpp"
 
-TEST_F(E2ETestFixture, SendAndPollMessagesRoundTrip) {
+class LowLevelE2E_Message : public E2ETestFixture {};
+
+TEST_F(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
     RecordProperty("description", "Sends 10 messages and polls them back, verifying count, offsets, and payloads.");
     const std::string stream_name = "cpp-msg-roundtrip";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -59,7 +61,7 @@ TEST_F(E2ETestFixture, SendAndPollMessagesRoundTrip) {
     }
 }
 
-TEST_F(E2ETestFixture, PollMessagesVerifyMessageIds) {
+TEST_F(LowLevelE2E_Message, PollMessagesVerifyMessageIds) {
     RecordProperty("description", "Verifies that polled message IDs match the sent IDs.");
     const std::string stream_name = "cpp-msg-verify-ids";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -87,7 +89,7 @@ TEST_F(E2ETestFixture, PollMessagesVerifyMessageIds) {
     ASSERT_EQ(polled.messages[0].id_hi, 0u);
 }
 
-TEST_F(E2ETestFixture, PollMessagesFromEmptyPartition) {
+TEST_F(LowLevelE2E_Message, PollMessagesFromEmptyPartition) {
     RecordProperty("description", "Verifies polling from an empty partition returns zero messages.");
     const std::string stream_name = "cpp-msg-empty-poll";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -105,7 +107,7 @@ TEST_F(E2ETestFixture, PollMessagesFromEmptyPartition) {
     ASSERT_EQ(polled.messages.size(), 0u);
 }
 
-TEST_F(E2ETestFixture, SendMessagesBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Message, SendMessagesBeforeLoginThrows) {
     RecordProperty("description", "Verifies send_messages throws when not authenticated.");
     iggy::ffi::Client *client = GetLoggedOutClient();
     ASSERT_NO_THROW(client->connect());
@@ -119,7 +121,7 @@ TEST_F(E2ETestFixture, SendMessagesBeforeLoginThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, SendMessagesWithInvalidStreamId) {
+TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidStreamId) {
     RecordProperty("description", "Throws when sending messages with an invalid stream identifier.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -136,7 +138,7 @@ TEST_F(E2ETestFixture, SendMessagesWithInvalidStreamId) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, SendMessagesToNonExistentStream) {
+TEST_F(LowLevelE2E_Message, SendMessagesToNonExistentStream) {
     RecordProperty("description", "Throws when sending messages to a non-existent stream.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -149,7 +151,7 @@ TEST_F(E2ETestFixture, SendMessagesToNonExistentStream) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, SendMessagesWithInvalidPartitioningKind) {
+TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidPartitioningKind) {
     RecordProperty("description", "Throws when sending messages with an invalid partitioning kind.");
     const std::string stream_name = "cpp-msg-invalid-part-kind";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -169,7 +171,7 @@ TEST_F(E2ETestFixture, SendMessagesWithInvalidPartitioningKind) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, SendMessagesWithInvalidPartitioningValue) {
+TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidPartitioningValue) {
     RecordProperty("description", "Throws when sending messages with insufficient partitioning value bytes.");
     const std::string stream_name = "cpp-msg-invalid-part-val";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -193,7 +195,7 @@ TEST_F(E2ETestFixture, SendMessagesWithInvalidPartitioningValue) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, SendMessagesToSpecificPartitionVerified) {
+TEST_F(LowLevelE2E_Message, SendMessagesToSpecificPartitionVerified) {
     RecordProperty("description",
                    "Verifies messages sent to a specific partition are only retrievable from that partition.");
     const std::string stream_name = "cpp-msg-specific-part";
@@ -225,7 +227,7 @@ TEST_F(E2ETestFixture, SendMessagesToSpecificPartitionVerified) {
     ASSERT_EQ(polled_part1.count, 0u);
 }
 
-TEST_F(E2ETestFixture, SendEmptyMessageVectorThrows) {
+TEST_F(LowLevelE2E_Message, SendEmptyMessageVectorThrows) {
     RecordProperty("description", "Throws when sending an empty message vector.");
     const std::string stream_name = "cpp-msg-empty-vec";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -243,7 +245,7 @@ TEST_F(E2ETestFixture, SendEmptyMessageVectorThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, SendMessageWithEmptyPayloadThrows) {
+TEST_F(LowLevelE2E_Message, SendMessageWithEmptyPayloadThrows) {
     RecordProperty("description", "Throws when sending a message with an empty payload.");
     const std::string stream_name = "cpp-msg-empty-payload";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -264,7 +266,7 @@ TEST_F(E2ETestFixture, SendMessageWithEmptyPayloadThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, SendMessageWithOversizedPayloadThrows) {
+TEST_F(LowLevelE2E_Message, SendMessageWithOversizedPayloadThrows) {
     RecordProperty("description", "Throws when sending a message exceeding maximum payload size.");
     const std::string stream_name = "cpp-msg-oversized";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -292,7 +294,7 @@ TEST_F(E2ETestFixture, SendMessageWithOversizedPayloadThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, SendMessagesPreservesOrder) {
+TEST_F(LowLevelE2E_Message, SendMessagesPreservesOrder) {
     RecordProperty("description", "Verifies messages are stored and retrieved in the order they were sent.");
     const std::string stream_name = "cpp-msg-order";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -324,7 +326,7 @@ TEST_F(E2ETestFixture, SendMessagesPreservesOrder) {
     }
 }
 
-TEST_F(E2ETestFixture, SendMessagesWithDuplicateIds) {
+TEST_F(LowLevelE2E_Message, SendMessagesWithDuplicateIds) {
     RecordProperty("description", "Verifies sending multiple messages with the same ID succeeds.");
     const std::string stream_name = "cpp-msg-dup-ids";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -355,7 +357,7 @@ TEST_F(E2ETestFixture, SendMessagesWithDuplicateIds) {
     }
 }
 
-TEST_F(E2ETestFixture, SendMessagesWithVariousPayloads) {
+TEST_F(LowLevelE2E_Message, SendMessagesWithVariousPayloads) {
     RecordProperty("description",
                    "Verifies various payload types including null bytes, UTF-8, and binary data are preserved.");
     const std::string stream_name = "cpp-msg-various-payloads";
@@ -420,7 +422,7 @@ TEST_F(E2ETestFixture, SendMessagesWithVariousPayloads) {
     EXPECT_EQ(polled.messages[3].payload[3], 0xEF);
 }
 
-TEST_F(E2ETestFixture, PollMessagesBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Message, PollMessagesBeforeLoginThrows) {
     RecordProperty("description", "Throws when polling messages before authentication.");
     iggy::ffi::Client *client = GetLoggedOutClient();
     ASSERT_NO_THROW(client->connect());
@@ -430,7 +432,7 @@ TEST_F(E2ETestFixture, PollMessagesBeforeLoginThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, PollMessagesWithInvalidStreamIdThrows) {
+TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidStreamIdThrows) {
     RecordProperty("description", "Throws when polling messages with an invalid stream identifier.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -443,7 +445,7 @@ TEST_F(E2ETestFixture, PollMessagesWithInvalidStreamIdThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, PollMessagesFromNonExistentStreamThrows) {
+TEST_F(LowLevelE2E_Message, PollMessagesFromNonExistentStreamThrows) {
     RecordProperty("description", "Throws when polling messages from a non-existent stream.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -452,7 +454,7 @@ TEST_F(E2ETestFixture, PollMessagesFromNonExistentStreamThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, PollMessagesWithInvalidConsumerKindThrows) {
+TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidConsumerKindThrows) {
     RecordProperty("description", "Throws when polling messages with an invalid consumer kind.");
     const std::string stream_name = "cpp-msg-invalid-consumer";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -468,7 +470,7 @@ TEST_F(E2ETestFixture, PollMessagesWithInvalidConsumerKindThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, PollMessagesWithInvalidStrategyKindThrows) {
+TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidStrategyKindThrows) {
     RecordProperty("description", "Throws when polling messages with an invalid polling strategy kind.");
     const std::string stream_name = "cpp-msg-invalid-strategy";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -484,7 +486,7 @@ TEST_F(E2ETestFixture, PollMessagesWithInvalidStrategyKindThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, PollMessagesCountLessThanAvailable) {
+TEST_F(LowLevelE2E_Message, PollMessagesCountLessThanAvailable) {
     RecordProperty("description", "Returns only the requested count when fewer messages are requested than available.");
     const std::string stream_name = "cpp-msg-count-less";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -511,7 +513,7 @@ TEST_F(E2ETestFixture, PollMessagesCountLessThanAvailable) {
     ASSERT_EQ(polled.messages.size(), 5u);
 }
 
-TEST_F(E2ETestFixture, PollMessagesWithLargeOffset) {
+TEST_F(LowLevelE2E_Message, PollMessagesWithLargeOffset) {
     RecordProperty("description", "Returns zero messages when polling with an offset beyond available messages.");
     const std::string stream_name = "cpp-msg-large-offset";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -538,7 +540,7 @@ TEST_F(E2ETestFixture, PollMessagesWithLargeOffset) {
     ASSERT_EQ(polled.messages.size(), 0u);
 }
 
-TEST_F(E2ETestFixture, PollMessagesFirstStrategy) {
+TEST_F(LowLevelE2E_Message, PollMessagesFirstStrategy) {
     RecordProperty("description", "Verifies first polling strategy returns messages from the beginning.");
     const std::string stream_name = "cpp-msg-first-strategy";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -572,7 +574,7 @@ TEST_F(E2ETestFixture, PollMessagesFirstStrategy) {
     }
 }
 
-TEST_F(E2ETestFixture, PollMessagesLastStrategy) {
+TEST_F(LowLevelE2E_Message, PollMessagesLastStrategy) {
     RecordProperty("description", "Verifies last polling strategy returns messages from the end.");
     const std::string stream_name = "cpp-msg-last-strategy";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -606,7 +608,7 @@ TEST_F(E2ETestFixture, PollMessagesLastStrategy) {
     }
 }
 
-TEST_F(E2ETestFixture, PollMessagesNextStrategyNoAutoCommit) {
+TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyNoAutoCommit) {
     RecordProperty("description",
                    "Verifies next strategy without auto-commit returns the same messages on repeated calls.");
     const std::string stream_name = "cpp-msg-next-no-commit";
@@ -648,7 +650,7 @@ TEST_F(E2ETestFixture, PollMessagesNextStrategyNoAutoCommit) {
     }
 }
 
-TEST_F(E2ETestFixture, PollMessagesNextStrategyAutoCommit) {
+TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyAutoCommit) {
     RecordProperty("description", "Verifies next strategy with auto-commit advances the offset on subsequent polls.");
     const std::string stream_name = "cpp-msg-next-auto-commit";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -695,7 +697,7 @@ TEST_F(E2ETestFixture, PollMessagesNextStrategyAutoCommit) {
     ASSERT_EQ(polled3.count, 0u);
 }
 
-TEST_F(E2ETestFixture, PollMessagesConsumerIdIndependence) {
+TEST_F(LowLevelE2E_Message, PollMessagesConsumerIdIndependence) {
     RecordProperty("description", "Verifies different consumer IDs maintain independent offsets.");
     const std::string stream_name = "cpp-msg-consumer-indep";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -728,7 +730,7 @@ TEST_F(E2ETestFixture, PollMessagesConsumerIdIndependence) {
     ASSERT_EQ(polled_c1_again.count, 2u);
 }
 
-TEST_F(E2ETestFixture, PollMessagesMultipleSendsThenPollOrder) {
+TEST_F(LowLevelE2E_Message, PollMessagesMultipleSendsThenPollOrder) {
     RecordProperty("description", "Verifies message ordering is preserved across multiple send batches.");
     const std::string stream_name = "cpp-msg-multi-batch-order";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -774,7 +776,7 @@ TEST_F(E2ETestFixture, PollMessagesMultipleSendsThenPollOrder) {
     }
 }
 
-TEST_F(E2ETestFixture, PollMessagesMultipleCustomIds) {
+TEST_F(LowLevelE2E_Message, PollMessagesMultipleCustomIds) {
     RecordProperty("description", "Verifies multiple messages with distinct custom IDs are all preserved.");
     const std::string stream_name = "cpp-msg-multi-custom-ids";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -807,7 +809,7 @@ TEST_F(E2ETestFixture, PollMessagesMultipleCustomIds) {
     }
 }
 
-TEST_F(E2ETestFixture, PollMessagesAfterStreamDeletedThrows) {
+TEST_F(LowLevelE2E_Message, PollMessagesAfterStreamDeletedThrows) {
     RecordProperty("description", "Throws when polling messages after the stream has been deleted.");
     const std::string stream_name = "cpp-msg-deleted-stream";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -827,13 +829,14 @@ TEST_F(E2ETestFixture, PollMessagesAfterStreamDeletedThrows) {
 
     std::uint32_t saved_stream_id = stream.id;
     client->delete_stream(make_numeric_identifier(saved_stream_id));
+    ForgetTrackedStream(saved_stream_id);
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(saved_stream_id), make_numeric_identifier(0), 0,
                                        "consumer", make_numeric_identifier(1), "offset", 0, 10, false),
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, PollMessagesWithInvalidPartitionIdThrows) {
+TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidPartitionIdThrows) {
     RecordProperty("description", "Throws when polling with a non-existent partition ID.");
     const std::string stream_name = "cpp-msg-invalid-partition";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -849,7 +852,7 @@ TEST_F(E2ETestFixture, PollMessagesWithInvalidPartitionIdThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, PollMessagesWithCountZeroThrows) {
+TEST_F(LowLevelE2E_Message, PollMessagesWithCountZeroThrows) {
     RecordProperty("description", "Throws when polling with count=0.");
     const std::string stream_name = "cpp-msg-count-zero";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -865,7 +868,7 @@ TEST_F(E2ETestFixture, PollMessagesWithCountZeroThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, PollMessagesWithoutSpecifyingPartition) {
+TEST_F(LowLevelE2E_Message, PollMessagesWithoutSpecifyingPartition) {
     RecordProperty("description",
                    "Verifies polling with partition_id=u32::MAX defaults to partition 0 and returns messages.");
     const std::string stream_name = "cpp-msg-no-partition";
@@ -900,7 +903,7 @@ TEST_F(E2ETestFixture, PollMessagesWithoutSpecifyingPartition) {
     }
 }
 
-TEST_F(E2ETestFixture, PollMessagesTimestampStrategy) {
+TEST_F(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
     RecordProperty("description",
                    "Verifies timestamp polling strategy returns messages with timestamp >= the specified value.");
     const std::string stream_name = "cpp-msg-timestamp-strategy";
@@ -960,7 +963,7 @@ TEST_F(E2ETestFixture, PollMessagesTimestampStrategy) {
     }
 }
 
-TEST_F(E2ETestFixture, PollMessagesMonotonicOffsets) {
+TEST_F(LowLevelE2E_Message, PollMessagesMonotonicOffsets) {
     RecordProperty("description",
                    "Verifies offsets are monotonically increasing and continuous across multiple polls.");
     const std::string stream_name = "cpp-msg-monotonic-offsets";
@@ -998,7 +1001,7 @@ TEST_F(E2ETestFixture, PollMessagesMonotonicOffsets) {
     ASSERT_EQ(expected_offset, 20u);
 }
 
-TEST_F(E2ETestFixture, SendMessagesLargeBatch) {
+TEST_F(LowLevelE2E_Message, SendMessagesLargeBatch) {
     RecordProperty("description", "Verifies sending a large batch of 1000 messages succeeds and all are retrievable.");
     const std::string stream_name = "cpp-msg-large-batch";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -1027,7 +1030,7 @@ TEST_F(E2ETestFixture, SendMessagesLargeBatch) {
     EXPECT_EQ(polled.messages[999].offset, 999u);
 }
 
-TEST_F(E2ETestFixture, SendMessagesWithInvalidTopicIdThrows) {
+TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidTopicIdThrows) {
     RecordProperty("description", "Throws when sending messages with an invalid topic identifier.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -1044,7 +1047,7 @@ TEST_F(E2ETestFixture, SendMessagesWithInvalidTopicIdThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, PollMessagesWithInvalidTopicIdThrows) {
+TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidTopicIdThrows) {
     RecordProperty("description", "Throws when polling messages with an invalid topic identifier.");
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -1057,7 +1060,7 @@ TEST_F(E2ETestFixture, PollMessagesWithInvalidTopicIdThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, PollMessagesWithInvalidConsumerIdThrows) {
+TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidConsumerIdThrows) {
     RecordProperty("description", "Throws when polling messages with an invalid consumer identifier.");
     const std::string stream_name = "cpp-msg-invalid-consumer-id";
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -1077,7 +1080,7 @@ TEST_F(E2ETestFixture, PollMessagesWithInvalidConsumerIdThrows) {
                  std::exception);
 }
 
-TEST_F(E2ETestFixture, ConsumerGroupCreateJoinAndPollMessages) {
+TEST_F(LowLevelE2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
     RecordProperty("description",
                    "Creates a consumer group, joins it, sends messages, and polls them using consumer_group kind.");
     const std::string stream_name = "cpp-msg-consumer-group";
