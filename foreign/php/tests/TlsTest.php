@@ -21,13 +21,15 @@
 
 declare(strict_types=1);
 
-final class TlsTest
+use PHPUnit\Framework\TestCase;
+
+final class TlsTest extends TestCase
 {
     public function testConnectionStringWithTlsParams(): void
     {
         $connectionString = getenv('IGGY_TLS_CONNECTION_STRING');
         if ($connectionString === false || $connectionString === '') {
-            throw new SkippedTest('set IGGY_TLS_CONNECTION_STRING to run TLS tests');
+            $this->markTestSkipped('set IGGY_TLS_CONNECTION_STRING to run TLS tests');
         }
 
         $client = IggyClient::fromConnectionString($connectionString);
@@ -39,7 +41,7 @@ final class TlsTest
     {
         $connectionString = getenv('IGGY_TLS_CONNECTION_STRING');
         if ($connectionString === false || $connectionString === '') {
-            throw new SkippedTest('set IGGY_TLS_CONNECTION_STRING to run TLS tests');
+            $this->markTestSkipped('set IGGY_TLS_CONNECTION_STRING to run TLS tests');
         }
 
         $client = IggyClient::fromConnectionString($connectionString);
@@ -68,15 +70,10 @@ final class TlsTest
     {
         $address = getenv('IGGY_TLS_PLAINTEXT_ADDRESS');
         if ($address === false || $address === '') {
-            throw new SkippedTest('set IGGY_TLS_PLAINTEXT_ADDRESS to run this TLS failure test');
+            $this->markTestSkipped('set IGGY_TLS_PLAINTEXT_ADDRESS to run this TLS failure test');
         }
 
         $client = new IggyClient($address);
         assert_throws(static fn () => $client->connect());
     }
 }
-
-final class SkippedTest extends RuntimeException
-{
-}
-

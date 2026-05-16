@@ -21,7 +21,9 @@
 
 declare(strict_types=1);
 
-final class IggySdkTest
+use PHPUnit\Framework\TestCase;
+
+final class IggySdkTest extends TestCase
 {
     public function testPing(): void
     {
@@ -97,38 +99,14 @@ final class IggySdkTest
         assert_same(1, $topic->partitions_count);
     }
 
-    public function testSendAndPollMessages(): void
+    public function testSendAndPollBinaryMessages(): void
     {
         $client = new_client();
         $streamName = unique_name('msg-stream');
         $topicName = unique_name('msg-topic');
         $partitionId = 0;
         $messages = array_map(
-            static fn (int $i): string => "Test message {$i} - {$streamName}",
-            range(1, 3),
-        );
-
-        create_stream_and_topic($client, $streamName, $topicName);
-        $client->sendMessages(
-            $streamName,
-            $topicName,
-            $partitionId,
-            array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
-        );
-
-        $polled = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::first(), 10, true);
-        assert_true(count($polled) >= count($messages), 'expected at least the sent messages');
-        assert_same($messages, array_slice(collect_payloads($polled), 0, count($messages)));
-    }
-
-    public function testSendAndPollMessagesAsBytes(): void
-    {
-        $client = new_client();
-        $streamName = unique_name('msg-stream');
-        $topicName = unique_name('msg-topic');
-        $partitionId = 0;
-        $messages = array_map(
-            static fn (int $i): string => "Binary message {$i} - {$streamName}",
+            static fn (int $i): string => random_bytes(16) . pack('C*', 0, $i, 255),
             range(1, 3),
         );
 
@@ -314,51 +292,4 @@ final class IggySdkTest
         assert_same($messages, $received);
     }
 
-    public function testIterMessages(): void
-    {
-        $client = new_client();
-        $consumerName = unique_name('consumer-group-consumer');
-        $streamName = unique_name('consumer-group-stream');
-        $topicName = unique_name('consumer-group-topic');
-        $partitionId = 0;
-        $messages = array_map(
-            static fn (int $i): string => "Iterator test {$i} - {$streamName}",
-            range(0, 4),
-        );
-
-        create_stream_and_topic($client, $streamName, $topicName);
-        $client->sendMessages(
-            $streamName,
-            $topicName,
-            $partitionId,
-            array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
-        );
-
-        $consumer = $client->consumerGroup(
-            $consumerName,
-            $streamName,
-            $topicName,
-            $partitionId,
-            PollingStrategy::next(),
-            10,
-            AutoCommit::interval(micros(5)),
-            true,
-            true,
-            micros(1),
-            null,
-            null,
-            null,
-            false,
-        );
-
-        $iterator = $consumer->iterMessages();
-        $received = [];
-        while (count($received) < count($messages)) {
-            $message = $iterator->next();
-            assert_not_null($message);
-            $received[] = $message->payload();
-        }
-
-        assert_same($messages, $received);
-    }
 }

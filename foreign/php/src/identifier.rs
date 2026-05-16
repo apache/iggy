@@ -18,7 +18,12 @@
 
 use std::str::FromStr;
 
-use ext_php_rs::{convert::FromZval, flags::DataType, types::Zval};
+use ext_php_rs::{
+    convert::FromZval,
+    exception::{PhpException, PhpResult},
+    flags::DataType,
+    types::Zval,
+};
 use iggy::prelude::{IdKind, Identifier};
 
 pub enum PhpIdentifier {
@@ -40,20 +45,29 @@ impl FromZval<'_> for PhpIdentifier {
     }
 }
 
-impl From<PhpIdentifier> for Identifier {
-    fn from(identifier: PhpIdentifier) -> Self {
-        match identifier {
-            PhpIdentifier::String(value) => Identifier::from_str(&value).unwrap(),
-            PhpIdentifier::Int(value) => Identifier::numeric(value).unwrap(),
+impl PhpIdentifier {
+    pub(crate) fn into_identifier(self) -> PhpResult<Identifier> {
+        match self {
+            PhpIdentifier::String(value) => Identifier::from_str(&value),
+            PhpIdentifier::Int(value) => Identifier::numeric(value),
         }
+        .map_err(|err| PhpException::default(err.to_string()))
     }
 }
 
-impl From<&Identifier> for PhpIdentifier {
-    fn from(value: &Identifier) -> PhpIdentifier {
+impl TryFrom<&Identifier> for PhpIdentifier {
+    type Error = PhpException;
+
+    fn try_from(value: &Identifier) -> Result<Self, Self::Error> {
         match value.kind {
-            IdKind::String => PhpIdentifier::String(value.get_string_value().unwrap()),
-            IdKind::Numeric => PhpIdentifier::Int(value.get_u32_value().unwrap()),
+            IdKind::String => value
+                .get_string_value()
+                .map(PhpIdentifier::String)
+                .map_err(|err| PhpException::default(err.to_string())),
+            IdKind::Numeric => value
+                .get_u32_value()
+                .map(PhpIdentifier::Int)
+                .map_err(|err| PhpException::default(err.to_string())),
         }
     }
 }

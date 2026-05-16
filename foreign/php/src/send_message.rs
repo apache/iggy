@@ -58,7 +58,13 @@ impl SendMessage {
     /// PHP strings are byte strings, so this accepts both text and binary payloads.
     #[php(constructor)]
     pub fn __construct(data: Binary<u8>) -> PhpResult<Self> {
-        Self::from_payload(Vec::from(data))
+        // `Binary` already owns the PHP string bytes; `Bytes::from(Vec<_>)` reuses that buffer.
+        let inner = RustIggyMessage::builder()
+            .payload(Bytes::from(Vec::<u8>::from(data)))
+            .build()
+            .map_err(|err| PhpException::default(err.to_string()))?;
+
+        Ok(Self { inner })
     }
 
     #[php(getter)]
@@ -69,16 +75,5 @@ impl SendMessage {
     #[php(getter)]
     pub fn payload(&self) -> Binary<u8> {
         Binary::new(self.inner.payload.to_vec())
-    }
-}
-
-impl SendMessage {
-    fn from_payload(payload: Vec<u8>) -> PhpResult<Self> {
-        let inner = RustIggyMessage::builder()
-            .payload(Bytes::from(payload))
-            .build()
-            .map_err(|err| PhpException::default(err.to_string()))?;
-
-        Ok(Self { inner })
     }
 }

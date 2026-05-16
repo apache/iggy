@@ -3,7 +3,10 @@
     "description": "PHP extension bindings for Apache Iggy.",
     "license": "Apache-2.0",
     "type": "library",
+    "require-dev": {
+        "phpunit/phpunit": "^10.5"
+    },
     "scripts": {
-        "test": "php tests/run.php"
+        "test": "phpunit"
     }
 }

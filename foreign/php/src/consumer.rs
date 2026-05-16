@@ -23,13 +23,15 @@ use ext_php_rs::{
     php_class, php_impl,
     types::ZendCallable,
 };
+use futures::StreamExt;
 use iggy::prelude::{
     AutoCommit as RustAutoCommit, AutoCommitAfter as RustAutoCommitAfter,
     AutoCommitWhen as RustAutoCommitWhen, IggyConsumer as RustIggyConsumer, IggyDuration,
 };
 use tokio::sync::Mutex;
 
-use crate::iterator::ReceiveMessageIterator;
+use crate::receive_message::ReceiveMessage;
+use crate::runtime::runtime;
 
 /// A PHP class representing the Iggy consumer.
 #[php_class]
@@ -41,36 +43,32 @@ pub struct IggyConsumer {
 impl IggyConsumer {
     /// Get the last consumed offset or null if no offset has been consumed yet.
     pub fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
-        self.inner
-            .blocking_lock()
-            .get_last_consumed_offset(partition_id)
+        self.with_consumer(|inner| inner.get_last_consumed_offset(partition_id))
     }
 
     /// Get the last stored offset or null if no offset has been stored yet.
     pub fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
-        self.inner
-            .blocking_lock()
-            .get_last_stored_offset(partition_id)
+        self.with_consumer(|inner| inner.get_last_stored_offset(partition_id))
     }
 
     /// Gets the name of the consumer group.
     pub fn name(&self) -> String {
-        self.inner.blocking_lock().name().to_string()
+        self.with_consumer(|inner| inner.name().to_string())
     }
 
     /// Gets the current partition id or 0 if no messages have been polled yet.
     pub fn partition_id(&self) -> u32 {
-        self.inner.blocking_lock().partition_id()
+        self.with_consumer(RustIggyConsumer::partition_id)
     }
 
     /// Gets the stream identifier this consumer is configured for.
     pub fn stream(&self) -> String {
-        self.inner.blocking_lock().stream().to_string()
+        self.with_consumer(|inner| inner.stream().to_string())
     }
 
     /// Gets the topic identifier this consumer is configured for.
     pub fn topic(&self) -> String {
-        self.inner.blocking_lock().topic().to_string()
+        self.with_consumer(|inner| inner.topic().to_string())
     }
 
     /// Stores the provided offset for the provided partition id.
@@ -105,13 +103,6 @@ impl IggyConsumer {
         })
     }
 
-    /// Returns an iterator whose next() method blocks until a message is available.
-    pub fn iter_messages(&self) -> ReceiveMessageIterator {
-        ReceiveMessageIterator {
-            inner: self.inner.clone(),
-        }
-    }
-
     /// Consumes messages with a PHP callback.
     ///
     /// The callback is called as callback(ReceiveMessage $message). If limit is null,
@@ -121,7 +112,7 @@ impl IggyConsumer {
         let max_messages = limit.unwrap_or(u32::MAX);
 
         while consumed < max_messages {
-            let Some(message) = self.iter_messages().next()? else {
+            let Some(message) = self.next_message()? else {
                 break;
             };
 
@@ -132,6 +123,34 @@ impl IggyConsumer {
         }
 
         Ok(consumed)
+    }
+}
+
+impl IggyConsumer {
+    fn with_consumer<T>(&self, f: impl FnOnce(&RustIggyConsumer) -> T) -> T {
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            let inner = inner.lock().await;
+            f(&inner)
+        })
+    }
+
+    fn next_message(&self) -> PhpResult<Option<ReceiveMessage>> {
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            let mut inner = inner.lock().await;
+
+            match inner.next().await {
+                Some(Ok(message)) => Ok(Some(ReceiveMessage {
+                    inner: message.message,
+                    partition_id: message.partition_id,
+                })),
+                Some(Err(err)) => Err(PhpException::default(err.to_string())),
+                None => Ok(None),
+            }
+        })
     }
 }
 
@@ -266,15 +285,4 @@ impl From<&AutoCommitAfter> for RustAutoCommitAfter {
 
 fn iggy_duration_from_micros(micros: u64) -> IggyDuration {
     IggyDuration::new(Duration::from_micros(micros))
-}
-
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("failed to initialize Tokio runtime")
-    })
 }

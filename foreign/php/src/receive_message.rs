@@ -21,9 +21,9 @@ use iggy::prelude::{
     IggyMessage as RustReceiveMessage, IggyMessageHeader, PollingStrategy as RustPollingStrategy,
 };
 
-/// A Python class representing a received message.
+/// A PHP class representing a received message.
 ///
-/// This class wraps a Rust message, allowing for access to its payload and offset from Python.
+/// This class wraps a Rust message, allowing PHP code to access its payload and metadata.
 #[php_class]
 pub struct ReceiveMessage {
     pub(crate) inner: RustReceiveMessage,

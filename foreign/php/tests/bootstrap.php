@@ -21,37 +21,26 @@
 
 declare(strict_types=1);
 
-final class TestFailure extends RuntimeException
-{
-}
+use PHPUnit\Framework\Assert;
 
 function assert_true(bool $condition, string $message = 'expected condition to be true'): void
 {
-    if (!$condition) {
-        throw new TestFailure($message);
-    }
+    Assert::assertTrue($condition, $message);
 }
 
 function assert_same(mixed $expected, mixed $actual, string $message = ''): void
 {
-    if ($expected !== $actual) {
-        $message = $message !== '' ? $message . ': ' : '';
-        throw new TestFailure($message . 'expected ' . var_export($expected, true) . ', got ' . var_export($actual, true));
-    }
+    Assert::assertSame($expected, $actual, $message);
 }
 
 function assert_not_null(mixed $value, string $message = 'expected value not to be null'): void
 {
-    if ($value === null) {
-        throw new TestFailure($message);
-    }
+    Assert::assertNotNull($value, $message);
 }
 
 function assert_null(mixed $value, string $message = 'expected value to be null'): void
 {
-    if ($value !== null) {
-        throw new TestFailure($message . ', got ' . var_export($value, true));
-    }
+    Assert::assertNull($value, $message);
 }
 
 function assert_throws(callable $callback, ?string $messageContains = null): Throwable
@@ -60,7 +49,7 @@ function assert_throws(callable $callback, ?string $messageContains = null): Thr
         $callback();
     } catch (Throwable $throwable) {
         if ($messageContains !== null && !str_contains($throwable->getMessage(), $messageContains)) {
-            throw new TestFailure(
+            Assert::fail(
                 'expected exception message to contain ' . var_export($messageContains, true)
                 . ', got ' . var_export($throwable->getMessage(), true)
             );
@@ -69,7 +58,7 @@ function assert_throws(callable $callback, ?string $messageContains = null): Thr
         return $throwable;
     }
 
-    throw new TestFailure('expected callable to throw');
+    Assert::fail('expected callable to throw');
 }
 
 function unique_name(string $prefix): string
@@ -111,7 +100,7 @@ function wait_for_server(string $host, int $port, int $timeoutSeconds = 30): voi
         usleep(250_000);
     }
 
-    throw new TestFailure("Iggy server was not reachable at {$host}:{$port}" . ($lastError !== null ? " ({$lastError})" : ''));
+    Assert::fail("Iggy server was not reachable at {$host}:{$port}" . ($lastError !== null ? " ({$lastError})" : ''));
 }
 
 function new_client(): IggyClient
@@ -151,3 +140,9 @@ function micros(int $seconds): int
 {
     return $seconds * 1_000_000;
 }
+
+if (!extension_loaded('iggy-php')) {
+    Assert::fail('The iggy-php extension is not loaded.');
+}
+
+wait_for_server(server_host(), server_port());

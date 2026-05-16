@@ -41,4 +41,4 @@ if [ -n "${PHP_IGGY_EXTENSION:-}" ]; then
     PHP_ARGS+=("-d" "extension=${PHP_IGGY_EXTENSION}")
 fi
 
-"${PHP_BIN}" "${PHP_ARGS[@]}" tests/run.php "$@"
+"${PHP_BIN}" "${PHP_ARGS[@]}" vendor/bin/phpunit "$@"

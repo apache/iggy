@@ -24,8 +24,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     clang \
     libclang-dev \
     libssl-dev \
+    composer \
     php-cli \
     php-dev \
+    php-mbstring \
+    php-xml \
     pkg-config \
     unzip \
     && rm -rf /var/lib/apt/lists/*
@@ -42,6 +45,7 @@ COPY core/ ./core/
 
 COPY foreign/php/Cargo.toml ./foreign/php/
 COPY foreign/php/composer.json ./foreign/php/
+COPY foreign/php/phpunit.xml.dist ./foreign/php/
 COPY foreign/php/README.md foreign/php/LICENSE foreign/php/NOTICE ./foreign/php/
 COPY foreign/php/.cargo/ ./foreign/php/.cargo/
 COPY foreign/php/src/ ./foreign/php/src/
@@ -51,7 +55,8 @@ COPY foreign/php/scripts/ ./foreign/php/scripts/
 WORKDIR /workspace/foreign/php
 
 RUN cargo install cargo-php --locked
-RUN cargo php install --release --yes
+RUN composer install --no-interaction --prefer-dist
+RUN cargo php install --yes
 RUN chmod +x ./scripts/test.sh
 
 CMD ["./scripts/test.sh"]

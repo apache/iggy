@@ -11,6 +11,7 @@ synchronous PHP API over the Rust Iggy client.
 - Rust and Cargo
 - PHP with `php-config`
 - `cargo-php`
+- Composer, for installing PHPUnit
 - Docker, for running the integration test server
 
 On macOS with Homebrew PHP:
@@ -109,7 +110,8 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit -
 Run the PHP test suite:
 
 ```sh
-php tests/run.php
+composer install
+composer test
 ```
 
 Run Rust verification:

@@ -23,7 +23,7 @@ use ext_php_rs::{
     php_class, php_impl,
 };
 use iggy::prelude::{
-    CompressionAlgorithm, Consumer as RustConsumer, Identifier, IggyClient as RustIggyClient,
+    CompressionAlgorithm, Consumer as RustConsumer, IggyClient as RustIggyClient,
     IggyClientBuilder, IggyDuration, IggyExpiry, IggyMessage as RustMessage, MaxTopicSize,
     Partitioning, PollingStrategy as RustPollingStrategy, *,
 };
@@ -32,6 +32,7 @@ use tokio::sync::Mutex;
 use crate::consumer::{AutoCommit, IggyConsumer};
 use crate::identifier::PhpIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
+use crate::runtime::runtime;
 use crate::send_message::SendMessage;
 use crate::stream::StreamDetails;
 use crate::topic::TopicDetails;
@@ -108,7 +109,7 @@ impl IggyClient {
 
     /// Gets a stream by id or name.
     pub fn get_stream(&self, stream_id: PhpIdentifier) -> PhpResult<Option<StreamDetails>> {
-        let stream_id = Identifier::from(stream_id);
+        let stream_id = stream_id.into_identifier()?;
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
@@ -142,7 +143,7 @@ impl IggyClient {
             IggyExpiry::ExpireDuration(iggy_duration_from_micros(micros))
         });
         let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
-        let stream = Identifier::from(stream);
+        let stream = stream.into_identifier()?;
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
@@ -168,8 +169,8 @@ impl IggyClient {
         stream_id: PhpIdentifier,
         topic_id: PhpIdentifier,
     ) -> PhpResult<Option<TopicDetails>> {
-        let stream_id = Identifier::from(stream_id);
-        let topic_id = Identifier::from(topic_id);
+        let stream_id = stream_id.into_identifier()?;
+        let topic_id = topic_id.into_identifier()?;
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
@@ -189,8 +190,8 @@ impl IggyClient {
         partition_id: u32,
         messages: Vec<&SendMessage>,
     ) -> PhpResult {
-        let stream = Identifier::from(stream);
-        let topic = Identifier::from(topic);
+        let stream = stream.into_identifier()?;
+        let topic = topic.into_identifier()?;
         let partitioning = Partitioning::partition_id(partition_id);
         let mut messages: Vec<RustMessage> = messages
             .into_iter()
@@ -217,8 +218,8 @@ impl IggyClient {
         auto_commit: bool,
     ) -> PhpResult<Vec<ReceiveMessage>> {
         let consumer = RustConsumer::default();
-        let stream = Identifier::from(stream);
-        let topic = Identifier::from(topic);
+        let stream = stream.into_identifier()?;
+        let topic = topic.into_identifier()?;
         let strategy: RustPollingStrategy = polling_strategy.into();
         let inner = self.inner.clone();
 
@@ -336,15 +337,4 @@ fn to_php_exception(error: impl std::fmt::Display) -> PhpException {
 
 fn iggy_duration_from_micros(micros: u64) -> IggyDuration {
     IggyDuration::new(Duration::from_micros(micros))
-}
-
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("failed to initialize Tokio runtime")
-    })
 }

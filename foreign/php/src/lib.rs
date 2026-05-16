@@ -19,8 +19,8 @@
 pub mod client;
 pub mod consumer;
 pub mod identifier;
-pub mod iterator;
 pub mod receive_message;
+pub mod runtime;
 pub mod send_message;
 pub mod stream;
 pub mod topic;
@@ -29,7 +29,6 @@ use ext_php_rs::prelude::*;
 
 use crate::client::IggyClient;
 use crate::consumer::{AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer};
-use crate::iterator::ReceiveMessageIterator;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
 use crate::stream::StreamDetails;
@@ -43,7 +42,6 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .class::<AutoCommit>()
         .class::<AutoCommitWhen>()
         .class::<AutoCommitAfter>()
-        .class::<ReceiveMessageIterator>()
         .class::<PollingStrategy>()
         .class::<ReceiveMessage>()
         .class::<SendMessage>()
