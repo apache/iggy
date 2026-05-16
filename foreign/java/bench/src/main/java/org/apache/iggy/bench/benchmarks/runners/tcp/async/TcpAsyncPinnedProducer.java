@@ -20,6 +20,7 @@
 package org.apache.iggy.bench.benchmarks.runners.tcp.async;
 
 import org.apache.iggy.bench.benchmarks.actors.tcp.async.TcpAsyncPinnedProducerActor;
+import org.apache.iggy.bench.common.exception.BenchmarkException;
 import org.apache.iggy.bench.common.generator.BenchmarkBatchGenerator;
 import org.apache.iggy.bench.common.provision.ResourceProvisioner;
 import org.apache.iggy.bench.models.cli.GlobalCliArgs;
@@ -43,21 +44,26 @@ public final class TcpAsyncPinnedProducer {
         this.globalCliArgs = globalCliArgs;
         this.pinnedProducerCliArgs = pinnedProducerCliArgs;
         this.resourceProvisioner = resourceProvisioner;
-
-        provisionResources();
-        runBenchmark().join();
     }
 
     public TcpAsyncPinnedProducer(GlobalCliArgs globalCliArgs, PinnedProducerCliArgs pinnedProducerCliArgs) {
         this(globalCliArgs, pinnedProducerCliArgs, new ResourceProvisioner());
     }
 
-    private void provisionResources() {
+    public void provisionResources() {
         this.provisionedResources = resourceProvisioner.provisionResources(globalCliArgs, pinnedProducerCliArgs);
+    }
+
+    public void run() {
+        runBenchmark().join();
     }
 
     private CompletableFuture<Void> runBenchmark() {
         try {
+            if (provisionedResources == null) {
+                throw new BenchmarkException("Benchmark resources must be provisioned before running.");
+            }
+
             String topicName = provisionedResources.topicNames().get(0);
             var batchGenerator =
                     new BenchmarkBatchGenerator(globalCliArgs.messageSize(), globalCliArgs.messagesPerBatch());

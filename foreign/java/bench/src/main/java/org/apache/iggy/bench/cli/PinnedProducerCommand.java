@@ -97,7 +97,9 @@ public final class PinnedProducerCommand implements Callable<Integer> {
             pinnedProducerCliArgs.validate();
 
             log.info("Starting the Pinned Producer benchmark...");
-            new TcpAsyncPinnedProducer(globalCliArgs, pinnedProducerCliArgs);
+            var benchmark = new TcpAsyncPinnedProducer(globalCliArgs, pinnedProducerCliArgs);
+            benchmark.provisionResources();
+            benchmark.run();
 
             return ExitCode.OK;
         } catch (RuntimeException exception) {
