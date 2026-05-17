@@ -115,8 +115,7 @@ func TestSerialize_CreatePersonalAccessToken(t *testing.T) {
 	expected := []byte{
 		0x04,                   // Name length = 4
 		0x74, 0x65, 0x73, 0x74, // "test"
-		0x00, 0x00, 0x00, 0x00, // Expiry high bytes (protocol uses u64, Go writes u32 at end)
-		0x10, 0x0E, 0x00, 0x00, // Expiry low bytes = 3600
+		0x10, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Expiry = 3600 (u64 LE)
 	}
 
 	if !bytes.Equal(serialized, expected) {
@@ -139,8 +138,7 @@ func TestSerialize_CreatePersonalAccessToken_ZeroExpiry(t *testing.T) {
 	expected := []byte{
 		0x05,                         // Name length = 5
 		0x74, 0x6F, 0x6B, 0x65, 0x6E, // "token"
-		0x00, 0x00, 0x00, 0x00, // Expiry high bytes (protocol uses u64, Go writes u32 at end)
-		0x00, 0x00, 0x00, 0x00, // Expiry = 0 (little endian uint32)
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Expiry = 0 (u64 LE)
 	}
 
 	if !bytes.Equal(serialized, expected) {
@@ -148,11 +146,11 @@ func TestSerialize_CreatePersonalAccessToken_ZeroExpiry(t *testing.T) {
 	}
 }
 
-// TestSerialize_CreatePersonalAccessToken_MaxExpiry tests edge case with maximum uint32 expiry
+// TestSerialize_CreatePersonalAccessToken_MaxExpiry tests edge case with maximum uint64 expiry
 func TestSerialize_CreatePersonalAccessToken_MaxExpiry(t *testing.T) {
 	cmd := CreatePersonalAccessToken{
 		Name:   "long_token",
-		Expiry: 4294967295, // Max uint32 value
+		Expiry: 18446744073709551615, // Max uint64 value
 	}
 
 	serialized, err := cmd.MarshalBinary()
@@ -163,8 +161,7 @@ func TestSerialize_CreatePersonalAccessToken_MaxExpiry(t *testing.T) {
 	expected := []byte{
 		0x0A,                                                       // Name length = 10
 		0x6C, 0x6F, 0x6E, 0x67, 0x5F, 0x74, 0x6F, 0x6B, 0x65, 0x6E, // "long_token"
-		0x00, 0x00, 0x00, 0x00, // Expiry high bytes (protocol uses u64, Go writes u32 at end)
-		0xFF, 0xFF, 0xFF, 0xFF, // Expiry = 4294967295 (little endian uint32)
+		0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Expiry = max uint64 (u64 LE)
 	}
 
 	if !bytes.Equal(serialized, expected) {
@@ -185,9 +182,8 @@ func TestSerialize_CreatePersonalAccessToken_EmptyName(t *testing.T) {
 	}
 
 	expected := []byte{
-		0x00,                   // Name length = 0
-		0x00, 0x00, 0x00, 0x00, // Expiry high bytes (protocol uses u64, Go writes u32 at end)
-		0xE8, 0x03, 0x00, 0x00, // Expiry = 1000 (little endian uint32)
+		0x00,                                           // Name length = 0
+		0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Expiry = 1000 (u64 LE)
 	}
 
 	if !bytes.Equal(serialized, expected) {
@@ -215,8 +211,7 @@ func TestSerialize_CreatePersonalAccessToken_LongName(t *testing.T) {
 		0x73, 0x6F, 0x6E, 0x61, 0x6C, 0x5F, 0x61, 0x63,
 		0x63, 0x65, 0x73, 0x73, 0x5F, 0x74, 0x6F, 0x6B,
 		0x65, 0x6E, 0x5F, 0x6E, 0x61, 0x6D, 0x65,
-		0x00, 0x00, 0x00, 0x00, // Expiry high bytes (protocol uses u64, Go writes u32 at end)
-		0x80, 0x51, 0x01, 0x00, // Expiry = 86400 (little endian uint32)
+		0x80, 0x51, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, // Expiry = 86400 (u64 LE)
 	}
 
 	if !bytes.Equal(serialized, expected) {

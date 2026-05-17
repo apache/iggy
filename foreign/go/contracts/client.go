@@ -246,7 +246,7 @@ type Client interface {
 	DeleteUser(identifier Identifier) error
 
 	// CreatePersonalAccessToken create a new personal access token for the currently authenticated user.
-	CreatePersonalAccessToken(name string, expiry uint32) (*RawPersonalAccessToken, error)
+	CreatePersonalAccessToken(name string, expiry uint64) (*RawPersonalAccessToken, error)
 
 	// DeletePersonalAccessToken delete a personal access token of the currently authenticated user by unique token name.
 	DeletePersonalAccessToken(name string) error

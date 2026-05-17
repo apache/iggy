@@ -21,7 +21,7 @@ import "encoding/binary"
 
 type CreatePersonalAccessToken struct {
 	Name   string `json:"Name"`
-	Expiry uint32 `json:"Expiry"`
+	Expiry uint64 `json:"Expiry"`
 }
 
 func (c *CreatePersonalAccessToken) Code() Code {
@@ -33,7 +33,7 @@ func (c *CreatePersonalAccessToken) MarshalBinary() ([]byte, error) {
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(c.Name))
 	copy(bytes[1:], c.Name)
-	binary.LittleEndian.PutUint32(bytes[len(bytes)-4:], c.Expiry)
+	binary.LittleEndian.PutUint64(bytes[1+len(c.Name):], c.Expiry)
 	return bytes, nil
 }
 

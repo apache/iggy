@@ -36,11 +36,10 @@ func (u *UpdateUser) MarshalBinary() ([]byte, error) {
 	}
 	length := len(userIdBytes) + 2
 
-	if u.Username == nil {
-		u.Username = new(string)
+	var username string
+	if u.Username != nil {
+		username = *u.Username
 	}
-
-	username := *u.Username
 
 	if len(username) != 0 {
 		length += 1 + len(username)

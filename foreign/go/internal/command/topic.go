@@ -38,8 +38,9 @@ func (t *CreateTopic) Code() Code {
 }
 
 func (t *CreateTopic) MarshalBinary() ([]byte, error) {
-	if t.ReplicationFactor == nil {
-		t.ReplicationFactor = new(uint8)
+	var replicationFactor uint8
+	if t.ReplicationFactor != nil {
+		replicationFactor = *t.ReplicationFactor
 	}
 
 	streamIdBytes, err := t.StreamId.MarshalBinary()
@@ -81,7 +82,7 @@ func (t *CreateTopic) MarshalBinary() ([]byte, error) {
 	position += 8
 
 	// ReplicationFactor
-	bytes[position] = *t.ReplicationFactor
+	bytes[position] = replicationFactor
 	position++
 
 	// Name
@@ -145,8 +146,9 @@ func (u *UpdateTopic) Code() Code {
 }
 
 func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
-	if u.ReplicationFactor == nil {
-		u.ReplicationFactor = new(uint8)
+	var replicationFactor uint8
+	if u.ReplicationFactor != nil {
+		replicationFactor = *u.ReplicationFactor
 	}
 	streamIdBytes, err := u.StreamId.MarshalBinary()
 	if err != nil {
@@ -173,7 +175,7 @@ func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
 	binary.LittleEndian.PutUint64(buffer[offset:], u.MaxTopicSize)
 	offset += 8
 
-	buffer[offset] = *u.ReplicationFactor
+	buffer[offset] = replicationFactor
 	offset++
 
 	buffer[offset] = uint8(len(u.Name))
