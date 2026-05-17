@@ -591,17 +591,19 @@ async fn process_messages(
         messages.as_ptr(),
         messages.len(),
     );
+
     if status != 0 {
-        return Err(RuntimeError::SinkConsumeFailed {
-            plugin_id,
+        error!(
+            "Sink connector with ID: {plugin_id} failed to consume {processed_count} processed messages \
+             from stream: {}, topic: {}, partition: {}, current offset: {}, schema: {}, status: {}",
+            topic_metadata.stream,
+            topic_metadata.topic,
+            messages_metadata.partition_id,
+            messages_metadata.current_offset,
+            messages_metadata.schema,
             status,
-            stream: topic_metadata.stream.clone(),
-            topic: topic_metadata.topic.clone(),
-            partition_id: messages_metadata.partition_id,
-            current_offset: messages_metadata.current_offset,
-            schema: messages_metadata.schema.to_string(),
-            processed_count,
-        });
+        );
+        return Ok(0);
     }
 
     Ok(processed_count)
@@ -638,11 +640,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_messages_returns_error_when_consume_callback_fails() {
+    async fn process_messages_returns_zero_processed_count_when_consume_callback_fails() {
         let plugin_id = 42;
         let consume: ConsumeCallback = failing_consume;
         let decoder: Arc<dyn StreamDecoder> = Arc::new(TestDecoder);
-        let result = process_messages(
+        let processed_count = process_messages(
             plugin_id,
             MessagesMetadata {
                 partition_id: 1,
@@ -671,20 +673,9 @@ mod tests {
             &Vec::new(),
             &decoder,
         )
-        .await;
+        .await
+        .unwrap();
 
-        assert!(matches!(
-            result,
-            Err(RuntimeError::SinkConsumeFailed {
-                plugin_id: 42,
-                status: 1,
-                stream,
-                topic,
-                partition_id: 1,
-                current_offset: 0,
-                schema,
-                processed_count: 1
-            }) if stream == "stream" && topic == "topic" && schema == "raw"
-        ));
+        assert_eq!(processed_count, 0);
     }
 }
