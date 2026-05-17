@@ -216,7 +216,7 @@ async fn write_data(
             table.metadata().uuid(),
             err
         );
-        Error::CatalogError(err.to_string())
+        Error::TransactionApplyError(err.to_string())
     })?;
 
     let _table = tx.commit(catalog).await.map_err(|err| {
@@ -225,7 +225,7 @@ async fn write_data(
             table.metadata().uuid(),
             err
         );
-        Error::CatalogError(err.to_string())
+        Error::CatalogCommitError(err.to_string())
     })?;
     Ok(())
 }

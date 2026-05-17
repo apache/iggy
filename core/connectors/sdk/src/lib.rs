@@ -433,8 +433,12 @@ pub enum Error {
     /// writer close). Distinct from record-level validation errors.
     #[error("Write failure: {0}")]
     WriteFailure(String),
-    /// A catalog or transaction-level failure (e.g. applying or committing an
-    /// Iceberg transaction). Callers may retry on transient catalog outages.
-    #[error("Catalog error: {0}")]
-    CatalogError(String),
+    /// In-memory transaction preparation failed (e.g. invalid partition spec,
+    /// schema validation). These failures are deterministic and not retryable.
+    #[error("Transaction apply error: {0}")]
+    TransactionApplyError(String),
+    /// A catalog commit failed over the network (e.g. REST catalog I/O,
+    /// conflict). Transient failures may be retried.
+    #[error("Catalog commit error: {0}")]
+    CatalogCommitError(String),
 }
