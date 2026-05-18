@@ -472,17 +472,17 @@ impl Sink for DorisSink {
         for chunk in messages.chunks(batch_size) {
             let json_values: Vec<&simd_json::OwnedValue> = chunk
                 .iter()
-                .filter_map(|m| match &m.payload {
-                    Payload::Json(value) => Some(value),
+                .map(|m| match &m.payload {
+                    Payload::Json(value) => Ok(value),
                     _ => {
-                        warn!(
-                            "Doris sink ID {} dropping non-JSON payload (schema={})",
+                        error!(
+                            "Doris sink ID {} received non-JSON payload (schema={}); aborting batch",
                             self.id, messages_metadata.schema
                         );
-                        None
+                        Err(Error::InvalidPayloadType)
                     }
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
 
             if json_values.is_empty() {
                 continue;
@@ -809,5 +809,74 @@ mod tests {
         let sink = DorisSink::new(1, make_config());
         // base64("root:pw") = cm9vdDpwdw==
         assert_eq!(sink.auth_header.expose_secret(), "Basic cm9vdDpwdw==");
+    }
+
+    fn text_msg(offset: u64) -> ConsumedMessage {
+        ConsumedMessage {
+            id: offset as u128,
+            offset,
+            checksum: 0,
+            timestamp: 0,
+            origin_timestamp: 0,
+            headers: None,
+            payload: Payload::Text("not json".into()),
+        }
+    }
+
+    fn json_msg(offset: u64) -> ConsumedMessage {
+        let mut bytes = br#"{"k":1}"#.to_vec();
+        let value = simd_json::to_owned_value(&mut bytes).unwrap();
+        ConsumedMessage {
+            id: offset as u128,
+            offset,
+            checksum: 0,
+            timestamp: 0,
+            origin_timestamp: 0,
+            headers: None,
+            payload: Payload::Json(value),
+        }
+    }
+
+    fn topic_meta() -> TopicMetadata {
+        TopicMetadata {
+            stream: "events".into(),
+            topic: "orders".into(),
+        }
+    }
+
+    fn messages_meta() -> MessagesMetadata {
+        MessagesMetadata {
+            partition_id: 0,
+            current_offset: 0,
+            schema: iggy_connector_sdk::Schema::Json,
+        }
+    }
+
+    #[tokio::test]
+    async fn consume_aborts_on_first_non_json_payload() {
+        let sink = DorisSink::new(1, make_config());
+        let result = sink
+            .consume(&topic_meta(), messages_meta(), vec![text_msg(0)])
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidPayloadType)),
+            "expected InvalidPayloadType, got {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_aborts_on_non_json_in_mixed_batch() {
+        let sink = DorisSink::new(1, make_config());
+        let result = sink
+            .consume(
+                &topic_meta(),
+                messages_meta(),
+                vec![json_msg(0), text_msg(1)],
+            )
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidPayloadType)),
+            "expected InvalidPayloadType, got {result:?}",
+        );
     }
 }
