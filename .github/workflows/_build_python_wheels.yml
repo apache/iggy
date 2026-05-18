@@ -43,6 +43,9 @@ on:
         description: "Name of the uploaded artifact containing wheels"
         value: ${{ jobs.collect.outputs.artifact_name }}
 
+permissions:
+  contents: read
+
 jobs:
   linux:
     runs-on: ${{ matrix.runner }}

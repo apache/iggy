@@ -53,6 +53,9 @@ on:
         description: "Name of the uploaded artifact containing all artifacts"
         value: ${{ jobs.collect.outputs.artifact_name }}
 
+permissions:
+  contents: read
+
 env:
   IGGY_CI_BUILD: true
 
