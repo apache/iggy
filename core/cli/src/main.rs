@@ -43,6 +43,7 @@ use iggy::prelude::{Aes256GcmEncryptor, Args, EncryptorKind, PersonalAccessToken
 use iggy_cli::commands::binary_context::common::ContextManager;
 use iggy_cli::commands::binary_context::create_context::CreateContextCmd;
 use iggy_cli::commands::binary_context::delete_context::DeleteContextCmd;
+use iggy_cli::commands::binary_context::show_context::ShowContextCmd;
 use iggy_cli::commands::binary_context::use_context::UseContextCmd;
 use iggy_cli::commands::binary_segments::delete_segments::DeleteSegmentsCmd;
 use iggy_cli::commands::binary_system::snapshot::GetSnapshotCmd;
@@ -95,6 +96,8 @@ use tracing::{Level, event};
 
 #[cfg(feature = "login-session")]
 mod main_login_session {
+    pub(crate) use crate::args::session::SessionAction;
+    pub(crate) use iggy_cli::commands::binary_system::session_status::SessionStatusCmd;
     pub(crate) use iggy_cli::commands::binary_system::{login::LoginCmd, logout::LogoutCmd};
     pub(crate) use iggy_cli::commands::utils::login_session_expiry::LoginSessionExpiry;
 }
@@ -337,6 +340,9 @@ fn get_command(
             ContextAction::Delete(delete_args) => {
                 Box::new(DeleteContextCmd::new(delete_args.context_name.clone()))
             }
+            ContextAction::Show(show_args) => {
+                Box::new(ShowContextCmd::new(show_args.context_name.clone()))
+            }
         },
         #[cfg(feature = "login-session")]
         Command::Login(login_args) => Box::new(LoginCmd::new(
@@ -345,6 +351,12 @@ fn get_command(
         )),
         #[cfg(feature = "login-session")]
         Command::Logout => Box::new(LogoutCmd::new(iggy_args.get_server_address().unwrap())),
+        #[cfg(feature = "login-session")]
+        Command::Session(command) => match command {
+            SessionAction::Status => Box::new(SessionStatusCmd::new(
+                iggy_args.get_server_address().unwrap(),
+            )),
+        },
     }
 }
 

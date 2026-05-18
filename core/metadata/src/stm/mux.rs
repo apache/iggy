@@ -46,6 +46,15 @@ where
     }
 }
 
+impl<T> Default for MuxStateMachine<T>
+where
+    T: StateMachine + Default,
+{
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
 impl<T> StateMachine for MuxStateMachine<T>
 where
     T: StateMachine,
@@ -229,6 +238,19 @@ mod tests {
         // Verify restored state
         let mut verify_snapshot = MetadataSnapshot::new(0);
         restored.fill_snapshot(&mut verify_snapshot).unwrap();
+        assert!(verify_snapshot.users.is_some());
+        assert!(verify_snapshot.streams.is_some());
+        assert!(verify_snapshot.consumer_groups.is_some());
+    }
+
+    #[test]
+    fn mux_state_machine_default_initializes_empty_state() {
+        type MuxTuple = (Users, (Streams, (ConsumerGroups, ())));
+
+        let mux = MuxStateMachine::<MuxTuple>::default();
+
+        let mut verify_snapshot = MetadataSnapshot::new(0);
+        mux.fill_snapshot(&mut verify_snapshot).unwrap();
         assert!(verify_snapshot.users.is_some());
         assert!(verify_snapshot.streams.is_some());
         assert!(verify_snapshot.consumer_groups.is_some());

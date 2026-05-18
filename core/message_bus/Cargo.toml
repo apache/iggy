@@ -29,16 +29,28 @@ readme = "../../../README.md"
 publish = false
 
 [dependencies]
+ahash = { workspace = true }
 async-channel = { workspace = true }
+bytes = { workspace = true }
 compio = { workspace = true }
+compio-quic = { workspace = true }
+compio-ws = { workspace = true }
+configs = { workspace = true }
 futures = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+scopeguard = { workspace = true }
 socket2 = { workspace = true, features = ["all"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tempfile = { workspace = true }
 
 [lints.clippy]
 enum_glob_use = "deny"

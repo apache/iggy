@@ -33,23 +33,36 @@ public class TestHooks
     public void BeforeScenario()
     {
         _context.TcpUrl = Environment.GetEnvironmentVariable("IGGY_TCP_ADDRESS") ?? "127.0.0.1:8090";
+        _context.LeaderTcpUrl = Environment.GetEnvironmentVariable("IGGY_TCP_ADDRESS_LEADER") ?? "127.0.0.1:8091";
+        _context.FollowerTcpUrl = Environment.GetEnvironmentVariable("IGGY_TCP_ADDRESS_FOLLOWER") ?? "127.0.0.1:8092";
+        _context.Clients.Clear();
+        _context.CreatedStream = null;
+        _context.RedirectionOccurred = false;
+        _context.LastStreamId = null;
     }
 
     [AfterScenario]
     public void AfterScenario()
     {
-        //
+        var clients = _context.Clients.Values.Distinct().ToList();
+        if (_context.IggyClient is not null && !clients.Contains(_context.IggyClient))
+        {
+            clients.Add(_context.IggyClient);
+        }
+
+        foreach (var client in clients)
+        {
+            try { client.Dispose(); } catch { /* best-effort cleanup */ }
+        }
     }
 
     [BeforeFeature]
     public static void BeforeFeature()
     {
-        //
     }
 
     [AfterFeature]
     public static void AfterFeature()
     {
-        //
     }
 }

@@ -150,8 +150,9 @@ if [ "$MODE" = "fix" ]; then
 
   echo "🔧 Removing trailing whitespace from ${#FILES_WITH_TRAILING[@]} file(s)..."
   for file in "${FILES_WITH_TRAILING[@]}"; do
-    # Remove trailing whitespace (in-place)
-    sed -i 's/[[:space:]]*$//' "$file"
+    # Use a backup suffix so in-place editing works with both GNU and BSD sed.
+    sed -i.bak 's/[[:space:]]*$//' "$file"
+    rm -f "$file.bak"
     echo "  Fixed: $file"
   done
   echo "✅ Trailing whitespace removed from ${#FILES_WITH_TRAILING[@]} file(s)"

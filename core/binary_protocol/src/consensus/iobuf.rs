@@ -331,6 +331,12 @@ impl<const ALIGN: usize> Deref for Frozen<ALIGN> {
     }
 }
 
+impl<const ALIGN: usize> AsRef<[u8]> for Frozen<ALIGN> {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 impl<const ALIGN: usize> IoBuf for Frozen<ALIGN> {
     fn as_init(&self) -> &[u8] {
         self.as_slice()
