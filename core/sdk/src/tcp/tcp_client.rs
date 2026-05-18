@@ -716,9 +716,12 @@ impl TcpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "vsr"))]
     use tokio::io::AsyncWriteExt;
+    #[cfg(not(feature = "vsr"))]
     use tokio::net::TcpListener;
 
+    #[cfg(not(feature = "vsr"))]
     async fn make_dummy_stream(data: &[u8]) -> ConnectionStreamKind {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1002,6 +1005,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "vsr"))]
     #[tokio::test]
     async fn should_return_error_when_status_is_non_zero() {
         let mut stream = make_dummy_stream(&[1u8; 10]).await;
@@ -1009,6 +1013,7 @@ mod tests {
         assert!(tcp_client.is_err());
     }
 
+    #[cfg(not(feature = "vsr"))]
     #[tokio::test]
     async fn should_return_ok_when_status_is_zero() {
         let mut stream = make_dummy_stream(&[1u8; 10]).await;
@@ -1016,6 +1021,7 @@ mod tests {
         assert!(tcp_client.is_ok());
     }
 
+    #[cfg(not(feature = "vsr"))]
     #[tokio::test]
     async fn should_return_ok_when_length_is_less_than_data() {
         let mut stream = make_dummy_stream(&[1u8; 10]).await;
@@ -1023,6 +1029,7 @@ mod tests {
         assert!(tcp_client.is_ok());
     }
 
+    #[cfg(not(feature = "vsr"))]
     #[tokio::test]
     async fn should_return_ok_when_length_is_equal_to_one() {
         let mut stream = make_dummy_stream(&[1u8; 10]).await;
@@ -1030,6 +1037,7 @@ mod tests {
         assert_eq!(tcp_client.unwrap(), Bytes::new());
     }
 
+    #[cfg(not(feature = "vsr"))]
     #[tokio::test]
     async fn should_return_err_when_length_exceeds_data() {
         let mut stream = make_dummy_stream(&[1u8; 10]).await;

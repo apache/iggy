@@ -696,10 +696,6 @@ where
                     let _ = sender.send(reply.clone());
                 }
 
-                if prepare_header.operation == Operation::Register {
-                    continue;
-                }
-
                 let generic_reply = reply.into_generic();
                 let reply_buffers = freeze_client_reply(generic_reply);
                 emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
