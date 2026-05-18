@@ -260,7 +260,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check typos
-        uses: crate-ci/typos@v1.45.0
+        uses: crate-ci/typos@v1.46.2
 
   summary:
     name: Common checks summary
