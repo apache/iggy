@@ -160,7 +160,7 @@ futures = "0.3.32"
 futures-core = { version = "0.3.32", default-features = false }
 futures-util = "0.3.32"
 getrandom = { version = "0.4", features = ["wasm_js"] }
-git2 = { version = "0.20.4", default-features = false, features = ["vendored-libgit2"] }
+git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
 gloo = "0.12"
 governor = "0.10.4"
 harness_derive = { path = "core/harness_derive" }

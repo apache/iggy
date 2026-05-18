@@ -1817,7 +1817,7 @@ dependencies = [
  "anyhow",
  "clap",
  "dircpy",
- "git2",
+ "git2 0.21.0",
  "tempfile",
  "tokio",
  "tracing",
@@ -5100,6 +5100,18 @@ dependencies = [
  "libgit2-sys",
  "log",
  "url",
+]
+
+[[package]]
+name = "git2"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddddbf932745a6be37109b6112d3ee09696106f848449069d3a57bba937ab82e"
+dependencies = [
+ "bitflags 2.11.1",
+ "libc",
+ "libgit2-sys",
+ "log",
 ]
 
 [[package]]
@@ -13510,7 +13522,7 @@ checksum = "d51ab55ddf1188c8d679f349775362b0fa9e90bd7a4ac69838b2a087623f0d57"
 dependencies = [
  "anyhow",
  "derive_builder",
- "git2",
+ "git2 0.20.4",
  "rustversion",
  "time",
  "vergen",
