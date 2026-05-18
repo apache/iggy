@@ -810,9 +810,9 @@ impl TestBinary for ServerHandle {
         } else {
             Command::cargo_bin(Self::default_server_binary()).map_err(|e| {
                 TestBinaryError::ProcessSpawn {
-                binary: launched_binary.clone(),
-                source: std::io::Error::other(e.to_string()),
-            }
+                    binary: launched_binary.clone(),
+                    source: std::io::Error::other(e.to_string()),
+                }
             })?
         };
 

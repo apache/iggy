@@ -1783,9 +1783,9 @@ fn start_client_listeners(
 
     if let Some(ws_addr) = topology.ws_listen_addr {
         let (listener, bound_addr) = client_listener::ws::bind(ws_addr).map_err(|source| {
-                error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
-                source
-            })?;
+            error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
+            source
+        })?;
         let token = shard.bus.token();
         let accepted_ws = accepted_clients.ws.clone();
         let ws_handle = compio::runtime::spawn(async move {
@@ -1827,15 +1827,16 @@ fn start_client_listeners(
     if config.tcp.enabled && config.tcp.tls.enabled {
         let credentials = load_tcp_tls_server_credentials(config)?;
         let (listener, tls_config, bound_addr) =
-            client_listener::tcp_tls::bind(topology.client_listen_addr, credentials)
-                .map_err(|source| {
+            client_listener::tcp_tls::bind(topology.client_listen_addr, credentials).map_err(
+                |source| {
                     error!(
                         addr = %topology.client_listen_addr,
                         error = %source,
                         "failed to bind TCP TLS listener"
                     );
                     source
-                })?;
+                },
+            )?;
         let token = shard.bus.token();
         let accepted_tls = accepted_clients.tcp_tls.clone();
         let tls_handle = compio::runtime::spawn(async move {
