@@ -48,6 +48,7 @@ mod sdk;
 mod server;
 #[cfg(not(feature = "vsr"))]
 mod state;
+mod storage;
 
 lazy_static! {
     static ref TESTS_FAILED: AtomicBool = AtomicBool::new(false);
