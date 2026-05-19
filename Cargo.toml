@@ -74,9 +74,9 @@ aligned-vec = "0.6.4"
 anyhow = "1.0.102"
 apache-avro = "0.21.0"
 argon2 = "0.5.3"
-arrow = "57.3.0"
-arrow-array = "57.3.0"
-arrow-json = "57.3.0"
+arrow = "57.3.1"
+arrow-array = "57.3.1"
+arrow-json = "57.3.1"
 assert_cmd = "2.2.2"
 async-broadcast = "0.7.2"
 async-channel = "2.5.0"
@@ -127,16 +127,16 @@ configs_derive = { path = "core/configs_derive", version = "0.1.0" }
 consensus = { path = "core/consensus" }
 console-subscriber = "0.5.0"
 crossbeam = "0.8.4"
-crossfire = "3.1.10"
+crossfire = "3.1.12"
 csv = "1.4.0"
-ctor = "1.0.5"
+ctor = "1.0.6"
 ctrlc = { version = "3.5", features = ["termination"] }
 cucumber = "0.23"
 cyper = { version = "0.8.3", features = ["rustls"], default-features = false }
 cyper-axum = { version = "0.8.0" }
 darling = "0.23"
-dashmap = "6.1.0"
-deltalake = { version = "0.32.1", features = ["azure", "gcs", "s3"] }
+dashmap = "6.2.1"
+deltalake = { version = "0.32.2", features = ["azure", "gcs", "s3"] }
 derive-new = "0.7.0"
 derive_builder = "0.20.2"
 derive_more = { version = "2.1.1", features = ["full"] }
@@ -144,7 +144,7 @@ dircpy = "0.3.20"
 dirs = "6.0.0"
 dlopen2 = "0.8.2"
 dotenvy = "0.15.7"
-dtor = "1.0.2"
+dtor = "1.0.3"
 elasticsearch = { version = "9.1.0-alpha.1", features = ["rustls-tls"], default-features = false }
 enumset = "1.1"
 env_logger = "0.11.10"
@@ -160,7 +160,7 @@ futures = "0.3.32"
 futures-core = { version = "0.3.32", default-features = false }
 futures-util = "0.3.32"
 getrandom = { version = "0.4", features = ["wasm_js"] }
-git2 = { version = "0.20.4", default-features = false, features = ["vendored-libgit2"] }
+git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
 gloo = "0.12"
 governor = "0.10.4"
 harness_derive = { path = "core/harness_derive" }
@@ -199,11 +199,11 @@ mongodb = { version = "3.6.0", features = ["rustls-tls"] }
 nix = { version = "0.31.3", features = ["feature", "fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 notify = "8.2.0"
-octocrab = "0.50.0"
+octocrab = "0.51.0"
 once_cell = "1.21.4"
-opentelemetry = { version = "0.31.0", features = ["trace", "logs"] }
-opentelemetry-appender-tracing = { version = "0.31.1", features = ["log"] }
-opentelemetry-otlp = { version = "0.31.1", features = [
+opentelemetry = { version = "0.32.0", features = ["trace", "logs"] }
+opentelemetry-appender-tracing = { version = "0.32.0", features = ["log"] }
+opentelemetry-otlp = { version = "0.32.0", features = [
     "logs",
     "trace",
     "grpc-tonic",
@@ -211,8 +211,8 @@ opentelemetry-otlp = { version = "0.31.1", features = [
     "http-proto",
     "reqwest-client",
 ] }
-opentelemetry-semantic-conventions = "0.31.0"
-opentelemetry_sdk = { version = "0.31.0", features = [
+opentelemetry-semantic-conventions = "0.32.0"
+opentelemetry_sdk = { version = "0.32.0", features = [
     "logs",
     "trace",
     "experimental_async_runtime",
@@ -220,7 +220,7 @@ opentelemetry_sdk = { version = "0.31.0", features = [
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
 papaya = "0.2.4"
-parquet = "57.3.0"
+parquet = "57.3.1"
 partitions = { path = "core/partitions" }
 passterm = "2.0.6"
 paste = "1.0"
@@ -235,7 +235,7 @@ protox-parse = "0.9.0"
 quinn = "0.11.9"
 quote = "1"
 rand = "0.10.1"
-rand_xoshiro = "0.8.0"
+rand_xoshiro = "0.8.1"
 rayon = "1.12.0"
 rcgen = "0.14.8"
 regex = "1.12.3"
@@ -245,7 +245,7 @@ reqwest-retry = "0.9.1"
 reqwest-tracing = "0.7.0"
 ring = "0.17.14"
 ringbuffer = "0.16.0"
-rmcp = "1.6.0"
+rmcp = "1.7.0"
 rmp-serde = "1.3.1"
 rolling-file = "0.2.0"
 rust-embed = "8.11.0"
@@ -279,7 +279,7 @@ static-toml = "1.3.0"
 strum = { version = "0.28.0", features = ["derive"] }
 strum_macros = "0.28.0"
 syn = { version = "2", features = ["full", "extra-traits"] }
-sysinfo = "0.39.1"
+sysinfo = "0.39.2"
 tempfile = "3.27.0"
 terminal_size = { version = "0.4.4" }
 test-case = "3.3.1"
@@ -290,10 +290,10 @@ tokio-rustls = "0.26.4"
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7.18", features = ["compat"] }
 toml = "1.1.2"
-tower-http = { version = "0.6.10", features = ["add-extension", "cors", "trace"] }
+tower-http = { version = "0.6.11", features = ["add-extension", "cors", "trace"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
-tracing-opentelemetry = "0.32.1"
+tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [
     "fmt",
     "env-filter",
