@@ -280,7 +280,7 @@ jobs:
         binary-artifacts,
         typos,
       ]
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Summary
