@@ -127,7 +127,7 @@ jobs:
       github.event_name == 'pull_request_target'
       || (github.event_name == 'workflow_run'
           && github.event.workflow_run.conclusion == 'success')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     steps:
       - name: Download triage event artifact
