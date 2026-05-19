@@ -53,7 +53,10 @@ func DeserializeOffset(payload []byte) *iggcon.ConsumerOffsetInfo {
 }
 
 func DeserializeStream(payload []byte) (*iggcon.StreamDetails, error) {
-	stream, pos := DeserializeToStream(payload, 0)
+	stream, pos, err := DeserializeToStream(payload, 0)
+	if err != nil {
+		return nil, err
+	}
 	topics := make([]iggcon.Topic, 0)
 	for pos < len(payload) {
 		topic, readBytes, err := DeserializeToTopic(payload, pos)
@@ -74,22 +77,32 @@ func DeserializeStream(payload []byte) (*iggcon.StreamDetails, error) {
 	}, nil
 }
 
-func DeserializeStreams(payload []byte) []iggcon.Stream {
+func DeserializeStreams(payload []byte) ([]iggcon.Stream, error) {
 	streams := make([]iggcon.Stream, 0)
 	position := 0
 
-	//TODO there's a deserialization bug, investigate this
-	//it occurs only with payload greater than 2 pow 16
 	for position < len(payload) {
-		stream, readBytes := DeserializeToStream(payload, position)
+		stream, readBytes, err := DeserializeToStream(payload, position)
+		if err != nil {
+			return nil, fmt.Errorf("failed to deserialize stream at offset %d: %w", position, err)
+		}
 		streams = append(streams, stream)
 		position += readBytes
 	}
 
-	return streams
+	return streams, nil
 }
 
-func DeserializeToStream(payload []byte, position int) (iggcon.Stream, int) {
+const streamFixedSize = 4 + 8 + 4 + 8 + 8 + 1 // 33 bytes: id + created_at + topics_count + size_bytes + messages_count + name_len
+
+func DeserializeToStream(payload []byte, position int) (iggcon.Stream, int, error) {
+	remaining := len(payload) - position
+	if remaining < streamFixedSize {
+		return iggcon.Stream{}, 0, fmt.Errorf(
+			"not enough data to read stream header: need %d bytes, got %d",
+			streamFixedSize, remaining)
+	}
+
 	id := binary.LittleEndian.Uint32(payload[position : position+4])
 	createdAt := binary.LittleEndian.Uint64(payload[position+4 : position+12])
 	topicsCount := binary.LittleEndian.Uint32(payload[position+12 : position+16])
@@ -97,10 +110,14 @@ func DeserializeToStream(payload []byte, position int) (iggcon.Stream, int) {
 	messagesCount := binary.LittleEndian.Uint64(payload[position+24 : position+32])
 	nameLength := int(payload[position+32])
 
-	nameBytes := payload[position+33 : position+33+nameLength]
-	name := string(nameBytes)
+	totalSize := streamFixedSize + nameLength
+	if remaining < totalSize {
+		return iggcon.Stream{}, 0, fmt.Errorf(
+			"not enough data to read stream name: need %d bytes, got %d",
+			totalSize, remaining)
+	}
 
-	readBytes := 4 + 8 + 4 + 8 + 8 + 1 + nameLength
+	name := string(payload[position+33 : position+33+nameLength])
 
 	return iggcon.Stream{
 		Id:            id,
@@ -109,7 +126,7 @@ func DeserializeToStream(payload []byte, position int) (iggcon.Stream, int) {
 		SizeBytes:     sizeBytes,
 		MessagesCount: messagesCount,
 		CreatedAt:     createdAt,
-	}, readBytes
+	}, totalSize, nil
 }
 
 func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMessageCompression) (*iggcon.PolledMessage, error) {

@@ -19,7 +19,7 @@
 
 package org.apache.iggy.bench.models.cli;
 
-import org.apache.iggy.bench.exception.BenchmarkException;
+import org.apache.iggy.bench.common.exception.BenchmarkException;
 
 public record GlobalCliArgs(
         int messageSize,
