@@ -18,6 +18,7 @@
 
 pub mod client;
 pub mod consumer;
+pub mod error;
 pub mod identifier;
 pub mod receive_message;
 pub mod runtime;

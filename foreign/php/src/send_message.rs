@@ -17,12 +17,10 @@
  */
 
 use bytes::Bytes;
-use ext_php_rs::{
-    binary::Binary,
-    exception::{PhpException, PhpResult},
-    php_class, php_impl,
-};
+use ext_php_rs::{binary::Binary, exception::PhpResult, php_class, php_impl};
 use iggy::prelude::{IggyMessage as RustIggyMessage, IggyMessageHeader};
+
+use crate::error::to_php_exception;
 
 /// A PHP class representing a message to be sent.
 #[php_class]
@@ -62,7 +60,7 @@ impl SendMessage {
         let inner = RustIggyMessage::builder()
             .payload(Bytes::from(Vec::<u8>::from(data)))
             .build()
-            .map_err(|err| PhpException::default(err.to_string()))?;
+            .map_err(to_php_exception)?;
 
         Ok(Self { inner })
     }

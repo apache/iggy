@@ -16,12 +16,9 @@
  * under the License.
  */
 
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{str::FromStr, sync::Arc};
 
-use ext_php_rs::{
-    exception::{PhpException, PhpResult},
-    php_class, php_impl,
-};
+use ext_php_rs::{exception::PhpResult, php_class, php_impl};
 use iggy::prelude::{
     CompressionAlgorithm, Consumer as RustConsumer, IggyClient as RustIggyClient,
     IggyClientBuilder, IggyDuration, IggyExpiry, IggyMessage as RustMessage, MaxTopicSize,
@@ -30,6 +27,7 @@ use iggy::prelude::{
 use tokio::sync::Mutex;
 
 use crate::consumer::{AutoCommit, IggyConsumer};
+use crate::error::to_php_exception;
 use crate::identifier::PhpIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::runtime::runtime;
@@ -109,7 +107,7 @@ impl IggyClient {
 
     /// Gets a stream by id or name.
     pub fn get_stream(&self, stream_id: PhpIdentifier) -> PhpResult<Option<StreamDetails>> {
-        let stream_id = stream_id.into_identifier()?;
+        let stream_id: Identifier = stream_id.try_into()?;
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
@@ -140,10 +138,10 @@ impl IggyClient {
             None => CompressionAlgorithm::default(),
         };
         let expiry = message_expiry_micros.map_or(IggyExpiry::ServerDefault, |micros| {
-            IggyExpiry::ExpireDuration(iggy_duration_from_micros(micros))
+            IggyExpiry::ExpireDuration(IggyDuration::from(micros))
         });
         let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
-        let stream = stream.into_identifier()?;
+        let stream: Identifier = stream.try_into()?;
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
@@ -169,8 +167,8 @@ impl IggyClient {
         stream_id: PhpIdentifier,
         topic_id: PhpIdentifier,
     ) -> PhpResult<Option<TopicDetails>> {
-        let stream_id = stream_id.into_identifier()?;
-        let topic_id = topic_id.into_identifier()?;
+        let stream_id: Identifier = stream_id.try_into()?;
+        let topic_id: Identifier = topic_id.try_into()?;
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
@@ -190,8 +188,8 @@ impl IggyClient {
         partition_id: u32,
         messages: Vec<&SendMessage>,
     ) -> PhpResult {
-        let stream = stream.into_identifier()?;
-        let topic = topic.into_identifier()?;
+        let stream: Identifier = stream.try_into()?;
+        let topic: Identifier = topic.try_into()?;
         let partitioning = Partitioning::partition_id(partition_id);
         let mut messages: Vec<RustMessage> = messages
             .into_iter()
@@ -218,8 +216,8 @@ impl IggyClient {
         auto_commit: bool,
     ) -> PhpResult<Vec<ReceiveMessage>> {
         let consumer = RustConsumer::default();
-        let stream = stream.into_identifier()?;
-        let topic = topic.into_identifier()?;
+        let stream: Identifier = stream.try_into()?;
+        let topic: Identifier = topic.try_into()?;
         let strategy: RustPollingStrategy = polling_strategy.into();
         let inner = self.inner.clone();
 
@@ -248,8 +246,40 @@ impl IggyClient {
         })
     }
 
+    /// Deletes a stream by id or name.
+    pub fn delete_stream(&self, stream_id: PhpIdentifier) -> PhpResult {
+        let stream_id: Identifier = stream_id.try_into()?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .delete_stream(&stream_id)
+                .await
+                .map_err(to_php_exception)
+        })
+    }
+
+    /// Deletes a topic by stream and topic id/name.
+    pub fn delete_topic(&self, stream_id: PhpIdentifier, topic_id: PhpIdentifier) -> PhpResult {
+        let stream_id: Identifier = stream_id.try_into()?;
+        let topic_id: Identifier = topic_id.try_into()?;
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .delete_topic(&stream_id, &topic_id)
+                .await
+                .map_err(to_php_exception)
+        })
+    }
+
     /// Creates and initializes a consumer group consumer.
     #[allow(clippy::too_many_arguments)]
+    #[php(defaults(
+        create_consumer_group_if_not_exists = true,
+        auto_join_consumer_group = true,
+        allow_replay = false
+    ))]
     pub fn consumer_group(
         &self,
         name: String,
@@ -294,16 +324,16 @@ impl IggyClient {
             builder = builder.auto_commit(auto_commit.into());
         }
         builder = match poll_interval_micros {
-            Some(micros) => builder.poll_interval(iggy_duration_from_micros(micros)),
+            Some(micros) => builder.poll_interval(IggyDuration::from(micros)),
             None => builder.without_poll_interval(),
         };
         if let Some(micros) = polling_retry_interval_micros {
-            builder = builder.polling_retry_interval(iggy_duration_from_micros(micros));
+            builder = builder.polling_retry_interval(IggyDuration::from(micros));
         }
 
         match (init_retries, init_retry_interval_micros) {
             (Some(retries), Some(micros)) => {
-                builder = builder.init_retries(retries, iggy_duration_from_micros(micros));
+                builder = builder.init_retries(retries, IggyDuration::from(micros));
             }
             (Some(_), None) => {
                 return Err(
@@ -329,12 +359,4 @@ impl IggyClient {
             })
         })
     }
-}
-
-fn to_php_exception(error: impl std::fmt::Display) -> PhpException {
-    PhpException::default(error.to_string())
-}
-
-fn iggy_duration_from_micros(micros: u64) -> IggyDuration {
-    IggyDuration::new(Duration::from_micros(micros))
 }

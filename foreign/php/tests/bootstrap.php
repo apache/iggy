@@ -43,6 +43,11 @@ function assert_null(mixed $value, string $message = 'expected value to be null'
     Assert::assertNull($value, $message);
 }
 
+function assert_count(int $expected, array $actual, string $message = ''): void
+{
+    Assert::assertCount($expected, $actual, $message);
+}
+
 function assert_throws(callable $callback, ?string $messageContains = null): Throwable
 {
     try {
@@ -54,6 +59,8 @@ function assert_throws(callable $callback, ?string $messageContains = null): Thr
                 . ', got ' . var_export($throwable->getMessage(), true)
             );
         }
+
+        Assert::assertInstanceOf(Throwable::class, $throwable);
 
         return $throwable;
     }
@@ -131,9 +138,39 @@ function create_stream_and_topic(object $client, string $stream, string $topic, 
     $client->createTopic($stream, $topic, $partitions, null, null, null, null);
 }
 
+function cleanup_topic(object $client, string|int $stream, string|int $topic): void
+{
+    try {
+        $client->deleteTopic($stream, $topic);
+    } catch (Throwable) {
+    }
+}
+
+function cleanup_stream(object $client, string|int $stream): void
+{
+    try {
+        $client->deleteStream($stream);
+    } catch (Throwable) {
+    }
+}
+
+function cleanup_stream_with_topics(object $client, string|int $stream, array $topics): void
+{
+    foreach ($topics as $topic) {
+        cleanup_topic($client, $stream, $topic);
+    }
+
+    cleanup_stream($client, $stream);
+}
+
 function collect_payloads(array $messages): array
 {
     return array_map(static fn (ReceiveMessage $message): string => $message->payload(), $messages);
+}
+
+function collect_offsets(array $messages): array
+{
+    return array_map(static fn (ReceiveMessage $message): int => $message->offset(), $messages);
 }
 
 function micros(int $seconds): int

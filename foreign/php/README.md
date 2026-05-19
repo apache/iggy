@@ -28,6 +28,12 @@ export PHP_CONFIG=/opt/homebrew/opt/php/bin/php-config
 cargo build --release
 ```
 
+Generate IDE stubs after changing the exported PHP API:
+
+```sh
+cargo php stubs --manifest Cargo.toml -o iggy-php.stubs.php
+```
+
 ## Install
 
 ```sh
@@ -54,6 +60,12 @@ docker run --rm --name iggy-php-test \
   -p 8090:8090 \
   -p 3000:3000 \
   apache/iggy:latest
+```
+
+You can also run a local server from the repository root:
+
+```sh
+cargo run --bin iggy-server --fresh --with-default-root-credentials
 ```
 
 The tests assume:

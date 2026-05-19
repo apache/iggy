@@ -16,13 +16,9 @@
  * under the License.
  */
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
-use ext_php_rs::{
-    exception::{PhpException, PhpResult},
-    php_class, php_impl,
-    types::ZendCallable,
-};
+use ext_php_rs::{exception::PhpResult, php_class, php_impl, types::ZendCallable};
 use futures::StreamExt;
 use iggy::prelude::{
     AutoCommit as RustAutoCommit, AutoCommitAfter as RustAutoCommitAfter,
@@ -30,6 +26,7 @@ use iggy::prelude::{
 };
 use tokio::sync::Mutex;
 
+use crate::error::to_php_exception;
 use crate::receive_message::ReceiveMessage;
 use crate::runtime::runtime;
 
@@ -83,7 +80,7 @@ impl IggyConsumer {
                 .await
                 .store_offset(offset, partition_id)
                 .await
-                .map_err(|err| PhpException::default(err.to_string()))
+                .map_err(to_php_exception)
         })
     }
 
@@ -99,7 +96,7 @@ impl IggyConsumer {
                 .await
                 .delete_offset(partition_id)
                 .await
-                .map_err(|err| PhpException::default(err.to_string()))
+                .map_err(to_php_exception)
         })
     }
 
@@ -118,7 +115,7 @@ impl IggyConsumer {
 
             callback
                 .try_call(vec![&message])
-                .map_err(|err| PhpException::default(err.to_string()))?;
+                .map_err(to_php_exception)?;
             consumed += 1;
         }
 
@@ -147,7 +144,7 @@ impl IggyConsumer {
                     inner: message.message,
                     partition_id: message.partition_id,
                 })),
-                Some(Err(err)) => Err(PhpException::default(err.to_string())),
+                Some(Err(err)) => Err(to_php_exception(err)),
                 None => Ok(None),
             }
         })
@@ -170,23 +167,20 @@ impl AutoCommit {
 
     pub fn interval(interval_micros: u64) -> Self {
         Self {
-            inner: RustAutoCommit::Interval(iggy_duration_from_micros(interval_micros)),
+            inner: RustAutoCommit::Interval(IggyDuration::from(interval_micros)),
         }
     }
 
     pub fn interval_or_when(interval_micros: u64, when: &AutoCommitWhen) -> Self {
         Self {
-            inner: RustAutoCommit::IntervalOrWhen(
-                iggy_duration_from_micros(interval_micros),
-                when.inner,
-            ),
+            inner: RustAutoCommit::IntervalOrWhen(IggyDuration::from(interval_micros), when.inner),
         }
     }
 
     pub fn interval_or_after(interval_micros: u64, after: &AutoCommitAfter) -> Self {
         Self {
             inner: RustAutoCommit::IntervalOrAfter(
-                iggy_duration_from_micros(interval_micros),
+                IggyDuration::from(interval_micros),
                 after.inner,
             ),
         }
@@ -281,8 +275,4 @@ impl From<&AutoCommitAfter> for RustAutoCommitAfter {
     fn from(value: &AutoCommitAfter) -> Self {
         value.inner
     }
-}
-
-fn iggy_duration_from_micros(micros: u64) -> IggyDuration {
-    IggyDuration::new(Duration::from_micros(micros))
 }

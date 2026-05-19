@@ -53,17 +53,21 @@ final class TlsTest extends TestCase
         $partitionId = 0;
         $messages = array_map(static fn (int $i): string => "tls-message-{$i}", range(0, 2));
 
-        create_stream_and_topic($client, $streamName, $topicName);
-        $client->sendMessages(
-            $streamName,
-            $topicName,
-            $partitionId,
-            array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
-        );
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages(
+                $streamName,
+                $topicName,
+                $partitionId,
+                array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
+            );
 
-        $polled = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::first(), 10, true);
-        assert_true(count($polled) >= count($messages), 'expected TLS messages');
-        assert_same($messages, array_slice(collect_payloads($polled), 0, count($messages)));
+            $polled = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::first(), 10, true);
+            assert_count(count($messages), $polled, 'expected TLS messages');
+            assert_same($messages, collect_payloads($polled));
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
     }
 
     public function testConnectWithoutTlsShouldFail(): void

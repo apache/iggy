@@ -21,84 +21,139 @@
 
 declare(strict_types=1);
 
+use PHPUnit\Framework\Attributes\TestDox;
 use PHPUnit\Framework\TestCase;
 
 final class IggySdkTest extends TestCase
 {
+    #[TestDox('A connected client can ping the server')]
     public function testPing(): void
     {
         new_client()->ping();
+        assert_true(true, 'ping completed without throwing');
     }
 
+    #[TestDox('The TCP constructor returns an IggyClient instance')]
     public function testClientNotNull(): void
     {
         assert_true(new_client() instanceof IggyClient);
     }
 
+    #[TestDox('A client created from a connection string can connect and ping')]
     public function testClientFromConnectionString(): void
     {
         $client = new_connection_string_client();
         $client->ping();
+
+        assert_true($client instanceof IggyClient);
     }
 
+    #[TestDox('A stream can be created and fetched by name')]
     public function testCreateAndGetStream(): void
     {
         $client = new_client();
         $streamName = unique_name('test-stream');
 
-        $client->createStream($streamName);
-        $stream = $client->getStream($streamName);
+        try {
+            $client->createStream($streamName);
+            $stream = $client->getStream($streamName);
 
-        assert_not_null($stream);
-        assert_same($streamName, $stream->name);
-        assert_true($stream->id >= 0, 'expected non-negative stream id');
+            assert_not_null($stream);
+            assert_same($streamName, $stream->name);
+            assert_true($stream->id >= 0, 'expected non-negative stream id');
+        } finally {
+            cleanup_stream($client, $streamName);
+        }
     }
 
+    #[TestDox('A newly created stream reports no topics')]
     public function testNewStreamHasNoTopics(): void
     {
         $client = new_client();
         $streamName = unique_name('test-stream');
 
-        $client->createStream($streamName);
-        $stream = $client->getStream($streamName);
+        try {
+            $client->createStream($streamName);
+            $stream = $client->getStream($streamName);
 
-        assert_not_null($stream);
-        assert_same($streamName, $stream->name);
-        assert_true($stream->id > 0, 'expected positive stream id');
-        assert_same(0, $stream->topics_count);
+            assert_not_null($stream);
+            assert_same($streamName, $stream->name);
+            assert_true($stream->id >= 0, 'expected non-negative stream id');
+            assert_same(0, $stream->topics_count);
+        } finally {
+            cleanup_stream($client, $streamName);
+        }
     }
 
+    #[TestDox('A topic can be created and fetched by name')]
     public function testCreateAndGetTopic(): void
     {
         $client = new_client();
         $streamName = unique_name('test-stream');
         $topicName = unique_name('test-topic');
 
-        $client->createStream($streamName);
-        $client->createTopic($streamName, $topicName, 2, null, null, null, null);
-        $topic = $client->getTopic($streamName, $topicName);
+        try {
+            $client->createStream($streamName);
+            $client->createTopic($streamName, $topicName, 2, null, null, null, null);
+            $topic = $client->getTopic($streamName, $topicName);
 
-        assert_not_null($topic);
-        assert_same($topicName, $topic->name);
-        assert_true($topic->id >= 0, 'expected non-negative topic id');
-        assert_same(2, $topic->partitions_count);
+            assert_not_null($topic);
+            assert_same($topicName, $topic->name);
+            assert_true($topic->id >= 0, 'expected non-negative topic id');
+            assert_same(2, $topic->partitions_count);
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
     }
 
+    #[TestDox('Streams and topics can be fetched with numeric PHP identifiers')]
+    public function testNumericIdentifiers(): void
+    {
+        $client = new_client();
+        $streamName = unique_name('numeric-stream');
+        $topicName = unique_name('numeric-topic');
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $streamByName = $client->getStream($streamName);
+            assert_not_null($streamByName);
+
+            $streamById = $client->getStream($streamByName->id);
+            assert_not_null($streamById);
+            assert_same($streamName, $streamById->name);
+
+            $topicByName = $client->getTopic($streamByName->id, $topicName);
+            assert_not_null($topicByName);
+
+            $topicById = $client->getTopic($streamByName->id, $topicByName->id);
+            assert_not_null($topicById);
+            assert_same($topicName, $topicById->name);
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('A topic created through the helper can be fetched')]
     public function testListTopicsViaGetTopic(): void
     {
         $client = new_client();
         $streamName = unique_name('test-stream');
         $topicName = unique_name('test-topic');
 
-        create_stream_and_topic($client, $streamName, $topicName);
-        $topic = $client->getTopic($streamName, $topicName);
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $topic = $client->getTopic($streamName, $topicName);
 
-        assert_not_null($topic);
-        assert_same($topicName, $topic->name);
-        assert_true($topic->id >= 0, 'expected non-negative topic id');
-        assert_same(1, $topic->partitions_count);
+            assert_not_null($topic);
+            assert_same($topicName, $topic->name);
+            assert_true($topic->id >= 0, 'expected non-negative topic id');
+            assert_same(1, $topic->partitions_count);
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
     }
 
+    #[TestDox('Binary payloads round-trip through sendMessages and pollMessages')]
     public function testSendAndPollBinaryMessages(): void
     {
         $client = new_client();
@@ -110,19 +165,24 @@ final class IggySdkTest extends TestCase
             range(1, 3),
         );
 
-        create_stream_and_topic($client, $streamName, $topicName);
-        $client->sendMessages(
-            $streamName,
-            $topicName,
-            $partitionId,
-            array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
-        );
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages(
+                $streamName,
+                $topicName,
+                $partitionId,
+                array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
+            );
 
-        $polled = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::first(), 10, true);
-        assert_true(count($polled) >= count($messages), 'expected at least the sent messages');
-        assert_same($messages, array_slice(collect_payloads($polled), 0, count($messages)));
+            $polled = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::first(), 10, true);
+            assert_count(count($messages), $polled);
+            assert_same($messages, collect_payloads($polled));
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
     }
 
+    #[TestDox('Received messages expose payload and metadata')]
     public function testMessageProperties(): void
     {
         $client = new_client();
@@ -131,22 +191,27 @@ final class IggySdkTest extends TestCase
         $partitionId = 0;
         $payload = unique_name('Property test');
 
-        create_stream_and_topic($client, $streamName, $topicName);
-        $client->sendMessages($streamName, $topicName, $partitionId, [new SendMessage($payload)]);
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages($streamName, $topicName, $partitionId, [new SendMessage($payload)]);
 
-        $polled = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::last(), 1, true);
-        assert_true(count($polled) >= 1, 'expected one message');
+            $polled = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::last(), 1, true);
+            assert_count(1, $polled);
 
-        $message = $polled[0];
-        assert_same($payload, $message->payload());
-        assert_true($message->offset() >= 0, 'expected non-negative offset');
-        assert_true($message->id() !== '', 'expected message id');
-        assert_true($message->timestamp() > 0, 'expected positive timestamp');
-        assert_true(ctype_digit($message->checksum()), 'expected numeric checksum');
-        assert_true($message->length() > 0, 'expected positive length');
-        assert_same($partitionId, $message->partitionId());
+            $message = $polled[0];
+            assert_same($payload, $message->payload());
+            assert_true($message->offset() >= 0, 'expected non-negative offset');
+            assert_true($message->id() !== '', 'expected message id');
+            assert_true($message->timestamp() > 0, 'expected positive timestamp');
+            assert_true(ctype_digit($message->checksum()), 'expected numeric checksum');
+            assert_true($message->length() > 0, 'expected positive length');
+            assert_same($partitionId, $message->partitionId());
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
     }
 
+    #[TestDox('Polling strategies return the expected payloads and next advances stored offsets')]
     public function testPollingStrategies(): void
     {
         $client = new_client();
@@ -158,43 +223,67 @@ final class IggySdkTest extends TestCase
             range(0, 4),
         );
 
-        create_stream_and_topic($client, $streamName, $topicName);
-        $client->sendMessages(
-            $streamName,
-            $topicName,
-            $partitionId,
-            array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
-        );
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages(
+                $streamName,
+                $topicName,
+                $partitionId,
+                array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
+            );
 
-        $firstMessages = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::first(), 1, false);
-        assert_true(count($firstMessages) >= 1, 'first strategy returned no messages');
+            $firstMessages = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::first(), 1, false);
+            assert_count(1, $firstMessages);
+            assert_same([$messages[0]], collect_payloads($firstMessages));
 
-        $lastMessages = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::last(), 1, false);
-        assert_true(count($lastMessages) >= 1, 'last strategy returned no messages');
+            $lastMessages = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::last(), 1, false);
+            assert_count(1, $lastMessages);
+            assert_same([$messages[4]], collect_payloads($lastMessages));
 
-        $nextMessages = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::next(), 2, false);
-        assert_true(count($nextMessages) >= 1, 'next strategy returned no messages');
+            $offset = $firstMessages[0]->offset() + 2;
+            $offsetMessages = $client->pollMessages(
+                $streamName,
+                $topicName,
+                $partitionId,
+                PollingStrategy::offset($offset),
+                2,
+                false,
+            );
+            assert_count(2, $offsetMessages);
+            assert_same([$messages[2], $messages[3]], collect_payloads($offsetMessages));
+            assert_same([$offset, $offset + 1], collect_offsets($offsetMessages));
 
-        $offsetMessages = $client->pollMessages(
-            $streamName,
-            $topicName,
-            $partitionId,
-            PollingStrategy::offset($firstMessages[0]->offset()),
-            1,
-            false,
-        );
-        assert_true(count($offsetMessages) >= 1, 'offset strategy returned no messages');
+            $nextFirstBatch = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::next(), 2, true);
+            assert_count(2, $nextFirstBatch);
+            assert_same([$messages[0], $messages[1]], collect_payloads($nextFirstBatch));
+
+            $nextSecondBatch = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::next(), 2, true);
+            assert_count(2, $nextSecondBatch);
+            assert_same([$messages[2], $messages[3]], collect_payloads($nextSecondBatch));
+
+            $nextThirdBatch = $client->pollMessages($streamName, $topicName, $partitionId, PollingStrategy::next(), 2, true);
+            assert_count(1, $nextThirdBatch);
+            assert_same([$messages[4]], collect_payloads($nextThirdBatch));
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
     }
 
+    #[TestDox('Creating the same stream twice raises an error')]
     public function testDuplicateStreamCreation(): void
     {
         $client = new_client();
         $streamName = unique_name('duplicate-test');
 
-        $client->createStream($streamName);
-        assert_throws(static fn () => $client->createStream($streamName), 'already exists');
+        try {
+            $client->createStream($streamName);
+            assert_throws(static fn () => $client->createStream($streamName), 'already exists');
+        } finally {
+            cleanup_stream($client, $streamName);
+        }
     }
 
+    #[TestDox('Fetching a missing stream returns null')]
     public function testGetNonexistentStream(): void
     {
         $stream = new_client()->getStream(unique_name('nonexistent'));
@@ -202,6 +291,7 @@ final class IggySdkTest extends TestCase
         assert_null($stream);
     }
 
+    #[TestDox('Creating a topic in a missing stream raises an error')]
     public function testCreateTopicInNonexistentStream(): void
     {
         $client = new_client();
@@ -211,6 +301,7 @@ final class IggySdkTest extends TestCase
         );
     }
 
+    #[TestDox('Consumer group metadata exposes name, stream, topic, partition, and empty offsets')]
     public function testConsumerGroupMeta(): void
     {
         $client = new_client();
@@ -219,31 +310,37 @@ final class IggySdkTest extends TestCase
         $topicName = unique_name('consumer-group-topic');
         $partitionId = 0;
 
-        create_stream_and_topic($client, $streamName, $topicName);
-        $consumer = $client->consumerGroup(
-            $consumerName,
-            $streamName,
-            $topicName,
-            $partitionId,
-            PollingStrategy::next(),
-            10,
-            AutoCommit::interval(micros(5)),
-            true,
-            true,
-            micros(1),
-            null,
-            null,
-            null,
-            false,
-        );
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $consumer = $client->consumerGroup(
+                $consumerName,
+                $streamName,
+                $topicName,
+                $partitionId,
+                PollingStrategy::next(),
+                10,
+                AutoCommit::interval(micros(5)),
+                true,
+                true,
+                micros(1),
+                null,
+                null,
+                null,
+                false,
+            );
 
-        assert_same($streamName, $consumer->stream());
-        assert_same($topicName, $consumer->topic());
-        assert_same(0, $consumer->partitionId());
-        assert_null($consumer->getLastConsumedOffset($partitionId));
-        assert_null($consumer->getLastStoredOffset($partitionId));
+            assert_same($consumerName, $consumer->name());
+            assert_same($streamName, $consumer->stream());
+            assert_same($topicName, $consumer->topic());
+            assert_same(0, $consumer->partitionId());
+            assert_null($consumer->getLastConsumedOffset($partitionId));
+            assert_null($consumer->getLastStoredOffset($partitionId));
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
     }
 
+    #[TestDox('A consumer group callback receives messages in order')]
     public function testConsumeMessages(): void
     {
         $client = new_client();
@@ -256,40 +353,43 @@ final class IggySdkTest extends TestCase
             range(0, 4),
         );
 
-        create_stream_and_topic($client, $streamName, $topicName);
-        $client->sendMessages(
-            $streamName,
-            $topicName,
-            $partitionId,
-            array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
-        );
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $client->sendMessages(
+                $streamName,
+                $topicName,
+                $partitionId,
+                array_map(static fn (string $payload): SendMessage => new SendMessage($payload), $messages),
+            );
 
-        $consumer = $client->consumerGroup(
-            $consumerName,
-            $streamName,
-            $topicName,
-            $partitionId,
-            PollingStrategy::next(),
-            10,
-            AutoCommit::interval(micros(5)),
-            true,
-            true,
-            micros(1),
-            null,
-            null,
-            null,
-            false,
-        );
-        $received = [];
-        $count = $consumer->consumeMessages(
-            static function (ReceiveMessage $message) use (&$received): void {
-                $received[] = $message->payload();
-            },
-            count($messages),
-        );
+            $consumer = $client->consumerGroup(
+                $consumerName,
+                $streamName,
+                $topicName,
+                $partitionId,
+                PollingStrategy::next(),
+                10,
+                AutoCommit::interval(micros(5)),
+                true,
+                true,
+                micros(1),
+                null,
+                null,
+                null,
+                false,
+            );
+            $received = [];
+            $count = $consumer->consumeMessages(
+                static function (ReceiveMessage $message) use (&$received): void {
+                    $received[] = $message->payload();
+                },
+                count($messages),
+            );
 
-        assert_same(count($messages), $count);
-        assert_same($messages, $received);
+            assert_same(count($messages), $count);
+            assert_same($messages, $received);
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
     }
-
 }
