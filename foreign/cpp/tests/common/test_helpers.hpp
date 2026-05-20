@@ -42,3 +42,20 @@ inline iggy::ffi::Client *login_to_server() {
     client->login_user("iggy", "iggy");
     return client;
 }
+
+inline rust::Vec<std::uint8_t> to_payload(const std::string &s) {
+    rust::Vec<std::uint8_t> v;
+    for (const char c : s) {
+        v.push_back(static_cast<std::uint8_t>(c));
+    }
+    return v;
+}
+
+inline rust::Vec<std::uint8_t> partition_id_bytes(std::uint32_t id) {
+    rust::Vec<std::uint8_t> v;
+    v.push_back(static_cast<std::uint8_t>(id & 0xFF));
+    v.push_back(static_cast<std::uint8_t>((id >> 8) & 0xFF));
+    v.push_back(static_cast<std::uint8_t>((id >> 16) & 0xFF));
+    v.push_back(static_cast<std::uint8_t>((id >> 24) & 0xFF));
+    return v;
+}

@@ -70,6 +70,17 @@ Here's the example configuration to be used with Claude Desktop:
 
 ![MCP](../../../assets/iggy_mcp_server.png)
 
+## Systemd integration
+
+Build with the `systemd` feature to enable systemd readiness and watchdog notifications:
+
+```sh
+cargo build --bin iggy-mcp --release --features iggy-mcp/systemd
+```
+
+The MCP server behaves the same way the Iggy server does under systemd. See
+[Systemd integration](../../server/README.md#systemd-integration) for details.
+
 ## Telemetry
 
 The MCP server supports OpenTelemetry for logs and traces. To enable telemetry, add the following configuration:

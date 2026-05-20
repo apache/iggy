@@ -331,12 +331,7 @@ runs:
       id: ctx
       shell: bash
       run: |
-        # For web-ui, the context should be the web directory
-        if [ "${{ inputs.component }}" = "web-ui" ]; then
-          context="web"
-        else
-          context="${{ inputs.context }}"
-        fi
+        context="${{ inputs.context }}"
         echo "context=$context" >> "$GITHUB_OUTPUT"
         echo "📁 Build context: $context"
 

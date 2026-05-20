@@ -48,6 +48,18 @@ nextest: build
 nextests TEST: build
   cargo nextest run --nocapture -- {{TEST}}
 
+# Run Miri (UB detector) on the unsafe-heavy crates that don't pull
+# tokio/compio. Mirrors the `miri` task in CI. Pinned to the same nightly
+# as `.github/actions/rust/pre-merge/action.yml` so local runs don't drift
+# from CI on the next nightly bump — keep these two dates in sync.
+# Requires:
+#
+#   rustup toolchain install nightly-2026-04-21 --component miri
+#
+miri:
+  MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" \
+    cargo +nightly-2026-04-21 miri test -p iggy_binary_protocol -p consensus
+
 server *ARGS:
   cargo run --bin iggy-server {{ARGS}}
 
@@ -74,12 +86,6 @@ licenses-fix:
 
 licenses-check:
   ./scripts/ci/license-headers.sh --check
-
-licenses-list-check:
-  ./scripts/ci/licenses-list.sh --check
-
-licenses-list-fix:
-  ./scripts/ci/licenses-list.sh --fix
 
 markdownlint:
   markdownlint '**/*.md' --ignore-path .gitignore

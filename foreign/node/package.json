@@ -1,7 +1,7 @@
 {
   "name": "apache-iggy",
   "type": "module",
-  "version": "0.8.0",
+  "version": "0.8.1-edge.1",
   "description": "Official Apache Iggy NodeJS SDK",
   "keywords": [
     "iggy",
@@ -28,7 +28,9 @@
     "dist/**/*.d.ts",
     "dist/index.d.ts",
     "!dist/bdd/",
-    "!dist/examples/"
+    "!dist/examples/",
+    "LICENSE",
+    "NOTICE"
   ],
   "types": "dist/index.d.ts",
   "main": "dist/index.js",

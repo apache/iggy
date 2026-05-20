@@ -39,8 +39,19 @@ Components:
   rust-server          core/server
   rust-cli             core/cli + workspace dep
   rust-connector-sdk   core/connectors/sdk + workspace dep
+  rust-mcp             core/ai/mcp
+  rust-bench           core/bench
+  rust-bench-dashboard-frontend   core/bench/dashboard/frontend
+  rust-bench-dashboard-server     core/bench/dashboard/server
+  rust-bench-report    core/bench/report
   rust-all             All Rust crates at once
-  --all                All components (Rust + SDKs + web-ui)
+  rust-connector-runtime          core/connectors/runtime
+  rust-connector-<name>-sink      core/connectors/sinks/<name>_sink
+  rust-connector-<name>-source    core/connectors/sources/<name>_source
+  connectors-sinks     All connector sink crates at once
+  connectors-sources   All connector source crates at once
+  connectors-all       runtime + all sink + all source crates
+  --all                All components (Rust + connectors + SDKs + web-ui)
   sdk-python           foreign/python/Cargo.toml + foreign/python/pyproject.toml
   sdk-node             foreign/node/package.json
   sdk-go               foreign/go/contracts/version.go
@@ -68,14 +79,19 @@ Examples:
   bump-version.sh rust-all --minor --edge --dry-run
   bump-version.sh --all --strip-edge
   bump-version.sh rust-sdk --patch
+  bump-version.sh connectors-all --patch --edge
+  bump-version.sh rust-connector-stdout-sink --minor
   bump-version.sh sdk-python --set 0.8.0
-  bump-version.sh --status
+  bump-version.sh --status connectors-all
 EOF
 }
 
-RUST_COMPONENTS="rust-sdk rust-common rust-binary-protocol rust-server rust-cli rust-connector-sdk"
+RUST_COMPONENTS="rust-sdk rust-common rust-binary-protocol rust-server rust-cli rust-connector-sdk rust-mcp rust-bench rust-bench-dashboard-frontend rust-bench-dashboard-server rust-bench-report"
+CONNECTOR_SINK_COMPONENTS="rust-connector-delta-sink rust-connector-elasticsearch-sink rust-connector-http-sink rust-connector-iceberg-sink rust-connector-influxdb-sink rust-connector-mongodb-sink rust-connector-postgres-sink rust-connector-quickwit-sink rust-connector-stdout-sink"
+CONNECTOR_SOURCE_COMPONENTS="rust-connector-elasticsearch-source rust-connector-influxdb-source rust-connector-postgres-source rust-connector-random-source"
+CONNECTOR_COMPONENTS="rust-connector-runtime ${CONNECTOR_SINK_COMPONENTS} ${CONNECTOR_SOURCE_COMPONENTS}"
 SDK_COMPONENTS="sdk-python sdk-node sdk-go sdk-csharp sdk-java"
-ALL_COMPONENTS="${RUST_COMPONENTS} ${SDK_COMPONENTS} web-ui"
+ALL_COMPONENTS="${RUST_COMPONENTS} ${CONNECTOR_COMPONENTS} ${SDK_COMPONENTS} web-ui"
 
 # Returns "file:format" lines per component.
 # Format keys: cargo, cargo-ws-dep:PKG, cargo-dep:PKG, python-cargo, pyproject, json, csproj, gradle, go
@@ -106,6 +122,32 @@ get_version_files() {
             echo "core/connectors/sdk/Cargo.toml:cargo"
             echo "Cargo.toml:cargo-ws-dep:iggy_connector_sdk"
             ;;
+        rust-connector-runtime)
+            echo "core/connectors/runtime/Cargo.toml:cargo"
+            ;;
+        rust-connector-*-sink)
+            local dir="${component#rust-connector-}"
+            echo "core/connectors/sinks/${dir//-/_}/Cargo.toml:cargo"
+            ;;
+        rust-connector-*-source)
+            local dir="${component#rust-connector-}"
+            echo "core/connectors/sources/${dir//-/_}/Cargo.toml:cargo"
+            ;;
+        rust-mcp)
+            echo "core/ai/mcp/Cargo.toml:cargo"
+            ;;
+        rust-bench)
+            echo "core/bench/Cargo.toml:cargo"
+            ;;
+        rust-bench-dashboard-frontend)
+            echo "core/bench/dashboard/frontend/Cargo.toml:cargo"
+            ;;
+        rust-bench-dashboard-server)
+            echo "core/bench/dashboard/server/Cargo.toml:cargo"
+            ;;
+        rust-bench-report)
+            echo "core/bench/report/Cargo.toml:cargo"
+            ;;
         sdk-python)
             echo "foreign/python/Cargo.toml:python-cargo"
             echo "foreign/python/pyproject.toml:pyproject"
@@ -127,7 +169,7 @@ get_version_files() {
             ;;
         *)
             echo -e "${RED}Unknown component: ${component}${NC}" >&2
-            echo "Valid: rust-all ${ALL_COMPONENTS}" >&2
+            echo "Valid: rust-all connectors-all connectors-sinks connectors-sources ${ALL_COMPONENTS}" >&2
             return 1
             ;;
     esac
@@ -339,13 +381,14 @@ write_version() {
 cmd_status() {
     local filter="${1:-}"
     local components
-    if [[ "$filter" == "rust-all" ]]; then
-        components="$RUST_COMPONENTS"
-    elif [[ -n "$filter" ]]; then
-        components="$filter"
-    else
-        components="$ALL_COMPONENTS"
-    fi
+    case "$filter" in
+        rust-all)           components="$RUST_COMPONENTS" ;;
+        connectors-all)     components="$CONNECTOR_COMPONENTS" ;;
+        connectors-sinks)   components="$CONNECTOR_SINK_COMPONENTS" ;;
+        connectors-sources) components="$CONNECTOR_SOURCE_COMPONENTS" ;;
+        "")                 components="$ALL_COMPONENTS" ;;
+        *)                  components="$filter" ;;
+    esac
 
     for comp in $components; do
         echo -e "${CYAN}${comp}${NC}"
@@ -641,6 +684,15 @@ case "$1" in
     rust-all)
         shift
         cmd_bump_multi "$RUST_COMPONENTS" "$@" ;;
+    connectors-all)
+        shift
+        cmd_bump_multi "$CONNECTOR_COMPONENTS" "$@" ;;
+    connectors-sinks)
+        shift
+        cmd_bump_multi "$CONNECTOR_SINK_COMPONENTS" "$@" ;;
+    connectors-sources)
+        shift
+        cmd_bump_multi "$CONNECTOR_SOURCE_COMPONENTS" "$@" ;;
     --*)
         echo -e "${RED}Expected component name, got flag: ${1}${NC}" >&2
         echo "Use: bump-version.sh <component> <flags>" >&2

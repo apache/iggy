@@ -1,0 +1,111 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Removes the S-stale label on PR comments and review submissions, via
+# the workflow_run handoff from pr-triage-collect.yml.
+#
+# Why workflow_run instead of issue_comment / pull_request_review here:
+# those events deliver a read-only GITHUB_TOKEN on cross-fork PRs
+# regardless of the workflow's permissions block, so the label DELETE
+# silently fails for the majority of contributor PRs. pr-triage-collect.yml
+# already collects the event payload as an artifact under a read-only
+# token; this workflow runs against base ref via workflow_run, where the
+# GITHUB_TOKEN has write perms, and removes the label.
+#
+# Push-driven unmark stays in stale-prs-unmark.yml because
+# pull_request_target.synchronize gets a write token directly.
+#
+# SECURITY: no actions/checkout, no exec of PR contents. The artifact
+# contents come from the runner-written event_path, not from PR code.
+
+name: Unmark Stale PRs on Activity
+
+on:
+  workflow_run:
+    workflows: ["PR Triage Collect"]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+  contents: read
+  # Required for actions/download-artifact@v8 to fetch the triage-event
+  # artifact uploaded by the upstream PR Triage Collect run via run-id.
+  actions: read
+
+concurrency:
+  # workflow_run cannot key on PR number until after artifact parse, so it
+  # falls back to the upstream run id. Same constraint as pr-triage-apply.
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  unmark:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Download triage event artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: triage-event
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: payload/
+
+      - name: Extract PR number
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # The artifact contains exactly one file: the JSON event payload
+          # uploaded as ${{ github.event_path }}. Its on-disk name is
+          # whatever the runner used; resolve it dynamically.
+          payload=( payload/*.json payload/event.json )
+          f=""
+          for candidate in "${payload[@]}"; do
+            [[ -f "$candidate" ]] && f="$candidate" && break
+          done
+          if [[ -z "$f" ]]; then
+            echo "triage payload not found under payload/" >&2
+            ls -la payload/ >&2 || true
+            exit 1
+          fi
+          pr=$(jq -r '.pull_request.number // .issue.number // ""' "$f")
+          if [[ -z "$pr" ]]; then
+            echo "no PR number in payload" >&2
+            exit 1
+          fi
+          echo "PR_NUMBER=$pr" >> "$GITHUB_ENV"
+
+      - name: Remove stale label if present
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ env.PR_NUMBER }}
+          REPO: ${{ github.repository }}
+        # Pre-check via REST so we only invoke the GraphQL edit when the
+        # label is actually on the PR. Saves an API write on every drive-by
+        # comment that is far more common than a comment on a stale PR.
+        # The edit itself is idempotent (GraphQL removeLabelsFromLabelable
+        # succeeds whether or not the label is set), so the gate is purely
+        # a cost optimization.
+        run: |
+          set -euo pipefail
+          if gh api "repos/$REPO/issues/$PR_NUMBER/labels" \
+               --jq '.[].name' | grep -qx S-stale; then
+            gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label S-stale
+          else
+            echo "PR #$PR_NUMBER has no S-stale label, skipping"
+          fi
