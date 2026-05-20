@@ -65,6 +65,9 @@ pub enum Operation {
     SendMessages = 160,
     StoreConsumerOffset = 161,
     DeleteConsumerOffset = 162,
+    // 163 is reserved for the planned DeleteSegments move (see TODO above).
+    StoreConsumerOffset2 = 164,
+    DeleteConsumerOffset2 = 165,
 }
 
 impl Operation {
@@ -165,7 +168,9 @@ impl Operation {
             | Self::DeletePersonalAccessToken
             | Self::SendMessages
             | Self::StoreConsumerOffset
-            | Self::DeleteConsumerOffset => match crate::dispatch::lookup_by_operation(*self) {
+            | Self::DeleteConsumerOffset
+            | Self::StoreConsumerOffset2
+            | Self::DeleteConsumerOffset2 => match crate::dispatch::lookup_by_operation(*self) {
                 Some(meta) => Some(meta.code),
                 None => None,
             },
@@ -214,6 +219,8 @@ mod tests {
             Operation::SendMessages,
             Operation::StoreConsumerOffset,
             Operation::DeleteConsumerOffset,
+            Operation::StoreConsumerOffset2,
+            Operation::DeleteConsumerOffset2,
         ];
         for op in ops {
             let code = op
@@ -270,5 +277,7 @@ mod tests {
         assert!(!Operation::SendMessages.is_metadata());
         assert!(Operation::DeleteSegments.is_partition());
         assert!(Operation::DeleteConsumerOffset.is_partition());
+        assert!(Operation::StoreConsumerOffset2.is_partition());
+        assert!(Operation::DeleteConsumerOffset2.is_partition());
     }
 }

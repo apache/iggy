@@ -17,46 +17,15 @@
 
 //! Per-connection socket options.
 //!
-//! `compio::net::SocketOpts` exposes `keepalive(bool)` only - it does not
-//! let callers tune `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, or `TCP_KEEPCNT`. We
-//! reach through to `socket2::SockRef` for the finer knobs so the bus can
-//! detect a silently dead peer within a predictable bound without waiting
-//! for the kernel defaults (2 hours idle on Linux).
+//! Keepalive is intentionally NOT configured here: SDK clients manage
+//! their own keepalive policy at the application layer, and
+//! replica<->replica liveness is observed by VSR heartbeats rather
+//! than by `SO_KEEPALIVE`. Only `TCP_NODELAY` toggling lives in this
+//! module today.
 
 use compio::net::TcpStream;
-use socket2::{SockRef, TcpKeepalive};
+use socket2::SockRef;
 use std::io;
-use std::time::Duration;
-
-/// Configure TCP keepalive on a freshly accepted or freshly dialed
-/// connection. Uses `socket2` directly because compio's `SocketOpts` only
-/// exposes the on/off toggle; we need the idle/interval/count tuning to get
-/// a bounded detection window on a half-dead peer.
-///
-/// `idle` maps to `TCP_KEEPIDLE`, `interval` to `TCP_KEEPINTVL`, `retries`
-/// to `TCP_KEEPCNT`. Total detection window is roughly
-/// `idle + retries * interval`; keep it comfortably shorter than the VSR
-/// view-change timeout so replicas can observe a dead peer ahead of the
-/// consensus-level decision.
-///
-/// # Errors
-///
-/// Returns the underlying `io::Error` if the kernel rejects any of the
-/// setsockopt calls. Callers log-and-continue rather than tear down the
-/// connection, because a missing keepalive is a soft failure.
-pub fn apply_keepalive_for_connection(
-    stream: &TcpStream,
-    idle: Duration,
-    interval: Duration,
-    retries: u32,
-) -> io::Result<()> {
-    let sock = SockRef::from(stream);
-    let params = TcpKeepalive::new()
-        .with_time(idle)
-        .with_interval(interval)
-        .with_retries(retries);
-    sock.set_tcp_keepalive(&params)
-}
 
 /// Disable Nagle on a per-connection socket.
 ///

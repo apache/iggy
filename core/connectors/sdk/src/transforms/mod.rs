@@ -17,6 +17,7 @@
  */
 
 mod add_fields;
+pub mod avro_convert;
 mod delete_fields;
 mod filter_fields;
 pub mod flatbuffer_convert;
@@ -25,6 +26,7 @@ pub mod proto_convert;
 mod update_fields;
 use crate::{DecodedMessage, Error, TopicMetadata};
 pub use add_fields::{AddFields, AddFieldsConfig, Field as AddField};
+pub use avro_convert::{AvroConvert, AvroConvertConfig};
 pub use delete_fields::{DeleteFields, DeleteFieldsConfig};
 pub use filter_fields::{
     FilterFields, FilterFieldsConfig, FilterPattern, KeyPattern as FilterKeyPattern,
@@ -86,6 +88,7 @@ pub enum TransformType {
     UpdateFields,
     ProtoConvert,
     FlatBufferConvert,
+    AvroConvert,
 }
 
 pub fn from_config(
@@ -122,6 +125,11 @@ pub fn from_config(
             let cfg: FlatBufferConvertConfig =
                 serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
             Ok(Arc::new(FlatBufferConvert::new(cfg)))
+        }
+        TransformType::AvroConvert => {
+            let cfg: AvroConvertConfig =
+                serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
+            Ok(Arc::new(AvroConvert::new(cfg)))
         }
     }
 }

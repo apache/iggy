@@ -16,7 +16,8 @@
  * under the License.
  */
 
-use ctor::{ctor, dtor};
+use ctor::ctor;
+use dtor::dtor;
 use integration::harness::get_test_directory;
 use lazy_static::lazy_static;
 use std::collections::{HashMap, HashSet};
@@ -39,6 +40,7 @@ mod mcp;
 mod sdk;
 mod server;
 mod state;
+mod storage;
 
 lazy_static! {
     static ref TESTS_FAILED: AtomicBool = AtomicBool::new(false);
@@ -168,14 +170,14 @@ fn teardown() {
     }
 }
 
-#[ctor]
+#[ctor(unsafe)]
 fn before_all_tests() {
     INIT.call_once(|| {
         setup();
     });
 }
 
-#[dtor]
+#[dtor(unsafe)]
 fn after_all_tests() {
     teardown();
 }

@@ -182,14 +182,20 @@ async fn handle_messages<T: Source>(
                 break;
             }
             messages = source.poll() => {
-                let Ok(messages) = messages else {
-                    error!("Failed to poll messages for source connector with ID: {plugin_id}");
-                    continue;
+                let messages = match messages {
+                    Ok(messages) => messages,
+                    Err(err) => {
+                        error!("Failed to poll messages for source connector with ID: {plugin_id}. {err}");
+                        continue;
+                    }
                 };
 
-                let Ok(messages) = postcard::to_allocvec(&messages) else {
-                    error!("Failed to serialize messages for source connector with ID: {plugin_id}");
-                    continue;
+                let messages = match postcard::to_allocvec(&messages) {
+                    Ok(messages) => messages,
+                    Err(err) => {
+                        error!("Failed to serialize messages for source connector with ID: {plugin_id}. {err}");
+                        continue;
+                    }
                 };
 
                 callback(plugin_id, messages.as_ptr(), messages.len());
@@ -226,6 +232,13 @@ macro_rules! source_connector {
             state_len: usize,
             log_callback: LogCallback,
         ) -> i32 {
+            if INSTANCES.contains_key(&id) {
+                // Duplicate id: caller did not close before reopening. Without
+                // this guard the existing entry would be silently overwritten,
+                // discarding any in-flight buffered data and orphaning tasks.
+                return -1;
+            }
+
             let mut container = SourceContainer::new(id);
             let result = container.open(
                 id,

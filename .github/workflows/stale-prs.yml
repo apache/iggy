@@ -33,7 +33,8 @@ jobs:
         with:
           days-before-pr-stale: 7
           days-before-pr-close: 7
-          stale-pr-label: "stale"
+          stale-pr-label: "S-stale"
+          remove-stale-when-updated: false
           stale-pr-message: >
             This pull request has been automatically marked as stale because
             it has not had recent activity. It will be closed in 7 days if
@@ -42,7 +43,7 @@ jobs:
 
             If you need a review, please ensure CI is green and the PR is rebased
             on the latest master. Don't hesitate to ping the maintainers - either
-            @core on Discord or by mentioning them directly here on the PR.
+            `@core` on Discord or by mentioning them directly here on the PR.
 
 
             Thank you for your contribution!

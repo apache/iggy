@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_binary_protocol"
-version = "0.10.0"
+version = "0.10.1-edge.1"
 description = "Wire protocol types and codec for the Iggy binary protocol. Shared between server and SDK."
 edition = "2024"
 license = "Apache-2.0"
@@ -26,7 +26,7 @@ categories = ["command-line-utilities", "database", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
-readme = "../../README.md"
+readme = "README.md"
 
 [dependencies]
 aligned-vec = { workspace = true }
