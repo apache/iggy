@@ -220,7 +220,7 @@ opentelemetry_sdk = { version = "0.32.0", features = [
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
 papaya = "0.2.4"
-parquet = "57.3.1"
+parquet = "58.3.0"
 partitions = { path = "core/partitions" }
 passterm = "2.0.6"
 paste = "1.0"
