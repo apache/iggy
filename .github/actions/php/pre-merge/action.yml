@@ -32,10 +32,13 @@ runs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
           clang \
+          composer \
           libclang-dev \
           libssl-dev \
           php-cli \
           php-dev \
+          php-mbstring \
+          php-xml \
           pkg-config \
           unzip
 
@@ -43,6 +46,7 @@ runs:
         echo "PHP_CONFIG=$(command -v php-config)" >> "$GITHUB_ENV"
         php --version
         php-config --version
+        composer --version
 
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
@@ -100,6 +104,12 @@ runs:
         fi
         echo "PHP_IGGY_EXTENSION=$(realpath "$extension")" >> "$GITHUB_ENV"
         ls -lh "$extension"
+
+    - name: Install PHP test dependencies
+      if: inputs.task == 'test'
+      shell: bash
+      working-directory: foreign/php
+      run: composer install --no-interaction --prefer-dist --no-progress
 
     - name: Start Iggy server
       if: inputs.task == 'test'
