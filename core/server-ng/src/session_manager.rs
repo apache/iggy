@@ -81,7 +81,6 @@ pub struct SessionManager {
     /// Reverse index: `client_id` → `connection_id` for fast lookup when
     /// a consensus reply arrives and needs routing to the right connection.
     client_to_connection: HashMap<u128, u128>,
-    next_connection_id: u128,
 }
 
 impl SessionManager {
@@ -90,28 +89,7 @@ impl SessionManager {
         Self {
             connections: HashMap::new(),
             client_to_connection: HashMap::new(),
-            next_connection_id: 1,
         }
-    }
-
-    /// Register a new transport connection. Returns the assigned connection ID.
-    ///
-    /// # Panics
-    /// Panics if the connection ID counter overflows `u64::MAX`.
-    pub fn add_connection(&mut self, address: SocketAddr) -> u128 {
-        let id = self.next_connection_id;
-        self.next_connection_id = self
-            .next_connection_id
-            .checked_add(1)
-            .expect("connection ID overflow (u128::MAX connections without restart)");
-        self.connections.insert(
-            id,
-            Connection {
-                address,
-                state: ConnectionState::Connected,
-            },
-        );
-        id
     }
 
     pub fn ensure_connection(&mut self, connection_id: u128, address: SocketAddr) {
@@ -324,7 +302,8 @@ mod tests {
     fn full_lifecycle() {
         let mut mgr = SessionManager::new();
 
-        let conn = mgr.add_connection(addr(5000));
+        let conn = 1;
+        mgr.ensure_connection(conn, addr(5000));
         assert_eq!(mgr.connection_count(), 1);
         assert!(mgr.get_session(conn).is_none());
 
@@ -351,7 +330,8 @@ mod tests {
     #[test]
     fn login_requires_connected_state() {
         let mut mgr = SessionManager::new();
-        let conn = mgr.add_connection(addr(5000));
+        let conn = 1;
+        mgr.ensure_connection(conn, addr(5000));
         mgr.login(conn, 1).unwrap();
 
         // Double login should fail. Already Authenticated.
@@ -361,7 +341,8 @@ mod tests {
     #[test]
     fn bind_requires_authenticated_state() {
         let mut mgr = SessionManager::new();
-        let conn = mgr.add_connection(addr(5000));
+        let conn = 1;
+        mgr.ensure_connection(conn, addr(5000));
 
         // Bind without login should fail.
         assert!(mgr.bind_session(conn, 1, 1).is_err());
@@ -372,13 +353,15 @@ mod tests {
         let mut mgr = SessionManager::new();
 
         // First connection binds to client_id 99.
-        let conn1 = mgr.add_connection(addr(5000));
+        let conn1 = 1;
+        mgr.ensure_connection(conn1, addr(5000));
         mgr.login(conn1, 1).unwrap();
         mgr.bind_session(conn1, 99, 10).unwrap();
         assert_eq!(mgr.connection_for_client(99), Some(conn1));
 
         // Second connection binds to same client_id. Evicts conn1.
-        let conn2 = mgr.add_connection(addr(5001));
+        let conn2 = 2;
+        mgr.ensure_connection(conn2, addr(5001));
         mgr.login(conn2, 1).unwrap();
         mgr.bind_session(conn2, 99, 20).unwrap();
 
@@ -402,7 +385,8 @@ mod tests {
     #[test]
     fn reset_to_connected_from_authenticated() {
         let mut mgr = SessionManager::new();
-        let conn = mgr.add_connection(addr(5000));
+        let conn = 1;
+        mgr.ensure_connection(conn, addr(5000));
         mgr.login(conn, 1).unwrap();
         mgr.reset_to_connected(conn).unwrap();
         // Back to Connected. Can login again.
@@ -412,7 +396,8 @@ mod tests {
     #[test]
     fn reset_to_connected_rejects_wrong_state() {
         let mut mgr = SessionManager::new();
-        let conn = mgr.add_connection(addr(5000));
+        let conn = 1;
+        mgr.ensure_connection(conn, addr(5000));
         // Connected - reset should fail.
         assert!(mgr.reset_to_connected(conn).is_err());
     }
@@ -421,8 +406,10 @@ mod tests {
     fn multiple_independent_sessions() {
         let mut mgr = SessionManager::new();
 
-        let c1 = mgr.add_connection(addr(5000));
-        let c2 = mgr.add_connection(addr(5001));
+        let c1 = 1;
+        let c2 = 2;
+        mgr.ensure_connection(c1, addr(5000));
+        mgr.ensure_connection(c2, addr(5001));
         mgr.login(c1, 1).unwrap();
         mgr.login(c2, 2).unwrap();
         mgr.bind_session(c1, 100, 10).unwrap();

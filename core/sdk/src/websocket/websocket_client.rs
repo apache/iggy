@@ -135,6 +135,11 @@ impl BinaryTransport for WebSocketClient {
             return Err(IggyError::Disconnected);
         }
 
+        #[cfg(feature = "vsr")]
+        if matches!(self.config.auto_login, AutoLogin::Disabled) {
+            return Err(error);
+        }
+
         self.disconnect().await?;
 
         {

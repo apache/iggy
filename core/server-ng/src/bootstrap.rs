@@ -24,6 +24,7 @@ use crate::session_manager::SessionManager;
 use bytes::Bytes;
 use configs::server_ng::ServerNgConfig;
 use consensus::{LocalPipeline, PartitionsHandle, Sequencer, VsrConsensus};
+use iggy_binary_protocol::codes::PING_CODE;
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
@@ -371,7 +372,7 @@ async fn build_single_shard(
     let senders = vec![sender];
     let shard_handle = Rc::new(RefCell::new(None));
     let on_replica_message = make_deferred_replica_message_handler(&shard_handle);
-    let on_client_request = make_deferred_client_request_handler(&shard_handle);
+    let on_client_request = make_deferred_client_request_handler(&bus, &shard_handle);
     let built = IggyShardBuilder::new(
         ShardIdentity::new(SHARD_ID, SHARD_NAME.to_string()),
         Rc::clone(&bus),
@@ -1269,6 +1270,14 @@ fn make_replica_message_handler(shard: &Rc<ServerNgShard>) -> MessageHandler {
 fn make_client_request_handler(shard: &Rc<ServerNgShard>) -> RequestHandler {
     let shard = Rc::clone(shard);
     let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    let sessions_for_disconnect = Rc::clone(&sessions);
+    shard
+        .bus
+        .set_client_connection_lost_fn(Rc::new(move |client_id| {
+            sessions_for_disconnect
+                .borrow_mut()
+                .remove_connection(client_id);
+        }));
     Rc::new(move |client_id, message| {
         let shard = Rc::clone(&shard);
         let sessions = Rc::clone(&sessions);
@@ -1288,9 +1297,18 @@ fn make_deferred_replica_message_handler(shard_handle: &ServerNgShardHandle) -> 
     })
 }
 
-fn make_deferred_client_request_handler(shard_handle: &ServerNgShardHandle) -> RequestHandler {
+fn make_deferred_client_request_handler(
+    bus: &Rc<IggyMessageBus>,
+    shard_handle: &ServerNgShardHandle,
+) -> RequestHandler {
     let shard_handle = Rc::clone(shard_handle);
     let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    let sessions_for_disconnect = Rc::clone(&sessions);
+    bus.set_client_connection_lost_fn(Rc::new(move |client_id| {
+        sessions_for_disconnect
+            .borrow_mut()
+            .remove_connection(client_id);
+    }));
     Rc::new(move |client_id, message| {
         let shard_handle = Rc::clone(&shard_handle);
         let sessions = Rc::clone(&sessions);
@@ -1326,6 +1344,11 @@ async fn handle_client_request(
     ensure_transport_connection(shard, sessions, transport_client_id);
 
     let header = *request.header();
+    if header.operation == Operation::NonReplicated {
+        handle_non_replicated_request(shard, transport_client_id, request).await;
+        return;
+    }
+
     if header.operation == Operation::Register && header.session == 0 && header.request == 0 {
         handle_login_register_request(shard, sessions, transport_client_id, request).await;
         return;
@@ -1341,6 +1364,43 @@ async fn handle_client_request(
         }
     });
     shard.dispatch(request.into_generic());
+}
+
+#[allow(clippy::future_not_send)]
+async fn handle_non_replicated_request(
+    shard: &Rc<ServerNgShard>,
+    transport_client_id: u128,
+    request: Message<RequestHeader>,
+) {
+    const CODE_RANGE: std::ops::Range<usize> = 0..4;
+    let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
+    match code {
+        PING_CODE => {
+            let reply = build_login_register_reply(
+                request.header(),
+                request.header().client,
+                request.header().session,
+                &Bytes::new(),
+            );
+            if let Err(error) = shard
+                .bus
+                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+                .await
+            {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    "failed to send non-replicated ping reply"
+                );
+            }
+        }
+        _ => {
+            warn!(
+                transport_client_id,
+                code, "dropping unsupported non-replicated VSR request"
+            );
+        }
+    }
 }
 
 fn ensure_transport_connection(

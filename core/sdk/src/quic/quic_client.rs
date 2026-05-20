@@ -132,6 +132,11 @@ impl BinaryTransport for QuicClient {
             return Err(IggyError::Disconnected);
         }
 
+        #[cfg(feature = "vsr")]
+        if matches!(self.config.auto_login, AutoLogin::Disabled) {
+            return Err(error);
+        }
+
         self.disconnect().await?;
         let server_address = self.current_server_address.lock().await.to_string();
         info!(

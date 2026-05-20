@@ -35,3 +35,14 @@ async fn hello_world(harness: &TestHarness) {
         .await
         .unwrap();
 }
+
+#[cfg(feature = "vsr")]
+#[iggy_harness(test_client_transport = Tcp)]
+async fn hello_world_ping(harness: &TestHarness) {
+    let client = harness.new_client().await.unwrap();
+    client
+        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .await
+        .unwrap();
+    client.ping().await.unwrap();
+}
