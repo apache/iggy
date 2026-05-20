@@ -90,6 +90,7 @@ define_state! {
         index: AHashMap<Arc<str>, UserId>,
         items: Slab<User>,
         personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>>,
+        personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>)>,
         permissioner: Permissioner,
     }
 }
@@ -141,6 +142,9 @@ impl Users {
             return;
         }
 
+        // Boot-only invariant: server-ng calls this before listeners and
+        // consensus traffic start, on shard 0 initialization. The read/apply
+        // split cannot race another user creation in that phase.
         let username = WireName::new(username).expect("root username must be valid");
         self.inner
             .do_apply(UsersCommand::CreateUser(CreateUserRequest {
@@ -250,7 +254,11 @@ impl StateHandler for DeleteUserRequest {
             let username = user.username.clone();
             state.items.remove(user_id);
             state.index.remove(&username);
-            state.personal_access_tokens.remove(&(user_id as UserId));
+            if let Some(tokens) = state.personal_access_tokens.remove(&(user_id as UserId)) {
+                for pat in tokens.values() {
+                    state.personal_access_token_index.remove(&pat.token);
+                }
+            }
         }
         Bytes::new()
     }
@@ -309,7 +317,11 @@ impl StateHandler for CreatePersonalAccessTokenRequest {
 
         let (pat, _) =
             PersonalAccessToken::new(user_id, self.name.as_ref(), IggyTimestamp::now(), expiry);
+        let token_hash = Arc::clone(&pat.token);
         user_tokens.insert(name_arc, pat);
+        state
+            .personal_access_token_index
+            .insert(token_hash, (user_id, Arc::from(self.name.as_str())));
         Bytes::new()
     }
 }
@@ -322,7 +334,9 @@ impl StateHandler for DeletePersonalAccessTokenRequest {
 
         if let Some(user_tokens) = state.personal_access_tokens.get_mut(&user_id) {
             let name_arc: Arc<str> = Arc::from(self.name.as_str());
-            user_tokens.remove(&name_arc);
+            if let Some(pat) = user_tokens.remove(&name_arc) {
+                state.personal_access_token_index.remove(&pat.token);
+            }
         }
         Bytes::new()
     }
@@ -486,16 +500,21 @@ impl Snapshotable for Users {
 
         let mut personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>> =
             AHashMap::new();
+        let mut personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>)> =
+            AHashMap::new();
         for (user_id, tokens) in snapshot.personal_access_tokens {
             let mut token_map: AHashMap<Arc<str>, PersonalAccessToken> = AHashMap::new();
             for (name, pat_snap) in tokens {
+                let name: Arc<str> = Arc::from(name.as_str());
                 let pat = PersonalAccessToken::raw(
                     pat_snap.user_id,
                     &pat_snap.name,
                     &pat_snap.token,
                     pat_snap.expiry_at,
                 );
-                token_map.insert(Arc::from(name.as_str()), pat);
+                personal_access_token_index
+                    .insert(Arc::clone(&pat.token), (user_id, Arc::clone(&name)));
+                token_map.insert(name, pat);
             }
             personal_access_tokens.insert(user_id, token_map);
         }
@@ -537,6 +556,7 @@ impl Snapshotable for Users {
             index,
             items,
             personal_access_tokens,
+            personal_access_token_index,
             permissioner,
             last_result: None,
         };

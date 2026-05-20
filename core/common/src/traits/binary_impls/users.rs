@@ -28,18 +28,18 @@ use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::LOGIN_REGISTER_CODE;
 use iggy_binary_protocol::codes::{
     CHANGE_PASSWORD_CODE, CREATE_USER_CODE, DELETE_USER_CODE, GET_USER_CODE, GET_USERS_CODE,
-    UPDATE_PERMISSIONS_CODE, UPDATE_USER_CODE,
+    LOGOUT_USER_CODE, UPDATE_PERMISSIONS_CODE, UPDATE_USER_CODE,
 };
 #[cfg(not(feature = "vsr"))]
-use iggy_binary_protocol::codes::{LOGIN_USER_CODE, LOGOUT_USER_CODE};
+use iggy_binary_protocol::codes::LOGIN_USER_CODE;
 #[cfg(feature = "vsr")]
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, GetUserRequest, GetUsersRequest,
-    UpdatePermissionsRequest, UpdateUserRequest,
+    LogoutUserRequest, UpdatePermissionsRequest, UpdateUserRequest,
 };
 #[cfg(not(feature = "vsr"))]
-use iggy_binary_protocol::requests::users::{LoginUserRequest, LogoutUserRequest};
+use iggy_binary_protocol::requests::users::LoginUserRequest;
 #[cfg(feature = "vsr")]
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 #[cfg(not(feature = "vsr"))]
@@ -251,21 +251,11 @@ impl<B: BinaryClient> UserClient for B {
     }
 
     async fn logout_user(&self) -> Result<(), IggyError> {
-        #[cfg(feature = "vsr")]
-        {
-            return Err(IggyError::FeatureUnavailable);
-        }
-
-        #[cfg(not(feature = "vsr"))]
         fail_if_not_authenticated(self).await?;
-        #[cfg(not(feature = "vsr"))]
         self.send_raw_with_response(LOGOUT_USER_CODE, LogoutUserRequest.to_bytes())
             .await?;
-        #[cfg(not(feature = "vsr"))]
         self.set_state(ClientState::Connected).await;
-        #[cfg(not(feature = "vsr"))]
         self.publish_event(DiagnosticEvent::SignedOut).await;
-        #[cfg(not(feature = "vsr"))]
         Ok(())
     }
 }

@@ -636,6 +636,11 @@ impl WebSocketClient {
             code,
             payload.len()
         );
+        #[cfg(feature = "vsr")]
+        trace!(
+            "Sending {NAME} VSR request of size {} with code: {code}",
+            request.len()
+        );
 
         stream.write(&request).await?;
         stream.flush().await?;
@@ -656,7 +661,7 @@ impl WebSocketClient {
                 response.put_slice(&response_body);
             }
 
-            crate::vsr::decode_response(&response.freeze())
+            crate::vsr::decode_response(response.freeze())
         }
 
         #[cfg(not(feature = "vsr"))]

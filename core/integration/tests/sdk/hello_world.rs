@@ -45,4 +45,5 @@ async fn hello_world_ping(harness: &TestHarness) {
         .await
         .unwrap();
     client.ping().await.unwrap();
+    client.logout_user().await.unwrap();
 }

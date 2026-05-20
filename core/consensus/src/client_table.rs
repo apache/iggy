@@ -364,6 +364,18 @@ impl ClientTable {
             .reply = CachedReply::from_message(reply);
     }
 
+    /// Remove a client session and cached reply.
+    ///
+    /// Returns `true` when a slot existed. This is used by transport-level
+    /// disconnect/logout cleanup to release local table capacity.
+    pub fn remove_client(&mut self, client_id: u128) -> bool {
+        let Some(slot_idx) = self.index.remove(&client_id) else {
+            return false;
+        };
+        self.slots[slot_idx] = None;
+        true
+    }
+
     /// Evict client with oldest commit, preferring no-in-flight.
     ///
     /// Deterministic: fixed-array iteration, ties broken by lowest slot index.

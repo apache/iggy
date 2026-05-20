@@ -21,8 +21,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::WireDecode;
 use iggy_binary_protocol::codes::{
     DELETE_CONSUMER_OFFSET_2_CODE, DELETE_CONSUMER_OFFSET_CODE, DELETE_SEGMENTS_CODE,
-    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, PING_CODE, SEND_MESSAGES_CODE,
-    STORE_CONSUMER_OFFSET_2_CODE, STORE_CONSUMER_OFFSET_CODE,
+    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE, PING_CODE,
+    SEND_MESSAGES_CODE, STORE_CONSUMER_OFFSET_2_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
 use iggy_binary_protocol::consensus::{
     Command2, HEADER_SIZE, Operation, ReplyHeader, RequestHeader, read_size_field,
@@ -44,6 +44,18 @@ pub(crate) fn encode_request(
     code: u32,
     payload: &Bytes,
 ) -> Result<Bytes, IggyError> {
+    let (header, total_size) = encode_request_header(session, code, payload)?;
+    let mut request = BytesMut::with_capacity(total_size);
+    request.put_slice(bytemuck::bytes_of(&header));
+    request.put_slice(payload);
+    Ok(request.freeze())
+}
+
+pub(crate) fn encode_request_header(
+    session: &mut ConsensusSession,
+    code: u32,
+    payload: &Bytes,
+) -> Result<(RequestHeader, usize), IggyError> {
     let (operation, request_id, session_id) = match code {
         LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE => {
             (Operation::Register, session.register_request_id(), 0)
@@ -76,10 +88,7 @@ pub(crate) fn encode_request(
         ..Default::default()
     };
 
-    let mut request = BytesMut::with_capacity(total_size);
-    request.put_slice(bytemuck::bytes_of(&header));
-    request.put_slice(payload);
-    Ok(request.freeze())
+    Ok((header, total_size))
 }
 
 fn operation_for_code(code: u32) -> Result<Operation, IggyError> {
@@ -88,7 +97,9 @@ fn operation_for_code(code: u32) -> Result<Operation, IggyError> {
     }
 
     match iggy_binary_protocol::dispatch::lookup_command(code) {
-        Some(meta) if !meta.is_replicated() && code == PING_CODE => Ok(Operation::NonReplicated),
+        Some(meta) if !meta.is_replicated() && matches!(code, PING_CODE | LOGOUT_USER_CODE) => {
+            Ok(Operation::NonReplicated)
+        }
         Some(_) => Err(IggyError::FeatureUnavailable),
         None => Err(IggyError::InvalidCommand),
     }
@@ -102,7 +113,7 @@ pub(crate) fn response_size(header: &[u8]) -> Result<usize, IggyError> {
     Ok(size)
 }
 
-pub(crate) fn decode_response(response: &[u8]) -> Result<Bytes, IggyError> {
+pub(crate) fn decode_response(response: Bytes) -> Result<Bytes, IggyError> {
     if response.len() < HEADER_SIZE {
         return Err(IggyError::EmptyResponse);
     }
@@ -118,7 +129,7 @@ pub(crate) fn decode_response(response: &[u8]) -> Result<Bytes, IggyError> {
         return Err(IggyError::InvalidCommand);
     }
 
-    Ok(Bytes::copy_from_slice(&response[HEADER_SIZE..total_size]))
+    Ok(response.slice(HEADER_SIZE..total_size))
 }
 
 fn namespace_for_request(
@@ -224,7 +235,7 @@ fn validate_namespace_field(value: u32, exclusive_max: usize) -> Result<(), Iggy
 mod tests {
     use super::*;
     use crate::session::ConsensusSession;
-    use iggy_binary_protocol::codes::{CREATE_STREAM_CODE, GET_STREAM_CODE};
+    use iggy_binary_protocol::codes::{CREATE_STREAM_CODE, GET_STREAM_CODE, LOGOUT_USER_CODE};
     use iggy_binary_protocol::consensus::{Message, RequestHeader, iobuf::Owned};
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
@@ -293,6 +304,27 @@ mod tests {
                     .unwrap()
             ),
             PING_CODE
+        );
+        assert_eq!(header.session, 99);
+        assert_eq!(header.namespace, 0);
+    }
+
+    #[test]
+    fn logout_uses_non_replicated_operation() {
+        let mut session = ConsensusSession::with_client_id(42);
+        session.bind(99);
+        let bytes = encode_request(&mut session, LOGOUT_USER_CODE, &Bytes::new()).unwrap();
+        let request = decode_request(&bytes);
+        let header = request.header();
+
+        assert_eq!(header.operation, Operation::NonReplicated);
+        assert_eq!(
+            u32::from_le_bytes(
+                header.reserved[NON_REPLICATED_CODE_RANGE]
+                    .try_into()
+                    .unwrap()
+            ),
+            LOGOUT_USER_CODE
         );
         assert_eq!(header.session, 99);
         assert_eq!(header.namespace, 0);

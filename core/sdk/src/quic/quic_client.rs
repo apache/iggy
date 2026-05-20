@@ -275,7 +275,7 @@ impl QuicClient {
 
         #[cfg(feature = "vsr")]
         {
-            crate::vsr::decode_response(&buffer)
+            crate::vsr::decode_response(Bytes::from(buffer))
         }
 
         #[cfg(not(feature = "vsr"))]
@@ -580,9 +580,9 @@ impl QuicClient {
             let connection = connection.lock().await;
             if let Some(connection) = connection.as_ref() {
                 #[cfg(feature = "vsr")]
-                let request = {
+                let (request_header, request_size) = {
                     let mut consensus_session = consensus_session.lock().await;
-                    crate::vsr::encode_request(&mut consensus_session, code, &payload)?
+                    crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
                 };
                 #[cfg(not(feature = "vsr"))]
                 let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
@@ -592,8 +592,27 @@ impl QuicClient {
                 })?;
                 trace!("Sending a QUIC request with code: {code}");
                 #[cfg(feature = "vsr")]
-                send.write_all(&request).await.map_err(|error| {
-                    error!("Failed to write VSR request: {error}");
+                trace!(
+                    "Sending a QUIC VSR request of size {} with code: {code}",
+                    request_size
+                );
+                #[cfg(feature = "vsr")]
+                send.write_all(bytemuck::bytes_of(&request_header))
+                    .await
+                    .map_err(|error| {
+                        error!("Failed to write VSR request header: {error}");
+                        IggyError::QuicError
+                    })?;
+                #[cfg(feature = "vsr")]
+                if !payload.is_empty() {
+                    send.write_all(&payload).await.map_err(|error| {
+                        error!("Failed to write VSR request payload: {error}");
+                        IggyError::QuicError
+                    })?;
+                }
+                #[cfg(feature = "vsr")]
+                send.finish().map_err(|error| {
+                    error!("Failed to finish VSR request stream: {error}");
                     IggyError::QuicError
                 })?;
                 #[cfg(not(feature = "vsr"))]
@@ -613,6 +632,7 @@ impl QuicClient {
                     error!("Failed to write payload: {error}");
                     IggyError::QuicError
                 })?;
+                #[cfg(not(feature = "vsr"))]
                 send.finish().map_err(|error| {
                     error!("Failed to finish sending data: {error}");
                     IggyError::QuicError

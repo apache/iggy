@@ -100,12 +100,17 @@ impl SessionManager {
     }
 
     /// Remove a connection (disconnect). Cleans up the reverse index if bound.
-    pub fn remove_connection(&mut self, connection_id: u128) {
+    ///
+    /// Returns the bound consensus client id when the removed connection had
+    /// one, so callers can release the corresponding client-table slot.
+    pub fn remove_connection(&mut self, connection_id: u128) -> Option<u128> {
         if let Some(conn) = self.connections.remove(&connection_id)
             && let ConnectionState::Bound { client_id, .. } = conn.state
         {
             self.client_to_connection.remove(&client_id);
+            return Some(client_id);
         }
+        None
     }
 
     /// Transition to `Authenticated` after successful login.

@@ -603,21 +603,25 @@ impl TcpClient {
             let mut stream = stream.lock().await;
             if let Some(stream) = stream.as_mut() {
                 #[cfg(feature = "vsr")]
-                let request = {
+                let (request_header, request_size) = {
                     let mut consensus_session = consensus_session.lock().await;
-                    crate::vsr::encode_request(&mut consensus_session, code, &payload)?
+                    crate::vsr::encode_request_header(&mut consensus_session, code, &payload)?
                 };
                 #[cfg(not(feature = "vsr"))]
                 let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
                 #[cfg(feature = "vsr")]
                 trace!(
                     "Sending a TCP VSR request of size {} with code: {code}",
-                    request.len()
+                    request_size
                 );
                 #[cfg(not(feature = "vsr"))]
                 trace!("Sending a TCP request of size {payload_length} with code: {code}");
                 #[cfg(feature = "vsr")]
-                stream.write(&request).await?;
+                stream.write(bytemuck::bytes_of(&request_header)).await?;
+                #[cfg(feature = "vsr")]
+                if !payload.is_empty() {
+                    stream.write(&payload).await?;
+                }
                 #[cfg(not(feature = "vsr"))]
                 stream.write(&(payload_length as u32).to_le_bytes()).await?;
                 #[cfg(not(feature = "vsr"))]
@@ -649,8 +653,7 @@ impl TcpClient {
 
                     if response_size > iggy_binary_protocol::HEADER_SIZE {
                         let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
-                        let mut body = vec![0u8; body_size];
-                        stream.read(&mut body).await.map_err(|error| {
+                        stream.read_buf(&mut response, body_size).await.map_err(|error| {
                             error!(
                                 "Failed to read VSR response body for TCP request with code: {code}: {error}",
                                 code = code,
@@ -658,10 +661,9 @@ impl TcpClient {
                             );
                             IggyError::Disconnected
                         })?;
-                        response.put_slice(&body);
                     }
 
-                    return crate::vsr::decode_response(&response.freeze());
+                    return crate::vsr::decode_response(response.freeze());
                 }
 
                 #[cfg(not(feature = "vsr"))]

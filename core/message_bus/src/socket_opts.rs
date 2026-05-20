@@ -63,7 +63,7 @@ pub fn bind_reusable_tcp_listener(addr: SocketAddr) -> io::Result<TcpListener> {
     ))]
     socket.set_reuse_port(true)?;
     socket.bind(&addr.into())?;
-    socket.listen(128)?;
+    socket.listen(libc::SOMAXCONN)?;
     socket.set_nonblocking(true)?;
 
     let std_listener: std::net::TcpListener = socket.into();

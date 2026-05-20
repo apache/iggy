@@ -24,11 +24,11 @@ use crate::session_manager::SessionManager;
 use bytes::Bytes;
 use configs::server_ng::ServerNgConfig;
 use consensus::{LocalPipeline, PartitionsHandle, Sequencer, VsrConsensus};
-use iggy_binary_protocol::codes::PING_CODE;
+use iggy_binary_protocol::codes::{LOGOUT_USER_CODE, PING_CODE};
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
-    Command2, Message, Operation, ReplyHeader, RequestHeader, WireDecode, WireEncode,
+    Command2, GenericHeader, Message, Operation, ReplyHeader, RequestHeader, WireDecode, WireEncode,
 };
 use iggy_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use iggy_common::{
@@ -77,6 +77,7 @@ use shard::{
     CoordinatorConfig, IggyShard, PartitionConsensusConfig, ShardIdentity, channel, shard_channel,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -1267,24 +1268,39 @@ fn make_replica_message_handler(shard: &Rc<ServerNgShard>) -> MessageHandler {
     })
 }
 
+type ClientRequestQueues = Rc<RefCell<HashMap<u128, VecDeque<Message<GenericHeader>>>>>;
+type ActiveClientRequests = Rc<RefCell<HashSet<u128>>>;
+
 fn make_client_request_handler(shard: &Rc<ServerNgShard>) -> RequestHandler {
     let shard = Rc::clone(shard);
     let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    let queues: ClientRequestQueues = Rc::new(RefCell::new(HashMap::new()));
+    let active: ActiveClientRequests = Rc::new(RefCell::new(HashSet::new()));
     let sessions_for_disconnect = Rc::clone(&sessions);
+    let shard_for_disconnect = Rc::clone(&shard);
     shard
         .bus
         .set_client_connection_lost_fn(Rc::new(move |client_id| {
-            sessions_for_disconnect
+            if let Some(vsr_client_id) = sessions_for_disconnect
                 .borrow_mut()
-                .remove_connection(client_id);
+                .remove_connection(client_id)
+            {
+                shard_for_disconnect
+                    .plane
+                    .inner()
+                    .0
+                    .remove_client_session(vsr_client_id);
+            }
         }));
     Rc::new(move |client_id, message| {
-        let shard = Rc::clone(&shard);
-        let sessions = Rc::clone(&sessions);
-        compio::runtime::spawn(async move {
-            handle_client_request(&shard, &sessions, client_id, message).await;
-        })
-        .detach();
+        enqueue_client_request(
+            Rc::clone(&shard),
+            Rc::clone(&sessions),
+            Rc::clone(&queues),
+            Rc::clone(&active),
+            client_id,
+            message,
+        );
     })
 }
 
@@ -1303,23 +1319,100 @@ fn make_deferred_client_request_handler(
 ) -> RequestHandler {
     let shard_handle = Rc::clone(shard_handle);
     let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    let queues: ClientRequestQueues = Rc::new(RefCell::new(HashMap::new()));
+    let active: ActiveClientRequests = Rc::new(RefCell::new(HashSet::new()));
     let sessions_for_disconnect = Rc::clone(&sessions);
+    let shard_handle_for_disconnect = Rc::clone(&shard_handle);
     bus.set_client_connection_lost_fn(Rc::new(move |client_id| {
-        sessions_for_disconnect
+        if let Some(vsr_client_id) = sessions_for_disconnect
             .borrow_mut()
-            .remove_connection(client_id);
+            .remove_connection(client_id)
+            && let Some(shard) = upgrade_shard_handle(&shard_handle_for_disconnect)
+        {
+            shard.plane.inner().0.remove_client_session(vsr_client_id);
+        }
     }));
     Rc::new(move |client_id, message| {
         let shard_handle = Rc::clone(&shard_handle);
         let sessions = Rc::clone(&sessions);
+        let queues = Rc::clone(&queues);
+        let active = Rc::clone(&active);
+        queues
+            .borrow_mut()
+            .entry(client_id)
+            .or_default()
+            .push_back(message);
+        if !active.borrow_mut().insert(client_id) {
+            return;
+        }
         compio::runtime::spawn(async move {
             let Some(shard) = upgrade_shard_handle(&shard_handle) else {
+                active.borrow_mut().remove(&client_id);
                 return;
             };
-            handle_client_request(&shard, &sessions, client_id, message).await;
+            drain_client_requests(shard, sessions, queues, active, client_id).await;
         })
         .detach();
     })
+}
+
+fn enqueue_client_request(
+    shard: Rc<ServerNgShard>,
+    sessions: Rc<RefCell<SessionManager>>,
+    queues: ClientRequestQueues,
+    active: ActiveClientRequests,
+    client_id: u128,
+    message: Message<GenericHeader>,
+) {
+    queues
+        .borrow_mut()
+        .entry(client_id)
+        .or_default()
+        .push_back(message);
+    if !active.borrow_mut().insert(client_id) {
+        return;
+    }
+
+    compio::runtime::spawn(async move {
+        drain_client_requests(shard, sessions, queues, active, client_id).await;
+    })
+    .detach();
+}
+
+#[allow(clippy::future_not_send)]
+async fn drain_client_requests(
+    shard: Rc<ServerNgShard>,
+    sessions: Rc<RefCell<SessionManager>>,
+    queues: ClientRequestQueues,
+    active: ActiveClientRequests,
+    client_id: u128,
+) {
+    loop {
+        let Some(message) = pop_next_client_request(&queues, &active, client_id) else {
+            return;
+        };
+        handle_client_request(&shard, &sessions, client_id, message).await;
+    }
+}
+
+fn pop_next_client_request(
+    queues: &ClientRequestQueues,
+    active: &ActiveClientRequests,
+    client_id: u128,
+) -> Option<Message<GenericHeader>> {
+    let mut queues = queues.borrow_mut();
+    let Some(queue) = queues.get_mut(&client_id) else {
+        active.borrow_mut().remove(&client_id);
+        return None;
+    };
+    let message = queue.pop_front();
+    if queue.is_empty() {
+        queues.remove(&client_id);
+    }
+    if message.is_none() {
+        active.borrow_mut().remove(&client_id);
+    }
+    message
 }
 
 #[allow(clippy::future_not_send)]
@@ -1345,7 +1438,7 @@ async fn handle_client_request(
 
     let header = *request.header();
     if header.operation == Operation::NonReplicated {
-        handle_non_replicated_request(shard, transport_client_id, request).await;
+        handle_non_replicated_request(shard, sessions, transport_client_id, request).await;
         return;
     }
 
@@ -1369,6 +1462,7 @@ async fn handle_client_request(
 #[allow(clippy::future_not_send)]
 async fn handle_non_replicated_request(
     shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: Message<RequestHeader>,
 ) {
@@ -1376,10 +1470,12 @@ async fn handle_non_replicated_request(
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
     match code {
         PING_CODE => {
+            let commit = current_metadata_commit(shard);
             let reply = build_login_register_reply(
                 request.header(),
                 request.header().client,
                 request.header().session,
+                commit,
                 &Bytes::new(),
             );
             if let Err(error) = shard
@@ -1391,6 +1487,32 @@ async fn handle_non_replicated_request(
                     transport_client_id,
                     error = %error,
                     "failed to send non-replicated ping reply"
+                );
+            }
+        }
+        LOGOUT_USER_CODE => {
+            if let Some(vsr_client_id) =
+                sessions.borrow_mut().remove_connection(transport_client_id)
+            {
+                shard.plane.inner().0.remove_client_session(vsr_client_id);
+            }
+            let commit = current_metadata_commit(shard);
+            let reply = build_login_register_reply(
+                request.header(),
+                request.header().client,
+                request.header().session,
+                commit,
+                &Bytes::new(),
+            );
+            if let Err(error) = shard
+                .bus
+                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+                .await
+            {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    "failed to send non-replicated logout reply"
                 );
             }
         }
@@ -1503,14 +1625,10 @@ fn verify_login_credentials(
     password: &str,
 ) -> Result<u32, LoginRegisterError> {
     shard.plane.inner().0.mux_stm.inner().0.read(|users| {
-        let Some((_, user_id)) = users
-            .index
-            .iter()
-            .find(|(name, _)| name.as_ref() == username)
-        else {
+        let Some(user_id) = users.index.get(username).copied() else {
             return Err(LoginRegisterError::InvalidCredentials);
         };
-        let Some(user) = users.items.get(*user_id as usize) else {
+        let Some(user) = users.items.get(user_id as usize) else {
             return Err(LoginRegisterError::InvalidCredentials);
         };
         if user.status != UserStatus::Active {
@@ -1530,23 +1648,22 @@ fn verify_pat_credentials(
     let token_hash = PersonalAccessToken::hash_token(token);
     let now = IggyTimestamp::now();
     shard.plane.inner().0.mux_stm.inner().0.read(|users| {
-        let Some((user_id, pat)) =
-            users
-                .personal_access_tokens
-                .iter()
-                .find_map(|(user_id, tokens)| {
-                    tokens
-                        .values()
-                        .find(|pat| pat.token.as_ref() == token_hash)
-                        .map(|pat| (*user_id, pat))
-                })
+        let Some((user_id, token_name)) =
+            users.personal_access_token_index.get(token_hash.as_str())
+        else {
+            return Err(LoginRegisterError::InvalidToken);
+        };
+        let Some(pat) = users
+            .personal_access_tokens
+            .get(user_id)
+            .and_then(|tokens| tokens.get(token_name))
         else {
             return Err(LoginRegisterError::InvalidToken);
         };
         if pat.is_expired(now) {
             return Err(LoginRegisterError::InvalidToken);
         }
-        let Some(user) = users.items.get(user_id as usize) else {
+        let Some(user) = users.items.get(*user_id as usize) else {
             return Err(LoginRegisterError::InvalidToken);
         };
         if user.status != UserStatus::Active {
@@ -1573,7 +1690,9 @@ async fn complete_login_register(
     };
     if let Some(session) = existing_session {
         let response = LoginRegisterResponse { user_id, session }.to_bytes();
-        let reply = build_login_register_reply(request_header, vsr_client_id, session, &response);
+        let commit = current_metadata_commit(shard);
+        let reply =
+            build_login_register_reply(request_header, vsr_client_id, session, commit, &response);
         let _ = shard
             .bus
             .send_to_client(transport_client_id, reply.into_generic().into_frozen())
@@ -1606,13 +1725,16 @@ async fn complete_login_register(
 
     {
         let mut sessions = sessions.borrow_mut();
-        sessions
-            .bind_session(transport_client_id, vsr_client_id, session)
-            .map_err(LoginRegisterError::Session)?;
+        if let Err(error) = sessions.bind_session(transport_client_id, vsr_client_id, session) {
+            shard.plane.inner().0.remove_client_session(vsr_client_id);
+            return Err(LoginRegisterError::Session(error));
+        }
     }
 
     let response = LoginRegisterResponse { user_id, session }.to_bytes();
-    let reply = build_login_register_reply(request_header, vsr_client_id, session, &response);
+    let commit = current_metadata_commit(shard);
+    let reply =
+        build_login_register_reply(request_header, vsr_client_id, session, commit, &response);
     if let Err(error) = shard
         .bus
         .send_to_client(transport_client_id, reply.into_generic().into_frozen())
@@ -1643,6 +1765,7 @@ fn build_login_register_reply(
     request_header: &RequestHeader,
     client_id: u128,
     session: u64,
+    commit: u64,
     body: &Bytes,
 ) -> Message<ReplyHeader> {
     let total_size = std::mem::size_of::<ReplyHeader>() + body.len();
@@ -1662,7 +1785,7 @@ fn build_login_register_reply(
         request_checksum: request_header.request_checksum,
         client: client_id,
         op: session,
-        commit: session,
+        commit,
         timestamp: request_header.timestamp,
         request: request_header.request,
         operation: request_header.operation,
@@ -1673,6 +1796,16 @@ fn build_login_register_reply(
         reply.as_mut_slice()[std::mem::size_of::<ReplyHeader>()..total_size].copy_from_slice(body);
     }
     reply
+}
+
+fn current_metadata_commit(shard: &Rc<ServerNgShard>) -> u64 {
+    shard
+        .plane
+        .inner()
+        .0
+        .consensus
+        .as_ref()
+        .map_or(0, VsrConsensus::commit_max)
 }
 
 fn upgrade_shard_handle(shard_handle: &ServerNgShardHandle) -> Option<Rc<ServerNgShard>> {

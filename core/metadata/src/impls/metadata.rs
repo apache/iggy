@@ -845,10 +845,19 @@ where
         let mut loopback = Vec::new();
         consensus.drain_loopback_into(&mut loopback);
         for message in loopback {
-            let prepare_ok: Message<PrepareOkHeader> = message
-                .try_into_typed()
-                .expect("metadata loopback queue must only contain PrepareOk messages");
-            self.on_ack(prepare_ok).await;
+            match message.header().command {
+                Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
+                    Ok(prepare_ok) => self.on_ack(prepare_ok).await,
+                    Err(error) => warn!(
+                        error = %error,
+                        "dropping malformed PrepareOk from metadata loopback queue"
+                    ),
+                },
+                command => warn!(
+                    ?command,
+                    "dropping unexpected message from metadata loopback queue"
+                ),
+            }
         }
 
         match receiver.await {
@@ -867,6 +876,10 @@ where
                     .ok_or(RegisterSubmitError::Canceled)
             }
         }
+    }
+
+    pub fn remove_client_session(&self, client_id: u128) -> bool {
+        self.client_table.borrow_mut().remove_client(client_id)
     }
 
     /// Promote up to `slots_freed` buffered requests into prepares after
