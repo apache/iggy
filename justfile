@@ -48,6 +48,16 @@ nextest: build
 nextests TEST: build
   cargo nextest run --nocapture -- {{TEST}}
 
+# Run Miri (UB detector) on the unsafe-heavy crates that don't pull
+# tokio/compio. Mirrors the `miri` task in CI. Requires a nightly toolchain
+# with the `miri` component:
+#
+#   rustup toolchain install nightly --component miri
+#
+miri:
+  MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-strict-provenance" \
+    cargo +nightly miri test -p iggy_binary_protocol -p consensus
+
 server *ARGS:
   cargo run --bin iggy-server {{ARGS}}
 

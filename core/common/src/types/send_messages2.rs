@@ -583,16 +583,37 @@ fn decode_request_slice(body: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> 
     Ok(SendMessages2Ref { header, blob })
 }
 
+/// Decode a `Prepare` message from a slice of bytes.
+///
+/// `bytes` must be 16-byte aligned (`PrepareHeader` has `u128` fields). Source
+/// from `Frozen<MESSAGE_ALIGN>` / `Owned<MESSAGE_ALIGN>` / `Message<H>`.
+/// Misalignment: `debug_assert!` in debug; `InvalidCommand` in release.
+///
+/// # Errors
+///
+/// `IggyError::InvalidCommand` on: short buffer, bad bit pattern, `size`
+/// outside `[header_size, bytes.len()]`, short/checksum-mismatched body.
 pub fn decode_prepare_slice(bytes: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> {
     let header_size = std::mem::size_of::<PrepareHeader>();
     if bytes.len() < header_size {
         return Err(IggyError::InvalidCommand);
     }
 
+    // Bytemuck enforces alignment in release (maps to InvalidCommand below);
+    // debug_assert surfaces the contract violation early in dev.
+    debug_assert_eq!(
+        bytes
+            .as_ptr()
+            .align_offset(std::mem::align_of::<PrepareHeader>()),
+        0,
+        "decode_prepare_slice: bytes must be at least 16-byte aligned",
+    );
+
     let prepare = bytemuck::checked::try_from_bytes::<PrepareHeader>(&bytes[..header_size])
         .map_err(|_| IggyError::InvalidCommand)?;
     let total_size = prepare.size as usize;
-    if bytes.len() < total_size {
+    // Wire-controllable `size`: reject < header_size to avoid slice OOB below.
+    if total_size < header_size || bytes.len() < total_size {
         return Err(IggyError::InvalidCommand);
     }
 
@@ -752,4 +773,50 @@ fn read_u128(bytes: &[u8], offset: usize) -> Result<u128, IggyError> {
         .and_then(|slice| slice.try_into().ok())
         .map(u128::from_le_bytes)
         .ok_or(IggyError::InvalidNumberEncoding)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_binary_protocol::Command2;
+
+    fn aligned_prepare_bytes(size: u32) -> Owned<MESSAGE_ALIGN> {
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(std::mem::size_of::<PrepareHeader>());
+        let header: &mut PrepareHeader =
+            bytemuck::checked::try_from_bytes_mut(owned.as_mut_slice())
+                .expect("zeroed bytes form a valid PrepareHeader");
+        header.command = Command2::Prepare;
+        header.size = size;
+        owned
+    }
+
+    #[test]
+    fn decode_prepare_slice_size_below_header_size_does_not_panic() {
+        // Regression: without the `total_size < header_size` guard,
+        // `&bytes[256..size]` panics for any size < 256.
+        for adversarial_size in [0u32, 255] {
+            let owned = aligned_prepare_bytes(adversarial_size);
+            let result = decode_prepare_slice(owned.as_slice());
+            assert!(
+                matches!(result, Err(IggyError::InvalidCommand)),
+                "size={adversarial_size} must be rejected, got {result:?}",
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "must be at least 16-byte aligned")]
+    fn decode_prepare_slice_debug_asserts_on_misaligned_input() {
+        // `Vec<u8>` requests align=1; glibc returns 16-aligned bases so
+        // `&buf[1..]` is reliably misaligned (16k + 1 mod 16 = 1).
+        let buf: Vec<u8> = vec![0u8; std::mem::size_of::<PrepareHeader>() + 1];
+        let misaligned = &buf[1..];
+        assert_ne!(
+            misaligned.as_ptr().align_offset(16),
+            0,
+            "test setup: allocator returned non-16k base",
+        );
+        let _ = decode_prepare_slice(misaligned);
+    }
 }
