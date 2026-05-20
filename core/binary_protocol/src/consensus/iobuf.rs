@@ -511,7 +511,10 @@ unsafe fn release_control_block_w_allocation<const ALIGN: usize>(ctrlb: NonNull<
     let old = unsafe { ctrlb.as_ref() }
         .ref_count
         .fetch_sub(1, Ordering::Release);
-    // Underflow = use-after-free. Assert in release: wrap → delayed double-free.
+    // Underflow = use-after-free. The `fetch_sub` has already wrapped by the
+    // time we observe `old == 0`, so detection is post-corruption, but
+    // aborting here still beats letting the wrapped count drive a
+    // double-free.
     assert!(old > 0, "control block refcount underflow");
 
     if old != 1 {

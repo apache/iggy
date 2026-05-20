@@ -808,8 +808,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be at least 16-byte aligned")]
     fn decode_prepare_slice_debug_asserts_on_misaligned_input() {
-        // `Vec<u8>` requests align=1; glibc returns 16-aligned bases so
-        // `&buf[1..]` is reliably misaligned (16k + 1 mod 16 = 1).
+        // `Vec<u8>` requests align=1; glibc returns a base that is a
+        // multiple of 16, so `&buf[1..]` has offset 1 mod 16, eliably
+        // misaligned.
         let buf: Vec<u8> = vec![0u8; std::mem::size_of::<PrepareHeader>() + 1];
         let misaligned = &buf[1..];
         assert_ne!(

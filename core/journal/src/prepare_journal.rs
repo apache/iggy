@@ -581,9 +581,11 @@ mod tests {
             journal.storage.fsync().await.unwrap();
         }
 
-        // Entry 2 at offset HEADER_SIZE+64=320; command byte at +60 within header.
+        // Entry 2 at offset HEADER_SIZE+64=320; `offset_of!` guards against
+        // future field reorders silently corrupting an unrelated byte.
         let entry_2_offset = (HEADER_SIZE + 64) as u64;
-        let command_byte_offset = entry_2_offset + 60;
+        let command_byte_offset =
+            entry_2_offset + std::mem::offset_of!(PrepareHeader, command) as u64;
         {
             use std::io::{Seek, SeekFrom, Write};
             let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
