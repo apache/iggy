@@ -73,6 +73,9 @@ async fn write_config(
         }
     }
 
+    #[cfg(feature = "systemd")]
+    crate::shard::systemd::notify_ready();
+
     let mut current_config = shard_clone.config.clone();
 
     let tcp_addr = shard_clone.tcp_bound_address.get();

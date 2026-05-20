@@ -190,6 +190,11 @@ impl ConsensusHeader for RequestHeader {
                 found: self.command,
             });
         }
+        if self.client == 0 {
+            return Err(ConsensusError::InvalidField(
+                "request: client must be != 0".to_string(),
+            ));
+        }
         // Register: session must be 0, request must be 0.
         // Non-register: session must be > 0, request must be > 0.
         if self.operation == Operation::Register {
@@ -298,6 +303,188 @@ impl ConsensusHeader for ReplyHeader {
     fn validate(&self) -> Result<(), ConsensusError> {
         if self.command != Command2::Reply {
             return Err(ConsensusError::ReplyInvalidCommand2);
+        }
+        Ok(())
+    }
+}
+
+// EvictionReason, wire-level reason in EvictionHeader.
+//
+// Discriminants pinned: any reorder/reuse breaks SDK decoders. New
+// variants also break old SDKs (CheckedBitPattern fails). Coordinate
+// SDK releases on every extension.
+
+/// Wire reason on [`EvictionHeader`]. Session-terminal; never transient.
+/// No `Default`: callers must name reason so `..default()` can't ship
+/// `Reserved`.
+///
+/// **Wire-version pinned.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq, NoUninit, CheckedBitPattern)]
+#[repr(u8)]
+pub enum EvictionReason {
+    /// Sentinel; rejected on wire.
+    Reserved = 0,
+
+    /// No session for `client_id`.
+    NoSession = 1,
+    /// Client release < cluster min.
+    ClientReleaseTooLow = 2,
+    /// Client release > cluster max.
+    ClientReleaseTooHigh = 3,
+    /// Invalid operation discriminant.
+    InvalidRequestOperation = 4,
+    /// Body failed state-machine validation.
+    InvalidRequestBody = 5,
+    /// Body size mismatch.
+    InvalidRequestBodySize = 6,
+    /// Session < cluster retained minimum.
+    SessionTooLow = 7,
+    /// Session release ≠ client's current release.
+    SessionReleaseMismatch = 8,
+
+    // iggy-specific (9..).
+    InvalidCredentials = 9,
+    InvalidToken = 10,
+    UserInactive = 11,
+    SessionError = 12,
+}
+
+// EvictionHeader - primary -> client (session-terminal, no body)
+
+/// Primary→client: session-terminal eviction. 256 bytes, header-only.
+/// Session-level ("your session is dead, deinit"), no per-request
+/// correlation. SDK fires eviction callback and stops. Never transient.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, CheckedBitPattern, NoUninit)]
+pub struct EvictionHeader {
+    pub checksum: u128,
+    pub checksum_body: u128,
+    pub cluster: u128,
+    pub size: u32,
+    pub view: u32,
+    pub release: u32,
+    pub command: Command2,
+    pub replica: u8,
+    pub reserved_frame: [u8; 66],
+
+    pub client: u128,
+    pub reserved: [u8; 111],
+    pub reason: EvictionReason,
+}
+const _: () = {
+    assert!(size_of::<EvictionHeader>() == HEADER_SIZE);
+    assert!(
+        offset_of!(EvictionHeader, client)
+            == offset_of!(EvictionHeader, reserved_frame) + size_of::<[u8; 66]>()
+    );
+    assert!(offset_of!(EvictionHeader, reason) + size_of::<EvictionReason>() == HEADER_SIZE);
+};
+
+// No `Default`: forces use of [`EvictionHeader::new`] so wire-required
+// `reason` can't be filled via `..default()`.
+
+impl EvictionHeader {
+    /// Build well-formed header. Wire-required fields set; rest zeroed.
+    ///
+    /// # Panics (debug)
+    /// On `ClientReleaseTooLow`/`ClientReleaseTooHigh`: `release` hardcoded
+    /// to 0, those reasons need real bounds. Add `release_min`/`release_max`
+    /// params before emitting them.
+    ///
+    /// # Safety
+    /// `client` must be non-zero , `validate` rejects zero so SDKs can
+    /// route the frame back to the originating handler.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn new(
+        cluster: u128,
+        view: u32,
+        replica: u8,
+        client: u128,
+        reason: EvictionReason,
+    ) -> Self {
+        debug_assert!(
+            !matches!(
+                reason,
+                EvictionReason::ClientReleaseTooLow | EvictionReason::ClientReleaseTooHigh,
+            ),
+            "EvictionHeader::new: ClientRelease* needs release_min/release_max",
+        );
+        // Cap from consensus REPLICAS_MAX=32; literal here to avoid
+        // wire-proto crate depending on consensus crate.
+        debug_assert!(
+            replica < 32,
+            "EvictionHeader::new: replica >= REPLICAS_MAX(32)",
+        );
+        Self {
+            checksum: 0,
+            checksum_body: 0,
+            cluster,
+            size: HEADER_SIZE as u32,
+            view,
+            release: 0,
+            command: Command2::Eviction,
+            replica,
+            reserved_frame: [0; 66],
+            client,
+            reserved: [0; 111],
+            reason,
+        }
+    }
+}
+
+impl ConsensusHeader for EvictionHeader {
+    const COMMAND: Command2 = Command2::Eviction;
+    /// Session-level (not per-op): always `Reserved`.
+    fn operation(&self) -> Operation {
+        Operation::Reserved
+    }
+    fn command(&self) -> Command2 {
+        self.command
+    }
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn validate(&self) -> Result<(), ConsensusError> {
+        if self.command != Command2::Eviction {
+            return Err(ConsensusError::InvalidCommand {
+                expected: Command2::Eviction,
+                found: self.command,
+            });
+        }
+        if self.size as usize != HEADER_SIZE {
+            return Err(ConsensusError::InvalidSize {
+                expected: HEADER_SIZE as u32,
+                found: self.size,
+            });
+        }
+        // Non-zero client_id so SDK can route back to client handler.
+        if self.client == 0 {
+            return Err(ConsensusError::InvalidField(
+                "eviction: client must be != 0".to_string(),
+            ));
+        }
+
+        // Validate BOTH reserved regions to block forward-compat smuggling:
+        // a future field carved from reserved_frame would be silently zero
+        // on old peers. Strict zero-check forces release bump.
+        if self.reserved_frame.iter().any(|&b| b != 0) {
+            return Err(ConsensusError::InvalidField(
+                "eviction: reserved_frame bytes must be zero".to_string(),
+            ));
+        }
+        if self.reserved.iter().any(|&b| b != 0) {
+            return Err(ConsensusError::InvalidField(
+                "eviction: reserved bytes must be zero".to_string(),
+            ));
+        }
+        // Reserved on wire = sender forgot to set reason.
+        if self.reason == EvictionReason::Reserved {
+            return Err(ConsensusError::InvalidField(
+                "eviction: reason must not be Reserved".to_string(),
+            ));
         }
         Ok(())
     }
@@ -726,9 +913,9 @@ impl ConsensusHeader for StartViewHeader {
 #[cfg(test)]
 mod tests {
     use super::{
-        Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader, GenericHeader, Operation,
-        PrepareHeader, PrepareOkHeader, ReplyHeader, RequestHeader, StartViewChangeHeader,
-        StartViewHeader,
+        Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader, EvictionHeader,
+        EvictionReason, GenericHeader, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader,
+        RequestHeader, StartViewChangeHeader, StartViewHeader,
     };
 
     fn aligned_zeroed(size: usize) -> bytes::BytesMut {
@@ -760,6 +947,9 @@ mod tests {
     fn request_header_zero_copy() {
         let mut buf = aligned_zeroed(256);
         buf[60] = Command2::Request as u8;
+        // client offset = 60 + 1 (replica) + 66 (reserved_frame) = 128.
+        // validate rejects client == 0.
+        buf[128] = 1;
         let header: &RequestHeader = bytemuck::checked::try_from_bytes(&buf).unwrap();
         assert_eq!(header.command, Command2::Request);
         assert!(header.validate().is_ok());
@@ -801,6 +991,7 @@ mod tests {
         let header = RequestHeader {
             command: Command2::Request,
             operation: Operation::SendMessages,
+            client: 0xCAFE,
             session: 10,
             request: 1,
             ..RequestHeader::default()
@@ -839,5 +1030,54 @@ mod tests {
         let header: &ReplyHeader = bytemuck::checked::try_from_bytes(&buf).unwrap();
         assert_eq!(header.command, Command2::Reply);
         assert!(header.validate().is_ok());
+    }
+
+    // Wire-discriminant pin: any change breaks SDK decoders.
+    #[test]
+    fn eviction_reason_discriminants_pinned() {
+        assert_eq!(EvictionReason::Reserved as u8, 0);
+        assert_eq!(EvictionReason::NoSession as u8, 1);
+        assert_eq!(EvictionReason::ClientReleaseTooLow as u8, 2);
+        assert_eq!(EvictionReason::ClientReleaseTooHigh as u8, 3);
+        assert_eq!(EvictionReason::InvalidRequestOperation as u8, 4);
+        assert_eq!(EvictionReason::InvalidRequestBody as u8, 5);
+        assert_eq!(EvictionReason::InvalidRequestBodySize as u8, 6);
+        assert_eq!(EvictionReason::SessionTooLow as u8, 7);
+        assert_eq!(EvictionReason::SessionReleaseMismatch as u8, 8);
+        assert_eq!(EvictionReason::InvalidCredentials as u8, 9);
+        assert_eq!(EvictionReason::InvalidToken as u8, 10);
+        assert_eq!(EvictionReason::UserInactive as u8, 11);
+        assert_eq!(EvictionReason::SessionError as u8, 12);
+    }
+
+    #[test]
+    fn eviction_validate_rejects_zero_client() {
+        let header = EvictionHeader::new(0, 0, 0, 0, EvictionReason::NoSession);
+        assert!(header.validate().is_err());
+    }
+
+    #[test]
+    fn eviction_validate_rejects_reserved_reason() {
+        let header = EvictionHeader::new(0, 0, 0, 1, EvictionReason::Reserved);
+        assert!(header.validate().is_err());
+    }
+
+    // Reserved bytes guard: blocks forward-incompat smuggling.
+    #[test]
+    fn eviction_validate_rejects_nonzero_reserved() {
+        let mut header = EvictionHeader::new(0, 0, 0, 1, EvictionReason::NoSession);
+        header.reserved[0] = 1;
+        assert!(header.validate().is_err());
+    }
+
+    #[test]
+    fn eviction_validate_accepts_well_formed_frame() {
+        let header = EvictionHeader::new(0, 0, 0, 0xCAFE, EvictionReason::NoSession);
+        assert!(header.validate().is_ok());
+    }
+
+    #[test]
+    fn eviction_header_is_256_bytes() {
+        assert_eq!(size_of::<EvictionHeader>(), 256);
     }
 }

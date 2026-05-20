@@ -305,7 +305,7 @@ jobs:
 
       - name: Build matrix from inputs
         id: mk
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const componentsB64 = '${{ steps.cfg.outputs.components_b64 }}';
@@ -564,8 +564,22 @@ jobs:
               EXISTING_SHA="${REMOTE_PEELED:-${REMOTE_RAW}}"
               SHORT_SHA=$(echo "$EXISTING_SHA" | head -c 8)
 
-              # Fail-fast on wrong-target. A wrong-target tag means
-              # create-git-tag would hard-fail 20-40 minutes later after
+              # Auto-publish (create_edge_docker_tag=true) runs on every push
+              # to master, but component versions only change when a human
+              # bumps them. So the same immutable tag (e.g. server-0.8.1-edge.1)
+              # is re-seen on every run after the one that first created it.
+              # That is the expected steady state, not an error: the version
+              # is already released. The run still refreshes the rolling :edge
+              # Docker image; it just skips the versioned git tag / crate /
+              # :version manifest for that component. An existing tag here - at
+              # ANY commit - is therefore informational, never fatal.
+              # WRONG_TARGET_TAGS stays empty in this mode so the fail-fast
+              # exit 1 below cannot trigger.
+              if [ "${{ inputs.create_edge_docker_tag }}" = "true" ]; then
+                echo "ℹ️ $NAME: $TAG already exists at $SHORT_SHA - already released, run will refresh :edge only"
+                echo "| $NAME | $VERSION | $TAG | ℹ️ Already released ($SHORT_SHA) - :edge refresh only |" >> $GITHUB_STEP_SUMMARY
+              # Fail-fast on wrong-target for MANUAL publish. A wrong-target tag
+              # means create-git-tag would hard-fail 20-40 minutes later after
               # publishing artifacts to crates.io / PyPI / npm / Maven /
               # NuGet / DockerHub. Catching it at check-tags converts that
               # into a fast, cheap failure at the top of the run.
@@ -579,7 +593,7 @@ jobs:
               # manually or run a follow-up without skip_tag_creation to
               # converge. The fail-fast exit 1 below is gated on
               # skip_tag_creation != true.
-              if [ "$EXISTING_SHA" != "${{ needs.validate.outputs.commit }}" ]; then
+              elif [ "$EXISTING_SHA" != "${{ needs.validate.outputs.commit }}" ]; then
                 WRONG_TARGET_TAGS+=("$TAG|$SHORT_SHA")
                 if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
                   echo "⚠️  Tag exists on remote at WRONG target: $TAG (points to $SHORT_SHA, not enforced: skip_tag_creation=true)"
@@ -719,7 +733,7 @@ jobs:
     name: Docker ${{ matrix.name }} (${{ matrix.arch }})
     needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
     if: |
-      always() &&
+      !cancelled() &&
       needs.validate.outputs.has_targets == 'true' &&
       needs.plan.outputs.has_docker == 'true' &&
       fromJson(needs.plan.outputs.docker_matrix).include[0].key != 'noop' &&
@@ -823,7 +837,7 @@ jobs:
     name: Docker manifests
     needs: [validate, plan, publish-docker]
     if: |
-      always() &&
+      !cancelled() &&
       needs.validate.outputs.has_targets == 'true' &&
       needs.plan.outputs.has_docker == 'true' &&
       fromJson(needs.plan.outputs.docker_components).include[0].key != 'noop' &&
@@ -879,6 +893,19 @@ jobs:
             SHOULD_TAG=false
           fi
 
+          # Git tags are immutable. A component version is bumped by a human;
+          # auto-publish then re-runs on every subsequent master push with that
+          # same version until the next bump. Once the tag exists the versioned
+          # release (git tag + :version manifest) is already done - this run
+          # only refreshes the rolling :edge image. Querying the remote (not the
+          # shallow local clone) so this agrees with create-git-tag's own
+          # authoritative ls-remote check.
+          if [ "$SHOULD_TAG" = "true" ] && [ -n "$TAG" ] \
+             && git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "ℹ️ $TAG already exists on remote - versioned release already done, refreshing :edge only"
+            SHOULD_TAG=false
+          fi
+
           {
             echo "version=$VERSION"
             echo "tag=$TAG"
@@ -924,6 +951,8 @@ jobs:
 
       - name: Create and push manifest
         working-directory: ${{ runner.temp }}/digests
+        env:
+          SHOULD_TAG: ${{ steps.ver.outputs.should_tag }}
         run: |
           IMAGE="${{ steps.config.outputs.image }}"
           VERSION="${{ steps.ver.outputs.version }}"
@@ -931,52 +960,54 @@ jobs:
           echo "Creating manifests for $IMAGE from digests:"
           ls -la
 
-          # Create :edge tag if requested (for auto-publish from post-merge)
           if [ "${{ inputs.create_edge_docker_tag }}" = "true" ]; then
+            # Auto-publish: :edge is the rolling tag and is ALWAYS refreshed.
             docker buildx imagetools create \
               -t "${IMAGE}:edge" \
               $(printf "${IMAGE}@sha256:%s " *)
             echo "✅ Pushed manifest: ${IMAGE}:edge"
-          fi
 
-          # Create versioned tag
-          # When called from auto-publish (create_edge_docker_tag=true), only create
-          # versioned tag for pre-release versions to match original post-merge behavior.
-          # Manual publish always creates versioned tag.
-          if [ "${{ inputs.create_edge_docker_tag }}" = "true" ]; then
-            if [[ "$VERSION" =~ -(edge|rc) ]]; then
+            # The versioned :version manifest is part of the immutable release
+            # and ships only alongside a new git tag. should_tag is false when
+            # the version is stable (versioned release is manual-only) OR when
+            # the tag already exists (already released). In both cases this run
+            # refreshes :edge and nothing else.
+            if [ "$SHOULD_TAG" = "true" ]; then
               docker buildx imagetools create \
                 -t "${IMAGE}:${VERSION}" \
                 $(printf "${IMAGE}@sha256:%s " *)
               echo "✅ Pushed manifest: ${IMAGE}:${VERSION}"
             else
-              echo "ℹ️ Skipping versioned tag for stable version in auto-publish mode"
+              echo "ℹ️ should_tag=false - :edge refreshed, skipping versioned :${VERSION} manifest"
             fi
           else
+            # Manual publish: always push the versioned manifest, plus :latest
+            # for stable (non edge/rc) releases.
             docker buildx imagetools create \
               -t "${IMAGE}:${VERSION}" \
               $(printf "${IMAGE}@sha256:%s " *)
             echo "✅ Pushed manifest: ${IMAGE}:${VERSION}"
-          fi
 
-          # Create :latest for stable releases (not edge/rc)
-          # Only create :latest in manual publish mode - auto-publish should never update :latest
-          if [ "${{ inputs.create_edge_docker_tag }}" != "true" ] && [[ ! "$VERSION" =~ -(edge|rc) ]]; then
-            echo "Creating 'latest' manifest"
-            docker buildx imagetools create \
-              -t "${IMAGE}:latest" \
-              $(printf "${IMAGE}@sha256:%s " *)
-            echo "✅ Pushed manifest: ${IMAGE}:latest"
+            if [[ ! "$VERSION" =~ -(edge|rc) ]]; then
+              echo "Creating 'latest' manifest"
+              docker buildx imagetools create \
+                -t "${IMAGE}:latest" \
+                $(printf "${IMAGE}@sha256:%s " *)
+              echo "✅ Pushed manifest: ${IMAGE}:latest"
+            fi
           fi
 
       - name: Inspect manifest
+        env:
+          SHOULD_TAG: ${{ steps.ver.outputs.should_tag }}
         run: |
           IMAGE="${{ steps.config.outputs.image }}"
           VERSION="${{ steps.ver.outputs.version }}"
 
-          # In auto-publish mode with stable version, we only pushed :edge
-          if [ "${{ inputs.create_edge_docker_tag }}" = "true" ] && [[ ! "$VERSION" =~ -(edge|rc) ]]; then
-            echo "Inspecting :edge manifest (versioned tag was skipped for stable version)"
+          # Auto-publish pushed :version only when should_tag was true; in
+          # every other auto-publish case (:edge-only) inspect :edge instead.
+          if [ "${{ inputs.create_edge_docker_tag }}" = "true" ] && [ "$SHOULD_TAG" != "true" ]; then
+            echo "Inspecting :edge manifest (versioned manifest was skipped: should_tag=false)"
             docker buildx imagetools inspect "${IMAGE}:edge"
           else
             docker buildx imagetools inspect "${IMAGE}:${VERSION}"
@@ -1009,7 +1040,7 @@ jobs:
     name: ${{ matrix.name }}
     needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
     if: |
-      always() &&
+      !cancelled() &&
       needs.validate.outputs.has_targets == 'true' &&
       fromJson(needs.plan.outputs.non_docker_targets).include[0].key != 'noop' &&
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
@@ -1319,7 +1350,7 @@ jobs:
         docker-manifests,
         publish,
       ]
-    if: always() && needs.validate.outputs.has_targets == 'true'
+    if: ${{ !cancelled() && needs.validate.outputs.has_targets == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Download latest copy script from master

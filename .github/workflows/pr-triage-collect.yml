@@ -1,0 +1,59 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: PR Triage Collect
+
+# Read-only collector for fork-restricted events. issue_comment and
+# pull_request_review on cross-fork PRs deliver a read-only GITHUB_TOKEN
+# regardless of the workflow's permissions: block, so the label mutations
+# cannot run here. This workflow uploads the raw event payload as an
+# artifact; pr-triage-apply.yml picks it up via workflow_run and applies
+# the labels with a write token from the base ref.
+#
+# pull_request_target is NOT routed through this collector — it already
+# runs against base ref with a write token and is handled directly in
+# pr-triage-apply.yml.
+#
+# SECURITY: no actions/checkout, no exec of PR contents, no token export.
+# The artifact contents come from the GitHub-runner-written event_path,
+# not from PR code.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    if: |
+      github.event_name == 'pull_request_review'
+      || (github.event_name == 'issue_comment'
+          && github.event.issue.pull_request != null)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 2
+    steps:
+      - name: Upload event payload
+        uses: actions/upload-artifact@v7
+        with:
+          name: triage-event
+          path: ${{ github.event_path }}
+          retention-days: 1
+          if-no-files-found: error

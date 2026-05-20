@@ -17,12 +17,12 @@
  * under the License.
  */
 
-package org.apache.iggy.bench.provision;
+package org.apache.iggy.bench.common.provision;
 
-import org.apache.iggy.bench.exception.BenchmarkException;
+import org.apache.iggy.bench.common.exception.BenchmarkException;
 import org.apache.iggy.bench.models.cli.GlobalCliArgs;
 import org.apache.iggy.bench.models.cli.PinnedProducerCliArgs;
-import org.apache.iggy.bench.models.provision.ProvisionedResources;
+import org.apache.iggy.bench.models.common.provision.ProvisionedResources;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.topic.CompressionAlgorithm;

@@ -59,6 +59,9 @@ pub mod task_registry;
 pub mod tasks;
 pub mod transmission;
 
+#[cfg(feature = "systemd")]
+pub mod systemd;
+
 mod communication;
 
 pub use communication::calculate_shard_assignment;
@@ -175,6 +178,11 @@ impl IggyShard {
         if !self.config.system.logging.sysinfo_print_interval.is_zero() && self.id == 0 {
             periodic::spawn_sysinfo_printer(self.clone());
         }
+
+        #[cfg(feature = "systemd")]
+        if self.id == 0 {
+            periodic::spawn_systemd_watchdog(self.clone());
+        }
     }
 
     pub async fn run(self: &Rc<Self>) -> Result<(), IggyError> {
@@ -194,7 +202,18 @@ impl IggyShard {
         // Spawn shutdown handler
         compio::runtime::spawn(async move {
             let _ = stop_receiver.recv().await;
-            shard_for_shutdown.trigger_shutdown().await;
+            #[cfg(feature = "systemd")]
+            if shard_for_shutdown.id == 0 {
+                systemd::notify_stopping();
+            }
+            let drained = shard_for_shutdown.trigger_shutdown().await;
+            #[cfg(feature = "systemd")]
+            if shard_for_shutdown.id == 0 && !drained {
+                warn!("Graceful shutdown timed out; some tasks did not drain in time");
+                systemd::notify_status("graceful shutdown timed out");
+            }
+            #[cfg(not(feature = "systemd"))]
+            let _ = drained;
             let _ = shutdown_complete_tx.send(()).await;
         })
         .detach();
