@@ -1,0 +1,191 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: wait-for-crate
+description: >
+  Poll the crates.io sparse index for an exact crate + version match.
+  The sparse index is the data `cargo publish` writes to, is CDN-fronted,
+  has no anonymous rate limit, and is authoritative as of the moment
+  `cargo publish` returns. Prefer this over `cargo search`, which uses the
+  laggy search API, returns relevance-ranked top hits instead of exact
+  matches, and is rate-limited for anonymous callers - all three modes
+  wedged the 0.10.0-rc1 publish chain.
+
+  Pass max_attempts=1 to reuse this as a one-shot idempotency pre-check
+  (is this version already on crates.io?). Combine with
+  continue-on-error: true in the caller so the publish can proceed on
+  exit 1 (not yet there) and skip on exit 0 (already there).
+
+inputs:
+  package:
+    description: "Crate name exactly as it appears on crates.io (e.g. iggy, iggy_common, iggy-cli)."
+    required: true
+  version:
+    description: "Exact version string to match against the sparse index `vers` field. Matched literally, so semver build metadata (`+`) is safe."
+    required: true
+  max_attempts:
+    description: "Maximum poll attempts before giving up."
+    required: false
+    default: "30"
+  initial_sleep_seconds:
+    description: "Sleep between the first two attempts in seconds. Doubles each attempt, capped at max_sleep_seconds."
+    required: false
+    default: "3"
+  max_sleep_seconds:
+    description: "Upper bound on per-attempt sleep, in seconds."
+    required: false
+    default: "30"
+
+runs:
+  using: composite
+  steps:
+    - name: Wait for crate on crates.io sparse index
+      shell: bash
+      env:
+        PACKAGE: ${{ inputs.package }}
+        VERSION: ${{ inputs.version }}
+        MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+        INITIAL_SLEEP_SECONDS: ${{ inputs.initial_sleep_seconds }}
+        MAX_SLEEP_SECONDS: ${{ inputs.max_sleep_seconds }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${PACKAGE}" ] || [ -z "${VERSION}" ]; then
+          echo "❌ wait-for-crate: 'package' and 'version' inputs are required"
+          exit 1
+        fi
+
+        # Defensive validation: both inputs become part of a URL and a shell
+        # string comparison. Reject anything outside the crates.io-accepted
+        # crate name alphabet / semver alphabet so the composite cannot be
+        # coerced into fetching a different URL if a caller ever derives
+        # these from less trusted sources.
+        if ! [[ "${PACKAGE}" =~ ^[A-Za-z0-9_-]+$ ]]; then
+          echo "❌ wait-for-crate: package '${PACKAGE}' contains characters outside [A-Za-z0-9_-]"
+          exit 1
+        fi
+        if ! [[ "${VERSION}" =~ ^[A-Za-z0-9._+-]+$ ]]; then
+          echo "❌ wait-for-crate: version '${VERSION}' contains characters outside the semver alphabet"
+          exit 1
+        fi
+        if ! [[ "${MAX_ATTEMPTS}" =~ ^[0-9]+$ ]] || [ "${MAX_ATTEMPTS}" -lt 1 ]; then
+          echo "❌ wait-for-crate: max_attempts '${MAX_ATTEMPTS}' must be a positive integer"
+          exit 1
+        fi
+        if ! [[ "${INITIAL_SLEEP_SECONDS}" =~ ^[0-9]+$ ]]; then
+          echo "❌ wait-for-crate: initial_sleep_seconds '${INITIAL_SLEEP_SECONDS}' must be a non-negative integer"
+          exit 1
+        fi
+        if ! [[ "${MAX_SLEEP_SECONDS}" =~ ^[0-9]+$ ]] || [ "${MAX_SLEEP_SECONDS}" -lt 1 ]; then
+          echo "❌ wait-for-crate: max_sleep_seconds '${MAX_SLEEP_SECONDS}' must be a positive integer"
+          exit 1
+        fi
+
+        # Compute the sparse-index prefix path from the leading characters
+        # of the lowercased crate name. Layout is documented at
+        # https://doc.rust-lang.org/cargo/reference/registry-index.html
+        #   1-char:  1/<name>
+        #   2-char:  2/<name>
+        #   3-char:  3/<first>/<name>
+        #   4+ char: <first-2>/<chars-3-4>/<name>
+        name_lc=$(echo "${PACKAGE}" | tr '[:upper:]' '[:lower:]')
+        case ${#name_lc} in
+          1) prefix="1" ;;
+          2) prefix="2" ;;
+          3) prefix="3/${name_lc:0:1}" ;;
+          *) prefix="${name_lc:0:2}/${name_lc:2:2}" ;;
+        esac
+        URL="https://index.crates.io/${prefix}/${name_lc}"
+
+        echo "📡 Sparse index URL: ${URL}"
+        echo "🎯 Target version:   ${VERSION}"
+        echo ""
+
+        # Capture curl stderr AND body to tempfiles. Stderr preserves hard
+        # curl errors (DNS, TLS, connection refused, --max-time timeouts) so
+        # they can be surfaced on the final failure branch instead of being
+        # silenced by 2>/dev/null. Body goes to a file so we can distinguish
+        # "HTTP 200 but empty body" from "HTTP 4xx" from "network failure",
+        # and only parse JSON when the HTTP code says it's worth parsing.
+        curl_stderr="$(mktemp)"
+        body_file="$(mktemp)"
+        trap 'rm -f "${curl_stderr}" "${body_file}"' EXIT
+
+        sleep_s="${INITIAL_SLEEP_SECONDS}"
+        http_code="000"
+        for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
+          # -sS: silent but still show hard curl errors on stderr (network,
+          #     DNS, TLS, --max-time timeout) — captured to ${curl_stderr}.
+          # -L: follow redirects (the CDN may redirect to a mirror).
+          # -w '%{http_code}': capture the HTTP status code so we can tell
+          #     404 ("not yet on index") from 5xx ("transient") from 200
+          #     ("live") in the per-attempt log and the final-failure
+          #     branch. Symmetric with wait-for-url.
+          # --max-time 30: per-request wall-clock cap so a wedged TCP
+          #     connection does not burn the whole retry budget on one
+          #     attempt. Without this, kernel TCP keepalive can hold a
+          #     dead connection for ~5 min silently — the exact tail
+          #     latency bug we are trying to avoid. Symmetric with
+          #     wait-for-url:115.
+          # No -f: we inspect the HTTP code ourselves, so 4xx surfaces as
+          #     a code we can log instead of an empty body + non-zero exit.
+          : >"${curl_stderr}"
+          : >"${body_file}"
+          http_code=$(curl -sSL -o "${body_file}" -w '%{http_code}' \
+                        --max-time 30 "${URL}" 2>"${curl_stderr}" || echo "000")
+
+          # The sparse-index body is newline-delimited JSON: one record
+          # per published version. `jq -R 'fromjson?'` reads each line as
+          # a raw string and silently drops lines that fail to parse, so
+          # a malformed or partially-truncated response (e.g., CDN
+          # serving an HTML error page or an incomplete body) does not
+          # kill the whole pipeline under `set -o pipefail`. `grep -Fxq`
+          # does an exact literal full-line match, so `0.10.0+build.5`
+          # is matched as itself, not as a regex where `.` and `+` would
+          # mean something else.
+          if [ "${http_code}" = "200" ] && [ -s "${body_file}" ] \
+             && jq -Rr 'fromjson? | .vers // empty' "${body_file}" 2>/dev/null | grep -Fxq "${VERSION}"; then
+            echo "✅ ${PACKAGE} v${VERSION} is on the sparse index"
+            exit 0
+          fi
+
+          if [ "${attempt}" -eq "${MAX_ATTEMPTS}" ]; then
+            break
+          fi
+          echo "⏳ HTTP ${http_code} - ${PACKAGE} v${VERSION} not yet visible (attempt ${attempt}/${MAX_ATTEMPTS}, sleep ${sleep_s}s)"
+          sleep "${sleep_s}"
+          sleep_s=$(( sleep_s * 2 ))
+          if [ "${sleep_s}" -gt "${MAX_SLEEP_SECONDS}" ]; then
+            sleep_s="${MAX_SLEEP_SECONDS}"
+          fi
+        done
+
+        # Failure message is phrased so it is accurate for both usage modes:
+        #   * max_attempts=1 → "not found on a one-shot check"
+        #   * max_attempts>1 → "never appeared inside the budget"
+        echo "❌ ${PACKAGE} v${VERSION} is not on the sparse index after ${MAX_ATTEMPTS} attempt(s)"
+        echo "   URL: ${URL}"
+        echo "   Last HTTP code: ${http_code}"
+        if [ -s "${curl_stderr}" ]; then
+          echo "   last curl stderr:"
+          sed 's/^/     /' "${curl_stderr}"
+        fi
+        echo "   Common causes:"
+        echo "     - cargo publish did not actually land the upload (inspect the preceding publish step)"
+        echo "     - the crates.io sparse-index CDN is lagging (usually seconds, rarely >1 min)"
+        echo "     - the version input does not match the version that was uploaded"
+        exit 1

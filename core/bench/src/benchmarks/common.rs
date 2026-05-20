@@ -116,6 +116,7 @@ pub fn build_producer_futures(
     let sampling_time = args.sampling_time();
     let moving_average_window = args.moving_average_window();
     let kind = args.kind();
+    let pretty = args.pretty;
     let shared_finish_condition =
         BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
     let rate_limit = rate_limit_per_actor(args.rate_limit(), actors);
@@ -149,6 +150,7 @@ pub fn build_producer_futures(
                     sampling_time,
                     moving_average_window,
                     rate_limit,
+                    pretty,
                 );
                 producer.run().await
             }
@@ -168,6 +170,7 @@ pub fn build_consumer_futures(
     let sampling_time = args.sampling_time();
     let moving_average_window = args.moving_average_window();
     let kind = args.kind();
+    let pretty = args.pretty;
     let polling_kind = if cg_count > 0 {
         PollingKind::Next
     } else {
@@ -236,6 +239,7 @@ pub fn build_consumer_futures(
                     polling_kind,
                     rate_limit,
                     origin_timestamp_latency_calculation,
+                    pretty,
                 );
                 consumer.run().await
             }
@@ -298,6 +302,7 @@ pub fn build_producing_consumers_futures(
                     rate_limit,
                     polling_kind,
                     origin_timestamp_latency_calculation,
+                    args_clone.pretty,
                 );
                 actor.run().await
             }
@@ -400,6 +405,7 @@ pub fn build_producing_consumer_groups_futures(
                     rate_limit,
                     polling_kind,
                     origin_timestamp_latency_calculation,
+                    args_clone.pretty,
                 );
 
                 actor.run().await

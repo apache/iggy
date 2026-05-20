@@ -24,6 +24,7 @@ pub enum MeasurementType {
     Latency,
     Throughput,
     Distribution,
+    Tail,
 }
 
 impl Display for MeasurementType {
@@ -32,6 +33,7 @@ impl Display for MeasurementType {
             MeasurementType::Latency => write!(f, "Latency"),
             MeasurementType::Throughput => write!(f, "Throughput"),
             MeasurementType::Distribution => write!(f, "Distribution"),
+            MeasurementType::Tail => write!(f, "Tail"),
         }
     }
 }
@@ -44,6 +46,7 @@ impl FromStr for MeasurementType {
             "Latency" => Ok(MeasurementType::Latency),
             "Throughput" => Ok(MeasurementType::Throughput),
             "Distribution" => Ok(MeasurementType::Distribution),
+            "Tail" => Ok(MeasurementType::Tail),
             _ => Err(()),
         }
     }
@@ -81,6 +84,12 @@ pub fn measurement_type_selector(props: &MeasurementTypeSelectorProps) -> Html {
                     onclick={props.on_measurement_select.reform(|_| MeasurementType::Distribution)}
                 >
                     {"Distribution"}
+                </button>
+                <button
+                    class={if *selected == MeasurementType::Tail { "segment active" } else { "segment" }}
+                    onclick={props.on_measurement_select.reform(|_| MeasurementType::Tail)}
+                >
+                    {"Tail"}
                 </button>
             </div>
         </div>

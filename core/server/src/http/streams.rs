@@ -25,13 +25,17 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Extension, Json, Router, debug_handler};
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::requests::streams::{
+    CreateStreamRequest as WireCreateStream, DeleteStreamRequest as WireDeleteStream,
+    PurgeStreamRequest as WirePurgeStream, UpdateStreamRequest as WireUpdateStream,
+};
 use iggy_common::Identifier;
 use iggy_common::Validatable;
 use iggy_common::create_stream::CreateStream;
-use iggy_common::delete_stream::DeleteStream;
-use iggy_common::purge_stream::PurgeStream;
 use iggy_common::update_stream::UpdateStream;
-use iggy_common::{Stream, StreamDetails};
+use iggy_common::wire_conversions::identifier_to_wire;
+use iggy_common::{IggyError, Stream, StreamDetails};
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -99,9 +103,12 @@ async fn create_stream(
 ) -> Result<Json<StreamDetails>, CustomError> {
     command.validate()?;
 
+    let wire_command = WireCreateStream {
+        name: WireName::new(&command.name).map_err(|_| IggyError::InvalidStreamName)?,
+    };
     let request = ShardRequest::control_plane(ShardRequestPayload::CreateStreamRequest {
         user_id: identity.user_id,
-        command,
+        command: wire_command,
     });
 
     match state.shard.send_to_control_plane(request).await? {
@@ -131,9 +138,13 @@ async fn update_stream(
     command.stream_id = Identifier::from_str_value(&stream_id)?;
     command.validate()?;
 
+    let wire_command = WireUpdateStream {
+        stream_id: identifier_to_wire(&command.stream_id)?,
+        name: WireName::new(&command.name).map_err(|_| IggyError::InvalidStreamName)?,
+    };
     let request = ShardRequest::control_plane(ShardRequestPayload::UpdateStreamRequest {
         user_id: identity.user_id,
-        command,
+        command: wire_command,
     });
 
     match state.shard.send_to_control_plane(request).await? {
@@ -154,7 +165,9 @@ async fn delete_stream(
 
     let request = ShardRequest::control_plane(ShardRequestPayload::DeleteStreamRequest {
         user_id: identity.user_id,
-        command: DeleteStream { stream_id },
+        command: WireDeleteStream {
+            stream_id: identifier_to_wire(&stream_id)?,
+        },
     });
 
     match state.shard.send_to_control_plane(request).await? {
@@ -175,7 +188,9 @@ async fn purge_stream(
 
     let request = ShardRequest::control_plane(ShardRequestPayload::PurgeStreamRequest {
         user_id: identity.user_id,
-        command: PurgeStream { stream_id },
+        command: WirePurgeStream {
+            stream_id: identifier_to_wire(&stream_id)?,
+        },
     });
 
     match state.shard.send_to_control_plane(request).await? {

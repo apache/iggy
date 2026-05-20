@@ -21,17 +21,13 @@ use super::container::{
     DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SOURCE_BATCH_SIZE, ENV_SOURCE_INDEX,
     ENV_SOURCE_PATH, ENV_SOURCE_POLLING_INTERVAL, ENV_SOURCE_STREAMS_0_SCHEMA,
     ENV_SOURCE_STREAMS_0_STREAM, ENV_SOURCE_STREAMS_0_TOPIC, ENV_SOURCE_TIMESTAMP_FIELD,
-    ENV_SOURCE_URL, ElasticsearchContainer, ElasticsearchOps, HEALTH_CHECK_ATTEMPTS,
-    HEALTH_CHECK_INTERVAL_MS, create_http_client,
+    ENV_SOURCE_URL, ElasticsearchContainer, ElasticsearchOps, create_http_client,
 };
 use async_trait::async_trait;
 use iggy_common::IggyTimestamp;
 use integration::harness::{TestBinaryError, TestFixture};
 use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use std::collections::HashMap;
-use std::time::Duration;
-use tokio::time::sleep;
-use tracing::info;
 
 const TEST_INDEX: &str = "test_documents";
 
@@ -102,28 +98,11 @@ impl TestFixture for ElasticsearchSourceFixture {
         let container = ElasticsearchContainer::start().await?;
         let http_client = create_http_client();
 
-        let fixture = Self {
+        // Container startup already waits for /_cluster/health to return 200
+        // via HttpWaitStrategy, so no additional health check is needed.
+        Ok(Self {
             container,
             http_client,
-        };
-
-        for _ in 0..HEALTH_CHECK_ATTEMPTS {
-            let url = format!("{}/_cluster/health", fixture.container.base_url);
-            if let Ok(response) = fixture.http_client.get(&url).send().await
-                && response.status().is_success()
-            {
-                info!("Elasticsearch cluster is healthy");
-                return Ok(fixture);
-            }
-            sleep(Duration::from_millis(HEALTH_CHECK_INTERVAL_MS)).await;
-        }
-
-        Err(TestBinaryError::FixtureSetup {
-            fixture_type: "ElasticsearchSource".to_string(),
-            message: format!(
-                "Failed to confirm Elasticsearch cluster health after {} attempts",
-                HEALTH_CHECK_ATTEMPTS
-            ),
         })
     }
 

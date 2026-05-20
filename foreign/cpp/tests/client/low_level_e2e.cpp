@@ -16,12 +16,14 @@
 // under the License.
 
 // TODO(slbotbm): create fixture for setup/teardown.
+// TODO(slbotbm): Add tests for join_consumer_group() and leave_consumer_group()
 
 #include <string>
 
 #include <gtest/gtest.h>
 
 #include "lib.rs.h"
+#include "tests/common/test_helpers.hpp"
 
 TEST(LowLevelE2E_Client, ConnectAndLogin) {
     RecordProperty("description", "Connects and logs in successfully using each supported connection string format.");

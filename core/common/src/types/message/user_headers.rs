@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
 use crate::error::IggyError;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_with::base64::Base64;
 use serde_with::serde_as;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -85,7 +84,7 @@ pub type HeaderKey = HeaderField<KeyMarker>;
 pub type HeaderValue = HeaderField<ValueMarker>;
 
 /// Type alias for a collection of user-defined message headers.
-pub type UserHeaders = HashMap<HeaderKey, HeaderValue>;
+pub type UserHeaders = BTreeMap<HeaderKey, HeaderValue>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeyMarker;
@@ -267,11 +266,11 @@ impl HeaderKind {
             13 => Ok(HeaderKind::Uint128),
             14 => Ok(HeaderKind::Float32),
             15 => Ok(HeaderKind::Float64),
-            _ => Err(IggyError::InvalidCommand),
+            _ => Err(IggyError::InvalidHeaderKind(code)),
         }
     }
 
-    fn expected_size(&self) -> Option<usize> {
+    pub(crate) fn expected_size(&self) -> Option<usize> {
         match self {
             HeaderKind::Raw | HeaderKind::String => None,
             HeaderKind::Bool | HeaderKind::Int8 | HeaderKind::Uint8 => Some(1),
@@ -280,6 +279,18 @@ impl HeaderKind {
             HeaderKind::Int64 | HeaderKind::Uint64 | HeaderKind::Float64 => Some(8),
             HeaderKind::Int128 | HeaderKind::Uint128 => Some(16),
         }
+    }
+}
+
+impl Ord for HeaderKind {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_code().cmp(&other.as_code())
+    }
+}
+
+impl PartialOrd for HeaderKind {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -599,12 +610,24 @@ impl<T> HeaderField<T> {
         }
     }
 
-    fn new_unchecked(kind: HeaderKind, value: &[u8]) -> Self {
+    pub(crate) fn new_unchecked(kind: HeaderKind, value: &[u8]) -> Self {
         Self {
             kind,
-            value: Bytes::from(value.to_vec()),
+            value: Bytes::copy_from_slice(value),
             _marker: PhantomData,
         }
+    }
+}
+
+impl<T: Eq> Ord for HeaderField<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.kind.as_code(), &self.value).cmp(&(other.kind.as_code(), &other.value))
+    }
+}
+
+impl<T: Eq> PartialOrd for HeaderField<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -930,115 +953,6 @@ impl<T> TryFrom<&HeaderField<T>> for Vec<u8> {
     }
 }
 
-impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
-    fn to_bytes(&self) -> Bytes {
-        if self.is_empty() {
-            return Bytes::new();
-        }
-
-        let mut bytes = BytesMut::new();
-        for (key, value) in self {
-            bytes.put_u8(key.kind().as_code());
-            #[allow(clippy::cast_possible_truncation)]
-            bytes.put_u32_le(key.as_bytes().len() as u32);
-            bytes.put_slice(key.as_bytes());
-            bytes.put_u8(value.kind().as_code());
-            #[allow(clippy::cast_possible_truncation)]
-            bytes.put_u32_le(value.as_bytes().len() as u32);
-            bytes.put_slice(value.as_bytes());
-        }
-
-        bytes.freeze()
-    }
-
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        if bytes.is_empty() {
-            return Ok(Self::new());
-        }
-
-        let mut headers = Self::new();
-        let mut position = 0;
-        while position < bytes.len() {
-            let key_kind = HeaderKind::from_code(bytes[position])?;
-            position += 1;
-
-            if position + 4 > bytes.len() {
-                return Err(IggyError::InvalidHeaderKey);
-            }
-            let key_length = u32::from_le_bytes(
-                bytes[position..position + 4]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            ) as usize;
-            if key_length == 0 || key_length > 255 {
-                return Err(IggyError::InvalidHeaderKey);
-            }
-            position += 4;
-
-            if position + key_length > bytes.len() {
-                return Err(IggyError::InvalidHeaderKey);
-            }
-            if let Some(expected) = key_kind.expected_size()
-                && key_length != expected
-            {
-                return Err(IggyError::InvalidHeaderKey);
-            }
-            let key_value = bytes[position..position + key_length].to_vec();
-            position += key_length;
-
-            if position >= bytes.len() {
-                return Err(IggyError::InvalidHeaderValue);
-            }
-            let value_kind = HeaderKind::from_code(bytes[position])?;
-            position += 1;
-
-            if position + 4 > bytes.len() {
-                return Err(IggyError::InvalidHeaderValue);
-            }
-            let value_length = u32::from_le_bytes(
-                bytes[position..position + 4]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            ) as usize;
-            if value_length == 0 || value_length > 255 {
-                return Err(IggyError::InvalidHeaderValue);
-            }
-            position += 4;
-
-            if position + value_length > bytes.len() {
-                return Err(IggyError::InvalidHeaderValue);
-            }
-            if let Some(expected) = value_kind.expected_size()
-                && value_length != expected
-            {
-                return Err(IggyError::InvalidHeaderValue);
-            }
-            let value_value = bytes[position..position + value_length].to_vec();
-            position += value_length;
-
-            headers.insert(
-                HeaderKey::new_unchecked(key_kind, &key_value),
-                HeaderValue::new_unchecked(value_kind, &value_value),
-            );
-        }
-
-        Ok(headers)
-    }
-}
-
-pub fn get_user_headers_size(headers: &Option<HashMap<HeaderKey, HeaderValue>>) -> Option<u32> {
-    let mut size = 0;
-    if let Some(headers) = headers {
-        for (key, value) in headers {
-            size += 1 + 4 + key.as_bytes().len() as u32 + 1 + 4 + value.as_bytes().len() as u32;
-        }
-    }
-    Some(size)
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct HeaderEntry {
     pub key: HeaderKey,
@@ -1086,6 +1000,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire_conversions::{user_headers_from_wire, user_headers_to_wire};
+    use bytes::{BufMut, BytesMut};
+    use iggy_binary_protocol::WireUserHeaders;
 
     #[test]
     fn header_key_should_be_created_for_valid_value() {
@@ -1362,7 +1279,7 @@ mod tests {
 
     #[test]
     fn should_be_serialized_as_bytes() {
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert(
             HeaderKey::try_from("key-1").unwrap(),
             HeaderValue::from_str("Value 1").unwrap(),
@@ -1370,7 +1287,7 @@ mod tests {
         headers.insert(HeaderKey::try_from("key 1").unwrap(), 12345u64.into());
         headers.insert(HeaderKey::try_from("key_3").unwrap(), true.into());
 
-        let bytes = headers.to_bytes();
+        let bytes = user_headers_to_wire(&headers).into_bytes();
 
         let mut position = 0;
         let mut headers_count = 0;
@@ -1409,7 +1326,7 @@ mod tests {
 
     #[test]
     fn should_be_deserialized_from_bytes() {
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert(
             HeaderKey::try_from("key-1").unwrap(),
             HeaderValue::from_str("Value 1").unwrap(),
@@ -1427,7 +1344,9 @@ mod tests {
             bytes.put_slice(&value.value);
         }
 
-        let deserialized_headers = HashMap::<HeaderKey, HeaderValue>::from_bytes(bytes.freeze());
+        let frozen = bytes.freeze();
+        let wire = WireUserHeaders::from_slice(&frozen).unwrap();
+        let deserialized_headers = user_headers_from_wire(&wire);
 
         assert!(deserialized_headers.is_ok());
         let deserialized_headers = deserialized_headers.unwrap();
@@ -1444,15 +1363,16 @@ mod tests {
 
     #[test]
     fn should_serialize_and_deserialize_typed_keys() {
-        let mut headers = HashMap::new();
+        let mut headers = BTreeMap::new();
         headers.insert(
             123i32.into(),
             HeaderValue::from_str("Value for int key").unwrap(),
         );
         headers.insert(999u64.into(), true.into());
 
-        let bytes = headers.to_bytes();
-        let deserialized = HashMap::<HeaderKey, HeaderValue>::from_bytes(bytes).unwrap();
+        let bytes = user_headers_to_wire(&headers).into_bytes();
+        let wire = WireUserHeaders::from_slice(&bytes).unwrap();
+        let deserialized = user_headers_from_wire(&wire).unwrap();
 
         assert_eq!(deserialized.len(), headers.len());
         for (key, value) in &headers {
@@ -1661,7 +1581,7 @@ mod tests {
         bytes.put_u32_le(100); // key_len = 100 (lie!)
         bytes.put_slice(b"abc"); // only 3 bytes of key data
 
-        let result = HashMap::<HeaderKey, HeaderValue>::from_bytes(bytes.freeze());
+        let result = WireUserHeaders::from_slice(&bytes.freeze());
         assert!(result.is_err());
     }
 
@@ -1688,7 +1608,9 @@ mod tests {
         bytes.put_u32_le(4); // value_len = 4 (wrong, should be 2)
         bytes.put_slice(&[1, 2, 3, 4]);
 
-        let result = HashMap::<HeaderKey, HeaderValue>::from_bytes(bytes.freeze());
+        let frozen = bytes.freeze();
+        let wire = WireUserHeaders::from_slice(&frozen).unwrap();
+        let result = user_headers_from_wire(&wire);
         assert!(result.is_err());
     }
 
@@ -1703,7 +1625,7 @@ mod tests {
         bytes.put_u8(6); // value_kind = Int32
         // Missing value length bytes
 
-        let result = HashMap::<HeaderKey, HeaderValue>::from_bytes(bytes.freeze());
+        let result = WireUserHeaders::from_slice(&bytes.freeze());
         assert!(result.is_err());
     }
 

@@ -17,8 +17,7 @@
  */
 
 use super::PartitioningKind;
-use crate::{BytesSerializable, IggyByteSize, Sizeable, error::IggyError};
-use bytes::{BufMut, Bytes, BytesMut};
+use crate::{IggyByteSize, Sizeable, error::IggyError};
 use serde::{Deserialize, Serialize};
 use serde_with::base64::Base64;
 use serde_with::serde_as;
@@ -187,33 +186,6 @@ impl Sizeable for Partitioning {
     }
 }
 
-impl BytesSerializable for Partitioning {
-    fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::with_capacity(2 + self.length as usize);
-        bytes.put_u8(self.kind.as_code());
-        bytes.put_u8(self.length);
-        bytes.put_slice(&self.value);
-        bytes.freeze()
-    }
-
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        Self::from_raw_bytes(&bytes)
-    }
-
-    fn write_to_buffer(&self, bytes: &mut BytesMut) {
-        bytes.put_u8(self.kind.as_code());
-        bytes.put_u8(self.length);
-        bytes.put_slice(&self.value);
-    }
-
-    fn get_buffer_size(&self) -> usize {
-        2 + self.length as usize
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,23 +213,10 @@ mod tests {
     }
 
     #[test]
-    fn from_bytes_should_reject_partition_id_with_wrong_length() {
-        for bad_len in [0u8, 1, 2, 3, 5] {
-            let mut buf = BytesMut::new();
-            buf.put_u8(PartitioningKind::PartitionId.as_code());
-            buf.put_u8(bad_len);
-            buf.extend(vec![0u8; bad_len as usize]);
-            assert!(
-                Partitioning::from_bytes(buf.freeze()).is_err(),
-                "expected error for PartitionId with length={bad_len}"
-            );
-        }
-    }
-
-    #[test]
     fn from_raw_bytes_should_fail_on_truncated_input() {
         let p = Partitioning::partition_id(99);
-        let full = p.to_bytes();
+        let mut full = vec![p.kind.as_code(), p.length];
+        full.extend_from_slice(&p.value);
         for i in 0..full.len() {
             assert!(
                 Partitioning::from_raw_bytes(&full[..i]).is_err(),
@@ -278,14 +237,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_partition_id() {
-        let original = Partitioning::partition_id(12345);
-        let bytes = original.to_bytes();
-        let restored = Partitioning::from_bytes(bytes).unwrap();
-        assert_eq!(original, restored);
-    }
-
-    #[test]
     fn from_raw_bytes_should_reject_balanced_with_nonzero_length() {
         for bad_len in [1u8, 2, 4, 255] {
             let mut buf = vec![PartitioningKind::Balanced.as_code(), bad_len];
@@ -295,21 +246,5 @@ mod tests {
                 "expected error for Balanced with length={bad_len}"
             );
         }
-    }
-
-    #[test]
-    fn round_trip_balanced() {
-        let original = Partitioning::balanced();
-        let bytes = original.to_bytes();
-        let restored = Partitioning::from_bytes(bytes).unwrap();
-        assert_eq!(original, restored);
-    }
-
-    #[test]
-    fn round_trip_messages_key() {
-        let original = Partitioning::messages_key(b"my-key").unwrap();
-        let bytes = original.to_bytes();
-        let restored = Partitioning::from_bytes(bytes).unwrap();
-        assert_eq!(original, restored);
     }
 }

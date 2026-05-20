@@ -25,6 +25,7 @@ use reqwest_retry::policies::ExponentialBackoff;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
+use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -38,7 +39,6 @@ const DEFAULT_POLL_INTERVAL_MS: u64 = 50;
 const QUICKWIT_IMAGE: &str = "quickwit/quickwit";
 const QUICKWIT_TAG: &str = "0.8.2";
 const QUICKWIT_PORT: u16 = 7280;
-const QUICKWIT_READY_MSG: &str = "REST server is ready";
 const QUICKWIT_LISTEN_ADDRESS: &str = "0.0.0.0";
 
 const ENV_PLUGIN_URL: &str = "IGGY_CONNECTORS_SINK_QUICKWIT_PLUGIN_CONFIG_URL";
@@ -69,7 +69,11 @@ impl QuickwitContainer {
 
         let container = GenericImage::new(QUICKWIT_IMAGE, QUICKWIT_TAG)
             .with_exposed_port(0.tcp())
-            .with_wait_for(WaitFor::message_on_stdout(QUICKWIT_READY_MSG))
+            .with_wait_for(WaitFor::http(
+                HttpWaitStrategy::new("/health/readyz")
+                    .with_port(QUICKWIT_PORT.tcp())
+                    .with_expected_status_code(200u16),
+            ))
             .with_network(unique_network)
             .with_cmd(["run"])
             .with_env_var("QW_LISTEN_ADDRESS", QUICKWIT_LISTEN_ADDRESS)

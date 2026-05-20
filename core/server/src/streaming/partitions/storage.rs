@@ -25,10 +25,9 @@ use compio::{
     fs::{self, OpenOptions, create_dir_all},
     io::AsyncWriteAtExt,
 };
-use err_trail::ErrContext;
 use iggy_common::{ConsumerKind, IggyError};
 use std::{io::Read, path::Path, sync::atomic::AtomicU64};
-use tracing::{error, trace};
+use tracing::{error, trace, warn};
 
 pub async fn create_partition_file_hierarchy(
     stream_id: usize,
@@ -170,20 +169,43 @@ pub fn load_consumer_offsets(path: &str) -> Result<Vec<ConsumerOffset>, IggyErro
     let mut consumer_offsets = Vec::new();
     let dir_entries = dir_entries.unwrap();
     for dir_entry in dir_entries {
-        let dir_entry = dir_entry.unwrap();
-        let metadata = dir_entry.metadata();
-        if metadata.is_err() {
-            break;
-        }
+        let dir_entry = match dir_entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                warn!(
+                    "Failed to read directory entry in consumer offsets path: {path}, \
+                     error: {e}, skipping."
+                );
+                continue;
+            }
+        };
 
-        if metadata.unwrap().is_dir() {
+        let metadata = match dir_entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    "Failed to read metadata for entry in consumer offsets path: {path}, \
+                     error: {e}, skipping."
+                );
+                continue;
+            }
+        };
+
+        if metadata.is_dir() {
             continue;
         }
 
-        let name = dir_entry.file_name().into_string().unwrap();
-        let consumer_id = name.parse::<u32>().unwrap_or_else(|_| {
-            panic!("Invalid consumer ID file with name: '{}'.", name);
-        });
+        let name = dir_entry.file_name().to_string_lossy().to_string();
+        let consumer_id = match name.parse::<u32>() {
+            Ok(id) => id,
+            Err(_) => {
+                warn!(
+                    "Unexpected non-numeric consumer offset file: '{}', skipping.",
+                    name
+                );
+                continue;
+            }
+        };
 
         let path = dir_entry.path();
         let path = path.to_str();
@@ -193,19 +215,25 @@ pub fn load_consumer_offsets(path: &str) -> Result<Vec<ConsumerOffset>, IggyErro
         }
 
         let path = path.unwrap().to_string();
-        let file = std::fs::File::open(&path)
-            .error(|e: &std::io::Error| {
-                format!("{COMPONENT} (error: {e}) - failed to open offset file, path: {path}")
-            })
-            .map_err(|_| IggyError::CannotReadFile)?;
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(
+                    "{COMPONENT} (error: {e}) - failed to open offset file, \
+                     path: {path}, skipping."
+                );
+                continue;
+            }
+        };
         let mut cursor = std::io::Cursor::new(file);
         let mut offset = [0; 8];
-        cursor
-            .get_mut().read_exact(&mut offset)
-            .error(|e: &std::io::Error| {
-                format!("{COMPONENT} (error: {e}) - failed to read consumer offset from file, path: {path}")
-            })
-            .map_err(|_| IggyError::CannotReadFile)?;
+        if let Err(e) = cursor.get_mut().read_exact(&mut offset) {
+            warn!(
+                "{COMPONENT} (error: {e}) - failed to read consumer offset from file \
+                 (truncated or corrupt?), path: {path}, skipping."
+            );
+            continue;
+        }
         let offset = AtomicU64::new(u64::from_le_bytes(offset));
 
         consumer_offsets.push(ConsumerOffset {
@@ -216,7 +244,7 @@ pub fn load_consumer_offsets(path: &str) -> Result<Vec<ConsumerOffset>, IggyErro
         });
     }
 
-    consumer_offsets.sort_by(|a, b| a.consumer_id.cmp(&b.consumer_id));
+    consumer_offsets.sort_by_key(|o| o.consumer_id);
     Ok(consumer_offsets)
 }
 
@@ -232,24 +260,44 @@ pub fn load_consumer_group_offsets(
     let mut consumer_group_offsets = Vec::new();
     let dir_entries = dir_entries.unwrap();
     for dir_entry in dir_entries {
-        let dir_entry = dir_entry.unwrap();
-        let metadata = dir_entry.metadata();
-        if metadata.is_err() {
-            break;
-        }
+        let dir_entry = match dir_entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                warn!(
+                    "Failed to read directory entry in consumer group offsets path: {path}, \
+                     error: {e}, skipping."
+                );
+                continue;
+            }
+        };
 
-        if metadata.unwrap().is_dir() {
+        let metadata = match dir_entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    "Failed to read metadata for entry in consumer group offsets path: {path}, \
+                     error: {e}, skipping."
+                );
+                continue;
+            }
+        };
+
+        if metadata.is_dir() {
             continue;
         }
 
-        let name = dir_entry.file_name().into_string().unwrap();
+        let name = dir_entry.file_name().to_string_lossy().to_string();
 
-        let consumer_group_id = name.parse::<u32>().unwrap_or_else(|_| {
-            panic!(
-                "Invalid consumer group ID in consumer group file with name: '{}'.",
-                name
-            );
-        });
+        let consumer_group_id = match name.parse::<u32>() {
+            Ok(id) => id,
+            Err(_) => {
+                warn!(
+                    "Unexpected non-numeric consumer group offset file: '{}', skipping.",
+                    name
+                );
+                continue;
+            }
+        };
         let consumer_group_id = ConsumerGroupId(consumer_group_id as usize);
 
         let path = dir_entry.path();
@@ -263,19 +311,25 @@ pub fn load_consumer_group_offsets(
         }
 
         let path = path.unwrap().to_string();
-        let file = std::fs::File::open(&path)
-            .error(|e: &std::io::Error| {
-                format!("{COMPONENT} (error: {e}) - failed to open offset file, path: {path}")
-            })
-            .map_err(|_| IggyError::CannotReadFile)?;
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(
+                    "{COMPONENT} (error: {e}) - failed to open offset file, \
+                     path: {path}, skipping."
+                );
+                continue;
+            }
+        };
         let mut cursor = std::io::Cursor::new(file);
         let mut offset = [0; 8];
-        cursor
-            .get_mut().read_exact(&mut offset)
-            .error(|e: &std::io::Error| {
-                format!("{COMPONENT} (error: {e}) - failed to read consumer group offset from file, path: {path}")
-            })
-            .map_err(|_| IggyError::CannotReadFile)?;
+        if let Err(e) = cursor.get_mut().read_exact(&mut offset) {
+            warn!(
+                "{COMPONENT} (error: {e}) - failed to read consumer group offset from file \
+                 (truncated or corrupt?), path: {path}, skipping."
+            );
+            continue;
+        }
         let offset = AtomicU64::new(u64::from_le_bytes(offset));
 
         let consumer_offset = ConsumerOffset {

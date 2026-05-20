@@ -17,6 +17,7 @@
 
 mod plot_trend;
 pub mod single_chart;
+pub mod tail_chart;
 pub mod trend_chart;
 
 use wasm_bindgen::prelude::wasm_bindgen;

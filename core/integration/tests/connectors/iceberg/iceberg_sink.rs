@@ -19,7 +19,7 @@
 
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
-    DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergOps, IcebergPreCreatedFixture,
+    DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergEnvAuthFixture, IcebergOps, IcebergPreCreatedFixture,
 };
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
@@ -206,4 +206,56 @@ async fn iceberg_sink_handles_bulk_messages(
 
     assert_eq!(sinks.len(), 1);
     assert!(sinks[0].last_error.is_none());
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/iceberg/sink_default_credentials.toml")),
+    seed = seeds::connector_stream
+)]
+async fn iceberg_sink_uses_default_credential_chain(
+    harness: &TestHarness,
+    fixture: IcebergEnvAuthFixture,
+) {
+    let client = harness
+        .root_client()
+        .await
+        .expect("Failed to get root client");
+    let stream_id: iggy_common::Identifier =
+        seeds::names::STREAM.try_into().expect("Invalid stream id");
+    let topic_id: iggy_common::Identifier =
+        seeds::names::TOPIC.try_into().expect("Invalid topic id");
+    let test_messages = crate::connectors::create_test_messages(5);
+    let mut messages: Vec<IggyMessage> = test_messages
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| {
+            let payload = serde_json::to_vec(msg).expect("Failed to serialize message");
+            IggyMessage::builder()
+                .id((i + 1) as u128)
+                .payload(bytes::Bytes::from(payload))
+                .build()
+                .expect("Failed to build message")
+        })
+        .collect();
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("Failed to send fake messages");
+    let snapshot_count = fixture
+        .wait_for_snapshots(
+            DEFAULT_NAMESPACE,
+            DEFAULT_TABLE,
+            1,
+            SNAPSHOT_POLL_ATTEMPTS,
+            SNAPSHOT_POLL_INTERVAL_MS,
+        )
+        .await
+        .expect("Data should be written to Iceberg table");
+    assert!(snapshot_count >= 1);
+    drop(fixture);
 }

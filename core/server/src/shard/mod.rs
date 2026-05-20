@@ -59,6 +59,9 @@ pub mod task_registry;
 pub mod tasks;
 pub mod transmission;
 
+#[cfg(feature = "systemd")]
+pub mod systemd;
+
 mod communication;
 
 pub use communication::calculate_shard_assignment;
@@ -85,6 +88,10 @@ pub struct IggyShard {
     pub(crate) client_manager: ClientManager,
     pub(crate) metrics: Metrics,
     pub(crate) is_follower: bool,
+    /// Index into `config.cluster.nodes` that describes this running node.
+    /// `Some` only when cluster mode is enabled; validated at bootstrap to
+    /// match exactly one entry in the nodes list.
+    pub(crate) current_replica_id: Option<u8>,
     pub messages_receiver: Cell<Option<Receiver<ShardFrame>>>,
     pub(crate) stop_receiver: StopReceiver,
     pub(crate) is_shutting_down: AtomicBool,
@@ -171,6 +178,11 @@ impl IggyShard {
         if !self.config.system.logging.sysinfo_print_interval.is_zero() && self.id == 0 {
             periodic::spawn_sysinfo_printer(self.clone());
         }
+
+        #[cfg(feature = "systemd")]
+        if self.id == 0 {
+            periodic::spawn_systemd_watchdog(self.clone());
+        }
     }
 
     pub async fn run(self: &Rc<Self>) -> Result<(), IggyError> {
@@ -190,7 +202,18 @@ impl IggyShard {
         // Spawn shutdown handler
         compio::runtime::spawn(async move {
             let _ = stop_receiver.recv().await;
-            shard_for_shutdown.trigger_shutdown().await;
+            #[cfg(feature = "systemd")]
+            if shard_for_shutdown.id == 0 {
+                systemd::notify_stopping();
+            }
+            let drained = shard_for_shutdown.trigger_shutdown().await;
+            #[cfg(feature = "systemd")]
+            if shard_for_shutdown.id == 0 && !drained {
+                warn!("Graceful shutdown timed out; some tasks did not drain in time");
+                systemd::notify_status("graceful shutdown timed out");
+            }
+            #[cfg(not(feature = "systemd"))]
+            let _ = drained;
             let _ = shutdown_complete_tx.send(()).await;
         })
         .detach();

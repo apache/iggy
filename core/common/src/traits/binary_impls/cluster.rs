@@ -16,16 +16,25 @@
  * under the License.
  */
 
-use crate::BinaryClient;
 use crate::traits::binary_auth::fail_if_not_authenticated;
-use crate::traits::binary_mapper;
-use crate::{ClusterClient, ClusterMetadata, GetClusterMetadata, IggyError};
+use crate::wire_conversions::cluster_metadata_from_wire;
+use crate::{BinaryClient, ClusterClient, ClusterMetadata, IggyError};
+use iggy_binary_protocol::codec::WireEncode;
+use iggy_binary_protocol::codes::GET_CLUSTER_METADATA_CODE;
+use iggy_binary_protocol::requests::system::GetClusterMetadataRequest;
+use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterMetadataResponse;
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> ClusterClient for B {
     async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError> {
         fail_if_not_authenticated(self).await?;
-        let response = self.send_with_response(&GetClusterMetadata {}).await?;
-        binary_mapper::map_cluster_metadata(response)
+        let response = self
+            .send_raw_with_response(
+                GET_CLUSTER_METADATA_CODE,
+                GetClusterMetadataRequest.to_bytes(),
+            )
+            .await?;
+        let wire_resp = super::decode_response::<ClusterMetadataResponse>(&response)?;
+        cluster_metadata_from_wire(wire_resp)
     }
 }

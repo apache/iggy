@@ -14,23 +14,57 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::stm::StateMachine;
+use crate::MuxStateMachine;
+use crate::stm::consumer_group::ConsumerGroups;
 use crate::stm::snapshot::{FillSnapshot, MetadataSnapshot, Snapshot, SnapshotError};
+use crate::stm::stream::Streams;
+use crate::stm::user::Users;
+use crate::stm::{ConsensusGroupAllocator, StateMachine};
 use consensus::{
-    Consensus, Pipeline, PipelineEntry, Plane, PlaneIdentity, Project, Sequencer, VsrConsensus,
-    ack_preflight, ack_quorum_reached, build_reply_message, drain_committable_prefix,
-    fence_old_prepare_by_commit, panic_if_hash_chain_would_break_in_same_view,
-    pipeline_prepare_common, replicate_preflight, replicate_to_next_in_chain,
+    CLIENTS_TABLE_MAX, Canceled, ClientTable, CommitLogEvent, Consensus, Pipeline, PipelineEntry,
+    Plane, PlaneIdentity, PlaneKind, Project, ReplicaLogContext, RequestLogEvent, Sequencer,
+    SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached, build_reply_message,
+    drain_committable_prefix, emit_sim_event, fence_old_prepare_by_commit, is_caught_up_primary,
+    panic_if_hash_chain_would_break_in_same_view, pipeline_prepare_common, register_preflight,
+    replicate_preflight, replicate_to_next_in_chain, request_preflight,
     send_prepare_ok as send_prepare_ok_common,
 };
+use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest as WireCreatePartitionsRequest;
+use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsRequest as PersistedCreatePartitionsRequest;
+use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
+use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, GenericHeader, Message, PrepareHeader, PrepareOkHeader,
-    RequestHeader,
+    Command2, ConsensusHeader, GenericHeader, Message, Operation, PrepareHeader, PrepareOkHeader,
+    RequestHeader, WireDecode, WireEncode,
 };
+use iggy_common::IggyError;
+use iggy_common::variadic;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
+use std::cell::RefCell;
+use std::mem::size_of;
 use std::path::Path;
 use tracing::{debug, error, warn};
+
+fn freeze_client_reply(
+    message: Message<GenericHeader>,
+) -> iggy_binary_protocol::consensus::iobuf::Frozen<
+    { iggy_binary_protocol::consensus::MESSAGE_ALIGN },
+> {
+    message.into_frozen()
+}
+
+pub trait StreamsFrontend {
+    #[must_use]
+    fn streams(&self) -> &Streams;
+}
+
+impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)> {
+    fn streams(&self) -> &Streams {
+        &self.inner().1.0
+    }
+}
 
 #[derive(Debug, Clone)]
 #[allow(unused)]
@@ -231,6 +265,43 @@ impl<M> SnapshotCoordinator<M> {
     }
 }
 
+/// Failures for [`IggyMetadata::submit_register_in_process`]. All transient;
+/// the login/register handler wraps every variant in
+/// `LoginRegisterError::Transient` so SDK read-timeout replays.
+//
+// TODO(pipeline-backpressure, canceled-retry): absorb-silently loop will
+// make transients internal-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RegisterSubmitError {
+    /// Not primary / not Normal.
+    NotPrimary,
+    /// Primary but `commit_min < commit_max`. Fresh dispatch would race an
+    /// inherited register and panic `commit_register`'s session-eq assert.
+    NotCaughtUp,
+    /// Prepare queue full.
+    PipelineFull,
+    /// In-flight prepare from this client.
+    InProgress,
+    /// Receiver `Canceled` and post-await re-check showed no session.
+    /// SDK replay hits new primary via cached register reply or `New`.
+    Canceled,
+}
+
+impl std::fmt::Display for RegisterSubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotPrimary => f.write_str("not primary in normal status"),
+            Self::NotCaughtUp => f.write_str("primary not yet caught up on commit_journal"),
+            Self::PipelineFull => f.write_str("metadata prepare queue is full"),
+            Self::InProgress => f.write_str("another register from this client is in flight"),
+            Self::Canceled => f.write_str("view change canceled the pending register"),
+        }
+    }
+}
+
+impl std::error::Error for RegisterSubmitError {}
+
 pub struct IggyMetadata<C, J, S, M> {
     /// Some on shard0, None on other shards
     pub consensus: Option<C>,
@@ -240,13 +311,16 @@ pub struct IggyMetadata<C, J, S, M> {
     pub snapshot: Option<S>,
     /// State machine - lives on all shards
     pub mux_stm: M,
+    pub allocator: ConsensusGroupAllocator,
     /// Snapshot coordinator - present when persistent checkpointing is configured.
     pub coordinator: Option<SnapshotCoordinator<M>>,
+    /// Per-client session state (sessions, dedup, eviction). Metadata-only.
+    pub client_table: RefCell<ClientTable>,
 }
 
 impl<C, J, S, M> IggyMetadata<C, J, S, M>
 where
-    M: FillSnapshot<MetadataSnapshot>,
+    M: StreamsFrontend + FillSnapshot<MetadataSnapshot>,
 {
     /// Create a new `IggyMetadata` instance.
     ///
@@ -260,14 +334,17 @@ where
         mux_stm: M,
         data_dir: Option<std::path::PathBuf>,
     ) -> Self {
-        let coordinator = data_dir
-            .map(|dir| SnapshotCoordinator::new(dir, |stm, seq| IggySnapshot::create(stm, seq)));
+        let allocator =
+            ConsensusGroupAllocator::new(mux_stm.streams().highest_partition_consensus_group_id());
+        let coordinator = data_dir.map(|dir| SnapshotCoordinator::new(dir, IggySnapshot::create));
         Self {
             consensus,
             journal,
             snapshot,
             mux_stm,
+            allocator,
             coordinator,
+            client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
         }
     }
 }
@@ -275,10 +352,11 @@ where
 #[allow(clippy::future_not_send)]
 impl<B, J, S, M> Plane<VsrConsensus<B>> for IggyMetadata<VsrConsensus<B>, J, S, M>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
+    B: MessageBus,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    M: StateMachine<
+    M: StreamsFrontend
+        + StateMachine<
             Input = Message<PrepareHeader>,
             Output = bytes::Bytes,
             Error = iggy_common::IggyError,
@@ -286,25 +364,90 @@ where
 {
     async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
+        let client_id = message.header().client;
+        let session = message.header().session;
+        let request = message.header().request;
+        let operation = message.header().operation;
 
-        // TODO: Bunch of asserts.
-        debug!("handling metadata request");
-        let prepare = message.project(consensus);
-        pipeline_prepare_common(consensus, prepare, |prepare| self.on_replicate(prepare)).await;
+        // Preflight first: dedup, eviction sends, cached-reply replay all
+        // must run regardless of pipeline pressure.
+        let preflight = if operation == Operation::Register {
+            register_preflight(consensus, &self.client_table, client_id).await
+        } else {
+            request_preflight(consensus, &self.client_table, client_id, session, request).await
+        };
+        if !preflight {
+            return;
+        }
+
+        emit_sim_event(
+            SimEventKind::ClientRequestReceived,
+            &RequestLogEvent {
+                replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Metadata),
+                client_id: message.header().client,
+                request_id: message.header().request,
+                operation: message.header().operation,
+            },
+        );
+
+        // Two-queue admission: prepare slot then project+replicate; prepare
+        // full + request room then buffer; both full then drop+warn (SDK
+        // retries via read-timeout).
+        if consensus.pipeline().borrow().is_full() {
+            let push_result = consensus
+                .pipeline()
+                .borrow_mut()
+                .push_request(consensus::RequestEntry::new(message));
+            if push_result.is_err() {
+                warn!(
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    client = client_id,
+                    request = request,
+                    "on_request: prepare and request queues both full, dropping"
+                );
+            }
+            return;
+        }
+
+        let prepare = match self.prepare_request(message) {
+            Ok(prepare) => prepare,
+            Err(error) => {
+                warn!(
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    error = %error,
+                    "failed to transform metadata request into prepare"
+                );
+                return;
+            }
+        };
+        pipeline_prepare_common(consensus, PlaneKind::Metadata, prepare, |prepare| {
+            self.on_replicate(prepare)
+        })
+        .await;
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
-        let header = message.header();
+        let header = *message.header();
 
-        let current_op = match replicate_preflight(consensus, header) {
+        let current_op = match replicate_preflight(consensus, &header) {
             Ok(current_op) => current_op,
             Err(reason) => {
                 warn!(
-                    replica = consensus.replica(),
-                    "on_replicate: ignoring ({reason})"
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    view = consensus.view(),
+                    op = header.op,
+                    operation = ?header.operation,
+                    reason = reason.as_str(),
+                    "ignoring prepare during replicate preflight"
                 );
                 return;
             }
@@ -312,106 +455,163 @@ where
 
         // TODO: Handle idx calculation, for now using header.op, but since the journal may get compacted, this may not be correct.
         #[allow(clippy::cast_possible_truncation)]
-        let is_old_prepare = fence_old_prepare_by_commit(consensus, header)
+        let is_old_prepare = fence_old_prepare_by_commit(consensus, &header)
             || journal.handle().header(header.op as usize).is_some();
         if is_old_prepare {
-            warn!("received old prepare, not replicating");
-        } else {
-            self.replicate(message.clone()).await;
+            warn!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                view = consensus.view(),
+                op = header.op,
+                commit = consensus.commit_max(),
+                operation = ?header.operation,
+                "received old prepare, skipping replication"
+            );
+            // Old prepare: downstream already has it or learns via newer
+            // forward; no chain-replicate; WAL unaffected.
+            return;
         }
 
         // TODO add assertions for valid state here.
 
         // TODO handle gap in ops.
 
-        // Force a checkpoint if the journal is running low on capacity.
-        if let Some(coordinator) = &self.coordinator {
-            let snap_op = consensus.commit();
-            match coordinator
-                .checkpoint_if_needed(&self.mux_stm, journal, snap_op)
-                .await
-            {
-                Ok(true) => {
-                    debug!(
-                        replica = consensus.replica(),
-                        "on_replicate: forced checkpoint at op={snap_op}"
-                    );
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    error!(
-                        replica = consensus.replica(),
-                        "on_replicate: forced checkpoint failed: {e}"
-                    );
-                    return;
-                }
+        // Verify hash chain integrity BEFORE checkpoint. `checkpoint_if_needed`
+        // can drain WAL entries, making previous_header return None.
+        if let Some(previous) = journal.handle().previous_header(&header) {
+            panic_if_hash_chain_would_break_in_same_view(&previous, &header);
+        }
+
+        if !self.checkpoint_if_needed(consensus, journal).await {
+            return;
+        }
+
+        // Backup: gap check (op == current_op + 1).
+        // Primary: sequencer pre-advanced by push_prepare_entry (guards
+        // sibling on_request races during journal.append await).
+        // TODO: hard assert for backups once message repair lands.
+        if consensus.is_follower() {
+            if header.op != current_op + 1 {
+                warn!(
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    op = header.op,
+                    expected = current_op + 1,
+                    "on_replicate: dropping out-of-order prepare (gap)"
+                );
+                return;
             }
+        } else {
+            debug_assert_eq!(
+                header.op, current_op,
+                "primary: sequencer pre-advance broken"
+            );
         }
 
-        // Verify hash chain integrity.
-        if let Some(previous) = journal.handle().previous_header(header) {
-            panic_if_hash_chain_would_break_in_same_view(&previous, header);
-        }
-
-        assert_eq!(header.op, current_op + 1);
-
-        consensus.sequencer().set_sequence(header.op);
-        consensus.set_last_prepare_checksum(header.checksum);
-
-        // Append to journal.
+        // Journal append first; sequencer + checksum after successful append
+        // so a failed write doesn't leave state pointing at a phantom entry.
+        //
+        // Durability BEFORE chain-replicate / PrepareOk: forwarding an
+        // un-persisted prepare advertises an op the WAL doesn't hold,
+        // violates VSR tail-ahead-of-head, recoverable only via hash-chain
+        // fence + view change (burns a view).
         if let Err(e) = journal.handle().append(message.clone()).await {
             error!(
-                replica = consensus.replica(),
-                "on_replicate: journal append failed: {e}"
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                op = header.op,
+                operation = ?header.operation,
+                error = %e,
+                "journal append failed"
             );
             return;
         }
 
+        // Durable; chain-replicate. `replicate` borrows + freezes; we keep
+        // message for the sequencer/checksum bookkeeping below.
+        self.replicate(&message).await;
+
+        self.observe_prepare_runtime_state(&message);
+        // Backup: advance sequencer + checksum post-append. Primary also
+        // reaches here; push_prepare_entry already advanced sync with the
+        // pipeline push, so calls are idempotent on primary.
+        consensus.sequencer().set_sequence(header.op);
+        consensus.set_last_prepare_checksum(header.checksum);
+
         // After successful journal write, send prepare_ok to primary.
-        self.send_prepare_ok(header).await;
+        self.send_prepare_ok(&header).await;
 
         // If follower, commit any newly committable entries.
         if consensus.is_follower() {
-            self.commit_journal();
+            self.commit_journal().await;
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareOkHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
         let header = message.header();
 
         if let Err(reason) = ack_preflight(consensus) {
-            warn!("on_ack: ignoring ({reason})");
+            warn!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                view = consensus.view(),
+                op = header.op,
+                reason = reason.as_str(),
+                "ignoring ack during preflight"
+            );
             return;
         }
 
         {
             let pipeline = consensus.pipeline().borrow();
             if pipeline
-                .message_by_op_and_checksum(header.op, header.prepare_checksum)
+                .entry_by_op_and_checksum(header.op, header.prepare_checksum)
                 .is_none()
             {
-                debug!("on_ack: prepare not in pipeline op={}", header.op);
+                debug!(
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    op = header.op,
+                    prepare_checksum = header.prepare_checksum,
+                    "ack target prepare not in pipeline"
+                );
                 return;
             }
         }
 
-        if ack_quorum_reached(consensus, header) {
+        if ack_quorum_reached(consensus, PlaneKind::Metadata, header) {
             let journal = self.journal.as_ref().unwrap();
 
-            debug!("on_ack: quorum received for op={}", header.op);
+            debug!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                op = header.op,
+                "ack quorum received"
+            );
 
             let drained = drain_committable_prefix(consensus);
+            let drained_count = drained.len();
             if let (Some(first), Some(last)) = (drained.first(), drained.last()) {
                 debug!(
-                    "on_ack: draining committed prefix ops=[{}..={}] count={}",
-                    first.header.op,
-                    last.header.op,
-                    drained.len()
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    first_op = first.header.op,
+                    last_op = last.header.op,
+                    drained_count = drained_count,
+                    "draining committed metadata prefix"
                 );
             }
 
-            for entry in drained {
+            for mut entry in drained {
                 let prepare_header = entry.header;
                 // TODO(hubcio): should we replace this with graceful fallback (warn + return)?
                 // When journal compaction is implemented compaction could race
@@ -427,37 +627,102 @@ where
                         )
                     });
 
-                let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
-                    warn!(
-                        "on_ack: state machine error for op={}: {err}",
-                        prepare_header.op
+                let pipeline_depth = consensus.pipeline().borrow().len();
+                let event = CommitLogEvent {
+                    replica: ReplicaLogContext::from_consensus(consensus, PlaneKind::Metadata),
+                    op: prepare_header.op,
+                    client_id: prepare_header.client,
+                    request_id: prepare_header.request,
+                    operation: prepare_header.operation,
+                    pipeline_depth,
+                };
+
+                // Apply SM + mutate client_table BEFORE advancing commit_min.
+                // `is_caught_up_primary` reads `commit_min == commit_max` as
+                // proof the table is caught up. Table first, counter last:
+                // panic mid-commit leaves the gate closed.
+                //
+                // Invariant: no .await or panic between client_table.commit_*
+                // and advance_commit_min. Sync-only.
+                let reply = if prepare_header.operation == Operation::Register {
+                    // Register: commit_register creates session, no SM.
+                    let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
+                    let in_flight =
+                        |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
+                    self.client_table.borrow_mut().commit_register(
+                        prepare_header.client,
+                        reply.clone(),
+                        in_flight,
                     );
-                    bytes::Bytes::new()
-                });
-                debug!("on_ack: state applied for op={}", prepare_header.op);
+                    reply
+                } else {
+                    // Normal op: apply SM, commit_reply.
+                    let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                        panic!(
+                            "on_ack: committed metadata op={} failed to apply: {err}",
+                            prepare_header.op
+                        );
+                    });
+                    let reply = build_reply_message(&prepare_header, &response);
+                    // Cache only if session exists. Client evicted between
+                    // prepare and commit: skip cache (`commit_reply` no-ops),
+                    // wire reply still ships.
+                    let session = self
+                        .client_table
+                        .borrow()
+                        .get_session(prepare_header.client);
+                    if let Some(session) = session {
+                        self.client_table.borrow_mut().commit_reply(
+                            prepare_header.client,
+                            session,
+                            reply.clone(),
+                        );
+                    } else {
+                        tracing::trace!(
+                            client = prepare_header.client,
+                            op = prepare_header.op,
+                            "on_ack: client evicted while being prepared; emitting reply but skipping cache"
+                        );
+                    }
+                    reply
+                };
+                consensus.advance_commit_min(prepare_header.op);
+                emit_sim_event(SimEventKind::OperationCommitted, &event);
 
-                let generic_reply =
-                    build_reply_message(consensus, &prepare_header, response).into_generic();
-                debug!(
-                    "on_ack: sending reply to client={} for op={}",
-                    prepare_header.client, prepare_header.op
-                );
+                // Fire subscriber BEFORE wire send. Slot already updated
+                // (slot-first ordering, see take_reply_sender). Dropped
+                // receiver: ignored.
+                if let Some(sender) = entry.take_reply_sender() {
+                    let _ = sender.send(reply.clone());
+                }
 
-                // TODO: Propagate send error instead of panicking; requires bus error design.
-                consensus
+                let generic_reply = reply.into_generic();
+                let reply_buffers = freeze_client_reply(generic_reply);
+                emit_sim_event(SimEventKind::ClientReplyEmitted, &event);
+
+                if let Err(e) = consensus
                     .message_bus()
-                    .send_to_client(prepare_header.client, generic_reply)
+                    .send_to_client(prepare_header.client, reply_buffers)
                     .await
-                    .unwrap();
+                {
+                    warn!(
+                        "on_ack: failed to send reply to client={}: {e}",
+                        prepare_header.client
+                    );
+                }
             }
+
+            // Each commit frees one prepare slot, promote up to
+            // drained_count buffered requests so the pipeline stays busy.
+            self.drain_request_queue_into_prepares(drained_count).await;
         }
     }
 }
 
 impl<B, P, J, S, M> PlaneIdentity<VsrConsensus<B, P>> for IggyMetadata<VsrConsensus<B, P>, J, S, M>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StateMachine<Input = Message<PrepareHeader>>,
@@ -470,50 +735,448 @@ where
             message.header().command(),
             Command2::Request | Command2::Prepare | Command2::PrepareOk
         ));
-        message.header().operation().is_metadata()
+        let op = message.header().operation();
+        op.is_metadata() || op == Operation::Register
+    }
+}
+
+impl<B, J, S, M> IggyMetadata<VsrConsensus<B>, J, S, M>
+where
+    B: MessageBus,
+    J: JournalHandle,
+    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    M: StreamsFrontend
+        + StateMachine<
+            Input = Message<PrepareHeader>,
+            Output = bytes::Bytes,
+            Error = iggy_common::IggyError,
+        >,
+{
+    /// Submit `Register` from in-process, await commit. Wire reply still fires
+    /// via `message_bus.send_to_client`; subscriber is additive.
+    ///
+    /// # Returns
+    /// Session number (= commit op). Idempotent: existing session short-circuits.
+    ///
+    /// # Errors
+    /// [`RegisterSubmitError`] (all transient): `NotPrimary`, `NotCaughtUp`,
+    /// `PipelineFull`, `InProgress`, `Canceled`. `Canceled` dominates on view
+    /// change; new primary inherits via `commit_journal`, SDK retries.
+    ///
+    /// # Panics
+    /// On `client_id == 0` or shard without consensus.
+    ///
+    /// # Safety
+    /// Catch-up gate load-bearing: dispatch with `commit_min < commit_max`
+    /// produces two register entries and panics on replay.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_register_in_process(
+        &self,
+        client_id: u128,
+    ) -> Result<u64, RegisterSubmitError> {
+        assert!(client_id != 0, "client_id 0 is reserved for internal use");
+        let consensus = self
+            .consensus
+            .as_ref()
+            .expect("submit_register_in_process: consensus only exists on shard 0");
+
+        // Idempotent fast path: existing session skips pipeline + wire-reply.
+        if let Some(session) = self.client_table.borrow().get_session(client_id) {
+            return Ok(session);
+        }
+
+        // Status + catch-up gate (see doc). Split variants for telemetry:
+        // NotPrimary (try peer) vs NotCaughtUp (retry). Caller policy same.
+        if !is_caught_up_primary(consensus) {
+            return Err(
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_syncing() {
+                    RegisterSubmitError::NotCaughtUp
+                } else {
+                    RegisterSubmitError::NotPrimary
+                },
+            );
+        }
+
+        // Mirror wire-path register_preflight: a racing second prepare fails
+        // check_register on commit. Surface pre-synthesis.
+        if consensus
+            .pipeline()
+            .borrow()
+            .has_message_from_client(client_id)
+        {
+            return Err(RegisterSubmitError::InProgress);
+        }
+
+        // TODO(pipeline-backpressure): in-process has no request_queue yet;
+        // terminal on full. Wire path buffers.
+        if consensus.pipeline().borrow().is_full() {
+            return Err(RegisterSubmitError::PipelineFull);
+        }
+
+        let request = build_register_request_message(consensus, client_id);
+        // Wire path runs `RequestHeader::validate` at network boundary;
+        // in-process skips it. debug_assert pins drift.
+        debug_assert!(
+            {
+                use iggy_binary_protocol::ConsensusHeader;
+                request.header().validate().is_ok()
+            },
+            "build_register_request_message produced a header that fails validate()"
+        );
+        // `prepare_request` only fails on `!is_client_allowed`; Register is
+        // allowed, so unreachable. Panic loudly on regression instead of
+        // smuggling through wire-eviction.
+        let prepare = self
+            .prepare_request(request)
+            .expect("Operation::Register is client-allowed; prepare projection cannot fail");
+
+        // Subscribe before await so receiver registers before any self-loopback
+        // ack fires. compio is single-threaded; explicit anyway.
+        consensus.verify_pipeline();
+        let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &prepare);
+        // Re-check gate post-subscribe: `pipeline_message_with_subscriber`
+        // can drop the borrow. No commit-max advance flips the gate today;
+        // pin against future await between check and dispatch.
+        debug_assert!(
+            is_caught_up_primary(consensus),
+            "submit_register_in_process: gate flipped between check and dispatch"
+        );
+        self.on_replicate(prepare).await;
+
+        match receiver.await {
+            Ok(reply) => Ok(reply.header().commit),
+            Err(Canceled) => {
+                // View-change cancel. Re-check is correct-by-VSR: any
+                // inherited Register applied via local commit_journal between
+                // cancel and read produces a cluster-authoritative session
+                // (`session = commit-op`, deterministic). Own surviving
+                // Register would have routed through `AlreadyRegistered`
+                // against the same entry, so no "this primary vs inherited
+                // primary" split.
+                self.client_table
+                    .borrow()
+                    .get_session(client_id)
+                    .ok_or(RegisterSubmitError::Canceled)
+            }
+        }
+    }
+
+    /// Promote up to `slots_freed` buffered requests into prepares after
+    /// `on_ack` commits a prefix.
+    ///
+    /// # Safety
+    /// Re-preflight per iteration: `commit_journal` may have advanced the
+    /// client's request between push and drain (Stale / Duplicate /
+    /// `AlreadyRegistered`). Skipping produces a duplicate prepare and panics.
+    #[allow(clippy::future_not_send)]
+    async fn drain_request_queue_into_prepares(&self, slots_freed: usize) {
+        let consensus = self.consensus.as_ref().unwrap();
+        for _ in 0..slots_freed {
+            let req = consensus.pipeline().borrow_mut().pop_request();
+            let Some(req) = req else { break };
+
+            let client_id = req.message.header().client;
+            let session = req.message.header().session;
+            let request = req.message.header().request;
+            let operation = req.message.header().operation;
+            let preflight = if operation == Operation::Register {
+                register_preflight(consensus, &self.client_table, client_id).await
+            } else {
+                request_preflight(consensus, &self.client_table, client_id, session, request).await
+            };
+            if !preflight {
+                continue;
+            }
+
+            let prepare = match self.prepare_request(req.message) {
+                Ok(prepare) => prepare,
+                Err(error) => {
+                    warn!(
+                        target: "iggy.metadata.diag",
+                        plane = "metadata",
+                        replica_id = consensus.replica(),
+                        error = %error,
+                        "drain_request_queue: failed to project queued request into prepare"
+                    );
+                    continue;
+                }
+            };
+            pipeline_prepare_common(consensus, PlaneKind::Metadata, prepare, |prepare| {
+                self.on_replicate(prepare)
+            })
+            .await;
+        }
     }
 }
 
 impl<B, P, J, S, M> IggyMetadata<VsrConsensus<B, P>, J, S, M>
 where
-    B: MessageBus<Replica = u8, Data = Message<GenericHeader>, Client = u128>,
-    P: Pipeline<Message = Message<PrepareHeader>, Entry = PipelineEntry>,
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
     J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    M: StateMachine<Input = Message<PrepareHeader>>,
+    M: StreamsFrontend
+        + StateMachine<
+            Input = Message<PrepareHeader>,
+            Output = bytes::Bytes,
+            Error = iggy_common::IggyError,
+        >,
 {
+    #[allow(clippy::future_not_send)]
+    async fn checkpoint_if_needed(&self, consensus: &VsrConsensus<B, P>, journal: &J) -> bool {
+        let Some(coordinator) = &self.coordinator else {
+            return true;
+        };
+
+        // Use commit_min (locally executed), not commit_max. WAL entries
+        // between commit_min+1 and commit_max haven't been applied to the
+        // state machine yet, draining them would lose data on crash.
+        let snap_op = consensus.commit_min();
+        match coordinator
+            .checkpoint_if_needed(&self.mux_stm, journal, snap_op)
+            .await
+        {
+            Ok(true) => {
+                debug!(
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    checkpoint_op = snap_op,
+                    "forced checkpoint completed"
+                );
+                true
+            }
+            Ok(false) => true,
+            Err(e) => {
+                error!(
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    checkpoint_op = snap_op,
+                    error = %e,
+                    "forced checkpoint failed"
+                );
+                false
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn prepare_request(
+        &self,
+        message: Message<RequestHeader>,
+    ) -> Result<Message<PrepareHeader>, iggy_common::IggyError> {
+        let consensus = self.consensus.as_ref().unwrap();
+        let header = *message.header();
+        if !header.operation.is_client_allowed() {
+            return Err(IggyError::InvalidCommand);
+        }
+        let body = &message.as_slice()[size_of::<RequestHeader>()..header.size as usize];
+
+        match header.operation {
+            Operation::CreateTopic => {
+                let request = WireCreateTopicRequest::decode_from(body)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                let partitions = self
+                    .allocator
+                    .allocate_many(request.partitions_count as usize)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(partition_id, consensus_group_id)| {
+                        Ok(CreatedPartitionAssignment {
+                            partition_id: u32::try_from(partition_id)
+                                .map_err(|_| IggyError::InvalidCommand)?,
+                            consensus_group_id,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let body = PersistedCreateTopicRequest {
+                    request,
+                    partitions,
+                }
+                .to_bytes();
+                Ok(build_prepare_message(
+                    consensus,
+                    &header,
+                    Operation::CreateTopicWithAssignments,
+                    &body,
+                ))
+            }
+            Operation::CreatePartitions => {
+                let request = WireCreatePartitionsRequest::decode_from(body)
+                    .map_err(|_| IggyError::InvalidCommand)?;
+                self.mux_stm
+                    .streams()
+                    .current_partition_count(&request.stream_id, &request.topic_id)
+                    .ok_or(IggyError::InvalidCommand)?;
+                let partitions = self
+                    .allocator
+                    .allocate_many(request.partitions_count as usize)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, consensus_group_id)| {
+                        Ok(CreatedPartitionAssignment {
+                            partition_id: u32::try_from(offset)
+                                .map_err(|_| IggyError::InvalidCommand)?,
+                            consensus_group_id,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let body = PersistedCreatePartitionsRequest {
+                    request,
+                    partitions,
+                }
+                .to_bytes();
+                Ok(build_prepare_message(
+                    consensus,
+                    &header,
+                    Operation::CreatePartitionsWithAssignments,
+                    &body,
+                ))
+            }
+            _ => Ok(message.project(consensus)),
+        }
+    }
+
     /// Replicate a prepare message to the next replica in the chain.
     ///
     /// Chain replication pattern:
     /// - Primary sends to first backup
     /// - Each backup forwards to the next
     /// - Stops when we would forward back to primary
+    ///
+    /// Caller must have already appended `message` to the local journal
+    /// before invoking this helper (VSR tail-ahead-of-head). Forwarding
+    /// an un-persisted prepare would leave downstream WALs with an op
+    /// this replica's journal does not hold.
     #[allow(clippy::future_not_send)]
-    async fn replicate(&self, message: Message<PrepareHeader>) {
+    async fn replicate(&self, message: &Message<PrepareHeader>) {
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
-        let header = message.header();
+        let header = *message.header();
 
         // TODO: calculate the index;
         #[allow(clippy::cast_possible_truncation)]
         let idx = header.op as usize;
         assert_eq!(header.command, Command2::Prepare);
         assert!(
-            journal.handle().header(idx).is_none(),
-            "replicate: must not already have prepare"
+            journal.handle().header(idx).is_some(),
+            "replicate: prepare must be durable in local journal before chain-forward"
         );
-        replicate_to_next_in_chain(consensus, message).await;
+        if let Err(e) = replicate_to_next_in_chain(consensus, message).await {
+            tracing::warn!(op = header.op, error = ?e, "chain replication failed");
+        }
     }
 
     // TODO: Implement jump_to_newer_op
     // fn jump_to_newer_op(&self, header: &PrepareHeader) {}
 
-    #[allow(clippy::unused_self)]
-    const fn commit_journal(&self) {
-        // TODO: Implement commit logic
-        // Walk through journal from last committed to current commit number
-        // Apply each entry to the state machine
+    /// Apply ops `[commit_min+1 .. commit_max]` to state machine and
+    /// `client_table`. Backup does NOT ship wire replies (primary's job).
+    ///
+    /// # Safety: ordering invariant
+    ///
+    /// `advance_commit_min(op)` and matching `client_table` mutation
+    /// (`commit_register` / `commit_reply`) run back-to-back, no `.await`
+    /// between. [`crate::metadata_helpers::is_caught_up_primary`] reads
+    /// `commit_min == commit_max` as proof the table is caught up; an await
+    /// here lets another task observe transient equality with stale table,
+    /// dispatch a fresh Register on an already-registered client, and panic
+    /// `commit_register`'s session-eq assert.
+    ///
+    /// Inner block sync today. Future async state-machine must either:
+    /// 1. Apply SM + bump `commit_min` in one `RefCell` borrow, or
+    /// 2. Buffer apply, bump `commit_min` post table-mutation, gate
+    ///    `is_caught_up_primary` on a higher "applied frontier".
+    ///
+    /// `is_caught_up_primary_gate_states` pins clauses, NOT intra-loop window.
+    #[allow(clippy::cast_possible_truncation, clippy::missing_panics_doc)]
+    #[allow(clippy::future_not_send)]
+    pub async fn commit_journal(&self) {
+        let consensus = self.consensus.as_ref().unwrap();
+        let journal = self.journal.as_ref().unwrap();
+
+        while consensus.commit_min() < consensus.commit_max() {
+            let op = consensus.commit_min() + 1;
+
+            let Some(header) = journal.handle().header(op as usize) else {
+                // TODO: Implement message repair: request missing prepare from
+                // primary or other replicas. Until then, the backup stalls here.
+                break;
+            };
+            let header = *header;
+
+            let Some(prepare) = journal.handle().entry(&header).await else {
+                warn!("commit_journal: prepare body missing for op={op}, stopping");
+                break;
+            };
+
+            // SM apply + client_table mutation BEFORE `advance_commit_min`
+            // (see `on_ack` for matching invariant). No await between table
+            // mutation and counter bump.
+            if header.operation == Operation::Register {
+                // Register: commit_register creates session, no SM.
+                let reply = build_reply_message(&header, &bytes::Bytes::new());
+                let in_flight = |c: u128| consensus.pipeline().borrow().has_message_from_client(c);
+                self.client_table
+                    .borrow_mut()
+                    .commit_register(header.client, reply, in_flight);
+            } else {
+                // Normal op: apply SM, commit_reply.
+                let response = self.mux_stm.update(prepare).unwrap_or_else(|err| {
+                    panic!("commit_journal: committed metadata op={op} failed to apply: {err}");
+                });
+                let reply = build_reply_message(&header, &response);
+                // Cache only if session still exists. WAL replay may carry a
+                // reply for a later-evicted client; `commit_reply` no-ops.
+                let session = self.client_table.borrow().get_session(header.client);
+                if let Some(session) = session {
+                    self.client_table
+                        .borrow_mut()
+                        .commit_reply(header.client, session, reply);
+                } else {
+                    tracing::trace!(
+                        client = header.client,
+                        op = op,
+                        "commit_journal: client evicted while being prepared; skipping cache"
+                    );
+                }
+            }
+            consensus.advance_commit_min(op);
+            debug!("commit_journal: committed op={op}");
+        }
+    }
+
+    fn observe_prepare_runtime_state(&self, prepare: &Message<PrepareHeader>) {
+        let header = prepare.header();
+        let body = &prepare.as_slice()[size_of::<PrepareHeader>()..header.size as usize];
+
+        match header.operation {
+            Operation::CreateTopicWithAssignments => {
+                let request = PersistedCreateTopicRequest::decode_from(body)
+                    .expect("create topic with assignments prepare must decode");
+                let highest_consensus_group_id = request
+                    .partitions
+                    .iter()
+                    .map(|partition| partition.consensus_group_id)
+                    .max()
+                    .expect("create topic with assignments must allocate partitions");
+                self.allocator.observe(highest_consensus_group_id);
+            }
+            Operation::CreatePartitionsWithAssignments => {
+                let request = PersistedCreatePartitionsRequest::decode_from(body)
+                    .expect("create partitions with assignments prepare must decode");
+                let highest_consensus_group_id = request
+                    .partitions
+                    .iter()
+                    .map(|partition| partition.consensus_group_id)
+                    .max()
+                    .expect("create partitions with assignments must allocate partitions");
+                self.allocator.observe(highest_consensus_group_id);
+            }
+            _ => {}
+        }
     }
 
     #[allow(clippy::future_not_send, clippy::cast_possible_truncation)]
@@ -523,4 +1186,85 @@ where
         let persisted = journal.handle().header(header.op as usize).is_some();
         send_prepare_ok_common(consensus, header, Some(persisted)).await;
     }
+}
+
+/// In-process Register `Message<RequestHeader>`. Mirrors
+/// `SimClient::register`: `session=0`, `request=0` per
+/// [`RequestHeader::validate`]; empty body.
+///
+/// `cluster` + `view` from `consensus` for self-consistency before
+/// `Project::project` overwrites. `release = 0` matches wire today; both
+/// paths should switch to `consensus.release()` once
+/// `ClientReleaseTooLow/TooHigh` lands.
+///
+/// Buffer is `size_of::<RequestHeader>()`; `prepare_request` transmutes into
+/// `PrepareHeader` (also 256 bytes), no realloc.
+fn build_register_request_message<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    client_id: u128,
+) -> Message<RequestHeader>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let header_size = size_of::<RequestHeader>();
+    let mut msg = Message::<RequestHeader>::new(header_size);
+    let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
+        &mut msg.as_mut_slice()[..header_size],
+    )
+    .expect("zeroed bytes are a valid RequestHeader");
+    *header = RequestHeader {
+        command: Command2::Request,
+        operation: Operation::Register,
+        size: u32::try_from(header_size).expect("RequestHeader size fits u32"),
+        cluster: consensus.cluster(),
+        view: consensus.view(),
+        release: 0,
+        client: client_id,
+        session: 0,
+        request: 0,
+        ..RequestHeader::default()
+    };
+    msg
+}
+
+fn build_prepare_message<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    request: &RequestHeader,
+    operation: Operation,
+    body: &[u8],
+) -> Message<PrepareHeader>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry>,
+{
+    let op = consensus.sequencer().current_sequence() + 1;
+    let size = size_of::<PrepareHeader>() + body.len();
+    let mut prepare = Message::<PrepareHeader>::new(size);
+    let prepare_bytes = prepare.as_mut_slice();
+    prepare_bytes[size_of::<PrepareHeader>()..size].copy_from_slice(body);
+
+    let header_bytes = &mut prepare_bytes[..size_of::<PrepareHeader>()];
+    let new_header = bytemuck::checked::try_from_bytes_mut::<PrepareHeader>(header_bytes)
+        .expect("prepare header bytes should be valid");
+    *new_header = PrepareHeader {
+        cluster: consensus.cluster(),
+        size: u32::try_from(size).expect("prepare message size exceeds u32"),
+        view: consensus.view(),
+        release: request.release,
+        command: Command2::Prepare,
+        replica: consensus.replica(),
+        client: request.client,
+        parent: consensus.last_prepare_checksum(),
+        request_checksum: request.request_checksum,
+        request: request.request,
+        commit: consensus.commit_max(),
+        op,
+        timestamp: 0,
+        operation,
+        namespace: request.namespace,
+        ..Default::default()
+    };
+
+    prepare
 }

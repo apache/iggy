@@ -15,43 +15,43 @@
 # specific language governing permissions and limitations
 # under the License.
 {{ if .Values.server.enabled }}
-{{- if hasKey .Values.server "podSecurityContext" }}
-{{- fail "server.podSecurityContext has been moved to podSecurityContext (root level). Please update your values." }}
-{{- end }}
+  {{- if hasKey .Values.server "podSecurityContext" }}
+    {{- fail "server.podSecurityContext has been moved to podSecurityContext (root level). Please update your values." }}
+  {{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "iggy.fullname" . }}
   labels:
-    {{ include "iggy.labels" . | nindent 4 }}
+    {{- include "iggy.labels" . | nindent 4 }}
 spec:
   {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.server.replicaCount }}
   {{- end }}
   selector:
     matchLabels:
-      {{ include "iggy.selectorLabels" . | nindent 6 }}
+      {{- include "iggy.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
+  {{- with .Values.podAnnotations }}
       annotations:
-        {{ toYaml . | nindent 8 }}
-      {{- end }}
+        {{- toYaml . | nindent 8 }}
+  {{- end }}
       labels:
-        {{ include "iggy.labels" . | nindent 8 }}
+        {{- include "iggy.labels" . | nindent 8 }}
     spec:
-      {{- with .Values.imagePullSecrets }}
+  {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
-        {{ toYaml . | nindent 8 }}
-      {{- end }}
+        {{- toYaml . | nindent 8 }}
+  {{- end }}
       serviceAccountName: {{ include "iggy.serviceAccountName" . }}
       securityContext:
-        {{ toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
-            {{ toYaml .Values.securityContext | nindent 12 }}
+            {{- toYaml .Values.securityContext | nindent 12 }}
           image: "{{ .Values.server.image.repository }}:{{ .Values.server.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.server.image.pullPolicy }}
           ports:
@@ -65,7 +65,7 @@ spec:
               containerPort: {{ .Values.server.ports.quic }}
               protocol: TCP
           env:
-            {{ if .Values.server.users.root.existingSecret.name }}
+  {{- if .Values.server.users.root.existingSecret.name }}
             - name: IGGY_ROOT_USERNAME
               valueFrom:
                 secretKeyRef:
@@ -76,7 +76,7 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.server.users.root.existingSecret.name }}
                   key: {{ .Values.server.users.root.existingSecret.passwordKey }}
-            {{ else }}{{ if .Values.server.users.root.createSecret }}
+  {{- else }}{{- if .Values.server.users.root.createSecret }}
             - name: IGGY_ROOT_USERNAME
               valueFrom:
                 secretKeyRef:
@@ -87,13 +87,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "iggy.fullname" . }}-root-credentials
                   key: password
-            {{- end }}{{- end}}
-            {{ if .Values.server.env }}
-            {{- range .Values.server.env }}
+  {{- end }}{{- end}}
+  {{- if .Values.server.env }}
+    {{- range .Values.server.env }}
             - name: {{ .name }}
               value: {{ .value | quote }}
-            {{- end }}
-            {{ end }}
+    {{- end }}
+  {{- end }}
           volumeMounts:
             - name: iggy-server-data
               mountPath: /app/local_data
@@ -115,26 +115,26 @@ spec:
               port: http
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-      {{- with .Values.server.nodeSelector }}
+  {{- with .Values.server.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.server.affinity }}
+  {{- end }}
+  {{- with .Values.server.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.server.tolerations }}
+  {{- end }}
+  {{- with .Values.server.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+  {{- end }}
       volumes:
         - name: iggy-server-data
-          {{- if .Values.server.persistence.enabled }}
+  {{- if .Values.server.persistence.enabled }}
           persistentVolumeClaim:
             claimName: {{ if .Values.server.persistence.existingClaim }}{{ .Values.server.persistence.existingClaim }}{{- else }}{{ template "iggy.fullname" . }}{{- end }}
-          {{- else }}
+  {{- else }}
           emptyDir: {}
-          {{- end }}
+  {{- end }}
 {{- end }}
 {{ if .Values.ui.enabled }}
 ---
@@ -143,36 +143,36 @@ kind: Deployment
 metadata:
   name: {{ include "iggy.fullname" . }}-ui
   labels:
-    {{ include "iggy-ui.labels" . | nindent 4 }}
+    {{- include "iggy-ui.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.ui.replicaCount }}
   selector:
     matchLabels:
-      {{ include "iggy-ui.selectorLabels" . | nindent 6 }}
+      {{- include "iggy-ui.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
+  {{- with .Values.podAnnotations }}
       annotations:
-        {{ toYaml . | nindent 8 }}
-      {{- end }}
+        {{- toYaml . | nindent 8 }}
+  {{- end }}
       labels:
-        {{ include "iggy-ui.labels" . | nindent 8 }}-ui
+        {{- include "iggy-ui.labels" . | nindent 8 }}-ui
     spec:
-      {{- with .Values.imagePullSecrets }}
+  {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
-        {{ toYaml . | nindent 8 }}
-      {{- end }}
+        {{- toYaml . | nindent 8 }}
+  {{- end }}
       serviceAccountName: {{ include "iggy.serviceAccountName" . }}
-      {{- with .Values.ui.podSecurityContext }}
+  {{- with .Values.ui.podSecurityContext }}
       securityContext:
-        {{ toYaml . | nindent 8 }}
-      {{- end }}
+        {{- toYaml . | nindent 8 }}
+  {{- end }}
       containers:
         - name: {{ .Chart.Name }}
-          {{- with .Values.ui.securityContext }}
+  {{- with .Values.ui.securityContext }}
           securityContext:
-            {{ toYaml . | nindent 12 }}
-          {{- end }}
+            {{- toYaml . | nindent 12 }}
+  {{- end }}
           image: "{{ .Values.ui.image.repository }}:{{ .Values.ui.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.ui.image.pullPolicy }}
           ports:
@@ -188,26 +188,26 @@ spec:
               path: /healthz
               port: http
           resources:
-            {{ toYaml .Values.ui.resources | nindent 12 }}
+            {{- toYaml .Values.ui.resources | nindent 12 }}
           env:
             - name: PUBLIC_IGGY_API_URL
-              {{- if .Values.ui.server.endpoint }}
+  {{- if .Values.ui.server.endpoint }}
               value: {{ .Values.ui.server.endpoint }}
-              {{- else }}
+  {{- else }}
               value: http://{{ include "iggy.fullname" . }}:{{ .Values.server.ports.http }}{{- end }}
-          {{- with .Values.ui.env }}
+    {{- with .Values.ui.env }}
           {{ . | toYaml | nindent 10 }}
-          {{- end }}
-      {{- with .Values.ui.nodeSelector }}
+    {{- end }}
+    {{- with .Values.ui.nodeSelector }}
       nodeSelector:
-        {{ toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.ui.affinity }}
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    {{- with .Values.ui.affinity }}
       affinity:
-        {{ toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.ui.tolerations }}
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    {{- with .Values.ui.tolerations }}
       tolerations:
-        {{ toYaml . | nindent 8 }}
-      {{- end }}
-{{- end }}
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+  {{- end }}

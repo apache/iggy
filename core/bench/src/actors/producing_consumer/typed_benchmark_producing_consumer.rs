@@ -64,6 +64,7 @@ impl TypedBenchmarkProducingConsumer {
         limit_bytes_per_second: Option<IggyByteSize>,
         polling_kind: PollingKind,
         origin_timestamp_latency_calculation: bool,
+        pretty: bool,
     ) -> Self {
         let producer_config = BenchmarkProducerConfig {
             producer_id: actor_id,
@@ -72,6 +73,7 @@ impl TypedBenchmarkProducingConsumer {
             messages_per_batch,
             message_size,
             warmup_time,
+            pretty,
         };
 
         let consumer_config = BenchmarkConsumerConfig {
@@ -82,6 +84,7 @@ impl TypedBenchmarkProducingConsumer {
             warmup_time,
             polling_kind,
             origin_timestamp_latency_calculation,
+            pretty,
         };
 
         if use_high_level_api {

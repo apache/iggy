@@ -16,8 +16,7 @@
  * under the License.
  */
 
-use crate::{AutoLogin, IggyDuration, IggyError, WebSocketClientConfig};
-use std::net::SocketAddr;
+use crate::{AutoLogin, IggyDuration, IggyError, WebSocketClientConfig, validate_server_address};
 
 /// Builder for the WebSocket client configuration.
 /// Allows configuring the WebSocket client with custom settings or using defaults:
@@ -139,20 +138,44 @@ impl WebSocketClientConfigBuilder {
     }
 
     /// Builds the WebSocket client configuration.
-    pub fn build(self) -> Result<WebSocketClientConfig, IggyError> {
-        let addr = self.config.server_address.trim();
-
-        // Check if it's a valid socket address or host:port format
-        if addr.parse::<SocketAddr>().is_err() {
-            let (host, port) = addr.rsplit_once(':').unwrap_or((addr, ""));
-            if port.is_empty() || port.parse::<u16>().is_err() {
-                return Err(IggyError::InvalidIpAddress(
-                    host.to_owned(),
-                    port.to_owned(),
-                ));
-            }
-        }
+    pub fn build(mut self) -> Result<WebSocketClientConfig, IggyError> {
+        self.config.server_address = self.config.server_address.trim().to_owned();
+        validate_server_address(&self.config.server_address)?;
 
         Ok(self.config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_should_trim_and_validate_server_address() {
+        let config = WebSocketClientConfigBuilder::default()
+            .with_server_address(" 127.0.0.1:8092 ".to_string())
+            .build()
+            .expect("expected valid WebSocket server address");
+
+        assert_eq!(config.server_address, "127.0.0.1:8092");
+    }
+
+    #[test]
+    fn build_should_trim_whitespace_before_validation() {
+        let config = WebSocketClientConfigBuilder::default()
+            .with_server_address("\n\tlocalhost:8092 \t".to_string())
+            .build()
+            .expect("expected build() to trim before validation");
+
+        assert_eq!(config.server_address, "localhost:8092");
+    }
+
+    #[test]
+    fn build_should_fail_for_invalid_server_address() {
+        let result = WebSocketClientConfigBuilder::default()
+            .with_server_address("127.0.0.1".to_string())
+            .build();
+
+        assert!(result.is_err());
     }
 }

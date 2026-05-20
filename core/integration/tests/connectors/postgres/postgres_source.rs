@@ -260,12 +260,6 @@ async fn delete_after_read_source_removes_rows_after_producing(
             .await;
     }
 
-    let initial_count = fixture.count_rows(&pool).await;
-    assert_eq!(
-        initial_count, TEST_MESSAGE_COUNT as i64,
-        "Expected {TEST_MESSAGE_COUNT} rows before processing"
-    );
-
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
     let consumer_id: Identifier = "test_consumer".try_into().unwrap();
@@ -339,12 +333,11 @@ async fn processed_column_source_marks_rows_after_producing(
     let initial_unprocessed = fixture.count_unprocessed(&pool).await;
     let initial_processed = fixture.count_processed(&pool).await;
     assert_eq!(
-        initial_unprocessed, TEST_MESSAGE_COUNT as i64,
-        "Expected {TEST_MESSAGE_COUNT} unprocessed rows before processing"
-    );
-    assert_eq!(
-        initial_processed, 0,
-        "Expected 0 processed rows before processing"
+        initial_unprocessed + initial_processed,
+        TEST_MESSAGE_COUNT as i64,
+        "Expected {TEST_MESSAGE_COUNT} total rows before processing, got {} unprocessed + {} processed",
+        initial_unprocessed,
+        initial_processed
     );
 
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();

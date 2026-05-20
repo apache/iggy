@@ -21,7 +21,6 @@ use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::Client;
-use iggy_common::get_streams::GetStreams;
 use tracing::{Level, event};
 
 pub enum GetStreamsOutput {
@@ -30,23 +29,18 @@ pub enum GetStreamsOutput {
 }
 
 pub struct GetStreamsCmd {
-    _get_streams: GetStreams,
     output: GetStreamsOutput,
 }
 
 impl GetStreamsCmd {
     pub fn new(output: GetStreamsOutput) -> Self {
-        GetStreamsCmd {
-            _get_streams: GetStreams {},
-            output,
-        }
+        GetStreamsCmd { output }
     }
 }
 
 impl Default for GetStreamsCmd {
     fn default() -> Self {
         GetStreamsCmd {
-            _get_streams: GetStreams {},
             output: GetStreamsOutput::Table,
         }
     }

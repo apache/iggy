@@ -86,6 +86,8 @@ pub enum IggyError {
     InvalidIpAddress(String, String) = 35,
     #[error("Http error {0}")]
     HttpError(String) = 36,
+    #[error("Invalid API URL: {0}")]
+    InvalidApiUrl(String) = 37,
     #[error("Unauthenticated")]
     Unauthenticated = 40,
     #[error("Unauthorized")]
@@ -148,6 +150,8 @@ pub enum IggyError {
     AccessTokenMissing = 77,
     #[error("Invalid access token")]
     InvalidAccessToken = 78,
+    #[error("Cannot fetch JWKS from URL: {0}")]
+    CannotFetchJwks(String) = 79,
     #[error("Invalid size bytes")]
     InvalidSizeBytes = 80,
     #[error("Invalid UTF-8")]
@@ -384,6 +388,12 @@ pub enum IggyError {
     InvalidMessagesSize(u32, u32) = 4036,
     #[error("Too small message: {0}B, expected: {1}B")]
     TooSmallMessage(u32, u32) = 4037,
+    #[error("Invalid message timestamp delta: {0} microseconds exceeds the per-batch limit")]
+    InvalidMessageTimestampDelta(u64) = 4038,
+    #[error("Invalid batch checksum: {0}, expected: {1}, for base offset: {2}")]
+    InvalidBatchChecksum(u64, u64, u64) = 4039,
+    #[error("Invalid header kind code: {0}")]
+    InvalidHeaderKind(u8) = 4040,
     #[error("Cannot sed messages due to client disconnection")]
     CannotSendMessagesDueToClientDisconnection = 4050,
     #[error("Background send error")]

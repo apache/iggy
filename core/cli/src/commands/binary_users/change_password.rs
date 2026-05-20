@@ -21,7 +21,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use iggy_common::Client;
 use iggy_common::Identifier;
-use passterm::{Stream, isatty, prompt_password_stdin, prompt_password_tty};
+use passterm::{Stream, isatty, prompt_password_tty};
 use tracing::{Level, event};
 
 pub struct ChangePasswordCmd {
@@ -65,7 +65,9 @@ impl CliCommand for ChangePasswordCmd {
                 if isatty(Stream::Stdin) {
                     prompt_password_tty(Some("Current password: "))?
                 } else {
-                    prompt_password_stdin(None, Stream::Stdout)?
+                    let mut pwd = String::new();
+                    std::io::stdin().read_line(&mut pwd)?;
+                    pwd.trim_end_matches(['\n', '\r']).to_string()
                 }
             }
         };
@@ -76,7 +78,9 @@ impl CliCommand for ChangePasswordCmd {
                 if isatty(Stream::Stdin) {
                     prompt_password_tty(Some("New password: "))?
                 } else {
-                    prompt_password_stdin(None, Stream::Stdout)?
+                    let mut pwd = String::new();
+                    std::io::stdin().read_line(&mut pwd)?;
+                    pwd.trim_end_matches(['\n', '\r']).to_string()
                 }
             }
         };

@@ -17,13 +17,16 @@
 
 use crate::api::fetch_benchmark_report_full;
 use crate::components::chart::{PlotConfig, dispose_chart};
+use crate::components::loader::{IggyLoader, LoaderSize};
 use crate::components::selectors::measurement_type_selector::MeasurementType;
 use crate::hooks::use_size;
 use bench_report::report::BenchmarkReport;
+use bench_report::{
+    create_latency_chart, create_latency_distribution_chart, create_throughput_chart,
+};
 use charming::theme::Theme;
 use charming::{Echarts, WasmRenderer};
 use gloo::console::log;
-use gloo::history::{BrowserHistory, History};
 use uuid::Uuid;
 use yew::platform::spawn_local;
 use yew::prelude::*;
@@ -54,17 +57,6 @@ pub fn single_chart(props: &SingleChartProps) -> Html {
             let benchmark_uuid = *benchmark_uuid;
             is_loading.set(true);
 
-            let current_location = web_sys::window()
-                .and_then(|w| w.location().pathname().ok())
-                .unwrap_or_default();
-
-            let expected_path = format!("/benchmarks/{benchmark_uuid}");
-
-            if current_location != expected_path {
-                let history = BrowserHistory::new();
-                history.push(expected_path);
-            }
-
             spawn_local(async move {
                 match fetch_benchmark_report_full(&benchmark_uuid).await {
                     Ok(data) => {
@@ -81,12 +73,15 @@ pub fn single_chart(props: &SingleChartProps) -> Html {
         });
     }
 
+    let canvas_id = format!("single-chart-canvas-{}", props.benchmark_uuid);
+    let wrapper_id = format!("single-chart-{}", props.benchmark_uuid);
     {
         let data = (*chart_data).clone();
         let measurement_type = props.measurement_type.clone();
         let is_dark = props.is_dark;
         let echarts = echarts.clone();
         let is_loading = is_loading.clone();
+        let canvas_id_effect = canvas_id.clone();
 
         use_effect_with(
             (data, measurement_type, is_dark, chart_size, *is_loading),
@@ -96,27 +91,23 @@ pub fn single_chart(props: &SingleChartProps) -> Html {
                     width,
                     height,
                     is_dark: *is_dark,
-                    element_id: "single-chart-canvas".to_string(),
+                    element_id: canvas_id_effect.clone(),
                 };
 
                 if echarts.is_some() {
-                    dispose_chart("single-chart-canvas");
+                    dispose_chart(&canvas_id_effect);
                 }
 
                 if !is_loading {
                     let chart = match measurement_type {
-                        MeasurementType::Latency => {
-                            bench_report::create_latency_chart(data, config.is_dark, true)
+                        MeasurementType::Latency | MeasurementType::Tail => {
+                            create_latency_chart(data, config.is_dark, true)
                         }
                         MeasurementType::Throughput => {
-                            bench_report::create_throughput_chart(data, config.is_dark, true)
+                            create_throughput_chart(data, config.is_dark, true)
                         }
                         MeasurementType::Distribution => {
-                            bench_report::create_latency_distribution_chart(
-                                data,
-                                config.is_dark,
-                                true,
-                            )
+                            create_latency_distribution_chart(data, config.is_dark, true)
                         }
                     };
 
@@ -145,12 +136,12 @@ pub fn single_chart(props: &SingleChartProps) -> Html {
     let chart_class = if *is_loading { "loading" } else { "" };
 
     html! {
-        <div ref={chart_node} id="single-chart" style="width: 100%; height: 100%;">
+        <div ref={chart_node} id={wrapper_id} style="width: 100%; height: 100%;">
             <div class={classes!("chart-container", chart_class)}>
-                <div id="single-chart-canvas" style="width: 100%; height: 100%;"></div>
+                <div id={canvas_id} style="width: 100%; height: 100%;"></div>
             </div>
             <div class={classes!("loading-overlay", loading_class)}>
-                <div class="loading-spinner"></div>
+                <IggyLoader size={LoaderSize::Medium} />
             </div>
         </div>
     }

@@ -26,7 +26,8 @@ use elasticsearch::{
 };
 use iggy_common::IggyTimestamp;
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
+    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
+    convert::owned_value_to_serde_json, sink_connector,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -36,31 +37,6 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 sink_connector!(ElasticsearchSink);
-
-fn owned_value_to_serde_json(value: &OwnedValue) -> serde_json::Value {
-    match value {
-        OwnedValue::Static(s) => match s {
-            simd_json::StaticNode::Null => serde_json::Value::Null,
-            simd_json::StaticNode::Bool(b) => serde_json::Value::Bool(*b),
-            simd_json::StaticNode::I64(n) => serde_json::Value::Number((*n).into()),
-            simd_json::StaticNode::U64(n) => serde_json::Value::Number((*n).into()),
-            simd_json::StaticNode::F64(n) => serde_json::Number::from_f64(*n)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
-        },
-        OwnedValue::String(s) => serde_json::Value::String(s.to_string()),
-        OwnedValue::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(owned_value_to_serde_json).collect())
-        }
-        OwnedValue::Object(obj) => {
-            let map: serde_json::Map<String, serde_json::Value> = obj
-                .iter()
-                .map(|(k, v)| (k.to_string(), owned_value_to_serde_json(v)))
-                .collect();
-            serde_json::Value::Object(map)
-        }
-    }
-}
 
 #[derive(Debug)]
 struct State {

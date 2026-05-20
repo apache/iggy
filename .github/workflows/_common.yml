@@ -34,7 +34,7 @@ jobs:
     name: Check Rust versions sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check Rust versions are synchronized
         run: ./scripts/ci/sync-rust-version.sh --check
@@ -43,10 +43,29 @@ jobs:
     name: Check Python SDK versions sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check Python SDK versions are synchronized
-        run: ./scripts/ci/python-version-sync.sh --check
+        run: ./scripts/ci/python-sdk-version-sync.sh --check
+
+  version-consistency:
+    name: Check version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup yq
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
+            chmod +x /usr/local/bin/yq
+          fi
+
+      - name: Check version consistency
+        run: ./scripts/extract-version.sh --check
 
   pr-title:
     name: Check PR Title
@@ -54,7 +73,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Validate PR Title
-        uses: amannn/action-semantic-pull-request@v5
+        uses: amannn/action-semantic-pull-request@v6
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -78,6 +97,7 @@ jobs:
             ci
             cli
             clock
+            common
             connector
             connectors
             cpp
@@ -94,6 +114,7 @@ jobs:
             journal
             js
             mcp
+            node
             partitions
             proc
             pr_template
@@ -103,6 +124,7 @@ jobs:
             sdk
             security
             server
+            server-ng
             shard
             test
             web
@@ -118,7 +140,7 @@ jobs:
     name: Check license headers
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Go
         uses: ./.github/actions/utils/setup-go-with-cache
@@ -132,30 +154,21 @@ jobs:
       - name: Check Apache license headers
         run: ./scripts/ci/license-headers.sh --check
 
-  license-list:
-    name: Check licenses list
+  third-party-licenses:
+    name: Validate third-party licenses
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Rust toolchain
-        uses: ./.github/actions/utils/setup-rust-with-cache
-        with:
-          read-cache: "false"
-
-      - name: Install cargo-license
-        run: cargo install cargo-license
-
-      - run: ./scripts/ci/licenses-list.sh --check
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/utils/validate-third-party-licenses
 
   markdown:
     name: Markdown lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "23"
 
@@ -170,7 +183,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install shellcheck
         run: |
@@ -186,7 +199,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0 # Need full history to get diff
 
@@ -198,7 +211,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0 # Need full history to get diff
 
@@ -210,7 +223,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0 # Need full history to get diff
 
@@ -228,7 +241,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -243,11 +256,11 @@ jobs:
       FORCE_COLOR: 1
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Check typos
-        uses: crate-ci/typos@v1.41.0
+        uses: crate-ci/typos@v1.45.0
 
   summary:
     name: Common checks summary
@@ -255,9 +268,10 @@ jobs:
       [
         rust-versions,
         python-versions,
+        version-consistency,
         pr-title,
         license-headers,
-        license-list,
+        third-party-licenses,
         markdown,
         shellcheck,
         trailing-whitespace,
@@ -266,7 +280,7 @@ jobs:
         binary-artifacts,
         typos,
       ]
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Summary
@@ -295,8 +309,9 @@ jobs:
           # Always-run checks
           RUST_VERSIONS="${{ needs.rust-versions.result }}"
           PYTHON_VERSIONS="${{ needs.python-versions.result }}"
+          VERSION_CONSISTENCY="${{ needs.version-consistency.result }}"
           LICENSE_HEADERS="${{ needs.license-headers.result }}"
-          LICENSE_LIST="${{ needs.license-list.result }}"
+          THIRD_PARTY_LICENSES="${{ needs.third-party-licenses.result }}"
           MARKDOWN="${{ needs.markdown.result }}"
 
           if [ "$RUST_VERSIONS" = "success" ]; then
@@ -315,6 +330,14 @@ jobs:
             echo "| ⏭️ Python SDK Versions | $PYTHON_VERSIONS | Check skipped |" >> $GITHUB_STEP_SUMMARY
           fi
 
+          if [ "$VERSION_CONSISTENCY" = "success" ]; then
+            echo "| ✅ Version Consistency | success | Group and workspace dep versions match |" >> $GITHUB_STEP_SUMMARY
+          elif [ "$VERSION_CONSISTENCY" = "failure" ]; then
+            echo "| ❌ Version Consistency | failure | Version mismatch detected |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| ⏭️ Version Consistency | $VERSION_CONSISTENCY | Check skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+
           if [ "$LICENSE_HEADERS" = "success" ]; then
             echo "| ✅ License Headers | success | All files have Apache headers |" >> $GITHUB_STEP_SUMMARY
           elif [ "$LICENSE_HEADERS" = "failure" ]; then
@@ -323,12 +346,12 @@ jobs:
             echo "| ⏭️ License Headers | $LICENSE_HEADERS | Check skipped |" >> $GITHUB_STEP_SUMMARY
           fi
 
-          if [ "$LICENSE_LIST" = "success" ]; then
-            echo "| ✅ License List | success | Dependencies licenses validated |" >> $GITHUB_STEP_SUMMARY
-          elif [ "$LICENSE_LIST" = "failure" ]; then
-            echo "| ❌ License List | failure | License list needs update |" >> $GITHUB_STEP_SUMMARY
+          if [ "$THIRD_PARTY_LICENSES" = "success" ]; then
+            echo "| ✅ Third-Party Licenses | success | All deps in about.toml accept list |" >> $GITHUB_STEP_SUMMARY
+          elif [ "$THIRD_PARTY_LICENSES" = "failure" ]; then
+            echo "| ❌ Third-Party Licenses | failure | Disallowed license detected (see job log) |" >> $GITHUB_STEP_SUMMARY
           else
-            echo "| ⏭️ License List | $LICENSE_LIST | Check skipped |" >> $GITHUB_STEP_SUMMARY
+            echo "| ⏭️ Third-Party Licenses | $THIRD_PARTY_LICENSES | Check skipped |" >> $GITHUB_STEP_SUMMARY
           fi
 
           if [ "$MARKDOWN" = "success" ]; then

@@ -34,10 +34,10 @@ spec:
     requests:
       storage: {{ .Values.server.persistence.size | quote }}
   {{- with .Values.server.persistence.storageClass }}
-  {{- if (eq "-" .) }}
+    {{- if (eq "-" .) }}
   storageClassName: ""
-  {{- else }}
+    {{- else }}
   storageClassName: "{{ . }}"
-  {{- end }}
+    {{- end }}
   {{- end }}
 {{- end }}

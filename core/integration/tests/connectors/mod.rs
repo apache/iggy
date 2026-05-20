@@ -18,14 +18,18 @@
  */
 
 mod api;
+mod delta;
 mod elasticsearch;
 mod fixtures;
+mod http;
 mod http_config_provider;
 mod iceberg;
+mod influxdb;
 mod mongodb;
 mod postgres;
 mod quickwit;
 mod random;
+mod runtime;
 mod stdout;
 
 use iggy_common::IggyTimestamp;

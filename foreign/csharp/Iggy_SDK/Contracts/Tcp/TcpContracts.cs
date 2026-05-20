@@ -410,7 +410,7 @@ internal static class TcpContracts
         var msgSize = 0;
         foreach (var message in messages)
         {
-            var headersBytes = GetHeadersBytes(message.UserHeaders);
+            var headersBytes = message.RawUserHeaders ?? GetHeadersBytes(message.UserHeaders);
             BinaryPrimitives.WriteUInt64LittleEndian(bytes[position..(position + 8)], message.Header.Checksum);
             BinaryPrimitives.WriteUInt128LittleEndian(bytes[(position + 8)..(position + 24)], message.Header.Id);
             BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 24)..(position + 32)], message.Header.Offset);
@@ -548,7 +548,7 @@ internal static class TcpContracts
     //     return bytes;
     // }
 
-    private static byte[] GetHeadersBytes(Dictionary<HeaderKey, HeaderValue>? headers)
+    internal static byte[] GetHeadersBytes(Dictionary<HeaderKey, HeaderValue>? headers)
     {
         if (headers == null)
         {

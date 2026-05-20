@@ -115,12 +115,16 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
         let name = entry.name;
 
         // ================================================================
-        // SKIPPED COMMANDS (8 total)
+        // SKIPPED COMMANDS (10 total)
         // ================================================================
         // No auth required
         if matches!(
             code,
-            PING_CODE | LOGIN_USER_CODE | LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE
+            PING_CODE
+                | LOGIN_USER_CODE
+                | LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE
+                | LOGIN_REGISTER_CODE
+                | LOGIN_REGISTER_WITH_PAT_CODE
         ) {
             continue;
         }
@@ -132,6 +136,16 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
         if matches!(
             code,
             GET_SNAPSHOT_FILE_CODE | DELETE_SEGMENTS_CODE | LOGOUT_USER_CODE
+        ) {
+            continue;
+        }
+        // v2 consumer-offset ops are registered in the dispatch table for the
+        // consensus/simulator pathway but are not wired into the legacy binary
+        // server's dispatch. They'll move into server-ng alongside the rest of
+        // the v2 surface; re-enable these codes here once that lands.
+        if matches!(
+            code,
+            STORE_CONSUMER_OFFSET_2_CODE | DELETE_CONSUMER_OFFSET_2_CODE
         ) {
             continue;
         }

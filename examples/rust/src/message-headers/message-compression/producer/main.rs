@@ -18,7 +18,7 @@
 
 use bytes::Bytes;
 use iggy::prelude::*;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 // The compression and decompression utilities are shared between the producer and consumer compression examples.
 // Hence, we import them here.
 use iggy_examples::shared::codec::{Codec, NUM_MESSAGES, STREAM_NAME, TOPIC_NAME};
@@ -59,7 +59,7 @@ async fn main() -> Result<(), IggyError> {
     // NOTE: This is where the Codec is used to prepare the compression user-header for the IggyMessage.
     let key = Codec::header_key();
     let value = codec.to_header_value();
-    let compression_headers = HashMap::from([(key, value)]);
+    let compression_headers = BTreeMap::from([(key, value)]);
 
     // Generate artificial example messages to send to the server.
     let mut messages = Vec::new();

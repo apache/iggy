@@ -18,10 +18,9 @@
 
 use crate::state::StateSetup;
 use bytes::Bytes;
-use iggy::prelude::BytesSerializable;
-use iggy_common::create_stream::CreateStream;
-use iggy_common::create_user::CreateUser;
-use secrecy::SecretString;
+use iggy_binary_protocol::WireEncode;
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::requests::{streams::CreateStreamRequest, users::CreateUserRequest};
 use server::state::command::EntryCommand;
 use server::state::entry::StateEntry;
 use server::state::models::{CreateStreamWithId, CreateUserWithId};
@@ -44,10 +43,10 @@ async fn should_apply_single_entry() {
     let user_id = 0;
     let command = EntryCommand::CreateUser(CreateUserWithId {
         user_id: 1,
-        command: CreateUser {
-            username: "test".to_string(),
-            password: SecretString::from("secret"),
-            status: Default::default(),
+        command: CreateUserRequest {
+            username: WireName::new("test").unwrap(),
+            password: "secret".to_string(),
+            status: 1,
             permissions: None,
         },
     });
@@ -70,10 +69,10 @@ async fn should_apply_encrypted_entry() {
     let user_id = 0;
     let command = EntryCommand::CreateUser(CreateUserWithId {
         user_id: 1,
-        command: CreateUser {
-            username: "test".to_string(),
-            password: SecretString::from("secret"),
-            status: Default::default(),
+        command: CreateUserRequest {
+            username: WireName::new("test").unwrap(),
+            password: "secret".to_string(),
+            status: 1,
             permissions: None,
         },
     });
@@ -102,10 +101,10 @@ async fn should_apply_multiple_entries() {
     let created_user_id = 1; // First created user
     let create_user = EntryCommand::CreateUser(CreateUserWithId {
         user_id: created_user_id,
-        command: CreateUser {
-            username: "test".to_string(),
-            password: SecretString::from("secret"),
-            status: Default::default(),
+        command: CreateUserRequest {
+            username: WireName::new("test").unwrap(),
+            password: "secret".to_string(),
+            status: 1,
             permissions: None,
         },
     });
@@ -120,8 +119,8 @@ async fn should_apply_multiple_entries() {
     let stream_id = 1;
     let create_stream = EntryCommand::CreateStream(CreateStreamWithId {
         stream_id,
-        command: CreateStream {
-            name: "test".to_string(),
+        command: CreateStreamRequest {
+            name: WireName::new("test").unwrap(),
         },
     });
     let create_stream_bytes = create_stream.to_bytes();

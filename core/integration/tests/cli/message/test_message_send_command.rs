@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use iggy::prelude::*;
 use predicates::str::diff;
 use serial_test::parallel;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::str::from_utf8;
 use twox_hash::XxHash32;
 
@@ -58,7 +58,7 @@ struct TestMessageSendCmd {
     messages: Vec<String>,
     message_input: ProvideMessages,
     partitioning: PartitionSelection,
-    header: Option<HashMap<HeaderKey, HeaderValue>>,
+    header: Option<BTreeMap<HeaderKey, HeaderValue>>,
     // These will be populated after creating the resources
     actual_stream_id: Option<u32>,
     actual_topic_id: Option<u32>,
@@ -72,7 +72,7 @@ impl TestMessageSendCmd {
         messages: Vec<String>,
         message_input: ProvideMessages,
         partitioning: PartitionSelection,
-        header: Option<HashMap<HeaderKey, HeaderValue>>,
+        header: Option<BTreeMap<HeaderKey, HeaderValue>>,
     ) -> Self {
         Self {
             stream_name,
@@ -345,7 +345,7 @@ pub async fn should_be_successful() {
                 ],
                 message_input,
                 using_partitioning,
-                Some(HashMap::from([
+                Some(BTreeMap::from([
                     (
                         HeaderKey::try_from("key1").unwrap(),
                         HeaderValue::try_from("value1").unwrap(),

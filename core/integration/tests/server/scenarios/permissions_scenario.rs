@@ -27,10 +27,10 @@
 //! - Negative cases (missing permission denies access)
 
 use crate::server::scenarios::create_client;
-use ahash::AHashMap;
 use bytes::Bytes;
 use iggy::prelude::*;
 use integration::harness::TestHarness;
+use std::collections::BTreeMap;
 
 const STREAM_1: &str = "perm-stream-1";
 const STREAM_2: &str = "perm-stream-2";
@@ -782,7 +782,7 @@ async fn test_stream_specific_permissions(harness: &TestHarness, root_client: &I
         USER,
         Some(Permissions {
             global: GlobalPermissions::default(),
-            streams: Some(AHashMap::from([(
+            streams: Some(BTreeMap::from([(
                 stream1_numeric_id,
                 StreamPermissions {
                     read_stream: true,
@@ -918,10 +918,10 @@ async fn test_topic_specific_permissions(harness: &TestHarness, root_client: &Ig
         USER,
         Some(Permissions {
             global: GlobalPermissions::default(),
-            streams: Some(AHashMap::from([(
+            streams: Some(BTreeMap::from([(
                 stream1_numeric_id,
                 StreamPermissions {
-                    topics: Some(AHashMap::from([(
+                    topics: Some(BTreeMap::from([(
                         topic1_numeric_id,
                         TopicPermissions {
                             read_topic: true,
@@ -1392,7 +1392,7 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
         READ_STREAM_USER,
         Some(Permissions {
             global: GlobalPermissions::default(),
-            streams: Some(AHashMap::from([(
+            streams: Some(BTreeMap::from([(
                 stream1_numeric_id,
                 StreamPermissions {
                     read_stream: true,
@@ -1482,7 +1482,7 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
         MANAGE_STREAM_USER,
         Some(Permissions {
             global: GlobalPermissions::default(),
-            streams: Some(AHashMap::from([(
+            streams: Some(BTreeMap::from([(
                 stream1_numeric_id,
                 StreamPermissions {
                     manage_stream: true,
@@ -1587,7 +1587,7 @@ async fn test_stream_permission_inheritance(harness: &TestHarness, root_client: 
         MANAGE_TOPICS_STREAM_USER,
         Some(Permissions {
             global: GlobalPermissions::default(),
-            streams: Some(AHashMap::from([(
+            streams: Some(BTreeMap::from([(
                 stream1_numeric_id,
                 StreamPermissions {
                     manage_topics: true,
@@ -1682,10 +1682,10 @@ async fn test_topic_permission_inheritance(harness: &TestHarness, root_client: &
         READ_TOPIC_USER,
         Some(Permissions {
             global: GlobalPermissions::default(),
-            streams: Some(AHashMap::from([(
+            streams: Some(BTreeMap::from([(
                 stream1_numeric_id,
                 StreamPermissions {
-                    topics: Some(AHashMap::from([(
+                    topics: Some(BTreeMap::from([(
                         topic1_numeric_id,
                         TopicPermissions {
                             read_topic: true,
@@ -1751,10 +1751,10 @@ async fn test_topic_permission_inheritance(harness: &TestHarness, root_client: &
         MANAGE_TOPIC_USER,
         Some(Permissions {
             global: GlobalPermissions::default(),
-            streams: Some(AHashMap::from([(
+            streams: Some(BTreeMap::from([(
                 stream1_numeric_id,
                 StreamPermissions {
-                    topics: Some(AHashMap::from([(
+                    topics: Some(BTreeMap::from([(
                         topic1_numeric_id,
                         TopicPermissions {
                             manage_topic: true,
@@ -1941,10 +1941,10 @@ async fn test_consumer_group_operations(harness: &TestHarness, root_client: &Igg
         READ_TOPIC_CG_USER,
         Some(Permissions {
             global: GlobalPermissions::default(),
-            streams: Some(AHashMap::from([(
+            streams: Some(BTreeMap::from([(
                 stream1_numeric_id,
                 StreamPermissions {
-                    topics: Some(AHashMap::from([(
+                    topics: Some(BTreeMap::from([(
                         topic1_numeric_id,
                         TopicPermissions {
                             read_topic: true,
@@ -2040,7 +2040,7 @@ async fn test_union_semantics(harness: &TestHarness, root_client: &IggyClient) {
                 send_messages: true,
                 ..Default::default()
             },
-            streams: Some(AHashMap::from([(
+            streams: Some(BTreeMap::from([(
                 stream1_numeric_id,
                 StreamPermissions {
                     send_messages: false, // Explicitly false at stream level
@@ -2089,7 +2089,7 @@ async fn test_union_semantics(harness: &TestHarness, root_client: &IggyClient) {
                 read_streams: true, // Global read for all streams
                 ..Default::default()
             },
-            streams: Some(AHashMap::from([(
+            streams: Some(BTreeMap::from([(
                 stream1_numeric_id,
                 StreamPermissions {
                     send_messages: true, // Extra permission for stream 1 only
@@ -2151,11 +2151,11 @@ async fn test_union_semantics(harness: &TestHarness, root_client: &IggyClient) {
         TOPIC_ADDITIVE_USER,
         Some(Permissions {
             global: GlobalPermissions::default(),
-            streams: Some(AHashMap::from([(
+            streams: Some(BTreeMap::from([(
                 stream1_numeric_id,
                 StreamPermissions {
                     read_stream: true, // Can read stream and topics
-                    topics: Some(AHashMap::from([(
+                    topics: Some(BTreeMap::from([(
                         topic1_numeric_id,
                         TopicPermissions {
                             send_messages: true, // Extra: can send to topic 1
@@ -2380,7 +2380,7 @@ async fn test_missing_resource_behavior(harness: &TestHarness, root_client: &Igg
         SCOPED_USER,
         Some(Permissions {
             global: GlobalPermissions::default(),
-            streams: Some(AHashMap::from([(
+            streams: Some(BTreeMap::from([(
                 stream1_numeric_id,
                 StreamPermissions {
                     read_stream: true,

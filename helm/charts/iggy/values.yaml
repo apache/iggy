@@ -15,78 +15,80 @@
 # specific language governing permissions and limitations
 # under the License.
 
----
-# Iggy server configuration
+# -- Iggy server configuration
 server:
+  # -- Enable the Iggy server deployment
   enabled: true
+  # -- Number of server replicas
   replicaCount: 1
   image:
+    # -- Server image repository
     repository: apache/iggy
+    # -- Image pull policy
     pullPolicy: Always
-    # Overrides the image tag whose default is the chart appVersion.
+    # -- Server image tag (overrides chart appVersion)
     tag: "0.7.0"
   ports:
+    # -- HTTP API port
     http: 3000
+    # -- QUIC protocol port
     quic: 8080
+    # -- TCP protocol port
     tcp: 8090
 
   service:
+    # -- Service type for the server
     type: ClusterIP
+    # -- Service port for the server
     port: 3000
 
   serviceMonitor:
-    # -- Enable this if you're using [Prometheus Operator](https://github.com/coreos/prometheus-operator)
+    # -- Enable ServiceMonitor for Prometheus Operator
     enabled: false
     # -- Namespace to deploy the ServiceMonitor
     namespace: ""
-    # -- Fallback to the prometheus default unless specified
+    # -- Scrape interval (fallback to Prometheus default)
     interval: 30s
-    # -- Add custom labels to the ServiceMonitor resource
+    # -- Additional labels for the ServiceMonitor
     additionalLabels: {}
+    # -- Honor labels from the target
     honorLabels: false
-    # -- Path to scrape metrics
+    # -- Path to scrape metrics from
     path: /metrics
     # -- Timeout for scrape metrics request
     scrapeTimeout: 10s
 
   users:
     root:
-      # -- Create a secret for the root user
+      # -- Create a secret for the root user credentials
       createSecret: true
+      # -- Root username
       username: iggy
+      # -- Root password
       password: changeit
-      # -- Whether to use an existing secret for the root user
       existingSecret:
+        # -- Name of existing secret for root credentials
         name: ""
-        # -- Key in the secret to get the root username from
+        # -- Key in secret for username
         usernameKey: username
-        # -- Key in the secret to get the root password from
+        # -- Key in secret for password
         passwordKey: password
 
-  # -- Add persistence volume claim configuration
   persistence:
-    # -- Enable persistence using a PVC
+    # -- Enable persistence using PVC
     enabled: false
     # -- PVC annotations
     annotations: {}
-    # -- Persistent Volume Storage Class
-    # If defined, storageClassName: <storageClass>
-    # If set to "-", storageClassName: "", which disables dynamic provisioning
-    # If undefined (the default) or set to null, no storageClassName spec is
-    #   set, choosing the default provisioner.  (gp2 on AWS, standard on
-    #   GKE, AWS & OpenStack)
+    # -- Storage class for PVC (empty uses default provisioner)
     storageClass: ""
-
-    # -- A manually managed Persistent Volume and Claim
-    # Requires persistence.enabled: true
-    # If defined, PVC must be created manually before volume will be bound
+    # -- Use existing PVC (requires persistence.enabled: true)
     existingClaim: ""
-
-    # -- PVC Access mode
+    # -- PVC access mode
     accessMode: ReadWriteOnce
-    # -- PVC claim size
+    # -- PVC storage size
     size: 8Gi
-  # -- Set up environmental variables to be added to the container
+
+  # -- Environment variables for the server container
   env:
     - name: RUST_LOG
       value: info
@@ -99,134 +101,134 @@ server:
     - name: IGGY_WEBSOCKET_ADDRESS
       value: "0.0.0.0:8092"
 
+  # -- Node selector for server pods
   nodeSelector: {}
 
+  # -- Tolerations for server pods
   tolerations: []
 
+  # -- Affinity rules for server pods
   affinity: {}
 
   ingress:
+    # -- Enable ingress for the server
     enabled: false
+    # -- Ingress class name (controller-neutral)
     className: ""
+    # -- Ingress annotations (controller-specific)
     annotations: {}
-    # kubernetes.io/ingress.class: nginx
-    # kubernetes.io/tls-acme: "true"
+    # -- Ingress hosts configuration
     hosts:
       - host: chart-example.local
         paths:
           - path: /
             pathType: ImplementationSpecific
-    tls:
-      []
-      #  - secretName: chart-example-tls
-      #    hosts:
-      #      - chart-example.local
+    # -- Ingress TLS configuration
+    tls: []
 
-# Iggy web-ui configuration
+# -- Iggy web UI configuration
 ui:
+  # -- Enable the web UI deployment
   enabled: true
   ports:
+    # -- HTTP port for web UI
     http: 3050
   server:
-    # -- Set the Iggy server endpoint explicitly. If kept blank, the Iggy service URL will be used
+    # -- Iggy server endpoint (blank uses service URL)
     endpoint: ""
 
   service:
+    # -- Service type for the UI
     type: ClusterIP
+    # -- Service port for the UI
     port: 3050
+  # -- Number of UI replicas
   replicaCount: 1
-  # -- Extra environmental variables to add to the container
+  # -- Extra environment variables for UI container
   env: {}
   image:
+    # -- UI image repository
     repository: apache/iggy-web-ui
+    # -- UI image pull policy
     pullPolicy: Always
-    # Overrides the image tag whose default is the chart appVersion.
+    # -- UI image tag (overrides chart appVersion)
     tag: "edge"
   ingress:
+    # -- Enable ingress for the UI
     enabled: false
+    # -- Ingress class name (controller-neutral)
     className: ""
+    # -- Ingress annotations (controller-specific)
     annotations: {}
-    # kubernetes.io/ingress.class: nginx
-    # kubernetes.io/tls-acme: "true"
+    # -- Ingress hosts configuration
     hosts:
       - host: chart-example.local
         paths:
           - path: /
             pathType: ImplementationSpecific
+    # -- Ingress TLS configuration
     tls: []
-    #  - secretName: chart-example-tls
-    #    hosts:
-    #      - chart-example.local
-  resources:
-    {}
-    # We usually recommend not to specify default resources and to leave this as a conscious
-    # choice for the user. This also increases chances charts run on environments with little
-    # resources, such as Minikube. If you do want to specify resources, uncomment the following
-    # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
-    # limits:
-    #   cpu: 100m
-    #   memory: 128Mi
-    # requests:
-    #   cpu: 100m
-    #   memory: 128Mi
+  # -- Resource limits and requests for UI
+  resources: {}
 
-  # -- Web UI pod security context. Leave empty unless your UI deployment needs explicit pod-level settings.
+  # -- Pod security context for UI pods
   podSecurityContext: {}
 
-  # -- Web UI container security context. Leave empty unless your UI deployment needs explicit container-level settings.
+  # -- Container security context for UI
   securityContext: {}
 
+  # -- Node selector for UI pods
   nodeSelector: {}
 
+  # -- Tolerations for UI pods
   tolerations: []
 
+  # -- Affinity rules for UI pods
   affinity: {}
 
+# -- Image pull secrets for private registries
 imagePullSecrets: []
+# -- Override chart name
 nameOverride: ""
+# -- Override full release name
 fullnameOverride: ""
 
-# -- Additional labels to add to all resources
+# -- Additional labels for all resources
 additionalLabels: {}
 
 serviceAccount:
-  # Specifies whether a service account should be created
+  # -- Create a service account
   create: true
-  # Annotations to add to the service account
+  # -- Service account annotations
   annotations: {}
-  # The name of the service account to use.
-  # If not set and create is true, a name is generated using the fullname template
+  # -- Service account name (generated if not set)
   name: ""
 
+# -- Pod annotations
 podAnnotations: {}
 
+# -- Pod security context (server uses io_uring, requires unconfined seccomp)
 podSecurityContext:
-  # Required for Iggy server io_uring syscalls in containerized environments
   seccompProfile:
     type: Unconfined
 
+# -- Container security context (server requires IPC_LOCK for io_uring)
 securityContext:
   capabilities:
     add:
-      # Required for Iggy server memlock (io_uring memory)
       - IPC_LOCK
 
-resources:
-  {}
-  # We usually recommend not to specify default resources and to leave this as a conscious
-  # choice for the user. This also increases chances charts run on environments with little
-  # resources, such as Minikube. If you do want to specify resources, uncomment the following
-  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
-  # limits:
-  #   cpu: 100m
-  #   memory: 128Mi
-  # requests:
-  #   cpu: 100m
-  #   memory: 128Mi
+# -- Resource limits and requests for server
+resources: {}
 
 autoscaling:
+  # -- Enable horizontal pod autoscaling
   enabled: false
+  # -- Minimum replicas for autoscaling
   minReplicas: 1
+  # -- Maximum replicas for autoscaling
   maxReplicas: 100
+  # -- Target CPU utilization for autoscaling
   targetCPUUtilizationPercentage: 80
+  # -- Target memory utilization for autoscaling (optional)
   # targetMemoryUtilizationPercentage: 80

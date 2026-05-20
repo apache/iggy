@@ -16,14 +16,14 @@
  * under the License.
  */
 
-use crate::binary::dispatch::{HandlerResult, wire_id_to_identifier};
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
 use iggy_binary_protocol::requests::users::UpdateUserRequest;
-use iggy_common::update_user::UpdateUser;
-use iggy_common::{IggyError, SenderKind, UserStatus, Validatable};
+use iggy_common::defaults::{MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -41,19 +41,16 @@ pub async fn handle_update_user(
     shard.ensure_authenticated(session)?;
     shard.metadata.perm_update_user(session.get_user_id())?;
 
-    let user_id = wire_id_to_identifier(&req.user_id)?;
-    let status = req.status.map(UserStatus::from_code).transpose()?;
-
-    let command = UpdateUser {
-        user_id,
-        username: req.username.map(|n| n.to_string()),
-        status,
-    };
-    command.validate()?;
+    if let Some(ref username) = req.username {
+        let username_len = username.as_str().len();
+        if !(MIN_USERNAME_LENGTH..=MAX_USERNAME_LENGTH).contains(&username_len) {
+            return Err(IggyError::InvalidUsername);
+        }
+    }
 
     let request = ShardRequest::control_plane(ShardRequestPayload::UpdateUserRequest {
         user_id: session.get_user_id(),
-        command,
+        command: req,
     });
 
     match shard.send_to_control_plane(request).await? {

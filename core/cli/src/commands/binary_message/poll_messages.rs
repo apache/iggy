@@ -20,12 +20,14 @@ use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::{Cell, CellAlignment, Row, Table};
+use iggy_binary_protocol::WireUserHeaders;
 use iggy_common::Client;
 use iggy_common::{
-    BytesSerializable, Consumer, HeaderKey, HeaderKind, HeaderValue, Identifier, IggyByteSize,
-    IggyDuration, IggyMessage, IggyTimestamp, PollMessages, PollingStrategy, Sizeable,
+    Consumer, HeaderKey, HeaderKind, Identifier, IggyByteSize, IggyDuration, IggyMessage,
+    IggyTimestamp, PollMessages, PollingStrategy, Sizeable,
+    wire_conversions::user_headers_from_wire,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use tokio::io::AsyncWriteExt;
 use tracing::{Level, event};
 
@@ -85,7 +87,10 @@ impl PollMessagesCmd {
             .iter()
             .flat_map(|m| {
                 if let Some(user_headers) = &m.user_headers {
-                    match HashMap::<HeaderKey, HeaderValue>::from_bytes(user_headers.clone()) {
+                    match WireUserHeaders::from_bytes(user_headers.clone())
+                        .map_err(|_| iggy_common::IggyError::InvalidHeaderKey)
+                        .and_then(|w| user_headers_from_wire(&w))
+                    {
                         Ok(headers) => headers
                             .iter()
                             .map(|(k, v)| (k.clone(), v.kind()))

@@ -15,11 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 {{ if .Values.autoscaling.enabled -}}
-{{- if semverCompare ">=1.23-0" .Capabilities.KubeVersion.GitVersion -}}
+  {{- if semverCompare ">=1.23-0" .Capabilities.KubeVersion.GitVersion -}}
 apiVersion: autoscaling/v2
-{{- else -}}
+  {{- else -}}
 apiVersion: autoscaling/v2beta2
-{{- end }}
+  {{- end }}
 kind: HorizontalPodAutoscaler
 metadata:
   name: {{ include "iggy.fullname" . }}
@@ -33,28 +33,28 @@ spec:
   minReplicas: {{ .Values.autoscaling.minReplicas }}
   maxReplicas: {{ .Values.autoscaling.maxReplicas }}
   metrics:
-    {{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
+  {{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
     - type: Resource
       resource:
         name: cpu
-        {{- if semverCompare ">=1.23-0" .Capabilities.KubeVersion.GitVersion }}
+    {{- if semverCompare ">=1.23-0" .Capabilities.KubeVersion.GitVersion }}
         target:
           type: Utilization
           averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
-        {{- else }}
+    {{- else }}
         targetAverageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
-        {{- end }}
     {{- end }}
-    {{- if .Values.autoscaling.targetMemoryUtilizationPercentage }}
+  {{- end }}
+  {{- if .Values.autoscaling.targetMemoryUtilizationPercentage }}
     - type: Resource
       resource:
         name: memory
-        {{- if semverCompare ">=1.23-0" .Capabilities.KubeVersion.GitVersion }}
+    {{- if semverCompare ">=1.23-0" .Capabilities.KubeVersion.GitVersion }}
         target:
           type: Utilization
           averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
-        {{- else }}
+    {{- else }}
         targetAverageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
-        {{- end }}
     {{- end }}
+  {{- end }}
 {{- end }}

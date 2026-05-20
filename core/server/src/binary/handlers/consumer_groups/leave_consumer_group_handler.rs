@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use crate::binary::dispatch::{HandlerResult, wire_id_to_identifier};
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
 use iggy_binary_protocol::requests::consumer_groups::LeaveConsumerGroupRequest;
-use iggy_common::leave_consumer_group::LeaveConsumerGroup;
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
@@ -34,24 +33,16 @@ pub async fn handle_leave_consumer_group(
     session: &Session,
     shard: &Rc<IggyShard>,
 ) -> Result<HandlerResult, IggyError> {
-    let stream_id = wire_id_to_identifier(&req.stream_id)?;
-    let topic_id = wire_id_to_identifier(&req.topic_id)?;
-    let group_id = wire_id_to_identifier(&req.group_id)?;
     debug!(
-        "session: {session}, command: leave_consumer_group, stream_id: {stream_id}, topic_id: {topic_id}, group_id: {group_id}"
+        "session: {session}, command: leave_consumer_group, stream_id: {:?}, topic_id: {:?}, group_id: {:?}",
+        req.stream_id, req.topic_id, req.group_id
     );
     shard.ensure_authenticated(session)?;
-
-    let command = LeaveConsumerGroup {
-        stream_id,
-        topic_id,
-        group_id,
-    };
 
     let request = ShardRequest::control_plane(ShardRequestPayload::LeaveConsumerGroupRequest {
         user_id: session.get_user_id(),
         client_id: session.client_id,
-        command,
+        command: req,
     });
 
     match shard.send_to_control_plane(request).await? {

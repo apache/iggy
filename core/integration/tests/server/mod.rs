@@ -16,6 +16,7 @@
  * under the License.
  */
 
+mod a2a_jwt;
 mod cg;
 mod concurrent_addition;
 mod general;

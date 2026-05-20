@@ -26,16 +26,19 @@ homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../../README.md"
+publish = false
 
 [dependencies]
 bit-set = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
+futures-core = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 message_bus = { workspace = true }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }

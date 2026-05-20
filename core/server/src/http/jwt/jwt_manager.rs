@@ -16,9 +16,10 @@
  * under the License.
  */
 
-use crate::configs::http::HttpJwtConfig;
+use crate::configs::http::{HttpJwtConfig, TrustedIssuerConfig};
 use crate::http::jwt::COMPONENT;
-use crate::http::jwt::json_web_token::{GeneratedToken, JwtClaims, RevokedAccessToken};
+use crate::http::jwt::json_web_token::{Audience, GeneratedToken, JwtClaims, RevokedAccessToken};
+use crate::http::jwt::jwks::JwksClient;
 use crate::http::jwt::storage::TokenStorage;
 use crate::streaming::persistence::persister::PersisterKind;
 use ahash::AHashMap;
@@ -31,6 +32,7 @@ use iggy_common::UserId;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::locking::IggyRwLockFn;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation, encode};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info};
 
@@ -56,6 +58,8 @@ pub struct JwtManager {
     tokens_storage: TokenStorage,
     revoked_tokens: IggyRwLock<AHashMap<String, u64>>,
     validations: AHashMap<Algorithm, Validation>,
+    jwks_client: JwksClient,
+    trusted_issuer: HashMap<String, TrustedIssuerConfig>,
 }
 
 impl JwtManager {
@@ -78,6 +82,8 @@ impl JwtManager {
             validator,
             tokens_storage: TokenStorage::new(persister, path),
             revoked_tokens: IggyRwLock::new(AHashMap::new()),
+            jwks_client: JwksClient::default(),
+            trusted_issuer: HashMap::new(),
         })
     }
 
@@ -105,7 +111,18 @@ impl JwtManager {
                 format!("{COMPONENT} (error: {e}) - failed to get decoding key")
             })?,
         };
-        JwtManager::new(persister, path, issuer, validator)
+        let mut manager = JwtManager::new(persister, path, issuer, validator)?;
+
+        if let Some(trusted_issuers) = config.trusted_issuers.as_ref() {
+            for issuer_config in trusted_issuers {
+                let normalized_issuer = normalize_issuer_url(&issuer_config.issuer);
+                manager
+                    .trusted_issuer
+                    .insert(normalized_issuer, issuer_config.clone());
+            }
+        }
+
+        Ok(manager)
     }
 
     fn create_validation(
@@ -181,8 +198,8 @@ impl JwtManager {
         let nbf = iat + self.issuer.not_before.as_secs() as u64;
         let claims = JwtClaims {
             jti: uuid::Uuid::now_v7().to_string(),
-            sub: user_id,
-            aud: self.issuer.audience.to_string(),
+            sub: user_id.to_string(),
+            aud: Audience::from(self.issuer.audience.clone()),
             iss: self.issuer.issuer.to_string(),
             iat,
             exp,
@@ -210,7 +227,19 @@ impl JwtManager {
 
         let token_header =
             jsonwebtoken::decode_header(token).map_err(|_| IggyError::InvalidAccessToken)?;
-        let jwt_claims = self.decode(token, token_header.alg)?;
+        let jwt_claims = self.decode(token, token_header.alg).await?;
+
+        // Security fix: Reject A2A tokens from external trusted issuers
+        // A2A tokens should not be refreshable - they have their own lifecycle
+        let normalized_iss = normalize_issuer_url(&jwt_claims.claims.iss);
+        if self.trusted_issuer.contains_key(&normalized_iss) {
+            error!(
+                "Cannot refresh A2A token from external issuer: {}",
+                jwt_claims.claims.iss
+            );
+            return Err(IggyError::InvalidAccessToken);
+        }
+
         let id = jwt_claims.claims.jti;
         let expiry = jwt_claims.claims.exp;
         if self
@@ -232,26 +261,95 @@ impl JwtManager {
             .error(|e: &IggyError| {
                 format!("{COMPONENT} (error: {e}) - failed to save revoked access token: {id}")
             })?;
-        self.generate(jwt_claims.claims.sub)
+        let user_id = jwt_claims
+            .claims
+            .sub
+            .parse::<u32>()
+            .map_err(|_| IggyError::InvalidAccessToken)?;
+        self.generate(user_id)
     }
 
-    pub fn decode(
+    pub async fn decode(
         &self,
         token: &str,
         algorithm: Algorithm,
     ) -> Result<TokenData<JwtClaims>, IggyError> {
         let validation = self.validations.get(&algorithm);
-        if validation.is_none() {
-            return Err(IggyError::InvalidJwtAlgorithm(
-                Self::map_algorithm_to_string(algorithm),
-            ));
+        let kid = jsonwebtoken::decode_header(token).ok().and_then(|h| h.kid);
+
+        // try to decode using JWKS if it's a trusted issuer
+        let insecure = match jsonwebtoken::dangerous::insecure_decode::<JwtClaims>(token) {
+            Ok(claims) => claims,
+            Err(_) => {
+                error!("Failed to decode JWT insecurely");
+                return self.decode_with_fallback(token, validation, algorithm);
+            }
+        };
+
+        let normalized_iss = normalize_issuer_url(&insecure.claims.iss);
+        let config = match self.trusted_issuer.get(&normalized_iss) {
+            Some(config) => config,
+            None => {
+                debug!("No trusted issuer found for: {}", insecure.claims.iss);
+                return self.decode_with_fallback(token, validation, algorithm);
+            }
+        };
+
+        if config.user_id == 0 {
+            error!(
+                "A2A token cannot map to root user (user_id = 0) for issuer: {}",
+                config.issuer
+            );
+            return Err(IggyError::Unauthenticated);
         }
 
-        let validation = validation.unwrap();
-        match jsonwebtoken::decode::<JwtClaims>(token, &self.validator.key, validation) {
-            Ok(claims) => Ok(claims),
-            _ => Err(IggyError::Unauthenticated),
-        }
+        let kid_str = match kid.as_deref() {
+            Some(kid) => kid,
+            None => {
+                error!("No kid found in JWT header");
+                return self.decode_with_fallback(token, validation, algorithm);
+            }
+        };
+
+        let decoding_key = match self
+            .jwks_client
+            .get_key(&config.issuer, &config.jwks_url, kid_str)
+            .await
+        {
+            Some(key) => key,
+            None => {
+                error!("Failed to get decoding key from JWKS for kid: {}", kid_str);
+                return self.decode_with_fallback(token, validation, algorithm);
+            }
+        };
+        let mut validation = Validation::new(algorithm);
+        validation.set_issuer(std::slice::from_ref(&config.issuer));
+        validation.set_audience(std::slice::from_ref(&config.audience));
+
+        let mut result = jsonwebtoken::decode::<JwtClaims>(token, &decoding_key, &validation)
+            .map_err(|e| {
+                error!("Failed to decode JWT: {}", e);
+                IggyError::Unauthenticated
+            })?;
+
+        result.claims.sub = config.user_id.to_string();
+
+        Ok(result)
+    }
+
+    /// fallback to standard JWT validation if JWKS validation fails
+    fn decode_with_fallback(
+        &self,
+        token: &str,
+        validation: Option<&Validation>,
+        algorithm: Algorithm,
+    ) -> Result<TokenData<JwtClaims>, IggyError> {
+        let validation = validation.ok_or_else(|| {
+            IggyError::InvalidJwtAlgorithm(Self::map_algorithm_to_string(algorithm))
+        })?;
+
+        jsonwebtoken::decode::<JwtClaims>(token, &self.validator.key, validation)
+            .map_err(|_| IggyError::Unauthenticated)
     }
 
     fn map_algorithm_to_string(algorithm: Algorithm) -> String {
@@ -288,5 +386,73 @@ impl JwtManager {
     pub async fn is_token_revoked(&self, token_id: &str) -> bool {
         let revoked_tokens = self.revoked_tokens.read().await;
         revoked_tokens.contains_key(token_id)
+    }
+}
+
+/// Normalize issuer URL by lowercasing scheme and host, preserving path case
+///
+/// Example: "HTTPS://Example.COM/PATH" -> "https://example.com/PATH"
+fn normalize_issuer_url(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let scheme = scheme.to_lowercase();
+            // Find end of host (first '/' or end of string)
+            let (host, path) = match rest.find('/') {
+                Some(idx) => rest.split_at(idx),
+                None => (rest, ""),
+            };
+            format!("{}://{}{}", scheme, host.to_lowercase(), path)
+        }
+        None => url.trim_end_matches('/').to_lowercase(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_issuer_url_basic() {
+        assert_eq!(
+            normalize_issuer_url("HTTPS://Example.COM/PATH"),
+            "https://example.com/PATH"
+        );
+    }
+
+    #[test]
+    fn test_normalize_issuer_url_no_path() {
+        assert_eq!(
+            normalize_issuer_url("HTTPS://Example.COM"),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn test_normalize_issuer_url_no_scheme() {
+        assert_eq!(normalize_issuer_url("Example.COM"), "example.com");
+    }
+
+    #[test]
+    fn test_normalize_issuer_url_trailing_slash() {
+        assert_eq!(
+            normalize_issuer_url("HTTPS://Example.COM/"),
+            "https://example.com/"
+        );
+    }
+
+    #[test]
+    fn test_normalize_issuer_url_preserves_path_case() {
+        assert_eq!(
+            normalize_issuer_url("https://EXAMPLE.com/MyPath/SubPath"),
+            "https://example.com/MyPath/SubPath"
+        );
+    }
+
+    #[test]
+    fn test_normalize_issuer_url_already_normalized() {
+        assert_eq!(
+            normalize_issuer_url("https://example.com/path"),
+            "https://example.com/path"
+        );
     }
 }

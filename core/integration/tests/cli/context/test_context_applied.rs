@@ -26,7 +26,7 @@ use iggy_cli::commands::binary_context::common::ContextConfig;
 use integration::harness::ServerHandle;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 struct TestContextApplied {
     set_transport_context: Option<String>,
@@ -37,7 +37,7 @@ struct TestContextApplied {
 impl TestContextApplied {
     fn new(set_transport_context: Option<String>, set_transport_arg: Option<String>) -> Self {
         let test_iggy_context = TestIggyContext::new(
-            Some(HashMap::from([
+            Some(BTreeMap::from([
                 (
                     "default".to_string(),
                     ContextConfig {

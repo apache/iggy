@@ -27,11 +27,16 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Extension, Json, Router};
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::requests::consumer_groups::{
+    CreateConsumerGroupRequest as WireCreateConsumerGroup,
+    DeleteConsumerGroupRequest as WireDeleteConsumerGroup,
+};
 use iggy_common::Identifier;
 use iggy_common::Validatable;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
-use iggy_common::delete_consumer_group::DeleteConsumerGroup;
-use iggy_common::{ConsumerGroup, ConsumerGroupDetails};
+use iggy_common::wire_conversions::identifier_to_wire;
+use iggy_common::{ConsumerGroup, ConsumerGroupDetails, IggyError};
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -117,9 +122,14 @@ async fn create_consumer_group(
     let shard = state.shard.shard();
     let topic = shard.resolve_topic(&command.stream_id, &command.topic_id)?;
 
+    let wire_command = WireCreateConsumerGroup {
+        stream_id: identifier_to_wire(&command.stream_id)?,
+        topic_id: identifier_to_wire(&command.topic_id)?,
+        name: WireName::new(&command.name).map_err(|_| IggyError::InvalidConsumerGroupName)?,
+    };
     let request = ShardRequest::control_plane(ShardRequestPayload::CreateConsumerGroupRequest {
         user_id: identity.user_id,
-        command,
+        command: wire_command,
     });
 
     match state.shard.send_to_control_plane(request).await? {
@@ -149,13 +159,14 @@ async fn delete_consumer_group(
     let topic_id = Identifier::from_str_value(&topic_id)?;
     let group_id = Identifier::from_str_value(&group_id)?;
 
+    let wire_command = WireDeleteConsumerGroup {
+        stream_id: identifier_to_wire(&stream_id)?,
+        topic_id: identifier_to_wire(&topic_id)?,
+        group_id: identifier_to_wire(&group_id)?,
+    };
     let request = ShardRequest::control_plane(ShardRequestPayload::DeleteConsumerGroupRequest {
         user_id: identity.user_id,
-        command: DeleteConsumerGroup {
-            stream_id,
-            topic_id,
-            group_id,
-        },
+        command: wire_command,
     });
 
     match state.shard.send_to_control_plane(request).await? {

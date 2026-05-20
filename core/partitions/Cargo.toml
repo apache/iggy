@@ -26,15 +26,19 @@ homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
+publish = false
 
 [dependencies]
+bytemuck = { workspace = true }
 bytes = { workspace = true }
+compio = { workspace = true }
 consensus = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 journal = { workspace = true }
 message_bus = { workspace = true }
 ringbuffer = { workspace = true }
+smallvec = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

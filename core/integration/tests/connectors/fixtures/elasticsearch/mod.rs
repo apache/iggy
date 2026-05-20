@@ -17,9 +17,9 @@
  * under the License.
  */
 
-mod container;
-mod sink;
-mod source;
+pub mod container;
+pub mod sink;
+pub mod source;
 
 pub use sink::ElasticsearchSinkFixture;
 pub use source::ElasticsearchSourcePreCreatedFixture;

@@ -1,0 +1,52 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "source"
+key = "influxdb"
+enabled = true
+version = 0
+name = "InfluxDB source"
+path = "../../target/release/libiggy_connector_influxdb_source"
+verbose = false
+
+[[streams]]
+stream = "user_events"
+topic = "users"
+schema = "json"
+batch_length = 100
+
+[plugin_config]
+url = "http://localhost:8086"
+org = "iggy"
+token = "replace-with-token"
+query = '''
+from(bucket: "events")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "iggy_messages")
+  |> filter(fn: (r) => r._time > time(v: "$cursor"))
+  |> sort(columns: ["_time"])
+  |> limit(n: $limit)
+'''
+poll_interval = "5s"
+batch_size = 500
+cursor_field = "_time"
+initial_offset = "1970-01-01T00:00:00Z"
+include_metadata = true
+payload_format = "json"
+max_retries = 3
+retry_delay = "1s"
+timeout = "10s"

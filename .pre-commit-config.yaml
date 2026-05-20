@@ -43,32 +43,24 @@ repos:
       - id: markdownlint
         name: markdownlint
         entry: ./scripts/ci/markdownlint.sh
-        args: ["--fix", "--staged"]
+        args: ["--fix"]
         language: system
         types: [markdown]
-        pass_filenames: false
+        pass_filenames: true
 
       - id: shellcheck
         name: shellcheck
         entry: ./scripts/ci/shellcheck.sh
-        args: ["--fix", "--staged"]
+        args: ["--fix"]
         language: system
         types: [shell]
-        pass_filenames: false
+        pass_filenames: true
 
       - id: license-headers
         name: license headers
         entry: ./scripts/ci/license-headers.sh
         args: ["--fix"]
         language: system
-        pass_filenames: false
-
-      - id: licenses-list
-        name: licenses list
-        entry: ./scripts/ci/licenses-list.sh
-        args: ["--fix"]
-        language: system
-        files: ^Cargo\.lock$
         pass_filenames: false
 
       - id: rust-version-sync
@@ -79,9 +71,9 @@ repos:
         files: ^rust-toolchain\.toml$
         pass_filenames: false
 
-      - id: python-version-sync
+      - id: python-sdk-version-sync
         name: python sdk version sync
-        entry: ./scripts/ci/python-version-sync.sh
+        entry: ./scripts/ci/python-sdk-version-sync.sh
         args: ["--fix"]
         language: system
         files: ^foreign/python/(Cargo\.toml|pyproject\.toml)$
@@ -95,28 +87,36 @@ repos:
         files: ^(foreign|bdd|examples)/python/(pyproject\.toml|uv\.lock)$
         pass_filenames: false
 
+      - id: version-consistency
+        name: version consistency
+        entry: ./scripts/extract-version.sh
+        args: ["--check"]
+        language: system
+        files: (^Cargo\.toml$|^(core|foreign)/.*Cargo\.toml$|^foreign/node/package\.json$|^foreign/python/pyproject\.toml$|^foreign/csharp/.*\.csproj$|^foreign/java/gradle\.properties$|^foreign/go/contracts/version\.go$|^\.github/config/publish\.yml$)
+        pass_filenames: false
+
       - id: trailing-whitespace
         name: trailing whitespace
         entry: ./scripts/ci/trailing-whitespace.sh
-        args: ["--fix", "--staged"]
+        args: ["--fix"]
         language: system
         types: [text]
-        pass_filenames: false
+        pass_filenames: true
 
       - id: trailing-newline
         name: trailing newline
         entry: ./scripts/ci/trailing-newline.sh
-        args: ["--fix", "--staged"]
+        args: ["--fix"]
         language: system
         types: [text]
-        pass_filenames: false
+        pass_filenames: true
 
       - id: binary-artifacts
         name: binary artifacts
         entry: ./scripts/ci/binary-artifacts.sh
-        args: ["--check", "--staged"]
+        args: ["--check"]
         language: system
-        pass_filenames: false
+        pass_filenames: true
 
       - id: typos
         name: typos (spelling check)
@@ -124,15 +124,15 @@ repos:
         args: [ "-w" ]
         language: system
         types: [ text ]
-        pass_filenames: false
+        pass_filenames: true
 
       - id: taplo
         name: taplo (TOML format)
         entry: ./scripts/ci/taplo.sh
-        args: ["--fix", "--staged"]
+        args: ["--fix"]
         language: system
         types: [toml]
-        pass_filenames: false
+        pass_filenames: true
 
   # Rust
   - repo: local
@@ -260,3 +260,27 @@ repos:
         files: ^(foreign|examples)/csharp/.*\.cs$
         pass_filenames: false
         stages: [pre-push]
+
+  # Helm chart formatting and linting
+  - repo: local
+    hooks:
+      - id: helmfmt
+        name: helmfmt
+        entry: helmfmt
+        language: system
+        files: ^helm/charts/.*/templates/.*\.(yaml|tpl)$
+        pass_filenames: true
+
+      - id: yamllint-helm
+        name: yamllint (helm)
+        entry: yamllint -c helm/charts/iggy/.yamllint.yml
+        language: system
+        files: ^helm/charts/iggy/(values\.yaml|Chart\.yaml)$
+        pass_filenames: true
+
+      - id: helm-docs
+        name: helm-docs
+        entry: bash -c 'cd helm/charts/iggy && helm-docs'
+        language: system
+        files: ^helm/charts/iggy/(values\.yaml|README\.md\.gotmpl)$
+        pass_filenames: false

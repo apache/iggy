@@ -25,7 +25,7 @@ use bytes::Bytes;
 use iggy::prelude::*;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 struct TestMessagePollCmd {
@@ -143,7 +143,7 @@ impl IggyCmdTestCase for TestMessagePollCmd {
                 let payload = Bytes::from(s.as_bytes().to_vec());
                 IggyMessage::builder()
                     .payload(payload)
-                    .user_headers(HashMap::from([self.headers.clone()]))
+                    .user_headers(BTreeMap::from([self.headers.clone()]))
                     .build()
                     .expect("Failed to create message with headers")
             })

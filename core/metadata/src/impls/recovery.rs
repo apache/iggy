@@ -21,7 +21,7 @@ use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, Snapshot
 use iggy_binary_protocol::consensus::PrepareHeader;
 use iggy_binary_protocol::consensus::message::Message;
 use iggy_common::IggyError;
-use journal::metadata_journal::{JournalError, MetadataJournal};
+use journal::prepare_journal::{JournalError, PrepareJournal};
 use std::fmt;
 use std::path::Path;
 
@@ -82,8 +82,8 @@ impl From<std::io::Error> for RecoveryError {
 
 /// Result of a successful metadata recovery.
 pub struct RecoveredMetadata<M> {
-    pub journal: MetadataJournal,
-    pub snapshot: IggySnapshot,
+    pub journal: PrepareJournal,
+    pub snapshot: Option<IggySnapshot>,
     pub mux_stm: M,
     /// `None` means no snapshot existed and no journal entries were replayed.
     /// `Some(op)` is the highest op applied, either from the snapshot or journal replay.
@@ -92,10 +92,10 @@ pub struct RecoveredMetadata<M> {
 
 /// Recover metadata state from disk.
 ///
-/// 1. Load snapshot from `{data_dir}/metadata/snapshot.bin` (or empty default)
-/// 2. Restore state machine from snapshot
+/// 1. Load snapshot from `{data_dir}/metadata/snapshot.bin` if present
+/// 2. Restore state machine from snapshot, or initialize empty state
 /// 3. Open WAL at `{data_dir}/metadata/journal.wal`, scan and rebuild index
-/// 4. Replay journal entries from `snapshot.sequence_number + 1` through the state machine
+/// 4. Replay journal entries from the first post-snapshot op through the state machine
 /// 5. Return the assembled `RecoveredMetadata`
 ///
 /// # Errors
@@ -104,30 +104,41 @@ pub struct RecoveredMetadata<M> {
 pub async fn recover<M>(data_dir: &Path) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
     M: StateMachine<Input = Message<PrepareHeader>, Error = IggyError>
-        + RestoreSnapshot<MetadataSnapshot>,
+        + RestoreSnapshot<MetadataSnapshot>
+        + Default,
 {
     let metadata_dir = data_dir.join(super::METADATA_DIR);
     std::fs::create_dir_all(&metadata_dir)?;
 
-    // 1. Load snapshot (or empty default if missing)
+    // 1. Load snapshot if present.
     let snapshot_path = metadata_dir.join("snapshot.bin");
-    let (snapshot, replay_from) = if snapshot_path.exists() {
-        let s = IggySnapshot::load(&snapshot_path)?;
-        let from = s.sequence_number() + 1;
-        (s, from)
+    let snapshot = if snapshot_path.exists() {
+        Some(IggySnapshot::load(&snapshot_path)?)
     } else {
-        // No snapshot, replay from op 0.
-        (IggySnapshot::new(0), 0)
+        None
     };
+    let replay_from = snapshot
+        .as_ref()
+        .map_or(0, |snapshot| snapshot.sequence_number() + 1);
 
-    // 2. Restore state machine from snapshot
-    let mux_stm = M::restore_snapshot(snapshot.snapshot())?;
+    // 2. Restore state machine from snapshot, or start from a fresh empty state.
+    let mux_stm = match snapshot.as_ref() {
+        Some(snapshot) => M::restore_snapshot(snapshot.snapshot())?,
+        None => M::default(),
+    };
 
     // 3. Open journal, scan the WAL and build index
     let journal_path = metadata_dir.join("journal.wal");
-    let journal = MetadataJournal::open(&journal_path, snapshot.sequence_number()).await?;
+    let journal = PrepareJournal::open(
+        &journal_path,
+        snapshot.as_ref().map_or(0, IggySnapshot::sequence_number),
+    )
+    .await?;
 
-    // 4. Replay journal entries after snapshot
+    // 4. Replay journal entries after snapshot.
+    // Intentional fail-fast for now: if replay hits a bad entry, recovery
+    // aborts and the operator must repair or truncate the WAL before the
+    // node can boot again.
     let headers_to_replay = journal.iter_headers_from(replay_from);
 
     let mut last_applied_op: Option<u64> = None;
@@ -158,7 +169,7 @@ where
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use bytes::BytesMut;
+    use iggy_binary_protocol::consensus::iobuf::Owned;
     use iggy_binary_protocol::consensus::{Command2, Operation};
     use journal::Journal;
     use tempfile::tempdir;
@@ -171,13 +182,15 @@ mod tests {
 
     fn make_prepare(op: u64, body_size: usize) -> Message<PrepareHeader> {
         let total_size = HEADER_SIZE + body_size;
-        let mut buffer = BytesMut::zeroed(total_size);
-        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(&mut buffer[..HEADER_SIZE]);
+        let mut buffer = Owned::<4096>::zeroed(total_size);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut buffer.as_mut_slice()[..HEADER_SIZE],
+        );
         header.size = total_size as u32;
         header.command = Command2::Prepare;
         header.op = op;
         header.operation = Operation::CreateStream;
-        Message::from_bytes(buffer.freeze()).unwrap()
+        Message::try_from(buffer).unwrap()
     }
 
     #[compio::test]
@@ -201,7 +214,13 @@ mod tests {
             .unwrap();
 
         let recovered = recover::<TestStm>(dir.path()).await.unwrap();
-        assert_eq!(recovered.snapshot.sequence_number(), 42);
+        assert_eq!(
+            recovered
+                .snapshot
+                .as_ref()
+                .map(IggySnapshot::sequence_number),
+            Some(42)
+        );
         assert_eq!(recovered.last_applied_op, None);
     }
 
@@ -212,7 +231,7 @@ mod tests {
         std::fs::create_dir_all(&metadata_dir).unwrap();
 
         {
-            let journal = MetadataJournal::open(&metadata_dir.join("journal.wal"), 0)
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
                 .await
                 .unwrap();
             journal.append(make_prepare(1, 32)).await.unwrap();
@@ -222,6 +241,7 @@ mod tests {
         }
 
         let recovered = recover::<TestStm>(dir.path()).await.unwrap();
+        assert!(recovered.snapshot.is_none());
         assert_eq!(recovered.last_applied_op, Some(3));
         assert_eq!(recovered.journal.last_op(), Some(3));
     }
@@ -240,7 +260,7 @@ mod tests {
 
         // WAL has ops 1-10
         {
-            let journal = MetadataJournal::open(&metadata_dir.join("journal.wal"), 0)
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
                 .await
                 .unwrap();
             for op in 1..=10 {
@@ -252,7 +272,13 @@ mod tests {
         let recovered = recover::<TestStm>(dir.path()).await.unwrap();
         // Should replay ops 6-10 (snapshot was at 5)
         assert_eq!(recovered.last_applied_op, Some(10));
-        assert_eq!(recovered.snapshot.sequence_number(), 5);
+        assert_eq!(
+            recovered
+                .snapshot
+                .as_ref()
+                .map(IggySnapshot::sequence_number),
+            Some(5)
+        );
     }
 
     #[test]

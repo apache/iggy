@@ -22,8 +22,7 @@ use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
 use iggy_binary_protocol::requests::personal_access_tokens::DeletePersonalAccessTokenRequest;
-use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
-use iggy_common::{IggyError, SenderKind, Validatable};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -40,15 +39,10 @@ pub async fn handle_delete_personal_access_token(
     );
     shard.ensure_authenticated(session)?;
 
-    let command = DeletePersonalAccessToken {
-        name: req.name.to_string(),
-    };
-    command.validate()?;
-
     let request =
         ShardRequest::control_plane(ShardRequestPayload::DeletePersonalAccessTokenRequest {
             user_id: session.get_user_id(),
-            command,
+            command: req,
         });
 
     match shard.send_to_control_plane(request).await? {

@@ -46,7 +46,7 @@
 //!
 //! All consensus headers are 256 bytes with `#[repr(C)]` layout.
 //! Deserialization is zero-copy via `bytemuck`. The [`Message`] type
-//! wraps a `Bytes` buffer with typed header access.
+//! wraps request or response backing with typed header access.
 //!
 //! - Client-facing: [`RequestHeader`], [`ReplyHeader`]
 //! - Replication: [`PrepareHeader`], [`PrepareOkHeader`], [`CommitHeader`]
@@ -69,19 +69,31 @@ pub mod responses;
 pub use codec::{WireDecode, WireEncode};
 pub use consensus::{
     Command2, CommitHeader, ConsensusError, ConsensusHeader, ConsensusMessage, DoViewChangeHeader,
-    GenericHeader, HEADER_SIZE, MessageBag, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader,
-    RequestHeader, StartViewChangeHeader, StartViewHeader, message::Message,
+    EvictionHeader, EvictionReason, FragmentedBacking, GenericHeader, HEADER_SIZE, Message,
+    MessageBacking, MessageBag, MutableBacking, Operation, PrepareHeader, PrepareOkHeader,
+    ReplyHeader, RequestBacking, RequestBackingKind, RequestHeader, ResponseBacking,
+    ResponseBackingKind, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader,
+    read_size_field,
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;
-pub use framing::{RequestFrame, ResponseFrame, STATUS_OK};
+pub use framing::{RequestFrame, RequestFrame2, ResponseFrame, ResponseFrame2, STATUS_OK};
 pub use message_view::{
     WireMessageIterator, WireMessageIteratorMut, WireMessageView, WireMessageViewMut,
 };
+pub use primitives::ack_level::AckLevel;
 pub use primitives::consumer::WireConsumer;
 pub use primitives::identifier::{MAX_WIRE_NAME_LENGTH, WireIdentifier, WireName};
+pub use primitives::partition_assignment::CreatedPartitionAssignment;
 pub use primitives::partitioning::{MAX_MESSAGES_KEY_LENGTH, WirePartitioning};
 pub use primitives::permissions::{
     WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
 };
 pub use primitives::polling_strategy::WirePollingStrategy;
+pub use primitives::user_headers::{
+    WireHeaderKind, WireUserHeaderEntry, WireUserHeaderIterator, WireUserHeaders,
+    encode_user_headers, user_headers_encoded_size, validate_user_headers,
+};
+
+/// Maximum number of partitions allowed in a single create/delete request.
+pub const MAX_PARTITIONS_PER_REQUEST: u32 = 1000;

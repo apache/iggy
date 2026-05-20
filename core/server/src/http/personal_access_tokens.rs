@@ -29,11 +29,15 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router, debug_handler};
 use err_trail::ErrContext;
+use iggy_binary_protocol::WireName;
+use iggy_binary_protocol::requests::personal_access_tokens::{
+    CreatePersonalAccessTokenRequest as WireCreatePat,
+    DeletePersonalAccessTokenRequest as WireDeletePat,
+};
 use iggy_common::IdentityInfo;
 use iggy_common::PersonalAccessTokenInfo;
 use iggy_common::Validatable;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
-use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::{IggyError, RawPersonalAccessToken};
 use secrecy::ExposeSecret;
@@ -85,10 +89,15 @@ async fn create_personal_access_token(
 ) -> Result<Json<RawPersonalAccessToken>, CustomError> {
     command.validate()?;
 
+    let wire_command = WireCreatePat {
+        name: WireName::new(&command.name)
+            .map_err(|_| IggyError::InvalidPersonalAccessTokenName)?,
+        expiry: command.expiry.into(),
+    };
     let request =
         ShardRequest::control_plane(ShardRequestPayload::CreatePersonalAccessTokenRequest {
             user_id: identity.user_id,
-            command,
+            command: wire_command,
         });
 
     match state.shard.send_to_control_plane(request).await? {
@@ -107,11 +116,13 @@ async fn delete_personal_access_token(
     Extension(identity): Extension<Identity>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, CustomError> {
-    let command = DeletePersonalAccessToken { name };
+    let wire_command = WireDeletePat {
+        name: WireName::new(&name).map_err(|_| IggyError::InvalidPersonalAccessTokenName)?,
+    };
     let request =
         ShardRequest::control_plane(ShardRequestPayload::DeletePersonalAccessTokenRequest {
             user_id: identity.user_id,
-            command,
+            command: wire_command,
         });
 
     match state.shard.send_to_control_plane(request).await? {
@@ -126,7 +137,6 @@ async fn login_with_personal_access_token(
     State(state): State<Arc<AppState>>,
     Json(command): Json<LoginWithPersonalAccessToken>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
-    command.validate()?;
     let user = state
         .shard
         .shard()

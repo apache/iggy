@@ -15,7 +15,19 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.94
+# Apache Iggy (Incubating) is an effort undergoing incubation at the Apache
+# Software Foundation (ASF), sponsored by the Apache Incubator PMC.
+#
+# Incubation is required of all newly accepted projects until a further review
+# indicates that the infrastructure, communications, and decision making
+# process have stabilized in a manner consistent with other successful ASF
+# projects.
+#
+# While incubation status is not necessarily a reflection of the completeness
+# or stability of the code, it does indicate that the project has yet to be
+# fully endorsed by the ASF.
+
+ARG RUST_VERSION=1.95
 
 # Build stage
 FROM rust:${RUST_VERSION}-slim-trixie AS builder
@@ -56,6 +68,14 @@ RUN cd core/bench/dashboard/frontend && trunk build --release
 # Build the server with release profile
 RUN cargo build --release --bin iggy-bench-dashboard-server
 
+# Generate third-party license manifest. Required by ASF release policy:
+# convenience binaries that statically link third-party code MUST include
+# the full license text of every bundled crate inside the artifact.
+RUN TARGET="$(uname -m)-unknown-linux-musl" && \
+    curl -sSfL "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz" \
+      | tar -xz -C /usr/local/bin --strip-components=1 "cargo-about-0.9.0-${TARGET}/cargo-about" && \
+    ./scripts/ci/third-party-licenses.sh --generate --manifest core/bench/dashboard/server/Cargo.toml --output /usr/src/iggy-bench-dashboard/LICENSE-binary
+
 # Runtime stage
 FROM debian:trixie-slim
 
@@ -72,6 +92,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy the built binary and frontend files
 COPY --from=builder /usr/src/iggy-bench-dashboard/target/release/iggy-bench-dashboard-server /app/
 COPY --from=builder /usr/src/iggy-bench-dashboard/core/bench/dashboard/frontend/dist /app/frontend/dist
+COPY --from=builder /usr/src/iggy-bench-dashboard/LICENSE-binary /usr/share/doc/iggy-bench-dashboard/LICENSE-binary
+COPY LICENSE NOTICE /usr/share/doc/iggy-bench-dashboard/
 
 # Create data directory and non-root user
 RUN groupadd -r iggy && \

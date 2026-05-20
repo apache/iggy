@@ -1,0 +1,147 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: wait-for-url
+description: >
+  Poll an HTTP(S) URL until it returns HTTP 200, with exponential backoff
+  and a caller-configurable retry budget. Used to gate post-publish tag
+  creation on the target registry actually serving the uploaded artifact:
+  for npm, NuGet, PyPI JSON and Maven Central POM endpoints, HTTP 200 on
+  a version-qualified URL is a reliable "this version is live" signal.
+
+  This is the foreign-SDK analogue of wait-for-crate. crates.io has a
+  structured sparse index where we can grep a specific `vers` field;
+  every other ecosystem we publish to exposes per-version URLs instead,
+  so the signal is "HTTP 200 on a deterministic URL".
+
+inputs:
+  url:
+    description: "Full https URL to poll. Must contain the target version so HTTP 200 is unambiguous."
+    required: true
+  max_attempts:
+    description: "Maximum poll attempts before giving up."
+    required: false
+    default: "30"
+  initial_sleep_seconds:
+    description: "Sleep between the first two attempts in seconds. Doubles each attempt, capped at max_sleep_seconds."
+    required: false
+    default: "3"
+  max_sleep_seconds:
+    description: "Upper bound on per-attempt sleep, in seconds."
+    required: false
+    default: "30"
+  description:
+    description: "Short human-readable description of what is being waited for, shown in log lines."
+    required: false
+    default: "artifact"
+
+runs:
+  using: composite
+  steps:
+    - name: Wait for URL to return HTTP 200
+      shell: bash
+      env:
+        URL: ${{ inputs.url }}
+        MAX_ATTEMPTS: ${{ inputs.max_attempts }}
+        INITIAL_SLEEP_SECONDS: ${{ inputs.initial_sleep_seconds }}
+        MAX_SLEEP_SECONDS: ${{ inputs.max_sleep_seconds }}
+        DESCRIPTION: ${{ inputs.description }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${URL}" ]; then
+          echo "❌ wait-for-url: 'url' input is empty"
+          exit 1
+        fi
+        # Restrict to http/https so a malformed caller cannot coerce curl
+        # into fetching file:// or similar. Every registry we poll uses
+        # https today, so this is not a capability loss.
+        if ! [[ "${URL}" =~ ^https?:// ]]; then
+          echo "❌ wait-for-url: url '${URL}' must start with http:// or https://"
+          exit 1
+        fi
+        if ! [[ "${MAX_ATTEMPTS}" =~ ^[0-9]+$ ]] || [ "${MAX_ATTEMPTS}" -lt 1 ]; then
+          echo "❌ wait-for-url: max_attempts '${MAX_ATTEMPTS}' must be a positive integer"
+          exit 1
+        fi
+        if ! [[ "${INITIAL_SLEEP_SECONDS}" =~ ^[0-9]+$ ]]; then
+          echo "❌ wait-for-url: initial_sleep_seconds '${INITIAL_SLEEP_SECONDS}' must be a non-negative integer"
+          exit 1
+        fi
+        if ! [[ "${MAX_SLEEP_SECONDS}" =~ ^[0-9]+$ ]] || [ "${MAX_SLEEP_SECONDS}" -lt 1 ]; then
+          echo "❌ wait-for-url: max_sleep_seconds '${MAX_SLEEP_SECONDS}' must be a positive integer"
+          exit 1
+        fi
+
+        echo "📡 Polling URL: ${URL}"
+        echo "🔖 Waiting for: ${DESCRIPTION}"
+        echo "📊 Budget: up to ${MAX_ATTEMPTS} attempts"
+        echo ""
+
+        # Capture curl stderr to a tempfile so hard errors (DNS, TLS,
+        # connection refused, --max-time timeouts) are preserved across
+        # retries and surfaced on the final failure branch. The previous
+        # code redirected stderr to /dev/null, which contradicted the -sS
+        # flag's intent of keeping hard errors visible.
+        curl_stderr="$(mktemp)"
+        trap 'rm -f "${curl_stderr}"' EXIT
+
+        sleep_s="${INITIAL_SLEEP_SECONDS}"
+        http_code="000"
+        for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
+          # -sS: silent but still report hard errors on stderr (captured
+          # to ${curl_stderr} for the final-failure dump below).
+          # -L: follow redirects (registries sit behind CDNs that issue
+          # 301/302).
+          # No -f: we want the HTTP code on 4xx so we can distinguish 404
+          # ("not yet there") from 5xx ("transient") in the log.
+          # --max-time: cap per-request so a dead TCP connection does not
+          # burn the whole budget on one attempt.
+          : >"${curl_stderr}"
+          http_code=$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 30 "${URL}" 2>"${curl_stderr}" || echo "000")
+
+          if [ "${http_code}" = "200" ]; then
+            echo "✅ ${DESCRIPTION} is available (HTTP 200 from ${URL})"
+            exit 0
+          fi
+
+          if [ "${attempt}" -eq "${MAX_ATTEMPTS}" ]; then
+            break
+          fi
+          echo "⏳ HTTP ${http_code} - not yet available (attempt ${attempt}/${MAX_ATTEMPTS}, sleep ${sleep_s}s)"
+          sleep "${sleep_s}"
+          sleep_s=$(( sleep_s * 2 ))
+          if [ "${sleep_s}" -gt "${MAX_SLEEP_SECONDS}" ]; then
+            sleep_s="${MAX_SLEEP_SECONDS}"
+          fi
+        done
+
+        echo "❌ Timed out waiting for ${DESCRIPTION} after ${MAX_ATTEMPTS} attempts"
+        echo "   URL: ${URL}"
+        echo "   Last HTTP code: ${http_code}"
+        if [ -s "${curl_stderr}" ]; then
+          echo "   last curl stderr:"
+          sed 's/^/     /' "${curl_stderr}"
+        fi
+        echo "   Common causes:"
+        echo "     - registry propagation is slow (Maven Central especially can take >10 minutes)"
+        echo "     - the publish step did not actually land the artifact (inspect the preceding publish step)"
+        echo "     - the URL is wrong (verify package name, version, and URL template for the registry)"
+        echo ""
+        echo "   Not creating a git tag for this release; the operator can rerun this job once"
+        echo "   the registry has caught up, and the run will converge (the publish is idempotent)."
+        exit 1

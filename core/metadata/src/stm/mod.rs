@@ -24,6 +24,7 @@ pub mod user;
 use bytes::Bytes;
 use iggy_common::Either;
 use left_right::{Absorb, ReadHandle, WriteHandle};
+use std::cell::Cell;
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
@@ -159,6 +160,46 @@ pub trait StateMachine {
     fn update(&self, input: Self::Input) -> Result<Self::Output, Self::Error>;
 }
 
+#[derive(Debug)]
+pub struct ConsensusGroupAllocator {
+    highest: Cell<u64>,
+}
+
+impl ConsensusGroupAllocator {
+    #[must_use]
+    pub const fn new(initial_highest: u64) -> Self {
+        Self {
+            highest: Cell::new(initial_highest),
+        }
+    }
+
+    #[must_use]
+    pub const fn highest(&self) -> u64 {
+        self.highest.get()
+    }
+
+    pub fn observe(&self, assigned: u64) {
+        if assigned > self.highest.get() {
+            self.highest.set(assigned);
+        }
+    }
+
+    #[must_use]
+    ///
+    /// # Panics
+    /// Panics if allocating `count` more group IDs would overflow `u64`.
+    pub fn allocate_many(&self, count: usize) -> Vec<u64> {
+        let mut allocated = Vec::with_capacity(count);
+        let mut current = self.highest.get();
+        for _ in 0..count {
+            current = current.checked_add(1).expect("consensus group id overflow");
+            allocated.push(current);
+        }
+        self.highest.set(current);
+        allocated
+    }
+}
+
 /// Generates the state's inner struct and wrapper type.
 ///
 /// # Generated items
@@ -209,6 +250,12 @@ macro_rules! define_state {
                     left_right.into()
                 }
             }
+
+            impl Default for $state {
+                fn default() -> Self {
+                    [<$state Inner>]::new().into()
+                }
+            }
         }
     };
 }
@@ -223,7 +270,8 @@ macro_rules! define_state {
 /// - `Absorb<{$state}Command>` impl for `{$state}Inner`
 ///
 /// # Requirements
-/// Each listed operation type must implement `StateHandler<{$state}Inner>`.
+/// Each listed operation must have a corresponding `{Operation}Request` wire type
+/// that implements `WireDecode` and `StateHandler<State = {$state}Inner>`.
 #[macro_export]
 macro_rules! collect_handlers {
     (
@@ -235,7 +283,7 @@ macro_rules! collect_handlers {
             #[derive(Debug, Clone)]
             pub enum [<$state Command>] {
                 $(
-                    $operation($operation),
+                    $operation([<$operation Request>]),
                 )*
             }
 
@@ -245,14 +293,19 @@ macro_rules! collect_handlers {
                 type Error = ::iggy_common::IggyError;
 
                 fn parse(input: Self::Input) -> Result<::iggy_common::Either<Self::Cmd, Self::Input>, Self::Error> {
-                    use ::iggy_common::BytesSerializable;
+                    use ::iggy_binary_protocol::WireDecode;
                     use ::iggy_common::Either;
-                    use ::iggy_binary_protocol::Operation;
+                    use ::iggy_binary_protocol::{Operation, PrepareHeader};
                     match input.header().operation {
                         $(
                             Operation::$operation => {
-                                let body = input.body_bytes();
-                                let cmd = $operation::from_bytes(body)?;
+                                // TODO: FIXME, zero allocation operation construction.
+                                let header = *input.header();
+                                let body = ::bytes::Bytes::copy_from_slice(
+                                    &input.as_slice()[core::mem::size_of::<PrepareHeader>()..header.size as usize]
+                                );
+                                let cmd = [<$operation Request>]::decode_from(&body)
+                                    .map_err(|_| ::iggy_common::IggyError::InvalidCommand)?;
                                 Ok(Either::Left([<$state Command>]::$operation(cmd)))
                             },
                         )*

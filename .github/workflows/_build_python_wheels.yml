@@ -43,6 +43,9 @@ on:
         description: "Name of the uploaded artifact containing wheels"
         value: ${{ jobs.collect.outputs.artifact_name }}
 
+permissions:
+  contents: read
+
 jobs:
   linux:
     runs-on: ${{ matrix.runner }}
@@ -69,7 +72,7 @@ jobs:
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.commit }}
 
@@ -80,12 +83,19 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
+
+      - name: Generate third-party license manifest
+        run: |
+          TARGET="$(uname -m)-unknown-linux-musl"
+          curl -sSfL "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz" \
+            | tar -xz -C "$HOME/.cargo/bin" --strip-components=1 "cargo-about-0.9.0-${TARGET}/cargo-about"
+          ./scripts/ci/third-party-licenses.sh --generate --manifest foreign/python/Cargo.toml --output foreign/python/LICENSE-binary
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -105,7 +115,7 @@ jobs:
 
       - name: Upload wheels
         if: inputs.upload_artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-linux-${{ matrix.target }}-${{ matrix.manylinux }}
           path: foreign/python/dist
@@ -124,7 +134,7 @@ jobs:
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.commit }}
 
@@ -135,9 +145,27 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+
+      - name: Generate third-party license manifest
+        run: |
+          # Embark Studios releases an aarch64-apple-darwin tarball but
+          # NOT x86_64-apple-darwin (404 as of 0.9.0). Intel macOS
+          # falls back to compiling cargo-about from source.
+          ARCH="$(uname -m | sed 's/arm64/aarch64/')"
+          if [ "$ARCH" = "aarch64" ]; then
+            TARGET="aarch64-apple-darwin"
+            curl -sSfL "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz" \
+              | tar -xz -C "$HOME/.cargo/bin" --strip-components=1 "cargo-about-0.9.0-${TARGET}/cargo-about"
+          else
+            cargo install cargo-about --locked --version 0.9.0 --features cli
+          fi
+          ./scripts/ci/third-party-licenses.sh --generate --manifest foreign/python/Cargo.toml --output foreign/python/LICENSE-binary
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -149,7 +177,7 @@ jobs:
 
       - name: Upload wheels
         if: inputs.upload_artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-macos-${{ matrix.target }}
           path: foreign/python/dist
@@ -167,7 +195,7 @@ jobs:
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.commit }}
 
@@ -179,7 +207,7 @@ jobs:
           /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           architecture: x64
@@ -194,7 +222,7 @@ jobs:
 
       - name: Upload wheels
         if: inputs.upload_artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-windows-x64
           path: foreign/python/dist
@@ -210,7 +238,7 @@ jobs:
             -o /tmp/copy-latest-from-master.sh
           chmod +x /tmp/copy-latest-from-master.sh
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.commit }}
 
@@ -229,7 +257,7 @@ jobs:
 
       - name: Upload sdist
         if: inputs.upload_artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-sdist
           path: foreign/python/dist
@@ -244,7 +272,7 @@ jobs:
       artifact_name: ${{ steps.output.outputs.artifact_name }}
     steps:
       - name: Download all wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           merge-multiple: true
@@ -276,7 +304,7 @@ jobs:
           echo "**Total wheels built:** $(ls -1 dist/*.whl | wc -l)" >> $GITHUB_STEP_SUMMARY
 
       - name: Upload combined artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-wheels-all
           path: dist

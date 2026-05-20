@@ -1,0 +1,77 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# docker-compose for InfluxDB connector integration tests.
+#
+# File location:
+#   core/integration/tests/connectors/influxdb/docker-compose.yml
+#
+# Used as a fallback when running tests without a Docker daemon that supports
+# testcontainers auto-launch (e.g. some CI environments). Start manually with:
+#   docker compose -f core/integration/tests/connectors/influxdb/docker-compose.yml up -d
+# then run:
+#   INFLUXDB_URL=http://localhost:8086 cargo test -p iggy-integration-tests influxdb
+
+version: "3.8"
+
+services:
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: iggy-test-influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE:         setup
+      DOCKER_INFLUXDB_INIT_USERNAME:     iggy-admin
+      DOCKER_INFLUXDB_INIT_PASSWORD:     iggy-password
+      DOCKER_INFLUXDB_INIT_ORG:          iggy-test-org
+      DOCKER_INFLUXDB_INIT_BUCKET:       iggy-test-bucket
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN:  iggy-super-secret-test-token
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - iggy-influxdb-data:/var/lib/influxdb2
+
+  # InfluxDB instance for the SOURCE connector tests (separate bucket/org)
+  influxdb-source:
+    image: influxdb:2.7-alpine
+    container_name: iggy-test-influxdb-source
+    ports:
+      - "8087:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE:         setup
+      DOCKER_INFLUXDB_INIT_USERNAME:     iggy-admin
+      DOCKER_INFLUXDB_INIT_PASSWORD:     iggy-password
+      DOCKER_INFLUXDB_INIT_ORG:          iggy-src-org
+      DOCKER_INFLUXDB_INIT_BUCKET:       iggy-src-bucket
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN:  iggy-src-secret-token
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - iggy-influxdb-source-data:/var/lib/influxdb2
+
+volumes:
+  iggy-influxdb-data:
+  iggy-influxdb-source-data:

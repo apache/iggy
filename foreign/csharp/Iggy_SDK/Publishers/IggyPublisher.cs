@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Microsoft.Extensions.Logging;
@@ -310,7 +312,7 @@ public partial class IggyPublisher : IAsyncDisposable
 
     /// <summary>
     ///     Encrypts all messages in the list using the configured message encryptor, if available.
-    ///     Updates the payload length in the message header after encryption.
+    ///     Updates the payload and user headers lengths in the message header after encryption.
     /// </summary>
     /// <param name="messages">The messages to encrypt.</param>
     private void EncryptMessages(IList<Message> messages)
@@ -324,6 +326,15 @@ public partial class IggyPublisher : IAsyncDisposable
         {
             message.Payload = _config.MessageEncryptor.Encrypt(message.Payload);
             message.Header.PayloadLength = message.Payload.Length;
+
+            if (message.UserHeaders is { Count: > 0 })
+            {
+                var headerBytes = TcpContracts.GetHeadersBytes(message.UserHeaders);
+                var encryptedHeaderBytes = _config.MessageEncryptor.Encrypt(headerBytes);
+                message.RawUserHeaders = encryptedHeaderBytes;
+                message.UserHeaders = null;
+                message.Header.UserHeadersLength = encryptedHeaderBytes.Length;
+            }
         }
     }
 }

@@ -62,6 +62,10 @@ inputs:
     description: "Fail if port is already in use"
     required: false
     default: "true"
+  replica-id:
+    description: "--replica-id <u8> value (leave empty to omit)"
+    required: false
+    default: ""
 outputs:
   pid:
     description: "PID of the background server process"
@@ -149,7 +153,11 @@ runs:
         export IGGY_HTTP_ADDRESS="${{ inputs.http_address }}"
         export IGGY_ROOT_USERNAME="iggy"
         export IGGY_ROOT_PASSWORD="iggy"
-        nohup "${{ steps.resolve-bin.outputs.bin }}" >"$LOG_FILE" 2>&1 &
+        CLI_ARGS=()
+        if [[ -n "${{ inputs.replica-id }}" ]]; then
+          CLI_ARGS+=(--replica-id "${{ inputs.replica-id }}")
+        fi
+        nohup "${{ steps.resolve-bin.outputs.bin }}" "${CLI_ARGS[@]}" >"$LOG_FILE" 2>&1 &
         echo $! > "$PID_FILE"
         echo "Started server PID $(cat "$PID_FILE") → logs: $LOG_FILE"
         echo "Server configured with TCP=$IGGY_TCP_ADDRESS, HTTP=$IGGY_HTTP_ADDRESS"

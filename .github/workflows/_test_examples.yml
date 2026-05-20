@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Skip noop
         if: inputs.component == 'noop'
@@ -57,17 +57,17 @@ jobs:
 
       - name: Setup Python
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 
       - name: Setup uv
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
-        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098 # v7.3.1
+        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
 
       - name: Cache uv
         if: startsWith(inputs.component, 'examples-') && inputs.task == 'examples-python'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ hashFiles('examples/python/uv.lock', 'foreign/python/uv.lock', 'bdd/python/uv.lock') }}
@@ -160,7 +160,7 @@ jobs:
 
       - name: Upload reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.component }}-${{ inputs.task }}-reports-${{ github.run_id }}-${{ github.run_attempt }}
           path: |

@@ -22,6 +22,7 @@ use reqwest_middleware::ClientWithMiddleware as HttpClient;
 use reqwest_retry::RetryTransientMiddleware;
 use reqwest_retry::policies::ExponentialBackoff;
 use serde::Deserialize;
+use testcontainers_modules::testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -31,10 +32,7 @@ use uuid::Uuid;
 const ELASTICSEARCH_IMAGE: &str = "elasticsearch";
 const ELASTICSEARCH_TAG: &str = "9.3.0";
 const ELASTICSEARCH_PORT: u16 = 9200;
-const ELASTICSEARCH_READY_MSG: &str = "started";
-
-pub const HEALTH_CHECK_ATTEMPTS: usize = 30;
-pub const HEALTH_CHECK_INTERVAL_MS: u64 = 500;
+const ELASTICSEARCH_HEALTH_ENDPOINT: &str = "/_cluster/health";
 
 pub const DEFAULT_TEST_STREAM: &str = "test_stream";
 pub const DEFAULT_TEST_TOPIC: &str = "test_topic";
@@ -101,7 +99,11 @@ impl ElasticsearchContainer {
 
         let container = GenericImage::new(ELASTICSEARCH_IMAGE, ELASTICSEARCH_TAG)
             .with_exposed_port(ELASTICSEARCH_PORT.tcp())
-            .with_wait_for(WaitFor::message_on_stdout(ELASTICSEARCH_READY_MSG))
+            .with_wait_for(WaitFor::http(
+                HttpWaitStrategy::new(ELASTICSEARCH_HEALTH_ENDPOINT)
+                    .with_port(ELASTICSEARCH_PORT.tcp())
+                    .with_expected_status_code(200u16),
+            ))
             .with_network(unique_network)
             .with_env_var("discovery.type", "single-node")
             .with_env_var("xpack.security.enabled", "false")

@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{BytesSerializable, IggyError};
-use bytes::{BufMut, Bytes, BytesMut};
+use crate::IggyError;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display as StrumDisplay, EnumString};
 
@@ -54,29 +53,5 @@ impl TryFrom<u8> for ClusterNodeStatus {
             v if v == ClusterNodeStatus::Maintenance as u8 => Ok(ClusterNodeStatus::Maintenance),
             _ => Err(IggyError::InvalidCommand),
         }
-    }
-}
-
-impl BytesSerializable for ClusterNodeStatus {
-    fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::with_capacity(1);
-        self.write_to_buffer(&mut bytes);
-        bytes.freeze()
-    }
-
-    fn from_bytes(bytes: Bytes) -> Result<ClusterNodeStatus, IggyError> {
-        if bytes.is_empty() {
-            return Err(IggyError::InvalidCommand);
-        }
-
-        ClusterNodeStatus::try_from(bytes[0])
-    }
-
-    fn write_to_buffer(&self, buf: &mut BytesMut) {
-        buf.put_u8(*self as u8);
-    }
-
-    fn get_buffer_size(&self) -> usize {
-        1
     }
 }

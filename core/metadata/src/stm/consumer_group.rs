@@ -21,9 +21,10 @@ use crate::{collect_handlers, define_state, impl_fill_restore};
 use bytes::Bytes;
 
 use ahash::AHashMap;
-use iggy_common::create_consumer_group::CreateConsumerGroup;
-use iggy_common::delete_consumer_group::DeleteConsumerGroup;
-use iggy_common::{IdKind, Identifier};
+use iggy_binary_protocol::WireIdentifier;
+use iggy_binary_protocol::requests::consumer_groups::{
+    CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
+};
 use serde::{Deserialize, Serialize};
 use slab::Slab;
 use std::sync::Arc;
@@ -111,66 +112,50 @@ collect_handlers! {
 }
 
 impl ConsumerGroupsInner {
+    fn resolve_group_in_list(
+        &self,
+        groups_in_topic: &[usize],
+        group_id: &WireIdentifier,
+    ) -> Option<usize> {
+        match group_id {
+            WireIdentifier::Numeric(id) => {
+                let g_id = *id as usize;
+                groups_in_topic.contains(&g_id).then_some(g_id)
+            }
+            WireIdentifier::String(name) => groups_in_topic
+                .iter()
+                .find(|&&id| {
+                    self.items
+                        .get(id)
+                        .is_some_and(|g| g.name.as_ref() == name.as_str())
+                })
+                .copied(),
+        }
+    }
+
     fn resolve_consumer_group_id_by_identifiers(
         &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        group_id: &Identifier,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+        group_id: &WireIdentifier,
     ) -> Option<usize> {
-        if let (Ok(s), Ok(t)) = (stream_id.get_u32_value(), topic_id.get_u32_value()) {
-            let groups_in_topic = self.topic_index.get(&(s as usize, t as usize))?;
-
-            return match group_id.kind {
-                IdKind::Numeric => {
-                    let g_id = group_id.get_u32_value().ok()? as usize;
-                    groups_in_topic.contains(&g_id).then_some(g_id)
-                }
-                IdKind::String => {
-                    let g_name = group_id.get_string_value().ok()?;
-                    groups_in_topic
-                        .iter()
-                        .find(|&&id| {
-                            self.items
-                                .get(id)
-                                .is_some_and(|g| g.name.as_ref() == g_name)
-                        })
-                        .copied()
-                }
-            };
+        if let (WireIdentifier::Numeric(s), WireIdentifier::Numeric(t)) = (stream_id, topic_id) {
+            let groups_in_topic = self.topic_index.get(&(*s as usize, *t as usize))?;
+            return self.resolve_group_in_list(groups_in_topic, group_id);
         }
 
-        if let (Ok(s), Ok(t)) = (stream_id.get_string_value(), topic_id.get_string_value()) {
+        if let (WireIdentifier::String(s), WireIdentifier::String(t)) = (stream_id, topic_id) {
             let key = (Arc::from(s.as_str()), Arc::from(t.as_str()));
             let groups_in_topic = self.topic_name_index.get(&key)?;
-
-            return match group_id.kind {
-                IdKind::Numeric => {
-                    let g_id = group_id.get_u32_value().ok()? as usize;
-                    groups_in_topic.contains(&g_id).then_some(g_id)
-                }
-                IdKind::String => {
-                    let g_name = group_id.get_string_value().ok()?;
-                    groups_in_topic
-                        .iter()
-                        .find(|&&id| {
-                            self.items
-                                .get(id)
-                                .is_some_and(|g| g.name.as_ref() == g_name)
-                        })
-                        .copied()
-                }
-            };
+            return self.resolve_group_in_list(groups_in_topic, group_id);
         }
 
         None
     }
 }
 
-// TODO: This is all a hack, we need to figure out how to do this in a way where `Identifier`
-// does not reach this stage of execution.
-
 // TODO(hubcio): Serialize proper reply (e.g. assigned group ID) instead of empty Bytes.
-impl StateHandler for CreateConsumerGroup {
+impl StateHandler for CreateConsumerGroupRequest {
     type State = ConsumerGroupsInner;
     fn apply(&self, state: &mut ConsumerGroupsInner) -> Bytes {
         let name: Arc<str> = Arc::from(self.name.as_str());
@@ -184,21 +169,19 @@ impl StateHandler for CreateConsumerGroup {
 
         state.name_index.insert(name, id);
 
-        if let (Ok(s), Ok(t)) = (
-            self.stream_id.get_u32_value(),
-            self.topic_id.get_u32_value(),
-        ) {
+        if let (WireIdentifier::Numeric(s), WireIdentifier::Numeric(t)) =
+            (&self.stream_id, &self.topic_id)
+        {
             state
                 .topic_index
-                .entry((s as usize, t as usize))
+                .entry((*s as usize, *t as usize))
                 .or_default()
                 .push(id);
         }
 
-        if let (Ok(s), Ok(t)) = (
-            self.stream_id.get_string_value(),
-            self.topic_id.get_string_value(),
-        ) {
+        if let (WireIdentifier::String(s), WireIdentifier::String(t)) =
+            (&self.stream_id, &self.topic_id)
+        {
             let key = (Arc::from(s.as_str()), Arc::from(t.as_str()));
             state.topic_name_index.entry(key).or_default().push(id);
         }
@@ -206,7 +189,7 @@ impl StateHandler for CreateConsumerGroup {
     }
 }
 
-impl StateHandler for DeleteConsumerGroup {
+impl StateHandler for DeleteConsumerGroupRequest {
     type State = ConsumerGroupsInner;
     fn apply(&self, state: &mut ConsumerGroupsInner) -> Bytes {
         let Some(id) = state.resolve_consumer_group_id_by_identifiers(
@@ -220,18 +203,16 @@ impl StateHandler for DeleteConsumerGroup {
         let group = state.items.remove(id);
         state.name_index.remove(&group.name);
 
-        if let (Ok(s), Ok(t)) = (
-            self.stream_id.get_u32_value(),
-            self.topic_id.get_u32_value(),
-        ) && let Some(vec) = state.topic_index.get_mut(&(s as usize, t as usize))
+        if let (WireIdentifier::Numeric(s), WireIdentifier::Numeric(t)) =
+            (&self.stream_id, &self.topic_id)
+            && let Some(vec) = state.topic_index.get_mut(&(*s as usize, *t as usize))
         {
             vec.retain(|&x| x != id);
         }
 
-        if let (Ok(s), Ok(t)) = (
-            self.stream_id.get_string_value(),
-            self.topic_id.get_string_value(),
-        ) {
+        if let (WireIdentifier::String(s), WireIdentifier::String(t)) =
+            (&self.stream_id, &self.topic_id)
+        {
             let key = (Arc::from(s.as_str()), Arc::from(t.as_str()));
             if let Some(vec) = state.topic_name_index.get_mut(&key) {
                 vec.retain(|&x| x != id);

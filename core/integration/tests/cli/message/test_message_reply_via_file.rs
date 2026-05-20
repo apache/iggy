@@ -21,7 +21,7 @@ use crate::cli::message::test_message_poll_to_file_command::TestMessagePollToFil
 use crate::cli::message::test_message_send_from_file_command::TestMessageSendFromFileCmd;
 use iggy::prelude::*;
 use serial_test::parallel;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 #[tokio::test]
@@ -42,7 +42,7 @@ pub async fn should_be_successful() {
         "accusantium doloremque laudantium, totam rem aperiam, eaque ipsa",
     ];
 
-    let test_headers = HashMap::from([
+    let test_headers = BTreeMap::from([
         (
             HeaderKey::from_str("HeaderKey1").unwrap(),
             HeaderValue::from_str("HeaderValue1").unwrap(),

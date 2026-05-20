@@ -21,7 +21,6 @@ use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::Client;
-use iggy_common::get_personal_access_tokens::GetPersonalAccessTokens;
 use tracing::{Level, event};
 
 pub enum GetPersonalAccessTokensOutput {
@@ -30,16 +29,12 @@ pub enum GetPersonalAccessTokensOutput {
 }
 
 pub struct GetPersonalAccessTokensCmd {
-    _get_tokens: GetPersonalAccessTokens,
     output: GetPersonalAccessTokensOutput,
 }
 
 impl GetPersonalAccessTokensCmd {
     pub fn new(output: GetPersonalAccessTokensOutput) -> Self {
-        Self {
-            _get_tokens: GetPersonalAccessTokens {},
-            output,
-        }
+        Self { output }
     }
 }
 

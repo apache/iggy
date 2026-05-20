@@ -16,11 +16,11 @@
  * under the License.
  */
 
-use ahash::AHashMap;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
@@ -122,11 +122,9 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
 
     print_info("Creating clients for each tenant");
     let mut tenants = Vec::new();
-    let mut tenant_id = 1;
-    for (stream, user) in streams_with_users.into_iter() {
+    for (tenant_id, (stream, user)) in (1u32..).zip(streams_with_users.into_iter()) {
         let client = create_client(&address, &user, PASSWORD).await?;
         tenants.push(Tenant::new(tenant_id, stream, user, client));
-        tenant_id += 1;
     }
 
     if ensure_access {
@@ -192,7 +190,7 @@ async fn create_user(
         .get_stream(&stream_name.try_into()?)
         .await?
         .expect("Stream does not exist");
-    let mut topic_permissions = AHashMap::new();
+    let mut topic_permissions = BTreeMap::new();
     for topic in topics {
         let topic_id = Identifier::named(topic)?;
         let topic = client
@@ -210,7 +208,7 @@ async fn create_user(
         );
     }
 
-    let mut streams_permissions = AHashMap::new();
+    let mut streams_permissions = BTreeMap::new();
     streams_permissions.insert(
         stream.id as usize,
         StreamPermissions {

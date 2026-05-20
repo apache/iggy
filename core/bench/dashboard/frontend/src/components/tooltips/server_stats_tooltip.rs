@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::state::ui::ViewMode;
 use bench_dashboard_shared::BenchmarkReportLight;
 use yew::prelude::*;
 
@@ -23,7 +22,6 @@ use yew::prelude::*;
 pub struct ServerStatsTooltipProps {
     pub benchmark_report: Option<BenchmarkReportLight>,
     pub visible: bool,
-    pub view_mode: ViewMode,
 }
 
 #[function_component(ServerStatsTooltip)]

@@ -17,7 +17,7 @@
 
 [package]
 name = "apache-iggy"
-version = "0.7.4-dev1"
+version = "0.8.1-dev1"
 edition = "2024"
 authors = ["Iggy Committers <dev@iggy.apache.org>"]
 license = "Apache-2.0"
@@ -28,14 +28,14 @@ repository = "https://github.com/apache/iggy"
 [dependencies]
 bytes = "1.11.1"
 futures = "0.3.32"
-iggy = { path = "../../core/sdk", version = "0.9.4-edge.1" }
-pyo3 = "0.28.2"
+iggy = { path = "../../core/sdk", version = "0.10.1-edge.1" }
+pyo3 = "0.28.3"
 pyo3-async-runtimes = { version = "0.28.0", features = [
     "attributes",
     "tokio-runtime",
 ] }
-pyo3-stub-gen = "0.19.0"
-tokio = "1.50.0"
+pyo3-stub-gen = "0.22.3"
+tokio = "1.52.3"
 
 [lib]
 name = "apache_iggy"

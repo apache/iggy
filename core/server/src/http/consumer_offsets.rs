@@ -30,7 +30,6 @@ use iggy_common::Consumer;
 use iggy_common::ConsumerOffsetInfo;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
-use iggy_common::Validatable;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
@@ -56,26 +55,24 @@ async fn get_consumer_offset(
     Path((stream_id, topic_id)): Path<(String, String)>,
     query: Query<GetConsumerOffset>,
 ) -> Result<Json<ConsumerOffsetInfo>, CustomError> {
-    let mut query = query;
-    query.stream_id = Identifier::from_str_value(&stream_id)?;
-    query.topic_id = Identifier::from_str_value(&topic_id)?;
-    query.validate()?;
+    let stream_id = Identifier::from_str_value(&stream_id)?;
+    let topic_id = Identifier::from_str_value(&topic_id)?;
 
     let shard = state.shard.shard();
-    let topic = shard.resolve_topic(&query.stream_id, &query.topic_id)?;
+    let topic = shard.resolve_topic(&stream_id, &topic_id)?;
     shard
         .metadata
         .perm_get_consumer_offset(identity.user_id, topic.stream_id, topic.topic_id)?;
 
-    let consumer = Consumer::new(query.0.consumer.id);
+    let consumer = Consumer::new(query.consumer.id.clone());
     let Ok(offset) = state
         .shard
         .get_consumer_offset(
             0, // HTTP uses client_id 0 as it doesn't have persistent sessions
             consumer,
-            &query.0.stream_id,
-            &query.0.topic_id,
-            query.0.partition_id,
+            &stream_id,
+            &topic_id,
+            query.partition_id,
         )
         .await
     else {
@@ -94,30 +91,29 @@ async fn store_consumer_offset(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
     Path((stream_id, topic_id)): Path<(String, String)>,
-    mut command: Json<StoreConsumerOffset>,
+    Json(body): Json<StoreConsumerOffset>,
 ) -> Result<StatusCode, CustomError> {
-    command.stream_id = Identifier::from_str_value(&stream_id)?;
-    command.topic_id = Identifier::from_str_value(&topic_id)?;
-    command.validate()?;
+    let stream_id = Identifier::from_str_value(&stream_id)?;
+    let topic_id = Identifier::from_str_value(&topic_id)?;
 
     let shard = state.shard.shard();
-    let topic = shard.resolve_topic(&command.stream_id, &command.topic_id)?;
+    let topic = shard.resolve_topic(&stream_id, &topic_id)?;
     shard
         .metadata
         .perm_store_consumer_offset(identity.user_id, topic.stream_id, topic.topic_id)?;
 
-    let consumer = Consumer::new(command.0.consumer.id);
+    let consumer = Consumer::new(body.consumer.id);
     state.shard
         .store_consumer_offset(
             0, // HTTP uses client_id 0 as it doesn't have persistent sessions
             consumer,
-            &command.0.stream_id,
-            &command.0.topic_id,
-            command.0.partition_id,
-            command.0.offset,
+            &stream_id,
+            &topic_id,
+            body.partition_id,
+            body.offset,
         )
         .await
-        .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to store consumer offset, stream ID: {}, topic ID: {}, partition ID: {:?}", stream_id, topic_id, command.0.partition_id))?;
+        .error(|e: &IggyError| format!("{COMPONENT} (error: {e}) - failed to store consumer offset, stream ID: {stream_id}, topic ID: {topic_id}, partition ID: {:?}", body.partition_id))?;
     Ok(StatusCode::NO_CONTENT)
 }
 

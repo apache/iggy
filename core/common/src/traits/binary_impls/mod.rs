@@ -26,3 +26,14 @@ mod streams;
 mod system;
 mod topics;
 mod users;
+
+use crate::IggyError;
+use iggy_binary_protocol::WireDecode;
+
+/// Decode a wire response, logging the error details before converting to `IggyError`.
+pub(crate) fn decode_response<T: WireDecode>(response: &[u8]) -> Result<T, IggyError> {
+    T::decode_from(response).map_err(|e| {
+        tracing::warn!("failed to decode {}: {e}", std::any::type_name::<T>());
+        IggyError::InvalidFormat
+    })
+}

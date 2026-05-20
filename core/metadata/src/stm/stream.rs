@@ -15,23 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::stats::{StreamStats, TopicStats};
 use crate::stm::StateHandler;
 use crate::stm::snapshot::Snapshotable;
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
 use bytes::Bytes;
-use iggy_common::create_partitions::CreatePartitions;
-use iggy_common::create_stream::CreateStream;
-use iggy_common::create_topic::CreateTopic;
-use iggy_common::delete_partitions::DeletePartitions;
-use iggy_common::delete_stream::DeleteStream;
-use iggy_common::delete_topic::DeleteTopic;
-use iggy_common::purge_stream::PurgeStream;
-use iggy_common::purge_topic::PurgeTopic;
-use iggy_common::update_stream::UpdateStream;
-use iggy_common::update_topic::UpdateTopic;
-use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
+use iggy_binary_protocol::WireIdentifier;
+use iggy_binary_protocol::requests::partitions::{
+    CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
+};
+use iggy_binary_protocol::requests::streams::{
+    CreateStreamRequest, DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
+};
+use iggy_binary_protocol::requests::topics::{
+    CreateTopicWithAssignmentsRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
+};
+use iggy_common::{
+    CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, StreamStats, TopicStats,
+};
 use serde::{Deserialize, Serialize};
 use slab::Slab;
 use std::sync::Arc;
@@ -41,19 +42,25 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartitionSnapshot {
     pub id: usize,
+    pub consensus_group_id: u64,
     pub created_at: IggyTimestamp,
 }
 
 #[derive(Debug, Clone)]
 pub struct Partition {
     pub id: usize,
+    pub consensus_group_id: u64,
     pub created_at: IggyTimestamp,
 }
 
 impl Partition {
     #[must_use]
-    pub const fn new(id: usize, created_at: IggyTimestamp) -> Self {
-        Self { id, created_at }
+    pub const fn new(id: usize, consensus_group_id: u64, created_at: IggyTimestamp) -> Self {
+        Self {
+            id,
+            consensus_group_id,
+            created_at,
+        }
     }
 }
 
@@ -223,61 +230,105 @@ collect_handlers! {
         UpdateStream,
         DeleteStream,
         PurgeStream,
-        CreateTopic,
+        CreateTopicWithAssignments,
         UpdateTopic,
         DeleteTopic,
         PurgeTopic,
-        CreatePartitions,
+        CreatePartitionsWithAssignments,
         DeletePartitions,
     }
 }
 
 impl StreamsInner {
-    fn resolve_stream_id(&self, identifier: &iggy_common::Identifier) -> Option<usize> {
-        use iggy_common::IdKind;
-        match identifier.kind {
-            IdKind::Numeric => {
-                let id = identifier.get_u32_value().ok()? as usize;
+    fn resolve_stream_id(&self, identifier: &WireIdentifier) -> Option<usize> {
+        match identifier {
+            WireIdentifier::Numeric(id) => {
+                let id = *id as usize;
                 if self.items.contains(id) {
                     Some(id)
                 } else {
                     None
                 }
             }
-            IdKind::String => {
-                let name = identifier.get_string_value().ok()?;
-                self.index.get(name.as_str()).copied()
-            }
+            WireIdentifier::String(name) => self.index.get(name.as_str()).copied(),
         }
     }
 
-    fn resolve_topic_id(
-        &self,
-        stream_id: usize,
-        identifier: &iggy_common::Identifier,
-    ) -> Option<usize> {
-        use iggy_common::IdKind;
+    fn resolve_topic_id(&self, stream_id: usize, identifier: &WireIdentifier) -> Option<usize> {
         let stream = self.items.get(stream_id)?;
-
-        match identifier.kind {
-            IdKind::Numeric => {
-                let id = identifier.get_u32_value().ok()? as usize;
+        match identifier {
+            WireIdentifier::Numeric(id) => {
+                let id = *id as usize;
                 if stream.topics.contains(id) {
                     Some(id)
                 } else {
                     None
                 }
             }
-            IdKind::String => {
-                let name = identifier.get_string_value().ok()?;
-                stream.topic_index.get(name.as_str()).copied()
-            }
+            WireIdentifier::String(name) => stream.topic_index.get(name.as_str()).copied(),
         }
     }
 }
 
+impl Streams {
+    #[must_use]
+    pub fn read<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&StreamsInner) -> R,
+    {
+        self.inner.read(f)
+    }
+
+    #[must_use]
+    pub fn partition_count_context(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+    ) -> Option<((usize, usize), u32)> {
+        self.inner.read(|inner| {
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+            let stream = inner.items.get(stream_id)?;
+            let topic = stream.topics.get(topic_id)?;
+            let next_partition_id = topic
+                .partitions
+                .iter()
+                .map(|partition| partition.id)
+                .max()
+                .and_then(|partition_id| partition_id.checked_add(1))
+                .and_then(|partition_id| u32::try_from(partition_id).ok())
+                .unwrap_or(0);
+            Some(((stream_id, topic_id), next_partition_id))
+        })
+    }
+
+    #[must_use]
+    pub fn current_partition_count(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+    ) -> Option<u32> {
+        self.partition_count_context(stream_id, topic_id)
+            .map(|(_, next_partition_id)| next_partition_id)
+    }
+
+    #[must_use]
+    pub fn highest_partition_consensus_group_id(&self) -> u64 {
+        self.inner.read(|inner| {
+            inner
+                .items
+                .iter()
+                .flat_map(|(_, stream)| stream.topics.iter())
+                .flat_map(|(_, topic)| topic.partitions.iter())
+                .map(|partition| partition.consensus_group_id)
+                .max()
+                .unwrap_or(0)
+        })
+    }
+}
+
 // TODO(hubcio): Serialize proper reply (e.g. assigned stream ID) instead of empty Bytes.
-impl StateHandler for CreateStream {
+impl StateHandler for CreateStreamRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let name_arc: Arc<str> = Arc::from(self.name.as_str());
@@ -288,7 +339,7 @@ impl StateHandler for CreateStream {
         let stream = Stream {
             id: 0,
             name: name_arc.clone(),
-            created_at: iggy_common::IggyTimestamp::now(),
+            created_at: IggyTimestamp::now(),
             stats: Arc::new(StreamStats::default()),
             topics: Slab::new(),
             topic_index: AHashMap::default(),
@@ -303,7 +354,7 @@ impl StateHandler for CreateStream {
     }
 }
 
-impl StateHandler for UpdateStream {
+impl StateHandler for UpdateStreamRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
@@ -327,7 +378,7 @@ impl StateHandler for UpdateStream {
     }
 }
 
-impl StateHandler for DeleteStream {
+impl StateHandler for DeleteStreamRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
@@ -344,7 +395,7 @@ impl StateHandler for DeleteStream {
     }
 }
 
-impl StateHandler for PurgeStream {
+impl StateHandler for PurgeStreamRequest {
     type State = StreamsInner;
     fn apply(&self, _state: &mut StreamsInner) -> Bytes {
         // TODO
@@ -353,29 +404,38 @@ impl StateHandler for PurgeStream {
 }
 
 // TODO(hubcio): Serialize proper reply (e.g. assigned topic ID) instead of empty Bytes.
-impl StateHandler for CreateTopic {
+impl StateHandler for CreateTopicWithAssignmentsRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
-        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+        let Some(stream_id) = state.resolve_stream_id(&self.request.stream_id) else {
             return Bytes::new();
         };
         let Some(stream) = state.items.get_mut(stream_id) else {
             return Bytes::new();
         };
 
-        let name_arc: Arc<str> = Arc::from(self.name.as_str());
+        let name_arc: Arc<str> = Arc::from(self.request.name.as_str());
         if stream.topic_index.contains_key(&name_arc) {
             return Bytes::new();
         }
 
+        let replication_factor = if self.request.replication_factor == 0 {
+            1
+        } else {
+            self.request.replication_factor
+        };
+
         let topic = Topic {
             id: 0,
             name: name_arc.clone(),
-            created_at: iggy_common::IggyTimestamp::now(),
-            replication_factor: self.replication_factor.unwrap_or(1),
-            message_expiry: self.message_expiry,
-            compression_algorithm: self.compression_algorithm,
-            max_topic_size: self.max_topic_size,
+            created_at: IggyTimestamp::now(),
+            replication_factor,
+            message_expiry: IggyExpiry::from(self.request.message_expiry),
+            compression_algorithm: CompressionAlgorithm::from_code(
+                self.request.compression_algorithm,
+            )
+            .unwrap_or_default(),
+            max_topic_size: MaxTopicSize::from(self.request.max_topic_size),
             stats: Arc::new(TopicStats::new(stream.stats.clone())),
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
@@ -385,10 +445,11 @@ impl StateHandler for CreateTopic {
         if let Some(topic) = stream.topics.get_mut(topic_id) {
             topic.id = topic_id;
 
-            for partition_id in 0..self.partitions_count as usize {
+            for partition in &self.partitions {
                 let partition = Partition {
-                    id: partition_id,
-                    created_at: iggy_common::IggyTimestamp::now(),
+                    id: partition.partition_id as usize,
+                    consensus_group_id: partition.consensus_group_id,
+                    created_at: IggyTimestamp::now(),
                 };
                 topic.partitions.push(partition);
             }
@@ -399,7 +460,7 @@ impl StateHandler for CreateTopic {
     }
 }
 
-impl StateHandler for UpdateTopic {
+impl StateHandler for UpdateTopicRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
@@ -425,18 +486,19 @@ impl StateHandler for UpdateTopic {
 
         stream.topic_index.remove(&topic.name);
         topic.name = new_name_arc.clone();
-        topic.compression_algorithm = self.compression_algorithm;
-        topic.message_expiry = self.message_expiry;
-        topic.max_topic_size = self.max_topic_size;
-        if let Some(rf) = self.replication_factor {
-            topic.replication_factor = rf;
+        topic.compression_algorithm =
+            CompressionAlgorithm::from_code(self.compression_algorithm).unwrap_or_default();
+        topic.message_expiry = IggyExpiry::from(self.message_expiry);
+        topic.max_topic_size = MaxTopicSize::from(self.max_topic_size);
+        if self.replication_factor != 0 {
+            topic.replication_factor = self.replication_factor;
         }
         stream.topic_index.insert(new_name_arc, topic_id);
         Bytes::new()
     }
 }
 
-impl StateHandler for DeleteTopic {
+impl StateHandler for DeleteTopicRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
@@ -458,7 +520,7 @@ impl StateHandler for DeleteTopic {
     }
 }
 
-impl StateHandler for PurgeTopic {
+impl StateHandler for PurgeTopicRequest {
     type State = StreamsInner;
     fn apply(&self, _state: &mut StreamsInner) -> Bytes {
         // TODO
@@ -467,13 +529,13 @@ impl StateHandler for PurgeTopic {
 }
 
 // TODO(hubcio): Serialize proper reply (e.g. assigned partition IDs) instead of empty Bytes.
-impl StateHandler for CreatePartitions {
+impl StateHandler for CreatePartitionsWithAssignmentsRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
-        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+        let Some(stream_id) = state.resolve_stream_id(&self.request.stream_id) else {
             return Bytes::new();
         };
-        let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
+        let Some(topic_id) = state.resolve_topic_id(stream_id, &self.request.topic_id) else {
             return Bytes::new();
         };
 
@@ -484,12 +546,29 @@ impl StateHandler for CreatePartitions {
             return Bytes::new();
         };
 
-        let current_partition_count = topic.partitions.len();
-        for i in 0..self.partitions_count as usize {
-            let partition_id = current_partition_count + i;
+        let base_partition_id = topic
+            .partitions
+            .iter()
+            .map(|partition| partition.id)
+            .max()
+            .and_then(|partition_id| partition_id.checked_add(1))
+            .unwrap_or(0);
+        let Ok(base_partition_id) = u32::try_from(base_partition_id) else {
+            return Bytes::new();
+        };
+
+        for partition in &self.partitions {
+            let partition_id = partition
+                .partition_id
+                .checked_add(base_partition_id)
+                .and_then(|partition_id| usize::try_from(partition_id).ok());
+            let Some(partition_id) = partition_id else {
+                return Bytes::new();
+            };
             let partition = Partition {
                 id: partition_id,
-                created_at: iggy_common::IggyTimestamp::now(),
+                consensus_group_id: partition.consensus_group_id,
+                created_at: IggyTimestamp::now(),
             };
             topic.partitions.push(partition);
         }
@@ -497,7 +576,7 @@ impl StateHandler for CreatePartitions {
     }
 }
 
-impl StateHandler for DeletePartitions {
+impl StateHandler for DeletePartitionsRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner) -> Bytes {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
@@ -566,6 +645,7 @@ impl Snapshotable for Streams {
                                         .iter()
                                         .map(|p| PartitionSnapshot {
                                             id: p.id,
+                                            consensus_group_id: p.consensus_group_id,
                                             created_at: p.created_at,
                                         })
                                         .collect(),
@@ -635,6 +715,7 @@ impl Snapshotable for Streams {
                         .into_iter()
                         .map(|p| Partition {
                             id: p.id,
+                            consensus_group_id: p.consensus_group_id,
                             created_at: p.created_at,
                         })
                         .collect(),
@@ -671,3 +752,118 @@ impl Snapshotable for Streams {
 }
 
 impl_fill_restore!(Streams, streams);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_binary_protocol::WireName;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::partitions::{
+        CreatePartitionsRequest as WireCreatePartitionsRequest,
+        CreatePartitionsWithAssignmentsRequest,
+    };
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest as WireCreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
+
+    fn create_stream(inner: &mut StreamsInner, name: &str) {
+        let request = CreateStreamRequest {
+            name: WireName::new(name).unwrap(),
+        };
+        let _ = StateHandler::apply(&request, inner);
+    }
+
+    fn make_topic_request(
+        stream_id: u32,
+        partitions_count: u32,
+        name: &str,
+    ) -> WireCreateTopicRequest {
+        WireCreateTopicRequest {
+            stream_id: WireIdentifier::numeric(stream_id),
+            partitions_count,
+            compression_algorithm: 0,
+            message_expiry: 0,
+            max_topic_size: 0,
+            replication_factor: 1,
+            name: WireName::new(name).unwrap(),
+        }
+    }
+
+    #[test]
+    fn current_partition_count_scans_existing_topic_state() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 2, "topic"),
+            partitions: vec![
+                CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 1,
+                },
+                CreatedPartitionAssignment {
+                    partition_id: 1,
+                    consensus_group_id: 2,
+                },
+            ],
+        };
+        let _ = StateHandler::apply(&create_topic, &mut inner);
+        let streams: Streams = inner.into();
+
+        assert_eq!(
+            streams
+                .current_partition_count(&WireIdentifier::numeric(0), &WireIdentifier::numeric(0)),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn applying_enriched_create_commands_stores_consensus_group_ids() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 2, "topic"),
+            partitions: vec![
+                CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 10,
+                },
+                CreatedPartitionAssignment {
+                    partition_id: 1,
+                    consensus_group_id: 11,
+                },
+            ],
+        };
+        let _ = StateHandler::apply(&create_topic, &mut inner);
+
+        let create_partitions = CreatePartitionsWithAssignmentsRequest {
+            request: WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 2,
+            },
+            partitions: vec![
+                CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 12,
+                },
+                CreatedPartitionAssignment {
+                    partition_id: 1,
+                    consensus_group_id: 13,
+                },
+            ],
+        };
+        let _ = StateHandler::apply(&create_partitions, &mut inner);
+
+        assert_eq!(inner.items[0].topics[0].partitions.len(), 4);
+        assert_eq!(inner.items[0].topics[0].partitions[2].id, 2);
+        assert_eq!(inner.items[0].topics[0].partitions[3].id, 3);
+        assert_eq!(
+            inner.items[0].topics[0].partitions[0].consensus_group_id,
+            10
+        );
+        assert_eq!(
+            inner.items[0].topics[0].partitions[3].consensus_group_id,
+            13
+        );
+    }
+}

@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use crate::binary::dispatch::{HandlerResult, wire_id_to_identifier};
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
 use iggy_binary_protocol::requests::topics::PurgeTopicRequest;
-use iggy_common::purge_topic::PurgeTopic;
 use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
@@ -34,21 +33,15 @@ pub async fn handle_purge_topic(
     session: &Session,
     shard: &Rc<IggyShard>,
 ) -> Result<HandlerResult, IggyError> {
-    let stream_id = wire_id_to_identifier(&req.stream_id)?;
-    let topic_id = wire_id_to_identifier(&req.topic_id)?;
     debug!(
-        "session: {session}, command: purge_topic, stream_id: {stream_id}, topic_id: {topic_id}"
+        "session: {session}, command: purge_topic, stream_id: {:?}, topic_id: {:?}",
+        req.stream_id, req.topic_id
     );
     shard.ensure_authenticated(session)?;
 
-    let command = PurgeTopic {
-        stream_id,
-        topic_id,
-    };
-
     let request = ShardRequest::control_plane(ShardRequestPayload::PurgeTopicRequest {
         user_id: session.get_user_id(),
-        command,
+        command: req,
     });
 
     match shard.send_to_control_plane(request).await? {

@@ -61,6 +61,12 @@ impl MessageClient for IggyClient {
                 let payload = encryptor.decrypt(&message.payload)?;
                 message.payload = Bytes::from(payload);
                 message.header.payload_length = message.payload.len() as u32;
+
+                if let Some(ref user_headers) = message.user_headers {
+                    let decrypted_headers = encryptor.decrypt(user_headers)?;
+                    message.header.user_headers_length = decrypted_headers.len() as u32;
+                    message.user_headers = Some(Bytes::from(decrypted_headers));
+                }
             }
         }
 
@@ -82,6 +88,12 @@ impl MessageClient for IggyClient {
             for message in &mut *messages {
                 message.payload = Bytes::from(encryptor.encrypt(&message.payload)?);
                 message.header.payload_length = message.payload.len() as u32;
+
+                if let Some(ref user_headers) = message.user_headers {
+                    let encrypted_headers = encryptor.encrypt(user_headers)?;
+                    message.header.user_headers_length = encrypted_headers.len() as u32;
+                    message.user_headers = Some(Bytes::from(encrypted_headers));
+                }
             }
         }
 

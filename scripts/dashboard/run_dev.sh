@@ -20,10 +20,11 @@
 # Exit on any error
 set -euo pipefail
 
-# Check if performance_results directory exists
-if [ ! -d "${PWD}/performance_results" ]; then
-    echo "Error: 'performance_results' directory does not exist."
-    echo "Please run benchmarks with \`output\` subcommand first to generate performance results."
+RESULTS_DIR="${RESULTS_DIR:-${PWD}/performance_results}"
+
+if [ ! -d "$RESULTS_DIR" ]; then
+    echo "Error: results directory does not exist: $RESULTS_DIR"
+    echo "Set RESULTS_DIR=/path/to/performance_results or run benchmarks with \`output\` subcommand first."
     exit 1
 fi
 
@@ -56,8 +57,8 @@ if [ $# -gt 0 ]; then
 fi
 
 # Start server in background
-echo "Starting server..."
-cargo run --bin iggy-bench-dashboard-server &
+echo "Starting server (results: $RESULTS_DIR)..."
+cargo run --bin iggy-bench-dashboard-server -- --results-dir "$RESULTS_DIR" &
 
 # Wait a bit for server to start
 sleep 1

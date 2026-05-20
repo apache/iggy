@@ -293,6 +293,12 @@ impl ProducerCore {
             for message in messages {
                 message.payload = Bytes::from(encryptor.encrypt(&message.payload)?);
                 message.header.payload_length = message.payload.len() as u32;
+
+                if let Some(ref user_headers) = message.user_headers {
+                    let encrypted_headers = encryptor.encrypt(user_headers)?;
+                    message.header.user_headers_length = encrypted_headers.len() as u32;
+                    message.user_headers = Some(Bytes::from(encrypted_headers));
+                }
             }
         }
         Ok(())

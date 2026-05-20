@@ -80,7 +80,7 @@ impl PostgresSinkFixture {
                     return Ok(rows);
                 }
             }
-            sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS / 5)).await;
+            sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)).await;
         }
         Err(TestBinaryError::InvalidState {
             message: format!(

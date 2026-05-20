@@ -16,13 +16,10 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::error::IggyError;
-use ahash::AHashMap;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use comfy_table::Table;
 use comfy_table::presets::ASCII_NO_BORDERS;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt::Display;
 
 /// `Permissions` is used to define the permissions of a user.
@@ -35,7 +32,7 @@ pub struct Permissions {
     pub global: GlobalPermissions,
 
     /// Stream permissions are applied to a specific stream.
-    pub streams: Option<AHashMap<usize, StreamPermissions>>,
+    pub streams: Option<BTreeMap<usize, StreamPermissions>>,
 }
 
 /// `GlobalPermissions` are applied to all streams without a need to specify them one by one in the `streams` field.
@@ -142,7 +139,7 @@ pub struct StreamPermissions {
     pub send_messages: bool,
 
     /// The `topics` field allows to define the granular permissions for each topic of a stream.
-    pub topics: Option<AHashMap<usize, TopicPermissions>>,
+    pub topics: Option<BTreeMap<usize, TopicPermissions>>,
 }
 
 /// `TopicPermissions` are applied to a specific topic of a stream. This is the lowest level of permissions.
@@ -216,150 +213,6 @@ impl Display for Permissions {
         }
 
         write!(f, "{result}")
-    }
-}
-
-impl BytesSerializable for Permissions {
-    fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::new();
-        bytes.put_u8(if self.global.manage_servers { 1 } else { 0 });
-        bytes.put_u8(if self.global.read_servers { 1 } else { 0 });
-        bytes.put_u8(if self.global.manage_users { 1 } else { 0 });
-        bytes.put_u8(if self.global.read_users { 1 } else { 0 });
-        bytes.put_u8(if self.global.manage_streams { 1 } else { 0 });
-        bytes.put_u8(if self.global.read_streams { 1 } else { 0 });
-        bytes.put_u8(if self.global.manage_topics { 1 } else { 0 });
-        bytes.put_u8(if self.global.read_topics { 1 } else { 0 });
-        bytes.put_u8(if self.global.poll_messages { 1 } else { 0 });
-        bytes.put_u8(if self.global.send_messages { 1 } else { 0 });
-        if let Some(streams) = self.streams.as_ref().filter(|s| !s.is_empty()) {
-            bytes.put_u8(1);
-            let streams_count = streams.len();
-            let mut current_stream = 1;
-            for (stream_id, stream) in streams {
-                bytes.put_u32_le(*stream_id as u32);
-                bytes.put_u8(if stream.manage_stream { 1 } else { 0 });
-                bytes.put_u8(if stream.read_stream { 1 } else { 0 });
-                bytes.put_u8(if stream.manage_topics { 1 } else { 0 });
-                bytes.put_u8(if stream.read_topics { 1 } else { 0 });
-                bytes.put_u8(if stream.poll_messages { 1 } else { 0 });
-                bytes.put_u8(if stream.send_messages { 1 } else { 0 });
-                if let Some(topics) = stream.topics.as_ref().filter(|t| !t.is_empty()) {
-                    bytes.put_u8(1);
-                    let topics_count = topics.len();
-                    let mut current_topic = 1;
-                    for (topic_id, topic) in topics {
-                        bytes.put_u32_le(*topic_id as u32);
-                        bytes.put_u8(if topic.manage_topic { 1 } else { 0 });
-                        bytes.put_u8(if topic.read_topic { 1 } else { 0 });
-                        bytes.put_u8(if topic.poll_messages { 1 } else { 0 });
-                        bytes.put_u8(if topic.send_messages { 1 } else { 0 });
-                        if current_topic < topics_count {
-                            current_topic += 1;
-                            bytes.put_u8(1);
-                        } else {
-                            bytes.put_u8(0);
-                        }
-                    }
-                } else {
-                    bytes.put_u8(0);
-                }
-                if current_stream < streams_count {
-                    current_stream += 1;
-                    bytes.put_u8(1);
-                } else {
-                    bytes.put_u8(0);
-                }
-            }
-        } else {
-            bytes.put_u8(0);
-        }
-        bytes.freeze()
-    }
-
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        let mut bytes = bytes;
-        let manage_servers = bytes.get_u8() == 1;
-        let read_servers = bytes.get_u8() == 1;
-        let manage_users = bytes.get_u8() == 1;
-        let read_users = bytes.get_u8() == 1;
-        let manage_streams = bytes.get_u8() == 1;
-        let read_streams = bytes.get_u8() == 1;
-        let manage_topics = bytes.get_u8() == 1;
-        let read_topics = bytes.get_u8() == 1;
-        let poll_messages = bytes.get_u8() == 1;
-        let send_messages = bytes.get_u8() == 1;
-        let mut streams = None;
-        if bytes.get_u8() == 1 {
-            let mut streams_map = AHashMap::new();
-            loop {
-                let stream_id = bytes.get_u32_le() as usize;
-                let manage_stream = bytes.get_u8() == 1;
-                let read_stream = bytes.get_u8() == 1;
-                let manage_topics = bytes.get_u8() == 1;
-                let read_topics = bytes.get_u8() == 1;
-                let poll_messages = bytes.get_u8() == 1;
-                let send_messages = bytes.get_u8() == 1;
-                let mut topics = None;
-                if bytes.get_u8() == 1 {
-                    let mut topics_map = AHashMap::new();
-                    loop {
-                        let topic_id = bytes.get_u32_le() as usize;
-                        let manage_topic = bytes.get_u8() == 1;
-                        let read_topic = bytes.get_u8() == 1;
-                        let poll_messages = bytes.get_u8() == 1;
-                        let send_messages = bytes.get_u8() == 1;
-                        topics_map.insert(
-                            topic_id,
-                            TopicPermissions {
-                                manage_topic,
-                                read_topic,
-                                poll_messages,
-                                send_messages,
-                            },
-                        );
-                        if bytes.get_u8() == 0 {
-                            break;
-                        }
-                    }
-                    topics = Some(topics_map);
-                }
-                streams_map.insert(
-                    stream_id,
-                    StreamPermissions {
-                        manage_stream,
-                        read_stream,
-                        manage_topics,
-                        read_topics,
-                        poll_messages,
-                        send_messages,
-                        topics,
-                    },
-                );
-                if bytes.get_u8() == 0 {
-                    break;
-                }
-            }
-            streams = Some(streams_map);
-        }
-        Ok(Self {
-            global: GlobalPermissions {
-                manage_servers,
-                read_servers,
-                manage_users,
-                read_users,
-                manage_streams,
-                read_streams,
-                manage_topics,
-                read_topics,
-                poll_messages,
-                send_messages,
-            },
-            streams,
-        })
     }
 }
 
@@ -468,116 +321,5 @@ impl From<&StreamPermissions> for Table {
         }
 
         table
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn should_be_serialized_and_deserialized_from_bytes() {
-        let permissions = Permissions {
-            global: GlobalPermissions {
-                manage_servers: true,
-                read_servers: true,
-                manage_users: true,
-                read_users: true,
-                manage_streams: false,
-                read_streams: true,
-                manage_topics: false,
-                read_topics: true,
-                poll_messages: true,
-                send_messages: true,
-            },
-            streams: Some(AHashMap::from([
-                (
-                    1,
-                    StreamPermissions {
-                        manage_stream: true,
-                        read_stream: true,
-                        manage_topics: true,
-                        read_topics: true,
-                        poll_messages: true,
-                        send_messages: true,
-                        topics: Some(AHashMap::from([
-                            (
-                                1,
-                                TopicPermissions {
-                                    manage_topic: true,
-                                    read_topic: true,
-                                    poll_messages: true,
-                                    send_messages: true,
-                                },
-                            ),
-                            (
-                                2,
-                                TopicPermissions {
-                                    manage_topic: true,
-                                    read_topic: false,
-                                    poll_messages: true,
-                                    send_messages: false,
-                                },
-                            ),
-                        ])),
-                    },
-                ),
-                (
-                    2,
-                    StreamPermissions {
-                        manage_stream: false,
-                        read_stream: true,
-                        manage_topics: false,
-                        read_topics: true,
-                        poll_messages: true,
-                        send_messages: true,
-                        topics: None,
-                    },
-                ),
-            ])),
-        };
-
-        let bytes = permissions.to_bytes();
-        let deserialized_permissions = Permissions::from_bytes(bytes).unwrap();
-
-        assert_eq!(permissions, deserialized_permissions);
-    }
-
-    #[test]
-    fn should_handle_empty_streams_map() {
-        let permissions = Permissions {
-            global: GlobalPermissions::default(),
-            streams: Some(AHashMap::new()),
-        };
-
-        let bytes = permissions.to_bytes();
-        let deserialized = Permissions::from_bytes(bytes).unwrap();
-
-        assert!(deserialized.streams.is_none());
-    }
-
-    #[test]
-    fn should_handle_empty_topics_map() {
-        let permissions = Permissions {
-            global: GlobalPermissions::default(),
-            streams: Some(AHashMap::from([(
-                1,
-                StreamPermissions {
-                    manage_stream: true,
-                    read_stream: true,
-                    manage_topics: false,
-                    read_topics: false,
-                    poll_messages: false,
-                    send_messages: false,
-                    topics: Some(AHashMap::new()),
-                },
-            )])),
-        };
-
-        let bytes = permissions.to_bytes();
-        let deserialized = Permissions::from_bytes(bytes).unwrap();
-
-        let stream = deserialized.streams.as_ref().unwrap().get(&1).unwrap();
-        assert!(stream.topics.is_none());
     }
 }

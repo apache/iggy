@@ -19,7 +19,6 @@
 
 #pragma once
 
-#include <cassert>
 #include <cstdint>
 #include <string>
 
@@ -27,24 +26,13 @@
 
 inline iggy::ffi::Identifier make_string_identifier(const std::string &value) {
     iggy::ffi::Identifier identifier;
-    identifier.kind   = "string";
-    identifier.length = static_cast<std::uint8_t>(value.size());
-    for (const char c : value) {
-        identifier.value.push_back(static_cast<std::uint8_t>(c));
-    }
-    assert(identifier.length == identifier.value.size());
+    identifier.from_string(value);
     return identifier;
 }
 
 inline iggy::ffi::Identifier make_numeric_identifier(const std::uint32_t value) {
     iggy::ffi::Identifier identifier;
-    identifier.kind   = "numeric";
-    identifier.length = 4;
-    identifier.value.push_back(static_cast<std::uint8_t>(value & 0xFF));
-    identifier.value.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFF));
-    identifier.value.push_back(static_cast<std::uint8_t>((value >> 16) & 0xFF));
-    identifier.value.push_back(static_cast<std::uint8_t>((value >> 24) & 0xFF));
-    assert(identifier.length == identifier.value.size());
+    identifier.from_numeric(value);
     return identifier;
 }
 
@@ -53,4 +41,21 @@ inline iggy::ffi::Client *login_to_server() {
     client->connect();
     client->login_user("iggy", "iggy");
     return client;
+}
+
+inline rust::Vec<std::uint8_t> to_payload(const std::string &s) {
+    rust::Vec<std::uint8_t> v;
+    for (const char c : s) {
+        v.push_back(static_cast<std::uint8_t>(c));
+    }
+    return v;
+}
+
+inline rust::Vec<std::uint8_t> partition_id_bytes(std::uint32_t id) {
+    rust::Vec<std::uint8_t> v;
+    v.push_back(static_cast<std::uint8_t>(id & 0xFF));
+    v.push_back(static_cast<std::uint8_t>((id >> 8) & 0xFF));
+    v.push_back(static_cast<std::uint8_t>((id >> 16) & 0xFF));
+    v.push_back(static_cast<std::uint8_t>((id >> 24) & 0xFF));
+    return v;
 }

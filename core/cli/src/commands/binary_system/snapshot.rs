@@ -23,13 +23,13 @@ use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::Client;
-use iggy_common::get_snapshot::GetSnapshot;
 use iggy_common::{SnapshotCompression, SystemSnapshotType};
 use tokio::io::AsyncWriteExt;
 use tracing::{Level, event};
 
 pub struct GetSnapshotCmd {
-    _get_snapshot: GetSnapshot,
+    compression: SnapshotCompression,
+    snapshot_types: Vec<SystemSnapshotType>,
     out_dir: String,
 }
 
@@ -39,28 +39,23 @@ impl GetSnapshotCmd {
         snapshot_types: Option<Vec<SystemSnapshotType>>,
         out_dir: Option<String>,
     ) -> Self {
-        let mut cmd = GetSnapshotCmd::default();
-
-        if let Some(compress) = compression {
-            cmd._get_snapshot.compression = compress;
+        let default_types = vec![
+            SystemSnapshotType::FilesystemOverview,
+            SystemSnapshotType::ProcessList,
+            SystemSnapshotType::ResourceUsage,
+            SystemSnapshotType::ServerLogs,
+        ];
+        Self {
+            compression: compression.unwrap_or(SnapshotCompression::Deflated),
+            snapshot_types: snapshot_types.unwrap_or(default_types),
+            out_dir: out_dir.unwrap_or_else(|| ".".to_string()),
         }
-        if let Some(types) = snapshot_types {
-            cmd._get_snapshot.snapshot_types = types
-        }
-        if let Some(out) = out_dir {
-            cmd.out_dir = out
-        }
-
-        cmd
     }
 }
 
 impl Default for GetSnapshotCmd {
     fn default() -> Self {
-        Self {
-            _get_snapshot: GetSnapshot::default(),
-            out_dir: ".".to_string(),
-        }
+        Self::new(None, None, None)
     }
 }
 
@@ -72,10 +67,7 @@ impl CliCommand for GetSnapshotCmd {
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let snapshot_data = client
-            .snapshot(
-                self._get_snapshot.compression,
-                self._get_snapshot.snapshot_types.to_owned(),
-            )
+            .snapshot(self.compression, self.snapshot_types.to_owned())
             .await
             .with_context(|| "Problem sending snapshot command".to_owned())?;
         let file_path = Path::new(&self.out_dir).join(format!(

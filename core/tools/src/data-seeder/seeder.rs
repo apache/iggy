@@ -18,7 +18,7 @@
 
 use iggy::prelude::*;
 use rand::RngExt;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 const PROD_STREAM_NAME: &str = "prod";
 const TEST_STREAM_NAME: &str = "test";
@@ -155,7 +155,7 @@ async fn send_messages(client: &IggyClient, streams: &[(String, u32)]) -> Result
                     let headers = match rng.random_bool(0.5) {
                         false => None,
                         true => {
-                            let mut headers = HashMap::new();
+                            let mut headers = BTreeMap::new();
                             headers.insert(
                                 HeaderKey::try_from("key 1")?,
                                 HeaderValue::try_from("value1")?,

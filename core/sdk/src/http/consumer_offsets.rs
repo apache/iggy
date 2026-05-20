@@ -40,8 +40,6 @@ impl ConsumerOffsetClient for HttpClient {
             &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
             &StoreConsumerOffset {
                 consumer: consumer.clone(),
-                stream_id: stream_id.clone(),
-                topic_id: topic_id.clone(),
                 partition_id,
                 offset,
             },
@@ -62,8 +60,6 @@ impl ConsumerOffsetClient for HttpClient {
                 &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
                 &GetConsumerOffset {
                     consumer: consumer.clone(),
-                    stream_id: stream_id.clone(),
-                    topic_id: topic_id.clone(),
                     partition_id,
                 },
             )

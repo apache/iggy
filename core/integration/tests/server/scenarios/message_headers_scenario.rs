@@ -22,7 +22,7 @@ use crate::server::scenarios::{
 use bytes::Bytes;
 use iggy::prelude::*;
 use integration::harness::{TestHarness, assert_clean_system};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 pub async fn run(harness: &TestHarness) {
     let client = harness
@@ -129,8 +129,8 @@ fn create_message_payload(offset: u64) -> Bytes {
     Bytes::from(format!("message {offset}"))
 }
 
-fn create_message_headers() -> HashMap<HeaderKey, HeaderValue> {
-    let mut headers = HashMap::new();
+fn create_message_headers() -> BTreeMap<HeaderKey, HeaderValue> {
+    let mut headers = BTreeMap::new();
     headers.insert(
         HeaderKey::try_from("key_1").unwrap(),
         HeaderValue::try_from("Value 1").unwrap(),

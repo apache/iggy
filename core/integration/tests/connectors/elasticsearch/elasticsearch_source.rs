@@ -123,7 +123,7 @@ async fn elasticsearch_source_handles_empty_index(
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
     let consumer_id: Identifier = "test_consumer".try_into().unwrap();
 
-    sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(100)).await;
 
     let polled = client
         .poll_messages(
@@ -164,7 +164,7 @@ async fn elasticsearch_source_produces_bulk_messages(
     let consumer_id: Identifier = "test_consumer".try_into().unwrap();
 
     let mut received: Vec<serde_json::Value> = Vec::new();
-    for _ in 0..POLL_ATTEMPTS * 2 {
+    for _ in 0..POLL_ATTEMPTS {
         if let Ok(polled) = client
             .poll_messages(
                 &stream_id,
@@ -270,7 +270,7 @@ async fn state_persists_across_connector_restart(
         .start_dependents()
         .await
         .expect("Failed to restart connectors");
-    sleep(Duration::from_millis(500)).await;
+    sleep(Duration::from_millis(100)).await;
 
     let mut received_after: Vec<serde_json::Value> = Vec::new();
     for _ in 0..POLL_ATTEMPTS {

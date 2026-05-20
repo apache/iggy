@@ -23,20 +23,18 @@ use comfy_table::Table;
 use iggy_common::Client;
 use iggy_common::Identifier;
 use iggy_common::IggyExpiry;
-use iggy_common::get_topic::GetTopic;
 use tracing::{Level, event};
 
 pub struct GetTopicCmd {
-    get_topic: GetTopic,
+    stream_id: Identifier,
+    topic_id: Identifier,
 }
 
 impl GetTopicCmd {
     pub fn new(stream_id: Identifier, topic_id: Identifier) -> Self {
         Self {
-            get_topic: GetTopic {
-                stream_id,
-                topic_id,
-            },
+            stream_id,
+            topic_id,
         }
     }
 }
@@ -46,23 +44,23 @@ impl CliCommand for GetTopicCmd {
     fn explain(&self) -> String {
         format!(
             "get topic with ID: {} from stream with ID: {}",
-            self.get_topic.topic_id, self.get_topic.stream_id
+            self.topic_id, self.stream_id
         )
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let topic = client
-            .get_topic(&self.get_topic.stream_id, &self.get_topic.topic_id)
+            .get_topic(&self.stream_id, &self.topic_id)
             .await
             .with_context(|| {
                 format!(
                     "Problem getting topic with ID: {} in stream {}",
-                    self.get_topic.topic_id, self.get_topic.stream_id
+                    self.topic_id, self.stream_id
                 )
             })?;
 
         if topic.is_none() {
-            event!(target: PRINT_TARGET, Level::INFO, "Topic with ID: {} in stream {} was not found", self.get_topic.topic_id, self.get_topic.stream_id);
+            event!(target: PRINT_TARGET, Level::INFO, "Topic with ID: {} in stream {} was not found", self.topic_id, self.stream_id);
             return Ok(());
         }
 

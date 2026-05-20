@@ -10,6 +10,7 @@
         <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.0.1" />
         <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.102" />
         <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="18.3.2" />
+        <PackageVersion Include="Microsoft.Testing.Extensions.Retry" Version="2.2.1" />
         <PackageVersion Include="Microsoft.Testing.Extensions.TrxReport" Version="2.0.2" />
         <PackageVersion Include="Moq" Version="4.20.72" />
         <PackageVersion Include="Reqnroll.xunit.v3" Version="3.3.3" />

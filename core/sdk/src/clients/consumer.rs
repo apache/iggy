@@ -569,6 +569,9 @@ impl IggyConsumer {
                     DiagnosticEvent::Connected => {
                         trace!("Connected to the server");
                         joined_consumer_group.store(false, ORDERING);
+                        if !is_consumer_group {
+                            can_poll.store(true, ORDERING);
+                        }
                         if disconnected {
                             reconnected = true;
                             disconnected = false;
@@ -981,12 +984,12 @@ impl Stream for IggyConsumer {
                     } else {
                         if let Some(ref encryptor) = self.encryptor {
                             for message in &mut polled_messages.messages {
+                                let offset = message.header.offset;
                                 let payload = encryptor.decrypt(&message.payload);
                                 if let Err(error) = payload {
                                     self.poll_future = None;
                                     error!(
-                                        "Failed to decrypt the message payload at offset: {}, partition ID: {}",
-                                        message.header.offset, partition_id
+                                        "Failed to decrypt the message payload at offset: {offset}, partition ID: {partition_id}",
                                     );
                                     return Poll::Ready(Some(Err(error)));
                                 }
@@ -994,6 +997,21 @@ impl Stream for IggyConsumer {
                                 let payload = payload.unwrap();
                                 message.payload = Bytes::from(payload);
                                 message.header.payload_length = message.payload.len() as u32;
+
+                                if let Some(ref user_headers) = message.user_headers {
+                                    let decrypted_headers = encryptor.decrypt(user_headers);
+                                    if let Err(error) = decrypted_headers {
+                                        self.poll_future = None;
+                                        error!(
+                                            "Failed to decrypt the message user headers at offset: {offset}, partition ID: {partition_id}",
+                                        );
+                                        return Poll::Ready(Some(Err(error)));
+                                    }
+                                    let decrypted_headers = decrypted_headers.unwrap();
+                                    message.header.user_headers_length =
+                                        decrypted_headers.len() as u32;
+                                    message.user_headers = Some(Bytes::from(decrypted_headers));
+                                }
                             }
                         }
 

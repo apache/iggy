@@ -195,6 +195,6 @@ pub trait Benchmarkable: Send {
             .map(|rl| format!(" global rate limit: {rl}/s"))
             .unwrap_or_default();
 
-        format!("{message_size}{messages_per_batch}{data}{rate_limit}",)
+        format!("{message_size}{messages_per_batch}{data}{rate_limit}")
     }
 }

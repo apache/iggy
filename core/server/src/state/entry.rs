@@ -17,10 +17,11 @@
  */
 
 use crate::state::command::EntryCommand;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
+use iggy_binary_protocol::{WireDecode, WireEncode};
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
-use iggy_common::{BytesSerializable, calculate_checksum};
+use iggy_common::calculate_checksum;
 use std::fmt::{Display, Formatter};
 
 /// State entry in the log
@@ -78,7 +79,10 @@ impl StateEntry {
     }
 
     pub fn command(&self) -> Result<EntryCommand, IggyError> {
-        EntryCommand::from_bytes(self.command.clone())
+        EntryCommand::decode_from(&self.command).map_err(|e| {
+            tracing::warn!("wire decode error during WAL replay: {e}");
+            IggyError::InvalidCommand
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -126,52 +130,22 @@ impl Display for StateEntry {
     }
 }
 
-impl BytesSerializable for StateEntry {
-    fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::with_capacity(
-            8 + 8 + 4 + 4 + 8 + 8 + 4 + 4 + 4 + self.context.len() + self.command.len(),
-        );
-        bytes.put_u64_le(self.index);
-        bytes.put_u64_le(self.term);
-        bytes.put_u32_le(self.leader_id);
-        bytes.put_u32_le(self.version);
-        bytes.put_u64_le(self.flags);
-        bytes.put_u64_le(self.timestamp.into());
-        bytes.put_u32_le(self.user_id);
-        bytes.put_u64_le(self.checksum);
-        bytes.put_u32_le(self.context.len() as u32);
-        bytes.put_slice(&self.context);
-        bytes.extend(&self.command);
-        bytes.freeze()
+impl WireEncode for StateEntry {
+    fn encoded_size(&self) -> usize {
+        8 + 8 + 4 + 4 + 8 + 8 + 4 + 8 + 4 + self.context.len() + self.command.len()
     }
 
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError>
-    where
-        Self: Sized,
-    {
-        let index = bytes.slice(0..8).get_u64_le();
-        let term = bytes.slice(8..16).get_u64_le();
-        let leader_id = bytes.slice(16..20).get_u32_le();
-        let version = bytes.slice(20..24).get_u32_le();
-        let flags = bytes.slice(24..32).get_u64_le();
-        let timestamp = IggyTimestamp::from(bytes.slice(32..40).get_u64_le());
-        let user_id = bytes.slice(40..44).get_u32_le();
-        let checksum = bytes.slice(44..52).get_u64_le();
-        let context_length = bytes.slice(52..56).get_u32_le() as usize;
-        let context = bytes.slice(56..56 + context_length);
-        let command = bytes.slice(56 + context_length..);
-
-        Ok(StateEntry {
-            index,
-            term,
-            leader_id,
-            version,
-            flags,
-            timestamp,
-            user_id,
-            checksum,
-            context,
-            command,
-        })
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u64_le(self.index);
+        buf.put_u64_le(self.term);
+        buf.put_u32_le(self.leader_id);
+        buf.put_u32_le(self.version);
+        buf.put_u64_le(self.flags);
+        buf.put_u64_le(self.timestamp.into());
+        buf.put_u32_le(self.user_id);
+        buf.put_u64_le(self.checksum);
+        buf.put_u32_le(self.context.len() as u32);
+        buf.put_slice(&self.context);
+        buf.extend_from_slice(&self.command);
     }
 }

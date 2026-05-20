@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::binary::dispatch::wire_id_to_identifier;
 use crate::streaming::users::user::User;
 use crate::streaming::utils::crypto;
 use crate::{
@@ -35,29 +36,25 @@ use crate::{
     },
     streaming::polling_consumer::ConsumerGroupId,
 };
+use iggy_binary_protocol::requests::{
+    consumer_groups::*, partitions::*, personal_access_tokens::*, streams::*, topics::*, users::*,
+};
+use iggy_common::wire_conversions::wire_permissions_to_permissions;
 use iggy_common::{
-    Identifier, IggyError, PersonalAccessToken, change_password::ChangePassword,
-    create_consumer_group::CreateConsumerGroup, create_partitions::CreatePartitions,
-    create_personal_access_token::CreatePersonalAccessToken, create_stream::CreateStream,
-    create_topic::CreateTopic, delete_consumer_group::DeleteConsumerGroup,
-    delete_partitions::DeletePartitions, delete_personal_access_token::DeletePersonalAccessToken,
-    delete_stream::DeleteStream, delete_topic::DeleteTopic, delete_user::DeleteUser,
-    join_consumer_group::JoinConsumerGroup, leave_consumer_group::LeaveConsumerGroup,
-    purge_stream::PurgeStream, purge_topic::PurgeTopic, update_permissions::UpdatePermissions,
-    update_stream::UpdateStream, update_topic::UpdateTopic, update_user::UpdateUser,
+    CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, PersonalAccessToken,
+    UserStatus,
 };
 use secrecy::{ExposeSecret, SecretString};
 
 pub async fn execute_create_stream(
     shard: &IggyShard,
     user_id: u32,
-    command: CreateStream,
+    wire: CreateStreamRequest,
 ) -> Result<StreamResponseData, IggyError> {
     shard.metadata.perm_create_stream(user_id)?;
 
-    let stream_id = shard.create_stream(command.name.clone()).await?;
+    let stream_id = shard.create_stream(wire.name.to_string()).await?;
 
-    // Capture response data from metadata before state apply
     let response_data = shard.metadata.with_metadata(|m| {
         let stream = m
             .streams
@@ -76,7 +73,7 @@ pub async fn execute_create_stream(
             user_id,
             &EntryCommand::CreateStream(CreateStreamWithId {
                 stream_id: stream_id as u32,
-                command,
+                command: wire,
             }),
         )
         .await?;
@@ -87,16 +84,17 @@ pub async fn execute_create_stream(
 pub async fn execute_update_stream(
     shard: &IggyShard,
     user_id: u32,
-    command: UpdateStream,
+    wire: UpdateStreamRequest,
 ) -> Result<(), IggyError> {
-    let stream = shard.resolve_stream(&command.stream_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let stream = shard.resolve_stream(&stream_id)?;
     shard.metadata.perm_update_stream(user_id, stream.id())?;
 
-    shard.update_stream(stream, command.name.clone())?;
+    shard.update_stream(stream, wire.name.to_string())?;
 
     shard
         .state
-        .apply(user_id, &EntryCommand::UpdateStream(command))
+        .apply(user_id, &EntryCommand::UpdateStream(wire))
         .await?;
 
     Ok(())
@@ -105,9 +103,10 @@ pub async fn execute_update_stream(
 pub async fn execute_delete_stream(
     shard: &IggyShard,
     user_id: u32,
-    command: DeleteStream,
+    wire: DeleteStreamRequest,
 ) -> Result<(), IggyError> {
-    let stream = shard.resolve_stream(&command.stream_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let stream = shard.resolve_stream(&stream_id)?;
     shard.metadata.perm_delete_stream(user_id, stream.id())?;
 
     // Capture all topic/partition info BEFORE deletion for broadcast
@@ -125,7 +124,7 @@ pub async fn execute_delete_stream(
 
     shard
         .state
-        .apply(user_id, &EntryCommand::DeleteStream(command))
+        .apply(user_id, &EntryCommand::DeleteStream(wire))
         .await?;
 
     // Broadcast DeletedPartitions to all shards for each topic's partitions (best-effort)
@@ -152,9 +151,10 @@ pub async fn execute_delete_stream(
 pub async fn execute_purge_stream(
     shard: &IggyShard,
     user_id: u32,
-    command: PurgeStream,
+    wire: PurgeStreamRequest,
 ) -> Result<(), IggyError> {
-    let stream = shard.resolve_stream(&command.stream_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let stream = shard.resolve_stream(&stream_id)?;
     shard.metadata.perm_purge_stream(user_id, stream.id())?;
 
     shard.purge_stream(stream).await?;
@@ -162,7 +162,7 @@ pub async fn execute_purge_stream(
 
     shard
         .state
-        .apply(user_id, &EntryCommand::PurgeStream(command))
+        .apply(user_id, &EntryCommand::PurgeStream(wire))
         .await?;
 
     let event = ShardEvent::PurgedStream {
@@ -179,19 +179,29 @@ pub async fn execute_purge_stream(
 pub async fn execute_create_topic(
     shard: &IggyShard,
     user_id: u32,
-    command: CreateTopic,
+    wire: CreateTopicRequest,
 ) -> Result<TopicResponseData, IggyError> {
-    let stream = shard.resolve_stream(&command.stream_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let compression = CompressionAlgorithm::from_code(wire.compression_algorithm)?;
+    let message_expiry = IggyExpiry::from(wire.message_expiry);
+    let max_topic_size = MaxTopicSize::from(wire.max_topic_size);
+    let replication_factor = if wire.replication_factor == 0 {
+        None
+    } else {
+        Some(wire.replication_factor)
+    };
+
+    let stream = shard.resolve_stream(&stream_id)?;
     shard.metadata.perm_create_topic(user_id, stream.id())?;
 
     let topic_id = shard
         .create_topic(
             stream,
-            command.name.clone(),
-            command.message_expiry,
-            command.compression_algorithm,
-            command.max_topic_size,
-            command.replication_factor,
+            wire.name.to_string(),
+            message_expiry,
+            compression,
+            max_topic_size,
+            replication_factor,
         )
         .await?;
 
@@ -200,7 +210,7 @@ pub async fn execute_create_topic(
         topic_id,
     };
     let partition_infos = shard
-        .create_partitions(resolved_topic, command.partitions_count)
+        .create_partitions(resolved_topic, wire.partitions_count)
         .await?;
 
     let response_data = shard.metadata.with_metadata(|m| {
@@ -227,7 +237,7 @@ pub async fn execute_create_topic(
             user_id,
             &EntryCommand::CreateTopic(CreateTopicWithId {
                 topic_id: topic_id as u32,
-                command,
+                command: wire,
             }),
         )
         .await?;
@@ -248,25 +258,36 @@ pub async fn execute_create_topic(
 pub async fn execute_update_topic(
     shard: &IggyShard,
     user_id: u32,
-    command: UpdateTopic,
+    wire: UpdateTopicRequest,
 ) -> Result<(), IggyError> {
-    let topic = shard.resolve_topic(&command.stream_id, &command.topic_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let topic_id = wire_id_to_identifier(&wire.topic_id)?;
+    let compression = CompressionAlgorithm::from_code(wire.compression_algorithm)?;
+    let message_expiry = IggyExpiry::from(wire.message_expiry);
+    let max_topic_size = MaxTopicSize::from(wire.max_topic_size);
+    let replication_factor = if wire.replication_factor == 0 {
+        None
+    } else {
+        Some(wire.replication_factor)
+    };
+
+    let topic = shard.resolve_topic(&stream_id, &topic_id)?;
     shard
         .metadata
         .perm_update_topic(user_id, topic.stream_id, topic.topic_id)?;
 
     shard.update_topic(
         topic,
-        command.name.clone(),
-        command.message_expiry,
-        command.compression_algorithm,
-        command.max_topic_size,
-        command.replication_factor,
+        wire.name.to_string(),
+        message_expiry,
+        compression,
+        max_topic_size,
+        replication_factor,
     )?;
 
     shard
         .state
-        .apply(user_id, &EntryCommand::UpdateTopic(command))
+        .apply(user_id, &EntryCommand::UpdateTopic(wire))
         .await?;
 
     Ok(())
@@ -275,9 +296,11 @@ pub async fn execute_update_topic(
 pub async fn execute_delete_topic(
     shard: &IggyShard,
     user_id: u32,
-    command: DeleteTopic,
+    wire: DeleteTopicRequest,
 ) -> Result<(), IggyError> {
-    let topic = shard.resolve_topic(&command.stream_id, &command.topic_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let topic_id = wire_id_to_identifier(&wire.topic_id)?;
+    let topic = shard.resolve_topic(&stream_id, &topic_id)?;
     shard
         .metadata
         .perm_delete_topic(user_id, topic.stream_id, topic.topic_id)?;
@@ -291,7 +314,7 @@ pub async fn execute_delete_topic(
 
     shard
         .state
-        .apply(user_id, &EntryCommand::DeleteTopic(command))
+        .apply(user_id, &EntryCommand::DeleteTopic(wire))
         .await?;
 
     // Broadcast to all shards to clean up their local_partitions entries (best-effort)
@@ -313,9 +336,11 @@ pub async fn execute_delete_topic(
 pub async fn execute_purge_topic(
     shard: &IggyShard,
     user_id: u32,
-    command: PurgeTopic,
+    wire: PurgeTopicRequest,
 ) -> Result<(), IggyError> {
-    let topic = shard.resolve_topic(&command.stream_id, &command.topic_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let topic_id = wire_id_to_identifier(&wire.topic_id)?;
+    let topic = shard.resolve_topic(&stream_id, &topic_id)?;
     shard
         .metadata
         .perm_purge_topic(user_id, topic.stream_id, topic.topic_id)?;
@@ -325,7 +350,7 @@ pub async fn execute_purge_topic(
 
     shard
         .state
-        .apply(user_id, &EntryCommand::PurgeTopic(command))
+        .apply(user_id, &EntryCommand::PurgeTopic(wire))
         .await?;
 
     let event = ShardEvent::PurgedTopic {
@@ -344,15 +369,17 @@ pub async fn execute_purge_topic(
 pub async fn execute_create_partitions(
     shard: &IggyShard,
     user_id: u32,
-    command: CreatePartitions,
+    wire: CreatePartitionsRequest,
 ) -> Result<(), IggyError> {
-    let topic = shard.resolve_topic(&command.stream_id, &command.topic_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let topic_id = wire_id_to_identifier(&wire.topic_id)?;
+    let topic = shard.resolve_topic(&stream_id, &topic_id)?;
     shard
         .metadata
         .perm_create_partitions(user_id, topic.stream_id, topic.topic_id)?;
 
     let partition_infos = shard
-        .create_partitions(topic, command.partitions_count)
+        .create_partitions(topic, wire.partitions_count)
         .await?;
     let total_partition_count = shard
         .metadata
@@ -365,7 +392,7 @@ pub async fn execute_create_partitions(
 
     shard
         .state
-        .apply(user_id, &EntryCommand::CreatePartitions(command))
+        .apply(user_id, &EntryCommand::CreatePartitions(wire))
         .await?;
 
     let event = ShardEvent::CreatedPartitions {
@@ -385,15 +412,17 @@ pub async fn execute_create_partitions(
 pub async fn execute_delete_partitions(
     shard: &IggyShard,
     user_id: u32,
-    command: DeletePartitions,
+    wire: DeletePartitionsRequest,
 ) -> Result<(), IggyError> {
-    let topic = shard.resolve_topic(&command.stream_id, &command.topic_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let topic_id = wire_id_to_identifier(&wire.topic_id)?;
+    let topic = shard.resolve_topic(&stream_id, &topic_id)?;
     shard
         .metadata
         .perm_delete_partitions(user_id, topic.stream_id, topic.topic_id)?;
 
     let deleted_partition_ids = shard
-        .delete_partitions(topic, command.partitions_count)
+        .delete_partitions(topic, wire.partitions_count)
         .await?;
 
     let remaining_partition_count = shard
@@ -408,7 +437,7 @@ pub async fn execute_delete_partitions(
 
     shard
         .state
-        .apply(user_id, &EntryCommand::DeletePartitions(command))
+        .apply(user_id, &EntryCommand::DeletePartitions(wire))
         .await?;
 
     let event = ShardEvent::DeletedPartitions {
@@ -429,14 +458,16 @@ pub async fn execute_delete_partitions(
 pub async fn execute_create_consumer_group(
     shard: &IggyShard,
     user_id: u32,
-    command: CreateConsumerGroup,
+    wire: CreateConsumerGroupRequest,
 ) -> Result<ConsumerGroupResponseData, IggyError> {
-    let topic = shard.resolve_topic(&command.stream_id, &command.topic_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let topic_id = wire_id_to_identifier(&wire.topic_id)?;
+    let topic = shard.resolve_topic(&stream_id, &topic_id)?;
     shard
         .metadata
         .perm_create_consumer_group(user_id, topic.stream_id, topic.topic_id)?;
 
-    let group_id = shard.create_consumer_group(topic, command.name.clone())?;
+    let group_id = shard.create_consumer_group(topic, wire.name.to_string())?;
 
     let response_data = shard
         .metadata
@@ -454,7 +485,7 @@ pub async fn execute_create_consumer_group(
             user_id,
             &EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
                 group_id: group_id as u32,
-                command,
+                command: wire,
             }),
         )
         .await?;
@@ -465,10 +496,12 @@ pub async fn execute_create_consumer_group(
 pub async fn execute_delete_consumer_group(
     shard: &IggyShard,
     user_id: u32,
-    command: DeleteConsumerGroup,
+    wire: DeleteConsumerGroupRequest,
 ) -> Result<(), IggyError> {
-    let group =
-        shard.resolve_consumer_group(&command.stream_id, &command.topic_id, &command.group_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let topic_id = wire_id_to_identifier(&wire.topic_id)?;
+    let group_id = wire_id_to_identifier(&wire.group_id)?;
+    let group = shard.resolve_consumer_group(&stream_id, &topic_id, &group_id)?;
     shard
         .metadata
         .perm_delete_consumer_group(user_id, group.stream_id, group.topic_id)?;
@@ -487,7 +520,7 @@ pub async fn execute_delete_consumer_group(
 
     shard
         .state
-        .apply(user_id, &EntryCommand::DeleteConsumerGroup(command))
+        .apply(user_id, &EntryCommand::DeleteConsumerGroup(wire))
         .await?;
 
     Ok(())
@@ -497,10 +530,12 @@ pub fn execute_join_consumer_group(
     shard: &IggyShard,
     user_id: u32,
     client_id: u32,
-    command: JoinConsumerGroup,
+    wire: JoinConsumerGroupRequest,
 ) -> Result<(), IggyError> {
-    let group =
-        shard.resolve_consumer_group(&command.stream_id, &command.topic_id, &command.group_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let topic_id = wire_id_to_identifier(&wire.topic_id)?;
+    let group_id = wire_id_to_identifier(&wire.group_id)?;
+    let group = shard.resolve_consumer_group(&stream_id, &topic_id, &group_id)?;
     shard
         .metadata
         .perm_join_consumer_group(user_id, group.stream_id, group.topic_id)?;
@@ -514,10 +549,12 @@ pub fn execute_leave_consumer_group(
     shard: &IggyShard,
     user_id: u32,
     client_id: u32,
-    command: LeaveConsumerGroup,
+    wire: LeaveConsumerGroupRequest,
 ) -> Result<(), IggyError> {
-    let group =
-        shard.resolve_consumer_group(&command.stream_id, &command.topic_id, &command.group_id)?;
+    let stream_id = wire_id_to_identifier(&wire.stream_id)?;
+    let topic_id = wire_id_to_identifier(&wire.topic_id)?;
+    let group_id = wire_id_to_identifier(&wire.group_id)?;
+    let group = shard.resolve_consumer_group(&stream_id, &topic_id, &group_id)?;
     shard
         .metadata
         .perm_leave_consumer_group(user_id, group.stream_id, group.topic_id)?;
@@ -530,16 +567,23 @@ pub fn execute_leave_consumer_group(
 pub async fn execute_create_user(
     shard: &IggyShard,
     user_id: u32,
-    command: iggy_common::create_user::CreateUser,
+    wire: CreateUserRequest,
 ) -> Result<User, IggyError> {
     shard.metadata.perm_create_user(user_id)?;
 
-    let user = shard.create_user(
-        &command.username,
-        command.password.expose_secret(),
-        command.status,
-        command.permissions.clone(),
-    )?;
+    let username = wire.username.to_string();
+    let password = SecretString::from(wire.password.clone());
+    let status = UserStatus::from_code(wire.status)?;
+    let permissions = wire
+        .permissions
+        .as_ref()
+        .map(wire_permissions_to_permissions);
+
+    let user = shard.create_user(&username, password.expose_secret(), status, permissions)?;
+
+    // Hash the password before persisting to WAL
+    let mut wal_wire = wire;
+    wal_wire.password = crypto::hash_password(password.expose_secret());
 
     shard
         .state
@@ -547,12 +591,7 @@ pub async fn execute_create_user(
             user_id,
             &EntryCommand::CreateUser(CreateUserWithId {
                 user_id: user.id,
-                command: iggy_common::create_user::CreateUser {
-                    password: SecretString::from(crypto::hash_password(
-                        command.password.expose_secret(),
-                    )),
-                    ..command
-                },
+                command: wal_wire,
             }),
         )
         .await?;
@@ -563,15 +602,16 @@ pub async fn execute_create_user(
 pub async fn execute_delete_user(
     shard: &IggyShard,
     user_id: u32,
-    command: DeleteUser,
+    wire: DeleteUserRequest,
 ) -> Result<User, IggyError> {
     shard.metadata.perm_delete_user(user_id)?;
 
-    let user = shard.delete_user(&command.user_id)?;
+    let target_id = wire_id_to_identifier(&wire.user_id)?;
+    let user = shard.delete_user(&target_id)?;
 
     shard
         .state
-        .apply(user_id, &EntryCommand::DeleteUser(command))
+        .apply(user_id, &EntryCommand::DeleteUser(wire))
         .await?;
 
     Ok(user)
@@ -580,15 +620,18 @@ pub async fn execute_delete_user(
 pub async fn execute_update_user(
     shard: &IggyShard,
     user_id: u32,
-    command: UpdateUser,
+    wire: UpdateUserRequest,
 ) -> Result<User, IggyError> {
     shard.metadata.perm_update_user(user_id)?;
 
-    let user = shard.update_user(&command.user_id, command.username.clone(), command.status)?;
+    let target_id = wire_id_to_identifier(&wire.user_id)?;
+    let username = wire.username.as_ref().map(|n| n.to_string());
+    let status = wire.status.map(UserStatus::from_code).transpose()?;
+    let user = shard.update_user(&target_id, username, status)?;
 
     shard
         .state
-        .apply(user_id, &EntryCommand::UpdateUser(command))
+        .apply(user_id, &EntryCommand::UpdateUser(wire))
         .await?;
 
     Ok(user)
@@ -597,31 +640,26 @@ pub async fn execute_update_user(
 pub async fn execute_change_password(
     shard: &IggyShard,
     user_id: u32,
-    command: ChangePassword,
+    wire: ChangePasswordRequest,
 ) -> Result<(), IggyError> {
-    let target_user = shard.get_user(&command.user_id)?;
+    let target_id = wire_id_to_identifier(&wire.user_id)?;
+    let target_user = shard.get_user(&target_id)?;
     if target_user.id != user_id {
         shard.metadata.perm_change_password(user_id)?;
     }
 
-    shard.change_password(
-        &command.user_id,
-        command.current_password.expose_secret(),
-        command.new_password.expose_secret(),
-    )?;
+    shard.change_password(&target_id, &wire.current_password, &wire.new_password)?;
+
+    // Clear current password and hash new password before persisting to WAL
+    let wal_wire = ChangePasswordRequest {
+        user_id: wire.user_id,
+        current_password: String::new(),
+        new_password: crypto::hash_password(&wire.new_password),
+    };
 
     shard
         .state
-        .apply(
-            user_id,
-            &EntryCommand::ChangePassword(ChangePassword {
-                current_password: SecretString::from(String::new()),
-                new_password: SecretString::from(crypto::hash_password(
-                    command.new_password.expose_secret(),
-                )),
-                ..command
-            }),
-        )
+        .apply(user_id, &EntryCommand::ChangePassword(wal_wire))
         .await?;
 
     Ok(())
@@ -630,20 +668,25 @@ pub async fn execute_change_password(
 pub async fn execute_update_permissions(
     shard: &IggyShard,
     user_id: u32,
-    command: UpdatePermissions,
+    wire: UpdatePermissionsRequest,
 ) -> Result<(), IggyError> {
     shard.metadata.perm_update_permissions(user_id)?;
 
-    let target_user = shard.get_user(&command.user_id)?;
+    let target_id = wire_id_to_identifier(&wire.user_id)?;
+    let target_user = shard.get_user(&target_id)?;
     if target_user.is_root() {
         return Err(IggyError::CannotChangePermissions(target_user.id));
     }
 
-    shard.update_permissions(&command.user_id, command.permissions.clone())?;
+    let permissions = wire
+        .permissions
+        .as_ref()
+        .map(wire_permissions_to_permissions);
+    shard.update_permissions(&target_id, permissions)?;
 
     shard
         .state
-        .apply(user_id, &EntryCommand::UpdatePermissions(command))
+        .apply(user_id, &EntryCommand::UpdatePermissions(wire))
         .await?;
 
     Ok(())
@@ -652,10 +695,12 @@ pub async fn execute_update_permissions(
 pub async fn execute_create_personal_access_token(
     shard: &IggyShard,
     user_id: u32,
-    command: CreatePersonalAccessToken,
+    wire: CreatePersonalAccessTokenRequest,
 ) -> Result<(PersonalAccessToken, String), IggyError> {
+    let name = wire.name.to_string();
+    let expiry = IggyExpiry::from(wire.expiry);
     let (personal_access_token, token) =
-        shard.create_personal_access_token(user_id, &command.name, command.expiry)?;
+        shard.create_personal_access_token(user_id, &name, expiry)?;
 
     shard
         .state
@@ -663,7 +708,7 @@ pub async fn execute_create_personal_access_token(
             user_id,
             &EntryCommand::CreatePersonalAccessToken(CreatePersonalAccessTokenWithHash {
                 hash: personal_access_token.token.to_string(),
-                command,
+                command: wire,
             }),
         )
         .await?;
@@ -674,13 +719,13 @@ pub async fn execute_create_personal_access_token(
 pub async fn execute_delete_personal_access_token(
     shard: &IggyShard,
     user_id: u32,
-    command: DeletePersonalAccessToken,
+    wire: DeletePersonalAccessTokenRequest,
 ) -> Result<(), IggyError> {
-    shard.delete_personal_access_token(user_id, &command.name)?;
+    shard.delete_personal_access_token(user_id, wire.name.as_str())?;
 
     shard
         .state
-        .apply(user_id, &EntryCommand::DeletePersonalAccessToken(command))
+        .apply(user_id, &EntryCommand::DeletePersonalAccessToken(wire))
         .await?;
 
     Ok(())

@@ -24,9 +24,7 @@ use err_trail::ErrContext;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::personal_access_tokens::LoginWithPersonalAccessTokenRequest;
 use iggy_binary_protocol::responses::users::IdentityResponse;
-use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
-use iggy_common::{IggyError, SenderKind, Validatable};
-use secrecy::SecretString;
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -39,11 +37,6 @@ pub async fn handle_login_with_personal_access_token(
 ) -> Result<HandlerResult, IggyError> {
     debug!("session: {session}, command: login_with_personal_access_token");
     let token = req.token.as_str();
-
-    let command = LoginWithPersonalAccessToken {
-        token: SecretString::from(token),
-    };
-    command.validate()?;
 
     let user = shard
         .login_with_personal_access_token(token, Some(session))

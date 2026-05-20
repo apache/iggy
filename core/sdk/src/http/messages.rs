@@ -19,12 +19,13 @@
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
 use crate::prelude::{
-    Consumer, FlushUnsavedBuffer, Identifier, IggyError, IggyMessage, Partitioning, PollMessages,
-    PolledMessages, PollingStrategy, SendMessages,
+    Consumer, Identifier, IggyError, IggyMessage, Partitioning, PollMessages, PolledMessages,
+    PollingStrategy, SendMessages,
 };
 use async_trait::async_trait;
 use iggy_common::IggyMessagesBatch;
 use iggy_common::MessageClient;
+use iggy_common::flush_unsaved_buffer::FlushUnsavedBuffer;
 
 #[async_trait]
 impl MessageClient for HttpClient {
@@ -97,8 +98,6 @@ impl MessageClient for HttpClient {
                     fsync,
                 ),
                 &FlushUnsavedBuffer {
-                    stream_id: stream_id.clone(),
-                    topic_id: topic_id.clone(),
                     partition_id,
                     fsync,
                 },

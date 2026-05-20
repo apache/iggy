@@ -64,6 +64,10 @@ impl TestIggyContext {
         self.context_manager.read_active_context().await.unwrap()
     }
 
+    pub async fn read_saved_contexts(&self) -> Option<ContextsConfigMap> {
+        self.context_manager.read_contexts().await.unwrap()
+    }
+
     pub fn get_contexts(&self) -> Option<ContextsConfigMap> {
         self.maybe_contexts.clone()
     }

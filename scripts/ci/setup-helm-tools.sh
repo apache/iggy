@@ -22,26 +22,33 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/ci/setup-helm-tools.sh [--install-kind]
+Usage: scripts/ci/setup-helm-tools.sh [--install-kind] [--install-helm-docs]
 
 Install the pinned Helm toolchain used by Helm chart CI jobs. When requested,
-also install the pinned kind binary used by the Helm smoke test.
+also install the pinned kind binary used by the Helm smoke test or helm-docs
+for README generation.
 
 Environment:
   HELM_VERSION         Helm release version (default: v4.1.3)
   HELM_CHECKSUM        SHA256 checksum for the Helm tarball
   KIND_VERSION         kind release version (default: v0.31.0)
   KIND_CHECKSUM        SHA256 checksum for the kind binary
+  HELM_DOCS_VERSION    helm-docs release version (default: v1.14.2)
+  HELM_DOCS_CHECKSUM   SHA256 checksum for the helm-docs tarball
   HELM_TOOLS_BIN_DIR   Target binary directory (default: /usr/local/bin)
 EOF
 }
 
 INSTALL_KIND="false"
+INSTALL_HELM_DOCS="false"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --install-kind)
       INSTALL_KIND="true"
+      ;;
+    --install-helm-docs)
+      INSTALL_HELM_DOCS="true"
       ;;
     --help|-h|help)
       usage
@@ -60,6 +67,8 @@ HELM_VERSION="${HELM_VERSION:-v4.1.3}"
 HELM_CHECKSUM="${HELM_CHECKSUM:-02ce9722d541238f81459938b84cf47df2fdf1187493b4bfb2346754d82a4700}"
 KIND_VERSION="${KIND_VERSION:-v0.31.0}"
 KIND_CHECKSUM="${KIND_CHECKSUM:-eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa}"
+HELM_DOCS_VERSION="${HELM_DOCS_VERSION:-v1.14.2}"
+HELM_DOCS_CHECKSUM="${HELM_DOCS_CHECKSUM:-a8cf72ada34fad93285ba2a452b38bdc5bd52cc9a571236244ec31022928d6cc}"
 HELM_TOOLS_BIN_DIR="${HELM_TOOLS_BIN_DIR:-/usr/local/bin}"
 
 require_command() {
@@ -108,4 +117,15 @@ if [ "$INSTALL_KIND" = "true" ]; then
   wget -qO "$kind_binary" "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
   echo "${KIND_CHECKSUM}  ${kind_binary}" | sha256sum -c -
   install_binary "$kind_binary" "${HELM_TOOLS_BIN_DIR}/kind"
+fi
+
+if [ "$INSTALL_HELM_DOCS" = "true" ]; then
+  helm_docs_archive="/tmp/helm-docs.tar.gz"
+  helm_docs_dir="/tmp/helm-docs-extract"
+  wget -qO "$helm_docs_archive" "https://github.com/norwoodj/helm-docs/releases/download/${HELM_DOCS_VERSION}/helm-docs_${HELM_DOCS_VERSION#v}_Linux_x86_64.tar.gz"
+  echo "${HELM_DOCS_CHECKSUM}  ${helm_docs_archive}" | sha256sum -c -
+  rm -rf "$helm_docs_dir"
+  mkdir -p "$helm_docs_dir"
+  tar -zxf "$helm_docs_archive" -C "$helm_docs_dir" helm-docs
+  install_binary "$helm_docs_dir/helm-docs" "${HELM_TOOLS_BIN_DIR}/helm-docs"
 fi

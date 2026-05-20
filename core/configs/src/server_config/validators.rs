@@ -38,6 +38,24 @@ use tracing::warn;
 /// 1 GiB max segment size. Canonical definition; re-exported by core/server streaming.
 pub const SEGMENT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Return `Err(reason)` when `alloc` would yield a host-dependent shard
+/// count, disqualifying it for cluster mode where every node must derive
+/// the same count from its byte-identical config.
+///
+/// Deterministic variants (`Count(n)`, `Range(s, e)`, explicit
+/// `NumaAware`) return `Ok`.
+fn host_dependent_cpu_allocation(alloc: &CpuAllocation) -> Result<(), &'static str> {
+    match alloc {
+        CpuAllocation::All => Err("'all' (follows host CPU count)"),
+        CpuAllocation::NumaAware(numa) if numa.nodes.is_empty() && numa.cores_per_node == 0 => {
+            Err("'numa:auto' (follows host NUMA topology)")
+        }
+        CpuAllocation::Count(_) | CpuAllocation::Range(_, _) | CpuAllocation::NumaAware(_) => {
+            Ok(())
+        }
+    }
+}
+
 impl Validatable<ConfigurationError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
         self.system
@@ -82,6 +100,28 @@ impl Validatable<ConfigurationError> for ServerConfig {
         self.cluster.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate cluster config")
         })?;
+
+        // Cluster consensus routing (`calculate_shard_from_consensus_ns`)
+        // hashes namespaces modulo the local shard count. Every node must
+        // agree on that count or control-plane messages (StartViewChange,
+        // DoViewChange, StartView, Commit) route to different shards on
+        // different nodes, splitting the view-change quorum.
+        //
+        // Because `cluster.nodes` is byte-identical across every host, the
+        // only way shard counts can drift is if `system.sharding.cpu_allocation`
+        // depends on host topology. We can't prove divergence from a single
+        // node at load time (peers may be homogeneous), so this is a warning
+        // rather than a hard error; operators running heterogeneous hardware
+        // must pin a deterministic value themselves.
+        if self.cluster.enabled
+            && let Err(reason) = host_dependent_cpu_allocation(&self.system.sharding.cpu_allocation)
+        {
+            warn!(
+                "cluster.enabled = true with host-dependent system.sharding.cpu_allocation ({reason}); \
+                 if peers resolve this to different shard counts, view-change quorum will split. \
+                 Pin a deterministic value (count, explicit range, or explicit numa) on heterogeneous hardware."
+            );
+        }
 
         self.system
             .logging
@@ -394,26 +434,28 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        if self.node.current.name.trim().is_empty() {
-            eprintln!("Invalid cluster configuration: current node name cannot be empty");
+        if self.nodes.is_empty() {
+            eprintln!(
+                "Invalid cluster configuration: cluster.nodes must contain at least one entry when cluster is enabled"
+            );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        let mut node_names = std::collections::HashSet::new();
-        node_names.insert(self.node.current.name.clone());
+        // VSR needs every replica to have a stable, unique id strictly
+        // less than the total replica count. Duplicate ids would split the
+        // cluster into two replicas claiming the same slot; out-of-range
+        // ids never win a primary election. Both are unrecoverable at
+        // runtime - fail fast at startup.
+        let total_replicas = u8::try_from(self.nodes.len()).map_err(|_| {
+            eprintln!("Invalid cluster configuration: more than 255 replicas is unsupported");
+            ConfigurationError::InvalidConfigurationValue
+        })?;
 
-        for node in &self.node.others {
-            if !node_names.insert(node.name.clone()) {
-                eprintln!(
-                    "Invalid cluster configuration: duplicate node name '{}' found",
-                    node.name
-                );
-                return Err(ConfigurationError::InvalidConfigurationValue);
-            }
-        }
-
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut seen_names = std::collections::HashSet::new();
         let mut used_endpoints = std::collections::HashSet::new();
-        for node in &self.node.others {
+
+        for node in &self.nodes {
             if node.name.trim().is_empty() {
                 eprintln!("Invalid cluster configuration: node name cannot be empty");
                 return Err(ConfigurationError::InvalidConfigurationValue);
@@ -427,11 +469,36 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
 
+            if !seen_names.insert(node.name.clone()) {
+                eprintln!(
+                    "Invalid cluster configuration: duplicate node name '{}' found",
+                    node.name
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+
+            if node.replica_id >= total_replicas {
+                eprintln!(
+                    "Invalid cluster configuration: replica_id {} for node '{}' must be < total replica count {total_replicas}",
+                    node.replica_id, node.name
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+
+            if !seen_ids.insert(node.replica_id) {
+                eprintln!(
+                    "Invalid cluster configuration: duplicate replica_id {} (two nodes claim the same slot)",
+                    node.replica_id
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
+            }
+
             let port_list = [
                 ("TCP", node.ports.tcp),
                 ("QUIC", node.ports.quic),
                 ("HTTP", node.ports.http),
                 ("WebSocket", node.ports.websocket),
+                ("TCP_REPLICA", node.ports.tcp_replica),
             ];
 
             for (name, port_opt) in &port_list {
@@ -444,11 +511,11 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                         return Err(ConfigurationError::InvalidConfigurationValue);
                     }
 
-                    let endpoint = format!("{}:{}:{}", node.ip, name, port);
+                    let endpoint = format!("{}:{}", node.ip, port);
                     if !used_endpoints.insert(endpoint.clone()) {
                         eprintln!(
-                            "Invalid cluster configuration: port conflict - {}:{} is already used",
-                            node.ip, port
+                            "Invalid cluster configuration: port conflict - {endpoint} is already bound (node '{}', transport {name})",
+                            node.name
                         );
                         return Err(ConfigurationError::InvalidConfigurationValue);
                     }
@@ -457,5 +524,178 @@ impl Validatable<ConfigurationError> for ClusterConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cluster_validate_tests {
+    use super::*;
+    use crate::server_config::cluster::{ClusterConfig, ClusterNodeConfig, TransportPorts};
+
+    fn node(name: &str, id: u8) -> ClusterNodeConfig {
+        ClusterNodeConfig {
+            name: name.to_string(),
+            ip: "127.0.0.1".to_string(),
+            replica_id: id,
+            ports: TransportPorts::default(),
+        }
+    }
+
+    fn cfg(nodes: Vec<ClusterNodeConfig>) -> ClusterConfig {
+        ClusterConfig {
+            enabled: true,
+            name: "iggy-cluster".to_string(),
+            nodes,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_nodes() {
+        let c = cfg(vec![]);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_replica_ids() {
+        let c = cfg(vec![node("n1", 0), node("n2", 0)]);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_names() {
+        let c = cfg(vec![node("n1", 0), node("n1", 1)]);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_replica_id() {
+        // 2 nodes total, so id 2 is out of range.
+        let c = cfg(vec![node("n1", 0), node("n2", 2)]);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_unique_contiguous_replica_ids() {
+        let c = cfg(vec![node("n1", 0), node("n2", 1), node("n3", 2)]);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_skips_checks_when_disabled() {
+        let mut c = cfg(vec![]);
+        c.enabled = false;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_tcp_replica_port() {
+        let ports = TransportPorts {
+            tcp: None,
+            quic: None,
+            http: None,
+            websocket: None,
+            tcp_replica: Some(9090),
+        };
+        let mut n1 = node("n1", 0);
+        n1.ports = ports.clone();
+        let mut n2 = node("n2", 1);
+        n2.ports = ports;
+        let c = cfg(vec![n1, n2]);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_cross_transport_port_reuse() {
+        let mut n1 = node("n1", 0);
+        n1.ports = TransportPorts {
+            tcp: Some(8090),
+            quic: None,
+            http: Some(8090),
+            websocket: None,
+            tcp_replica: None,
+        };
+        let c = cfg(vec![n1]);
+        assert!(
+            c.validate().is_err(),
+            "same port on TCP and HTTP of the same node must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_same_port_on_different_ips() {
+        let mut n1 = node("n1", 0);
+        n1.ip = "127.0.0.1".to_string();
+        n1.ports = TransportPorts {
+            tcp: Some(8090),
+            quic: None,
+            http: None,
+            websocket: None,
+            tcp_replica: None,
+        };
+        let mut n2 = node("n2", 1);
+        n2.ip = "127.0.0.2".to_string();
+        n2.ports = TransportPorts {
+            tcp: Some(8090),
+            quic: None,
+            http: None,
+            websocket: None,
+            tcp_replica: None,
+        };
+        let c = cfg(vec![n1, n2]);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_tcp_replica_port() {
+        let ports = TransportPorts {
+            tcp: None,
+            quic: None,
+            http: None,
+            websocket: None,
+            tcp_replica: Some(0),
+        };
+        let mut n1 = node("n1", 0);
+        n1.ports = ports;
+        let c = cfg(vec![n1]);
+        assert!(c.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod cluster_shards_count_determinism_tests {
+    use super::*;
+    use crate::server_config::sharding::NumaConfig;
+
+    #[test]
+    fn all_is_rejected() {
+        let err = host_dependent_cpu_allocation(&CpuAllocation::All).unwrap_err();
+        assert!(err.contains("all"));
+    }
+
+    #[test]
+    fn numa_auto_is_rejected() {
+        let err = host_dependent_cpu_allocation(&CpuAllocation::NumaAware(NumaConfig::default()))
+            .unwrap_err();
+        assert!(err.contains("numa:auto"));
+    }
+
+    #[test]
+    fn count_is_accepted() {
+        assert!(host_dependent_cpu_allocation(&CpuAllocation::Count(4)).is_ok());
+    }
+
+    #[test]
+    fn range_is_accepted() {
+        assert!(host_dependent_cpu_allocation(&CpuAllocation::Range(0, 4)).is_ok());
+    }
+
+    #[test]
+    fn explicit_numa_is_accepted() {
+        let numa = NumaConfig {
+            nodes: vec![0, 1],
+            cores_per_node: 4,
+            avoid_hyperthread: true,
+        };
+        assert!(host_dependent_cpu_allocation(&CpuAllocation::NumaAware(numa)).is_ok());
     }
 }

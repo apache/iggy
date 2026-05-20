@@ -22,7 +22,7 @@ build-backend = "maturin"
 [project]
 name = "apache-iggy"
 requires-python = ">=3.10"
-version = "0.7.4.dev1"
+version = "0.8.1.dev1"
 description = "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -55,6 +55,12 @@ classifiers = [
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+# LICENSE-binary enumerates the statically-linked Rust crates
+# bundled into the wheel by maturin/PyO3. Generated at build time by
+# `scripts/ci/third-party-licenses.sh --generate --manifest foreign/python/Cargo.toml --output foreign/python/LICENSE-binary`
+# (foreign/python is excluded from the workspace, so cargo-about must be
+# pointed at this Cargo.toml explicitly). File is .gitignored; the wheel
+# build pipeline must generate it before invoking maturin.
 include = [
     { path = "LICENSE", format = [
         "sdist",
@@ -62,6 +68,9 @@ include = [
     ] },
     { path = "NOTICE", format = [
         "sdist",
+        "wheel",
+    ] },
+    { path = "LICENSE-binary", format = [
         "wheel",
     ] },
     { path = "apache_iggy.pyi", format = [
@@ -72,8 +81,8 @@ include = [
 [project.optional-dependencies]
 # Core testing dependencies
 testing = [
-    "pytest>=7.0,<9.0",
-    "pytest-asyncio>=0.21.0,<1.0",
+    "pytest>=9.0.3,<10.0",
+    "pytest-asyncio>=0.24.0,<2.0",
     "pytest-cov>=4.0,<7.0",
     "pytest-xdist>=3.0,<4.0",
     "pytest-timeout>=2.0,<3.0",
@@ -93,8 +102,8 @@ dev = [
 
 # All dependencies for full development setup
 all = [
-    "pytest>=7.0,<9.0",
-    "pytest-asyncio>=0.21.0,<1.0",
+    "pytest>=9.0.3,<10.0",
+    "pytest-asyncio>=0.24.0,<2.0",
     "pytest-cov>=4.0,<7.0",
     "pytest-xdist>=3.0,<4.0",
     "pytest-timeout>=2.0,<3.0",

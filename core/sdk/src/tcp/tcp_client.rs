@@ -26,9 +26,9 @@ use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_common::{
-    AutoLogin, ClientState, Command, ConnectionString, ConnectionStringUtils, Credentials,
-    DiagnosticEvent, IggyDuration, IggyError, IggyErrorDiscriminants, IggyTimestamp,
-    TcpConnectionStringOptions, TransportProtocol,
+    AutoLogin, ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
+    IggyDuration, IggyError, IggyErrorDiscriminants, IggyTimestamp, TcpConnectionStringOptions,
+    TransportProtocol,
 };
 use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
@@ -100,12 +100,6 @@ impl BinaryTransport for TcpClient {
         if let Err(error) = self.events.0.broadcast(event).await {
             error!("Failed to send a TCP diagnostic event: {error}");
         }
-    }
-
-    async fn send_with_response<T: Command>(&self, command: &T) -> Result<Bytes, IggyError> {
-        command.validate()?;
-        self.send_raw_with_response(command.code(), command.to_bytes())
-            .await
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
@@ -622,6 +616,23 @@ impl TcpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    async fn make_dummy_stream(data: &[u8]) -> ConnectionStreamKind {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let data = data.to_vec();
+        tokio::spawn(async move {
+            let (mut server_side, _) = listener.accept().await.unwrap();
+            server_side.write_all(&data).await.unwrap();
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        ConnectionStreamKind::Tcp(TcpConnectionStream::new(client_addr, client))
+    }
 
     #[test]
     fn should_fail_with_empty_connection_string() {
@@ -889,5 +900,40 @@ mod tests {
             tcp_client_config.reconnection.reestablish_after,
             IggyDuration::from_str("5s").unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn should_return_error_when_status_is_non_zero() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(1, 0, &mut stream).await;
+        assert!(tcp_client.is_err());
+    }
+
+    #[tokio::test]
+    async fn should_return_ok_when_status_is_zero() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(0, 0, &mut stream).await;
+        assert!(tcp_client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn should_return_ok_when_length_is_less_than_data() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(0, 5, &mut stream).await;
+        assert!(tcp_client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn should_return_ok_when_length_is_equal_to_one() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(0, 1, &mut stream).await;
+        assert_eq!(tcp_client.unwrap(), Bytes::new());
+    }
+
+    #[tokio::test]
+    async fn should_return_err_when_length_exceeds_data() {
+        let mut stream = make_dummy_stream(&[1u8; 10]).await;
+        let tcp_client = TcpClient::handle_response(0, 50, &mut stream).await;
+        assert!(tcp_client.is_err());
     }
 }

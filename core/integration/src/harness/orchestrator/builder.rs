@@ -19,8 +19,9 @@
 
 use super::harness::TestHarness;
 use crate::harness::config::{
-    ClientConfig, ConnectorsRuntimeConfig, IpAddrKind, McpConfig, TestServerConfig,
+    ClientConfig, ConnectorsRuntimeConfig, IpAddrKind, JwksConfig, McpConfig, TestServerConfig,
 };
+
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::handle::ServerHandle;
@@ -36,6 +37,7 @@ pub struct TestHarnessBuilder {
     server_config: Option<TestServerConfig>,
     mcp_config: Option<McpConfig>,
     connectors_runtime_config: Option<ConnectorsRuntimeConfig>,
+    jwks_config: Option<JwksConfig>,
     primary_transport: Option<iggy_common::TransportProtocol>,
     primary_client_config: Option<ClientConfig>,
     clients: Vec<ClientConfig>,
@@ -49,6 +51,7 @@ impl Default for TestHarnessBuilder {
             test_name: None,
             server_config: None,
             mcp_config: None,
+            jwks_config: None,
             connectors_runtime_config: None,
             primary_transport: None,
             primary_client_config: None,
@@ -99,6 +102,12 @@ impl TestHarnessBuilder {
     /// Configure the connectors runtime with default settings.
     pub fn default_connectors_runtime(mut self) -> Self {
         self.connectors_runtime_config = Some(ConnectorsRuntimeConfig::default());
+        self
+    }
+
+    /// Configure the JWKS server.
+    pub fn jwks(mut self, config: JwksConfig) -> Self {
+        self.jwks_config = Some(config);
         self
     }
 
@@ -225,6 +234,8 @@ impl TestHarnessBuilder {
             client_configs: self.clients,
             primary_transport,
             primary_client_config: self.primary_client_config,
+            jwks_config: self.jwks_config,
+            jwks_server: None,
             started: false,
         })
     }
@@ -300,57 +311,42 @@ fn build_cluster_envs(
 
     envs.insert("IGGY_CLUSTER_ENABLED".to_string(), "true".to_string());
     envs.insert("IGGY_CLUSTER_NAME".to_string(), cluster_name.to_string());
-    envs.insert(
-        "IGGY_CLUSTER_NODE_CURRENT_NAME".to_string(),
-        format!("node-{}", node_index),
-    );
-    envs.insert(
-        "IGGY_CLUSTER_NODE_CURRENT_IP".to_string(),
-        loopback.to_string(),
-    );
+    // Node identity is supplied via `--replica-id` on the command line by
+    // ServerHandle::spawn; every cluster env var emitted here is identical
+    // across all spawned servers.
+    let _ = node_index;
 
-    // Add other nodes' addresses
-    let mut other_index = 0;
+    // Emit the full roster at cluster.nodes[*]. Every node sees the same
+    // list; the per-node --replica-id CLI flag picks which entry is self.
     for (i, addrs) in all_addrs.iter().enumerate() {
-        if i == node_index {
-            continue;
-        }
-
-        envs.insert(
-            format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_NAME"),
-            format!("node-{i}"),
-        );
-        envs.insert(
-            format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_IP"),
-            loopback.to_string(),
-        );
+        envs.insert(format!("IGGY_CLUSTER_NODES_{i}_NAME"), format!("node-{i}"));
+        envs.insert(format!("IGGY_CLUSTER_NODES_{i}_IP"), loopback.to_string());
+        envs.insert(format!("IGGY_CLUSTER_NODES_{i}_REPLICA_ID"), i.to_string());
 
         if let Some(tcp) = addrs.tcp {
             envs.insert(
-                format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_PORTS_TCP"),
+                format!("IGGY_CLUSTER_NODES_{i}_PORTS_TCP"),
                 tcp.port().to_string(),
             );
         }
         if let Some(http) = addrs.http {
             envs.insert(
-                format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_PORTS_HTTP"),
+                format!("IGGY_CLUSTER_NODES_{i}_PORTS_HTTP"),
                 http.port().to_string(),
             );
         }
         if let Some(quic) = addrs.quic {
             envs.insert(
-                format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_PORTS_QUIC"),
+                format!("IGGY_CLUSTER_NODES_{i}_PORTS_QUIC"),
                 quic.port().to_string(),
             );
         }
         if let Some(websocket) = addrs.websocket {
             envs.insert(
-                format!("IGGY_CLUSTER_NODE_OTHERS_{other_index}_PORTS_WEBSOCKET"),
+                format!("IGGY_CLUSTER_NODES_{i}_PORTS_WEBSOCKET"),
                 websocket.port().to_string(),
             );
         }
-
-        other_index += 1;
     }
 
     envs

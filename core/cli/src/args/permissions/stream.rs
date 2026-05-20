@@ -22,8 +22,8 @@ use super::constants::{
     READ_TOPICS_SHORT, SEND_MESSAGES_LONG, SEND_MESSAGES_SHORT,
 };
 use crate::args::permissions::topic::TopicPermissionsArg;
-use ahash::AHashMap;
 use iggy::prelude::StreamPermissions;
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 #[derive(Debug, PartialEq)]
@@ -84,7 +84,7 @@ impl StreamPermissionsArg {
         }
 
         if !topic_permissions.is_empty() {
-            let mut permissions = AHashMap::new();
+            let mut permissions = BTreeMap::new();
             for permission in topic_permissions {
                 permissions.insert(permission.topic_id, permission.permissions);
             }
@@ -382,7 +382,7 @@ mod tests {
                     read_topics: false,
                     poll_messages: false,
                     send_messages: false,
-                    topics: Some(AHashMap::from([
+                    topics: Some(BTreeMap::from([
                         (
                             2,
                             TopicPermissions {
@@ -417,7 +417,7 @@ mod tests {
                     read_topics: false,
                     poll_messages: false,
                     send_messages: false,
-                    topics: Some(AHashMap::from([
+                    topics: Some(BTreeMap::from([
                         (
                             2,
                             TopicPermissions {
@@ -515,7 +515,7 @@ mod tests {
                     read_topics: false,
                     poll_messages: false,
                     send_messages: false,
-                    topics: Some(AHashMap::from([
+                    topics: Some(BTreeMap::from([
                         (
                             2,
                             TopicPermissions {

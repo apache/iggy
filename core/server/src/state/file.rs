@@ -24,7 +24,7 @@ use crate::streaming::utils::file;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use compio::io::AsyncReadExt;
 use err_trail::ErrContext;
-use iggy_common::BytesSerializable;
+use iggy_binary_protocol::{WireDecode, WireEncode};
 use iggy_common::EncryptorKind;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyError;
@@ -261,9 +261,14 @@ impl FileState {
             entry_command.put_u32_le(command_length as u32);
             entry_command.extend(command_payload);
             let command = entry_command.freeze();
-            EntryCommand::from_bytes(command.clone()).error(|e: &IggyError| {
-                format!("{COMPONENT} (error: {e}) - failed to parse entry command from bytes")
-            })?;
+            EntryCommand::decode_from(&command)
+                .map_err(|e| {
+                    tracing::warn!("wire decode error during WAL replay: {e}");
+                    IggyError::InvalidCommand
+                })
+                .error(|e: &IggyError| {
+                    format!("{COMPONENT} (error: {e}) - failed to parse entry command from bytes")
+                })?;
             let calculated_checksum = StateEntry::calculate_checksum(
                 index, term, leader_id, version, flags, timestamp, user_id, &context, &command,
             );

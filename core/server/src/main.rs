@@ -136,6 +136,7 @@ fn main() -> Result<(), ServerError> {
         print_ascii_art("Iggy Server");
 
         let is_follower = args.follower;
+        let replica_id = args.replica_id;
 
         // FIRST DISCRETE LOADING STEP.
         // Initialize early logging before config parsing so we can log during bootstrap.
@@ -433,6 +434,7 @@ fn main() -> Result<(), ServerError> {
                                 .version(current_version)
                                 .metrics(metrics)
                                 .is_follower(is_follower)
+                                .current_replica_id(replica_id)
                                 .metadata(shard_metadata);
 
                             if let Some(writer) = shard_metadata_writer {

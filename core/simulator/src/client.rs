@@ -15,17 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_binary_protocol::{Message, Operation, RequestHeader};
-use iggy_common::{
-    BytesSerializable, IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, Identifier,
-    create_stream::CreateStream, delete_stream::DeleteStream, sharding::IggyNamespace,
+use bytes::Bytes;
+use iggy_binary_protocol::consensus::iobuf::Owned;
+use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
+use iggy_binary_protocol::{
+    AckLevel, Message, Operation, RequestHeader, WireEncode, WireIdentifier, WireName,
 };
+use iggy_common::send_messages2::{
+    IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned,
+};
+use iggy_common::sharding::IggyNamespace;
 use std::cell::Cell;
 
 // TODO: Proper client which implements the full client SDK API
 pub struct SimClient {
     client_id: u128,
     request_counter: Cell<u64>,
+    session: Cell<u64>,
 }
 
 impl SimClient {
@@ -34,75 +40,117 @@ impl SimClient {
         Self {
             client_id,
             request_counter: Cell::new(0),
+            session: Cell::new(0),
         }
     }
 
-    fn next_request_number(&self) -> u64 {
-        let current = self.request_counter.get();
-        self.request_counter.set(current + 1);
-        current
+    #[must_use]
+    pub const fn client_id(&self) -> u128 {
+        self.client_id
     }
 
-    pub fn create_stream(&self, name: &str) -> Message<RequestHeader> {
-        let create_stream = CreateStream {
-            name: name.to_string(),
+    /// Bind the session assigned by the consensus layer after registration.
+    ///
+    /// # Panics
+    /// Panics if `session` is 0.
+    pub fn bind_session(&self, session: u64) {
+        assert!(session > 0, "bind_session: session must be > 0");
+        self.session.set(session);
+    }
+
+    fn next_request_number(&self) -> u64 {
+        let next = self.request_counter.get() + 1;
+        self.request_counter.set(next);
+        next
+    }
+
+    fn session_id(&self) -> u64 {
+        let s = self.session.get();
+        assert!(
+            s > 0,
+            "session not bound — call register() + bind_session() first"
+        );
+        s
+    }
+
+    /// Build a `Register` request for this client.
+    ///
+    /// Register uses `session=0, request=0` per the protocol spec.
+    /// The consensus layer assigns a session on commit.
+    ///
+    /// # Panics
+    /// Panics if the register request buffer is invalid.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn register(&self) -> Message<RequestHeader> {
+        let header_size = std::mem::size_of::<RequestHeader>();
+        let header = RequestHeader {
+            command: iggy_binary_protocol::Command2::Request,
+            operation: Operation::Register,
+            size: header_size as u32,
+            client: self.client_id,
+            session: 0,
+            request: 0,
+            ..Default::default()
         };
-        let payload = create_stream.to_bytes();
+
+        let header_bytes = bytemuck::bytes_of(&header);
+        let buffer = header_bytes.to_vec();
+
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
+            .expect("register request must be valid")
+    }
+
+    /// # Panics
+    /// Panics if the stream name is not a valid wire name.
+    pub fn create_stream(&self, name: &str) -> Message<RequestHeader> {
+        let wire = CreateStreamRequest {
+            name: WireName::new(name).expect("stream name must be valid"),
+        };
+        let payload = wire.to_bytes();
 
         self.build_request(Operation::CreateStream, &payload)
     }
 
     /// # Panics
-    /// Panics if the stream name cannot be converted to an `Identifier`.
+    /// Panics if the stream name cannot be converted to a `WireIdentifier`.
     pub fn delete_stream(&self, name: &str) -> Message<RequestHeader> {
-        let delete_stream = DeleteStream {
-            stream_id: Identifier::named(name).unwrap(),
+        let wire = DeleteStreamRequest {
+            stream_id: WireIdentifier::named(name).expect("stream name must be valid"),
         };
-        let payload = delete_stream.to_bytes();
+        let payload = wire.to_bytes();
 
         self.build_request(Operation::DeleteStream, &payload)
     }
 
     #[allow(clippy::cast_possible_truncation)]
+    /// # Panics
+    ///
+    /// Panics if the simulator cannot encode the provided messages into a valid
+    /// `SendMessages2` request.
     pub fn send_messages(
         &self,
         namespace: IggyNamespace,
         messages: &[&[u8]],
     ) -> Message<RequestHeader> {
-        let count = messages.len() as u32;
-        let mut indexes = Vec::with_capacity(count as usize * INDEX_SIZE);
-        let mut messages_buf = Vec::new();
-
-        let mut current_position = 0u32;
-        for (i, msg) in messages.iter().enumerate() {
-            let msg_total_len = (IGGY_MESSAGE_HEADER_SIZE + msg.len()) as u32;
-
-            // Index: offset(u32) + position(u32) + timestamp(u64)
-            indexes.extend_from_slice(&(i as u32).to_le_bytes()); // offset (relative)
-            indexes.extend_from_slice(&current_position.to_le_bytes()); // position
-            indexes.extend_from_slice(&0u64.to_le_bytes()); // timestamp (set in prepare)
-
-            // Message header (64 bytes)
-            messages_buf.extend_from_slice(&0u64.to_le_bytes()); // checksum
-            messages_buf.extend_from_slice(&0u128.to_le_bytes()); // id
-            messages_buf.extend_from_slice(&0u64.to_le_bytes()); // offset
-            messages_buf.extend_from_slice(&0u64.to_le_bytes()); // timestamp
-            messages_buf.extend_from_slice(&0u64.to_le_bytes()); // origin_timestamp
-            messages_buf.extend_from_slice(&0u32.to_le_bytes()); // user_headers_length
-            messages_buf.extend_from_slice(&(msg.len() as u32).to_le_bytes()); // payload_length
-            messages_buf.extend_from_slice(&0u64.to_le_bytes()); // reserved
-
-            // Payload
-            messages_buf.extend_from_slice(msg);
-            current_position += msg_total_len;
+        let mut batch = IggyMessages2::with_capacity(messages.len());
+        for message in messages {
+            batch.push(IggyMessage2 {
+                header: IggyMessage2Header {
+                    payload_length: message.len() as u32,
+                    ..Default::default()
+                },
+                payload: Bytes::copy_from_slice(message),
+                user_headers: None,
+            });
         }
 
-        let mut payload = Vec::with_capacity(4 + indexes.len() + messages_buf.len());
-        payload.extend_from_slice(&count.to_le_bytes());
-        payload.extend_from_slice(&indexes);
-        payload.extend_from_slice(&messages_buf);
-
-        self.build_request_with_namespace(Operation::SendMessages, &payload, namespace)
+        let batch = SendMessages2Owned::from_messages(namespace, &batch)
+            .expect("simulator must build a valid send_messages2 batch");
+        let total_size = std::mem::size_of::<RequestHeader>() + batch.header.total_size();
+        let request_header = self.request_header(Operation::SendMessages, namespace, total_size);
+        batch
+            .encode_request(request_header)
+            .expect("simulator must build a valid send_messages2 request")
     }
 
     pub fn store_consumer_offset(
@@ -120,6 +168,54 @@ impl SimClient {
         self.build_request_with_namespace(Operation::StoreConsumerOffset, &payload, namespace)
     }
 
+    pub fn delete_consumer_offset(
+        &self,
+        namespace: IggyNamespace,
+        consumer_kind: u8,
+        consumer_id: u32,
+    ) -> Message<RequestHeader> {
+        let mut payload = Vec::with_capacity(5);
+        payload.push(consumer_kind);
+        payload.extend_from_slice(&consumer_id.to_le_bytes());
+
+        self.build_request_with_namespace(Operation::DeleteConsumerOffset, &payload, namespace)
+    }
+
+    /// v2 of `store_consumer_offset` with an `AckLevel` byte. `NoAck` takes
+    /// the primary's fast path (no replication); `Quorum` goes through VSR.
+    pub fn store_consumer_offset_v2(
+        &self,
+        namespace: IggyNamespace,
+        consumer_kind: u8,
+        consumer_id: u32,
+        offset: u64,
+        ack: AckLevel,
+    ) -> Message<RequestHeader> {
+        let mut payload = Vec::with_capacity(14);
+        payload.push(consumer_kind);
+        payload.extend_from_slice(&consumer_id.to_le_bytes());
+        payload.extend_from_slice(&offset.to_le_bytes());
+        payload.push(ack.as_u8());
+
+        self.build_request_with_namespace(Operation::StoreConsumerOffset2, &payload, namespace)
+    }
+
+    /// v2 of `delete_consumer_offset` carrying an explicit `AckLevel` byte.
+    pub fn delete_consumer_offset_v2(
+        &self,
+        namespace: IggyNamespace,
+        consumer_kind: u8,
+        consumer_id: u32,
+        ack: AckLevel,
+    ) -> Message<RequestHeader> {
+        let mut payload = Vec::with_capacity(6);
+        payload.push(consumer_kind);
+        payload.extend_from_slice(&consumer_id.to_le_bytes());
+        payload.push(ack.as_u8());
+
+        self.build_request_with_namespace(Operation::DeleteConsumerOffset2, &payload, namespace)
+    }
+
     #[allow(clippy::cast_possible_truncation)]
     fn build_request_with_namespace(
         &self,
@@ -127,43 +223,22 @@ impl SimClient {
         payload: &[u8],
         namespace: IggyNamespace,
     ) -> Message<RequestHeader> {
-        use bytes::Bytes;
-
         let header_size = std::mem::size_of::<RequestHeader>();
         let total_size = header_size + payload.len();
 
-        let header = RequestHeader {
-            command: iggy_binary_protocol::Command2::Request,
-            operation,
-            size: total_size as u32,
-            cluster: 0,
-            checksum: 0,
-            checksum_body: 0,
-            view: 0,
-            release: 0,
-            replica: 0,
-            reserved_frame: [0; 66],
-            client: self.client_id,
-            request_checksum: 0,
-            timestamp: 0,
-            request: self.next_request_number(),
-            namespace: namespace.inner(),
-            ..Default::default()
-        };
+        let header = self.request_header(operation, namespace, total_size);
 
         let header_bytes = bytemuck::bytes_of(&header);
         let mut buffer = Vec::with_capacity(total_size);
         buffer.extend_from_slice(header_bytes);
         buffer.extend_from_slice(payload);
 
-        Message::<RequestHeader>::from_bytes(Bytes::from(buffer))
-            .expect("failed to build request message")
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
+            .expect("request buffer must contain a valid request message")
     }
 
     #[allow(clippy::cast_possible_truncation)]
     fn build_request(&self, operation: Operation, payload: &[u8]) -> Message<RequestHeader> {
-        use bytes::Bytes;
-
         let header_size = std::mem::size_of::<RequestHeader>();
         let total_size = header_size + payload.len();
 
@@ -181,6 +256,7 @@ impl SimClient {
             client: self.client_id,
             request_checksum: 0,
             timestamp: 0, // TODO: Use actual timestamp
+            session: self.session_id(),
             request: self.next_request_number(),
             ..Default::default()
         };
@@ -190,7 +266,35 @@ impl SimClient {
         buffer.extend_from_slice(header_bytes);
         buffer.extend_from_slice(payload);
 
-        Message::<RequestHeader>::from_bytes(Bytes::from(buffer))
-            .expect("failed to build request message")
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
+            .expect("request buffer must contain a valid request message")
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn request_header(
+        &self,
+        operation: Operation,
+        namespace: IggyNamespace,
+        total_size: usize,
+    ) -> RequestHeader {
+        RequestHeader {
+            command: iggy_binary_protocol::Command2::Request,
+            operation,
+            size: total_size as u32,
+            cluster: 0,
+            checksum: 0,
+            checksum_body: 0,
+            view: 0,
+            release: 0,
+            replica: 0,
+            reserved_frame: [0; 66],
+            client: self.client_id,
+            request_checksum: 0,
+            timestamp: 0,
+            session: self.session_id(),
+            request: self.next_request_number(),
+            namespace: namespace.inner(),
+            ..Default::default()
+        }
     }
 }

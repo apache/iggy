@@ -23,7 +23,7 @@ use bytes::Bytes;
 use iggy::prelude::*;
 use predicates::str::{ends_with, is_match, starts_with};
 use serial_test::parallel;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use tokio::io::AsyncWriteExt;
 
@@ -34,7 +34,7 @@ pub(super) struct TestMessageSendFromFileCmd<'a> {
     topic_name: String,
     messages: Vec<&'a str>,
     message_count: usize,
-    headers: HashMap<HeaderKey, HeaderValue>,
+    headers: BTreeMap<HeaderKey, HeaderValue>,
     // These will be populated after creating the resources
     actual_stream_id: Option<u32>,
     actual_topic_id: Option<u32>,
@@ -49,7 +49,7 @@ impl<'a> TestMessageSendFromFileCmd<'a> {
         topic_name: &str,
         messages: &[&'a str],
         message_count: usize,
-        headers: HashMap<HeaderKey, HeaderValue>,
+        headers: BTreeMap<HeaderKey, HeaderValue>,
     ) -> Self {
         assert!(message_count <= messages.len());
         Self {
@@ -273,7 +273,7 @@ pub async fn should_be_successful() {
         "accusantium doloremque laudantium, totam rem aperiam, eaque ipsa",
     ];
 
-    let test_headers = HashMap::from([
+    let test_headers = BTreeMap::from([
         (
             HeaderKey::from_str("HeaderKey1").unwrap(),
             HeaderValue::from_str("HeaderValue1").unwrap(),

@@ -27,83 +27,130 @@ impl IggyShard {
     pub fn get_cluster_metadata(&self) -> ClusterMetadata {
         let mut nodes = Vec::new();
 
-        // Determine cluster name and current node name based on whether clustering is enabled
-        let (cluster_name, current_node_name, current_ip) = if self.config.cluster.enabled {
-            (
-                self.config.cluster.name.clone(),
-                self.config.cluster.node.current.name.clone(),
-                self.config.cluster.node.current.ip.clone(),
-            )
-        } else {
-            (
-                "single-node".to_string(),
-                "iggy-node".to_string(),
-                extract_ip(&self.config.tcp.address),
-            )
+        if !self.config.cluster.enabled {
+            // Single-node: report ourselves as the sole leader; identity
+            // fields fall back to transport addresses since no cluster list
+            // is configured.
+            let current_endpoints = self.get_actual_bound_ports().unwrap_or_else(|| {
+                TransportEndpoints::new(
+                    extract_port(&self.config.tcp.address),
+                    extract_port(&self.config.quic.address),
+                    extract_port(&self.config.http.address),
+                    extract_port(&self.config.websocket.address),
+                )
+            });
+
+            nodes.push(ClusterNode {
+                name: "iggy-node".to_string(),
+                ip: extract_ip(&self.config.tcp.address),
+                endpoints: current_endpoints,
+                role: ClusterNodeRole::Leader,
+                status: ClusterNodeStatus::Healthy,
+            });
+
+            return ClusterMetadata {
+                name: "single-node".to_string(),
+                nodes,
+            };
+        }
+
+        // Cluster mode: resolve the current node from the roster by the
+        // runtime-supplied replica_id. Bootstrap already validated that
+        // exactly one entry matches; missing `current_replica_id` here
+        // would indicate a bootstrap bug, so fall back to a safe default
+        // rather than panicking on the hot metadata path.
+        let current_id = self.current_replica_id;
+        let current_node = current_id
+            .and_then(|id| {
+                self.config
+                    .cluster
+                    .nodes
+                    .iter()
+                    .find(|node| node.replica_id == id)
+            })
+            .or_else(|| self.config.cluster.nodes.first());
+
+        let Some(current_node) = current_node else {
+            // Nodes list is empty even though cluster.enabled=true. Validator
+            // refuses this state at startup; treat defensively if reached.
+            return ClusterMetadata {
+                name: self.config.cluster.name.clone(),
+                nodes,
+            };
         };
 
-        // Get the actual bound ports from the shard's bound addresses
+        // Use the actual bound ports for the current node so tests that bind
+        // to port 0 still report the OS-assigned port over the wire.
         let current_endpoints = self.get_actual_bound_ports().unwrap_or_else(|| {
             TransportEndpoints::new(
-                extract_port(&self.config.tcp.address),
-                extract_port(&self.config.quic.address),
-                extract_port(&self.config.http.address),
-                extract_port(&self.config.websocket.address),
+                current_node
+                    .ports
+                    .tcp
+                    .unwrap_or_else(|| extract_port(&self.config.tcp.address)),
+                current_node
+                    .ports
+                    .quic
+                    .unwrap_or_else(|| extract_port(&self.config.quic.address)),
+                current_node
+                    .ports
+                    .http
+                    .unwrap_or_else(|| extract_port(&self.config.http.address)),
+                current_node
+                    .ports
+                    .websocket
+                    .unwrap_or_else(|| extract_port(&self.config.websocket.address)),
             )
         });
 
-        // Add current node with appropriate role
         nodes.push(ClusterNode {
-            name: current_node_name.clone(),
-            ip: current_ip,
+            name: current_node.name.clone(),
+            ip: current_node.ip.clone(),
             endpoints: current_endpoints,
-            role: if self.config.cluster.enabled && self.is_follower {
+            role: if self.is_follower {
                 ClusterNodeRole::Follower
             } else {
-                // Always leader when clustering is disabled or when not a follower
                 ClusterNodeRole::Leader
             },
             status: ClusterNodeStatus::Healthy,
         });
 
-        // Only add other nodes if clustering is enabled
-        if self.config.cluster.enabled {
-            for other_node in &self.config.cluster.node.others {
-                let endpoints = TransportEndpoints::new(
-                    other_node
-                        .ports
-                        .tcp
-                        .unwrap_or_else(|| extract_port(&self.config.tcp.address)),
-                    other_node
-                        .ports
-                        .quic
-                        .unwrap_or_else(|| extract_port(&self.config.quic.address)),
-                    other_node
-                        .ports
-                        .http
-                        .unwrap_or_else(|| extract_port(&self.config.http.address)),
-                    other_node
-                        .ports
-                        .websocket
-                        .unwrap_or_else(|| extract_port(&self.config.websocket.address)),
-                );
+        for peer in self
+            .config
+            .cluster
+            .nodes
+            .iter()
+            .filter(|node| node.replica_id != current_node.replica_id)
+        {
+            let endpoints = TransportEndpoints::new(
+                peer.ports
+                    .tcp
+                    .unwrap_or_else(|| extract_port(&self.config.tcp.address)),
+                peer.ports
+                    .quic
+                    .unwrap_or_else(|| extract_port(&self.config.quic.address)),
+                peer.ports
+                    .http
+                    .unwrap_or_else(|| extract_port(&self.config.http.address)),
+                peer.ports
+                    .websocket
+                    .unwrap_or_else(|| extract_port(&self.config.websocket.address)),
+            );
 
-                nodes.push(ClusterNode {
-                    name: other_node.name.clone(),
-                    ip: other_node.ip.clone(),
-                    endpoints,
-                    role: if self.is_follower {
-                        ClusterNodeRole::Leader
-                    } else {
-                        ClusterNodeRole::Follower
-                    },
-                    status: ClusterNodeStatus::Healthy,
-                });
-            }
+            nodes.push(ClusterNode {
+                name: peer.name.clone(),
+                ip: peer.ip.clone(),
+                endpoints,
+                role: if self.is_follower {
+                    ClusterNodeRole::Leader
+                } else {
+                    ClusterNodeRole::Follower
+                },
+                status: ClusterNodeStatus::Healthy,
+            });
         }
 
         ClusterMetadata {
-            name: cluster_name,
+            name: self.config.cluster.name.clone(),
             nodes,
         }
     }

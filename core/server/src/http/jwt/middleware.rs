@@ -26,7 +26,6 @@ use axum::{
     response::Response,
 };
 use err_trail::ErrContext;
-use iggy_common::IggyError;
 use std::sync::Arc;
 
 const COMPONENT: &str = "JWT_MIDDLEWARE";
@@ -79,9 +78,7 @@ pub async fn jwt_auth(
     let jwt_claims = state
         .jwt_manager
         .decode(jwt_token, token_header.alg)
-        .error(|e: &IggyError| {
-            format!("{COMPONENT} (error: {e}) - failed to decode JWT with provided algorithm")
-        })
+        .await
         .map_err(|_| UNAUTHORIZED)?;
     if state
         .jwt_manager
@@ -92,10 +89,15 @@ pub async fn jwt_auth(
     }
 
     let request_details = request.extensions().get::<RequestDetails>().unwrap();
+    let user_id = jwt_claims
+        .claims
+        .sub
+        .parse::<u32>()
+        .map_err(|_| UNAUTHORIZED)?;
     let identity = Identity {
         token_id: jwt_claims.claims.jti,
         token_expiry: jwt_claims.claims.exp,
-        user_id: jwt_claims.claims.sub,
+        user_id,
         ip_address: request_details.ip_address,
     };
     request.extensions_mut().insert(identity);

@@ -16,15 +16,14 @@
  * under the License.
  */
 
-use crate::binary::dispatch::{HandlerResult, wire_id_to_identifier};
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use crate::streaming::session::Session;
 use iggy_binary_protocol::requests::users::ChangePasswordRequest;
-use iggy_common::change_password::ChangePassword;
-use iggy_common::{IggyError, SenderKind, Validatable};
-use secrecy::SecretString;
+use iggy_common::defaults::{MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -41,23 +40,18 @@ pub async fn handle_change_password(
     );
     shard.ensure_authenticated(session)?;
 
-    let user_id = wire_id_to_identifier(&req.user_id)?;
-
-    let target_user = shard.get_user(&user_id)?;
-    if target_user.id != session.get_user_id() {
-        shard.metadata.perm_change_password(session.get_user_id())?;
+    let current_len = req.current_password.len();
+    if !(MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH).contains(&current_len) {
+        return Err(IggyError::InvalidPassword);
     }
-
-    let command = ChangePassword {
-        user_id,
-        current_password: SecretString::from(req.current_password),
-        new_password: SecretString::from(req.new_password),
-    };
-    command.validate()?;
+    let new_len = req.new_password.len();
+    if !(MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH).contains(&new_len) {
+        return Err(IggyError::InvalidPassword);
+    }
 
     let request = ShardRequest::control_plane(ShardRequestPayload::ChangePasswordRequest {
         user_id: session.get_user_id(),
-        command,
+        command: req,
     });
 
     match shard.send_to_control_plane(request).await? {

@@ -25,8 +25,13 @@ public class TestContext
 {
     public IIggyClient IggyClient { get; set; } = null!;
     public string TcpUrl { get; set; } = string.Empty;
+    public string LeaderTcpUrl { get; set; } = string.Empty;
+    public string FollowerTcpUrl { get; set; } = string.Empty;
+    public Dictionary<string, IIggyClient> Clients { get; } = new();
     public StreamResponse? CreatedStream { get; set; }
     public TopicResponse? CreatedTopic { get; set; }
     public List<MessageResponse> PolledMessages { get; set; } = new();
     public Message? LastSendMessage { get; set; }
+    public bool RedirectionOccurred { get; set; }
+    public uint? LastStreamId { get; set; }
 }

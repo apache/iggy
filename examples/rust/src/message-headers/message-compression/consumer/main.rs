@@ -19,6 +19,7 @@
 use bytes::Bytes;
 use futures_util::stream::StreamExt;
 use iggy::prelude::*;
+use iggy_common::wire_conversions::user_headers_to_wire;
 // The compression and decompression utilities are shared between the producer and consumer compression examples.
 // Hence, we import them here.
 use iggy_examples::shared::codec::{Codec, NUM_MESSAGES, STREAM_NAME, TOPIC_NAME};
@@ -76,12 +77,13 @@ fn handle_payload_compression(msg: &mut ReceivedMessage) -> Result<(), IggyError
         // remove the compression header since payload is now decompressed
         if let Ok(Some(mut headers_map)) = msg.message.user_headers_map() {
             headers_map.remove(&Codec::header_key());
-            let headers_bytes = headers_map.to_bytes();
-            msg.message.header.user_headers_length = headers_bytes.len() as u32;
-            msg.message.user_headers = if headers_map.is_empty() {
-                None
+            if headers_map.is_empty() {
+                msg.message.header.user_headers_length = 0;
+                msg.message.user_headers = None;
             } else {
-                Some(headers_bytes)
+                let wire = user_headers_to_wire(&headers_map);
+                msg.message.header.user_headers_length = wire.as_bytes().len() as u32;
+                msg.message.user_headers = Some(wire.into_bytes());
             };
         }
     }

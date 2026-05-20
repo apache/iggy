@@ -51,6 +51,9 @@ nextests TEST: build
 server *ARGS:
   cargo run --bin iggy-server {{ARGS}}
 
+server-ng *ARGS:
+  cargo run --bin iggy-server-ng {{ARGS}}
+
 run-benches:
   ./scripts/run-benches.sh
 
@@ -71,12 +74,6 @@ licenses-fix:
 
 licenses-check:
   ./scripts/ci/license-headers.sh --check
-
-licenses-list-check:
-  ./scripts/ci/licenses-list.sh --check
-
-licenses-list-fix:
-  ./scripts/ci/licenses-list.sh --fix
 
 markdownlint:
   markdownlint '**/*.md' --ignore-path .gitignore

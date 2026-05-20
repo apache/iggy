@@ -22,7 +22,6 @@ use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::Client;
 use iggy_common::Identifier;
-use iggy_common::get_consumer_groups::GetConsumerGroups;
 use std::fmt::{self, Display, Formatter};
 use tracing::{Level, event};
 
@@ -43,7 +42,8 @@ impl Display for GetConsumerGroupsOutput {
 }
 
 pub struct GetConsumerGroupsCmd {
-    get_consumer_groups: GetConsumerGroups,
+    stream_id: Identifier,
+    topic_id: Identifier,
     output: GetConsumerGroupsOutput,
 }
 
@@ -54,10 +54,8 @@ impl GetConsumerGroupsCmd {
         output: GetConsumerGroupsOutput,
     ) -> Self {
         Self {
-            get_consumer_groups: GetConsumerGroups {
-                stream_id,
-                topic_id,
-            },
+            stream_id,
+            topic_id,
             output,
         }
     }
@@ -68,21 +66,18 @@ impl CliCommand for GetConsumerGroupsCmd {
     fn explain(&self) -> String {
         format!(
             "list consumer groups for stream with ID: {} and topic with ID: {} in {} mode",
-            self.get_consumer_groups.stream_id, self.get_consumer_groups.topic_id, self.output
+            self.stream_id, self.topic_id, self.output
         )
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let consumer_groups = client
-            .get_consumer_groups(
-                &self.get_consumer_groups.stream_id,
-                &self.get_consumer_groups.topic_id,
-            )
+            .get_consumer_groups(&self.stream_id, &self.topic_id)
             .await
             .with_context(|| {
                 format!(
                     "Problem getting consumer groups for stream with ID: {} and topic with ID: {}",
-                    self.get_consumer_groups.stream_id, self.get_consumer_groups.topic_id
+                    self.stream_id, self.topic_id
                 )
             })?;
 

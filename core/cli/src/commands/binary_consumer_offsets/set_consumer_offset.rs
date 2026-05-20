@@ -21,12 +21,15 @@ use anyhow::Context;
 use async_trait::async_trait;
 use iggy_common::Client;
 use iggy_common::Identifier;
-use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::{Consumer, ConsumerKind};
 use tracing::{Level, event};
 
 pub struct SetConsumerOffsetCmd {
-    set_consumer_offset: StoreConsumerOffset,
+    consumer: Consumer,
+    stream_id: Identifier,
+    topic_id: Identifier,
+    partition_id: u32,
+    offset: u64,
 }
 
 impl SetConsumerOffsetCmd {
@@ -39,16 +42,14 @@ impl SetConsumerOffsetCmd {
         kind: ConsumerKind,
     ) -> Self {
         Self {
-            set_consumer_offset: StoreConsumerOffset {
-                consumer: Consumer {
-                    kind,
-                    id: consumer_id,
-                },
-                stream_id,
-                topic_id,
-                partition_id: Some(partition_id),
-                offset,
+            consumer: Consumer {
+                kind,
+                id: consumer_id,
             },
+            stream_id,
+            topic_id,
+            partition_id,
+            offset,
         }
     }
 }
@@ -58,32 +59,28 @@ impl CliCommand for SetConsumerOffsetCmd {
     fn explain(&self) -> String {
         format!(
             "set consumer offset for consumer with ID: {} for stream with ID: {} and topic with ID: {} and partition with ID: {} to {}",
-            self.set_consumer_offset.consumer.id,
-            self.set_consumer_offset.stream_id,
-            self.set_consumer_offset.topic_id,
-            self.set_consumer_offset.partition_id.unwrap(),
-            self.set_consumer_offset.offset,
+            self.consumer.id, self.stream_id, self.topic_id, self.partition_id, self.offset,
         )
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
-            .store_consumer_offset(&self.set_consumer_offset.consumer, &self.set_consumer_offset.stream_id, &self.set_consumer_offset.topic_id, self.set_consumer_offset.partition_id, self.set_consumer_offset.offset)
+            .store_consumer_offset(&self.consumer, &self.stream_id, &self.topic_id, Some(self.partition_id), self.offset)
             .await
             .with_context(|| {
                 format!(
                     "Problem setting consumer offset for consumer with ID: {} for stream with ID: {} and topic with ID: {} and partition with ID: {}",
-                    self.set_consumer_offset.consumer.id, self.set_consumer_offset.stream_id, self.set_consumer_offset.topic_id, self.set_consumer_offset.partition_id.unwrap()
+                    self.consumer.id, self.stream_id, self.topic_id, self.partition_id
                 )
             })?;
 
         event!(target: PRINT_TARGET, Level::INFO,
             "Consumer offset for consumer with ID: {} for stream with ID: {} and topic with ID: {} and partition with ID: {} set to {}",
-            self.set_consumer_offset.consumer.id,
-            self.set_consumer_offset.stream_id,
-            self.set_consumer_offset.topic_id,
-            self.set_consumer_offset.partition_id.unwrap(),
-            self.set_consumer_offset.offset,
+            self.consumer.id,
+            self.stream_id,
+            self.topic_id,
+            self.partition_id,
+            self.offset,
         );
 
         Ok(())

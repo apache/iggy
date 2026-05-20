@@ -25,6 +25,8 @@ pub struct HttpClientConfig {
     pub api_url: String,
     /// The number of retries to perform on transient errors.
     pub retries: u32,
+    /// The JWT for A2A authentication.
+    pub jwt: Option<String>,
 }
 
 impl Default for HttpClientConfig {
@@ -32,6 +34,7 @@ impl Default for HttpClientConfig {
         HttpClientConfig {
             api_url: "http://127.0.0.1:3000".to_string(),
             retries: 3,
+            jwt: None,
         }
     }
 }
@@ -41,6 +44,7 @@ impl From<ConnectionString<HttpConnectionStringOptions>> for HttpClientConfig {
         HttpClientConfig {
             api_url: format!("http://{}", connection_string.server_address()),
             retries: connection_string.options().retries().unwrap(),
+            jwt: None,
         }
     }
 }

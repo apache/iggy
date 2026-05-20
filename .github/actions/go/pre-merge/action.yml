@@ -83,7 +83,7 @@ runs:
 
     - name: Lint
       if: inputs.task == 'lint'
-      uses: golangci/golangci-lint-action@v7
+      uses: golangci/golangci-lint-action@v9
       with:
         version: v2.11.3
         working-directory: foreign/go
@@ -92,7 +92,7 @@ runs:
 
     - name: Lint BDD
       if: inputs.task == 'lint' && hashFiles('bdd/go/go.mod') != ''
-      uses: golangci/golangci-lint-action@v7
+      uses: golangci/golangci-lint-action@v9
       with:
         version: v2.11.3
         working-directory: bdd/go
@@ -101,7 +101,7 @@ runs:
 
     - name: Lint Examples
       if: inputs.task == 'lint' && hashFiles('examples/go/go.mod') != ''
-      uses: golangci/golangci-lint-action@v7
+      uses: golangci/golangci-lint-action@v9
       with:
         version: v2.11.3
         working-directory: examples/go

@@ -19,8 +19,10 @@
 use super::PARTITION_ID;
 use bytes::BytesMut;
 use iggy::prelude::*;
+use iggy_binary_protocol::WireUserHeaders;
+use iggy_common::wire_conversions::user_headers_from_wire;
 use integration::harness::TestHarness;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 fn small_batches() -> Vec<u32> {
     vec![3, 4, 5, 6, 7]
@@ -172,7 +174,7 @@ fn create_single_message(id: u32, message_size: u64) -> IggyMessage {
     payload.resize(message_size as usize, 0xD);
     let payload = payload.freeze();
 
-    let mut headers = HashMap::new();
+    let mut headers = BTreeMap::new();
     headers.insert(
         HeaderKey::try_from("key_1").unwrap(),
         HeaderValue::try_from("Value 1").unwrap(),
@@ -404,7 +406,7 @@ async fn verify_message_content(
 
             if let Some(headers) = &msg.user_headers {
                 let headers_map =
-                    HashMap::<HeaderKey, HeaderValue>::from_bytes(headers.clone()).unwrap();
+                    user_headers_from_wire(&WireUserHeaders::from_slice(headers).unwrap()).unwrap();
                 assert_eq!(headers_map.len(), 3, "Expected 3 headers");
             }
         }

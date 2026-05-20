@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::state::ui::ViewMode;
 use bench_dashboard_shared::BenchmarkReportLight;
 use gloo::timers::callback::Timeout;
 use web_sys::window;
@@ -25,7 +24,6 @@ use yew::prelude::*;
 pub struct BenchmarkInfoTooltipProps {
     pub benchmark_report: Option<BenchmarkReportLight>,
     pub visible: bool,
-    pub view_mode: ViewMode,
 }
 
 #[function_component(BenchmarkInfoTooltip)]
@@ -37,7 +35,6 @@ pub fn benchmark_info_tooltip(props: &BenchmarkInfoTooltipProps) -> Html {
     let benchmark_report = props.benchmark_report.as_ref().unwrap();
     let hardware = &benchmark_report.hardware;
     let params = &benchmark_report.params;
-    let is_trend_view = matches!(props.view_mode, ViewMode::GitrefTrend);
     let notification_visible = use_state(|| false);
 
     let onclick = {
@@ -73,13 +70,7 @@ pub fn benchmark_info_tooltip(props: &BenchmarkInfoTooltipProps) -> Html {
             <div class="tooltip-section">
                 <h4>{"Benchmark Parameters"}</h4>
                 <div class="tooltip-content">
-                    {if !is_trend_view {
-                        html! {
-                            <p><strong>{"Time: "}</strong>{&benchmark_report.timestamp}</p>
-                        }
-                    } else {
-                        html! {}
-                    }}
+                    <p><strong>{"Time: "}</strong>{&benchmark_report.timestamp}</p>
                     <p><strong>{"Kind: "}</strong>{&params.benchmark_kind}</p>
                     <p><strong>{"Transport: "}</strong>{&params.transport}</p>
                     <p><strong>{"Messages: "}</strong>{format!("{} x {} ({} bytes)",
@@ -101,16 +92,8 @@ pub fn benchmark_info_tooltip(props: &BenchmarkInfoTooltipProps) -> Html {
                             )
                         }
                     }</p>
-                    {if !is_trend_view {
-                        html! {
-                            <>
-                                <p><strong>{"Git ref: "}</strong>{params.gitref.clone()}</p>
-                                <p><strong>{"Git ref date: "}</strong>{params.gitref_date.clone()}</p>
-                            </>
-                        }
-                    } else {
-                        html! {}
-                    }}
+                    <p><strong>{"Git ref: "}</strong>{params.gitref.clone()}</p>
+                    <p><strong>{"Git ref date: "}</strong>{params.gitref_date.clone()}</p>
                 </div>
             </div>
             <div class="tooltip-section">

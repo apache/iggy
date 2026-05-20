@@ -22,7 +22,7 @@ use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
 use iggy_examples::shared::messages_generator::MessagesGenerator;
 use iggy_examples::shared::system;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::sync::Arc;
 use tracing::info;
@@ -83,7 +83,7 @@ async fn produce_messages(args: &Args, client: &IggyClient) -> Result<(), Box<dy
             let json = serializable_message.to_json();
 
             // The message type will be stored in the custom message header.
-            let mut headers = HashMap::new();
+            let mut headers = BTreeMap::new();
             headers.insert(
                 HeaderKey::try_from("message_type").unwrap(),
                 HeaderValue::try_from(message_type).unwrap(),

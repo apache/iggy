@@ -439,7 +439,7 @@ impl IggyShard {
             (segments, storages, partition.stats.clone())
         };
 
-        for (mut storage, segment) in storages.into_iter().zip(segments.into_iter()) {
+        for (mut storage, segment) in storages.into_iter().zip(segments) {
             let (msg_writer, index_writer) = storage.shutdown();
             let start_offset = segment.start_offset;
 

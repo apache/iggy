@@ -15,7 +15,47 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_common::{IggyByteSize, PollingStrategy};
+use smallvec::SmallVec;
+
+#[derive(Debug, Clone)]
+pub struct Fragment<const ALIGN: usize = 4096> {
+    source: Frozen<ALIGN>,
+    start: usize,
+    end: usize,
+}
+
+impl<const ALIGN: usize> Fragment<ALIGN> {
+    #[must_use]
+    pub fn whole(source: Frozen<ALIGN>) -> Self {
+        let end = source.len();
+        Self {
+            source,
+            start: 0,
+            end,
+        }
+    }
+
+    #[must_use]
+    /// # Panics
+    ///
+    /// Panics if `start > end` or if `end` is past the end of `source`.
+    pub fn slice(source: Frozen<ALIGN>, start: usize, end: usize) -> Self {
+        assert!(start <= end);
+        assert!(end <= source.len());
+        Self { source, start, end }
+    }
+
+    #[must_use]
+    pub fn into_frozen(self) -> Frozen<ALIGN> {
+        if self.start == 0 && self.end == self.source.len() {
+            self.source
+        } else {
+            self.source.slice(self.start..self.end)
+        }
+    }
+}
 
 /// Arguments for polling messages from a partition.
 #[derive(Debug, Clone)]
@@ -24,6 +64,9 @@ pub struct PollingArgs {
     pub count: u32,
     pub auto_commit: bool,
 }
+
+pub type PollFragments<const ALIGN: usize = 4096> = SmallVec<[Fragment<ALIGN>; 4]>;
+pub type PollQueryResult<const ALIGN: usize = 4096> = (PollFragments<ALIGN>, Option<u64>);
 
 impl PollingArgs {
     #[must_use]
@@ -85,32 +128,28 @@ impl AppendResult {
 
 /// Current offset state of a partition.
 ///
-/// Tracks both the commit offset (visibility boundary) and write offset
-/// (highest written message). These may differ when there are prepared
-/// but uncommitted messages.
+/// Tracks both the durable offset (highest persisted message) and write offset
+/// (highest assigned message offset). These may differ when there are prepared
+/// messages that still only live in the in-memory journal.
 ///
 /// ```text
 /// Segment: [msg0][msg1][msg2][msg3][msg4][msg5][msg6][msg7]
 ///                                     ▲              ▲
-///                               commit_offset   write_offset
+///                              durable_offset   write_offset
 ///                                   (4)             (7)
 ///
-/// - Messages 0-4: COMMITTED (visible to consumers)
-/// - Messages 5-7: PREPARED but not committed (invisible)
+/// - Messages 0-4: durably persisted
+/// - Messages 5-7: prepared, but still buffered in memory
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartitionOffsets {
-    /// Highest offset visible to consumers.
-    ///
-    /// All messages with `offset <= commit_offset` can be read via
-    /// `read_committed()` or `poll_messages()`.
+    /// Highest durably persisted offset.
     pub commit_offset: u64,
 
-    /// Highest offset written to storage.
+    /// Highest offset assigned to the partition.
     ///
     /// This may be greater than `commit_offset` when there are prepared
-    /// but uncommitted messages (during the window between prepare and
-    /// commit in VSR).
+    /// messages buffered in the in-memory journal.
     ///
     /// Invariant: `write_offset >= commit_offset`
     pub write_offset: u64,
@@ -180,6 +219,16 @@ pub struct PartitionsConfig {
 }
 
 impl PartitionsConfig {
+    #[must_use]
+    pub fn get_partition_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!("/tmp/iggy_stub/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}")
+    }
+
     /// Constructs the file path for segment messages.
     ///
     /// TODO: This is a stub waiting for completion of issue to move server config
@@ -194,7 +243,8 @@ impl PartitionsConfig {
         start_offset: u64,
     ) -> String {
         format!(
-            "/tmp/iggy_stub/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}/{start_offset:0>20}.log",
+            "{}/{start_offset:0>20}.log",
+            self.get_partition_path(stream_id, topic_id, partition_id)
         )
     }
 
@@ -212,7 +262,47 @@ impl PartitionsConfig {
         start_offset: u64,
     ) -> String {
         format!(
-            "/tmp/iggy_stub/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}/{start_offset:0>20}.index",
+            "{}/{start_offset:0>20}.index",
+            self.get_partition_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    #[must_use]
+    pub fn get_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/offsets",
+            self.get_partition_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    #[must_use]
+    pub fn get_consumer_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/consumers",
+            self.get_offsets_path(stream_id, topic_id, partition_id)
+        )
+    }
+
+    #[must_use]
+    pub fn get_consumer_group_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
+        format!(
+            "{}/groups",
+            self.get_offsets_path(stream_id, topic_id, partition_id)
         )
     }
 }

@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::binary::dispatch::{HandlerResult, wire_id_to_identifier};
+use crate::binary::dispatch::HandlerResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
@@ -25,8 +25,7 @@ use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
 use iggy_binary_protocol::responses::consumer_groups::ConsumerGroupResponse;
-use iggy_common::create_consumer_group::CreateConsumerGroup;
-use iggy_common::{IggyError, SenderKind, Validatable};
+use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -37,24 +36,17 @@ pub async fn handle_create_consumer_group(
     session: &Session,
     shard: &Rc<IggyShard>,
 ) -> Result<HandlerResult, IggyError> {
-    let stream_id = wire_id_to_identifier(&req.stream_id)?;
-    let topic_id = wire_id_to_identifier(&req.topic_id)?;
     debug!(
-        "session: {session}, command: create_consumer_group, stream_id: {stream_id}, topic_id: {topic_id}, name: {}",
+        "session: {session}, command: create_consumer_group, stream_id: {:?}, topic_id: {:?}, name: {}",
+        req.stream_id,
+        req.topic_id,
         req.name.as_str()
     );
     shard.ensure_authenticated(session)?;
 
-    let command = CreateConsumerGroup {
-        stream_id,
-        topic_id,
-        name: req.name.to_string(),
-    };
-    command.validate()?;
-
     let request = ShardRequest::control_plane(ShardRequestPayload::CreateConsumerGroupRequest {
         user_id: session.get_user_id(),
-        command,
+        command: req,
     });
 
     match shard.send_to_control_plane(request).await? {

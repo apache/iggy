@@ -61,3 +61,23 @@ impl TryFrom<ffi::Identifier> for RustIdentifier {
         Ok(rust_identifier)
     }
 }
+
+// Rust 1.95 added the `wrong_self_convention` lint for `from_*` methods that take `&mut self`.
+// These methods initialize the FFI `Identifier` struct in place from C++ — keeping the names
+// preserves the C++ ABI used by every test and downstream binding.
+#[allow(clippy::wrong_self_convention)]
+impl ffi::Identifier {
+    pub fn from_string(&mut self, id: String) -> Result<(), String> {
+        *self = RustIdentifier::named(&id)
+            .map(ffi::Identifier::from)
+            .map_err(|error| format!("Could not create string identifier: {error}"))?;
+        Ok(())
+    }
+
+    pub fn from_numeric(&mut self, id: u32) -> Result<(), String> {
+        *self = RustIdentifier::numeric(id)
+            .map(ffi::Identifier::from)
+            .map_err(|error| format!("Could not create numeric identifier: {error}"))?;
+        Ok(())
+    }
+}

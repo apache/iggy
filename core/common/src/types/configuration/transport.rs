@@ -16,8 +16,7 @@
  * under the License.
  */
 
-use crate::{BytesSerializable, IggyError};
-use bytes::{BufMut, Bytes, BytesMut};
+use crate::IggyError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{fmt, str::FromStr};
 use strum::{Display, EnumString, IntoStaticStr};
@@ -141,25 +140,5 @@ impl<'de> Deserialize<'de> for TransportProtocol {
         }
 
         deserializer.deserialize_any(TransportProtocolVisitor)
-    }
-}
-
-impl BytesSerializable for TransportProtocol {
-    fn get_buffer_size(&self) -> usize {
-        1
-    }
-
-    fn to_bytes(&self) -> Bytes {
-        let mut bytes = BytesMut::with_capacity(1);
-        bytes.put_u8(*self as u8);
-        bytes.freeze()
-    }
-
-    fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
-        if bytes.is_empty() {
-            return Err(IggyError::InvalidCommand);
-        }
-
-        TransportProtocol::try_from(bytes[0])
     }
 }
