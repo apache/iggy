@@ -46,6 +46,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --fix     Format TOML files"
       echo ""
       echo "File selection:"
+      echo "  [none]    Check all tracked TOML files (default)"
       echo "  --ci      Check files changed in PR (for CI)"
       echo "  [files]   Check specific files"
       exit 0

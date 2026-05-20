@@ -23,8 +23,8 @@ set -euo pipefail
 MODE="check"
 FILES=()
 
-# Accept mode flags plus optional file paths. In pre-commit, matching staged
-# shell files are passed as positional arguments.
+# Accept mode flags plus optional file paths. Pre-commit passes matching shell
+# files as positional arguments.
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --check)
@@ -97,8 +97,8 @@ if [ "$MODE" = "fix" ]; then
   echo ""
 
   FAILED=0
-  # Use staged or explicitly provided files when present; otherwise keep the
-  # historical full-repository behavior for CI/manual all-file checks.
+  # Use file arguments from pre-commit or the caller when present; otherwise
+  # keep the historical full-repository behavior for CI/manual checks.
   if [ ${#FILES[@]} -gt 0 ]; then
     for script in "${FILES[@]}"; do
       [ -f "$script" ] || continue
@@ -128,8 +128,8 @@ if [ "$MODE" = "fix" ]; then
 else
   echo "🔍 Checking shell scripts..."
 
-  # Use staged or explicitly provided files when present; otherwise keep the
-  # historical full-repository behavior for CI/manual all-file checks.
+  # Use file arguments from pre-commit or the caller when present; otherwise
+  # keep the historical full-repository behavior for CI/manual checks.
   if [ ${#FILES[@]} -gt 0 ]; then
     if shellcheck -x "${FILES[@]}"; then
       echo "✅ All shell scripts passed shellcheck"

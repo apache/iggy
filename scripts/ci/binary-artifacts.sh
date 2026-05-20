@@ -51,6 +51,7 @@ while [[ $# -gt 0 ]]; do
       echo "Usage: $0 [--check] [--ci] [files...]"
       echo ""
       echo "File selection:"
+      echo "  [none]    Check all tracked files (default)"
       echo "  --ci      Check files changed in PR (for CI)"
       echo "  [files]   Check specific files"
       exit 0

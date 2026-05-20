@@ -21,8 +21,8 @@ set -euo pipefail
 MODE="check"
 FILES=()
 
-# Accept mode flags plus optional file paths. In pre-commit, matching staged
-# markdown files are passed as positional arguments.
+# Accept mode flags plus optional file paths. Pre-commit passes matching
+# markdown files as positional arguments.
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --check)
