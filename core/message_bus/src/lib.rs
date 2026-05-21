@@ -107,6 +107,7 @@ use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_binary_protocol::{GenericHeader, Message};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -169,6 +170,12 @@ impl AcceptedQuicConn {
             connection,
             streams,
         }
+    }
+
+    /// Remote peer address of this accepted QUIC connection.
+    #[must_use]
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.connection.remote_address()
     }
 
     /// Unbundle into the underlying `compio_quic` types.
@@ -616,7 +623,7 @@ impl IggyMessageBus {
     /// callers. A long-running bus is expected to keep this number
     /// bounded under sustained accept traffic; a leak shows up here as
     /// monotonic growth proportional to total accepts.
-    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
     #[must_use]
     pub fn background_tasks_len(&self) -> usize {
         self.background_tasks.borrow().len()

@@ -103,7 +103,7 @@ impl TcpClientConfigBuilder {
 
     /// Builds the TCP client configuration.
     pub fn build(mut self) -> Result<TcpClientConfig, IggyError> {
-        self.config.server_address = self.config.server_address.trim().to_string();
+        self.config.server_address = self.config.server_address.trim().to_owned();
         validate_server_address(&self.config.server_address)?;
 
         Ok(self.config)

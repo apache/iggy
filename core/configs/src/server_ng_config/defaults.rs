@@ -31,7 +31,7 @@
 
 use super::message_bus::MessageBusConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
-use super::server_ng::ServerNgConfig;
+use super::server_ng::{ExtraConfig, ServerNgConfig};
 use super::tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig};
 use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
 use crate::server_config::cluster::ClusterConfig;
@@ -53,6 +53,7 @@ impl Default for ServerNgConfig {
         ServerNgConfig {
             consumer_group: ConsumerGroupConfig::default(),
             data_maintenance: DataMaintenanceConfig::default(),
+            extra: ExtraConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             message_saver: MessageSaverConfig::default(),
             personal_access_token: PersonalAccessTokenConfig::default(),

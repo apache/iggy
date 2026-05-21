@@ -4,6 +4,17 @@ This is the core server component of Apache Iggy. You can run it directly with `
 
 The configuration file is located at [core/server/config.toml](https://github.com/apache/iggy/blob/master/core/server/config.toml). You can customize the server settings by modifying this file or by using environment variables e.g. `IGGY_TCP_ADDRESS=0.0.0.0:8090`.
 
+## Systemd integration
+
+Build with the `systemd` feature to enable systemd readiness and watchdog notifications:
+
+```sh
+cargo build --bin iggy-server --release --features systemd
+```
+
+The server will notify systemd when it is ready and then periodically send
+watchdog messages at half the configured `WatchdogSec` interval for the unit.
+
 ![Server](../../assets/server.png)
 
 ![Architecture](../../assets/iggy_architecture.png)

@@ -54,7 +54,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.rust_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.rust_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -69,7 +69,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.python_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.python_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -84,7 +84,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.node_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.node_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -99,7 +99,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.go_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.go_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -114,7 +114,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.java_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.java_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -129,7 +129,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.csharp_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.csharp_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -144,7 +144,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.cpp_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.cpp_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -157,7 +157,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.other_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.other_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -170,7 +170,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.bdd_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.bdd_matrix) }}
     uses: ./.github/workflows/_test_bdd.yml
     with:
@@ -183,7 +183,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.examples_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.examples_matrix) }}
     uses: ./.github/workflows/_test_examples.yml
     with:
@@ -191,15 +191,14 @@ jobs:
       task: ${{ matrix.task }}
 
   # Final status check
-  status:
-    name: CI Status
+  finalize_pr:
     runs-on: ubuntu-latest
     needs: [common, detect, test-rust, test-python, test-node, test-go, test-java, test-csharp, test-cpp, test-bdd, test-examples, test-other]
-    if: always()
+    if: ${{ !cancelled() }}
     steps:
       - name: Get job execution times
         id: times
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const jobs = await github.rest.actions.listJobsForWorkflowRun({
@@ -439,17 +438,3 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "✅ **CI Passed** - All checks completed successfully!" >> $GITHUB_STEP_SUMMARY
           fi
-
-  finalize_pr:
-    runs-on: ubuntu-latest
-    needs:
-      - status
-    if: always()
-    steps:
-      - name: Everything is fine
-        if: ${{ !(contains(needs.*.result, 'failure')) }}
-        run: exit 0
-
-      - name: Some tests failed
-        if: ${{ contains(needs.*.result, 'failure') }}
-        run: exit 1

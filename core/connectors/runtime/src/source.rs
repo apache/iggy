@@ -42,7 +42,7 @@ use crate::context::RuntimeContext;
 use crate::log::LOG_CALLBACK;
 use crate::metrics::ConnectorType;
 use crate::{
-    PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
+    FailedPlugin, PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
     SourceConnectorProducer, SourceConnectorWrapper, resolve_plugin_path,
     state::{FileStateProvider, StateProvider, StateStorage},
     transform,
@@ -56,12 +56,24 @@ pub fn cleanup_sender(plugin_id: u32) {
     SOURCE_SENDERS.remove(&plugin_id);
 }
 
+/// Initializes all enabled source connectors.
+///
+/// Per-connector failures (path resolution, dlopen, state load, plugin init,
+/// producer/encoder/transform setup) are captured against the offending
+/// connector and do not abort the runtime. Connectors that fail before their
+/// FFI container can be loaded are returned in the second tuple element so
+/// they remain visible in health/status output.
+///
+/// Only system-level errors that prevent any connector from running (e.g. a
+/// poisoned global state) are propagated as `Err`.
 pub async fn init(
     source_configs: HashMap<String, SourceConfig>,
     iggy_client: &IggyClient,
     state_path: &str,
-) -> Result<HashMap<String, SourceConnector>, RuntimeError> {
+) -> Result<(HashMap<String, SourceConnector>, Vec<FailedPlugin>), RuntimeError> {
     let mut source_connectors: HashMap<String, SourceConnector> = HashMap::new();
+    let mut failed_plugins: Vec<FailedPlugin> = Vec::new();
+
     for (key, config) in source_configs {
         let name = config.name.clone();
         if !config.enabled {
@@ -70,110 +82,153 @@ pub async fn init(
         }
 
         let plugin_id = PLUGIN_ID.fetch_add(1, Ordering::SeqCst);
-        let path = resolve_plugin_path(&config.path)?;
+
+        let path = match resolve_plugin_path(&config.path) {
+            Ok(path) => path,
+            Err(error) => {
+                let message = format!("Failed to resolve plugin path: {error}");
+                error!("Source: {name} ({key}) - {message}");
+                failed_plugins.push(FailedPlugin::new(
+                    plugin_id,
+                    &key,
+                    &name,
+                    &config.path,
+                    config.plugin_config_format,
+                    config.enabled,
+                    message,
+                ));
+                continue;
+            }
+        };
+
         info!(
             "Initializing source container with name: {name} ({key}), config version: {}, plugin: {path}",
             &config.version
         );
+
         let state_storage = get_state_storage(state_path, &key);
         let state = match &state_storage {
-            StateStorage::File(file) => file.load().await?,
+            StateStorage::File(file) => match file.load().await {
+                Ok(state) => state,
+                Err(error) => {
+                    let message = format!("Failed to load source state: {error}");
+                    error!("Source: {name} ({key}) - {message}");
+                    failed_plugins.push(FailedPlugin::new(
+                        plugin_id,
+                        &key,
+                        &name,
+                        &config.path,
+                        config.plugin_config_format,
+                        config.enabled,
+                        message,
+                    ));
+                    continue;
+                }
+            },
         };
-        let init_error: Option<String>;
-        if let Some(container) = source_connectors.get_mut(&path) {
-            info!("Source container for plugin: {path} is already loaded.");
-            let version = get_plugin_version(&container.container);
-            init_error = init_source(
-                &container.container,
-                &config.plugin_config.clone().unwrap_or_default(),
-                plugin_id,
-                state,
-            )
-            .err()
-            .map(|error| error.to_string());
-            container.plugins.push(SourceConnectorPlugin {
-                id: plugin_id,
-                key: key.clone(),
-                name: name.clone(),
-                path: path.clone(),
-                version,
-                config_format: config.plugin_config_format,
-                producer: None,
-                transforms: vec![],
-                state_storage,
-                error: init_error.clone(),
-                verbose: config.verbose,
-            });
-        } else {
-            let container: Container<SourceApi> = unsafe {
-                Container::load(&path).map_err(|error| {
-                    RuntimeError::InvalidConfiguration(format!(
-                        "Failed to load source container from {path}: {error}"
-                    ))
-                })?
+
+        if !source_connectors.contains_key(&path) {
+            let container = match unsafe { Container::<SourceApi>::load(&path) } {
+                Ok(container) => container,
+                Err(error) => {
+                    let message = format!("Failed to load source container from {path}: {error}");
+                    error!("Source: {name} ({key}) - {message}");
+                    failed_plugins.push(FailedPlugin::new(
+                        plugin_id,
+                        &key,
+                        &name,
+                        &config.path,
+                        config.plugin_config_format,
+                        config.enabled,
+                        message,
+                    ));
+                    continue;
+                }
             };
             info!("Source container for plugin: {path} loaded successfully.");
-            let version = get_plugin_version(&container);
-            init_error = init_source(
-                &container,
-                &config.plugin_config.clone().unwrap_or_default(),
-                plugin_id,
-                state,
-            )
-            .err()
-            .map(|error| error.to_string());
             source_connectors.insert(
                 path.clone(),
                 SourceConnector {
                     container,
-                    plugins: vec![SourceConnectorPlugin {
-                        id: plugin_id,
-                        key: key.clone(),
-                        name: name.clone(),
-                        path: path.clone(),
-                        version,
-                        config_format: config.plugin_config_format,
-                        producer: None,
-                        transforms: vec![],
-                        state_storage,
-                        error: init_error.clone(),
-                        verbose: config.verbose,
-                    }],
+                    plugins: Vec::new(),
                 },
             );
+        } else {
+            info!("Source container for plugin: {path} is already loaded.");
         }
+
+        let connector = source_connectors
+            .get_mut(&path)
+            .expect("source container was just ensured for this path");
+        let version = get_plugin_version(&connector.container);
+        let init_error = init_source(
+            &connector.container,
+            &config.plugin_config.clone().unwrap_or_default(),
+            plugin_id,
+            state,
+        )
+        .err()
+        .map(|error| error.to_string());
+
+        connector.plugins.push(SourceConnectorPlugin {
+            id: plugin_id,
+            key: key.clone(),
+            name: name.clone(),
+            path: path.clone(),
+            version,
+            config_format: config.plugin_config_format,
+            producer: None,
+            transforms: vec![],
+            state_storage,
+            error: init_error.clone(),
+            verbose: config.verbose,
+        });
 
         if let Some(error) = init_error {
             error!("Source container with name: {name} ({key}) failed to initialize: {error}");
             continue;
-        } else {
-            info!(
-                "Source container with name: {name} ({key}), initialized successfully with ID: {plugin_id}."
-            );
         }
 
-        let (producer, encoder, transforms) =
-            setup_source_producer(&key, &config, iggy_client).await?;
-
-        let connector = source_connectors.get_mut(&path).ok_or_else(|| {
-            RuntimeError::InvalidConfiguration(format!(
-                "Source connector not found for path: {path}"
-            ))
-        })?;
-        let plugin = connector
-            .plugins
-            .iter_mut()
-            .find(|p| p.id == plugin_id)
-            .ok_or_else(|| {
-                RuntimeError::InvalidConfiguration(format!(
-                    "Source plugin not found for ID: {plugin_id}"
-                ))
-            })?;
-        plugin.producer = Some(SourceConnectorProducer { producer, encoder });
-        plugin.transforms = transforms;
+        match setup_source_producer(&key, &config, iggy_client).await {
+            Ok((producer, encoder, transforms)) => {
+                let connector = source_connectors
+                    .get_mut(&path)
+                    .expect("source connector was inserted above");
+                let plugin = connector
+                    .plugins
+                    .iter_mut()
+                    .find(|plugin| plugin.id == plugin_id)
+                    .expect("source plugin was pushed above");
+                plugin.producer = Some(SourceConnectorProducer { producer, encoder });
+                plugin.transforms = transforms;
+                info!(
+                    "Source container with name: {name} ({key}) initialized successfully with ID: {plugin_id}."
+                );
+            }
+            Err(error) => {
+                let message = format!("Failed to set up source producer: {error}");
+                error!("Source: {name} ({key}) - {message}");
+                let connector = source_connectors
+                    .get_mut(&path)
+                    .expect("source connector was inserted above");
+                let close_result = (connector.container.iggy_source_close)(plugin_id);
+                if close_result != 0 {
+                    warn!(
+                        "iggy_source_close returned {close_result} while cleaning up failed source connector with ID: {plugin_id} ({key})"
+                    );
+                }
+                if let Some(plugin) = connector
+                    .plugins
+                    .iter_mut()
+                    .find(|plugin| plugin.id == plugin_id)
+                {
+                    plugin.error = Some(message);
+                }
+            }
+        }
     }
 
-    Ok(source_connectors)
+    Ok((source_connectors, failed_plugins))
 }
 
 fn get_plugin_version(container: &Container<SourceApi>) -> String {

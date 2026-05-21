@@ -39,6 +39,7 @@ pub enum Command2 {
     StartViewChange = 10,
     DoViewChange = 11,
     StartView = 12,
+    Eviction = 13,
 }
 
 // SAFETY: Command2 is #[repr(u8)] with no padding bytes.
@@ -49,17 +50,20 @@ unsafe impl CheckedBitPattern for Command2 {
     type Bits = u8;
 
     fn is_valid_bit_pattern(bits: &u8) -> bool {
-        *bits <= 12
+        *bits <= 13
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::consensus::GenericHeader;
+    use aligned_vec::{AVec, ConstAlign};
 
     #[test]
     fn invalid_bit_pattern_rejected() {
-        let mut buf = bytes::BytesMut::zeroed(256);
+        // 16-byte aligned (see `ConsensusHeader` doc); `BytesMut` fails Miri.
+        let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
+        buf.resize(256, 0);
         buf[60] = 99;
         let result = bytemuck::checked::try_from_bytes::<GenericHeader>(&buf);
         assert!(result.is_err());
