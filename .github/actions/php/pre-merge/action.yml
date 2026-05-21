@@ -87,8 +87,8 @@ runs:
         cargo php stubs "$extension" -o "$raw_stubs"
         {
           printf '<?php\n'
-          sed 's/^/\/\/ /' ASF_LICENSE.txt
-          printf '\n\n'
+          awk 'NF { print "// " $0; next } { print "//" }' ASF_LICENSE.txt
+          printf '\n'
           tail -n +2 "$raw_stubs"
         } > foreign/php/iggy-php.stubs.php
         rm -f "$raw_stubs"
