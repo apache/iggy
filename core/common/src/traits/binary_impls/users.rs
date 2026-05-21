@@ -26,20 +26,20 @@ use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 #[cfg(feature = "vsr")]
 use iggy_binary_protocol::codes::LOGIN_REGISTER_CODE;
+#[cfg(not(feature = "vsr"))]
+use iggy_binary_protocol::codes::LOGIN_USER_CODE;
 use iggy_binary_protocol::codes::{
     CHANGE_PASSWORD_CODE, CREATE_USER_CODE, DELETE_USER_CODE, GET_USER_CODE, GET_USERS_CODE,
     LOGOUT_USER_CODE, UPDATE_PERMISSIONS_CODE, UPDATE_USER_CODE,
 };
-#[cfg(not(feature = "vsr"))]
-use iggy_binary_protocol::codes::LOGIN_USER_CODE;
 #[cfg(feature = "vsr")]
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
+#[cfg(not(feature = "vsr"))]
+use iggy_binary_protocol::requests::users::LoginUserRequest;
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, GetUserRequest, GetUsersRequest,
     LogoutUserRequest, UpdatePermissionsRequest, UpdateUserRequest,
 };
-#[cfg(not(feature = "vsr"))]
-use iggy_binary_protocol::requests::users::LoginUserRequest;
 #[cfg(feature = "vsr")]
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 #[cfg(not(feature = "vsr"))]
