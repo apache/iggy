@@ -20,7 +20,7 @@ use crate::body::{build_json_body, build_row_binary_body, build_string_body};
 use crate::{ClickHouseSink, InsertFormat, client::ClickHouseClient};
 use async_trait::async_trait;
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 #[async_trait]
 impl Sink for ClickHouseSink {
@@ -101,7 +101,7 @@ impl Sink for ClickHouseSink {
         };
 
         if body.is_empty() {
-            warn!(
+            error!(
                 "ClickHouse sink ID: {} — no serialisable messages in batch of {}",
                 self.id,
                 messages.len()

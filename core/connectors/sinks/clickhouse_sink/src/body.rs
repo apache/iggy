@@ -26,7 +26,7 @@
 use crate::StringFormat;
 use crate::schema::Column;
 use iggy_connector_sdk::{ConsumedMessage, Error, Payload};
-use tracing::warn;
+use tracing::{error, warn};
 
 // ─── Body builders ───────────────────────────────────────────────────────────
 
@@ -44,7 +44,7 @@ pub(crate) fn build_json_body(messages: &[ConsumedMessage]) -> Vec<u8> {
                 }
             }
             _ => {
-                warn!(
+                error!(
                     "JSONEachRow mode: skipping unsupported payload type at offset {}",
                     msg.offset
                 );
@@ -67,7 +67,7 @@ pub(crate) fn build_row_binary_body(
                 crate::binary::serialize_row(value, schema, &mut buf)?;
             }
             _ => {
-                warn!(
+                error!(
                     "RowBinary mode: skipping unsupported payload type at offset {}",
                     msg.offset
                 );
@@ -94,7 +94,7 @@ pub(crate) fn build_string_body(
                 }
             }
             _ => {
-                warn!(
+                error!(
                     "String passthrough mode: skipping unsupported payload type at offset {}",
                     msg.offset
                 );
