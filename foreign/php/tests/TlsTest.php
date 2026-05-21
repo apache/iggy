@@ -21,6 +21,9 @@
 
 declare(strict_types=1);
 
+use Iggy\Client as IggyClient;
+use Iggy\PollingStrategy;
+use Iggy\SendMessage;
 use PHPUnit\Framework\TestCase;
 
 final class TlsTest extends TestCase

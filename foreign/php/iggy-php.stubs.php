@@ -1,117 +1,65 @@
 <?php
 
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
-
 // Stubs for iggy-php
 
-namespace {
+namespace Iggy {
     class AutoCommit {
         public function __construct() {}
 
         /**
-         * @param \AutoCommitAfter $after
-         * @return \AutoCommit
+         * @return \Iggy\AutoCommit
          */
-        public static function after(\AutoCommitAfter $after): \AutoCommit {}
-
-        /**
-         * @return \AutoCommit
-         */
-        public static function disabled(): \AutoCommit {}
+        public static function disabled(): \Iggy\AutoCommit {}
 
         /**
          * @param int $interval_micros
-         * @return \AutoCommit
+         * @return \Iggy\AutoCommit
          */
-        public static function interval(int $interval_micros): \AutoCommit {}
+        public static function interval(int $interval_micros): \Iggy\AutoCommit {}
 
         /**
          * @param int $interval_micros
-         * @param \AutoCommitAfter $after
-         * @return \AutoCommit
+         * @param \Iggy\AutoCommitWhen $when
+         * @return \Iggy\AutoCommit
          */
-        public static function intervalOrAfter(int $interval_micros, \AutoCommitAfter $after): \AutoCommit {}
+        public static function intervalOrWhen(int $interval_micros, \Iggy\AutoCommitWhen $when): \Iggy\AutoCommit {}
 
         /**
-         * @param int $interval_micros
-         * @param \AutoCommitWhen $when
-         * @return \AutoCommit
+         * @param \Iggy\AutoCommitWhen $when
+         * @return \Iggy\AutoCommit
          */
-        public static function intervalOrWhen(int $interval_micros, \AutoCommitWhen $when): \AutoCommit {}
-
-        /**
-         * @param \AutoCommitWhen $when
-         * @return \AutoCommit
-         */
-        public static function when(\AutoCommitWhen $when): \AutoCommit {}
-    }
-
-    class AutoCommitAfter {
-        public function __construct() {}
-
-        /**
-         * @return \AutoCommitAfter
-         */
-        public static function consumingAllMessages(): \AutoCommitAfter {}
-
-        /**
-         * @return \AutoCommitAfter
-         */
-        public static function consumingEachMessage(): \AutoCommitAfter {}
-
-        /**
-         * @param int $n
-         * @return \AutoCommitAfter
-         */
-        public static function consumingEveryNthMessage(int $n): \AutoCommitAfter {}
+        public static function when(\Iggy\AutoCommitWhen $when): \Iggy\AutoCommit {}
     }
 
     class AutoCommitWhen {
         public function __construct() {}
 
         /**
-         * @return \AutoCommitWhen
+         * @return \Iggy\AutoCommitWhen
          */
-        public static function consumingAllMessages(): \AutoCommitWhen {}
+        public static function consumingAllMessages(): \Iggy\AutoCommitWhen {}
 
         /**
-         * @return \AutoCommitWhen
+         * @return \Iggy\AutoCommitWhen
          */
-        public static function consumingEachMessage(): \AutoCommitWhen {}
+        public static function consumingEachMessage(): \Iggy\AutoCommitWhen {}
 
         /**
          * @param int $n
-         * @return \AutoCommitWhen
+         * @return \Iggy\AutoCommitWhen
          */
-        public static function consumingEveryNthMessage(int $n): \AutoCommitWhen {}
+        public static function consumingEveryNthMessage(int $n): \Iggy\AutoCommitWhen {}
 
         /**
-         * @return \AutoCommitWhen
+         * @return \Iggy\AutoCommitWhen
          */
-        public static function pollingMessages(): \AutoCommitWhen {}
+        public static function pollingMessages(): \Iggy\AutoCommitWhen {}
     }
 
     /**
      * A PHP class representing the Iggy client.
      */
-    class IggyClient {
+    class Client {
         /**
          * Constructs a new IggyClient from a TCP server address.
          *
@@ -133,9 +81,9 @@ namespace {
          * @param string $stream
          * @param string $topic
          * @param int|null $partition_id
-         * @param \PollingStrategy|null $polling_strategy
+         * @param \Iggy\PollingStrategy|null $polling_strategy
          * @param int|null $batch_length
-         * @param \AutoCommit|null $auto_commit
+         * @param \Iggy\AutoCommit|null $auto_commit
          * @param bool $create_consumer_group_if_not_exists
          * @param bool $auto_join_consumer_group
          * @param int|null $poll_interval_micros
@@ -143,9 +91,9 @@ namespace {
          * @param int|null $init_retries
          * @param int|null $init_retry_interval_micros
          * @param bool $allow_replay
-         * @return \IggyConsumer
+         * @return \Iggy\Consumer
          */
-        public function consumerGroup(string $name, string $stream, string $topic, ?int $partition_id = null, ?\PollingStrategy $polling_strategy = null, ?int $batch_length = null, ?\AutoCommit $auto_commit = null, bool $create_consumer_group_if_not_exists = true, bool $auto_join_consumer_group = true, ?int $poll_interval_micros = null, ?int $polling_retry_interval_micros = null, ?int $init_retries = null, ?int $init_retry_interval_micros = null, bool $allow_replay = false): \IggyConsumer {}
+        public function consumerGroup(string $name, string $stream, string $topic, ?int $partition_id = null, ?\Iggy\PollingStrategy $polling_strategy = null, ?int $batch_length = null, ?\Iggy\AutoCommit $auto_commit = null, bool $create_consumer_group_if_not_exists = true, bool $auto_join_consumer_group = true, ?int $poll_interval_micros = null, ?int $polling_retry_interval_micros = null, ?int $init_retries = null, ?int $init_retry_interval_micros = null, bool $allow_replay = false): \Iggy\Consumer {}
 
         /**
          * Creates a new stream.
@@ -192,26 +140,26 @@ namespace {
          * Constructs a new IggyClient from a connection string.
          *
          * @param string $connection_string
-         * @return \IggyClient
+         * @return \Iggy\Client
          */
-        public static function fromConnectionString(string $connection_string): \IggyClient {}
+        public static function fromConnectionString(string $connection_string): \Iggy\Client {}
 
         /**
          * Gets a stream by id or name.
          *
          * @param mixed $stream_id
-         * @return \StreamDetails|null
+         * @return \Iggy\StreamDetails|null
          */
-        public function getStream(mixed $stream_id): ?\StreamDetails {}
+        public function getStream(mixed $stream_id): ?\Iggy\StreamDetails {}
 
         /**
          * Gets a topic by stream and topic id/name.
          *
          * @param mixed $stream_id
          * @param mixed $topic_id
-         * @return \TopicDetails|null
+         * @return \Iggy\TopicDetails|null
          */
-        public function getTopic(mixed $stream_id, mixed $topic_id): ?\TopicDetails {}
+        public function getTopic(mixed $stream_id, mixed $topic_id): ?\Iggy\TopicDetails {}
 
         /**
          * Logs in the user with the given credentials.
@@ -235,12 +183,12 @@ namespace {
          * @param mixed $stream
          * @param mixed $topic
          * @param int $partition_id
-         * @param \PollingStrategy $polling_strategy
+         * @param \Iggy\PollingStrategy $polling_strategy
          * @param int $count
          * @param bool $auto_commit
          * @return array
          */
-        public function pollMessages(mixed $stream, mixed $topic, int $partition_id, \PollingStrategy $polling_strategy, int $count, bool $auto_commit): array {}
+        public function pollMessages(mixed $stream, mixed $topic, int $partition_id, \Iggy\PollingStrategy $polling_strategy, int $count, bool $auto_commit): array {}
 
         /**
          * Sends messages to a topic.
@@ -257,25 +205,28 @@ namespace {
     /**
      * A PHP class representing the Iggy consumer.
      */
-    class IggyConsumer {
+    class Consumer {
         public function __construct() {}
 
         /**
          * Consumes messages with a PHP callback.
          *
-         * The callback is called as callback(ReceiveMessage $message). If limit is null,
-         * this method runs until the consumer stream ends or an error occurs.
+         * The callback is called as callback(ReceiveMessage $message). A finite limit is required.
+         *
+         * With AutoCommit::when(), offsets may already be queued for commit before the
+         * PHP callback runs. Use AutoCommit::disabled() and call storeOffset() after a
+         * successful callback when at-least-once callback processing is required.
          *
          * @param callable $callback
-         * @param int|null $limit
+         * @param int $limit
          * @return int
          */
-        public function consumeMessages(callable $callback, ?int $limit = null): int {}
+        public function consumeMessages(callable $callback, int $limit): int {}
 
         /**
          * Deletes the stored offset for the provided partition id.
          *
-         * If partition_id is null, the current partition id is used.
+         * If partition_id is null, at least one message must have been polled first.
          *
          * @param int|null $partition_id
          * @return void
@@ -315,7 +266,7 @@ namespace {
         /**
          * Stores the provided offset for the provided partition id.
          *
-         * If partition_id is null, the current partition id is used.
+         * If partition_id is null, at least one message must have been polled first.
          *
          * @param int $offset
          * @param int|null $partition_id
@@ -342,31 +293,49 @@ namespace {
         public function __construct() {}
 
         /**
-         * @return \PollingStrategy
+         * @return \Iggy\PollingStrategy
          */
-        public static function first(): \PollingStrategy {}
+        public static function first(): \Iggy\PollingStrategy {}
 
         /**
-         * @return \PollingStrategy
+         * @return \Iggy\PollingStrategy
          */
-        public static function last(): \PollingStrategy {}
+        public static function last(): \Iggy\PollingStrategy {}
 
         /**
-         * @return \PollingStrategy
+         * @return \Iggy\PollingStrategy
          */
-        public static function next(): \PollingStrategy {}
-
-        /**
-         * @param int $value
-         * @return \PollingStrategy
-         */
-        public static function offset(int $value): \PollingStrategy {}
+        public static function next(): \Iggy\PollingStrategy {}
 
         /**
          * @param int $value
-         * @return \PollingStrategy
+         * @return \Iggy\PollingStrategy
          */
-        public static function timestamp(int $value): \PollingStrategy {}
+        public static function offset(int $value): \Iggy\PollingStrategy {}
+
+        /**
+         * Poll messages at or after a UNIX timestamp expressed in microseconds.
+         *
+         * @param int $value
+         * @return \Iggy\PollingStrategy
+         */
+        public static function timestamp(int $value): \Iggy\PollingStrategy {}
+
+        /**
+         * Poll messages at or after a UNIX timestamp expressed in microseconds.
+         *
+         * @param int $value
+         * @return \Iggy\PollingStrategy
+         */
+        public static function timestampMicros(int $value): \Iggy\PollingStrategy {}
+
+        /**
+         * Poll messages at or after a UNIX timestamp expressed in seconds.
+         *
+         * @param int $value
+         * @return \Iggy\PollingStrategy
+         */
+        public static function timestampSeconds(int $value): \Iggy\PollingStrategy {}
     }
 
     /**
@@ -424,6 +393,8 @@ namespace {
          * Retrieves the payload of the received message.
          *
          * The payload is returned as a PHP string, which can represent both text and binary data.
+         * The bytes are copied into a PHP string on each getter call; cache the result in PHP if
+         * the payload will be read repeatedly.
          *
          * @return string
          */
@@ -445,6 +416,12 @@ namespace {
     class SendMessage {
         public readonly string $id;
 
+        /**
+         * The bytes are copied into a PHP string on each getter call; cache the result in PHP if
+         * the payload will be read repeatedly.
+         *
+         * @var string
+         */
         public readonly string $payload;
 
         /**

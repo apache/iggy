@@ -21,6 +21,8 @@
 
 declare(strict_types=1);
 
+use Iggy\Client as IggyClient;
+use Iggy\ReceiveMessage;
 use PHPUnit\Framework\Assert;
 
 function assert_true(bool $condition, string $message = 'expected condition to be true'): void

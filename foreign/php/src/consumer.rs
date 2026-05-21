@@ -21,8 +21,8 @@ use std::sync::Arc;
 use ext_php_rs::{exception::PhpResult, php_class, php_impl, types::ZendCallable};
 use futures::StreamExt;
 use iggy::prelude::{
-    AutoCommit as RustAutoCommit, AutoCommitAfter as RustAutoCommitAfter,
-    AutoCommitWhen as RustAutoCommitWhen, IggyConsumer as RustIggyConsumer, IggyDuration,
+    AutoCommit as RustAutoCommit, AutoCommitWhen as RustAutoCommitWhen,
+    IggyConsumer as RustIggyConsumer, IggyDuration,
 };
 use tokio::sync::Mutex;
 
@@ -32,8 +32,12 @@ use crate::runtime::runtime;
 
 /// A PHP class representing the Iggy consumer.
 #[php_class]
+#[php(name = "Iggy\\Consumer")]
 pub struct IggyConsumer {
     pub(crate) inner: Arc<Mutex<RustIggyConsumer>>,
+    pub(crate) name: String,
+    pub(crate) stream: String,
+    pub(crate) topic: String,
 }
 
 #[php_impl]
@@ -50,7 +54,7 @@ impl IggyConsumer {
 
     /// Gets the name of the consumer group.
     pub fn name(&self) -> String {
-        self.with_consumer(|inner| inner.name().to_string())
+        self.name.clone()
     }
 
     /// Gets the current partition id or 0 if no messages have been polled yet.
@@ -60,24 +64,24 @@ impl IggyConsumer {
 
     /// Gets the stream identifier this consumer is configured for.
     pub fn stream(&self) -> String {
-        self.with_consumer(|inner| inner.stream().to_string())
+        self.stream.clone()
     }
 
     /// Gets the topic identifier this consumer is configured for.
     pub fn topic(&self) -> String {
-        self.with_consumer(|inner| inner.topic().to_string())
+        self.topic.clone()
     }
 
     /// Stores the provided offset for the provided partition id.
     ///
-    /// If partition_id is null, the current partition id is used.
+    /// If partition_id is null, at least one message must have been polled first.
     pub fn store_offset(&self, offset: u64, partition_id: Option<u32>) -> PhpResult {
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
+            let inner = inner.lock().await;
+            let partition_id = Self::partition_id_or_current_after_poll(&inner, partition_id)?;
             inner
-                .lock()
-                .await
                 .store_offset(offset, partition_id)
                 .await
                 .map_err(to_php_exception)
@@ -86,14 +90,14 @@ impl IggyConsumer {
 
     /// Deletes the stored offset for the provided partition id.
     ///
-    /// If partition_id is null, the current partition id is used.
+    /// If partition_id is null, at least one message must have been polled first.
     pub fn delete_offset(&self, partition_id: Option<u32>) -> PhpResult {
         let inner = self.inner.clone();
 
         runtime().block_on(async move {
+            let inner = inner.lock().await;
+            let partition_id = Self::partition_id_or_current_after_poll(&inner, partition_id)?;
             inner
-                .lock()
-                .await
                 .delete_offset(partition_id)
                 .await
                 .map_err(to_php_exception)
@@ -102,13 +106,15 @@ impl IggyConsumer {
 
     /// Consumes messages with a PHP callback.
     ///
-    /// The callback is called as callback(ReceiveMessage $message). If limit is null,
-    /// this method runs until the consumer stream ends or an error occurs.
-    pub fn consume_messages(&self, callback: ZendCallable, limit: Option<u32>) -> PhpResult<u32> {
+    /// The callback is called as callback(ReceiveMessage $message). A finite limit is required.
+    ///
+    /// With AutoCommit::when(), offsets may already be queued for commit before the
+    /// PHP callback runs. Use AutoCommit::disabled() and call storeOffset() after a
+    /// successful callback when at-least-once callback processing is required.
+    pub fn consume_messages(&self, callback: ZendCallable, limit: u32) -> PhpResult<u32> {
         let mut consumed = 0;
-        let max_messages = limit.unwrap_or(u32::MAX);
 
-        while consumed < max_messages {
+        while consumed < limit {
             let Some(message) = self.next_message()? else {
                 break;
             };
@@ -149,9 +155,31 @@ impl IggyConsumer {
             }
         })
     }
+
+    fn partition_id_or_current_after_poll(
+        inner: &RustIggyConsumer,
+        partition_id: Option<u32>,
+    ) -> PhpResult<Option<u32>> {
+        if let Some(partition_id) = partition_id {
+            return Ok(Some(partition_id));
+        }
+
+        let current_partition_id = inner.partition_id();
+        if inner
+            .get_last_consumed_offset(current_partition_id)
+            .is_none()
+        {
+            return Err(
+                "'partition_id' is required until at least one message has been polled".into(),
+            );
+        }
+
+        Ok(Some(current_partition_id))
+    }
 }
 
 #[php_class]
+#[php(name = "Iggy\\AutoCommit")]
 #[derive(Clone, Copy)]
 pub struct AutoCommit {
     pub(crate) inner: RustAutoCommit,
@@ -177,24 +205,9 @@ impl AutoCommit {
         }
     }
 
-    pub fn interval_or_after(interval_micros: u64, after: &AutoCommitAfter) -> Self {
-        Self {
-            inner: RustAutoCommit::IntervalOrAfter(
-                IggyDuration::from(interval_micros),
-                after.inner,
-            ),
-        }
-    }
-
     pub fn when(when: &AutoCommitWhen) -> Self {
         Self {
             inner: RustAutoCommit::When(when.inner),
-        }
-    }
-
-    pub fn after(after: &AutoCommitAfter) -> Self {
-        Self {
-            inner: RustAutoCommit::After(after.inner),
         }
     }
 }
@@ -206,6 +219,7 @@ impl From<&AutoCommit> for RustAutoCommit {
 }
 
 #[php_class]
+#[php(name = "Iggy\\AutoCommitWhen")]
 #[derive(Clone, Copy)]
 pub struct AutoCommitWhen {
     pub(crate) inner: RustAutoCommitWhen,
@@ -240,39 +254,6 @@ impl AutoCommitWhen {
 
 impl From<&AutoCommitWhen> for RustAutoCommitWhen {
     fn from(value: &AutoCommitWhen) -> Self {
-        value.inner
-    }
-}
-
-#[php_class]
-#[derive(Clone, Copy)]
-pub struct AutoCommitAfter {
-    pub(crate) inner: RustAutoCommitAfter,
-}
-
-#[php_impl]
-impl AutoCommitAfter {
-    pub fn consuming_all_messages() -> Self {
-        Self {
-            inner: RustAutoCommitAfter::ConsumingAllMessages,
-        }
-    }
-
-    pub fn consuming_each_message() -> Self {
-        Self {
-            inner: RustAutoCommitAfter::ConsumingEachMessage,
-        }
-    }
-
-    pub fn consuming_every_nth_message(n: u32) -> Self {
-        Self {
-            inner: RustAutoCommitAfter::ConsumingEveryNthMessage(n),
-        }
-    }
-}
-
-impl From<&AutoCommitAfter> for RustAutoCommitAfter {
-    fn from(value: &AutoCommitAfter) -> Self {
         value.inner
     }
 }

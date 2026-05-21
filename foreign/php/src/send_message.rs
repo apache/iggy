@@ -24,6 +24,7 @@ use crate::error::to_php_exception;
 
 /// A PHP class representing a message to be sent.
 #[php_class]
+#[php(name = "Iggy\\SendMessage")]
 pub struct SendMessage {
     pub(crate) inner: RustIggyMessage,
 }
@@ -71,6 +72,8 @@ impl SendMessage {
     }
 
     #[php(getter)]
+    /// The bytes are copied into a PHP string on each getter call; cache the result in PHP if
+    /// the payload will be read repeatedly.
     pub fn payload(&self) -> Binary<u8> {
         Binary::new(self.inner.payload.to_vec())
     }

@@ -20,6 +20,7 @@ use ext_php_rs::{php_class, php_impl};
 use iggy::prelude::TopicDetails as RustTopicDetails;
 
 #[php_class]
+#[php(name = "Iggy\\TopicDetails")]
 pub struct TopicDetails {
     pub(crate) inner: RustTopicDetails,
 }

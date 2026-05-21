@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use ext_php_rs::{binary::Binary, php_class, php_impl};
+use ext_php_rs::{binary::Binary, exception::PhpResult, php_class, php_impl};
 use iggy::prelude::{
     IggyMessage as RustReceiveMessage, IggyMessageHeader, PollingStrategy as RustPollingStrategy,
 };
@@ -25,6 +25,7 @@ use iggy::prelude::{
 ///
 /// This class wraps a Rust message, allowing PHP code to access its payload and metadata.
 #[php_class]
+#[php(name = "Iggy\\ReceiveMessage")]
 pub struct ReceiveMessage {
     pub(crate) inner: RustReceiveMessage,
     pub(crate) partition_id: u32,
@@ -57,6 +58,8 @@ impl ReceiveMessage {
     /// Retrieves the payload of the received message.
     ///
     /// The payload is returned as a PHP string, which can represent both text and binary data.
+    /// The bytes are copied into a PHP string on each getter call; cache the result in PHP if
+    /// the payload will be read repeatedly.
     pub fn payload(&self) -> Binary<u8> {
         Binary::new(self.inner.payload.to_vec())
     }
@@ -103,6 +106,7 @@ impl ReceiveMessage {
 }
 
 #[php_class]
+#[php(name = "Iggy\\PollingStrategy")]
 #[derive(Clone)]
 pub struct PollingStrategy {
     pub(crate) inner: RustPollingStrategy,
@@ -122,10 +126,25 @@ impl PollingStrategy {
         }
     }
 
-    pub fn timestamp(value: u64) -> Self {
+    /// Poll messages at or after a UNIX timestamp expressed in microseconds.
+    pub fn timestamp_micros(value: u64) -> Self {
         Self {
             inner: RustPollingStrategy::timestamp(value.into()),
         }
+    }
+
+    /// Poll messages at or after a UNIX timestamp expressed in seconds.
+    pub fn timestamp_seconds(value: u64) -> PhpResult<Self> {
+        let Some(micros) = value.checked_mul(1_000_000) else {
+            return Err("timestamp seconds value is too large".into());
+        };
+
+        Ok(Self::timestamp_micros(micros))
+    }
+
+    /// Poll messages at or after a UNIX timestamp expressed in microseconds.
+    pub fn timestamp(value: u64) -> Self {
+        Self::timestamp_micros(value)
     }
 
     pub fn first() -> Self {

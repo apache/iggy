@@ -21,6 +21,11 @@
 
 declare(strict_types=1);
 
+use Iggy\AutoCommit;
+use Iggy\Client as IggyClient;
+use Iggy\PollingStrategy;
+use Iggy\ReceiveMessage;
+use Iggy\SendMessage;
 use PHPUnit\Framework\Attributes\TestDox;
 use PHPUnit\Framework\TestCase;
 
@@ -37,6 +42,21 @@ final class IggySdkTest extends TestCase
     public function testClientNotNull(): void
     {
         assert_true(new_client() instanceof IggyClient);
+    }
+
+    #[TestDox('The TCP constructor treats an empty address as the default server address')]
+    public function testEmptyClientAddressUsesDefault(): void
+    {
+        if (!in_array(server_host(), ['127.0.0.1', 'localhost'], true)) {
+            $this->markTestSkipped('empty address defaults to localhost, but this run uses a remote test server');
+        }
+
+        $client = new IggyClient('');
+        $client->connect();
+        $client->loginUser(env_or_default('IGGY_USERNAME', 'iggy'), env_or_default('IGGY_PASSWORD', 'iggy'));
+        $client->ping();
+
+        assert_true($client instanceof IggyClient);
     }
 
     #[TestDox('A client created from a connection string can connect and ping')]
@@ -340,6 +360,115 @@ final class IggySdkTest extends TestCase
         }
     }
 
+    #[TestDox('Consumer group rejects zero duration options before initialization')]
+    public function testConsumerGroupRejectsZeroDurationOptions(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('consumer-group-consumer');
+        $streamName = unique_name('consumer-group-stream');
+        $topicName = unique_name('consumer-group-topic');
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+
+            assert_throws(
+                static fn () => $client->consumerGroup(
+                    $consumerName,
+                    $streamName,
+                    $topicName,
+                    0,
+                    PollingStrategy::next(),
+                    10,
+                    AutoCommit::disabled(),
+                    true,
+                    true,
+                    0,
+                    null,
+                    null,
+                    null,
+                    false,
+                ),
+                'poll_interval_micros',
+            );
+
+            assert_throws(
+                static fn () => $client->consumerGroup(
+                    $consumerName,
+                    $streamName,
+                    $topicName,
+                    0,
+                    PollingStrategy::next(),
+                    10,
+                    AutoCommit::disabled(),
+                    true,
+                    true,
+                    micros(1),
+                    0,
+                    null,
+                    null,
+                    false,
+                ),
+                'polling_retry_interval_micros',
+            );
+
+            assert_throws(
+                static fn () => $client->consumerGroup(
+                    $consumerName,
+                    $streamName,
+                    $topicName,
+                    0,
+                    PollingStrategy::next(),
+                    10,
+                    AutoCommit::disabled(),
+                    true,
+                    true,
+                    micros(1),
+                    null,
+                    0,
+                    0,
+                    false,
+                ),
+                'init_retry_interval_micros',
+            );
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('Consumer offsets require an explicit partition before any message is polled')]
+    public function testConsumerOffsetCurrentPartitionRequiresPriorPoll(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('consumer-group-consumer');
+        $streamName = unique_name('consumer-group-stream');
+        $topicName = unique_name('consumer-group-topic');
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $consumer = $client->consumerGroup(
+                $consumerName,
+                $streamName,
+                $topicName,
+                0,
+                PollingStrategy::next(),
+                10,
+                AutoCommit::disabled(),
+                true,
+                true,
+                micros(1),
+                null,
+                null,
+                null,
+                false,
+            );
+
+            assert_throws(static fn () => $consumer->storeOffset(0, null), 'partition_id');
+            assert_throws(static fn () => $consumer->deleteOffset(null), 'partition_id');
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
     #[TestDox('A consumer group callback receives messages in order')]
     public function testConsumeMessages(): void
     {
@@ -388,6 +517,39 @@ final class IggySdkTest extends TestCase
 
             assert_same(count($messages), $count);
             assert_same($messages, $received);
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
+    #[TestDox('Consumer group consumeMessages requires a finite limit')]
+    public function testConsumeMessagesRequiresLimit(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('consumer-group-consumer');
+        $streamName = unique_name('consumer-group-stream');
+        $topicName = unique_name('consumer-group-topic');
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $consumer = $client->consumerGroup(
+                $consumerName,
+                $streamName,
+                $topicName,
+                0,
+                PollingStrategy::next(),
+                10,
+                AutoCommit::disabled(),
+                true,
+                true,
+                micros(1),
+                null,
+                null,
+                null,
+                false,
+            );
+
+            assert_throws(static fn () => $consumer->consumeMessages(static fn (ReceiveMessage $message): null => null, null));
         } finally {
             cleanup_stream_with_topics($client, $streamName, [$topicName]);
         }

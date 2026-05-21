@@ -3,7 +3,7 @@
 PHP extension bindings for [Apache Iggy](https://iggy.apache.org/), built in Rust with
 [`ext-php-rs`](https://github.com/davidcole1340/ext-php-rs).
 
-This repository is experimental. The extension exposes `IggyClient`, a blocking
+This repository is experimental. The extension exposes `Iggy\Client`, a blocking
 synchronous PHP API over the Rust Iggy client.
 
 ## Requirements
@@ -33,6 +33,9 @@ Generate IDE stubs after changing the exported PHP API:
 ```sh
 cargo php stubs --manifest Cargo.toml -o iggy-php.stubs.php
 ```
+
+The CI lint job regenerates this file and fails if the checked-in stubs drift
+from the Rust signatures.
 
 ## Install
 
@@ -82,7 +85,7 @@ Override them with `IGGY_HOST`, `IGGY_PORT`, `IGGY_USERNAME`, and `IGGY_PASSWORD
 ```php
 <?php
 
-$client = new IggyClient('127.0.0.1:8090');
+$client = new \Iggy\Client('127.0.0.1:8090');
 $client->connect();
 $client->loginUser('iggy', 'iggy');
 
@@ -94,14 +97,14 @@ $client->createStream($stream);
 $client->createTopic($stream, $topic, 1, null, null, null, null);
 
 $client->sendMessages($stream, $topic, $partitionId, [
-    new SendMessage('hello from PHP'),
+    new \Iggy\SendMessage('hello from PHP'),
 ]);
 
 $messages = $client->pollMessages(
     $stream,
     $topic,
     $partitionId,
-    PollingStrategy::first(),
+    \Iggy\PollingStrategy::first(),
     10,
     true,
 );
@@ -109,6 +112,37 @@ $messages = $client->pollMessages(
 foreach ($messages as $message) {
     echo $message->payload(), PHP_EOL;
 }
+```
+
+Consumer group callbacks require a finite message limit:
+
+```php
+<?php
+
+$consumer = $client->consumerGroup(
+    'php-consumer',
+    $stream,
+    $topic,
+    $partitionId,
+    \Iggy\PollingStrategy::next(),
+    10,
+    \Iggy\AutoCommit::disabled(),
+    true,
+    true,
+    1_000_000,
+    null,
+    null,
+    null,
+    false,
+);
+
+$consumer->consumeMessages(
+    function (\Iggy\ReceiveMessage $message) use ($consumer): void {
+        process($message->payload());
+        $consumer->storeOffset($message->offset(), $message->partitionId());
+    },
+    100,
+);
 ```
 
 ## Tests
@@ -136,11 +170,40 @@ TLS tests are opt-in because they require a TLS-enabled Iggy server and certific
 setup. Set `IGGY_TLS_CONNECTION_STRING` to enable TLS connection tests. Set
 `IGGY_TLS_PLAINTEXT_ADDRESS` to run the negative plaintext-to-TLS test.
 
+TLS connection strings use the Rust SDK connection-string format, for example:
+
+```text
+iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&domain=localhost&ca_file=/path/to/ca.pem
+```
+
 ## API Notes
 
 - Methods are exposed to PHP as camelCase, for example `createStream()` and
   `pollMessages()`.
+- Classes live in the `Iggy` namespace, for example `Iggy\Client` and
+  `Iggy\SendMessage`.
 - Partition IDs use the Iggy partition index. For a topic with one partition, use `0`.
+- Passing `null` as the partition to `storeOffset()` or `deleteOffset()` uses the
+  current consumer partition, and is rejected until at least one message has been
+  polled. Pass an explicit partition id before the first poll.
+- `consumeMessages()` requires an explicit finite limit. It does not run forever
+  by default.
+- `AutoCommit::when()` may queue an offset commit before the PHP callback runs.
+  If callback success must control commits, use `AutoCommit::disabled()` and call
+  `storeOffset()` after the callback work succeeds.
+- `Iggy\PollingStrategy::timestamp()` and `Iggy\PollingStrategy::timestampMicros()`
+  expect microseconds since the Unix epoch. Use
+  `Iggy\PollingStrategy::timestampSeconds()` for PHP `time()` values.
+- PHP string identifiers that contain only digits are parsed by the Rust SDK as
+  numeric identifiers, not named identifiers. Numeric identifier `0` is accepted
+  by the underlying SDK.
+- `Iggy\SendMessage::payload` and `Iggy\ReceiveMessage::payload()` copy the payload
+  bytes into a PHP string on each read. Cache large payloads in PHP if they will
+  be read repeatedly.
 - Large unsigned values that can overflow PHP integers, such as message checksums,
   are returned as decimal strings.
-- `IggyClient` is synchronous and blocks the current PHP thread.
+- `Iggy\Client` is synchronous and blocks the current PHP thread.
+- The extension owns a lazy global Tokio runtime. Do not call `pcntl_fork()` after
+  the first Iggy SDK call; the child process inherits file descriptors but not
+  Tokio worker threads. Runtime initialization failure is unrecoverable and aborts
+  extension use.

@@ -37,6 +37,7 @@ use crate::topic::TopicDetails;
 
 /// A PHP class representing the Iggy client.
 #[php_class]
+#[php(name = "Iggy\\Client")]
 pub struct IggyClient {
     inner: Arc<RustIggyClient>,
 }
@@ -46,9 +47,12 @@ impl IggyClient {
     /// Constructs a new IggyClient from a TCP server address.
     #[php(constructor)]
     pub fn __construct(conn: Option<String>) -> PhpResult<Self> {
+        let server_address = conn
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "127.0.0.1:8090".to_string());
         let client = IggyClientBuilder::new()
             .with_tcp()
-            .with_server_address(conn.unwrap_or_else(|| "127.0.0.1:8090".to_string()))
+            .with_server_address(server_address)
             .build()
             .map_err(to_php_exception)?;
 
@@ -324,16 +328,24 @@ impl IggyClient {
             builder = builder.auto_commit(auto_commit.into());
         }
         builder = match poll_interval_micros {
-            Some(micros) => builder.poll_interval(IggyDuration::from(micros)),
+            Some(micros) => {
+                builder.poll_interval(non_zero_duration_micros("poll_interval_micros", micros)?)
+            }
             None => builder.without_poll_interval(),
         };
         if let Some(micros) = polling_retry_interval_micros {
-            builder = builder.polling_retry_interval(IggyDuration::from(micros));
+            builder = builder.polling_retry_interval(non_zero_duration_micros(
+                "polling_retry_interval_micros",
+                micros,
+            )?);
         }
 
         match (init_retries, init_retry_interval_micros) {
             (Some(retries), Some(micros)) => {
-                builder = builder.init_retries(retries, IggyDuration::from(micros));
+                builder = builder.init_retries(
+                    retries,
+                    non_zero_duration_micros("init_retry_interval_micros", micros)?,
+                );
             }
             (Some(_), None) => {
                 return Err(
@@ -354,9 +366,23 @@ impl IggyClient {
         let mut consumer = builder.build();
         runtime().block_on(async move {
             consumer.init().await.map_err(to_php_exception)?;
+            let name = consumer.name().to_string();
+            let stream = consumer.stream().to_string();
+            let topic = consumer.topic().to_string();
             Ok(IggyConsumer {
                 inner: Arc::new(Mutex::new(consumer)),
+                name,
+                stream,
+                topic,
             })
         })
     }
+}
+
+fn non_zero_duration_micros(field: &str, micros: u64) -> PhpResult<IggyDuration> {
+    if micros == 0 {
+        return Err(format!("'{field}' must be greater than 0 microseconds").into());
+    }
+
+    Ok(IggyDuration::from(micros))
 }

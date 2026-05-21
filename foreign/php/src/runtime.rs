@@ -22,6 +22,8 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
     RUNTIME.get_or_init(|| {
+        // The runtime is intentionally lazy and must not be initialized from PHP MINIT.
+        // Do not call pcntl_fork() after first use; Tokio worker threads are not inherited.
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

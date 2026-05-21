@@ -34,6 +34,7 @@ runs:
           clang \
           composer \
           libclang-dev \
+          libhwloc-dev \
           libssl-dev \
           php-cli \
           php-dev \
@@ -75,6 +76,15 @@ runs:
       run: |
         php -r 'json_decode(file_get_contents("foreign/php/composer.json"), true, 512, JSON_THROW_ON_ERROR);'
         cargo fmt --manifest-path foreign/php/Cargo.toml -- --check
+        cargo install cargo-php --locked
+        cargo build --manifest-path foreign/php/Cargo.toml
+        extension="$(find "${CARGO_TARGET_DIR}/debug" -maxdepth 1 -name 'libiggy_php.so' -print -quit)"
+        if [ -z "$extension" ]; then
+          echo "PHP extension was not produced"
+          exit 1
+        fi
+        cargo php stubs "$extension" -o foreign/php/iggy-php.stubs.php
+        git diff --exit-code -- foreign/php/iggy-php.stubs.php
         find foreign/php \
           -path foreign/php/vendor -prune -o \
           -name '*.php' -print0 \

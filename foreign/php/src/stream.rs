@@ -20,6 +20,7 @@ use ext_php_rs::{php_class, php_impl};
 use iggy::prelude::StreamDetails as RustStreamDetails;
 
 #[php_class]
+#[php(name = "Iggy\\StreamDetails")]
 pub struct StreamDetails {
     pub(crate) inner: RustStreamDetails,
 }
