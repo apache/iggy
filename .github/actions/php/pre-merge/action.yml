@@ -83,7 +83,15 @@ runs:
           echo "PHP extension was not produced"
           exit 1
         fi
-        cargo php stubs "$extension" -o foreign/php/iggy-php.stubs.php
+        raw_stubs="$(mktemp)"
+        cargo php stubs "$extension" -o "$raw_stubs"
+        {
+          printf '<?php\n'
+          sed 's/^/\/\/ /' ASF_LICENSE.txt
+          printf '\n\n'
+          tail -n +2 "$raw_stubs"
+        } > foreign/php/iggy-php.stubs.php
+        rm -f "$raw_stubs"
         git diff --exit-code -- foreign/php/iggy-php.stubs.php
         find foreign/php \
           -path foreign/php/vendor -prune -o \
