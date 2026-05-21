@@ -42,7 +42,11 @@ public sealed class PolledMessagesRental : IDisposable
     /// </summary>
     public required IReadOnlyList<RentedMessageResponse> Messages { get; init; }
 
-    internal PolledMessagesRental(IMemoryOwner<byte> owner)
+    /// <summary>
+    ///    Initializes a new instance of the <see cref="PolledMessagesRental" /> class with the specified memory owner.
+    /// </summary>
+    /// <param name="owner"></param>
+    public PolledMessagesRental(IMemoryOwner<byte> owner)
     {
         _owner = owner;
     }

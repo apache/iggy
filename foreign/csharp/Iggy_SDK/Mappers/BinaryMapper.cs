@@ -352,7 +352,9 @@ internal static class BinaryMapper
             };
         }
 
-        List<RentedMessageResponse> messages = new((int)messagesCount);
+        var maxMessages = (length - 16) / PropertiesSize;
+        var capacity = (int)Math.Min(messagesCount, (uint)maxMessages);
+        List<RentedMessageResponse> messages = new(capacity);
 
         while (position < length)
         {

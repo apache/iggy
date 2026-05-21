@@ -82,6 +82,14 @@ public partial class IggyConsumer : IAsyncDisposable
             return;
         }
 
+        _channel.Writer.TryComplete();
+        _rentedChannel.Writer.TryComplete();
+
+        while (_rentedChannel.Reader.TryRead(out var queued))
+        {
+            queued.Dispose();
+        }
+
         if (_isInitialized)
         {
             _client.UnsubscribeConnectionEvents(OnClientConnectionStateChangedAsync);

@@ -1310,7 +1310,7 @@ internal static class ArrayPoolHelper
 
         public Memory<byte> Memory => _value.AsMemory()[..minimumLength];
 
-        private void Dispose(bool suppressFinalize)
+        public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
             {
@@ -1318,20 +1318,6 @@ internal static class ArrayPoolHelper
             }
 
             ArrayPool<byte>.Shared.Return(_value);
-            if (suppressFinalize)
-            {
-                GC.SuppressFinalize(this);
-            }
-        }
-
-        ~SlicedMemoryOwner()
-        {
-            Dispose(false);
-        }
-
-        public void Dispose()
-        {
-            Dispose(true);
         }
     }
 }

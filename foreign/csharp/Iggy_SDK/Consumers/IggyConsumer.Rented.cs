@@ -201,16 +201,19 @@ public partial class IggyConsumer
                 anyNewMessages = true;
             }
 
-            if (!anyNewMessages
-                && _config.AutoCommitMode != AutoCommitMode.Disabled)
+            if (!anyNewMessages)
             {
-                if (_logger.IsEnabled(LogLevel.Debug))
+                if (_config.AutoCommitMode != AutoCommitMode.Disabled)
                 {
-                    _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
-                        lastPolledPartitionOffset, rental.PartitionId);
+                    if (_logger.IsEnabled(LogLevel.Debug))
+                    {
+                        _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
+                            lastPolledPartitionOffset, rental.PartitionId);
+                    }
+                    await StoreOffsetAsync(lastPolledPartitionOffset, partitionId, false, ct);
                 }
 
-                await StoreOffsetAsync(lastPolledPartitionOffset, partitionId, false, ct);
+                return;
             }
 
             if (anyNewMessages)
