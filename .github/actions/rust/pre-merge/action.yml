@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, compat)"
+    description: "Task to run (check, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, compat, miri)"
     required: true
   component:
     description: "Component name (for context)"
@@ -45,6 +45,10 @@ runs:
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
+        # Miri builds against a nightly toolchain with a separate `target/miri`
+        # subtree; isolate its cache from the stable `dev` namespace so the
+        # two don't evict each other.
+        shared-key: ${{ inputs.task == 'miri' && 'miri' || 'dev' }}
         print-cache-status: ${{ startsWith(inputs.task, 'test-') }}
 
     - name: Install tools for specific tasks
@@ -301,6 +305,29 @@ runs:
           --master-ref master \
           --pr-ref ${{ github.sha }} \
           --port 8090 --wait-secs 180
+      shell: bash
+
+    # Miri (UB detector) on the unsafe-heavy crates that don't pull tokio /
+    # compio. Pinned nightly so MIRIFLAGS behavior is stable across CI runs;
+    # bump the date quarterly. Tree-borrows is the future-default aliasing
+    # model and accepts the legitimate `NonNull::add` arithmetic in
+    # `iobuf.rs` that stacked-borrows would reject. Strict-provenance
+    # rejects int-to-pointer round trips, which we don't use.
+    - name: Install nightly Rust + miri component
+      if: inputs.task == 'miri'
+      run: |
+        rustup toolchain install nightly-2026-04-21 --component miri --profile minimal --no-self-update
+        cargo +nightly-2026-04-21 miri setup
+      shell: bash
+
+    - name: Run miri
+      if: inputs.task == 'miri'
+      env:
+        MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-strict-provenance"
+      run: |
+        cargo +nightly-2026-04-21 miri test --locked \
+          -p iggy_binary_protocol \
+          -p consensus
       shell: bash
 
     # aarch64 builds (run on ARM64 runners)

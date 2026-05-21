@@ -29,13 +29,13 @@ repository = "https://github.com/apache/iggy"
 bytes = "1.11.1"
 futures = "0.3.32"
 iggy = { path = "../../core/sdk", version = "0.10.1-edge.1" }
-pyo3 = "0.28.2"
+pyo3 = "0.28.3"
 pyo3-async-runtimes = { version = "0.28.0", features = [
     "attributes",
     "tokio-runtime",
 ] }
-pyo3-stub-gen = "0.19.0"
-tokio = "1.50.0"
+pyo3-stub-gen = "0.22.3"
+tokio = "1.52.3"
 
 [lib]
 name = "apache_iggy"

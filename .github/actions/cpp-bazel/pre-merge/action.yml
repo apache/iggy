@@ -27,6 +27,7 @@ runs:
   using: "composite"
   steps:
     - name: Setup Bazel with cache
+      if: inputs.task != 'lint'
       uses: ./.github/actions/utils/setup-cpp-with-cache
 
     - name: Setup Rust with cache
