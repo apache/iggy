@@ -754,14 +754,14 @@ impl Sink for InfluxDbSink {
                 Ok(()) => {
                     self.circuit_breaker.record_success();
                     self.write_success
-                        .fetch_add(batch.len() as u64, Ordering::AcqRel);
+                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
                 }
                 Err(e) => {
                     if !matches!(e, Error::PermanentHttpError(_)) {
                         self.circuit_breaker.record_failure().await;
                     }
                     self.write_errors
-                        .fetch_add(batch.len() as u64, Ordering::AcqRel);
+                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
                     error!(
                         "InfluxDB sink ID: {} failed batch of {}: {e}",
                         self.id,
@@ -776,7 +776,7 @@ impl Sink for InfluxDbSink {
 
         let total_processed = self
             .messages_attempted
-            .fetch_add(total as u64, Ordering::AcqRel)
+            .fetch_add(total as u64, Ordering::Relaxed)
             + total as u64;
 
         if self.verbose {
@@ -784,8 +784,8 @@ impl Sink for InfluxDbSink {
                 "InfluxDB sink ID: {} — processed={total}, cumulative={total_processed}, \
                  success={}, errors={}",
                 self.id,
-                self.write_success.load(Ordering::Acquire),
-                self.write_errors.load(Ordering::Acquire),
+                self.write_success.load(Ordering::Relaxed),
+                self.write_errors.load(Ordering::Relaxed),
             );
         } else {
             debug!(

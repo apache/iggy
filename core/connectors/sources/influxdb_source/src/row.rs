@@ -35,6 +35,9 @@ use std::collections::HashMap;
 /// values when building the message payload. V3 (JSONL) stores typed values
 /// directly — numbers, booleans, and nulls arrive pre-typed from SQL, so no
 /// string-round-trip parse is needed.
+// TODO(perf): Row uses std HashMap (SipHash) with per-key String allocation.
+// The dominant cost is the k.to_string() copy on every row field. Switching to
+// interned column names + AHashMap would reduce allocations on large batches.
 pub(crate) type Row = HashMap<String, serde_json::Value>;
 
 // ── InfluxDB V2 — annotated CSV ───────────────────────────────────────────────

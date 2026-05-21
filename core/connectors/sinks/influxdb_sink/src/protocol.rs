@@ -70,9 +70,12 @@ pub(crate) fn write_tag_value(buf: &mut String, value: &str) {
 ///
 /// Escapes: `\` → `\\`, `"` → `\"`, `\n` → `\\n`, `\r` → `\\r`
 ///
-/// Newline and carriage-return are the InfluxDB line-protocol record
-/// delimiters; a literal newline inside a string field value would split the
-/// line and corrupt the batch.
+/// NOTE: Escaping `\n` and `\r` inside quoted string field values is a
+/// deliberate divergence from the InfluxDB line-protocol spec (which only
+/// mandates `\\` and `\"` inside quoted strings). The divergence prevents
+/// line-splitting in downstream consumers that use raw newlines as record
+/// delimiters — e.g. log shippers, stream processors, and InfluxDB's own
+/// bulk-write HTTP parser if the body is re-streamed line by line.
 ///
 /// Tab (`\t`) is intentionally NOT escaped here. String field values are
 /// double-quoted in line protocol, and the spec permits literal tabs inside

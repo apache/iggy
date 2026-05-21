@@ -240,10 +240,12 @@ impl Source for InfluxDbSource {
             if cap > 0 && !cfg.query.contains("$offset") {
                 return Err(Error::InvalidConfigValue(
                     "V3 source query must contain the '$offset' placeholder when \
-                     stuck_batch_cap_factor > 0 (the default). Add \
-                     'OFFSET $offset' to your query to prevent duplicate delivery \
-                     during stuck-batch inflation. Example: \
-                     \"WHERE time > '$cursor' LIMIT $limit OFFSET $offset\""
+                     stuck_batch_cap_factor > 0 (the default). Add 'OFFSET $offset' \
+                     to your query to prevent duplicate delivery during stuck-batch \
+                     inflation. For simple queries add it at the top level: \
+                     \"WHERE time > '$cursor' ORDER BY time LIMIT $limit OFFSET $offset\". \
+                     For queries with subqueries or CTEs, $offset must appear on the \
+                     innermost SELECT that filters by time."
                         .into(),
                 ));
             }
@@ -333,6 +335,9 @@ impl Source for InfluxDbSource {
                 "{CONNECTOR_NAME} ID: {} — circuit breaker is OPEN. Skipping poll.",
                 self.id
             );
+            // TODO: sleep for the CB's remaining cool-down duration rather than
+            // poll_interval to avoid wakeup churn. Requires CircuitBreaker to
+            // expose a remaining_cool_down() method (SDK change).
             tokio::time::sleep(self.poll_interval).await;
             return Ok(ProducedMessages {
                 schema: Schema::Json,

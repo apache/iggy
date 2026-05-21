@@ -249,17 +249,26 @@ pub(crate) struct PollResult {
 /// precision (e.g. `"2026-04-26T02:32:20.526360865"`). The only required fix is
 /// appending `"Z"` when no timezone suffix is present (InfluxDB always stores UTC).
 ///
+/// Returns `Err` if the value is not a valid RFC 3339 timestamp even after appending
+/// `"Z"`, avoiding a wasted `Cow::Owned` allocation on garbage input.
+///
 /// Full nanosecond precision is intentionally preserved — truncating to milliseconds
 /// would place the cursor BEFORE the actual row timestamps within the same millisecond,
 /// causing `WHERE time > '$cursor'` to re-deliver already-seen rows on subsequent polls.
 /// InfluxDB 3's DataFusion SQL engine handles RFC 3339 strings with any number of
 /// fractional digits in WHERE clause timestamp comparisons.
-fn normalize_v3_timestamp(ts: &str) -> std::borrow::Cow<'_, str> {
+fn normalize_v3_timestamp(ts: &str) -> Result<std::borrow::Cow<'_, str>, Error> {
     if chrono::DateTime::parse_from_rfc3339(ts).is_ok() {
-        std::borrow::Cow::Borrowed(ts) // Zero allocation
-    } else {
-        std::borrow::Cow::Owned(format!("{ts}Z"))
+        return Ok(std::borrow::Cow::Borrowed(ts)); // Zero allocation
     }
+    let with_z = format!("{ts}Z");
+    if chrono::DateTime::parse_from_rfc3339(&with_z).is_ok() {
+        return Ok(std::borrow::Cow::Owned(with_z));
+    }
+    Err(Error::InvalidRecordValue(format!(
+        "cursor field contains {ts:?} which is not a valid RFC 3339 timestamp \
+         (tried appending 'Z' — still invalid)"
+    )))
 }
 
 /// Result of processing a batch of V3 rows into Iggy messages.
@@ -340,9 +349,12 @@ pub(crate) fn process_rows(
     let id_base = Uuid::new_v4().as_u128();
     for row in rows.iter() {
         if let Some(raw_cv) = row.get(ctx.cursor_field).and_then(|v| v.as_str()) {
-            let cv_owned = normalize_v3_timestamp(raw_cv);
+            let cv_owned = normalize_v3_timestamp(raw_cv)?;
             let cv: &str = &cv_owned;
             validate_cursor(cv)?;
+            // validate_cursor chains chrono::DateTime::parse_from_rfc3339, so if it
+            // returns Ok the parse below is guaranteed to succeed — (None, _) is
+            // unreachable here.
             let cv_parsed = cv.parse::<DateTime<Utc>>().ok();
             match (cv_parsed, max_cursor_parsed) {
                 (Some(new_dt), Some(cur_dt)) if new_dt > cur_dt => {
@@ -357,11 +369,6 @@ pub(crate) fn process_rows(
                     max_cursor = Some(cv.to_string());
                     max_cursor_parsed = Some(new_dt);
                     rows_at_max_cursor = 1;
-                }
-                (None, _) if max_cursor_parsed.is_none() => {
-                    // Unparsable cursor — still track it (string fallback) if no
-                    // parsable cursor has been seen yet.
-                    max_cursor = Some(cv.to_string());
                 }
                 _ => {}
             }
@@ -729,12 +736,12 @@ mod tests {
     fn normalize_already_valid_rfc3339_unchanged() {
         // Already valid RFC 3339 with Z and ms precision — must be returned as-is.
         assert_eq!(
-            normalize_v3_timestamp("2024-01-01T00:00:00.123Z"),
+            normalize_v3_timestamp("2024-01-01T00:00:00.123Z").unwrap(),
             "2024-01-01T00:00:00.123Z"
         );
         // Second-precision with Z is also ≤ms, returned unchanged.
         assert_eq!(
-            normalize_v3_timestamp("2024-01-01T00:00:00Z"),
+            normalize_v3_timestamp("2024-01-01T00:00:00Z").unwrap(),
             "2024-01-01T00:00:00Z"
         );
     }
@@ -743,29 +750,29 @@ mod tests {
     fn normalize_no_tz_nanoseconds_appends_z_only() {
         // InfluxDB 3 Core returns timestamps like this — 9 fractional digits, no Z.
         // Full nanosecond precision must be preserved (not truncated to ms).
-        let result = normalize_v3_timestamp("2026-04-26T02:32:20.526360865");
+        let result = normalize_v3_timestamp("2026-04-26T02:32:20.526360865").unwrap();
         assert_eq!(result, "2026-04-26T02:32:20.526360865Z");
     }
 
     #[test]
     fn normalize_no_tz_milliseconds_appends_z() {
         // No timezone suffix, ms precision — just append Z.
-        let result = normalize_v3_timestamp("2026-04-26T02:32:20.526");
+        let result = normalize_v3_timestamp("2026-04-26T02:32:20.526").unwrap();
         assert_eq!(result, "2026-04-26T02:32:20.526Z");
     }
 
     #[test]
     fn normalize_rfc3339_sub_ms_precision_returned_unchanged() {
         // Already valid RFC 3339 with Z and nanoseconds — returned as-is.
-        let result = normalize_v3_timestamp("2026-04-26T02:32:20.526360865Z");
+        let result = normalize_v3_timestamp("2026-04-26T02:32:20.526360865Z").unwrap();
         assert_eq!(result, "2026-04-26T02:32:20.526360865Z");
     }
 
     #[test]
-    fn normalize_invalid_returns_with_z_appended() {
-        // Unparsable string — append Z and return (validate_cursor will reject it later).
-        let result = normalize_v3_timestamp("not-a-timestamp");
-        assert_eq!(result, "not-a-timestampZ");
+    fn normalize_invalid_returns_err() {
+        // Garbage input that is not valid RFC 3339 even after appending Z must
+        // return Err — no wasted Cow::Owned allocation for an invalid value.
+        assert!(normalize_v3_timestamp("not-a-timestamp").is_err());
     }
 
     #[test]

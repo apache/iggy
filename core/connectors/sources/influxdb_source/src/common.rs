@@ -457,6 +457,15 @@ pub fn parse_scalar(value: &str) -> serde_json::Value {
 /// Substitute `$cursor` and `$limit` placeholders in a query template in a
 /// single pass, avoiding the two intermediate `String` allocations that
 /// `clone() + replace() + replace()` would produce.
+/// Returns `true` if `s` starts with `placeholder` and the character
+/// immediately after is not an identifier character (`[a-zA-Z0-9_]`).
+/// This prevents `$cursor_field` from matching `$cursor`.
+#[inline]
+fn matches_placeholder(s: &str, placeholder: &str) -> bool {
+    s.starts_with(placeholder)
+        && !s[placeholder.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+}
+
 pub(crate) fn apply_query_params(
     template: &str,
     cursor: &str,
@@ -469,13 +478,13 @@ pub(crate) fn apply_query_params(
     while let Some(pos) = remaining.find('$') {
         result.push_str(&remaining[..pos]);
         let after = &remaining[pos..];
-        if after.starts_with("$cursor") {
+        if matches_placeholder(after, "$cursor") {
             result.push_str(cursor);
             remaining = &remaining[pos + "$cursor".len()..];
-        } else if after.starts_with("$limit") {
+        } else if matches_placeholder(after, "$limit") {
             result.push_str(limit);
             remaining = &remaining[pos + "$limit".len()..];
-        } else if after.starts_with("$offset") {
+        } else if matches_placeholder(after, "$offset") {
             result.push_str(offset);
             remaining = &remaining[pos + "$offset".len()..];
         } else {
