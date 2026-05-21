@@ -57,10 +57,13 @@ unsafe impl CheckedBitPattern for Command2 {
 #[cfg(test)]
 mod tests {
     use crate::consensus::GenericHeader;
+    use aligned_vec::{AVec, ConstAlign};
 
     #[test]
     fn invalid_bit_pattern_rejected() {
-        let mut buf = bytes::BytesMut::zeroed(256);
+        // 16-byte aligned (see `ConsensusHeader` doc); `BytesMut` fails Miri.
+        let mut buf: AVec<u8, ConstAlign<16>> = AVec::new(16);
+        buf.resize(256, 0);
         buf[60] = 99;
         let result = bytemuck::checked::try_from_bytes::<GenericHeader>(&buf);
         assert!(result.is_err());

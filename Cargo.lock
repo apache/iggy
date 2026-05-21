@@ -3202,11 +3202,12 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crossfire"
-version = "3.1.12"
+version = "3.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72bdfcf389b100bb85fcf39ad434f67b617813cf0608095c905b79f6b2194aea"
+checksum = "48f956539b6d6369ec3e2b7a2cfa7652b9c2a1d51982338b111f5a814515ae1d"
 dependencies = [
  "crossbeam-utils",
+ "embed-collections",
  "futures-core",
  "parking_lot",
  "smallvec",
@@ -3652,9 +3653,9 @@ dependencies = [
 
 [[package]]
 name = "deltalake"
-version = "0.32.2"
+version = "0.32.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b7c2431da87e49b679a9ae8f72251e22ff7eb0e2c57c9631842b1c3ec16aaa9"
+checksum = "33449d2bcc676a8a0088ed644c3f7c5bf094ae4b115c1730735ba30e8a1866bb"
 dependencies = [
  "buoyant_kernel",
  "ctor 0.10.1",
@@ -4296,6 +4297,12 @@ dependencies = [
  "subtle",
  "zeroize",
 ]
+
+[[package]]
+name = "embed-collections"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a00ad60ee701d42d7b613057ee691272ffa40b90335e6a1e901a7fc4bf0769b8"
 
 [[package]]
 name = "embedded-io"
@@ -7621,9 +7628,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libmimalloc-sys"
-version = "0.1.47"
+version = "0.1.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d1eacfa31c33ec25e873c136ba5669f00f9866d0688bea7be4d3f7e43067df6"
+checksum = "2892ae4ea6fa2cb7acb0e236a6880d39523239cd9089de71d220910ccc806790"
 dependencies = [
  "cc",
 ]
@@ -8003,9 +8010,9 @@ dependencies = [
 
 [[package]]
 name = "mimalloc"
-version = "0.1.50"
+version = "0.1.51"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3627c4272df786b9260cabaa46aec1d59c93ede723d4c3ef646c503816b0640"
+checksum = "ebca48a43116bc25f18a61360f1be98412f50cc218f5e52c823086b999a4a21a"
 dependencies = [
  "libmimalloc-sys",
 ]
@@ -10323,9 +10330,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest-middleware"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "199dda04a536b532d0cc04d7979e39b1c763ea749bf91507017069c00b96056f"
+checksum = "07bc3f1384cffa4f274dad2d4ddd73aed32fed8f786d96c6be8aa4e5fd3c3b58"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10359,9 +10366,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest-tracing"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5c1a1510677d43dce9e9c0c07fc5db8772c0e5a43e4f9cef75a11affa05a578"
+checksum = "b5e5af0cd6fc3d3c8f703d597af70b6e4e62432c63157b49419fa1ffaf481702"
 dependencies = [
  "anyhow",
  "async-trait",
