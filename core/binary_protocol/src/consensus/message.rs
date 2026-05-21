@@ -278,6 +278,17 @@ where
         Ok(typed_message)
     }
 
+    /// Construct a typed `Message<H, B>` without re-validating the header.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee:
+    /// * `backing.total_len() >= size_of::<H>()`.
+    /// * Header bytes are a valid `H` bit pattern (`try_from_bytes` would succeed).
+    /// * `H::validate` would return `Ok`.
+    ///
+    /// Prefer `try_into_typed::<H>()`. Only use when bytes already validated
+    /// via another route (e.g. enclosing `MessageBag::try_from` dispatch).
     const unsafe fn from_backing_unchecked(backing: B) -> Self {
         Self {
             backing,
@@ -518,40 +529,25 @@ where
 {
     type Error = ConsensusError;
 
+    // Dispatch via `try_into_typed::<H>()`: re-runs per-typed `validate()`.
+    // `from_backing_unchecked` trusts the command byte alone, letting
+    // invariant violations (Commit size != 256, DoViewChange log_view > view)
+    // reach the router.
     fn try_from(value: Message<T>) -> Result<Self, Self::Error> {
         let command = value.as_generic().header().command;
-        let backing = value.into_inner();
 
         match command {
-            Command2::Prepare => {
-                let msg = unsafe { Message::<PrepareHeader>::from_backing_unchecked(backing) };
-                Ok(Self::Prepare(msg))
-            }
-            Command2::Request => {
-                let msg = unsafe { Message::<RequestHeader>::from_backing_unchecked(backing) };
-                Ok(Self::Request(msg))
-            }
-            Command2::PrepareOk => {
-                let msg = unsafe { Message::<PrepareOkHeader>::from_backing_unchecked(backing) };
-                Ok(Self::PrepareOk(msg))
-            }
-            Command2::StartViewChange => {
-                let msg =
-                    unsafe { Message::<StartViewChangeHeader>::from_backing_unchecked(backing) };
-                Ok(Self::StartViewChange(msg))
-            }
-            Command2::DoViewChange => {
-                let msg = unsafe { Message::<DoViewChangeHeader>::from_backing_unchecked(backing) };
-                Ok(Self::DoViewChange(msg))
-            }
-            Command2::StartView => {
-                let msg = unsafe { Message::<StartViewHeader>::from_backing_unchecked(backing) };
-                Ok(Self::StartView(msg))
-            }
-            Command2::Commit => {
-                let msg = unsafe { Message::<CommitHeader>::from_backing_unchecked(backing) };
-                Ok(Self::Commit(msg))
-            }
+            Command2::Prepare => Ok(Self::Prepare(value.try_into_typed::<PrepareHeader>()?)),
+            Command2::Request => Ok(Self::Request(value.try_into_typed::<RequestHeader>()?)),
+            Command2::PrepareOk => Ok(Self::PrepareOk(value.try_into_typed::<PrepareOkHeader>()?)),
+            Command2::StartViewChange => Ok(Self::StartViewChange(
+                value.try_into_typed::<StartViewChangeHeader>()?,
+            )),
+            Command2::DoViewChange => Ok(Self::DoViewChange(
+                value.try_into_typed::<DoViewChangeHeader>()?,
+            )),
+            Command2::StartView => Ok(Self::StartView(value.try_into_typed::<StartViewHeader>()?)),
+            Command2::Commit => Ok(Self::Commit(value.try_into_typed::<CommitHeader>()?)),
             // Reply / Eviction are server-to-client frames; they do not
             // appear on the inbound dispatch path.
             Command2::Reply | Command2::Eviction => {
@@ -562,5 +558,252 @@ where
                 found: other,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::{Operation, ReplyHeader};
+    use smallvec::smallvec;
+
+    // Field offsets via `offset_of!`: a field reorder fails to compile here
+    // rather than silently corrupting test bytes.
+    const SIZE_OFF: usize = std::mem::offset_of!(RequestHeader, size);
+    const COMMAND_OFF: usize = std::mem::offset_of!(RequestHeader, command);
+    const REQUEST_CLIENT_OFF: usize = std::mem::offset_of!(RequestHeader, client);
+    const REQUEST_OPERATION_OFF: usize = std::mem::offset_of!(RequestHeader, operation);
+    const REQUEST_SESSION_OFF: usize = std::mem::offset_of!(RequestHeader, session);
+
+    fn header_bytes(command: Command2, size: u32) -> Owned<MESSAGE_ALIGN> {
+        let mut o = Owned::<MESSAGE_ALIGN>::zeroed(256);
+        {
+            let buf = o.as_mut_slice();
+            buf[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&size.to_le_bytes());
+            buf[COMMAND_OFF] = command as u8;
+            // Typed headers reject client == 0. `#[repr(C)]` preamble layout
+            // is shared, so this offset works across header types.
+            buf[REQUEST_CLIENT_OFF..REQUEST_CLIENT_OFF + 16]
+                .copy_from_slice(&0xCAFE_u128.to_le_bytes());
+        }
+        o
+    }
+
+    // Construction via Message::new (zeroed)
+
+    #[test]
+    #[should_panic(expected = "size must be at least header size")]
+    fn message_new_smaller_than_header_panics() {
+        let _ = Message::<RequestHeader>::new(100);
+    }
+
+    // try_from(Owned): validation gates the unsafe construction
+
+    #[test]
+    fn try_from_owned_too_short_returns_err() {
+        let owned = Owned::<MESSAGE_ALIGN>::zeroed(100);
+        let result = Message::<RequestHeader>::try_from(owned);
+        assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
+    }
+
+    #[test]
+    fn try_from_owned_invalid_bit_pattern_returns_err() {
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(256);
+        owned.as_mut_slice()[COMMAND_OFF] = 99; // outside Command2's discriminant range
+        let result = Message::<RequestHeader>::try_from(owned);
+        assert!(matches!(result, Err(ConsensusError::InvalidBitPattern)));
+    }
+
+    #[test]
+    fn try_from_owned_buffer_shorter_than_claimed_size_returns_err() {
+        // Header parses cleanly (RequestHeader::validate doesn't gate on
+        // size), but the encoded `size` field claims more bytes than the
+        // backing buffer holds. The buffer-bounds check at the bottom of
+        // `Message::try_from` must reject. (Both this case and the
+        // "buffer shorter than `size_of::<H>`" case currently surface as
+        // the same `InvalidCommand` variant; promoting them to distinct
+        // `ConsensusError` variants is a separate hardening pass.)
+        let owned = header_bytes(Command2::Request, 999);
+        // header_bytes already produces a 256-byte buffer; size=999 > 256,
+        // so try_from rejects via `bytes.len() < header.size()`.
+        let result = Message::<RequestHeader>::try_from(owned);
+        assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
+    }
+
+    // as_generic: const unsafe pointer cast (#[repr(C)] equivalence)
+
+    #[test]
+    fn as_generic_view_reads_command_byte() {
+        let owned = header_bytes(Command2::Request, 256);
+        let typed = Message::<RequestHeader>::try_from(owned).expect("valid");
+        let generic = typed.as_generic();
+        assert_eq!(generic.header().command, Command2::Request);
+        assert_eq!(generic.total_len(), 256);
+    }
+
+    // try_as_typed: validation gates the unsafe ptr-cast reborrow
+
+    #[test]
+    fn try_as_typed_command_mismatch_returns_err_without_unsafe_cast() {
+        // bytes are a valid Prepare; asking for RequestHeader must fail
+        // *before* the unsafe ptr-cast inside try_as_typed.
+        let owned = header_bytes(Command2::Prepare, 256);
+        let generic = Message::<GenericHeader>::try_from(owned).expect("valid");
+        let result = generic.try_as_typed::<RequestHeader>();
+        assert!(matches!(
+            result,
+            Err(ConsensusError::InvalidCommand {
+                expected: Command2::Request,
+                found: Command2::Prepare,
+            })
+        ));
+    }
+
+    #[test]
+    fn try_as_typed_invalid_validation_returns_err() {
+        // RequestHeader::validate rejects operation=Register with non-zero session.
+        let mut owned = header_bytes(Command2::Request, 256);
+        {
+            let buf = owned.as_mut_slice();
+            buf[REQUEST_OPERATION_OFF] = Operation::Register as u8;
+            buf[REQUEST_SESSION_OFF..REQUEST_SESSION_OFF + 8].copy_from_slice(&5u64.to_le_bytes());
+        }
+        let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
+        let result = generic.try_as_typed::<RequestHeader>();
+        assert!(matches!(result, Err(ConsensusError::InvalidField(_))));
+    }
+
+    // try_into_typed: consuming variant of try_as_typed
+
+    #[test]
+    fn try_into_typed_command_mismatch_returns_err() {
+        let owned = header_bytes(Command2::Prepare, 256);
+        let generic = Message::<GenericHeader>::try_from(owned).expect("valid");
+        let result = generic.try_into_typed::<RequestHeader>();
+        assert!(matches!(
+            result,
+            Err(ConsensusError::InvalidCommand {
+                expected: Command2::Request,
+                found: Command2::Prepare,
+            })
+        ));
+    }
+
+    // MessageBag dispatch: 7 unsafe `from_backing_unchecked` arms
+
+    fn dispatch(command: Command2, size: u32) -> Result<MessageBag, ConsensusError> {
+        let owned = header_bytes(command, size);
+        let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
+        MessageBag::try_from(generic)
+    }
+
+    #[test]
+    fn messagebag_dispatch_unsupported_command_returns_err() {
+        // Ping is a valid Command2 bit pattern but is not a MessageBag variant.
+        let owned = header_bytes(Command2::Ping, 256);
+        let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
+        let result = MessageBag::try_from(generic);
+        assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
+    }
+
+    #[test]
+    fn messagebag_command_method_round_trips() {
+        for cmd in [
+            Command2::Request,
+            Command2::Prepare,
+            Command2::PrepareOk,
+            Command2::StartViewChange,
+            Command2::DoViewChange,
+            Command2::StartView,
+            Command2::Commit,
+        ] {
+            let bag = dispatch(cmd, 256).expect("dispatch");
+            assert_eq!(bag.command(), cmd, "round-trip for {cmd:?}");
+            assert_eq!(bag.size(), 256, "size for {cmd:?}");
+        }
+    }
+
+    // MessageBag dispatch must enforce per-typed validate()
+    // (Commit size != 256, Register with session != 0, etc.)
+
+    #[test]
+    fn messagebag_dispatch_commit_with_invalid_size_returns_err() {
+        // `CommitHeader::validate` rejects size != 256.
+        let owned = header_bytes(Command2::Commit, 128);
+        let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
+        let result = MessageBag::try_from(generic);
+        assert!(matches!(
+            result,
+            Err(ConsensusError::CommitInvalidSize(128))
+        ));
+    }
+
+    #[test]
+    fn messagebag_dispatch_request_with_invalid_register_session_returns_err() {
+        // `RequestHeader::validate` rejects Register with non-zero session.
+        let mut owned = header_bytes(Command2::Request, 256);
+        {
+            let buf = owned.as_mut_slice();
+            buf[REQUEST_OPERATION_OFF] = Operation::Register as u8;
+            buf[REQUEST_SESSION_OFF..REQUEST_SESSION_OFF + 8].copy_from_slice(&5u64.to_le_bytes());
+        }
+        let generic = Message::<GenericHeader>::try_from(owned).expect("valid generic");
+        let result = MessageBag::try_from(generic);
+        assert!(matches!(result, Err(ConsensusError::InvalidField(_))));
+    }
+
+    // deep_copy: byte-level independence after clone-like API
+
+    #[test]
+    fn request_message_deep_copy_independent() {
+        let owned = header_bytes(Command2::Request, 256);
+        let mut msg = Message::<RequestHeader>::try_from(owned).expect("valid");
+        let copy = msg.deep_copy();
+        // Mutate the original's bytes; the deep copy must be untouched.
+        msg.as_mut_slice()[200] = 0xab;
+        assert_eq!(copy.as_slice()[200], 0);
+        assert_eq!(msg.as_slice()[200], 0xab);
+    }
+
+    // transmute_header: rewrites the typed header in place
+
+    #[test]
+    fn transmute_header_request_to_prepare() {
+        let owned = header_bytes(Command2::Request, 256);
+        let msg = Message::<RequestHeader>::try_from(owned).expect("valid");
+        let prepared: Message<PrepareHeader> =
+            msg.transmute_header::<PrepareHeader>(|_old, new| {
+                new.command = Command2::Prepare;
+                new.size = 256;
+            });
+        assert_eq!(prepared.header().command, Command2::Prepare);
+    }
+
+    // ResponseBacking via SmallVec<Frozen>
+
+    #[test]
+    fn response_backing_single_fragment_roundtrip() {
+        let owned = header_bytes(Command2::Reply, 256);
+        let frozen: Frozen<MESSAGE_ALIGN> = owned.into();
+        let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![frozen];
+        let msg = Message::<ReplyHeader, ResponseBacking>::try_from(fragments).expect("valid");
+        assert_eq!(msg.header().command, Command2::Reply);
+        assert_eq!(msg.fragments().len(), 1);
+    }
+
+    #[test]
+    fn response_backing_empty_fragments_returns_err() {
+        let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![];
+        let result = Message::<ReplyHeader, ResponseBacking>::try_from(fragments);
+        assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
+    }
+
+    #[test]
+    fn response_backing_first_fragment_too_short_returns_err() {
+        let owned = Owned::<MESSAGE_ALIGN>::zeroed(100);
+        let frozen: Frozen<MESSAGE_ALIGN> = owned.into();
+        let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![frozen];
+        let result = Message::<ReplyHeader, ResponseBacking>::try_from(fragments);
+        assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
     }
 }

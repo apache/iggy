@@ -54,7 +54,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.rust_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.rust_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -69,7 +69,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.python_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.python_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -84,7 +84,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.node_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.node_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -99,7 +99,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.go_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.go_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -114,7 +114,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.java_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.java_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -129,7 +129,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.csharp_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.csharp_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -144,7 +144,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.cpp_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.cpp_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -157,7 +157,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.other_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.other_matrix) }}
     uses: ./.github/workflows/_test.yml
     with:
@@ -170,7 +170,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.bdd_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.bdd_matrix) }}
     uses: ./.github/workflows/_test_bdd.yml
     with:
@@ -183,7 +183,7 @@ jobs:
     needs: detect
     if: ${{ fromJson(needs.detect.outputs.examples_matrix).include[0].component != 'noop' }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJson(needs.detect.outputs.examples_matrix) }}
     uses: ./.github/workflows/_test_examples.yml
     with:

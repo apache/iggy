@@ -19,7 +19,7 @@ use crate::file_storage::FileStorage;
 use crate::{Journal, JournalHandle};
 use compio::io::AsyncWriteAtExt;
 use iggy_binary_protocol::consensus::iobuf::Owned;
-use iggy_binary_protocol::consensus::message::Message;
+use iggy_binary_protocol::consensus::message::{MESSAGE_ALIGN, Message};
 use iggy_binary_protocol::consensus::{Command2, PrepareHeader};
 use std::cell::{Cell, Ref, RefCell};
 use std::fmt;
@@ -139,12 +139,23 @@ impl PrepareJournal {
         let mut last_op: Option<u64> = None;
         let mut pos: u64 = 0;
         let mut header_buf = vec![0u8; HEADER_SIZE];
+        // Reused 16-aligned scratch (PrepareHeader has u128 fields). Avoids
+        // per-iteration 4 KiB-aligned alloc; bytes never become a `Message`.
+        let mut aligned = Owned::<16>::zeroed(HEADER_SIZE);
 
         while pos + HEADER_SIZE as u64 <= file_len {
             // Read the 256-byte header
             header_buf = storage.read_at(pos, header_buf).await?;
-            let header: PrepareHeader =
-                *bytemuck::checked::from_bytes::<PrepareHeader>(&header_buf);
+            aligned.as_mut_slice().copy_from_slice(&header_buf);
+            // `try_from_bytes`: corrupt discriminant on disk must NOT panic;
+            // route through the same truncate-here branch as command/size below.
+            let Ok(header_ref) =
+                bytemuck::checked::try_from_bytes::<PrepareHeader>(aligned.as_slice())
+            else {
+                storage.truncate(pos).await?;
+                break;
+            };
+            let header: PrepareHeader = *header_ref;
 
             // Validate: must be a Prepare command with sane size
             if header.command != Command2::Prepare
@@ -259,7 +270,7 @@ impl PrepareJournal {
         };
         let buf = vec![0u8; size];
         let buf = self.storage.read_at(offset, buf).await?;
-        let msg = Message::try_from(Owned::<4096>::copy_from_slice(&buf)).map_err(
+        let msg = Message::try_from(Owned::<MESSAGE_ALIGN>::copy_from_slice(&buf)).map_err(
             |e: iggy_binary_protocol::consensus::ConsensusError| {
                 io::Error::new(io::ErrorKind::InvalidData, e.to_string())
             },
@@ -350,7 +361,7 @@ impl Journal<FileStorage> for PrepareJournal {
         for (header, offset) in &to_drain {
             let buf = vec![0u8; header.size as usize];
             let buf = self.storage.read_at(*offset, buf).await?;
-            let msg = Message::try_from(Owned::<4096>::copy_from_slice(&buf)).map_err(
+            let msg = Message::try_from(Owned::<MESSAGE_ALIGN>::copy_from_slice(&buf)).map_err(
                 |e: iggy_binary_protocol::consensus::ConsensusError| {
                     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                 },
@@ -456,7 +467,7 @@ impl Journal<FileStorage> for PrepareJournal {
 
         let buffer = vec![0u8; size];
         let buffer = self.storage.read_at(offset, buffer).await.ok()?;
-        Message::try_from(Owned::<4096>::copy_from_slice(&buffer)).ok()
+        Message::try_from(Owned::<MESSAGE_ALIGN>::copy_from_slice(&buffer)).ok()
     }
 }
 
@@ -478,7 +489,7 @@ mod tests {
 
     fn make_prepare(op: u64, body_size: usize) -> Message<PrepareHeader> {
         let total_size = HEADER_SIZE + body_size;
-        let mut buffer = Owned::<4096>::zeroed(total_size);
+        let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total_size);
 
         let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
@@ -555,6 +566,38 @@ mod tests {
             let entry = journal.entry_at(&header).await.unwrap().unwrap();
             assert_eq!(entry.header().op, op as u64);
         }
+    }
+
+    #[compio::test]
+    async fn corrupt_command_byte_truncates_on_reopen() {
+        // Bit-flipped `Command2` discriminant: must truncate, not panic.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            journal.append(make_prepare(1, 64)).await.unwrap();
+            journal.append(make_prepare(2, 128)).await.unwrap();
+            journal.storage.fsync().await.unwrap();
+        }
+
+        // Entry 2 at offset HEADER_SIZE+64=320; `offset_of!` guards against
+        // future field reorders silently corrupting an unrelated byte.
+        let entry_2_offset = (HEADER_SIZE + 64) as u64;
+        let command_byte_offset =
+            entry_2_offset + std::mem::offset_of!(PrepareHeader, command) as u64;
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(command_byte_offset)).unwrap();
+            file.write_all(&[99u8]).unwrap(); // out of range for Command2
+            file.sync_all().unwrap();
+        }
+
+        let journal = PrepareJournal::open(&path, 0).await.unwrap();
+        assert_eq!(journal.last_op(), Some(1));
+        assert!(journal.header(2).is_none());
+        assert_eq!(journal.storage.file_len(), entry_2_offset);
     }
 
     #[compio::test]

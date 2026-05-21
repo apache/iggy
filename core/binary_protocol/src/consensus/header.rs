@@ -54,6 +54,15 @@ pub fn read_size_field(header: &[u8]) -> Option<u32> {
 ///
 /// Every header is exactly [`HEADER_SIZE`] bytes, `#[repr(C)]`, and supports
 /// zero-copy deserialization via `bytemuck`.
+///
+/// # Alignment
+///
+/// All headers contain `u128` fields → 16-byte alignment required by
+/// `bytemuck::checked::try_from_bytes`. Production uses `Owned<MESSAGE_ALIGN>`
+/// / `Frozen<MESSAGE_ALIGN>` (4096-aligned). `Vec<u8>` / `bytes::BytesMut`
+/// request align=1; they over-align under glibc by accident but fail under
+/// strict allocators (Miri, jemalloc, arenas). Use
+/// `aligned_vec::AVec<u8, ConstAlign<16>>` for explicit alignment.
 pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
     const COMMAND: Command2;
 
@@ -917,9 +926,14 @@ mod tests {
         EvictionReason, GenericHeader, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader,
         RequestHeader, StartViewChangeHeader, StartViewHeader,
     };
+    use aligned_vec::{AVec, ConstAlign};
 
-    fn aligned_zeroed(size: usize) -> bytes::BytesMut {
-        bytes::BytesMut::zeroed(size)
+    // bytemuck requires 16-byte alignment (see `ConsensusHeader` trait doc).
+    // `BytesMut::zeroed` works on glibc by accident, fails under Miri.
+    fn aligned_zeroed(size: usize) -> AVec<u8, ConstAlign<16>> {
+        let mut v: AVec<u8, ConstAlign<16>> = AVec::new(16);
+        v.resize(size, 0);
+        v
     }
 
     #[test]
