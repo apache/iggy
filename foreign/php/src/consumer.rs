@@ -112,6 +112,8 @@ impl IggyConsumer {
     /// PHP callback runs. Use AutoCommit::disabled() and call storeOffset() after a
     /// successful callback when at-least-once callback processing is required.
     pub fn consume_messages(&self, callback: ZendCallable, limit: u32) -> PhpResult<u32> {
+        // TODO: Add an iterator-style API like Python's iter_messages() so callers
+        // can compose consumption with generators or fibers instead of callbacks only.
         let mut consumed = 0;
 
         while consumed < limit {

@@ -3,8 +3,10 @@
 PHP extension bindings for [Apache Iggy](https://iggy.apache.org/), built in Rust with
 [`ext-php-rs`](https://github.com/davidcole1340/ext-php-rs).
 
-This repository is experimental. The extension exposes `Iggy\Client`, a blocking
-synchronous PHP API over the Rust Iggy client.
+This repository is experimental. The Rust Iggy SDK is async and Tokio-based, but
+this extension exposes `Iggy\Client` as a blocking synchronous PHP API. Each call
+drives the lazy global Tokio runtime and blocks the calling PHP thread until the
+future resolves; it does not provide fiber-aware or non-blocking I/O.
 
 ## Requirements
 

@@ -53,7 +53,7 @@ runs:
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
         shared-key: dev
-        save-cache: ${{ inputs.task == 'test' }}
+        save-cache: "false"
 
     - name: Use shared Cargo target directory
       shell: bash
