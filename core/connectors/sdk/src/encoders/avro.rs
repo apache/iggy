@@ -165,6 +165,26 @@ impl AvroStreamEncoder {
         })
     }
 
+    fn encode_bson_to_avro(&self, bson_value: bson::Bson) -> Result<Vec<u8>, Error> {
+        let schema = self.schema.as_ref().ok_or_else(|| {
+            error!("Cannot encode BSON to Avro without a schema");
+            Error::InvalidConfigValue("Avro schema is required for encoding".to_string())
+        })?;
+        let avro_value = Self::bson_to_avro_value(bson_value, schema)?;
+
+        apache_avro::to_avro_datum(schema, avro_value).map_err(|e| {
+            error!("Failed to encode Avro datum: {}", e);
+            Error::Serialization(format!("Avro encoding failed: {e}"))
+        })
+    }
+
+    fn bson_to_avro_value(
+        _value: bson::Bson,
+        _schema: &apache_avro::Schema,
+    ) -> Result<apache_avro::types::Value, Error> {
+        unimplemented!()
+    }
+
     fn serde_json_to_avro_value(
         value: serde_json::Value,
         schema: &apache_avro::Schema,
@@ -351,6 +371,7 @@ impl StreamEncoder for AvroStreamEncoder {
 
         match transformed_payload {
             Payload::Json(json_value) => self.encode_json_to_avro(json_value),
+            Payload::Bson(bson_value) => self.encode_bson_to_avro(bson_value),
             Payload::Text(text) => self.encode_text_to_avro(text),
             Payload::Raw(data) => self.encode_raw_to_avro(data),
             Payload::Avro(data) => Ok(data),

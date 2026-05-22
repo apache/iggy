@@ -22,6 +22,7 @@ use iggy_common::IggyTimestamp;
 use prost::Message;
 use prost_types::Any;
 use serde::{Deserialize, Serialize};
+use simd_json::OwnedValue;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{error, info};
@@ -375,6 +376,11 @@ impl ProtoStreamEncoder {
                 "avro_size": data.len(),
                 "data": general_purpose::STANDARD.encode(&data)
             }),
+            Payload::Bson(bson_value) => {
+                let json_value =
+                    serde_json::to_value(bson_value).map_err(|_| Error::InvalidBsonPayload)?;
+                OwnedValue::try_from(json_value).map_err(|_| Error::InvalidBsonPayload)?
+            }
         };
 
         if let simd_json::OwnedValue::Object(json_map) = json_value {
@@ -636,6 +642,17 @@ impl ProtoStreamEncoder {
                 ),
                 data,
             ),
+            Payload::Bson(bson_value) => {
+                let bson_string =
+                    simd_json::to_string(&bson_value).map_err(|_| Error::InvalidBsonPayload)?;
+                (
+                    format!(
+                        "{}/google.protobuf.StringValue",
+                        self.config.format_options.type_url_prefix
+                    ),
+                    bson_string.into_bytes(),
+                )
+            }
         };
 
         let any = Any {
@@ -656,6 +673,9 @@ impl ProtoStreamEncoder {
             Payload::Proto(text) => Ok(text.into_bytes()),
             Payload::FlatBuffer(data) => Ok(data),
             Payload::Avro(data) => Ok(data),
+            Payload::Bson(bson_value) => {
+                serde_json::to_vec(&bson_value).map_err(|_| Error::InvalidBsonPayload)
+            }
         }
     }
 

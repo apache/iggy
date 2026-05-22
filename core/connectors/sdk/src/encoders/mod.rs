@@ -17,6 +17,7 @@
  */
 
 pub mod avro;
+pub mod bson;
 pub mod flatbuffer;
 pub mod json;
 pub mod proto;
