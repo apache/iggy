@@ -21,18 +21,22 @@ use crate::config_writer::write_current_config;
 use crate::login_register::LoginRegisterError;
 use crate::server_error::ServerNgError;
 use crate::session_manager::SessionManager;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use configs::server_ng::ServerNgConfig;
 use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrConsensus};
 use iggy_binary_protocol::codes::{
     GET_CLUSTER_METADATA_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE,
+    GET_TOPICS_CODE, PING_CODE, POLL_MESSAGES_CODE,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
     StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::{PollMessagesRequest, SendMessagesHeader};
+use iggy_binary_protocol::requests::personal_access_tokens::{
+    CreatePersonalAccessTokenRequest as WireCreatePersonalAccessTokenRequest,
+    DeletePersonalAccessTokenRequest as WireDeletePersonalAccessTokenRequest,
+};
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsRequest};
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
@@ -48,7 +52,6 @@ use iggy_binary_protocol::responses::system::get_cluster_metadata::{
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
 use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
-use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
     Command2, GenericHeader, Message, Operation, ReplyHeader, RequestHeader, WireDecode,
     WireEncode, WireIdentifier, WireName, WirePartitioning,
@@ -83,6 +86,10 @@ use metadata::stm::consumer_group::ConsumerGroups;
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
 use metadata::stm::user::Users;
+use metadata::stm::user::{
+    CreatePersonalAccessTokenRequest as ReplicatedCreatePersonalAccessTokenRequest,
+    DeletePersonalAccessTokenRequest as ReplicatedDeletePersonalAccessTokenRequest,
+};
 use partitions::{
     IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig, Segment,
 };
@@ -94,6 +101,7 @@ use server::streaming::partitions::storage::{load_consumer_group_offsets, load_c
 use server::streaming::segments::storage::create_segment_storage;
 use server::streaming::users::user::User as LegacyUser;
 use server::streaming::utils::crypto;
+use server::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV};
 use shard::builder::IggyShardBuilder;
 use shard::shards_table::PapayaShardsTable;
 use shard::{
@@ -101,6 +109,7 @@ use shard::{
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -255,6 +264,7 @@ pub async fn bootstrap(
     let recovered = recover::<ServerNgMuxStateMachine>(Path::new(&config.system.path))
         .await
         .map_err(ServerNgError::MetadataRecovery)?;
+    validate_cluster_root_bootstrap(config, &recovered.mux_stm)?;
     ensure_default_root_user(&recovered.mux_stm);
     let restored_op = recovered.last_applied_op.unwrap_or_else(|| {
         recovered
@@ -1310,8 +1320,7 @@ fn make_client_request_handler(shard: &Rc<ServerNgShard>) -> RequestHandler {
             {
                 shard_for_disconnect
                     .plane
-                    .inner()
-                    .0
+                    .metadata()
                     .remove_client_session(vsr_client_id);
             }
         }));
@@ -1461,12 +1470,17 @@ async fn handle_client_request(
 
     let header = *request.header();
     if header.operation == Operation::NonReplicated {
-        handle_non_replicated_request(shard, sessions, transport_client_id, request).await;
+        handle_non_replicated_request(shard, transport_client_id, request).await;
         return;
     }
 
     if header.operation == Operation::Register && header.session == 0 && header.request == 0 {
         handle_login_register_request(shard, sessions, transport_client_id, request).await;
+        return;
+    }
+
+    if header.operation == Operation::Logout {
+        handle_logout_request(shard, sessions, transport_client_id, request).await;
         return;
     }
 
@@ -1498,13 +1512,24 @@ async fn handle_client_request(
             new_header.session = bound_session;
         }
     });
+    let request = match maybe_rewrite_pat_request(sessions, transport_client_id, request) {
+        Ok(request) => request,
+        Err(error) => {
+            warn!(
+                transport_client_id,
+                error = %error,
+                operation = ?header.operation,
+                "dropping request with invalid PAT replication context"
+            );
+            return;
+        }
+    };
     shard.dispatch(request.into_generic());
 }
 
 #[allow(clippy::future_not_send)]
 async fn handle_non_replicated_request(
     shard: &Rc<ServerNgShard>,
-    sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: Message<RequestHeader>,
 ) {
@@ -1513,12 +1538,11 @@ async fn handle_non_replicated_request(
     match code {
         PING_CODE => {
             let commit = current_metadata_commit(shard);
-            let reply = build_login_register_reply(
+            let reply = build_empty_reply(
                 request.header(),
                 request.header().client,
                 request.header().session,
                 commit,
-                &Bytes::new(),
             );
             if let Err(error) = shard
                 .bus
@@ -1532,41 +1556,14 @@ async fn handle_non_replicated_request(
                 );
             }
         }
-        LOGOUT_USER_CODE => {
-            if let Some(vsr_client_id) =
-                sessions.borrow_mut().remove_connection(transport_client_id)
-            {
-                shard.plane.metadata().remove_client_session(vsr_client_id);
-            }
-            let commit = current_metadata_commit(shard);
-            let reply = build_login_register_reply(
-                request.header(),
-                request.header().client,
-                request.header().session,
-                commit,
-                &Bytes::new(),
-            );
-            if let Err(error) = shard
-                .bus
-                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-                .await
-            {
-                warn!(
-                    transport_client_id,
-                    error = %error,
-                    "failed to send non-replicated logout reply"
-                );
-            }
-        }
         _ => match build_non_replicated_response(shard, code, request_body(&request)) {
-            Ok(body) => {
+            Ok(response) => {
                 let commit = current_metadata_commit(shard);
-                let reply = build_login_register_reply(
+                let reply = response.into_reply(
                     request.header(),
                     request.header().client,
                     request.header().session,
                     commit,
-                    &body,
                 );
                 if let Err(error) = shard
                     .bus
@@ -1593,6 +1590,51 @@ async fn handle_non_replicated_request(
     }
 }
 
+#[allow(clippy::future_not_send)]
+async fn handle_logout_request(
+    shard: &Rc<ServerNgShard>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+    request: Message<RequestHeader>,
+) {
+    let Some((vsr_client_id, session)) = sessions.borrow().get_session(transport_client_id) else {
+        warn!(
+            transport_client_id,
+            "dropping logout for unbound VSR session"
+        );
+        return;
+    };
+
+    let request_id = request.header().request;
+    let commit = match shard
+        .plane
+        .metadata()
+        .submit_logout_in_process(vsr_client_id, session, request_id)
+        .await
+    {
+        Ok(commit) => commit,
+        Err(error) => {
+            warn!(transport_client_id, error = %error, "logout/unregister failed");
+            return;
+        }
+    };
+
+    sessions.borrow_mut().remove_connection(transport_client_id);
+
+    let reply = build_empty_reply(request.header(), vsr_client_id, session, commit);
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            error = %error,
+            "failed to send logout reply"
+        );
+    }
+}
+
 fn ensure_transport_connection(
     shard: &Rc<ServerNgShard>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -1604,6 +1646,66 @@ fn ensure_transport_connection(
     sessions
         .borrow_mut()
         .ensure_connection(transport_client_id, meta.peer_addr);
+}
+
+fn maybe_rewrite_pat_request(
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+    request: Message<RequestHeader>,
+) -> Result<Message<RequestHeader>, IggyError> {
+    let operation = request.header().operation;
+    let user_id = match operation {
+        Operation::CreatePersonalAccessToken | Operation::DeletePersonalAccessToken => sessions
+            .borrow()
+            .get_user_id(transport_client_id)
+            .ok_or(IggyError::Unauthenticated)?,
+        _ => return Ok(request),
+    };
+
+    let body = request_body(&request);
+    let rewritten = match operation {
+        Operation::CreatePersonalAccessToken => {
+            let wire = WireCreatePersonalAccessTokenRequest::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
+            ReplicatedCreatePersonalAccessTokenRequest {
+                user_id,
+                name: wire.name,
+                expiry: wire.expiry,
+            }
+            .to_bytes()
+        }
+        Operation::DeletePersonalAccessToken => {
+            let wire = WireDeletePersonalAccessTokenRequest::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
+            ReplicatedDeletePersonalAccessTokenRequest {
+                user_id,
+                name: wire.name,
+            }
+            .to_bytes()
+        }
+        _ => unreachable!(),
+    };
+
+    rewrite_request_body(&request, &rewritten)
+}
+
+fn rewrite_request_body(
+    request: &Message<RequestHeader>,
+    body: &Bytes,
+) -> Result<Message<RequestHeader>, IggyError> {
+    let total_size = std::mem::size_of::<RequestHeader>()
+        .checked_add(body.len())
+        .ok_or(IggyError::InvalidConfiguration)?;
+    let size = u32::try_from(total_size).map_err(|_| IggyError::InvalidConfiguration)?;
+    let mut rewritten = Message::<RequestHeader>::new(total_size);
+    let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
+        &mut rewritten.as_mut_slice()[..std::mem::size_of::<RequestHeader>()],
+    )
+    .expect("zeroed bytes are a valid request header");
+    *header = *request.header();
+    header.size = size;
+    rewritten.as_mut_slice()[std::mem::size_of::<RequestHeader>()..].copy_from_slice(body);
+    Ok(rewritten)
 }
 
 #[allow(clippy::future_not_send)]
@@ -1799,40 +1901,54 @@ fn build_non_replicated_response(
     shard: &Rc<ServerNgShard>,
     code: u32,
     body: &[u8],
-) -> Result<Bytes, IggyError> {
+) -> Result<NonReplicatedResponse, IggyError> {
     match code {
-        GET_CLUSTER_METADATA_CODE => Ok(build_cluster_metadata_response().to_bytes()),
-        GET_STATS_CODE => Ok(build_stats_response(shard)?.to_bytes()),
+        GET_CLUSTER_METADATA_CODE => Ok(NonReplicatedResponse::Bytes(
+            build_cluster_metadata_response().to_bytes(),
+        )),
+        GET_STATS_CODE => Ok(NonReplicatedResponse::Bytes(
+            build_stats_response(shard)?.to_bytes(),
+        )),
         GET_STREAM_CODE => {
             let request =
                 GetStreamRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            build_get_stream_response(shard, &request.stream_id)
-                .map(|response| response.map_or_else(Bytes::new, |response| response.to_bytes()))
+            build_get_stream_response(shard, &request.stream_id).map(|response| {
+                response.map_or(NonReplicatedResponse::Empty, |response| {
+                    NonReplicatedResponse::Bytes(response.to_bytes())
+                })
+            })
         }
         GET_STREAMS_CODE => {
             let _ = GetStreamsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            Ok(build_get_streams_response(shard)?.to_bytes())
+            Ok(NonReplicatedResponse::Bytes(
+                build_get_streams_response(shard)?.to_bytes(),
+            ))
         }
         GET_TOPIC_CODE => {
             let request =
                 GetTopicRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            build_get_topic_response(shard, &request.stream_id, &request.topic_id)
-                .map(|response| response.map_or_else(Bytes::new, |response| response.to_bytes()))
+            build_get_topic_response(shard, &request.stream_id, &request.topic_id).map(|response| {
+                response.map_or(NonReplicatedResponse::Empty, |response| {
+                    NonReplicatedResponse::Bytes(response.to_bytes())
+                })
+            })
         }
         GET_TOPICS_CODE => {
             let request =
                 GetTopicsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            Ok(build_get_topics_response(shard, &request.stream_id)?.to_bytes())
+            Ok(NonReplicatedResponse::Bytes(
+                build_get_topics_response(shard, &request.stream_id)?.to_bytes(),
+            ))
         }
         POLL_MESSAGES_CODE => {
             let request =
                 PollMessagesRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            Ok(empty_polled_messages_response(
-                request.partition_id.unwrap_or(0),
-            ))
+            Ok(NonReplicatedResponse::EmptyPolledMessages {
+                partition_id: request.partition_id.unwrap_or(0),
+            })
         }
         _ => match iggy_binary_protocol::dispatch::lookup_command(code) {
-            Some(meta) if !meta.is_replicated() => Ok(Bytes::new()),
+            Some(meta) if !meta.is_replicated() => Ok(NonReplicatedResponse::Empty),
             Some(_) => Err(IggyError::FeatureUnavailable),
             None => Err(IggyError::InvalidCommand),
         },
@@ -2078,14 +2194,6 @@ fn partition_response(
     })
 }
 
-fn empty_polled_messages_response(partition_id: u32) -> Bytes {
-    let mut response = BytesMut::with_capacity(16);
-    response.put_u32_le(partition_id);
-    response.put_u64_le(0);
-    response.put_u32_le(0);
-    response.freeze()
-}
-
 fn usize_to_u32(value: usize) -> Result<u32, IggyError> {
     u32::try_from(value).map_err(|_| IggyError::InvalidIdentifier)
 }
@@ -2160,10 +2268,9 @@ async fn complete_login_register(
             .map(|(_, session)| session)
     };
     if let Some(session) = existing_session {
-        let response = LoginRegisterResponse { user_id, session }.to_bytes();
         let commit = current_metadata_commit(shard);
         let reply =
-            build_login_register_reply(request_header, vsr_client_id, session, commit, &response);
+            build_login_register_reply(request_header, vsr_client_id, session, commit, user_id);
         let _ = shard
             .bus
             .send_to_client(transport_client_id, reply.into_generic().into_frozen())
@@ -2180,8 +2287,7 @@ async fn complete_login_register(
 
     let session = match shard
         .plane
-        .inner()
-        .0
+        .metadata()
         .submit_register_in_process(vsr_client_id)
         .await
     {
@@ -2202,10 +2308,8 @@ async fn complete_login_register(
         }
     }
 
-    let response = LoginRegisterResponse { user_id, session }.to_bytes();
     let commit = current_metadata_commit(shard);
-    let reply =
-        build_login_register_reply(request_header, vsr_client_id, session, commit, &response);
+    let reply = build_login_register_reply(request_header, vsr_client_id, session, commit, user_id);
     if let Err(error) = shard
         .bus
         .send_to_client(transport_client_id, reply.into_generic().into_frozen())
@@ -2232,18 +2336,107 @@ fn ensure_default_root_user(mux_stm: &ServerNgMuxStateMachine) {
     mux_stm.users().ensure_root_user(&username, &password);
 }
 
+fn validate_cluster_root_bootstrap(
+    config: &ServerNgConfig,
+    mux_stm: &ServerNgMuxStateMachine,
+) -> Result<(), ServerNgError> {
+    if !config.cluster.enabled || !mux_stm.users().read(|users| users.items.is_empty()) {
+        return Ok(());
+    }
+
+    if env::var(IGGY_ROOT_USERNAME_ENV).is_ok() && env::var(IGGY_ROOT_PASSWORD_ENV).is_ok() {
+        return Ok(());
+    }
+
+    Err(ServerNgError::ClusterRootCredentialsRequired {
+        username_env: IGGY_ROOT_USERNAME_ENV,
+        password_env: IGGY_ROOT_PASSWORD_ENV,
+    })
+}
+
+enum NonReplicatedResponse {
+    Empty,
+    EmptyPolledMessages { partition_id: u32 },
+    Bytes(Bytes),
+}
+
+impl NonReplicatedResponse {
+    fn into_reply(
+        self,
+        request_header: &RequestHeader,
+        client_id: u128,
+        session: u64,
+        commit: u64,
+    ) -> Message<ReplyHeader> {
+        match self {
+            Self::Empty => build_empty_reply(request_header, client_id, session, commit),
+            Self::EmptyPolledMessages { partition_id } => {
+                build_reply_with_body(request_header, client_id, session, commit, 16, |body| {
+                    body[..4].copy_from_slice(&partition_id.to_le_bytes());
+                    body[4..12].copy_from_slice(&0u64.to_le_bytes());
+                    body[12..16].copy_from_slice(&0u32.to_le_bytes());
+                })
+            }
+            Self::Bytes(body) => {
+                build_reply_from_bytes(request_header, client_id, session, commit, &body)
+            }
+        }
+    }
+}
+
+fn build_empty_reply(
+    request_header: &RequestHeader,
+    client_id: u128,
+    session: u64,
+    commit: u64,
+) -> Message<ReplyHeader> {
+    build_reply_with_body(request_header, client_id, session, commit, 0, |_| {})
+}
+
 fn build_login_register_reply(
+    request_header: &RequestHeader,
+    client_id: u128,
+    session: u64,
+    commit: u64,
+    user_id: u32,
+) -> Message<ReplyHeader> {
+    build_reply_with_body(request_header, client_id, session, commit, 12, |body| {
+        body[..4].copy_from_slice(&user_id.to_le_bytes());
+        body[4..12].copy_from_slice(&session.to_le_bytes());
+    })
+}
+
+fn build_reply_from_bytes(
     request_header: &RequestHeader,
     client_id: u128,
     session: u64,
     commit: u64,
     body: &Bytes,
 ) -> Message<ReplyHeader> {
-    let total_size = std::mem::size_of::<ReplyHeader>() + body.len();
+    build_reply_with_body(
+        request_header,
+        client_id,
+        session,
+        commit,
+        body.len(),
+        |out| out.copy_from_slice(body),
+    )
+}
+
+fn build_reply_with_body(
+    request_header: &RequestHeader,
+    client_id: u128,
+    session: u64,
+    commit: u64,
+    body_len: usize,
+    write_body: impl FnOnce(&mut [u8]),
+) -> Message<ReplyHeader> {
+    let header_len = std::mem::size_of::<ReplyHeader>();
+    let total_size = header_len + body_len;
     let mut reply = Message::<ReplyHeader>::new(total_size);
     let header_size = u32::try_from(total_size).expect("reply size must fit into u32");
     let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
-        &mut reply.as_mut_slice()[..std::mem::size_of::<ReplyHeader>()],
+        &mut reply.as_mut_slice()[..header_len],
     )
     .expect("zeroed bytes are valid");
     *header = ReplyHeader {
@@ -2263,12 +2456,7 @@ fn build_login_register_reply(
         namespace: request_header.namespace,
         ..Default::default()
     };
-    if !body.is_empty() {
-        // TODO(vsr): encode reply bodies directly into the Message body region
-        // instead of serializing to Bytes first and copying them into the
-        // aligned message backing here.
-        reply.as_mut_slice()[std::mem::size_of::<ReplyHeader>()..total_size].copy_from_slice(body);
-    }
+    write_body(&mut reply.as_mut_slice()[header_len..total_size]);
     reply
 }
 

@@ -56,6 +56,13 @@ pub enum ServerNgError {
     #[error("cluster node for replica {replica_id} is missing tcp_replica port")]
     ClusterReplicaPortMissing { replica_id: u8 },
     #[error(
+        "cluster bootstrap with empty metadata requires both {username_env} and {password_env} to be set before server-ng can create the root user deterministically"
+    )]
+    ClusterRootCredentialsRequired {
+        username_env: &'static str,
+        password_env: &'static str,
+    },
+    #[error(
         "recovered segment for stream {stream_id}, topic {topic_id}, partition {partition_id} at start_offset {start_offset} has message/index divergence (messages_size={messages_size_bytes}, indexed_size={indexed_size_bytes}, end_offset={end_offset}); recovery aborted before opening listeners. Restore the partition from a healthy replica or snapshot, or move the segment aside for offline repair before restarting."
     )]
     RecoveredSegmentSizeDivergence {

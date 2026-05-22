@@ -27,6 +27,8 @@ use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
+#[cfg(feature = "vsr")]
+use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
 #[cfg(not(feature = "vsr"))]
 use iggy_common::IggyErrorDiscriminants;
 use iggy_common::{
@@ -65,6 +67,8 @@ pub struct TcpClient {
     pub(crate) current_server_address: Mutex<String>,
     #[cfg(feature = "vsr")]
     consensus_session: Arc<Mutex<ConsensusSession>>,
+    #[cfg(feature = "vsr")]
+    skip_auto_login_once: Mutex<bool>,
 }
 
 impl Default for TcpClient {
@@ -140,6 +144,13 @@ impl BinaryTransport for TcpClient {
 
         self.disconnect().await?;
 
+        #[cfg(feature = "vsr")]
+        let skip_auto_login = is_login_register_code(code);
+        #[cfg(feature = "vsr")]
+        if skip_auto_login {
+            *self.skip_auto_login_once.lock().await = true;
+        }
+
         {
             let client_address = self.get_client_address_value().await;
             let server_address = self.current_server_address.lock().await.clone();
@@ -149,7 +160,12 @@ impl BinaryTransport for TcpClient {
             );
         }
 
-        self.connect().await?;
+        let reconnect = self.connect().await;
+        #[cfg(feature = "vsr")]
+        if skip_auto_login && reconnect.is_err() {
+            *self.skip_auto_login_once.lock().await = false;
+        }
+        reconnect?;
         self.send_raw(code, payload).await
     }
 
@@ -243,6 +259,8 @@ impl TcpClient {
             current_server_address: Mutex::new(server_address),
             #[cfg(feature = "vsr")]
             consensus_session: Arc::new(Mutex::new(ConsensusSession::new())),
+            #[cfg(feature = "vsr")]
+            skip_auto_login_once: Mutex::new(false),
         })
     }
 
@@ -468,6 +486,12 @@ impl TcpClient {
             self.set_state(ClientState::Connected).await;
             self.connected_at.lock().await.replace(now);
             self.publish_event(DiagnosticEvent::Connected).await;
+            #[cfg(feature = "vsr")]
+            let skip_auto_login = {
+                let mut guard = self.skip_auto_login_once.lock().await;
+                std::mem::take(&mut *guard)
+            };
+
             // Handle auto-login
             let should_redirect = match &self.config.auto_login {
                 AutoLogin::Disabled => {
@@ -475,25 +499,53 @@ impl TcpClient {
                     false
                 }
                 AutoLogin::Enabled(credentials) => {
-                    info!("{NAME} client: {client_address} is signing in...");
-                    self.set_state(ClientState::Authenticating).await;
-                    match credentials {
-                        Credentials::UsernamePassword(username, password) => {
-                            self.login_user(username, password.expose_secret()).await?;
-                            info!(
-                                "{NAME} client: {client_address} has signed in with the user credentials, username: {username}",
-                            );
+                    #[cfg(feature = "vsr")]
+                    if skip_auto_login {
+                        info!("Skipping automatic sign-in for a retried login/register request.");
+                        false
+                    } else {
+                        info!("{NAME} client: {client_address} is signing in...");
+                        self.set_state(ClientState::Authenticating).await;
+                        match credentials {
+                            Credentials::UsernamePassword(username, password) => {
+                                self.login_user(username, password.expose_secret()).await?;
+                                info!(
+                                    "{NAME} client: {client_address} has signed in with the user credentials, username: {username}",
+                                );
+                            }
+                            Credentials::PersonalAccessToken(token) => {
+                                self.login_with_personal_access_token(token.expose_secret())
+                                    .await?;
+                                info!(
+                                    "{NAME} client: {client_address} has signed in with a personal access token.",
+                                );
+                            }
                         }
-                        Credentials::PersonalAccessToken(token) => {
-                            self.login_with_personal_access_token(token.expose_secret())
-                                .await?;
-                            info!(
-                                "{NAME} client: {client_address} has signed in with a personal access token.",
-                            );
-                        }
-                    }
 
-                    self.handle_leader_redirection().await?
+                        self.handle_leader_redirection().await?
+                    }
+                    #[cfg(not(feature = "vsr"))]
+                    {
+                        info!("{NAME} client: {client_address} is signing in...");
+                        self.set_state(ClientState::Authenticating).await;
+                        match credentials {
+                            Credentials::UsernamePassword(username, password) => {
+                                self.login_user(username, password.expose_secret()).await?;
+                                info!(
+                                    "{NAME} client: {client_address} has signed in with the user credentials, username: {username}",
+                                );
+                            }
+                            Credentials::PersonalAccessToken(token) => {
+                                self.login_with_personal_access_token(token.expose_secret())
+                                    .await?;
+                                info!(
+                                    "{NAME} client: {client_address} has signed in with a personal access token.",
+                                );
+                            }
+                        }
+
+                        self.handle_leader_redirection().await?
+                    }
                 }
             };
 
@@ -715,6 +767,11 @@ impl TcpClient {
             "unknown".to_string()
         }
     }
+}
+
+#[cfg(feature = "vsr")]
+const fn is_login_register_code(code: u32) -> bool {
+    matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
 }
 
 /// Unit tests for TcpClient.

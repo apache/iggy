@@ -21,7 +21,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::WireDecode;
 use iggy_binary_protocol::codes::{
     DELETE_CONSUMER_OFFSET_2_CODE, DELETE_CONSUMER_OFFSET_CODE, DELETE_SEGMENTS_CODE,
-    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, SEND_MESSAGES_CODE,
+    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE, SEND_MESSAGES_CODE,
     STORE_CONSUMER_OFFSET_2_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
 use iggy_binary_protocol::consensus::{
@@ -39,6 +39,16 @@ use iggy_common::{IggyError, IggyTimestamp};
 
 const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 
+// TODO(vsr): transparent retry-after-disconnect can weaken at-most-once semantics
+// for replicated writes. The transports currently disconnect, reconnect, and encode
+// the retry from the current ConsensusSession. If disconnect created a fresh VSR
+// client/session, the retried request gets a new (client_id, request_id) tuple, so
+// server-side deduplication cannot match a mutation that may already have committed
+// before the transport failure. TigerBeetle avoids session resume and relies on
+// idempotency for requests retried from a new client session. For Iggy, either stop
+// transparent retries for replicated mutations after VSR session reset, add explicit
+// session resume/rebind semantics, or add a protocol-level idempotency key that is
+// independent of (client_id, request_id).
 pub(crate) fn encode_contiguous_request(
     session: &mut ConsensusSession,
     code: u32,
@@ -92,6 +102,10 @@ pub(crate) fn encode_request_header(
 }
 
 fn operation_for_code(code: u32) -> Result<Operation, IggyError> {
+    if code == LOGOUT_USER_CODE {
+        return Ok(Operation::Logout);
+    }
+
     if let Some(operation) = Operation::from_command_code(code) {
         return Ok(operation);
     }
@@ -138,6 +152,7 @@ fn namespace_for_request(
     // Control-plane requests do not target a concrete stream/topic/partition shard.
     // They are encoded with namespace 0 and routed through metadata/shard 0.
     if operation == Operation::Register
+        || operation == Operation::Logout
         || operation == Operation::NonReplicated
         || operation.is_metadata()
     {
@@ -316,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn logout_uses_non_replicated_operation() {
+    fn logout_uses_replicated_logout_operation() {
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99);
         let bytes =
@@ -324,15 +339,8 @@ mod tests {
         let request = decode_request(&bytes);
         let header = request.header();
 
-        assert_eq!(header.operation, Operation::NonReplicated);
-        assert_eq!(
-            u32::from_le_bytes(
-                header.reserved[NON_REPLICATED_CODE_RANGE]
-                    .try_into()
-                    .unwrap()
-            ),
-            LOGOUT_USER_CODE
-        );
+        assert_eq!(header.operation, Operation::Logout);
+        assert_eq!(header.request, 1);
         assert_eq!(header.session, 99);
         assert_eq!(header.namespace, 0);
     }

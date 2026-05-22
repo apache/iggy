@@ -288,6 +288,7 @@ pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> 
         | Operation::CreatePartitionsWithAssignments
         | Operation::Reserved
         | Operation::Register
+        | Operation::Logout
         | Operation::NonReplicated => return None,
     };
     Some(&COMMAND_TABLE[idx])

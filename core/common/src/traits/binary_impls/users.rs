@@ -254,6 +254,8 @@ impl<B: BinaryClient> UserClient for B {
         fail_if_not_authenticated(self).await?;
         self.send_raw_with_response(LOGOUT_USER_CODE, LogoutUserRequest.to_bytes())
             .await?;
+        #[cfg(feature = "vsr")]
+        self.reset_vsr_session().await?;
         self.set_state(ClientState::Connected).await;
         self.publish_event(DiagnosticEvent::SignedOut).await;
         Ok(())

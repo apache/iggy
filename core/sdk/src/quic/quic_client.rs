@@ -27,6 +27,8 @@ use crate::quic::skip_server_verification::SkipServerVerification;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(feature = "vsr")]
+use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
 use iggy_common::{
     ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
     QuicConnectionStringOptions, TransportProtocol, validate_server_address,
@@ -62,6 +64,8 @@ pub struct QuicClient {
     pub(crate) current_server_address: Mutex<String>,
     #[cfg(feature = "vsr")]
     consensus_session: Arc<Mutex<ConsensusSession>>,
+    #[cfg(feature = "vsr")]
+    skip_auto_login_once: Mutex<bool>,
 }
 
 unsafe impl Send for QuicClient {}
@@ -138,12 +142,23 @@ impl BinaryTransport for QuicClient {
         }
 
         self.disconnect().await?;
+        #[cfg(feature = "vsr")]
+        let skip_auto_login = is_login_register_code(code);
+        #[cfg(feature = "vsr")]
+        if skip_auto_login {
+            *self.skip_auto_login_once.lock().await = true;
+        }
         let server_address = self.current_server_address.lock().await.to_string();
         info!(
             "Reconnecting to the server: {}, by client: {}",
             server_address, self.config.client_address
         );
-        self.connect().await?;
+        let reconnect = self.connect().await;
+        #[cfg(feature = "vsr")]
+        if skip_auto_login && reconnect.is_err() {
+            *self.skip_auto_login_once.lock().await = false;
+        }
+        reconnect?;
         self.send_raw(code, payload).await
     }
 
@@ -244,6 +259,8 @@ impl QuicClient {
             current_server_address: Mutex::new(server_address),
             #[cfg(feature = "vsr")]
             consensus_session: Arc::new(Mutex::new(ConsensusSession::new())),
+            #[cfg(feature = "vsr")]
+            skip_auto_login_once: Mutex::new(false),
         })
     }
 
@@ -424,6 +441,12 @@ impl QuicClient {
             self.connected_at.lock().await.replace(now);
             self.publish_event(DiagnosticEvent::Connected).await;
 
+            #[cfg(feature = "vsr")]
+            let skip_auto_login = {
+                let mut guard = self.skip_auto_login_once.lock().await;
+                std::mem::take(&mut *guard)
+            };
+
             // Handle auto-login
             let should_redirect = match &self.config.auto_login {
                 AutoLogin::Disabled => {
@@ -431,32 +454,67 @@ impl QuicClient {
                     false
                 }
                 AutoLogin::Enabled(credentials) => {
-                    info!(
-                        "{NAME} client: {} is signing in...",
-                        self.config.client_address
-                    );
-                    self.set_state(ClientState::Authenticating).await;
-                    match credentials {
-                        Credentials::UsernamePassword(username, password) => {
-                            self.login_user(username, password.expose_secret()).await?;
-                            self.publish_event(DiagnosticEvent::SignedIn).await;
-                            info!(
-                                "{NAME} client: {} has signed in with the user credentials, username: {username}",
-                                self.config.client_address
-                            );
+                    #[cfg(feature = "vsr")]
+                    if skip_auto_login {
+                        info!("Skipping automatic sign-in for a retried login/register request.");
+                        false
+                    } else {
+                        info!(
+                            "{NAME} client: {} is signing in...",
+                            self.config.client_address
+                        );
+                        self.set_state(ClientState::Authenticating).await;
+                        match credentials {
+                            Credentials::UsernamePassword(username, password) => {
+                                self.login_user(username, password.expose_secret()).await?;
+                                self.publish_event(DiagnosticEvent::SignedIn).await;
+                                info!(
+                                    "{NAME} client: {} has signed in with the user credentials, username: {username}",
+                                    self.config.client_address
+                                );
+                            }
+                            Credentials::PersonalAccessToken(token) => {
+                                self.login_with_personal_access_token(token.expose_secret())
+                                    .await?;
+                                self.publish_event(DiagnosticEvent::SignedIn).await;
+                                info!(
+                                    "{NAME} client: {} has signed in with a personal access token.",
+                                    self.config.client_address
+                                );
+                            }
                         }
-                        Credentials::PersonalAccessToken(token) => {
-                            self.login_with_personal_access_token(token.expose_secret())
-                                .await?;
-                            self.publish_event(DiagnosticEvent::SignedIn).await;
-                            info!(
-                                "{NAME} client: {} has signed in with a personal access token.",
-                                self.config.client_address
-                            );
-                        }
-                    }
 
-                    self.handle_leader_redirection().await?
+                        self.handle_leader_redirection().await?
+                    }
+                    #[cfg(not(feature = "vsr"))]
+                    {
+                        info!(
+                            "{NAME} client: {} is signing in...",
+                            self.config.client_address
+                        );
+                        self.set_state(ClientState::Authenticating).await;
+                        match credentials {
+                            Credentials::UsernamePassword(username, password) => {
+                                self.login_user(username, password.expose_secret()).await?;
+                                self.publish_event(DiagnosticEvent::SignedIn).await;
+                                info!(
+                                    "{NAME} client: {} has signed in with the user credentials, username: {username}",
+                                    self.config.client_address
+                                );
+                            }
+                            Credentials::PersonalAccessToken(token) => {
+                                self.login_with_personal_access_token(token.expose_secret())
+                                    .await?;
+                                self.publish_event(DiagnosticEvent::SignedIn).await;
+                                info!(
+                                    "{NAME} client: {} has signed in with a personal access token.",
+                                    self.config.client_address
+                                );
+                            }
+                        }
+
+                        self.handle_leader_redirection().await?
+                    }
                 }
             };
 
@@ -650,6 +708,11 @@ impl QuicClient {
             IggyError::QuicError
         })?
     }
+}
+
+#[cfg(feature = "vsr")]
+const fn is_login_register_code(code: u32) -> bool {
+    matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
 }
 
 fn configure(config: &QuicClientConfig) -> Result<ClientConfig, IggyError> {

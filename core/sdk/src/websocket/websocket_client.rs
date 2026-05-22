@@ -28,6 +28,8 @@ use crate::prelude::Client;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
+#[cfg(feature = "vsr")]
+use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
 #[cfg(not(feature = "vsr"))]
 use iggy_common::IggyErrorDiscriminants;
 use iggy_common::{
@@ -65,6 +67,8 @@ pub struct WebSocketClient {
     pub(crate) current_server_address: Mutex<String>,
     #[cfg(feature = "vsr")]
     consensus_session: Arc<Mutex<ConsensusSession>>,
+    #[cfg(feature = "vsr")]
+    skip_auto_login_once: Mutex<bool>,
 }
 
 impl Default for WebSocketClient {
@@ -142,6 +146,13 @@ impl BinaryTransport for WebSocketClient {
 
         self.disconnect().await?;
 
+        #[cfg(feature = "vsr")]
+        let skip_auto_login = is_login_register_code(code);
+        #[cfg(feature = "vsr")]
+        if skip_auto_login {
+            *self.skip_auto_login_once.lock().await = true;
+        }
+
         {
             let client_address = self.get_client_address_value().await;
             info!(
@@ -150,7 +161,12 @@ impl BinaryTransport for WebSocketClient {
             );
         }
 
-        self.connect().await?;
+        let reconnect = self.connect().await;
+        #[cfg(feature = "vsr")]
+        if skip_auto_login && reconnect.is_err() {
+            *self.skip_auto_login_once.lock().await = false;
+        }
+        reconnect?;
         self.send_raw(code, payload).await
     }
 
@@ -203,6 +219,8 @@ impl WebSocketClient {
             current_server_address: Mutex::new(server_address),
             #[cfg(feature = "vsr")]
             consensus_session: Arc::new(Mutex::new(ConsensusSession::new())),
+            #[cfg(feature = "vsr")]
+            skip_auto_login_once: Mutex::new(false),
         })
     }
 
@@ -521,12 +539,23 @@ impl WebSocketClient {
 
     async fn auto_login(&self) -> Result<(), IggyError> {
         let client_address = self.get_client_address_value().await;
+        #[cfg(feature = "vsr")]
+        let skip_auto_login = {
+            let mut guard = self.skip_auto_login_once.lock().await;
+            std::mem::take(&mut *guard)
+        };
+
         match &self.config.auto_login {
             AutoLogin::Disabled => {
                 info!("{NAME} client: {client_address} - automatic sign-in is disabled.");
                 Ok(())
             }
             AutoLogin::Enabled(credentials) => {
+                #[cfg(feature = "vsr")]
+                if skip_auto_login {
+                    info!("Skipping automatic sign-in for a retried login/register request.");
+                    return Ok(());
+                }
                 info!("{NAME} client: {client_address} is signing in...");
                 self.set_state(ClientState::Authenticating).await;
                 match credentials {
@@ -723,6 +752,11 @@ impl WebSocketClient {
             Ok(Bytes::from(response_buffer))
         }
     }
+}
+
+#[cfg(feature = "vsr")]
+const fn is_login_register_code(code: u32) -> bool {
+    matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
 }
 
 #[cfg(test)]

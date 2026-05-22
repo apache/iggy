@@ -227,6 +227,18 @@ impl SessionManager {
         }
     }
 
+    /// Look up the authenticated user id for a connection.
+    #[must_use]
+    pub fn get_user_id(&self, connection_id: u128) -> Option<u32> {
+        let conn = self.connections.get(&connection_id)?;
+        match conn.state {
+            ConnectionState::Authenticated { user_id } | ConnectionState::Bound { user_id, .. } => {
+                Some(user_id)
+            }
+            ConnectionState::Connected => None,
+        }
+    }
+
     /// Look up the connection ID for a client (for routing consensus replies).
     #[must_use]
     pub fn connection_for_client(&self, client_id: u128) -> Option<u128> {
