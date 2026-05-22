@@ -32,7 +32,11 @@ pub trait ShardsTable {
     fn shard_for(&self, namespace: IggyNamespace) -> Option<u16>;
 }
 
-/// No-op shards table for single-shard setups.
+/// Always-`None` impl. Satisfies the trait for test / simulator paths
+/// that never route via the table (e.g. [`crate::IggyShard::without_inbox`]).
+/// Do not use in production: the router drops any partition frame whose
+/// `shard_for` returns `None`, so a real cluster wired to this impl would
+/// silently shed every partition request.
 impl ShardsTable for () {
     fn shard_for(&self, _namespace: IggyNamespace) -> Option<u16> {
         None

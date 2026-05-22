@@ -23,19 +23,9 @@
 //! from `ServerConfig` lands. Kept in-crate for now to avoid churning
 //! the configs crate ahead of that wiring.
 
-use std::time::Duration;
-
 /// Tunables for [`crate::coordinator::ShardZeroCoordinator`].
 #[derive(Debug, Clone)]
 pub struct CoordinatorConfig {
-    /// Cadence at which shard 0 re-broadcasts its authoritative
-    /// `replica_id -> owning_shard` snapshot. A shard whose inbox was
-    /// full when the original `ReplicaMappingUpdate` was sent recovers
-    /// its mapping on the next tick rather than staying silently stale.
-    /// Must be comfortably shorter than the VSR view-change timeout so
-    /// a missed mapping cannot trigger a spurious view change.
-    pub refresh_period: Duration,
-
     /// When `total_shards > 1`, exclude shard 0 from replica placement.
     /// Shard 0 already hosts the coordinator, the metadata writer, and
     /// both listeners; replicas are long-lived steady flows, so offload
@@ -52,7 +42,6 @@ pub struct CoordinatorConfig {
 impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
-            refresh_period: Duration::from_secs(10),
             skip_shard_zero_for_replicas: true,
             skip_shard_zero_for_clients: false,
         }
