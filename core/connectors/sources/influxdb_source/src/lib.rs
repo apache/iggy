@@ -74,7 +74,8 @@ pub struct InfluxDbSource {
     retry_delay: Duration,
     circuit_breaker: Arc<CircuitBreaker>,
     auth_header: Option<SecretBox<String>>,
-    state_restore_failed: bool,
+    /// `Some(cause)` when state restore was rejected; `None` means restore succeeded.
+    state_restore_error: Option<String>,
 }
 
 impl InfluxDbSource {
@@ -90,14 +91,14 @@ impl InfluxDbSource {
         );
         let circuit_breaker = Arc::new(CircuitBreaker::new(cb_threshold, cb_cool_down));
 
-        let (version_state, state_restore_failed) = match &config {
+        let (version_state, state_restore_error) = match &config {
             InfluxDbSourceConfig::V2(_) => {
-                let (s, failed) = restore_v2_state(id, state);
-                (VersionState::V2(Mutex::new(s)), failed)
+                let (s, err) = restore_v2_state(id, state);
+                (VersionState::V2(Mutex::new(s)), err)
             }
             InfluxDbSourceConfig::V3(_) => {
-                let (s, failed) = restore_v3_state(id, state);
-                (VersionState::V3(Mutex::new(s)), failed)
+                let (s, err) = restore_v3_state(id, state);
+                (VersionState::V3(Mutex::new(s)), err)
             }
         };
 
@@ -111,7 +112,7 @@ impl InfluxDbSource {
             retry_delay,
             circuit_breaker,
             auth_header: None,
-            state_restore_failed,
+            state_restore_error,
         }
     }
 
@@ -124,64 +125,85 @@ impl InfluxDbSource {
 
 // ── State restore helpers ─────────────────────────────────────────────────────
 
-fn restore_v2_state(id: u32, state: Option<ConnectorState>) -> (V2State, bool) {
+fn restore_v2_state(id: u32, state: Option<ConnectorState>) -> (V2State, Option<String>) {
     let Some(cs) = state else {
-        return (V2State::default(), false);
+        return (V2State::default(), None);
     };
     match cs.deserialize::<PersistedState>(CONNECTOR_NAME, id) {
         Some(PersistedState::V2(s)) => {
+            if let Some(ref ts) = s.last_timestamp
+                && let Err(e) = validate_cursor(ts)
+            {
+                let cause = format!(
+                    "persisted V2 cursor {ts:?} failed validation: {e}. \
+                         Clear or migrate the connector state to recover."
+                );
+                error!("{CONNECTOR_NAME} ID {id}: {cause}");
+                return (V2State::default(), Some(cause));
+            }
+
             info!(
                 "{CONNECTOR_NAME} ID {id}: restored V2 state — \
                  last_timestamp={:?}, processed_rows={}",
                 s.last_timestamp, s.processed_rows
             );
-            (s, false)
+            (s, None)
         }
         Some(PersistedState::V3(_)) => {
-            error!(
-                "{CONNECTOR_NAME} ID {id}: persisted state is V3 but connector is configured \
-                 as V2. Refusing to start to prevent cursor reset. \
-                 Clear or migrate the connector state to proceed."
-            );
-            (V2State::default(), true)
+            let cause = "persisted state is V3 but connector is configured as V2. \
+                 Refusing to start to prevent cursor reset. \
+                 Clear or migrate the connector state to proceed.";
+
+            error!("{CONNECTOR_NAME} ID {id}: {cause}");
+            (V2State::default(), Some(cause.to_string()))
         }
         None => {
-            error!(
-                "{CONNECTOR_NAME} ID {id}: persisted state exists but could not be deserialized. \
-                 Refusing to start to prevent silent cursor reset."
-            );
-            (V2State::default(), true)
+            let cause = "persisted state exists but could not be deserialized. \
+                         Refusing to start to prevent silent cursor reset."
+                .to_string();
+            error!("{CONNECTOR_NAME} ID {id}: {cause}");
+            (V2State::default(), Some(cause))
         }
     }
 }
 
-fn restore_v3_state(id: u32, state: Option<ConnectorState>) -> (V3State, bool) {
+fn restore_v3_state(id: u32, state: Option<ConnectorState>) -> (V3State, Option<String>) {
     let Some(cs) = state else {
-        return (V3State::default(), false);
+        return (V3State::default(), None);
     };
     match cs.deserialize::<PersistedState>(CONNECTOR_NAME, id) {
         Some(PersistedState::V3(s)) => {
+            if let Some(ref ts) = s.last_timestamp
+                && let Err(e) = validate_cursor(ts)
+            {
+                let cause = format!(
+                    "persisted V3 cursor {ts:?} failed validation: {e}. \
+                         Clear or migrate the connector state to recover."
+                );
+                error!("{CONNECTOR_NAME} ID {id}: {cause}");
+                return (V3State::default(), Some(cause));
+            }
+
             info!(
                 "{CONNECTOR_NAME} ID {id}: restored V3 state — \
                  last_timestamp={:?}, processed_rows={}",
                 s.last_timestamp, s.processed_rows
             );
-            (s, false)
+            (s, None)
         }
         Some(PersistedState::V2(_)) => {
-            error!(
-                "{CONNECTOR_NAME} ID {id}: persisted state is V2 but connector is configured \
-                 as V3. Refusing to start to prevent cursor reset. \
-                 Clear or migrate the connector state to proceed."
-            );
-            (V3State::default(), true)
+            let cause = "persisted state is V2 but connector is configured as V3. \
+                 Refusing to start to prevent cursor reset. \
+                 Clear or migrate the connector state to proceed.";
+            error!("{CONNECTOR_NAME} ID {id}: {cause}");
+            (V3State::default(), Some(cause.to_string()))
         }
         None => {
-            error!(
-                "{CONNECTOR_NAME} ID {id}: persisted state exists but could not be deserialized. \
-                 Refusing to start to prevent silent cursor reset."
-            );
-            (V3State::default(), true)
+            let cause = "persisted state exists but could not be deserialized. \
+                         Refusing to start to prevent silent cursor reset."
+                .to_string();
+            error!("{CONNECTOR_NAME} ID {id}: {cause}");
+            (V3State::default(), Some(cause))
         }
     }
 }
@@ -191,8 +213,8 @@ fn restore_v3_state(id: u32, state: Option<ConnectorState>) -> (V3State, bool) {
 #[async_trait]
 impl Source for InfluxDbSource {
     async fn open(&mut self) -> Result<(), Error> {
-        if self.state_restore_failed {
-            return Err(Error::InvalidState);
+        if let Some(ref cause) = self.state_restore_error {
+            return Err(Error::InitError(format!("state restore failed: {cause}")));
         }
 
         let ver = self.config.version_label();
@@ -204,6 +226,35 @@ impl Source for InfluxDbSource {
         validate_cursor_field(self.config.cursor_field(), self.config.version_label())?;
         if let Some(offset) = self.config.initial_offset() {
             validate_cursor(offset)?;
+        }
+
+        // #10 — non-empty required fields
+        match &self.config {
+            InfluxDbSourceConfig::V2(c) if c.org.trim().is_empty() => {
+                return Err(Error::InvalidConfigValue(
+                    "V2 source config requires a non-empty 'org'".into(),
+                ));
+            }
+            InfluxDbSourceConfig::V3(c) if c.db.trim().is_empty() => {
+                return Err(Error::InvalidConfigValue(
+                    "V3 source config requires a non-empty 'db'".into(),
+                ));
+            }
+            _ => {}
+        }
+
+        // #11 — $cursor placeholder must be present; without it apply_query_params
+        // never substitutes the cursor and the same rows are re-delivered every poll.
+        let query = match &self.config {
+            InfluxDbSourceConfig::V2(c) => c.query.as_str(),
+            InfluxDbSourceConfig::V3(c) => c.query.as_str(),
+        };
+        if !query.contains("$cursor") {
+            return Err(Error::InvalidConfigValue(
+                "query must contain the '$cursor' placeholder — without it the connector \
+                 cannot advance and will re-deliver the same rows on every poll."
+                    .into(),
+            ));
         }
 
         if let InfluxDbSourceConfig::V3(cfg) = &self.config
@@ -269,6 +320,21 @@ impl Source for InfluxDbSource {
                  Add `|> sort(columns: [\"_time\"])` before `|> limit(...)` in your query.",
                 self.id
             )));
+        }
+
+        // #12 — V3 uses strict `> $cursor` semantics. If the query uses
+        // `>= '$cursor'`, rows at the cursor timestamp are re-fetched and
+        // re-delivered on the next poll (there is no skip-N dedup for V3).
+        if let InfluxDbSourceConfig::V3(cfg) = &self.config
+            && (cfg.query.contains(">= '$cursor'") || cfg.query.contains(">='$cursor'"))
+        {
+            return Err(Error::InvalidConfigValue(
+                "V3 source query uses '>= $cursor' (inclusive). V3 uses strict \
+                 '> $cursor' semantics — an inclusive cursor causes rows at the \
+                 cursor timestamp to be re-delivered on the next poll. \
+                 Change '>=' to '>' in your query."
+                    .into(),
+            ));
         }
 
         if let InfluxDbSourceConfig::V2(_) = &self.config
@@ -652,14 +718,14 @@ mod tests {
     fn v2_source_new_creates_v2_state() {
         let source = InfluxDbSource::new(1, make_v2_config(), None);
         assert!(matches!(source.version_state, VersionState::V2(_)));
-        assert!(!source.state_restore_failed);
+        assert!(source.state_restore_error.is_none());
     }
 
     #[test]
     fn v3_source_new_creates_v3_state() {
         let source = InfluxDbSource::new(1, make_v3_config(), None);
         assert!(matches!(source.version_state, VersionState::V3(_)));
-        assert!(!source.state_restore_failed);
+        assert!(source.state_restore_error.is_none());
     }
 
     #[tokio::test]
@@ -673,21 +739,101 @@ mod tests {
         let persisted = ConnectorState::serialize(&v2_state, CONNECTOR_NAME, 1).unwrap();
         let source = InfluxDbSource::new(1, make_v3_config(), Some(persisted));
         assert!(
-            source.state_restore_failed,
+            source.state_restore_error.is_some(),
             "V3 connector must refuse V2 persisted state"
         );
     }
 
     #[tokio::test]
-    async fn open_returns_invalid_state_when_restore_failed() {
+    async fn open_returns_init_error_when_restore_failed() {
+        // open() uses Error::InitError (which carries a String) so the cause
+        // is visible to callers without requiring log access.
         let garbage = ConnectorState(vec![0xFF, 0xFE, 0xFD]);
         let mut source = InfluxDbSource::new(1, make_v2_config(), Some(garbage));
-        assert!(source.state_restore_failed);
+        assert!(source.state_restore_error.is_some());
         let result = source.open().await;
         assert!(
-            matches!(result, Err(Error::InvalidState)),
-            "open() must fail fast on restore failure"
+            matches!(result, Err(Error::InitError(_))),
+            "open() must fail with InitError on restore failure"
         );
+        // The error message must include the cause so operators can diagnose the problem.
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("persisted state exists but could not be deserialized"),
+            "error message must include the cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn restore_v2_state_with_corrupt_cursor_marks_restore_error() {
+        // A state that deserializes successfully but contains a corrupt cursor
+        // must be rejected (state_restore_error set) so open() fails fast.
+        let bad_state = PersistedState::V2(V2State {
+            last_timestamp: Some("not-a-timestamp".to_string()),
+            processed_rows: 5,
+            cursor_row_count: 0,
+        });
+        let persisted = ConnectorState::serialize(&bad_state, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v2_config(), Some(persisted));
+        assert!(
+            source.state_restore_error.is_some(),
+            "corrupt cursor in persisted V2 state must set state_restore_error"
+        );
+        let msg = source.state_restore_error.unwrap();
+        assert!(
+            msg.contains("not-a-timestamp"),
+            "error message must quote the bad cursor value: {msg}"
+        );
+    }
+
+    #[test]
+    fn restore_v3_state_with_corrupt_cursor_marks_restore_error() {
+        let bad_state = PersistedState::V3(V3State {
+            last_timestamp: Some("not-a-timestamp".to_string()),
+            processed_rows: 5,
+            effective_batch_size: 500,
+            last_timestamp_row_offset: 0,
+        });
+        let persisted = ConnectorState::serialize(&bad_state, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v3_config(), Some(persisted));
+        assert!(
+            source.state_restore_error.is_some(),
+            "corrupt cursor in persisted V3 state must set state_restore_error"
+        );
+        let msg = source.state_restore_error.unwrap();
+        assert!(
+            msg.contains("not-a-timestamp"),
+            "error message must quote the bad cursor value: {msg}"
+        );
+    }
+
+    #[test]
+    fn restore_v2_state_with_valid_cursor_succeeds() {
+        // A well-formed V2 state with a valid cursor must restore without error.
+        let good_state = PersistedState::V2(V2State {
+            last_timestamp: Some("2025-01-01T00:00:00Z".to_string()),
+            processed_rows: 100,
+            cursor_row_count: 2,
+        });
+        let persisted = ConnectorState::serialize(&good_state, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v2_config(), Some(persisted));
+        assert!(
+            source.state_restore_error.is_none(),
+            "valid cursor must not produce restore error"
+        );
+    }
+
+    #[test]
+    fn restore_v2_state_with_none_cursor_succeeds() {
+        // last_timestamp = None (fresh start) must also restore without error.
+        let state = PersistedState::V2(V2State {
+            last_timestamp: None,
+            processed_rows: 0,
+            cursor_row_count: 0,
+        });
+        let persisted = ConnectorState::serialize(&state, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v2_config(), Some(persisted));
+        assert!(source.state_restore_error.is_none());
     }
 
     #[tokio::test]
@@ -752,6 +898,180 @@ mod tests {
         assert!(
             matches!(err, Error::InvalidConfigValue(_)),
             "initial_offset without timezone must be rejected"
+        );
+    }
+
+    // ── #10: org / db non-empty validation ────────────────────────────────────
+
+    #[tokio::test]
+    async fn open_v2_rejects_empty_org() {
+        let config = InfluxDbSourceConfig::V2(V2SourceConfig {
+            url: "http://localhost:18086".to_string(),
+            org: "".to_string(),
+            token: SecretString::from("t"),
+            query: "q WHERE time > '$cursor'".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "empty org must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_v3_rejects_empty_db() {
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "empty db must be rejected"
+        );
+    }
+
+    // ── #11: $cursor placeholder ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn open_rejects_query_missing_cursor_placeholder() {
+        let config = InfluxDbSourceConfig::V2(V2SourceConfig {
+            url: "http://localhost:18086".to_string(),
+            org: "myorg".to_string(),
+            token: SecretString::from("t"),
+            query: "from(bucket:\"b\") |> range(start: -1h) |> limit(n: $limit)".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("$cursor")),
+            "query without $cursor must be rejected: {err:?}"
+        );
+    }
+
+    // ── #12: V3 >= guard ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn open_v3_rejects_inclusive_cursor_operator() {
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "mydb".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT * FROM t WHERE time >= '$cursor' LIMIT $limit OFFSET $offset"
+                .to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains(">=")),
+            "V3 query with >= '$cursor' must be rejected: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_v3_allows_other_gte_in_query() {
+        // `>=` that does not apply to $cursor (e.g. a value filter) must be allowed.
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "mydb".to_string(),
+            token: SecretString::from("t"),
+            query:
+                "SELECT * FROM t WHERE time > '$cursor' AND val >= 0 LIMIT $limit OFFSET $offset"
+                    .to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        // Must fail on connectivity, NOT on the >= check.
+        assert!(
+            !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains(">=")),
+            "query with >= on non-cursor field must not be rejected for >=: {err:?}"
         );
     }
 
@@ -1058,7 +1378,7 @@ mod tests {
         let persisted = ConnectorState::serialize(&v2_state, CONNECTOR_NAME, 1).unwrap();
         let source = InfluxDbSource::new(1, make_v2_config(), Some(persisted));
         assert!(
-            !source.state_restore_failed,
+            source.state_restore_error.is_none(),
             "V2 state on V2 connector must succeed"
         );
         if let VersionState::V2(mu) = &source.version_state {
@@ -1085,8 +1405,8 @@ mod tests {
         let persisted = ConnectorState::serialize(&v3_state, CONNECTOR_NAME, 1).unwrap();
         let source = InfluxDbSource::new(1, make_v2_config(), Some(persisted));
         assert!(
-            source.state_restore_failed,
-            "V3 state on V2 connector must set state_restore_failed"
+            source.state_restore_error.is_some(),
+            "V3 state on V2 connector must set state_restore_error"
         );
     }
 
@@ -1102,7 +1422,7 @@ mod tests {
         let persisted = ConnectorState::serialize(&v3_state, CONNECTOR_NAME, 1).unwrap();
         let source = InfluxDbSource::new(1, make_v3_config(), Some(persisted));
         assert!(
-            !source.state_restore_failed,
+            source.state_restore_error.is_none(),
             "V3 state on V3 connector must succeed"
         );
         if let VersionState::V3(mu) = &source.version_state {
@@ -1129,6 +1449,60 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Connection(_))),
             "expected Connection error when client not initialized, got {result:?}"
+        );
+    }
+
+    // ── restore_v3_state — None deserialization path ─────────────────────────
+
+    #[test]
+    fn restore_v3_state_with_garbage_data_marks_restore_error() {
+        // Garbage bytes that cannot be deserialized must set state_restore_error
+        // on a V3 connector (mirrors the existing V2 test for coverage of the
+        // None branch in restore_v3_state at source/lib.rs:202-206).
+        let garbage = ConnectorState(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let source = InfluxDbSource::new(1, make_v3_config(), Some(garbage));
+        assert!(
+            source.state_restore_error.is_some(),
+            "garbage state for V3 connector must set state_restore_error"
+        );
+        let msg = source.state_restore_error.unwrap();
+        assert!(
+            msg.contains("could not be deserialized"),
+            "error message must explain the cause: {msg}"
+        );
+    }
+
+    // ── apply_v2_cursor_advance — corrupt cursor parse failure ───────────────
+
+    #[test]
+    fn apply_v2_cursor_advance_corrupt_cursor_does_not_advance() {
+        // When the persisted cursor is not valid RFC 3339, the parse fails and
+        // last_timestamp must NOT advance to the new max_cursor.
+        // The else-branch still accumulates cursor_row_count (normal behaviour
+        // for "same-cursor" polls); only the timestamp guard is affected.
+        let mut state = V2State {
+            last_timestamp: Some("this-is-not-a-timestamp".to_string()),
+            cursor_row_count: 3,
+            processed_rows: 0,
+        };
+        apply_v2_cursor_advance(
+            &mut state,
+            Some("2024-06-01T00:00:00Z".to_string()),
+            1,
+            0,
+        );
+        // last_timestamp must remain the corrupt string — should_advance=false
+        // because the old cursor failed to parse, so we do NOT replace it.
+        assert_eq!(
+            state.last_timestamp.as_deref(),
+            Some("this-is-not-a-timestamp"),
+            "corrupt cursor must not be replaced by new max_cursor"
+        );
+        // cursor_row_count is accumulated in the else branch (not reset), which
+        // is correct: the connector treats the parse failure as "same cursor".
+        assert_eq!(
+            state.cursor_row_count, 4,
+            "cursor_row_count must accumulate (+rows_at_max_cursor) in else branch"
         );
     }
 }

@@ -196,6 +196,216 @@ mod tests {
         assert_eq!(result.messages.len(), 1);
         assert!(result.max_cursor.is_none());
     }
+
+    #[test]
+    fn process_rows_message_ids_stable_across_repoll() {
+        // IDs must be deterministic: same rows must produce the same IDs on re-poll.
+        let rows = vec![
+            row(&[("_time", T1), ("_value", "10")]),
+            row(&[("_time", T2), ("_value", "20")]),
+        ];
+        let c = ctx(BASE_CURSOR, 0);
+        let first = process_rows(&rows, &c, 0).unwrap();
+        let second = process_rows(&rows, &c, 0).unwrap();
+        assert_eq!(
+            first.messages[0].id, second.messages[0].id,
+            "row at T1 must have the same ID on re-poll"
+        );
+        assert_eq!(
+            first.messages[1].id, second.messages[1].id,
+            "row at T2 must have the same ID on re-poll"
+        );
+    }
+
+    #[test]
+    fn process_rows_rows_at_same_timestamp_get_distinct_stable_ids() {
+        // Two rows sharing a cursor timestamp must get different IDs (position-disambiguated).
+        let rows = vec![
+            row(&[("_time", T1), ("_value", "a")]),
+            row(&[("_time", T1), ("_value", "b")]),
+        ];
+        let c = ctx(BASE_CURSOR, 0);
+        let result = process_rows(&rows, &c, 0).unwrap();
+        assert_ne!(
+            result.messages[0].id, result.messages[1].id,
+            "two rows at the same timestamp must have distinct IDs"
+        );
+        // Stability: IDs unchanged on re-poll.
+        let result2 = process_rows(&rows, &c, 0).unwrap();
+        assert_eq!(result.messages[0].id, result2.messages[0].id);
+        assert_eq!(result.messages[1].id, result2.messages[1].id);
+    }
+
+    // ── build_payload with payload_column ─────────────────────────────────────
+
+    #[test]
+    fn process_rows_payload_column_json_format_parses_and_reserializes() {
+        // payload_column + Json format: the CSV string value is parsed as JSON,
+        // normalized (compact), and written as the message bytes.
+        let rows = vec![row(&[
+            ("_time", T1),
+            ("data", r#"{"sensor":"temp","v":42}"#),
+        ])];
+        let result = process_rows(
+            &rows,
+            &RowContext {
+                cursor_field: "_time",
+                current_cursor: BASE_CURSOR,
+                include_metadata: true,
+                payload_col: Some("data"),
+                payload_format: PayloadFormat::Json,
+                now_micros: 1000,
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.messages.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&result.messages[0].payload).unwrap();
+        assert_eq!(body["sensor"], "temp");
+        assert_eq!(body["v"], 42);
+    }
+
+    #[test]
+    fn process_rows_payload_column_json_invalid_returns_error() {
+        // payload_column + Json format: non-JSON string must return Err.
+        let rows = vec![row(&[("_time", T1), ("data", "not-json")])];
+        let result = process_rows(
+            &rows,
+            &RowContext {
+                cursor_field: "_time",
+                current_cursor: BASE_CURSOR,
+                include_metadata: true,
+                payload_col: Some("data"),
+                payload_format: PayloadFormat::Json,
+                now_micros: 1000,
+            },
+            0,
+        );
+        assert!(result.is_err(), "invalid JSON payload column must return Err");
+    }
+
+    #[test]
+    fn process_rows_payload_column_raw_decodes_base64() {
+        // payload_column + Raw format: base64-encoded CSV value is decoded to bytes.
+        use base64::{Engine as _, engine::general_purpose};
+        let encoded = general_purpose::STANDARD.encode(b"binary\x00data");
+        let rows = vec![row(&[("_time", T1), ("blob", &encoded)])];
+        let result = process_rows(
+            &rows,
+            &RowContext {
+                cursor_field: "_time",
+                current_cursor: BASE_CURSOR,
+                include_metadata: true,
+                payload_col: Some("blob"),
+                payload_format: PayloadFormat::Raw,
+                now_micros: 1000,
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.messages[0].payload, b"binary\x00data");
+    }
+
+    #[test]
+    fn process_rows_payload_column_raw_invalid_base64_returns_error() {
+        let rows = vec![row(&[("_time", T1), ("blob", "!!!not-base64!!!")])];
+        let result = process_rows(
+            &rows,
+            &RowContext {
+                cursor_field: "_time",
+                current_cursor: BASE_CURSOR,
+                include_metadata: true,
+                payload_col: Some("blob"),
+                payload_format: PayloadFormat::Raw,
+                now_micros: 1000,
+            },
+            0,
+        );
+        assert!(result.is_err(), "invalid base64 payload column must return Err");
+    }
+
+    #[test]
+    fn process_rows_measurement_and_field_columns_included_in_metadata() {
+        // When include_metadata=true, _measurement and _field must appear in
+        // the wrapped JSON payload (confirming the uncovered branches at v2.rs:361-370).
+        let rows = vec![row(&[
+            ("_time", T1),
+            ("_measurement", "cpu"),
+            ("_field", "usage"),
+            ("_value", "55"),
+        ])];
+        let result = process_rows(
+            &rows,
+            &RowContext {
+                cursor_field: "_time",
+                current_cursor: BASE_CURSOR,
+                include_metadata: true,
+                payload_col: None,
+                payload_format: PayloadFormat::Json,
+                now_micros: 1000,
+            },
+            0,
+        )
+        .unwrap();
+        assert_eq!(result.messages.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_slice(&result.messages[0].payload).unwrap();
+        assert_eq!(body["measurement"], "cpu");
+        assert_eq!(body["field"], "usage");
+        // Row sub-object must contain the raw columns when include_metadata=true.
+        assert!(body["row"]["_measurement"].is_string());
+        assert!(body["row"]["_field"].is_string());
+    }
+
+    #[test]
+    fn process_rows_measurement_and_field_excluded_when_no_metadata() {
+        // include_metadata=false: _measurement and _field must NOT appear in row.
+        let rows = vec![row(&[
+            ("_time", T1),
+            ("_measurement", "cpu"),
+            ("_field", "usage"),
+            ("_value", "55"),
+        ])];
+        let result = process_rows(
+            &rows,
+            &RowContext {
+                cursor_field: "_time",
+                current_cursor: BASE_CURSOR,
+                include_metadata: false,
+                payload_col: None,
+                payload_format: PayloadFormat::Json,
+                now_micros: 1000,
+            },
+            0,
+        )
+        .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&result.messages[0].payload).unwrap();
+        // row sub-object must not contain _measurement or _field when metadata excluded
+        assert!(
+            body["row"].get("_measurement").is_none(),
+            "_measurement must be excluded when include_metadata=false"
+        );
+    }
+
+    #[test]
+    fn process_rows_missing_payload_column_returns_error() {
+        // If the specified payload_column is absent from the row, return Err.
+        let rows = vec![row(&[("_time", T1), ("other", "value")])];
+        let result = process_rows(
+            &rows,
+            &RowContext {
+                cursor_field: "_time",
+                current_cursor: BASE_CURSOR,
+                include_metadata: true,
+                payload_col: Some("missing_col"),
+                payload_format: PayloadFormat::Json,
+                now_micros: 1000,
+            },
+            0,
+        );
+        assert!(result.is_err(), "missing payload column must return Err");
+    }
 }
 
 // ── Query execution ───────────────────────────────────────────────────────────
@@ -360,6 +570,7 @@ fn build_payload(
         .map_err(|e| Error::Serialization(format!("JSON serialization failed: {e}")))
 }
 
+#[derive(Debug)]
 pub(crate) struct PollResult {
     pub messages: Vec<ProducedMessage>,
     pub max_cursor: Option<String>,
@@ -464,6 +675,16 @@ pub(crate) fn process_rows(
             }
         }
 
+        // Stable ID: cursor timestamp nanoseconds + emitted-message position.
+        // The same physical row always has the same cursor timestamp, and its
+        // position among emitted rows at that timestamp is stable for the same query.
+        // Falls back to a random base for rows that lack the cursor field.
+        let msg_id = cv
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+            .and_then(|dt| dt.timestamp_nanos_opt())
+            .map(|nanos| (nanos as u128).wrapping_add(messages.len() as u128))
+            .unwrap_or_else(|| id_base.wrapping_add(messages.len() as u128));
+
         let payload = build_payload(
             row,
             ctx.payload_col,
@@ -471,7 +692,7 @@ pub(crate) fn process_rows(
             ctx.include_metadata,
         )?;
         messages.push(ProducedMessage {
-            id: Some(id_base.wrapping_add(messages.len() as u128)),
+            id: Some(msg_id),
             checksum: None,
             timestamp: Some(ctx.now_micros),
             origin_timestamp: Some(ctx.now_micros),
@@ -516,6 +737,22 @@ pub(crate) async fn poll(
     };
 
     let result = process_rows(&rows, &ctx, already_seen)?;
+
+    // Detect all-skipped-at-cap livelock: already_seen has grown to or past the
+    // inflation cap, so capped_seen < already_seen. Every row fell inside the skip
+    // window; max_cursor stayed None. Without intervention, cursor_row_count would
+    // be reset to `skipped` (still ≥ cap) and the next poll would repeat identically.
+    let batch_u64 = config.batch_size.unwrap_or(500) as u64;
+    let cap = batch_u64.saturating_mul(MAX_SKIP_INFLATION_FACTOR);
+    if result.max_cursor.is_none() && result.skipped > 0 && already_seen >= cap {
+        tracing::error!(
+            "V2 source stuck-cursor livelock: already_seen ({already_seen}) has reached \
+             the inflation cap ({MAX_SKIP_INFLATION_FACTOR}×{batch_u64}={cap}). \
+             All rows were at the current cursor and skipped; the cursor cannot advance. \
+             Tripping circuit breaker — will retry after cool-down."
+        );
+        return Err(Error::InvalidState);
+    }
 
     let schema = if ctx.payload_col.is_some() {
         ctx.payload_format.schema()
@@ -964,5 +1201,50 @@ mod http_tests {
     #[test]
     fn build_query_invalid_base_returns_error() {
         assert!(build_query("not-a-url", "SELECT 1", None).is_err());
+    }
+
+    #[tokio::test]
+    async fn poll_livelock_at_inflation_cap_returns_error() {
+        // When cursor_row_count >= MAX_SKIP_INFLATION_FACTOR × batch_size and all rows
+        // are skipped, poll() must return an error to trip the circuit breaker.
+        // Without this, the connector loops forever: every poll skips all rows,
+        // max_cursor stays None, and cursor_row_count never decreases.
+        let t = "2024-01-01T00:00:00Z";
+        // Return MAX_SKIP_INFLATION_FACTOR × batch_size (= 10 × 10 = 100) rows all at cursor.
+        let batch_size: usize = 10;
+        let row_count = batch_size * (MAX_SKIP_INFLATION_FACTOR as usize);
+        let csv: String = std::iter::once("_time,_value\n".to_string())
+            .chain((0..row_count).map(|i| format!("{t},{i}\n")))
+            .collect();
+        let app = Router::new().route(
+            "/api/v2/query",
+            post(move || async move { (StatusCode::OK, csv) }),
+        );
+        let base = start_server(app).await;
+        let mut config = make_config(&base);
+        config.batch_size = Some(batch_size as u32);
+        // already_seen = cap = 10 × 10 = 100: exactly at the livelock threshold.
+        let state = V2State {
+            last_timestamp: Some(t.to_string()),
+            cursor_row_count: row_count as u64,
+            processed_rows: 0,
+        };
+        let result = poll(
+            &make_client(),
+            &config,
+            "Token tok",
+            &state,
+            PayloadFormat::Json,
+            true,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "poll at inflation cap with all rows skipped must return an error to trip the CB"
+        );
+        assert!(
+            matches!(result, Err(Error::InvalidState)),
+            "expected InvalidState livelock error, got {result:?}"
+        );
     }
 }

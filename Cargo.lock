@@ -6671,6 +6671,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "simd-json",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
@@ -6680,6 +6681,7 @@ dependencies = [
 name = "iggy_connector_influxdb_source"
 version = "0.4.1-edge.1"
 dependencies = [
+ "ahash 0.8.12",
  "async-trait",
  "axum",
  "base64",

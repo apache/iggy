@@ -56,19 +56,26 @@ pub enum InfluxDbSourceConfig {
 impl<'de> serde::Deserialize<'de> for InfluxDbSourceConfig {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = serde_json::Value::deserialize(d)?;
-        let version = match raw.get("version") {
-            None => "v2", // absent key → backward compat default
-            Some(v) => v.as_str().ok_or_else(|| {
-                serde::de::Error::custom(format!(
-                    "\"version\" must be a string (e.g. \"v2\" or \"v3\"), got: {v}"
-                ))
-            })?,
+        // Extract version as an owned String before moving `raw` into strip_version_key.
+        let version: String = match raw.get("version") {
+            None => "v2".to_string(), // absent key → backward compat default
+            Some(v) => v
+                .as_str()
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!(
+                        "\"version\" must be a string (e.g. \"v2\" or \"v3\"), got: {v}"
+                    ))
+                })?
+                .to_string(),
         };
-        match version {
-            "v2" => serde_json::from_value::<V2SourceConfig>(raw)
+        // Strip "version" before deserializing into the inner struct so that
+        // #[serde(deny_unknown_fields)] on V2/V3SourceConfig does not reject it.
+        let inner = strip_version_key(raw);
+        match version.as_str() {
+            "v2" => serde_json::from_value::<V2SourceConfig>(inner)
                 .map(Self::V2)
                 .map_err(serde::de::Error::custom),
-            "v3" => serde_json::from_value::<V3SourceConfig>(raw)
+            "v3" => serde_json::from_value::<V3SourceConfig>(inner)
                 .map(Self::V3)
                 .map_err(serde::de::Error::custom),
             other => Err(serde::de::Error::custom(format!(
@@ -78,7 +85,17 @@ impl<'de> serde::Deserialize<'de> for InfluxDbSourceConfig {
     }
 }
 
+/// Remove the `"version"` discriminator key before passing a raw JSON object to
+/// the inner config structs, which use `#[serde(deny_unknown_fields)]`.
+fn strip_version_key(mut raw: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::Object(ref mut m) = raw {
+        m.remove("version");
+    }
+    raw
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct V2SourceConfig {
     pub(crate) url: String,
     pub(crate) org: String,
@@ -104,6 +121,7 @@ pub struct V2SourceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct V3SourceConfig {
     pub(crate) url: String,
     pub(crate) db: String,
@@ -281,6 +299,7 @@ pub enum PersistedState {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct V2State {
     pub last_timestamp: Option<String>,
     pub processed_rows: u64,
@@ -290,6 +309,7 @@ pub struct V2State {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct V3State {
     pub last_timestamp: Option<String>,
     pub processed_rows: u64,
@@ -1032,5 +1052,66 @@ query   = "SELECT 1"
         let tmpl = "SELECT $unknown FROM t";
         let out = apply_query_params(tmpl, "T", "10", "0");
         assert_eq!(out, "SELECT $unknown FROM t");
+    }
+
+    // ── #[serde(default)] on V2State / V3State ────────────────────────────────
+
+    #[test]
+    fn v2_state_missing_field_defaults_to_zero() {
+        // Old persisted state without cursor_row_count must deserialize without error.
+        let json = r#"{"last_timestamp":"2024-01-01T00:00:00Z","processed_rows":5}"#;
+        let state: V2State = serde_json::from_str(json).unwrap();
+        assert_eq!(state.cursor_row_count, 0, "missing field must default to 0");
+        assert_eq!(state.processed_rows, 5);
+    }
+
+    #[test]
+    fn v3_state_missing_fields_default_to_zero() {
+        // Old persisted state without effective_batch_size or last_timestamp_row_offset.
+        let json = r#"{"last_timestamp":"2024-01-01T00:00:00Z","processed_rows":3}"#;
+        let state: V3State = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            state.effective_batch_size, 0,
+            "missing field must default to 0"
+        );
+        assert_eq!(
+            state.last_timestamp_row_offset, 0,
+            "missing field must default to 0"
+        );
+    }
+
+    // ── deny_unknown_fields ───────────────────────────────────────────────────
+
+    #[test]
+    fn source_config_v2_rejects_unknown_field() {
+        let json = r#"{"url":"http://h","org":"o","token":"t","query":"q","typo_key":"x"}"#;
+        let result: Result<InfluxDbSourceConfig, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "unknown field in V2 source config must be rejected"
+        );
+    }
+
+    #[test]
+    fn source_config_v3_rejects_unknown_field() {
+        let json =
+            r#"{"version":"v3","url":"http://h","db":"d","token":"t","query":"q","typo_key":"x"}"#;
+        let result: Result<InfluxDbSourceConfig, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "unknown field in V3 source config must be rejected"
+        );
+    }
+
+    #[test]
+    fn source_config_version_field_not_rejected_as_unknown() {
+        // The "version" discriminator must be stripped before inner-struct
+        // deserialization so it is not rejected as an unknown field.
+        let json = r#"{"version":"v2","url":"http://h","org":"o","token":"t","query":"q"}"#;
+        let result: Result<InfluxDbSourceConfig, _> = serde_json::from_str(json);
+        assert!(
+            result.is_ok(),
+            "version field must not be rejected by deny_unknown_fields: {result:?}"
+        );
     }
 }

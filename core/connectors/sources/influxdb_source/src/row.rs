@@ -23,10 +23,10 @@
 //! operates on this common representation so it runs unchanged regardless of
 //! which InfluxDB version is in use.
 
+use ahash::AHashMap;
 use csv::StringRecord;
 use iggy_connector_sdk::Error;
 use simd_json::BorrowedValue;
-use std::collections::HashMap;
 
 /// A single row returned by a query, field name → typed JSON value.
 ///
@@ -35,10 +35,10 @@ use std::collections::HashMap;
 /// values when building the message payload. V3 (JSONL) stores typed values
 /// directly — numbers, booleans, and nulls arrive pre-typed from SQL, so no
 /// string-round-trip parse is needed.
-// TODO(perf): Row uses std HashMap (SipHash) with per-key String allocation.
-// The dominant cost is the k.to_string() copy on every row field. Switching to
-// interned column names + AHashMap would reduce allocations on large batches.
-pub(crate) type Row = HashMap<String, serde_json::Value>;
+// TODO(perf): Row still pays a per-key String allocation on every row field.
+// Switching to interned column names (e.g. Arc<str>) would eliminate the
+// k.to_string() copy and reduce allocations on large batches.
+pub(crate) type Row = AHashMap<String, serde_json::Value>;
 
 // ── InfluxDB V2 — annotated CSV ───────────────────────────────────────────────
 
@@ -110,6 +110,7 @@ pub(crate) fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
                 continue;
             }
             let value = record.get(idx).unwrap_or("").to_string();
+            // TODO(perf): key.to_string() copies the column name on every row; use interned Arc<str> instead.
             mapped.insert(key.to_string(), serde_json::Value::String(value));
         }
 
@@ -171,6 +172,7 @@ fn parse_object(value: BorrowedValue<'_>) -> Result<Row, Error> {
             other => serde_json::to_value(other)
                 .map_err(|e| Error::InvalidRecordValue(format!("JSON conversion error: {e}")))?,
         };
+        // TODO(perf): k.to_string() copies the column name on every row; use interned Arc<str> instead.
         row.insert(k.to_string(), json_val);
     }
     Ok(row)

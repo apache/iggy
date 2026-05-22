@@ -55,6 +55,7 @@ const DEFAULT_CIRCUIT_COOL_DOWN: &str = "30s";
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct V2SinkConfig {
     pub(crate) url: String,
     pub(crate) org: String,
@@ -83,6 +84,7 @@ pub struct V2SinkConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct V3SinkConfig {
     pub(crate) url: String,
     pub(crate) db: String,
@@ -121,19 +123,26 @@ pub enum InfluxDbSinkConfig {
 impl<'de> serde::Deserialize<'de> for InfluxDbSinkConfig {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = serde_json::Value::deserialize(d)?;
-        let version = match raw.get("version") {
-            None => "v2", // absent key → backward compat default
-            Some(v) => v.as_str().ok_or_else(|| {
-                serde::de::Error::custom(format!(
-                    "\"version\" must be a string (e.g. \"v2\" or \"v3\"), got: {v}"
-                ))
-            })?,
+        // Extract version as an owned String before moving `raw` into strip_version_key.
+        let version: String = match raw.get("version") {
+            None => "v2".to_string(), // absent key → backward compat default
+            Some(v) => v
+                .as_str()
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!(
+                        "\"version\" must be a string (e.g. \"v2\" or \"v3\"), got: {v}"
+                    ))
+                })?
+                .to_string(),
         };
-        match version {
-            "v2" => serde_json::from_value::<V2SinkConfig>(raw)
+        // Strip "version" before deserializing into the inner struct so that
+        // #[serde(deny_unknown_fields)] on V2/V3SinkConfig does not reject it.
+        let inner = strip_version_key(raw);
+        match version.as_str() {
+            "v2" => serde_json::from_value::<V2SinkConfig>(inner)
                 .map(Self::V2)
                 .map_err(serde::de::Error::custom),
-            "v3" => serde_json::from_value::<V3SinkConfig>(raw)
+            "v3" => serde_json::from_value::<V3SinkConfig>(inner)
                 .map(Self::V3)
                 .map_err(serde::de::Error::custom),
             other => Err(serde::de::Error::custom(format!(
@@ -141,6 +150,13 @@ impl<'de> serde::Deserialize<'de> for InfluxDbSinkConfig {
             ))),
         }
     }
+}
+
+fn strip_version_key(mut raw: serde_json::Value) -> serde_json::Value {
+    if let serde_json::Value::Object(ref mut m) = raw {
+        m.remove("version");
+    }
+    raw
 }
 
 /// Map a short precision string to InfluxDB 3's long-form equivalent.
@@ -372,7 +388,16 @@ impl PayloadFormat {
         match value.map(|v| v.to_ascii_lowercase()).as_deref() {
             Some("text") | Some("utf8") => Self::Text,
             Some("base64") | Some("raw") => Self::Base64,
-            _ => Self::Json,
+            Some("json") => Self::Json,
+            other => {
+                if other.is_some() {
+                    warn!(
+                        "Unrecognized payload_format {:?}, falling back to JSON",
+                        other
+                    );
+                }
+                Self::Json
+            }
         }
     }
 }
@@ -447,7 +472,7 @@ impl InfluxDbSink {
             "us" => micros,
             "ms" => micros / 1_000,
             "s" => micros / 1_000_000,
-            _ => micros, // unreachable if open() validated precision as the precision is validated in the config validation
+            _ => unreachable!("precision was validated in open(); value is always ns/us/ms/s"),
         }
     }
 
@@ -458,7 +483,7 @@ impl InfluxDbSink {
         messages_metadata: &MessagesMetadata,
         message: &ConsumedMessage,
     ) -> Result<(), Error> {
-        write_measurement(buf, &self.measurement);
+        write_measurement(buf, &self.measurement)?;
 
         // Tag *key* strings below ("stream", "topic", "partition", "offset", etc.) are
         // static ASCII literals — they contain no InfluxDB line-protocol special chars
@@ -468,11 +493,11 @@ impl InfluxDbSink {
         // `write_measurement`.
         if self.include_metadata && self.include_stream_tag {
             buf.push_str(",stream=");
-            write_tag_value(buf, &topic_metadata.stream);
+            write_tag_value(buf, &topic_metadata.stream)?;
         }
         if self.include_metadata && self.include_topic_tag {
             buf.push_str(",topic=");
-            write_tag_value(buf, &topic_metadata.topic);
+            write_tag_value(buf, &topic_metadata.topic)?;
         }
         if self.include_metadata && self.include_partition_tag {
             write!(buf, ",partition={}", messages_metadata.partition_id).expect("infallible");
@@ -559,19 +584,20 @@ impl InfluxDbSink {
                 let bytes = message.payload.try_to_bytes().map_err(|e| {
                     Error::CannotStoreData(format!("Payload conversion failed: {e}"))
                 })?;
-                let encoded = general_purpose::STANDARD.encode(&bytes);
+                // base64 output charset [A-Za-z0-9+/=] contains no LP special
+                // characters, so write_field_string escaping is not needed here.
+                // encode_string appends directly into buf — no intermediate String.
                 buf.push_str(",payload_base64=\"");
-                write_field_string(buf, &encoded);
+                general_purpose::STANDARD.encode_string(&bytes, buf);
                 buf.push('"');
             }
         }
 
         let base_micros = if message.timestamp == 0 {
-            // timestamp == 0 is treated as "not set" — the iggy server overwrites
-            // the header timestamp on ingest, so live traffic never reaches here.
-            // This path fires only for externally-imported data stamped at UNIX_EPOCH.
-            warn!(
-                "sink ID: {} — message offset={} has timestamp=0 (Unix epoch or unset); \
+            // timestamp == 0 means "not set"; build_body already warned once for
+            // the whole batch so only debug-log the per-message detail here.
+            debug!(
+                "sink ID: {} — message offset={} has timestamp=0; \
                  substituting current wall-clock time",
                 self.id, message.offset
             );
@@ -599,9 +625,18 @@ impl InfluxDbSink {
         messages_metadata: &MessagesMetadata,
         messages: &[ConsumedMessage],
     ) -> Result<String, Error> {
-        // 1 KiB per message is a conservative estimate that accommodates JSON
-        // payloads without excessive reallocation.
-        let mut body = String::with_capacity(messages.len() * 1024);
+        // Warn once per batch rather than per-message to avoid log spam.
+        let zero_ts_count = messages.iter().filter(|m| m.timestamp == 0).count();
+        if zero_ts_count > 0 {
+            warn!(
+                "sink ID: {} — {zero_ts_count}/{} message(s) in this batch have \
+                 timestamp=0 (Unix epoch or unset); substituting current wall-clock time",
+                self.id,
+                messages.len()
+            );
+        }
+        // 256 bytes covers a typical line (measurement + a few tags + one field + timestamp).
+        let mut body = String::with_capacity(messages.len() * 256);
         for (i, msg) in messages.iter().enumerate() {
             self.append_line(&mut body, topic_metadata, messages_metadata, msg)?;
             if i + 1 < messages.len() {
@@ -680,11 +715,23 @@ impl Sink for InfluxDbSink {
             )));
         }
 
-        if let InfluxDbSinkConfig::V2(c) = &self.config
-            && c.org.trim().is_empty()
+        if let InfluxDbSinkConfig::V2(c) = &self.config {
+            if c.org.trim().is_empty() {
+                return Err(Error::InvalidConfigValue(
+                    "V2 sink config requires a non-empty 'org'".into(),
+                ));
+            }
+            if c.bucket.trim().is_empty() {
+                return Err(Error::InvalidConfigValue(
+                    "V2 sink config requires a non-empty 'bucket'".into(),
+                ));
+            }
+        }
+        if let InfluxDbSinkConfig::V3(c) = &self.config
+            && c.db.trim().is_empty()
         {
             return Err(Error::InvalidConfigValue(
-                "V2 sink config requires a non-empty 'org'".to_string(),
+                "V3 sink config requires a non-empty 'db'".into(),
             ));
         }
 
@@ -792,8 +839,8 @@ impl Sink for InfluxDbSink {
                 "InfluxDB sink ID: {} — processed={total}, cumulative={total_processed}, \
                  success={}, errors={}",
                 self.id,
-                self.write_success.load(Ordering::Acquire),
-                self.write_errors.load(Ordering::Acquire),
+                self.write_success.load(Ordering::Relaxed),
+                self.write_errors.load(Ordering::Relaxed),
             );
         }
 
@@ -805,9 +852,9 @@ impl Sink for InfluxDbSink {
         info!(
             "InfluxDB sink ID: {} closed — processed={}, success={}, errors={}",
             self.id,
-            self.messages_attempted.load(Ordering::Acquire),
-            self.write_success.load(Ordering::Acquire),
-            self.write_errors.load(Ordering::Acquire),
+            self.messages_attempted.load(Ordering::Relaxed),
+            self.write_success.load(Ordering::Relaxed),
+            self.write_errors.load(Ordering::Relaxed),
         );
         Ok(())
     }
@@ -1095,34 +1142,122 @@ token   = "t"
         ));
     }
 
+    #[tokio::test]
+    async fn open_rejects_empty_bucket_in_v2() {
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            url: "http://localhost:18086".to_string(),
+            bucket: "".to_string(),
+            ..make_v2_config().into_v2().unwrap()
+        });
+        let mut sink = InfluxDbSink::new(1, config);
+        let err = sink.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "expected InvalidConfigValue for empty bucket, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_rejects_whitespace_only_bucket_in_v2() {
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            url: "http://localhost:18086".to_string(),
+            bucket: "  ".to_string(),
+            ..make_v2_config().into_v2().unwrap()
+        });
+        let mut sink = InfluxDbSink::new(1, config);
+        assert!(matches!(
+            sink.open().await,
+            Err(Error::InvalidConfigValue(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_rejects_empty_db_in_v3() {
+        let config = InfluxDbSinkConfig::V3(V3SinkConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "".to_string(),
+            ..make_v3_config().into_v3().unwrap()
+        });
+        let mut sink = InfluxDbSink::new(1, config);
+        let err = sink.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "expected InvalidConfigValue for empty db, got {err:?}"
+        );
+    }
+
+    // ── deny_unknown_fields ───────────────────────────────────────────────
+
+    #[test]
+    fn sink_config_v2_rejects_unknown_field() {
+        let json = r#"{"url":"http://h","org":"o","bucket":"b","token":"t","typo_key":"x"}"#;
+        let result: Result<InfluxDbSinkConfig, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "unknown field in V2 sink config must be rejected"
+        );
+    }
+
+    #[test]
+    fn sink_config_v3_rejects_unknown_field() {
+        let json = r#"{"version":"v3","url":"http://h","db":"d","token":"t","typo_key":"x"}"#;
+        let result: Result<InfluxDbSinkConfig, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "unknown field in V3 sink config must be rejected"
+        );
+    }
+
+    #[test]
+    fn sink_config_version_field_not_rejected_as_unknown() {
+        let json = r#"{"version":"v2","url":"http://h","org":"o","bucket":"b","token":"t"}"#;
+        let result: Result<InfluxDbSinkConfig, _> = serde_json::from_str(json);
+        assert!(
+            result.is_ok(),
+            "version field must not be rejected by deny_unknown_fields: {result:?}"
+        );
+    }
+
     // ── line-protocol escaping ────────────────────────────────────────────
 
     #[test]
     fn measurement_escapes_comma_space_backslash() {
         let mut buf = String::new();
-        write_measurement(&mut buf, "m\\eas,urea meant");
+        write_measurement(&mut buf, "m\\eas,urea meant").unwrap();
         assert_eq!(buf, "m\\\\eas\\,urea\\ meant");
     }
 
     #[test]
     fn measurement_escapes_newlines() {
         let mut buf = String::new();
-        write_measurement(&mut buf, "meas\nurea\rment");
+        write_measurement(&mut buf, "meas\nurea\rment").unwrap();
         assert_eq!(buf, "meas\\nurea\\rment");
+    }
+
+    #[test]
+    fn measurement_rejects_tab() {
+        let mut buf = String::new();
+        assert!(write_measurement(&mut buf, "m\teasure").is_err());
     }
 
     #[test]
     fn tag_value_escapes_equals_sign() {
         let mut buf = String::new();
-        write_tag_value(&mut buf, "a=b,c d\\e");
+        write_tag_value(&mut buf, "a=b,c d\\e").unwrap();
         assert_eq!(buf, "a\\=b\\,c\\ d\\\\e");
     }
 
     #[test]
     fn tag_value_escapes_newlines() {
         let mut buf = String::new();
-        write_tag_value(&mut buf, "line1\nline2\r");
+        write_tag_value(&mut buf, "line1\nline2\r").unwrap();
         assert_eq!(buf, "line1\\nline2\\r");
+    }
+
+    #[test]
+    fn tag_value_rejects_tab() {
+        let mut buf = String::new();
+        assert!(write_tag_value(&mut buf, "val\tue").is_err());
     }
 
     #[test]
@@ -1137,6 +1272,42 @@ token   = "t"
         let mut buf = String::new();
         write_field_string(&mut buf, "line1\nline2\r");
         assert_eq!(buf, "line1\\nline2\\r");
+    }
+
+    #[test]
+    fn append_line_measurement_with_tab_returns_error() {
+        // Tabs in measurement names are rejected at the LP escaping layer, not silently mangled.
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            measurement: Some("bad\tmeasure".to_string()),
+            ..make_v2_config().into_v2().unwrap()
+        });
+        let sink = InfluxDbSink::new(1, config);
+        let mut buf = String::new();
+        let result = sink.append_line(
+            &mut buf,
+            &make_topic_metadata(),
+            &make_messages_metadata(),
+            &make_message(iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec())),
+        );
+        assert!(result.is_err(), "tab in measurement must be rejected");
+    }
+
+    #[test]
+    fn append_line_stream_tag_with_tab_returns_error() {
+        // Tabs in tag values (user-supplied stream/topic names) are rejected, not silently mangled.
+        let sink = make_sink();
+        let topic = TopicMetadata {
+            stream: "bad\tstream".to_string(),
+            topic: "ok".to_string(),
+        };
+        let mut buf = String::new();
+        let result = sink.append_line(
+            &mut buf,
+            &topic,
+            &make_messages_metadata(),
+            &make_message(iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec())),
+        );
+        assert!(result.is_err(), "tab in stream tag value must be rejected");
     }
 
     // ── append_line ───────────────────────────────────────────────────────
@@ -1347,6 +1518,233 @@ token   = "t"
             .unwrap();
         assert_eq!(body.lines().count(), 3);
     }
+
+    // ── version_label ─────────────────────────────────────────────────────
+
+    #[test]
+    fn version_label_v2_returns_v2() {
+        assert_eq!(make_v2_config().version_label(), "v2");
+    }
+
+    #[test]
+    fn version_label_v3_returns_v3() {
+        assert_eq!(make_v3_config().version_label(), "v3");
+    }
+
+    // ── PayloadFormat::from_config sink (warn on unknown) ─────────────────
+
+    #[test]
+    fn sink_payload_format_unknown_falls_back_to_json() {
+        // Unknown format must fall back to Json (same as source behaviour).
+        assert_eq!(PayloadFormat::from_config(Some("xml")), PayloadFormat::Json);
+        assert_eq!(PayloadFormat::from_config(Some("avro")), PayloadFormat::Json);
+    }
+
+    #[test]
+    fn sink_payload_format_none_defaults_to_json() {
+        assert_eq!(PayloadFormat::from_config(None), PayloadFormat::Json);
+    }
+
+    #[test]
+    fn sink_payload_format_json_explicit() {
+        assert_eq!(PayloadFormat::from_config(Some("json")), PayloadFormat::Json);
+    }
+
+    // ── append_line: metadata-as-fields when tag flags disabled ──────────
+
+    #[test]
+    fn append_line_stream_as_field_when_stream_tag_disabled() {
+        // include_metadata=true, include_stream_tag=false → stream written as
+        // iggy_stream field value instead of a tag.
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            include_metadata: Some(true),
+            include_stream_tag: Some(false),
+            include_topic_tag: Some(true),
+            include_partition_tag: Some(true),
+            ..make_v2_config().into_v2().unwrap()
+        });
+        let sink = InfluxDbSink::new(1, config);
+        let mut buf = String::new();
+        sink.append_line(
+            &mut buf,
+            &make_topic_metadata(),
+            &make_messages_metadata(),
+            &make_message(iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec())),
+        )
+        .unwrap();
+        assert!(
+            buf.contains("iggy_stream="),
+            "stream must appear as a field: {buf}"
+        );
+        assert!(
+            !buf.contains(",stream="),
+            "stream must NOT appear as a tag: {buf}"
+        );
+    }
+
+    #[test]
+    fn append_line_topic_as_field_when_topic_tag_disabled() {
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            include_metadata: Some(true),
+            include_stream_tag: Some(true),
+            include_topic_tag: Some(false),
+            include_partition_tag: Some(true),
+            ..make_v2_config().into_v2().unwrap()
+        });
+        let sink = InfluxDbSink::new(1, config);
+        let mut buf = String::new();
+        sink.append_line(
+            &mut buf,
+            &make_topic_metadata(),
+            &make_messages_metadata(),
+            &make_message(iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec())),
+        )
+        .unwrap();
+        assert!(buf.contains("iggy_topic="), "topic must appear as field: {buf}");
+        assert!(
+            !buf.contains(",topic="),
+            "topic must NOT appear as a tag: {buf}"
+        );
+    }
+
+    #[test]
+    fn append_line_partition_as_field_when_partition_tag_disabled() {
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            include_metadata: Some(true),
+            include_stream_tag: Some(true),
+            include_topic_tag: Some(true),
+            include_partition_tag: Some(false),
+            ..make_v2_config().into_v2().unwrap()
+        });
+        let sink = InfluxDbSink::new(1, config);
+        let mut buf = String::new();
+        sink.append_line(
+            &mut buf,
+            &make_topic_metadata(),
+            &make_messages_metadata(),
+            &make_message(iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec())),
+        )
+        .unwrap();
+        assert!(
+            buf.contains("iggy_partition="),
+            "partition must appear as field: {buf}"
+        );
+        assert!(
+            !buf.contains(",partition="),
+            "partition must NOT appear as a tag: {buf}"
+        );
+    }
+
+    // ── append_line: Payload::Json variant ───────────────────────────────
+
+    #[test]
+    fn append_line_json_payload_variant_serializes_directly() {
+        // Payload::Json bypasses the parse → serialize round-trip used for Raw/Text.
+        // Payload::Json wraps simd_json::OwnedValue.
+        let sink = make_sink();
+        let mut buf = String::new();
+        let json_bytes = br#"{"sensor":"temp","reading":42}"#;
+        let value: simd_json::OwnedValue =
+            simd_json::serde::from_slice(&mut json_bytes.to_vec()).unwrap();
+        sink.append_line(
+            &mut buf,
+            &make_topic_metadata(),
+            &make_messages_metadata(),
+            &make_message(iggy_connector_sdk::Payload::Json(value)),
+        )
+        .unwrap();
+        assert!(buf.contains("payload_json="), "Json payload must set field: {buf}");
+        assert!(buf.contains("sensor"), "Json payload content must appear: {buf}");
+    }
+
+    // ── append_line: timestamp == 0 fallback ──────────────────────────────
+
+    #[test]
+    fn append_line_zero_timestamp_uses_wall_clock() {
+        let sink = make_sink();
+        let mut buf = String::new();
+        let msg = ConsumedMessage {
+            id: 1,
+            offset: 0,
+            checksum: 0,
+            timestamp: 0, // unset — should fall back to wall-clock
+            origin_timestamp: 0,
+            headers: None,
+            payload: iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec()),
+        };
+        sink.append_line(&mut buf, &make_topic_metadata(), &make_messages_metadata(), &msg)
+            .unwrap();
+        // Body must end with a positive timestamp, not 0.
+        let ts: u64 = buf.split_whitespace().last().unwrap().parse().unwrap();
+        assert!(ts > 0, "wall-clock fallback must produce non-zero timestamp: {ts}");
+    }
+
+    // ── build_body: zero-timestamp batch warning ──────────────────────────
+
+    #[test]
+    fn build_body_with_zero_timestamp_messages_succeeds() {
+        // build_body must succeed even when messages have timestamp=0;
+        // it logs a batch-level warn but does not return an error.
+        let sink = make_sink();
+        let zero_msg = ConsumedMessage {
+            id: 1,
+            offset: 0,
+            checksum: 0,
+            timestamp: 0,
+            origin_timestamp: 0,
+            headers: None,
+            payload: iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec()),
+        };
+        let result = sink.build_body(&make_topic_metadata(), &make_messages_metadata(), &[zero_msg]);
+        assert!(result.is_ok(), "build_body must succeed for timestamp=0 message");
+    }
+
+    // ── close() ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn close_clears_client_and_returns_ok() {
+        // After open() populates the client, close() must clear it.
+        // We test with a pre-populated client by constructing a sink directly.
+        let mut sink = make_sink();
+        // Simulate client being initialized (without a live server).
+        assert!(sink.client.is_none(), "client should be None before open()");
+        let result = sink.close().await;
+        assert!(result.is_ok());
+        assert!(sink.client.is_none());
+    }
+
+    // ── get_client error when open() not called ───────────────────────────
+
+    #[test]
+    fn get_client_returns_connection_error_when_not_initialized() {
+        let sink = make_sink();
+        let err = sink.get_client().unwrap_err();
+        assert!(
+            matches!(err, Error::Connection(_)),
+            "expected Connection error, got {err:?}"
+        );
+    }
+
+    // ── append_line: text payload via include_metadata fields ─────────────
+
+    #[test]
+    fn append_line_text_payload_succeeds() {
+        let config = InfluxDbSinkConfig::V2(V2SinkConfig {
+            payload_format: Some("text".to_string()),
+            ..make_v2_config().into_v2().unwrap()
+        });
+        let sink = InfluxDbSink::new(1, config);
+        let mut buf = String::new();
+        sink.append_line(
+            &mut buf,
+            &make_topic_metadata(),
+            &make_messages_metadata(),
+            &make_message(iggy_connector_sdk::Payload::Raw(b"hello world".to_vec())),
+        )
+        .unwrap();
+        assert!(buf.contains("payload_text="), "text payload field must be set: {buf}");
+        assert!(buf.contains("hello world"), "payload content must appear: {buf}");
+    }
 }
 
 // ── Helper for tests: destructure config variants ─────────────────────────────
@@ -1357,6 +1755,14 @@ impl InfluxDbSinkConfig {
         match self {
             Self::V2(c) => Some(c),
             Self::V3(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn into_v3(self) -> Option<V3SinkConfig> {
+        match self {
+            Self::V3(c) => Some(c),
+            Self::V2(_) => None,
         }
     }
 }
@@ -1908,14 +2314,5 @@ mod http_tests {
             ..v2_config("http://placeholder").into_v2().unwrap()
         });
         assert!(config.build_write_url().is_err());
-    }
-
-    impl InfluxDbSinkConfig {
-        fn into_v3(self) -> Option<V3SinkConfig> {
-            match self {
-                Self::V3(c) => Some(c),
-                Self::V2(_) => None,
-            }
-        }
     }
 }

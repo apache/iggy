@@ -48,4 +48,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+simd-json = { workspace = true }
 toml = { workspace = true }

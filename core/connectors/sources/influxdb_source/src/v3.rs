@@ -199,13 +199,14 @@ fn build_payload(
     impl serde::Serialize for RowView<'_> {
         fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
             use serde::ser::SerializeMap;
-            let entries: Vec<_> = self
+            // serde_json ignores the length hint, so pass None and iterate directly
+            // to avoid the intermediate Vec allocation.
+            let mut map = s.serialize_map(None)?;
+            for (k, v) in self
                 .row
                 .iter()
                 .filter(|(k, _)| self.include_metadata || k.as_str() != self.cursor_field)
-                .collect();
-            let mut map = s.serialize_map(Some(entries.len()))?;
-            for (k, v) in &entries {
+            {
                 map.serialize_entry(k, v)?;
             }
             map.end()
@@ -344,10 +345,12 @@ pub(crate) fn process_rows(
     // Counted inline to avoid a second pass over rows (which would also
     // re-call normalize_v3_timestamp for each row — extra allocations).
     let mut rows_at_max_cursor = 0u64;
-    // Generate the base UUID once per poll; derive per-message IDs by addition.
-    // This is O(1) PRNG calls per batch instead of O(n), measurable at batch ≥ 100.
+    // Fallback ID base for rows that lack the cursor field (rare — such rows
+    // cause an error at the end of this function unless other rows have it).
     let id_base = Uuid::new_v4().as_u128();
     for row in rows.iter() {
+        // Default to random fallback; overwritten below if cursor field is present.
+        let mut this_row_id = id_base.wrapping_add(messages.len() as u128);
         if let Some(raw_cv) = row.get(ctx.cursor_field).and_then(|v| v.as_str()) {
             let cv_owned = normalize_v3_timestamp(raw_cv)?;
             let cv: &str = &cv_owned;
@@ -356,6 +359,13 @@ pub(crate) fn process_rows(
             // returns Ok the parse below is guaranteed to succeed — (None, _) is
             // unreachable here.
             let cv_parsed = cv.parse::<DateTime<Utc>>().ok();
+            // Stable ID: timestamp nanoseconds + message position.
+            // Deterministic across re-polls: the same physical row always has the same
+            // timestamp, and its position within the batch (determined by OFFSET) is
+            // stable for the same effective_batch_size + cursor combination.
+            if let Some(nanos) = cv_parsed.and_then(|dt| dt.timestamp_nanos_opt()) {
+                this_row_id = (nanos as u128).wrapping_add(messages.len() as u128);
+            }
             match (cv_parsed, max_cursor_parsed) {
                 (Some(new_dt), Some(cur_dt)) if new_dt > cur_dt => {
                     max_cursor = Some(cv.to_string());
@@ -370,7 +380,8 @@ pub(crate) fn process_rows(
                     max_cursor_parsed = Some(new_dt);
                     rows_at_max_cursor = 1;
                 }
-                _ => {}
+                (Some(_), Some(_)) => {} // new_dt < cur_dt: older row, no cursor update
+                (None, _) => unreachable!("validate_cursor succeeded so cv_parsed is always Some"),
             }
         }
 
@@ -382,7 +393,7 @@ pub(crate) fn process_rows(
             ctx.cursor_field,
         )?;
         messages.push(ProducedMessage {
-            id: Some(id_base.wrapping_add(messages.len() as u128)),
+            id: Some(this_row_id),
             checksum: None,
             timestamp: Some(ctx.now_micros),
             origin_timestamp: Some(ctx.now_micros),
@@ -460,12 +471,18 @@ pub(crate) async fn poll(
 
     let result = process_rows(&rows, &ctx)?;
 
-    // Stuck-timestamp detection: if the number of rows sharing the max cursor
-    // equals the effective batch size, the cursor cannot advance — inflate.
-    // Using rows_at_max_cursor (not all_at_cursor) works correctly with the
-    // default strict `> '$cursor'` semantics: those rows are NEVER at the
-    // input cursor, so all_at_cursor is permanently false under strict >.
-    let stuck = result.rows_at_max_cursor >= effective_batch as u64;
+    // Stuck-timestamp detection: the cursor cannot advance in two scenarios:
+    // 1. The batch fills up entirely with rows sharing the same max timestamp
+    //    (rows_at_max_cursor >= effective_batch): more rows at that timestamp exist.
+    // 2. ALL returned rows share the max cursor timestamp (rows_at_max_cursor ==
+    //    rows.len()): every row in the batch is at the same timestamp, meaning the
+    //    cursor did not advance within this batch regardless of batch size. This
+    //    handles the case where effective_batch was inflated but the server returned
+    //    fewer rows than the inflated limit (e.g. because the database has fewer
+    //    total rows at that timestamp than the inflated batch size), yet the cursor
+    //    still cannot advance past those tied rows.
+    let stuck = result.rows_at_max_cursor >= effective_batch as u64
+        || (!rows.is_empty() && result.rows_at_max_cursor == rows.len() as u64);
 
     if stuck {
         return match next_stuck_batch_size(effective_batch, base_batch, cap_factor) {
@@ -486,7 +503,10 @@ pub(crate) async fn poll(
                         last_timestamp: state.last_timestamp.clone(),
                         processed_rows: state.processed_rows,
                         effective_batch_size: next_batch,
-                        last_timestamp_row_offset: result.rows_at_max_cursor,
+                        // Accumulate across consecutive stuck polls: each poll sees a superset of previous
+                        // rows (inflated batch), so the total already-seen count must grow cumulatively.
+                        last_timestamp_row_offset: state.last_timestamp_row_offset
+                            + result.rows_at_max_cursor,
                     },
                     schema: Schema::Json,
                     trip_circuit_breaker: false,
@@ -541,7 +561,9 @@ pub(crate) async fn poll(
         last_timestamp: advanced_cursor,
         processed_rows,
         effective_batch_size: base_batch, // reset on successful advance
-        last_timestamp_row_offset: result.rows_at_max_cursor,
+        // Reset to 0: the new cursor already excludes old rows via strict >.
+        // A non-zero OFFSET would skip valid new rows on the next poll.
+        last_timestamp_row_offset: 0,
     };
 
     let schema = if ctx.payload_col.is_some() {
@@ -810,6 +832,155 @@ mod tests {
         );
         // Only row 3 is at max_cursor.
         assert_eq!(result.rows_at_max_cursor, 1);
+    }
+
+    #[test]
+    fn process_rows_message_ids_stable_across_repoll() {
+        // The same rows must produce identical message IDs on every call to process_rows.
+        // Previously random UUIDs meant IDs changed on every re-poll, breaking dedup.
+        let rows = vec![
+            row(&[("time", T1), ("val", "a")]),
+            row(&[("time", T2), ("val", "b")]),
+        ];
+        let c = ctx(T1, 1000);
+        let first = process_rows(&rows, &c).unwrap();
+        let second = process_rows(&rows, &c).unwrap();
+        assert_eq!(
+            first.messages[0].id, second.messages[0].id,
+            "row at T1 must have the same ID on re-poll"
+        );
+        assert_eq!(
+            first.messages[1].id, second.messages[1].id,
+            "row at T2 must have the same ID on re-poll"
+        );
+    }
+
+    #[test]
+    fn process_rows_rows_with_same_timestamp_get_distinct_stable_ids() {
+        // Two rows sharing a timestamp must have different IDs (disambiguated by position).
+        let rows = vec![
+            row(&[("time", T1), ("val", "first")]),
+            row(&[("time", T1), ("val", "second")]),
+        ];
+        let c = ctx("1970-01-01T00:00:00Z", 0);
+        let result = process_rows(&rows, &c).unwrap();
+        assert_ne!(
+            result.messages[0].id, result.messages[1].id,
+            "two rows at the same timestamp must have distinct IDs"
+        );
+        // IDs must also be stable across re-polls
+        let result2 = process_rows(&rows, &c).unwrap();
+        assert_eq!(result.messages[0].id, result2.messages[0].id);
+        assert_eq!(result.messages[1].id, result2.messages[1].id);
+    }
+
+    // ── build_payload with payload_column ────────────────────────────────────
+
+    #[test]
+    fn process_rows_payload_column_json_format_serializes_value() {
+        // payload_column + Json: the typed serde_json::Value is serialised directly.
+        let rows = vec![row(&[("time", T1), ("data", r#"{"k":1}"#)])];
+        let result = process_rows(
+            &rows,
+            &RowContext {
+                cursor_field: "time",
+                current_cursor: T1,
+                include_metadata: true,
+                payload_col: Some("data"),
+                payload_format: PayloadFormat::Json,
+                now_micros: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.messages.len(), 1);
+        // V3 stores row values as serde_json::Value::String for string columns.
+        // The payload must contain the raw string representation.
+        assert!(!result.messages[0].payload.is_empty());
+    }
+
+    #[test]
+    fn process_rows_payload_column_raw_decodes_base64() {
+        // payload_column + Raw: base64-encoded string value is decoded to bytes.
+        use base64::{Engine as _, engine::general_purpose};
+        let encoded = general_purpose::STANDARD.encode(b"raw-bytes");
+        let rows = vec![row(&[("time", T1), ("blob", &encoded)])];
+        let result = process_rows(
+            &rows,
+            &RowContext {
+                cursor_field: "time",
+                current_cursor: T1,
+                include_metadata: true,
+                payload_col: Some("blob"),
+                payload_format: PayloadFormat::Raw,
+                now_micros: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.messages[0].payload, b"raw-bytes");
+    }
+
+    #[test]
+    fn process_rows_payload_column_raw_non_string_value_returns_error() {
+        // Raw format requires the column value to be a string (base64-encoded).
+        // A non-string JSON value (e.g. a number) must return Err.
+        use crate::common::Row;
+        let mut row: Row = Row::default();
+        row.insert("time".to_string(), serde_json::Value::String(T1.to_string()));
+        // Insert a numeric value for the payload column — not a base64 string.
+        row.insert("blob".to_string(), serde_json::Value::Number(42.into()));
+        let err = process_rows(
+            &[row],
+            &RowContext {
+                cursor_field: "time",
+                current_cursor: T1,
+                include_metadata: true,
+                payload_col: Some("blob"),
+                payload_format: PayloadFormat::Raw,
+                now_micros: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidRecordValue(_)),
+            "non-string value for Raw format must return InvalidRecordValue: {err:?}"
+        );
+    }
+
+    #[test]
+    fn process_rows_payload_column_raw_invalid_base64_returns_error() {
+        let rows = vec![row(&[("time", T1), ("blob", "!!!invalid!!!")])];
+        let err = process_rows(
+            &rows,
+            &RowContext {
+                cursor_field: "time",
+                current_cursor: T1,
+                include_metadata: true,
+                payload_col: Some("blob"),
+                payload_format: PayloadFormat::Raw,
+                now_micros: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidRecordValue(_)));
+    }
+
+    #[test]
+    fn process_rows_missing_payload_column_returns_error() {
+        // If the specified payload_column is absent from the row, return Err.
+        let rows = vec![row(&[("time", T1), ("other", "value")])];
+        let err = process_rows(
+            &rows,
+            &RowContext {
+                cursor_field: "time",
+                current_cursor: T1,
+                include_metadata: true,
+                payload_col: Some("missing_col"),
+                payload_format: PayloadFormat::Json,
+                now_micros: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidRecordValue(_)));
     }
 }
 
@@ -1359,5 +1530,180 @@ mod http_tests {
     #[test]
     fn build_query_invalid_base_returns_error() {
         assert!(build_query("not-a-url", "SELECT 1", "db").is_err());
+    }
+
+    #[tokio::test]
+    async fn poll_non_stuck_advance_resets_row_offset_to_zero() {
+        // Bug #1: when the cursor advances, last_timestamp_row_offset must reset to 0.
+        // A non-zero offset on the next poll skips valid new rows — silent data loss.
+        let jsonl = "{\"time\":\"2024-01-01T00:00:01Z\",\"v\":1}\n\
+                     {\"time\":\"2024-01-01T00:00:02Z\",\"v\":2}\n";
+        let app = Router::new().route(
+            "/api/v3/query_sql",
+            post(move || async move { (StatusCode::OK, jsonl) }),
+        );
+        let base = start_server(app).await;
+        // Start with a non-zero offset from a previous stuck batch.
+        let state = V3State {
+            last_timestamp: Some("1970-01-01T00:00:00Z".to_string()),
+            last_timestamp_row_offset: 7, // leftover from previous stuck run
+            ..V3State::default()
+        };
+        let result = poll(
+            &make_client(),
+            &make_config(&base),
+            "Bearer tok",
+            &state,
+            PayloadFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
+        // Cursor advanced: offset must reset to 0, not carry forward the old 7.
+        assert_eq!(
+            result.new_state.last_timestamp_row_offset, 0,
+            "offset must reset to 0 after cursor advances"
+        );
+        assert_eq!(result.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn poll_stuck_accumulates_offset_across_consecutive_polls() {
+        // Bug #2: consecutive stuck polls must accumulate the row offset, not overwrite it.
+        // Overwriting re-delivers the same rows on each stuck poll (duplicate messages).
+        let t = "2024-01-01T00:00:00Z";
+        let jsonl: String = (0..10)
+            .map(|i| format!("{{\"time\":\"{t}\",\"val\":{i}}}\n"))
+            .collect();
+        let app = Router::new().route(
+            "/api/v3/query_sql",
+            post(move || async move { (StatusCode::OK, jsonl) }),
+        );
+        let base = start_server(app).await;
+
+        // First stuck poll: offset starts at 0, 10 rows all at `t`.
+        let state1 = V3State {
+            last_timestamp: Some(t.to_string()),
+            effective_batch_size: 10,
+            last_timestamp_row_offset: 0,
+            processed_rows: 0,
+        };
+        let r1 = poll(
+            &make_client(),
+            &make_config(&base),
+            "Bearer tok",
+            &state1,
+            PayloadFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            r1.messages.is_empty(),
+            "stuck poll must produce no messages"
+        );
+        let offset_after_first = r1.new_state.last_timestamp_row_offset;
+        assert!(
+            offset_after_first > 0,
+            "first stuck poll must set offset > 0"
+        );
+
+        // Second stuck poll: must ACCUMULATE, not overwrite.
+        let r2 = poll(
+            &make_client(),
+            &make_config(&base),
+            "Bearer tok",
+            &r1.new_state,
+            PayloadFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            r2.messages.is_empty(),
+            "second stuck poll must produce no messages"
+        );
+        assert!(
+            r2.new_state.last_timestamp_row_offset > offset_after_first,
+            "second stuck poll must accumulate offset: got {}, expected > {}",
+            r2.new_state.last_timestamp_row_offset,
+            offset_after_first
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_cursor_does_not_advance_when_new_is_not_after_saved() {
+        // When the DB returns rows whose max timestamp equals the saved cursor
+        // (which can happen if the clock skews or the same data is replayed),
+        // the cursor must not regress and a warn is logged. The state cursor
+        // value must be kept unchanged.
+        let saved_ts = "2024-01-01T00:00:02Z"; // cursor already at T3
+        // Server returns rows whose max timestamp == saved cursor (same, not newer).
+        let jsonl = format!(
+            "{{\"time\":\"{saved_ts}\",\"val\":1}}\n\
+             {{\"time\":\"{saved_ts}\",\"val\":2}}\n"
+        );
+        let app = Router::new().route(
+            "/api/v3/query_sql",
+            post(move || async move { (StatusCode::OK, jsonl) }),
+        );
+        let base = start_server(app).await;
+        let state = V3State {
+            last_timestamp: Some(saved_ts.to_string()),
+            ..V3State::default()
+        };
+        let result = poll(
+            &make_client(),
+            &make_config(&base),
+            "Bearer tok",
+            &state,
+            PayloadFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
+        // Cursor must not move backwards: kept at saved value.
+        assert_eq!(
+            result.new_state.last_timestamp.as_deref(),
+            Some(saved_ts),
+            "cursor must not regress when new max == saved cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_with_payload_column_returns_raw_schema() {
+        // When payload_column is set the schema returned must match the format,
+        // not always Json. This covers the payload_format.schema() path at v3.rs:570.
+        // Two rows with distinct timestamps are used so the stuck-batch condition
+        // (rows_at_max_cursor == rows.len()) does not fire and messages are emitted.
+        let jsonl = "{\"time\":\"2024-01-01T00:00:01Z\",\"data\":\"aGVsbG8=\"}\n\
+                     {\"time\":\"2024-01-01T00:00:02Z\",\"data\":\"d29ybGQ=\"}\n";
+        let app = Router::new().route(
+            "/api/v3/query_sql",
+            post(move || async move { (StatusCode::OK, jsonl) }),
+        );
+        let base = start_server(app).await;
+        let config = V3SourceConfig {
+            payload_column: Some("data".to_string()),
+            ..make_config(&base)
+        };
+        let state = V3State::default();
+        let result = poll(
+            &make_client(),
+            &config,
+            "Bearer tok",
+            &state,
+            PayloadFormat::Raw,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.messages.len(), 2, "both rows must produce messages");
+        // Schema must reflect the payload format, not the default Json.
+        assert_eq!(result.schema, Schema::Raw);
+        // First row payload must be the decoded bytes of "hello" (base64 "aGVsbG8=").
+        assert_eq!(&result.messages[0].payload, b"hello");
+        // Second row payload must be the decoded bytes of "world" (base64 "d29ybGQ=").
+        assert_eq!(&result.messages[1].payload, b"world");
     }
 }
