@@ -21,8 +21,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::WireDecode;
 use iggy_binary_protocol::codes::{
     DELETE_CONSUMER_OFFSET_2_CODE, DELETE_CONSUMER_OFFSET_CODE, DELETE_SEGMENTS_CODE,
-    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE, PING_CODE,
-    SEND_MESSAGES_CODE, STORE_CONSUMER_OFFSET_2_CODE, STORE_CONSUMER_OFFSET_CODE,
+    LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, SEND_MESSAGES_CODE,
+    STORE_CONSUMER_OFFSET_2_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
 use iggy_binary_protocol::consensus::{
     Command2, HEADER_SIZE, Operation, ReplyHeader, RequestHeader, read_size_field,
@@ -39,7 +39,7 @@ use iggy_common::{IggyError, IggyTimestamp};
 
 const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 
-pub(crate) fn encode_request(
+pub(crate) fn encode_contiguous_request(
     session: &mut ConsensusSession,
     code: u32,
     payload: &Bytes,
@@ -97,9 +97,7 @@ fn operation_for_code(code: u32) -> Result<Operation, IggyError> {
     }
 
     match iggy_binary_protocol::dispatch::lookup_command(code) {
-        Some(meta) if !meta.is_replicated() && matches!(code, PING_CODE | LOGOUT_USER_CODE) => {
-            Ok(Operation::NonReplicated)
-        }
+        Some(meta) if !meta.is_replicated() => Ok(Operation::NonReplicated),
         Some(_) => Err(IggyError::FeatureUnavailable),
         None => Err(IggyError::InvalidCommand),
     }
@@ -214,9 +212,13 @@ fn namespace_from_partition(
     topic_id: &WireIdentifier,
     partition_id: Option<u32>,
 ) -> Result<u64, IggyError> {
-    let stream_id = stream_id.as_u32().ok_or(IggyError::InvalidIdentifier)?;
-    let topic_id = topic_id.as_u32().ok_or(IggyError::InvalidIdentifier)?;
     let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    let Some(stream_id) = stream_id.as_u32() else {
+        return Ok(0);
+    };
+    let Some(topic_id) = topic_id.as_u32() else {
+        return Ok(0);
+    };
     validate_namespace_field(stream_id, MAX_STREAMS)?;
     validate_namespace_field(topic_id, MAX_TOPICS)?;
     validate_namespace_field(partition_id, MAX_PARTITIONS)?;
@@ -235,7 +237,9 @@ fn validate_namespace_field(value: u32, exclusive_max: usize) -> Result<(), Iggy
 mod tests {
     use super::*;
     use crate::session::ConsensusSession;
-    use iggy_binary_protocol::codes::{CREATE_STREAM_CODE, GET_STREAM_CODE, LOGOUT_USER_CODE};
+    use iggy_binary_protocol::codes::{
+        CREATE_STREAM_CODE, GET_STREAM_CODE, LOGOUT_USER_CODE, PING_CODE,
+    };
     use iggy_binary_protocol::consensus::{Message, RequestHeader, iobuf::Owned};
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
@@ -258,7 +262,9 @@ mod tests {
             client_context: None,
         };
 
-        let bytes = encode_request(&mut session, LOGIN_REGISTER_CODE, &request.to_bytes()).unwrap();
+        let bytes =
+            encode_contiguous_request(&mut session, LOGIN_REGISTER_CODE, &request.to_bytes())
+                .unwrap();
         let request = decode_request(&bytes);
         let header = request.header();
 
@@ -279,8 +285,8 @@ mod tests {
         }
         .to_bytes();
 
-        let first = encode_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
-        let second = encode_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
+        let first = encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
+        let second = encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
 
         assert_eq!(decode_request(&first).header().request, 1);
         assert_eq!(decode_request(&second).header().request, 2);
@@ -292,7 +298,7 @@ mod tests {
     fn ping_uses_non_replicated_operation() {
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99);
-        let bytes = encode_request(&mut session, PING_CODE, &Bytes::new()).unwrap();
+        let bytes = encode_contiguous_request(&mut session, PING_CODE, &Bytes::new()).unwrap();
         let request = decode_request(&bytes);
         let header = request.header();
 
@@ -313,7 +319,8 @@ mod tests {
     fn logout_uses_non_replicated_operation() {
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99);
-        let bytes = encode_request(&mut session, LOGOUT_USER_CODE, &Bytes::new()).unwrap();
+        let bytes =
+            encode_contiguous_request(&mut session, LOGOUT_USER_CODE, &Bytes::new()).unwrap();
         let request = decode_request(&bytes);
         let header = request.header();
 
@@ -331,21 +338,32 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_non_replicated_request_is_rejected() {
+    fn read_only_request_uses_non_replicated_operation() {
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99);
-        assert!(matches!(
-            encode_request(&mut session, GET_STREAM_CODE, &Bytes::new()),
-            Err(IggyError::FeatureUnavailable)
-        ));
+        let bytes =
+            encode_contiguous_request(&mut session, GET_STREAM_CODE, &Bytes::new()).unwrap();
+        let request = decode_request(&bytes);
+        let header = request.header();
+
+        assert_eq!(header.operation, Operation::NonReplicated);
+        assert_eq!(
+            u32::from_le_bytes(
+                header.reserved[NON_REPLICATED_CODE_RANGE]
+                    .try_into()
+                    .unwrap()
+            ),
+            GET_STREAM_CODE
+        );
+        assert_eq!(header.session, 99);
     }
 
     #[test]
-    fn namespace_rejects_named_identifiers() {
+    fn namespace_defers_named_identifiers_to_server_resolution() {
         let stream = WireIdentifier::named("stream").unwrap();
         let topic = WireIdentifier::numeric(1);
-        let err = namespace_from_partition(&stream, &topic, Some(0)).unwrap_err();
-        assert!(matches!(err, IggyError::InvalidIdentifier));
+        let namespace = namespace_from_partition(&stream, &topic, Some(0)).unwrap();
+        assert_eq!(namespace, 0);
     }
 
     #[test]

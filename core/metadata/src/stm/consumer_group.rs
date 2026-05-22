@@ -154,6 +154,16 @@ impl ConsumerGroupsInner {
     }
 }
 
+impl ConsumerGroups {
+    #[must_use]
+    pub fn read<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&ConsumerGroupsInner) -> R,
+    {
+        self.inner.read(f)
+    }
+}
+
 // TODO(hubcio): Serialize proper reply (e.g. assigned group ID) instead of empty Bytes.
 impl StateHandler for CreateConsumerGroupRequest {
     type State = ConsumerGroupsInner;

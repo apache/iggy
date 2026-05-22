@@ -57,12 +57,24 @@ fn freeze_client_reply(
 
 pub trait StreamsFrontend {
     #[must_use]
+    fn users(&self) -> &Users;
+    #[must_use]
     fn streams(&self) -> &Streams;
+    #[must_use]
+    fn consumer_groups(&self) -> &ConsumerGroups;
 }
 
 impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)> {
+    fn users(&self) -> &Users {
+        &self.inner().0
+    }
+
     fn streams(&self) -> &Streams {
         &self.inner().1.0
+    }
+
+    fn consumer_groups(&self) -> &ConsumerGroups {
+        &self.inner().1.1.0
     }
 }
 

@@ -32,6 +32,7 @@ use iggy_binary_protocol::requests::topics::{
 };
 use iggy_common::{
     CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, StreamStats, TopicStats,
+    sharding::IggyNamespace,
 };
 use serde::{Deserialize, Serialize};
 use slab::Slab;
@@ -310,6 +311,27 @@ impl Streams {
     ) -> Option<u32> {
         self.partition_count_context(stream_id, topic_id)
             .map(|(_, next_partition_id)| next_partition_id)
+    }
+
+    #[must_use]
+    pub fn namespace_from_partition(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+        partition_id: u32,
+    ) -> Option<IggyNamespace> {
+        self.inner.read(|inner| {
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
+            let stream = inner.items.get(stream_id)?;
+            let topic = stream.topics.get(topic_id)?;
+            let partition_id = usize::try_from(partition_id).ok()?;
+            topic
+                .partitions
+                .iter()
+                .any(|partition| partition.id == partition_id)
+                .then(|| IggyNamespace::new(stream_id, topic_id, partition_id))
+        })
     }
 
     #[must_use]

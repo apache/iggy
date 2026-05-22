@@ -21,14 +21,37 @@ use crate::config_writer::write_current_config;
 use crate::login_register::LoginRegisterError;
 use crate::server_error::ServerNgError;
 use crate::session_manager::SessionManager;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use configs::server_ng::ServerNgConfig;
-use consensus::{LocalPipeline, PartitionsHandle, Sequencer, VsrConsensus};
-use iggy_binary_protocol::codes::{LOGOUT_USER_CODE, PING_CODE};
+use consensus::{LocalPipeline, MetadataHandle, PartitionsHandle, Sequencer, VsrConsensus};
+use iggy_binary_protocol::codes::{
+    GET_CLUSTER_METADATA_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
+    GET_TOPICS_CODE, LOGOUT_USER_CODE, PING_CODE, POLL_MESSAGES_CODE,
+};
+use iggy_binary_protocol::requests::consumer_offsets::{
+    DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
+    StoreConsumerOffsetRequest,
+};
+use iggy_binary_protocol::requests::messages::{PollMessagesRequest, SendMessagesHeader};
+use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
+use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsRequest};
+use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
+use iggy_binary_protocol::responses::streams::StreamResponse;
+use iggy_binary_protocol::responses::streams::get_stream::{
+    GetStreamResponse, TopicHeader as StreamTopicHeader,
+};
+use iggy_binary_protocol::responses::streams::get_streams::GetStreamsResponse;
+use iggy_binary_protocol::responses::system::get_cluster_metadata::{
+    ClusterMetadataResponse, ClusterNodeResponse,
+};
+use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
+use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
+use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
-    Command2, GenericHeader, Message, Operation, ReplyHeader, RequestHeader, WireDecode, WireEncode,
+    Command2, GenericHeader, Message, Operation, ReplyHeader, RequestHeader, WireDecode,
+    WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
 use iggy_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use iggy_common::{
@@ -1329,7 +1352,7 @@ fn make_deferred_client_request_handler(
             .remove_connection(client_id)
             && let Some(shard) = upgrade_shard_handle(&shard_handle_for_disconnect)
         {
-            shard.plane.inner().0.remove_client_session(vsr_client_id);
+            shard.plane.metadata().remove_client_session(vsr_client_id);
         }
     }));
     Rc::new(move |client_id, message| {
@@ -1448,9 +1471,28 @@ async fn handle_client_request(
     }
 
     let bound = sessions.borrow().get_session(transport_client_id);
+    let resolved_namespace = if header.operation.is_partition() {
+        match resolve_partition_request_namespace(shard, header.operation, request_body(&request)) {
+            Ok(namespace) => Some(namespace),
+            Err(error) => {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    operation = ?header.operation,
+                    "dropping partition request with unresolved namespace"
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let request = request.transmute_header(|header, new_header: &mut RequestHeader| {
         *new_header = header;
         new_header.client = transport_client_id;
+        if let Some(namespace) = resolved_namespace {
+            new_header.namespace = namespace;
+        }
         if let Some((bound_client_id, bound_session)) = bound {
             new_header.client = bound_client_id;
             new_header.session = bound_session;
@@ -1494,7 +1536,7 @@ async fn handle_non_replicated_request(
             if let Some(vsr_client_id) =
                 sessions.borrow_mut().remove_connection(transport_client_id)
             {
-                shard.plane.inner().0.remove_client_session(vsr_client_id);
+                shard.plane.metadata().remove_client_session(vsr_client_id);
             }
             let commit = current_metadata_commit(shard);
             let reply = build_login_register_reply(
@@ -1516,12 +1558,38 @@ async fn handle_non_replicated_request(
                 );
             }
         }
-        _ => {
-            warn!(
-                transport_client_id,
-                code, "dropping unsupported non-replicated VSR request"
-            );
-        }
+        _ => match build_non_replicated_response(shard, code, request_body(&request)) {
+            Ok(body) => {
+                let commit = current_metadata_commit(shard);
+                let reply = build_login_register_reply(
+                    request.header(),
+                    request.header().client,
+                    request.header().session,
+                    commit,
+                    &body,
+                );
+                if let Err(error) = shard
+                    .bus
+                    .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+                    .await
+                {
+                    warn!(
+                        transport_client_id,
+                        code,
+                        error = %error,
+                        "failed to send non-replicated VSR reply"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    transport_client_id,
+                    code,
+                    error = %error,
+                    "dropping unsupported non-replicated VSR request"
+                );
+            }
+        },
     }
 }
 
@@ -1619,12 +1687,415 @@ fn request_body(request: &Message<RequestHeader>) -> &[u8] {
     &request.as_slice()[std::mem::size_of::<RequestHeader>()..request.header().size as usize]
 }
 
+fn resolve_partition_request_namespace(
+    shard: &Rc<ServerNgShard>,
+    operation: Operation,
+    body: &[u8],
+) -> Result<u64, IggyError> {
+    let namespace = match operation {
+        Operation::SendMessages => {
+            if body.len() < 4 {
+                return Err(IggyError::InvalidCommand);
+            }
+            let metadata_length = u32::from_le_bytes(
+                body[..4]
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
+            ) as usize;
+            if body.len() < 4 + metadata_length {
+                return Err(IggyError::InvalidCommand);
+            }
+            let header = SendMessagesHeader::decode_from(&body[4..4 + metadata_length])
+                .map_err(|_| IggyError::InvalidCommand)?;
+            resolve_send_messages_namespace(shard, &header)?
+        }
+        Operation::StoreConsumerOffset => {
+            let request = StoreConsumerOffsetRequest::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
+            resolve_partition_namespace(
+                shard,
+                &request.stream_id,
+                &request.topic_id,
+                request.partition_id,
+            )?
+        }
+        Operation::DeleteConsumerOffset => {
+            let request = DeleteConsumerOffsetRequest::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
+            resolve_partition_namespace(
+                shard,
+                &request.stream_id,
+                &request.topic_id,
+                request.partition_id,
+            )?
+        }
+        Operation::StoreConsumerOffset2 => {
+            let request = StoreConsumerOffset2Request::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
+            resolve_partition_namespace(
+                shard,
+                &request.stream_id,
+                &request.topic_id,
+                request.partition_id,
+            )?
+        }
+        Operation::DeleteConsumerOffset2 => {
+            let request = DeleteConsumerOffset2Request::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
+            resolve_partition_namespace(
+                shard,
+                &request.stream_id,
+                &request.topic_id,
+                request.partition_id,
+            )?
+        }
+        Operation::DeleteSegments => {
+            let request =
+                DeleteSegmentsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            resolve_partition_namespace(
+                shard,
+                &request.stream_id,
+                &request.topic_id,
+                Some(request.partition_id),
+            )?
+        }
+        _ => return Err(IggyError::FeatureUnavailable),
+    };
+    Ok(namespace.inner())
+}
+
+fn resolve_send_messages_namespace(
+    shard: &Rc<ServerNgShard>,
+    header: &SendMessagesHeader,
+) -> Result<IggyNamespace, IggyError> {
+    let WirePartitioning::PartitionId(partition_id) = header.partitioning else {
+        return Err(IggyError::FeatureUnavailable);
+    };
+    resolve_partition_namespace(
+        shard,
+        &header.stream_id,
+        &header.topic_id,
+        Some(partition_id),
+    )
+}
+
+fn resolve_partition_namespace(
+    shard: &Rc<ServerNgShard>,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    partition_id: Option<u32>,
+) -> Result<IggyNamespace, IggyError> {
+    let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .namespace_from_partition(stream_id, topic_id, partition_id)
+        .ok_or(IggyError::InvalidIdentifier)
+}
+
+fn build_non_replicated_response(
+    shard: &Rc<ServerNgShard>,
+    code: u32,
+    body: &[u8],
+) -> Result<Bytes, IggyError> {
+    match code {
+        GET_CLUSTER_METADATA_CODE => Ok(build_cluster_metadata_response().to_bytes()),
+        GET_STATS_CODE => Ok(build_stats_response(shard)?.to_bytes()),
+        GET_STREAM_CODE => {
+            let request =
+                GetStreamRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            build_get_stream_response(shard, &request.stream_id)
+                .map(|response| response.map_or_else(Bytes::new, |response| response.to_bytes()))
+        }
+        GET_STREAMS_CODE => {
+            let _ = GetStreamsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            Ok(build_get_streams_response(shard)?.to_bytes())
+        }
+        GET_TOPIC_CODE => {
+            let request =
+                GetTopicRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            build_get_topic_response(shard, &request.stream_id, &request.topic_id)
+                .map(|response| response.map_or_else(Bytes::new, |response| response.to_bytes()))
+        }
+        GET_TOPICS_CODE => {
+            let request =
+                GetTopicsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            Ok(build_get_topics_response(shard, &request.stream_id)?.to_bytes())
+        }
+        POLL_MESSAGES_CODE => {
+            let request =
+                PollMessagesRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            Ok(empty_polled_messages_response(
+                request.partition_id.unwrap_or(0),
+            ))
+        }
+        _ => match iggy_binary_protocol::dispatch::lookup_command(code) {
+            Some(meta) if !meta.is_replicated() => Ok(Bytes::new()),
+            Some(_) => Err(IggyError::FeatureUnavailable),
+            None => Err(IggyError::InvalidCommand),
+        },
+    }
+}
+
+fn build_cluster_metadata_response() -> ClusterMetadataResponse {
+    ClusterMetadataResponse {
+        name: "server-ng".to_owned(),
+        nodes: vec![ClusterNodeResponse {
+            name: "node-0".to_owned(),
+            ip: "127.0.0.1".to_owned(),
+            tcp_port: 0,
+            quic_port: 0,
+            http_port: 0,
+            websocket_port: 0,
+            role: 0,
+            status: 0,
+        }],
+    }
+}
+
+fn build_stats_response(shard: &Rc<ServerNgShard>) -> Result<StatsResponse, IggyError> {
+    let (streams_count, topics_count, partitions_count, messages_size_bytes, messages_count) =
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|streams| -> Result<_, IggyError> {
+                let mut topics_count = 0u32;
+                let mut partitions_count = 0u32;
+                let mut messages_size_bytes = 0u64;
+                let mut messages_count = 0u64;
+                for (_, stream) in &streams.items {
+                    topics_count = topics_count.saturating_add(usize_to_u32(stream.topics.len())?);
+                    messages_size_bytes =
+                        messages_size_bytes.saturating_add(stream.stats.size_bytes_inconsistent());
+                    messages_count =
+                        messages_count.saturating_add(stream.stats.messages_count_inconsistent());
+                    for (_, topic) in &stream.topics {
+                        partitions_count =
+                            partitions_count.saturating_add(usize_to_u32(topic.partitions.len())?);
+                    }
+                }
+                Ok((
+                    usize_to_u32(streams.items.len())?,
+                    topics_count,
+                    partitions_count,
+                    messages_size_bytes,
+                    messages_count,
+                ))
+            })?;
+    let consumer_groups_count = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .consumer_groups()
+        .read(|groups| usize_to_u32(groups.items.len()))?;
+
+    Ok(StatsResponse {
+        process_id: std::process::id(),
+        cpu_usage: 0.0,
+        total_cpu_usage: 0.0,
+        memory_usage: 0,
+        total_memory: 0,
+        available_memory: 0,
+        run_time: 0,
+        start_time: 0,
+        read_bytes: 0,
+        written_bytes: 0,
+        messages_size_bytes,
+        streams_count,
+        topics_count,
+        partitions_count,
+        segments_count: 0,
+        messages_count,
+        clients_count: 0,
+        consumer_groups_count,
+        hostname: "unknown_hostname".to_owned(),
+        os_name: "unknown_os_name".to_owned(),
+        os_version: "unknown_os_version".to_owned(),
+        kernel_version: "unknown_kernel_version".to_owned(),
+        iggy_server_version: server::VERSION.to_owned(),
+        iggy_server_semver: server::SEMANTIC_VERSION.get_numeric_version().ok(),
+        cache_metrics: Vec::new(),
+        threads_count: 0,
+        free_disk_space: 0,
+        total_disk_space: 0,
+    })
+}
+
+fn build_get_stream_response(
+    shard: &Rc<ServerNgShard>,
+    stream_id: &WireIdentifier,
+) -> Result<Option<GetStreamResponse>, IggyError> {
+    shard.plane.metadata().mux_stm.streams().read(|streams| {
+        let Some(stream_id) = resolve_stream_id(streams, stream_id) else {
+            return Ok(None);
+        };
+        let stream = streams
+            .items
+            .get(stream_id)
+            .ok_or(IggyError::InvalidIdentifier)?;
+        Ok(Some(GetStreamResponse {
+            stream: stream_response(stream)?,
+            topics: stream
+                .topics
+                .iter()
+                .map(|(_, topic)| topic_header(topic))
+                .collect::<Result<Vec<_>, _>>()?,
+        }))
+    })
+}
+
+fn build_get_streams_response(shard: &Rc<ServerNgShard>) -> Result<GetStreamsResponse, IggyError> {
+    shard.plane.metadata().mux_stm.streams().read(|streams| {
+        streams
+            .items
+            .iter()
+            .map(|(_, stream)| stream_response(stream))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|streams| GetStreamsResponse { streams })
+    })
+}
+
+fn build_get_topic_response(
+    shard: &Rc<ServerNgShard>,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+) -> Result<Option<GetTopicResponse>, IggyError> {
+    shard.plane.metadata().mux_stm.streams().read(|streams| {
+        let Some(stream_id) = resolve_stream_id(streams, stream_id) else {
+            return Ok(None);
+        };
+        let Some(topic_id) = resolve_topic_id(streams, stream_id, topic_id) else {
+            return Ok(None);
+        };
+        let stream = streams
+            .items
+            .get(stream_id)
+            .ok_or(IggyError::InvalidIdentifier)?;
+        let topic = stream
+            .topics
+            .get(topic_id)
+            .ok_or(IggyError::InvalidIdentifier)?;
+        Ok(Some(GetTopicResponse {
+            topic: topic_header(topic)?,
+            partitions: topic
+                .partitions
+                .iter()
+                .map(partition_response)
+                .collect::<Result<Vec<_>, _>>()?,
+        }))
+    })
+}
+
+fn build_get_topics_response(
+    shard: &Rc<ServerNgShard>,
+    stream_id: &WireIdentifier,
+) -> Result<GetTopicsResponse, IggyError> {
+    shard.plane.metadata().mux_stm.streams().read(|streams| {
+        let Some(stream_id) = resolve_stream_id(streams, stream_id) else {
+            return Ok(GetTopicsResponse { topics: Vec::new() });
+        };
+        let stream = streams
+            .items
+            .get(stream_id)
+            .ok_or(IggyError::InvalidIdentifier)?;
+        stream
+            .topics
+            .iter()
+            .map(|(_, topic)| topic_header(topic))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|topics| GetTopicsResponse { topics })
+    })
+}
+
+fn resolve_stream_id(
+    streams: &metadata::stm::stream::StreamsInner,
+    identifier: &WireIdentifier,
+) -> Option<usize> {
+    match identifier {
+        WireIdentifier::Numeric(id) => {
+            let id = *id as usize;
+            streams.items.contains(id).then_some(id)
+        }
+        WireIdentifier::String(name) => streams.index.get(name.as_str()).copied(),
+    }
+}
+
+fn resolve_topic_id(
+    streams: &metadata::stm::stream::StreamsInner,
+    stream_id: usize,
+    identifier: &WireIdentifier,
+) -> Option<usize> {
+    let stream = streams.items.get(stream_id)?;
+    match identifier {
+        WireIdentifier::Numeric(id) => {
+            let id = *id as usize;
+            stream.topics.contains(id).then_some(id)
+        }
+        WireIdentifier::String(name) => stream.topic_index.get(name.as_str()).copied(),
+    }
+}
+
+fn stream_response(stream: &metadata::stm::stream::Stream) -> Result<StreamResponse, IggyError> {
+    Ok(StreamResponse {
+        id: usize_to_u32(stream.id)?,
+        created_at: stream.created_at.as_micros(),
+        topics_count: usize_to_u32(stream.topics.len())?,
+        size_bytes: stream.stats.size_bytes_inconsistent(),
+        messages_count: stream.stats.messages_count_inconsistent(),
+        name: WireName::new(stream.name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
+    })
+}
+
+fn topic_header(topic: &metadata::stm::stream::Topic) -> Result<StreamTopicHeader, IggyError> {
+    Ok(StreamTopicHeader {
+        id: usize_to_u32(topic.id)?,
+        created_at: topic.created_at.as_micros(),
+        partitions_count: usize_to_u32(topic.partitions.len())?,
+        message_expiry: u64::from(topic.message_expiry),
+        compression_algorithm: topic.compression_algorithm.as_code(),
+        max_topic_size: topic.max_topic_size.as_bytes_u64(),
+        replication_factor: topic.replication_factor,
+        size_bytes: topic.stats.size_bytes_inconsistent(),
+        messages_count: topic.stats.messages_count_inconsistent(),
+        name: WireName::new(topic.name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
+    })
+}
+
+fn partition_response(
+    partition: &metadata::stm::stream::Partition,
+) -> Result<PartitionResponse, IggyError> {
+    Ok(PartitionResponse {
+        id: usize_to_u32(partition.id)?,
+        created_at: partition.created_at.as_micros(),
+        segments_count: 0,
+        current_offset: 0,
+        size_bytes: 0,
+        messages_count: 0,
+    })
+}
+
+fn empty_polled_messages_response(partition_id: u32) -> Bytes {
+    let mut response = BytesMut::with_capacity(16);
+    response.put_u32_le(partition_id);
+    response.put_u64_le(0);
+    response.put_u32_le(0);
+    response.freeze()
+}
+
+fn usize_to_u32(value: usize) -> Result<u32, IggyError> {
+    u32::try_from(value).map_err(|_| IggyError::InvalidIdentifier)
+}
+
 fn verify_login_credentials(
     shard: &Rc<ServerNgShard>,
     username: &str,
     password: &str,
 ) -> Result<u32, LoginRegisterError> {
-    shard.plane.inner().0.mux_stm.inner().0.read(|users| {
+    shard.plane.metadata().mux_stm.users().read(|users| {
         let Some(user_id) = users.index.get(username).copied() else {
             return Err(LoginRegisterError::InvalidCredentials);
         };
@@ -1647,7 +2118,7 @@ fn verify_pat_credentials(
 ) -> Result<u32, LoginRegisterError> {
     let token_hash = PersonalAccessToken::hash_token(token);
     let now = IggyTimestamp::now();
-    shard.plane.inner().0.mux_stm.inner().0.read(|users| {
+    shard.plane.metadata().mux_stm.users().read(|users| {
         let Some((user_id, token_name)) =
             users.personal_access_token_index.get(token_hash.as_str())
         else {
@@ -1726,7 +2197,7 @@ async fn complete_login_register(
     {
         let mut sessions = sessions.borrow_mut();
         if let Err(error) = sessions.bind_session(transport_client_id, vsr_client_id, session) {
-            shard.plane.inner().0.remove_client_session(vsr_client_id);
+            shard.plane.metadata().remove_client_session(vsr_client_id);
             return Err(LoginRegisterError::Session(error));
         }
     }
@@ -1751,14 +2222,14 @@ async fn complete_login_register(
 }
 
 fn ensure_default_root_user(mux_stm: &ServerNgMuxStateMachine) {
-    if !mux_stm.inner().0.read(|users| users.items.is_empty()) {
+    if !mux_stm.users().read(|users| users.items.is_empty()) {
         return;
     }
 
     let LegacyUser {
         username, password, ..
     } = server::bootstrap::create_root_user();
-    mux_stm.inner().0.ensure_root_user(&username, &password);
+    mux_stm.users().ensure_root_user(&username, &password);
 }
 
 fn build_login_register_reply(
@@ -1793,6 +2264,9 @@ fn build_login_register_reply(
         ..Default::default()
     };
     if !body.is_empty() {
+        // TODO(vsr): encode reply bodies directly into the Message body region
+        // instead of serializing to Bytes first and copying them into the
+        // aligned message backing here.
         reply.as_mut_slice()[std::mem::size_of::<ReplyHeader>()..total_size].copy_from_slice(body);
     }
     reply
@@ -1801,8 +2275,7 @@ fn build_login_register_reply(
 fn current_metadata_commit(shard: &Rc<ServerNgShard>) -> u64 {
     shard
         .plane
-        .inner()
-        .0
+        .metadata()
         .consensus
         .as_ref()
         .map_or(0, VsrConsensus::commit_max)

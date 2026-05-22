@@ -618,7 +618,7 @@ impl WebSocketClient {
         #[cfg(feature = "vsr")]
         let request = {
             let mut consensus_session = self.consensus_session.lock().await;
-            crate::vsr::encode_request(&mut consensus_session, code, &payload)?
+            crate::vsr::encode_contiguous_request(&mut consensus_session, code, &payload)?
         };
         #[cfg(not(feature = "vsr"))]
         let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
