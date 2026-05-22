@@ -135,9 +135,9 @@ pub fn from_config(
             Ok(Arc::new(AvroConvert::new(cfg)))
         }
         TransformType::UnwrapEnvelope => {
-            let cfg: UnwrapEnvelopeConfig =
-                serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
-            Ok(Arc::new(UnwrapEnvelope::new(cfg)))
+            let cfg: UnwrapEnvelopeConfig = serde_json::from_value(raw.clone())
+                .map_err(|e| Error::InvalidConfigValue(format!("unwrap_envelope: {e}")))?;
+            Ok(Arc::new(UnwrapEnvelope::new(cfg)?))
         }
     }
 }

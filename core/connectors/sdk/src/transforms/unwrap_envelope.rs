@@ -23,10 +23,10 @@ use serde::{Deserialize, Serialize};
 /// Configuration for the UnwrapEnvelope transform.
 ///
 /// Extracts a nested JSON field from an envelope object and promotes it
-/// to the top-level payload. For example, given a Postgres source
-/// `DatabaseRecord` with shape `{ table_name, operation_type, timestamp,
-/// data: { ... }, old_data }`, setting `field = "data"` replaces the
-/// entire payload with the contents of `data`.
+/// to the top-level payload. For example, given a source envelope with
+/// shape `{ table_name, operation_type, timestamp, data: { ... },
+/// old_data }`, setting `field = "data"` replaces the entire payload
+/// with the contents of `data`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UnwrapEnvelopeConfig {
     pub field: String,
@@ -34,13 +34,19 @@ pub struct UnwrapEnvelopeConfig {
 
 /// Transform that extracts a nested field from a JSON envelope and
 /// promotes it as the top-level payload.
+#[derive(Debug)]
 pub struct UnwrapEnvelope {
     pub field: String,
 }
 
 impl UnwrapEnvelope {
-    pub fn new(cfg: UnwrapEnvelopeConfig) -> Self {
-        Self { field: cfg.field }
+    pub fn new(cfg: UnwrapEnvelopeConfig) -> Result<Self, Error> {
+        if cfg.field.is_empty() {
+            return Err(Error::InvalidConfigValue(
+                "unwrap_envelope: 'field' must not be empty".into(),
+            ));
+        }
+        Ok(Self { field: cfg.field })
     }
 }
 
