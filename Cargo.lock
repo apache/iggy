@@ -11635,6 +11635,7 @@ dependencies = [
  "futures",
  "iggy_binary_protocol",
  "iggy_common",
+ "indexmap 2.14.0",
  "journal",
  "message_bus",
  "metadata",
@@ -11642,6 +11643,7 @@ dependencies = [
  "rand 0.10.1",
  "rand_xoshiro",
  "shard",
+ "strum 0.28.0",
  "tracing",
 ]
 

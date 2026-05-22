@@ -22,6 +22,7 @@ pub mod network;
 pub mod packet;
 pub mod ready_queue;
 pub mod replica;
+pub mod workload;
 
 use bus::SimOutbox;
 use client::SimClient;
@@ -52,7 +53,13 @@ pub struct Simulator {
 }
 
 impl Simulator {
-    /// Create a new simulator with per-replica outboxes routed through a [`Network`].
+    /// New simulator with per-replica outboxes routed through a [`Network`].
+    ///
+    /// # Panics
+    /// Panics if `clients` yields duplicate `client_id`s. The auditor
+    /// keys in-flight entries by `(client_id, request)` and the network
+    /// indexes packet routes by `client_id`; duplicates would collide on
+    /// both.
     #[allow(clippy::cast_possible_truncation)]
     pub fn new(
         replica_count: usize,
@@ -60,6 +67,16 @@ impl Simulator {
         network_options: PacketSimulatorOptions,
     ) -> Self {
         let client_ids: Vec<u128> = clients.collect();
+        {
+            let mut seen = HashSet::with_capacity(client_ids.len());
+            for &cid in &client_ids {
+                assert!(
+                    seen.insert(cid),
+                    "Simulator::new: duplicate client_id {cid}; \
+                     auditor and network both key on client_id"
+                );
+            }
+        }
         let mut network = Network::new(network_options);
 
         for &cid in &client_ids {
@@ -95,7 +112,7 @@ impl Simulator {
         }
     }
 
-    /// Initialize a partition with its own consensus group on all live replicas.
+    /// Init a partition with its own consensus group on every live replica.
     #[allow(clippy::cast_possible_truncation)]
     pub fn init_partition(&mut self, namespace: IggyNamespace) {
         for (i, replica) in self.replicas.iter_mut().enumerate() {
@@ -105,25 +122,17 @@ impl Simulator {
         }
     }
 
-    /// Advance the simulation by one tick.
+    /// Advance the simulation by one tick. Returns client replies delivered.
     ///
-    /// Returns all client replies delivered during this tick.
+    /// Phases never borrow replicas and network simultaneously:
     ///
-    /// The tick has four phases that never borrow replicas and network
-    /// simultaneously:
-    ///
-    /// 0. **Consensus tick**: advance consensus timeouts on live replicas,
-    ///    dispatching any resulting actions (view change messages, retransmissions).
-    /// 1. **Deliver**: `network.step()` returns ready packets; each is
-    ///    dispatched to its target replica (or collected as a client reply).
-    /// 2. **Drain**: each live replica's outbox is drained and fed into
-    ///    `network.submit()`.
-    /// 3. **Tick**: `network.tick()` advances network time (partitions,
-    ///    clogging, etc.).
+    /// 0. Tick consensus on live replicas (view change, retransmits).
+    /// 1. Deliver ready packets from the network to replicas or clients.
+    /// 2. Drain each live replica's outbox into `network.submit()`.
+    /// 3. `network.tick()` advances network time.
     ///
     /// # Panics
-    /// Panics if a packet addressed to a client cannot be converted to a
-    /// `ReplyHeader` message.
+    /// If a client-addressed packet cannot be decoded as `ReplyHeader`.
     #[allow(clippy::cast_possible_truncation)]
     pub fn step(&mut self) -> Vec<Message<ReplyHeader>> {
         let mut client_replies = Vec::new();
@@ -189,10 +198,8 @@ impl Simulator {
         client_replies
     }
 
-    /// Submit a client request into the simulated network.
-    ///
-    /// This is the simulator equivalent of a client opening a TCP connection
-    /// and sending a message to a replica.
+    /// Submit a client request into the simulated network. Equivalent to a
+    /// client opening a TCP connection and sending a message to a replica.
     pub fn submit_request(
         &mut self,
         client_id: u128,
@@ -206,17 +213,12 @@ impl Simulator {
         );
     }
 
-    /// Register a client with the consensus cluster via the primary (replica 0).
-    ///
-    /// This sends a `Register` through consensus (metadata plane) and also
-    /// directly registers the client in each live replica's partition consensus
-    /// client table. The partition plane doesn't yet handle `Register` via
-    /// the network protocol, so we seed it manually.
-    ///
-    /// Binds the assigned session on the `SimClient`.
+    /// Register a client via the primary (replica 0). Sends `Register`
+    /// through the metadata plane and binds the assigned session on
+    /// `SimClient`.
     ///
     /// # Panics
-    /// Panics if no reply arrives within 100 steps.
+    /// If no reply arrives within 100 steps.
     #[allow(clippy::cast_possible_truncation)]
     pub fn register_client_with_primary(&mut self, client: &SimClient) {
         let msg = client.register();
@@ -226,7 +228,21 @@ impl Simulator {
         for _ in 0..100 {
             let replies = self.step();
             if !replies.is_empty() {
-                session = replies[0].header().commit;
+                let header = replies[0].header();
+                debug_assert_eq!(
+                    header.operation,
+                    iggy_binary_protocol::Operation::Register,
+                    "register_client_with_primary: first reply was not Register"
+                );
+                assert_eq!(
+                    header.client,
+                    client.client_id(),
+                    "register_client_with_primary: reply client_id mismatch \
+                     (expected {}, got {})",
+                    client.client_id(),
+                    header.client,
+                );
+                session = header.commit;
                 got_reply = true;
                 break;
             }
@@ -243,13 +259,11 @@ impl Simulator {
     }
 
     /// Crash a replica: disable its network links and discard its outbox.
-    ///
-    /// The replica object is kept alive but will not receive any messages or
-    /// have its outbox drained until a future `replica_restart` (not yet
-    /// implemented and it requires consensus durability support).
+    /// The replica object stays alive but receives no messages until a
+    /// `replica_restart` (not yet implemented; needs consensus durability).
     ///
     /// # Panics
-    /// Panics if the replica is already crashed.
+    /// If the replica is already crashed.
     pub fn replica_crash(&mut self, replica_index: u8) {
         assert!(
             !self.crashed.contains(&replica_index),
@@ -266,16 +280,15 @@ impl Simulator {
         self.crashed.insert(replica_index);
     }
 
-    /// Returns `true` if the given replica is currently crashed.
+    /// `true` if the replica is currently crashed.
     #[must_use]
     pub fn is_crashed(&self, replica_index: u8) -> bool {
         self.crashed.contains(&replica_index)
     }
 
-    /// Advance consensus timeouts and dispatch actions on every live replica.
-    ///
-    /// Note: `step()` already calls this internally. This method is provided
-    /// for callers that need to tick consensus without a full step cycle.
+    /// Advance consensus timeouts and dispatch on every live replica.
+    /// `step()` calls this internally; exposed for callers that need to
+    /// tick consensus without a full step cycle.
     #[allow(clippy::future_not_send, clippy::cast_possible_truncation)]
     pub async fn tick(&self) {
         for (i, replica) in self.replicas.iter().enumerate() {
@@ -289,7 +302,7 @@ impl Simulator {
     /// Poll messages directly from a replica's partition.
     ///
     /// # Errors
-    /// Returns `IggyError::ResourceNotFound` if the namespace does not exist on this replica.
+    /// `IggyError::ResourceNotFound` if the namespace is not on this replica.
     pub fn poll_messages(
         &self,
         replica_idx: usize,
@@ -309,7 +322,7 @@ impl Simulator {
         futures::executor::block_on(partition.poll_messages(consumer, args))
     }
 
-    /// Get partition offsets from a replica.
+    /// Partition offsets from a replica.
     #[must_use]
     pub fn offsets(
         &self,
@@ -347,12 +360,13 @@ impl Simulator {
 mod tests {
     use super::*;
     use crate::client::SimClient;
+    use crate::workload::apply_sim_commands;
+    use bytes::Bytes;
     use consensus::Status;
     use iggy_common::sharding::IggyNamespace;
 
-    /// After crashing the primary in a 5-node cluster, the 4 remaining
-    /// backups should detect the failure via heartbeat timeout and elect
-    /// a new primary through the view change protocol.
+    /// Crashing the primary in a 5-node cluster: 4 survivors detect via
+    /// heartbeat timeout and elect a new primary via view change.
     #[test]
     fn view_change_after_primary_crash() {
         iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
@@ -382,7 +396,7 @@ mod tests {
         sim.register_client_with_primary(&client);
 
         // Send a message through the primary (replica 0) to verify normal operation.
-        let msg = client.send_messages(ns, &[b"before crash"]);
+        let msg = client.send_messages(ns, &[Bytes::from_static(b"before crash")]);
         sim.submit_request(client_id, 0, msg.into_generic());
         let mut got_reply = false;
         for _ in 0..100 {
@@ -432,7 +446,7 @@ mod tests {
             .consensus();
         let new_primary_idx = c.primary_index(c.view());
 
-        let msg2 = client.send_messages(ns, &[b"after view change"]);
+        let msg2 = client.send_messages(ns, &[Bytes::from_static(b"after view change")]);
         sim.submit_request(client_id, new_primary_idx, msg2.into_generic());
         let mut got_reply_after = false;
         for _ in 0..200 {
@@ -447,18 +461,10 @@ mod tests {
         );
     }
 
-    /// Failover-then-retry under at-least-once: `SendMessages` retry on
-    /// new primary re-executes; consumers dedup if they care.
-    ///
-    /// 1. Primary commits op N, replies.
-    /// 2. Primary crashes.
-    /// 3. Backup promotes via view change.
-    /// 4. Client retries SAME `(client, session, request)` on new primary.
-    ///    No partition-plane dedup -> flows through, commits at op M > N.
-    ///
-    /// Retry reply MUST carry higher `commit` op (re-execution proof, not
-    /// dedup). Duplicate payload now at two offsets; consumers dedup by
-    /// key / content if they need at-most-once-per-payload.
+    /// At-least-once failover: `SendMessages` retry on a new primary
+    /// re-executes. Retry reply carries a HIGHER `commit` op (re-execution
+    /// proof, not dedup). Duplicate payload lives at two offsets; consumers
+    /// dedup if they need at-most-once-per-payload.
     #[test]
     fn failover_retry_re_executes_under_at_least_once() {
         iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
@@ -487,7 +493,7 @@ mod tests {
 
         // Same `(client, session, request)` for replay; mirrors SDK's
         // connection-loss retry.
-        let original_req = client.send_messages(ns, &[b"failover-test"]);
+        let original_req = client.send_messages(ns, &[Bytes::from_static(b"failover-test")]);
         let replay_req = original_req.deep_copy();
         let original_request_id = original_req.header().request;
 
@@ -510,7 +516,7 @@ mod tests {
         );
 
         // Crash primary. Real-world: TCP buffer might have lost reply
-        // before ack , same retry path.
+        // before ack; same retry path.
         sim.replica_crash(0);
 
         // Steps for view change across 4 survivors.
@@ -548,7 +554,7 @@ mod tests {
             }
         }
         let retry_reply = retry_reply.expect(
-            "reply must arrive after retry , new primary re-commits as \
+            "reply must arrive after retry; new primary re-commits as \
              fresh prepare (at-least-once)",
         );
 
@@ -571,10 +577,9 @@ mod tests {
         );
     }
 
-    /// Regression: a behind backup (`commit_min < commit_max`) becoming the new
+    /// Regression: a behind backup (`commit_min < commit_max`) becoming
     /// primary must not panic during the `CommitMessage` heartbeat timeout.
-    /// Previously, `handle_commit_message_timeout` asserted `commit_min == commit_max`,
-    /// which fails when the new primary hasn't caught up yet.
+    /// `handle_commit_message_timeout` used to assert `commit_min == commit_max`.
     #[test]
     fn view_change_behind_backup_becomes_primary() {
         iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
@@ -603,16 +608,15 @@ mod tests {
         // Register the client with the consensus cluster.
         sim.register_client_with_primary(&client);
 
-        // Send several messages so the primary commits ahead of backups.
-        // Backups receive prepares but may not have committed all of them
-        // (commit_max lags behind the primary's commit_min because the
-        // primary's commit point is only propagated via subsequent Prepare
-        // headers or Commit heartbeats).
+        // Send several messages so primary commits ahead of backups.
+        // Backups receive prepares but may lag on commit (`commit_max` <
+        // primary's `commit_min`): commit point only propagates via later
+        // Prepare headers or Commit heartbeats.
         for i in 0..3 {
-            let msg = client.send_messages(ns, &[format!("msg-{i}").as_bytes()]);
+            let msg = client.send_messages(ns, &[Bytes::from(format!("msg-{i}"))]);
             sim.submit_request(client_id, 0, msg.into_generic());
-            // Only a few steps — enough for replication but not for the
-            // backup to fully learn the commit point.
+            // Few steps: enough for replication, not enough for backups
+            // to fully learn the commit point.
             for _ in 0..10 {
                 sim.step();
             }
@@ -640,5 +644,371 @@ mod tests {
             }
         }
         assert!(new_primary_found, "expected a new primary");
+    }
+
+    /// Determinism: fresh simulator + workload from the same seed (network
+    /// and workload) produces an identical reply-header sequence.
+    #[test]
+    fn workload_replay_is_deterministic() {
+        iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let h1 = workload_hash_for_seed(0xDEAD_BEEF);
+        let h2 = workload_hash_for_seed(0xDEAD_BEEF);
+        assert_eq!(
+            h1, h2,
+            "workload reply hash diverged across runs with the same seed"
+        );
+
+        // Sanity: a different seed should generally produce a different
+        // trace. (Theoretically possible to collide, but vanishingly so.)
+        let h3 = workload_hash_for_seed(0xCAFE_BABE);
+        assert_ne!(
+            h1, h3,
+            "different seeds produced identical reply hashes; determinism collapsed"
+        );
+
+        // Fragile cross-run baseline. Drifts whenever reply shape,
+        // partition commit values, or PRNG draw order change. Re-lock on
+        // intentional changes; expect re-locks until error discriminants
+        // and reply bodies stabilize the wire format.
+        assert_eq!(
+            h1, 0x882B_163F_CA9B_A0BC,
+            "workload reply hash drifted from locked baseline"
+        );
+    }
+
+    /// Drive workload with uniform weights across all 25 `Action` variants.
+    /// Assert it runs without panic and observes at least one reply.
+    /// Per-op coverage not asserted: some ops can starve the in-flight slot
+    /// at single-client / 1-slot pipeline limits.
+    #[test]
+    fn uniform_weights_runs_clean() {
+        use crate::workload::{
+            Workload,
+            actions::Action,
+            options::{ActionWeights, WorkloadOptions},
+        };
+        use strum::{EnumCount, IntoEnumIterator};
+
+        iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0xC0FF_EE00,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = client::SimClient::new(client_id);
+        let ns_a = iggy_common::sharding::IggyNamespace::new(1, 1, 0);
+        let ns_b = iggy_common::sharding::IggyNamespace::new(1, 1, 1);
+        sim.init_partition(ns_a);
+        sim.init_partition(ns_b);
+        sim.register_client_with_primary(&client);
+
+        // 25 variants × 4 = 100.
+        assert_eq!(Action::COUNT, 25, "Action::COUNT changed; adjust weights");
+        let entries: Vec<(Action, u8)> = Action::iter().map(|a| (a, 4)).collect();
+        let weights = ActionWeights::new(&entries);
+
+        let mut options = WorkloadOptions::new(0xC0FF_EE00, replica_count, vec![ns_a, ns_b]);
+        options.weights = weights;
+        let mut wl = Workload::new(options);
+
+        let mut replies_seen = 0u64;
+        for _tick in 0..2_000u32 {
+            if let Some((target, msg)) = wl.build_request(&client) {
+                sim.submit_request(client.client_id(), target, msg.into_generic());
+            }
+            for reply in sim.step() {
+                let cmds = wl.on_reply(&reply);
+                apply_sim_commands(&mut sim, &cmds);
+                replies_seen += 1;
+            }
+        }
+        assert!(
+            replies_seen > 0,
+            "uniform-weight workload produced no replies; sampling or dispatch broken"
+        );
+    }
+
+    /// Drive Create-heavy then Delete-heavy workload; assert shadow tracks
+    /// live streams:
+    ///
+    /// - At least one `CreateStream` commits.
+    /// - At least one `DeleteStream` commits, proving sample picked a live
+    ///   name (without shadow tracking, sample would return `None`).
+    /// - Shadow stream count matches net `creates - deletes`.
+    #[test]
+    fn shadow_tracks_live_streams() {
+        use crate::workload::{
+            Workload,
+            actions::Action,
+            options::{ActionWeights, WorkloadOptions},
+        };
+
+        iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0x5EED_0002,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = client::SimClient::new(client_id);
+        let ns_a = iggy_common::sharding::IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns_a);
+        sim.register_client_with_primary(&client);
+
+        // Phase 1: Create-heavy to populate the shadow.
+        let mut options = WorkloadOptions::new(0x5EED_0002, replica_count, vec![ns_a]);
+        options.weights = ActionWeights::new(&[(Action::CreateStream, 100)]);
+        let mut wl = Workload::new(options);
+        for _tick in 0..3_000u32 {
+            if let Some((target, msg)) = wl.build_request(&client) {
+                sim.submit_request(client.client_id(), target, msg.into_generic());
+            }
+            for reply in sim.step() {
+                let cmds = wl.on_reply(&reply);
+                apply_sim_commands(&mut sim, &cmds);
+            }
+        }
+        let created = wl.auditor.stats().commits_per_action[Action::CreateStream as usize];
+        assert!(created > 0, "Create-only workload produced no commits");
+        assert_eq!(
+            wl.shadow.stream_names.len() as u64,
+            created,
+            "shadow stream count diverged from CreateStream commits"
+        );
+
+        // Phase 2: Create/Delete mix. DeleteStream sample succeeds only if
+        // shadow.pick_stream_name returns Some (the wiring under test).
+        wl.options.weights =
+            ActionWeights::new(&[(Action::CreateStream, 30), (Action::DeleteStream, 70)]);
+        for _tick in 0..3_000u32 {
+            if let Some((target, msg)) = wl.build_request(&client) {
+                sim.submit_request(client.client_id(), target, msg.into_generic());
+            }
+            for reply in sim.step() {
+                let cmds = wl.on_reply(&reply);
+                apply_sim_commands(&mut sim, &cmds);
+            }
+        }
+        let deleted = wl.auditor.stats().commits_per_action[Action::DeleteStream as usize];
+        let created_total = wl.auditor.stats().commits_per_action[Action::CreateStream as usize];
+        assert!(
+            deleted > 0,
+            "DeleteStream never committed; shadow-driven sampling is broken \
+             (sample would return None unless pick_stream_name found a live name)"
+        );
+        let expected_live = created_total.saturating_sub(deleted);
+        assert_eq!(
+            wl.shadow.stream_names.len() as u64,
+            expected_live,
+            "shadow.stream_names.len() ({}) != creates ({}) - deletes ({}) = {}",
+            wl.shadow.stream_names.len(),
+            created_total,
+            deleted,
+            expected_live,
+        );
+    }
+
+    /// Drive workload with 4 concurrent clients over two namespaces; assert:
+    ///
+    /// - Every client observes at least one commit (no starvation).
+    /// - Per-(client, namespace) commit-monotonic invariant holds.
+    /// - Commits interleave across clients.
+    #[test]
+    fn multi_client_interleaves_commits() {
+        use crate::workload::{
+            Workload,
+            actions::Action,
+            options::{ActionWeights, WorkloadOptions},
+        };
+
+        iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_ids: Vec<u128> = (1..=4).collect();
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: u8::try_from(client_ids.len()).expect("fits"),
+            seed: 0x5EED_0005,
+            ..packet::PacketSimulatorOptions::default()
+        };
+
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            client_ids.iter().copied(),
+            network_opts,
+        );
+        let clients: Vec<client::SimClient> = client_ids
+            .iter()
+            .map(|&id| client::SimClient::new(id))
+            .collect();
+        let ns_a = iggy_common::sharding::IggyNamespace::new(1, 1, 0);
+        let ns_b = iggy_common::sharding::IggyNamespace::new(1, 1, 1);
+        sim.init_partition(ns_a);
+        sim.init_partition(ns_b);
+        for c in &clients {
+            sim.register_client_with_primary(c);
+        }
+
+        let mut options = WorkloadOptions::new(0x5EED_0005, replica_count, vec![ns_a, ns_b]);
+        options.client_count = u8::try_from(clients.len()).expect("fits");
+        options.weights = ActionWeights::new(&[
+            (Action::CreateStream, 5),
+            (Action::SendMessages, 70),
+            (Action::StoreConsumerOffset2, 25),
+        ]);
+        let mut wl = Workload::new(options);
+
+        let mut commits_per_client: std::collections::HashMap<u128, u64> =
+            std::collections::HashMap::new();
+        let mut replies_seen = 0u64;
+        for _tick in 0..4_000u32 {
+            for c in &clients {
+                if let Some((target, msg)) = wl.build_request(c) {
+                    sim.submit_request(c.client_id(), target, msg.into_generic());
+                }
+            }
+            for reply in sim.step() {
+                let client_id = reply.header().client;
+                let cmds = wl.on_reply(&reply);
+                apply_sim_commands(&mut sim, &cmds);
+                *commits_per_client.entry(client_id).or_insert(0) += 1;
+                replies_seen += 1;
+            }
+        }
+
+        assert!(
+            replies_seen > 0,
+            "multi-client workload produced no replies"
+        );
+        for &id in &client_ids {
+            let count = commits_per_client.get(&id).copied().unwrap_or(0);
+            assert!(
+                count > 0,
+                "client {id} observed no commits; multi-client routing is starving \
+                 (counts: {commits_per_client:?})",
+            );
+        }
+        let distinct = commits_per_client.values().filter(|&&c| c > 0).count();
+        assert!(
+            distinct >= 2,
+            "commits concentrated on a single client ({commits_per_client:?}); \
+             no interleaving observed"
+        );
+    }
+
+    fn workload_hash_for_seed(seed: u64) -> u64 {
+        use crate::workload::{
+            Workload,
+            actions::Action,
+            options::{ActionWeights, WorkloadOptions},
+        };
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed,
+            ..packet::PacketSimulatorOptions::default()
+        };
+
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+
+        let ns_a = IggyNamespace::new(1, 1, 0);
+        let ns_b = IggyNamespace::new(1, 1, 1);
+        sim.init_partition(ns_a);
+        sim.init_partition(ns_b);
+        sim.register_client_with_primary(&client);
+
+        let mut options = WorkloadOptions::new(seed, replica_count, vec![ns_a, ns_b]);
+        options.weights = ActionWeights::new(&[
+            (Action::CreateStream, 5),
+            (Action::SendMessages, 70),
+            (Action::StoreConsumerOffset2, 25),
+        ]);
+
+        let mut wl = Workload::new(options);
+        let mut hasher = DefaultHasher::new();
+        let mut replies_seen = 0u64;
+
+        // Inline driver: hash each reply tuple so divergence is caught at
+        // the first non-matching reply, not just end-of-run aggregates.
+        // The reply cap lives inside the per-reply loop so a multi-reply
+        // tick at replies_seen=49 cannot leak a 50th+ reply into the hash.
+        'outer: for _tick in 0..5_000u32 {
+            if let Some((target, msg)) = wl.build_request(&client) {
+                sim.submit_request(client.client_id(), target, msg.into_generic());
+            }
+            for reply in sim.step() {
+                let h = reply.header();
+                (
+                    h.client,
+                    h.request,
+                    h.op,
+                    h.commit,
+                    h.namespace,
+                    h.operation as u8,
+                )
+                    .hash(&mut hasher);
+                let cmds = wl.on_reply(&reply);
+                apply_sim_commands(&mut sim, &cmds);
+                replies_seen += 1;
+                if replies_seen >= 50 {
+                    break 'outer;
+                }
+            }
+        }
+        assert!(
+            replies_seen > 0,
+            "workload produced no replies; driver / sim wiring is broken"
+        );
+
+        replies_seen.hash(&mut hasher);
+        wl.shadow.sends_committed(ns_a).hash(&mut hasher);
+        wl.shadow.sends_committed(ns_b).hash(&mut hasher);
+        // Catches PRNG-trace shifts from `sample` returning `None`.
+        // Stays 0 on the current seed mix; non-zero drifts the baseline.
+        wl.samples_none().hash(&mut hasher);
+        hasher.finish()
     }
 }
