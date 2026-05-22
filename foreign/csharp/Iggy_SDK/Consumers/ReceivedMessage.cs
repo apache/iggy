@@ -16,19 +16,53 @@
 // under the License.
 
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Headers;
+using Apache.Iggy.Messages;
 
 namespace Apache.Iggy.Consumers;
 
 /// <summary>
-///     Represents a message received from the Iggy consumer with a deserialized payload of type T
+///     Represents a message whose payload was deserialized directly from rented memory. The rented buffer has
+///     already been returned to the pool by the time this message is yielded, so only the header, user headers,
+///     and the deserialized <see cref="Data" /> are available; the raw payload bytes are not retained.
 /// </summary>
-/// <typeparam name="T">The type of the deserialized message payload</typeparam>
-public class ReceivedMessage<T> : ReceivedMessage
+/// <typeparam name="T">The deserialized payload type.</typeparam>
+public sealed class ReceivedMessage<T>
 {
     /// <summary>
-    ///     The deserialized message payload. Will be null if deserialization failed.
+    ///     Message header.
+    /// </summary>
+    public required MessageHeader Header { get; init; }
+
+    /// <summary>
+    ///     The deserialized payload. Null if <see cref="Status" /> is not <see cref="MessageStatus.Success" />.
     /// </summary>
     public T? Data { get; init; }
+
+    /// <summary>
+    ///     Parsed user headers, if present.
+    /// </summary>
+    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
+
+    /// <summary>
+    ///     The current offset of this message in the partition.
+    /// </summary>
+    public required ulong CurrentOffset { get; init; }
+
+    /// <summary>
+    ///     The partition ID from which this message was consumed.
+    /// </summary>
+    public uint PartitionId { get; init; }
+
+    /// <summary>
+    ///     The status of the message (Success, DecryptionFailed, DeserializationFailed).
+    /// </summary>
+    public MessageStatus Status { get; init; } = MessageStatus.Success;
+
+    /// <summary>
+    ///     The exception that occurred during processing, if any.
+    /// </summary>
+    public Exception? Error { get; init; }
 }
 
 /// <summary>

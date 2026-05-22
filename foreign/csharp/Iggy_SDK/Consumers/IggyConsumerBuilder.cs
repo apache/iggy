@@ -300,6 +300,12 @@ public class IggyConsumerBuilder
             throw new InvalidOperationException("BatchSize must be greater than 0.");
         }
 
+        if (Config.BatchSize > int.MaxValue / 2)
+        {
+            throw new InvalidOperationException(
+                $"BatchSize must be less than or equal to {int.MaxValue / 2}.");
+        }
+
         if (Config.PollingIntervalMs < 0)
         {
             throw new InvalidOperationException("PollingIntervalMs cannot be negative.");

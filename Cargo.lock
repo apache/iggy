@@ -11388,6 +11388,7 @@ dependencies = [
  "compio",
  "configs",
  "consensus",
+ "crossfire",
  "ctrlc",
  "cyper",
  "cyper-axum",
@@ -11396,7 +11397,6 @@ dependencies = [
  "err_trail",
  "error_set",
  "figlet-rs",
- "flume 0.12.0",
  "fs2",
  "hash32 1.0.0",
  "human-repr",
@@ -11518,6 +11518,8 @@ dependencies = [
  "metadata",
  "papaya",
  "partitions",
+ "prometheus-client",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -11633,6 +11635,7 @@ dependencies = [
  "futures",
  "iggy_binary_protocol",
  "iggy_common",
+ "indexmap 2.14.0",
  "journal",
  "message_bus",
  "metadata",
@@ -11640,6 +11643,7 @@ dependencies = [
  "rand 0.10.1",
  "rand_xoshiro",
  "shard",
+ "strum 0.28.0",
  "tracing",
 ]
 

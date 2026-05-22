@@ -143,6 +143,10 @@ impl MessageBus for SimOutbox {
 
         Ok(())
     }
+
+    fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
+    fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
+    fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
 }
 
 /// Newtype wrapper for shared [`SimOutbox`] that implements [`MessageBus`]
@@ -171,5 +175,17 @@ impl MessageBus for SharedSimOutbox {
         data: Frozen<MESSAGE_ALIGN>,
     ) -> Result<(), SendError> {
         self.0.send_to_replica(replica, data).await
+    }
+
+    fn set_connection_lost_fn(&self, f: message_bus::ConnectionLostFn) {
+        self.0.set_connection_lost_fn(f);
+    }
+
+    fn set_replica_forward_fn(&self, f: message_bus::ReplicaForwardFn) {
+        self.0.set_replica_forward_fn(f);
+    }
+
+    fn set_client_forward_fn(&self, f: message_bus::ClientForwardFn) {
+        self.0.set_client_forward_fn(f);
     }
 }

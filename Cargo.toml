@@ -178,6 +178,7 @@ iggy-cli = { path = "core/cli", version = "0.13.1-edge.1" }
 iggy_binary_protocol = { path = "core/binary_protocol", version = "0.10.1-edge.1" }
 iggy_common = { path = "core/common", version = "0.10.1-edge.1" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.3.1-edge.1" }
+indexmap = "2.14.0"
 integration = { path = "core/integration" }
 journal = { path = "core/journal" }
 js-sys = "0.3"
