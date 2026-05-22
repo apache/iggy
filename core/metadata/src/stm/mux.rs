@@ -16,9 +16,10 @@
 // under the License.
 
 use crate::stm::snapshot::{FillSnapshot, RestoreSnapshot, SnapshotError};
-use iggy_binary_protocol::{Message, PrepareHeader};
+use iggy_binary_protocol::PrepareHeader;
 use iggy_common::Either;
 use iggy_common::variadic;
+use server_common::Message;
 
 use crate::stm::{State, StateMachine};
 
@@ -220,7 +221,8 @@ mod tests {
         use crate::stm::mux::MuxStateMachine;
         use crate::stm::stream::{Streams, StreamsInner};
         use crate::stm::user::{Users, UsersInner};
-        use iggy_binary_protocol::{Message, PrepareHeader};
+        use iggy_binary_protocol::PrepareHeader;
+        use server_common::Message;
 
         let users: Users = UsersInner::new().into();
         let streams: Streams = StreamsInner::new().into();

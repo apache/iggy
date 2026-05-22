@@ -44,6 +44,7 @@ rand = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 scopeguard = { workspace = true }
+server_common = { workspace = true }
 socket2 = { workspace = true, features = ["all"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }

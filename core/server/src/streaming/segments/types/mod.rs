@@ -16,6 +16,5 @@
  * under the License.
  */
 
-pub use iggy_common::{
-    IggyMessageHeaderViewMut, IggyMessageViewMut, IggyMessagesBatchMut, IggyMessagesBatchSet,
-};
+pub use iggy_common::{IggyMessageHeaderViewMut, IggyMessageViewMut};
+pub use server_common::{IggyMessagesBatchMut, IggyMessagesBatchSet};

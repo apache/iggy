@@ -17,8 +17,8 @@
 
 use crate::{Pipeline, PipelineEntry, Status, VsrAction, VsrConsensus};
 use iggy_binary_protocol::Operation;
-use iggy_common::sharding::IggyNamespace;
 use message_bus::MessageBus;
+use server_common::sharding::IggyNamespace;
 use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

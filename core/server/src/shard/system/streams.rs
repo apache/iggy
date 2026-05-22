@@ -20,8 +20,8 @@ use crate::metadata::StreamMeta;
 use crate::shard::IggyShard;
 use crate::shard::transmission::message::{ResolvedStream, ResolvedTopic};
 use crate::streaming::streams::storage::{create_stream_file_hierarchy, delete_stream_directory};
-use iggy_common::sharding::IggyNamespace;
 use iggy_common::{IggyError, IggyTimestamp};
+use server_common::sharding::IggyNamespace;
 use std::sync::Arc;
 
 /// Info returned when a stream is deleted - contains what callers need for logging/events.

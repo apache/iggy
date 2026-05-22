@@ -17,6 +17,7 @@
  */
 
 use crate::binary::handlers;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use bytes::BytesMut;
@@ -33,9 +34,7 @@ use iggy_binary_protocol::requests::streams::*;
 use iggy_binary_protocol::requests::system::*;
 use iggy_binary_protocol::requests::topics::*;
 use iggy_binary_protocol::requests::users::*;
-use iggy_common::{
-    Consumer, ConsumerKind, Identifier, IggyError, PollingKind, PollingStrategy, SenderKind,
-};
+use iggy_common::{Consumer, ConsumerKind, Identifier, IggyError, PollingKind, PollingStrategy};
 use std::rc::Rc;
 use tracing::{error, warn};
 

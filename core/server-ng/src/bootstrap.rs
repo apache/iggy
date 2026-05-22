@@ -29,10 +29,9 @@ use consensus::{LocalPipeline, PartitionsHandle, Sequencer, VsrConsensus};
 // non-blocking variants for cancel-safe shutdown polling.
 use crossfire::{AsyncRxTrait, AsyncTxTrait};
 use iggy_binary_protocol::RequestHeader;
-use iggy_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use iggy_common::{
     ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, PartitionStats, TopicStats,
-    sharding::LocalIdx, variadic,
+    variadic,
 };
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
@@ -61,6 +60,7 @@ use metadata::stm::user::Users;
 use partitions::{
     IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig, Segment,
 };
+use server_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
 // TODO: decouple bootstrap/storage helpers and logging from the `server` crate.
 use server::bootstrap::{create_directories, create_shard_executor};
 use server::log::logger::Logging;
@@ -1103,7 +1103,7 @@ fn restore_metadata_consensus(
         CLUSTER_ID,
         self_replica_id,
         replica_count,
-        iggy_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+        server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
         bus,
         LocalPipeline::new(),
     );
@@ -1373,7 +1373,7 @@ fn indexes_max_timestamp(indexes: &server::streaming::segments::IggyIndexesMut) 
 }
 
 async fn load_segment_max_timestamp(
-    storage: &iggy_common::SegmentStorage,
+    storage: &server_common::SegmentStorage,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
@@ -2262,7 +2262,7 @@ fn load_quic_server_credentials(
 ) -> Result<replica_io::QuicServerCredentials, ServerNgError> {
     let certificate = &config.quic.certificate;
     if certificate.self_signed {
-        let (cert_chain, key_der) = iggy_common::generate_self_signed_certificate("localhost")
+        let (cert_chain, key_der) = server_common::generate_self_signed_certificate("localhost")
             .map_err(|error| ServerNgError::ListenerCredentials {
                 transport: "quic",
                 source: std::io::Error::other(error.to_string()),
