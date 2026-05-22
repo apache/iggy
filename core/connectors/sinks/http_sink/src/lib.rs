@@ -408,6 +408,7 @@ impl HttpSink {
                 serde_json::to_value(encoded)
                     .map_err(|e| Error::Serialization(format!("EncodedPayload: {}", e)))
             }
+            Payload::Bson(_bson_value) => todo!(),
         }
     }
 
