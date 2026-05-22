@@ -71,7 +71,7 @@ pub fn sample(
 
 #[must_use]
 pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
-    client.delete_consumer_offset_v2(input.ns, input.consumer_kind, input.consumer_id, input.ack)
+    client.delete_consumer_offset_2(input.ns, input.consumer_kind, input.consumer_id, input.ack)
 }
 
 #[must_use]

@@ -64,6 +64,7 @@ pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
 #[must_use]
 pub const fn predicted_effect(_input: &Input, outcome: Outcome) -> Effect {
     match outcome {
+        // TODO: zero sends_committed under this topic; see purge_stream.
         Outcome::Success => Effect::None,
     }
 }

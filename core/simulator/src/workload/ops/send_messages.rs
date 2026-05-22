@@ -21,6 +21,7 @@
 //! 2. batch length (`prng.random_range(0..span)`)
 //! 3. one `prng.random()` per payload to disambiguate body bytes
 
+use bytes::Bytes;
 use iggy_binary_protocol::{Message, ReplyHeader, RequestHeader};
 use iggy_common::sharding::IggyNamespace;
 use rand::RngExt;
@@ -35,7 +36,8 @@ use crate::workload::shadow::Shadow;
 pub struct Input {
     pub ns: IggyNamespace,
     pub batch_len: u32,
-    pub payloads: Vec<Vec<u8>>,
+    /// `Bytes` so `build_message` does refcount bumps, not allocations.
+    pub payloads: Vec<Bytes>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -56,10 +58,10 @@ pub fn sample(
             let ns = shadow.pick_namespace(prng)?;
             let span = options.batch_size_span.max(1);
             let batch_len = options.batch_size_min + prng.random_range(0..span);
-            let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(batch_len as usize);
+            let mut payloads: Vec<Bytes> = Vec::with_capacity(batch_len as usize);
             for i in 0..batch_len {
                 let r: u32 = prng.random();
-                payloads.push(format!("wl-msg-{i:04x}-{r:08x}").into_bytes());
+                payloads.push(Bytes::from(format!("wl-msg-{i:04x}-{r:08x}")));
             }
             Some(Input {
                 ns,
@@ -72,8 +74,7 @@ pub fn sample(
 
 #[must_use]
 pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
-    let refs: Vec<&[u8]> = input.payloads.iter().map(Vec::as_slice).collect();
-    client.send_messages(input.ns, &refs)
+    client.send_messages(input.ns, &input.payloads)
 }
 
 #[must_use]

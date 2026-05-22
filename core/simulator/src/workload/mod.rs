@@ -42,7 +42,7 @@ use rand_xoshiro::rand_core::SeedableRng;
 use crate::Simulator;
 use crate::client::SimClient;
 use actions::Action;
-use auditor::ServerAuditor;
+use auditor::{OnReply, ServerAuditor};
 use effect::SimCommand;
 use options::WorkloadOptions;
 use shadow::Shadow;
@@ -59,6 +59,9 @@ pub struct Workload {
     pub shadow: Shadow,
     pub options: WorkloadOptions,
     /// Number of in-flight requests per client.
+    ///
+    /// TODO: reap on client disconnect; bounded today by the fixed
+    /// `Simulator::new` set.
     in_flight_per_client: HashMap<u128, usize>,
     /// Debug counter for `sample()` returning `None`. Useful when an
     /// outcome-first generation lands and divergence in `apply` branches
@@ -141,18 +144,21 @@ impl Workload {
     /// must run against the simulator (e.g. `init_partition`); the
     /// auditor stays transport-agnostic.
     ///
-    /// Returns an empty `Vec` when the reply has no matching in-flight
-    /// entry (duplicate cached reply or stale at-least-once
-    /// re-execution); see [`auditor::ServerAuditor::on_reply`] for the
-    /// at-least-once contract.
+    /// Returns an empty `Vec` for unknown replies (duplicate or stale
+    /// at-least-once) and for `OnReply::NsMismatch`. See
+    /// [`auditor::ServerAuditor::on_reply`] for the per-variant contract.
     #[must_use = "returned SimCommands must be applied; call apply_sim_commands or use Workload::run"]
     pub fn on_reply(&mut self, reply: &Message<ReplyHeader>) -> Vec<SimCommand> {
         let header = reply.header();
         let key = (header.client, header.request);
-        let Some(entry) = self.auditor.on_reply(key, header) else {
-            // Duplicate or otherwise unknown reply; do not double-apply
-            // effects or decrement the client's in-flight counter.
-            return Vec::new();
+        let entry = match self.auditor.on_reply(key, header) {
+            OnReply::Match(entry) => entry,
+            OnReply::NsMismatch => {
+                // Entry consumed; release slot, skip effects (misrouted).
+                self.decrement_in_flight(header.client);
+                return Vec::new();
+            }
+            OnReply::Unknown => return Vec::new(),
         };
 
         // v2.4: every op currently classifies as `Outcome::Success`
@@ -171,13 +177,30 @@ impl Workload {
         let effect = ops::predicted_effect(&entry.input, &entry.outcome);
         let result = self.shadow.apply(effect);
 
-        self.auditor.note_committed(entry.action);
-
-        if let Some(count) = self.in_flight_per_client.get_mut(&header.client) {
-            *count = count.saturating_sub(1);
+        // Skip note_committed on no-op apply (e.g. AddTopic after a
+        // concurrent RemoveStream) so commits_per_action tracks shadow.
+        if result.applied {
+            self.auditor.note_committed(entry.action);
         }
 
+        self.decrement_in_flight(header.client);
+
         result.sim_commands
+    }
+
+    /// Release one in-flight slot. Panics on underflow so a future
+    /// double-decrement surfaces instead of being silently clamped.
+    ///
+    /// # Panics
+    /// Panics if no entry exists for `client`, or if the counter is 0.
+    fn decrement_in_flight(&mut self, client: u128) {
+        let count = self
+            .in_flight_per_client
+            .get_mut(&client)
+            .expect("decrement_in_flight: no entry for client; record_in_flight must precede");
+        *count = count
+            .checked_sub(1)
+            .expect("in_flight underflow: per-client counter went below 0");
     }
 
     /// Debug counter for `sample()` returning `None`. Surfaces sampling

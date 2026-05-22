@@ -49,7 +49,8 @@ pub fn sample(
     match outcome {
         Outcome::Success => {
             let user = shadow.pick_user_name(prng)?;
-            let current_password = format!("pw-{user}");
+            // After first rotation, `pw-{user}` mismatches; use shadow.
+            let current_password = shadow.password_for(&user)?.to_string();
             let r: u32 = prng.random();
             let new_password = format!("pw-{r:08x}");
             Some(Input {
@@ -72,8 +73,11 @@ pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
 }
 
 #[must_use]
-pub const fn predicted_effect(_input: &Input, outcome: Outcome) -> Effect {
+pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
     match outcome {
-        Outcome::Success => Effect::None,
+        Outcome::Success => Effect::PasswordChanged {
+            user: input.user.clone(),
+            new_password: input.new_password.clone(),
+        },
     }
 }

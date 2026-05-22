@@ -359,6 +359,7 @@ mod tests {
     use super::*;
     use crate::client::SimClient;
     use crate::workload::apply_sim_commands;
+    use bytes::Bytes;
     use consensus::Status;
     use iggy_common::sharding::IggyNamespace;
 
@@ -393,7 +394,7 @@ mod tests {
         sim.register_client_with_primary(&client);
 
         // Send a message through the primary (replica 0) to verify normal operation.
-        let msg = client.send_messages(ns, &[b"before crash"]);
+        let msg = client.send_messages(ns, &[Bytes::from_static(b"before crash")]);
         sim.submit_request(client_id, 0, msg.into_generic());
         let mut got_reply = false;
         for _ in 0..100 {
@@ -443,7 +444,7 @@ mod tests {
             .consensus();
         let new_primary_idx = c.primary_index(c.view());
 
-        let msg2 = client.send_messages(ns, &[b"after view change"]);
+        let msg2 = client.send_messages(ns, &[Bytes::from_static(b"after view change")]);
         sim.submit_request(client_id, new_primary_idx, msg2.into_generic());
         let mut got_reply_after = false;
         for _ in 0..200 {
@@ -490,7 +491,7 @@ mod tests {
 
         // Same `(client, session, request)` for replay; mirrors SDK's
         // connection-loss retry.
-        let original_req = client.send_messages(ns, &[b"failover-test"]);
+        let original_req = client.send_messages(ns, &[Bytes::from_static(b"failover-test")]);
         let replay_req = original_req.deep_copy();
         let original_request_id = original_req.header().request;
 
@@ -610,7 +611,7 @@ mod tests {
         // primary's `commit_min`): commit point only propagates via later
         // Prepare headers or Commit heartbeats.
         for i in 0..3 {
-            let msg = client.send_messages(ns, &[format!("msg-{i}").as_bytes()]);
+            let msg = client.send_messages(ns, &[Bytes::from(format!("msg-{i}"))]);
             sim.submit_request(client_id, 0, msg.into_generic());
             // Few steps: enough for replication, not enough for backups
             // to fully learn the commit point.
@@ -673,7 +674,7 @@ mod tests {
         // intentional changes; expect re-locks until error discriminants
         // and reply bodies stabilize the wire format.
         assert_eq!(
-            h1, 0x8E94_76D9_08F5_CF39,
+            h1, 0x882B_163F_CA9B_A0BC,
             "workload reply hash drifted from locked baseline"
         );
     }
@@ -1003,6 +1004,9 @@ mod tests {
         replies_seen.hash(&mut hasher);
         wl.shadow.sends_committed(ns_a).hash(&mut hasher);
         wl.shadow.sends_committed(ns_b).hash(&mut hasher);
+        // Catches PRNG-trace shifts from `sample` returning `None`.
+        // Stays 0 on the current seed mix; non-zero drifts the baseline.
+        wl.samples_none().hash(&mut hasher);
         hasher.finish()
     }
 }

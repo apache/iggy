@@ -31,8 +31,8 @@ pub enum IdPermutation {
     Identity,
     /// `index → u64::MAX - index`.
     Inversion,
-    /// `index → (index << 32) | rand32(seed ⊕ index)`. Decode discards
-    /// the random low 32 bits. Index must fit in `u32`.
+    /// `index → (index << 32) | rand32(seed.wrapping_add(index))`.
+    /// Decode discards the low 32 bits. Index must fit in `u32`.
     Random(u64),
 }
 

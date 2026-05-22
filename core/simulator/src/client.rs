@@ -399,7 +399,7 @@ impl SimClient {
     pub fn send_messages(
         &self,
         namespace: IggyNamespace,
-        messages: &[&[u8]],
+        messages: &[Bytes],
     ) -> Message<RequestHeader> {
         let mut batch = IggyMessages2::with_capacity(messages.len());
         for message in messages {
@@ -408,7 +408,8 @@ impl SimClient {
                     payload_length: message.len() as u32,
                     ..Default::default()
                 },
-                payload: Bytes::copy_from_slice(message),
+                // Refcount bump; no allocation, no copy.
+                payload: message.clone(),
                 user_headers: None,
             });
         }
@@ -452,7 +453,11 @@ impl SimClient {
 
     /// Store offset with explicit `AckLevel`. `NoAck` takes the primary's
     /// fast path (no replication); `Quorum` goes through VSR.
-    pub fn store_consumer_offset_v2(
+    ///
+    /// # Panics
+    /// Panics on payload too large for `Owned::<4096>` or invalid
+    /// `Message<RequestHeader>` parse; both are simulator misconfig.
+    pub fn store_consumer_offset_2(
         &self,
         namespace: IggyNamespace,
         consumer_kind: u8,
@@ -470,7 +475,11 @@ impl SimClient {
     }
 
     /// Delete offset with explicit `AckLevel`.
-    pub fn delete_consumer_offset_v2(
+    ///
+    /// # Panics
+    /// Panics on payload too large for `Owned::<4096>` or invalid
+    /// `Message<RequestHeader>` parse; both are simulator misconfig.
+    pub fn delete_consumer_offset_2(
         &self,
         namespace: IggyNamespace,
         consumer_kind: u8,

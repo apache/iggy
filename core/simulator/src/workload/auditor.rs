@@ -34,6 +34,19 @@ use strum::EnumCount;
 use crate::workload::actions::Action;
 use crate::workload::ops::InFlight;
 
+/// Outcome of [`ServerAuditor::on_reply`]. See its docs for caller
+/// obligations per variant.
+#[derive(Debug)]
+pub enum OnReply {
+    /// Entry consumed; effects should be applied.
+    Match(InFlight),
+    /// Entry consumed but reply landed in the wrong namespace; caller
+    /// must decrement the per-client counter and skip effects.
+    NsMismatch,
+    /// No entry; caller must not decrement.
+    Unknown,
+}
+
 #[derive(Debug, Clone)]
 pub struct AuditorStats {
     pub replies_seen: u64,
@@ -61,10 +74,14 @@ impl AuditorStats {
 
 pub struct ServerAuditor {
     in_flight: HashMap<(u128, u64), InFlight>,
-    /// Highest `commit` op observed per `(client, namespace)`. Each VSR
-    /// group (one per partition, plus metadata at `namespace = 0`) has its
-    /// own op counter; monotonicity is per-namespace, not per-client.
-    last_commit_per_client_ns: HashMap<(u128, u64), u64>,
+    /// High-water mark of `header.commit` per `(client, namespace)`. Not
+    /// strictly monotonic: parallel in-flights across namespaces +
+    /// at-least-once delivery let replies arrive out of `commit` order.
+    /// Each VSR group has its own op counter; this map tracks the
+    /// highest seen.
+    ///
+    /// TODO: reap on client disconnect; bounded today by the fixed set.
+    last_commit_watermark_per_client_ns: HashMap<(u128, u64), u64>,
     stats: AuditorStats,
 }
 
@@ -73,7 +90,7 @@ impl ServerAuditor {
     pub fn new() -> Self {
         Self {
             in_flight: HashMap::new(),
-            last_commit_per_client_ns: HashMap::new(),
+            last_commit_watermark_per_client_ns: HashMap::new(),
             stats: AuditorStats::default(),
         }
     }
@@ -92,14 +109,19 @@ impl ServerAuditor {
     }
 
     /// Match a reply to its in-flight entry and update the per-(client,
-    /// namespace) last-commit cursor. Returns the entry so the caller can
-    /// run outcome classification and effect application.
+    /// namespace) last-commit cursor.
     ///
-    /// Returns `None` (and bumps `replies_unknown`) when the reply has no
-    /// matching in-flight entry, duplicate cached reply on the metadata
-    /// plane, or a stale at-least-once re-execution on a partition plane
-    /// or when the reply's `header.namespace` does not match the
-    /// namespace the in-flight request was submitted to.
+    /// Outcomes:
+    /// - [`OnReply::Match`]: entry found, namespace matched. Caller
+    ///   classifies, applies effects, decrements the counter.
+    /// - [`OnReply::NsMismatch`]: entry consumed but reply namespace
+    ///   diverged from the request namespace. Caller decrements but
+    ///   skips effects + `note_committed`. Unreachable today (server-ng
+    ///   echoes the request namespace); guards future routing/dedup
+    ///   bugs from wedging a client at `CLIENT_REQUEST_QUEUE_MAX = 1`.
+    /// - [`OnReply::Unknown`]: no matching entry (duplicate cached
+    ///   reply or stale at-least-once re-execution). Caller must not
+    ///   decrement.
     ///
     /// The in-flight lookup runs before any watermark update so a stray
     /// reply for an unknown key cannot advance the cursor and mask a
@@ -111,31 +133,34 @@ impl ServerAuditor {
     /// in-flight cross-check already rejects unknown / misrouted
     /// replies; cross-replica commit-order invariants belong in the
     /// quiesce-time validator (v2.7-base).
-    pub fn on_reply(&mut self, key: (u128, u64), header: &ReplyHeader) -> Option<InFlight> {
+    pub fn on_reply(&mut self, key: (u128, u64), header: &ReplyHeader) -> OnReply {
         self.stats.replies_seen += 1;
 
         // Lookup first so a stray reply cannot advance the watermark.
         let Some(entry) = self.in_flight.remove(&key) else {
             self.stats.replies_unknown += 1;
-            return None;
+            return OnReply::Unknown;
         };
 
         // Reply's namespace must match the namespace the request was
         // submitted to. A mismatch means the reply landed in the wrong
         // VSR group's bookkeeping; refuse to apply effects against the
-        // wrong shadow bucket.
+        // wrong shadow bucket. Entry already consumed.
         if entry.request_namespace != header.namespace {
             self.stats.replies_unknown += 1;
-            return None;
+            return OnReply::NsMismatch;
         }
 
         let ns_key = (header.client, header.namespace);
-        let last_commit = self.last_commit_per_client_ns.entry(ns_key).or_insert(0);
+        let last_commit = self
+            .last_commit_watermark_per_client_ns
+            .entry(ns_key)
+            .or_insert(0);
         if header.commit > *last_commit {
             *last_commit = header.commit;
         }
 
-        Some(entry)
+        OnReply::Match(entry)
     }
 
     /// Increment the per-action committed counter. Called after a reply

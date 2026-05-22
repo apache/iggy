@@ -61,7 +61,11 @@ pub const fn classify_reply(_reply: &ReplyHeader) -> Outcome {
 #[must_use]
 pub const fn predicted_effect(_input: &Input, outcome: Outcome) -> Effect {
     match outcome {
-        // Purge clears messages but keeps the stream entity live.
+        // Purge clears messages; stream stays live.
+        //
+        // TODO: zero `shadow.sends_committed` for partitions under
+        // this stream. Blocked on a name→ns reverse index; needed
+        // once `store_consumer_offset.rs` clamps against post-purge.
         Outcome::Success => Effect::None,
     }
 }

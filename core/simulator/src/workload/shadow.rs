@@ -40,12 +40,21 @@ pub struct Shadow {
     pub namespaces_live: IndexSet<IggyNamespace>,
 
     /// Live streams by name. `CreateStream` inserts; `DeleteStream` removes.
+    ///
+    /// TODO: name sets to `IndexSet<Arc<str>>` for long-running runs;
+    /// bounded today by `tick_budget`.
     pub stream_names: IndexSet<String>,
     /// Live topics by `(stream, topic)`. Only added if parent stream lives.
     pub topic_names: IndexSet<(String, String)>,
     pub user_names: IndexSet<String>,
     pub pat_names: IndexSet<String>,
     pub consumer_group_names: IndexSet<(String, String, String)>,
+
+    /// Per-user current password. `AddUser` seeds `pw-{user}`,
+    /// `PasswordChanged` rotates, `RenameUser` re-keys, `RemoveUser`
+    /// drops. Lets `change_password::sample` track `current_password`
+    /// across rotations.
+    pub passwords: HashMap<String, String>,
 
     pub sends_committed: HashMap<IggyNamespace, u64>,
     pub consumer_offsets: HashMap<(IggyNamespace, u8, u32), u64>,
@@ -59,7 +68,14 @@ pub struct Shadow {
 impl Shadow {
     #[must_use]
     pub fn new(namespaces: Vec<IggyNamespace>, id_permutation: IdPermutation) -> Self {
+        let input_len = namespaces.len();
         let namespaces_live: IndexSet<IggyNamespace> = namespaces.into_iter().collect();
+        // IndexSet::collect silently dedups; catch typo'd fixtures.
+        debug_assert_eq!(
+            input_len,
+            namespaces_live.len(),
+            "Shadow::new: duplicate namespaces in input",
+        );
         Self {
             namespaces_live,
             stream_names: IndexSet::new(),
@@ -67,6 +83,7 @@ impl Shadow {
             user_names: IndexSet::new(),
             pat_names: IndexSet::new(),
             consumer_group_names: IndexSet::new(),
+            passwords: HashMap::new(),
             sends_committed: HashMap::new(),
             consumer_offsets: HashMap::new(),
             id_permutation,
@@ -147,25 +164,30 @@ impl Shadow {
         format!("wl-{prefix}-{index:08x}")
     }
 
-    /// Apply a predicted effect to the shadow. Returns any
-    /// [`SimCommand`](crate::workload::effect::SimCommand)s the driver
-    /// must run against the simulator (e.g. `init_partition`).
+    /// Apply a predicted effect. Returns [`SimCommand`]s for the driver
+    /// plus an `applied` flag gating `auditor.note_committed`.
     ///
-    /// Cascades use `IndexSet::retain` for a single-pass O(n) walk that
-    /// preserves insertion order (`shift_remove`, not `swap_remove`):
-    /// `pick_*_name` returns `get_index`-based samples, so insertion
-    /// order is part of the determinism contract.
+    /// `applied = false` when a precondition no longer holds (parent
+    /// gone, `Rename*` `old` gone). Reachable under multi-client
+    /// interleave: another commit can defeat sample-time preconditions.
+    ///
+    /// Insertion order is part of the determinism contract
+    /// (`pick_*_name` samples by index). Cascade deletes use
+    /// `IndexSet::retain` (O(n), order preserved). Cascade renames
+    /// rebuild via `into_iter().map().collect()` (O(n), order
+    /// preserved). The outer rename target does `shift_remove(old)` +
+    /// `insert(new)`, moving the entry to the tail; same op sequence
+    /// replays to the same tail.
     pub fn apply(&mut self, e: Effect) -> ApplyResult {
         let sim_commands = Vec::new();
-        match e {
-            Effect::None => {}
-            Effect::AddStream { name } => {
-                self.stream_names.insert(name);
-            }
+        let applied = match e {
+            Effect::None => true,
+            Effect::AddStream { name } => self.stream_names.insert(name),
             Effect::RemoveStream { name } => {
-                self.stream_names.shift_remove(&name);
+                let removed = self.stream_names.shift_remove(&name);
                 self.topic_names.retain(|(s, _)| s != &name);
                 self.consumer_group_names.retain(|(s, _, _)| s != &name);
+                removed
             }
             Effect::AddTopic {
                 stream,
@@ -173,125 +195,148 @@ impl Shadow {
                 partitions: _,
             } => {
                 if self.stream_names.contains(&stream) {
-                    self.topic_names.insert((stream, name));
+                    self.topic_names.insert((stream, name))
+                } else {
+                    false
                 }
             }
             Effect::RemoveTopic { stream, name } => {
-                self.topic_names
+                let removed = self
+                    .topic_names
                     .shift_remove(&(stream.clone(), name.clone()));
                 self.consumer_group_names
                     .retain(|(s, t, _)| !(s == &stream && t == &name));
+                removed
             }
             Effect::AddUser { name } => {
-                self.user_names.insert(name);
+                // Matches `create_user::sample`'s pw-{name} baseline.
+                let password = format!("pw-{name}");
+                let inserted = self.user_names.insert(name.clone());
+                self.passwords.insert(name, password);
+                inserted
             }
             Effect::RemoveUser { name } => {
-                self.user_names.shift_remove(&name);
+                self.passwords.remove(&name);
+                self.user_names.shift_remove(&name)
             }
-            Effect::AddPat { name } => {
-                self.pat_names.insert(name);
-            }
-            Effect::RemovePat { name } => {
-                self.pat_names.shift_remove(&name);
-            }
+            Effect::AddPat { name } => self.pat_names.insert(name),
+            Effect::RemovePat { name } => self.pat_names.shift_remove(&name),
             Effect::AddConsumerGroup {
                 stream,
                 topic,
                 name,
             } => {
                 if self.topic_names.contains(&(stream.clone(), topic.clone())) {
-                    self.consumer_group_names.insert((stream, topic, name));
+                    self.consumer_group_names.insert((stream, topic, name))
+                } else {
+                    false
                 }
             }
             Effect::RemoveConsumerGroup {
                 stream,
                 topic,
                 name,
-            } => {
-                self.consumer_group_names
-                    .shift_remove(&(stream, topic, name));
-            }
+            } => self
+                .consumer_group_names
+                .shift_remove(&(stream, topic, name)),
             Effect::SendCommitted { ns, count } => {
                 *self.sends_committed.entry(ns).or_insert(0) += count;
+                true
             }
             Effect::OffsetStored { key, value } => {
                 self.consumer_offsets.insert(key, value);
+                true
             }
             Effect::OffsetDeleted { key } => {
                 self.consumer_offsets.remove(&key);
+                true
             }
             Effect::RenameStream { old, new } => self.rename_stream(&old, &new),
-            Effect::RenameTopic { stream, old, new } => {
-                self.rename_topic(&stream, &old, &new);
-            }
-            Effect::RenameUser { old, new } => {
+            Effect::RenameTopic { stream, old, new } => self.rename_topic(&stream, &old, &new),
+            Effect::RenameUser { old, new, password } => {
                 if self.user_names.shift_remove(&old) {
-                    self.user_names.insert(new);
+                    self.user_names.insert(new.clone());
+                    self.passwords.remove(&old);
+                    self.passwords.insert(new, password);
+                    true
+                } else {
+                    false
                 }
             }
+            Effect::PasswordChanged { user, new_password } => {
+                if self.user_names.contains(&user) {
+                    self.passwords.insert(user, new_password);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        ApplyResult {
+            sim_commands,
+            applied,
         }
-        ApplyResult { sim_commands }
     }
 
-    fn rename_stream(&mut self, old: &str, new: &str) {
+    fn rename_stream(&mut self, old: &str, new: &str) -> bool {
         if !self.stream_names.shift_remove(old) {
-            return;
+            return false;
         }
         self.stream_names.insert(new.to_string());
-        // Rename in (stream, topic) and (stream, topic, group):
-        // collect-then-rebuild keeps the loop borrow simple.
-        let old_topics: Vec<(String, String)> = self
-            .topic_names
-            .iter()
-            .filter(|(s, _)| s == old)
-            .cloned()
+        // O(N) rebuild per cascade (was O(N*M) via shift_remove loop).
+        // IndexSet::into_iter -> collect preserves insertion order.
+        let new_owned = new.to_string();
+        self.topic_names = std::mem::take(&mut self.topic_names)
+            .into_iter()
+            .map(|(s, t)| {
+                if s == old {
+                    (new_owned.clone(), t)
+                } else {
+                    (s, t)
+                }
+            })
             .collect();
-        for (_, topic) in old_topics {
-            self.topic_names
-                .shift_remove(&(old.to_string(), topic.clone()));
-            self.topic_names.insert((new.to_string(), topic));
-        }
-        let old_cgs: Vec<(String, String, String)> = self
-            .consumer_group_names
-            .iter()
-            .filter(|(s, _, _)| s == old)
-            .cloned()
+        self.consumer_group_names = std::mem::take(&mut self.consumer_group_names)
+            .into_iter()
+            .map(|(s, t, g)| {
+                if s == old {
+                    (new_owned.clone(), t, g)
+                } else {
+                    (s, t, g)
+                }
+            })
             .collect();
-        for (_, topic, group) in old_cgs {
-            self.consumer_group_names.shift_remove(&(
-                old.to_string(),
-                topic.clone(),
-                group.clone(),
-            ));
-            self.consumer_group_names
-                .insert((new.to_string(), topic, group));
-        }
+        true
     }
 
-    fn rename_topic(&mut self, stream: &str, old: &str, new: &str) {
+    fn rename_topic(&mut self, stream: &str, old: &str, new: &str) -> bool {
         if !self
             .topic_names
             .shift_remove(&(stream.to_string(), old.to_string()))
         {
-            return;
+            return false;
         }
         self.topic_names
             .insert((stream.to_string(), new.to_string()));
-        let old_cgs: Vec<(String, String, String)> = self
-            .consumer_group_names
-            .iter()
-            .filter(|(s, t, _)| s == stream && t == old)
-            .cloned()
+        let new_owned = new.to_string();
+        self.consumer_group_names = std::mem::take(&mut self.consumer_group_names)
+            .into_iter()
+            .map(|(s, t, g)| {
+                if s == stream && t == old {
+                    (s, new_owned.clone(), g)
+                } else {
+                    (s, t, g)
+                }
+            })
             .collect();
-        for (_, _, group) in old_cgs {
-            self.consumer_group_names.shift_remove(&(
-                stream.to_string(),
-                old.to_string(),
-                group.clone(),
-            ));
-            self.consumer_group_names
-                .insert((stream.to_string(), new.to_string(), group));
-        }
+        true
+    }
+
+    /// Current password for `user`; `None` if unknown. Use instead of
+    /// reconstructing `pw-{user}` (only correct pre-rotation).
+    #[must_use]
+    pub fn password_for(&self, user: &str) -> Option<&str> {
+        self.passwords.get(user).map(String::as_str)
     }
 
     #[must_use]

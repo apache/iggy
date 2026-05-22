@@ -87,6 +87,15 @@ pub enum Effect {
     RenameUser {
         old: String,
         new: String,
+        /// Carries the current password through the rename so the
+        /// shadow re-keys `passwords` under `new` without loss.
+        password: String,
+    },
+    /// Password rotated; shadow updates `passwords` so the next
+    /// `ChangePassword` sample reads the new value.
+    PasswordChanged {
+        user: String,
+        new_password: String,
     },
 }
 
@@ -100,7 +109,20 @@ pub enum SimCommand {
     InitPartition { ns: IggyNamespace },
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ApplyResult {
     pub sim_commands: Vec<SimCommand>,
+    /// `true` when the shadow actually mutated; `false` when the effect
+    /// was a no-op (e.g. `AddTopic` after parent stream removed, or a
+    /// `Rename*` whose `old` key is gone).
+    pub applied: bool,
+}
+
+impl Default for ApplyResult {
+    fn default() -> Self {
+        Self {
+            sim_commands: Vec::new(),
+            applied: true,
+        }
+    }
 }

@@ -30,6 +30,9 @@ pub struct Input {
     pub user: String,
     pub new_username: Option<String>,
     pub status: Option<u8>,
+    /// Current password from shadow; carried through `Effect::RenameUser`
+    /// so the shadow re-keys `passwords` under `new_username`.
+    pub current_password: String,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -48,11 +51,13 @@ pub fn sample(
     match outcome {
         Outcome::Success => {
             let user = shadow.pick_user_name(prng)?;
+            let current_password = shadow.password_for(&user)?.to_string();
             let new_username = Some(shadow.fresh_name("user"));
             Some(Input {
                 user,
                 new_username,
                 status: Some(1),
+                current_password,
             })
         }
     }
@@ -78,6 +83,7 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
                 .map_or(Effect::None, |new| Effect::RenameUser {
                     old: input.user.clone(),
                     new: new.clone(),
+                    password: input.current_password.clone(),
                 })
         }
     }
