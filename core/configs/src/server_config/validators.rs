@@ -23,7 +23,10 @@ use super::server::{
     DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, TelemetryConfig,
 };
 use super::server::{MemoryPoolConfig, PersonalAccessTokenConfig, ServerConfig};
-use super::sharding::{CpuAllocation, ShardingConfig};
+use super::sharding::{
+    CpuAllocation, INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
+    ShardingConfig,
+};
 use super::system::SegmentConfig;
 use super::system::{CompressionConfig, LoggingConfig, PartitionConfig};
 use crate::ConfigurationError;
@@ -379,6 +382,66 @@ impl Validatable<ConfigurationError> for MemoryPoolConfig {
 
 impl Validatable<ConfigurationError> for ShardingConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
+        if self.inbox_capacity == 0 {
+            eprintln!(
+                "Invalid sharding configuration: inbox_capacity must be > 0 (crossfire silently \
+                 rounds 0 to 1, masking config errors)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.inbox_capacity > INBOX_CAPACITY_MAX {
+            eprintln!(
+                "Invalid sharding configuration: inbox_capacity {} exceeds the {} cap (each \
+                 shard preallocates a channel of this size; oversizing here OOMs the process at \
+                 boot)",
+                self.inbox_capacity, INBOX_CAPACITY_MAX
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        let drain = self.shutdown_drain_timeout.get_duration();
+        if drain.is_zero() {
+            eprintln!(
+                "Invalid sharding configuration: shutdown_drain_timeout must be > 0 (a zero \
+                 budget force-tears the bus mid-WAL-fsync on every shutdown)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if drain > SHUTDOWN_DRAIN_TIMEOUT_MAX {
+            eprintln!(
+                "Invalid sharding configuration: shutdown_drain_timeout {:?} exceeds the {:?} \
+                 cap (an unbounded drain wedges process exit on bus stall)",
+                drain, SHUTDOWN_DRAIN_TIMEOUT_MAX
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        let poll = self.shutdown_poll_interval.get_duration();
+        if poll.is_zero() {
+            eprintln!(
+                "Invalid sharding configuration: shutdown_poll_interval must be > 0 (a zero \
+                 cadence busy-loops every shard's watchdog and metadata-handoff poller)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if poll > SHUTDOWN_POLL_INTERVAL_MAX {
+            eprintln!(
+                "Invalid sharding configuration: shutdown_poll_interval {:?} exceeds the {:?} \
+                 cap (a coarse cadence stalls Ctrl-C handling and metadata handoff abort)",
+                poll, SHUTDOWN_POLL_INTERVAL_MAX
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if poll > drain {
+            eprintln!(
+                "Invalid sharding configuration: shutdown_poll_interval {:?} must be <= \
+                 shutdown_drain_timeout {:?} (a poll cadence coarser than the drain budget makes \
+                 the shutdown flag effectively unobservable)",
+                poll, drain
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         let available_cpus = available_parallelism()
             .map_err(|_| {
                 eprintln!("Failed to detect available CPU cores");
@@ -697,5 +760,68 @@ mod cluster_shards_count_determinism_tests {
             avoid_hyperthread: true,
         };
         assert!(host_dependent_cpu_allocation(&CpuAllocation::NumaAware(numa)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod sharding_shutdown_knob_tests {
+    use super::*;
+    use crate::server_config::sharding::{SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX};
+    use iggy_common::IggyDuration;
+    use std::time::Duration;
+
+    #[test]
+    fn defaults_validate() {
+        assert!(ShardingConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn zero_drain_is_rejected() {
+        let cfg = ShardingConfig {
+            shutdown_drain_timeout: IggyDuration::new(Duration::ZERO),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn over_cap_drain_is_rejected() {
+        let cfg = ShardingConfig {
+            shutdown_drain_timeout: IggyDuration::new(
+                SHUTDOWN_DRAIN_TIMEOUT_MAX + Duration::from_secs(1),
+            ),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zero_poll_is_rejected() {
+        let cfg = ShardingConfig {
+            shutdown_poll_interval: IggyDuration::new(Duration::ZERO),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn over_cap_poll_is_rejected() {
+        let cfg = ShardingConfig {
+            shutdown_poll_interval: IggyDuration::new(
+                SHUTDOWN_POLL_INTERVAL_MAX + Duration::from_secs(1),
+            ),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn poll_greater_than_drain_is_rejected() {
+        let cfg = ShardingConfig {
+            shutdown_drain_timeout: IggyDuration::new(Duration::from_millis(20)),
+            shutdown_poll_interval: IggyDuration::new(Duration::from_millis(50)),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 }
