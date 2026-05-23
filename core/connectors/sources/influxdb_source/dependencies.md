@@ -25,9 +25,9 @@ its workspace-pinned version, license, and the specific role it plays
 in this connector. Transitive dependencies are not listed here; refer
 to `cargo tree -p iggy_connector_influxdb_source` for the full graph.
 
-> **New in this PR (`feat/influxdb_v2_v3_connector`):**  
-> `ahash 0.8.12` was added. It replaces the standard-library `HashMap`  
-> with `AHashMap` in `row.rs` to reduce hash-table overhead on the hot  
+> **New in this PR (`feat/influxdb_v2_v3_connector`):**
+> `ahash 0.8.12` was added. It replaces the standard-library `HashMap`
+> with `AHashMap` in `row.rs` to reduce hash-table overhead on the hot
 > row-parsing path (see review comment `row.rs:41`).
 
 ---
