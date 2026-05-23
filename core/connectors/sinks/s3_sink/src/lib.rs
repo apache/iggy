@@ -72,8 +72,8 @@ pub struct S3SinkConfig {
     pub include_metadata: bool,
     #[serde(default)]
     pub include_headers: bool,
-    #[serde(default)]
-    pub max_retries: Option<u32>,
+    #[serde(default, alias = "max_retries")]
+    pub max_attempts: Option<u32>,
     #[serde(default)]
     pub retry_delay: Option<String>,
     #[serde(default)]
@@ -96,7 +96,7 @@ impl fmt::Debug for S3SinkConfig {
             .field("output_format", &self.output_format)
             .field("include_metadata", &self.include_metadata)
             .field("include_headers", &self.include_headers)
-            .field("max_retries", &self.max_retries)
+            .field("max_attempts", &self.max_attempts)
             .field("retry_delay", &self.retry_delay)
             .field("path_style", &self.path_style)
             .finish()
@@ -171,16 +171,31 @@ impl OutputFormat {
     }
 }
 
-#[derive(Debug)]
 pub struct S3Sink {
     id: u32,
     config: S3SinkConfig,
     bucket: Option<Box<s3::Bucket>>,
     buffers: DashMap<BufferKey, Arc<tokio::sync::Mutex<buffer::FileBuffer>>>,
     max_file_size_bytes: u64,
+    max_messages: u64,
     output_format: OutputFormat,
     state: tokio::sync::Mutex<SinkState>,
     retry_delay: std::time::Duration,
+}
+
+impl fmt::Debug for S3Sink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3Sink")
+            .field("id", &self.id)
+            .field("config", &self.config)
+            .field("bucket", &self.bucket.as_ref().map(|b| &b.name))
+            .field("buffers_count", &self.buffers.len())
+            .field("max_file_size_bytes", &self.max_file_size_bytes)
+            .field("max_messages", &self.max_messages)
+            .field("output_format", &self.output_format)
+            .field("retry_delay", &self.retry_delay)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -205,6 +220,7 @@ impl S3Sink {
             bucket: None,
             buffers: DashMap::new(),
             max_file_size_bytes: 0,
+            max_messages: u64::MAX,
             output_format: OutputFormat::JsonLines,
             state: tokio::sync::Mutex::new(SinkState {
                 messages_received: 0,
@@ -271,15 +287,24 @@ impl S3Sink {
                         "max_messages_per_file must be greater than 0".to_owned(),
                     ));
                 }
-                Some(_) => {}
+                Some(n) => {
+                    self.max_messages = n;
+                }
             }
+        } else if let Some(n) = self.config.max_messages_per_file {
+            if n == 0 {
+                return Err(Error::InvalidConfigValue(
+                    "max_messages_per_file must be greater than 0".to_owned(),
+                ));
+            }
+            self.max_messages = n;
         }
 
         Ok(())
     }
 
     fn max_attempts(&self) -> u32 {
-        self.config.max_retries.unwrap_or(DEFAULT_MAX_ATTEMPTS)
+        self.config.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS)
     }
 }
 
@@ -394,7 +419,7 @@ mod tests {
             "output_format": "json_array",
             "include_metadata": false,
             "include_headers": true,
-            "max_retries": 5,
+            "max_attempts": 5,
             "retry_delay": "2s",
             "path_style": true
         }"#;
@@ -406,7 +431,7 @@ mod tests {
         assert_eq!(config.max_messages_per_file, Some(5000));
         assert!(!config.include_metadata);
         assert!(config.include_headers);
-        assert_eq!(config.max_retries, Some(5));
+        assert_eq!(config.max_attempts, Some(5));
         assert_eq!(config.path_style, Some(true));
     }
 
@@ -428,5 +453,28 @@ mod tests {
         assert!(!debug_output.contains("AKIA"));
         assert!(!debug_output.contains("s3cr3t"));
         assert!(debug_output.contains("REDACTED"));
+    }
+
+    #[test]
+    fn s3sink_debug_does_not_leak_bucket_credentials() {
+        let json = r#"{"bucket":"b","region":"us-east-1","access_key_id":"AKIAIOSFODNN7EXAMPLE","secret_access_key":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}"#;
+        let config: S3SinkConfig = serde_json::from_str(json).unwrap();
+        let sink = S3Sink::new(1, config);
+        let debug_output = format!("{:?}", sink);
+        assert!(
+            !debug_output.contains("AKIAIOSFODNN7EXAMPLE"),
+            "Debug output must not contain the access key"
+        );
+        assert!(
+            !debug_output.contains("wJalrXUtnFEMI"),
+            "Debug output must not contain the secret key"
+        );
+    }
+
+    #[test]
+    fn max_retries_alias_accepted() {
+        let json = r#"{"bucket":"b","region":"us-east-1","max_retries":5}"#;
+        let config: S3SinkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_attempts, Some(5));
     }
 }

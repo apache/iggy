@@ -19,32 +19,26 @@ type = "sink"
 key = "s3"
 enabled = true
 version = 0
-name = "S3 sink"
-path = "../../target/release/libiggy_connector_s3_sink"
+name = "S3 sink rotation test"
+path = "../../target/debug/libiggy_connector_s3_sink"
 verbose = false
 
 [[streams]]
-stream = "application_logs"
-topics = ["api_requests", "errors"]
+stream = "test_stream"
+topics = ["test_topic"]
 schema = "json"
-batch_length = 1000
+batch_length = 100
 poll_interval = "100ms"
-consumer_group = "s3_sink"
+consumer_group = "s3_sink_rotation_test"
 
 [plugin_config]
-bucket = "my-data-lake"
-prefix = "iggy/raw"
+bucket = "iggy-s3-test"
 region = "us-east-1"
-# endpoint = "http://localhost:9000"       # uncomment for MinIO / S3-compatible stores
-# access_key_id = "minioadmin"             # omit to use env vars / instance profile
-# secret_access_key = "minioadmin"         # omit to use env vars / instance profile
 path_template = "{stream}/{topic}/{date}/{hour}"
-file_rotation = "size"
-max_file_size = "8MiB"
-# max_messages_per_file = 10000            # used when file_rotation = "messages"
+file_rotation = "messages"
+max_messages_per_file = 10
 output_format = "json_lines"
 include_metadata = true
-include_headers = true
+include_headers = false
 max_attempts = 3
 retry_delay = "1s"
-# path_style = true                        # auto-enabled when endpoint is set (for MinIO)

@@ -85,21 +85,12 @@ impl Sink for S3Sink {
             partition_id: messages_metadata.partition_id,
         };
 
-        let max_messages = match self.config.max_messages_per_file {
-            Some(0) => {
-                return Err(Error::InvalidConfigValue(
-                    "max_messages_per_file must be greater than 0".to_owned(),
-                ));
-            }
-            Some(n) => n,
-            None if self.config.file_rotation == crate::FileRotation::Messages => {
-                return Err(Error::InvalidConfigValue(
-                    "file_rotation is 'messages' but max_messages_per_file is not set".to_owned(),
-                ));
-            }
-            None => u64::MAX,
-        };
         let batch_size = messages.len() as u64;
+
+        {
+            let mut state = self.state.lock().await;
+            state.messages_received += batch_size;
+        }
 
         let buffer_arc = self
             .buffers
@@ -107,39 +98,32 @@ impl Sink for S3Sink {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(FileBuffer::new())))
             .clone();
 
-        for message in &messages {
-            let formatted = formatter::format_message(
-                message,
+        let mut processed = 0u64;
+        let result = self
+            .process_messages_inner(
+                bucket,
+                &key,
+                &buffer_arc,
                 topic_metadata,
                 &messages_metadata,
-                self.config.include_metadata,
-                self.config.include_headers,
-                self.output_format,
-            )?;
+                &messages,
+                &mut processed,
+            )
+            .await;
 
-            let flush_payload = {
-                let mut buffer = buffer_arc.lock().await;
-                buffer.append(&formatted, message.offset, message.timestamp);
-
-                if buffer.should_rotate(
-                    self.config.file_rotation,
-                    self.max_file_size_bytes,
-                    max_messages,
-                ) {
-                    Some(self.extract_flush_payload(&key, &mut buffer)?)
-                } else {
-                    None
-                }
-            };
-
-            if let Some(payload) = flush_payload {
-                self.do_upload(bucket, payload).await?;
+        if let Err(ref e) = result {
+            let lost = batch_size - processed;
+            if lost > 0 {
+                let mut state = self.state.lock().await;
+                state.messages_lost += lost;
+                error!(
+                    "S3 sink ID: {} lost {lost} messages from batch of {batch_size} for {}/{}/{}: {e}",
+                    self.id,
+                    topic_metadata.stream,
+                    topic_metadata.topic,
+                    messages_metadata.partition_id,
+                );
             }
-        }
-
-        {
-            let mut state = self.state.lock().await;
-            state.messages_received += batch_size;
         }
 
         debug!(
@@ -151,7 +135,7 @@ impl Sink for S3Sink {
             messages_metadata.partition_id,
         );
 
-        Ok(())
+        result
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -208,6 +192,51 @@ impl Sink for S3Sink {
 }
 
 impl S3Sink {
+    #[allow(clippy::too_many_arguments)]
+    async fn process_messages_inner(
+        &self,
+        bucket: &s3::Bucket,
+        key: &BufferKey,
+        buffer_arc: &Arc<tokio::sync::Mutex<FileBuffer>>,
+        topic_metadata: &TopicMetadata,
+        messages_metadata: &MessagesMetadata,
+        messages: &[ConsumedMessage],
+        processed: &mut u64,
+    ) -> Result<(), Error> {
+        for message in messages {
+            let formatted = formatter::format_message(
+                message,
+                topic_metadata,
+                messages_metadata,
+                self.config.include_metadata,
+                self.config.include_headers,
+                self.output_format,
+            )?;
+
+            let flush_payload = {
+                let mut buffer = buffer_arc.lock().await;
+                buffer.append(&formatted, message.offset, message.timestamp);
+
+                if buffer.should_rotate(
+                    self.config.file_rotation,
+                    self.max_file_size_bytes,
+                    self.max_messages,
+                ) {
+                    Some(self.extract_flush_payload(key, &mut buffer)?)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(payload) = flush_payload {
+                self.do_upload(bucket, payload).await?;
+            }
+
+            *processed += 1;
+        }
+        Ok(())
+    }
+
     fn extract_flush_payload(
         &self,
         key: &BufferKey,
@@ -303,9 +332,12 @@ impl S3Sink {
         let body = format!(
             "offset_range: {first_offset}-{last_offset}\nmessage_count: {msg_count}\nerror: {error}\n"
         );
-        if let Err(e) = bucket.put_object(&marker_key, body.as_bytes()).await {
+        if let Err(e) = self
+            .upload_with_retry(bucket, &marker_key, body.as_bytes())
+            .await
+        {
             warn!(
-                "S3 sink ID: {} failed to write .lost marker at {}: {e}",
+                "S3 sink ID: {} failed to write .lost marker at {} after retries: {e}",
                 self.id, marker_key
             );
         }
@@ -367,4 +399,261 @@ impl S3Sink {
 
 fn is_retriable_status(status: u16) -> bool {
     status >= 500 || status == 408 || status == 429
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        DEFAULT_MAX_FILE_SIZE, DEFAULT_OUTPUT_FORMAT, DEFAULT_PATH_TEMPLATE, FileRotation, S3Sink,
+        S3SinkConfig,
+    };
+
+    fn test_config() -> S3SinkConfig {
+        S3SinkConfig {
+            bucket: "test-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            prefix: Some("data".to_string()),
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: None,
+            path_template: DEFAULT_PATH_TEMPLATE.to_string(),
+            file_rotation: FileRotation::Size,
+            max_file_size: DEFAULT_MAX_FILE_SIZE.to_string(),
+            max_messages_per_file: None,
+            output_format: DEFAULT_OUTPUT_FORMAT.to_string(),
+            include_metadata: true,
+            include_headers: false,
+            max_attempts: None,
+            retry_delay: None,
+            path_style: None,
+        }
+    }
+
+    #[test]
+    fn is_retriable_5xx() {
+        assert!(is_retriable_status(500));
+        assert!(is_retriable_status(502));
+        assert!(is_retriable_status(503));
+        assert!(is_retriable_status(599));
+    }
+
+    #[test]
+    fn is_retriable_408_429() {
+        assert!(is_retriable_status(408));
+        assert!(is_retriable_status(429));
+    }
+
+    #[test]
+    fn not_retriable_4xx() {
+        assert!(!is_retriable_status(400));
+        assert!(!is_retriable_status(403));
+        assert!(!is_retriable_status(404));
+        assert!(!is_retriable_status(405));
+    }
+
+    #[test]
+    fn not_retriable_2xx() {
+        assert!(!is_retriable_status(200));
+        assert!(!is_retriable_status(204));
+    }
+
+    #[test]
+    fn extract_flush_payload_embeds_partition_id() {
+        let config = test_config();
+        let mut sink = S3Sink::new(1, config);
+        sink.validate_and_parse_config().unwrap();
+
+        let key = BufferKey {
+            stream: "logs".to_string(),
+            topic: "events".to_string(),
+            partition_id: 7,
+        };
+
+        let mut buffer = FileBuffer::new();
+        buffer.append(b"{\"a\":1}", 0, 1_710_597_600_000_000);
+        buffer.append(b"{\"b\":2}", 1, 1_710_597_601_000_000);
+
+        let payload = sink.extract_flush_payload(&key, &mut buffer).unwrap();
+        assert!(
+            payload.s3_key.contains("00007-"),
+            "S3 key must contain partition_id: {}",
+            payload.s3_key
+        );
+        assert_eq!(payload.msg_count, 2);
+        assert_eq!(payload.first_offset, 0);
+        assert_eq!(payload.last_offset, 1);
+    }
+
+    #[test]
+    fn extract_flush_payload_offset_padding_lex_sort() {
+        let config = test_config();
+        let mut sink = S3Sink::new(1, config);
+        sink.validate_and_parse_config().unwrap();
+
+        let key = BufferKey {
+            stream: "s".to_string(),
+            topic: "t".to_string(),
+            partition_id: 0,
+        };
+
+        let mut buf1 = FileBuffer::new();
+        buf1.append(b"x", 999_999, 1_000_000);
+        let p1 = sink.extract_flush_payload(&key, &mut buf1).unwrap();
+
+        let mut buf2 = FileBuffer::new();
+        buf2.append(b"y", 1_000_000, 1_000_000);
+        let p2 = sink.extract_flush_payload(&key, &mut buf2).unwrap();
+
+        assert!(
+            p1.s3_key < p2.s3_key,
+            "Lex sort must be correct: {} < {}",
+            p1.s3_key,
+            p2.s3_key
+        );
+    }
+
+    #[test]
+    fn validate_max_messages_set_for_rotation_by_messages() {
+        let config = S3SinkConfig {
+            file_rotation: FileRotation::Messages,
+            max_messages_per_file: Some(500),
+            ..test_config()
+        };
+        let mut sink = S3Sink::new(1, config);
+        sink.validate_and_parse_config().unwrap();
+        assert_eq!(sink.max_messages, 500);
+    }
+
+    #[test]
+    fn validate_rejects_messages_rotation_without_max() {
+        let config = S3SinkConfig {
+            file_rotation: FileRotation::Messages,
+            max_messages_per_file: None,
+            ..test_config()
+        };
+        let mut sink = S3Sink::new(1, config);
+        assert!(sink.validate_and_parse_config().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_messages() {
+        let config = S3SinkConfig {
+            file_rotation: FileRotation::Messages,
+            max_messages_per_file: Some(0),
+            ..test_config()
+        };
+        let mut sink = S3Sink::new(1, config);
+        assert!(sink.validate_and_parse_config().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_file_size() {
+        let config = S3SinkConfig {
+            max_file_size: "0B".to_string(),
+            ..test_config()
+        };
+        let mut sink = S3Sink::new(1, config);
+        assert!(sink.validate_and_parse_config().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_over_5gib_file_size() {
+        let config = S3SinkConfig {
+            max_file_size: "10GiB".to_string(),
+            ..test_config()
+        };
+        let mut sink = S3Sink::new(1, config);
+        assert!(sink.validate_and_parse_config().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_bucket() {
+        let config = S3SinkConfig {
+            bucket: "".to_string(),
+            ..test_config()
+        };
+        let mut sink = S3Sink::new(1, config);
+        assert!(sink.validate_and_parse_config().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_region() {
+        let config = S3SinkConfig {
+            region: "".to_string(),
+            ..test_config()
+        };
+        let mut sink = S3Sink::new(1, config);
+        assert!(sink.validate_and_parse_config().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_path_template() {
+        let config = S3SinkConfig {
+            path_template: "".to_string(),
+            ..test_config()
+        };
+        let mut sink = S3Sink::new(1, config);
+        assert!(sink.validate_and_parse_config().is_err());
+    }
+
+    #[test]
+    fn validate_size_rotation_max_messages_defaults_to_max() {
+        let config = test_config();
+        let mut sink = S3Sink::new(1, config);
+        sink.validate_and_parse_config().unwrap();
+        assert_eq!(sink.max_messages, u64::MAX);
+    }
+
+    #[test]
+    fn flush_payload_data_is_json_lines() {
+        let config = test_config();
+        let mut sink = S3Sink::new(1, config);
+        sink.validate_and_parse_config().unwrap();
+
+        let key = BufferKey {
+            stream: "s".to_string(),
+            topic: "t".to_string(),
+            partition_id: 0,
+        };
+
+        let mut buffer = FileBuffer::new();
+        buffer.append(b"{\"a\":1}", 0, 1_000_000);
+        buffer.append(b"{\"b\":2}", 1, 2_000_000);
+
+        let payload = sink.extract_flush_payload(&key, &mut buffer).unwrap();
+        assert_eq!(payload.data, b"{\"a\":1}\n{\"b\":2}\n");
+    }
+
+    #[test]
+    fn flush_payload_data_is_json_array() {
+        let config = S3SinkConfig {
+            output_format: "json_array".to_string(),
+            ..test_config()
+        };
+        let mut sink = S3Sink::new(1, config);
+        sink.validate_and_parse_config().unwrap();
+
+        let key = BufferKey {
+            stream: "s".to_string(),
+            topic: "t".to_string(),
+            partition_id: 0,
+        };
+
+        let mut buffer = FileBuffer::new();
+        buffer.append(b"{\"a\":1}", 0, 1_000_000);
+        buffer.append(b"{\"b\":2}", 1, 2_000_000);
+
+        let payload = sink.extract_flush_payload(&key, &mut buffer).unwrap();
+        assert_eq!(payload.data, b"[{\"a\":1},{\"b\":2}]");
+    }
+
+    #[test]
+    fn close_without_bucket_does_not_panic() {
+        let config = test_config();
+        let mut sink = S3Sink::new(1, config);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(sink.close());
+        assert!(result.is_ok());
+    }
 }

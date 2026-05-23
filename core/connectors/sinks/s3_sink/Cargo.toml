@@ -29,9 +29,6 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 publish = false
 
-[package.metadata.cargo-machete]
-ignored = ["dashmap", "once_cell", "simd-json"]
-
 [lib]
 crate-type = ["cdylib", "lib"]
 
@@ -44,11 +41,12 @@ dashmap = { workspace = true }
 humantime = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
-once_cell = { workspace = true }
 rust-s3 = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-simd-json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+simd-json = { workspace = true }

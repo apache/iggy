@@ -116,7 +116,7 @@ mod tests {
             output_format: default_output_format(),
             include_metadata: true,
             include_headers: false,
-            max_retries: None,
+            max_attempts: None,
             retry_delay: None,
             path_style: None,
         }
