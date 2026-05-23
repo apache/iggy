@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use bytes::Bytes;
 use iggy_binary_protocol::{Message, ReplyHeader};
 use iggy_common::sharding::IggyNamespace;
 use iggy_common::{IggyByteSize, MemoryPool, MemoryPoolConfigOther, PollingStrategy};
@@ -67,10 +68,10 @@ fn main() {
 
     // 1. Send messages to a partition
     println!("[sim] Sending messages to partition");
-    let test_messages = vec![
-        b"Hello, partition!".as_slice(),
-        b"Message 2".as_slice(),
-        b"Message 3".as_slice(),
+    let test_messages = [
+        Bytes::from_static(b"Hello, partition!"),
+        Bytes::from_static(b"Message 2"),
+        Bytes::from_static(b"Message 3"),
     ];
     let send_msg = client.send_messages(test_namespace, &test_messages);
     sim.submit_request(client_id, leader, send_msg.into_generic());
@@ -100,7 +101,7 @@ fn main() {
     sim.replica_crash(2);
     assert!(sim.is_crashed(2));
 
-    let send_msg2 = client.send_messages(test_namespace, &[b"After crash".as_slice()]);
+    let send_msg2 = client.send_messages(test_namespace, &[Bytes::from_static(b"After crash")]);
     sim.submit_request(client_id, leader, send_msg2.into_generic());
 
     let replies = step_until_reply(&mut sim, 100);

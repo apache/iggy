@@ -19,6 +19,7 @@ using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Extensions;
+using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Tests.Utils;
 using Apache.Iggy.Tests.Utils.Groups;
 using Apache.Iggy.Tests.Utils.Messages;
@@ -84,7 +85,8 @@ public sealed class BinaryMapper
         msgTwoPayload.CopyTo(combinedPayload.AsSpan(16 + msgOnePayload.Length));
 
         // Act
-        var responses = Mappers.BinaryMapper.MapMessages(combinedPayload);
+        var responses
+            = Mappers.BinaryMapper.MapRentedMessages(combinedPayload, TcpMessageStream.EmptyMemoryOwner.Instance);
 
         // Assert
         Assert.NotNull(responses);

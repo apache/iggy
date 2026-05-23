@@ -22,6 +22,49 @@ use iggy_common::variadic;
 
 use crate::stm::{State, StateMachine};
 
+/// Cross-thread read-side handoff for a state machine.
+///
+/// The owning shard (typically shard 0) materialises a `Bundle` after
+/// recovering the WAL and hands one clone to every peer shard. Peer
+/// shards then call [`WithFactory::from_factory_bundle`] on their own
+/// runtime to construct a reader-mode state machine — no WAL replay,
+/// no shared `!Sync` `ReadHandle`, just `Send + Sync` factories per
+/// state.
+///
+/// The variadic tuple impl below recurses over the state list, so a
+/// `MuxStateMachine<variadic!(Users, Streams, ConsumerGroups)>` ends up
+/// with `Bundle = (Users::Bundle, (Streams::Bundle, (ConsumerGroups::Bundle, ())))`.
+pub trait WithFactory: Sized {
+    type Bundle: Clone + Send + Sync;
+    fn factory_bundle(&self) -> Self::Bundle;
+    fn from_factory_bundle(bundle: Self::Bundle) -> Self;
+}
+
+impl WithFactory for () {
+    type Bundle = ();
+    fn factory_bundle(&self) -> Self::Bundle {}
+    fn from_factory_bundle((): Self::Bundle) -> Self {}
+}
+
+impl<S, Rest> WithFactory for variadic!(S, ...Rest)
+where
+    S: WithFactory,
+    Rest: WithFactory,
+{
+    type Bundle = (S::Bundle, Rest::Bundle);
+
+    fn factory_bundle(&self) -> Self::Bundle {
+        (self.0.factory_bundle(), self.1.factory_bundle())
+    }
+
+    fn from_factory_bundle(bundle: Self::Bundle) -> Self {
+        (
+            S::from_factory_bundle(bundle.0),
+            Rest::from_factory_bundle(bundle.1),
+        )
+    }
+}
+
 // MuxStateMachine that proxies to an tuple of variadic state machines
 #[derive(Debug)]
 pub struct MuxStateMachine<T>
@@ -52,6 +95,26 @@ where
 {
     fn default() -> Self {
         Self::new(T::default())
+    }
+}
+
+impl<T> MuxStateMachine<T>
+where
+    T: StateMachine + WithFactory,
+{
+    /// Mint a factory bundle from the owning state machine so peer shards
+    /// can rebuild a reader-mode mirror on their own runtimes.
+    #[must_use]
+    pub fn factory_bundle(&self) -> T::Bundle {
+        self.inner.factory_bundle()
+    }
+
+    /// Reconstruct a reader-mode `MuxStateMachine` from a bundle minted
+    /// on the writer-side shard. Must be invoked on the destination
+    /// runtime so the inner `!Sync` `ReadHandle`s are created in place.
+    #[must_use]
+    pub fn from_factory_bundle(bundle: T::Bundle) -> Self {
+        Self::new(T::from_factory_bundle(bundle))
     }
 }
 

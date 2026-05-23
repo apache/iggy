@@ -23,12 +23,16 @@
 //!
 //! 1. picks the next target shard via round-robin,
 //! 2. duplicates the TCP fd,
-//! 3. sends a `ShardFramePayload::{Replica,Client}ConnectionSetup` frame to
+//! 3. sends a `LifecycleFrame::{Replica,Client}ConnectionSetup` frame to
 //!    the target shard's inbox,
 //! 4. drops its own `TcpStream` so only the target shard's wrapped fd
-//!    keeps the socket alive,
-//! 5. broadcasts the resulting replica -> owning shard mapping so every
-//!    bus' `send_to_replica` slow path can route to the owner.
+//!    keeps the socket alive.
+//!
+//! The shard-shared [`message_bus::ReplicaOwnerTable`] is the
+//! authoritative `replica_id -> owning_shard` view; the owning shard
+//! stamps and CAS-clears its slot synchronously through
+//! `mark_replica_owned` / `clear_replica_owned`, so the coordinator does
+//! not need a separate mapping cache or broadcast subsystem.
 //!
 //! Client ids encode the owning shard in their top 16 bits, so clients do
 //! not need a mapping table; any shard can route a client reply from the
@@ -40,102 +44,69 @@
 //! dropped connection.
 
 use crate::config::CoordinatorConfig;
-use crate::{ShardFrame, ShardFramePayload, TaggedSender, assert_sender_ordering};
+use crate::metrics::{frame_drop_reason, frame_drop_variant};
+use crate::{LifecycleFrame, ShardCtorError, ShardFrame, TaggedSender, validate_sender_ordering};
 use compio::net::TcpStream;
-use compio::runtime::JoinHandle;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
-use message_bus::lifecycle::ShutdownToken;
 use message_bus::{SendError, fd_transfer};
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
-use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// Coordinator owned by shard 0 only.
 ///
 /// Wrapped in `Rc` by the bootstrap and shared with the replica listener,
 /// the connector, and the client listener so each of those paths can
 /// delegate immediately.
-pub struct ShardZeroCoordinator<R: Send + 'static = ()> {
+pub struct ShardZeroCoordinator {
     /// Inter-shard channel senders, indexed by shard id.
     ///
     /// Each [`TaggedSender`] carries the id of the shard whose paired
-    /// receiver drains it, and the ctor asserts `senders[i].shard_id() == i`.
-    /// The previous plain-`Sender` form was a silent-misroute hazard: a Vec
-    /// with correct length but permuted ordering had no way to be caught.
-    senders: Rc<Vec<TaggedSender<R>>>,
+    /// receiver drains it; the ctor asserts `senders[i].shard_id() == i`
+    /// so a permuted Vec is caught at boot rather than misrouting frames.
+    senders: Rc<Vec<TaggedSender>>,
+    /// Per-shard observability handle. Cloned at construction; bumps the
+    /// `frame_drops_total{variant=fd_transfer}` counter when a `try_send`
+    /// rejection occurs in the lifecycle path.
+    metrics: crate::metrics::ShardMetrics,
     total_shards: u16,
     cfg: CoordinatorConfig,
     replica_rr: Cell<u16>,
     client_rr: Cell<u16>,
     client_seq: Cell<u128>,
-    /// Authoritative `replica_id -> owning_shard` view as understood by the
-    /// coordinator. Populated on successful `delegate_replica`, transitioned
-    /// to [`MappingSlot::Cleared`] by [`forget_mapping`](Self::forget_mapping)
-    /// when a replica dies. The periodic refresh task re-broadcasts this
-    /// snapshot so shards whose inbox was full when the original
-    /// `ReplicaMappingUpdate` or `ReplicaMappingClear` was sent recover on
-    /// the next tick rather than staying silently stale until the replica
-    /// reconnects.
-    ///
-    /// Three-state slot is what makes refresh complete: `Untouched` slots
-    /// emit nothing (the cluster never saw that replica id), `Active` slots
-    /// re-emit `ReplicaMappingUpdate`, and `Cleared` slots re-emit
-    /// `ReplicaMappingClear`. A two-state `Option<u16>` would silently lose
-    /// clears against shards whose inbox was full at clear-time.
-    ///
-    /// Flat `[MappingSlot; 256]` to mirror `ReplicaRegistry` and avoid a
-    /// hash lookup on the refresh hot path.
-    mappings: RefCell<[MappingSlot; 256]>,
 }
 
-/// Per-replica mapping state tracked by the coordinator.
-///
-/// `Cleared` is structurally distinct from `Untouched` so the refresh task
-/// can re-broadcast `ReplicaMappingClear` for replicas the cluster did once
-/// see but is no longer routing to.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum MappingSlot {
-    /// Coordinator has never delegated this replica id.
-    #[default]
-    Untouched,
-    /// Replica is connected and routed via `owning_shard`.
-    Active(u16),
-    /// Replica was once active and is now disconnected. Refresh re-broadcasts
-    /// a `ReplicaMappingClear` for this slot until a fresh `delegate_replica`
-    /// flips it back to `Active`.
-    Cleared,
-}
-
-impl<R: Send + 'static> ShardZeroCoordinator<R> {
-    /// # Panics
+impl ShardZeroCoordinator {
+    /// # Errors
     ///
-    /// Panics if `senders.len() != total_shards`, if `total_shards < 1`, or
-    /// if any `senders[i].shard_id() != i`. Permuted senders are a
-    /// bootstrap programming error; `TaggedSender` lifts the ordering
-    /// invariant from a doc comment to a ctor assertion.
-    #[must_use]
+    /// Returns [`ShardCtorError::CoordinatorSendersMismatch`] if
+    /// `senders.len() != total_shards` or `total_shards == 0`, and
+    /// [`ShardCtorError::SenderOrderingInvalid`] if any
+    /// `senders[i].shard_id() != i`. Permuted senders are a bootstrap
+    /// programming error; `TaggedSender` lifts the ordering invariant
+    /// from a doc comment to a ctor check.
     pub fn new(
-        senders: Rc<Vec<TaggedSender<R>>>,
+        senders: Rc<Vec<TaggedSender>>,
         total_shards: u16,
         cfg: CoordinatorConfig,
-    ) -> Self {
-        assert_eq!(
-            senders.len(),
-            total_shards as usize,
-            "senders must have one entry per shard",
-        );
-        assert!(total_shards >= 1, "total_shards must be at least 1");
-        assert_sender_ordering(&senders);
-        Self {
+        metrics: crate::metrics::ShardMetrics,
+    ) -> Result<Self, ShardCtorError> {
+        if total_shards == 0 || senders.len() != total_shards as usize {
+            return Err(ShardCtorError::CoordinatorSendersMismatch {
+                senders: senders.len(),
+                total_shards,
+            });
+        }
+        validate_sender_ordering(&senders)?;
+        Ok(Self {
             senders,
+            metrics,
             total_shards,
             cfg,
             replica_rr: Cell::new(0),
             client_rr: Cell::new(0),
             client_seq: Cell::new(1),
-            mappings: RefCell::new([MappingSlot::Untouched; 256]),
-        }
+        })
     }
 
     /// Pick the next target shard for a replica connection.
@@ -170,11 +141,28 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
         (u128::from(target_shard) << 112) | seq
     }
 
+    /// Mint a client id for a connection that terminates locally on shard 0
+    /// (QUIC, TCP-TLS) instead of being round-robin delegated.
+    ///
+    /// Shares the coordinator's `client_seq` counter with the delegated
+    /// TCP/WS path. Both a shard-0-local connection and a delegated
+    /// connection that round-robined to shard 0 encode `target_shard = 0`
+    /// in the top 16 bits; drawing from separate counters would let them
+    /// mint the same id and collide in shard 0's single connection
+    /// registry. One counter keeps every shard-0 id distinct.
+    #[must_use]
+    pub fn mint_shard_zero_client_id(&self) -> u128 {
+        self.mint_client_id(0)
+    }
+
     /// Ship a replica TCP connection to the next round-robin target shard.
     ///
-    /// On success broadcasts a `ReplicaMappingUpdate` to every shard and
-    /// returns `Ok(target_shard)`. On inter-shard channel failure closes
-    /// the duplicated fd and returns `Err(SendError::RoutingFailed)`.
+    /// Returns `Ok(target_shard)` on a successful `try_send`. The owning
+    /// shard records itself in the shard-shared
+    /// [`message_bus::ReplicaOwnerTable`] once its installer accepts the
+    /// fd, so no extra broadcast or mapping cache is needed here. On
+    /// inter-shard channel failure closes the duplicated fd and returns
+    /// `Err(SendError::RoutingFailed)`.
     ///
     /// # Errors
     ///
@@ -184,11 +172,13 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
         let target = self.next_replica_target();
         let fd = fd_transfer::dup_fd(&stream).map_err(SendError::DupFailed)?;
 
-        let setup = ShardFramePayload::ReplicaConnectionSetup { fd, replica_id };
+        let setup = LifecycleFrame::ReplicaConnectionSetup { fd, replica_id };
         if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
             // The frame (and the `DupedFd` inside) is returned in `e` and
             // dropped at end-of-block, which closes the dup. No explicit
             // `close_fd` needed.
+            self.metrics
+                .record_frame_drop(frame_drop_variant::FD_TRANSFER, classify_try_send_err(&e));
             warn!(
                 replica_id,
                 target, "delegate_replica try_send failed: {e:?}"
@@ -200,33 +190,7 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
         // the socket open.
         drop(stream);
 
-        // Record the mapping on the coordinator's authoritative snapshot
-        // BEFORE broadcasting: if `broadcast_mapping_update` drops a frame
-        // on a full inbox, the periodic refresh task reads this snapshot
-        // and re-broadcasts.
-        self.mappings.borrow_mut()[usize::from(replica_id)] = MappingSlot::Active(target);
-        self.broadcast_mapping_update(replica_id, target);
-
         Ok(target)
-    }
-
-    fn broadcast_mapping_update(&self, replica_id: u8, owning_shard: u16) {
-        // Broadcast to every shard (including shard 0 and the owner
-        // itself). Drops on full inbox are tolerable: the owning shard
-        // already holds the fd and the periodic refresh task reconciles
-        // any missed mapping on its next tick.
-        for sender in self.senders.iter() {
-            let update = ShardFramePayload::ReplicaMappingUpdate {
-                replica_id,
-                owning_shard,
-            };
-            if let Err(e) = sender.try_send(ShardFrame::lifecycle(update)) {
-                debug!(
-                    shard_id = sender.shard_id(),
-                    replica_id, "mapping update try_send failed: {e:?}"
-                );
-            }
-        }
     }
 
     /// Ship a client TCP connection to the next round-robin target shard.
@@ -247,9 +211,11 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
 
         let fd = fd_transfer::dup_fd(&stream).map_err(SendError::DupFailed)?;
         let meta = ClientConnMeta::new(client_id, peer_addr, ClientTransportKind::Tcp);
-        let setup = ShardFramePayload::ClientConnectionSetup { fd, meta };
+        let setup = LifecycleFrame::ClientConnectionSetup { fd, meta };
         if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
             // The returned frame owns the `DupedFd` and closes it on drop.
+            self.metrics
+                .record_frame_drop(frame_drop_variant::FD_TRANSFER, classify_try_send_err(&e));
             warn!(client_id, target, "delegate_client try_send failed: {e:?}");
             return Err(SendError::RoutingFailed(target));
         }
@@ -262,7 +228,7 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
     /// round-robin target shard.
     ///
     /// Identical wire path to [`Self::delegate_client`] but ships
-    /// [`ShardFramePayload::ClientWsConnectionSetup`] so the receiving
+    /// [`LifecycleFrame::ClientWsConnectionSetup`] so the receiving
     /// shard runs `compio_ws::accept_async_with_config` before
     /// installing the connection. The fd at ship-time is plain TCP;
     /// the WS state machine only materialises post-upgrade on the
@@ -280,8 +246,10 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
 
         let fd = fd_transfer::dup_fd(&stream).map_err(SendError::DupFailed)?;
         let meta = ClientConnMeta::new(client_id, peer_addr, ClientTransportKind::Ws);
-        let setup = ShardFramePayload::ClientWsConnectionSetup { fd, meta };
+        let setup = LifecycleFrame::ClientWsConnectionSetup { fd, meta };
         if let Err(e) = self.senders[target as usize].try_send(ShardFrame::lifecycle(setup)) {
+            self.metrics
+                .record_frame_drop(frame_drop_variant::FD_TRANSFER, classify_try_send_err(&e));
             warn!(
                 client_id,
                 target, "delegate_ws_client try_send failed: {e:?}"
@@ -293,81 +261,18 @@ impl<R: Send + 'static> ShardZeroCoordinator<R> {
         Ok(client_id)
     }
 
-    /// Broadcast a `ReplicaMappingClear` to every shard. Used by the
-    /// `ConnectionLost` handler before the next `delegate_replica` runs.
-    pub fn broadcast_mapping_clear(&self, replica_id: u8) {
-        crate::broadcast_mapping_clear(&self.senders, replica_id);
-    }
-
-    /// Transition the coordinator's authoritative entry for `replica_id`
-    /// to [`MappingSlot::Cleared`] so the periodic refresh task re-broadcasts
-    /// `ReplicaMappingClear` until a fresh delegation revives the slot. A
-    /// shard whose inbox was full at the original clear-time recovers on the
-    /// next refresh tick rather than retaining the stale `Active(owner)`
-    /// view forever.
-    ///
-    /// Call from shard 0's `ConnectionLost` handler paired with
-    /// [`broadcast_mapping_clear`](Self::broadcast_mapping_clear).
-    pub fn forget_mapping(&self, replica_id: u8) {
-        self.mappings.borrow_mut()[usize::from(replica_id)] = MappingSlot::Cleared;
-    }
-
-    /// Re-broadcast every mapping the coordinator is tracking.
-    ///
-    /// `delegate_replica` and `forget_mapping` broadcast their respective
-    /// `ReplicaMappingUpdate` / `ReplicaMappingClear` as best-effort
-    /// `try_send`: a shard whose inbox was full at the moment of the
-    /// original broadcast permanently lost the change. Without periodic
-    /// refresh, an `Update` miss leaves `send_to_replica` returning
-    /// `ReplicaNotConnected` until the peer reconnects, and a `Clear` miss
-    /// leaves a stale `owning_shard` view that misroutes traffic to a shard
-    /// that no longer holds the connection. This refresh closes both gaps.
-    pub fn broadcast_mapping_snapshot(&self) {
-        // Stage entries in scratch `Vec`s so the `RefCell` borrow is
-        // released before any `try_send` runs, matching the borrow
-        // discipline of the other mapping paths. Heap allocation is
-        // acceptable: this snapshot runs on a periodic refresh tick,
-        // not on the per-message hot path.
-        let mut updates: Vec<(u8, u16)> = Vec::new();
-        let mut clears: Vec<u8> = Vec::new();
-        for (idx, slot) in self.mappings.borrow().iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
-            let replica_id = idx as u8;
-            match *slot {
-                MappingSlot::Active(owner) => updates.push((replica_id, owner)),
-                MappingSlot::Cleared => clears.push(replica_id),
-                MappingSlot::Untouched => {}
-            }
-        }
-        for (replica_id, owning_shard) in updates {
-            self.broadcast_mapping_update(replica_id, owning_shard);
-        }
-        for replica_id in clears {
-            crate::broadcast_mapping_clear(&self.senders, replica_id);
-        }
-    }
-
-    /// Spawn a compio task that calls [`Self::broadcast_mapping_snapshot`]
-    /// every `period` until `token` fires. Bootstrap is expected to track
-    /// the returned handle on the bus's background tasks so graceful
-    /// shutdown awaits it.
-    pub fn spawn_refresh_task(
-        self: &Rc<Self>,
-        token: ShutdownToken,
-        period: Duration,
-    ) -> JoinHandle<()> {
-        let coord = Rc::clone(self);
-        compio::runtime::spawn(async move {
-            while token.sleep_or_shutdown(period).await {
-                coord.broadcast_mapping_snapshot();
-            }
-            debug!("coordinator mapping refresh task exiting");
-        })
-    }
-
     #[must_use]
     pub const fn total_shards(&self) -> u16 {
         self.total_shards
+    }
+}
+
+/// Map `crossfire::TrySendError` to the `frame_drop_reason` label set so
+/// every drop site picks the same string.
+pub(crate) const fn classify_try_send_err<T>(err: &crossfire::TrySendError<T>) -> &'static str {
+    match err {
+        crossfire::TrySendError::Full(_) => frame_drop_reason::FULL,
+        crossfire::TrySendError::Disconnected(_) => frame_drop_reason::DISCONNECTED,
     }
 }
 
@@ -394,7 +299,7 @@ mod tests {
     fn build_senders(total: u16) -> Rc<Vec<TaggedSender>> {
         let mut senders = Vec::with_capacity(total as usize);
         for shard_id in 0..total {
-            let (tx, _rx) = crate::shard_channel::<()>(shard_id, 16);
+            let (tx, _rx) = crate::shard_channel(shard_id, 16);
             senders.push(tx);
         }
         Rc::new(senders)
@@ -406,7 +311,7 @@ mod tests {
         let mut senders = Vec::with_capacity(total as usize);
         let mut receivers = Vec::with_capacity(total as usize);
         for shard_id in 0..total {
-            let (tx, rx) = crate::shard_channel::<()>(shard_id, 16);
+            let (tx, rx) = crate::shard_channel(shard_id, 16);
             senders.push(tx);
             receivers.push(rx);
         }
@@ -414,23 +319,42 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "inter-shard vec must be in canonical order")]
     fn ctor_rejects_permuted_sender_vec() {
         // Build senders in correct order, then swap two entries so the
         // indexed position no longer matches the tagged shard id.
-        let (tx0, _rx0) = crate::shard_channel::<()>(0, 16);
-        let (tx1, _rx1) = crate::shard_channel::<()>(1, 16);
-        let (tx2, _rx2) = crate::shard_channel::<()>(2, 16);
-        let (tx3, _rx3) = crate::shard_channel::<()>(3, 16);
+        let (tx0, _rx0) = crate::shard_channel(0, 16);
+        let (tx1, _rx1) = crate::shard_channel(1, 16);
+        let (tx2, _rx2) = crate::shard_channel(2, 16);
+        let (tx3, _rx3) = crate::shard_channel(3, 16);
         let permuted = Rc::new(vec![tx0, tx2, tx1, tx3]);
-        let _coord = ShardZeroCoordinator::<()>::new(permuted, 4, CoordinatorConfig::default());
+        let result = ShardZeroCoordinator::new(
+            permuted,
+            4,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        );
+        assert!(
+            matches!(
+                result.as_ref().err(),
+                Some(ShardCtorError::SenderOrderingInvalid { .. }),
+            ),
+            "expected SenderOrderingInvalid, got {:?}",
+            result.as_ref().err(),
+        );
+        drop(result);
     }
 
     #[test]
     fn replica_rr_default_skips_shard_zero() {
         // Default config: replicas skip shard 0, clients include it.
         let senders = build_senders(4);
-        let coord = ShardZeroCoordinator::<()>::new(senders, 4, CoordinatorConfig::default());
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            4,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        )
+        .expect("coord ctor ok");
 
         // Replicas wrap over [1, 4).
         assert_eq!(coord.next_replica_target(), 1);
@@ -453,9 +377,10 @@ mod tests {
         let cfg = CoordinatorConfig {
             skip_shard_zero_for_replicas: false,
             skip_shard_zero_for_clients: false,
-            ..CoordinatorConfig::default()
         };
-        let coord = ShardZeroCoordinator::<()>::new(senders, 4, cfg);
+        let coord =
+            ShardZeroCoordinator::new(senders, 4, cfg, crate::metrics::ShardMetrics::for_shard())
+                .expect("coord ctor ok");
 
         assert_eq!(coord.next_replica_target(), 0);
         assert_eq!(coord.next_replica_target(), 1);
@@ -473,9 +398,10 @@ mod tests {
         let cfg = CoordinatorConfig {
             skip_shard_zero_for_replicas: true,
             skip_shard_zero_for_clients: true,
-            ..CoordinatorConfig::default()
         };
-        let coord = ShardZeroCoordinator::<()>::new(senders, 4, cfg);
+        let coord =
+            ShardZeroCoordinator::new(senders, 4, cfg, crate::metrics::ShardMetrics::for_shard())
+                .expect("coord ctor ok");
 
         for _ in 0..8 {
             let r = coord.next_replica_target();
@@ -491,9 +417,10 @@ mod tests {
         let cfg = CoordinatorConfig {
             skip_shard_zero_for_replicas: true,
             skip_shard_zero_for_clients: true,
-            ..CoordinatorConfig::default()
         };
-        let coord = ShardZeroCoordinator::<()>::new(senders, 1, cfg);
+        let coord =
+            ShardZeroCoordinator::new(senders, 1, cfg, crate::metrics::ShardMetrics::for_shard())
+                .expect("coord ctor ok");
         for _ in 0..4 {
             assert_eq!(coord.next_replica_target(), 0);
             assert_eq!(coord.next_client_target(), 0);
@@ -503,18 +430,58 @@ mod tests {
     #[test]
     fn mint_client_id_encodes_target_shard() {
         let senders = build_senders(8);
-        let coord = ShardZeroCoordinator::<()>::new(senders, 8, CoordinatorConfig::default());
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            8,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        )
+        .expect("coord ctor ok");
 
         let id = coord.mint_client_id(5);
         assert_eq!((id >> 112) as u16, 5);
         assert_eq!(id & ((1u128 << 112) - 1), 1, "first seq is 1");
     }
 
+    #[test]
+    fn shard_zero_local_and_delegated_ids_never_collide() {
+        let senders = build_senders(4);
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            4,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        )
+        .expect("coord ctor ok");
+
+        // Interleave shard-0-local mints (QUIC / TCP-TLS path) with
+        // delegated mints that round-robin to shard 0. Both encode target
+        // shard 0 in the top 16 bits; the shared counter keeps every id
+        // distinct so they cannot overwrite each other in shard 0's
+        // connection registry.
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..8 {
+            assert!(ids.insert(coord.mint_shard_zero_client_id()));
+            assert!(ids.insert(coord.mint_client_id(0)));
+        }
+        assert_eq!(
+            ids.len(),
+            16,
+            "every minted shard-0 client id must be unique"
+        );
+    }
+
     #[compio::test]
     #[allow(clippy::future_not_send)]
-    async fn delegate_replica_sends_setup_then_broadcasts_mapping() {
+    async fn delegate_replica_ships_setup_to_target_shard() {
         let (senders, receivers) = build_senders_with_rx(4);
-        let coord = ShardZeroCoordinator::<()>::new(senders, 4, CoordinatorConfig::default());
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            4,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        )
+        .expect("coord ctor ok");
 
         // Loopback TCP pair so delegate_replica has a real fd to dup.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -531,29 +498,25 @@ mod tests {
 
         // Target shard should observe ReplicaConnectionSetup.
         let setup_frame = receivers[target as usize].recv().await.unwrap();
-        match setup_frame.payload {
-            ShardFramePayload::ReplicaConnectionSetup { fd, replica_id } => {
+        match setup_frame {
+            ShardFrame::Lifecycle(LifecycleFrame::ReplicaConnectionSetup { fd, replica_id }) => {
                 assert_eq!(replica_id, 7);
-                // Drop closes the dup'd fd via `DupedFd::Drop`.
                 drop(fd);
             }
             _ => panic!("expected ReplicaConnectionSetup on target shard"),
         }
 
-        // Every shard (including shard 0 and the target itself) should
-        // observe the ReplicaMappingUpdate broadcast.
+        // Non-target shards must not receive any frame: delegate_replica
+        // no longer broadcasts a mapping update, the shard-shared
+        // owner table covers cross-shard routing.
         for (idx, rx) in receivers.iter().enumerate() {
-            let frame = rx.recv().await.unwrap();
-            match frame.payload {
-                ShardFramePayload::ReplicaMappingUpdate {
-                    replica_id,
-                    owning_shard,
-                } => {
-                    assert_eq!(replica_id, 7, "shard {idx} mapping update replica id");
-                    assert_eq!(owning_shard, target, "shard {idx} mapping update owner");
-                }
-                _ => panic!("shard {idx} expected ReplicaMappingUpdate"),
+            if idx == target as usize {
+                continue;
             }
+            assert!(
+                rx.try_recv().is_err(),
+                "shard {idx} unexpectedly received a frame after delegate_replica",
+            );
         }
     }
 
@@ -561,7 +524,13 @@ mod tests {
     #[allow(clippy::future_not_send)]
     async fn delegate_client_ships_setup_with_meta_transport_tcp() {
         let (senders, receivers) = build_senders_with_rx(4);
-        let coord = ShardZeroCoordinator::<()>::new(senders, 4, CoordinatorConfig::default());
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            4,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        )
+        .expect("coord ctor ok");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -577,8 +546,8 @@ mod tests {
         );
 
         let setup_frame = receivers[target as usize].recv().await.unwrap();
-        match setup_frame.payload {
-            ShardFramePayload::ClientConnectionSetup { fd, meta } => {
+        match setup_frame {
+            ShardFrame::Lifecycle(LifecycleFrame::ClientConnectionSetup { fd, meta }) => {
                 assert_eq!(meta.client_id, client_id);
                 assert!(matches!(meta.transport, ClientTransportKind::Tcp));
                 drop(fd);
@@ -591,7 +560,13 @@ mod tests {
     #[allow(clippy::future_not_send)]
     async fn delegate_ws_client_ships_setup_with_meta_transport_ws() {
         let (senders, receivers) = build_senders_with_rx(4);
-        let coord = ShardZeroCoordinator::<()>::new(senders, 4, CoordinatorConfig::default());
+        let coord = ShardZeroCoordinator::new(
+            senders,
+            4,
+            CoordinatorConfig::default(),
+            crate::metrics::ShardMetrics::for_shard(),
+        )
+        .expect("coord ctor ok");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -607,8 +582,8 @@ mod tests {
         );
 
         let setup_frame = receivers[target as usize].recv().await.unwrap();
-        match setup_frame.payload {
-            ShardFramePayload::ClientWsConnectionSetup { fd, meta } => {
+        match setup_frame {
+            ShardFrame::Lifecycle(LifecycleFrame::ClientWsConnectionSetup { fd, meta }) => {
                 assert_eq!(meta.client_id, client_id);
                 assert!(
                     matches!(meta.transport, ClientTransportKind::Ws),
@@ -618,158 +593,6 @@ mod tests {
                 drop(fd);
             }
             _ => panic!("expected ClientWsConnectionSetup variant"),
-        }
-    }
-
-    #[compio::test]
-    #[allow(clippy::future_not_send)]
-    async fn broadcast_mapping_clear_reaches_every_shard() {
-        let (senders, receivers) = build_senders_with_rx(4);
-        let coord = ShardZeroCoordinator::<()>::new(senders, 4, CoordinatorConfig::default());
-
-        coord.broadcast_mapping_clear(9);
-
-        for (idx, rx) in receivers.iter().enumerate() {
-            let frame = rx.recv().await.unwrap();
-            match frame.payload {
-                ShardFramePayload::ReplicaMappingClear { replica_id } => {
-                    assert_eq!(replica_id, 9, "shard {idx} mapping clear replica id");
-                }
-                _ => panic!("shard {idx} expected ReplicaMappingClear"),
-            }
-        }
-    }
-
-    #[compio::test]
-    #[allow(clippy::future_not_send)]
-    async fn snapshot_rebroadcasts_every_tracked_mapping() {
-        let (senders, receivers) = build_senders_with_rx(4);
-        let coord = Rc::new(ShardZeroCoordinator::<()>::new(
-            senders,
-            4,
-            CoordinatorConfig::default(),
-        ));
-
-        // Seed the coordinator's tracked mappings directly (delegate_replica
-        // needs a real TCP fd; the snapshot path is orthogonal to dup).
-        coord.mappings.borrow_mut()[3] = MappingSlot::Active(1);
-        coord.mappings.borrow_mut()[7] = MappingSlot::Active(2);
-
-        coord.broadcast_mapping_snapshot();
-
-        // Each shard must observe an update for each seeded mapping. The
-        // order across replica ids is unspecified (HashMap->Vec iteration
-        // on the collected snapshot), so collect and compare as a set.
-        for (idx, rx) in receivers.iter().enumerate() {
-            let mut observed = std::collections::BTreeSet::new();
-            for _ in 0..2 {
-                let frame = rx.recv().await.unwrap();
-                match frame.payload {
-                    ShardFramePayload::ReplicaMappingUpdate {
-                        replica_id,
-                        owning_shard,
-                    } => {
-                        observed.insert((replica_id, owning_shard));
-                    }
-                    _ => panic!("shard {idx} expected ReplicaMappingUpdate"),
-                }
-            }
-            let expected: std::collections::BTreeSet<_> =
-                [(3u8, 1u16), (7u8, 2u16)].into_iter().collect();
-            assert_eq!(
-                observed, expected,
-                "shard {idx} did not receive the full snapshot"
-            );
-        }
-    }
-
-    #[compio::test]
-    #[allow(clippy::future_not_send)]
-    async fn forget_mapping_transitions_slot_to_cleared_state() {
-        let (senders, _receivers) = build_senders_with_rx(2);
-        let coord = ShardZeroCoordinator::<()>::new(senders, 2, CoordinatorConfig::default());
-
-        coord.mappings.borrow_mut()[4] = MappingSlot::Active(1);
-        coord.mappings.borrow_mut()[5] = MappingSlot::Active(1);
-        coord.forget_mapping(4);
-
-        assert_eq!(coord.mappings.borrow()[4], MappingSlot::Cleared);
-        assert_eq!(coord.mappings.borrow()[5], MappingSlot::Active(1));
-    }
-
-    #[compio::test]
-    #[allow(clippy::future_not_send)]
-    async fn snapshot_includes_clear_for_forgotten_slots() {
-        let (senders, receivers) = build_senders_with_rx(3);
-        let coord = Rc::new(ShardZeroCoordinator::<()>::new(
-            senders,
-            3,
-            CoordinatorConfig::default(),
-        ));
-
-        // Two live mappings + one slot that was previously delegated and is
-        // now forgotten. Refresh must rebroadcast a Clear for the forgotten
-        // slot so a shard that missed the original Clear (full inbox) can
-        // reconcile its stale Active view on the next tick.
-        coord.mappings.borrow_mut()[3] = MappingSlot::Active(1);
-        coord.mappings.borrow_mut()[7] = MappingSlot::Active(2);
-        coord.mappings.borrow_mut()[5] = MappingSlot::Cleared;
-
-        coord.broadcast_mapping_snapshot();
-
-        for (idx, rx) in receivers.iter().enumerate() {
-            let mut updates = std::collections::BTreeSet::new();
-            let mut clears = std::collections::BTreeSet::new();
-            for _ in 0..3 {
-                let frame = rx.recv().await.unwrap();
-                match frame.payload {
-                    ShardFramePayload::ReplicaMappingUpdate {
-                        replica_id,
-                        owning_shard,
-                    } => {
-                        updates.insert((replica_id, owning_shard));
-                    }
-                    ShardFramePayload::ReplicaMappingClear { replica_id } => {
-                        clears.insert(replica_id);
-                    }
-                    _ => panic!("shard {idx} expected mapping update or clear"),
-                }
-            }
-
-            let expected_updates: std::collections::BTreeSet<_> =
-                [(3u8, 1u16), (7u8, 2u16)].into_iter().collect();
-            let expected_clears: std::collections::BTreeSet<_> = std::iter::once(5u8).collect();
-            assert_eq!(
-                updates, expected_updates,
-                "shard {idx} did not receive both Update frames"
-            );
-            assert_eq!(
-                clears, expected_clears,
-                "shard {idx} did not receive a Clear for the forgotten slot"
-            );
-        }
-    }
-
-    #[compio::test]
-    #[allow(clippy::future_not_send)]
-    async fn snapshot_skips_untouched_slots() {
-        let (senders, receivers) = build_senders_with_rx(2);
-        let coord = Rc::new(ShardZeroCoordinator::<()>::new(
-            senders,
-            2,
-            CoordinatorConfig::default(),
-        ));
-
-        // No mappings populated: every slot is `Untouched`. Snapshot must
-        // be silent so the cluster does not pay 256 try_sends per shard per
-        // refresh tick when nothing has been delegated yet.
-        coord.broadcast_mapping_snapshot();
-
-        for (idx, rx) in receivers.iter().enumerate() {
-            assert!(
-                rx.try_recv().is_err(),
-                "shard {idx} should not receive any frame from an empty snapshot"
-            );
         }
     }
 }

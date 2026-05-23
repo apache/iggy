@@ -20,14 +20,75 @@
 use metadata::impls::recovery::RecoveryError;
 // TODO: decouple logging errors from the `server` crate.
 use server::server_error::LogError;
+use server::shard_allocator::ShardingError;
+use shard::ShardCtorError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ServerNgError {
     #[error(transparent)]
     Iggy(Box<iggy_common::IggyError>),
     #[error("failed to load server-ng config")]
     Config(#[source] configs::ConfigurationError),
+    #[error("failed to allocate shards from sharding.cpu_allocation")]
+    ShardAllocator(#[source] ShardingError),
+    #[error("failed to bind shard {shard_id} to its CPU set")]
+    CpuAffinityFailed {
+        shard_id: u16,
+        #[source]
+        source: ShardingError,
+    },
+    #[error("failed to bind shard {shard_id} memory to its NUMA node")]
+    MemoryAffinityFailed {
+        shard_id: u16,
+        #[source]
+        source: ShardingError,
+    },
+    #[error("failed to spawn OS thread for shard {shard_id}")]
+    ShardSpawnFailed {
+        shard_id: u16,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to create io_uring runtime for shard {shard_id}")]
+    ShardRuntimeCreateFailed {
+        shard_id: u16,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "shard allocator produced zero shards; server must run at least one \
+         shard (check [system.sharding] cpu_allocation)"
+    )]
+    ShardsCountZero,
+    #[error(
+        "computed shards_count = {count} exceeds the maximum of {} shards per \
+         server; shard ids must fit in u16 and stay below the OWNER_NONE \
+         sentinel",
+        message_bus::OWNER_NONE - 1
+    )]
+    ShardsCountOverflow { count: usize },
+    #[error("system.sharding.inbox_capacity must be in 1..={max}; got {value}")]
+    InvalidInboxCapacity { value: usize, max: usize },
+    #[error("system.sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]
+    InvalidShutdownDrainTimeout {
+        value: std::time::Duration,
+        max: std::time::Duration,
+    },
+    #[error("system.sharding.shutdown_poll_interval must be in (0, {max:?}]; got {value:?}")]
+    InvalidShutdownPollInterval {
+        value: std::time::Duration,
+        max: std::time::Duration,
+    },
+    #[error(
+        "system.sharding.shutdown_poll_interval ({poll:?}) must be <= \
+         shutdown_drain_timeout ({drain:?})"
+    )]
+    ShutdownPollExceedsDrain {
+        poll: std::time::Duration,
+        drain: std::time::Duration,
+    },
     #[error("failed to serialize current server-ng config")]
     CurrentConfigSerialize(#[source] toml::ser::Error),
     #[error("failed to write current server-ng config at {path}")]
@@ -40,6 +101,11 @@ pub enum ServerNgError {
     Logging(#[source] LogError),
     #[error("failed to recover metadata snapshot and journal")]
     MetadataRecovery(#[source] RecoveryError),
+    #[error(
+        "shard {shard_id} aborted while waiting for shard-0 to broadcast the metadata \
+         factory bundle; shard 0 dropped its sender (most likely it failed to recover)"
+    )]
+    MetadataHandoffAborted { shard_id: u16 },
     #[error("failed to parse {context} socket address '{address}'")]
     SocketAddressParse {
         context: &'static str,
@@ -53,6 +119,12 @@ pub enum ServerNgError {
     ClusterReplicaCountTooLarge { count: usize },
     #[error("cluster mode requires --replica-id to identify the current node")]
     MissingReplicaId,
+    #[error(
+        "--replica-id {supplied} was passed with cluster.enabled=false; the WAL would commit \
+         under replica {default} which permanently fixes this node's identity. Either set \
+         cluster.enabled=true with a matching nodes[] entry, or drop --replica-id"
+    )]
+    ReplicaIdRequiresCluster { supplied: u8, default: u8 },
     #[error("cluster node for replica {replica_id} is missing tcp_replica port")]
     ClusterReplicaPortMissing { replica_id: u8 },
     #[error(
@@ -96,10 +168,85 @@ pub enum ServerNgError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to construct IggyShard from bootstrap inputs")]
+    ShardConstruction(#[source] ShardCtorError),
+    #[error("{} shard thread(s) failed: {}", failures.len(), format_shard_failures(failures))]
+    ShardJoinFailures { failures: Vec<ShardJoinFailure> },
+}
+
+/// Per-shard outcome captured by [`crate::bootstrap::ShardHandles::join_all`]
+/// when a shard either returned `Err` or panicked.
+///
+/// Bundled into [`ServerNgError::ShardJoinFailures`] so the operator sees
+/// every failing shard rather than only the first one, which previously
+/// lived in the trace log alone.
+#[derive(Debug)]
+pub struct ShardJoinFailure {
+    pub shard_id: u16,
+    pub kind: ShardJoinFailureKind,
+}
+
+#[derive(Debug)]
+pub enum ShardJoinFailureKind {
+    Error(Box<ServerNgError>),
+    Panic { message: String },
+}
+
+fn format_shard_failures(failures: &[ShardJoinFailure]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (idx, failure) in failures.iter().enumerate() {
+        if idx > 0 {
+            out.push_str("; ");
+        }
+        match &failure.kind {
+            ShardJoinFailureKind::Error(err) => {
+                let _ = write!(out, "shard {} -> {err}", failure.shard_id);
+            }
+            ShardJoinFailureKind::Panic { message } => {
+                let _ = write!(out, "shard {} panicked: {message}", failure.shard_id);
+            }
+        }
+    }
+    out
 }
 
 impl From<iggy_common::IggyError> for ServerNgError {
     fn from(source: iggy_common::IggyError) -> Self {
         Self::Iggy(Box::new(source))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shard_join_failures_display_aggregates_all_entries() {
+        let failures = vec![
+            ShardJoinFailure {
+                shard_id: 0,
+                kind: ShardJoinFailureKind::Error(Box::new(ServerNgError::MissingReplicaId)),
+            },
+            ShardJoinFailure {
+                shard_id: 2,
+                kind: ShardJoinFailureKind::Panic {
+                    message: "boom".to_string(),
+                },
+            },
+        ];
+        let rendered = ServerNgError::ShardJoinFailures { failures }.to_string();
+        assert!(
+            rendered.starts_with("2 shard thread(s) failed:"),
+            "expected count prefix, got {rendered}"
+        );
+        assert!(
+            rendered.contains("shard 0 ->"),
+            "shard 0 entry missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("shard 2 panicked: boom"),
+            "shard 2 panic entry missing: {rendered}"
+        );
     }
 }

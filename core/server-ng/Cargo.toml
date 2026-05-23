@@ -43,7 +43,6 @@ ignored = [
     "err_trail",
     "error_set",
     "figlet-rs",
-    "flume",
     "fs2",
     "hash32",
     "human-repr",
@@ -105,6 +104,7 @@ clap = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
 consensus = { workspace = true }
+crossfire = { workspace = true }
 ctrlc = { workspace = true }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }
@@ -113,7 +113,6 @@ dotenvy = { workspace = true }
 err_trail = { workspace = true }
 error_set = { workspace = true }
 figlet-rs = { workspace = true }
-flume = { workspace = true }
 fs2 = { workspace = true }
 hash32 = { workspace = true }
 human-repr = { workspace = true }

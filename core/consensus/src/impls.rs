@@ -28,6 +28,7 @@ use iggy_binary_protocol::{
     Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, Message, PrepareHeader,
     PrepareOkHeader, ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
+use iggy_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
 use std::cell::{Cell, RefCell};
@@ -691,6 +692,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             "replica index must be < replica_count"
         );
         assert!(replica_count >= 1, "need at least 1 replica");
+        // Consensus-control routing distinguishes metadata frames from
+        // partition frames by namespace value: metadata uses the sentinel,
+        // partitions use `IggyNamespace::inner()` which lives strictly
+        // inside the packed range. A namespace outside both ranges would
+        // route to neither and silently warn-drop on every receiving peer.
+        debug_assert!(
+            namespace == METADATA_CONSENSUS_NAMESPACE || IggyNamespace::is_packable(namespace),
+            "VsrConsensus namespace must be METADATA_CONSENSUS_NAMESPACE or a packable \
+             IggyNamespace; got {namespace:#x}"
+        );
         // TODO: Verify that XOR-based seeding provides sufficient jitter diversity
         // across groups. Consider using a proper hash (e.g., Murmur3) of
         // (replica_id, namespace) for production.

@@ -73,8 +73,10 @@ internal sealed class MessageResponseConverter : JsonConverter<MessageResponse>
                     }
                     else
                     {
-                        userHeaders = HeadersConverter.Read(ref reader, typeof(Dictionary<HeaderKey, HeaderValue>), options);
+                        userHeaders = HeadersConverter.Read(ref reader, typeof(Dictionary<HeaderKey, HeaderValue>),
+                            options);
                     }
+
                     break;
                 default:
                     reader.Skip();
@@ -82,13 +84,19 @@ internal sealed class MessageResponseConverter : JsonConverter<MessageResponse>
             }
         }
 
-        return new MessageResponse
+        var response = new MessageResponse
         {
             Header = header ?? throw new JsonException("Missing 'header' field."),
             Payload = payload ?? throw new JsonException("Missing 'payload' field."),
-            UserHeaders = userHeaders,
             RawUserHeaders = rawUserHeaders
         };
+
+        if (rawUserHeaders is null)
+        {
+            response.UserHeaders = userHeaders;
+        }
+
+        return response;
     }
 
     public override void Write(Utf8JsonWriter writer, MessageResponse value, JsonSerializerOptions options)
