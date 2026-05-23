@@ -220,7 +220,10 @@ async fn write_data(
     .await;
 
     if let Err(e) = &write_result {
-        error!("Batch loop failed ({}), closing writer to release resources", e);
+        error!(
+            "Batch loop failed ({}), closing writer to release resources",
+            e
+        );
         if let Err(close_err) = writer.close().await {
             error!("Failed to close writer after batch error: {}", close_err);
         }
@@ -229,7 +232,10 @@ async fn write_data(
 
     let data_files = writer.close().await.map_err(|err| {
         let chain = format_error_chain(&err);
-        error!("Error while writing data records to Parquet file: {}", chain);
+        error!(
+            "Error while writing data records to Parquet file: {}",
+            chain
+        );
         Error::WriteFailure(chain)
     })?;
 
