@@ -817,6 +817,18 @@ TEST(LowLevelE2E_Client, SnapshotAllCombinedWithOtherTypeThrows) {
     client = nullptr;
 }
 
+TEST(LowLevelE2E_Client, SnapshotWithEmptySnapshotTypesThrows) {
+    RecordProperty("description", "Rejects an empty snapshot type list in the wrapper before sending.");
+    iggy::ffi::Client *client = login_to_server();
+    ASSERT_NE(client, nullptr);
+
+    rust::Vec<rust::String> snapshot_types;
+    ASSERT_THROW(client->snapshot("deflated", snapshot_types), std::exception);
+
+    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
+    client = nullptr;
+}
+
 TEST(LowLevelE2E_Client, SnapshotReturnsNonEmptyBytes) {
     RecordProperty("description", "Returns a non-empty snapshot for a valid compression and snapshot type.");
     iggy::ffi::Client *client = login_to_server();

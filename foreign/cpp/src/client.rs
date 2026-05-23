@@ -29,6 +29,7 @@ use iggy_common::{
     CacheMetrics as RustCacheMetrics, CacheMetricsKey as RustCacheMetricsKey,
     ClientInfo as RustClientInfo, ClientInfoDetails as RustClientInfoDetails, Stats as RustStats,
 };
+use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -768,8 +769,14 @@ impl Client {
                 format!("Could not capture snapshot: invalid compression '{value}': {error}")
             })?,
         };
+        if snapshot_types.is_empty() {
+            return Err("Could not capture snapshot: snapshot_types must not be empty".to_string());
+        }
+
+        let mut seen_snapshot_types = HashSet::new();
         let rust_snapshot_types = snapshot_types
             .into_iter()
+            .filter(|snapshot_type| seen_snapshot_types.insert(snapshot_type.clone()))
             .map(|snapshot_type| {
                 RustSystemSnapshotType::from_str(&snapshot_type).map_err(|error| {
                     format!(
