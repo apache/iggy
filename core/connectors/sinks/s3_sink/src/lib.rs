@@ -17,16 +17,19 @@
  * under the License.
  */
 
-use iggy_connector_sdk::{Error, sink_connector};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fmt;
+use std::str::FromStr;
+use std::sync::Arc;
 
-pub mod buffer;
-pub mod client;
-pub mod formatter;
-pub mod path;
-pub mod sink;
+use iggy_connector_sdk::{Error, sink_connector};
+use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
+
+mod buffer;
+mod client;
+mod formatter;
+mod path;
+mod sink;
 
 sink_connector!(S3Sink);
 
@@ -35,8 +38,9 @@ const DEFAULT_RETRY_DELAY: &str = "1s";
 const DEFAULT_MAX_FILE_SIZE: &str = "8MiB";
 const DEFAULT_PATH_TEMPLATE: &str = "{stream}/{topic}/{date}/{hour}";
 const DEFAULT_OUTPUT_FORMAT: &str = "json_lines";
+const MAX_S3_SINGLE_PUT_SIZE: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct S3SinkConfig {
     pub bucket: String,
     pub region: String,
@@ -44,10 +48,16 @@ pub struct S3SinkConfig {
     pub prefix: Option<String>,
     #[serde(default)]
     pub endpoint: Option<String>,
-    #[serde(default)]
-    pub access_key_id: Option<String>,
-    #[serde(default)]
-    pub secret_access_key: Option<String>,
+    #[serde(
+        default,
+        serialize_with = "iggy_common::serde_secret::serialize_optional_secret"
+    )]
+    pub access_key_id: Option<SecretString>,
+    #[serde(
+        default,
+        serialize_with = "iggy_common::serde_secret::serialize_optional_secret"
+    )]
+    pub secret_access_key: Option<SecretString>,
     #[serde(default = "default_path_template")]
     pub path_template: String,
     #[serde(default = "default_file_rotation")]
@@ -68,6 +78,29 @@ pub struct S3SinkConfig {
     pub retry_delay: Option<String>,
     #[serde(default)]
     pub path_style: Option<bool>,
+}
+
+impl fmt::Debug for S3SinkConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3SinkConfig")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("prefix", &self.prefix)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &"[REDACTED]")
+            .field("secret_access_key", &"[REDACTED]")
+            .field("path_template", &self.path_template)
+            .field("file_rotation", &self.file_rotation)
+            .field("max_file_size", &self.max_file_size)
+            .field("max_messages_per_file", &self.max_messages_per_file)
+            .field("output_format", &self.output_format)
+            .field("include_metadata", &self.include_metadata)
+            .field("include_headers", &self.include_headers)
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay", &self.retry_delay)
+            .field("path_style", &self.path_style)
+            .finish()
+    }
 }
 
 fn default_path_template() -> String {
@@ -107,7 +140,7 @@ impl fmt::Display for FileRotation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputFormat {
+pub(crate) enum OutputFormat {
     JsonLines,
     JsonArray,
     Raw,
@@ -119,7 +152,7 @@ impl TryFrom<&str> for OutputFormat {
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s.to_lowercase().as_str() {
             "json_lines" | "jsonl" | "jsonlines" => Ok(OutputFormat::JsonLines),
-            "json_array" | "json" => Ok(OutputFormat::JsonArray),
+            "json_array" => Ok(OutputFormat::JsonArray),
             "raw" => Ok(OutputFormat::Raw),
             other => Err(Error::InvalidConfigValue(format!(
                 "Unknown output format: '{other}'. Expected: json_lines, json_array, or raw"
@@ -143,7 +176,7 @@ pub struct S3Sink {
     id: u32,
     config: S3SinkConfig,
     bucket: Option<Box<s3::Bucket>>,
-    buffers: tokio::sync::Mutex<HashMap<BufferKey, buffer::FileBuffer>>,
+    buffers: DashMap<BufferKey, Arc<tokio::sync::Mutex<buffer::FileBuffer>>>,
     max_file_size_bytes: u64,
     output_format: OutputFormat,
     state: tokio::sync::Mutex<SinkState>,
@@ -151,7 +184,7 @@ pub struct S3Sink {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct BufferKey {
+pub(crate) struct BufferKey {
     pub stream: String,
     pub topic: String,
     pub partition_id: u32,
@@ -170,7 +203,7 @@ impl S3Sink {
             id,
             config,
             bucket: None,
-            buffers: tokio::sync::Mutex::new(HashMap::new()),
+            buffers: DashMap::new(),
             max_file_size_bytes: 0,
             output_format: OutputFormat::JsonLines,
             state: tokio::sync::Mutex::new(SinkState {
@@ -183,8 +216,36 @@ impl S3Sink {
     }
 
     pub fn validate_and_parse_config(&mut self) -> Result<(), Error> {
+        if self.config.bucket.is_empty() {
+            return Err(Error::InvalidConfigValue(
+                "bucket must not be empty".to_owned(),
+            ));
+        }
+        if self.config.region.is_empty() {
+            return Err(Error::InvalidConfigValue(
+                "region must not be empty".to_owned(),
+            ));
+        }
+        if self.config.path_template.is_empty() {
+            return Err(Error::InvalidConfigValue(
+                "path_template must not be empty".to_owned(),
+            ));
+        }
+
         self.output_format = OutputFormat::try_from(self.config.output_format.as_str())?;
         self.max_file_size_bytes = parse_file_size(&self.config.max_file_size)?;
+
+        if self.max_file_size_bytes == 0 {
+            return Err(Error::InvalidConfigValue(
+                "max_file_size must be greater than 0".to_owned(),
+            ));
+        }
+        if self.max_file_size_bytes > MAX_S3_SINGLE_PUT_SIZE {
+            return Err(Error::InvalidConfigValue(format!(
+                "max_file_size ({}) exceeds S3 single PutObject limit of 5 GiB",
+                self.config.max_file_size
+            )));
+        }
 
         let delay_str = self
             .config
@@ -197,13 +258,21 @@ impl S3Sink {
                 Error::InvalidConfigValue(format!("Invalid retry_delay '{delay_str}': {e}"))
             })?;
 
-        if self.config.file_rotation == FileRotation::Messages
-            && self.config.max_messages_per_file.is_none()
-        {
-            return Err(Error::InvalidConfigValue(
-                "file_rotation is set to 'messages' but max_messages_per_file is not configured"
-                    .to_owned(),
-            ));
+        if self.config.file_rotation == FileRotation::Messages {
+            match self.config.max_messages_per_file {
+                None => {
+                    return Err(Error::InvalidConfigValue(
+                        "file_rotation is 'messages' but max_messages_per_file is not configured"
+                            .to_owned(),
+                    ));
+                }
+                Some(0) => {
+                    return Err(Error::InvalidConfigValue(
+                        "max_messages_per_file must be greater than 0".to_owned(),
+                    ));
+                }
+                Some(_) => {}
+            }
         }
 
         Ok(())
@@ -213,8 +282,6 @@ impl S3Sink {
         self.config.max_retries.unwrap_or(DEFAULT_MAX_ATTEMPTS)
     }
 }
-
-use std::str::FromStr;
 
 fn parse_file_size(s: &str) -> Result<u64, Error> {
     byte_unit::Byte::from_str(s)
@@ -263,10 +330,11 @@ mod tests {
             OutputFormat::try_from("json_array").unwrap(),
             OutputFormat::JsonArray
         );
-        assert_eq!(
-            OutputFormat::try_from("json").unwrap(),
-            OutputFormat::JsonArray
-        );
+    }
+
+    #[test]
+    fn output_format_json_alias_removed() {
+        assert!(OutputFormat::try_from("json").is_err());
     }
 
     #[test]
@@ -344,26 +412,21 @@ mod tests {
 
     #[test]
     fn partial_credentials_detected() {
-        let config_with_key_only = S3SinkConfig {
-            bucket: "b".to_string(),
-            region: "us-east-1".to_string(),
-            prefix: None,
-            endpoint: None,
-            access_key_id: Some("key".to_string()),
-            secret_access_key: None,
-            path_template: default_path_template(),
-            file_rotation: FileRotation::Size,
-            max_file_size: default_max_file_size(),
-            max_messages_per_file: None,
-            output_format: default_output_format(),
-            include_metadata: true,
-            include_headers: false,
-            max_retries: None,
-            retry_delay: None,
-            path_style: None,
-        };
+        let json = r#"{"bucket":"b","region":"us-east-1","access_key_id":"key"}"#;
+        let config: S3SinkConfig = serde_json::from_str(json).unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(client::create_bucket(&config_with_key_only));
+        let result = rt.block_on(client::create_bucket(&config));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn debug_does_not_leak_secrets() {
+        let json =
+            r#"{"bucket":"b","region":"r","access_key_id":"AKIA","secret_access_key":"s3cr3t"}"#;
+        let config: S3SinkConfig = serde_json::from_str(json).unwrap();
+        let debug_output = format!("{:?}", config);
+        assert!(!debug_output.contains("AKIA"));
+        assert!(!debug_output.contains("s3cr3t"));
+        assert!(debug_output.contains("REDACTED"));
     }
 }

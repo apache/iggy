@@ -24,10 +24,19 @@ use crate::{BufferKey, S3Sink};
 use async_trait::async_trait;
 use iggy_connector_sdk::retry::{exponential_backoff, jitter};
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+struct FlushPayload {
+    data: Vec<u8>,
+    s3_key: String,
+    msg_count: u64,
+    first_offset: u64,
+    last_offset: u64,
+}
 
 #[async_trait]
 impl Sink for S3Sink {
@@ -38,26 +47,12 @@ impl Sink for S3Sink {
 
         let bucket = crate::client::create_bucket(&self.config).await?;
 
+        crate::client::verify_bucket(&bucket).await?;
+
         info!(
             "S3 sink ID: {} connected to bucket '{}' in region '{}'",
             self.id, self.config.bucket, self.config.region
         );
-
-        match crate::client::verify_bucket(&bucket).await {
-            Ok(()) => {
-                info!(
-                    "S3 sink ID: {} bucket '{}' connectivity verified",
-                    self.id, self.config.bucket
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "S3 sink ID: {} bucket verification returned an error (non-fatal, \
-                     the bucket may still be accessible): {e}",
-                    self.id
-                );
-            }
-        }
 
         self.bucket = Some(bucket);
 
@@ -91,6 +86,11 @@ impl Sink for S3Sink {
         };
 
         let max_messages = match self.config.max_messages_per_file {
+            Some(0) => {
+                return Err(Error::InvalidConfigValue(
+                    "max_messages_per_file must be greater than 0".to_owned(),
+                ));
+            }
             Some(n) => n,
             None if self.config.file_rotation == crate::FileRotation::Messages => {
                 return Err(Error::InvalidConfigValue(
@@ -101,8 +101,11 @@ impl Sink for S3Sink {
         };
         let batch_size = messages.len() as u64;
 
-        let mut buffers = self.buffers.lock().await;
-        let buffer = buffers.entry(key.clone()).or_insert_with(FileBuffer::new);
+        let buffer_arc = self
+            .buffers
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(FileBuffer::new())))
+            .clone();
 
         for message in &messages {
             let formatted = formatter::format_message(
@@ -112,15 +115,25 @@ impl Sink for S3Sink {
                 self.config.include_metadata,
                 self.config.include_headers,
                 self.output_format,
-            );
-            buffer.append(formatted, message.offset, message.timestamp);
+            )?;
 
-            if buffer.should_rotate(
-                self.config.file_rotation,
-                self.max_file_size_bytes,
-                max_messages,
-            ) {
-                self.flush_buffer(bucket, &key, buffer).await;
+            let flush_payload = {
+                let mut buffer = buffer_arc.lock().await;
+                buffer.append(&formatted, message.offset, message.timestamp);
+
+                if buffer.should_rotate(
+                    self.config.file_rotation,
+                    self.max_file_size_bytes,
+                    max_messages,
+                ) {
+                    Some(self.extract_flush_payload(&key, &mut buffer)?)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(payload) = flush_payload {
+                self.do_upload(bucket, payload).await?;
             }
         }
 
@@ -145,18 +158,37 @@ impl Sink for S3Sink {
         info!("Closing S3 sink connector with ID: {}", self.id);
 
         if let Some(bucket) = &self.bucket {
-            let mut buffers = self.buffers.lock().await;
-            let keys: Vec<BufferKey> = buffers.keys().cloned().collect();
-            for key in keys {
-                if let Some(buffer) = buffers.get_mut(&key)
-                    && !buffer.is_empty()
-                {
-                    self.flush_buffer(bucket, &key, buffer).await;
+            for entry in self.buffers.iter() {
+                let key = entry.key().clone();
+                let buffer_arc = entry.value().clone();
+                let flush_payload = {
+                    let mut buffer = buffer_arc.lock().await;
+                    if buffer.is_empty() {
+                        None
+                    } else {
+                        Some(self.extract_flush_payload(&key, &mut buffer))
+                    }
+                };
+                if let Some(Ok(payload)) = flush_payload {
+                    if let Err(e) = self.do_upload(bucket, payload).await {
+                        error!(
+                            "S3 sink ID: {} failed to flush on close for {}/{}/{}: {e}",
+                            self.id, key.stream, key.topic, key.partition_id
+                        );
+                    }
+                } else if let Some(Err(e)) = flush_payload {
+                    error!(
+                        "S3 sink ID: {} failed to prepare flush on close for {}/{}/{}: {e}",
+                        self.id, key.stream, key.topic, key.partition_id
+                    );
                 }
             }
         } else {
-            let buffers = self.buffers.lock().await;
-            let pending: u64 = buffers.values().map(|b| b.message_count()).sum();
+            let pending: u64 = self
+                .buffers
+                .iter()
+                .map(|e| e.value().try_lock().map(|b| b.message_count()).unwrap_or(0))
+                .sum();
             if pending > 0 {
                 warn!(
                     "S3 sink ID: {} closing without S3 client — {pending} buffered messages will be lost",
@@ -176,11 +208,11 @@ impl Sink for S3Sink {
 }
 
 impl S3Sink {
-    async fn flush_buffer(&self, bucket: &s3::Bucket, key: &BufferKey, buffer: &mut FileBuffer) {
-        if buffer.is_empty() {
-            return;
-        }
-
+    fn extract_flush_payload(
+        &self,
+        key: &BufferKey,
+        buffer: &mut FileBuffer,
+    ) -> Result<FlushPayload, Error> {
         let data = formatter::finalize_buffer(buffer.entries(), self.output_format);
 
         let ctx = PathContext {
@@ -197,33 +229,86 @@ impl S3Sink {
             buffer.first_offset(),
             buffer.last_offset(),
             self.output_format,
-        );
+        )?;
 
         let msg_count = buffer.message_count();
+        let first_offset = buffer.first_offset();
+        let last_offset = buffer.last_offset();
 
-        match self.upload_with_retry(bucket, &s3_key, &data).await {
+        buffer.reset();
+
+        Ok(FlushPayload {
+            data,
+            s3_key,
+            msg_count,
+            first_offset,
+            last_offset,
+        })
+    }
+
+    async fn do_upload(&self, bucket: &s3::Bucket, payload: FlushPayload) -> Result<(), Error> {
+        match self
+            .upload_with_retry(bucket, &payload.s3_key, &payload.data)
+            .await
+        {
             Ok(()) => {
                 debug!(
                     "S3 sink ID: {} uploaded {} ({} messages, {} bytes)",
                     self.id,
-                    s3_key,
-                    msg_count,
-                    data.len(),
+                    payload.s3_key,
+                    payload.msg_count,
+                    payload.data.len(),
                 );
                 let mut state = self.state.lock().await;
-                state.messages_uploaded += msg_count;
+                state.messages_uploaded += payload.msg_count;
+                Ok(())
             }
             Err(e) => {
                 error!(
-                    "S3 sink ID: {} failed to upload {} ({} messages lost): {e}",
-                    self.id, s3_key, msg_count
+                    "S3 sink ID: {} failed to upload {} ({} messages, offsets {}-{} lost): {e}",
+                    self.id,
+                    payload.s3_key,
+                    payload.msg_count,
+                    payload.first_offset,
+                    payload.last_offset,
                 );
                 let mut state = self.state.lock().await;
-                state.messages_lost += msg_count;
+                state.messages_lost += payload.msg_count;
+
+                self.write_lost_marker(
+                    bucket,
+                    &payload.s3_key,
+                    payload.first_offset,
+                    payload.last_offset,
+                    payload.msg_count,
+                    &e,
+                )
+                .await;
+
+                Err(e)
             }
         }
+    }
 
-        buffer.reset();
+    async fn write_lost_marker(
+        &self,
+        bucket: &s3::Bucket,
+        s3_key: &str,
+        first_offset: u64,
+        last_offset: u64,
+        msg_count: u64,
+        error: &Error,
+    ) {
+        let marker_key = format!("{s3_key}.lost");
+        let body = format!(
+            "offset_range: {first_offset}-{last_offset}\nmessage_count: {msg_count}\nerror: {error}\n"
+        );
+        if let Err(e) = bucket.put_object(&marker_key, body.as_bytes()).await {
+            warn!(
+                "S3 sink ID: {} failed to write .lost marker at {}: {e}",
+                self.id, marker_key
+            );
+        }
     }
 
     async fn upload_with_retry(
