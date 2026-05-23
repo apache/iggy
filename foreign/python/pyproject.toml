@@ -107,12 +107,13 @@ testing = [
 ]
 
 # For containerized testing (CI/CD)
-testing-docker = ["testcontainers[docker]>=3.7.0,<5.0"]
+testing-docker = ["testcontainers>=3.7.0,<5.0"]
 
 # Development tools
 dev = [
     "maturin>=1.2,<2.0",
     "ruff>=0.1.0,<1.0",
+    "mypy>=1.5.0,<2.0",
 ]
 
 # All dependencies for full development setup
@@ -122,9 +123,10 @@ all = [
     "pytest-cov>=4.0,<7.0",
     "pytest-xdist>=3.0,<4.0",
     "pytest-timeout>=2.0,<3.0",
-    "testcontainers[docker]>=3.7.0,<5.0",
+    "testcontainers>=3.7.0,<5.0",
     "maturin>=1.2,<2.0",
     "ruff>=0.1.0,<1.0",
+    "mypy>=1.5.0,<2.0",
 ]
 
 [tool.pytest.ini_options]
