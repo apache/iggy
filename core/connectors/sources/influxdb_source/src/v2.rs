@@ -281,7 +281,10 @@ mod tests {
             },
             0,
         );
-        assert!(result.is_err(), "invalid JSON payload column must return Err");
+        assert!(
+            result.is_err(),
+            "invalid JSON payload column must return Err"
+        );
     }
 
     #[test]
@@ -321,7 +324,10 @@ mod tests {
             },
             0,
         );
-        assert!(result.is_err(), "invalid base64 payload column must return Err");
+        assert!(
+            result.is_err(),
+            "invalid base64 payload column must return Err"
+        );
     }
 
     #[test]
@@ -348,8 +354,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.messages.len(), 1);
-        let body: serde_json::Value =
-            serde_json::from_slice(&result.messages[0].payload).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&result.messages[0].payload).unwrap();
         assert_eq!(body["measurement"], "cpu");
         assert_eq!(body["field"], "usage");
         // Row sub-object must contain the raw columns when include_metadata=true.
@@ -379,8 +384,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let body: serde_json::Value =
-            serde_json::from_slice(&result.messages[0].payload).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&result.messages[0].payload).unwrap();
         // row sub-object must not contain _measurement or _field when metadata excluded
         assert!(
             body["row"].get("_measurement").is_none(),

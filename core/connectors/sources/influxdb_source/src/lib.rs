@@ -1485,12 +1485,7 @@ mod tests {
             cursor_row_count: 3,
             processed_rows: 0,
         };
-        apply_v2_cursor_advance(
-            &mut state,
-            Some("2024-06-01T00:00:00Z".to_string()),
-            1,
-            0,
-        );
+        apply_v2_cursor_advance(&mut state, Some("2024-06-01T00:00:00Z".to_string()), 1, 0);
         // last_timestamp must remain the corrupt string — should_advance=false
         // because the old cursor failed to parse, so we do NOT replace it.
         assert_eq!(

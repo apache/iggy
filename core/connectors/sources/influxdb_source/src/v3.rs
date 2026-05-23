@@ -925,7 +925,10 @@ mod tests {
         // A non-string JSON value (e.g. a number) must return Err.
         use crate::common::Row;
         let mut row: Row = Row::default();
-        row.insert("time".to_string(), serde_json::Value::String(T1.to_string()));
+        row.insert(
+            "time".to_string(),
+            serde_json::Value::String(T1.to_string()),
+        );
         // Insert a numeric value for the payload column — not a base64 string.
         row.insert("blob".to_string(), serde_json::Value::Number(42.into()));
         let err = process_rows(

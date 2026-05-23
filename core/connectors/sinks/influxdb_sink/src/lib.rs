@@ -1537,7 +1537,10 @@ token   = "t"
     fn sink_payload_format_unknown_falls_back_to_json() {
         // Unknown format must fall back to Json (same as source behaviour).
         assert_eq!(PayloadFormat::from_config(Some("xml")), PayloadFormat::Json);
-        assert_eq!(PayloadFormat::from_config(Some("avro")), PayloadFormat::Json);
+        assert_eq!(
+            PayloadFormat::from_config(Some("avro")),
+            PayloadFormat::Json
+        );
     }
 
     #[test]
@@ -1547,7 +1550,10 @@ token   = "t"
 
     #[test]
     fn sink_payload_format_json_explicit() {
-        assert_eq!(PayloadFormat::from_config(Some("json")), PayloadFormat::Json);
+        assert_eq!(
+            PayloadFormat::from_config(Some("json")),
+            PayloadFormat::Json
+        );
     }
 
     // ── append_line: metadata-as-fields when tag flags disabled ──────────
@@ -1600,7 +1606,10 @@ token   = "t"
             &make_message(iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec())),
         )
         .unwrap();
-        assert!(buf.contains("iggy_topic="), "topic must appear as field: {buf}");
+        assert!(
+            buf.contains("iggy_topic="),
+            "topic must appear as field: {buf}"
+        );
         assert!(
             !buf.contains(",topic="),
             "topic must NOT appear as a tag: {buf}"
@@ -1653,8 +1662,14 @@ token   = "t"
             &make_message(iggy_connector_sdk::Payload::Json(value)),
         )
         .unwrap();
-        assert!(buf.contains("payload_json="), "Json payload must set field: {buf}");
-        assert!(buf.contains("sensor"), "Json payload content must appear: {buf}");
+        assert!(
+            buf.contains("payload_json="),
+            "Json payload must set field: {buf}"
+        );
+        assert!(
+            buf.contains("sensor"),
+            "Json payload content must appear: {buf}"
+        );
     }
 
     // ── append_line: timestamp == 0 fallback ──────────────────────────────
@@ -1672,11 +1687,19 @@ token   = "t"
             headers: None,
             payload: iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec()),
         };
-        sink.append_line(&mut buf, &make_topic_metadata(), &make_messages_metadata(), &msg)
-            .unwrap();
+        sink.append_line(
+            &mut buf,
+            &make_topic_metadata(),
+            &make_messages_metadata(),
+            &msg,
+        )
+        .unwrap();
         // Body must end with a positive timestamp, not 0.
         let ts: u64 = buf.split_whitespace().last().unwrap().parse().unwrap();
-        assert!(ts > 0, "wall-clock fallback must produce non-zero timestamp: {ts}");
+        assert!(
+            ts > 0,
+            "wall-clock fallback must produce non-zero timestamp: {ts}"
+        );
     }
 
     // ── build_body: zero-timestamp batch warning ──────────────────────────
@@ -1695,8 +1718,15 @@ token   = "t"
             headers: None,
             payload: iggy_connector_sdk::Payload::Raw(b"{\"k\":1}".to_vec()),
         };
-        let result = sink.build_body(&make_topic_metadata(), &make_messages_metadata(), &[zero_msg]);
-        assert!(result.is_ok(), "build_body must succeed for timestamp=0 message");
+        let result = sink.build_body(
+            &make_topic_metadata(),
+            &make_messages_metadata(),
+            &[zero_msg],
+        );
+        assert!(
+            result.is_ok(),
+            "build_body must succeed for timestamp=0 message"
+        );
     }
 
     // ── close() ───────────────────────────────────────────────────────────
@@ -1742,8 +1772,14 @@ token   = "t"
             &make_message(iggy_connector_sdk::Payload::Raw(b"hello world".to_vec())),
         )
         .unwrap();
-        assert!(buf.contains("payload_text="), "text payload field must be set: {buf}");
-        assert!(buf.contains("hello world"), "payload content must appear: {buf}");
+        assert!(
+            buf.contains("payload_text="),
+            "text payload field must be set: {buf}"
+        );
+        assert!(
+            buf.contains("hello world"),
+            "payload content must appear: {buf}"
+        );
     }
 }
 
