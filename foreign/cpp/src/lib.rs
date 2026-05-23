@@ -172,7 +172,10 @@ mod ffi {
         os_version: String,
         kernel_version: String,
         iggy_server_version: String,
+        // `iggy_server_semver` is only meaningful when this flag is true.
         has_server_semver: bool,
+        // Uses `0` when the Rust `Option<u32>` is absent; check `has_server_semver`
+        // before reading this field.
         iggy_server_semver: u32,
         cache_metrics: Vec<CacheMetricEntry>,
         threads_count: u32,
