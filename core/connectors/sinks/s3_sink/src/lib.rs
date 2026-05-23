@@ -30,7 +30,7 @@ pub mod sink;
 
 sink_connector!(S3Sink);
 
-const DEFAULT_MAX_RETRIES: u32 = 3;
+const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_RETRY_DELAY: &str = "1s";
 const DEFAULT_MAX_FILE_SIZE: &str = "8MiB";
 const DEFAULT_PATH_TEMPLATE: &str = "{stream}/{topic}/{date}/{hour}";
@@ -159,9 +159,9 @@ pub struct BufferKey {
 
 #[derive(Debug)]
 struct SinkState {
-    messages_processed: u64,
-    uploads_completed: u64,
-    upload_errors: u64,
+    messages_received: u64,
+    messages_uploaded: u64,
+    messages_lost: u64,
 }
 
 impl S3Sink {
@@ -174,9 +174,9 @@ impl S3Sink {
             max_file_size_bytes: 0,
             output_format: OutputFormat::JsonLines,
             state: tokio::sync::Mutex::new(SinkState {
-                messages_processed: 0,
-                uploads_completed: 0,
-                upload_errors: 0,
+                messages_received: 0,
+                messages_uploaded: 0,
+                messages_lost: 0,
             }),
             retry_delay: std::time::Duration::from_secs(1),
         }
@@ -209,8 +209,8 @@ impl S3Sink {
         Ok(())
     }
 
-    fn max_retries(&self) -> u32 {
-        self.config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES)
+    fn max_attempts(&self) -> u32 {
+        self.config.max_retries.unwrap_or(DEFAULT_MAX_ATTEMPTS)
     }
 }
 
