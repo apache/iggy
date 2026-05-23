@@ -19,6 +19,7 @@ package command
 
 import (
 	"bytes"
+	"math"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -161,7 +162,7 @@ func TestSerialize_StoreConsumerOffsetRequest_MaxOffset(t *testing.T) {
 		StreamId:    streamId,
 		TopicId:     topicId,
 		PartitionId: uint32Ptr(10),
-		Offset:      18446744073709551615, // Max uint64
+		Offset:      math.MaxUint64,
 	}
 
 	serialized, err := cmd.MarshalBinary()
@@ -390,7 +391,7 @@ func TestSerialize_DeleteConsumerOffset_MaxPartition(t *testing.T) {
 		Consumer:    iggcon.NewSingleConsumer(consumerId),
 		StreamId:    streamId,
 		TopicId:     topicId,
-		PartitionId: uint32Ptr(4294967295), // Max uint32
+		PartitionId: uint32Ptr(math.MaxUint32),
 	}
 
 	serialized, err := cmd.MarshalBinary()

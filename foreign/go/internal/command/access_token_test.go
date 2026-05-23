@@ -19,6 +19,7 @@ package command
 
 import (
 	"bytes"
+	"math"
 	"testing"
 )
 
@@ -150,7 +151,7 @@ func TestSerialize_CreatePersonalAccessToken_ZeroExpiry(t *testing.T) {
 func TestSerialize_CreatePersonalAccessToken_MaxExpiry(t *testing.T) {
 	cmd := CreatePersonalAccessToken{
 		Name:   "long_token",
-		Expiry: 18446744073709551615, // Max uint64 value
+		Expiry: math.MaxUint64,
 	}
 
 	serialized, err := cmd.MarshalBinary()

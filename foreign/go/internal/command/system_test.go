@@ -19,6 +19,7 @@ package command
 
 import (
 	"bytes"
+	"math"
 	"testing"
 )
 
@@ -129,7 +130,7 @@ func TestSerialize_GetClient_Zero(t *testing.T) {
 // TestSerialize_GetClient_MaxValue tests serialization with maximum uint32 value (edge case)
 func TestSerialize_GetClient_MaxValue(t *testing.T) {
 	cmd := GetClient{
-		ClientID: 4294967295, // Max uint32 value
+		ClientID: math.MaxUint32,
 	}
 
 	serialized, err := cmd.MarshalBinary()

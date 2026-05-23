@@ -19,6 +19,7 @@ package command
 
 import (
 	"bytes"
+	"math"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -218,7 +219,7 @@ func TestSerialize_DeletePartitions_MaxCount(t *testing.T) {
 	cmd := DeletePartitions{
 		StreamId:        streamId,
 		TopicId:         topicId,
-		PartitionsCount: 4294967295, // Max uint32 value
+		PartitionsCount: math.MaxUint32,
 	}
 
 	serialized, err := cmd.MarshalBinary()

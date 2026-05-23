@@ -40,13 +40,6 @@ func TestMarshalBinary_DoesNotMutateReceiver(t *testing.T) {
 	status := iggcon.Active
 	replicationFactor := uint8(1)
 
-	perms := &iggcon.Permissions{
-		Global: iggcon.GlobalPermissions{
-			ManageServers: true,
-			ReadServers:   true,
-		},
-	}
-
 	tests := []struct {
 		name    string
 		makeCMD func() (cmd interface{ MarshalBinary() ([]byte, error) }, snapshot interface{})
@@ -78,8 +71,10 @@ func TestMarshalBinary_DoesNotMutateReceiver(t *testing.T) {
 		{
 			name: "CreateUser",
 			makeCMD: func() (interface{ MarshalBinary() ([]byte, error) }, interface{}) {
-				cmd := &CreateUser{Username: "user", Password: "pass", Status: iggcon.Active, Permissions: perms}
-				snap := CreateUser{Username: "user", Password: "pass", Status: iggcon.Active, Permissions: perms}
+				p1 := &iggcon.Permissions{Global: iggcon.GlobalPermissions{ManageServers: true, ReadServers: true}}
+				p2 := &iggcon.Permissions{Global: iggcon.GlobalPermissions{ManageServers: true, ReadServers: true}}
+				cmd := &CreateUser{Username: "user", Password: "pass", Status: iggcon.Active, Permissions: p1}
+				snap := CreateUser{Username: "user", Password: "pass", Status: iggcon.Active, Permissions: p2}
 				return cmd, snap
 			},
 		},
@@ -110,8 +105,10 @@ func TestMarshalBinary_DoesNotMutateReceiver(t *testing.T) {
 		{
 			name: "UpdatePermissions_WithPermissions",
 			makeCMD: func() (interface{ MarshalBinary() ([]byte, error) }, interface{}) {
-				cmd := &UpdatePermissions{UserID: userId, Permissions: perms}
-				snap := UpdatePermissions{UserID: userId, Permissions: perms}
+				p1 := &iggcon.Permissions{Global: iggcon.GlobalPermissions{ManageServers: true, ReadServers: true}}
+				p2 := &iggcon.Permissions{Global: iggcon.GlobalPermissions{ManageServers: true, ReadServers: true}}
+				cmd := &UpdatePermissions{UserID: userId, Permissions: p1}
+				snap := UpdatePermissions{UserID: userId, Permissions: p2}
 				return cmd, snap
 			},
 		},
@@ -142,28 +139,28 @@ func TestMarshalBinary_DoesNotMutateReceiver(t *testing.T) {
 		{
 			name: "UpdateUser_BothFields",
 			makeCMD: func() (interface{ MarshalBinary() ([]byte, error) }, interface{}) {
-				u := username
-				s := status
-				cmd := &UpdateUser{UserID: userId, Username: &u, Status: &s}
-				snap := UpdateUser{UserID: userId, Username: &u, Status: &s}
+				u1, u2 := username, username
+				s1, s2 := status, status
+				cmd := &UpdateUser{UserID: userId, Username: &u1, Status: &s1}
+				snap := UpdateUser{UserID: userId, Username: &u2, Status: &s2}
 				return cmd, snap
 			},
 		},
 		{
 			name: "UpdateUser_NilUsername",
 			makeCMD: func() (interface{ MarshalBinary() ([]byte, error) }, interface{}) {
-				s := status
-				cmd := &UpdateUser{UserID: userId, Username: nil, Status: &s}
-				snap := UpdateUser{UserID: userId, Username: nil, Status: &s}
+				s1, s2 := status, status
+				cmd := &UpdateUser{UserID: userId, Username: nil, Status: &s1}
+				snap := UpdateUser{UserID: userId, Username: nil, Status: &s2}
 				return cmd, snap
 			},
 		},
 		{
 			name: "UpdateUser_NilStatus",
 			makeCMD: func() (interface{ MarshalBinary() ([]byte, error) }, interface{}) {
-				u := username
-				cmd := &UpdateUser{UserID: userId, Username: &u, Status: nil}
-				snap := UpdateUser{UserID: userId, Username: &u, Status: nil}
+				u1, u2 := username, username
+				cmd := &UpdateUser{UserID: userId, Username: &u1, Status: nil}
+				snap := UpdateUser{UserID: userId, Username: &u2, Status: nil}
 				return cmd, snap
 			},
 		},
@@ -250,9 +247,9 @@ func TestMarshalBinary_DoesNotMutateReceiver(t *testing.T) {
 		{
 			name: "CreateTopic_WithReplicationFactor",
 			makeCMD: func() (interface{ MarshalBinary() ([]byte, error) }, interface{}) {
-				rf := replicationFactor
-				cmd := &CreateTopic{StreamId: streamId, PartitionsCount: 2, Name: "t", ReplicationFactor: &rf}
-				snap := CreateTopic{StreamId: streamId, PartitionsCount: 2, Name: "t", ReplicationFactor: &rf}
+				rf1, rf2 := replicationFactor, replicationFactor
+				cmd := &CreateTopic{StreamId: streamId, PartitionsCount: 2, Name: "t", ReplicationFactor: &rf1}
+				snap := CreateTopic{StreamId: streamId, PartitionsCount: 2, Name: "t", ReplicationFactor: &rf2}
 				return cmd, snap
 			},
 		},
@@ -267,9 +264,9 @@ func TestMarshalBinary_DoesNotMutateReceiver(t *testing.T) {
 		{
 			name: "UpdateTopic_WithReplicationFactor",
 			makeCMD: func() (interface{ MarshalBinary() ([]byte, error) }, interface{}) {
-				rf := replicationFactor
-				cmd := &UpdateTopic{StreamId: streamId, TopicId: topicId, Name: "t", ReplicationFactor: &rf}
-				snap := UpdateTopic{StreamId: streamId, TopicId: topicId, Name: "t", ReplicationFactor: &rf}
+				rf1, rf2 := replicationFactor, replicationFactor
+				cmd := &UpdateTopic{StreamId: streamId, TopicId: topicId, Name: "t", ReplicationFactor: &rf1}
+				snap := UpdateTopic{StreamId: streamId, TopicId: topicId, Name: "t", ReplicationFactor: &rf2}
 				return cmd, snap
 			},
 		},
@@ -364,9 +361,9 @@ func TestMarshalBinary_DoesNotMutateReceiver(t *testing.T) {
 		{
 			name: "StoreConsumerOffsetRequest_WithPartition",
 			makeCMD: func() (interface{ MarshalBinary() ([]byte, error) }, interface{}) {
-				p := partitionId
-				cmd := &StoreConsumerOffsetRequest{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: &p, Offset: 100}
-				snap := StoreConsumerOffsetRequest{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: &p, Offset: 100}
+				p1, p2 := partitionId, partitionId
+				cmd := &StoreConsumerOffsetRequest{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: &p1, Offset: 100}
+				snap := StoreConsumerOffsetRequest{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: &p2, Offset: 100}
 				return cmd, snap
 			},
 		},
@@ -381,9 +378,9 @@ func TestMarshalBinary_DoesNotMutateReceiver(t *testing.T) {
 		{
 			name: "GetConsumerOffset_WithPartition",
 			makeCMD: func() (interface{ MarshalBinary() ([]byte, error) }, interface{}) {
-				p := partitionId
-				cmd := &GetConsumerOffset{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: &p}
-				snap := GetConsumerOffset{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: &p}
+				p1, p2 := partitionId, partitionId
+				cmd := &GetConsumerOffset{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: &p1}
+				snap := GetConsumerOffset{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: &p2}
 				return cmd, snap
 			},
 		},
@@ -398,9 +395,9 @@ func TestMarshalBinary_DoesNotMutateReceiver(t *testing.T) {
 		{
 			name: "DeleteConsumerOffset_WithPartition",
 			makeCMD: func() (interface{ MarshalBinary() ([]byte, error) }, interface{}) {
-				p := partitionId
-				cmd := &DeleteConsumerOffset{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: &p}
-				snap := DeleteConsumerOffset{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: &p}
+				p1, p2 := partitionId, partitionId
+				cmd := &DeleteConsumerOffset{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: &p1}
+				snap := DeleteConsumerOffset{StreamId: streamId, TopicId: topicId, Consumer: consumer, PartitionId: &p2}
 				return cmd, snap
 			},
 		},

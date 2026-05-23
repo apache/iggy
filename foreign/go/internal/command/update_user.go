@@ -36,6 +36,9 @@ func (u *UpdateUser) MarshalBinary() ([]byte, error) {
 	}
 	length := len(userIdBytes) + 2
 
+	// Intentional: empty string collapses to the same wire bytes as nil (has-username=0).
+	// The Rust server rejects empty usernames via WireName validation (1-255 bytes),
+	// so sending has-username=1 with a zero-length name would be a protocol error anyway.
 	var username string
 	if u.Username != nil {
 		username = *u.Username

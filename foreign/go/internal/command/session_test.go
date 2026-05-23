@@ -25,40 +25,6 @@ import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
-// buildExpectedLoginUser constructs the expected byte representation for a LoginUser command.
-// Format: [username_len(1)][username][password_len(1)][password][version_len(4)][version][context_len(4)][context]
-func buildExpectedLoginUser(username, password string) []byte {
-	versionBytes := []byte(iggcon.Version)
-	contextBytes := []byte("")
-
-	totalLength := 1 + len(username) + 1 + len(password) +
-		4 + len(versionBytes) + 4 + len(contextBytes)
-
-	buf := make([]byte, totalLength)
-	pos := 0
-
-	buf[pos] = byte(len(username))
-	pos++
-	copy(buf[pos:], username)
-	pos += len(username)
-
-	buf[pos] = byte(len(password))
-	pos++
-	copy(buf[pos:], password)
-	pos += len(password)
-
-	binary.LittleEndian.PutUint32(buf[pos:], uint32(len(versionBytes)))
-	pos += 4
-	copy(buf[pos:], versionBytes)
-	pos += len(versionBytes)
-
-	binary.LittleEndian.PutUint32(buf[pos:], uint32(len(contextBytes)))
-	pos += 4
-	copy(buf[pos:], contextBytes)
-
-	return buf
-}
-
 // TestSerialize_LoginUser_ContainsVersion verifies that the SDK version is included in login serialization.
 func TestSerialize_LoginUser_ContainsVersion(t *testing.T) {
 	request := LoginUser{
@@ -86,7 +52,9 @@ func TestSerialize_LoginUser_ContainsVersion(t *testing.T) {
 	}
 }
 
-// TestSerialize_LoginUser tests normal login with username and password
+// TestSerialize_LoginUser tests normal login by asserting each field individually
+// against literal byte values, so a structural bug in production code is not masked
+// by a helper that mirrors the same logic.
 func TestSerialize_LoginUser(t *testing.T) {
 	cmd := LoginUser{
 		Username: "admin",
@@ -98,68 +66,119 @@ func TestSerialize_LoginUser(t *testing.T) {
 		t.Fatalf("Failed to serialize LoginUser: %v", err)
 	}
 
-	expected := buildExpectedLoginUser("admin", "secret123")
+	pos := 0
 
-	if !bytes.Equal(serialized, expected) {
-		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	// Username: [len:u8][bytes]
+	if serialized[pos] != 5 {
+		t.Errorf("username length = %d, want 5", serialized[pos])
+	}
+	pos++
+	if string(serialized[pos:pos+5]) != "admin" {
+		t.Errorf("username = %q, want %q", string(serialized[pos:pos+5]), "admin")
+	}
+	pos += 5
+
+	// Password: [len:u8][bytes]
+	if serialized[pos] != 9 {
+		t.Errorf("password length = %d, want 9", serialized[pos])
+	}
+	pos++
+	if string(serialized[pos:pos+9]) != "secret123" {
+		t.Errorf("password = %q, want %q", string(serialized[pos:pos+9]), "secret123")
+	}
+	pos += 9
+
+	// Version: [len:u32_le][bytes]
+	versionLen := binary.LittleEndian.Uint32(serialized[pos : pos+4])
+	pos += 4
+	version := string(serialized[pos : pos+int(versionLen)])
+	if version != iggcon.Version {
+		t.Errorf("version = %q, want %q", version, iggcon.Version)
+	}
+	pos += int(versionLen)
+
+	// Context: [len:u32_le][bytes]
+	contextLen := binary.LittleEndian.Uint32(serialized[pos : pos+4])
+	pos += 4
+	if contextLen != 0 {
+		t.Errorf("context length = %d, want 0", contextLen)
+	}
+
+	// Total length check
+	if pos != len(serialized) {
+		t.Errorf("consumed %d bytes, but serialized has %d", pos, len(serialized))
+	}
+}
+
+// assertLoginUserFields validates each field of a serialized LoginUser independently
+// against literal values, so structural bugs in production code are not masked.
+func assertLoginUserFields(t *testing.T, serialized []byte, username, password string) {
+	t.Helper()
+	pos := 0
+
+	if serialized[pos] != byte(len(username)) {
+		t.Errorf("username length = %d, want %d", serialized[pos], len(username))
+	}
+	pos++
+	if string(serialized[pos:pos+len(username)]) != username {
+		t.Errorf("username = %q, want %q", string(serialized[pos:pos+len(username)]), username)
+	}
+	pos += len(username)
+
+	if serialized[pos] != byte(len(password)) {
+		t.Errorf("password length = %d, want %d", serialized[pos], len(password))
+	}
+	pos++
+	if string(serialized[pos:pos+len(password)]) != password {
+		t.Errorf("password = %q, want %q", string(serialized[pos:pos+len(password)]), password)
+	}
+	pos += len(password)
+
+	versionLen := binary.LittleEndian.Uint32(serialized[pos : pos+4])
+	pos += 4
+	if string(serialized[pos:pos+int(versionLen)]) != iggcon.Version {
+		t.Errorf("version = %q, want %q", string(serialized[pos:pos+int(versionLen)]), iggcon.Version)
+	}
+	pos += int(versionLen)
+
+	contextLen := binary.LittleEndian.Uint32(serialized[pos : pos+4])
+	pos += 4
+	if contextLen != 0 {
+		t.Errorf("context length = %d, want 0", contextLen)
+	}
+	if pos != len(serialized) {
+		t.Errorf("consumed %d bytes, but serialized has %d", pos, len(serialized))
 	}
 }
 
 // TestSerialize_LoginUser_EmptyCredentials tests edge case with empty username and password
 func TestSerialize_LoginUser_EmptyCredentials(t *testing.T) {
-	cmd := LoginUser{
-		Username: "",
-		Password: "",
-	}
-
+	cmd := LoginUser{Username: "", Password: ""}
 	serialized, err := cmd.MarshalBinary()
 	if err != nil {
 		t.Fatalf("Failed to serialize LoginUser with empty credentials: %v", err)
 	}
-
-	expected := buildExpectedLoginUser("", "")
-
-	if !bytes.Equal(serialized, expected) {
-		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
-	}
+	assertLoginUserFields(t, serialized, "", "")
 }
 
 // TestSerialize_LoginUser_LongCredentials tests with longer username and password
 func TestSerialize_LoginUser_LongCredentials(t *testing.T) {
-	cmd := LoginUser{
-		Username: "user@example.com",
-		Password: "very_secure_password_123!",
-	}
-
+	cmd := LoginUser{Username: "user@example.com", Password: "very_secure_password_123!"}
 	serialized, err := cmd.MarshalBinary()
 	if err != nil {
 		t.Fatalf("Failed to serialize LoginUser with long credentials: %v", err)
 	}
-
-	expected := buildExpectedLoginUser("user@example.com", "very_secure_password_123!")
-
-	if !bytes.Equal(serialized, expected) {
-		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
-	}
+	assertLoginUserFields(t, serialized, "user@example.com", "very_secure_password_123!")
 }
 
 // TestSerialize_LoginUser_SingleCharCredentials tests edge case with single character credentials
 func TestSerialize_LoginUser_SingleCharCredentials(t *testing.T) {
-	cmd := LoginUser{
-		Username: "a",
-		Password: "b",
-	}
-
+	cmd := LoginUser{Username: "a", Password: "b"}
 	serialized, err := cmd.MarshalBinary()
 	if err != nil {
 		t.Fatalf("Failed to serialize LoginUser with single char credentials: %v", err)
 	}
-
-	expected := buildExpectedLoginUser("a", "b")
-
-	if !bytes.Equal(serialized, expected) {
-		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
-	}
+	assertLoginUserFields(t, serialized, "a", "b")
 }
 
 // TestSerialize_LoginWithPersonalAccessToken tests login with token
