@@ -733,7 +733,7 @@ jobs:
     name: Docker ${{ matrix.name }} (${{ matrix.arch }})
     needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
     if: |
-      always() &&
+      !cancelled() &&
       needs.validate.outputs.has_targets == 'true' &&
       needs.plan.outputs.has_docker == 'true' &&
       fromJson(needs.plan.outputs.docker_matrix).include[0].key != 'noop' &&
@@ -837,7 +837,7 @@ jobs:
     name: Docker manifests
     needs: [validate, plan, publish-docker]
     if: |
-      always() &&
+      !cancelled() &&
       needs.validate.outputs.has_targets == 'true' &&
       needs.plan.outputs.has_docker == 'true' &&
       fromJson(needs.plan.outputs.docker_components).include[0].key != 'noop' &&
@@ -944,7 +944,7 @@ jobs:
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
       - name: Login to Docker Hub
-        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           username: ${{ env.DOCKERHUB_USER }}
           password: ${{ env.DOCKERHUB_TOKEN }}
@@ -1040,7 +1040,7 @@ jobs:
     name: ${{ matrix.name }}
     needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
     if: |
-      always() &&
+      !cancelled() &&
       needs.validate.outputs.has_targets == 'true' &&
       fromJson(needs.plan.outputs.non_docker_targets).include[0].key != 'noop' &&
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
@@ -1350,7 +1350,7 @@ jobs:
         docker-manifests,
         publish,
       ]
-    if: always() && needs.validate.outputs.has_targets == 'true'
+    if: ${{ !cancelled() && needs.validate.outputs.has_targets == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Download latest copy script from master

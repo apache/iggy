@@ -51,6 +51,26 @@ pub const PARTITION_MASK: u64 = (1u64 << PARTITION_BITS) - 1;
 pub const TOPIC_MASK: u64 = (1u64 << TOPIC_BITS) - 1;
 pub const STREAM_MASK: u64 = (1u64 << STREAM_BITS) - 1;
 
+/// Total bits used by the packed `IggyNamespace` layout (stream | topic | partition).
+/// Any `u64` whose set bits all sit within this range is a legal packable namespace.
+pub const PACKED_NAMESPACE_BITS: u32 = STREAM_BITS + TOPIC_BITS + PARTITION_BITS;
+
+/// Largest `u64` value that can be produced by [`IggyNamespace::new`].
+/// Equivalent to `(1 << PACKED_NAMESPACE_BITS) - 1`.
+pub const PACKED_NAMESPACE_MAX: u64 = (1u64 << PACKED_NAMESPACE_BITS) - 1;
+
+/// Reserved consensus-namespace identifier for the cluster's metadata replica.
+///
+/// The packed `IggyNamespace` layout uses only bits `0..PACKED_NAMESPACE_BITS`,
+/// so the top bit is guaranteed to be unreachable from any
+/// `IggyNamespace::new(stream, topic, partition).inner()`. This lets routers
+/// distinguish metadata's single global consensus group from per-partition
+/// consensus groups by value alone, without needing a wire-format scope tag.
+///
+/// `IggyNamespace::new(0, 0, 0).inner() == 0` is a legal partition, so `0`
+/// cannot serve as a sentinel.
+pub const METADATA_CONSENSUS_NAMESPACE: u64 = 1u64 << 63;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum NamespaceCapacityError {
     #[error("max_streams must be greater than 0")]
@@ -112,6 +132,15 @@ impl IggyNamespace {
         Self(value)
     }
 
+    /// Returns `true` when `value` could have been produced by [`Self::new`].
+    /// False for the metadata sentinel and for any `u64` with bits set above
+    /// the packed range.
+    #[inline]
+    #[must_use]
+    pub const fn is_packable(value: u64) -> bool {
+        value <= PACKED_NAMESPACE_MAX
+    }
+
     pub fn validate_capacity(
         max_streams: usize,
         max_topics: usize,
@@ -157,7 +186,37 @@ impl IggyNamespace {
 
 #[cfg(test)]
 mod tests {
-    use super::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS, NamespaceCapacityError};
+    use super::{
+        IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS, METADATA_CONSENSUS_NAMESPACE,
+        NamespaceCapacityError, PACKED_NAMESPACE_BITS, PACKED_NAMESPACE_MAX,
+    };
+
+    // Both static facts (sentinel above the packed range; bit layout matches
+    // module constants) are checked at compile time so any future tweak to
+    // STREAM_BITS / TOPIC_BITS / PARTITION_BITS that closes the gap between
+    // the packed range and the sentinel will fail to build.
+    const _: () = {
+        assert!(METADATA_CONSENSUS_NAMESPACE > PACKED_NAMESPACE_MAX);
+        assert!(PACKED_NAMESPACE_BITS == 12 + 12 + 20);
+        assert!(PACKED_NAMESPACE_MAX == (1u64 << PACKED_NAMESPACE_BITS) - 1);
+    };
+
+    #[test]
+    fn metadata_sentinel_cannot_collide_with_any_packable_namespace() {
+        assert!(!IggyNamespace::is_packable(METADATA_CONSENSUS_NAMESPACE));
+
+        // The (0, 0, 0) corner is intentionally a legal partition, which is
+        // precisely why `0` is unsuitable as the metadata sentinel.
+        let zero = IggyNamespace::new(0, 0, 0);
+        assert_eq!(zero.inner(), 0);
+        assert!(IggyNamespace::is_packable(zero.inner()));
+        assert_ne!(zero.inner(), METADATA_CONSENSUS_NAMESPACE);
+
+        // Maximum packable triple stays inside the packed range.
+        let max = IggyNamespace::new(MAX_STREAMS - 1, MAX_TOPICS - 1, MAX_PARTITIONS - 1);
+        assert!(IggyNamespace::is_packable(max.inner()));
+        assert_ne!(max.inner(), METADATA_CONSENSUS_NAMESPACE);
+    }
 
     #[test]
     fn validates_default_namespace_capacity() {

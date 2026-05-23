@@ -16,65 +16,49 @@
 // under the License.
 
 //! One-stop construction for an [`IggyShard`] plus, on shard 0 only, its
-//! associated [`ShardZeroCoordinator`] and periodic mapping-refresh task.
+//! associated [`ShardZeroCoordinator`].
 //!
-//! The coordinator owns the authoritative `replica_id -> owning_shard`
-//! snapshot used by the router's `ConnectionLost` fast path and by the
-//! refresh task that re-broadcasts the snapshot to recover shards whose
-//! inbox was full when an earlier `ReplicaMappingUpdate` was sent.
-//! Both the `set_coordinator` call and the refresh-task spawn must happen
-//! together: wiring one without the other breaks the drop-recovery story
-//! the coordinator's rustdoc promises.
+//! The coordinator owns shard-0's round-robin state for replica and
+//! client placement. Cluster-wide `replica_id -> owning_shard` routing
+//! flows through the cluster-shared [`message_bus::ReplicaOwnerTable`],
+//! stamped by the owning shard's installer and CAS-cleared on disconnect.
 //!
-//! Bootstrap code constructs an [`IggyShardBuilder`] per shard and calls
-//! [`IggyShardBuilder::build`]. On shard 0 the returned [`BuiltShard`]
-//! carries the refresh task's [`JoinHandle`]; bootstrap is responsible for
-//! tracking it on the bus' background-task set so graceful shutdown awaits
-//! it. On non-zero shards the handle is `None` and the coordinator field
-//! on the shard stays unset.
+//! The coordinator is constructed before the shard and passed to
+//! [`IggyShard::new`] as a ctor argument, so an `IggyShard` is fully
+//! wired the instant it becomes observable to any reader.
 
-use crate::coordinator::ShardZeroCoordinator;
+use crate::coordinator::{ShardZeroCoordinator, classify_try_send_err};
+use crate::metrics::{ShardMetrics, frame_drop_variant};
 use crate::{
-    CoordinatorConfig, IggyShard, PartitionConsensusConfig, Receiver, ShardFrame,
-    ShardFramePayload, ShardIdentity, TaggedSender,
+    CoordinatorConfig, IggyShard, LifecycleFrame, PartitionConsensusConfig, Receiver,
+    ShardCtorError, ShardFrame, ShardIdentity, TaggedSender,
 };
-use compio::runtime::JoinHandle;
 use consensus::VsrConsensus;
 use journal::JournalHandle;
-use message_bus::MessageBus;
 use message_bus::client_listener::RequestHandler;
-use message_bus::lifecycle::ShutdownToken;
 use message_bus::replica::listener::MessageHandler;
+use message_bus::{MessageBus, SendError};
 use metadata::IggyMetadata;
 use metadata::stm::StateMachine;
 use partitions::IggyPartitions;
 use std::rc::Rc;
-use tracing::warn;
 
 use crate::shards_table::ShardsTable;
 
-/// A freshly constructed [`IggyShard`], paired with the refresh-task
-/// [`JoinHandle`] when this is shard 0. Bootstrap tracks the handle on
-/// the bus' background tasks so graceful shutdown awaits it.
-pub struct BuiltShard<B, MJ, S, M, T, R = ()>
+/// A freshly constructed [`IggyShard`].
+pub struct BuiltShard<B, MJ, S, M, T>
 where
     B: MessageBus,
-    R: Send + 'static,
 {
-    pub shard: IggyShard<B, MJ, S, M, T, R>,
-    /// `Some` on shard 0, `None` otherwise. Pass to
-    /// `IggyMessageBus::track_background` (or an equivalent tracker) so
-    /// the task is awaited on shutdown.
-    pub refresh_task: Option<JoinHandle<()>>,
+    pub shard: IggyShard<B, MJ, S, M, T>,
 }
 
 /// Builder that pairs [`IggyShard`] construction with coordinator wiring
 /// on shard 0. Non-zero shards skip the coordinator entirely; the
-/// `coord_config` and `shutdown_token` fields are then ignored.
-pub struct IggyShardBuilder<B, MJ, S, M, T, R = ()>
+/// `coord_config` field is then ignored.
+pub struct IggyShardBuilder<B, MJ, S, M, T>
 where
     B: MessageBus,
-    R: Send + 'static,
 {
     identity: ShardIdentity,
     bus: B,
@@ -82,26 +66,24 @@ where
     on_client_request: RequestHandler,
     metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
     partitions: IggyPartitions<B>,
-    senders: Vec<TaggedSender<R>>,
-    inbox: Receiver<ShardFrame<R>>,
+    senders: Vec<TaggedSender>,
+    inbox: Receiver<ShardFrame>,
     shards_table: T,
     partition_consensus: PartitionConsensusConfig<B>,
     coord_config: CoordinatorConfig,
-    shutdown_token: ShutdownToken,
+    metrics: ShardMetrics,
 }
 
-impl<B, MJ, S, M, T, R> IggyShardBuilder<B, MJ, S, M, T, R>
+impl<B, MJ, S, M, T> IggyShardBuilder<B, MJ, S, M, T>
 where
-    B: MessageBus,
-    R: Send + 'static,
+    B: MessageBus + Clone + 'static,
     T: ShardsTable,
     MJ: JournalHandle,
     S: Send + 'static,
     M: StateMachine,
 {
     /// Create a builder carrying every input needed by both
-    /// [`IggyShard::new`] and (for shard 0) `ShardZeroCoordinator::new`
-    /// plus `spawn_refresh_task`.
+    /// [`IggyShard::new`] and (for shard 0) `ShardZeroCoordinator::new`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         identity: ShardIdentity,
@@ -110,12 +92,12 @@ where
         on_client_request: RequestHandler,
         metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
         partitions: IggyPartitions<B>,
-        senders: Vec<TaggedSender<R>>,
-        inbox: Receiver<ShardFrame<R>>,
+        senders: Vec<TaggedSender>,
+        inbox: Receiver<ShardFrame>,
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
         coord_config: CoordinatorConfig,
-        shutdown_token: ShutdownToken,
+        metrics: ShardMetrics,
     ) -> Self {
         Self {
             identity,
@@ -129,65 +111,99 @@ where
             shards_table,
             partition_consensus,
             coord_config,
-            shutdown_token,
+            metrics,
         }
     }
 
     /// Consume the builder and produce a fully wired [`BuiltShard`]. On
-    /// shard 0 this constructs the coordinator, attaches it to the shard,
-    /// and spawns the periodic refresh task. On any other shard the
-    /// coordinator-specific fields are dropped and `refresh_task` is
-    /// `None`.
+    /// shard 0 this constructs the coordinator and passes it to the shard
+    /// ctor. On any other shard the coordinator-specific fields are
+    /// dropped.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `senders` is not in canonical order
-    /// (`senders[i].shard_id() != i`) or if `senders.len()` does not
+    /// Returns [`ShardCtorError::SenderOrderingInvalid`] if `senders` is
+    /// not in canonical order (`senders[i].shard_id() != i`) and
+    /// [`ShardCtorError::ShardCountOverflow`] if `senders.len()` does not
     /// fit in `u16`. Both are bootstrap programming errors and the
     /// `u16` overflow check fires on every shard, not only shard 0.
-    pub fn build(self) -> BuiltShard<B, MJ, S, M, T, R> {
+    pub fn build(self) -> Result<BuiltShard<B, MJ, S, M, T>, ShardCtorError> {
         let is_shard_zero = self.identity.id == 0;
 
-        let total_shards = u16::try_from(self.senders.len())
-            .expect("cluster shard count must fit in u16 (bootstrap invariant)");
+        // Fail fast before installing forward closures: a misordered
+        // senders vec would silently misroute every cross-shard frame.
+        crate::validate_sender_ordering(&self.senders)?;
+        let total_shards =
+            u16::try_from(self.senders.len()).map_err(|_| ShardCtorError::ShardCountOverflow {
+                count: self.senders.len(),
+            })?;
 
-        // Wire the bus' connection-lost notifier to push a ConnectionLost
-        // frame into shard 0's inbox. Every shard's bus needs this so that
-        // a dead replica connection anywhere surfaces at the coordinator.
-        // Shard 0's sender is cloned once here; the closure captures that
-        // clone and runs on the owning shard's reader/writer tasks.
-        let shard_zero_sender = self.senders[0].sender().clone();
-        let connection_lost_fn: message_bus::ConnectionLostFn = Rc::new(move |replica_id: u8| {
-            let frame = ShardFrame::<R> {
-                payload: ShardFramePayload::ConnectionLost { replica_id },
-                response_sender: None,
-            };
-            if let Err(e) = shard_zero_sender.try_send(frame) {
-                // Inbox full: the coordinator's periodic refresh task
-                // re-broadcasts the authoritative snapshot and the bus
-                // retries on next dial, so a single drop is recoverable.
-                // Warn so operators see repeated drops if they occur.
-                warn!(
-                    replica_id,
-                    "shard-0 inbox rejected ConnectionLost frame: {e}"
-                );
-            }
-        });
-        self.bus.set_connection_lost_fn(connection_lost_fn);
+        // Install the cross-shard forward closures. The bus' slow path
+        // (`send_to_replica` / `send_to_client`) calls these when the
+        // destination connection lives on a different shard; the closure
+        // wraps the message into a `LifecycleFrame::Forward{Replica,
+        // Client}Send` and `try_send`s it to the owning shard's inbox.
+        // The receiving shard's router unwraps the frame and re-enters
+        // the bus' fast path locally. The `senders` Vec is canonically
+        // ordered (`senders[i].shard_id() == i`).
+        let senders_for_replica: Rc<Vec<TaggedSender>> = Rc::new(self.senders.clone());
+        let senders_for_client = Rc::clone(&senders_for_replica);
+        let metrics_for_replica = self.metrics.clone();
+        let metrics_for_client = self.metrics.clone();
+        self.bus
+            .set_replica_forward_fn(Box::new(move |replica_id, owning_shard, msg| {
+                senders_for_replica.get(usize::from(owning_shard)).map_or(
+                    Err(SendError::ReplicaForwardFailed(replica_id)),
+                    |sender| {
+                        let frame = ShardFrame::lifecycle(LifecycleFrame::ForwardReplicaSend {
+                            replica_id,
+                            msg,
+                        });
+                        sender.try_send(frame).map_err(|err| {
+                            metrics_for_replica.record_frame_drop(
+                                frame_drop_variant::FORWARD_REPLICA_SEND,
+                                classify_try_send_err(&err),
+                            );
+                            SendError::ReplicaForwardFailed(replica_id)
+                        })
+                    },
+                )
+            }));
+        self.bus
+            .set_client_forward_fn(Box::new(move |client_id, owning_shard, msg| {
+                senders_for_client.get(usize::from(owning_shard)).map_or(
+                    Err(SendError::ClientForwardFailed(client_id)),
+                    |sender| {
+                        let frame = ShardFrame::lifecycle(LifecycleFrame::ForwardClientSend {
+                            client_id,
+                            msg,
+                        });
+                        sender.try_send(frame).map_err(|err| {
+                            metrics_for_client.record_frame_drop(
+                                frame_drop_variant::FORWARD_CLIENT_SEND,
+                                classify_try_send_err(&err),
+                            );
+                            SendError::ClientForwardFailed(client_id)
+                        })
+                    },
+                )
+            }));
 
-        let coord_inputs = if is_shard_zero {
-            let coord_senders: Vec<TaggedSender<R>> = self.senders.clone();
-            Some((
+        // On shard 0: build the coordinator BEFORE the shard, so the
+        // coordinator can be passed to `IggyShard::new` as a ctor arg.
+        let coordinator = if is_shard_zero {
+            let coord_senders: Vec<TaggedSender> = self.senders.clone();
+            Some(Rc::new(ShardZeroCoordinator::new(
                 Rc::new(coord_senders),
                 total_shards,
-                self.coord_config,
-                self.shutdown_token,
-            ))
+                self.coord_config.clone(),
+                self.metrics.clone(),
+            )?))
         } else {
             None
         };
 
-        let mut shard = IggyShard::new(
+        let shard = IggyShard::new(
             self.identity,
             self.bus,
             self.on_replica_message,
@@ -198,20 +214,10 @@ where
             self.inbox,
             self.shards_table,
             self.partition_consensus,
-        );
+            coordinator,
+            self.metrics,
+        )?;
 
-        let refresh_task = if let Some((senders_rc, total_shards, cfg, token)) = coord_inputs {
-            let refresh_period = cfg.refresh_period;
-            let coord = Rc::new(ShardZeroCoordinator::new(senders_rc, total_shards, cfg));
-            shard.set_coordinator(Rc::clone(&coord));
-            Some(coord.spawn_refresh_task(token, refresh_period))
-        } else {
-            None
-        };
-
-        BuiltShard {
-            shard,
-            refresh_task,
-        }
+        Ok(BuiltShard { shard })
     }
 }
