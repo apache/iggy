@@ -50,12 +50,11 @@ pub struct IggyClient {
 #[pymethods]
 impl IggyClient {
     /// Constructs a new IggyClient from a TCP server address.
-    ///
     /// This initializes a new runtime for asynchronous operations.
     /// Future versions might utilize asyncio for more Pythonic async.
     #[new]
     #[pyo3(signature = (conn=None))]
-    fn new(conn: Option<String>) -> Self {
+    fn new(#[gen_stub(override_type(type_repr = "builtins.str | None"))] conn: Option<String>) -> Self {
         let client = IggyClientBuilder::new()
             .with_tcp()
             .with_server_address(conn.unwrap_or("127.0.0.1:8090".to_string()))
@@ -67,7 +66,6 @@ impl IggyClient {
     }
 
     /// Constructs a new IggyClient from a connection string.
-    ///
     /// Returns an error if the connection string provided is invalid.
     // TODO: add examples for connection strings or at least a link to the doc page where
     // connection strings are explained.
@@ -85,7 +83,6 @@ impl IggyClient {
     }
 
     /// Sends a ping request to the server to check connectivity.
-    ///
     /// Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
     /// if the connection fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -100,7 +97,6 @@ impl IggyClient {
     }
 
     /// Logs in the user with the given credentials.
-    ///
     /// Returns `Ok(())` on success, or a PyRuntimeError on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn login_user<'a>(
@@ -120,7 +116,6 @@ impl IggyClient {
     }
 
     /// Connects the IggyClient to its service.
-    ///
     /// Returns Ok(()) on successful connection or a PyRuntimeError on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn connect<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
@@ -135,7 +130,6 @@ impl IggyClient {
     }
 
     /// Creates a new stream with the provided ID and name.
-    ///
     /// Returns Ok(()) on successful stream creation or a PyRuntimeError on failure.
     #[pyo3(signature = (name))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -151,9 +145,8 @@ impl IggyClient {
     }
 
     /// Gets stream by id.
-    ///
     /// Returns Option of stream details or a PyRuntimeError on failure.
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[typing.Optional[StreamDetails]]", imports=("collections.abc")))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[StreamDetails | None]", imports=("collections.abc")))]
     fn get_stream<'a>(
         &self,
         py: Python<'a>,
@@ -172,7 +165,6 @@ impl IggyClient {
     }
 
     /// Creates a new topic with the given parameters.
-    ///
     /// Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
     #[pyo3(
         signature = (stream, name, partitions_count, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
@@ -185,9 +177,13 @@ impl IggyClient {
         stream: PyIdentifier,
         name: String,
         partitions_count: u32,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))]
         compression_algorithm: Option<String>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
         replication_factor: Option<u8>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         message_expiry: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
         max_topic_size: Option<u64>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let compression_algorithm = match compression_algorithm {
@@ -224,9 +220,8 @@ impl IggyClient {
     }
 
     /// Gets topic by stream and id.
-    ///
     /// Returns Option of topic details or a PyRuntimeError on failure.
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[typing.Optional[TopicDetails]]", imports=("collections.abc")))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[TopicDetails | None]", imports=("collections.abc")))]
     fn get_topic<'a>(
         &self,
         py: Python<'a>,
@@ -247,7 +242,6 @@ impl IggyClient {
     }
 
     /// Sends a list of messages to the specified topic.
-    ///
     /// Returns Ok(()) on successful sending or a PyRuntimeError on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn send_messages<'a>(
@@ -285,7 +279,6 @@ impl IggyClient {
     }
 
     /// Polls for messages from the specified topic and partition.
-    ///
     /// Returns a list of received messages or a PyRuntimeError on failure.
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ReceiveMessage]]", imports=("collections.abc")))]
@@ -332,7 +325,6 @@ impl IggyClient {
     }
 
     /// Creates a new consumer group consumer.
-    ///
     /// Returns the consumer or a PyRuntimeError on failure.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
@@ -358,15 +350,23 @@ impl IggyClient {
         name: &str,
         stream: &str,
         topic: &str,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
         partition_id: Option<u32>,
+        #[gen_stub(override_type(type_repr = "PollingStrategy | None"))]
         polling_strategy: Option<&PollingStrategy>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
         batch_length: Option<u32>,
+        #[gen_stub(override_type(type_repr = "AutoCommit | None"))]
         auto_commit: Option<&AutoCommit>,
         create_consumer_group_if_not_exists: bool,
         auto_join_consumer_group: bool,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         poll_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         polling_retry_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
         init_retries: Option<u32>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         init_retry_interval: Option<Py<PyDelta>>,
         allow_replay: bool,
     ) -> PyResult<Bound<'a, PyAny>> {

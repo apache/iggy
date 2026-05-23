@@ -78,6 +78,24 @@ include = [
     ] },
 ]
 
+[tool.ruff.lint]
+select = [
+    "S", # detects usage of commands like `exec()` and `eval()`. Also usage of `pickle`, `marshal`, etc.
+    "B", # flake8-bugbear rule family for likely bugs and unsafe exception patterns
+    "E", # pycodestyle errors: basic PEP 8 style violations
+    "F", # Pyflakes: undefined names, unused imports, and other logic issues
+    "W", # pycodestyle warnings: whitespace and other style warnings
+    "I", # isort: import sorting and grouping rules
+    "T10", # flake8-debugger: debugger statements like pdb or breakpoint
+    "C4", # flake8-comprehensions: unnecessary or suboptimal comprehensions
+    "ARG", # flake8-unused-arguments: unused function arguments
+    "SIM", # flake8-simplify: simplify redundant logic and expressions
+    "UP", # pyupgrade: use newer, simpler Python syntax
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["S101", "B017"]
+
 [project.optional-dependencies]
 # Core testing dependencies
 testing = [
@@ -94,9 +112,6 @@ testing-docker = ["testcontainers[docker]>=3.7.0,<5.0"]
 # Development tools
 dev = [
     "maturin>=1.2,<2.0",
-    "black>=23.0,<27.0",
-    "isort>=5.12.0,<6.0",
-    "mypy>=1.5.0,<2.0",
     "ruff>=0.1.0,<1.0",
 ]
 
@@ -107,12 +122,8 @@ all = [
     "pytest-cov>=4.0,<7.0",
     "pytest-xdist>=3.0,<4.0",
     "pytest-timeout>=2.0,<3.0",
-    "loguru>=0.7.0,<1.0",
     "testcontainers[docker]>=3.7.0,<5.0",
     "maturin>=1.2,<2.0",
-    "black>=23.0,<27.0",
-    "isort>=5.12.0,<6.0",
-    "mypy>=1.5.0,<2.0",
     "ruff>=0.1.0,<1.0",
 ]
 

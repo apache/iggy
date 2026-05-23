@@ -31,6 +31,7 @@ use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::{future_into_py, get_runtime, into_future, scope};
 use pyo3_async_runtimes::TaskLocals;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
+use pyo3_stub_gen::{PyStubType, TypeInfo};
 use tokio::sync::oneshot::Sender;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -52,6 +53,7 @@ pub struct IggyConsumer {
 #[pymethods]
 impl IggyConsumer {
     /// Get the last consumed offset or `None` if no offset has been consumed yet.
+    #[gen_stub(override_return_type(type_repr="builtins.int | None"))]
     fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
         self.inner
             .blocking_lock()
@@ -59,6 +61,7 @@ impl IggyConsumer {
     }
 
     /// Get the last stored offset or `None` if no offset has been stored yet.
+    #[gen_stub(override_return_type(type_repr="builtins.int | None"))]
     fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
         self.inner
             .blocking_lock()
@@ -87,7 +90,6 @@ impl IggyConsumer {
 
     /// Stores the provided offset for the provided partition id or if none is specified
     /// uses the current partition id for the consumer group.
-    ///
     /// Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
     /// if the operation fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -95,6 +97,7 @@ impl IggyConsumer {
         &self,
         py: Python<'a>,
         offset: u64,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
         partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -110,13 +113,13 @@ impl IggyConsumer {
 
     /// Deletes the offset for the provided partition id or if none is specified
     /// uses the current partition id for the consumer group.
-    ///
     /// Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
     /// if the operation fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn delete_offset<'a>(
         &self,
         py: Python<'a>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
         partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -131,10 +134,8 @@ impl IggyConsumer {
     }
 
     /// Asynchronously iterate over `ReceiveMessage`s.
-    ///
     /// Returns an async iterator that raises `StopAsyncIteration` when no more messages are available
     /// or a `PyRuntimeError` on failure.
-    ///
     /// Note: This method does not currently support `AutoCommit.After`.
     /// For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
     /// only the interval part is applied; the `after` mode is ignored.
@@ -146,7 +147,6 @@ impl IggyConsumer {
     }
 
     /// Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
-    ///
     /// Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn consume_messages<'a>(
@@ -154,7 +154,7 @@ impl IggyConsumer {
         py: Python<'a>,
         #[gen_stub(override_type(type_repr="collections.abc.Callable[[ReceiveMessage], collections.abc.Awaitable[None]]", imports=("collections.abc")))]
         callback: Bound<'a, PyAny>,
-        #[gen_stub(override_type(type_repr="typing.Optional[asyncio.Event]", imports=("asyncio")))]
+        #[gen_stub(override_type(type_repr="asyncio.Event | None", imports=("asyncio")))]
         shutdown_event: Option<Bound<'a, PyAny>>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -291,7 +291,7 @@ impl From<&AutoCommit> for RustAutoCommit {
 
 /// The auto-commit mode for storing the offset on the server.
 #[derive(Debug, PartialEq, Copy, Clone)]
-#[gen_stub_pyclass_complex_enum]
+#[gen_stub_pyclass_complex_enum(skip_stub_type)]
 #[pyclass(from_py_object)]
 pub enum AutoCommitWhen {
     /// The offset is stored on the server when the messages are received.
@@ -317,9 +317,15 @@ impl From<&AutoCommitWhen> for RustAutoCommitWhen {
     }
 }
 
+impl PyStubType for AutoCommitWhen {
+    fn type_output() -> TypeInfo {
+        TypeInfo::unqualified("AutoCommitWhen")
+    }
+}
+
 /// The auto-commit mode for storing the offset on the server **after** receiving the messages.
 #[derive(Debug, PartialEq, Copy, Clone)]
-#[gen_stub_pyclass_complex_enum]
+#[gen_stub_pyclass_complex_enum(skip_stub_type)]
 #[pyclass(from_py_object)]
 #[allow(clippy::enum_variant_names)]
 pub enum AutoCommitAfter {
@@ -340,6 +346,12 @@ impl From<&AutoCommitAfter> for RustAutoCommitAfter {
                 RustAutoCommitAfter::ConsumingEveryNthMessage(n.to_owned())
             }
         }
+    }
+}
+
+impl PyStubType for AutoCommitAfter {
+    fn type_output() -> TypeInfo {
+        TypeInfo::unqualified("AutoCommitAfter")
     }
 }
 
