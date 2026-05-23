@@ -19,32 +19,36 @@
 
 use crate::OutputFormat;
 use chrono::{DateTime, Utc};
+use iggy_connector_sdk::Error;
 
-pub struct PathContext<'a> {
+pub(crate) struct PathContext<'a> {
     pub stream: &'a str,
     pub topic: &'a str,
     pub partition_id: u32,
     pub first_timestamp_micros: u64,
 }
 
-pub fn render_s3_key(
+pub(crate) fn render_s3_key(
     prefix: Option<&str>,
     template: &str,
     ctx: &PathContext<'_>,
     offset_start: u64,
     offset_end: u64,
     format: OutputFormat,
-) -> String {
-    let rendered = render_template(template, ctx);
+) -> Result<String, Error> {
+    let rendered = render_template(template, ctx)?;
 
+    // Partition ID is always embedded in the filename to prevent cross-partition
+    // key collisions (partitions have independent offset spaces starting at 0).
     let filename = format!(
-        "{:06}-{:06}.{}",
+        "{:05}-{:020}-{:020}.{}",
+        ctx.partition_id,
         offset_start,
         offset_end,
         format.file_extension()
     );
 
-    match prefix {
+    let key = match prefix {
         Some(p) => {
             let p = p.trim_matches('/');
             if p.is_empty() {
@@ -54,28 +58,34 @@ pub fn render_s3_key(
             }
         }
         None => format!("{rendered}/{filename}"),
-    }
+    };
+
+    Ok(key)
 }
 
-fn render_template(template: &str, ctx: &PathContext<'_>) -> String {
-    let dt = timestamp_to_datetime(ctx.first_timestamp_micros);
+fn render_template(template: &str, ctx: &PathContext<'_>) -> Result<String, Error> {
+    let dt = timestamp_to_datetime(ctx.first_timestamp_micros)?;
     let date = dt.format("%Y-%m-%d").to_string();
     let hour = dt.format("%H").to_string();
-    let now_millis = Utc::now().timestamp_millis().to_string();
+    let ts_millis = (ctx.first_timestamp_micros / 1_000).to_string();
 
-    template
+    Ok(template
         .replace("{stream}", ctx.stream)
         .replace("{topic}", ctx.topic)
         .replace("{partition}", &ctx.partition_id.to_string())
         .replace("{date}", &date)
         .replace("{hour}", &hour)
-        .replace("{timestamp}", &now_millis)
+        .replace("{timestamp}", &ts_millis))
 }
 
-fn timestamp_to_datetime(micros: u64) -> DateTime<Utc> {
+fn timestamp_to_datetime(micros: u64) -> Result<DateTime<Utc>, Error> {
     let secs = (micros / 1_000_000) as i64;
     let nanos = ((micros % 1_000_000) * 1_000) as u32;
-    DateTime::<Utc>::from_timestamp(secs, nanos).unwrap_or_else(Utc::now)
+    DateTime::<Utc>::from_timestamp(secs, nanos).ok_or_else(|| {
+        Error::CannotStoreData(format!(
+            "Invalid message timestamp: {micros} micros is out of range"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -101,10 +111,11 @@ mod tests {
             0,
             99,
             OutputFormat::JsonLines,
-        );
+        )
+        .unwrap();
         assert_eq!(
             key,
-            "iggy/raw/app_logs/api_requests/2024-03-16/14/000000-000099.jsonl"
+            "iggy/raw/app_logs/api_requests/2024-03-16/14/00001-00000000000000000000-00000000000000000099.jsonl"
         );
     }
 
@@ -118,22 +129,32 @@ mod tests {
             100,
             199,
             OutputFormat::JsonArray,
+        )
+        .unwrap();
+        assert_eq!(
+            key,
+            "app_logs/api_requests/1/2024-03-16/00001-00000000000000000100-00000000000000000199.json"
         );
-        assert_eq!(key, "app_logs/api_requests/1/2024-03-16/000100-000199.json");
     }
 
     #[test]
     fn render_no_prefix() {
         let ctx = test_ctx();
-        let key = render_s3_key(None, "{stream}/{topic}", &ctx, 0, 9, OutputFormat::Raw);
-        assert_eq!(key, "app_logs/api_requests/000000-000009.bin");
+        let key = render_s3_key(None, "{stream}/{topic}", &ctx, 0, 9, OutputFormat::Raw).unwrap();
+        assert_eq!(
+            key,
+            "app_logs/api_requests/00001-00000000000000000000-00000000000000000009.bin"
+        );
     }
 
     #[test]
     fn render_empty_prefix() {
         let ctx = test_ctx();
-        let key = render_s3_key(Some(""), "{stream}", &ctx, 0, 0, OutputFormat::JsonLines);
-        assert_eq!(key, "app_logs/000000-000000.jsonl");
+        let key = render_s3_key(Some(""), "{stream}", &ctx, 0, 0, OutputFormat::JsonLines).unwrap();
+        assert_eq!(
+            key,
+            "app_logs/00001-00000000000000000000-00000000000000000000.jsonl"
+        );
     }
 
     #[test]
@@ -146,19 +167,48 @@ mod tests {
             5,
             10,
             OutputFormat::JsonLines,
+        )
+        .unwrap();
+        assert_eq!(
+            key,
+            "data/api_requests/00001-00000000000000000005-00000000000000000010.jsonl"
         );
-        assert_eq!(key, "data/api_requests/000005-000010.jsonl");
+    }
+
+    #[test]
+    fn timestamp_deterministic_from_message() {
+        let ctx = test_ctx();
+        let key1 = render_s3_key(None, "{timestamp}", &ctx, 0, 0, OutputFormat::Raw).unwrap();
+        let key2 = render_s3_key(None, "{timestamp}", &ctx, 0, 0, OutputFormat::Raw).unwrap();
+        assert_eq!(key1, key2);
     }
 
     #[test]
     fn timestamp_to_datetime_zero() {
-        let dt = timestamp_to_datetime(0);
+        let dt = timestamp_to_datetime(0).unwrap();
         assert_eq!(dt.format("%Y-%m-%d").to_string(), "1970-01-01");
     }
 
     #[test]
     fn timestamp_to_datetime_known() {
-        let dt = timestamp_to_datetime(1_710_597_600_000_000);
+        let dt = timestamp_to_datetime(1_710_597_600_000_000).unwrap();
         assert_eq!(dt.format("%Y-%m-%dT%H").to_string(), "2024-03-16T14");
+    }
+
+    #[test]
+    fn lex_sort_correct_with_large_offsets() {
+        let ctx = test_ctx();
+        let key_small =
+            render_s3_key(None, "{stream}", &ctx, 999_900, 999_999, OutputFormat::Raw).unwrap();
+        let key_large = render_s3_key(
+            None,
+            "{stream}",
+            &ctx,
+            1_000_000,
+            1_001_000,
+            OutputFormat::Raw,
+        )
+        .unwrap();
+        assert!(key_small < key_large, "Lexicographic sort must be correct");
     }
 }

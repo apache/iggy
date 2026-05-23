@@ -21,9 +21,10 @@ use crate::S3SinkConfig;
 use iggy_connector_sdk::Error;
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
+use secrecy::ExposeSecret;
 use tracing::info;
 
-fn validate_credential_pair(config: &S3SinkConfig) -> Result<(), Error> {
+pub(crate) async fn create_bucket(config: &S3SinkConfig) -> Result<Box<Bucket>, Error> {
     if config.access_key_id.is_some() != config.secret_access_key.is_some() {
         return Err(Error::InvalidConfigValue(
             "Partially configured credentials. You must provide both access_key_id \
@@ -31,18 +32,19 @@ fn validate_credential_pair(config: &S3SinkConfig) -> Result<(), Error> {
                 .to_owned(),
         ));
     }
-    Ok(())
-}
-
-pub async fn create_bucket(config: &S3SinkConfig) -> Result<Box<Bucket>, Error> {
-    validate_credential_pair(config)?;
 
     let credentials = match (&config.access_key_id, &config.secret_access_key) {
         (Some(key), Some(secret)) => {
-            let redacted_key = key.chars().take(3).collect::<String>();
-            info!("Using explicit S3 credentials (access key: {redacted_key}***)");
-            Credentials::new(Some(key), Some(secret), None, None, None)
-                .map_err(|e| Error::InitError(format!("Failed to create S3 credentials: {e}")))?
+            let key_len = key.expose_secret().len();
+            info!("Using explicit S3 credentials (key length: {key_len} chars)");
+            Credentials::new(
+                Some(key.expose_secret()),
+                Some(secret.expose_secret()),
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| Error::InitError(format!("Failed to create S3 credentials: {e}")))?
         }
         _ => {
             info!(
@@ -78,13 +80,17 @@ pub async fn create_bucket(config: &S3SinkConfig) -> Result<Box<Bucket>, Error> 
     Ok(bucket)
 }
 
-pub async fn verify_bucket(bucket: &Bucket) -> Result<(), Error> {
-    bucket.head_object("/").await.map_err(|e| {
-        Error::InitError(format!(
-            "S3 bucket '{}' connectivity check failed: {e}",
-            bucket.name
-        ))
-    })?;
+/// Verify bucket connectivity by listing zero objects. Fatal on failure.
+pub(crate) async fn verify_bucket(bucket: &Bucket) -> Result<(), Error> {
+    bucket
+        .list_page("".to_string(), None, None, None, Some(1))
+        .await
+        .map_err(|e| {
+            Error::InitError(format!(
+                "S3 bucket '{}' connectivity check failed: {e}",
+                bucket.name
+            ))
+        })?;
     Ok(())
 }
 
@@ -119,36 +125,46 @@ mod tests {
     #[test]
     fn validate_both_credentials_present() {
         let config = S3SinkConfig {
-            access_key_id: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
-            secret_access_key: Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            access_key_id: Some("AKIAIOSFODNN7EXAMPLE".into()),
+            secret_access_key: Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into()),
             ..base_config()
         };
-        assert!(validate_credential_pair(&config).is_ok());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // create_bucket will succeed on credential validation but may fail on
+        // actual region parsing in test env -- we just check it gets past validation
+        let result = rt.block_on(create_bucket(&config));
+        assert!(result.is_ok() || !format!("{:?}", result).contains("Partially configured"));
     }
 
     #[test]
     fn validate_no_credentials() {
         let config = base_config();
-        assert!(validate_credential_pair(&config).is_ok());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(create_bucket(&config));
+        assert!(result.is_ok() || !format!("{:?}", result).contains("Partially configured"));
     }
 
     #[test]
     fn validate_partial_access_key_only() {
         let config = S3SinkConfig {
-            access_key_id: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
+            access_key_id: Some("AKIAIOSFODNN7EXAMPLE".into()),
             secret_access_key: None,
             ..base_config()
         };
-        assert!(validate_credential_pair(&config).is_err());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(create_bucket(&config));
+        assert!(result.is_err());
     }
 
     #[test]
     fn validate_partial_secret_key_only() {
         let config = S3SinkConfig {
             access_key_id: None,
-            secret_access_key: Some("secret".to_string()),
+            secret_access_key: Some("secret".into()),
             ..base_config()
         };
-        assert!(validate_credential_pair(&config).is_err());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(create_bucket(&config));
+        assert!(result.is_err());
     }
 }

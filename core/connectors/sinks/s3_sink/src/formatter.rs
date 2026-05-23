@@ -19,17 +19,37 @@
 
 use crate::OutputFormat;
 use chrono::{DateTime, Utc};
-use iggy_connector_sdk::{ConsumedMessage, MessagesMetadata, Payload, TopicMetadata};
-use serde_json::{Map, Value};
+use iggy_connector_sdk::{
+    ConsumedMessage, Error, MessagesMetadata, Payload, TopicMetadata, owned_value_to_serde_json,
+};
+use serde::Serialize;
+use serde_json::Value;
 
-pub fn format_message(
+#[derive(Serialize)]
+struct JsonMessage<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topic: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    partition_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers: Option<Value>,
+    payload: Value,
+}
+
+pub(crate) fn format_message(
     message: &ConsumedMessage,
     topic_metadata: &TopicMetadata,
     messages_metadata: &MessagesMetadata,
     include_metadata: bool,
     include_headers: bool,
     format: OutputFormat,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, Error> {
     match format {
         OutputFormat::JsonLines | OutputFormat::JsonArray => format_json_message(
             message,
@@ -48,60 +68,107 @@ fn format_json_message(
     messages_metadata: &MessagesMetadata,
     include_metadata: bool,
     include_headers: bool,
-) -> Vec<u8> {
-    let mut obj = Map::new();
+) -> Result<Vec<u8>, Error> {
+    let ts_str = if include_metadata {
+        Some(timestamp_to_rfc3339(message.timestamp))
+    } else {
+        None
+    };
+    let msg = JsonMessage {
+        offset: if include_metadata {
+            Some(message.offset)
+        } else {
+            None
+        },
+        timestamp: ts_str.as_deref(),
+        stream: if include_metadata {
+            Some(&topic_metadata.stream)
+        } else {
+            None
+        },
+        topic: if include_metadata {
+            Some(&topic_metadata.topic)
+        } else {
+            None
+        },
+        partition_id: if include_metadata {
+            Some(messages_metadata.partition_id)
+        } else {
+            None
+        },
+        headers: if include_headers {
+            message.headers.as_ref().map(serialize_headers)
+        } else {
+            None
+        },
+        payload: payload_to_json_value(&message.payload),
+    };
 
-    if include_metadata {
-        obj.insert("offset".to_string(), Value::Number(message.offset.into()));
-        let ts = timestamp_to_rfc3339(message.timestamp);
-        obj.insert("timestamp".to_string(), Value::String(ts));
-        obj.insert(
-            "stream".to_string(),
-            Value::String(topic_metadata.stream.clone()),
-        );
-        obj.insert(
-            "topic".to_string(),
-            Value::String(topic_metadata.topic.clone()),
-        );
-        obj.insert(
-            "partition_id".to_string(),
-            Value::Number(messages_metadata.partition_id.into()),
-        );
-    }
-
-    if include_headers && let Some(headers) = &message.headers {
-        let mut headers_obj = Map::new();
-        for (key, value) in headers {
-            headers_obj.insert(key.to_string(), Value::String(value.to_string()));
-        }
-        obj.insert("headers".to_string(), Value::Object(headers_obj));
-    }
-
-    let payload_value = payload_to_json_value(&message.payload);
-    obj.insert("payload".to_string(), payload_value);
-
-    match serde_json::to_vec(&Value::Object(obj)) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!(
-                "Failed to serialize message at offset {}: {e}",
-                message.offset
-            );
-            Vec::new()
-        }
-    }
+    serde_json::to_vec(&msg).map_err(|e| {
+        Error::CannotStoreData(format!(
+            "Failed to serialize message at offset {}: {e}",
+            message.offset
+        ))
+    })
 }
 
-fn format_raw_message(message: &ConsumedMessage) -> Vec<u8> {
-    message.payload.try_to_bytes().unwrap_or_default()
+fn format_raw_message(message: &ConsumedMessage) -> Result<Vec<u8>, Error> {
+    message.payload.try_to_bytes().map_err(|e| {
+        Error::CannotStoreData(format!(
+            "Failed to extract raw bytes at offset {}: {e}",
+            message.offset
+        ))
+    })
+}
+
+fn serialize_headers(
+    headers: &std::collections::BTreeMap<iggy_common::HeaderKey, iggy_common::HeaderValue>,
+) -> Value {
+    use iggy_common::HeaderKind;
+    use serde_json::Map;
+
+    let mut obj = Map::new();
+    for (key, value) in headers {
+        let key_str = key.as_str().unwrap_or("").to_string();
+        let json_value = match value.kind() {
+            HeaderKind::String => {
+                Value::String(String::from_utf8_lossy(&value.value()).into_owned())
+            }
+            HeaderKind::Raw => Value::String(base64_encode(&value.value())),
+            HeaderKind::Bool => {
+                let b = !value.value().is_empty() && value.value()[0] != 0;
+                Value::Bool(b)
+            }
+            HeaderKind::Int8 | HeaderKind::Int16 | HeaderKind::Int32 | HeaderKind::Int64 => {
+                let s = value.to_string_value();
+                s.parse::<i64>()
+                    .map(|n| Value::Number(n.into()))
+                    .unwrap_or(Value::String(s))
+            }
+            HeaderKind::Uint8 | HeaderKind::Uint16 | HeaderKind::Uint32 | HeaderKind::Uint64 => {
+                let s = value.to_string_value();
+                s.parse::<u64>()
+                    .map(|n| Value::Number(n.into()))
+                    .unwrap_or(Value::String(s))
+            }
+            HeaderKind::Float32 | HeaderKind::Float64 => {
+                let s = value.to_string_value();
+                s.parse::<f64>()
+                    .ok()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(Value::Number)
+                    .unwrap_or(Value::String(s))
+            }
+            _ => Value::String(value.to_string_value()),
+        };
+        obj.insert(key_str, json_value);
+    }
+    Value::Object(obj)
 }
 
 fn payload_to_json_value(payload: &Payload) -> Value {
     match payload {
-        Payload::Json(value) => {
-            let bytes = simd_json::to_vec(value).unwrap_or_default();
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-        }
+        Payload::Json(value) => owned_value_to_serde_json(value),
         Payload::Text(text) => Value::String(text.clone()),
         Payload::Raw(bytes) => match serde_json::from_slice(bytes) {
             Ok(v) => v,
@@ -126,29 +193,33 @@ fn timestamp_to_rfc3339(micros: u64) -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
 
-pub fn finalize_buffer(data: &[Vec<u8>], format: OutputFormat) -> Vec<u8> {
+/// Finalize buffer entries into the output byte format.
+/// For JsonArray: byte-concatenation (no re-parse). For JsonLines/Raw: newline-separated.
+pub(crate) fn finalize_buffer<'a>(
+    entries: impl Iterator<Item = &'a [u8]>,
+    format: OutputFormat,
+) -> Vec<u8> {
     match format {
-        OutputFormat::JsonLines => {
+        OutputFormat::JsonLines | OutputFormat::Raw => {
             let mut result = Vec::new();
-            for entry in data {
+            for entry in entries {
                 result.extend_from_slice(entry);
                 result.push(b'\n');
             }
             result
         }
         OutputFormat::JsonArray => {
-            let entries: Vec<Value> = data
-                .iter()
-                .filter_map(|bytes| serde_json::from_slice(bytes).ok())
-                .collect();
-            serde_json::to_vec(&entries).unwrap_or_default()
-        }
-        OutputFormat::Raw => {
             let mut result = Vec::new();
-            for entry in data {
+            result.push(b'[');
+            let mut first = true;
+            for entry in entries {
+                if !first {
+                    result.push(b',');
+                }
                 result.extend_from_slice(entry);
-                result.push(b'\n');
+                first = false;
             }
+            result.push(b']');
             result
         }
     }
@@ -200,7 +271,8 @@ mod tests {
         let topic = make_topic_metadata();
         let meta = make_messages_metadata();
 
-        let bytes = format_message(&msg, &topic, &meta, true, false, OutputFormat::JsonLines);
+        let bytes =
+            format_message(&msg, &topic, &meta, true, false, OutputFormat::JsonLines).unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(value["offset"], 42);
@@ -218,7 +290,8 @@ mod tests {
         let topic = make_topic_metadata();
         let meta = make_messages_metadata();
 
-        let bytes = format_message(&msg, &topic, &meta, false, false, OutputFormat::JsonLines);
+        let bytes =
+            format_message(&msg, &topic, &meta, false, false, OutputFormat::JsonLines).unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert!(value.get("offset").is_none());
@@ -240,10 +313,12 @@ mod tests {
         let topic = make_topic_metadata();
         let meta = make_messages_metadata();
 
-        let bytes = format_message(&msg, &topic, &meta, false, true, OutputFormat::JsonLines);
+        let bytes =
+            format_message(&msg, &topic, &meta, false, true, OutputFormat::JsonLines).unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
 
         assert!(value["headers"].is_object());
+        assert_eq!(value["headers"]["content-type"], "application/json");
     }
 
     #[test]
@@ -253,24 +328,26 @@ mod tests {
         let topic = make_topic_metadata();
         let meta = make_messages_metadata();
 
-        let bytes = format_message(&msg, &topic, &meta, true, false, OutputFormat::Raw);
+        let bytes = format_message(&msg, &topic, &meta, true, false, OutputFormat::Raw).unwrap();
         assert_eq!(bytes, b"hello world");
     }
 
     #[test]
     fn finalize_json_lines() {
-        let entries = vec![b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()];
-        let result = finalize_buffer(&entries, OutputFormat::JsonLines);
+        let data = b"{\"a\":1}{\"b\":2}";
+        let boundaries = [7usize, 14];
+        let entries = entries_from_boundaries(data, &boundaries);
+        let result = finalize_buffer(entries, OutputFormat::JsonLines);
         assert_eq!(result, b"{\"a\":1}\n{\"b\":2}\n");
     }
 
     #[test]
     fn finalize_json_array() {
-        let entries = vec![b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()];
-        let result = finalize_buffer(&entries, OutputFormat::JsonArray);
-        let value: Value = serde_json::from_slice(&result).unwrap();
-        assert!(value.is_array());
-        assert_eq!(value.as_array().unwrap().len(), 2);
+        let data = b"{\"a\":1}{\"b\":2}";
+        let boundaries = [7usize, 14];
+        let entries = entries_from_boundaries(data, &boundaries);
+        let result = finalize_buffer(entries, OutputFormat::JsonArray);
+        assert_eq!(result, b"[{\"a\":1},{\"b\":2}]");
     }
 
     #[test]
@@ -284,5 +361,17 @@ mod tests {
     fn timestamp_zero() {
         let ts = timestamp_to_rfc3339(0);
         assert_eq!(ts, "1970-01-01T00:00:00Z");
+    }
+
+    fn entries_from_boundaries<'a>(
+        data: &'a [u8],
+        boundaries: &'a [usize],
+    ) -> impl Iterator<Item = &'a [u8]> {
+        let mut start = 0;
+        boundaries.iter().map(move |&end| {
+            let s = &data[start..end];
+            start = end;
+            s
+        })
     }
 }
