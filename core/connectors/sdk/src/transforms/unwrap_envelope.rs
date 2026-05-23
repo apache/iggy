@@ -23,10 +23,9 @@ use serde::{Deserialize, Serialize};
 /// Configuration for the UnwrapEnvelope transform.
 ///
 /// Extracts a nested JSON field from an envelope object and promotes it
-/// to the top-level payload. For example, given a source envelope with
-/// shape `{ table_name, operation_type, timestamp, data: { ... },
-/// old_data }`, setting `field = "data"` replaces the entire payload
-/// with the contents of `data`.
+/// to the top-level payload. For example, given an envelope with shape
+/// `{ metadata_a, metadata_b, data: { ... } }`, setting `field = "data"`
+/// replaces the entire payload with the contents of `data`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UnwrapEnvelopeConfig {
     pub field: String,

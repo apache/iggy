@@ -83,23 +83,19 @@ Example:
 
 ## Source Compatibility
 
-The Iceberg sink expects flat JSON where each top-level key maps directly to a column in the
-target Iceberg table schema. Sources that wrap row data in an envelope (e.g., the Postgres
-source emits `DatabaseRecord` objects with `table_name`, `operation_type`, `timestamp`, `data`,
-and `old_data` fields) are **not** directly compatible — the Arrow JSON reader will map envelope
-keys to table columns, producing nulls or schema errors.
+The Iceberg sink expects **flat JSON** where each top-level key maps directly to a column in the
+target Iceberg table schema. Sources that wrap row data in an envelope (with metadata fields
+alongside a nested data object) are not directly compatible — the Arrow JSON reader will map
+envelope keys to table columns, producing nulls or schema errors.
 
-Use the `unwrap_envelope` transform to extract the inner data before it reaches the sink:
+If your source emits envelope-wrapped JSON, use the `unwrap_envelope` transform to extract the
+inner data field before it reaches the sink:
 
 ```toml
-[[streams]]
-stream = "postgres_stream"
-topic = "postgres_topic"
-schema = "json"
-
 [transforms.unwrap_envelope]
 enabled = true
 field = "data"
 ```
 
-Alternatively, configure the Postgres source with `payload_column` and `payload_format = "json_direct"` to bypass the envelope entirely — see the Postgres source README for details.
+Set `field` to the envelope key that contains the actual row data. See the SDK README and your
+source connector's documentation for details on the envelope shape.

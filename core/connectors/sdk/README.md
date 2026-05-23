@@ -106,9 +106,8 @@ preserve_structure = false
   - **`preserve_structure`**: Whether to preserve the original message structure during conversion
   - **`field_mappings`**: Mapping of field names for transformation (e.g., `"old_field" = "new_field"`)
 - **`unwrap_envelope`**: Extracts a nested JSON field and promotes it as the top-level payload.
-  Required when a source emits envelope-wrapped records (e.g., Postgres `DatabaseRecord` with
-  `table_name`, `operation_type`, `data`, etc.) and the downstream sink expects flat JSON
-  matching the target table schema (e.g., Iceberg, Delta).
+  Required when a source emits envelope-wrapped records (with metadata fields alongside a nested
+  data object) and the downstream sink expects flat JSON matching the target table schema.
   - **`field`**: The envelope key whose value becomes the new payload (e.g., `"data"`). Must not be empty.
 
 ```toml
