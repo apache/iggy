@@ -426,19 +426,24 @@ pub enum Error {
     #[error("Permanent HTTP error: {0}")]
     PermanentHttpError(String),
     /// The source schema could not be mapped to the destination schema.
-    /// Indicates a table definition or configuration problem
+    /// Indicates a table definition or configuration problem.
     #[error("Schema mismatch: {0}")]
     SchemaMismatch(String),
     /// An I/O failure while writing data (e.g. Parquet serialization, file
-    /// writer close). Distinct from record-level validation errors.
+    /// writer close). Distinct from record-level validation errors. May leave
+    /// orphaned partial files on the object store; cleanup is caller-side.
     #[error("Write failure: {0}")]
     WriteFailure(String),
     /// In-memory transaction preparation failed (e.g. invalid partition spec,
-    /// schema validation). These failures are deterministic and not retryable.
+    /// schema validation). Typically deterministic in the current Iceberg
+    /// version; check the underlying Iceberg error to decide retryability.
     #[error("Transaction apply error: {0}")]
     TransactionApplyError(String),
-    /// A catalog commit failed over the network (e.g. REST catalog I/O,
-    /// conflict). Transient failures may be retried.
+    /// A catalog commit failed. `Transaction::commit()` consumes the
+    /// transaction, so retrying requires rebuilding it from new data files.
+    /// Retry is not idempotent: callers must verify via the catalog whether
+    /// the original commit was applied before retrying, otherwise data may
+    /// be duplicated.
     #[error("Catalog commit error: {0}")]
     CatalogCommitError(String),
 }
