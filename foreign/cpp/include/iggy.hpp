@@ -99,34 +99,35 @@ class SnapshotCompression final : private detail::StringTag<SnapshotCompression>
         : detail::StringTag<SnapshotCompression>(std::move(snapshot_compression)) {}
 };
 
-/// Snapshot selector for `Client::snapshot(...)`.
+/// System snapshot selector for `Client::snapshot(...)`.
 ///
 /// Use this type to choose which snapshot data the server should include.
 ///
 /// Internally, each selected value is passed across the Rust FFI as a string.
 /// Values outside the supported set are rejected by the Rust client.
 /// Some Rust-side aliases may also be accepted for compatibility.
-class SnapshotType final : private detail::StringTag<SnapshotType> {
+class SystemSnapshotType final : private detail::StringTag<SystemSnapshotType> {
   public:
     /// Include an overview of the filesystem structure.
-    static SnapshotType filesystem_overview() { return SnapshotType("filesystem_overview"); }
+    static SystemSnapshotType filesystem_overview() { return SystemSnapshotType("filesystem_overview"); }
     /// Include the list of currently running processes.
-    static SnapshotType process_list() { return SnapshotType("process_list"); }
+    static SystemSnapshotType process_list() { return SystemSnapshotType("process_list"); }
     /// Include CPU, memory, and other system resource usage statistics.
-    static SnapshotType resource_usage() { return SnapshotType("resource_usage"); }
+    static SystemSnapshotType resource_usage() { return SystemSnapshotType("resource_usage"); }
     /// Include the test snapshot used for development and testing.
-    static SnapshotType test() { return SnapshotType("test"); }
+    static SystemSnapshotType test() { return SystemSnapshotType("test"); }
     /// Include server logs from the configured logging directory.
-    static SnapshotType server_logs() { return SnapshotType("server_logs"); }
+    static SystemSnapshotType server_logs() { return SystemSnapshotType("server_logs"); }
     /// Include the server configuration.
-    static SnapshotType server_config() { return SnapshotType("server_config"); }
+    static SystemSnapshotType server_config() { return SystemSnapshotType("server_config"); }
     /// Include all available snapshot types.
-    static SnapshotType all() { return SnapshotType("all"); }
+    static SystemSnapshotType all() { return SystemSnapshotType("all"); }
 
     std::string_view snapshot_type_value() const { return value(); }
 
   private:
-    explicit SnapshotType(std::string snapshot_type) : detail::StringTag<SnapshotType>(std::move(snapshot_type)) {}
+    explicit SystemSnapshotType(std::string snapshot_type)
+        : detail::StringTag<SystemSnapshotType>(std::move(snapshot_type)) {}
 };
 
 /// Maximum retained size for a topic.

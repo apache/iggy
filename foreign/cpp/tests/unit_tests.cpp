@@ -35,14 +35,14 @@ TEST(SnapshotCompressionTest, ReturnsExpectedValues) {
     EXPECT_EQ(iggy::SnapshotCompression::xz().snapshot_compression_value(), "xz");
 }
 
-TEST(SnapshotTypeTest, ReturnsExpectedValues) {
-    EXPECT_EQ(iggy::SnapshotType::filesystem_overview().snapshot_type_value(), "filesystem_overview");
-    EXPECT_EQ(iggy::SnapshotType::process_list().snapshot_type_value(), "process_list");
-    EXPECT_EQ(iggy::SnapshotType::resource_usage().snapshot_type_value(), "resource_usage");
-    EXPECT_EQ(iggy::SnapshotType::test().snapshot_type_value(), "test");
-    EXPECT_EQ(iggy::SnapshotType::server_logs().snapshot_type_value(), "server_logs");
-    EXPECT_EQ(iggy::SnapshotType::server_config().snapshot_type_value(), "server_config");
-    EXPECT_EQ(iggy::SnapshotType::all().snapshot_type_value(), "all");
+TEST(SystemSnapshotTypeTest, ReturnsExpectedValues) {
+    EXPECT_EQ(iggy::SystemSnapshotType::filesystem_overview().snapshot_type_value(), "filesystem_overview");
+    EXPECT_EQ(iggy::SystemSnapshotType::process_list().snapshot_type_value(), "process_list");
+    EXPECT_EQ(iggy::SystemSnapshotType::resource_usage().snapshot_type_value(), "resource_usage");
+    EXPECT_EQ(iggy::SystemSnapshotType::test().snapshot_type_value(), "test");
+    EXPECT_EQ(iggy::SystemSnapshotType::server_logs().snapshot_type_value(), "server_logs");
+    EXPECT_EQ(iggy::SystemSnapshotType::server_config().snapshot_type_value(), "server_config");
+    EXPECT_EQ(iggy::SystemSnapshotType::all().snapshot_type_value(), "all");
 }
 
 TEST(IdKindTest, ReturnsExpectedValues) {
