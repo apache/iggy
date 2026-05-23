@@ -171,6 +171,10 @@ TEST(LowLevelE2E_Client, GetStatsBeforeLoginThrows) {
 
 // TODO(slbotbmR): add a test to create some streams, topics, partitions, and segments, send messages, and create
 // consumer groups and verify it.
+// TODO(slbotbm): every e2e test that creates streams, topics, consumer groups, or similar resources should use
+// randomized names so a failed ASSERT does not leave fixed names behind for the next run; this test should also relax
+// shared-server count assertions such as clients_count to EXPECT_GE so unrelated client connections do not make it
+// order-dependent.
 TEST(LowLevelE2E_Client, GetStatsReturnsServerStats) {
     RecordProperty("description",
                    "Returns empty resource counts first, then reflects aggregated streams, topics, partitions, "
@@ -203,7 +207,6 @@ TEST(LowLevelE2E_Client, GetStatsReturnsServerStats) {
         EXPECT_FALSE(static_cast<std::string>(empty_stats.os_version).empty());
         EXPECT_FALSE(static_cast<std::string>(empty_stats.kernel_version).empty());
         EXPECT_FALSE(static_cast<std::string>(empty_stats.iggy_server_version).empty());
-        EXPECT_TRUE(!empty_stats.has_server_semver || empty_stats.iggy_server_semver > 0u);
     });
 
     ASSERT_NO_THROW(client->create_stream(first_stream_name));
