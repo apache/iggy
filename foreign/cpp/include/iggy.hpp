@@ -55,7 +55,6 @@ class StringTag {
 ///
 /// Internally, this value is passed across the Rust FFI as a string.
 /// Values outside the supported set are rejected by the Rust client.
-/// Some Rust-side aliases may also be accepted for compatibility.
 class CompressionAlgorithm final : private detail::StringTag<CompressionAlgorithm> {
   public:
     /// Store messages without compression.
@@ -76,7 +75,6 @@ class CompressionAlgorithm final : private detail::StringTag<CompressionAlgorith
 ///
 /// Internally, this value is passed across the Rust FFI as a string.
 /// Values outside the supported set are rejected by the Rust client.
-/// Some Rust-side aliases may also be accepted for compatibility.
 class SnapshotCompression final : private detail::StringTag<SnapshotCompression> {
   public:
     /// Store snapshot files without compression.
@@ -105,7 +103,6 @@ class SnapshotCompression final : private detail::StringTag<SnapshotCompression>
 ///
 /// Internally, each selected value is passed across the Rust FFI as a string.
 /// Values outside the supported set are rejected by the Rust client.
-/// Some Rust-side aliases may also be accepted for compatibility.
 class SystemSnapshotType final : private detail::StringTag<SystemSnapshotType> {
   public:
     /// Include an overview of the filesystem structure.
@@ -137,7 +134,9 @@ class SystemSnapshotType final : private detail::StringTag<SystemSnapshotType> {
 ///
 /// Internally, this value is passed across the Rust FFI as a string.
 /// Values outside the supported set are rejected by the Rust client.
-/// Some Rust-side aliases may also be accepted for compatibility.
+/// In addition to `server_default` and `unlimited`, the Rust parser also accepts
+/// numeric size strings. A value of `0` is treated as `server_default`, and a
+/// value of `std::numeric_limits<std::uint64_t>::max()` is treated as `unlimited`.
 class MaxTopicSize final : private detail::StringTag<MaxTopicSize> {
   public:
     /// Use the server's default maximum topic size.
