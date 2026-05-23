@@ -22,8 +22,12 @@ use crate::formatter;
 use crate::path::{PathContext, render_s3_key};
 use crate::{BufferKey, S3Sink};
 use async_trait::async_trait;
+use iggy_connector_sdk::retry::{exponential_backoff, jitter};
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
+
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 #[async_trait]
 impl Sink for S3Sink {
@@ -86,7 +90,16 @@ impl Sink for S3Sink {
             partition_id: messages_metadata.partition_id,
         };
 
-        let max_messages = self.config.max_messages_per_file.unwrap_or(u64::MAX);
+        let max_messages = match self.config.max_messages_per_file {
+            Some(n) => n,
+            None if self.config.file_rotation == crate::FileRotation::Messages => {
+                return Err(Error::InvalidConfigValue(
+                    "file_rotation is 'messages' but max_messages_per_file is not set".to_owned(),
+                ));
+            }
+            None => u64::MAX,
+        };
+        let batch_size = messages.len() as u64;
 
         let mut buffers = self.buffers.lock().await;
         let buffer = buffers.entry(key.clone()).or_insert_with(FileBuffer::new);
@@ -111,13 +124,15 @@ impl Sink for S3Sink {
             }
         }
 
-        let mut state = self.state.lock().await;
-        state.messages_processed += messages.len() as u64;
+        {
+            let mut state = self.state.lock().await;
+            state.messages_received += batch_size;
+        }
 
         debug!(
-            "S3 sink ID: {} processed {} messages for {}/{}/{}",
+            "S3 sink ID: {} buffered {} messages for {}/{}/{}",
             self.id,
-            messages.len(),
+            batch_size,
             topic_metadata.stream,
             topic_metadata.topic,
             messages_metadata.partition_id,
@@ -152,8 +167,8 @@ impl Sink for S3Sink {
 
         let state = self.state.lock().await;
         info!(
-            "S3 sink ID: {} closed. messages_processed={}, uploads_completed={}, upload_errors={}",
-            self.id, state.messages_processed, state.uploads_completed, state.upload_errors,
+            "S3 sink ID: {} closed. received={}, uploaded={}, lost={}",
+            self.id, state.messages_received, state.messages_uploaded, state.messages_lost,
         );
 
         Ok(())
@@ -196,9 +211,7 @@ impl S3Sink {
                     data.len(),
                 );
                 let mut state = self.state.lock().await;
-                state.uploads_completed += 1;
-                drop(state);
-                buffer.reset();
+                state.messages_uploaded += msg_count;
             }
             Err(e) => {
                 error!(
@@ -206,14 +219,11 @@ impl S3Sink {
                     self.id, s3_key, msg_count
                 );
                 let mut state = self.state.lock().await;
-                state.upload_errors += 1;
-                drop(state);
-                // Reset buffer even on failure to prevent unbounded growth.
-                // Messages are lost but offsets will be re-delivered by the
-                // runtime on next poll since consume() returned Ok.
-                buffer.reset();
+                state.messages_lost += msg_count;
             }
         }
+
+        buffer.reset();
     }
 
     async fn upload_with_retry(
@@ -222,9 +232,9 @@ impl S3Sink {
         s3_key: &str,
         data: &[u8],
     ) -> Result<(), Error> {
-        let max_retries = self.max_retries();
-        let retry_delay = self.retry_delay;
-        let mut attempts = 0u32;
+        let max_attempts = self.max_attempts();
+        let base_delay = self.retry_delay;
+        let mut attempt = 0u32;
 
         loop {
             match bucket.put_object(s3_key, data).await {
@@ -233,31 +243,43 @@ impl S3Sink {
                     if (200..300).contains(&status) {
                         return Ok(());
                     }
-                    attempts += 1;
-                    if attempts >= max_retries {
+
+                    if !is_retriable_status(status) {
                         return Err(Error::CannotStoreData(format!(
-                            "S3 PutObject returned status {status} after {attempts} attempts for key '{s3_key}'"
+                            "S3 PutObject returned non-retriable status {status} for key '{s3_key}'"
+                        )));
+                    }
+
+                    attempt += 1;
+                    if attempt >= max_attempts {
+                        return Err(Error::CannotStoreData(format!(
+                            "S3 PutObject returned status {status} after {max_attempts} attempts for key '{s3_key}'"
                         )));
                     }
                     warn!(
-                        "S3 sink ID: {} PutObject status {status} (attempt {attempts}/{max_retries}). Retrying...",
+                        "S3 sink ID: {} PutObject status {status} (attempt {attempt}/{max_attempts}). Retrying...",
                         self.id
                     );
                 }
                 Err(e) => {
-                    attempts += 1;
-                    if attempts >= max_retries {
+                    attempt += 1;
+                    if attempt >= max_attempts {
                         return Err(Error::CannotStoreData(format!(
-                            "S3 PutObject failed after {attempts} attempts for key '{s3_key}': {e}"
+                            "S3 PutObject failed after {max_attempts} attempts for key '{s3_key}': {e}"
                         )));
                     }
                     warn!(
-                        "S3 sink ID: {} PutObject error (attempt {attempts}/{max_retries}): {e}. Retrying...",
+                        "S3 sink ID: {} PutObject error (attempt {attempt}/{max_attempts}): {e}. Retrying...",
                         self.id
                     );
                 }
             }
-            tokio::time::sleep(retry_delay * attempts).await;
+            let delay = jitter(exponential_backoff(base_delay, attempt - 1, MAX_BACKOFF));
+            tokio::time::sleep(delay).await;
         }
     }
+}
+
+fn is_retriable_status(status: u16) -> bool {
+    status >= 500 || status == 408 || status == 429
 }

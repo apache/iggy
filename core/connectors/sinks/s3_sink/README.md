@@ -7,10 +7,10 @@ Writes messages from Iggy streams to Amazon S3 and S3-compatible object stores (
 - Buffered uploads with configurable file rotation (by size or message count)
 - Multiple output formats: JSON Lines, JSON Array, Raw
 - Configurable path templates with variables for stream, topic, date, hour, partition
-- Deterministic S3 keys based on offset ranges for idempotent crash recovery
+- S3 keys include offset ranges for human-readable object naming
 - Optional metadata and header inclusion in output
 - Support for custom endpoints (MinIO, R2) and path-style addressing
-- Retry with exponential backoff on upload failures
+- Retry with exponential backoff and jitter on transient upload failures
 
 ## Configuration
 
@@ -67,12 +67,12 @@ retry_delay = "1s"
 | `path_template` | String | `{stream}/{topic}/{date}/{hour}` | Template for S3 key directory structure |
 | `file_rotation` | String | `size` | Rotation strategy: `size` or `messages` |
 | `max_file_size` | String | `8MiB` | Max file size before rotation (when `file_rotation = "size"`) |
-| `max_messages_per_file` | Integer | `None` | Max messages per file (when `file_rotation = "messages"`) |
+| `max_messages_per_file` | Integer | `None` | Max messages per file (required when `file_rotation = "messages"`) |
 | `output_format` | String | `json_lines` | Output format: `json_lines`, `json_array`, or `raw` |
 | `include_metadata` | Boolean | `true` | Include stream/topic/partition/offset in output |
 | `include_headers` | Boolean | `false` | Include message headers in output |
-| `max_retries` | Integer | `3` | Max upload retry attempts |
-| `retry_delay` | String | `1s` | Base delay between retries (humantime format) |
+| `max_retries` | Integer | `3` | Max total upload attempts per file |
+| `retry_delay` | String | `1s` | Base delay for exponential backoff (humantime format) |
 | `path_style` | Boolean | auto | Force path-style S3 addressing; auto-enabled when `endpoint` is set |
 
 ### Path Template Variables
@@ -82,9 +82,11 @@ retry_delay = "1s"
 | `{stream}` | Iggy stream name | `application_logs` |
 | `{topic}` | Iggy topic name | `api_requests` |
 | `{partition}` | Partition ID | `1` |
-| `{date}` | UTC date from first message | `2026-03-16` |
-| `{hour}` | UTC hour from first message | `14` |
-| `{timestamp}` | Current epoch milliseconds | `1710597600000` |
+| `{date}` | UTC date from first message in buffer | `2026-03-16` |
+| `{hour}` | UTC hour from first message in buffer | `14` |
+| `{timestamp}` | Wall-clock epoch millis at flush time (non-deterministic) | `1710597600000` |
+
+**Note:** `{timestamp}` uses wall-clock time at the moment of upload, not message time. It produces different keys on retry or restart. Avoid it if you need stable/reproducible object paths. Prefer `{date}/{hour}` which are derived from the first message timestamp in each buffer.
 
 ### Credentials
 
@@ -134,9 +136,24 @@ access_key_id = "..."
 secret_access_key = "..."
 ```
 
-## Data Delivery Guarantees
+## Delivery Semantics
 
-This connector provides **at-least-once** delivery under normal operation. However, **data loss can occur** if all upload retries are exhausted (controlled by `max_retries`). When an upload fails after all retry attempts, the affected messages are dropped and an error is logged. Monitor your connector logs for `failed to upload` errors in production. Increase `max_retries` and `retry_delay` if transient S3 failures are common in your environment.
+All retry logic lives inside `consume()`. The connector runtime invokes `consume()` via an FFI callback that returns an `i32` status code. The runtime does not inspect this return value (see `process_messages()` in `runtime/src/sink.rs`), so errors logged by the sink are not propagated to the runtime's retry or alerting mechanisms. Additionally, consumer group offsets are committed before processing ([runtime issue #1](#known-limitations)). This means:
+
+- Failed messages are **not retried by the runtime** — only by the sink's internal retry loop
+- Messages are committed **before delivery** — a crash after commit but before delivery loses messages
+
+The effective delivery guarantee is **at-most-once** at the runtime level. The sink's internal retries provide best-effort delivery within each `consume()` call.
+
+## Known Limitations
+
+1. **Runtime ignores `consume()` status**: The connector runtime invokes `consume()` via an FFI callback returning `i32`. The `process_messages()` function in `runtime/src/sink.rs` does not inspect the return value. Errors are logged internally by the sink but do not trigger runtime-level retry or alerting. ([#2927](https://github.com/apache/iggy/issues/2927))
+
+2. **Offsets committed before processing**: The `PollingMessages` auto-commit strategy commits consumer group offsets before `consume()` is called. Combined with limitation 1, at-least-once delivery is not achievable. ([#2928](https://github.com/apache/iggy/issues/2928))
+
+3. **In-memory buffering only**: There is no write-ahead log. A process crash loses all in-memory buffered messages that have not yet been flushed to S3.
+
+4. **No dead letter queue**: Failed messages are logged at `error!` level but not persisted to a DLQ. DLQ support would be a runtime-level feature.
 
 ## Building
 
