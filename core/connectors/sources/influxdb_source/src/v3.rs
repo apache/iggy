@@ -244,32 +244,34 @@ pub(crate) struct PollResult {
 
 // ── Row processing (pure, testable without HTTP) ──────────────────────────────
 
-/// Normalize a raw timestamp from InfluxDB V3 JSONL into a cursor-safe RFC 3339 string.
+/// Normalize a raw timestamp from InfluxDB V3 JSONL into a cursor-safe RFC 3339 string
+/// and its parsed `DateTime<Utc>`.
 ///
 /// InfluxDB 3 Core returns timestamps without a timezone suffix and with nanosecond
 /// precision (e.g. `"2026-04-26T02:32:20.526360865"`). The only required fix is
 /// appending `"Z"` when no timezone suffix is present (InfluxDB always stores UTC).
 ///
-/// Returns `Err` if the value is not a valid RFC 3339 timestamp even after appending
-/// `"Z"`, avoiding a wasted `Cow::Owned` allocation on garbage input.
+/// Returns `(normalized_string, parsed_utc)` on success so the caller receives the
+/// parsed `DateTime<Utc>` directly, avoiding a second `parse_from_rfc3339` call.
+/// The string is borrowed when no `"Z"` was appended (zero allocation).
+///
+/// Returns `Err` if the value is not a valid RFC 3339 timestamp even after appending `"Z"`.
 ///
 /// Full nanosecond precision is intentionally preserved — truncating to milliseconds
 /// would place the cursor BEFORE the actual row timestamps within the same millisecond,
 /// causing `WHERE time > '$cursor'` to re-deliver already-seen rows on subsequent polls.
-/// InfluxDB 3's DataFusion SQL engine handles RFC 3339 strings with any number of
-/// fractional digits in WHERE clause timestamp comparisons.
-fn normalize_v3_timestamp(ts: &str) -> Result<std::borrow::Cow<'_, str>, Error> {
-    if chrono::DateTime::parse_from_rfc3339(ts).is_ok() {
-        return Ok(std::borrow::Cow::Borrowed(ts)); // Zero allocation
+fn normalize_v3_timestamp(ts: &str) -> Result<(std::borrow::Cow<'_, str>, DateTime<Utc>), Error> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+        return Ok((std::borrow::Cow::Borrowed(ts), dt.with_timezone(&Utc)));
     }
     let with_z = format!("{ts}Z");
-    if chrono::DateTime::parse_from_rfc3339(&with_z).is_ok() {
-        return Ok(std::borrow::Cow::Owned(with_z));
+    match chrono::DateTime::parse_from_rfc3339(&with_z) {
+        Ok(dt) => Ok((std::borrow::Cow::Owned(with_z), dt.with_timezone(&Utc))),
+        Err(_) => Err(Error::InvalidRecordValue(format!(
+            "cursor field contains {ts:?} which is not a valid RFC 3339 timestamp \
+             (tried appending 'Z' — still invalid)"
+        ))),
     }
-    Err(Error::InvalidRecordValue(format!(
-        "cursor field contains {ts:?} which is not a valid RFC 3339 timestamp \
-         (tried appending 'Z' — still invalid)"
-    )))
 }
 
 /// Result of processing a batch of V3 rows into Iggy messages.
@@ -352,36 +354,30 @@ pub(crate) fn process_rows(
         // Default to random fallback; overwritten below if cursor field is present.
         let mut this_row_id = id_base.wrapping_add(messages.len() as u128);
         if let Some(raw_cv) = row.get(ctx.cursor_field).and_then(|v| v.as_str()) {
-            let cv_owned = normalize_v3_timestamp(raw_cv)?;
+            let (cv_owned, cv_dt) = normalize_v3_timestamp(raw_cv)?;
             let cv: &str = &cv_owned;
-            validate_cursor(cv)?;
-            // validate_cursor chains chrono::DateTime::parse_from_rfc3339, so if it
-            // returns Ok the parse below is guaranteed to succeed — (None, _) is
-            // unreachable here.
-            let cv_parsed = cv.parse::<DateTime<Utc>>().ok();
             // Stable ID: timestamp nanoseconds + message position.
             // Deterministic across re-polls: the same physical row always has the same
             // timestamp, and its position within the batch (determined by OFFSET) is
             // stable for the same effective_batch_size + cursor combination.
-            if let Some(nanos) = cv_parsed.and_then(|dt| dt.timestamp_nanos_opt()) {
+            if let Some(nanos) = cv_dt.timestamp_nanos_opt() {
                 this_row_id = (nanos as u128).wrapping_add(messages.len() as u128);
             }
-            match (cv_parsed, max_cursor_parsed) {
-                (Some(new_dt), Some(cur_dt)) if new_dt > cur_dt => {
+            match max_cursor_parsed {
+                Some(cur_dt) if cv_dt > cur_dt => {
                     max_cursor = Some(cv.to_string());
-                    max_cursor_parsed = Some(new_dt);
+                    max_cursor_parsed = Some(cv_dt);
                     rows_at_max_cursor = 1;
                 }
-                (Some(new_dt), Some(cur_dt)) if new_dt == cur_dt => {
+                Some(cur_dt) if cv_dt == cur_dt => {
                     rows_at_max_cursor += 1;
                 }
-                (Some(new_dt), None) => {
+                Some(_) => {} // cv_dt < cur_dt: older row, no cursor update
+                None => {
                     max_cursor = Some(cv.to_string());
-                    max_cursor_parsed = Some(new_dt);
+                    max_cursor_parsed = Some(cv_dt);
                     rows_at_max_cursor = 1;
                 }
-                (Some(_), Some(_)) => {} // new_dt < cur_dt: older row, no cursor update
-                (None, _) => unreachable!("validate_cursor succeeded so cv_parsed is always Some"),
             }
         }
 
@@ -471,18 +467,13 @@ pub(crate) async fn poll(
 
     let result = process_rows(&rows, &ctx)?;
 
-    // Stuck-timestamp detection: the cursor cannot advance in two scenarios:
-    // 1. The batch fills up entirely with rows sharing the same max timestamp
-    //    (rows_at_max_cursor >= effective_batch): more rows at that timestamp exist.
-    // 2. ALL returned rows share the max cursor timestamp (rows_at_max_cursor ==
-    //    rows.len()): every row in the batch is at the same timestamp, meaning the
-    //    cursor did not advance within this batch regardless of batch size. This
-    //    handles the case where effective_batch was inflated but the server returned
-    //    fewer rows than the inflated limit (e.g. because the database has fewer
-    //    total rows at that timestamp than the inflated batch size), yet the cursor
-    //    still cannot advance past those tied rows.
-    let stuck = result.rows_at_max_cursor >= effective_batch as u64
-        || (!rows.is_empty() && result.rows_at_max_cursor == rows.len() as u64);
+    // Stuck-timestamp detection: when the batch fills up entirely with rows sharing
+    // the same max timestamp (rows_at_max_cursor >= effective_batch), there may be
+    // more rows at that timestamp beyond the LIMIT. The cursor cannot safely advance
+    // to that timestamp until all tied rows have been seen.
+    // A partial batch (rows.len() < effective_batch) means the server returned all
+    // available rows — the cursor can advance regardless of how many share the max timestamp.
+    let stuck = result.rows_at_max_cursor >= effective_batch as u64;
 
     if stuck {
         return match next_stuck_batch_size(effective_batch, base_batch, cap_factor) {
@@ -758,12 +749,12 @@ mod tests {
     fn normalize_already_valid_rfc3339_unchanged() {
         // Already valid RFC 3339 with Z and ms precision — must be returned as-is.
         assert_eq!(
-            normalize_v3_timestamp("2024-01-01T00:00:00.123Z").unwrap(),
+            normalize_v3_timestamp("2024-01-01T00:00:00.123Z").unwrap().0,
             "2024-01-01T00:00:00.123Z"
         );
         // Second-precision with Z is also ≤ms, returned unchanged.
         assert_eq!(
-            normalize_v3_timestamp("2024-01-01T00:00:00Z").unwrap(),
+            normalize_v3_timestamp("2024-01-01T00:00:00Z").unwrap().0,
             "2024-01-01T00:00:00Z"
         );
     }
@@ -772,28 +763,27 @@ mod tests {
     fn normalize_no_tz_nanoseconds_appends_z_only() {
         // InfluxDB 3 Core returns timestamps like this — 9 fractional digits, no Z.
         // Full nanosecond precision must be preserved (not truncated to ms).
-        let result = normalize_v3_timestamp("2026-04-26T02:32:20.526360865").unwrap();
+        let (result, _) = normalize_v3_timestamp("2026-04-26T02:32:20.526360865").unwrap();
         assert_eq!(result, "2026-04-26T02:32:20.526360865Z");
     }
 
     #[test]
     fn normalize_no_tz_milliseconds_appends_z() {
         // No timezone suffix, ms precision — just append Z.
-        let result = normalize_v3_timestamp("2026-04-26T02:32:20.526").unwrap();
+        let (result, _) = normalize_v3_timestamp("2026-04-26T02:32:20.526").unwrap();
         assert_eq!(result, "2026-04-26T02:32:20.526Z");
     }
 
     #[test]
     fn normalize_rfc3339_sub_ms_precision_returned_unchanged() {
         // Already valid RFC 3339 with Z and nanoseconds — returned as-is.
-        let result = normalize_v3_timestamp("2026-04-26T02:32:20.526360865Z").unwrap();
+        let (result, _) = normalize_v3_timestamp("2026-04-26T02:32:20.526360865Z").unwrap();
         assert_eq!(result, "2026-04-26T02:32:20.526360865Z");
     }
 
     #[test]
     fn normalize_invalid_returns_err() {
-        // Garbage input that is not valid RFC 3339 even after appending Z must
-        // return Err — no wasted Cow::Owned allocation for an invalid value.
+        // Garbage input that is not valid RFC 3339 even after appending Z must return Err.
         assert!(normalize_v3_timestamp("not-a-timestamp").is_err());
     }
 
@@ -1405,6 +1395,54 @@ mod http_tests {
     }
 
     #[tokio::test]
+    async fn poll_small_batch_all_same_timestamp_is_not_stuck() {
+        // Regression: a batch smaller than batch_size where all rows share the
+        // same timestamp must NOT trigger stuck detection. Previously the second
+        // `||` condition in the stuck check caused data loss — no messages were
+        // emitted, the offset advanced past those rows, and they were permanently
+        // lost on restart.
+        let t2 = "2024-01-01T00:00:01Z";
+        let jsonl = format!(
+            "{{\"time\":\"{t2}\",\"val\":0}}\n\
+             {{\"time\":\"{t2}\",\"val\":1}}\n\
+             {{\"time\":\"{t2}\",\"val\":2}}\n"
+        );
+        let app = Router::new().route(
+            "/api/v3/query_sql",
+            post(move || async move { (StatusCode::OK, jsonl) }),
+        );
+        let base = start_server(app).await;
+        // make_config has batch_size=10 but only 3 rows are returned.
+        let state = V3State {
+            last_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            effective_batch_size: 10,
+            last_timestamp_row_offset: 0,
+            processed_rows: 0,
+        };
+        let result = poll(
+            &make_client(),
+            &make_config(&base),
+            "Bearer tok",
+            &state,
+            PayloadFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.messages.len(), 3, "all 3 rows must be emitted");
+        assert!(!result.trip_circuit_breaker);
+        assert_eq!(
+            result.new_state.last_timestamp.as_deref(),
+            Some(t2),
+            "cursor must advance to t2"
+        );
+        assert_eq!(
+            result.new_state.last_timestamp_row_offset, 0,
+            "offset must reset to 0 after cursor advance"
+        );
+    }
+
+    #[tokio::test]
     async fn poll_resets_effective_batch_size_on_cursor_advance() {
         // State has an inflated batch size from a previous stuck run.
         // When the cursor advances the batch size must reset to the base value.
@@ -1571,9 +1609,11 @@ mod http_tests {
     }
 
     #[tokio::test]
-    async fn poll_stuck_accumulates_offset_across_consecutive_polls() {
-        // Bug #2: consecutive stuck polls must accumulate the row offset, not overwrite it.
-        // Overwriting re-delivers the same rows on each stuck poll (duplicate messages).
+    async fn poll_stuck_first_poll_sets_offset_and_inflation_resolves_stuck() {
+        // First stuck poll (rows_at_max_cursor >= effective_batch) must set the row
+        // offset and double the batch. On the next poll the server returns fewer rows
+        // than the inflated limit — not stuck — so messages are emitted and the
+        // offset resets to 0 as the cursor advances.
         let t = "2024-01-01T00:00:00Z";
         let jsonl: String = (0..10)
             .map(|i| format!("{{\"time\":\"{t}\",\"val\":{i}}}\n"))
@@ -1584,7 +1624,7 @@ mod http_tests {
         );
         let base = start_server(app).await;
 
-        // First stuck poll: offset starts at 0, 10 rows all at `t`.
+        // First stuck poll: 10 rows all at `t`, effective_batch=10 → rows_at_max_cursor(10) >= 10.
         let state1 = V3State {
             last_timestamp: Some(t.to_string()),
             effective_batch_size: 10,
@@ -1601,17 +1641,13 @@ mod http_tests {
         )
         .await
         .unwrap();
-        assert!(
-            r1.messages.is_empty(),
-            "stuck poll must produce no messages"
-        );
+        assert!(r1.messages.is_empty(), "first stuck poll must produce no messages");
         let offset_after_first = r1.new_state.last_timestamp_row_offset;
-        assert!(
-            offset_after_first > 0,
-            "first stuck poll must set offset > 0"
-        );
+        assert!(offset_after_first > 0, "first stuck poll must set offset > 0");
+        assert_eq!(r1.new_state.effective_batch_size, 20, "batch must double on stuck");
 
-        // Second stuck poll: must ACCUMULATE, not overwrite.
+        // Second poll with inflated batch (20): server returns 10 rows < 20 → not stuck.
+        // Cursor advances, messages emitted, and offset resets to 0.
         let r2 = poll(
             &make_client(),
             &make_config(&base),
@@ -1622,15 +1658,14 @@ mod http_tests {
         )
         .await
         .unwrap();
-        assert!(
-            r2.messages.is_empty(),
-            "second stuck poll must produce no messages"
+        assert_eq!(
+            r2.messages.len(),
+            10,
+            "inflated poll must emit messages when rows returned < effective_batch"
         );
-        assert!(
-            r2.new_state.last_timestamp_row_offset > offset_after_first,
-            "second stuck poll must accumulate offset: got {}, expected > {}",
-            r2.new_state.last_timestamp_row_offset,
-            offset_after_first
+        assert_eq!(
+            r2.new_state.last_timestamp_row_offset, 0,
+            "offset must reset to 0 after cursor advances"
         );
     }
 

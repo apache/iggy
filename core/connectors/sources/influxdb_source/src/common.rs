@@ -492,7 +492,7 @@ pub(crate) fn apply_query_params(
     limit: &str,
     offset: &str,
 ) -> String {
-    let capacity = template.len() + cursor.len() + limit.len();
+    let capacity = template.len() + cursor.len() + limit.len() + offset.len();
     let mut result = String::with_capacity(capacity);
     let mut remaining = template;
     while let Some(pos) = remaining.find('$') {

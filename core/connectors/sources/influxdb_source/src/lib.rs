@@ -477,6 +477,14 @@ impl Source for InfluxDbSource {
                             CONNECTOR_NAME,
                             self.id,
                         );
+                        if persisted.is_none() {
+                            warn!(
+                                "{CONNECTOR_NAME} ID: {} — state serialization failed; \
+                                 cursor will not be persisted. Messages were emitted; \
+                                 restart may cause re-delivery.",
+                                self.id
+                            );
+                        }
 
                         Ok(ProducedMessages {
                             schema: result.schema,
@@ -540,6 +548,14 @@ impl Source for InfluxDbSource {
                             CONNECTOR_NAME,
                             self.id,
                         );
+                        if persisted.is_none() {
+                            warn!(
+                                "{CONNECTOR_NAME} ID: {} — state serialization failed; \
+                                 cursor will not be persisted. Messages were emitted; \
+                                 restart may cause re-delivery.",
+                                self.id
+                            );
+                        }
 
                         Ok(ProducedMessages {
                             schema: result.schema,

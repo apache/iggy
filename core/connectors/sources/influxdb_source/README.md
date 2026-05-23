@@ -14,6 +14,9 @@ A source connector that polls InfluxDB and produces messages into Iggy streams. 
 | Cursor semantics | `>= $cursor` (inclusive) | `> '$cursor'` (exclusive) |
 | Default cursor field | `_time` | `time` |
 | Config `version` key | `"v2"` (or omit — default) | `"v3"` |
+| Payload value types | All fields as strings (CSV has no types); `parse_scalar` coerces to bool/int/float where possible | Native JSON types: numbers, booleans, and nulls preserved as-is from SQL |
+
+> **Breaking schema note for consumers migrating V2 → V3**: a field that arrives as the string `"42"` under V2 will arrive as the integer `42` under V3. Update consumer deserialization accordingly.
 
 ## Cursor-Based Polling
 
@@ -88,6 +91,8 @@ payload_column       = ""
 payload_format       = "json"
 include_metadata     = true
 stuck_batch_cap_factor = 10      # max effective_batch = 10 × batch_size (default: 10, max: 100)
+                                 # set to 0 to disable stuck-batch detection entirely;
+                                 # $offset is not required in the query when cap = 0
 verbose_logging      = false
 ```
 
@@ -114,7 +119,7 @@ circuit_breaker_cool_down = "30s"   # cool-down before half-open probe
 
 ## Payload Formats
 
-- **`json`** (default): Each row is serialised as a JSON object. All columns are included unless `include_metadata = false`, in which case the cursor column is excluded.
+- **`json`** (default): Each row is serialised as a JSON object. When `include_metadata = false`, only the cursor column (`time` for V3, `_time` for V2) is excluded; all other columns are still present. When `include_metadata = true` (the default), all columns including the cursor column are included.
 - **`text`**: The value of `payload_column` is written as a UTF-8 string. Requires `payload_column` to be set.
 - **`raw`**: The value of `payload_column` is base64-decoded and written as raw bytes. Requires `payload_column` to be set.
 
