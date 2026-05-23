@@ -50,7 +50,7 @@ use crate::{
         utils::{crypto, file::overwrite},
     },
 };
-use compio::{fs::create_dir_all, runtime::Runtime};
+use compio::fs::create_dir_all;
 use err_trail::ErrContext;
 use iggy_common::SemanticVersion;
 use iggy_common::{
@@ -170,31 +170,7 @@ pub fn create_root_user() -> User {
     User::root(&username, &password)
 }
 
-// Shard executors require IORING_SETUP_COOP_TASKRUN for predictable latency.
-// Falling back to default flags would silently degrade shard performance -
-// do not add a retry with reduced flags here.
-pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
-    // TODO: The event interval tick, could be configured based on the fact
-    // How many clients we expect to have connected.
-    // This roughly estimates the number of tasks we will create.
-    let mut proactor = compio::driver::ProactorBuilder::new();
-
-    proactor
-        .capacity(4096)
-        .coop_taskrun(true)
-        .taskrun_flag(true);
-
-    // FIXME(hubcio): Only set thread_pool_limit(0) on non-macOS platforms
-    // This causes a freeze on macOS with compio fs operations
-    // see https://github.com/compio-rs/compio/issues/446
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    proactor.thread_pool_limit(0);
-
-    compio::runtime::RuntimeBuilder::new()
-        .with_proactor(proactor.to_owned())
-        .event_interval(128)
-        .build()
-}
+pub use server_runtime::create_shard_executor;
 
 pub fn resolve_persister(enforce_fsync: bool) -> Arc<PersisterKind> {
     match enforce_fsync {

@@ -11355,6 +11355,7 @@ dependencies = [
  "send_wrapper",
  "serde",
  "serde_json",
+ "server_runtime",
  "slab",
  "socket2 0.6.3",
  "strum 0.28.0",
@@ -11430,6 +11431,7 @@ dependencies = [
  "send_wrapper",
  "serde",
  "server",
+ "server_runtime",
  "shard",
  "slab",
  "socket2 0.6.3",
@@ -11445,6 +11447,14 @@ dependencies = [
  "ulid",
  "uuid",
  "vergen-git2",
+]
+
+[[package]]
+name = "server_runtime"
+version = "0.1.0"
+dependencies = [
+ "compio",
+ "nix",
 ]
 
 [[package]]

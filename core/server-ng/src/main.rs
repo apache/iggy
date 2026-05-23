@@ -28,21 +28,18 @@ use server_ng::server_error::ServerNgError;
 use tracing::{error, info};
 
 fn main() -> Result<(), ServerNgError> {
-    // TODO(hubcio): decouple runtime creation from the `server` crate and
-    // move the shared compio executor setup into a lower-level crate/module
-    // used by both binaries.
-    let bootstrap_runtime = match server::bootstrap::create_shard_executor() {
+    let bootstrap_runtime = match server_runtime::create_shard_executor() {
         Ok(rt) => rt,
         Err(e) => {
             match e.kind() {
                 std::io::ErrorKind::InvalidInput => {
-                    server::diagnostics::print_invalid_io_uring_args_info();
+                    server_runtime::diagnostics::print_invalid_io_uring_args_info();
                 }
                 std::io::ErrorKind::OutOfMemory => {
-                    server::diagnostics::print_locked_memory_limit_info();
+                    server_runtime::diagnostics::print_locked_memory_limit_info();
                 }
                 std::io::ErrorKind::PermissionDenied => {
-                    server::diagnostics::print_io_uring_permission_info();
+                    server_runtime::diagnostics::print_io_uring_permission_info();
                 }
                 _ => {}
             }
