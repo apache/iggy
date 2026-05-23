@@ -40,6 +40,7 @@ template <typename Tag>
 class StringTag {
   protected:
     explicit StringTag(std::string value) : value_(std::move(value)) {}
+    ~StringTag() = default;
 
     std::string_view value() const { return value_; }
 
