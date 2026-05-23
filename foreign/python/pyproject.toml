@@ -96,6 +96,12 @@ select = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*.py" = ["S101", "B017"]
 
+[tool.mypy]
+
+[[tool.mypy.overrides]]
+module = ["testcontainers", "testcontainers.*"]
+ignore_missing_imports = true
+
 [project.optional-dependencies]
 # Core testing dependencies
 testing = [

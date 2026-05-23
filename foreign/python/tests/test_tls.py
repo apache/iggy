@@ -33,12 +33,8 @@ import os
 import uuid
 
 import pytest
-from testcontainers.core.container import (
-    DockerContainer,  # type: ignore[import-untyped]
-)
-from testcontainers.core.waiting_utils import (
-    wait_for_logs,  # type: ignore[import-untyped]
-)
+from testcontainers.core.container import DockerContainer
+from testcontainers.core.waiting_utils import wait_for_logs
 
 from apache_iggy import IggyClient, PollingStrategy
 from apache_iggy import SendMessage as Message
