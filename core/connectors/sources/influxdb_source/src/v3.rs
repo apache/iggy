@@ -20,10 +20,10 @@
 //!
 //! V3 uses strict `> cursor` semantics. DataFusion/Parquet does not guarantee
 //! stable ordering for rows that share the same timestamp, so the V2 skip-N
-//! approach is not safe here. If all rows in a batch share the same timestamp,
-//! the cursor cannot advance — the effective batch size is doubled each poll
-//! up to `stuck_batch_cap_factor × batch_size`. If the cap is reached, the
-//! circuit breaker is tripped.
+//! approach is not safe here. If a full batch is returned and all rows share
+//! the same timestamp, the cursor cannot advance — the effective batch size is
+//! doubled each poll up to `stuck_batch_cap_factor × batch_size`. If the cap
+//! is reached, the circuit breaker is tripped.
 
 use crate::common::{
     DEFAULT_V3_CURSOR_FIELD, PayloadFormat, Row, RowContext, V3SourceConfig, V3State,
@@ -314,7 +314,8 @@ pub(crate) struct RowProcessingResult {
 ///
 /// ## Error conditions
 ///
-/// - Any row whose cursor field value fails [`validate_cursor`] is an immediate error.
+/// - Any row whose cursor field value fails [`normalize_v3_timestamp`] (not a valid RFC 3339
+///   timestamp even after appending `"Z"`) is an immediate error.
 /// - If the batch is non-empty but *no* row contains the cursor field, an error is
 ///   returned — the cursor cannot advance and the connector would re-deliver the same
 ///   rows indefinitely. Individual rows that merely lack the cursor field (while at
@@ -1712,8 +1713,8 @@ mod http_tests {
     async fn poll_with_payload_column_returns_raw_schema() {
         // When payload_column is set the schema returned must match the format,
         // not always Json. This covers the payload_format.schema() path at v3.rs:570.
-        // Two rows with distinct timestamps are used so the stuck-batch condition
-        // (rows_at_max_cursor == rows.len()) does not fire and messages are emitted.
+        // Two rows with distinct timestamps ensure the batch is not stuck
+        // (rows_at_max_cursor < effective_batch) so messages are emitted.
         let jsonl = "{\"time\":\"2024-01-01T00:00:01Z\",\"data\":\"aGVsbG8=\"}\n\
                      {\"time\":\"2024-01-01T00:00:02Z\",\"data\":\"d29ybGQ=\"}\n";
         let app = Router::new().route(
