@@ -35,7 +35,7 @@ to `cargo tree -p iggy_connector_influxdb_source` for the full graph.
 ## Runtime dependencies
 
 | Crate | Version (workspace) | License | Role in this connector |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `ahash` | `^0.8.12` | MIT / Apache-2.0 | Non-cryptographic hash map (`AHashMap`) used as the `Row` type in `row.rs`. Replaces `std::HashMap` to reduce hash-table overhead on the per-row parsing hot path. |
 | `async-trait` | `^0.1.89` | MIT / Apache-2.0 | Proc-macro that enables `async fn` in trait definitions; required by the `Source` trait impl in `lib.rs`. |
 | `base64` | `^0.22.1` | MIT / Apache-2.0 | Decodes base64-encoded payload column values when `payload_format = "raw"` is configured (`v2.rs`, `v3.rs`). |
@@ -59,12 +59,12 @@ to `cargo tree -p iggy_connector_influxdb_source` for the full graph.
 ## Dev-only dependencies
 
 | Crate | Version | License | Role |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `axum` | `^0.8.9` | MIT | Minimal HTTP server used in `#[tokio::test]` http_tests to mock the InfluxDB V2 and V3 query endpoints without requiring a live server. |
 | `toml` | `^1.1.2` | MIT / Apache-2.0 | Deserialises TOML config snippets in unit tests that validate backward-compatible config loading. |
 
 ## Dependency change log
 
 | Version | Change | Reason |
-|---|---|---|
+| --- | --- | --- |
 | 0.4.1-edge.1 | Added `ahash ^0.8.12` | Switched `Row` type alias from `std::HashMap` to `AHashMap` in `row.rs`. AHash's non-cryptographic algorithm reduces hash-table overhead on the per-row hot path. Crate was already present in the workspace. |

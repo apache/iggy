@@ -5,7 +5,7 @@ A source connector that polls InfluxDB and produces messages into Iggy streams. 
 ## V2 vs V3 Differences
 
 | Aspect | InfluxDB V2 | InfluxDB V3 |
-|---|---|---|
+| --- | --- | --- |
 | Data organisation | `org` (query param) | `db` |
 | Query endpoint | `POST /api/v2/query` | `POST /api/v3/query_sql` |
 | Query language | Flux | SQL |
@@ -107,7 +107,7 @@ circuit_breaker_cool_down = "30s"   # cool-down before half-open probe
 ## Query Template Placeholders
 
 | Placeholder | Substituted with |
-|---|---|
+| --- | --- |
 | `$cursor` | Current cursor value (RFC 3339 timestamp) |
 | `$limit` | Current effective batch size |
 | `$offset` | Row offset within the current cursor group (V3 only; required when `stuck_batch_cap_factor > 0`) |
@@ -165,10 +165,10 @@ Persisted state (via the connector runtime's state store) holds the last cursor 
 ### V2 vs V3 API Comparison
 
 | Concern | InfluxDB V2 | InfluxDB V3 |
-|---|---|---|
+| --- | --- | --- |
 | Write body format | Line Protocol | Line Protocol |
 | Health check | `GET /health` | `GET /health` |
 | Retry triggers | 429 / 5xx | 429 / 5xx |
 | Cursor field default | `_time` | `time` |
 | Timestamp format | RFC 3339 with TZ | RFC 3339 (TZ appended by connector if absent) |
-| Sort guarantee | Flux `|> sort(...)` explicit | DataFusion — no stable order for tied timestamps |
+| Sort guarantee | Flux <code>\|> sort(...)</code> explicit | DataFusion — no stable order for tied timestamps |

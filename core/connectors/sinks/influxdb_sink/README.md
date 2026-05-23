@@ -5,7 +5,7 @@ A sink connector that consumes messages from Iggy streams and writes them to Inf
 ## V2 vs V3 Differences
 
 | Aspect | InfluxDB V2 | InfluxDB V3 |
-|---|---|---|
+| --- | --- | --- |
 | Data organisation | `org` + `bucket` | `db` |
 | Write endpoint | `POST /api/v2/write` | `POST /api/v3/write_lp` |
 | Auth header | `Authorization: Token {t}` | `Authorization: Bearer {t}` |

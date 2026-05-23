@@ -36,7 +36,7 @@ to `cargo tree -p iggy_connector_influxdb_sink` for the full graph.
 ## Runtime dependencies
 
 | Crate | Version (workspace) | License | Role in this connector |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `async-trait` | `^0.1.89` | MIT / Apache-2.0 | Proc-macro that enables `async fn` in trait definitions; required by the `Sink` trait impl in `lib.rs`. |
 | `base64` | `^0.22.1` | MIT / Apache-2.0 | Encodes raw message payloads as base64 when `payload_format = "base64"` is configured. Uses `Engine::encode_string` to write directly into the line-protocol output buffer with no intermediate allocation. |
 | `bytes` | `^1.11.1` | MIT | Zero-copy `Bytes::from(body.into_bytes())` converts the line-protocol string body into the request body sent to InfluxDB's write endpoint without an extra copy. |
@@ -53,12 +53,12 @@ to `cargo tree -p iggy_connector_influxdb_sink` for the full graph.
 ## Dev-only dependencies
 
 | Crate | Version | License | Role |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `axum` | `^0.8.9` | MIT | Minimal HTTP server used in `#[tokio::test]` http_tests to mock the InfluxDB V2 (`/api/v2/write`) and V3 (`/api/v3/write_lp`) write endpoints and the shared `/health` probe endpoint. |
 | `toml` | `^1.1.2` | MIT / Apache-2.0 | Deserialises TOML config snippets in unit tests that validate backward-compatible config loading. |
 
 ## Dependency change log
 
 | Version | Change | Reason |
-|---|---|---|
+| --- | --- | --- |
 | 0.4.1-edge.1 | No Cargo.toml changes | `base64 ^0.22.1` (already a dependency) gained additional usage: `Engine::encode_string` now writes base64 directly into the line-protocol string buffer, eliminating the intermediate `String` allocation that the previous `encode()` call produced. |
