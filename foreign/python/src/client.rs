@@ -20,16 +20,16 @@ use iggy::prelude::{
     Consumer as RustConsumer, IggyClient as RustIggyClient, IggyMessage as RustMessage,
     PollingStrategy as RustPollingStrategy, *,
 };
+use pyo3::PyRef;
 use pyo3::prelude::*;
 use pyo3::types::{PyDelta, PyList, PyType};
-use pyo3::PyRef;
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::consumer::{py_delta_to_iggy_duration, AutoCommit, IggyConsumer};
+use crate::consumer::{AutoCommit, IggyConsumer, py_delta_to_iggy_duration};
 use crate::identifier::PyIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
@@ -54,7 +54,9 @@ impl IggyClient {
     /// Future versions might utilize asyncio for more Pythonic async.
     #[new]
     #[pyo3(signature = (conn=None))]
-    fn new(#[gen_stub(override_type(type_repr = "builtins.str | None"))] conn: Option<String>) -> Self {
+    fn new(
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] conn: Option<String>,
+    ) -> Self {
         let client = IggyClientBuilder::new()
             .with_tcp()
             .with_server_address(conn.unwrap_or("127.0.0.1:8090".to_string()))
@@ -177,14 +179,15 @@ impl IggyClient {
         stream: PyIdentifier,
         name: String,
         partitions_count: u32,
-        #[gen_stub(override_type(type_repr = "builtins.str | None"))]
-        compression_algorithm: Option<String>,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
-        replication_factor: Option<u8>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] compression_algorithm: Option<
+            String,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] replication_factor: Option<
+            u8,
+        >,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         message_expiry: Option<Py<PyDelta>>,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
-        max_topic_size: Option<u64>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_topic_size: Option<u64>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let compression_algorithm = match compression_algorithm {
             Some(algo) => CompressionAlgorithm::from_str(&algo)
@@ -350,22 +353,21 @@ impl IggyClient {
         name: &str,
         stream: &str,
         topic: &str,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
-        partition_id: Option<u32>,
-        #[gen_stub(override_type(type_repr = "PollingStrategy | None"))]
-        polling_strategy: Option<&PollingStrategy>,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
-        batch_length: Option<u32>,
-        #[gen_stub(override_type(type_repr = "AutoCommit | None"))]
-        auto_commit: Option<&AutoCommit>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
+        #[gen_stub(override_type(type_repr = "PollingStrategy | None"))] polling_strategy: Option<
+            &PollingStrategy,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] batch_length: Option<u32>,
+        #[gen_stub(override_type(type_repr = "AutoCommit | None"))] auto_commit: Option<
+            &AutoCommit,
+        >,
         create_consumer_group_if_not_exists: bool,
         auto_join_consumer_group: bool,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         poll_interval: Option<Py<PyDelta>>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         polling_retry_interval: Option<Py<PyDelta>>,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
-        init_retries: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] init_retries: Option<u32>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         init_retry_interval: Option<Py<PyDelta>>,
         allow_replay: bool,

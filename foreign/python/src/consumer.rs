@@ -28,12 +28,12 @@ use iggy::prelude::{IggyConsumer as RustIggyConsumer, IggyError, ReceivedMessage
 use pyo3::types::{PyDelta, PyDeltaAccess};
 
 use pyo3::prelude::*;
-use pyo3_async_runtimes::tokio::{future_into_py, get_runtime, into_future, scope};
 use pyo3_async_runtimes::TaskLocals;
+use pyo3_async_runtimes::tokio::{future_into_py, get_runtime, into_future, scope};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 use pyo3_stub_gen::{PyStubType, TypeInfo};
-use tokio::sync::oneshot::Sender;
 use tokio::sync::Mutex;
+use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 
 use crate::identifier::PyIdentifier;
@@ -53,7 +53,7 @@ pub struct IggyConsumer {
 #[pymethods]
 impl IggyConsumer {
     /// Get the last consumed offset or `None` if no offset has been consumed yet.
-    #[gen_stub(override_return_type(type_repr="builtins.int | None"))]
+    #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
         self.inner
             .blocking_lock()
@@ -61,7 +61,7 @@ impl IggyConsumer {
     }
 
     /// Get the last stored offset or `None` if no offset has been stored yet.
-    #[gen_stub(override_return_type(type_repr="builtins.int | None"))]
+    #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
         self.inner
             .blocking_lock()
@@ -97,8 +97,7 @@ impl IggyConsumer {
         &self,
         py: Python<'a>,
         offset: u64,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
-        partition_id: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
@@ -119,8 +118,7 @@ impl IggyConsumer {
     fn delete_offset<'a>(
         &self,
         py: Python<'a>,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
-        partition_id: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
