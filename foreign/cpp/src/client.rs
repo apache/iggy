@@ -654,8 +654,7 @@ impl Client {
                 .await
                 .map_err(|error| {
                     format!(
-                        "Could not join consumer group '{}' for topic '{}' on stream '{}': {error}",
-                        rust_group_id, rust_topic_id, rust_stream_id
+                        "Could not join consumer group '{rust_group_id}' for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
                     )
                 })?;
             Ok(())
@@ -739,8 +738,7 @@ impl Client {
                 .await
                 .map_err(|error| {
                     format!(
-                        "Could not leave consumer group '{}' for topic '{}' on stream '{}': {error}",
-                        rust_group_id, rust_topic_id, rust_stream_id
+                        "Could not leave consumer group '{rust_group_id}' for topic '{rust_topic_id}' on stream '{rust_stream_id}': {error}"
                     )
                 })?;
             Ok(())
