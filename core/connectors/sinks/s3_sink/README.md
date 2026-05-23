@@ -50,7 +50,7 @@ max_file_size = "8MiB"
 output_format = "json_lines"
 include_metadata = true
 include_headers = true
-max_retries = 3
+max_attempts = 3
 retry_delay = "1s"
 ```
 
@@ -71,7 +71,7 @@ retry_delay = "1s"
 | `output_format` | String | `json_lines` | Output format: `json_lines`, `json_array`, or `raw` |
 | `include_metadata` | Boolean | `true` | Include stream/topic/partition/offset in output |
 | `include_headers` | Boolean | `false` | Include message headers in output |
-| `max_retries` | Integer | `3` | Max total upload attempts per file |
+| `max_attempts` | Integer | `3` | Max total upload attempts per file (also accepts `max_retries` as alias) |
 | `retry_delay` | String | `1s` | Base delay for exponential backoff (humantime format) |
 | `path_style` | Boolean | auto | Force path-style S3 addressing; auto-enabled when `endpoint` is set |
 
@@ -84,9 +84,9 @@ retry_delay = "1s"
 | `{partition}` | Partition ID | `1` |
 | `{date}` | UTC date from first message in buffer | `2026-03-16` |
 | `{hour}` | UTC hour from first message in buffer | `14` |
-| `{timestamp}` | Wall-clock epoch millis at flush time (non-deterministic) | `1710597600000` |
+| `{timestamp}` | Epoch millis derived from first message timestamp in buffer (deterministic) | `1710597600000` |
 
-**Note:** `{timestamp}` uses wall-clock time at the moment of upload, not message time. It produces different keys on retry or restart. Avoid it if you need stable/reproducible object paths. Prefer `{date}/{hour}` which are derived from the first message timestamp in each buffer.
+**Note:** `{timestamp}`, `{date}`, and `{hour}` are all derived from the first message timestamp in each buffer. They are deterministic across retries within the same process. However, a process restart resets in-memory buffers, so batch boundaries (and therefore timestamps in the key) may differ after recovery.
 
 ### Credentials
 
