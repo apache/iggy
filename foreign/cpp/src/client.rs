@@ -44,7 +44,7 @@ impl From<RustClientInfo> for ffi::ClientInfo {
         ffi::ClientInfo {
             client_id: client.client_id,
             has_user_id,
-            user_id: client.user_id.unwrap_or(0),
+            user_id: client.user_id.unwrap_or(u32::MAX),
             address: client.address,
             transport: client.transport,
             consumer_groups_count: client.consumer_groups_count,
@@ -58,7 +58,7 @@ impl From<RustClientInfoDetails> for ffi::ClientInfoDetails {
         ffi::ClientInfoDetails {
             client_id: client.client_id,
             has_user_id,
-            user_id: client.user_id.unwrap_or(0),
+            user_id: client.user_id.unwrap_or(u32::MAX),
             address: client.address,
             transport: client.transport,
             consumer_groups_count: client.consumer_groups_count,
