@@ -25,10 +25,10 @@ its workspace-pinned version, license, and the specific role it plays
 in this connector. Transitive dependencies are not listed here; refer
 to `cargo tree -p iggy_connector_influxdb_sink` for the full graph.
 
-> **No new dependencies were added in this PR (`feat/influxdb_v2_v3_connector`).**  
-> All changes are within existing dependencies. The `base64::Engine::encode_string`  
-> API (already in `base64 ^0.22.1`) replaced `encode()` to write directly into  
-> the output buffer without an intermediate `String` allocation (see review  
+> **No new dependencies were added in this PR (`feat/influxdb_v2_v3_connector`).**
+> All changes are within existing dependencies. The `base64::Engine::encode_string`
+> API (already in `base64 ^0.22.1`) replaced `encode()` to write directly into
+> the output buffer without an intermediate `String` allocation (see review
 > comment `sink/lib.rs:562`).
 
 ---
