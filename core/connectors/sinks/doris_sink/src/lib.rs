@@ -381,7 +381,7 @@ fn validate_identifier(name: &str, field: &str, id: u32) -> Result<(), Error> {
     }
     if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(Error::InvalidConfigValue(format!(
-            "Doris sink ID {id}: {field} '{name}' must match [A-Za-z0-9_]+ (Doris identifier rules)"
+            "Doris sink ID {id}: {field} '{name}' must match [A-Za-z0-9_]+ (iggy's stricter subset of Doris identifiers, used as a path-traversal guard)"
         )));
     }
     Ok(())
@@ -430,9 +430,10 @@ impl Sink for DorisSink {
             ))
         })?;
 
-        // Reject `database`/`table` outside Doris's identifier alphabet.
-        // Doris would reject them server-side anyway, but rejecting here
-        // also prevents path traversal in the constructed
+        // Constrain `database`/`table` to [A-Za-z0-9_]+ — a stricter subset
+        // than Doris's actual identifier rules (which permit `$` and, when
+        // backtick-quoted, almost anything). We're deliberately narrower to
+        // prevent path traversal in the constructed
         // `/api/{db}/{table}/_stream_load` URL.
         validate_identifier(&self.config.database, "database", self.id)?;
         validate_identifier(&self.config.table, "table", self.id)?;
