@@ -44,7 +44,12 @@ const MAX_REDIRECTS: u8 = 5;
 // `[A-Za-z0-9_-]`. These caps keep the worst-case label well under that limit.
 const MAX_LABEL_PREFIX_LEN: usize = 16;
 const MAX_LABEL_NAME_LEN: usize = 16;
-const LABEL_HASH_HEX_LEN: usize = 8;
+// A single 16-hex-char (64-bit) hash over the raw (stream, topic) pair. 64 bits
+// puts the adversarial birthday bound at ~5B, so a multi-tenant namer can't
+// cheaply force the label collisions that Doris's server-side dedupe would
+// otherwise turn into silent data loss. One joint hash (not one per segment)
+// buys that entropy for the same budget, leaving the names full-length.
+const LABEL_HASH_HEX_LEN: usize = 16;
 // Doris Stream Load responses are normally tiny JSON blobs (~200 B). Cap the
 // portion we keep for logs/errors so a misbehaving proxy that returns a giant
 // body cannot OOM the connector or flood logs.
@@ -265,27 +270,38 @@ fn sanitize_segment(value: &str, max_len: usize) -> String {
         .collect()
 }
 
-/// Sanitize + truncate a stream/topic name and append a short blake3 hash
-/// of the *raw* (unsanitized) name. The hash disambiguates names that
-/// sanitize to the same string (e.g. `events.v1` vs `events_v1`), which
-/// would otherwise produce identical labels and cause silent data loss
-/// via Doris's server-side label dedupe.
-fn label_segment_with_hash(value: &str) -> String {
-    let san = sanitize_segment(value, MAX_LABEL_NAME_LEN);
-    let hash = blake3::hash(value.as_bytes()).to_hex();
-    format!("{san}_{}", &hash.as_str()[..LABEL_HASH_HEX_LEN])
+/// A single blake3 fingerprint over the *raw* (unsanitized) `stream` and
+/// `topic`, truncated to `LABEL_HASH_HEX_LEN` hex chars. This disambiguates
+/// identities that sanitize to the same string (e.g. `events.v1` vs
+/// `events_v1`), which would otherwise produce identical labels and cause
+/// silent data loss via Doris's server-side label dedupe.
+///
+/// Hashing the pair jointly (rather than one hash per segment) yields 64-bit
+/// collision resistance over the full identity while spending the budget of a
+/// single segment, so the sanitized names stay full-length for readability.
+/// Inputs are length-prefixed so distinct pairs can't alias into one digest
+/// (e.g. `("ab", "c")` vs `("a", "bc")`).
+fn identity_hash(stream: &str, topic: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(stream.len() as u64).to_le_bytes());
+    hasher.update(stream.as_bytes());
+    hasher.update(&(topic.len() as u64).to_le_bytes());
+    hasher.update(topic.as_bytes());
+    let hash = hasher.finalize().to_hex();
+    hash.as_str()[..LABEL_HASH_HEX_LEN].to_string()
 }
 
 /// Pure label builder. Format:
-/// `{prefix}-{stream_san}_{hash8}-{topic_san}_{hash8}-{partition}-{first}-{last}`.
+/// `{prefix}-{stream_san}-{topic_san}-{hash16}-{partition}-{first}-{last}`.
 ///
 /// Exposed as a `pub` free function so integration tests can produce the
 /// exact same label without instantiating a `DorisSink`. The format is
 /// engineered to:
 ///   1. Bound the total length under Doris's 128-char label cap regardless
-///      of input name length.
-///   2. Eliminate the silent-collision risk between names that sanitize to
-///      the same string (the hash is over the raw name).
+///      of input name length (worst case 120 chars).
+///   2. Eliminate the silent-collision risk between identities that sanitize
+///      to the same string — the joint `hash16` is over the raw names, so it
+///      stays distinct even when both sanitized segments collide.
 pub fn build_label(
     prefix: &str,
     stream: &str,
@@ -295,10 +311,11 @@ pub fn build_label(
     last_offset: u64,
 ) -> String {
     format!(
-        "{}-{}-{}-{}-{}-{}",
+        "{}-{}-{}-{}-{}-{}-{}",
         sanitize_segment(prefix, MAX_LABEL_PREFIX_LEN),
-        label_segment_with_hash(stream),
-        label_segment_with_hash(topic),
+        sanitize_segment(stream, MAX_LABEL_NAME_LEN),
+        sanitize_segment(topic, MAX_LABEL_NAME_LEN),
+        identity_hash(stream, topic),
         partition_id,
         first_offset,
         last_offset,
@@ -605,17 +622,17 @@ mod tests {
         let a = sink.build_label(&topic, 7, 100, 199);
         let b = sink.build_label(&topic, 7, 100, 199);
         assert_eq!(a, b);
-        // Format: {prefix}-{stream_san}_{hash8}-{topic_san}_{hash8}-{partition}-{first}-{last}
+        // Format: {prefix}-{stream_san}-{topic_san}-{hash16}-{partition}-{first}-{last}
         let parts: Vec<&str> = a.split('-').collect();
-        assert_eq!(parts.len(), 6);
+        assert_eq!(parts.len(), 7);
         assert_eq!(parts[0], "iggy");
-        assert!(parts[1].starts_with("events_"));
-        assert_eq!(parts[1].len(), "events_".len() + LABEL_HASH_HEX_LEN);
-        assert!(parts[2].starts_with("orders_"));
-        assert_eq!(parts[2].len(), "orders_".len() + LABEL_HASH_HEX_LEN);
-        assert_eq!(parts[3], "7");
-        assert_eq!(parts[4], "100");
-        assert_eq!(parts[5], "199");
+        assert_eq!(parts[1], "events");
+        assert_eq!(parts[2], "orders");
+        assert_eq!(parts[3].len(), LABEL_HASH_HEX_LEN);
+        assert!(parts[3].chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(parts[4], "7");
+        assert_eq!(parts[5], "100");
+        assert_eq!(parts[6], "199");
     }
 
     #[test]
@@ -633,9 +650,9 @@ mod tests {
 
     #[test]
     fn label_disambiguates_names_that_sanitize_identically() {
-        // The whole point of the hash suffix: `events.v1` and `events_v1`
+        // The whole point of the joint hash: `events.v1` and `events_v1`
         // collapse to the same sanitized form, but the hash is over the raw
-        // name so the final labels differ. Without this, two streams could
+        // names so the final labels differ. Without this, two streams could
         // silently dedupe against each other in Doris.
         let sink = DorisSink::new(1, make_config());
         let dotted = TopicMetadata {
@@ -650,6 +667,19 @@ mod tests {
             sink.build_label(&dotted, 0, 0, 0),
             sink.build_label(&underscored, 0, 0, 0),
             "labels must NOT collide for names that sanitize to the same string"
+        );
+    }
+
+    #[test]
+    fn identity_hash_is_not_aliased_by_boundary_shift() {
+        // The joint hash is length-prefixed so shifting the stream/topic
+        // boundary cannot produce the same digest: `("ab", "c")` must differ
+        // from `("a", "bc")`, otherwise two distinct identities could share a
+        // label and silently dedupe in Doris.
+        assert_ne!(identity_hash("ab", "c"), identity_hash("a", "bc"));
+        assert_ne!(
+            identity_hash("events", "orders"),
+            identity_hash("event", "sorders")
         );
     }
 
