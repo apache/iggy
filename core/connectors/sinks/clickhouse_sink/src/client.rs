@@ -218,7 +218,7 @@ impl ClickHouseClient {
 
                     if is_retryable_status(status) {
                         attempts += 1;
-                        if attempts > max_retries {
+                        if attempts >= max_retries {
                             error!(
                                 "Insert failed after {attempts} attempts (HTTP {status}): {body_text}"
                             );

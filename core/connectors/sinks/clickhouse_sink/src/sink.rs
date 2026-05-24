@@ -20,7 +20,7 @@ use crate::body::{build_json_body, build_row_binary_body, build_string_body};
 use crate::{ClickHouseSink, InsertFormat, client::ClickHouseClient};
 use async_trait::async_trait;
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 #[async_trait]
 impl Sink for ClickHouseSink {
@@ -40,13 +40,46 @@ impl Sink for ClickHouseSink {
             self.timeout(),
         )?;
 
-        client.ping().await?;
+        let max_retries = self.max_retries();
+        let retry_delay = self.retry_delay;
+
+        let mut attempts = 0u32;
+        loop {
+            match client.ping().await {
+                Ok(()) => break,
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= max_retries {
+                        error!("Ping failed after {attempts} attempt(s): {e}");
+                        return Err(e);
+                    }
+                    let backoff = retry_delay * attempts;
+                    warn!("Ping failed (attempt {attempts}/{max_retries}): {e}. Retrying in {backoff:?}…");
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
         info!("ClickHouse sink ID: {} — ping OK", self.id);
 
         // For RowBinary mode, fetch and validate the table schema at startup.
         // This fails fast if the table doesn't exist or contains unsupported types.
         if self.insert_format == InsertFormat::RowBinary {
-            let schema = client.fetch_schema(&self.config.table).await?;
+            let mut attempts = 0u32;
+            let schema = loop {
+                match client.fetch_schema(&self.config.table).await {
+                    Ok(schema) => break schema,
+                    Err(e) => {
+                        attempts += 1;
+                        if attempts >= max_retries {
+                            error!("fetch_schema failed after {attempts} attempt(s): {e}");
+                            return Err(e);
+                        }
+                        let backoff = retry_delay * attempts;
+                        warn!("fetch_schema failed (attempt {attempts}/{max_retries}): {e}. Retrying in {backoff:?}…");
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+            };
             info!(
                 "ClickHouse sink ID: {} — loaded schema ({} columns) for table '{}'",
                 self.id,
