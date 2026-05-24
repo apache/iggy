@@ -561,22 +561,21 @@ pub(crate) async fn poll(
     if let (Some(new), Some(_)) = (
         result.max_cursor.as_deref(),
         state.last_timestamp.as_deref(),
-    ) {
-        if !old_dt.is_some_and(|dt| is_timestamp_after(new, dt)) {
-            warn!("V3 source: max_cursor did not advance past saved cursor; keeping old value");
-            return Ok(PollResult {
-                messages: result.messages,
-                new_state: V3State {
-                    last_timestamp: state.last_timestamp.clone(),
-                    processed_rows,
-                    effective_batch_size: state.effective_batch_size,
-                    last_timestamp_row_offset: state.last_timestamp_row_offset,
-                    stuck_cursor: state.stuck_cursor.clone(),
-                },
-                schema,
-                trip_circuit_breaker: false,
-            });
-        }
+    ) && !old_dt.is_some_and(|dt| is_timestamp_after(new, dt))
+    {
+        warn!("V3 source: max_cursor did not advance past saved cursor; keeping old value");
+        return Ok(PollResult {
+            messages: result.messages,
+            new_state: V3State {
+                last_timestamp: state.last_timestamp.clone(),
+                processed_rows,
+                effective_batch_size: state.effective_batch_size,
+                last_timestamp_row_offset: state.last_timestamp_row_offset,
+                stuck_cursor: state.stuck_cursor.clone(),
+            },
+            schema,
+            trip_circuit_breaker: false,
+        });
     }
 
     let advanced_cursor = match (

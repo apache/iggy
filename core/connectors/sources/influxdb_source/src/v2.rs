@@ -19,8 +19,8 @@
 //! InfluxDB V2 source — Flux queries, annotated-CSV responses, Token auth.
 
 use crate::common::{
-    PayloadFormat, Row, RowContext, V2SourceConfig, V2State, apply_query_params,
-    is_timestamp_after, parse_csv_rows, parse_scalar, validate_cursor,
+    PayloadFormat, Row, RowContext, V2SourceConfig, V2State, apply_query_params, parse_csv_rows,
+    parse_scalar, validate_cursor,
 };
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
