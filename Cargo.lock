@@ -6598,7 +6598,6 @@ dependencies = [
  "async-trait",
  "bytes",
  "dashmap",
- "humantime",
  "iggy_connector_sdk",
  "once_cell",
  "reqwest 0.13.3",

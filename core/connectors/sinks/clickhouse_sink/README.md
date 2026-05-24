@@ -36,7 +36,7 @@ table = "events"
 insert_format = "json_each_row"
 timeout_seconds = 30
 max_retries = 3
-retry_delay = "1s"
+retry_delay = 1  # seconds
 verbose_logging = false
 ```
 
@@ -53,7 +53,7 @@ verbose_logging = false
 | `string_format` | string | `"json_each_row"` | ClickHouse format for `string` mode: `json_each_row`, `csv`, or `tsv` |
 | `timeout_seconds` | u64 | `30` | HTTP request timeout |
 | `max_retries` | u32 | `3` | Max retry attempts on transient errors |
-| `retry_delay` | string | `"1s"` | Delay between retries (e.g. `500ms`, `2s`) |
+| `retry_delay` | u64 | `1` | Delay between retries, in seconds |
 | `verbose_logging` | bool | `false` | Log inserts at info level instead of debug |
 
 ## Insert Formats
@@ -135,7 +135,7 @@ database = "telemetry"
 table = "metrics"
 insert_format = "row_binary"
 max_retries = 5
-retry_delay = "500ms"
+retry_delay = 1  # seconds
 verbose_logging = true
 ```
 

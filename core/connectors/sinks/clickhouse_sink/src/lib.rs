@@ -16,11 +16,9 @@
  * under the License.
  */
 
-use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::{Error, sink_connector};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use std::str::FromStr;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -37,7 +35,7 @@ const DEFAULT_USERNAME: &str = "default";
 const DEFAULT_PASSWORD: &str = "";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_RETRIES: u32 = 3;
-const DEFAULT_RETRY_DELAY: &str = "1s";
+const DEFAULT_RETRY_DELAY_SECS: u64 = 1;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClickHouseSinkConfig {
@@ -52,7 +50,8 @@ pub struct ClickHouseSinkConfig {
     pub string_format: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub max_retries: Option<u32>,
-    pub retry_delay: Option<String>,
+    /// Delay between retry attempts, in seconds.
+    pub retry_delay: Option<u64>,
     pub verbose_logging: Option<bool>,
 }
 
@@ -134,10 +133,7 @@ impl ClickHouseSink {
     pub fn new(id: u32, config: ClickHouseSinkConfig) -> Self {
         let insert_format = InsertFormat::from_config(config.insert_format.as_deref());
         let string_format = StringFormat::from_config(config.string_format.as_deref());
-        let delay_str = config.retry_delay.as_deref().unwrap_or(DEFAULT_RETRY_DELAY);
-        let retry_delay = HumanDuration::from_str(delay_str)
-            .map(|d| d.into())
-            .unwrap_or_else(|_| Duration::from_secs(1));
+        let retry_delay = Duration::from_secs(config.retry_delay.unwrap_or(DEFAULT_RETRY_DELAY_SECS));
 
         ClickHouseSink {
             id,
@@ -250,11 +246,11 @@ mod tests {
     }
 
     #[test]
-    fn given_custom_retry_delay_should_parse_humantime() {
+    fn given_custom_retry_delay_should_use_configured_seconds() {
         let mut config = test_config();
-        config.retry_delay = Some("500ms".into());
+        config.retry_delay = Some(5);
         let sink = ClickHouseSink::new(1, config);
-        assert_eq!(sink.retry_delay, Duration::from_millis(500));
+        assert_eq!(sink.retry_delay, Duration::from_secs(5));
     }
 
     #[test]
