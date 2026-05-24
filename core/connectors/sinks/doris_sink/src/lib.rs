@@ -66,6 +66,11 @@ pub struct DorisSink {
     // Precomputed once in `new()` — the target only depends on fe_url/database/
     // table, so there's no need to re-format it on every batch.
     stream_load_url: String,
+    // Precomputed once in `new()`: `max_filter_ratio` is config-static, so its
+    // header string is formatted up front rather than via `to_string()` on
+    // every PUT (and every redirect hop). `columns`/`where` are already stored
+    // as `String` in the config and borrowed directly, so they need no cache.
+    max_filter_ratio_header: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,12 +138,15 @@ impl DorisSink {
             config.table,
         );
 
+        let max_filter_ratio_header = config.max_filter_ratio.map(|ratio| ratio.to_string());
+
         DorisSink {
             id,
             config,
             client: None,
             auth_header,
             stream_load_url,
+            max_filter_ratio_header,
         }
     }
 
@@ -228,8 +236,8 @@ impl DorisSink {
                 .header("label", label)
                 .body(body.clone());
 
-            if let Some(ratio) = self.config.max_filter_ratio {
-                request = request.header("max_filter_ratio", ratio.to_string());
+            if let Some(ratio) = &self.max_filter_ratio_header {
+                request = request.header("max_filter_ratio", ratio);
             }
             if let Some(columns) = &self.config.columns {
                 request = request.header("columns", columns);
