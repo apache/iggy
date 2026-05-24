@@ -41,3 +41,11 @@ password = ""
 label_prefix = "iggy"
 batch_size = 1000
 timeout_secs = 30
+# Stream Load redirect security. Doris's FE redirects (307) to a BE on another
+# host; credentials are re-attached across that hop. By default a redirect that
+# downgrades https -> http is refused (it would leak credentials in cleartext).
+# Set true only for a known-insecure FE -> BE topology.
+# allow_insecure_redirect = false
+# Optional allowlist of hosts a redirect may target. When set and non-empty,
+# any redirect to another host is refused (hard lockdown against a MITM'd FE).
+# allowed_redirect_hosts = ["be1.doris.internal", "be2.doris.internal"]

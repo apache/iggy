@@ -60,7 +60,9 @@ pub struct DorisSink {
     id: u32,
     config: DorisSinkConfig,
     client: Option<reqwest::Client>,
-    auth_header: SecretString,
+    // Precomputed once in `new()` and marked sensitive so reqwest keeps it out
+    // of any debug/trace output (and never HPACK-indexes it on HTTP/2).
+    auth_header: header::HeaderValue,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +79,17 @@ pub struct DorisSinkConfig {
     pub where_clause: Option<String>,
     pub timeout_secs: Option<u64>,
     pub batch_size: Option<u32>,
+    /// Permit a redirect that downgrades the scheme (e.g. `https://` FE ->
+    /// `http://` BE). Off by default: a downgrade would push Basic-auth
+    /// credentials onto a cleartext hop, so we refuse it unless the operator
+    /// explicitly opts in for a known-insecure FE -> BE topology.
+    pub allow_insecure_redirect: Option<bool>,
+    /// Optional allowlist of hosts a Stream Load redirect may target. When set
+    /// and non-empty, a redirect to any other host is refused — a hard lockdown
+    /// against a compromised/MITM'd FE exfiltrating credentials via `Location`.
+    /// When unset, cross-host redirects are allowed (required for the normal
+    /// FE -> BE topology) subject only to the scheme-downgrade rule above.
+    pub allowed_redirect_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,10 +110,14 @@ struct StreamLoadResponse {
 impl DorisSink {
     pub fn new(id: u32, config: DorisSinkConfig) -> Self {
         let credential = format!("{}:{}", config.username, config.password.expose_secret());
-        let auth_header = SecretString::from(format!(
+        // base64 over `Basic <...>` is always within the visible-ASCII set that
+        // HeaderValue accepts, so this conversion cannot fail.
+        let mut auth_header = header::HeaderValue::from_str(&format!(
             "Basic {}",
             general_purpose::STANDARD.encode(credential)
-        ));
+        ))
+        .expect("Basic auth header is always valid ASCII");
+        auth_header.set_sensitive(true);
 
         DorisSink {
             id,
@@ -175,12 +192,21 @@ impl DorisSink {
             ))
         })?;
         let mut url = self.stream_load_url();
+        // Baseline for redirect validation: every redirect target is checked
+        // against the originally configured FE scheme/host before we re-attach
+        // credentials, so a compromised FE cannot exfiltrate them via Location.
+        let base_url = reqwest::Url::parse(&url).map_err(|e| {
+            Error::PermanentHttpError(format!(
+                "Doris sink ID {} has unparsable stream load URL '{url}': {e}",
+                self.id
+            ))
+        })?;
         let mut redirects = 0u8;
 
         loop {
             let mut request = client
                 .request(Method::PUT, &url)
-                .header(header::AUTHORIZATION, self.auth_header.expose_secret())
+                .header(header::AUTHORIZATION, self.auth_header.clone())
                 .header(header::EXPECT, "100-continue")
                 .header("format", "json")
                 .header("strip_outer_array", "true")
@@ -224,8 +250,32 @@ impl DorisSink {
                         self.id
                     )));
                 };
-                debug!("Doris sink ID {} following redirect to {location}", self.id);
-                url = location.to_string();
+                // Resolve Location (Doris returns absolute; fall back to joining
+                // a relative one onto the current URL) and validate the target
+                // before trusting it with credentials on the next iteration.
+                let current = reqwest::Url::parse(&url).map_err(|e| {
+                    Error::PermanentHttpError(format!(
+                        "Doris sink ID {} has unparsable redirect source '{url}': {e}",
+                        self.id
+                    ))
+                })?;
+                let target = reqwest::Url::parse(location)
+                    .or_else(|_| current.join(location))
+                    .map_err(|e| {
+                        Error::PermanentHttpError(format!(
+                            "Doris sink ID {} got {status} with unparsable Location '{location}': {e}",
+                            self.id
+                        ))
+                    })?;
+                validate_redirect(
+                    &base_url,
+                    &target,
+                    self.config.allow_insecure_redirect.unwrap_or(false),
+                    self.config.allowed_redirect_hosts.as_deref(),
+                    self.id,
+                )?;
+                debug!("Doris sink ID {} following redirect to {target}", self.id);
+                url = target.to_string();
                 continue;
             }
 
@@ -252,6 +302,50 @@ impl DorisSink {
             return parse_stream_load_response(&response_text);
         }
     }
+}
+
+/// Validate a Stream Load redirect target before re-attaching credentials.
+///
+/// Doris's FE legitimately redirects (307) to a BE on a *different host*, so we
+/// cannot require same-host. Instead we enforce two rules that close the
+/// credential-exfiltration vector a compromised/MITM'd FE would otherwise have:
+///
+///   1. Scheme must not be downgraded (`https` -> `http`) unless `allow_insecure`
+///      is set — a downgrade would push Basic-auth creds onto a cleartext hop.
+///   2. If `allowed_hosts` is non-empty, the target host must be in it — a hard
+///      lockdown for operators who want to pin redirects to known BE hosts.
+fn validate_redirect(
+    base: &reqwest::Url,
+    target: &reqwest::Url,
+    allow_insecure: bool,
+    allowed_hosts: Option<&[String]>,
+    id: u32,
+) -> Result<(), Error> {
+    let downgraded = base.scheme().eq_ignore_ascii_case("https")
+        && !target.scheme().eq_ignore_ascii_case("https");
+    if downgraded && !allow_insecure {
+        return Err(Error::PermanentHttpError(format!(
+            "Doris sink ID {id}: refusing redirect that downgrades {} -> {} \
+             (would leak credentials in cleartext; set allow_insecure_redirect=true \
+             to permit a known-insecure FE -> BE topology)",
+            base.scheme(),
+            target.scheme(),
+        )));
+    }
+
+    if let Some(allowed) = allowed_hosts
+        && !allowed.is_empty()
+    {
+        let host = target.host_str().unwrap_or("");
+        if !allowed.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+            return Err(Error::PermanentHttpError(format!(
+                "Doris sink ID {id}: redirect target host '{host}' is not in \
+                 allowed_redirect_hosts",
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Replace Doris-label-illegal characters with `_` and cap the result at
@@ -442,10 +536,12 @@ impl Sink for DorisSink {
         //
         // NOTE on trust model: this connector intentionally preserves the
         // Authorization header across the FE -> BE 307 redirect (reqwest
-        // would otherwise strip it on cross-host redirects). That means a
-        // compromised or MITM'd FE could exfiltrate credentials by responding
-        // with `Location: http://attacker/`. The cleartext warning is the
-        // primary mitigation; for hostile networks, deploy Doris over TLS.
+        // would otherwise strip it on cross-host redirects). A compromised or
+        // MITM'd FE could try to exfiltrate credentials via `Location:
+        // http://attacker/` — `validate_redirect` enforces the trust boundary
+        // by refusing scheme downgrades (and honoring `allowed_redirect_hosts`)
+        // before re-attaching credentials. This warning remains for the case
+        // where the FE itself is plain http; deploy Doris over TLS in prod.
         if parsed_url.scheme().eq_ignore_ascii_case("http") {
             let host = parsed_url.host_str().unwrap_or("");
             let is_loopback = host == "localhost" || host == "127.0.0.1" || host == "::1";
@@ -593,6 +689,8 @@ mod tests {
             where_clause: None,
             timeout_secs: None,
             batch_size: None,
+            allow_insecure_redirect: None,
+            allowed_redirect_hosts: None,
         }
     }
 
@@ -835,11 +933,99 @@ mod tests {
         assert!(matches!(slot, Some(Error::PermanentHttpError(_))));
     }
 
+    fn url(s: &str) -> reqwest::Url {
+        reqwest::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn redirect_refuses_https_to_http_downgrade_by_default() {
+        // A compromised FE redirecting https -> http would leak Basic creds in
+        // cleartext. Refuse it unless explicitly opted in.
+        let err = validate_redirect(
+            &url("https://fe.doris:8030"),
+            &url("http://attacker.evil/"),
+            false,
+            None,
+            1,
+        );
+        assert!(matches!(err, Err(Error::PermanentHttpError(_))));
+    }
+
+    #[test]
+    fn redirect_allows_downgrade_when_opted_in() {
+        // Known-insecure FE -> BE topology: operator accepts the risk.
+        assert!(
+            validate_redirect(
+                &url("https://fe.doris:8030"),
+                &url("http://be.doris:8040/"),
+                true,
+                None,
+                1,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn redirect_allows_cross_host_same_scheme() {
+        // The normal FE -> BE hop: different host, same scheme, no allowlist.
+        assert!(
+            validate_redirect(
+                &url("https://fe.doris:8030"),
+                &url("https://be.doris:8040/"),
+                false,
+                None,
+                1,
+            )
+            .is_ok()
+        );
+        // http -> http is not a downgrade.
+        assert!(
+            validate_redirect(
+                &url("http://fe.doris:8030"),
+                &url("http://be.doris:8040/"),
+                false,
+                None,
+                1,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn redirect_enforces_host_allowlist_when_set() {
+        let allowed = vec!["be1.doris".to_string(), "be2.doris".to_string()];
+        // Target host not in the allowlist is refused.
+        assert!(matches!(
+            validate_redirect(
+                &url("http://fe.doris:8030"),
+                &url("http://attacker.evil:8040/"),
+                false,
+                Some(&allowed),
+                1,
+            ),
+            Err(Error::PermanentHttpError(_))
+        ));
+        // Target host in the allowlist passes.
+        assert!(
+            validate_redirect(
+                &url("http://fe.doris:8030"),
+                &url("http://be2.doris:8040/"),
+                false,
+                Some(&allowed),
+                1,
+            )
+            .is_ok()
+        );
+    }
+
     #[test]
     fn auth_header_is_basic_b64() {
         let sink = DorisSink::new(1, make_config());
         // base64("root:pw") = cm9vdDpwdw==
-        assert_eq!(sink.auth_header.expose_secret(), "Basic cm9vdDpwdw==");
+        assert_eq!(sink.auth_header.to_str().unwrap(), "Basic cm9vdDpwdw==");
+        // Marked sensitive so reqwest keeps it out of debug/trace output.
+        assert!(sink.auth_header.is_sensitive());
     }
 
     fn text_msg(offset: u64) -> ConsumedMessage {

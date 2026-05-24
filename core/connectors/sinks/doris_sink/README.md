@@ -39,6 +39,8 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 | `max_filter_ratio` | no | unset | Forwarded as the `max_filter_ratio` Stream Load header. |
 | `columns` | no | unset | Forwarded as the `columns` Stream Load header. |
 | `where` | no | unset | Forwarded as the `where` Stream Load header. |
+| `allow_insecure_redirect` | no | `false` | Permit a Stream Load redirect that downgrades `https://` → `http://`. Refused by default because it would push credentials onto a cleartext hop. |
+| `allowed_redirect_hosts` | no | unset | Allowlist of hosts a redirect may target. When set and non-empty, a redirect to any other host is refused. |
 
 ### Example
 
@@ -73,7 +75,7 @@ timeout_secs = 30
 ## Security notes
 
 - **Use `https://` in production.** The connector accepts `http://` URLs and logs a `warn!` when `fe_url` points at a non-loopback host over plain HTTP, but it does not refuse. Over `http://`, the HTTP Basic credentials travel in cleartext.
-- **Trust boundary on the FE.** The connector intentionally preserves the `Authorization` header across the FE → BE 307 redirect (reqwest would otherwise strip it on cross-host redirects). A compromised or MITM'd FE could exfiltrate credentials by responding with `Location: http://attacker/`. The `http://` warning above is the primary mitigation; deploy Doris over TLS in hostile networks.
+- **Trust boundary on the FE.** The connector intentionally preserves the `Authorization` header across the FE → BE 307 redirect (reqwest would otherwise strip it on cross-host redirects). A compromised or MITM'd FE could try to exfiltrate credentials by responding with `Location: http://attacker/`. Before re-attaching credentials, the connector validates the redirect target: it **refuses a scheme downgrade** (`https://` → `http://`) unless `allow_insecure_redirect = true`, and — if `allowed_redirect_hosts` is set — refuses any host outside that allowlist. Cross-host redirects on the same scheme are allowed, since that is the normal FE → BE topology. For maximum lockdown in hostile networks, set `allowed_redirect_hosts` to your known BE hosts and deploy Doris over TLS.
 - **`columns` and `where` are SQL-expression pass-throughs.** Whatever you put in those config fields is forwarded verbatim to Doris's Stream Load and evaluated as a SQL expression. Keep this config trusted.
 
 ## Operational guidance
