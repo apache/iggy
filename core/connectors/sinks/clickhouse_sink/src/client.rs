@@ -163,6 +163,13 @@ impl ClickHouseClient {
     ///
     /// Retries up to `max_retries` times on transient errors (network errors,
     /// HTTP 429, HTTP 5xx). Does not retry on HTTP 4xx (data errors).
+    ///
+    /// # At-least-once semantics
+    ///
+    /// Each retry resends the identical body with no `insert_deduplication_token`.
+    /// If the server committed the batch but the response was lost, the retry
+    /// produces duplicate rows. Callers must tolerate this or handle
+    /// deduplication at read time. See the README for details.
     pub async fn insert(
         &self,
         table: &str,

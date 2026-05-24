@@ -162,3 +162,18 @@ string_format = "csv"
 The connector retries failed inserts up to `max_retries` times with a fixed delay of `retry_delay` between attempts. The delay is applied as-is on each attempt (not exponential backoff). Non-retryable errors fail immediately.
 
 On shutdown the connector logs the total number of messages processed.
+
+### Delivery semantics: at-least-once
+
+This connector provides **at-least-once** delivery — not exactly-once. Retries resend the full batch body without an `insert_deduplication_token`, so if the server applied a batch but the acknowledgement was lost in transit (network drop, timeout), the retry will insert the same rows again.
+
+**Affected table engines:**
+
+- `MergeTree` — no deduplication at all; duplicate rows will be stored.
+- `ReplicatedMergeTree` — has implicit block-level deduplication based on the data checksum (controlled by `replicated_deduplication_window`, default 100 blocks), which will suppress duplicates in the common retry case as long as the window has not been exceeded.
+
+If your workload cannot tolerate duplicate rows, either:
+
+1. Use a `ReplicatedMergeTree` table and keep `max_retries` low enough that retries stay within the deduplication window, or
+2. Use a `CollapsingMergeTree` / `ReplacingMergeTree` and apply deduplication at query time, or
+3. Accept duplicates at write time and deduplicate with `DISTINCT` or `GROUP BY` in your queries.
