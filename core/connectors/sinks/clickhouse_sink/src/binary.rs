@@ -488,12 +488,15 @@ fn coerce_to_days(value: &OwnedValue) -> Result<i64, Error> {
         OwnedValue::Static(simd_json::StaticNode::U64(n)) => Ok(*n as i64),
         OwnedValue::String(s) => {
             // Parse "YYYY-MM-DD" manually
-            let parts: Vec<&str> = s.splitn(3, '-').collect();
-            if parts.len() != 3 {
-                error!("Invalid date string: {s}");
-                return Err(Error::InvalidRecord);
-            }
-            let (y, m, d) = parse_ymd(parts[0], parts[1], parts[2]).map_err(|_| {
+            let mut it = s.splitn(3, '-');
+            let (y_s, m_s, d_s) = match (it.next(), it.next(), it.next()) {
+                (Some(y), Some(m), Some(d)) => (y, m, d),
+                _ => {
+                    error!("Invalid date string: {s}");
+                    return Err(Error::InvalidRecord);
+                }
+            };
+            let (y, m, d) = parse_ymd(y_s, m_s, d_s).map_err(|_| {
                 error!("Cannot parse date: {s}");
                 Error::InvalidRecord
             })?;
@@ -537,12 +540,15 @@ fn parse_datetime_string(s: &str) -> Result<f64, Error> {
         (s, "00:00:00")
     };
 
-    let date_parts: Vec<&str> = date_part.splitn(3, '-').collect();
-    if date_parts.len() != 3 {
-        error!("Cannot parse datetime string: {s}");
-        return Err(Error::InvalidRecord);
-    }
-    let (y, m, d) = parse_ymd(date_parts[0], date_parts[1], date_parts[2]).map_err(|_| {
+    let mut it = date_part.splitn(3, '-');
+    let (y_s, m_s, d_s) = match (it.next(), it.next(), it.next()) {
+        (Some(y), Some(m), Some(d)) => (y, m, d),
+        _ => {
+            error!("Cannot parse datetime string: {s}");
+            return Err(Error::InvalidRecord);
+        }
+    };
+    let (y, m, d) = parse_ymd(y_s, m_s, d_s).map_err(|_| {
         error!("Cannot parse date component of: {s}");
         Error::InvalidRecord
     })?;
@@ -580,13 +586,13 @@ fn ymd_to_days(y: i32, m: u32, d: u32) -> i64 {
 
 /// Parse "hh:mm:ss[.frac]" into total seconds (f64).
 fn parse_time(s: &str) -> Result<f64, ()> {
-    let parts: Vec<&str> = s.splitn(3, ':').collect();
-    if parts.len() < 2 {
+    let mut it = s.splitn(3, ':');
+    let (Some(h_s), Some(min_s)) = (it.next(), it.next()) else {
         return Err(());
-    }
-    let h: f64 = parts[0].parse().map_err(|_| ())?;
-    let min: f64 = parts[1].parse().map_err(|_| ())?;
-    let sec: f64 = parts.get(2).unwrap_or(&"0").parse().map_err(|_| ())?;
+    };
+    let h: f64 = h_s.parse().map_err(|_| ())?;
+    let min: f64 = min_s.parse().map_err(|_| ())?;
+    let sec: f64 = it.next().unwrap_or("0").parse().map_err(|_| ())?;
     Ok(h * 3600.0 + min * 60.0 + sec)
 }
 
@@ -602,15 +608,16 @@ fn strip_timezone(s: &str) -> (&str, i64) {
             if pos > 0 {
                 let tz = &s[pos + 1..];
                 let secs = if tz.contains(':') {
-                    let parts: Vec<&str> = tz.splitn(2, ':').collect();
-                    if parts.len() == 2 {
-                        if let (Ok(h), Ok(m)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
-                            Some(sign * (h * 3600 + m * 60))
-                        } else {
-                            None
+                    let mut it = tz.splitn(2, ':');
+                    match (it.next(), it.next()) {
+                        (Some(h_s), Some(m_s)) => {
+                            if let (Ok(h), Ok(m)) = (h_s.parse::<i64>(), m_s.parse::<i64>()) {
+                                Some(sign * (h * 3600 + m * 60))
+                            } else {
+                                None
+                            }
                         }
-                    } else {
-                        None
+                        _ => None,
                     }
                 } else if tz.len() == 4 {
                     if let Ok(hhmm) = tz.parse::<i64>() {
