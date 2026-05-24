@@ -78,6 +78,10 @@ pub struct DorisSinkConfig {
     #[serde(rename = "where")]
     pub where_clause: Option<String>,
     pub timeout_secs: Option<u64>,
+    /// TCP connect timeout. Independent of `timeout_secs` (the total request
+    /// budget). Defaults to 5s; raise it for cross-region or cold-start FEs
+    /// that are slow to accept the connection.
+    pub connect_timeout_secs: Option<u64>,
     pub batch_size: Option<u32>,
     /// Permit a redirect that downgrades the scheme (e.g. `https://` FE ->
     /// `http://` BE). Off by default: a downgrade would push Basic-auth
@@ -132,10 +136,15 @@ impl DorisSink {
         // We follow redirects manually to keep the Authorization header alive
         // across the FE -> BE hop. reqwest strips Authorization on cross-host
         // 307s by design.
+        let connect_timeout = Duration::from_secs(
+            self.config
+                .connect_timeout_secs
+                .unwrap_or(CONNECT_TIMEOUT_SECS),
+        );
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
-            .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+            .connect_timeout(connect_timeout)
             .build()
             .map_err(|e| Error::InitError(format!("Failed to build Doris HTTP client: {e}")))
     }
@@ -688,6 +697,7 @@ mod tests {
             columns: None,
             where_clause: None,
             timeout_secs: None,
+            connect_timeout_secs: None,
             batch_size: None,
             allow_insecure_redirect: None,
             allowed_redirect_hosts: None,

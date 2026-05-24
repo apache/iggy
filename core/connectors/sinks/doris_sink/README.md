@@ -35,7 +35,8 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 | `password` | yes | — | Doris user password. Stored as a `secrecy::SecretString` and never logged. |
 | `label_prefix` | no | `iggy` | Prefix for the deterministic Stream Load label. |
 | `batch_size` | no | `1000` | Maximum number of messages per Stream Load request. |
-| `timeout_secs` | no | `30` | Per-request HTTP timeout. |
+| `timeout_secs` | no | `30` | Per-request HTTP timeout (total request budget). |
+| `connect_timeout_secs` | no | `5` | TCP connect timeout, independent of `timeout_secs`. Raise it for cross-region or cold-start FEs. |
 | `max_filter_ratio` | no | unset | Forwarded as the `max_filter_ratio` Stream Load header. |
 | `columns` | no | unset | Forwarded as the `columns` Stream Load header. |
 | `where` | no | unset | Forwarded as the `where` Stream Load header. |
