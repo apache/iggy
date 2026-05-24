@@ -21,7 +21,10 @@ mod row;
 mod v2;
 mod v3;
 
-use crate::common::is_timestamp_after;
+use crate::common::{
+    is_timestamp_after, query_has_cursor_placeholder, query_has_offset_placeholder,
+    strip_block_comments,
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use common::{
@@ -39,6 +42,7 @@ use reqwest::Url;
 use reqwest_middleware::ClientWithMiddleware;
 use secrecy::{ExposeSecret, SecretBox};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -46,6 +50,7 @@ use tracing::{debug, error, info, warn};
 source_connector!(InfluxDbSource);
 
 const CONNECTOR_NAME: &str = "InfluxDB source";
+const MAX_STATE_SERIALIZE_FAILURES: u32 = 3;
 const DEFAULT_RETRY_DELAY: &str = "1s";
 const DEFAULT_POLL_INTERVAL: &str = "5s";
 const DEFAULT_TIMEOUT: &str = "10s";
@@ -65,7 +70,7 @@ enum VersionState {
 
 #[derive(Debug)]
 pub struct InfluxDbSource {
-    pub id: u32,
+    id: u32,
     config: InfluxDbSourceConfig,
     client: Option<ClientWithMiddleware>,
     version_state: VersionState,
@@ -76,6 +81,8 @@ pub struct InfluxDbSource {
     auth_header: Option<SecretBox<String>>,
     /// `Some(cause)` when state restore was rejected; `None` means restore succeeded.
     state_restore_error: Option<String>,
+    /// Consecutive `ConnectorState::serialize` failures since last success.
+    state_serialize_failures: AtomicU32,
 }
 
 impl InfluxDbSource {
@@ -113,6 +120,7 @@ impl InfluxDbSource {
             circuit_breaker,
             auth_header: None,
             state_restore_error,
+            state_serialize_failures: AtomicU32::new(0),
         }
     }
 
@@ -129,6 +137,8 @@ fn restore_v2_state(id: u32, state: Option<ConnectorState>) -> (V2State, Option<
     let Some(cs) = state else {
         return (V2State::default(), None);
     };
+    // Clone bytes before consuming cs — needed for the legacy fallback path below.
+    let raw_bytes = cs.0.clone();
     match cs.deserialize::<PersistedState>(CONNECTOR_NAME, id) {
         Some(PersistedState::V2(s)) => {
             if let Some(ref ts) = s.last_timestamp
@@ -158,6 +168,26 @@ fn restore_v2_state(id: u32, state: Option<ConnectorState>) -> (V2State, Option<
             (V2State::default(), Some(cause.to_string()))
         }
         None => {
+            // PersistedState deserialization failed. Try the legacy format: direct V2State
+            // bytes without the PersistedState wrapper, written by an older connector version.
+            if let Some(s) = ConnectorState(raw_bytes).deserialize::<V2State>(CONNECTOR_NAME, id) {
+                if let Some(ref ts) = s.last_timestamp
+                    && let Err(e) = validate_cursor(ts)
+                {
+                    let cause = format!(
+                        "legacy V2 cursor {ts:?} failed validation: {e}. \
+                             Clear or migrate the connector state to recover."
+                    );
+                    error!("{CONNECTOR_NAME} ID {id}: {cause}");
+                    return (V2State::default(), Some(cause));
+                }
+                info!(
+                    "{CONNECTOR_NAME} ID {id}: restored V2 state from legacy format — \
+                     last_timestamp={:?}, processed_rows={}",
+                    s.last_timestamp, s.processed_rows
+                );
+                return (s, None);
+            }
             let cause = "persisted state exists but could not be deserialized. \
                          Refusing to start to prevent silent cursor reset."
                 .to_string();
@@ -178,6 +208,16 @@ fn restore_v3_state(id: u32, state: Option<ConnectorState>) -> (V3State, Option<
             {
                 let cause = format!(
                     "persisted V3 cursor {ts:?} failed validation: {e}. \
+                         Clear or migrate the connector state to recover."
+                );
+                error!("{CONNECTOR_NAME} ID {id}: {cause}");
+                return (V3State::default(), Some(cause));
+            }
+            if let Some(ref sc) = s.stuck_cursor
+                && let Err(e) = validate_cursor(sc)
+            {
+                let cause = format!(
+                    "persisted V3 stuck_cursor {sc:?} failed validation: {e}. \
                          Clear or migrate the connector state to recover."
                 );
                 error!("{CONNECTOR_NAME} ID {id}: {cause}");
@@ -249,7 +289,7 @@ impl Source for InfluxDbSource {
             InfluxDbSourceConfig::V2(c) => c.query.as_str(),
             InfluxDbSourceConfig::V3(c) => c.query.as_str(),
         };
-        if !query.contains("$cursor") {
+        if !query_has_cursor_placeholder(query) {
             return Err(Error::InvalidConfigValue(
                 "query must contain the '$cursor' placeholder — without it the connector \
                  cannot advance and will re-deliver the same rows on every poll."
@@ -263,18 +303,18 @@ impl Source for InfluxDbSource {
         {
             return Err(Error::InvalidConfigValue(format!(
                 "stuck_batch_cap_factor {cap} exceeds maximum of {}; \
-                 reduce it to avoid querying up to {}×batch_size rows per poll.",
-                v3::MAX_STUCK_CAP_FACTOR,
+                 reduce it to avoid querying up to {cap}×batch_size rows per poll.",
                 v3::MAX_STUCK_CAP_FACTOR
             )));
         }
 
-        if let InfluxDbSourceConfig::V3(_) = &self.config
-            && self.config.batch_size() == 0
+        if let InfluxDbSourceConfig::V3(cfg) = &self.config
+            && cfg.stuck_batch_cap_factor == Some(1)
         {
             return Err(Error::InvalidConfigValue(
-                "batch_size must be >= 1; got 0. \
-         A LIMIT 0 query would return no rows and stall the connector."
+                "stuck_batch_cap_factor 1 is invalid — cap equals base_batch so \
+                 the connector trips the circuit breaker on the first stuck poll \
+                 with no inflation at all; use 0 to disable stuck detection or >= 2."
                     .into(),
             ));
         }
@@ -288,7 +328,7 @@ impl Source for InfluxDbSource {
             let cap = cfg
                 .stuck_batch_cap_factor
                 .unwrap_or(v3::DEFAULT_STUCK_CAP_FACTOR);
-            if cap > 0 && !cfg.query.contains("$offset") {
+            if cap > 0 && !query_has_offset_placeholder(&cfg.query) {
                 return Err(Error::InvalidConfigValue(
                     "V3 source query must contain the '$offset' placeholder when \
                      stuck_batch_cap_factor > 0 (the default). Add 'OFFSET $offset' \
@@ -297,6 +337,21 @@ impl Source for InfluxDbSource {
                      \"WHERE time > '$cursor' ORDER BY time LIMIT $limit OFFSET $offset\". \
                      For queries with subqueries or CTEs, $offset must appear on the \
                      innermost SELECT that filters by time."
+                        .into(),
+                ));
+            }
+            // DataFusion does not guarantee stable row ordering for tied timestamps
+            // unless ORDER BY is present. OFFSET-based dedup relies on consistent ordering:
+            // without it, different rows may be skipped on each poll, causing silent data
+            // loss or re-delivery.
+            if cap > 0 && !query_has_order_by(&cfg.query) {
+                return Err(Error::InvalidConfigValue(
+                    "V3 source query must contain an ORDER BY clause when \
+                     stuck_batch_cap_factor > 0 (the default). DataFusion does not \
+                     guarantee stable row ordering for tied timestamps without ORDER BY; \
+                     OFFSET-based dedup relies on consistent ordering. Add \
+                     'ORDER BY <cursor_field>' to your query, for example: \
+                     \"SELECT * FROM <measurement> WHERE time > '$cursor' ORDER BY time LIMIT $limit OFFSET $offset\"."
                         .into(),
                 ));
             }
@@ -333,16 +388,6 @@ impl Source for InfluxDbSource {
                  '> $cursor' semantics — an inclusive cursor causes rows at the \
                  cursor timestamp to be re-delivered on the next poll. \
                  Change '>=' to '>' in your query."
-                    .into(),
-            ));
-        }
-
-        if let InfluxDbSourceConfig::V2(_) = &self.config
-            && self.config.batch_size() == 0
-        {
-            return Err(Error::InvalidConfigValue(
-                "batch_size must be >= 1; got 0. \
-         A LIMIT 0 query would return no rows and stall the connector."
                     .into(),
             ));
         }
@@ -439,8 +484,10 @@ impl Source for InfluxDbSource {
                 {
                     Ok(result) => {
                         self.circuit_breaker.record_success();
+                        let messages = result.messages;
+                        let schema = result.schema;
                         let mut state = state_mu.lock().await;
-                        state.processed_rows += result.messages.len() as u64;
+                        state.processed_rows += messages.len() as u64;
                         apply_v2_cursor_advance(
                             &mut state,
                             result.max_cursor,
@@ -453,7 +500,7 @@ impl Source for InfluxDbSource {
                                 "{CONNECTOR_NAME} ID: {} produced {} messages (V2). \
                                  Total: {}. Cursor: {:?}",
                                 self.id,
-                                result.messages.len(),
+                                messages.len(),
                                 state.processed_rows,
                                 state.last_timestamp
                             );
@@ -462,33 +509,51 @@ impl Source for InfluxDbSource {
                                 "{CONNECTOR_NAME} ID: {} produced {} messages (V2). \
                                  Total: {}. Cursor: {:?}",
                                 self.id,
-                                result.messages.len(),
+                                messages.len(),
                                 state.processed_rows,
                                 state.last_timestamp
                             );
                         }
 
                         let persisted = ConnectorState::serialize(
-                            &PersistedState::V2(V2State {
-                                last_timestamp: state.last_timestamp.clone(),
-                                processed_rows: state.processed_rows,
-                                cursor_row_count: state.cursor_row_count,
-                            }),
+                            &PersistedState::V2(state.clone()),
                             CONNECTOR_NAME,
                             self.id,
                         );
-                        if persisted.is_none() {
-                            warn!(
-                                "{CONNECTOR_NAME} ID: {} — state serialization failed; \
-                                 cursor will not be persisted. Messages were emitted; \
-                                 restart may cause re-delivery.",
-                                self.id
-                            );
+                        match &persisted {
+                            Some(_) => {
+                                self.state_serialize_failures.store(0, Ordering::Relaxed);
+                            }
+                            None => {
+                                let failures = self
+                                    .state_serialize_failures
+                                    .fetch_add(1, Ordering::Relaxed)
+                                    + 1;
+                                if failures >= MAX_STATE_SERIALIZE_FAILURES {
+                                    // Trip the CB to surface the persistence fault, but
+                                    // still deliver messages to maintain at-least-once.
+                                    // state:None means disk cursor lags; a process restart
+                                    // will re-deliver from the last successfully persisted cursor.
+                                    self.circuit_breaker.record_failure().await;
+                                    return Ok(ProducedMessages {
+                                        schema,
+                                        messages,
+                                        state: None,
+                                    });
+                                }
+                                warn!(
+                                    "{CONNECTOR_NAME} ID: {} — state serialization failed \
+                                     ({failures}/{MAX_STATE_SERIALIZE_FAILURES}); \
+                                     cursor will not be persisted. Messages were emitted; \
+                                     restart may cause re-delivery.",
+                                    self.id
+                                );
+                            }
                         }
 
                         Ok(ProducedMessages {
-                            schema: result.schema,
-                            messages: result.messages,
+                            schema,
+                            messages,
                             state: persisted,
                         })
                     }
@@ -520,7 +585,9 @@ impl Source for InfluxDbSource {
                         }
 
                         let new = result.new_state;
-                        let msg_count = result.messages.len();
+                        let messages = result.messages;
+                        let schema = result.schema;
+                        let msg_count = messages.len();
                         let mut state = state_mu.lock().await;
                         *state = new;
 
@@ -539,27 +606,40 @@ impl Source for InfluxDbSource {
                         }
 
                         let persisted = ConnectorState::serialize(
-                            &PersistedState::V3(V3State {
-                                last_timestamp: state.last_timestamp.clone(),
-                                processed_rows: state.processed_rows,
-                                effective_batch_size: state.effective_batch_size,
-                                last_timestamp_row_offset: state.last_timestamp_row_offset,
-                            }),
+                            &PersistedState::V3(state.clone()),
                             CONNECTOR_NAME,
                             self.id,
                         );
-                        if persisted.is_none() {
-                            warn!(
-                                "{CONNECTOR_NAME} ID: {} — state serialization failed; \
-                                 cursor will not be persisted. Messages were emitted; \
-                                 restart may cause re-delivery.",
-                                self.id
-                            );
+                        match &persisted {
+                            Some(_) => {
+                                self.state_serialize_failures.store(0, Ordering::Relaxed);
+                            }
+                            None => {
+                                let failures = self
+                                    .state_serialize_failures
+                                    .fetch_add(1, Ordering::Relaxed)
+                                    + 1;
+                                if failures >= MAX_STATE_SERIALIZE_FAILURES {
+                                    self.circuit_breaker.record_failure().await;
+                                    return Ok(ProducedMessages {
+                                        schema,
+                                        messages,
+                                        state: None,
+                                    });
+                                }
+                                warn!(
+                                    "{CONNECTOR_NAME} ID: {} — state serialization failed \
+                                     ({failures}/{MAX_STATE_SERIALIZE_FAILURES}); \
+                                     cursor will not be persisted. Messages were emitted; \
+                                     restart may cause re-delivery.",
+                                    self.id
+                                );
+                            }
                         }
 
                         Ok(ProducedMessages {
-                            schema: result.schema,
-                            messages: result.messages,
+                            schema,
+                            messages,
                             state: persisted,
                         })
                     }
@@ -594,7 +674,27 @@ impl InfluxDbSource {
     }
 }
 
-// ── Sort heuristic ────────────────────────────────────────────────────────────
+// ── Query structure heuristics ────────────────────────────────────────────────
+
+/// Return `true` if `query` contains an `ORDER BY` clause (case-insensitive).
+///
+/// DataFusion (used by InfluxDB 3 Core) does not guarantee stable row ordering
+/// for tied timestamps unless `ORDER BY` is present. V3 OFFSET-based dedup relies
+/// on consistent ordering - without `ORDER BY`, different rows may be skipped on
+/// each poll, causing silent data loss or re-delivery.
+///
+/// `/* */` block comments are stripped first; `--` line comments are stripped
+/// per-line. `ORDER BY` appearing only inside a comment does NOT satisfy the check.
+fn query_has_order_by(query: &str) -> bool {
+    let q = strip_block_comments(query);
+    q.lines().any(|line| {
+        let code = match line.find("--") {
+            Some(pos) => &line[..pos],
+            None => line,
+        };
+        code.to_ascii_uppercase().contains("ORDER BY")
+    })
+}
 
 /// Return `true` if `query` contains a `sort(` call that is not part of a longer
 /// identifier (e.g. `mysort(` is excluded; `|> sort(` and bare `sort(` are included).
@@ -809,6 +909,7 @@ mod tests {
             processed_rows: 5,
             effective_batch_size: 500,
             last_timestamp_row_offset: 0,
+            stuck_cursor: None,
         });
         let persisted = ConnectorState::serialize(&bad_state, CONNECTOR_NAME, 1).unwrap();
         let source = InfluxDbSource::new(1, make_v3_config(), Some(persisted));
@@ -1018,6 +1119,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn open_rejects_query_with_cursor_as_prefix_of_longer_identifier() {
+        // "$cursor_field" contains "$cursor" as a substring but is NOT a bare
+        // $cursor placeholder; apply_query_params will not substitute it, so
+        // open() must reject it the same as a missing placeholder.
+        let config = InfluxDbSourceConfig::V2(V2SourceConfig {
+            url: "http://localhost:18086".to_string(),
+            org: "myorg".to_string(),
+            token: SecretString::from("t"),
+            query: "from(bucket:\"b\") |> range(start: $cursor_field) |> limit(n: $limit)"
+                .to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("$cursor")),
+            "$cursor_field must not satisfy the $cursor placeholder check: {err:?}"
+        );
+    }
+
     // ── #12: V3 >= guard ──────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1026,8 +1163,9 @@ mod tests {
             url: "http://localhost:18181".to_string(),
             db: "mydb".to_string(),
             token: SecretString::from("t"),
-            query: "SELECT * FROM t WHERE time >= '$cursor' LIMIT $limit OFFSET $offset"
-                .to_string(),
+            query:
+                "SELECT * FROM t WHERE time >= '$cursor' ORDER BY time LIMIT $limit OFFSET $offset"
+                    .to_string(),
             poll_interval: None,
             batch_size: None,
             cursor_field: None,
@@ -1062,7 +1200,7 @@ mod tests {
             db: "mydb".to_string(),
             token: SecretString::from("t"),
             query:
-                "SELECT * FROM t WHERE time > '$cursor' AND val >= 0 LIMIT $limit OFFSET $offset"
+                "SELECT * FROM t WHERE time > '$cursor' AND val >= 0 ORDER BY time LIMIT $limit OFFSET $offset"
                     .to_string(),
             poll_interval: None,
             batch_size: None,
@@ -1084,10 +1222,14 @@ mod tests {
         });
         let mut source = InfluxDbSource::new(1, config, None);
         let err = source.open().await.unwrap_err();
-        // Must fail on connectivity, NOT on the >= check.
+        // Must fail on connectivity, NOT on the >= or ORDER BY checks.
         assert!(
             !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains(">=")),
             "query with >= on non-cursor field must not be rejected for >=: {err:?}"
+        );
+        assert!(
+            !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("ORDER BY")),
+            "query with ORDER BY must not be rejected for ORDER BY: {err:?}"
         );
     }
 
@@ -1191,13 +1333,15 @@ mod tests {
 
     #[tokio::test]
     async fn open_v3_accepts_query_with_offset_placeholder() {
-        // A query with $offset (and a URL that fails health check) must NOT be
-        // rejected for the offset reason — it must proceed to the connectivity check.
+        // A query with $offset and ORDER BY (and a URL that fails health check) must NOT be
+        // rejected for the offset or ORDER BY reason — it must proceed to the connectivity check.
         let config = InfluxDbSourceConfig::V3(V3SourceConfig {
             url: "http://localhost:18181".to_string(),
             db: "db".to_string(),
             token: SecretString::from("t"),
-            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset".to_string(),
+            query:
+                "SELECT * FROM t WHERE time > '$cursor' ORDER BY time LIMIT $limit OFFSET $offset"
+                    .to_string(),
             poll_interval: None,
             batch_size: None,
             cursor_field: None,
@@ -1218,10 +1362,14 @@ mod tests {
         });
         let mut source = InfluxDbSource::new(1, config, None);
         let err = source.open().await.unwrap_err();
-        // Must NOT be InvalidConfigValue for the offset reason; connectivity fails instead.
+        // Must NOT be InvalidConfigValue for offset or ORDER BY reasons; connectivity fails instead.
         assert!(
             !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("$offset")),
             "open() must not reject a query that contains $offset; got {err:?}"
+        );
+        assert!(
+            !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("ORDER BY")),
+            "open() must not reject a query that contains ORDER BY; got {err:?}"
         );
     }
 
@@ -1257,6 +1405,75 @@ mod tests {
         assert!(
             !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("$offset")),
             "open() must not check $offset when stuck_batch_cap_factor=0; got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_v3_rejects_query_without_order_by_when_stuck_cap_active() {
+        // $offset present but no ORDER BY — DataFusion ordering is unstable for tied
+        // timestamps, so OFFSET-based dedup may skip different rows each poll.
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "db".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: None, // default 10 > 0
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("ORDER BY")),
+            "V3 query without ORDER BY must be rejected when stuck detection active: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_v3_with_zero_stuck_cap_skips_order_by_check() {
+        // stuck_batch_cap_factor=0 disables stuck detection; ORDER BY is not required.
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "db".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: Some(0),
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            !matches!(err, Error::InvalidConfigValue(ref msg) if msg.contains("ORDER BY")),
+            "ORDER BY check must be skipped when stuck_batch_cap_factor=0; got {err:?}"
         );
     }
 
@@ -1365,6 +1582,53 @@ mod tests {
         ));
     }
 
+    // ── query_has_order_by heuristic ──────────────────────────────────────────
+
+    #[test]
+    fn order_by_detected_in_sql_query() {
+        assert!(query_has_order_by(
+            "SELECT * FROM t WHERE time > '$cursor' ORDER BY time LIMIT $limit"
+        ));
+        assert!(query_has_order_by("SELECT 1 order by id"));
+        assert!(query_has_order_by("SELECT 1 Order By x DESC"));
+    }
+
+    #[test]
+    fn order_by_not_detected_when_absent() {
+        assert!(!query_has_order_by(
+            "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset"
+        ));
+    }
+
+    #[test]
+    fn order_by_in_sql_comment_is_ignored() {
+        // "ORDER BY" only in a -- comment must NOT trigger the check — the query
+        // executes without ORDER BY and DataFusion ordering is unstable.
+        assert!(!query_has_order_by(
+            "-- ORDER BY legacy behavior\nSELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset"
+        ));
+        // ORDER BY before the comment on the same line must still be detected.
+        assert!(query_has_order_by(
+            "SELECT * FROM t ORDER BY time -- sort by time\nLIMIT $limit"
+        ));
+    }
+
+    #[test]
+    fn order_by_in_block_comment_is_ignored() {
+        // "ORDER BY" only inside /* */ must NOT satisfy the check.
+        assert!(!query_has_order_by(
+            "/* ORDER BY example */\nSELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset"
+        ));
+        // Multi-line block comment spanning ORDER BY must also be ignored.
+        assert!(!query_has_order_by(
+            "/* this is\n   ORDER BY a comment */\nSELECT * FROM t LIMIT $limit"
+        ));
+        // Real ORDER BY with an unrelated block comment must still be detected.
+        assert!(query_has_order_by(
+            "/* header */\nSELECT * FROM t WHERE time > '$cursor' ORDER BY time LIMIT $limit"
+        ));
+    }
+
     #[test]
     fn apply_v2_cursor_advance_no_new_cursor_no_skipped_is_noop() {
         let mut state = V2State {
@@ -1417,6 +1681,7 @@ mod tests {
             processed_rows: 10,
             effective_batch_size: 500,
             last_timestamp_row_offset: 0,
+            stuck_cursor: None,
         });
         let persisted = ConnectorState::serialize(&v3_state, CONNECTOR_NAME, 1).unwrap();
         let source = InfluxDbSource::new(1, make_v2_config(), Some(persisted));
@@ -1434,6 +1699,7 @@ mod tests {
             processed_rows: 500,
             effective_batch_size: 1000,
             last_timestamp_row_offset: 5,
+            stuck_cursor: None,
         });
         let persisted = ConnectorState::serialize(&v3_state, CONNECTOR_NAME, 1).unwrap();
         let source = InfluxDbSource::new(1, make_v3_config(), Some(persisted));
@@ -1465,6 +1731,58 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Connection(_))),
             "expected Connection error when client not initialized, got {result:?}"
+        );
+    }
+
+    // ── Warning 3: legacy V2 state without version tag ───────────────────────
+
+    #[test]
+    fn restore_v2_state_with_legacy_format_succeeds() {
+        // State persisted before PersistedState was introduced contains only
+        // V2State fields with no version tag. Must restore without error.
+        let old_v2 = V2State {
+            last_timestamp: Some("2024-06-01T00:00:00Z".to_string()),
+            processed_rows: 42,
+            cursor_row_count: 3,
+        };
+        // Serialize V2State directly (not wrapped in PersistedState) to simulate old format.
+        let cs = ConnectorState::serialize(&old_v2, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v2_config(), Some(cs));
+        assert!(
+            source.state_restore_error.is_none(),
+            "legacy V2 state without version tag must restore without error"
+        );
+        if let VersionState::V2(mu) = &source.version_state {
+            let state = mu.blocking_lock();
+            assert_eq!(state.processed_rows, 42);
+            assert_eq!(state.cursor_row_count, 3);
+        } else {
+            panic!("expected V2 version state");
+        }
+    }
+
+    #[test]
+    fn restore_v3_state_with_invalid_stuck_cursor_marks_restore_error() {
+        // A state with a valid last_timestamp but corrupt stuck_cursor must be rejected —
+        // an invalid stuck_cursor could advance the cursor to a garbage value on the
+        // next empty poll, causing data loss or query errors.
+        let bad_state = PersistedState::V3(V3State {
+            last_timestamp: Some("2025-01-01T00:00:00Z".to_string()),
+            processed_rows: 5,
+            effective_batch_size: 500,
+            last_timestamp_row_offset: 3,
+            stuck_cursor: Some("not-a-timestamp".to_string()),
+        });
+        let persisted = ConnectorState::serialize(&bad_state, CONNECTOR_NAME, 1).unwrap();
+        let source = InfluxDbSource::new(1, make_v3_config(), Some(persisted));
+        assert!(
+            source.state_restore_error.is_some(),
+            "corrupt stuck_cursor in persisted V3 state must set state_restore_error"
+        );
+        let msg = source.state_restore_error.unwrap();
+        assert!(
+            msg.contains("not-a-timestamp"),
+            "error message must quote the bad stuck_cursor value: {msg}"
         );
     }
 
@@ -1514,6 +1832,42 @@ mod tests {
         assert_eq!(
             state.cursor_row_count, 4,
             "cursor_row_count must accumulate (+rows_at_max_cursor) in else branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_v3_rejects_stuck_cap_factor_of_one() {
+        // cap_factor=1 means cap = base_batch × 1 = base_batch.
+        // next_stuck_batch_size(base, base, 1) returns None immediately so the CB
+        // trips on the very first stuck poll with zero inflation — an infinite CB loop.
+        let config = InfluxDbSourceConfig::V3(V3SourceConfig {
+            url: "http://localhost:18181".to_string(),
+            db: "mydb".to_string(),
+            token: SecretString::from("t"),
+            query: "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit OFFSET $offset".to_string(),
+            poll_interval: None,
+            batch_size: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: Some(1),
+            retry_delay: None,
+            timeout: Some("1s".to_string()),
+            max_open_retries: Some(1),
+            open_retry_max_delay: Some("1ms".to_string()),
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+            stuck_batch_cap_factor: Some(1),
+        });
+        let mut source = InfluxDbSource::new(1, config, None);
+        let err = source.open().await.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfigValue(_)),
+            "stuck_batch_cap_factor=1 must be rejected — use 0 to disable or >= 2; got {err:?}"
         );
     }
 }

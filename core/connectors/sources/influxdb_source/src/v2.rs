@@ -68,7 +68,7 @@ const MAX_RESPONSE_BODY_BYTES: usize = 256 * 1024 * 1024; // 256 MiB
 /// to prevent excessively large queries when the cursor is stuck.
 fn render_query(config: &V2SourceConfig, cursor: &str, already_seen: u64) -> Result<String, Error> {
     validate_cursor(cursor)?;
-    let batch = config.batch_size.unwrap_or(500) as u64;
+    let batch = config.batch_size.unwrap_or(500).max(1) as u64;
     // Cap inflation so a stuck cursor cannot issue arbitrarily large queries.
     let capped_seen = already_seen.min(batch.saturating_mul(MAX_SKIP_INFLATION_FACTOR));
     let limit = batch.saturating_add(capped_seen).to_string();
@@ -392,6 +392,56 @@ mod tests {
         );
     }
 
+    // ── render_query ──────────────────────────────────────────────────────────
+
+    fn minimal_config(batch_size: Option<u32>, query: &str) -> V2SourceConfig {
+        use secrecy::SecretString;
+        V2SourceConfig {
+            url: "http://localhost:8086".to_string(),
+            org: "o".to_string(),
+            token: SecretString::from("t"),
+            query: query.to_string(),
+            batch_size,
+            poll_interval: None,
+            cursor_field: None,
+            initial_offset: None,
+            payload_column: None,
+            payload_format: None,
+            include_metadata: None,
+            verbose_logging: None,
+            max_retries: None,
+            retry_delay: None,
+            timeout: None,
+            max_open_retries: None,
+            open_retry_max_delay: None,
+            retry_max_delay: None,
+            circuit_breaker_threshold: None,
+            circuit_breaker_cool_down: None,
+        }
+    }
+
+    /// Bug: batch_size=0 causes render_query to produce LIMIT 0, silently stalling
+    /// the connector. The limit must be floored to 1.
+    #[test]
+    fn render_query_zero_batch_size_floors_to_limit_one() {
+        let cfg = minimal_config(Some(0), "SELECT * FROM t LIMIT $limit");
+        let q = render_query(&cfg, "1970-01-01T00:00:00Z", 0).unwrap();
+        assert!(
+            q.contains("LIMIT 1"),
+            "batch_size=0 must floor to LIMIT 1, got: {q}"
+        );
+    }
+
+    #[test]
+    fn render_query_normal_batch_size_preserved() {
+        let cfg = minimal_config(Some(42), "SELECT * FROM t LIMIT $limit");
+        let q = render_query(&cfg, "1970-01-01T00:00:00Z", 0).unwrap();
+        assert!(
+            q.contains("LIMIT 42"),
+            "batch_size=42 must produce LIMIT 42: {q}"
+        );
+    }
+
     #[test]
     fn process_rows_missing_payload_column_returns_error() {
         // If the specified payload_column is absent from the row, return Err.
@@ -409,6 +459,71 @@ mod tests {
             0,
         );
         assert!(result.is_err(), "missing payload column must return Err");
+    }
+
+    #[test]
+    fn process_rows_skip_normalizes_rfc3339_formats() {
+        // Cursor stored as "Z" suffix; rows return "+00:00" offset — same instant.
+        // String equality misses the skip, causing re-delivery. Datetime comparison fixes it.
+        let cursor_z = "2024-01-01T00:00:00Z";
+        let rows = vec![
+            row(&[("_time", "2024-01-01T00:00:00+00:00"), ("val", "1")]),
+            row(&[("_time", "2024-01-01T00:00:00+00:00"), ("val", "2")]),
+            row(&[("_time", "2024-01-01T00:00:01Z"), ("val", "3")]),
+        ];
+        // already_seen=1: first row at cursor must be skipped
+        let result = process_rows(&rows, &ctx(cursor_z, 0), 1).unwrap();
+        assert_eq!(
+            result.skipped, 1,
+            "+00:00 and Z represent the same instant — skip must fire"
+        );
+        assert_eq!(result.messages.len(), 2);
+    }
+
+    #[test]
+    fn process_rows_ids_are_globally_positioned() {
+        // With already_seen=N, the first post-skip row is at global position N.
+        // Using batch-relative messages.len() gives position 0 — collision with the
+        // same row from a prior batch where it had already_seen=0 and position 0.
+        // Fix: use already_seen + messages.len() so each row's ID encodes its global slot.
+        let rows = vec![
+            row(&[("_time", T1), ("val", "a")]), // global pos 0 — will be skipped
+            row(&[("_time", T1), ("val", "b")]), // global pos 1 — first emitted
+            row(&[("_time", T1), ("val", "c")]), // global pos 2
+        ];
+        // Baseline: already_seen=0, all three emitted
+        let base = process_rows(&rows, &ctx(T1, 0), 0).unwrap();
+        // With skip: already_seen=1, row 0 skipped, rows 1 and 2 emitted
+        let skipped = process_rows(&rows, &ctx(T1, 0), 1).unwrap();
+        assert_eq!(skipped.skipped, 1);
+        assert_eq!(skipped.messages.len(), 2);
+        // The first emitted row with skip must have the SAME id as row[1] without skip.
+        assert_eq!(
+            skipped.messages[0].id, base.messages[1].id,
+            "first post-skip row must have same id as it had in the unskipped baseline"
+        );
+        assert_eq!(
+            skipped.messages[1].id, base.messages[2].id,
+            "second post-skip row must have same id as it had in the unskipped baseline"
+        );
+    }
+
+    #[test]
+    fn process_rows_rows_at_max_cursor_normalized_across_rfc3339_formats() {
+        // Both rows are the same instant ("Z" vs "+00:00"). String equality counts only
+        // the one that string-matches max_cursor, under-counting ties at max timestamp.
+        // Under-counting causes cursor_row_count to be too low → skip-N under-fires on
+        // the next poll → re-delivery.
+        let rows = vec![
+            row(&[("_time", "2024-01-01T00:00:00Z"), ("val", "1")]),
+            row(&[("_time", "2024-01-01T00:00:00+00:00"), ("val", "2")]),
+        ];
+        let result = process_rows(&rows, &ctx(BASE_CURSOR, 0), 0).unwrap();
+        assert_eq!(
+            result.rows_at_max_cursor, 2,
+            "Z and +00:00 are the same instant — both must count toward rows_at_max_cursor"
+        );
+        assert_eq!(result.messages.len(), 2);
     }
 }
 
@@ -650,44 +765,56 @@ pub(crate) fn process_rows(
     // Generate the base UUID once per poll; derive per-message IDs by addition.
     // This is O(1) PRNG calls per batch instead of O(n), measurable at batch ≥ 100.
     let id_base = Uuid::new_v4().as_u128();
+    // Parse once outside the loop to normalise RFC 3339 variants (Z vs +00:00)
+    // so skip logic compares instants, not strings.
+    let current_cursor_dt: Option<DateTime<Utc>> = ctx.current_cursor.parse().ok();
 
     for row in rows.iter() {
         // Single lookup for cursor_field — used for both skip logic and max-cursor tracking.
         // V2 CSV rows store all values as Value::String; .as_str() is always Some.
         let cv = row.get(ctx.cursor_field).and_then(|v| v.as_str());
-        if cv == Some(ctx.current_cursor) && skipped < already_seen {
-            skipped += 1;
-            continue;
+        // Parse once per row; DateTime<Utc> is Copy so reuse in skip, cursor, and ID logic.
+        let cv_dt: Option<DateTime<Utc>> = cv.and_then(|s| s.parse().ok());
+        if skipped < already_seen {
+            let cursor_matches = match current_cursor_dt {
+                Some(ref cc_dt) => cv_dt.as_ref() == Some(cc_dt),
+                None => cv == Some(ctx.current_cursor),
+            };
+            if cursor_matches {
+                skipped += 1;
+                continue;
+            }
         }
 
         if let Some(cv) = cv {
             match max_cursor_parsed {
                 None => {
                     max_cursor = Some(cv.to_string());
-                    max_cursor_parsed = cv.parse::<DateTime<Utc>>().ok();
+                    max_cursor_parsed = cv_dt;
                     rows_at_max_cursor = 1;
                 }
-                Some(current_dt) => {
-                    if is_timestamp_after(cv, current_dt) {
+                Some(current_dt) => match cv_dt {
+                    Some(v) if v > current_dt => {
                         max_cursor = Some(cv.to_string());
-                        max_cursor_parsed = cv.parse::<DateTime<Utc>>().ok();
+                        max_cursor_parsed = Some(v);
                         rows_at_max_cursor = 1;
-                    } else if max_cursor.as_deref() == Some(cv) {
+                    }
+                    Some(v) if v == current_dt => {
                         rows_at_max_cursor += 1;
                     }
-                }
+                    _ => {}
+                },
             }
         }
 
-        // Stable ID: cursor timestamp nanoseconds + emitted-message position.
-        // The same physical row always has the same cursor timestamp, and its
-        // position among emitted rows at that timestamp is stable for the same query.
-        // Falls back to a random base for rows that lack the cursor field.
-        let msg_id = cv
-            .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        // Stable ID: cursor timestamp nanoseconds + DB-absolute row position.
+        // Position = already_seen + emitted so far; encodes the row's global slot
+        // in the result set so IDs are stable across re-polls with changing already_seen.
+        let global_pos = already_seen as u128 + messages.len() as u128;
+        let msg_id = cv_dt
             .and_then(|dt| dt.timestamp_nanos_opt())
-            .map(|nanos| (nanos as u128).wrapping_add(messages.len() as u128))
-            .unwrap_or_else(|| id_base.wrapping_add(messages.len() as u128));
+            .map(|nanos| (nanos as u128).wrapping_add(global_pos))
+            .unwrap_or_else(|| id_base.wrapping_add(global_pos));
 
         let payload = build_payload(
             row,
@@ -742,13 +869,14 @@ pub(crate) async fn poll(
 
     let result = process_rows(&rows, &ctx, already_seen)?;
 
-    // Detect all-skipped-at-cap livelock: already_seen has grown to or past the
-    // inflation cap, so capped_seen < already_seen. Every row fell inside the skip
-    // window; max_cursor stayed None. Without intervention, cursor_row_count would
-    // be reset to `skipped` (still ≥ cap) and the next poll would repeat identically.
-    let batch_u64 = config.batch_size.unwrap_or(500) as u64;
+    // Detect all-skipped-at-cap livelock: every row was at the current cursor and
+    // skipped; max_cursor stayed None; cursor cannot advance. Fire at cap-1 (not just
+    // cap) to catch the off-by-one: when already_seen = cap-1 and the server returns
+    // exactly cap-1 rows (all at cursor), the guard at >= cap would miss it and the
+    // connector spins with cursor_row_count fixed at cap-1 forever.
+    let batch_u64 = config.batch_size.unwrap_or(500).max(1) as u64;
     let cap = batch_u64.saturating_mul(MAX_SKIP_INFLATION_FACTOR);
-    if result.max_cursor.is_none() && result.skipped > 0 && already_seen >= cap {
+    if result.max_cursor.is_none() && result.skipped > 0 && already_seen.saturating_add(1) >= cap {
         tracing::error!(
             "V2 source stuck-cursor livelock: already_seen ({already_seen}) has reached \
              the inflation cap ({MAX_SKIP_INFLATION_FACTOR}×{batch_u64}={cap}). \
@@ -1249,6 +1377,48 @@ mod http_tests {
         assert!(
             matches!(result, Err(Error::InvalidState)),
             "expected InvalidState livelock error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_livelock_at_cap_minus_one_returns_error() {
+        // Off-by-one: guard fires at already_seen >= cap but misses already_seen = cap-1.
+        // When the server returns exactly cap-1 rows (all at cursor), all are skipped,
+        // cursor_row_count is reset to cap-1, and the next poll repeats identically — livelock.
+        let t = "2024-01-01T00:00:00Z";
+        let batch_size: usize = 10;
+        let row_count = batch_size * (MAX_SKIP_INFLATION_FACTOR as usize) - 1; // cap-1 = 99
+        let csv: String = std::iter::once("_time,_value\n".to_string())
+            .chain((0..row_count).map(|i| format!("{t},{i}\n")))
+            .collect();
+        let app = Router::new().route(
+            "/api/v2/query",
+            post(move || async move { (StatusCode::OK, csv) }),
+        );
+        let base = start_server(app).await;
+        let mut config = make_config(&base);
+        config.batch_size = Some(batch_size as u32);
+        let state = V2State {
+            last_timestamp: Some(t.to_string()),
+            cursor_row_count: row_count as u64, // = cap - 1 = 99
+            processed_rows: 0,
+        };
+        let result = poll(
+            &make_client(),
+            &config,
+            "Token tok",
+            &state,
+            PayloadFormat::Json,
+            true,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "poll at cap-1 with all rows skipped must return an error to trip the CB"
+        );
+        assert!(
+            matches!(result, Err(Error::InvalidState)),
+            "expected InvalidState livelock error at cap-1, got {result:?}"
         );
     }
 }

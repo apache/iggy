@@ -119,7 +119,9 @@ circuit_breaker_cool_down = "30s"   # cool-down before half-open probe
 
 ## Payload Formats
 
-- **`json`** (default): Each row is serialised as a JSON object. When `include_metadata = false`, only the cursor column (`time` for V3, `_time` for V2) is excluded; all other columns are still present. When `include_metadata = true` (the default), all columns including the cursor column are included.
+- **`json`** (default): Behaviour differs by version.
+  - **V3**: Each row is a flat JSON object. `include_metadata = false` excludes the cursor column (`time`); all other columns are present. `include_metadata = true` (the default) includes all columns.
+  - **V2**: Each row is wrapped in an envelope: `{"measurement":"..","field":"..","timestamp":"..","value":..,"row":{..}}`. The `row` object always includes `_time` and `_value`. `include_metadata = false` additionally excludes `_measurement` and `_field` from `row`; `include_metadata = true` includes them.
 - **`text`**: The value of `payload_column` is written as a UTF-8 string. Requires `payload_column` to be set.
 - **`raw`**: The value of `payload_column` is base64-decoded and written as raw bytes. Requires `payload_column` to be set.
 

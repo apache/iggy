@@ -126,13 +126,14 @@ pub(crate) fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
 
 /// Parse an InfluxDB V3 JSONL response body into a list of rows.
 ///
-/// Each non-empty line must be a JSON object. Field values of any JSON type
-/// are stringified to `String`:
-/// - `null` → `"null"`
-/// - `bool` → `"true"` / `"false"`
-/// - `number` → decimal representation
-/// - `string` → value as-is (no extra quotes)
-/// - `array` / `object` → compact JSON representation
+/// Each non-empty line must be a JSON object. Field values preserve their
+/// native JSON types as `serde_json::Value`:
+/// - `null` → `Value::Null`
+/// - `bool` → `Value::Bool`
+/// - integer / unsigned integer → `Value::Number`
+/// - float → `Value::Number` (or `Value::Null` for non-finite)
+/// - `string` → `Value::String`
+/// - `array` / `object` → serialized via simd_json then re-parsed as serde_json
 ///
 /// Blank lines are silently skipped. Lines that fail to parse as JSON objects
 /// return an error.

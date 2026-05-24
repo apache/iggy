@@ -79,7 +79,7 @@ pub(crate) async fn run_query(
         &config.query,
         cursor,
         &effective_batch.to_string(),
-        &offset.to_string(), /* &str */
+        &offset.to_string(),
     );
     let base = config.url.trim_end_matches('/');
     let (url, body) = build_query(base, &q, &config.db)?;
@@ -341,6 +341,7 @@ pub(crate) struct RowProcessingResult {
 pub(crate) fn process_rows(
     rows: &[Row],
     ctx: &RowContext<'_>,
+    row_offset_base: u64,
 ) -> Result<RowProcessingResult, Error> {
     let mut messages = Vec::with_capacity(rows.len());
     let mut max_cursor: Option<String> = None;
@@ -352,21 +353,22 @@ pub(crate) fn process_rows(
     // cause an error at the end of this function unless other rows have it).
     let id_base = Uuid::new_v4().as_u128();
     for row in rows.iter() {
+        // DB-absolute position: offset into the full result set for this cursor value.
+        // Using batch-relative position (messages.len() alone) would assign the same ID
+        // to different rows when OFFSET regresses after a serialization failure.
+        let db_pos = row_offset_base as u128 + messages.len() as u128;
         // Default to random fallback; overwritten below if cursor field is present.
-        let mut this_row_id = id_base.wrapping_add(messages.len() as u128);
+        let mut this_row_id = id_base.wrapping_add(db_pos);
         if let Some(raw_cv) = row.get(ctx.cursor_field).and_then(|v| v.as_str()) {
             let (cv_owned, cv_dt) = normalize_v3_timestamp(raw_cv)?;
-            let cv: &str = &cv_owned;
-            // Stable ID: timestamp nanoseconds + message position.
-            // Deterministic across re-polls: the same physical row always has the same
-            // timestamp, and its position within the batch (determined by OFFSET) is
-            // stable for the same effective_batch_size + cursor combination.
+            // Stable ID: timestamp nanoseconds + DB-absolute row position within that
+            // timestamp group. Deterministic across re-polls and OFFSET changes.
             if let Some(nanos) = cv_dt.timestamp_nanos_opt() {
-                this_row_id = (nanos as u128).wrapping_add(messages.len() as u128);
+                this_row_id = (nanos as u128).wrapping_add(db_pos);
             }
             match max_cursor_parsed {
                 Some(cur_dt) if cv_dt > cur_dt => {
-                    max_cursor = Some(cv.to_string());
+                    max_cursor = Some(cv_owned.into_owned());
                     max_cursor_parsed = Some(cv_dt);
                     rows_at_max_cursor = 1;
                 }
@@ -375,7 +377,7 @@ pub(crate) fn process_rows(
                 }
                 Some(_) => {} // cv_dt < cur_dt: older row, no cursor update
                 None => {
-                    max_cursor = Some(cv.to_string());
+                    max_cursor = Some(cv_owned.into_owned());
                     max_cursor_parsed = Some(cv_dt);
                     rows_at_max_cursor = 1;
                 }
@@ -433,7 +435,7 @@ pub(crate) async fn poll(
         .or_else(|| config.initial_offset.clone())
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
-    let base_batch = config.batch_size.unwrap_or(500);
+    let base_batch = config.batch_size.unwrap_or(500).max(1);
     let effective_batch = if state.effective_batch_size == 0 {
         base_batch
     } else {
@@ -466,7 +468,13 @@ pub(crate) async fn poll(
         now_micros: iggy_common::Utc::now().timestamp_micros() as u64,
     };
 
-    let result = process_rows(&rows, &ctx)?;
+    let result = process_rows(&rows, &ctx, state.last_timestamp_row_offset)?;
+
+    let schema = if ctx.payload_col.is_some() {
+        ctx.payload_format.schema()
+    } else {
+        Schema::Json
+    };
 
     // Stuck-timestamp detection: when the batch fills up entirely with rows sharing
     // the same max timestamp (rows_at_max_cursor >= effective_batch), there may be
@@ -474,33 +482,41 @@ pub(crate) async fn poll(
     // to that timestamp until all tied rows have been seen.
     // A partial batch (rows.len() < effective_batch) means the server returned all
     // available rows — the cursor can advance regardless of how many share the max timestamp.
-    let stuck = result.rows_at_max_cursor >= effective_batch as u64;
+    // cap_factor == 0 disables detection entirely: cursor advances even on a full same-timestamp
+    // batch (consistent with open() skipping the $offset requirement when cap_factor == 0).
+    let stuck = cap_factor > 0 && result.rows_at_max_cursor >= effective_batch as u64;
 
     if stuck {
         return match next_stuck_batch_size(effective_batch, base_batch, cap_factor) {
             Some(next_batch) => {
                 warn!(
-                    "InfluxDB V3 source — all {} rows share timestamp {cursor:?}; \
+                    "InfluxDB V3 source — all {} rows share timestamp {}; \
                      inflating batch size {} → {} (cap={}×{}={})",
                     rows.len(),
+                    result.max_cursor.as_deref().unwrap_or("unknown"),
                     effective_batch,
                     next_batch,
                     cap_factor,
                     base_batch,
                     base_batch.saturating_mul(cap_factor)
                 );
+                let msg_count = result.messages.len() as u64;
                 Ok(PollResult {
-                    messages: vec![],
+                    messages: result.messages,
                     new_state: V3State {
                         last_timestamp: state.last_timestamp.clone(),
-                        processed_rows: state.processed_rows,
+                        processed_rows: state.processed_rows + msg_count,
                         effective_batch_size: next_batch,
                         // Accumulate across consecutive stuck polls: each poll sees a superset of previous
                         // rows (inflated batch), so the total already-seen count must grow cumulatively.
-                        last_timestamp_row_offset: state.last_timestamp_row_offset
-                            + result.rows_at_max_cursor,
+                        last_timestamp_row_offset: state
+                            .last_timestamp_row_offset
+                            .saturating_add(result.rows_at_max_cursor),
+                        // Remember the stuck timestamp so an empty follow-up poll can
+                        // advance the cursor to it rather than looping back to T0.
+                        stuck_cursor: result.max_cursor,
                     },
-                    schema: Schema::Json,
+                    schema,
                     trip_circuit_breaker: false,
                 })
             }
@@ -521,8 +537,12 @@ pub(crate) async fn poll(
                         processed_rows: state.processed_rows,
                         effective_batch_size: base_batch,
                         last_timestamp_row_offset: state.last_timestamp_row_offset,
+                        // Preserve the stuck timestamp so an empty follow-up poll
+                        // after CB cooldown can advance the cursor past this point
+                        // instead of staying at last_timestamp forever.
+                        stuck_cursor: result.max_cursor,
                     },
-                    schema: Schema::Json,
+                    schema,
                     trip_circuit_breaker: true,
                 })
             }
@@ -530,38 +550,56 @@ pub(crate) async fn poll(
     }
 
     let processed_rows = state.processed_rows + result.messages.len() as u64;
-    let old_dt = state
-        .last_timestamp
-        .as_deref()
-        .and_then(|s| s.parse::<DateTime<Utc>>().ok());
+    let old_dt = state.last_timestamp.as_deref().and_then(|s| {
+        DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    });
+
+    // Cursor did not advance: preserve stuck-sequence progress so the
+    // livelock-resolution arm can fire on the next empty-batch poll.
+    if let (Some(new), Some(_)) = (
+        result.max_cursor.as_deref(),
+        state.last_timestamp.as_deref(),
+    ) {
+        if !old_dt.is_some_and(|dt| is_timestamp_after(new, dt)) {
+            warn!("V3 source: max_cursor did not advance past saved cursor; keeping old value");
+            return Ok(PollResult {
+                messages: result.messages,
+                new_state: V3State {
+                    last_timestamp: state.last_timestamp.clone(),
+                    processed_rows,
+                    effective_batch_size: state.effective_batch_size,
+                    last_timestamp_row_offset: state.last_timestamp_row_offset,
+                    stuck_cursor: state.stuck_cursor.clone(),
+                },
+                schema,
+                trip_circuit_breaker: false,
+            });
+        }
+    }
+
     let advanced_cursor = match (
         result.max_cursor.as_deref(),
         state.last_timestamp.as_deref(),
     ) {
-        (Some(new), Some(_)) if old_dt.is_some_and(|dt| is_timestamp_after(new, dt)) => {
-            result.max_cursor
+        (Some(_), _) => result.max_cursor,
+        // Empty batch after stuck sequence: zero-row response at accumulated offset
+        // confirms all rows at stuck_cursor seen; advance there instead of T0.
+        _ if state.last_timestamp_row_offset > 0 && state.stuck_cursor.is_some() => {
+            state.stuck_cursor.clone()
         }
-        (Some(_), Some(_)) => {
-            warn!("V3 source: max_cursor did not advance past saved cursor; keeping old value");
-            state.last_timestamp.clone()
-        }
-        (Some(_), None) => result.max_cursor, // first poll
-        _ => state.last_timestamp.clone(),    // empty batch
+        _ => state.last_timestamp.clone(),
     };
 
     let new_state = V3State {
         last_timestamp: advanced_cursor,
         processed_rows,
-        effective_batch_size: base_batch, // reset on successful advance
-        // Reset to 0: the new cursor already excludes old rows via strict >.
-        // A non-zero OFFSET would skip valid new rows on the next poll.
+        effective_batch_size: base_batch,
+        // Reset to 0: new cursor excludes old rows via strict >; non-zero OFFSET
+        // would skip valid rows on the next poll.
         last_timestamp_row_offset: 0,
-    };
-
-    let schema = if ctx.payload_col.is_some() {
-        ctx.payload_format.schema()
-    } else {
-        Schema::Json
+        stuck_cursor: None,
     };
 
     Ok(PollResult {
@@ -603,7 +641,7 @@ mod tests {
 
     #[test]
     fn process_rows_empty_returns_empty() {
-        let result = process_rows(&[], &ctx(T1, 1000)).unwrap();
+        let result = process_rows(&[], &ctx(T1, 1000), 0).unwrap();
         assert!(result.messages.is_empty());
         assert!(result.max_cursor.is_none());
         assert_eq!(
@@ -615,7 +653,7 @@ mod tests {
     #[test]
     fn process_rows_single_row_advances_cursor() {
         let rows = vec![row(&[("time", T1), ("val", "1")])];
-        let result = process_rows(&rows, &ctx(T1, 1000)).unwrap();
+        let result = process_rows(&rows, &ctx(T1, 1000), 0).unwrap();
         assert_eq!(result.messages.len(), 1);
         assert_eq!(result.max_cursor.as_deref(), Some(T1));
     }
@@ -627,7 +665,7 @@ mod tests {
             row(&[("time", T3)]),
             row(&[("time", T2)]),
         ];
-        let result = process_rows(&rows, &ctx(T1, 1000)).unwrap();
+        let result = process_rows(&rows, &ctx(T1, 1000), 0).unwrap();
         assert_eq!(result.max_cursor.as_deref(), Some(T3));
         assert_eq!(result.messages.len(), 3);
     }
@@ -639,7 +677,7 @@ mod tests {
             row(&[("time", T1)]), // earlier — must not overwrite max
             row(&[("time", T2)]),
         ];
-        let result = process_rows(&rows, &ctx(T1, 1000)).unwrap();
+        let result = process_rows(&rows, &ctx(T1, 1000), 0).unwrap();
         assert_eq!(result.max_cursor.as_deref(), Some(T2));
     }
 
@@ -648,7 +686,7 @@ mod tests {
         // A batch where no row has the cursor column must return Err rather than
         // silently re-delivering the same rows on every poll.
         let rows = vec![row(&[("val", "1")])]; // no "time" field
-        let err = process_rows(&rows, &ctx(T1, 1000)).unwrap_err();
+        let err = process_rows(&rows, &ctx(T1, 1000), 0).unwrap_err();
         assert!(
             matches!(err, Error::InvalidRecordValue(_)),
             "expected InvalidRecordValue when cursor column is absent, got {err:?}"
@@ -665,7 +703,7 @@ mod tests {
             row(&[("val", "2")]),
             row(&[("val", "3")]),
         ];
-        let err = process_rows(&rows, &ctx(T1, 1000)).unwrap_err();
+        let err = process_rows(&rows, &ctx(T1, 1000), 0).unwrap_err();
         assert!(
             matches!(err, Error::InvalidRecordValue(_)),
             "expected InvalidRecordValue when cursor column is absent, got {err:?}"
@@ -675,7 +713,7 @@ mod tests {
     #[test]
     fn process_rows_message_ids_are_some_and_unique() {
         let rows = vec![row(&[("time", T1)]), row(&[("time", T2)])];
-        let result = process_rows(&rows, &ctx(T1, 1000)).unwrap();
+        let result = process_rows(&rows, &ctx(T1, 1000), 0).unwrap();
         assert!(result.messages[0].id.is_some());
         assert!(result.messages[1].id.is_some());
         assert_ne!(result.messages[0].id, result.messages[1].id);
@@ -684,7 +722,7 @@ mod tests {
     #[test]
     fn process_rows_message_timestamps_use_now_micros() {
         let rows = vec![row(&[("time", T1)])];
-        let result = process_rows(&rows, &ctx(T1, 888_888)).unwrap();
+        let result = process_rows(&rows, &ctx(T1, 888_888), 0).unwrap();
         assert_eq!(result.messages[0].timestamp, Some(888_888));
         assert_eq!(result.messages[0].origin_timestamp, Some(888_888));
     }
@@ -704,6 +742,7 @@ mod tests {
                 payload_format: PayloadFormat::Text,
                 now_micros: 1000,
             },
+            0,
         )
         .unwrap();
         assert_eq!(result.messages.len(), 1);
@@ -715,7 +754,7 @@ mod tests {
     fn process_rows_rows_at_max_cursor_counts_rows_sharing_max_timestamp() {
         // Two rows at T1: both equal max_cursor → rows_at_max_cursor = 2.
         let rows = vec![row(&[("time", T1)]), row(&[("time", T1)])];
-        let result = process_rows(&rows, &ctx(T1, 1000)).unwrap();
+        let result = process_rows(&rows, &ctx(T1, 1000), 0).unwrap();
         assert_eq!(result.rows_at_max_cursor, 2);
     }
 
@@ -723,14 +762,14 @@ mod tests {
     fn process_rows_rows_at_max_cursor_resets_when_cursor_advances() {
         // T1 then T2: max_cursor = T2, only 1 row at T2 → rows_at_max_cursor = 1.
         let rows = vec![row(&[("time", T1)]), row(&[("time", T2)])];
-        let result = process_rows(&rows, &ctx(T1, 1000)).unwrap();
+        let result = process_rows(&rows, &ctx(T1, 1000), 0).unwrap();
         assert_eq!(result.rows_at_max_cursor, 1);
         assert_eq!(result.max_cursor.as_deref(), Some(T2));
     }
 
     #[test]
     fn process_rows_rows_at_max_cursor_zero_for_empty_slice() {
-        let result = process_rows(&[], &ctx(T1, 1000)).unwrap();
+        let result = process_rows(&[], &ctx(T1, 1000), 0).unwrap();
         assert_eq!(result.rows_at_max_cursor, 0);
     }
 
@@ -750,7 +789,9 @@ mod tests {
     fn normalize_already_valid_rfc3339_unchanged() {
         // Already valid RFC 3339 with Z and ms precision — must be returned as-is.
         assert_eq!(
-            normalize_v3_timestamp("2024-01-01T00:00:00.123Z").unwrap().0,
+            normalize_v3_timestamp("2024-01-01T00:00:00.123Z")
+                .unwrap()
+                .0,
             "2024-01-01T00:00:00.123Z"
         );
         // Second-precision with Z is also ≤ms, returned unchanged.
@@ -797,7 +838,7 @@ mod tests {
             row(&[("time", "2026-04-26T02:32:21.000000000"), ("val", "2")]),
         ];
         let c = ctx("2026-04-26T02:32:19.000Z", 0);
-        let result = process_rows(&rows, &c).expect("should not fail on bare timestamps");
+        let result = process_rows(&rows, &c, 0).expect("should not fail on bare timestamps");
         assert_eq!(result.messages.len(), 2);
         assert_eq!(
             result.max_cursor.as_deref(),
@@ -815,7 +856,7 @@ mod tests {
             row(&[("time", "2026-04-26T02:32:20.526362000"), ("val", "c")]),
         ];
         let c = ctx("2026-04-26T02:32:19.000Z", 0);
-        let result = process_rows(&rows, &c).expect("should succeed");
+        let result = process_rows(&rows, &c, 0).expect("should succeed");
         // max_cursor must be the latest nanosecond timestamp (row 3), not a truncated ms.
         assert_eq!(
             result.max_cursor.as_deref(),
@@ -834,8 +875,8 @@ mod tests {
             row(&[("time", T2), ("val", "b")]),
         ];
         let c = ctx(T1, 1000);
-        let first = process_rows(&rows, &c).unwrap();
-        let second = process_rows(&rows, &c).unwrap();
+        let first = process_rows(&rows, &c, 0).unwrap();
+        let second = process_rows(&rows, &c, 0).unwrap();
         assert_eq!(
             first.messages[0].id, second.messages[0].id,
             "row at T1 must have the same ID on re-poll"
@@ -854,15 +895,54 @@ mod tests {
             row(&[("time", T1), ("val", "second")]),
         ];
         let c = ctx("1970-01-01T00:00:00Z", 0);
-        let result = process_rows(&rows, &c).unwrap();
+        let result = process_rows(&rows, &c, 0).unwrap();
         assert_ne!(
             result.messages[0].id, result.messages[1].id,
             "two rows at the same timestamp must have distinct IDs"
         );
         // IDs must also be stable across re-polls
-        let result2 = process_rows(&rows, &c).unwrap();
+        let result2 = process_rows(&rows, &c, 0).unwrap();
         assert_eq!(result.messages[0].id, result2.messages[0].id);
         assert_eq!(result.messages[1].id, result2.messages[1].id);
+    }
+
+    #[test]
+    fn process_rows_offset_base_prevents_id_collision_across_batches() {
+        // Regression: when OFFSET regresses (e.g. a stuck-batch state is persisted but
+        // the follow-up non-stuck state is not), a later re-poll uses a different offset.
+        // Without row_offset_base, different physical rows at the same timestamp get the
+        // same ID = nanos + batch_local_position. With row_offset_base, each row's ID
+        // uses its DB-absolute position, so IDs remain distinct across batches.
+        //
+        // Simulate: batch A (offset=0) returns rows [R0, R1] at T1.
+        //           batch B (offset=2) returns rows [R2, R3] at T1.
+        // R0 and R2 are different rows but both appear at batch position 0.
+        let rows_a = vec![
+            row(&[("time", T1), ("val", "R0")]),
+            row(&[("time", T1), ("val", "R1")]),
+        ];
+        let rows_b = vec![
+            row(&[("time", T1), ("val", "R2")]),
+            row(&[("time", T1), ("val", "R3")]),
+        ];
+        let c = ctx("1970-01-01T00:00:00Z", 0);
+
+        let result_a = process_rows(&rows_a, &c, 0).unwrap();
+        let result_b = process_rows(&rows_b, &c, 2).unwrap();
+
+        // R0 (offset=0, pos=0) and R2 (offset=2, pos=0) must have different IDs.
+        assert_ne!(
+            result_a.messages[0].id, result_b.messages[0].id,
+            "R0 and R2 share batch position 0 but differ by offset — must not collide"
+        );
+        // R1 (offset=0, pos=1) and R3 (offset=2, pos=1) must also not collide.
+        assert_ne!(
+            result_a.messages[1].id, result_b.messages[1].id,
+            "R1 and R3 share batch position 1 but differ by offset — must not collide"
+        );
+        // IDs within each batch remain distinct.
+        assert_ne!(result_a.messages[0].id, result_a.messages[1].id);
+        assert_ne!(result_b.messages[0].id, result_b.messages[1].id);
     }
 
     // ── build_payload with payload_column ────────────────────────────────────
@@ -881,6 +961,7 @@ mod tests {
                 payload_format: PayloadFormat::Json,
                 now_micros: 0,
             },
+            0,
         )
         .unwrap();
         assert_eq!(result.messages.len(), 1);
@@ -905,6 +986,7 @@ mod tests {
                 payload_format: PayloadFormat::Raw,
                 now_micros: 0,
             },
+            0,
         )
         .unwrap();
         assert_eq!(result.messages[0].payload, b"raw-bytes");
@@ -932,6 +1014,7 @@ mod tests {
                 payload_format: PayloadFormat::Raw,
                 now_micros: 0,
             },
+            0,
         )
         .unwrap_err();
         assert!(
@@ -953,6 +1036,7 @@ mod tests {
                 payload_format: PayloadFormat::Raw,
                 now_micros: 0,
             },
+            0,
         )
         .unwrap_err();
         assert!(matches!(err, Error::InvalidRecordValue(_)));
@@ -972,6 +1056,7 @@ mod tests {
                 payload_format: PayloadFormat::Json,
                 now_micros: 0,
             },
+            0,
         )
         .unwrap_err();
         assert!(matches!(err, Error::InvalidRecordValue(_)));
@@ -1337,6 +1422,7 @@ mod http_tests {
             effective_batch_size: 10,
             processed_rows: 0,
             last_timestamp_row_offset: 0,
+            stuck_cursor: None,
         };
         let result = poll(
             &make_client(),
@@ -1348,9 +1434,10 @@ mod http_tests {
         )
         .await
         .unwrap();
-        assert!(
-            result.messages.is_empty(),
-            "stuck batch must produce no messages"
+        assert_eq!(
+            result.messages.len(),
+            10,
+            "stuck batch must emit rows, not discard them"
         );
         assert_eq!(result.new_state.effective_batch_size, 20, "should double");
         assert!(!result.trip_circuit_breaker);
@@ -1360,10 +1447,12 @@ mod http_tests {
 
     #[tokio::test]
     async fn poll_trips_circuit_breaker_when_stuck_cap_reached() {
-        // cap_factor=1 → cap = batch_size × 1 = 10.
-        // effective_batch_size is already 10 (= cap) → next_stuck_batch_size returns None.
+        // cap_factor=2 → cap = batch_size × 2 = 20.
+        // effective_batch_size is already 20 (= cap) → next_stuck_batch_size returns None → CB trips.
+        // cap_factor=1 is rejected by open(); minimum valid cap that causes an immediate trip
+        // at the start of inflation is cap=2 with effective_batch already at cap.
         let t = "2024-01-01T00:00:00Z";
-        let jsonl: String = (0..10)
+        let jsonl: String = (0..20)
             .map(|i| format!("{{\"time\":\"{t}\",\"val\":{i}}}\n"))
             .collect();
         let app = Router::new().route(
@@ -1372,14 +1461,15 @@ mod http_tests {
         );
         let base = start_server(app).await;
         let config = V3SourceConfig {
-            stuck_batch_cap_factor: Some(1),
+            stuck_batch_cap_factor: Some(2),
             ..make_config(&base)
         };
         let state = V3State {
             last_timestamp: Some(t.to_string()),
-            effective_batch_size: 10,
+            effective_batch_size: 20,
             processed_rows: 0,
             last_timestamp_row_offset: 0,
+            stuck_cursor: None,
         };
         let result = poll(
             &make_client(),
@@ -1419,6 +1509,7 @@ mod http_tests {
             effective_batch_size: 10,
             last_timestamp_row_offset: 0,
             processed_rows: 0,
+            stuck_cursor: None,
         };
         let result = poll(
             &make_client(),
@@ -1440,6 +1531,54 @@ mod http_tests {
         assert_eq!(
             result.new_state.last_timestamp_row_offset, 0,
             "offset must reset to 0 after cursor advance"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_zero_cap_factor_full_batch_advances_cursor() {
+        // stuck_batch_cap_factor=0 disables stuck detection: a full batch where every
+        // row shares the same timestamp must still advance the cursor and deliver messages,
+        // not trip the circuit breaker.
+        let t1 = "2024-01-01T00:00:01Z";
+        // Return exactly batch_size=10 rows, all at t1 — this would normally trigger stuck.
+        let jsonl = (0..10)
+            .map(|i| format!("{{\"time\":\"{t1}\",\"val\":{i}}}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let app = Router::new().route(
+            "/api/v3/query_sql",
+            post(move || async move { (StatusCode::OK, jsonl) }),
+        );
+        let base = start_server(app).await;
+        let mut cfg = make_config(&base);
+        cfg.stuck_batch_cap_factor = Some(0);
+        let state = V3State {
+            last_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            effective_batch_size: 10,
+            last_timestamp_row_offset: 0,
+            processed_rows: 0,
+            stuck_cursor: None,
+        };
+        let result = poll(
+            &make_client(),
+            &cfg,
+            "Bearer tok",
+            &state,
+            PayloadFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.messages.len(), 10, "all 10 rows must be emitted");
+        assert!(
+            !result.trip_circuit_breaker,
+            "CB must not trip when cap_factor=0"
+        );
+        assert_eq!(
+            result.new_state.last_timestamp.as_deref(),
+            Some(t1),
+            "cursor must advance to t1"
         );
     }
 
@@ -1589,6 +1728,7 @@ mod http_tests {
         let state = V3State {
             last_timestamp: Some("1970-01-01T00:00:00Z".to_string()),
             last_timestamp_row_offset: 7, // leftover from previous stuck run
+            stuck_cursor: Some("2024-01-01T00:00:01Z".to_string()), // simulate prior stuck
             ..V3State::default()
         };
         let result = poll(
@@ -1613,28 +1753,34 @@ mod http_tests {
     async fn poll_stuck_first_poll_sets_offset_and_inflation_resolves_stuck() {
         // First stuck poll (rows_at_max_cursor >= effective_batch) must set the row
         // offset and double the batch. On the next poll the server returns fewer rows
-        // than the inflated limit — not stuck — so messages are emitted and the
-        // offset resets to 0 as the cursor advances.
-        let t = "2024-01-01T00:00:00Z";
-        let jsonl: String = (0..10)
-            .map(|i| format!("{{\"time\":\"{t}\",\"val\":{i}}}\n"))
+        // than the inflated limit at a NEWER timestamp — cursor advances and offset
+        // resets to 0.
+        let t0 = "2024-01-01T00:00:00Z";
+        let t1 = "2024-01-01T00:00:01Z"; // strictly after t0
+        let jsonl_stuck: String = (0..10)
+            .map(|i| format!("{{\"time\":\"{t0}\",\"val\":{i}}}\n"))
             .collect();
-        let app = Router::new().route(
-            "/api/v3/query_sql",
-            post(move || async move { (StatusCode::OK, jsonl) }),
-        );
-        let base = start_server(app).await;
+        let jsonl_advance: String = (0..5)
+            .map(|i| format!("{{\"time\":\"{t1}\",\"val\":{i}}}\n"))
+            .collect();
 
-        // First stuck poll: 10 rows all at `t`, effective_batch=10 → rows_at_max_cursor(10) >= 10.
+        // First poll server: returns 10 rows at t0 (triggers stuck).
+        let app1 = Router::new().route(
+            "/api/v3/query_sql",
+            post(move || async move { (StatusCode::OK, jsonl_stuck) }),
+        );
+        let base1 = start_server(app1).await;
+
         let state1 = V3State {
-            last_timestamp: Some(t.to_string()),
+            last_timestamp: Some(t0.to_string()),
             effective_batch_size: 10,
             last_timestamp_row_offset: 0,
             processed_rows: 0,
+            stuck_cursor: None,
         };
         let r1 = poll(
             &make_client(),
-            &make_config(&base),
+            &make_config(&base1),
             "Bearer tok",
             &state1,
             PayloadFormat::Json,
@@ -1642,16 +1788,26 @@ mod http_tests {
         )
         .await
         .unwrap();
-        assert!(r1.messages.is_empty(), "first stuck poll must produce no messages");
-        let offset_after_first = r1.new_state.last_timestamp_row_offset;
-        assert!(offset_after_first > 0, "first stuck poll must set offset > 0");
-        assert_eq!(r1.new_state.effective_batch_size, 20, "batch must double on stuck");
+        assert_eq!(r1.messages.len(), 10, "first stuck poll must emit messages");
+        assert!(
+            r1.new_state.last_timestamp_row_offset > 0,
+            "first stuck poll must set offset > 0"
+        );
+        assert_eq!(
+            r1.new_state.effective_batch_size, 20,
+            "batch must double on stuck"
+        );
 
-        // Second poll with inflated batch (20): server returns 10 rows < 20 → not stuck.
-        // Cursor advances, messages emitted, and offset resets to 0.
+        // Second poll server: returns 5 rows at t1 > t0 (< effective_batch 20, not stuck).
+        // Cursor advances to t1, offset resets to 0.
+        let app2 = Router::new().route(
+            "/api/v3/query_sql",
+            post(move || async move { (StatusCode::OK, jsonl_advance) }),
+        );
+        let base2 = start_server(app2).await;
         let r2 = poll(
             &make_client(),
-            &make_config(&base),
+            &make_config(&base2),
             "Bearer tok",
             &r1.new_state,
             PayloadFormat::Json,
@@ -1659,14 +1815,15 @@ mod http_tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            r2.messages.len(),
-            10,
-            "inflated poll must emit messages when rows returned < effective_batch"
-        );
+        assert_eq!(r2.messages.len(), 5, "advancing poll must emit messages");
         assert_eq!(
             r2.new_state.last_timestamp_row_offset, 0,
             "offset must reset to 0 after cursor advances"
+        );
+        assert_eq!(
+            r2.new_state.last_timestamp.as_deref(),
+            Some(t1),
+            "cursor must advance to t1"
         );
     }
 
@@ -1707,6 +1864,274 @@ mod http_tests {
             Some(saved_ts),
             "cursor must not regress when new max == saved cursor"
         );
+    }
+
+    #[tokio::test]
+    async fn poll_cursor_non_advancing_preserves_stuck_sequence_state() {
+        // When cursor doesn't advance mid-stuck-sequence, last_timestamp_row_offset
+        // and stuck_cursor must be preserved - resetting them would re-deliver the
+        // already-seen head rows and break livelock resolution on the next empty poll.
+        let t0 = "2024-01-01T00:00:00Z";
+        let t1 = "2024-01-01T00:00:01Z"; // stuck_cursor value from prior stuck polls
+        let jsonl = format!(
+            "{{\"time\":\"{t0}\",\"val\":1}}\n\
+             {{\"time\":\"{t0}\",\"val\":2}}\n"
+        );
+        let app = Router::new().route(
+            "/api/v3/query_sql",
+            post(move || async move { (StatusCode::OK, jsonl) }),
+        );
+        let base = start_server(app).await;
+        let state = V3State {
+            last_timestamp: Some(t0.to_string()),
+            effective_batch_size: 20,
+            last_timestamp_row_offset: 10,
+            stuck_cursor: Some(t1.to_string()),
+            ..V3State::default()
+        };
+        let result = poll(
+            &make_client(),
+            &make_config(&base),
+            "Bearer tok",
+            &state,
+            PayloadFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.new_state.last_timestamp.as_deref(),
+            Some(t0),
+            "cursor must stay at t0"
+        );
+        assert_eq!(
+            result.new_state.last_timestamp_row_offset, 10,
+            "offset must be preserved, not reset to 0"
+        );
+        assert_eq!(
+            result.new_state.stuck_cursor.as_deref(),
+            Some(t1),
+            "stuck_cursor must be preserved for livelock resolution"
+        );
+        assert_eq!(
+            result.new_state.effective_batch_size, 20,
+            "inflated batch size must be preserved"
+        );
+    }
+
+    // ── Bug regression tests ─────────────────────────────────────────────────
+
+    /// Bug 1: stuck path was silently dropping all rows that triggered the stuck
+    /// detection. The rows must be emitted; only cursor advancement is withheld.
+    #[tokio::test]
+    async fn poll_stuck_batch_emits_messages() {
+        let t0 = "2024-01-01T00:00:00Z";
+        let t1 = "2024-01-01T00:00:01Z"; // strictly after cursor
+        let jsonl: String = (0..10)
+            .map(|i| format!("{{\"time\":\"{t1}\",\"val\":{i}}}\n"))
+            .collect();
+        let app = Router::new().route(
+            "/api/v3/query_sql",
+            post(move || async move { (StatusCode::OK, jsonl) }),
+        );
+        let base = start_server(app).await;
+        let state = V3State {
+            last_timestamp: Some(t0.to_string()),
+            effective_batch_size: 10,
+            ..V3State::default()
+        };
+        let result = poll(
+            &make_client(),
+            &make_config(&base),
+            "Bearer tok",
+            &state,
+            PayloadFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.messages.len(),
+            10,
+            "stuck batch must emit rows, not discard them"
+        );
+        assert_eq!(
+            result.new_state.last_timestamp.as_deref(),
+            Some(t0),
+            "cursor must not advance when stuck"
+        );
+        assert_eq!(
+            result.new_state.effective_batch_size, 20,
+            "batch must double"
+        );
+        assert!(!result.trip_circuit_breaker);
+    }
+
+    /// Bug 2: when exactly batch_size rows exist at T1, poll 1 is stuck and poll 2
+    /// returns 0 rows at the inflated offset. Without the fix this livelocks because
+    /// the cursor never advances past T0. The cursor must reach T1 after poll 2.
+    #[tokio::test]
+    async fn poll_livelock_resolved_when_empty_batch_follows_stuck() {
+        let t0 = "2024-01-01T00:00:00Z";
+        let t1 = "2024-01-01T00:00:01Z";
+        let jsonl_t1: String = (0..10)
+            .map(|i| format!("{{\"time\":\"{t1}\",\"val\":{i}}}\n"))
+            .collect();
+        let cc = Arc::new(Mutex::new(0u32));
+        let cc2 = cc.clone();
+        let rows2 = jsonl_t1.clone();
+        let app = Router::new().route(
+            "/api/v3/query_sql",
+            post(move || {
+                let counter = cc2.clone();
+                let rows = rows2.clone();
+                async move {
+                    let mut n = counter.lock().await;
+                    *n += 1;
+                    if *n == 1 {
+                        (StatusCode::OK, rows)
+                    } else {
+                        (StatusCode::OK, String::new())
+                    }
+                }
+            }),
+        );
+        let base = start_server(app).await;
+        let state1 = V3State {
+            last_timestamp: Some(t0.to_string()),
+            effective_batch_size: 10,
+            ..V3State::default()
+        };
+        // Poll 1: 10 rows at T1 → stuck
+        let r1 = poll(
+            &make_client(),
+            &make_config(&base),
+            "Bearer tok",
+            &state1,
+            PayloadFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r1.new_state.last_timestamp_row_offset, 10,
+            "offset must accumulate after stuck poll"
+        );
+        // Poll 2: 0 rows at OFFSET=10 → cursor must advance to T1
+        let r2 = poll(
+            &make_client(),
+            &make_config(&base),
+            "Bearer tok",
+            &r1.new_state,
+            PayloadFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r2.new_state.last_timestamp.as_deref(),
+            Some(t1),
+            "cursor must advance to T1 after empty follow-up confirms all rows at T1 seen; livelock not allowed"
+        );
+        assert_eq!(
+            r2.new_state.last_timestamp_row_offset, 0,
+            "offset must reset after cursor advance"
+        );
+        assert_eq!(
+            r2.new_state.effective_batch_size, 10,
+            "batch must reset to base"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_cb_trip_preserves_stuck_cursor() {
+        // When CB trips (batch already at cap), stuck_cursor must be set to the
+        // stuck timestamp so after cooldown an empty poll can advance past it.
+        // Without this fix stuck_cursor=None causes the cursor to freeze after CB cooldown.
+        let t0 = "2024-01-01T00:00:00Z"; // last saved cursor
+        let t1 = "2024-01-01T00:00:01Z"; // stuck timestamp (strictly after t0)
+        // cap_factor=2, batch_size=10 → cap=20. effective_batch=20 (= cap).
+        // Return 20 rows all at t1: rows_at_max_cursor(20) >= effective_batch(20) → stuck.
+        // next_stuck_batch_size(20, 10, 2) → 20 >= 20 → None → CB trips.
+        let jsonl: String = (0..20)
+            .map(|i| format!("{{\"time\":\"{t1}\",\"val\":{i}}}\n"))
+            .collect();
+        let app = Router::new().route(
+            "/api/v3/query_sql",
+            post(move || async move { (StatusCode::OK, jsonl) }),
+        );
+        let base = start_server(app).await;
+        let config = V3SourceConfig {
+            stuck_batch_cap_factor: Some(2),
+            ..make_config(&base)
+        };
+        let state = V3State {
+            last_timestamp: Some(t0.to_string()),
+            effective_batch_size: 20,
+            last_timestamp_row_offset: 10,
+            processed_rows: 10,
+            stuck_cursor: None,
+        };
+        let result = poll(
+            &make_client(),
+            &config,
+            "Bearer tok",
+            &state,
+            PayloadFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(result.trip_circuit_breaker, "must trip CB when at cap");
+        assert!(result.messages.is_empty());
+        assert_eq!(
+            result.new_state.stuck_cursor.as_deref(),
+            Some(t1),
+            "stuck_cursor must be the stuck timestamp so cooldown poll can advance past it"
+        );
+        // CB resets batch to base
+        assert_eq!(
+            result.new_state.effective_batch_size, 10,
+            "CB trip must reset batch to base"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_v3_zero_batch_size_is_floored_to_one() {
+        // batch_size=Some(0) must floor to 1 inside poll().
+        // Without .max(1): base_batch=0, cap=0, next_stuck_batch_size(0,0,cap)=None → CB trips.
+        // With .max(1): base_batch=1, cap=cap_factor×1=10; 1 row at new timestamp is
+        // not stuck (rows_at_max_cursor=1 >= effective_batch=1 is true but inflation gives
+        // Some(2) → no CB trip, message emitted).
+        let t1 = "2024-01-01T00:00:01Z";
+        let jsonl = format!("{{\"time\":\"{t1}\",\"val\":1}}\n");
+        let app = Router::new().route(
+            "/api/v3/query_sql",
+            post(move || async move { (StatusCode::OK, jsonl) }),
+        );
+        let base = start_server(app).await;
+        let mut config = make_config(&base);
+        config.batch_size = Some(0);
+        let state = V3State {
+            last_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            effective_batch_size: 0,
+            ..V3State::default()
+        };
+        let result = poll(
+            &make_client(),
+            &config,
+            "Bearer tok",
+            &state,
+            PayloadFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !result.trip_circuit_breaker,
+            "batch_size=0 must floor to 1, not trip CB immediately"
+        );
+        assert_eq!(result.messages.len(), 1, "row must be emitted");
     }
 
     #[tokio::test]

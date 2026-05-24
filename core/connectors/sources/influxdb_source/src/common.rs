@@ -108,6 +108,10 @@ pub struct V2SourceConfig {
     pub(crate) initial_offset: Option<String>,
     pub(crate) payload_column: Option<String>,
     pub(crate) payload_format: Option<String>,
+    /// When `false`, non-cursor measurement and field columns are excluded from
+    /// the emitted JSON payload. Note: the `_time` cursor column is always
+    /// present in V2 Flux CSV output and cannot be stripped at query time —
+    /// it will appear in the payload regardless of this setting.
     pub(crate) include_metadata: Option<bool>,
     pub(crate) verbose_logging: Option<bool>,
     pub(crate) max_retries: Option<u32>,
@@ -150,6 +154,8 @@ pub struct V3SourceConfig {
     /// Maximum factor by which batch_size may be inflated before the stuck-timestamp
     /// circuit breaker trips. Defaults to 10 (i.e. up to 10× the configured batch_size).
     /// Maximum accepted value is 100; higher values risk OOM-inducing queries.
+    /// Set to `0` to disable stuck-timestamp detection entirely (cursor advances
+    /// even when a full batch shares one timestamp, risking re-delivery of tied rows).
     pub(crate) stuck_batch_cap_factor: Option<u32>,
 }
 
@@ -319,6 +325,11 @@ pub struct V3State {
     /// Row offset within the last timestamp group — used as a tiebreaker
     /// so that siblings at the same timestamp are not silently dropped.
     pub last_timestamp_row_offset: u64,
+    /// Max timestamp seen during the current stuck-batch sequence. Set when
+    /// rows_at_max_cursor >= effective_batch; cleared when the cursor advances.
+    /// When an empty follow-up poll confirms no more rows exist at this timestamp,
+    /// the cursor is advanced here rather than staying at last_timestamp (T0).
+    pub stuck_cursor: Option<String>,
 }
 
 // ── Payload format ────────────────────────────────────────────────────────────
@@ -474,9 +485,27 @@ pub fn parse_scalar(value: &str) -> serde_json::Value {
 
 // ── Query template substitution ───────────────────────────────────────────────
 
-/// Substitute `$cursor` and `$limit` placeholders in a query template in a
-/// single pass, avoiding the two intermediate `String` allocations that
-/// `clone() + replace() + replace()` would produce.
+/// Strip `/* ... */` block comments from `s`. Handles multi-line blocks.
+/// Unterminated `/*` treats the rest of the string as a comment.
+pub(crate) fn strip_block_comments(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains("/*") {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        rest = &rest[start + 2..];
+        if let Some(end) = rest.find("*/") {
+            rest = &rest[end + 2..];
+        } else {
+            break;
+        }
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
 /// Returns `true` if `s` starts with `placeholder` and the character
 /// immediately after is not an identifier character (`[a-zA-Z0-9_]`).
 /// This prevents `$cursor_field` from matching `$cursor`.
@@ -486,6 +515,48 @@ fn matches_placeholder(s: &str, placeholder: &str) -> bool {
         && !s[placeholder.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Returns `true` if `query` contains a bare `placeholder` token outside of
+/// comments - not immediately followed by an alphanumeric character or `_`.
+/// `/* */` block comments and `--` line comments are stripped before checking.
+fn scan_placeholder(query: &str, placeholder: &str) -> bool {
+    let q = strip_block_comments(query);
+    q.lines().any(|line| {
+        let code = match line.find("--") {
+            Some(pos) => &line[..pos],
+            None => line,
+        };
+        let mut rest = code;
+        while let Some(pos) = rest.find(placeholder) {
+            if matches_placeholder(&rest[pos..], placeholder) {
+                return true;
+            }
+            rest = &rest[pos + 1..];
+        }
+        false
+    })
+}
+
+/// Returns `true` if `query` contains a bare `$cursor` placeholder outside of
+/// comments. Uses the same boundary rule as `apply_query_params` so `open()`
+/// and `poll()` agree on whether substitution will occur.
+///
+/// Both `/* */` block comments and `--` line comments are stripped before
+/// checking. `$cursor` appearing only inside a comment does NOT satisfy this
+/// check.
+pub(crate) fn query_has_cursor_placeholder(query: &str) -> bool {
+    scan_placeholder(query, "$cursor")
+}
+
+/// Returns `true` if `query` contains a bare `$offset` placeholder outside of
+/// comments. Same boundary rule and comment-stripping as
+/// `query_has_cursor_placeholder`.
+pub(crate) fn query_has_offset_placeholder(query: &str) -> bool {
+    scan_placeholder(query, "$offset")
+}
+
+/// Substitute `$cursor`, `$limit`, and `$offset` placeholders in a query
+/// template in a single pass, avoiding the intermediate `String` allocations
+/// that chained `replace()` calls would produce.
 pub(crate) fn apply_query_params(
     template: &str,
     cursor: &str,
@@ -584,8 +655,6 @@ mod tests {
 
     #[test]
     fn validate_cursor_field_is_version_strict() {
-        // Swapping column names across versions is an error, not a silent passthrough:
-        // using "time" with v2 or "_time" with v3 produces empty results at the DB level.
         assert!(
             validate_cursor_field("time", "v2").is_err(),
             "\"time\" must be rejected for v2 — correct column is \"_time\""
@@ -598,8 +667,6 @@ mod tests {
 
     #[test]
     fn validate_cursor_field_error_is_version_specific() {
-        // The cross-version error messages reference the wrong column and hint at
-        // the correct one, so users can fix config without reading the docs.
         let v2_err = validate_cursor_field("time", "v2").unwrap_err().to_string();
         assert!(
             v2_err.contains("v2"),
@@ -609,7 +676,6 @@ mod tests {
             v2_err.contains("\"_time\""),
             "v2 error should suggest _time, got: {v2_err}"
         );
-
         let v3_err = validate_cursor_field("_time", "v3")
             .unwrap_err()
             .to_string();
@@ -622,6 +688,7 @@ mod tests {
             "v3 error should suggest time, got: {v3_err}"
         );
     }
+
     #[test]
     fn parse_scalar_types() {
         assert_eq!(parse_scalar(""), serde_json::Value::Null);
@@ -653,6 +720,34 @@ mod tests {
         assert!(!is_timestamp_after("not-a-timestamp", sentinel));
         // Valid `a` that is older than `b` must also return false.
         assert!(!is_timestamp_after("2023-01-01T00:00:00Z", sentinel));
+    }
+
+    #[test]
+    fn cursor_placeholder_detected_when_bare() {
+        assert!(query_has_cursor_placeholder(
+            "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit"
+        ));
+        assert!(query_has_cursor_placeholder("$cursor"));
+        assert!(query_has_cursor_placeholder("prefix $cursor suffix"));
+    }
+
+    #[test]
+    fn cursor_placeholder_not_detected_when_extended_identifier() {
+        // $cursor_field must NOT match — apply_query_params would not substitute it.
+        assert!(!query_has_cursor_placeholder(
+            "SELECT * FROM t WHERE time > $cursor_field LIMIT $limit"
+        ));
+        assert!(!query_has_cursor_placeholder("no placeholder here"));
+        assert!(!query_has_cursor_placeholder("$cursorX"));
+        assert!(!query_has_cursor_placeholder("$cursor2"));
+    }
+
+    #[test]
+    fn cursor_placeholder_detected_among_extended_identifiers() {
+        // Mixed: one extended, one bare — bare must still be found.
+        assert!(query_has_cursor_placeholder(
+            "SELECT $cursor_field FROM t WHERE time > '$cursor'"
+        ));
     }
 
     #[test]
@@ -719,6 +814,7 @@ mod tests {
             processed_rows: 100,
             effective_batch_size: 1000,
             last_timestamp_row_offset: 0,
+            stuck_cursor: None,
         };
         let cloned = original.clone();
         assert_eq!(cloned.last_timestamp, original.last_timestamp);
@@ -747,6 +843,7 @@ mod tests {
             processed_rows: 500,
             effective_batch_size: 2000,
             last_timestamp_row_offset: 0,
+            stuck_cursor: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: V3State = serde_json::from_str(&json).unwrap();
@@ -775,6 +872,7 @@ mod tests {
             processed_rows: 1,
             effective_batch_size: 500,
             last_timestamp_row_offset: 0,
+            stuck_cursor: None,
         });
         let json = serde_json::to_string(&state).unwrap();
         assert!(json.contains(r#""version":"v3""#));
