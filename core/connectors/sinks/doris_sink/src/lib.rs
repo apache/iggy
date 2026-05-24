@@ -288,7 +288,17 @@ impl DorisSink {
                 continue;
             }
 
-            let response_text = response.text().await.unwrap_or_default();
+            let response_text = response.text().await.unwrap_or_else(|e| {
+                // A body-read failure shouldn't be silently swallowed: log it,
+                // then fall back to an empty body so the status-based handling
+                // below still classifies the outcome (an unparsable/empty body
+                // on a non-2xx becomes a permanent error, which is correct).
+                warn!(
+                    "Doris sink ID {} failed to read response body: {e}",
+                    self.id
+                );
+                String::new()
+            });
             let response_for_log = truncate_for_log(&response_text, MAX_RESPONSE_LOG_BYTES);
 
             if !status.is_success() {
@@ -592,6 +602,14 @@ impl Sink for DorisSink {
         let batch_size = self.batch_size();
         let mut worst_error: Option<Error> = None;
 
+        // Best-effort across chunks: on a chunk failure we record the error and
+        // `continue` rather than `break`, so a later chunk still gets a chance to
+        // land. Under the runtime's AutoCommit-at-poll semantics the consumer
+        // offset for this whole poll is already committed before consume() runs,
+        // so returning early would *not* replay the unprocessed chunks anyway —
+        // it would only drop them. Pushing as much data as possible and then
+        // surfacing the worst error (so the runtime's DLQ/alerting still fires)
+        // is therefore strictly better than bailing on the first failure.
         for chunk in messages.chunks(batch_size) {
             let json_values: Vec<&simd_json::OwnedValue> = chunk
                 .iter()
@@ -622,8 +640,18 @@ impl Sink for DorisSink {
                 }
             };
 
-            let first_offset = chunk.first().map(|m| m.offset).unwrap_or(0);
-            let last_offset = chunk.last().map(|m| m.offset).unwrap_or(0);
+            // `chunks()` never yields an empty slice, so first/last are always
+            // present. Use `.expect` rather than `unwrap_or(0)`: a fabricated
+            // offset 0 here would alias the real offset-0 label and break the
+            // idempotency contract, so a broken invariant must fail loud.
+            let first_offset = chunk
+                .first()
+                .map(|m| m.offset)
+                .expect("chunks() never yields an empty chunk");
+            let last_offset = chunk
+                .last()
+                .map(|m| m.offset)
+                .expect("chunks() never yields an empty chunk");
             let label = self.build_label(
                 topic_metadata,
                 messages_metadata.partition_id,

@@ -83,6 +83,7 @@ timeout_secs = 30
 
 - **`label_keep_max_second`.** Idempotent replay relies on Doris retaining each label for at least as long as it could take the Iggy runtime to redrive a failed batch. The Doris default is 3 days, which is conservative. If you set this lower on the Doris side, make sure your runtime retry budget fits inside the window — once a label expires, a replay re-loads instead of deduping, producing duplicate rows.
 - **Filtered-row alerts.** When Doris reports `number_filtered_rows > 0`, the connector emits a `warn!`. This is your signal that upstream message shapes have drifted from the table schema; alert on it.
+- **Multi-chunk batches are best-effort.** A poll larger than `batch_size` is split into chunks, each loaded as its own labelled Stream Load. If one chunk fails, the connector still attempts the remaining chunks and then returns the worst error — it does **not** stop at the first failure. The runtime commits the consumer offset for the whole poll before `consume()` runs, so a failed chunk is not replayed regardless; pushing the other chunks through maximizes delivered data, and the surfaced error still drives the runtime's error path.
 
 ## Limitations (todo)
 
