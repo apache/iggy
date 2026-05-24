@@ -68,13 +68,13 @@ rcgen = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
-rust-s3 = { workspace = true }
 rmcp = { workspace = true, features = [
     "client",
     "reqwest",
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
 ] }
+rust-s3 = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
