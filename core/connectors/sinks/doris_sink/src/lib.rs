@@ -415,6 +415,10 @@ fn identity_hash(stream: &str, topic: &str) -> String {
 ///   2. Eliminate the silent-collision risk between identities that sanitize
 ///      to the same string — the joint `hash16` is over the raw names, so it
 ///      stays distinct even when both sanitized segments collide.
+///
+/// `#[doc(hidden)]`: this is `pub` only so the integration test harness can
+/// call it; it is not part of the connector's supported API.
+#[doc(hidden)]
 pub fn build_label(
     prefix: &str,
     stream: &str,

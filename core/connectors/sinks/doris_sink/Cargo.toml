@@ -27,6 +27,7 @@ homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
+publish = false
 
 [lib]
 crate-type = ["cdylib", "lib"]

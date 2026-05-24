@@ -12,10 +12,10 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 ## How it works
 
 1. For each batch of messages, the connector serializes the JSON payloads into a JSON array.
-2. It computes a deterministic Stream Load `label` of the form `{label_prefix}-{stream}_{hash8}-{topic}_{hash8}-{partition}-{first_offset}-{last_offset}`.
-   - Each variable-length segment carries a 32-bit blake3 hash of the raw name, so names that sanitize to the same string (e.g. `events.v1` vs `events_v1`) cannot collide.
-   - The total label is bounded under Doris's 128-char cap regardless of input length.
-   - Doris dedupes loads by label inside its `label_keep_max_second` window, so a replayed batch (after restart, retry, etc.) is silently absorbed instead of producing duplicates.
+2. It computes a deterministic Stream Load `label` of the form `{label_prefix}-{stream_san}-{topic_san}-{hash16}-{partition}-{first_offset}-{last_offset}`.
+   - `hash16` is a single 64-bit blake3 hash computed over the *raw* (un-sanitized), length-prefixed `(stream, topic)` pair. So two identities that sanitize to the same string (e.g. `events.v1` vs `events_v1`) get distinct labels, and no boundary-shift aliasing is possible (`("ab","c")` ≠ `("a","bc")`).
+   - The total label is bounded under Doris's 128-char cap regardless of input length (worst case 120 chars).
+   - Doris dedupes loads by label inside its `label_keep_max_second` window. This makes a **runtime-driven retry/redrive** of the same batch idempotent — the second load is absorbed instead of duplicating rows. Note this is *not* a crash-recovery guarantee: the runtime commits the consumer offset at poll time, before `consume()` runs, so a crash mid-load yields at-most-once delivery (the batch is not replayed). Label dedup protects against in-process retries, not against lost batches.
 3. It `PUT`s the batch to `{fe_url}/api/{database}/{table}/_stream_load` with HTTP Basic auth and the headers `Expect: 100-continue`, `format: json`, `strip_outer_array: true`, `label: <label>`. (`Expect: 100-continue` lets Doris reject auth/4xx failures before the connector uploads the whole body — important for large batches and required if a reverse proxy sits in front of Doris.)
 4. The Doris frontend (FE) responds with a `307 Temporary Redirect` to a backend (BE). The connector follows the redirect manually so that the `Authorization` header is preserved across the hop (`reqwest`'s default policy strips it on cross-host redirects). `308 Permanent Redirect` is also followed as a defensive measure; redirects beyond a hard cap of 5 are rejected as `HttpRequestFailed`.
 5. The HTTP body is parsed as JSON and the `Status` field decides the outcome:
@@ -85,7 +85,7 @@ timeout_secs = 30
 - **Filtered-row alerts.** When Doris reports `number_filtered_rows > 0`, the connector emits a `warn!`. This is your signal that upstream message shapes have drifted from the table schema; alert on it.
 - **Multi-chunk batches are best-effort.** A poll larger than `batch_size` is split into chunks, each loaded as its own labelled Stream Load. If one chunk fails, the connector still attempts the remaining chunks and then returns the worst error — it does **not** stop at the first failure. The runtime commits the consumer offset for the whole poll before `consume()` runs, so a failed chunk is not replayed regardless; pushing the other chunks through maximizes delivered data, and the surfaced error still drives the runtime's error path.
 
-## Limitations (todo)
+## Limitations
 
 - JSON payload only. CSV and raw-text payloads are not supported yet.
 - HTTP Basic auth only.
