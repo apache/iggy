@@ -59,6 +59,6 @@ func (d *DeletePersonalAccessToken) MarshalBinary() ([]byte, error) {
 	length := 1 + len(d.Name)
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(d.Name))
-	copy(bytes[1:], d.Name)
+	copy(bytes[1:1+len(d.Name)], d.Name)
 	return bytes, nil
 }

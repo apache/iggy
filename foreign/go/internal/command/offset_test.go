@@ -191,6 +191,46 @@ func TestSerialize_StoreConsumerOffsetRequest_MaxOffset(t *testing.T) {
 	}
 }
 
+// TestSerialize_StoreConsumerOffsetRequest_MaxPartition tests with maximum uint32 partition ID
+func TestSerialize_StoreConsumerOffsetRequest_MaxPartition(t *testing.T) {
+	consumerId, _ := iggcon.NewIdentifier(uint32(1))
+	streamId, _ := iggcon.NewIdentifier(uint32(2))
+	topicId, _ := iggcon.NewIdentifier(uint32(3))
+
+	cmd := StoreConsumerOffsetRequest{
+		Consumer:    iggcon.NewSingleConsumer(consumerId),
+		StreamId:    streamId,
+		TopicId:     topicId,
+		PartitionId: uint32Ptr(math.MaxUint32),
+		Offset:      100,
+	}
+
+	serialized, err := cmd.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Failed to serialize StoreConsumerOffsetRequest with max partition: %v", err)
+	}
+
+	expected := []byte{
+		0x01,                   // Consumer Kind = Single
+		0x01,                   // ConsumerId Kind = NumericId
+		0x04,                   // ConsumerId Length = 4
+		0x01, 0x00, 0x00, 0x00, // ConsumerId Value = 1
+		0x01,                   // StreamId Kind = NumericId
+		0x04,                   // StreamId Length = 4
+		0x02, 0x00, 0x00, 0x00, // StreamId Value = 2
+		0x01,                   // TopicId Kind = NumericId
+		0x04,                   // TopicId Length = 4
+		0x03, 0x00, 0x00, 0x00, // TopicId Value = 3
+		0x01,                   // hasPartition = 1
+		0xFF, 0xFF, 0xFF, 0xFF, // PartitionId = max uint32
+		0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Offset = 100 (uint64)
+	}
+
+	if !bytes.Equal(serialized, expected) {
+		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	}
+}
+
 // TestSerialize_GetConsumerOffset_WithPartition tests GetConsumerOffset with partition
 func TestSerialize_GetConsumerOffset_WithPartition(t *testing.T) {
 	consumerId, _ := iggcon.NewIdentifier("grp1")
@@ -298,6 +338,44 @@ func TestSerialize_GetConsumerOffset_MixedIds(t *testing.T) {
 		0x6C, 0x6F, 0x67, 0x73, // "logs"
 		0x01,                   // hasPartition = 1
 		0x07, 0x00, 0x00, 0x00, // PartitionId = 7
+	}
+
+	if !bytes.Equal(serialized, expected) {
+		t.Errorf("Serialized bytes are incorrect.\nExpected:\t%v\nGot:\t\t%v", expected, serialized)
+	}
+}
+
+// TestSerialize_GetConsumerOffset_MaxPartition tests with maximum uint32 partition ID
+func TestSerialize_GetConsumerOffset_MaxPartition(t *testing.T) {
+	consumerId, _ := iggcon.NewIdentifier(uint32(1))
+	streamId, _ := iggcon.NewIdentifier(uint32(2))
+	topicId, _ := iggcon.NewIdentifier(uint32(3))
+
+	cmd := GetConsumerOffset{
+		Consumer:    iggcon.NewSingleConsumer(consumerId),
+		StreamId:    streamId,
+		TopicId:     topicId,
+		PartitionId: uint32Ptr(math.MaxUint32),
+	}
+
+	serialized, err := cmd.MarshalBinary()
+	if err != nil {
+		t.Fatalf("Failed to serialize GetConsumerOffset with max partition: %v", err)
+	}
+
+	expected := []byte{
+		0x01,                   // Consumer Kind = Single
+		0x01,                   // ConsumerId Kind = NumericId
+		0x04,                   // ConsumerId Length = 4
+		0x01, 0x00, 0x00, 0x00, // ConsumerId Value = 1
+		0x01,                   // StreamId Kind = NumericId
+		0x04,                   // StreamId Length = 4
+		0x02, 0x00, 0x00, 0x00, // StreamId Value = 2
+		0x01,                   // TopicId Kind = NumericId
+		0x04,                   // TopicId Length = 4
+		0x03, 0x00, 0x00, 0x00, // TopicId Value = 3
+		0x01,                   // hasPartition = 1
+		0xFF, 0xFF, 0xFF, 0xFF, // PartitionId = max uint32
 	}
 
 	if !bytes.Equal(serialized, expected) {
