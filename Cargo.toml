@@ -275,6 +275,9 @@ socket2 = "0.6.3"
 sqlx = { version = "0.8.6", features = [
     "runtime-tokio-rustls",
     "postgres",
+    # "mysql": Doris exposes a MySQL-wire frontend; the Doris sink's
+    # integration-test fixture talks to it over this driver. Cargo unifies
+    # features across the workspace, so it is declared once here.
     "mysql",
     "chrono",
     "uuid",
