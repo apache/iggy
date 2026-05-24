@@ -6,7 +6,7 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 
 - The target Doris **database and table must be pre-created** before enabling the sink. The connector never issues DDL.
 - `database` and `table` config values must match `[A-Za-z0-9_]+`. Anything else is rejected at startup with `Error::InvalidConfigValue` — this also prevents path traversal in the constructed `/api/{db}/{table}/_stream_load` URL.
-- Messages must arrive with `Payload::Json` (i.e. the configured stream schema is `json`). Other payload types are dropped with a `warn!` and the consumer offset advances past them — this is silent data loss for any non-JSON message, so the upstream schema must be guaranteed JSON.
+- Messages must arrive with `Payload::Json` (i.e. the configured stream schema is `json`). If a non-JSON payload reaches the connector it logs at `error!` and aborts the whole poll; since the consumer offset is already committed at poll time the batch is not replayed — effectively silent data loss — so the upstream schema must be guaranteed JSON. (Under `schema = "json"` the SDK drops non-JSON before the connector sees it, so this abort is a defensive guard.)
 - The Iggy message JSON shape must match the target table columns. Use the optional `columns` plugin setting if the column order differs from the JSON keys.
 
 ## How it works
@@ -86,8 +86,9 @@ timeout_secs = 30
 
 - **`label_keep_max_second`.** Idempotent replay relies on Doris retaining each label for at least as long as it could take the Iggy runtime to redrive a failed batch. The Doris default is 3 days, which is conservative. If you set this lower on the Doris side, make sure your runtime retry budget fits inside the window — once a label expires, a replay re-loads instead of deduping, producing duplicate rows.
 - **Filtered-row alerts.** When Doris reports `number_filtered_rows > 0`, the connector emits a `warn!`. This is your signal that upstream message shapes have drifted from the table schema; alert on it.
-- **Multi-chunk batches are best-effort.** A poll larger than `batch_size` is split into chunks, each loaded as its own labelled Stream Load. If one chunk fails, the connector still attempts the remaining chunks and then returns the worst error — it does **not** stop at the first failure.
-  The runtime commits the consumer offset for the whole poll before `consume()` runs, so a failed chunk is not replayed regardless; pushing the other chunks through maximizes delivered data, and the surfaced error still drives the runtime's error path.
+- **Multi-chunk batches are best-effort for operational failures.** A poll larger than `batch_size` is split into chunks, each loaded as its own labelled Stream Load. If a chunk fails *operationally* (serialize, HTTP, or status-classification error), the connector still attempts the remaining chunks and then returns the worst error — it does **not** stop at the first such failure.
+  The runtime commits the consumer offset for the whole poll before `consume()` runs, so a failed chunk is not replayed regardless; pushing the other chunks through maximizes delivered data, and the worst error is surfaced at the end (logged at `error!` for observability — the runtime currently discards `consume()`'s return value, so there is no retry or DLQ).
+  The one deliberate exception is a **non-JSON payload**, which is treated as a schema-contract violation and aborts the whole poll immediately (see the Requirements note above). Under `schema = "json"` this is unreachable, so it is a defensive guard rather than a normal path.
 
 ## Limitations
 

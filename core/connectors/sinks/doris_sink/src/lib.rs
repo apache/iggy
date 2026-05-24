@@ -52,7 +52,10 @@ const MAX_LABEL_NAME_LEN: usize = 16;
 const LABEL_HASH_HEX_LEN: usize = 16;
 // Doris Stream Load responses are normally tiny JSON blobs (~200 B). Cap the
 // portion we keep for logs/errors so a misbehaving proxy that returns a giant
-// body cannot OOM the connector or flood logs.
+// body cannot flood the logs. NOTE: this bounds only what we *log*, not peak
+// memory — `response.text()` already buffers the full body before truncation.
+// A true memory guard would need a Content-Length check or a byte budget over
+// `bytes_stream()`; deferred, since the destination is trusted operator infra.
 const MAX_RESPONSE_LOG_BYTES: usize = 4096;
 
 #[derive(Debug)]
@@ -598,7 +601,15 @@ impl Sink for DorisSink {
         // where the FE itself is plain http; deploy Doris over TLS in prod.
         if parsed_url.scheme().eq_ignore_ascii_case("http") {
             let host = parsed_url.host_str().unwrap_or("");
-            let is_loopback = host == "localhost" || host == "127.0.0.1" || host == "::1";
+            // `host_str()` returns IPv6 literals in bracketed form (`[::1]`),
+            // so strip brackets before parsing. Parsing as an `IpAddr` covers
+            // `127.0.0.1`, `::1`, and any other loopback spelling.
+            let is_loopback = host == "localhost"
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback());
             if !is_loopback {
                 warn!(
                     "Doris sink ID {} is configured with http:// to non-loopback host '{}'; \
@@ -637,14 +648,22 @@ impl Sink for DorisSink {
         let batch_size = self.batch_size();
         let mut worst_error: Option<Error> = None;
 
-        // Best-effort across chunks: on a chunk failure we record the error and
-        // `continue` rather than `break`, so a later chunk still gets a chance to
-        // land. Under the runtime's AutoCommit-at-poll semantics the consumer
-        // offset for this whole poll is already committed before consume() runs,
-        // so returning early would *not* replay the unprocessed chunks anyway —
-        // it would only drop them. Pushing as much data as possible and then
-        // surfacing the worst error (so the runtime's DLQ/alerting still fires)
-        // is therefore strictly better than bailing on the first failure.
+        // Best-effort across chunks for *operational* failures (serialize, HTTP,
+        // status classification): we record the error and `continue` rather than
+        // `break`, so a later chunk still gets a chance to land. Under the
+        // runtime's AutoCommit-at-poll semantics the consumer offset for this
+        // whole poll is already committed before consume() runs, so returning
+        // early would *not* replay the unprocessed chunks anyway — it would only
+        // drop them. We push as much data as possible and surface the worst error
+        // at the end (logged at error!; the runtime currently discards the return
+        // value, so this is for observability, not retry/DLQ).
+        //
+        // The one *deliberate* exception is a non-JSON payload (below): that is a
+        // schema-contract violation — the whole stream is misconfigured, not one
+        // chunk transiently failing — so we abort the entire poll via `?` to fail
+        // loudly. Under the documented `schema = "json"` config this is
+        // unreachable (the SDK drops non-JSON payloads before consume() is
+        // called), so it stands as a defensive guard.
         for chunk in messages.chunks(batch_size) {
             let json_values: Vec<&simd_json::OwnedValue> = chunk
                 .iter()
@@ -652,7 +671,7 @@ impl Sink for DorisSink {
                     Payload::Json(value) => Ok(value),
                     _ => {
                         error!(
-                            "Doris sink ID {} received non-JSON payload (schema={}); aborting batch",
+                            "Doris sink ID {} received non-JSON payload (schema={}); aborting poll",
                             self.id, messages_metadata.schema
                         );
                         Err(Error::InvalidPayloadType)
