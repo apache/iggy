@@ -142,10 +142,7 @@ async fn s3_sink_writes_jsonl_with_correct_layout(harness: &TestHarness, fixture
     server(connectors_runtime(config_path = "tests/connectors/s3/sink_rotation.toml")),
     seed = seeds::connector_stream
 )]
-async fn s3_sink_rotates_on_message_count(
-    harness: &TestHarness,
-    fixture: S3SinkRotationFixture,
-) {
+async fn s3_sink_rotates_on_message_count(harness: &TestHarness, fixture: S3SinkRotationFixture) {
     let client = harness.root_client().await.unwrap();
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
