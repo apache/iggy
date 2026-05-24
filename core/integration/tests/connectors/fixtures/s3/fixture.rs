@@ -79,13 +79,13 @@ pub trait S3SinkOps: Sync {
         key: &str,
     ) -> impl std::future::Future<Output = Result<Vec<u8>, TestBinaryError>> + Send {
         async move {
-            let response = self
-                .bucket()
-                .get_object(key)
-                .await
-                .map_err(|e| TestBinaryError::InvalidState {
-                    message: format!("Failed to get object '{key}': {e}"),
-                })?;
+            let response =
+                self.bucket()
+                    .get_object(key)
+                    .await
+                    .map_err(|e| TestBinaryError::InvalidState {
+                        message: format!("Failed to get object '{key}': {e}"),
+                    })?;
             Ok(response.to_vec())
         }
     }
@@ -211,8 +211,7 @@ impl TestFixture for S3SinkFixture {
         })?;
         info!(
             "S3 bucket '{}' ready (status: {})",
-            MINIO_BUCKET,
-            response.response_code
+            MINIO_BUCKET, response.response_code
         );
 
         let mut bucket = Bucket::new(MINIO_BUCKET, region, credentials).map_err(|e| {
