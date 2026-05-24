@@ -1161,4 +1161,121 @@ mod tests {
             "expected InvalidPayloadType, got {result:?}",
         );
     }
+
+    /// Drives a real 307 FE -> BE redirect through `send_stream_load` and
+    /// asserts the connector rebuilds the *full* Stream Load request on the
+    /// redirected hop. The BE mock only matches when every header is present
+    /// — crucially the `Authorization` header, which reqwest would otherwise
+    /// strip on a cross-host redirect — so a regression that drops a header
+    /// makes the BE mock miss, yielding a 404 and a failed assertion.
+    #[tokio::test]
+    async fn redirect_rebuilds_full_request_on_be() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let expected_auth = format!("Basic {}", general_purpose::STANDARD.encode("root:pw"));
+        // Same host + scheme as the FE, so `validate_redirect` permits it —
+        // this is the normal Doris FE -> BE topology.
+        let be_url = format!("{}/be/_stream_load", server.uri());
+
+        Mock::given(method("PUT"))
+            .and(path("/api/test_db/test_tbl/_stream_load"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", be_url.as_str()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("PUT"))
+            .and(path("/be/_stream_load"))
+            .and(header("authorization", expected_auth.as_str()))
+            .and(header("format", "json"))
+            .and(header("strip_outer_array", "true"))
+            .and(header("expect", "100-continue"))
+            .and(header("label", "iggy-test-label"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Status": "Success",
+                "Message": "OK",
+                "NumberLoadedRows": 1,
+                "NumberFilteredRows": 0,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cfg = make_config();
+        cfg.fe_url = server.uri();
+        let mut sink = DorisSink::new(1, cfg);
+        sink.open().await.expect("open should succeed");
+
+        let result = sink
+            .send_stream_load("iggy-test-label", Bytes::from_static(b"[{\"a\":1}]"))
+            .await;
+
+        assert!(
+            matches!(&result, Ok(r) if r.status == "Success"),
+            "expected Ok(Success) after redirect, got {result:?}",
+        );
+    }
+
+    /// A redirect loop must surface as a *permanent* error: retrying just
+    /// re-walks the loop. (Regression guard for the HttpRequestFailed ->
+    /// PermanentHttpError reclassification.)
+    #[tokio::test]
+    async fn redirect_loop_is_permanent_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut cfg = make_config();
+        cfg.fe_url = server.uri();
+        // Self-redirect: same host + scheme, so validate_redirect permits it,
+        // and the connector loops until MAX_REDIRECTS is exceeded.
+        let self_url = format!("{}/api/test_db/test_tbl/_stream_load", server.uri());
+
+        Mock::given(method("PUT"))
+            .and(path("/api/test_db/test_tbl/_stream_load"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", self_url.as_str()))
+            .mount(&server)
+            .await;
+
+        let mut sink = DorisSink::new(1, cfg);
+        sink.open().await.expect("open should succeed");
+        let result = sink
+            .send_stream_load("iggy-test-label", Bytes::from_static(b"[{\"a\":1}]"))
+            .await;
+
+        assert!(
+            matches!(&result, Err(Error::PermanentHttpError(_))),
+            "expected PermanentHttpError on redirect loop, got {result:?}",
+        );
+    }
+
+    /// A redirect with no usable `Location` is malformed and permanent.
+    #[tokio::test]
+    async fn redirect_without_location_is_permanent_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut cfg = make_config();
+        cfg.fe_url = server.uri();
+
+        Mock::given(method("PUT"))
+            .and(path("/api/test_db/test_tbl/_stream_load"))
+            .respond_with(ResponseTemplate::new(307)) // no Location header
+            .mount(&server)
+            .await;
+
+        let mut sink = DorisSink::new(1, cfg);
+        sink.open().await.expect("open should succeed");
+        let result = sink
+            .send_stream_load("iggy-test-label", Bytes::from_static(b"[{\"a\":1}]"))
+            .await;
+
+        assert!(
+            matches!(&result, Err(Error::PermanentHttpError(_))),
+            "expected PermanentHttpError on missing Location, got {result:?}",
+        );
+    }
 }
