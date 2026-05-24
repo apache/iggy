@@ -74,6 +74,11 @@ pub struct DorisSink {
     // every PUT (and every redirect hop). `columns`/`where` are already stored
     // as `String` in the config and borrowed directly, so they need no cache.
     max_filter_ratio_header: Option<String>,
+    // The parsed Stream Load URL, populated in `open()` (which already parses it
+    // to validate the config). Cached so `send_stream_load` neither re-parses it
+    // on every batch nor re-parses the current hop on every redirect, and so the
+    // redirect-validation baseline (original FE scheme/host) is a `Url` directly.
+    base_url: Option<reqwest::Url>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +155,7 @@ impl DorisSink {
             auth_header,
             stream_load_url,
             max_filter_ratio_header,
+            base_url: None,
         }
     }
 
@@ -217,21 +223,24 @@ impl DorisSink {
                 self.id
             ))
         })?;
-        let mut url = self.stream_load_url().to_string();
         // Baseline for redirect validation: every redirect target is checked
         // against the originally configured FE scheme/host before we re-attach
         // credentials, so a compromised FE cannot exfiltrate them via Location.
-        let base_url = reqwest::Url::parse(&url).map_err(|e| {
-            Error::PermanentHttpError(format!(
-                "Doris sink ID {} has unparsable stream load URL '{url}': {e}",
+        // Parsed once in `open()` and reused here so we don't re-parse per batch.
+        let base = self.base_url.as_ref().ok_or_else(|| {
+            Error::InitError(format!(
+                "Doris sink ID {} called before open() — base URL not initialized",
                 self.id
             ))
         })?;
+        // The current request target, carried as a parsed `Url` so each redirect
+        // hop can `join` a relative Location without re-parsing the source.
+        let mut url = base.clone();
         let mut redirects = 0u8;
 
         loop {
             let mut request = client
-                .request(Method::PUT, &url)
+                .request(Method::PUT, url.clone())
                 .header(header::AUTHORIZATION, self.auth_header.clone())
                 .header(header::EXPECT, "100-continue")
                 .header("format", "json")
@@ -285,14 +294,8 @@ impl DorisSink {
                 // Resolve Location (Doris returns absolute; fall back to joining
                 // a relative one onto the current URL) and validate the target
                 // before trusting it with credentials on the next iteration.
-                let current = reqwest::Url::parse(&url).map_err(|e| {
-                    Error::PermanentHttpError(format!(
-                        "Doris sink ID {} has unparsable redirect source '{url}': {e}",
-                        self.id
-                    ))
-                })?;
                 let target = reqwest::Url::parse(location)
-                    .or_else(|_| current.join(location))
+                    .or_else(|_| url.join(location))
                     .map_err(|e| {
                         Error::PermanentHttpError(format!(
                             "Doris sink ID {} got {status} with unparsable Location '{location}': {e}",
@@ -300,14 +303,14 @@ impl DorisSink {
                         ))
                     })?;
                 validate_redirect(
-                    &base_url,
+                    base,
                     &target,
                     self.config.allow_insecure_redirect.unwrap_or(false),
                     self.config.allowed_redirect_hosts.as_deref(),
                     self.id,
                 )?;
                 debug!("Doris sink ID {} following redirect to {target}", self.id);
-                url = target.to_string();
+                url = target;
                 continue;
             }
 
@@ -621,6 +624,9 @@ impl Sink for DorisSink {
         }
 
         self.client = Some(self.build_client()?);
+        // Cache the parsed URL so `send_stream_load` reuses it as the
+        // redirect-validation baseline instead of re-parsing on every batch.
+        self.base_url = Some(parsed_url);
 
         info!(
             "Opened Doris sink ID {} for {}.{} at {}",
@@ -679,10 +685,9 @@ impl Sink for DorisSink {
                 })
                 .collect::<Result<_, _>>()?;
 
-            if json_values.is_empty() {
-                continue;
-            }
-
+            // `chunks()` never yields an empty slice and every element maps to a
+            // value (or the `?` above already bailed), so `json_values` is always
+            // non-empty here — no empty-check needed before serializing.
             let body = match simd_json::to_vec(&json_values) {
                 Ok(b) => Bytes::from(b),
                 Err(e) => {
