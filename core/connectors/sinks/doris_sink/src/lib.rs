@@ -250,7 +250,10 @@ impl DorisSink {
             ) {
                 redirects += 1;
                 if redirects > MAX_REDIRECTS {
-                    return Err(Error::HttpRequestFailed(format!(
+                    // A redirect loop is a permanent protocol violation, not a
+                    // transient connectivity failure — retrying re-walks the
+                    // same loop. Surface it as permanent so it's not retried.
+                    return Err(Error::PermanentHttpError(format!(
                         "Doris sink ID {} exceeded max redirects ({MAX_REDIRECTS})",
                         self.id
                     )));
@@ -260,7 +263,10 @@ impl DorisSink {
                     .get(header::LOCATION)
                     .and_then(|v| v.to_str().ok())
                 else {
-                    return Err(Error::HttpRequestFailed(format!(
+                    // A redirect with no usable Location is malformed; retrying
+                    // won't produce one. Permanent, matching the unparsable-
+                    // Location cases below.
+                    return Err(Error::PermanentHttpError(format!(
                         "Doris sink ID {} got {status} with no Location header",
                         self.id
                     )));
