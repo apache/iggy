@@ -79,6 +79,14 @@ repos:
         files: ^foreign/python/(Cargo\.toml|pyproject\.toml)$
         pass_filenames: false
 
+      - id: python-interpreter-version-sync
+        name: python interpreter version sync
+        entry: ./scripts/ci/sync-python-version.sh
+        args: ["--fix"]
+        language: system
+        files: ^(scripts/ci/sync-python-version\.sh|foreign/python/(pyproject\.toml|pylock\.toml|Dockerfile\.test|README\.md|\.devcontainer/Dockerfile)|bdd/python/(pyproject\.toml|pylock\.toml)|examples/python/(pyproject\.toml|pylock\.toml)|\.github/actions/python-maturin/pre-merge/action\.yml|\.github/workflows/(_build_python_wheels|_test_examples|coverage-baseline)\.yml)$
+        pass_filenames: false
+
       - id: uv-lock-check
         name: uv lock check
         entry: ./scripts/ci/uv-lock-check.sh

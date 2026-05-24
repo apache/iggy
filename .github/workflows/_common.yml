@@ -48,6 +48,15 @@ jobs:
       - name: Check Python SDK versions are synchronized
         run: ./scripts/ci/python-sdk-version-sync.sh --check
 
+  python-interpreter-versions:
+    name: Check Python interpreter versions sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check Python interpreter versions are synchronized
+        run: ./scripts/ci/sync-python-version.sh --check
+
   version-consistency:
     name: Check version consistency
     runs-on: ubuntu-latest
@@ -268,6 +277,7 @@ jobs:
       [
         rust-versions,
         python-versions,
+        python-interpreter-versions,
         version-consistency,
         pr-title,
         license-headers,
@@ -309,6 +319,7 @@ jobs:
           # Always-run checks
           RUST_VERSIONS="${{ needs.rust-versions.result }}"
           PYTHON_VERSIONS="${{ needs.python-versions.result }}"
+          PYTHON_INTERPRETER_VERSIONS="${{ needs.python-interpreter-versions.result }}"
           VERSION_CONSISTENCY="${{ needs.version-consistency.result }}"
           LICENSE_HEADERS="${{ needs.license-headers.result }}"
           THIRD_PARTY_LICENSES="${{ needs.third-party-licenses.result }}"
@@ -328,6 +339,14 @@ jobs:
             echo "| ❌ Python SDK Versions | failure | Version mismatch between Cargo.toml and pyproject.toml |" >> $GITHUB_STEP_SUMMARY
           else
             echo "| ⏭️ Python SDK Versions | $PYTHON_VERSIONS | Check skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$PYTHON_INTERPRETER_VERSIONS" = "success" ]; then
+            echo "| ✅ Python Interpreter Versions | success | Python interpreter versions synchronized |" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$PYTHON_INTERPRETER_VERSIONS" = "failure" ]; then
+            echo "| ❌ Python Interpreter Versions | failure | Python interpreter version mismatch detected |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| ⏭️ Python Interpreter Versions | $PYTHON_INTERPRETER_VERSIONS | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
           if [ "$VERSION_CONSISTENCY" = "success" ]; then
