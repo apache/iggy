@@ -15,18 +15,57 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::metrics::{frame_drop_reason, frame_drop_variant};
 use crate::shards_table::{ShardsTable, calculate_shard_from_consensus_ns};
-use crate::{IggyShard, Receiver, ShardFrame};
+use crate::{IggyShard, LifecycleFrame, Receiver, ShardFrame};
 use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{
-    ConsensusError, ConsensusHeader, GenericHeader, Message, MessageBag, PrepareHeader,
+    ConsensusHeader, GenericHeader, Message, MessageBag, Operation, PrepareHeader,
 };
-use iggy_common::sharding::IggyNamespace;
+use iggy_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
+
+/// Decompose a [`MessageBag`] into the routing-relevant tuple
+/// `(operation, namespace, generic_message)`.
+///
+/// Single source of truth used by every dispatch entry point so the
+/// operation / namespace extraction never drifts between call sites.
+fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) {
+    match bag {
+        MessageBag::Request(r) => {
+            let h = *r.header();
+            (h.operation, h.namespace, r.into_generic())
+        }
+        MessageBag::Prepare(p) => {
+            let h = *p.header();
+            (h.operation, h.namespace, p.into_generic())
+        }
+        MessageBag::PrepareOk(p) => {
+            let h = *p.header();
+            (h.operation, h.namespace, p.into_generic())
+        }
+        MessageBag::StartViewChange(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::DoViewChange(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::StartView(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+        MessageBag::Commit(m) => {
+            let h = *m.header();
+            (h.operation(), h.namespace, m.into_generic())
+        }
+    }
+}
 
 /// Inter-shard dispatch logic.
 ///
@@ -34,18 +73,28 @@ use metadata::stm::StateMachine;
 /// through the channel into the target shard's message pump.  This ensures
 /// that every mutation on a shard is serialized through a single point (the
 /// pump), preventing concurrent access from independent async tasks.
-impl<B, MJ, S, M, T, R> IggyShard<B, MJ, S, M, T, R>
+impl<B, MJ, S, M, T> IggyShard<B, MJ, S, M, T>
 where
     B: MessageBus + ConnectionInstaller,
     T: ShardsTable,
-    R: Send + 'static,
 {
-    /// Classify a raw network message and route it to
-    /// the correct shard's message pump.
-    ///
-    /// Decomposes the generic message into its typed form (Request, Prepare,
-    /// or `PrepareOk`) to access the operation and namespace, then resolves
-    /// the target shard and enqueues the message via its channel sender.
+    /// Network-receive entry point. Classifies the raw
+    /// `Message<GenericHeader>` and routes it to the owning shard via
+    /// `route_typed`.
+    //
+    // TODO(hubcio): perf - this `MessageBag::try_from` is run twice per
+    // consensus frame: once here to extract (operation, namespace) for
+    // routing, and a second time on the receiving shard inside `on_message`
+    // (lib.rs ~560) to dispatch to the correct on_* handler. The second
+    // parse re-runs `bytemuck::checked::try_from_bytes` + per-header
+    // `validate()` on bytes already validated upstream. Measured ~50 ns/
+    // frame; at 1M ops/sec/shard ~ 50 ms/sec/shard of pure re-validation.
+    //
+    // Fix: thread the classified bag through `ShardFrame::Consensus` (carry
+    // `MessageBag` instead of `Message<GenericHeader>`) so the inbox path
+    // matches directly with no second parse. Consensus variant grows from
+    // ~24 B to ~32 B, but `ShardFrame` total stays at 160 B (LifecycleFrame
+    // drives the union size).
     pub fn dispatch(&self, message: Message<GenericHeader>) {
         let bag = match MessageBag::try_from(message) {
             Ok(bag) => bag,
@@ -54,42 +103,55 @@ where
                 return;
             }
         };
-        let (operation, namespace, generic) = match bag {
-            MessageBag::Request(r) => {
-                let h = *r.header();
-                (h.operation, h.namespace, r.into_generic())
-            }
-            MessageBag::Prepare(p) => {
-                let h = *p.header();
-                (h.operation, h.namespace, p.into_generic())
-            }
-            MessageBag::PrepareOk(p) => {
-                let h = *p.header();
-                (h.operation, h.namespace, p.into_generic())
-            }
-            MessageBag::StartViewChange(m) => {
-                let h = *m.header();
-                (h.operation(), h.namespace, m.into_generic())
-            }
-            MessageBag::DoViewChange(m) => {
-                let h = *m.header();
-                (h.operation(), h.namespace, m.into_generic())
-            }
-            MessageBag::StartView(m) => {
-                let h = *m.header();
-                (h.operation(), h.namespace, m.into_generic())
-            }
-            MessageBag::Commit(m) => {
-                let h = *m.header();
-                (h.operation(), h.namespace, m.into_generic())
-            }
-        };
-        let raw_namespace = namespace;
-        let partition_namespace = IggyNamespace::from_raw(raw_namespace);
-        let target = if operation.is_metadata() {
-            0
-        } else if operation.is_partition() {
+        let (operation, namespace, generic) = extract_routing(bag);
+        self.route_typed(operation, namespace, generic);
+    }
+
+    /// Route a consensus-control message (`StartViewChange`, `DoViewChange`,
+    /// `StartView`, `Commit`) by hashing its raw `u64` consensus namespace.
+    /// Every node uses the same hash so the shard owning the consensus
+    /// group is deterministic across the cluster.
+    pub(crate) fn route_consensus_control(
+        &self,
+        message: Message<GenericHeader>,
+        namespace_u64: u64,
+        operation: Operation,
+    ) {
+        let target = calculate_shard_from_consensus_ns(namespace_u64, self.shard_count);
+        self.try_send_to_target(target, message, operation);
+    }
+
+    /// Branch on operation class to pick the right routing rule. Used by
+    /// [`Self::dispatch`].
+    ///
+    /// Three classes:
+    /// 1. `is_metadata`: metadata data-plane operation, owned by shard 0.
+    /// 2. `is_partition`: partition data-plane operation, owned by the
+    ///    shard that the `IggyNamespace -> shard_id` table assigns.
+    /// 3. `is_vsr_reserved` (`Reserved` / `Register`): VSR control-plane
+    ///    frame (`StartViewChange`, `DoViewChange`, `StartView`, `Commit`)
+    ///    or a client `Register` request. The owning consensus group is
+    ///    identified by `namespace_u64`:
+    ///    - `METADATA_CONSENSUS_NAMESPACE` -> shard 0.
+    ///    - packable `IggyNamespace::inner()` -> the shard owning that
+    ///      partition's consensus group.
+    fn route_typed(
+        &self,
+        operation: Operation,
+        namespace_u64: u64,
+        generic: Message<GenericHeader>,
+    ) {
+        if operation.is_metadata() {
+            self.try_send_to_target(0, generic, operation);
+            return;
+        }
+        if operation.is_partition() {
+            let partition_namespace = IggyNamespace::from_raw(namespace_u64);
             let Some(target) = self.shards_table.shard_for(partition_namespace) else {
+                self.metrics.record_frame_drop(
+                    frame_drop_variant::PARTITION,
+                    frame_drop_reason::UNROUTABLE,
+                );
                 tracing::error!(
                     shard = self.id,
                     stream = partition_namespace.stream_id(),
@@ -99,26 +161,51 @@ where
                 );
                 return;
             };
-            target
-        } else {
-            // View-change / Commit messages carry an opaque u64 consensus
-            // namespace (not an `IggyNamespace`). Hash it with the same
-            // function the partition-plane lookup table uses so the
-            // shard owning the consensus group is deterministically the
-            // same across every node. Single-shard deployments trivially
-            // collapse to 0.
-            #[allow(clippy::cast_lossless)]
-            let shard_count = u32::try_from(self.senders.len()).unwrap_or(u32::MAX);
-            calculate_shard_from_consensus_ns(raw_namespace, shard_count)
+            self.try_send_to_target(target, generic, operation);
+            return;
+        }
+        debug_assert!(
+            operation.is_vsr_reserved(),
+            "route_typed: operation {operation:?} fell through unclassified; \
+             expected is_metadata / is_partition / is_vsr_reserved"
+        );
+        if namespace_u64 == METADATA_CONSENSUS_NAMESPACE {
+            self.try_send_to_target(0, generic, operation);
+            return;
+        }
+        self.route_consensus_control(generic, namespace_u64, operation);
+    }
+
+    /// Send `message` into `senders[target]`. Honors the `io_uring` reactor
+    /// constraint: never blocks; drops on `Full` / `Disconnected` and
+    /// records the drop in `frame_drops_total{variant=consensus}`. VSR
+    /// retransmit recovers consensus drops. A `target` past the end of
+    /// `senders` (a stored `u16` from `shard_for`, not a trusted index)
+    /// is dropped with `reason=unroutable` rather than panicking.
+    /// Metadata frames always pass `target = 0` here, since `is_metadata`
+    /// operations are owned by shard 0.
+    fn try_send_to_target(
+        &self,
+        target: u16,
+        message: Message<GenericHeader>,
+        operation: Operation,
+    ) {
+        let Some(sender) = self.senders.get(target as usize) else {
+            self.metrics
+                .record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::UNROUTABLE);
+            tracing::error!(
+                shard = self.id,
+                target,
+                ?operation,
+                "dispatch: target shard id out of range, message dropped"
+            );
+            return;
         };
-        // `senders[target]` is a `crossfire::MTx`, which in compio is
-        // running on an io_uring reactor: a blocking `send` on a full
-        // inbox would park the reactor thread and stall every other
-        // connection on the shard. Drop instead - consensus recovers via
-        // WAL retransmit or a view change.
-        match self.senders[target as usize].try_send(ShardFrame::fire_and_forget(generic)) {
+        match sender.try_send(ShardFrame::consensus(target, message)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
+                self.metrics
+                    .record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::FULL);
                 tracing::warn!(
                     shard = self.id,
                     target,
@@ -127,6 +214,10 @@ where
                 );
             }
             Err(TrySendError::Disconnected(_)) => {
+                self.metrics.record_frame_drop(
+                    frame_drop_variant::CONSENSUS,
+                    frame_drop_reason::DISCONNECTED,
+                );
                 tracing::warn!(
                     shard = self.id,
                     target,
@@ -137,106 +228,9 @@ where
         }
     }
 
-    /// Dispatch a message and return a receiver that resolves when the target
-    /// shard has finished processing it.
-    ///
-    /// # Errors
-    /// Returns `ConsensusError` if the message cannot be routed.
-    pub fn dispatch_request(
-        &self,
-        message: Message<GenericHeader>,
-    ) -> Result<Receiver<R>, ConsensusError> {
-        let bag = MessageBag::try_from(message)?;
-        let (operation, namespace, generic) = match bag {
-            MessageBag::Request(r) => {
-                let h = *r.header();
-                (h.operation, h.namespace, r.into_generic())
-            }
-            MessageBag::Prepare(p) => {
-                let h = *p.header();
-                (h.operation, h.namespace, p.into_generic())
-            }
-            MessageBag::PrepareOk(p) => {
-                let h = *p.header();
-                (h.operation, h.namespace, p.into_generic())
-            }
-            MessageBag::StartViewChange(m) => {
-                let h = *m.header();
-                (h.operation(), h.namespace, m.into_generic())
-            }
-            MessageBag::DoViewChange(m) => {
-                let h = *m.header();
-                (h.operation(), h.namespace, m.into_generic())
-            }
-            MessageBag::StartView(m) => {
-                let h = *m.header();
-                (h.operation(), h.namespace, m.into_generic())
-            }
-            MessageBag::Commit(m) => {
-                let h = *m.header();
-                (h.operation(), h.namespace, m.into_generic())
-            }
-        };
-        let raw_namespace = namespace;
-        let partition_namespace = IggyNamespace::from_raw(raw_namespace);
-
-        // Determine which shard should handle a message given its operation and
-        // namespace.
-        //
-        // - Metadata operations always route to shard 0 (the control plane).
-        // - Partition operations route to the shard that owns the namespace,
-        //   looked up via the [`ShardsTable`].
-        // - Consensus control-plane (`StartViewChange`, `DoViewChange`,
-        //   `StartView`, `Commit`) carries a raw `u64` consensus namespace;
-        //   route it via a deterministic hash function so every node agrees
-        //   on the owning shard without consulting the partitions table.
-        let target = if operation.is_metadata() {
-            0
-        } else if operation.is_partition() {
-            self.shards_table
-                .shard_for(partition_namespace)
-                .ok_or_else(|| {
-                    ConsensusError::InvalidField(format!(
-                        "namespace {raw_namespace} is not registered in shards_table"
-                    ))
-                })?
-        } else {
-            #[allow(clippy::cast_lossless)]
-            let shard_count = u32::try_from(self.senders.len()).unwrap_or(u32::MAX);
-            calculate_shard_from_consensus_ns(raw_namespace, shard_count)
-        };
-        // Create a frame and send it to the target shard. Same non-
-        // blocking `try_send` reason as `dispatch` above: blocking on a
-        // full inbox would park the io_uring reactor.
-        //
-        // On `Full` / `Disconnected` we drop the frame and let the
-        // caller's `rx` observe the disconnect (the `response_sender`
-        // inside the frame is dropped together with the frame). Callers
-        // see an early error rather than hanging.
-        let (frame, rx) = ShardFrame::<R>::with_response(generic);
-        match self.senders[target as usize].try_send(frame) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                tracing::warn!(
-                    shard = self.id,
-                    target,
-                    ?operation,
-                    "dispatch_request: shard inbox full, message dropped"
-                );
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                tracing::warn!(
-                    shard = self.id,
-                    target,
-                    ?operation,
-                    "dispatch_request: shard inbox closed, message dropped"
-                );
-            }
-        }
-        Ok(rx)
-    }
-
-    /// Drain this shard's inbox and process each frame locally.
+    /// Drain this shard's inbox and process each frame locally until the
+    /// `stop` signal fires or the inbox disconnects, then drain any frames
+    /// still queued so in-flight requests still get a response.
     #[allow(clippy::future_not_send)]
     pub async fn run_message_pump(&self, stop: Receiver<()>)
     where
@@ -253,15 +247,20 @@ where
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
-        let mut loopback_buf = Vec::new();
+        // Reused across every pump iteration; pre-size to skip the
+        // first-drain reallocation.
+        let mut loopback_buf = Vec::with_capacity(64);
+        let mut namespace_scratch: Vec<IggyNamespace> = Vec::with_capacity(64);
         loop {
             futures::select! {
                 _ = stop.recv().fuse() => break,
                 frame = self.inbox.recv().fuse() => {
                     match frame {
                         Ok(frame) => {
-                            self.process_frame(frame).await;
-                            self.process_loopback(&mut loopback_buf).await;
+                            if self.accept_frame_for_self(&frame) {
+                                self.process_frame(frame).await;
+                                self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
+                            }
                         }
                         Err(_) => break,
                     }
@@ -271,13 +270,49 @@ where
 
         // Drain remaining frames so in-flight requests get a response.
         while let Ok(frame) = self.inbox.try_recv() {
-            self.process_frame(frame).await;
-            self.process_loopback(&mut loopback_buf).await;
+            if self.accept_frame_for_self(&frame) {
+                self.process_frame(frame).await;
+                self.process_loopback(&mut loopback_buf, &mut namespace_scratch)
+                    .await;
+            }
         }
     }
 
+    /// Sanity check at pump entry: every Consensus frame routed through
+    /// [`Self::dispatch`] must land on the shard whose `id` matches the
+    /// `target_shard` the sender stamped on the frame. The ctor
+    /// `assert_sender_ordering` proves `senders[i].shard_id() == i`, but
+    /// only checks the sender vec - it cannot catch a receiver moved to
+    /// the wrong runtime. This check closes that gap. Non-Consensus
+    /// frames are always accepted; a Consensus frame stamped for a
+    /// *different* shard fires a `debug_assert_eq!` in test/debug builds
+    /// and is logged + dropped in release. Returns `true` when the frame
+    /// may be processed, `false` when it must be dropped.
+    fn accept_frame_for_self(&self, frame: &ShardFrame) -> bool {
+        let ShardFrame::Consensus { target_shard, .. } = frame else {
+            return true;
+        };
+        if *target_shard == self.id {
+            return true;
+        }
+        debug_assert_eq!(
+            *target_shard, self.id,
+            "shard {} pump received Consensus frame whose target_shard={target_shard}; \
+             senders/runtime incorrectly bound",
+            self.id
+        );
+        self.metrics
+            .record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::MISROUTED);
+        tracing::error!(
+            shard = self.id,
+            target_shard,
+            "Consensus frame routed to wrong shard; dropping frame to preserve safety"
+        );
+        false
+    }
+
     #[allow(clippy::future_not_send)]
-    async fn process_frame(&self, frame: ShardFrame<R>)
+    async fn process_frame(&self, frame: ShardFrame)
     where
         B: MessageBus,
         MJ: JournalHandle,
@@ -292,11 +327,21 @@ where
                 Error = iggy_common::IggyError,
             > + StreamsFrontend,
     {
-        match frame.payload {
-            crate::ShardFramePayload::Consensus(message) => {
+        match frame {
+            ShardFrame::Consensus { message, .. } => {
                 self.on_message(message).await;
             }
-            crate::ShardFramePayload::ReplicaConnectionSetup { fd, replica_id } => {
+            ShardFrame::Lifecycle(payload) => self.process_lifecycle(payload).await,
+        }
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn process_lifecycle(&self, payload: LifecycleFrame)
+    where
+        B: MessageBus,
+    {
+        match payload {
+            LifecycleFrame::ReplicaConnectionSetup { fd, replica_id } => {
                 tracing::info!(
                     shard = self.id,
                     replica_id,
@@ -306,7 +351,7 @@ where
                 self.bus
                     .install_replica_tcp_fd(fd, replica_id, self.on_replica_message.clone());
             }
-            crate::ShardFramePayload::ClientConnectionSetup { fd, meta } => {
+            LifecycleFrame::ClientConnectionSetup { fd, meta } => {
                 tracing::info!(
                     shard = self.id,
                     client_id = meta.client_id,
@@ -316,7 +361,7 @@ where
                 self.bus
                     .install_client_fd(fd, meta, self.on_client_request.clone());
             }
-            crate::ShardFramePayload::ClientWsConnectionSetup { fd, meta } => {
+            LifecycleFrame::ClientWsConnectionSetup { fd, meta } => {
                 tracing::info!(
                     shard = self.id,
                     client_id = meta.client_id,
@@ -326,18 +371,7 @@ where
                 self.bus
                     .install_client_ws_fd(fd, meta, self.on_client_request.clone());
             }
-            crate::ShardFramePayload::ReplicaMappingUpdate {
-                replica_id,
-                owning_shard,
-            } => {
-                self.bus.set_shard_mapping(replica_id, owning_shard);
-            }
-            crate::ShardFramePayload::ReplicaMappingClear { replica_id } => {
-                self.bus.remove_shard_mapping(replica_id);
-            }
-            crate::ShardFramePayload::ForwardReplicaSend { replica_id, msg } => {
-                // Fast path on the owning shard: re-enter `send_to_replica`
-                // which finds the local `BusSender` in the replicas registry.
+            LifecycleFrame::ForwardReplicaSend { replica_id, msg } => {
                 if let Err(e) = self.bus.send_to_replica(replica_id, msg).await {
                     tracing::debug!(
                         shard = self.id,
@@ -347,9 +381,18 @@ where
                     );
                 }
             }
-            crate::ShardFramePayload::ForwardClientSend { client_id, msg } => {
+            LifecycleFrame::ForwardClientSend { client_id, msg } => {
                 if let Err(e) = self.bus.send_to_client(client_id, msg).await {
-                    tracing::debug!(
+                    // Terminal per `SendError` docs: the client never
+                    // receives the reply and request / response semantics
+                    // break above the bus. Bump the receiver-side counter
+                    // (sender side already bumps in `builder.rs`) and raise
+                    // to `warn!` so it surfaces in default operator logs.
+                    self.metrics.record_frame_drop(
+                        frame_drop_variant::FORWARD_CLIENT_SEND,
+                        frame_drop_reason::DELIVERY_FAILED,
+                    );
+                    tracing::warn!(
                         shard = self.id,
                         client_id,
                         error = ?e,
@@ -357,35 +400,6 @@ where
                     );
                 }
             }
-            crate::ShardFramePayload::ConnectionLost { replica_id } => {
-                // Shard 0 is the sole responder; the next reconnect sweep
-                // will re-dial the peer. Non-zero shards should not see this
-                // variant.
-                if self.id == 0 {
-                    tracing::warn!(replica_id, "shard 0 observed replica connection loss");
-                    // If a coordinator is attached, let it broadcast the
-                    // clear AND drop its tracked mapping so the periodic
-                    // refresh task stops re-broadcasting a dead replica's
-                    // mapping. Tests that bypass the coordinator fall back
-                    // to the direct broadcast.
-                    if let Some(coord) = &self.coordinator {
-                        coord.forget_mapping(replica_id);
-                        coord.broadcast_mapping_clear(replica_id);
-                    } else {
-                        crate::broadcast_mapping_clear(&self.senders, replica_id);
-                    }
-                } else {
-                    tracing::warn!(
-                        shard = self.id,
-                        replica_id,
-                        "non-zero shard received ConnectionLost; dropping"
-                    );
-                }
-            }
         }
-        // TODO: once on_message returns an R (e.g. ShardResponse), send it
-        // back via frame.response_sender.  For now the sender is dropped and
-        // the caller's receiver will observe a disconnect.
-        drop(frame.response_sender);
     }
 }

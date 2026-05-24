@@ -41,7 +41,7 @@ use tracing::warn;
 ///
 /// `TCP_NODELAY` is applied pre-handshake for symmetry with
 /// [`super::tcp_tls::install_client_tcp_tls`]. `SO_KEEPALIVE` is
-/// intentionally NOT set; see [`crate::socket_opts`].
+/// intentionally NOT set; see `socket_opts`.
 ///
 /// WSS is shard-0 terminal for the same reasons as the TCP-TLS plane;
 /// see [`super::tcp_tls::install_client_tcp_tls`] for the rustls

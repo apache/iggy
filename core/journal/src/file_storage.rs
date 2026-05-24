@@ -31,7 +31,8 @@ pub struct FileStorage {
 
 #[allow(clippy::future_not_send)]
 impl FileStorage {
-    /// Open or create the file at `path`, setting `write_offset` to current file length.
+    /// Open or create the file at `path` in read-write mode, setting
+    /// `write_offset` to current file length.
     ///
     /// # Errors
     /// Returns an I/O error if the file cannot be opened or created.

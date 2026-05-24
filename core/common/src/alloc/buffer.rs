@@ -346,3 +346,168 @@ impl IoBufMut for PooledBuffer {
         unsafe { std::slice::from_raw_parts_mut(ptr, cap) }
     }
 }
+
+#[cfg(test)]
+mod miri_tests {
+    //! Miri targets the 3 unsafe sites: `IoBufMut::as_uninit`
+    //! (`from_raw_parts_mut` ptr cast), `SetLen::set_len`, `split_to`
+    //! (`ptr::copy` forward-overlap + `set_len`).
+    //!
+    //! Pool-free helper avoids the global `MEMORY_POOL` (a `OnceCell` whose
+    //! `ArrayQueue` buckets leak under Miri) and `serial_test` (pulls
+    //! `sdd`/`scc` with int→ptr casts rejected by `-Zmiri-strict-provenance`).
+    //! `split_to` tests need the pool internally; gated `#[cfg(not(miri))]`.
+
+    use super::*;
+    use aligned_vec::{AVec, ConstAlign};
+
+    /// Build `PooledBuffer` with `from_pool == false` to skip the global pool.
+    fn pool_free_with_capacity(cap: usize) -> PooledBuffer {
+        let v: AVec<u8, ConstAlign<ALIGNMENT>> = AVec::with_capacity(ALIGNMENT, cap);
+        PooledBuffer::from_existing(v)
+    }
+
+    // IoBufMut::as_uninit
+
+    #[test]
+    fn as_uninit_returns_slice_of_full_capacity() {
+        let mut buf = pool_free_with_capacity(256);
+        let cap_before = buf.capacity();
+        let uninit = buf.as_uninit();
+        assert_eq!(
+            uninit.len(),
+            cap_before,
+            "as_uninit must expose the full capacity, not just initialized len",
+        );
+    }
+
+    #[test]
+    fn as_uninit_pointer_is_4096_aligned() {
+        let mut buf = pool_free_with_capacity(8192);
+        let addr = buf.as_uninit().as_mut_ptr() as usize;
+        assert_eq!(addr % ALIGNMENT, 0);
+    }
+
+    #[test]
+    fn as_uninit_write_then_set_len_observes_writes() {
+        let mut buf = pool_free_with_capacity(128);
+        {
+            let uninit = buf.as_uninit();
+            for (i, slot) in uninit.iter_mut().take(16).enumerate() {
+                slot.write(u8::try_from(i).unwrap());
+            }
+        }
+        // SAFETY: 16 bytes initialized above.
+        unsafe { <PooledBuffer as SetLen>::set_len(&mut buf, 16) };
+        assert_eq!(
+            buf.as_init(),
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+    }
+
+    // SetLen::set_len
+
+    #[test]
+    fn set_len_to_full_capacity_after_uninit_fill() {
+        // Fill entire capacity then `set_len(cap)`: Miri verifies every
+        // byte initialized before read via `as_init()`.
+        let mut buf = pool_free_with_capacity(256);
+        let cap = buf.capacity();
+        {
+            let uninit = buf.as_uninit();
+            assert_eq!(uninit.len(), cap);
+            for (i, slot) in uninit.iter_mut().enumerate() {
+                slot.write(u8::try_from(i & 0xff).unwrap());
+            }
+        }
+        // SAFETY: 0..cap initialized above.
+        unsafe { <PooledBuffer as SetLen>::set_len(&mut buf, cap) };
+        assert_eq!(buf.len(), cap);
+        assert_eq!(buf.as_init()[0], 0);
+        assert_eq!(
+            buf.as_init()[cap - 1],
+            u8::try_from((cap - 1) & 0xff).unwrap()
+        );
+    }
+
+    // split_to: `ptr::copy` (forward-overlap capable) + `set_len`.
+    // Needs global pool; skip Miri (ArrayQueue retention reads as leak,
+    // serial_test fails strict-provenance).
+
+    #[cfg(not(miri))]
+    mod split_to {
+        use super::*;
+        use crate::IggyByteSize;
+        use crate::alloc::memory_pool::{MemoryPool, MemoryPoolConfigOther};
+        use serial_test::serial;
+        use std::str::FromStr;
+        use std::sync::Once;
+
+        static MIRI_POOL_INIT: Once = Once::new();
+
+        fn init_pool_for_split_to_tests() {
+            MIRI_POOL_INIT.call_once(|| {
+                let config = MemoryPoolConfigOther {
+                    enabled: true,
+                    size: IggyByteSize::from_str("64MiB").unwrap(),
+                    bucket_capacity: 16,
+                };
+                MemoryPool::init_pool(&config);
+            });
+        }
+
+        #[test]
+        #[serial(memory_pool)]
+        fn basic_split() {
+            init_pool_for_split_to_tests();
+            let mut buf = pool_free_with_capacity(64);
+            buf.extend_from_slice(b"abcdefghij");
+            let prefix = buf.split_to(4);
+            assert_eq!(prefix.as_ref(), b"abcd");
+            assert_eq!(buf.as_ref(), b"efghij");
+        }
+
+        #[test]
+        #[serial(memory_pool)]
+        fn at_zero_yields_empty_prefix_and_unchanged_self() {
+            init_pool_for_split_to_tests();
+            let mut buf = pool_free_with_capacity(32);
+            buf.extend_from_slice(b"abcd");
+            let prefix = buf.split_to(0);
+            assert!(prefix.is_empty());
+            assert_eq!(buf.as_ref(), b"abcd");
+        }
+
+        #[test]
+        #[serial(memory_pool)]
+        fn at_len_yields_full_prefix_and_empty_self() {
+            init_pool_for_split_to_tests();
+            let mut buf = pool_free_with_capacity(32);
+            buf.extend_from_slice(b"abcd");
+            let prefix = buf.split_to(4);
+            assert_eq!(prefix.as_ref(), b"abcd");
+            assert!(buf.is_empty());
+        }
+
+        #[test]
+        #[serial(memory_pool)]
+        fn forward_overlap_preserves_bytes() {
+            // at=2, len=8: source [2..8) overlaps destination [0..6).
+            // `ptr::copy` handles overlap; `copy_nonoverlapping` would be UB.
+            init_pool_for_split_to_tests();
+            let mut buf = pool_free_with_capacity(32);
+            buf.extend_from_slice(b"ABCDEFGH");
+            let prefix = buf.split_to(2);
+            assert_eq!(prefix.as_ref(), b"AB");
+            assert_eq!(buf.as_ref(), b"CDEFGH");
+        }
+    }
+
+    // Drop short-circuit for `from_pool == false`. Miri leak detector enforces.
+    #[test]
+    fn pool_free_buffer_drop_does_not_leak() {
+        let mut buf = pool_free_with_capacity(256);
+        buf.extend_from_slice(&[0xaa; 200]);
+        drop(buf);
+    }
+}

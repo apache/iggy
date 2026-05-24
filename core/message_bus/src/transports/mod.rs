@@ -70,7 +70,7 @@
 //! - fd-delegation (`F_DUPFD_CLOEXEC`) stays TCP-only and lives outside
 //!   this trait (see [`crate::fd_transfer`]). Other transports terminate
 //!   on shard 0 and forward `Frozen<MESSAGE_ALIGN>` over the inter-shard
-//!   flume via [`crate::ShardForwardFn`].
+//!   crossfire channel via [`crate::ReplicaForwardFn`] / [`crate::ClientForwardFn`].
 //!
 //! Per-transport impls live in
 //! `transports/{tcp,tcp_tls,ws,wss,quic}.rs`.

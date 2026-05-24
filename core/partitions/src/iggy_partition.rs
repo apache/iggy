@@ -1416,14 +1416,14 @@ where
                     .send_to_client(prepare_header.client, reply_buffers)
                     .await
                 {
-                    warn!(
+                    tracing::error!(
                         target: "iggy.partitions.diag",
                         plane = "partitions",
                         client = prepare_header.client,
                         op = prepare_header.op,
                         namespace_raw,
                         %error,
-                        "failed to send reply to client"
+                        "client reply forward failed, no retransmit path; client will time out",
                     );
                 }
             }
