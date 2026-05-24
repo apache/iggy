@@ -38,7 +38,7 @@ concurrency:
 
 jobs:
   unmark:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 2
     if: contains(github.event.pull_request.labels.*.name, 'S-stale')
     steps:

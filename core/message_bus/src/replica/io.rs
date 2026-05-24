@@ -207,7 +207,7 @@ pub async fn start_on_shard_zero(
     );
 
     let (replica_listener, replica_bound) = bind_replica_listener(replica_listen_addr).await?;
-    let (clients_listener, client_bound) = client_listener::tcp::bind(client_listen_addr)?;
+    let (clients_listener, client_bound) = client_listener::tcp::bind(client_listen_addr).await?;
 
     let token_for_replica = bus.token();
     let on_accepted_replica_for_listener = on_accepted_replica.clone();
@@ -236,7 +236,7 @@ pub async fn start_on_shard_zero(
 
     let ws_bound = match (ws_listen_addr, on_accepted_ws_client) {
         (Some(addr), Some(on_accepted_ws)) => {
-            let (ws_listener, ws_bound) = client_listener::ws::bind(addr)?;
+            let (ws_listener, ws_bound) = client_listener::ws::bind(addr).await?;
             let token_for_ws = bus.token();
             let ws_handle = compio::runtime::spawn(async move {
                 client_listener::ws::run(ws_listener, token_for_ws, on_accepted_ws).await;

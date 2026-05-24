@@ -20,7 +20,7 @@
 //! Runs only on shard 0. The accept loop performs no protocol work
 //! beyond `TcpListener::accept`: every accepted stream is handed
 //! verbatim to the supplied callback, which dups the fd and ships a
-//! `ShardFramePayload::ClientWsConnectionSetup` frame to the
+//! `shard::LifecycleFrame::ClientWsConnectionSetup` frame to the
 //! round-robin-selected target shard. The HTTP-Upgrade handshake runs
 //! on the owning shard inside
 //! [`crate::ConnectionInstaller::install_client_ws_fd`]; no
@@ -30,14 +30,13 @@
 //! well-defined. The WS state machine only materialises after the
 //! upgrade, on the owning shard, where it can stay non-`Send`.
 //!
-//! `ShardFramePayload::ClientWsConnectionSetup` is defined in
+//! `shard::LifecycleFrame::ClientWsConnectionSetup` is defined in
 //! `core/shard/src/lib.rs`; the rustdoc cannot intra-link across crates
 //! without pulling `shard` in as a doc-only dep.
 
 use crate::AcceptedWsClientFn;
 use crate::lifecycle::ShutdownToken;
-use crate::socket_opts::bind_reusable_tcp_listener;
-use compio::net::TcpListener;
+use compio::net::{SocketOpts, TcpListener};
 use futures::FutureExt;
 use iggy_common::IggyError;
 use std::net::SocketAddr;
@@ -48,7 +47,7 @@ use tracing::{debug, error, info};
 ///
 /// Mirrors [`crate::client_listener::tcp::bind`] in shape: `TCP_NODELAY`
 /// on by default; `SO_KEEPALIVE` intentionally NOT set (see
-/// [`crate::socket_opts`]). The receiving shard re-applies socket
+/// `socket_opts`). The receiving shard re-applies socket
 /// options on the dup'd fd via the existing client-install path, so
 /// kernel-level options propagate end-to-end.
 ///
@@ -56,8 +55,13 @@ use tracing::{debug, error, info};
 ///
 /// Returns [`IggyError::CannotBindToSocket`] if the bind fails.
 #[allow(clippy::future_not_send)]
-pub fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyError> {
-    let listener = bind_reusable_tcp_listener(addr)
+pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyError> {
+    // `SO_REUSEPORT` intentionally not set: only shard 0 binds the WS
+    // listener. The shard-0 coordinator round-robins accepts to owning
+    // shards via `shard::LifecycleFrame::ClientWsConnectionSetup`.
+    let opts = SocketOpts::new().nodelay(true);
+    let listener = TcpListener::bind_with_options(addr, &opts)
+        .await
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
     let actual = listener
         .local_addr()

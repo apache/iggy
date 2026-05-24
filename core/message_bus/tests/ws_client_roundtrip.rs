@@ -67,7 +67,7 @@ async fn handshake_succeeds_and_round_trip_completes() {
         .detach();
     });
 
-    let (listener, server_addr) = bind(loopback()).expect("bind");
+    let (listener, server_addr) = bind(loopback()).await.expect("bind");
     let token = bus.token();
     let on_accepted = install_ws_clients_locally(bus.clone(), on_request);
     let accept_handle = compio::runtime::spawn(async move {
@@ -124,7 +124,7 @@ async fn handshake_succeeds_without_subprotocol_header() {
     let bus = Rc::new(IggyMessageBus::new(0));
     let on_request: RequestHandler = Rc::new(|_, _| {});
 
-    let (listener, server_addr) = bind(loopback()).expect("bind");
+    let (listener, server_addr) = bind(loopback()).await.expect("bind");
     let token = bus.token();
     let on_accepted = install_ws_clients_locally(bus.clone(), on_request);
     let accept_handle = compio::runtime::spawn(async move {

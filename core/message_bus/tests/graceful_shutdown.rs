@@ -32,7 +32,7 @@ use std::time::Duration;
 async fn drains_all_clients_within_timeout() {
     let bus = Rc::new(IggyMessageBus::new(0));
     let on_request: RequestHandler = Rc::new(|_, _| {});
-    let (listener, addr) = bind(loopback()).unwrap();
+    let (listener, addr) = bind(loopback()).await.unwrap();
 
     let token = bus.token();
     let accept_delegate = install_clients_locally(bus.clone(), on_request);
@@ -87,7 +87,7 @@ async fn drains_all_clients_within_timeout() {
 async fn connection_drain_precedes_slow_background() {
     let bus = Rc::new(IggyMessageBus::new(0));
     let on_request: RequestHandler = Rc::new(|_, _| {});
-    let (listener, addr) = bind(loopback()).unwrap();
+    let (listener, addr) = bind(loopback()).await.unwrap();
 
     let token = bus.token();
     let accept_delegate = install_clients_locally(bus.clone(), on_request);

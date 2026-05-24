@@ -146,7 +146,7 @@ impl Users {
         // split cannot race another user creation in that phase.
         let username = WireName::new(username).expect("root username must be valid");
         self.inner
-            .do_apply(UsersCommand::CreateUser(CreateUserRequest {
+            .try_apply(UsersCommand::CreateUser(CreateUserRequest {
                 username,
                 password: password_hash.to_string(),
                 status: UserStatus::Active.as_code(),
@@ -165,7 +165,8 @@ impl Users {
                     },
                     streams: Vec::new(),
                 }),
-            }));
+            }))
+            .expect("root user bootstrap must run on the metadata writer");
     }
 }
 

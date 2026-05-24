@@ -55,7 +55,7 @@ concurrency:
 jobs:
   unmark:
     if: github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 2
     steps:
       - name: Download triage event artifact

@@ -28,8 +28,7 @@
 
 use crate::AcceptedClientFn;
 use crate::lifecycle::ShutdownToken;
-use crate::socket_opts::bind_reusable_tcp_listener;
-use compio::net::TcpListener;
+use compio::net::{SocketOpts, TcpListener};
 use futures::FutureExt;
 use iggy_common::IggyError;
 use std::net::SocketAddr;
@@ -42,8 +41,13 @@ use tracing::{debug, error, info};
 ///
 /// Returns [`IggyError::CannotBindToSocket`] if the bind fails.
 #[allow(clippy::future_not_send)]
-pub fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyError> {
-    let listener = bind_reusable_tcp_listener(addr)
+pub async fn bind(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyError> {
+    // `SO_REUSEPORT` intentionally not set: only shard 0 binds the client
+    // listener. The shard-0 coordinator round-robins accepts to owning
+    // shards via `shard::LifecycleFrame::ClientConnectionSetup`.
+    let opts = SocketOpts::new().nodelay(true);
+    let listener = TcpListener::bind_with_options(addr, &opts)
+        .await
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
     let actual = listener
         .local_addr()

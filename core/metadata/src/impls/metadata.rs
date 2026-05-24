@@ -314,12 +314,45 @@ impl std::fmt::Display for RegisterSubmitError {
 
 impl std::error::Error for RegisterSubmitError {}
 
+/// Log + surface `None` when a metadata callback runs on a peer shard
+/// (whose `consensus` / `journal` slot is `None`). The `Plane` trait
+/// callbacks are addressed to the shard 0 owner; if the routing layer
+/// ever dispatches one to a peer the only honest answer is "drop and
+/// alert" - panicking would crash the bus and mask the routing bug.
+fn require_shard_zero<'a, T>(
+    slot: Option<&'a T>,
+    callback: &'static str,
+    field: &'static str,
+) -> Option<&'a T> {
+    if slot.is_none() {
+        error!(
+            target: "iggy.metadata.diag",
+            plane = "metadata",
+            callback,
+            field,
+            "metadata callback fired on a peer shard (field is None); routing layer \
+             must direct metadata traffic to shard 0 - dropping the message"
+        );
+    }
+    slot
+}
+
 pub struct IggyMetadata<C, J, S, M> {
-    /// Some on shard0, None on other shards
+    /// `Some` on shard 0, `None` on other shards. Server-ng bootstrap
+    /// holds the invariant: only shard 0 owns the metadata consensus
+    /// replica; every other shard reconstructs `mux_stm` from the
+    /// `MetadataHandoff::Waiter` factory bundle broadcast by shard 0
+    /// (no consensus replica, no journal access).
     pub consensus: Option<C>,
-    /// Some on shard0, None on other shards
+    /// `Some` on shard 0, `None` on other shards. Shard 0 owns the WAL
+    /// writer (via `PrepareJournal::open`); non-owning shards never open
+    /// the WAL at all. They receive a `MetadataHandoff::Waiter` factory
+    /// bundle from shard 0 over the bootstrap broadcast channel and
+    /// reconstruct `mux_stm` from the in-memory snapshot it carries (see
+    /// `server-ng/src/bootstrap.rs` `await_metadata_bundle` /
+    /// `broadcast_metadata_bundle`).
     pub journal: Option<J>,
-    /// Some on shard0, None on other shards
+    /// `Some` on shard 0, `None` on other shards.
     pub snapshot: Option<S>,
     /// State machine - lives on all shards
     pub mux_stm: M,
@@ -375,7 +408,11 @@ where
         >,
 {
     async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
-        let consensus = self.consensus.as_ref().unwrap();
+        let Some(consensus) =
+            require_shard_zero(self.consensus.as_ref(), "on_request", "consensus")
+        else {
+            return;
+        };
         let client_id = message.header().client;
         let session = message.header().session;
         let request = message.header().request;
@@ -443,8 +480,15 @@ where
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
-        let consensus = self.consensus.as_ref().unwrap();
-        let journal = self.journal.as_ref().unwrap();
+        let Some(consensus) =
+            require_shard_zero(self.consensus.as_ref(), "on_replicate", "consensus")
+        else {
+            return;
+        };
+        let Some(journal) = require_shard_zero(self.journal.as_ref(), "on_replicate", "journal")
+        else {
+            return;
+        };
 
         let header = *message.header();
 
@@ -529,6 +573,19 @@ where
         // un-persisted prepare advertises an op the WAL doesn't hold,
         // violates VSR tail-ahead-of-head, recoverable only via hash-chain
         // fence + view change (burns a view).
+        //
+        // TODO(hubcio): the primary path violates the invariant in the
+        // comment above. `consensus::impls::push_prepare_entry` pre-advances
+        // `sequencer.set_sequence(header.op)` and
+        // `set_last_prepare_checksum(header.checksum)` BEFORE this append.
+        // If the append below returns `Err`, sequencer + checksum stay
+        // advanced while the WAL holds no matching entry: the next prepare
+        // chains off a phantom op, cluster state diverges, and the
+        // `MetadataHandoff::Waiter` factory bundle propagates the divergence
+        // to peers. Fix: rollback `sequencer.set_sequence` +
+        // `set_last_prepare_checksum` to their captured prior values on
+        // append failure (preferred per CLAUDE.md "no panics in libraries"),
+        // or abort the shard.
         if let Err(e) = journal.handle().append(message.clone()).await {
             error!(
                 target: "iggy.metadata.diag",
@@ -724,9 +781,13 @@ where
                     .send_to_client(prepare_header.client, reply_buffers)
                     .await
                 {
-                    warn!(
-                        "on_ack: failed to send reply to client={}: {e}",
-                        prepare_header.client
+                    error!(
+                        client = prepare_header.client,
+                        op = prepare_header.op,
+                        request_id = prepare_header.request,
+                        operation = ?prepare_header.operation,
+                        %e,
+                        "client reply forward failed, no retransmit path; client will time out",
                     );
                 }
             }
