@@ -18,6 +18,7 @@
  */
 
 use async_trait::async_trait;
+use integration::harness::seeds;
 use integration::harness::{TestBinaryError, TestFixture};
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
@@ -38,12 +39,18 @@ const MINIO_ACCESS_KEY: &str = "admin";
 const MINIO_SECRET_KEY: &str = "password";
 const MINIO_BUCKET: &str = "iggy-s3-test";
 
-const ENV_SINK_BUCKET: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_BUCKET";
-const ENV_SINK_REGION: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_REGION";
-const ENV_SINK_ENDPOINT: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_ENDPOINT";
-const ENV_SINK_ACCESS_KEY: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_ACCESS_KEY_ID";
-const ENV_SINK_SECRET_KEY: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_SECRET_ACCESS_KEY";
 const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_S3_PATH";
+const ENV_SINK_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_S3_STREAMS_0_STREAM";
+const ENV_SINK_STREAMS_0_TOPICS: &str = "IGGY_CONNECTORS_SINK_S3_STREAMS_0_TOPICS";
+const ENV_SINK_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SINK_S3_STREAMS_0_SCHEMA";
+const ENV_SINK_PLUGIN_BUCKET: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_BUCKET";
+const ENV_SINK_PLUGIN_REGION: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_REGION";
+const ENV_SINK_PLUGIN_ENDPOINT: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_ENDPOINT";
+const ENV_SINK_PLUGIN_ACCESS_KEY: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_ACCESS_KEY_ID";
+const ENV_SINK_PLUGIN_SECRET_KEY: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_SECRET_ACCESS_KEY";
+const ENV_SINK_PLUGIN_FILE_ROTATION: &str = "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_FILE_ROTATION";
+const ENV_SINK_PLUGIN_MAX_MESSAGES: &str =
+    "IGGY_CONNECTORS_SINK_S3_PLUGIN_CONFIG_MAX_MESSAGES_PER_FILE";
 
 const POLL_ATTEMPTS: usize = 30;
 const POLL_INTERVAL_MS: u64 = 500;
@@ -231,20 +238,29 @@ impl TestFixture for S3SinkFixture {
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         let mut envs = HashMap::new();
-        envs.insert(ENV_SINK_BUCKET.to_string(), MINIO_BUCKET.to_string());
-        envs.insert(ENV_SINK_REGION.to_string(), "us-east-1".to_string());
-        envs.insert(ENV_SINK_ENDPOINT.to_string(), self.endpoint.clone());
-        envs.insert(
-            ENV_SINK_ACCESS_KEY.to_string(),
-            MINIO_ACCESS_KEY.to_string(),
-        );
-        envs.insert(
-            ENV_SINK_SECRET_KEY.to_string(),
-            MINIO_SECRET_KEY.to_string(),
-        );
         envs.insert(
             ENV_SINK_PATH.to_string(),
             "../../target/debug/libiggy_connector_s3_sink".to_string(),
+        );
+        envs.insert(
+            ENV_SINK_STREAMS_0_STREAM.to_string(),
+            seeds::names::STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SINK_STREAMS_0_TOPICS.to_string(),
+            format!("[{}]", seeds::names::TOPIC),
+        );
+        envs.insert(ENV_SINK_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SINK_PLUGIN_BUCKET.to_string(), MINIO_BUCKET.to_string());
+        envs.insert(ENV_SINK_PLUGIN_REGION.to_string(), "us-east-1".to_string());
+        envs.insert(ENV_SINK_PLUGIN_ENDPOINT.to_string(), self.endpoint.clone());
+        envs.insert(
+            ENV_SINK_PLUGIN_ACCESS_KEY.to_string(),
+            MINIO_ACCESS_KEY.to_string(),
+        );
+        envs.insert(
+            ENV_SINK_PLUGIN_SECRET_KEY.to_string(),
+            MINIO_SECRET_KEY.to_string(),
         );
         envs
     }
@@ -272,6 +288,12 @@ impl TestFixture for S3SinkRotationFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        self.inner.connectors_runtime_envs()
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(
+            ENV_SINK_PLUGIN_FILE_ROTATION.to_string(),
+            "messages".to_string(),
+        );
+        envs.insert(ENV_SINK_PLUGIN_MAX_MESSAGES.to_string(), "10".to_string());
+        envs
     }
 }

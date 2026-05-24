@@ -15,30 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-type = "sink"
-key = "s3"
-enabled = true
-version = 0
-name = "S3 sink integration test"
-path = "../../target/debug/libiggy_connector_s3_sink"
-verbose = false
-
-[[streams]]
-stream = "test_stream"
-topics = ["test_topic"]
-schema = "json"
-batch_length = 100
-poll_interval = "100ms"
-consumer_group = "s3_sink_test"
-
-[plugin_config]
-bucket = "iggy-s3-test"
-region = "us-east-1"
-path_template = "{stream}/{topic}/{date}/{hour}"
-file_rotation = "size"
-max_file_size = "8MiB"
-output_format = "json_lines"
-include_metadata = true
-include_headers = true
-max_attempts = 3
-retry_delay = "1s"
+[connectors]
+config_type = "local"
+config_dir = "../connectors/sinks/s3_sink"
