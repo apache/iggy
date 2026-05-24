@@ -63,6 +63,9 @@ pub struct DorisSink {
     // Precomputed once in `new()` and marked sensitive so reqwest keeps it out
     // of any debug/trace output (and never HPACK-indexes it on HTTP/2).
     auth_header: header::HeaderValue,
+    // Precomputed once in `new()` — the target only depends on fe_url/database/
+    // table, so there's no need to re-format it on every batch.
+    stream_load_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,11 +126,19 @@ impl DorisSink {
         .expect("Basic auth header is always valid ASCII");
         auth_header.set_sensitive(true);
 
+        let stream_load_url = format!(
+            "{}/api/{}/{}/_stream_load",
+            config.fe_url.trim_end_matches('/'),
+            config.database,
+            config.table,
+        );
+
         DorisSink {
             id,
             config,
             client: None,
             auth_header,
+            stream_load_url,
         }
     }
 
@@ -149,13 +160,8 @@ impl DorisSink {
             .map_err(|e| Error::InitError(format!("Failed to build Doris HTTP client: {e}")))
     }
 
-    fn stream_load_url(&self) -> String {
-        format!(
-            "{}/api/{}/{}/_stream_load",
-            self.config.fe_url.trim_end_matches('/'),
-            self.config.database,
-            self.config.table,
-        )
+    fn stream_load_url(&self) -> &str {
+        &self.stream_load_url
     }
 
     fn label_prefix(&self) -> &str {
@@ -200,7 +206,7 @@ impl DorisSink {
                 self.id
             ))
         })?;
-        let mut url = self.stream_load_url();
+        let mut url = self.stream_load_url().to_string();
         // Baseline for redirect validation: every redirect target is checked
         // against the originally configured FE scheme/host before we re-attach
         // credentials, so a compromised FE cannot exfiltrate them via Location.
@@ -540,7 +546,7 @@ impl Sink for DorisSink {
     async fn open(&mut self) -> Result<(), Error> {
         // Validate the URL up front so a bad config fails at startup rather
         // than on the first batch.
-        let parsed_url = reqwest::Url::parse(&self.stream_load_url()).map_err(|e| {
+        let parsed_url = reqwest::Url::parse(self.stream_load_url()).map_err(|e| {
             Error::InvalidConfigValue(format!(
                 "Doris sink ID {} has invalid fe_url '{}': {e}",
                 self.id, self.config.fe_url
@@ -554,6 +560,17 @@ impl Sink for DorisSink {
         // `/api/{db}/{table}/_stream_load` URL.
         validate_identifier(&self.config.database, "database", self.id)?;
         validate_identifier(&self.config.table, "table", self.id)?;
+
+        // Doris permits passwordless users (e.g. a fresh `root`), so an empty
+        // password is valid — but it's almost always a misconfiguration in a
+        // real deployment. Warn rather than fail so local/dev setups still work.
+        if self.config.password.expose_secret().is_empty() {
+            warn!(
+                "Doris sink ID {} is configured with an empty password for user '{}'; \
+                 this is accepted but is usually a misconfiguration.",
+                self.id, self.config.username
+            );
+        }
 
         // Warn when credentials would travel in cleartext.
         //
