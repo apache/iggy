@@ -33,52 +33,45 @@ sink_connector!(DorisSink);
 const DEFAULT_LABEL_PREFIX: &str = "iggy";
 const DEFAULT_BATCH_SIZE: u32 = 1000;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
-// A bounded TCP handshake timeout so an unreachable FE fails fast instead of
-// eating the entire request-timeout budget on connect alone.
+// Bounded TCP handshake timeout so an unreachable FE fails fast instead of
+// burning the whole request-timeout budget on connect alone.
 const CONNECT_TIMEOUT_SECS: u64 = 5;
-// Doris's FE Stream Load returns 307 to a BE; reqwest's default policy strips
-// the Authorization header on cross-host redirects, so we follow redirects
-// manually. This cap protects against a misbehaving cluster looping.
+// Doris's FE Stream Load 307s to a BE, and reqwest strips Authorization on
+// cross-host redirects, so we follow them manually. This caps a looping cluster.
 const MAX_REDIRECTS: u8 = 5;
-// Per Doris docs, Stream Load labels must be 1..=128 chars matching
-// `[A-Za-z0-9_-]`. These caps keep the worst-case label well under that limit.
+// Doris Stream Load labels must be 1..=128 chars of `[A-Za-z0-9_-]`. These caps
+// keep the worst-case label well under that limit.
 const MAX_LABEL_PREFIX_LEN: usize = 16;
 const MAX_LABEL_NAME_LEN: usize = 16;
-// A single 16-hex-char (64-bit) hash over the raw (stream, topic) pair. 64 bits
-// puts the adversarial birthday bound at ~5B, so a multi-tenant namer can't
-// cheaply force the label collisions that Doris's server-side dedupe would
-// otherwise turn into silent data loss. One joint hash (not one per segment)
-// buys that entropy for the same budget, leaving the names full-length.
+// A single 64-bit (16-hex) joint hash over the raw (stream, topic) pair. 64 bits
+// keeps the adversarial birthday bound high enough that a multi-tenant namer
+// can't cheaply force the label collisions that Doris's server-side dedupe would
+// turn into silent data loss. One joint hash (not one per segment) buys that for
+// the same length budget, leaving the sanitized names full-length.
 const LABEL_HASH_HEX_LEN: usize = 16;
-// Doris Stream Load responses are normally tiny JSON blobs (~200 B). Cap the
-// portion we keep for logs/errors so a misbehaving proxy that returns a giant
-// body cannot flood the logs. NOTE: this bounds only what we *log*, not peak
-// memory — `response.text()` already buffers the full body before truncation.
-// A true memory guard would need a Content-Length check or a byte budget over
-// `bytes_stream()`; deferred, since the destination is trusted operator infra.
+// Cap the response-body slice kept for logs/errors so a misbehaving proxy that
+// returns a giant body can't flood the logs. Bounds only what we *log*, not peak
+// memory — `response.text()` already buffers the full body first.
 const MAX_RESPONSE_LOG_BYTES: usize = 4096;
 
 #[derive(Debug)]
 pub struct DorisSink {
     id: u32,
     config: DorisSinkConfig,
-    client: Option<reqwest::Client>,
-    // Precomputed once in `new()` and marked sensitive so reqwest keeps it out
-    // of any debug/trace output (and never HPACK-indexes it on HTTP/2).
+    // Precomputed in `new()` and marked sensitive so reqwest keeps it out of any
+    // debug/trace output (and never HPACK-indexes it on HTTP/2).
     auth_header: header::HeaderValue,
-    // Precomputed once in `new()` — the target only depends on fe_url/database/
-    // table, so there's no need to re-format it on every batch.
+    // Precomputed in `new()`; depends only on fe_url/database/table.
     stream_load_url: String,
-    // Precomputed once in `new()`: `max_filter_ratio` is config-static, so its
-    // header string is formatted up front rather than via `to_string()` on
-    // every PUT (and every redirect hop). `columns`/`where` are already stored
-    // as `String` in the config and borrowed directly, so they need no cache.
-    max_filter_ratio_header: Option<String>,
-    // The parsed Stream Load URL, populated in `open()` (which already parses it
-    // to validate the config). Cached so `send_stream_load` neither re-parses it
-    // on every batch nor re-parses the current hop on every redirect, and so the
-    // redirect-validation baseline (original FE scheme/host) is a `Url` directly.
-    base_url: Option<reqwest::Url>,
+    // Set in `open()`, `None` until then. Holds the HTTP client and the parsed
+    // Stream Load URL, which doubles as the redirect-validation baseline.
+    connected: Option<Connected>,
+}
+
+#[derive(Debug)]
+struct Connected {
+    client: reqwest::Client,
+    base_url: reqwest::Url,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,8 +123,7 @@ struct StreamLoadResponse {
 impl DorisSink {
     pub fn new(id: u32, config: DorisSinkConfig) -> Self {
         let credential = format!("{}:{}", config.username, config.password.expose_secret());
-        // base64 over `Basic <...>` is always within the visible-ASCII set that
-        // HeaderValue accepts, so this conversion cannot fail.
+        // `Basic <base64>` is always visible ASCII, so this conversion cannot fail.
         let mut auth_header = header::HeaderValue::from_str(&format!(
             "Basic {}",
             general_purpose::STANDARD.encode(credential)
@@ -146,29 +138,24 @@ impl DorisSink {
             config.table,
         );
 
-        let max_filter_ratio_header = config.max_filter_ratio.map(|ratio| ratio.to_string());
-
         DorisSink {
             id,
             config,
-            client: None,
             auth_header,
             stream_load_url,
-            max_filter_ratio_header,
-            base_url: None,
+            connected: None,
         }
     }
 
     fn build_client(&self) -> Result<reqwest::Client, Error> {
         let timeout = Duration::from_secs(self.config.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS));
-        // We follow redirects manually to keep the Authorization header alive
-        // across the FE -> BE hop. reqwest strips Authorization on cross-host
-        // 307s by design.
         let connect_timeout = Duration::from_secs(
             self.config
                 .connect_timeout_secs
                 .unwrap_or(CONNECT_TIMEOUT_SECS),
         );
+        // `Policy::none()` so we follow redirects manually and keep Authorization
+        // alive across the FE -> BE hop (reqwest strips it on cross-host 307s).
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
@@ -217,25 +204,16 @@ impl DorisSink {
         label: &str,
         body: Bytes,
     ) -> Result<StreamLoadResponse, Error> {
-        let client = self.client.as_ref().ok_or_else(|| {
+        // `base_url` is the redirect-validation baseline (original FE scheme/host)
+        // and the parsed first-hop target, so each redirect can `join` a relative
+        // Location without re-parsing the source.
+        let Connected { client, base_url } = self.connected.as_ref().ok_or_else(|| {
             Error::InitError(format!(
-                "Doris sink ID {} called before open() — client not initialized",
+                "Doris sink ID {} called before open() — not connected",
                 self.id
             ))
         })?;
-        // Baseline for redirect validation: every redirect target is checked
-        // against the originally configured FE scheme/host before we re-attach
-        // credentials, so a compromised FE cannot exfiltrate them via Location.
-        // Parsed once in `open()` and reused here so we don't re-parse per batch.
-        let base = self.base_url.as_ref().ok_or_else(|| {
-            Error::InitError(format!(
-                "Doris sink ID {} called before open() — base URL not initialized",
-                self.id
-            ))
-        })?;
-        // The current request target, carried as a parsed `Url` so each redirect
-        // hop can `join` a relative Location without re-parsing the source.
-        let mut url = base.clone();
+        let mut url = base_url.clone();
         let mut redirects = 0u8;
 
         loop {
@@ -248,8 +226,8 @@ impl DorisSink {
                 .header("label", label)
                 .body(body.clone());
 
-            if let Some(ratio) = &self.max_filter_ratio_header {
-                request = request.header("max_filter_ratio", ratio);
+            if let Some(ratio) = self.config.max_filter_ratio {
+                request = request.header("max_filter_ratio", ratio.to_string());
             }
             if let Some(columns) = &self.config.columns {
                 request = request.header("columns", columns);
@@ -270,9 +248,8 @@ impl DorisSink {
             ) {
                 redirects += 1;
                 if redirects > MAX_REDIRECTS {
-                    // A redirect loop is a permanent protocol violation, not a
-                    // transient connectivity failure — retrying re-walks the
-                    // same loop. Surface it as permanent so it's not retried.
+                    // A redirect loop is permanent, not transient: retrying just
+                    // re-walks the same loop, so surface it as such.
                     return Err(Error::PermanentHttpError(format!(
                         "Doris sink ID {} exceeded max redirects ({MAX_REDIRECTS})",
                         self.id
@@ -284,16 +261,15 @@ impl DorisSink {
                     .and_then(|v| v.to_str().ok())
                 else {
                     // A redirect with no usable Location is malformed; retrying
-                    // won't produce one. Permanent, matching the unparsable-
-                    // Location cases below.
+                    // won't produce one.
                     return Err(Error::PermanentHttpError(format!(
                         "Doris sink ID {} got {status} with no Location header",
                         self.id
                     )));
                 };
-                // Resolve Location (Doris returns absolute; fall back to joining
-                // a relative one onto the current URL) and validate the target
-                // before trusting it with credentials on the next iteration.
+                // Doris returns an absolute Location; fall back to joining a
+                // relative one. Validate the target before trusting it with
+                // credentials on the next iteration.
                 let target = reqwest::Url::parse(location)
                     .or_else(|_| url.join(location))
                     .map_err(|e| {
@@ -303,7 +279,7 @@ impl DorisSink {
                         ))
                     })?;
                 validate_redirect(
-                    base,
+                    base_url,
                     &target,
                     self.config.allow_insecure_redirect.unwrap_or(false),
                     self.config.allowed_redirect_hosts.as_deref(),
@@ -315,10 +291,9 @@ impl DorisSink {
             }
 
             let response_text = response.text().await.unwrap_or_else(|e| {
-                // A body-read failure shouldn't be silently swallowed: log it,
-                // then fall back to an empty body so the status-based handling
-                // below still classifies the outcome (an unparsable/empty body
-                // on a non-2xx becomes a permanent error, which is correct).
+                // Don't swallow a body-read failure: log it, then fall back to an
+                // empty body so the status-based handling below still classifies
+                // the outcome (an empty body on a non-2xx becomes permanent).
                 warn!(
                     "Doris sink ID {} failed to read response body: {e}",
                     self.id
@@ -333,8 +308,7 @@ impl DorisSink {
                     self.id
                 );
                 error!("{msg}");
-                // 408 (Request Timeout) and 429 (Too Many Requests) are 4xx
-                // but transient — they should be retried, not DLQ'd.
+                // 408/429 are 4xx but transient — retry them, don't DLQ.
                 return Err(match status {
                     StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS => {
                         Error::CannotStoreData(msg)
@@ -352,11 +326,11 @@ impl DorisSink {
 /// Validate a Stream Load redirect target before re-attaching credentials.
 ///
 /// Doris's FE legitimately redirects (307) to a BE on a *different host*, so we
-/// cannot require same-host. Instead we enforce two rules that close the
+/// can't require same-host. Instead we enforce two rules that close the
 /// credential-exfiltration vector a compromised/MITM'd FE would otherwise have:
 ///
-///   1. Scheme must not be downgraded (`https` -> `http`) unless `allow_insecure`
-///      is set — a downgrade would push Basic-auth creds onto a cleartext hop.
+///   1. No scheme downgrade (`https` -> `http`) unless `allow_insecure` is set —
+///      a downgrade would push Basic-auth creds onto a cleartext hop.
 ///   2. If `allowed_hosts` is non-empty, the target host must be in it — a hard
 ///      lockdown for operators who want to pin redirects to known BE hosts.
 fn validate_redirect(
@@ -412,14 +386,9 @@ fn sanitize_segment(value: &str, max_len: usize) -> String {
 /// A single blake3 fingerprint over the *raw* (unsanitized) `stream` and
 /// `topic`, truncated to `LABEL_HASH_HEX_LEN` hex chars. This disambiguates
 /// identities that sanitize to the same string (e.g. `events.v1` vs
-/// `events_v1`), which would otherwise produce identical labels and cause
-/// silent data loss via Doris's server-side label dedupe.
-///
-/// Hashing the pair jointly (rather than one hash per segment) yields 64-bit
-/// collision resistance over the full identity while spending the budget of a
-/// single segment, so the sanitized names stay full-length for readability.
-/// Inputs are length-prefixed so distinct pairs can't alias into one digest
-/// (e.g. `("ab", "c")` vs `("a", "bc")`).
+/// `events_v1`), which would otherwise produce identical labels and cause silent
+/// data loss via Doris's server-side label dedupe. Inputs are length-prefixed so
+/// distinct pairs can't alias into one digest (e.g. `("ab","c")` vs `("a","bc")`).
 fn identity_hash(stream: &str, topic: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&(stream.len() as u64).to_le_bytes());
@@ -433,17 +402,12 @@ fn identity_hash(stream: &str, topic: &str) -> String {
 /// Pure label builder. Format:
 /// `{prefix}-{stream_san}-{topic_san}-{hash16}-{partition}-{first}-{last}`.
 ///
-/// Exposed as a `pub` free function so integration tests can produce the
-/// exact same label without instantiating a `DorisSink`. The format is
-/// engineered to:
-///   1. Bound the total length under Doris's 128-char label cap regardless
-///      of input name length (worst case 120 chars).
-///   2. Eliminate the silent-collision risk between identities that sanitize
-///      to the same string — the joint `hash16` is over the raw names, so it
-///      stays distinct even when both sanitized segments collide.
+/// The segment caps bound the total under Doris's 128-char label limit (worst
+/// case 120), and the joint `hash16` over the raw names keeps labels distinct
+/// even when both sanitized segments collide.
 ///
-/// `#[doc(hidden)]`: this is `pub` only so the integration test harness can
-/// call it; it is not part of the connector's supported API.
+/// `#[doc(hidden)]`: `pub` only so the integration test harness can reproduce
+/// labels; not part of the connector's supported API.
 #[doc(hidden)]
 pub fn build_label(
     prefix: &str,
@@ -465,9 +429,9 @@ pub fn build_label(
     )
 }
 
-/// Truncate `s` at the largest char boundary `<= max_bytes` and append a
-/// marker that records the original size. Used to bound the portion of an
-/// HTTP response body that lands in logs or error variants.
+/// Truncate `s` at the largest char boundary `<= max_bytes` and append a marker
+/// recording the original size. Bounds the portion of an HTTP response body that
+/// lands in logs or error variants.
 fn truncate_for_log(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
@@ -480,40 +444,15 @@ fn truncate_for_log(s: &str, max_bytes: usize) -> String {
 }
 
 fn parse_stream_load_response(body: &str) -> Result<StreamLoadResponse, Error> {
-    // An unparsable 200-OK body is almost always a Doris bug, a proxy that
-    // injected HTML, or a future schema change — none of those are cured by
-    // retrying the same bytes. Default to permanent so the runtime DLQs the
-    // batch instead of looping forever.
+    // An unparsable 200-OK body (Doris bug, proxy-injected HTML, future schema
+    // change) isn't cured by retrying the same bytes — default to permanent so
+    // the runtime DLQs the batch instead of looping.
     serde_json::from_str(body).map_err(|e| {
         Error::PermanentHttpError(format!(
             "Failed to parse Doris stream load response: {e}. Body: {}",
             truncate_for_log(body, MAX_RESPONSE_LOG_BYTES)
         ))
     })
-}
-
-/// True for errors the runtime must NOT retry (schema mismatch, bad config,
-/// permanent HTTP error, etc.). Used by `consume` to pick the most-severe
-/// error across chunks: a transient error from chunk N must NOT shadow a
-/// permanent error from chunk M, or the runtime would retry forever instead
-/// of routing the batch to its DLQ path.
-fn is_permanent_error(e: &Error) -> bool {
-    matches!(
-        e,
-        Error::PermanentHttpError(_) | Error::InvalidConfigValue(_) | Error::InvalidPayloadType
-    )
-}
-
-/// Replace `slot` with `e` either when it's still empty or when `e` is
-/// permanent and the existing entry is transient.
-fn record_error(slot: &mut Option<Error>, e: Error) {
-    let replace = match slot.as_ref() {
-        None => true,
-        Some(existing) => is_permanent_error(&e) && !is_permanent_error(existing),
-    };
-    if replace {
-        *slot = Some(e);
-    }
 }
 
 fn validate_identifier(name: &str, field: &str, id: u32) -> Result<(), Error> {
@@ -550,10 +489,9 @@ fn classify_status(response: &StreamLoadResponse) -> Result<(), Error> {
             "Doris stream load failed: {}",
             response.message
         ))),
-        // Default unknown statuses to permanent: silently retrying an
-        // unrecognized failure (e.g. a future Doris error variant) is worse
-        // than surfacing it. The runtime will route the batch to its DLQ
-        // path instead of hammering the FE forever.
+        // Default unknown statuses to permanent: surfacing an unrecognized
+        // failure (e.g. a future Doris error variant) and letting the runtime DLQ
+        // it beats silently retrying it against the FE forever.
         other => Err(Error::PermanentHttpError(format!(
             "Doris stream load returned unexpected status '{other}': {}",
             response.message
@@ -564,8 +502,8 @@ fn classify_status(response: &StreamLoadResponse) -> Result<(), Error> {
 #[async_trait]
 impl Sink for DorisSink {
     async fn open(&mut self) -> Result<(), Error> {
-        // Validate the URL up front so a bad config fails at startup rather
-        // than on the first batch.
+        // Validate the URL up front so a bad config fails at startup, not on the
+        // first batch.
         let parsed_url = reqwest::Url::parse(self.stream_load_url()).map_err(|e| {
             Error::InvalidConfigValue(format!(
                 "Doris sink ID {} has invalid fe_url '{}': {e}",
@@ -573,17 +511,15 @@ impl Sink for DorisSink {
             ))
         })?;
 
-        // Constrain `database`/`table` to [A-Za-z0-9_]+ — a stricter subset
-        // than Doris's actual identifier rules (which permit `$` and, when
-        // backtick-quoted, almost anything). We're deliberately narrower to
-        // prevent path traversal in the constructed
+        // Constrain `database`/`table` to [A-Za-z0-9_]+ — narrower than Doris's
+        // own identifier rules — to prevent path traversal in the constructed
         // `/api/{db}/{table}/_stream_load` URL.
         validate_identifier(&self.config.database, "database", self.id)?;
         validate_identifier(&self.config.table, "table", self.id)?;
 
         // Doris permits passwordless users (e.g. a fresh `root`), so an empty
-        // password is valid — but it's almost always a misconfiguration in a
-        // real deployment. Warn rather than fail so local/dev setups still work.
+        // password is valid — but almost always a misconfiguration. Warn, don't
+        // fail, so local/dev setups still work.
         if self.config.password.expose_secret().is_empty() {
             warn!(
                 "Doris sink ID {} is configured with an empty password for user '{}'; \
@@ -592,21 +528,13 @@ impl Sink for DorisSink {
             );
         }
 
-        // Warn when credentials would travel in cleartext.
-        //
-        // NOTE on trust model: this connector intentionally preserves the
-        // Authorization header across the FE -> BE 307 redirect (reqwest
-        // would otherwise strip it on cross-host redirects). A compromised or
-        // MITM'd FE could try to exfiltrate credentials via `Location:
-        // http://attacker/` — `validate_redirect` enforces the trust boundary
-        // by refusing scheme downgrades (and honoring `allowed_redirect_hosts`)
-        // before re-attaching credentials. This warning remains for the case
-        // where the FE itself is plain http; deploy Doris over TLS in prod.
+        // Warn when credentials would travel in cleartext. The FE -> BE 307 hop
+        // itself is guarded by `validate_redirect` (scheme downgrade + host
+        // allowlist); this covers the case where the FE itself is plain http.
         if parsed_url.scheme().eq_ignore_ascii_case("http") {
             let host = parsed_url.host_str().unwrap_or("");
-            // `host_str()` returns IPv6 literals in bracketed form (`[::1]`),
-            // so strip brackets before parsing. Parsing as an `IpAddr` covers
-            // `127.0.0.1`, `::1`, and any other loopback spelling.
+            // `host_str()` brackets IPv6 literals (`[::1]`); strip them and parse
+            // as `IpAddr` to catch `127.0.0.1`, `::1`, and any loopback spelling.
             let is_loopback = host == "localhost"
                 || host
                     .trim_start_matches('[')
@@ -623,10 +551,10 @@ impl Sink for DorisSink {
             }
         }
 
-        self.client = Some(self.build_client()?);
-        // Cache the parsed URL so `send_stream_load` reuses it as the
-        // redirect-validation baseline instead of re-parsing on every batch.
-        self.base_url = Some(parsed_url);
+        self.connected = Some(Connected {
+            client: self.build_client()?,
+            base_url: parsed_url,
+        });
 
         info!(
             "Opened Doris sink ID {} for {}.{} at {}",
@@ -652,24 +580,20 @@ impl Sink for DorisSink {
         );
 
         let batch_size = self.batch_size();
-        let mut worst_error: Option<Error> = None;
+        let mut first_error: Option<Error> = None;
 
-        // Best-effort across chunks for *operational* failures (serialize, HTTP,
-        // status classification): we record the error and `continue` rather than
-        // `break`, so a later chunk still gets a chance to land. Under the
-        // runtime's AutoCommit-at-poll semantics the consumer offset for this
-        // whole poll is already committed before consume() runs, so returning
-        // early would *not* replay the unprocessed chunks anyway — it would only
-        // drop them. We push as much data as possible and surface the worst error
-        // at the end (logged at error!; the runtime currently discards the return
-        // value, so this is for observability, not retry/DLQ).
+        // Best-effort across chunks: on a per-chunk serialize/HTTP/status failure
+        // we log it, keep the first error, and `continue` so later chunks still
+        // land. The runtime commits this poll's consumer offset before consume()
+        // runs, so returning early would drop the remaining chunks rather than
+        // replay them. The returned error is mapped to a 0/1 status at the FFI
+        // boundary (severity isn't propagated), and every chunk error is already
+        // logged individually below — so first-error is sufficient.
         //
-        // The one *deliberate* exception is a non-JSON payload (below): that is a
-        // schema-contract violation — the whole stream is misconfigured, not one
-        // chunk transiently failing — so we abort the entire poll via `?` to fail
-        // loudly. Under the documented `schema = "json"` config this is
-        // unreachable (the SDK drops non-JSON payloads before consume() is
-        // called), so it stands as a defensive guard.
+        // The lone hard-abort is a non-JSON payload (via `?`): a stream-wide
+        // schema-contract violation, not a transient chunk failure. Under the
+        // documented `schema = "json"` config the SDK drops non-JSON before
+        // consume() is called, so this stands as a defensive guard.
         for chunk in messages.chunks(batch_size) {
             let json_values: Vec<&simd_json::OwnedValue> = chunk
                 .iter()
@@ -686,23 +610,22 @@ impl Sink for DorisSink {
                 .collect::<Result<_, _>>()?;
 
             // `chunks()` never yields an empty slice and every element maps to a
-            // value (or the `?` above already bailed), so `json_values` is always
-            // non-empty here — no empty-check needed before serializing.
+            // value (or the `?` above bailed), so `json_values` is non-empty.
             let body = match simd_json::to_vec(&json_values) {
                 Ok(b) => Bytes::from(b),
                 Err(e) => {
-                    record_error(
-                        &mut worst_error,
-                        Error::CannotStoreData(format!("Failed to serialize batch for Doris: {e}")),
-                    );
+                    error!("Doris sink ID {} failed to serialize batch: {e}", self.id);
+                    first_error.get_or_insert(Error::CannotStoreData(format!(
+                        "Failed to serialize batch for Doris: {e}"
+                    )));
                     continue;
                 }
             };
 
-            // `chunks()` never yields an empty slice, so first/last are always
-            // present. Use `.expect` rather than `unwrap_or(0)`: a fabricated
-            // offset 0 here would alias the real offset-0 label and break the
-            // idempotency contract, so a broken invariant must fail loud.
+            // `chunks()` never yields an empty slice, so first/last are present.
+            // Use `.expect` over `unwrap_or(0)`: a fabricated offset 0 would alias
+            // the real offset-0 label and break idempotency, so a broken invariant
+            // must fail loud.
             let first_offset = chunk
                 .first()
                 .map(|m| m.offset)
@@ -722,9 +645,8 @@ impl Sink for DorisSink {
                 Ok(response) => match classify_status(&response) {
                     Ok(()) => {
                         if response.number_filtered_rows > 0 {
-                            // Filtered rows usually indicate schema drift in
-                            // upstream messages. Surface above debug so
-                            // operators can alert on it.
+                            // Filtered rows usually mean schema drift upstream.
+                            // Surface above debug so operators can alert on it.
                             warn!(
                                 "Doris sink ID {} loaded {} rows but FILTERED {} rows for {}.{} (label={label}); \
                                  likely schema drift upstream",
@@ -746,17 +668,17 @@ impl Sink for DorisSink {
                     }
                     Err(e) => {
                         error!("Doris sink ID {} batch failed: {e}", self.id);
-                        record_error(&mut worst_error, e);
+                        first_error.get_or_insert(e);
                     }
                 },
                 Err(e) => {
                     error!("Doris sink ID {} HTTP failed: {e}", self.id);
-                    record_error(&mut worst_error, e);
+                    first_error.get_or_insert(e);
                 }
             }
         }
 
-        if let Some(err) = worst_error {
+        if let Some(err) = first_error {
             return Err(err);
         }
         Ok(())
@@ -1010,24 +932,6 @@ mod tests {
     fn truncate_for_log_passes_short_input_through() {
         let short = "hello";
         assert_eq!(truncate_for_log(short, 100), "hello");
-    }
-
-    #[test]
-    fn record_error_prefers_permanent_over_transient() {
-        let mut slot: Option<Error> = None;
-        record_error(&mut slot, Error::CannotStoreData("transient".into()));
-        record_error(&mut slot, Error::PermanentHttpError("permanent".into()));
-        // Permanent must shadow transient — otherwise the runtime retries
-        // forever instead of routing to DLQ.
-        assert!(matches!(slot, Some(Error::PermanentHttpError(_))));
-    }
-
-    #[test]
-    fn record_error_keeps_permanent_when_transient_arrives_later() {
-        let mut slot: Option<Error> = None;
-        record_error(&mut slot, Error::PermanentHttpError("p".into()));
-        record_error(&mut slot, Error::CannotStoreData("t".into()));
-        assert!(matches!(slot, Some(Error::PermanentHttpError(_))));
     }
 
     fn url(s: &str) -> reqwest::Url {
