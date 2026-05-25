@@ -41,6 +41,17 @@ use std::sync::Arc;
 use tracing::{error, warn};
 use uuid::Uuid;
 
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut chain = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        chain.push_str(": ");
+        chain.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    chain
+}
+
 mod arrow_streamer;
 pub mod dynamic_router;
 pub mod static_router;
@@ -173,12 +184,13 @@ async fn write_data(
     let cursor = JsonArrowReader::new(msgs.as_slice());
     let reader = ReaderBuilder::new(Arc::new(
         schema_to_arrow_schema(&table.metadata().current_schema().clone()).map_err(|err| {
+            let chain = format_error_chain(&err);
             error!(
                 "Error while mapping records to Iceberg table with uuid: {}. Error {}",
                 table.metadata().uuid(),
-                err
+                chain
             );
-            Error::InvalidRecord
+            Error::SchemaMismatch(chain)
         })?,
     ))
     .build(cursor)
@@ -190,20 +202,41 @@ async fn write_data(
         Error::InitError(err.to_string())
     })?;
 
-    for batch in reader {
-        let batch_data = batch.map_err(|err| {
-            error!("Error while getting record batch: {}", err);
-            Error::InvalidRecord
-        })?;
-        writer.write(batch_data).await.map_err(|err| {
-            error!("Error while writing record batch: {}", err);
-            Error::InvalidRecord
-        })?;
+    let write_result: Result<(), Error> = async {
+        for batch in reader {
+            let batch_data = batch.map_err(|err| {
+                let chain = format_error_chain(&err);
+                error!("Error while getting record batch: {}", chain);
+                Error::InvalidRecordValue(chain)
+            })?;
+            writer.write(batch_data).await.map_err(|err| {
+                let chain = format_error_chain(&err);
+                error!("Error while writing record batch: {}", chain);
+                Error::WriteFailure(chain)
+            })?;
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = &write_result {
+        error!(
+            "Batch loop failed ({}), closing writer to release resources",
+            e
+        );
+        if let Err(close_err) = writer.close().await {
+            error!("Failed to close writer after batch error: {}", close_err);
+        }
+        return Err(write_result.unwrap_err());
     }
 
     let data_files = writer.close().await.map_err(|err| {
-        error!("Error while writing data records to Parquet file: {}", err);
-        Error::InvalidRecord
+        let chain = format_error_chain(&err);
+        error!(
+            "Error while writing data records to Parquet file: {}",
+            chain
+        );
+        Error::WriteFailure(chain)
     })?;
 
     let table_commit = Transaction::new(table);
@@ -211,21 +244,23 @@ async fn write_data(
     let action = table_commit.fast_append().add_data_files(data_files);
 
     let tx = action.apply(table_commit).map_err(|err| {
+        let chain = format_error_chain(&err);
         error!(
             "Failed to apply transaction on table with UUID: {}, Error: {}",
             table.metadata().uuid(),
-            err
+            chain
         );
-        Error::InvalidRecord
+        Error::TransactionApplyError(chain)
     })?;
 
     let _table = tx.commit(catalog).await.map_err(|err| {
+        let chain = format_error_chain(&err);
         error!(
             "Failed to commit transaction on table with UUID: {}, Error: {}",
             table.metadata().uuid(),
-            err
+            chain
         );
-        Error::InvalidRecord
+        Error::CatalogCommitError(chain)
     })?;
     Ok(())
 }
