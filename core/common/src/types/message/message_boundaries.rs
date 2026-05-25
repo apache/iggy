@@ -17,7 +17,7 @@
  */
 
 #[derive(Clone, Copy)]
-pub(crate) struct IggyMessageBoundaries<'a> {
+pub struct IggyMessageBoundaries<'a> {
     indexes: &'a [u8],
     messages_len: usize,
     base_position: u32,
@@ -25,7 +25,7 @@ pub(crate) struct IggyMessageBoundaries<'a> {
 }
 
 impl<'a> IggyMessageBoundaries<'a> {
-    pub(crate) fn new(
+    pub fn new(
         indexes: &'a [u8],
         messages_len: usize,
         base_position: u32,
@@ -45,11 +45,11 @@ impl<'a> IggyMessageBoundaries<'a> {
         })
     }
 
-    pub(crate) fn count(&self) -> usize {
+    pub fn count(&self) -> usize {
         self.count
     }
 
-    pub(crate) fn boundaries(&self, index: usize) -> Option<(usize, usize)> {
+    pub fn boundaries(&self, index: usize) -> Option<(usize, usize)> {
         if index >= self.count {
             return None;
         }

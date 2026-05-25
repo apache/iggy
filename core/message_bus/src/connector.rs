@@ -100,11 +100,12 @@ async fn connect_all(
         // connection lives on shard 0; `owning_shard` covers multi-shard
         // deployments where the fd was delegated to a peer shard but the
         // mapping broadcast reached shard 0. Either hit means a previous
-        // sweep (or the inbound listener) already installed this peer.
-        // Redialing wastes a TCP round-trip; the live entry stays intact
-        // (the loser of the registry insert race in `install_replica_conn`
-        // gets `RejectedRegistration` back and tears DOWN ITS OWN orphan
-        // tasks via `drain_rejected_registration`, never the winner's).
+        // sweep (or the inbound listener) already installed this peer,
+        // and redialing wastes a TCP round-trip. The same `owning_shard`
+        // CAS is also taken inside `install_replica_conn` before any
+        // task is spawned, so a concurrent inbound install for the same
+        // peer on a different shard loses the race there and drops the
+        // fd; the live entry stays intact on the winner.
         if bus.replicas().contains(peer_id) || bus.owning_shard(peer_id).is_some() {
             debug!(
                 replica = peer_id,

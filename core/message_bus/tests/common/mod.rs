@@ -26,7 +26,7 @@
 
 #![allow(dead_code)] // each test binary uses a subset
 
-use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, Message};
+use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
 use message_bus::ConnectionInstaller;
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica::listener::MessageHandler;
@@ -35,6 +35,7 @@ use message_bus::{
     AcceptedTlsClientFn, AcceptedWsClientFn, AcceptedWssClientFn, ClientConnMeta,
     ClientTransportKind, IggyMessageBus, fd_transfer, installer,
 };
+use server_common::Message;
 use std::cell::Cell;
 use std::net::SocketAddr;
 use std::rc::Rc;

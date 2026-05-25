@@ -17,7 +17,77 @@
  * under the License.
  */
 
-fn main() {
-    tracing_subscriber::fmt::init();
-    tracing::info!("iggy-server-ng starting...");
+#![allow(clippy::future_not_send)]
+
+mod args;
+
+use args::Args;
+use clap::Parser;
+use server_ng::bootstrap::{bootstrap, load_config};
+use server_ng::server_error::ServerNgError;
+use tracing::{error, info};
+
+fn main() -> Result<(), ServerNgError> {
+    // TODO(hubcio): decouple runtime creation from the `server` crate and
+    // move the shared compio executor setup into a lower-level crate/module
+    // used by both binaries.
+    let bootstrap_runtime = match server::bootstrap::create_shard_executor() {
+        Ok(rt) => rt,
+        Err(e) => {
+            match e.kind() {
+                std::io::ErrorKind::InvalidInput => {
+                    server::diagnostics::print_invalid_io_uring_args_info();
+                }
+                std::io::ErrorKind::OutOfMemory => {
+                    server::diagnostics::print_locked_memory_limit_info();
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    server::diagnostics::print_io_uring_permission_info();
+                }
+                _ => {}
+            }
+            panic!("Cannot create server-ng bootstrap executor: {e}");
+        }
+    };
+
+    // Bootstrap on a temporary runtime: parse args, init logging, load
+    // config, init the memory pool. Then drop the runtime and spawn the
+    // per-shard runtimes - each shard thread builds its OWN
+    // `compio::runtime::Runtime` via `create_shard_executor`, pinned to
+    // its CPU.
+    let bootstrap_result: Result<(configs::server_ng::ServerNgConfig, Option<u8>), ServerNgError> =
+        bootstrap_runtime.block_on(async {
+            let args = Args::parse();
+            if let Ok(env_path) = std::env::var("IGGY_ENV_PATH") {
+                let _ = dotenvy::from_path(&env_path);
+            } else {
+                let _ = dotenvy::dotenv();
+            }
+
+            // TODO: decouple logging from the `server` crate.
+            let mut logging = server::log::logger::Logging::new();
+            logging.early_init();
+
+            let config = load_config(&mut logging).await?;
+            server_common::MemoryPool::init_pool(&config.system.memory_pool.into_other());
+
+            Ok((config, args.replica_id))
+        });
+    let (config, replica_id) = bootstrap_result?;
+    drop(bootstrap_runtime);
+
+    let shards = bootstrap(config, replica_id)?;
+    if let Err(error) = shards.install_ctrlc_handler() {
+        // Without a working SIGINT handler the server has no way to
+        // observe an operator Ctrl-C and the shutdown flag would never
+        // flip, leaving shard threads parked indefinitely. Fail fast
+        // rather than boot into an un-killable state.
+        error!(error = %error, "failed to install Ctrl-C handler; aborting boot");
+        std::process::exit(1);
+    }
+
+    info!("server-ng running; waiting on shard threads");
+    shards.join_all()?;
+    info!("server-ng shutdown complete");
+    Ok(())
 }

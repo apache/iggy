@@ -23,6 +23,7 @@ using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
+using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Utils;
 
@@ -332,85 +333,77 @@ internal static class BinaryMapper
         };
     }
 
-    internal static PolledMessages MapMessages(ReadOnlySpan<byte> payload)
+    internal static PolledMessagesRental MapRentedMessages(ReadOnlyMemory<byte> payload,
+        IMemoryOwner<byte> payloadOwner)
     {
+        ReadOnlySpan<byte> span = payload.Span;
         var length = payload.Length;
-        var partitionId = BinaryPrimitives.ReadInt32LittleEndian(payload[..4]);
-        var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(payload[4..12]);
-        var messagesCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[12..16]);
+        var partitionId = BinaryPrimitives.ReadInt32LittleEndian(span[..4]);
+        var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[4..12]);
+        var messagesCount = BinaryPrimitives.ReadUInt32LittleEndian(span[12..16]);
         var position = 16;
         if (position >= length)
         {
-            return PolledMessages.Empty;
+            return new PolledMessagesRental(payloadOwner)
+            {
+                PartitionId = partitionId,
+                CurrentOffset = currentOffset,
+                Messages = []
+            };
         }
 
-        List<MessageResponse> messages = new();
+        var maxMessages = (length - 16) / PropertiesSize;
+        var capacity = (int)Math.Min(messagesCount, (uint)maxMessages);
+        List<RentedMessageResponse> messages = new(capacity);
 
         while (position < length)
         {
-            var checksum = BinaryPrimitives.ReadUInt64LittleEndian(payload[position..(position + 8)]);
-            var id = BinaryPrimitives.ReadUInt128LittleEndian(payload[(position + 8)..(position + 24)]);
-            var offset = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 24)..(position + 32)]);
-            var timestamp = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 32)..(position + 40)]);
-            var originTimestamp = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 40)..(position + 48)]);
-            var headersLength = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 48)..(position + 52)]);
-            var payloadLength = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 52)..(position + 56)]);
-            var reserved = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 56)..(position + 64)]);
+            var checksum = BinaryPrimitives.ReadUInt64LittleEndian(span[position..(position + 8)]);
+            var id = BinaryPrimitives.ReadUInt128LittleEndian(span[(position + 8)..(position + 24)]);
+            var offset = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 24)..(position + 32)]);
+            var timestamp = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 32)..(position + 40)]);
+            var originTimestamp = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 40)..(position + 48)]);
+            var headersLength = BinaryPrimitives.ReadInt32LittleEndian(span[(position + 48)..(position + 52)]);
+            var payloadLength = BinaryPrimitives.ReadInt32LittleEndian(span[(position + 52)..(position + 56)]);
+            var reserved = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 56)..(position + 64)]);
 
             var wireHeadersLength = headersLength;
-            byte[]? rawUserHeaders = null;
-            Dictionary<HeaderKey, HeaderValue>? headers;
-            if (headersLength == 0)
-            {
-                headers = null;
-            }
-            else if (headersLength < 0)
+            if (headersLength < 0)
             {
                 throw new ArgumentOutOfRangeException();
-            }
-            else
-            {
-                rawUserHeaders = payload[(position + 64 + payloadLength)..(position + 64 + payloadLength + headersLength)].ToArray();
-                headers = TryMapHeaders(rawUserHeaders);
             }
 
             var payloadRangeStart = position + 64;
             var payloadRangeEnd = position + 64 + payloadLength;
-            if (payloadRangeStart > length || payloadRangeEnd > length)
+            var headersRangeStart = payloadRangeEnd;
+            var headersRangeEnd = headersRangeStart + headersLength;
+            if (payloadRangeStart > length || payloadRangeEnd > length || headersRangeStart > length ||
+                headersRangeEnd > length)
             {
                 break;
             }
 
-            ReadOnlySpan<byte> payloadSlice = payload[payloadRangeStart..payloadRangeEnd];
-            var messagePayload = ArrayPool<byte>.Shared.Rent(payloadSlice.Length);
-            var payloadSliceLen = payloadSlice.Length;
+            ReadOnlyMemory<byte> payloadSlice = payload.Slice(payloadRangeStart, payloadLength);
+            ReadOnlyMemory<byte> rawHeaders = headersLength > 0
+                ? payload.Slice(headersRangeStart, headersLength)
+                : ReadOnlyMemory<byte>.Empty;
 
-            try
+            messages.Add(new RentedMessageResponse
             {
-                payloadSlice.CopyTo(messagePayload.AsSpan()[..payloadSliceLen]);
-
-                messages.Add(new MessageResponse
+                Header = new MessageHeader
                 {
-                    Header = new MessageHeader
-                    {
-                        Checksum = checksum,
-                        Id = id,
-                        Offset = offset,
-                        OriginTimestamp = originTimestamp,
-                        PayloadLength = payloadLength,
-                        Timestamp = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(timestamp),
-                        UserHeadersLength = headersLength,
-                        Reserved = reserved
-                    },
-                    UserHeaders = headers,
-                    RawUserHeaders = rawUserHeaders,
-                    Payload = messagePayload[..payloadSliceLen]
-                });
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(messagePayload);
-            }
+                    Checksum = checksum,
+                    Id = id,
+                    Offset = offset,
+                    OriginTimestamp = originTimestamp,
+                    PayloadLength = payloadLength,
+                    Timestamp = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(timestamp),
+                    UserHeadersLength = headersLength,
+                    Reserved = reserved
+                },
+                RawUserHeaders = rawHeaders,
+                Payload = payloadSlice
+            });
 
             position += 64 + payloadLength + wireHeadersLength;
             if (position + PropertiesSize >= length)
@@ -419,11 +412,54 @@ internal static class BinaryMapper
             }
         }
 
-        return new PolledMessages
+        return new PolledMessagesRental(payloadOwner)
         {
             PartitionId = partitionId,
             CurrentOffset = currentOffset,
-            Messages = messages.AsReadOnly()
+            Messages = messages
+        };
+    }
+
+    internal static PolledMessages MaterializeMessages(PolledMessagesRental rental)
+    {
+        var messages = new List<MessageResponse>(rental.Messages.Count);
+        foreach (var message in rental.Messages)
+        {
+            messages.Add(new MessageResponse
+            {
+                Header = message.Header,
+                RawUserHeaders = message.RawUserHeaders.IsEmpty ? null : message.RawUserHeaders.ToArray(),
+                Payload = message.Payload.ToArray()
+            });
+        }
+
+        return new PolledMessages
+        {
+            PartitionId = rental.PartitionId,
+            CurrentOffset = rental.CurrentOffset,
+            Messages = messages
+        };
+    }
+
+    internal static PolledMessagesRental ToRentedMessages(PolledMessages messages)
+    {
+        var rentedMessages = new List<RentedMessageResponse>(messages.Messages.Count);
+        foreach (var message in messages.Messages)
+        {
+            rentedMessages.Add(new RentedMessageResponse
+            {
+                Header = message.Header,
+                Payload = message.Payload,
+                RawUserHeaders = message.RawUserHeaders ?? ReadOnlyMemory<byte>.Empty,
+                UserHeaders = message.UserHeaders
+            });
+        }
+
+        return new PolledMessagesRental(TcpMessageStream.EmptyMemoryOwner.Instance)
+        {
+            PartitionId = messages.PartitionId,
+            CurrentOffset = messages.CurrentOffset,
+            Messages = rentedMessages
         };
     }
 
@@ -480,36 +516,61 @@ internal static class BinaryMapper
         while (position < payload.Length)
         {
             if (!TryMapHeaderKind(payload[position], out var keyKind))
+            {
                 return null;
+            }
+
             position++;
 
             if (position + 4 > payload.Length)
+            {
                 return null;
+            }
+
             var keyLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
             if (keyLength is <= 0 or > 255)
+            {
                 return null;
+            }
 
             position += 4;
             if (position + keyLength > payload.Length)
+            {
                 return null;
+            }
+
             var keyValue = payload[position..(position + keyLength)].ToArray();
             position += keyLength;
 
             if (position >= payload.Length)
+            {
                 return null;
+            }
+
             if (!TryMapHeaderKind(payload[position], out var valueKind))
+            {
                 return null;
+            }
+
             position++;
 
             if (position + 4 > payload.Length)
+            {
                 return null;
+            }
+
             var valueLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
             if (valueLength is <= 0 or > 255)
+            {
                 return null;
+            }
 
             position += 4;
             if (position + valueLength > payload.Length)
+            {
                 return null;
+            }
+
             ReadOnlySpan<byte> value = payload[position..(position + valueLength)];
             position += valueLength;
 
@@ -550,6 +611,7 @@ internal static class BinaryMapper
             kind = MapHeaderKind(value);
             return true;
         }
+
         kind = default;
         return false;
     }

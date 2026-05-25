@@ -36,28 +36,19 @@ ignored = [
     "axum-server",
     "bytes",
     "chrono",
-    "clap",
-    "compio",
-    "configs",
     "ctrlc",
     "cyper",
     "cyper-axum",
     "dashmap",
-    "dotenvy",
     "err_trail",
     "error_set",
     "figlet-rs",
-    "flume",
     "fs2",
-    "futures",
     "hash32",
     "human-repr",
     "hwlocality",
-    "iggy_binary_protocol",
-    "iggy_common",
     "jsonwebtoken",
     "left-right",
-    "metadata",
     "mimalloc",
     "mime_guess",
     "nix",
@@ -75,7 +66,6 @@ ignored = [
     "rust-embed",
     "rustls",
     "rustls-pemfile",
-    "secrecy",
     "send_wrapper",
     "serde",
     "slab",
@@ -83,8 +73,6 @@ ignored = [
     "strum",
     "sysinfo",
     "tempfile",
-    "thiserror",
-    "toml",
     "tower-http",
     "tracing-appender",
     "tracing-opentelemetry",
@@ -105,7 +93,6 @@ iggy-web = ["dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
 ahash = { workspace = true }
-anyhow = { workspace = true }
 argon2 = { workspace = true }
 async-channel = { workspace = true }
 async_zip = { workspace = true }
@@ -116,6 +103,8 @@ chrono = { workspace = true }
 clap = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
+consensus = { workspace = true }
+crossfire = { workspace = true }
 ctrlc = { workspace = true }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }
@@ -124,15 +113,15 @@ dotenvy = { workspace = true }
 err_trail = { workspace = true }
 error_set = { workspace = true }
 figlet-rs = { workspace = true }
-flume = { workspace = true }
 fs2 = { workspace = true }
-futures = { workspace = true }
 hash32 = { workspace = true }
 human-repr = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+journal = { workspace = true }
 jsonwebtoken = { workspace = true }
 left-right = { workspace = true }
+message_bus = { workspace = true }
 metadata = { workspace = true }
 mimalloc = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
@@ -143,6 +132,7 @@ opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 papaya = { workspace = true }
+partitions = { workspace = true }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
 ringbuffer = { workspace = true }
@@ -154,6 +144,9 @@ rustls-pemfile = { workspace = true }
 secrecy = { workspace = true }
 send_wrapper = { workspace = true }
 serde = { workspace = true }
+server = { workspace = true }
+server_common = { workspace = true }
+shard = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true }
 strum = { workspace = true }
@@ -165,7 +158,6 @@ tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
 uuid = { workspace = true }
 

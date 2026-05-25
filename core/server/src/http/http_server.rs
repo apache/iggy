@@ -310,8 +310,8 @@ async fn build_app_state(
         Ok(manager) => manager,
         Err(error) => panic!("Failed to initialize JWT manager: {error}"),
     };
-    if jwt_manager.load_revoked_tokens().await.is_err() {
-        panic!("Failed to load revoked access tokens");
+    if let Err(error) = jwt_manager.load_revoked_tokens().await {
+        panic!("Failed to load revoked access tokens: {error}");
     }
 
     Arc::new(AppState {

@@ -24,8 +24,23 @@ updates:
     rebase-strategy: "disabled"
     commit-message:
       prefix: "chore(deps): "
-    assignees:
+    reviewers:
       - "apache/iggy-committers"
+    groups:
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    rebase-strategy: "disabled"
+    commit-message:
+      prefix: "chore(deps): "
     reviewers:
       - "apache/iggy-committers"
     groups:

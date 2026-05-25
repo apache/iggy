@@ -64,6 +64,7 @@ async fn json_rows_source_produces_messages_to_iggy(
     let consumer_id: Identifier = "test_consumer".try_into().unwrap();
 
     let mut received: Vec<DatabaseRecord> = Vec::new();
+    let mut raw_payloads: Vec<Vec<u8>> = Vec::new();
     for _ in 0..POLL_ATTEMPTS {
         if let Ok(polled) = client
             .poll_messages(
@@ -79,6 +80,7 @@ async fn json_rows_source_produces_messages_to_iggy(
         {
             for msg in polled.messages {
                 if let Ok(record) = serde_json::from_slice(&msg.payload) {
+                    raw_payloads.push(msg.payload.to_vec());
                     received.push(record);
                 }
             }
@@ -108,6 +110,21 @@ async fn json_rows_source_produces_messages_to_iggy(
         assert_eq!(
             record.data, test_messages[i],
             "Message data mismatch at record {i}"
+        );
+    }
+
+    // Verify BPCHAR (CHAR(n)) column extraction — Postgres reports CHAR(n) as BPCHAR
+    for (i, raw) in raw_payloads.iter().enumerate() {
+        let json: serde_json::Value =
+            serde_json::from_slice(raw).expect("Failed to parse raw payload");
+        let tag = json["data"]["tag"]
+            .as_str()
+            .unwrap_or_else(|| panic!("Missing BPCHAR 'tag' field in record {i}"));
+        let expected_tag = format!("tag_{}", test_messages[i].id);
+        assert_eq!(
+            tag.trim(),
+            expected_tag,
+            "BPCHAR tag mismatch at record {i}"
         );
     }
 }

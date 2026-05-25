@@ -37,6 +37,7 @@ namespace Apache.Iggy.Consumers;
 public partial class IggyConsumer : IAsyncDisposable
 {
     private readonly Channel<ReceivedMessage> _channel;
+    private readonly Channel<ReceivedRentedMessage> _rentedChannel;
     private readonly IIggyClient _client;
     private readonly IggyConsumerConfig _config;
     private readonly SemaphoreSlim _connectionStateSemaphore = new(1, 1);
@@ -50,6 +51,9 @@ public partial class IggyConsumer : IAsyncDisposable
     private volatile bool _joinedConsumerGroup;
     private long _lastPolledAtMs;
 
+    /// <summary>Whether this consumer has been initialized via <see cref="InitAsync" />.</summary>
+    protected bool IsInitialized => _isInitialized;
+
     /// <summary>
     ///     Initializes a new instance of the <see cref="IggyConsumer" /> class
     /// </summary>
@@ -62,7 +66,9 @@ public partial class IggyConsumer : IAsyncDisposable
         _config = config;
         _logger = loggerFactory.CreateLogger<IggyConsumer>();
 
-        _channel = Channel.CreateUnbounded<ReceivedMessage>();
+        _channel = Channel.CreateBounded<ReceivedMessage>(new BoundedChannelOptions((int)config.BatchSize * 2));
+        _rentedChannel
+            = Channel.CreateBounded<ReceivedRentedMessage>(new BoundedChannelOptions((int)config.BatchSize * 2));
         _consumerErrorEvents = new EventAggregator<ConsumerErrorEventArgs>(loggerFactory);
     }
 
@@ -74,6 +80,14 @@ public partial class IggyConsumer : IAsyncDisposable
         if (Interlocked.Exchange(ref _disposeState, 1) == 1)
         {
             return;
+        }
+
+        _channel.Writer.TryComplete();
+        _rentedChannel.Writer.TryComplete();
+
+        while (_rentedChannel.Reader.TryRead(out var queued))
+        {
+            queued.Dispose();
         }
 
         if (_isInitialized)
@@ -112,7 +126,6 @@ public partial class IggyConsumer : IAsyncDisposable
         _consumerErrorEvents.Clear();
         _pollingSemaphore.Dispose();
         _connectionStateSemaphore.Dispose();
-
     }
 
     /// <summary>
@@ -187,7 +200,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
             if (_config.AutoCommitMode == AutoCommitMode.AfterReceive)
             {
-                await StoreOffsetAsync(message.CurrentOffset, message.PartitionId, ct);
+                await StoreOffsetAsync(message.CurrentOffset, message.PartitionId, false, ct);
             }
         } while (!ct.IsCancellationRequested);
     }
@@ -198,10 +211,17 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     /// <param name="offset">The offset to store</param>
     /// <param name="partitionId">The partition ID</param>
+    /// <param name="resetLastPolled"></param>
     /// <param name="ct">Cancellation token</param>
-    public async Task StoreOffsetAsync(ulong offset, uint partitionId, CancellationToken ct = default)
+    public async Task StoreOffsetAsync(ulong offset, uint partitionId, bool resetLastPolled = false,
+        CancellationToken ct = default)
     {
         await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId, ct);
+
+        if (resetLastPolled)
+        {
+            _lastPolledOffset[(int)partitionId] = offset;
+        }
     }
 
     /// <summary>
@@ -349,30 +369,23 @@ public partial class IggyConsumer : IAsyncDisposable
                 _config.PartitionId, _config.Consumer, _config.PollingStrategy, _config.BatchSize,
                 _config.AutoCommit, ct);
 
-            var receiveMessages = messages.Messages.Count > 0;
-
-            if (_lastPolledOffset.TryGetValue(messages.PartitionId, out var lastPolledPartitionOffset))
-            {
-                messages.Messages = messages.Messages.Where(x => x.Header.Offset > lastPolledPartitionOffset).ToList();
-            }
-
-            if (messages.Messages.Count == 0
-                && receiveMessages
-                && _config.AutoCommitMode != AutoCommitMode.Disabled)
-            {
-                _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
-                    lastPolledPartitionOffset, messages.PartitionId);
-                await StoreOffsetAsync(lastPolledPartitionOffset, (uint)messages.PartitionId, ct);
-            }
-
             if (messages.Messages.Count == 0)
             {
                 return;
             }
 
+            var hasLastOffset = _lastPolledOffset.TryGetValue(messages.PartitionId,
+                out var lastPolledPartitionOffset);
+
             var currentOffset = 0ul;
+            var anyNewMessages = false;
             foreach (var message in messages.Messages)
             {
+                if (hasLastOffset && message.Header.Offset <= lastPolledPartitionOffset)
+                {
+                    continue;
+                }
+
                 var processedMessage = message;
                 var status = MessageStatus.Success;
                 Exception? error = null;
@@ -416,6 +429,19 @@ public partial class IggyConsumer : IAsyncDisposable
 
                 await _channel.Writer.WriteAsync(receivedMessage, ct);
                 currentOffset = receivedMessage.CurrentOffset;
+                anyNewMessages = true;
+            }
+
+            if (!anyNewMessages)
+            {
+                if (_config.AutoCommitMode != AutoCommitMode.Disabled)
+                {
+                    _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
+                        lastPolledPartitionOffset, messages.PartitionId);
+                    await StoreOffsetAsync(lastPolledPartitionOffset, (uint)messages.PartitionId, false, ct);
+                }
+
+                return;
             }
 
             _lastPolledOffset.AddOrUpdate(messages.PartitionId, currentOffset,

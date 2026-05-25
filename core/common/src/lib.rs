@@ -17,14 +17,9 @@
  * under the License.
  */
 
-mod alloc;
-mod certificates;
-mod deduplication;
 mod error;
 pub mod http;
 mod macros;
-mod sender;
-pub mod sharding;
 mod traits;
 mod types;
 mod utils;
@@ -34,11 +29,7 @@ pub use error::client_error::ClientError;
 pub use error::iggy_error::{IggyError, IggyErrorDiscriminants};
 // Locking is feature gated, thus only mod level re-export.
 pub mod locking;
-pub use alloc::buffer::PooledBuffer;
-pub use alloc::memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_pool};
-pub use certificates::generate_self_signed_certificate;
 pub use chrono::{DateTime, Duration as ChronoDuration, Utc};
-pub use deduplication::MessageDeduplicator;
 pub use http::consumer_groups::*;
 pub use http::consumer_offsets::*;
 pub use http::messages::*;
@@ -49,9 +40,6 @@ pub use http::streams::*;
 pub use http::system::*;
 pub use http::topics::*;
 pub use http::users::*;
-pub use sender::{
-    QuicSender, Sender, SenderKind, TcpSender, TcpTlsSender, WebSocketSender, WebSocketTlsSender,
-};
 pub use traits::binary_client::BinaryClient;
 pub use traits::binary_transport::BinaryTransport;
 pub use traits::client::Client;
@@ -110,8 +98,6 @@ pub use types::permissions::permissions_global::*;
 pub use types::permissions::personal_access_token::*;
 pub use types::personal_access_tokens::*;
 pub use types::segment::Segment;
-pub use types::segment_storage::*;
-pub use types::send_messages2;
 pub use types::snapshot::*;
 pub use types::stats::*;
 pub use types::stream::*;
@@ -126,6 +112,7 @@ pub use utils::crypto::*;
 pub use utils::duration::{IggyDuration, SEC_IN_MICRO};
 pub use utils::expiry::IggyExpiry;
 pub use utils::hash::*;
+pub use utils::net::validate_api_url;
 pub use utils::net::validate_server_address;
 pub use utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
 pub use utils::random_id;

@@ -45,8 +45,9 @@
 //! # VSR consensus framing
 //!
 //! All consensus headers are 256 bytes with `#[repr(C)]` layout.
-//! Deserialization is zero-copy via `bytemuck`. The [`Message`] type
-//! wraps request or response backing with typed header access.
+//! Deserialization is zero-copy via `bytemuck`. Runtime message wrappers
+//! (`Message`, `MessageBag`, backings) live in `server_common`; this crate
+//! exposes only the wire-level header types.
 //!
 //! - Client-facing: [`RequestHeader`], [`ReplyHeader`]
 //! - Replication: [`PrepareHeader`], [`PrepareOkHeader`], [`CommitHeader`]
@@ -68,11 +69,10 @@ pub mod responses;
 
 pub use codec::{WireDecode, WireEncode};
 pub use consensus::{
-    Command2, CommitHeader, ConsensusError, ConsensusHeader, ConsensusMessage, DoViewChangeHeader,
-    FragmentedBacking, GenericHeader, HEADER_SIZE, Message, MessageBacking, MessageBag,
-    MutableBacking, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader, RequestBacking,
-    RequestBackingKind, RequestHeader, ResponseBacking, ResponseBackingKind, SIZE_FIELD_OFFSET,
-    StartViewChangeHeader, StartViewHeader, read_size_field,
+    Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, EvictionHeader,
+    EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader, PrepareOkHeader,
+    ReplyHeader, RequestHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader,
+    read_size_field,
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;

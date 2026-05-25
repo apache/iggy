@@ -126,6 +126,12 @@ decoding_secret = ""
 # `false` means the secret is in plain text.
 use_base64_secret = false
 
+# Trusted issuers for A2A (Application-to-Application) authentication
+[[http.jwt.trusted_issuers]]
+issuer = "test-issuer"
+jwks_url = "http://127.0.0.1:8081/.well-known/jwks.json"
+audience = "iggy.apache.org"
+
 # Metrics configuration for HTTP.
 [http.metrics]
 # Enable or disable the metrics endpoint.
@@ -583,7 +589,22 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 
 # - numa settings:
 #     + "numa:auto": Use all available numa node, cores
 #     + "numa:nodes=0,1;cores=4;no_ht=true": Use NUMA node 0 and 1, each nodes use 4 cores, and no hyperthreads
-cpu_allocation = "numa:auto"
+# TODO(hubcio): revert to "numa:auto" once multi-shard server-ng is stable.
+cpu_allocation = 1
+
+# Wall-clock budget for a single shard's bus drain on shutdown. Drives
+# the per-shard watchdog and the parallel-join survivor path; sized
+# larger than typical TCP RTT times in-flight write-batch so writers
+# receive their full last `write_vectored_all` budget before the
+# connection registry force-tears the bus. Slow-fsync hosts may need
+# to extend this past the default.
+shutdown_drain_timeout = "10 s"
+
+# Poll cadence for the cross-thread shutdown flag and for the
+# metadata-handoff loops. Trades off Ctrl-C latency against idle wakeup
+# cost; the default keeps shutdown observably prompt without measurable
+# scheduler overhead. Must be less than or equal to shutdown_drain_timeout.
+shutdown_poll_interval = "50 ms"
 
 [websocket]
 enabled = true
@@ -653,3 +674,8 @@ handshake_grace = "10 s"
 # Whether to accept unmasked frames from clients in violation of
 # RFC 6455 client-to-server framing rules. Strict (false) by default.
 ws_accept_unmasked_frames = false
+
+[extra.namespace]
+max_streams = 4096
+max_topics = 4096
+max_partitions = 1_000_000

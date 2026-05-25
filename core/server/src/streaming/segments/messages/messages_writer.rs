@@ -15,4 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub use iggy_common::MessagesWriter;
+pub use server_common::MessagesWriter;

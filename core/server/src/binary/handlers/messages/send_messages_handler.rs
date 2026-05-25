@@ -17,6 +17,7 @@
  */
 
 use crate::binary::dispatch::HandlerResult;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::shard::transmission::message::{ResolvedPartition, ShardRequest, ShardRequestPayload};
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
@@ -24,12 +25,11 @@ use crate::streaming::session::Session;
 use crate::streaming::topics;
 use compio::buf::{IntoInner as _, IoBuf};
 use iggy_common::Identifier;
-use iggy_common::PooledBuffer;
-use iggy_common::SenderKind;
 use iggy_common::Sizeable;
-use iggy_common::sharding::IggyNamespace;
 use iggy_common::{INDEX_SIZE, PartitioningKind};
 use iggy_common::{IggyError, Partitioning, Validatable};
+use server_common::PooledBuffer;
+use server_common::sharding::IggyNamespace;
 use std::rc::Rc;
 use tracing::{debug, error, info, instrument};
 

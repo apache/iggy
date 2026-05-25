@@ -82,11 +82,10 @@ use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::TcpStream;
 use compio::tls::{TlsAcceptor, TlsConnector, TlsStream};
 use futures::FutureExt;
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Owned;
-use iggy_binary_protocol::{GenericHeader, HEADER_SIZE, Message, read_size_field};
+use iggy_binary_protocol::{GenericHeader, HEADER_SIZE, read_size_field};
 use iggy_common::IggyError;
 use rustls::pki_types::ServerName;
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Owned};
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
@@ -619,10 +618,9 @@ mod tests {
     use crate::transports::tls::{install_default_crypto_provider, self_signed_for_loopback};
     use async_channel::{Receiver, Sender, bounded};
     use compio::net::TcpListener;
-    use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-    use iggy_binary_protocol::consensus::iobuf::Frozen;
-    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, Message};
+    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
     use rustls::RootCertStore;
+    use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
     use std::net::SocketAddr;
     use std::sync::OnceLock;
 

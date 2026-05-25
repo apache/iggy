@@ -34,6 +34,8 @@ mod error;
 mod log;
 mod service;
 mod stream;
+#[cfg(feature = "systemd")]
+mod systemd;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -89,6 +91,9 @@ async fn main() -> Result<(), McpRuntimeError> {
         delete: config.permissions.delete,
     };
 
+    #[cfg(feature = "systemd")]
+    let watchdog_cancel = tokio_util::sync::CancellationToken::new();
+
     if transport == McpTransport::Stdio {
         let Ok(service) = IggyService::new(iggy_client, iggy_consumer, permissions)
             .serve(stdio())
@@ -101,11 +106,21 @@ async fn main() -> Result<(), McpRuntimeError> {
             return Err(McpRuntimeError::FailedToCreateService);
         };
 
+        #[cfg(feature = "systemd")]
+        systemd::notify_ready();
+        #[cfg(feature = "systemd")]
+        systemd::spawn_watchdog(watchdog_cancel.clone());
+
         if let Err(error) = service.waiting().await {
             error!("Waiting for service error. {error}");
         }
     } else {
         api::init(config.http, iggy_client, iggy_consumer, permissions).await?;
+
+        #[cfg(feature = "systemd")]
+        systemd::notify_ready();
+        #[cfg(feature = "systemd")]
+        systemd::spawn_watchdog(watchdog_cancel.clone());
     }
 
     #[cfg(unix)]
@@ -125,6 +140,12 @@ async fn main() -> Result<(), McpRuntimeError> {
         _ = sigterm.recv() => {
             info!("Received SIGTERM. Shutting down Iggy MCP Server...");
         }
+    }
+
+    #[cfg(feature = "systemd")]
+    {
+        watchdog_cancel.cancel();
+        systemd::notify_stopping();
     }
 
     client_to_shutdown.shutdown().await?;
