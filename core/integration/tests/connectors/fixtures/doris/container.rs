@@ -49,7 +49,11 @@ static DORIS_LOCK: Lazy<std::sync::Arc<Mutex<()>>> =
     Lazy::new(|| std::sync::Arc::new(Mutex::new(())));
 
 const DORIS_IMAGE: &str = "apache/doris";
-const DORIS_TAG: &str = "doris-all-in-one-2.1.0";
+// Apache's maintained single-container line is now tagged `<version>-all` /
+// `<version>-all-slim` (the old one-off `doris-all-in-one-2.1.0` was pushed once
+// in 2024 and never refreshed). `-slim` is the smaller base, so it pulls faster
+// on CI runners.
+const DORIS_TAG: &str = "4.0.3-all-slim";
 const FE_HTTP_PORT: u16 = 8030;
 const FE_MYSQL_PORT: u16 = 9030;
 const BE_HTTP_PORT: u16 = 8040;
@@ -90,10 +94,10 @@ const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_DORIS_PATH";
 
 /// The schema used by `TestMessage` in the integration tests.
 ///
-/// `replication_num = 1` because the all-in-one container has a single BE.
-/// `storage_medium = HDD` because that BE advertises HDD; without this
-/// override Doris defaults the table to SSD and the FE rejects CREATE with
-/// "Failed to find enough backend ... storage medium: SSD".
+/// `replication_num = 1` because the all-in-one container has a single BE. The
+/// table storage medium is left to Doris's default (the 2.1 all-in-one image
+/// advertised HDD-only and needed an explicit `storage_medium = HDD` override;
+/// the 4.0 image no longer does).
 const TEST_TABLE_DDL_TEMPLATE: &str = "
 CREATE TABLE IF NOT EXISTS {db}.{table} (
     id BIGINT NOT NULL,
@@ -106,8 +110,7 @@ CREATE TABLE IF NOT EXISTS {db}.{table} (
 DUPLICATE KEY(id)
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES (
-    \"replication_num\" = \"1\",
-    \"storage_medium\" = \"HDD\"
+    \"replication_num\" = \"1\"
 );
 ";
 
@@ -129,8 +132,7 @@ CREATE TABLE IF NOT EXISTS {db}.{table} (
 DUPLICATE KEY(id)
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES (
-    \"replication_num\" = \"1\",
-    \"storage_medium\" = \"HDD\"
+    \"replication_num\" = \"1\"
 );
 ";
 
