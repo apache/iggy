@@ -22,8 +22,8 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 5. The HTTP body is parsed as JSON and the `Status` field decides the outcome:
    - `Success` → batch accepted.
    - `Label Already Exists` → idempotent replay, treated as success.
-   - `Publish Timeout` or HTTP `5xx`/`408`/`429` → transient error (`Error::CannotStoreData`); the runtime can retry.
-   - `Fail`, any other `4xx`, or an unparsable response body → permanent error (`Error::PermanentHttpError`); retrying is not useful.
+   - `Publish Timeout` or HTTP `5xx`/`408`/`429` → classified as a transient error (`Error::CannotStoreData`) — retryable in principle, but per the at-most-once note above the runtime does not currently act on it.
+   - `Fail`, any other `4xx`, or an unparsable response body → permanent error (`Error::PermanentHttpError`); retrying would not help even if the runtime did redrive.
 
 ## Configuration
 
@@ -38,7 +38,7 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 | `batch_size` | no | `1000` | Maximum number of messages per Stream Load request. |
 | `timeout` | no | `30s` | Per-request HTTP timeout (total request budget), as a human-readable duration (e.g. `30s`, `1m`). |
 | `connect_timeout` | no | `5s` | TCP connect timeout, independent of `timeout`, as a human-readable duration. Raise it for cross-region or cold-start FEs. |
-| `max_filter_ratio` | no | unset | Forwarded as the `max_filter_ratio` Stream Load header. |
+| `max_filter_ratio` | no | unset | Forwarded as the `max_filter_ratio` Stream Load header. Must be a finite value in `[0.0, 1.0]`; an out-of-range value fails `open()`. |
 | `columns` | no | unset | Forwarded as the `columns` Stream Load header. Validated at startup; an invalid value fails `open()`. |
 | `where` | no | unset | Forwarded as the `where` Stream Load header. Validated at startup; an invalid value fails `open()`. |
 | `allow_insecure_redirect` | no | `false` | Permit a Stream Load redirect that downgrades `https://` → `http://`. Refused by default because it would push credentials onto a cleartext hop. |

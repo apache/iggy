@@ -355,11 +355,14 @@ impl Connected {
 }
 
 /// Match a redirect target against the allowlist. An entry of `host` matches any
-/// port on that host; an entry of `host:port` pins the exact endpoint. Only a
-/// trailing `:<digits>` is read as a port, so DNS names and IPv4 literals split
-/// cleanly.
+/// port on that host; an entry of `host:port` pins the exact endpoint. DNS names,
+/// IPv4 literals, and IPv6 literals (bare `::1` or bracketed `[::1]`/`[::1]:8040`)
+/// all split cleanly.
 fn redirect_target_allowed(allowed: &[String], target: &reqwest::Url) -> bool {
-    let host = target.host_str().unwrap_or("");
+    let raw_host = target.host_str().unwrap_or("");
+    // `host_str()` brackets IPv6 literals (`[::1]`); strip them so a bare (`::1`)
+    // or bracketed (`[::1]`) allowlist entry both compare equal.
+    let host = strip_brackets(raw_host);
     let port = target.port_or_known_default();
     allowed.iter().any(|entry| match split_host_port(entry) {
         (entry_host, Some(entry_port)) => {
@@ -369,9 +372,37 @@ fn redirect_target_allowed(allowed: &[String], target: &reqwest::Url) -> bool {
     })
 }
 
-/// Split an allowlist entry into `(host, optional port)`. A trailing
-/// `:<digits>` is treated as the port; anything else is host-only.
+/// Strip a single pair of surrounding `[ ]` brackets from an IPv6 literal, so a
+/// bracketed host compares equal to its bare form.
+fn strip_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// Split an allowlist entry into `(host, optional port)`, with the host returned
+/// *unbracketed* so it compares against a bracket-stripped `host_str()`.
+///
+/// - `[host]` / `[host]:port` — bracketed IPv6: the bracketed host splits from an
+///   optional trailing `:<port>`.
+/// - A bare entry with more than one `:` is an unbracketed IPv6 literal (`::1`,
+///   `fe80::1`); a port suffix on it would be ambiguous, so it is host-only. Pin a
+///   port on an IPv6 host by bracketing it (`[::1]:8040`).
+/// - Otherwise a trailing `:<digits>` is the port; anything else is host-only.
 fn split_host_port(entry: &str) -> (&str, Option<u16>) {
+    if let Some(rest) = entry.strip_prefix('[') {
+        // Bracketed IPv6: `[host]` or `[host]:port`.
+        if let Some((host, after)) = rest.split_once(']') {
+            let port = after.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+            return (host, port);
+        }
+        // No closing `]`: malformed, treat the whole thing as host-only.
+        return (entry, None);
+    }
+    // A bare multi-colon entry is an unbracketed IPv6 literal: host-only.
+    if entry.matches(':').count() > 1 {
+        return (entry, None);
+    }
     if let Some((host, port)) = entry.rsplit_once(':')
         && !port.is_empty()
         && let Ok(port) = port.parse::<u16>()
@@ -383,15 +414,28 @@ fn split_host_port(entry: &str) -> (&str, Option<u16>) {
 }
 
 /// Parse a human-readable duration (e.g. "30s"), falling back to `default` with
-/// a warning on a malformed value. Mirrors the http/influxdb sinks.
+/// a warning on a malformed *or zero* value. Mirrors the http/influxdb sinks.
+///
+/// A zero duration parses fine but is degenerate: reqwest treats a zero
+/// timeout/connect-timeout as an immediate deadline, so every request fails with
+/// a `TimedOut` error before it can complete. Treat it like a malformed value.
 fn parse_duration(input: Option<&str>, default: &str) -> Duration {
     let raw = input.unwrap_or(default);
-    HumanDuration::from_str(raw)
+    let fallback = || *HumanDuration::from_str(default).expect("default duration must be valid");
+    let parsed = HumanDuration::from_str(raw)
         .map(|d| *d)
         .unwrap_or_else(|e| {
             warn!("Invalid duration '{raw}': {e}, using default '{default}'");
-            *HumanDuration::from_str(default).expect("default duration must be valid")
-        })
+            fallback()
+        });
+    if parsed.is_zero() {
+        warn!(
+            "Duration '{raw}' is zero, which would time out every request immediately; \
+             using default '{default}'"
+        );
+        return fallback();
+    }
+    parsed
 }
 
 /// Build the Stream Load URL from `fe_url` and the (already identifier-checked)
@@ -408,6 +452,14 @@ fn build_stream_load_url(
             "Doris sink ID {id} has invalid fe_url '{fe_url}': {e}"
         ))
     })?;
+    // Stream Load speaks HTTP. A `file://`/`ftp://`/... base parses fine but would
+    // only fail later, per-batch, at `send()`; reject it here at startup instead.
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(Error::InvalidConfigValue(format!(
+            "Doris sink ID {id} fe_url '{fe_url}' must use http or https, got '{scheme}'"
+        )));
+    }
     url.set_path(&format!("/api/{database}/{table}/_stream_load"));
     Ok(url)
 }
@@ -616,11 +668,23 @@ impl Sink for DorisSink {
         // Validate + precompute the optional Stream Load headers once. A bad byte
         // in `columns`/`where` fails here at startup, not silently per batch.
         let max_filter_ratio_header = match self.config.max_filter_ratio {
-            Some(ratio) => Some(validated_header(
-                "max_filter_ratio",
-                &ratio.to_string(),
-                self.id,
-            )?),
+            Some(ratio) => {
+                // Doris's max_filter_ratio is a fraction in [0.0, 1.0]. A NaN/inf or
+                // out-of-range value formats to a header-valid string (so the ASCII
+                // check below would pass) but Doris rejects it on every batch —
+                // catch it here at startup instead.
+                if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+                    return Err(Error::InvalidConfigValue(format!(
+                        "Doris sink ID {}: max_filter_ratio must be a finite value in [0.0, 1.0], got {ratio}",
+                        self.id
+                    )));
+                }
+                Some(validated_header(
+                    "max_filter_ratio",
+                    &ratio.to_string(),
+                    self.id,
+                )?)
+            }
             None => None,
         };
         let columns_header = match self.config.columns.as_deref() {
@@ -826,6 +890,20 @@ mod tests {
             build_stream_load_url(1, "not a url", "db", "tbl"),
             Err(Error::InvalidConfigValue(_))
         ));
+    }
+
+    #[test]
+    fn stream_load_url_rejects_non_http_scheme() {
+        // A parseable but non-HTTP base would only fail later, per-batch, at send().
+        for fe_url in ["file:///etc", "ftp://host/path", "ws://host:8030"] {
+            assert!(
+                matches!(
+                    build_stream_load_url(1, fe_url, "db", "tbl"),
+                    Err(Error::InvalidConfigValue(_))
+                ),
+                "expected {fe_url} to be rejected at startup",
+            );
+        }
     }
 
     #[test]
@@ -1035,6 +1113,36 @@ mod tests {
             parse_duration(Some("not_a_duration"), "30s"),
             Duration::from_secs(30)
         );
+        // A zero duration is degenerate (reqwest times out every request
+        // immediately) and falls back to the default.
+        assert_eq!(parse_duration(Some("0s"), "30s"), Duration::from_secs(30));
+        assert_eq!(parse_duration(Some("0ms"), "5s"), Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn open_rejects_out_of_range_max_filter_ratio() {
+        for ratio in [1.5_f64, -0.1_f64, f64::INFINITY, f64::NAN] {
+            let mut cfg = make_config();
+            cfg.max_filter_ratio = Some(ratio);
+            let mut sink = DorisSink::new(1, cfg);
+            assert!(
+                matches!(sink.open().await, Err(Error::InvalidConfigValue(_))),
+                "expected InvalidConfigValue for max_filter_ratio={ratio}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_accepts_in_range_max_filter_ratio() {
+        for ratio in [0.0_f64, 0.5_f64, 1.0_f64] {
+            let mut cfg = make_config();
+            cfg.max_filter_ratio = Some(ratio);
+            let mut sink = DorisSink::new(1, cfg);
+            assert!(
+                sink.open().await.is_ok(),
+                "expected open() to accept max_filter_ratio={ratio}",
+            );
+        }
     }
 
     fn url(s: &str) -> reqwest::Url {
@@ -1109,6 +1217,39 @@ mod tests {
                 .validate_redirect(&url("http://be2.doris:8040/"), 1)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn redirect_allowlist_matches_ipv6_targets() {
+        // `host_str()` brackets IPv6 (`[::1]`), so a naive `rsplit_once(':')` on a
+        // bare `::1` entry used to misparse to host ":" / port 1 and refuse a
+        // legitimate IPv6 BE redirect. Bare, bracketed, and port-pinned entries
+        // must all match the same `http://[::1]:8040` target.
+        let target = "http://[::1]:8040/api/db/tbl/_stream_load";
+        for entry in ["::1", "[::1]", "[::1]:8040"] {
+            assert!(
+                connected("http://fe.doris:8030", false, Some(vec![entry.to_string()]))
+                    .validate_redirect(&url(target), 1)
+                    .is_ok(),
+                "IPv6 allowlist entry {entry:?} should match {target}"
+            );
+        }
+        // A port-pinned IPv6 entry still refuses the wrong port.
+        assert!(matches!(
+            connected(
+                "http://fe.doris:8030",
+                false,
+                Some(vec!["[::1]:8040".to_string()])
+            )
+            .validate_redirect(&url("http://[::1]:6379/exfil"), 1),
+            Err(Error::PermanentHttpError(_))
+        ));
+        // A different IPv6 host is refused.
+        assert!(matches!(
+            connected("http://fe.doris:8030", false, Some(vec!["::1".to_string()]))
+                .validate_redirect(&url("http://[fe80::1]:8040/"), 1),
+            Err(Error::PermanentHttpError(_))
+        ));
     }
 
     #[test]
