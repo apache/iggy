@@ -181,7 +181,7 @@ TEST_F(LowLevelE2E_Client, GetStatsReturnsServerStats) {
     const std::string second_group_name                 = "cpp-get-stats-group-2";
     const std::string third_group_name                  = "cpp-get-stats-group-3";
     constexpr std::uint32_t additional_partitions_count = 2;
-    iggy::ffi::Client *client = GetLoggedInClient();
+    iggy::ffi::Client *client                           = GetLoggedInClient();
 
     iggy::ffi::Client *second_client = nullptr;
     iggy::ffi::Client *third_client  = nullptr;
@@ -691,7 +691,7 @@ TEST_F(LowLevelE2E_Client, HeartbeatIntervalReturnsDefaultValueForNewConnection)
     RecordProperty("description",
                    "Returns the default heartbeat interval in microseconds for a fresh unauthenticated client.");
     constexpr std::uint64_t default_heartbeat_micros = 5'000'000ull;
-    iggy::ffi::Client *client = GetLoggedOutClient();
+    iggy::ffi::Client *client                        = GetLoggedOutClient();
 
     const auto heartbeat_interval = client->heartbeat_interval();
     EXPECT_EQ(heartbeat_interval, default_heartbeat_micros);
