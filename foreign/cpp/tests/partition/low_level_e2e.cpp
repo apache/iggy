@@ -30,8 +30,8 @@ class LowLevelE2E_Partition : public E2ETestFixture {};
 
 TEST_F(LowLevelE2E_Partition, CreatePartitionsSucceeds) {
     RecordProperty("description", "Creates partitions for an existing topic and verifies the resulting count.");
-    const std::string stream_name = "cpp-create-partitions-happy-path";
-    const std::string topic_name  = "topic-create-partitions-happy-path";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -53,8 +53,8 @@ TEST_F(LowLevelE2E_Partition, CreatePartitionsSucceeds) {
 TEST_F(LowLevelE2E_Partition, CreatePartitionsBeforeLoginThrows) {
     RecordProperty("description",
                    "Throws when create_partitions is called before connect, and after connect but before login.");
-    const std::string stream_name = "cpp-create-partitions-before-login";
-    const std::string topic_name  = "topic-create-partitions-before-login";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedOutClient();
 
@@ -67,10 +67,10 @@ TEST_F(LowLevelE2E_Partition, CreatePartitionsBeforeLoginThrows) {
 
 TEST_F(LowLevelE2E_Partition, CreatePartitionsOnNonExistentResourcesThrows) {
     RecordProperty("description", "Throws when create_partitions is called for a stream or topic that does not exist.");
-    const std::string stream_name         = "cpp-create-partitions-missing-resource-stream";
-    const std::string topic_name          = "topic-create-partitions-missing-resource-topic";
-    const std::string missing_stream_name = "cpp-create-partitions-missing-stream";
-    const std::string missing_topic_name  = "topic-create-partitions-missing-topic";
+    const std::string stream_name         = GetRandomName();
+    const std::string topic_name          = GetRandomName();
+    const std::string missing_stream_name = GetRandomName();
+    const std::string missing_topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -89,8 +89,8 @@ TEST_F(LowLevelE2E_Partition, CreatePartitionsOnNonExistentResourcesThrows) {
 
 TEST_F(LowLevelE2E_Partition, CreatePartitionsWithInvalidIdentifiersThrows) {
     RecordProperty("description", "Rejects create_partitions requests that use invalid stream or topic identifiers.");
-    const std::string stream_name = "cpp-create-partitions-invalid-identifier";
-    const std::string topic_name  = "topic-create-partitions-invalid-identifier";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -131,7 +131,7 @@ TEST_F(LowLevelE2E_Partition, CreatePartitionsWithInvalidIdentifiersThrows) {
 TEST_F(LowLevelE2E_Partition, CreatePartitionsWithBoundaryPartitionsCountValues) {
     RecordProperty("description",
                    "Accepts supported create_partitions counts and rejects values outside the allowed range.");
-    const std::string stream_name = "cpp-create-partitions-boundary-values";
+    const std::string stream_name = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -146,12 +146,12 @@ TEST_F(LowLevelE2E_Partition, CreatePartitionsWithBoundaryPartitionsCountValues)
     };
 
     const std::vector<TestCase> test_cases = {
-        {"topic-partitions-minus-1", static_cast<std::uint32_t>(-1), false, 1},
-        {"topic-partitions-0", 0, false, 1},
-        {"topic-partitions-1", 1, true, 2},
-        {"topic-partitions-43", 43, true, 44},
-        {"topic-partitions-1000", 1000, true, 1001},
-        {"topic-partitions-1001", 1001, false, 1},
+        {GetRandomName(), static_cast<std::uint32_t>(-1), false, 1},
+        {GetRandomName(), 0, false, 1},
+        {GetRandomName(), 1, true, 2},
+        {GetRandomName(), 43, true, 44},
+        {GetRandomName(), 1000, true, 1001},
+        {GetRandomName(), 1001, false, 1},
     };
 
     for (const auto &test_case : test_cases) {
@@ -191,8 +191,8 @@ TEST_F(LowLevelE2E_Partition, CreatePartitionsWithBoundaryPartitionsCountValues)
 TEST_F(LowLevelE2E_Partition, CreatePartitionsWithNumericIdentifiersSucceeds) {
     RecordProperty("description",
                    "Creates partitions successfully when valid numeric stream and topic identifiers are used.");
-    const std::string stream_name = "cpp-create-partitions-numeric-identifiers";
-    const std::string topic_name  = "topic-create-partitions-numeric-identifiers";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -218,8 +218,8 @@ TEST_F(LowLevelE2E_Partition, CreatePartitionsWithNumericIdentifiersSucceeds) {
 
 TEST_F(LowLevelE2E_Partition, DeletePartitionsSucceeds) {
     RecordProperty("description", "Deletes partitions from an existing topic and verifies the resulting count.");
-    const std::string stream_name = "cpp-delete-partitions-happy-path";
-    const std::string topic_name  = "topic-delete-partitions-happy-path";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -241,7 +241,7 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsSucceeds) {
 TEST_F(LowLevelE2E_Partition, DeleteMorePartitionsThanExistingThrows) {
     RecordProperty("description",
                    "Rejects delete_partitions counts outside the allowed range and counts greater than existing.");
-    const std::string stream_name = "cpp-delete-partitions-boundary-values";
+    const std::string stream_name = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -257,10 +257,10 @@ TEST_F(LowLevelE2E_Partition, DeleteMorePartitionsThanExistingThrows) {
     };
 
     const std::vector<TestCase> test_cases = {
-        {"topic-delete-partitions-minus-1", static_cast<std::uint32_t>(-1), false, 3, 3},
-        {"topic-delete-partitions-0", 0, false, 3, 3},
-        {"topic-delete-partitions-1", 1, true, 3, 2},
-        {"topic-delete-partitions-4", 4, false, 3, 3},
+        {GetRandomName(), static_cast<std::uint32_t>(-1), false, 3, 3},
+        {GetRandomName(), 0, false, 3, 3},
+        {GetRandomName(), 1, true, 3, 2},
+        {GetRandomName(), 4, false, 3, 3},
     };
 
     for (const auto &test_case : test_cases) {
@@ -301,8 +301,8 @@ TEST_F(LowLevelE2E_Partition, DeleteMorePartitionsThanExistingThrows) {
 TEST_F(LowLevelE2E_Partition, DeletePartitionsBeforeCreatingAdditionalPartitionsSucceeds) {
     RecordProperty("description",
                    "Deletes partitions from the initial topic allocation without calling create_partitions first.");
-    const std::string stream_name = "cpp-delete-partitions-before-create-partitions";
-    const std::string topic_name  = "topic-delete-partitions-before-create-partitions";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -323,8 +323,8 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsBeforeCreatingAdditionalPartitions
 TEST_F(LowLevelE2E_Partition, DeletePartitionsFromTopicWithZeroPartitionsThrows) {
     RecordProperty("description",
                    "Throws when delete_partitions is called with count 1 for a topic that currently has 0 partitions.");
-    const std::string stream_name = "cpp-delete-partitions-zero-existing-partitions";
-    const std::string topic_name  = "topic-delete-partitions-zero-existing-partitions";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -347,8 +347,8 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsFromTopicWithZeroPartitionsThrows)
 TEST_F(LowLevelE2E_Partition, DeletePartitionsBeforeLoginThrows) {
     RecordProperty("description",
                    "Throws when delete_partitions is called before connect, and after connect but before login.");
-    const std::string stream_name = "cpp-delete-partitions-before-login";
-    const std::string topic_name  = "topic-delete-partitions-before-login";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedOutClient();
 
@@ -361,10 +361,10 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsBeforeLoginThrows) {
 
 TEST_F(LowLevelE2E_Partition, DeletePartitionsOnNonExistentResourcesThrows) {
     RecordProperty("description", "Throws when delete_partitions is called for a stream or topic that does not exist.");
-    const std::string stream_name         = "cpp-delete-partitions-missing-resource-stream";
-    const std::string topic_name          = "topic-delete-partitions-missing-resource-topic";
-    const std::string missing_stream_name = "cpp-delete-partitions-missing-stream";
-    const std::string missing_topic_name  = "topic-delete-partitions-missing-topic";
+    const std::string stream_name         = GetRandomName();
+    const std::string topic_name          = GetRandomName();
+    const std::string missing_stream_name = GetRandomName();
+    const std::string missing_topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -383,8 +383,8 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsOnNonExistentResourcesThrows) {
 
 TEST_F(LowLevelE2E_Partition, DeletePartitionsWithInvalidIdentifiersThrows) {
     RecordProperty("description", "Rejects delete_partitions requests that use invalid stream or topic identifiers.");
-    const std::string stream_name = "cpp-delete-partitions-invalid-identifier";
-    const std::string topic_name  = "topic-delete-partitions-invalid-identifier";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -424,8 +424,8 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsWithInvalidIdentifiersThrows) {
 
 TEST_F(LowLevelE2E_Partition, DeletePartitionsTwiceForSameTopicSucceeds) {
     RecordProperty("description", "Allows delete_partitions to be called twice for the same stream and topic.");
-    const std::string stream_name = "cpp-delete-partitions-twice-same-topic";
-    const std::string topic_name  = "topic-delete-partitions-twice-same-topic";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -448,8 +448,8 @@ TEST_F(LowLevelE2E_Partition, DeletePartitionsTwiceForSameTopicSucceeds) {
 
 TEST_F(LowLevelE2E_Partition, DeletePartitionsAfterStreamDeletionThrows) {
     RecordProperty("description", "Throws when delete_partitions is called after the stream has been deleted.");
-    const std::string stream_name = "cpp-delete-partitions-after-stream-deletion";
-    const std::string topic_name  = "topic-delete-partitions-after-stream-deletion";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 

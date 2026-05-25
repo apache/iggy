@@ -36,7 +36,7 @@ class LowLevelE2E_Topic : public E2ETestFixture {};
 TEST_F(LowLevelE2E_Topic, CreateTopicWithAllOptionCombinations) {
     RecordProperty("description",
                    "Creates topics across supported option combinations and verifies they are all returned.");
-    const std::string stream_name = "cpp-create-topic-after-login";
+    const std::string stream_name = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -62,11 +62,11 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithAllOptionCombinations) {
         for (const auto replication_factor : replication_factors) {
             for (const auto &expiry_option : expiry_options) {
                 for (const auto &max_topic_size : max_topic_sizes) {
-                    const std::string topic_name =
-                        "topic-compression-" + compression_algorithm + "-replication-" +
-                        std::to_string(replication_factor) + "-expiry-" + expiry_option.kind + "-expiry-value-" +
-                        std::to_string(expiry_option.value) + "-max-topic-size-" + max_topic_size;
-                    SCOPED_TRACE(topic_name);
+                    const std::string topic_name = GetRandomName();
+                    SCOPED_TRACE(
+                        "compression=" + compression_algorithm + ", replication=" + std::to_string(replication_factor) +
+                        ", expiry_kind=" + expiry_option.kind +
+                        ", expiry_value=" + std::to_string(expiry_option.value) + ", max_topic_size=" + max_topic_size);
 
                     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1,
                                                          compression_algorithm, replication_factor, expiry_option.kind,
@@ -94,18 +94,21 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithAllOptionCombinations) {
 
 TEST_F(LowLevelE2E_Topic, CreateTopicWithBoundaryPartitionsCountValues) {
     RecordProperty("description", "Accepts boundary partition counts and rejects values above the supported maximum.");
-    const std::string stream_name = "cpp-create-topic-boundary-partitions";
+    const std::string stream_name                = GetRandomName();
+    const std::string zero_partitions_topic_name = GetRandomName();
+    const std::string max_partitions_topic_name  = GetRandomName();
+    const std::string overflow_topic_name        = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
 
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), "topic-partitions-0", 0, "none", 0,
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), zero_partitions_topic_name, 0, "none", 0,
                                          "server_default", 0, "server_default"));
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), "topic-partitions-1000", 1000, "none", 0,
-                                         "server_default", 0, "server_default"));
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), "topic-partitions-1001", 1001, "none", 0,
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), max_partitions_topic_name, 1000, "none",
+                                         0, "server_default", 0, "server_default"));
+    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), overflow_topic_name, 1001, "none", 0,
                                       "server_default", 0, "server_default"),
                  std::exception);
 
@@ -119,13 +122,13 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithBoundaryPartitionsCountValues) {
     }
 
     EXPECT_EQ(topic_partitions.size(), 2u);
-    EXPECT_EQ(topic_partitions["topic-partitions-0"], 0u);
-    EXPECT_EQ(topic_partitions["topic-partitions-1000"], 1000u);
+    EXPECT_EQ(topic_partitions[zero_partitions_topic_name], 0u);
+    EXPECT_EQ(topic_partitions[max_partitions_topic_name], 1000u);
 }
 
 TEST_F(LowLevelE2E_Topic, CreateTopicWithInvalidNamesThrows) {
     RecordProperty("description", "Rejects invalid topic names and accepts the maximum allowed name length.");
-    const std::string stream_name = "cpp-create-topic-invalid-names";
+    const std::string stream_name = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -150,8 +153,8 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithInvalidNamesThrows) {
 
 TEST_F(LowLevelE2E_Topic, CreateDuplicateTopicThrows) {
     RecordProperty("description", "Rejects creating a duplicate topic within the same stream.");
-    const std::string stream_name = "cpp-create-duplicate-topic";
-    const std::string topic_name  = "topic-duplicate";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -166,9 +169,9 @@ TEST_F(LowLevelE2E_Topic, CreateDuplicateTopicThrows) {
 
 TEST_F(LowLevelE2E_Topic, CreateSameTopicNameInDifferentStreamsSucceeds) {
     RecordProperty("description", "Allows the same topic name to be created in different streams.");
-    const std::string first_stream_name  = "cpp-create-topic-same-name-stream-a";
-    const std::string second_stream_name = "cpp-create-topic-same-name-stream-b";
-    const std::string topic_name         = "shared-topic-name";
+    const std::string first_stream_name  = GetRandomName();
+    const std::string second_stream_name = GetRandomName();
+    const std::string topic_name         = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -185,20 +188,23 @@ TEST_F(LowLevelE2E_Topic, CreateSameTopicNameInDifferentStreamsSucceeds) {
 
 TEST_F(LowLevelE2E_Topic, CreateTopicWithInvalidOptionsThrows) {
     RecordProperty("description", "Rejects topic creation requests that use invalid option values.");
-    const std::string stream_name = "cpp-create-topic-invalid-options";
+    const std::string stream_name                    = GetRandomName();
+    const std::string invalid_compression_topic_name = GetRandomName();
+    const std::string invalid_expiry_topic_name      = GetRandomName();
+    const std::string invalid_max_size_topic_name    = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
 
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), "topic-invalid-compression", 1,
+    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), invalid_compression_topic_name, 1,
                                       "invalid-compression", 0, "server_default", 0, "server_default"),
                  std::exception);
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), "topic-invalid-expiry", 1, "none", 0,
+    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), invalid_expiry_topic_name, 1, "none", 0,
                                       "invalid-expiry-kind", 0, "server_default"),
                  std::exception);
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), "topic-invalid-max-size", 1, "none", 0,
+    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), invalid_max_size_topic_name, 1, "none", 0,
                                       "server_default", 0, "not-a-size"),
                  std::exception);
 }
@@ -206,31 +212,34 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithInvalidOptionsThrows) {
 TEST_F(LowLevelE2E_Topic, CreateTopicWithMaxTopicSizeBelowSegmentSizeThrows) {
     RecordProperty("description",
                    "Rejects topic creation when the maximum topic size is smaller than the segment size.");
-    const std::string stream_name = "cpp-create-topic-below-segment-size";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), "topic-below-segment-size", 1, "none", 0,
-                                      "server_default", 0, "1024"),
+    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "server_default",
+                                      0, "1024"),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Topic, CreateTopicOnNonExistentStreamThrows) {
     RecordProperty("description", "Throws when creating a topic on a stream that does not exist.");
-    const std::string stream_name = "cpp-create-topic-non-existent-stream";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), "topic-on-missing-stream", 1, "none", 0,
-                                      "server_default", 0, "server_default"),
+    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "server_default",
+                                      0, "server_default"),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Topic, CreateTopicAfterStreamDeletionThrows) {
     RecordProperty("description", "Throws when creating a topic after its stream has been deleted.");
-    const std::string stream_name = "cpp-create-topic-after-stream-deletion";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -239,14 +248,16 @@ TEST_F(LowLevelE2E_Topic, CreateTopicAfterStreamDeletionThrows) {
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
     ForgetTrackedStream(stream_name);
 
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), "topic-after-stream-deletion", 1, "none", 0,
-                                      "server_default", 0, "server_default"),
+    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "server_default",
+                                      0, "server_default"),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Topic, CreateTopicWithInvalidStreamIdentifierThrows) {
     RecordProperty("description", "Rejects topic creation requests that use invalid stream identifier formats.");
-    const std::string stream_name = "cpp-create-topic-invalid-stream-identifier";
+    const std::string stream_name       = GetRandomName();
+    const std::string first_topic_name  = GetRandomName();
+    const std::string second_topic_name = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 
@@ -257,23 +268,23 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithInvalidStreamIdentifierThrows) {
     invalid_kind_id.kind   = "invalid";
     invalid_kind_id.length = 4;
     invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->create_topic(std::move(invalid_kind_id), "topic-invalid-stream-id-kind", 1, "none", 0,
-                                      "server_default", 0, "server_default"),
+    ASSERT_THROW(client->create_topic(std::move(invalid_kind_id), first_topic_name, 1, "none", 0, "server_default", 0,
+                                      "server_default"),
                  std::exception);
 
     iggy::ffi::Identifier invalid_numeric_id;
     invalid_numeric_id.kind   = "numeric";
     invalid_numeric_id.length = 1;
     invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->create_topic(std::move(invalid_numeric_id), "topic-invalid-stream-id-numeric", 1, "none", 0,
-                                      "server_default", 0, "server_default"),
+    ASSERT_THROW(client->create_topic(std::move(invalid_numeric_id), second_topic_name, 1, "none", 0, "server_default",
+                                      0, "server_default"),
                  std::exception);
 }
 
 TEST_F(LowLevelE2E_Topic, CreateTopicBeforeLoginThrows) {
     RecordProperty("description", "Throws when topic creation is attempted from an unauthenticated client.");
-    const std::string stream_name = "cpp-create-topic-before-login";
-    const std::string topic_name  = "topic-before-login";
+    const std::string stream_name = GetRandomName();
+    const std::string topic_name  = GetRandomName();
 
     iggy::ffi::Client *client = GetLoggedInClient();
 

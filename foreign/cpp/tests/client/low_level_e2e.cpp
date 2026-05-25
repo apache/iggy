@@ -172,14 +172,14 @@ TEST_F(LowLevelE2E_Client, GetStatsReturnsServerStats) {
     RecordProperty("description",
                    "Returns empty resource counts first, then reflects aggregated streams, topics, partitions, "
                    "consumer groups, and clients.");
-    const std::string first_stream_name                 = "cpp-get-stats-stream-1";
-    const std::string second_stream_name                = "cpp-get-stats-stream-2";
-    const std::string first_topic_name                  = "cpp-get-stats-topic-1";
-    const std::string second_topic_name                 = "cpp-get-stats-topic-2";
-    const std::string third_topic_name                  = "cpp-get-stats-topic-3";
-    const std::string first_group_name                  = "cpp-get-stats-group-1";
-    const std::string second_group_name                 = "cpp-get-stats-group-2";
-    const std::string third_group_name                  = "cpp-get-stats-group-3";
+    const std::string first_stream_name                 = GetRandomName();
+    const std::string second_stream_name                = GetRandomName();
+    const std::string first_topic_name                  = GetRandomName();
+    const std::string second_topic_name                 = GetRandomName();
+    const std::string third_topic_name                  = GetRandomName();
+    const std::string first_group_name                  = GetRandomName();
+    const std::string second_group_name                 = GetRandomName();
+    const std::string third_group_name                  = GetRandomName();
     constexpr std::uint32_t additional_partitions_count = 2;
     iggy::ffi::Client *client                           = GetLoggedInClient();
 

@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <exception>
 #include <initializer_list>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -97,6 +98,23 @@ class E2ETestFixture : public ::testing::Test {
         EXPECT_NO_THROW(client->login_user("iggy", "iggy"));
 
         return client;
+    }
+
+    std::string GetRandomName() {
+        static constexpr char alphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        static thread_local std::mt19937 generator(std::random_device{}());
+        std::uniform_int_distribution<std::size_t> length_distribution(8, 255);
+        std::uniform_int_distribution<std::size_t> distribution(0, sizeof(alphabet) - 2);
+        const std::size_t length = length_distribution(generator);
+
+        std::string name;
+        name.reserve(length);
+        name.push_back('a');
+        for (std::size_t i = 1; i < length; ++i) {
+            name.push_back(alphabet[distribution(generator)]);
+        }
+
+        return name;
     }
 
     void TrackStream(const std::string &stream_name) { tracked_stream_names_.push_back(stream_name); }
