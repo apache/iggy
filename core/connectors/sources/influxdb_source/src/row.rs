@@ -27,6 +27,7 @@ use ahash::AHashMap;
 use csv::StringRecord;
 use iggy_connector_sdk::Error;
 use simd_json::BorrowedValue;
+use std::sync::Arc;
 
 /// A single row returned by a query, field name → typed JSON value.
 ///
@@ -35,10 +36,10 @@ use simd_json::BorrowedValue;
 /// values when building the message payload. V3 (JSONL) stores typed values
 /// directly — numbers, booleans, and nulls arrive pre-typed from SQL, so no
 /// string-round-trip parse is needed.
-// TODO(perf): Row still pays a per-key String allocation on every row field.
-// Switching to interned column names (e.g. Arc<str>) would eliminate the
-// k.to_string() copy and reduce allocations on large batches.
-pub(crate) type Row = AHashMap<String, serde_json::Value>;
+///
+/// Column names are interned as `Arc<str>` so they are allocated once per
+/// unique name and cloned cheaply (pointer bump) for every data row.
+pub(crate) type Row = AHashMap<Arc<str>, serde_json::Value>;
 
 // ── InfluxDB V2 — annotated CSV ───────────────────────────────────────────────
 
@@ -74,6 +75,9 @@ pub(crate) fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
         .from_reader(csv_text.as_bytes());
 
     let mut headers: Option<StringRecord> = None;
+    // Interned column names: allocated once per unique name when a header row is
+    // seen, then cheap-cloned (pointer bump) for every data row below.
+    let mut header_keys: Vec<Arc<str>> = Vec::new();
     let mut rows = Vec::new();
 
     for result in reader.records() {
@@ -91,6 +95,7 @@ pub(crate) fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
         }
 
         if is_header_record(&record) {
+            header_keys = record.iter().map(Arc::<str>::from).collect();
             headers = Some(record.clone());
             continue;
         }
@@ -104,14 +109,13 @@ pub(crate) fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
             continue;
         }
 
-        let mut mapped = Row::with_capacity(active_headers.len());
-        for (idx, key) in active_headers.iter().enumerate() {
+        let mut mapped = Row::with_capacity(header_keys.len());
+        for (idx, key) in header_keys.iter().enumerate() {
             if key.is_empty() {
                 continue;
             }
             let value = record.get(idx).unwrap_or("").to_string();
-            // TODO(perf): key.to_string() copies the column name on every row; use interned Arc<str> instead.
-            mapped.insert(key.to_string(), serde_json::Value::String(value));
+            mapped.insert(Arc::clone(key), serde_json::Value::String(value));
         }
 
         if !mapped.is_empty() {
@@ -142,7 +146,10 @@ pub(crate) fn parse_csv_rows(csv_text: &str) -> Result<Vec<Row>, Error> {
 /// `simd_json::from_slice` requires `&mut [u8]` and modifies the bytes in
 /// place for zero-copy SIMD parsing; we clone each line into a `Vec<u8>` to
 /// satisfy the mutability requirement without borrowing the original string.
-fn parse_object(value: BorrowedValue<'_>) -> Result<Row, Error> {
+fn parse_object(
+    value: BorrowedValue<'_>,
+    intern: &mut AHashMap<String, Arc<str>>,
+) -> Result<Row, Error> {
     let BorrowedValue::Object(map) = value else {
         return Err(Error::InvalidRecordValue(
             "expected a JSON object in JSONL response".to_string(),
@@ -173,8 +180,16 @@ fn parse_object(value: BorrowedValue<'_>) -> Result<Row, Error> {
             other => serde_json::to_value(other)
                 .map_err(|e| Error::InvalidRecordValue(format!("JSON conversion error: {e}")))?,
         };
-        // TODO(perf): k.to_string() copies the column name on every row; use interned Arc<str> instead.
-        row.insert(k.to_string(), json_val);
+        // Intern the column name: on first occurrence allocate Arc<str> and store it;
+        // on subsequent rows clone the Arc (pointer bump, no heap allocation).
+        let key = if let Some(arc) = intern.get(k.as_ref()) {
+            Arc::clone(arc)
+        } else {
+            let arc: Arc<str> = Arc::from(k.as_ref());
+            intern.insert(k.to_string(), Arc::clone(&arc));
+            arc
+        };
+        row.insert(key, json_val);
     }
     Ok(row)
 }
@@ -182,6 +197,9 @@ fn parse_object(value: BorrowedValue<'_>) -> Result<Row, Error> {
 pub fn parse_jsonl_rows(data: &str) -> Result<Vec<Row>, Error> {
     let mut rows = Vec::new();
     let mut scratch = Vec::new(); // reused across lines
+    // Intern table: maps column name String → Arc<str>; allocated once per unique
+    // column name across all rows in the response, cloned cheaply thereafter.
+    let mut intern: AHashMap<String, Arc<str>> = AHashMap::new();
     for line in data.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -191,7 +209,7 @@ pub fn parse_jsonl_rows(data: &str) -> Result<Vec<Row>, Error> {
         scratch.extend_from_slice(trimmed.as_bytes());
         let obj: simd_json::BorrowedValue = simd_json::to_borrowed_value(&mut scratch)
             .map_err(|e| Error::InvalidRecordValue(format!("JSON parse error: {e}")))?;
-        rows.push(parse_object(obj)?);
+        rows.push(parse_object(obj, &mut intern)?);
     }
     Ok(rows)
 }

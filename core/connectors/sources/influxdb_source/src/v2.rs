@@ -79,11 +79,17 @@ fn render_query(config: &V2SourceConfig, cursor: &str, already_seen: u64) -> Res
 mod tests {
     use super::*;
     use crate::common::{Row, RowContext};
+    use std::sync::Arc;
 
     fn row(pairs: &[(&str, &str)]) -> Row {
         pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .map(|(k, v)| {
+                (
+                    Arc::<str>::from(*k),
+                    serde_json::Value::String(v.to_string()),
+                )
+            })
             .collect()
     }
 
@@ -646,32 +652,32 @@ fn build_payload(
     // parse_scalar to infer bool / i64 / f64 / string type from the raw text.
     for (key, val) in row {
         let val_str = val.as_str().unwrap_or("");
-        match key.as_str() {
+        match key.as_ref() {
             "_measurement" => {
                 measurement = val_str;
                 if include_metadata {
-                    json_row.insert(key.clone(), parse_scalar(val_str));
+                    json_row.insert(key.to_string(), parse_scalar(val_str));
                 }
             }
             "_field" => {
                 field_name = val_str;
                 if include_metadata {
-                    json_row.insert(key.clone(), parse_scalar(val_str));
+                    json_row.insert(key.to_string(), parse_scalar(val_str));
                 }
             }
             "_time" => {
                 timestamp_str = val_str;
                 // _time always included (needed for cursor tracking by consumers)
-                json_row.insert(key.clone(), parse_scalar(val_str));
+                json_row.insert(key.to_string(), parse_scalar(val_str));
             }
             "_value" => {
                 let parsed = parse_scalar(val_str);
                 field_value = parsed.clone();
-                json_row.insert(key.clone(), parsed);
+                json_row.insert(key.to_string(), parsed);
             }
             _ => {
                 if include_metadata {
-                    json_row.insert(key.clone(), parse_scalar(val_str));
+                    json_row.insert(key.to_string(), parse_scalar(val_str));
                 }
             }
         }

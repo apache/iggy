@@ -205,7 +205,7 @@ fn build_payload(
             for (k, v) in self
                 .row
                 .iter()
-                .filter(|(k, _)| self.include_metadata || k.as_str() != self.cursor_field)
+                .filter(|(k, _)| self.include_metadata || k.as_ref() != self.cursor_field)
             {
                 map.serialize_entry(k, v)?;
             }
@@ -728,11 +728,17 @@ pub(crate) async fn poll(
 mod tests {
     use super::*;
     use crate::common::{Row, RowContext};
+    use std::sync::Arc;
 
     fn row(pairs: &[(&str, &str)]) -> Row {
         pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .map(|(k, v)| {
+                (
+                    Arc::<str>::from(*k),
+                    serde_json::Value::String(v.to_string()),
+                )
+            })
             .collect()
     }
 
@@ -1153,11 +1159,14 @@ mod tests {
         use crate::common::Row;
         let mut row: Row = Row::default();
         row.insert(
-            "time".to_string(),
+            Arc::<str>::from("time"),
             serde_json::Value::String(T1.to_string()),
         );
         // Insert a numeric value for the payload column — not a base64 string.
-        row.insert("blob".to_string(), serde_json::Value::Number(42.into()));
+        row.insert(
+            Arc::<str>::from("blob"),
+            serde_json::Value::Number(42.into()),
+        );
         let err = process_rows(
             &[row],
             &RowContext {
