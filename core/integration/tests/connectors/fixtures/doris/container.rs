@@ -55,7 +55,6 @@ const FE_MYSQL_PORT: u16 = 9030;
 const BE_HTTP_PORT: u16 = 8040;
 const FE_HEALTH_ENDPOINT: &str = "/api/health";
 
-const DEFAULT_TEST_DATABASE: &str = "iggy_test_db";
 const DEFAULT_TEST_TABLE: &str = "test_topic";
 const DEFAULT_USER: &str = "root";
 const DEFAULT_PASSWORD: &str = "";
@@ -142,18 +141,58 @@ pub const COLUMNS_MAPPING_HEADER: &str =
     "id, name, count, amount, active, timestamp, calculated = count + 1";
 
 pub struct DorisContainer {
+    // `None` when connected to an externally-managed shared cluster (CI starts
+    // one container per job and exports its address): the container lifecycle is
+    // owned by the job, not this test process.
     #[allow(dead_code)]
-    container: ContainerAsync<GenericImage>,
-    fe_http_host_port: u16,
+    container: Option<ContainerAsync<GenericImage>>,
+    fe_url: String,
     fe_mysql_host_port: u16,
-    // Held for the lifetime of the fixture so the next Doris fixture cannot
-    // start until this one is dropped.
+    // Unique per test, so many tests can share one cluster without their loads
+    // colliding. Created during setup; the connector writes into it.
+    database: String,
+    // Held only on the self-boot path to serialize container starts within a
+    // single process (local `cargo test`); `None` when connecting to a shared
+    // cluster (there is no host port to contend for). Cross-process
+    // serialization of self-boot is handled by the `doris` nextest test-group
+    // (max-threads = 1) in `.config/nextest.toml`.
     #[allow(dead_code)]
-    serial_guard: OwnedMutexGuard<()>,
+    serial_guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl DorisContainer {
     pub async fn start() -> Result<Self, TestBinaryError> {
+        // A fresh database per test so any number of tests can share one
+        // cluster without their Stream Loads colliding. `simple()` drops the
+        // hyphens so the name stays a valid Doris identifier ([A-Za-z0-9_]).
+        let database = format!("iggy_test_db_{}", Uuid::new_v4().simple());
+
+        // CI starts a single shared Doris container at the job level and
+        // exports its address; connect to that (and use our own per-test
+        // database) instead of booting a throwaway. The env is unset locally,
+        // so each test boots its own container as before.
+        if let Ok(fe_url) = std::env::var("DORIS_FE_URL") {
+            let fe_mysql_host_port = std::env::var("DORIS_FE_MYSQL_PORT")
+                .ok()
+                .and_then(|p| p.parse::<u16>().ok())
+                .ok_or_else(|| TestBinaryError::FixtureSetup {
+                    fixture_type: "DorisContainer".to_string(),
+                    message: "DORIS_FE_URL is set but DORIS_FE_MYSQL_PORT is missing/invalid"
+                        .to_string(),
+                })?;
+            info!("Connecting to shared Doris cluster at {fe_url} (database {database})");
+            let this = Self {
+                container: None,
+                fe_url,
+                fe_mysql_host_port,
+                database,
+                serial_guard: None,
+            };
+            this.wait_for_be_alive().await?;
+            this.create_test_database().await?;
+            return Ok(this);
+        }
+
         let serial_guard = DORIS_LOCK.clone().lock_owned().await;
         let unique_network = format!("iggy-doris-{}", Uuid::new_v4());
 
@@ -208,10 +247,11 @@ impl DorisContainer {
         info!("Doris FE HTTP -> {fe_http_host_port}, FE MySQL -> {fe_mysql_host_port}");
 
         let this = Self {
-            container,
-            fe_http_host_port,
+            container: Some(container),
+            fe_url: format!("http://127.0.0.1:{fe_http_host_port}"),
             fe_mysql_host_port,
-            serial_guard,
+            database,
+            serial_guard: Some(serial_guard),
         };
 
         this.wait_for_be_alive().await?;
@@ -221,7 +261,12 @@ impl DorisContainer {
     }
 
     pub fn fe_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.fe_http_host_port)
+        self.fe_url.clone()
+    }
+
+    /// The unique per-test database this fixture's connector writes into.
+    pub fn database(&self) -> &str {
+        &self.database
     }
 
     async fn create_pool(&self) -> Result<MySqlPool, TestBinaryError> {
@@ -304,15 +349,13 @@ impl DorisContainer {
     async fn create_test_database(&self) -> Result<(), TestBinaryError> {
         let pool = self.create_pool().await?;
         // raw_sql avoids the PREPARE path Doris doesn't accept for DDL.
-        sqlx::raw_sql(&format!(
-            "CREATE DATABASE IF NOT EXISTS {DEFAULT_TEST_DATABASE}"
-        ))
-        .execute(&pool)
-        .await
-        .map_err(|e| TestBinaryError::FixtureSetup {
-            fixture_type: "DorisContainer".to_string(),
-            message: format!("Failed to create test database: {e}"),
-        })?;
+        sqlx::raw_sql(&format!("CREATE DATABASE IF NOT EXISTS {}", self.database))
+            .execute(&pool)
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "DorisContainer".to_string(),
+                message: format!("Failed to create test database: {e}"),
+            })?;
         Ok(())
     }
 }
@@ -320,6 +363,11 @@ impl DorisContainer {
 #[async_trait]
 pub trait DorisOps: Sync {
     fn container(&self) -> &DorisContainer;
+
+    /// The unique per-test database this fixture's connector writes into.
+    fn database(&self) -> &str {
+        self.container().database()
+    }
 
     async fn pool(&self) -> Result<MySqlPool, TestBinaryError> {
         self.container().create_pool().await
@@ -435,15 +483,12 @@ pub trait DorisOps: Sync {
     }
 }
 
-fn build_connector_envs(fe_url: &str) -> HashMap<String, String> {
+fn build_connector_envs(fe_url: &str, database: &str) -> HashMap<String, String> {
     use integration::harness::seeds;
 
     HashMap::from([
         (ENV_SINK_FE_URL.to_string(), fe_url.to_string()),
-        (
-            ENV_SINK_DATABASE.to_string(),
-            DEFAULT_TEST_DATABASE.to_string(),
-        ),
+        (ENV_SINK_DATABASE.to_string(), database.to_string()),
         (ENV_SINK_TABLE.to_string(), DEFAULT_TEST_TABLE.to_string()),
         (ENV_SINK_USERNAME.to_string(), DEFAULT_USER.to_string()),
         (ENV_SINK_PASSWORD.to_string(), DEFAULT_PASSWORD.to_string()),
@@ -490,7 +535,7 @@ impl TestFixture for DorisSinkFixture {
     }
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
-        build_connector_envs(&self.container.fe_url())
+        build_connector_envs(&self.container.fe_url(), self.container.database())
     }
 }
 
@@ -519,7 +564,7 @@ impl TestFixture for DorisSinkPreCreatedFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
         let inner = DorisSinkFixture::setup().await?;
         inner
-            .create_table(DEFAULT_TEST_DATABASE, DEFAULT_TEST_TABLE)
+            .create_table(inner.container.database(), DEFAULT_TEST_TABLE)
             .await?;
         Ok(Self { inner })
     }
@@ -591,7 +636,7 @@ impl TestFixture for DorisSinkColumnsMappingFixture {
         let inner = DorisSinkFixture::setup().await?;
         inner
             .create_table_with_template(
-                DEFAULT_TEST_DATABASE,
+                inner.container.database(),
                 DEFAULT_TEST_TABLE,
                 TEST_TABLE_WITH_CALCULATED_DDL_TEMPLATE,
             )

@@ -21,16 +21,24 @@
 filter = 'package(integration) and test(cli::system::test_cli_session_scenario::should_be_successful)'
 threads-required = "num-cpus"
 
-# Doris testcontainer must bind host:8040 1:1 (FE→BE 307 redirects to
-# 127.0.0.1:8040; BE's priority_networks pins the advertise address) and the
-# all-in-one image is heavy enough that running it alongside other
-# container-backed tests (e.g. elasticsearch) starves their startup timers.
-# threads-required = "num-cpus" forces each doris test to run alone, matching
-# the existing pattern used elsewhere in this file. The longer slow-timeout
-# accounts for cold container boot (~60-90s on Linux CI) plus the test body.
+# Doris tests are serialized among themselves, but no longer monopolize the
+# whole runner. The all-in-one image's BE advertises 127.0.0.1:8040 for the
+# FE→BE 307 redirect, so only one Doris container can bind host:8040 at a time.
+# A `max-threads = 1` test-group enforces "one Doris test at a time" *across
+# nextest's per-test processes* (an in-process Mutex can't, since each test is
+# its own process) — which is what keeps the self-boot fallback safe — while
+# letting unrelated light tests fill the rest of the runner.
+#
+# In CI a single shared container is started at the job level and its address
+# exported via DORIS_FE_URL (see the rust pre-merge action), so these tests
+# connect instead of booting; the serialization then just orders fast
+# connect+load workloads rather than ~60-90s container boots.
+[test-groups.doris]
+max-threads = 1
+
 [[profile.default.overrides]]
 filter = 'package(integration) and test(/connectors::doris::/)'
-threads-required = "num-cpus"
+test-group = "doris"
 slow-timeout = { period = "60s", terminate-after = 8 }
 
 [profile.default]

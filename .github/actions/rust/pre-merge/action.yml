@@ -250,6 +250,43 @@ runs:
           echo -n "warmup" | secret-tool store --label="ci-warmup" ci-test warmup
         fi
 
+        # Start ONE shared Doris container for the whole job when integration
+        # tests are in scope. The all-in-one image boots in ~60-90s; nextest's
+        # process-per-test model would otherwise force that boot once per doris
+        # test. The fixture connects to DORIS_FE_URL when it is exported and
+        # falls back to booting its own container when it is not, so any failure
+        # here degrades to the previous (slower) behavior rather than breaking
+        # the run. BE 8040 is pinned 1:1 because the FE redirects Stream Load to
+        # 127.0.0.1:8040 (hardcoded in the image entrypoint).
+        if [[ "$RUNNER_OS" == "Linux" ]] && { [[ -z "$NEXTEST_FILTER" ]] || echo "$NEXTEST_FILTER" | grep -qi 'integration'; }; then
+          echo "::group::Start shared Doris container"
+          if docker run -d --name iggy-doris-shared \
+              -p 8030 -p 9030 -p 8040:8040 \
+              apache/doris:doris-all-in-one-2.1.0; then
+            FE_PORT=""
+            for _ in $(seq 1 90); do
+              FE_PORT=$(docker port iggy-doris-shared 8030/tcp 2>/dev/null | head -1 | sed 's/.*://')
+              if [[ -n "$FE_PORT" ]] && curl -fsS "http://127.0.0.1:${FE_PORT}/api/health" >/dev/null 2>&1; then
+                break
+              fi
+              FE_PORT=""
+              sleep 2
+            done
+            MYSQL_PORT=$(docker port iggy-doris-shared 9030/tcp 2>/dev/null | head -1 | sed 's/.*://')
+            if [[ -n "$FE_PORT" && -n "$MYSQL_PORT" ]]; then
+              export DORIS_FE_URL="http://127.0.0.1:${FE_PORT}"
+              export DORIS_FE_MYSQL_PORT="${MYSQL_PORT}"
+              echo "Shared Doris ready: FE ${DORIS_FE_URL}, MySQL ${MYSQL_PORT}"
+            else
+              echo "::warning::Shared Doris did not become healthy; doris tests will self-boot"
+              docker rm -f iggy-doris-shared >/dev/null 2>&1 || true
+            fi
+          else
+            echo "::warning::Failed to start shared Doris container; doris tests will self-boot"
+          fi
+          echo "::endgroup::"
+        fi
+
         test_start=$(date +%s)
         if command -v cargo-nextest &> /dev/null; then
           if [[ -n "$NEXTEST_FILTER" ]]; then
@@ -296,6 +333,11 @@ runs:
         cargo llvm-cov report --codecov --output-path codecov.json
         echo "Coverage report generated: codecov.json"
         ls -la codecov.json
+      shell: bash
+
+    - name: Stop shared Doris container
+      if: always() && runner.os == 'Linux' && startsWith(inputs.task, 'test-')
+      run: docker rm -f iggy-doris-shared >/dev/null 2>&1 || true
       shell: bash
 
     - name: Backwards compatibility check

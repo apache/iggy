@@ -30,7 +30,6 @@ use integration::harness::seeds;
 use integration::iggy_harness;
 use serde::{Deserialize, Serialize};
 
-const TEST_DATABASE: &str = "iggy_test_db";
 const TEST_TABLE: &str = "test_topic";
 
 #[iggy_harness(
@@ -75,7 +74,7 @@ async fn given_existent_doris_table_should_store(
         .expect("send messages");
 
     let count = fixture
-        .wait_for_rows(TEST_DATABASE, TEST_TABLE, message_count as i64)
+        .wait_for_rows(fixture.database(), TEST_TABLE, message_count as i64)
         .await
         .expect("rows");
     assert_eq!(count, message_count as i64);
@@ -120,7 +119,7 @@ async fn given_bulk_message_send_should_store(
         .expect("send messages");
 
     let count = fixture
-        .wait_for_rows(TEST_DATABASE, TEST_TABLE, message_count as i64)
+        .wait_for_rows(fixture.database(), TEST_TABLE, message_count as i64)
         .await
         .expect("rows");
     assert_eq!(count, message_count as i64);
@@ -178,7 +177,7 @@ async fn given_invalid_messages_should_skip_via_max_filter_ratio(
         .expect("send messages");
 
     let count = fixture
-        .wait_for_rows(TEST_DATABASE, TEST_TABLE, 2)
+        .wait_for_rows(fixture.database(), TEST_TABLE, 2)
         .await
         .expect("rows");
     assert_eq!(count, 2, "only the two valid rows should land");
@@ -189,11 +188,12 @@ async fn given_invalid_messages_should_skip_via_max_filter_ratio(
     seed = seeds::connector_stream
 )]
 async fn given_replayed_label_should_dedupe(harness: &TestHarness, fixture: DorisSinkFixture) {
+    let db = fixture.database();
     // This fixture variant does NOT pre-create the table; the test creates
     // it explicitly before producing messages so we can drop and recreate
     // between rounds without disturbing the connector runtime's state.
     fixture
-        .create_table(TEST_DATABASE, TEST_TABLE)
+        .create_table(db, TEST_TABLE)
         .await
         .expect("create table");
 
@@ -228,7 +228,7 @@ async fn given_replayed_label_should_dedupe(harness: &TestHarness, fixture: Dori
         .expect("send messages round 1");
 
     let count = fixture
-        .wait_for_rows(TEST_DATABASE, TEST_TABLE, message_count as i64)
+        .wait_for_rows(db, TEST_TABLE, message_count as i64)
         .await
         .expect("rows after round 1");
     assert_eq!(count, message_count as i64);
@@ -248,7 +248,7 @@ async fn given_replayed_label_should_dedupe(harness: &TestHarness, fixture: Dori
     // Use the fixture's count helper (raw_sql under the hood) — Doris's
     // MySQL frontend rejects prepared sqlx::query/query_scalar statements.
     let row_before = fixture
-        .count_rows(TEST_DATABASE, TEST_TABLE)
+        .count_rows(db, TEST_TABLE)
         .await
         .expect("count before");
     assert_eq!(row_before, message_count as i64);
@@ -273,7 +273,7 @@ async fn given_replayed_label_should_dedupe(harness: &TestHarness, fixture: Dori
         .unwrap();
 
     let url = format!(
-        "{}/api/{TEST_DATABASE}/{TEST_TABLE}/_stream_load",
+        "{}/api/{db}/{TEST_TABLE}/_stream_load",
         fixture.container().fe_url()
     );
 
@@ -328,7 +328,7 @@ async fn given_replayed_label_should_dedupe(harness: &TestHarness, fixture: Dori
     );
 
     let row_after = fixture
-        .count_rows(TEST_DATABASE, TEST_TABLE)
+        .count_rows(db, TEST_TABLE)
         .await
         .expect("count after");
     assert_eq!(
@@ -387,9 +387,11 @@ async fn given_missing_target_table_should_not_create_or_corrupt(
     // least one Stream Load PUT against the missing table.
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
+    let db = fixture.database();
+
     // 1. The target table must NOT have been auto-created.
     let exists = fixture
-        .table_exists(TEST_DATABASE, TEST_TABLE)
+        .table_exists(db, TEST_TABLE)
         .await
         .expect("information_schema query");
     assert!(
@@ -397,25 +399,25 @@ async fn given_missing_target_table_should_not_create_or_corrupt(
         "Doris sink must NOT auto-create the target table on a failed load"
     );
 
-    // 2 + 3. The cluster is still healthy and `iggy_test_db` has no rogue
-    // tables — proves we didn't write anywhere unexpected and that the
+    // 2 + 3. The cluster is still healthy and the per-test database has no
+    // rogue tables — proves we didn't write anywhere unexpected and that the
     // connector's HTTP failures didn't take Doris down.
     let pool = fixture.pool().await.expect("pool after failed loads");
     use sqlx::Row;
-    let rows = sqlx::raw_sql(
+    let rows = sqlx::raw_sql(&format!(
         "SELECT TABLE_NAME FROM information_schema.tables \
-         WHERE TABLE_SCHEMA = 'iggy_test_db'",
-    )
+         WHERE TABLE_SCHEMA = '{db}'"
+    ))
     .fetch_all(&pool)
     .await
-    .expect("list tables in iggy_test_db");
+    .expect("list tables in test database");
     let tables: Vec<String> = rows
         .iter()
         .filter_map(|r| r.try_get::<String, _>("TABLE_NAME").ok())
         .collect();
     assert!(
         tables.is_empty(),
-        "iggy_test_db should be empty after failed loads, found: {tables:?}"
+        "test database {db} should be empty after failed loads, found: {tables:?}"
     );
 }
 
@@ -461,8 +463,9 @@ async fn given_columns_config_should_apply_derived_expression(
         .await
         .expect("send messages");
 
+    let db = fixture.database();
     let count = fixture
-        .wait_for_rows(TEST_DATABASE, TEST_TABLE, message_count as i64)
+        .wait_for_rows(db, TEST_TABLE, message_count as i64)
         .await
         .expect("rows");
     assert_eq!(count, message_count as i64);
@@ -474,7 +477,7 @@ async fn given_columns_config_should_apply_derived_expression(
     let pool = fixture.pool().await.expect("pool");
     use sqlx::Row;
     let row = sqlx::raw_sql(&format!(
-        "SELECT SUM(calculated - `count`) AS delta FROM {TEST_DATABASE}.{TEST_TABLE}"
+        "SELECT SUM(calculated - `count`) AS delta FROM {db}.{TEST_TABLE}"
     ))
     .fetch_one(&pool)
     .await
