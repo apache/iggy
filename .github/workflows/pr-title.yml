@@ -75,6 +75,7 @@ jobs:
             mcp
             node
             partitions
+            php
             proc
             pr_template
             python

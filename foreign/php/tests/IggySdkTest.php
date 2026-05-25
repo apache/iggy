@@ -153,6 +153,28 @@ final class IggySdkTest extends TestCase
         }
     }
 
+    #[TestDox('Digit-only PHP string identifiers are fetched by name')]
+    public function testDigitOnlyStringIdentifiersAreNamed(): void
+    {
+        $client = new_client();
+        $streamName = (string) random_int(2_000_000_000, 4_294_967_295);
+        $topicName = (string) random_int(2_000_000_000, 4_294_967_295);
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+
+            $stream = $client->getStream($streamName);
+            assert_not_null($stream);
+            assert_same($streamName, $stream->name);
+
+            $topic = $client->getTopic($streamName, $topicName);
+            assert_not_null($topic);
+            assert_same($topicName, $topic->name);
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
     #[TestDox('A topic created through the helper can be fetched')]
     public function testListTopicsViaGetTopic(): void
     {

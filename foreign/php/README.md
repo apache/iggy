@@ -196,9 +196,8 @@ iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&domain=localhost&ca_file=/path/to/c
 - `Iggy\PollingStrategy::timestamp()` and `Iggy\PollingStrategy::timestampMicros()`
   expect microseconds since the Unix epoch. Use
   `Iggy\PollingStrategy::timestampSeconds()` for PHP `time()` values.
-- PHP string identifiers that contain only digits are parsed by the Rust SDK as
-  numeric identifiers, not named identifiers. Numeric identifier `0` is accepted
-  by the underlying SDK.
+- PHP strings are passed as named identifiers, including strings that contain
+  only digits. PHP integers are passed as numeric identifiers.
 - `Iggy\SendMessage::payload` and `Iggy\ReceiveMessage::payload()` copy the payload
   bytes into a PHP string on each read. Cache large payloads in PHP if they will
   be read repeatedly.

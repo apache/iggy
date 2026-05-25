@@ -45,7 +45,7 @@ impl TryFrom<PhpIdentifier> for Identifier {
 
     fn try_from(value: PhpIdentifier) -> Result<Self, Self::Error> {
         match value {
-            PhpIdentifier::String(value) => value.try_into(),
+            PhpIdentifier::String(value) => Identifier::named(&value),
             PhpIdentifier::Int(value) => Identifier::numeric(value),
         }
         .map_err(to_php_exception)
@@ -66,5 +66,26 @@ impl TryFrom<&Identifier> for PhpIdentifier {
                 .map(PhpIdentifier::Int)
                 .map_err(to_php_exception),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn php_string_identifier_is_always_named() {
+        let identifier = Identifier::try_from(PhpIdentifier::String("5".to_string())).unwrap();
+
+        assert_eq!(identifier.kind, IdKind::String);
+        assert_eq!(identifier.get_string_value().unwrap(), "5");
+    }
+
+    #[test]
+    fn php_int_identifier_is_numeric() {
+        let identifier = Identifier::try_from(PhpIdentifier::Int(5)).unwrap();
+
+        assert_eq!(identifier.kind, IdKind::Numeric);
+        assert_eq!(identifier.get_u32_value().unwrap(), 5);
     }
 }
