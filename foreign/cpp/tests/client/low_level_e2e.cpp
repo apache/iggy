@@ -153,18 +153,13 @@ TEST_F(LowLevelE2E_Client, DeleteNullConnectionIsNoop) {
     ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
 }
 
-TEST(LowLevelE2E_Client, GetStatsBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Client, GetStatsBeforeLoginThrows) {
     RecordProperty("description", "Rejects get_stats before connect, and after connect but before login.");
-    iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_THROW(client->get_stats(), std::exception);
     ASSERT_NO_THROW(client->connect());
     ASSERT_THROW(client->get_stats(), std::exception);
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
 // TODO(slbotbmR): add a test to create some streams, topics, partitions, and segments, send messages, and create
@@ -173,7 +168,7 @@ TEST(LowLevelE2E_Client, GetStatsBeforeLoginThrows) {
 // randomized names so a failed ASSERT does not leave fixed names behind for the next run; this test should also relax
 // shared-server count assertions such as clients_count to EXPECT_GE so unrelated client connections do not make it
 // order-dependent.
-TEST(LowLevelE2E_Client, GetStatsReturnsServerStats) {
+TEST_F(LowLevelE2E_Client, GetStatsReturnsServerStats) {
     RecordProperty("description",
                    "Returns empty resource counts first, then reflects aggregated streams, topics, partitions, "
                    "consumer groups, and clients.");
@@ -186,8 +181,7 @@ TEST(LowLevelE2E_Client, GetStatsReturnsServerStats) {
     const std::string second_group_name                 = "cpp-get-stats-group-2";
     const std::string third_group_name                  = "cpp-get-stats-group-3";
     constexpr std::uint32_t additional_partitions_count = 2;
-    iggy::ffi::Client *client                           = login_to_server();
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedInClient();
 
     iggy::ffi::Client *second_client = nullptr;
     iggy::ffi::Client *third_client  = nullptr;
@@ -208,7 +202,9 @@ TEST(LowLevelE2E_Client, GetStatsReturnsServerStats) {
     });
 
     ASSERT_NO_THROW(client->create_stream(first_stream_name));
+    TrackStream(first_stream_name);
     ASSERT_NO_THROW(client->create_stream(second_stream_name));
+    TrackStream(second_stream_name);
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(first_stream_name), first_topic_name, 1, "none", 0,
                                          "server_default", 0, "server_default"));
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(first_stream_name), second_topic_name, 2, "none", 0,
@@ -224,9 +220,9 @@ TEST(LowLevelE2E_Client, GetStatsReturnsServerStats) {
     const auto third_group = client->create_consumer_group(make_string_identifier(second_stream_name),
                                                            make_string_identifier(third_topic_name), third_group_name);
 
-    ASSERT_NO_THROW({ second_client = login_to_server(); });
+    ASSERT_NO_THROW({ second_client = GetLoggedInClient(); });
     ASSERT_NE(second_client, nullptr);
-    ASSERT_NO_THROW({ third_client = login_to_server(); });
+    ASSERT_NO_THROW({ third_client = GetLoggedInClient(); });
     ASSERT_NE(third_client, nullptr);
 
     const auto first_stream_details           = client->get_stream(make_string_identifier(first_stream_name));
@@ -265,11 +261,11 @@ TEST(LowLevelE2E_Client, GetStatsReturnsServerStats) {
     });
 
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(second_stream_name)));
+    ForgetTrackedStream(second_stream_name);
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(first_stream_name)));
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(third_client));
-    third_client = nullptr;
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(second_client));
-    second_client = nullptr;
+    ForgetTrackedStream(first_stream_name);
+    DeleteClient(third_client);
+    DeleteClient(second_client);
 
     ASSERT_NO_THROW({
         const auto stats = client->get_stats();
@@ -279,17 +275,13 @@ TEST(LowLevelE2E_Client, GetStatsReturnsServerStats) {
         EXPECT_EQ(stats.segments_count, empty_stats.segments_count);
         EXPECT_EQ(stats.consumer_groups_count, empty_stats.consumer_groups_count);
     });
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, GetStatsIsStableAcrossBackToBackCalls) {
+TEST_F(LowLevelE2E_Client, GetStatsIsStableAcrossBackToBackCalls) {
     RecordProperty(
         "description",
         "Returns sane invariant fields across back-to-back get_stats calls on an idle authenticated client.");
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedInClient();
 
     iggy::ffi::Stats first_stats{};
     iggy::ffi::Stats second_stats{};
@@ -329,30 +321,21 @@ TEST(LowLevelE2E_Client, GetStatsIsStableAcrossBackToBackCalls) {
     EXPECT_EQ(second_stats.topics_count, first_stats.topics_count);
     EXPECT_EQ(second_stats.partitions_count, first_stats.partitions_count);
     EXPECT_EQ(second_stats.consumer_groups_count, first_stats.consumer_groups_count);
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, GetMeBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Client, GetMeBeforeLoginThrows) {
     RecordProperty("description", "Rejects get_me before connect, and after connect but before login.");
-    iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_THROW(client->get_me(), std::exception);
     ASSERT_NO_THROW(client->connect());
     ASSERT_THROW(client->get_me(), std::exception);
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
 // TODO(slbotbm): add additional validation for get_me after merging join_consumer_group PR.
-TEST(LowLevelE2E_Client, GetMeReturnsCurrentClientDetails) {
+TEST_F(LowLevelE2E_Client, GetMeReturnsCurrentClientDetails) {
     RecordProperty("description", "Returns the current authenticated client details.");
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedInClient();
 
     ASSERT_NO_THROW({
         const auto me = client->get_me();
@@ -363,15 +346,11 @@ TEST(LowLevelE2E_Client, GetMeReturnsCurrentClientDetails) {
         EXPECT_EQ(me.consumer_groups_count, 0u);
         EXPECT_TRUE(me.consumer_groups.empty());
     });
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, GetMeIsStableAcrossBackToBackCalls) {
+TEST_F(LowLevelE2E_Client, GetMeIsStableAcrossBackToBackCalls) {
     RecordProperty("description", "Returns stable current-client details across back-to-back get_me calls.");
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails first_me{};
     iggy::ffi::ClientInfoDetails second_me{};
@@ -392,19 +371,14 @@ TEST(LowLevelE2E_Client, GetMeIsStableAcrossBackToBackCalls) {
     EXPECT_EQ(static_cast<std::string>(second_me.transport), static_cast<std::string>(first_me.transport));
     EXPECT_EQ(second_me.consumer_groups_count, first_me.consumer_groups_count);
     EXPECT_EQ(second_me.consumer_groups.size(), first_me.consumer_groups.size());
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, GetMeReturnsDistinctClientIdsForDifferentSessions) {
+TEST_F(LowLevelE2E_Client, GetMeReturnsDistinctClientIdsForDifferentSessions) {
     RecordProperty(
         "description",
         "Returns different client ids for separate authenticated sessions while keeping the same user identity.");
-    iggy::ffi::Client *first_client  = login_to_server();
-    iggy::ffi::Client *second_client = login_to_server();
-    ASSERT_NE(first_client, nullptr);
-    ASSERT_NE(second_client, nullptr);
+    iggy::ffi::Client *first_client  = GetLoggedInClient();
+    iggy::ffi::Client *second_client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails first_me{};
     iggy::ffi::ClientInfoDetails second_me{};
@@ -423,28 +397,23 @@ TEST(LowLevelE2E_Client, GetMeReturnsDistinctClientIdsForDifferentSessions) {
     EXPECT_EQ(static_cast<std::string>(first_me.transport), "TCP");
     EXPECT_EQ(static_cast<std::string>(second_me.transport), "TCP");
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(second_client));
-    second_client = nullptr;
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(first_client));
-    first_client = nullptr;
+    DeleteClient(second_client);
+    DeleteClient(first_client);
 }
 
-TEST(LowLevelE2E_Client, GetMeReturnsValidDetailsAfterReconnect) {
+TEST_F(LowLevelE2E_Client, GetMeReturnsValidDetailsAfterReconnect) {
     RecordProperty("description",
                    "Returns valid current-client details after reconnecting with a fresh authenticated session.");
-    iggy::ffi::Client *first_client = login_to_server();
-    ASSERT_NE(first_client, nullptr);
+    iggy::ffi::Client *first_client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails first_me{};
     ASSERT_NO_THROW({ first_me = first_client->get_me(); });
     EXPECT_NE(first_me.client_id, 0u);
     EXPECT_TRUE(first_me.has_user_id);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(first_client));
-    first_client = nullptr;
+    DeleteClient(first_client);
 
-    iggy::ffi::Client *second_client = login_to_server();
-    ASSERT_NE(second_client, nullptr);
+    iggy::ffi::Client *second_client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails second_me{};
     ASSERT_NO_THROW({ second_me = second_client->get_me(); });
@@ -459,28 +428,21 @@ TEST(LowLevelE2E_Client, GetMeReturnsValidDetailsAfterReconnect) {
     EXPECT_EQ(second_me.consumer_groups_count, 0u);
     EXPECT_TRUE(second_me.consumer_groups.empty());
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(second_client));
-    second_client = nullptr;
+    DeleteClient(second_client);
 }
 
-TEST(LowLevelE2E_Client, GetClientBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Client, GetClientBeforeLoginThrows) {
     RecordProperty("description", "Rejects get_client before connect, and after connect but before login.");
-    iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_THROW(client->get_client(1), std::exception);
     ASSERT_NO_THROW(client->connect());
     ASSERT_THROW(client->get_client(1), std::exception);
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, GetClientWithWrongClientIdThrows) {
+TEST_F(LowLevelE2E_Client, GetClientWithWrongClientIdThrows) {
     RecordProperty("description", "Rejects querying invalid or non-existent client ids.");
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedInClient();
 
     std::uint32_t non_existent_client_id = 1u;
     ASSERT_NO_THROW({
@@ -500,15 +462,11 @@ TEST(LowLevelE2E_Client, GetClientWithWrongClientIdThrows) {
         SCOPED_TRACE(wrong_client_id);
         ASSERT_THROW(client->get_client(wrong_client_id), std::exception);
     }
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, GetClientReturnsDetailsForMatchingClientId) {
+TEST_F(LowLevelE2E_Client, GetClientReturnsDetailsForMatchingClientId) {
     RecordProperty("description", "Returns current client details when querying with the authenticated client id.");
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails current_client{};
     iggy::ffi::ClientInfoDetails looked_up_client{};
@@ -528,15 +486,11 @@ TEST(LowLevelE2E_Client, GetClientReturnsDetailsForMatchingClientId) {
     EXPECT_EQ(static_cast<std::string>(looked_up_client.transport), static_cast<std::string>(current_client.transport));
     EXPECT_EQ(looked_up_client.consumer_groups_count, current_client.consumer_groups_count);
     EXPECT_EQ(looked_up_client.consumer_groups.size(), current_client.consumer_groups.size());
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, GetClientIsStableAcrossBackToBackCalls) {
+TEST_F(LowLevelE2E_Client, GetClientIsStableAcrossBackToBackCalls) {
     RecordProperty("description", "Returns stable client details across back-to-back get_client calls.");
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails current_client{};
     iggy::ffi::ClientInfoDetails first_lookup{};
@@ -562,31 +516,21 @@ TEST(LowLevelE2E_Client, GetClientIsStableAcrossBackToBackCalls) {
     EXPECT_EQ(static_cast<std::string>(second_lookup.transport), static_cast<std::string>(first_lookup.transport));
     EXPECT_EQ(second_lookup.consumer_groups_count, first_lookup.consumer_groups_count);
     EXPECT_EQ(second_lookup.consumer_groups.size(), first_lookup.consumer_groups.size());
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, GetClientsBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Client, GetClientsBeforeLoginThrows) {
     RecordProperty("description", "Rejects get_clients before connect, and after connect but before login.");
-    iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_THROW(client->get_clients(), std::exception);
     ASSERT_NO_THROW(client->connect());
     ASSERT_THROW(client->get_clients(), std::exception);
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, GetClientsReturnsActiveClientSessions) {
+TEST_F(LowLevelE2E_Client, GetClientsReturnsActiveClientSessions) {
     RecordProperty("description", "Returns the currently active authenticated client sessions.");
-    iggy::ffi::Client *first_client  = login_to_server();
-    iggy::ffi::Client *second_client = login_to_server();
-    ASSERT_NE(first_client, nullptr);
-    ASSERT_NE(second_client, nullptr);
+    iggy::ffi::Client *first_client  = GetLoggedInClient();
+    iggy::ffi::Client *second_client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails first_me{};
     iggy::ffi::ClientInfoDetails second_me{};
@@ -625,18 +569,14 @@ TEST(LowLevelE2E_Client, GetClientsReturnsActiveClientSessions) {
     EXPECT_TRUE(found_first);
     EXPECT_TRUE(found_second);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(second_client));
-    second_client = nullptr;
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(first_client));
-    first_client = nullptr;
+    DeleteClient(second_client);
+    DeleteClient(first_client);
 }
 
-TEST(LowLevelE2E_Client, GetClientsIsStableAcrossBackToBackCalls) {
+TEST_F(LowLevelE2E_Client, GetClientsIsStableAcrossBackToBackCalls) {
     RecordProperty("description", "Returns stable client lists across back-to-back get_clients calls.");
-    iggy::ffi::Client *first_client  = login_to_server();
-    iggy::ffi::Client *second_client = login_to_server();
-    ASSERT_NE(first_client, nullptr);
-    ASSERT_NE(second_client, nullptr);
+    iggy::ffi::Client *first_client  = GetLoggedInClient();
+    iggy::ffi::Client *second_client = GetLoggedInClient();
 
     rust::Vec<iggy::ffi::ClientInfo> first_clients;
     rust::Vec<iggy::ffi::ClientInfo> second_clients;
@@ -665,18 +605,14 @@ TEST(LowLevelE2E_Client, GetClientsIsStableAcrossBackToBackCalls) {
         EXPECT_TRUE(found_match);
     }
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(second_client));
-    second_client = nullptr;
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(first_client));
-    first_client = nullptr;
+    DeleteClient(second_client);
+    DeleteClient(first_client);
 }
 
-TEST(LowLevelE2E_Client, GetClientsMatchesGetClientForReturnedIds) {
+TEST_F(LowLevelE2E_Client, GetClientsMatchesGetClientForReturnedIds) {
     RecordProperty("description", "Returns list entries that agree with get_client for each returned client id.");
-    iggy::ffi::Client *first_client  = login_to_server();
-    iggy::ffi::Client *second_client = login_to_server();
-    ASSERT_NE(first_client, nullptr);
-    ASSERT_NE(second_client, nullptr);
+    iggy::ffi::Client *first_client  = GetLoggedInClient();
+    iggy::ffi::Client *second_client = GetLoggedInClient();
 
     rust::Vec<iggy::ffi::ClientInfo> clients;
     ASSERT_NO_THROW({ clients = first_client->get_clients(); });
@@ -695,22 +631,18 @@ TEST(LowLevelE2E_Client, GetClientsMatchesGetClientForReturnedIds) {
         EXPECT_EQ(details.consumer_groups_count, client.consumer_groups_count);
     }
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(second_client));
-    second_client = nullptr;
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(first_client));
-    first_client = nullptr;
+    DeleteClient(second_client);
+    DeleteClient(first_client);
 }
 
-TEST(LowLevelE2E_Client, GetClientsReflectsAdditionalSession) {
+TEST_F(LowLevelE2E_Client, GetClientsReflectsAdditionalSession) {
     RecordProperty("description", "Reflects a newly added authenticated session in subsequent get_clients results.");
-    iggy::ffi::Client *first_client = login_to_server();
-    ASSERT_NE(first_client, nullptr);
+    iggy::ffi::Client *first_client = GetLoggedInClient();
 
     rust::Vec<iggy::ffi::ClientInfo> clients_before;
     ASSERT_NO_THROW({ clients_before = first_client->get_clients(); });
 
-    iggy::ffi::Client *second_client = login_to_server();
-    ASSERT_NE(second_client, nullptr);
+    iggy::ffi::Client *second_client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails second_me{};
     rust::Vec<iggy::ffi::ClientInfo> clients_after;
@@ -744,125 +676,86 @@ TEST(LowLevelE2E_Client, GetClientsReflectsAdditionalSession) {
     }
     EXPECT_TRUE(found_after);
 
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(second_client));
-    second_client = nullptr;
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(first_client));
-    first_client = nullptr;
+    DeleteClient(second_client);
+    DeleteClient(first_client);
 }
 
-TEST(LowLevelE2E_Client, PingSucceedsForNewConnection) {
+TEST_F(LowLevelE2E_Client, PingSucceedsForNewConnection) {
     RecordProperty("description", "Successfully pings the server from a fresh unauthenticated client session.");
-    iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_NO_THROW(client->ping());
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, HeartbeatIntervalReturnsDefaultValueForNewConnection) {
+TEST_F(LowLevelE2E_Client, HeartbeatIntervalReturnsDefaultValueForNewConnection) {
     RecordProperty("description",
                    "Returns the default heartbeat interval in microseconds for a fresh unauthenticated client.");
     constexpr std::uint64_t default_heartbeat_micros = 5'000'000ull;
-    iggy::ffi::Client *client                        = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedOutClient();
 
     const auto heartbeat_interval = client->heartbeat_interval();
     EXPECT_EQ(heartbeat_interval, default_heartbeat_micros);
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, HeartbeatIntervalReturnsConfiguredValueFromConnectionString) {
+TEST_F(LowLevelE2E_Client, HeartbeatIntervalReturnsConfiguredValueFromConnectionString) {
     RecordProperty("description",
                    "Returns the configured heartbeat interval in microseconds from the connection string.");
     constexpr std::uint64_t configured_heartbeat_micros = 10'000'000ull;
     iggy::ffi::Client *client                           = nullptr;
     ASSERT_NO_THROW({ client = iggy::ffi::new_connection("iggy://iggy:iggy@127.0.0.1:8090?heartbeat_interval=10s"); });
     ASSERT_NE(client, nullptr);
+    TrackClient(client);
 
     const auto heartbeat_interval = client->heartbeat_interval();
     EXPECT_EQ(heartbeat_interval, configured_heartbeat_micros);
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, SnapshotBeforeLoginThrows) {
+TEST_F(LowLevelE2E_Client, SnapshotBeforeLoginThrows) {
     RecordProperty("description", "Rejects snapshot before connect, and after connect but before login.");
-    iggy::ffi::Client *client = nullptr;
-    ASSERT_NO_THROW({ client = iggy::ffi::new_connection(""); });
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_THROW(client->snapshot("deflated", make_snapshot_types({"test"})), std::exception);
 
     ASSERT_NO_THROW(client->connect());
     ASSERT_THROW(client->snapshot("deflated", make_snapshot_types({"test"})), std::exception);
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, SnapshotAllCombinedWithOtherTypeThrows) {
+TEST_F(LowLevelE2E_Client, SnapshotAllCombinedWithOtherTypeThrows) {
     RecordProperty("description", "Rejects combining the all snapshot type with any other snapshot type.");
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedInClient();
 
     ASSERT_THROW(client->snapshot("deflated", make_snapshot_types({"all", "test"})), std::exception);
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, SnapshotWithEmptySnapshotTypesThrows) {
+TEST_F(LowLevelE2E_Client, SnapshotWithEmptySnapshotTypesThrows) {
     RecordProperty("description", "Rejects an empty snapshot type list in the wrapper before sending.");
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedInClient();
 
     rust::Vec<rust::String> snapshot_types;
     ASSERT_THROW(client->snapshot("deflated", snapshot_types), std::exception);
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, SnapshotReturnsNonEmptyBytes) {
+TEST_F(LowLevelE2E_Client, SnapshotReturnsNonEmptyBytes) {
     RecordProperty("description", "Returns a non-empty snapshot for a valid compression and snapshot type.");
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedInClient();
 
     rust::Vec<std::uint8_t> snapshot_bytes;
     ASSERT_NO_THROW({ snapshot_bytes = client->snapshot("deflated", make_snapshot_types({"test"})); });
     EXPECT_FALSE(snapshot_bytes.empty());
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, SnapshotWithInvalidCompressionThrows) {
+TEST_F(LowLevelE2E_Client, SnapshotWithInvalidCompressionThrows) {
     RecordProperty("description",
                    "Rejects empty or invalid snapshot compression values in the wrapper before sending.");
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedInClient();
 
     ASSERT_THROW(client->snapshot("", make_snapshot_types({"test"})), std::exception);
     ASSERT_THROW(client->snapshot("invalid-compression", make_snapshot_types({"test"})), std::exception);
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
 
-TEST(LowLevelE2E_Client, SnapshotWithInvalidSnapshotTypeThrows) {
+TEST_F(LowLevelE2E_Client, SnapshotWithInvalidSnapshotTypeThrows) {
     RecordProperty("description", "Rejects invalid snapshot type values in the wrapper before sending.");
-    iggy::ffi::Client *client = login_to_server();
-    ASSERT_NE(client, nullptr);
+    iggy::ffi::Client *client = GetLoggedInClient();
 
     ASSERT_THROW(client->snapshot("deflated", make_snapshot_types({"not-a-real-type"})), std::exception);
-
-    ASSERT_NO_THROW(iggy::ffi::delete_connection(client));
-    client = nullptr;
 }
