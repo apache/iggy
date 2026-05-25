@@ -40,10 +40,10 @@ username = "root"
 password = ""
 label_prefix = "iggy"
 batch_size = 1000
-timeout_secs = 30
-# TCP connect timeout in seconds (default 5). Independent of timeout_secs;
-# raise it for cross-region or cold-start FEs that are slow to accept.
-# connect_timeout_secs = 5
+timeout = "30s"
+# TCP connect timeout (default "5s"). Independent of timeout; raise it for
+# cross-region or cold-start FEs that are slow to accept the connection.
+# connect_timeout = "5s"
 # Stream Load redirect security. Doris's FE redirects (307) to a BE on another
 # host; credentials are re-attached across that hop. By default a redirect that
 # downgrades https -> http is refused (it would leak credentials in cleartext).

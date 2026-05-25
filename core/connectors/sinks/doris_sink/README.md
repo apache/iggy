@@ -15,7 +15,7 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 2. It computes a deterministic Stream Load `label` of the form `{label_prefix}-{stream_san}-{topic_san}-{hash16}-{partition}-{first_offset}-{last_offset}`.
    - `hash16` is a single 64-bit blake3 hash computed over the *raw* (un-sanitized), length-prefixed `(stream, topic)` pair. So two identities that sanitize to the same string (e.g. `events.v1` vs `events_v1`) get distinct labels, and no boundary-shift aliasing is possible (`("ab","c")` ≠ `("a","bc")`).
    - The total label is bounded under Doris's 128-char cap regardless of input length (worst case 120 chars).
-   - Doris dedupes loads by label inside its `label_keep_max_second` window. This makes a **runtime-driven retry/redrive** of the same batch idempotent — the second load is absorbed instead of duplicating rows. Note this is *not* a crash-recovery guarantee: the runtime commits the consumer offset at poll time, before `consume()` runs, so a crash mid-load yields at-most-once delivery (the batch is not replayed). Label dedup protects against in-process retries, not against lost batches.
+   - Doris dedupes loads by label inside its `label_keep_max_second` window. The deterministic label is **forward-compatible scaffolding**: if the runtime ever gains a retry/redrive of the same batch, the second load would be absorbed instead of duplicating rows. **Today it protects no production scenario** — the connector has no in-process retry loop, `consume()` runs once per poll, and the runtime discards `consume()`'s return value (see the note below line 91), so a failed or crashed load is never replayed. Delivery is therefore at-most-once: the runtime commits the consumer offset at poll time, before `consume()` runs, so the batch is not replayed.
 3. It `PUT`s the batch to `{fe_url}/api/{database}/{table}/_stream_load` with HTTP Basic auth and the headers `Expect: 100-continue`, `format: json`, `strip_outer_array: true`, `label: <label>`. (`Expect: 100-continue` is required by Doris's Stream Load endpoint, which rejects PUTs that omit it. Where the HTTP stack negotiates the handshake it also lets Doris reject auth/4xx before the body uploads — a secondary benefit, not relied on for correctness.)
 4. The Doris frontend (FE) responds with a `307 Temporary Redirect` to a backend (BE). The connector follows the redirect manually so that the `Authorization` header is preserved across the hop (`reqwest`'s default policy strips it on cross-host redirects).
    `308 Permanent Redirect` is also followed as a defensive measure; redirects beyond a hard cap of 5 (or a redirect with no usable `Location`) are rejected as a permanent `PermanentHttpError`, since retrying a malformed/looping redirect cannot help.
@@ -36,13 +36,13 @@ The Doris sink connector consumes JSON messages from Iggy streams and writes the
 | `password` | yes | — | Doris user password. Stored as a `secrecy::SecretString` and never logged. |
 | `label_prefix` | no | `iggy` | Prefix for the deterministic Stream Load label. |
 | `batch_size` | no | `1000` | Maximum number of messages per Stream Load request. |
-| `timeout_secs` | no | `30` | Per-request HTTP timeout (total request budget). |
-| `connect_timeout_secs` | no | `5` | TCP connect timeout, independent of `timeout_secs`. Raise it for cross-region or cold-start FEs. |
+| `timeout` | no | `30s` | Per-request HTTP timeout (total request budget), as a human-readable duration (e.g. `30s`, `1m`). |
+| `connect_timeout` | no | `5s` | TCP connect timeout, independent of `timeout`, as a human-readable duration. Raise it for cross-region or cold-start FEs. |
 | `max_filter_ratio` | no | unset | Forwarded as the `max_filter_ratio` Stream Load header. |
-| `columns` | no | unset | Forwarded as the `columns` Stream Load header. |
-| `where` | no | unset | Forwarded as the `where` Stream Load header. |
+| `columns` | no | unset | Forwarded as the `columns` Stream Load header. Validated at startup; an invalid value fails `open()`. |
+| `where` | no | unset | Forwarded as the `where` Stream Load header. Validated at startup; an invalid value fails `open()`. |
 | `allow_insecure_redirect` | no | `false` | Permit a Stream Load redirect that downgrades `https://` → `http://`. Refused by default because it would push credentials onto a cleartext hop. |
-| `allowed_redirect_hosts` | no | unset | Allowlist of hosts a redirect may target. When set and non-empty, a redirect to any other host is refused. |
+| `allowed_redirect_hosts` | no | unset | Allowlist of redirect targets. Each entry is `host` (pins the host, any port) or `host:port` (pins the exact endpoint). When set and non-empty, any other redirect target is refused. |
 
 ### Example
 
@@ -71,15 +71,15 @@ username = "root"
 password = "replace_with_secret"
 label_prefix = "iggy"
 batch_size = 1000
-timeout_secs = 30
+timeout = "30s"
 ```
 
 ## Security notes
 
 - **Use `https://` in production.** The connector accepts `http://` URLs and logs a `warn!` when `fe_url` points at a non-loopback host over plain HTTP, but it does not refuse. Over `http://`, the HTTP Basic credentials travel in cleartext.
 - **Trust boundary on the FE.** The connector intentionally preserves the `Authorization` header across the FE → BE 307 redirect (reqwest would otherwise strip it on cross-host redirects).
-  A compromised or MITM'd FE could try to exfiltrate credentials by responding with `Location: http://attacker/`. Before re-attaching credentials, the connector validates the redirect target: it **refuses a scheme downgrade** (`https://` → `http://`) unless `allow_insecure_redirect = true`, and — if `allowed_redirect_hosts` is set — refuses any host outside that allowlist.
-  Cross-host redirects on the same scheme are allowed, since that is the normal FE → BE topology. For maximum lockdown in hostile networks, set `allowed_redirect_hosts` to your known BE hosts and deploy Doris over TLS.
+  A compromised or MITM'd FE could try to exfiltrate credentials by responding with `Location: http://attacker/`. Before re-attaching credentials, the connector validates the redirect target: it **refuses a scheme downgrade** (`https://` → `http://`) unless `allow_insecure_redirect = true`, requires an **absolute** `Location` (a relative one is rejected, not silently resolved), and — if `allowed_redirect_hosts` is set — refuses any target outside that allowlist.
+  **When `allowed_redirect_hosts` is unset (the default), any same-scheme host is accepted** — that is the price of supporting the normal cross-host FE → BE topology out of the box. For lockdown in hostile networks, set `allowed_redirect_hosts` to your known BE endpoints and deploy Doris over TLS. List a bare `host` to pin only the host, or `host:port` to pin the exact endpoint — pinning the port closes the "allowlisted host, attacker port" vector.
 - **`columns` and `where` are SQL-expression pass-throughs.** Whatever you put in those config fields is forwarded verbatim to Doris's Stream Load and evaluated as a SQL expression. Keep this config trusted.
 
 ## Operational guidance

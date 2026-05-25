@@ -327,6 +327,7 @@ web-sys = { version = "0.3", features = [
     "ResizeObserverEntry",
 ] }
 webpki-roots = "1.0.7"
+wiremock = "0.6"
 yew = { version = "0.23", features = ["csr"] }
 yew-router = "0.20"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

@@ -87,5 +87,5 @@ tracing-subscriber = { workspace = true }
 twox-hash = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
-wiremock = "0.6"
+wiremock = { workspace = true }
 zip = { workspace = true }

@@ -37,6 +37,7 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
+humantime = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 reqwest = { workspace = true }
 secrecy = { workspace = true }
@@ -47,4 +48,4 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-wiremock = "0.6"
+wiremock = { workspace = true }
