@@ -22,7 +22,7 @@
 //! address entities by name (`WireIdentifier::named`). Id-keyed effects
 //! return once reply-body parsing lands.
 
-use iggy_common::sharding::IggyNamespace;
+use server_common::sharding::IggyNamespace;
 
 #[derive(Debug, Clone)]
 pub enum Effect {

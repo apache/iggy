@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
-use iggy_binary_protocol::{Message, ReplyHeader};
+use iggy_binary_protocol::ReplyHeader;
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use std::collections::HashMap;
 use std::mem::size_of;
 use tracing::trace;
@@ -119,7 +118,7 @@ pub enum RequestStatus {
 /// Backs Register session, request contiguity, metadata-retry dedup, and
 /// `NoSession`/`SessionTooLow` eviction. Partition plane is at-least-once;
 /// `SendMessages` retries can re-commit at a new offset and consumers
-/// dedup via message ID (`iggy_common::MessageDeduplicator`).
+/// dedup via message ID (`server_common::MessageDeduplicator`).
 ///
 /// Do not add per-partition `ClientTable` or `(client_id, request)` dedup
 /// on the partition side, that flips iggy's contract toward at-most-once.

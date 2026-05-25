@@ -18,6 +18,7 @@
 
 use crate::binary::dispatch::HandlerResult;
 use crate::binary::handlers::personal_access_tokens::COMPONENT;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use err_trail::ErrContext;
@@ -27,7 +28,6 @@ use iggy_binary_protocol::responses::personal_access_tokens::{
     GetPersonalAccessTokensResponse, PersonalAccessTokenResponse,
 };
 use iggy_common::IggyError;
-use iggy_common::SenderKind;
 use std::rc::Rc;
 use tracing::debug;
 

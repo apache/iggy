@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::IggyMessagesBatch;
+use iggy_common::IggyMessagesBatch;
 
 /// Holds batches that are being written to disk.
 ///

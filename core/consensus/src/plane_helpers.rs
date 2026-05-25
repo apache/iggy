@@ -19,11 +19,9 @@ use crate::{
     Consensus, IgnoreReason, Pipeline, PipelineEntry, PlaneKind, PrepareOkOutcome, Sequencer,
     Status, VsrConsensus,
 };
-use iggy_binary_protocol::consensus::iobuf::Owned;
-use iggy_binary_protocol::{
-    Command2, Message, PrepareHeader, PrepareOkHeader, ReplyHeader, RequestHeader,
-};
+use iggy_binary_protocol::{Command2, PrepareHeader, PrepareOkHeader, ReplyHeader, RequestHeader};
 use message_bus::{MessageBus, SendError};
+use server_common::{Message, iobuf::Owned};
 use std::ops::AsyncFnOnce;
 
 /// Shared pipeline-first request flow (metadata + partitions).
@@ -449,9 +447,8 @@ pub async fn send_prepare_ok<B, P>(
 mod tests {
     use super::*;
     use crate::{Consensus, LocalPipeline};
-    use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-    use iggy_binary_protocol::consensus::iobuf::Frozen;
     use message_bus::SendError;
+    use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
 
     #[derive(Debug, Default)]
     struct NoopBus;

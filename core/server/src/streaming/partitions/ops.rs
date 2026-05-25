@@ -41,8 +41,8 @@ use crate::shard::system::messages::PollingArgs;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::IggyMessagesBatchSet;
 use iggy_common::IggyPollMetadata;
-use iggy_common::sharding::IggyNamespace;
 use iggy_common::{IggyError, PollingKind};
+use server_common::sharding::IggyNamespace;
 use std::cell::RefCell;
 use std::sync::atomic::Ordering;
 

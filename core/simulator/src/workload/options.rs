@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::workload::actions::Action;
-use iggy_common::sharding::IggyNamespace;
+use server_common::sharding::IggyNamespace;
 use strum::EnumCount;
 
 /// Per-action sampling weights as percentages. Unlisted variants default

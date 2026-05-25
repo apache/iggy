@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::sender::SenderKind;
 use crate::{
     shard::{
         IggyShard, execution,
@@ -31,8 +32,9 @@ use crate::{
     },
 };
 use compio::net::TcpStream;
-use iggy_common::{IggyError, SenderKind, TransportProtocol, sharding::IggyNamespace};
+use iggy_common::{IggyError, TransportProtocol};
 use nix::sys::stat::SFlag;
+use server_common::sharding::IggyNamespace;
 use std::os::fd::{FromRawFd, IntoRawFd};
 use tracing::info;
 

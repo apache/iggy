@@ -34,10 +34,11 @@ pub mod shadow;
 
 use std::collections::HashMap;
 
-use iggy_binary_protocol::{Message, ReplyHeader, RequestHeader};
+use iggy_binary_protocol::{ReplyHeader, RequestHeader};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::SeedableRng;
+use server_common::Message;
 
 use crate::Simulator;
 use crate::client::SimClient;

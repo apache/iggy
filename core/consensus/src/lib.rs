@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_binary_protocol::{ConsensusHeader, ConsensusMessage};
+use iggy_binary_protocol::ConsensusHeader;
 use message_bus::MessageBus;
+use server_common::ConsensusMessage;
 
 pub trait Project<T, C: Consensus> {
     type Consensus: Consensus;
