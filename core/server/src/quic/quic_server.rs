@@ -185,7 +185,7 @@ fn configure_quic(config: &QuicConfig) -> Result<ServerConfig, QuicError> {
 
 fn generate_self_signed_cert<'a>() -> Result<(Vec<CertificateDer<'a>>, PrivateKeyDer<'a>), QuicError>
 {
-    iggy_common::generate_self_signed_certificate("localhost").map_err(|e| {
+    server_common::generate_self_signed_certificate("localhost").map_err(|e| {
         error!("{COMPONENT} (error: {e}) - failed to generate self-signed certificate");
         QuicError::CertGenerationError
     })

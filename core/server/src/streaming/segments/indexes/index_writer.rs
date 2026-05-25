@@ -15,4 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub use iggy_common::IndexWriter;
+pub use server_common::IndexWriter;

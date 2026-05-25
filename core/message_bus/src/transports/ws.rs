@@ -79,8 +79,8 @@ use compio::net::TcpStream;
 use compio::ws::WebSocketStream;
 use compio::ws::tungstenite::{self, Message as WsMessage};
 use futures::FutureExt;
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::{GenericHeader, Message, read_size_field};
+use iggy_binary_protocol::{GenericHeader, read_size_field};
+use server_common::{MESSAGE_ALIGN, Message};
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -118,8 +118,7 @@ pub(in crate::transports) fn decode_consensus_frame(
     // straight into io_uring O_DIRECT buffers without a bounce copy. WS
     // payloads have no alignment guarantee, so the only way to satisfy
     // the invariant is one allocate-and-copy here.
-    let owned =
-        iggy_binary_protocol::consensus::iobuf::Owned::<MESSAGE_ALIGN>::copy_from_slice(body);
+    let owned = server_common::iobuf::Owned::<MESSAGE_ALIGN>::copy_from_slice(body);
     Message::<GenericHeader>::try_from(owned).map_err(|_| FrameDecodeError::BadHeader)
 }
 
@@ -314,8 +313,9 @@ mod tests {
     use crate::lifecycle::Shutdown;
     use async_channel::{Receiver, Sender, bounded};
     use compio::net::TcpListener;
-    use iggy_binary_protocol::consensus::iobuf::Frozen;
-    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, Message};
+    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
+    use server_common::Message;
+    use server_common::iobuf::Frozen;
     use std::time::Duration;
 
     #[allow(clippy::cast_possible_truncation)]

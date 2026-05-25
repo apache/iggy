@@ -18,10 +18,11 @@
 //! `StoreConsumerOffset` op. Pre-`AckLevel` manual encoding. Live
 //! namespace via shadow, fabricated consumer kind/id. Samples Success.
 
-use iggy_binary_protocol::{Message, ReplyHeader, RequestHeader};
-use iggy_common::sharding::IggyNamespace;
+use iggy_binary_protocol::{ReplyHeader, RequestHeader};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
+use server_common::Message;
+use server_common::sharding::IggyNamespace;
 
 use crate::client::SimClient;
 use crate::workload::effect::Effect;

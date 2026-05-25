@@ -20,7 +20,7 @@ use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
 use iggy_common::IggyError;
-use iggy_common::sharding::IggyNamespace;
+use server_common::sharding::IggyNamespace;
 use std::rc::Rc;
 use tracing::{error, info, trace};
 

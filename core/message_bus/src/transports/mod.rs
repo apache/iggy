@@ -84,7 +84,8 @@ pub mod wss;
 
 use crate::lifecycle::{BusReceiver, FusedShutdown};
 use async_channel::Sender;
-use iggy_binary_protocol::{GenericHeader, Message};
+use iggy_binary_protocol::GenericHeader;
+use server_common::Message;
 use std::io;
 use std::net::SocketAddr;
 

@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView, IggyIndexesMut, PooledBuffer};
+use crate::{IggyIndexesMut, PooledBuffer};
 use compio::{
     buf::{IntoInner, IoBuf},
     fs::{File, OpenOptions},
     io::AsyncReadAtExt,
 };
 use err_trail::ErrContext;
+use iggy_common::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView};
 use std::{
     io::ErrorKind,
     rc::Rc,

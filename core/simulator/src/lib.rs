@@ -27,13 +27,14 @@ pub mod workload;
 use bus::SimOutbox;
 use client::SimClient;
 use consensus::PartitionsHandle;
-use iggy_binary_protocol::{GenericHeader, Message, ReplyHeader};
+use iggy_binary_protocol::{GenericHeader, ReplyHeader};
 use iggy_common::IggyError;
-use iggy_common::sharding::IggyNamespace;
 use network::Network;
 use packet::{PacketSimulatorOptions, ProcessId};
 use partitions::{Partition, PartitionOffsets, PollQueryResult, PollingArgs, PollingConsumer};
 use replica::{Replica, new_replica};
+use server_common::Message;
+use server_common::sharding::IggyNamespace;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -363,13 +364,13 @@ mod tests {
     use crate::workload::apply_sim_commands;
     use bytes::Bytes;
     use consensus::Status;
-    use iggy_common::sharding::IggyNamespace;
+    use server_common::sharding::IggyNamespace;
 
     /// Crashing the primary in a 5-node cluster: 4 survivors detect via
     /// heartbeat timeout and elect a new primary via view change.
     #[test]
     fn view_change_after_primary_crash() {
-        iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -467,7 +468,7 @@ mod tests {
     /// dedup if they need at-most-once-per-payload.
     #[test]
     fn failover_retry_re_executes_under_at_least_once() {
-        iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -582,7 +583,7 @@ mod tests {
     /// `handle_commit_message_timeout` used to assert `commit_min == commit_max`.
     #[test]
     fn view_change_behind_backup_becomes_primary() {
-        iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -650,7 +651,7 @@ mod tests {
     /// and workload) produces an identical reply-header sequence.
     #[test]
     fn workload_replay_is_deterministic() {
-        iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -694,7 +695,7 @@ mod tests {
         };
         use strum::{EnumCount, IntoEnumIterator};
 
-        iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -714,8 +715,8 @@ mod tests {
             network_opts,
         );
         let client = client::SimClient::new(client_id);
-        let ns_a = iggy_common::sharding::IggyNamespace::new(1, 1, 0);
-        let ns_b = iggy_common::sharding::IggyNamespace::new(1, 1, 1);
+        let ns_a = server_common::sharding::IggyNamespace::new(1, 1, 0);
+        let ns_b = server_common::sharding::IggyNamespace::new(1, 1, 1);
         sim.init_partition(ns_a);
         sim.init_partition(ns_b);
         sim.register_client_with_primary(&client);
@@ -761,7 +762,7 @@ mod tests {
             options::{ActionWeights, WorkloadOptions},
         };
 
-        iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -781,7 +782,7 @@ mod tests {
             network_opts,
         );
         let client = client::SimClient::new(client_id);
-        let ns_a = iggy_common::sharding::IggyNamespace::new(1, 1, 0);
+        let ns_a = server_common::sharding::IggyNamespace::new(1, 1, 0);
         sim.init_partition(ns_a);
         sim.register_client_with_primary(&client);
 
@@ -851,7 +852,7 @@ mod tests {
             options::{ActionWeights, WorkloadOptions},
         };
 
-        iggy_common::MemoryPool::init_pool(&iggy_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -875,8 +876,8 @@ mod tests {
             .iter()
             .map(|&id| client::SimClient::new(id))
             .collect();
-        let ns_a = iggy_common::sharding::IggyNamespace::new(1, 1, 0);
-        let ns_b = iggy_common::sharding::IggyNamespace::new(1, 1, 1);
+        let ns_a = server_common::sharding::IggyNamespace::new(1, 1, 0);
+        let ns_b = server_common::sharding::IggyNamespace::new(1, 1, 1);
         sim.init_partition(ns_a);
         sim.init_partition(ns_b);
         for c in &clients {

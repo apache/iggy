@@ -372,3 +372,21 @@ The source and sink connectors can work together for pass-through scenarios:
 
 1. **Sink** with `payload_format = "json"` stores messages as JSONB
 2. **Source** with `payload_column = "payload"` and `payload_format = "json_direct"` reads JSONB directly
+
+### Flat-Schema Sinks (Iceberg, Delta)
+
+In the default JSON mode (no `payload_column`), the Postgres source wraps each row in a
+`DatabaseRecord` envelope containing `table_name`, `operation_type`, `timestamp`, `data`, and
+`old_data`. Sinks like Iceberg and Delta expect flat JSON matching the target table schema, so
+the envelope must be unwrapped before the data reaches the sink.
+
+**Option A — use the `unwrap_envelope` transform** on the sink side to extract the `data` field:
+
+```toml
+[transforms.unwrap_envelope]
+enabled = true
+field = "data"
+```
+
+**Option B — bypass the envelope** by configuring the source with `payload_column` and
+`payload_format = "json_direct"` to emit raw JSONB directly (see Payload Column Extraction above).

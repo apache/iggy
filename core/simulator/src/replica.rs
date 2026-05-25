@@ -19,13 +19,13 @@ use crate::bus::{SharedSimOutbox, SimOutbox};
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use consensus::{LocalPipeline, VsrConsensus};
 use iggy_common::IggyByteSize;
-use iggy_common::sharding::ShardId;
 use iggy_common::variadic;
 use metadata::IggyMetadata;
 use metadata::stm::consumer_group::{ConsumerGroups, ConsumerGroupsInner};
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
 use partitions::{IggyPartitions, PartitionsConfig};
+use server_common::sharding::ShardId;
 use std::sync::Arc;
 
 // TODO: Make configurable
