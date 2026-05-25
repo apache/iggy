@@ -17,6 +17,7 @@
  */
 
 use crate::binary::dispatch::HandlerResult;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
@@ -25,7 +26,7 @@ use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
 use iggy_binary_protocol::responses::consumer_groups::ConsumerGroupResponse;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::IggyError;
 use std::rc::Rc;
 use tracing::{debug, instrument};
 

@@ -29,7 +29,7 @@ TEST(LowLevelE2E_Identifier, FromStringCreatesStringIdentifier) {
     const std::string value = "stream-identifier";
     iggy::ffi::Identifier identifier;
 
-    ASSERT_NO_THROW(identifier.from_string(value));
+    ASSERT_NO_THROW(identifier.set_string(value));
 
     ASSERT_EQ(identifier.kind, "string");
     ASSERT_EQ(identifier.length, value.size());
@@ -50,7 +50,7 @@ TEST(LowLevelE2E_Identifier, FromStringAcceptsExact255ByteUtf8Value) {
     ASSERT_EQ(value.size(), 255u);
 
     iggy::ffi::Identifier identifier;
-    ASSERT_NO_THROW(identifier.from_string(value));
+    ASSERT_NO_THROW(identifier.set_string(value));
 
     ASSERT_EQ(identifier.kind, "string");
     ASSERT_EQ(identifier.length, value.size());
@@ -64,7 +64,7 @@ TEST(LowLevelE2E_Identifier, FromStringRejectsEmptyValue) {
     RecordProperty("description", "Rejects creating a string identifier from an empty string.");
     iggy::ffi::Identifier identifier;
 
-    ASSERT_THROW(identifier.from_string(""), std::exception);
+    ASSERT_THROW(identifier.set_string(""), std::exception);
 }
 
 TEST(LowLevelE2E_Identifier, FromStringRejectsUtf8ValueLongerThan255Bytes) {
@@ -77,7 +77,7 @@ TEST(LowLevelE2E_Identifier, FromStringRejectsUtf8ValueLongerThan255Bytes) {
 
     ASSERT_EQ(too_long_value.size(), 256u);
 
-    ASSERT_THROW(identifier.from_string(too_long_value), std::exception);
+    ASSERT_THROW(identifier.set_string(too_long_value), std::exception);
 }
 
 TEST(LowLevelE2E_Identifier, FromStringRejectsAsciiValueLongerThan255Bytes) {
@@ -85,7 +85,7 @@ TEST(LowLevelE2E_Identifier, FromStringRejectsAsciiValueLongerThan255Bytes) {
     iggy::ffi::Identifier identifier;
     const std::string too_long_value(256, 'a');
 
-    ASSERT_THROW(identifier.from_string(too_long_value), std::exception);
+    ASSERT_THROW(identifier.set_string(too_long_value), std::exception);
 }
 
 TEST(LowLevelE2E_Identifier, FromNumericCreatesNumericIdentifier) {
@@ -94,7 +94,7 @@ TEST(LowLevelE2E_Identifier, FromNumericCreatesNumericIdentifier) {
     constexpr std::uint32_t value                        = 0x12345678;
     constexpr std::array<std::uint8_t, 4> expected_bytes = {0x78, 0x56, 0x34, 0x12};
 
-    ASSERT_NO_THROW(identifier.from_numeric(value));
+    ASSERT_NO_THROW(identifier.set_numeric(value));
 
     ASSERT_EQ(identifier.kind, "numeric");
     ASSERT_EQ(identifier.length, 4u);
@@ -109,7 +109,7 @@ TEST(LowLevelE2E_Identifier, FromNumericCreatesUint32MaxIdentifier) {
     iggy::ffi::Identifier identifier;
     constexpr std::array<std::uint8_t, 4> expected_bytes = {0xFF, 0xFF, 0xFF, 0xFF};
 
-    ASSERT_NO_THROW(identifier.from_numeric(std::numeric_limits<std::uint32_t>::max()));
+    ASSERT_NO_THROW(identifier.set_numeric(std::numeric_limits<std::uint32_t>::max()));
 
     ASSERT_EQ(identifier.kind, "numeric");
     ASSERT_EQ(identifier.length, 4u);
@@ -123,8 +123,8 @@ TEST(LowLevelE2E_Identifier, FromNumericOverwritesExistingStringIdentifier) {
     RecordProperty("description", "Replaces a previously created string identifier with numeric identifier data.");
     iggy::ffi::Identifier identifier;
 
-    ASSERT_NO_THROW(identifier.from_string("temporary-name"));
-    ASSERT_NO_THROW(identifier.from_numeric(7));
+    ASSERT_NO_THROW(identifier.set_string("temporary-name"));
+    ASSERT_NO_THROW(identifier.set_numeric(7));
 
     ASSERT_EQ(identifier.kind, "numeric");
     ASSERT_EQ(identifier.length, 4u);
@@ -140,8 +140,8 @@ TEST(LowLevelE2E_Identifier, FromStringOverwritesExistingNumericIdentifier) {
     const std::string value = "replacement-name";
     iggy::ffi::Identifier identifier;
 
-    ASSERT_NO_THROW(identifier.from_numeric(42));
-    ASSERT_NO_THROW(identifier.from_string(value));
+    ASSERT_NO_THROW(identifier.set_numeric(42));
+    ASSERT_NO_THROW(identifier.set_string(value));
 
     ASSERT_EQ(identifier.kind, "string");
     ASSERT_EQ(identifier.length, value.size());

@@ -25,6 +25,7 @@ use super::ComputedValue;
 pub mod add_fields;
 pub mod delete_fields;
 pub mod filter_fields;
+pub mod unwrap_envelope;
 pub mod update_fields;
 
 /// Computes a JSON value based on the specified computed value type

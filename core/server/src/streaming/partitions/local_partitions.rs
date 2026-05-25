@@ -20,7 +20,7 @@
 //! Single-threaded (compio runtime) - NO synchronization needed!
 
 use super::local_partition::LocalPartition;
-use iggy_common::sharding::IggyNamespace;
+use server_common::sharding::IggyNamespace;
 use std::collections::HashMap;
 
 /// Per-shard partition storage.

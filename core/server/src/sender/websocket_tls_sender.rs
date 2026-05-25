@@ -17,14 +17,14 @@
  */
 
 use super::Sender;
-use crate::IggyError;
-use crate::alloc::buffer::PooledBuffer;
 use bytes::{BufMut, BytesMut};
 use compio::buf::IoBufMut;
 use compio::net::TcpStream;
 use compio::tls::TlsStream;
 use compio::ws::WebSocketStream;
 use compio::ws::tungstenite::{Error as TungsteniteError, Message};
+use iggy_common::IggyError;
+use server_common::PooledBuffer;
 use std::ptr;
 use tracing::debug;
 

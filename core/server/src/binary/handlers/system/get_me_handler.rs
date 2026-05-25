@@ -17,6 +17,7 @@
  */
 
 use crate::binary::dispatch::HandlerResult;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::clients::client_manager::Client;
 use crate::streaming::session::Session;
@@ -25,7 +26,6 @@ use iggy_binary_protocol::responses::clients::{
     ClientDetailsResponse, ClientResponse, ConsumerGroupInfoResponse,
 };
 use iggy_common::IggyError;
-use iggy_common::SenderKind;
 use std::rc::Rc;
 
 pub async fn handle_get_me(

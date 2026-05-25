@@ -24,11 +24,11 @@ use crate::streaming::partitions::consumer_group_offsets::ConsumerGroupOffsets;
 use crate::streaming::partitions::consumer_offsets::ConsumerOffsets;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::stats::{PartitionStats, StreamStats, TopicStats};
-use iggy_common::sharding::IggyNamespace;
 use iggy_common::{
     IdKind, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize, PersonalAccessToken,
 };
 use left_right::ReadGuard;
+use server_common::sharding::IggyNamespace;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
