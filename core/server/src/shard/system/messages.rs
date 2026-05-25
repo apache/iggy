@@ -27,11 +27,11 @@ use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
 use err_trail::ErrContext;
 use iggy_common::IggyPollMetadata;
-use iggy_common::PooledBuffer;
-use iggy_common::sharding::IggyNamespace;
 use iggy_common::{
     Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError, PollingStrategy,
 };
+use server_common::PooledBuffer;
+use server_common::sharding::IggyNamespace;
 use std::sync::atomic::Ordering;
 use tracing::error;
 

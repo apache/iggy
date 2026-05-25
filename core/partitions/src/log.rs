@@ -19,9 +19,10 @@ use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndexCache};
 use crate::iggy_index_writer::IggyIndexWriter;
 use crate::messages_writer::MessagesWriter;
 use crate::segment::Segment;
-use iggy_common::{IggyByteSize, IggyMessagesBatch, IggyMessagesBatchSetInFlight, SegmentStorage};
+use iggy_common::{IggyByteSize, IggyMessagesBatch};
 use journal::{Journal, Storage};
 use ringbuffer::AllocRingBuffer;
+use server_common::{IggyMessagesBatchSetInFlight, SegmentStorage};
 use std::fmt::Debug;
 use std::rc::Rc;
 

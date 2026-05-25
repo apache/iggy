@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_binary_protocol::consensus::iobuf::{Frozen, Owned};
 use iggy_binary_protocol::{Operation, PrepareHeader};
-use iggy_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice};
 use journal::{Journal, Storage};
+use server_common::{
+    iobuf::{Frozen, Owned},
+    send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice},
+};
 use std::io;
 use std::{
     cell::UnsafeCell,
@@ -569,8 +571,9 @@ fn push_selected_batch_fragments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::{Command2, HEADER_SIZE, Message};
+    use iggy_binary_protocol::{Command2, HEADER_SIZE};
     use journal::Journal;
+    use server_common::Message;
 
     fn build_prepare(op: u64, size: usize) -> Message<PrepareHeader> {
         Message::<PrepareHeader>::new(size).transmute_header(|_, h: &mut PrepareHeader| {

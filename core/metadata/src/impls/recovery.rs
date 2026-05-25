@@ -19,9 +19,9 @@ use crate::impls::metadata::IggySnapshot;
 use crate::stm::StateMachine;
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
 use iggy_binary_protocol::consensus::PrepareHeader;
-use iggy_binary_protocol::consensus::message::Message;
 use iggy_common::IggyError;
 use journal::prepare_journal::{JournalError, PrepareJournal};
+use server_common::Message;
 use std::fmt;
 use std::path::Path;
 
@@ -164,9 +164,9 @@ where
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::consensus::iobuf::Owned;
     use iggy_binary_protocol::consensus::{Command2, Operation};
     use journal::Journal;
+    use server_common::iobuf::Owned;
     use tempfile::tempdir;
 
     use crate::MuxStateMachine;

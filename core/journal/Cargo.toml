@@ -32,6 +32,7 @@ publish = false
 bytemuck = { workspace = true }
 compio = { workspace = true }
 iggy_binary_protocol = { workspace = true }
+server_common = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

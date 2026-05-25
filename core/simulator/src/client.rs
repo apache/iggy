@@ -16,7 +16,6 @@
 // under the License.
 
 use bytes::Bytes;
-use iggy_binary_protocol::consensus::iobuf::Owned;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
@@ -38,12 +37,14 @@ use iggy_binary_protocol::requests::users::{
     UpdateUserRequest,
 };
 use iggy_binary_protocol::{
-    AckLevel, Message, Operation, RequestHeader, WireEncode, WireIdentifier, WireName,
+    AckLevel, Operation, RequestHeader, WireEncode, WireIdentifier, WireName,
 };
-use iggy_common::send_messages2::{
-    IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned,
+use server_common::sharding::IggyNamespace;
+use server_common::{
+    Message,
+    iobuf::Owned,
+    send_messages2::{IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned},
 };
-use iggy_common::sharding::IggyNamespace;
 use std::cell::Cell;
 
 // TODO: Proper client which implements the full client SDK API

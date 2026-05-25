@@ -22,7 +22,7 @@ use crate::{
 use iggy_binary_protocol::requests::{
     consumer_groups::*, partitions::*, personal_access_tokens::*, streams::*, topics::*, users::*,
 };
-use iggy_common::sharding::IggyNamespace;
+use server_common::sharding::IggyNamespace;
 
 use std::{net::SocketAddr, os::fd::OwnedFd};
 

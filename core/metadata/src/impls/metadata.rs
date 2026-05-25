@@ -35,13 +35,14 @@ use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsR
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, GenericHeader, Message, Operation, PrepareHeader, PrepareOkHeader,
+    Command2, ConsensusHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
     RequestHeader, WireDecode, WireEncode,
 };
 use iggy_common::IggyError;
 use iggy_common::variadic;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
+use server_common::Message;
 use std::cell::RefCell;
 use std::mem::size_of;
 use std::path::Path;
@@ -49,9 +50,7 @@ use tracing::{debug, error, warn};
 
 fn freeze_client_reply(
     message: Message<GenericHeader>,
-) -> iggy_binary_protocol::consensus::iobuf::Frozen<
-    { iggy_binary_protocol::consensus::MESSAGE_ALIGN },
-> {
+) -> server_common::iobuf::Frozen<{ server_common::MESSAGE_ALIGN }> {
     message.into_frozen()
 }
 

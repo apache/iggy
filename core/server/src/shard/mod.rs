@@ -36,8 +36,8 @@ use ahash::AHashSet;
 use builder::IggyShardBuilder;
 use dashmap::DashMap;
 use iggy_common::SemanticVersion;
-use iggy_common::sharding::{IggyNamespace, PartitionLocation};
 use iggy_common::{EncryptorKind, IggyByteSize, IggyError};
+use server_common::sharding::{IggyNamespace, PartitionLocation};
 use std::{
     cell::{Cell, RefCell},
     net::SocketAddr,

@@ -29,14 +29,14 @@ repository = "https://github.com/apache/iggy"
 readme = "README.md"
 
 [dependencies]
-aligned-vec = { workspace = true }
 bytemuck = { workspace = true }
 bytes = { workspace = true }
-compio-buf = { workspace = true }
 enumset = { workspace = true }
 secrecy = { workspace = true }
-smallvec = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+aligned-vec = { workspace = true }
 
 [lints.clippy]
 enum_glob_use = "deny"

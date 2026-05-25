@@ -17,11 +17,11 @@
  */
 
 use crate::binary::dispatch::HandlerResult;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
-use iggy_common::SenderKind;
 use std::rc::Rc;
 use tracing::debug;
 

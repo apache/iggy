@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::iobuf::{Frozen, Owned};
-use crate::consensus::{
-    self, Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
-    GenericHeader, PrepareHeader, PrepareOkHeader, RequestHeader, StartViewChangeHeader,
+use crate::iobuf::{Frozen, Owned};
+use iggy_binary_protocol::{
+    Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, GenericHeader,
+    Operation, PrepareHeader, PrepareOkHeader, RequestHeader, StartViewChangeHeader,
     StartViewHeader,
 };
 use smallvec::SmallVec;
@@ -510,7 +510,7 @@ impl MessageBag {
     }
 
     #[must_use]
-    pub fn operation(&self) -> consensus::Operation {
+    pub fn operation(&self) -> Operation {
         match self {
             Self::Request(message) => message.header().operation,
             Self::Prepare(message) => message.header().operation,
@@ -564,7 +564,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::{Operation, ReplyHeader};
+    use iggy_binary_protocol::{Operation, ReplyHeader};
     use smallvec::smallvec;
 
     // Field offsets via `offset_of!`: a field reorder fails to compile here
