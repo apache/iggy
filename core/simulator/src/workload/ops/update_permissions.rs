@@ -17,8 +17,9 @@
 
 //! `UpdatePermissions` op. Live username; no permissions payload.
 
-use iggy_binary_protocol::{Message, ReplyHeader, RequestHeader};
+use iggy_binary_protocol::{ReplyHeader, RequestHeader};
 use rand_xoshiro::Xoshiro256Plus;
+use server_common::Message;
 
 use crate::client::SimClient;
 use crate::workload::effect::Effect;

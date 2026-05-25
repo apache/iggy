@@ -31,6 +31,7 @@ runs:
       uses: ./.github/actions/utils/setup-cpp-with-cache
 
     - name: Setup Rust with cache
+      if: inputs.task != 'lint'
       uses: ./.github/actions/utils/setup-rust-with-cache
 
     - name: Install clang-format

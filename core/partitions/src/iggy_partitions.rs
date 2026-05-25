@@ -23,8 +23,8 @@ use consensus::{Consensus, Plane, PlaneIdentity, VsrConsensus};
 use iggy_binary_protocol::{
     Command2, ConsensusHeader, PrepareHeader, PrepareOkHeader, RequestHeader,
 };
-use iggy_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 use message_bus::MessageBus;
+use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use tracing::warn;

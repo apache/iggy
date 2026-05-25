@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy_binary_protocol::consensus::iobuf::Owned;
-use iggy_binary_protocol::{Message, PrepareHeader};
+use iggy_binary_protocol::PrepareHeader;
 use iggy_common::variadic;
 use journal::{Journal, JournalHandle, Storage};
 use metadata::MuxStateMachine;
 use metadata::stm::consumer_group::ConsumerGroups;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
+use server_common::{Message, iobuf::Owned};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 

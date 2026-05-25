@@ -18,13 +18,14 @@
 
 use crate::binary::dispatch::HandlerResult;
 use crate::binary::handlers::personal_access_tokens::COMPONENT;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use err_trail::ErrContext;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::personal_access_tokens::LoginWithPersonalAccessTokenRequest;
 use iggy_binary_protocol::responses::users::IdentityResponse;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::IggyError;
 use std::rc::Rc;
 use tracing::{debug, instrument};
 

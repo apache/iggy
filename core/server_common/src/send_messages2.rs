@@ -15,14 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{INDEX_SIZE, IggyError, random_id, sharding::IggyNamespace};
+use crate::consensus_message::{MESSAGE_ALIGN, Message};
+use crate::iobuf::Owned;
+use crate::sharding::IggyNamespace;
 use bytes::{Bytes, BytesMut};
-use iggy_binary_protocol::consensus::iobuf::Owned;
-use iggy_binary_protocol::{Message, PrepareHeader, RequestHeader};
+use iggy_binary_protocol::{PrepareHeader, RequestHeader};
+use iggy_common::{INDEX_SIZE, IggyError, random_id};
 use std::hash::Hasher;
 use twox_hash::XxHash3_64;
 
-const MESSAGE_ALIGN: usize = 4096;
 pub const COMMAND_HEADER_SIZE: usize = 256;
 pub const PREPARE_SPLIT_POINT: usize = 512;
 const MESSAGE_HEADER_SIZE: usize = 48;
@@ -544,7 +545,7 @@ impl<'a> Iterator for SendMessages2IteratorWithOffsets<'a> {
     }
 }
 
-pub(crate) type FrozenBatchHeader = iggy_binary_protocol::consensus::iobuf::Frozen<MESSAGE_ALIGN>;
+pub(crate) type FrozenBatchHeader = crate::iobuf::Frozen<MESSAGE_ALIGN>;
 
 pub fn convert_request_message(
     namespace: IggyNamespace,

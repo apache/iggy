@@ -25,12 +25,13 @@ use crate::{
 };
 use bit_set::BitSet;
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, Message, PrepareHeader,
-    PrepareOkHeader, ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
+    Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
+    ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
-use iggy_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
+use server_common::Message;
+use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
@@ -2259,7 +2260,8 @@ mod pipeline_entry_tests {
     //! subscriber `Canceled` even on happy path. Tests pin both halves.
 
     use super::*;
-    use iggy_binary_protocol::{Command2, Message, ReplyHeader};
+    use iggy_binary_protocol::{Command2, ReplyHeader};
+    use server_common::Message;
 
     fn make_reply(client: u128, request: u64) -> Message<ReplyHeader> {
         let header_size = std::mem::size_of::<ReplyHeader>();

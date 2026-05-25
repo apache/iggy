@@ -16,13 +16,14 @@
  * under the License.
  */
 
-use super::{PooledBuffer, Sender};
-use crate::IggyError;
+use super::Sender;
 use compio::BufResult;
 use compio::buf::IoBufMut;
 use compio::io::{AsyncReadExt, AsyncWriteExt};
 use compio::quic::{ClosedStream, RecvStream, SendStream};
 use err_trail::ErrContext;
+use iggy_common::IggyError;
+use server_common::PooledBuffer;
 use tracing::{debug, error};
 
 const COMPONENT: &str = "QUIC";
