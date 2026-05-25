@@ -15,12 +15,34 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Harness config for InfluxDB V3 source connector integration tests.
-# Uses the native /api/v3/query_sql endpoint with Bearer auth and JSONL response.
+# Connector config for InfluxDB V3 source integration tests.
+# Contains only V3 fields — no V2-only fields (org).
+# All placeholder values are overridden at test time via env vars.
 
-[connectors]
-config_type = "local"
-config_dir = "tests/connectors/influxdb/source_v3_config"
+type = "source"
+key = "influxdb"
+enabled = true
+version = 0
+name = "InfluxDB V3 source"
+path = "../../target/debug/libiggy_connector_influxdb_source"
+verbose = false
+
+[[streams]]
+stream = "test_stream"
+topic = "test_topic"
+schema = "json"
+batch_length = 100
+
 [plugin_config]
 version = "v3"
-precision = "ns"
+url = "http://localhost:8181"
+db = "iggy-test-db"
+token = "placeholder"
+query = "SELECT * FROM sensor_readings WHERE time > '$cursor' ORDER BY time LIMIT $limit OFFSET $offset"
+poll_interval = "100ms"
+batch_size = 100
+cursor_field = "time"
+payload_format = "json"
+max_retries = 3
+retry_delay = "200ms"
+timeout = "10s"

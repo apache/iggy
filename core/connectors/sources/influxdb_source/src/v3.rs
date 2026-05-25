@@ -240,6 +240,11 @@ pub(crate) struct PollResult {
     /// Set to true when the stuck-timestamp cap was reached and the circuit
     /// breaker should be tripped by the caller.
     pub trip_circuit_breaker: bool,
+    /// Set to true when the poll detected a stuck batch or clock regression.
+    /// Caller must NOT call `record_success()` - the query succeeded but the
+    /// cursor did not advance; recording success would reset failure counters
+    /// and mask genuine errors that accumulated earlier.
+    pub is_stuck: bool,
 }
 
 // ── Row processing (pure, testable without HTTP) ──────────────────────────────
@@ -283,6 +288,21 @@ pub(crate) struct RowProcessingResult {
     /// Used for stuck-batch detection: if this equals effective_batch, the cursor
     /// cannot advance and the batch size must be inflated.
     pub rows_at_max_cursor: u64,
+    /// Highest timestamp strictly before `max_cursor`, if the batch contains two
+    /// or more distinct timestamps. `None` when all rows share one timestamp.
+    ///
+    /// Used for mixed-timestamp full-batch detection: when a batch is completely
+    /// full but `rows_at_max_cursor < effective_batch` (mixed timestamps), advancing
+    /// the cursor to `max_cursor` would silently drop any rows at that timestamp
+    /// that did not fit in this batch. Advancing to `penultimate_cursor` instead
+    /// keeps those rows reachable on the next poll.
+    pub penultimate_cursor: Option<String>,
+    /// Number of messages with cursor timestamp strictly less than `max_cursor`.
+    ///
+    /// On a full mixed-timestamp batch, only `messages[..safe_message_count]` are
+    /// emitted so that no rows at `max_cursor` are lost — the rest are re-fetched
+    /// via `WHERE time > penultimate_cursor` on the next poll.
+    pub safe_message_count: usize,
 }
 
 /// Converts a slice of V3 query rows into Iggy messages.
@@ -349,6 +369,11 @@ pub(crate) fn process_rows(
     // Counted inline to avoid a second pass over rows (which would also
     // re-call normalize_v3_timestamp for each row — extra allocations).
     let mut rows_at_max_cursor = 0u64;
+    let mut penultimate_cursor: Option<String> = None;
+    // Snapshot of messages.len() at the moment max_cursor last changed.
+    // All messages before this index have timestamps < max_cursor (safe to emit
+    // on a full mixed-timestamp batch without risking loss at max_cursor).
+    let mut safe_message_count = 0usize;
     // Fallback ID base for rows that lack the cursor field (rare — such rows
     // cause an error at the end of this function unless other rows have it).
     let id_base = Uuid::new_v4().as_u128();
@@ -361,16 +386,20 @@ pub(crate) fn process_rows(
         let mut this_row_id = id_base.wrapping_add(db_pos);
         if let Some(raw_cv) = row.get(ctx.cursor_field).and_then(|v| v.as_str()) {
             let (cv_owned, cv_dt) = normalize_v3_timestamp(raw_cv)?;
-            // Stable ID: timestamp nanoseconds + DB-absolute row position within that
-            // timestamp group. Deterministic across re-polls and OFFSET changes.
-            if let Some(nanos) = cv_dt.timestamp_nanos_opt() {
-                this_row_id = (nanos as u128).wrapping_add(db_pos);
-            }
+            // Stable ID using i128 arithmetic to avoid the i64 nanosecond overflow
+            // that occurs for timestamps outside ~1678-2262 CE.
+            let nanos_i128 =
+                cv_dt.timestamp() as i128 * 1_000_000_000 + cv_dt.timestamp_subsec_nanos() as i128;
+            this_row_id = (nanos_i128 as u128).wrapping_add(db_pos);
             match max_cursor_parsed {
                 Some(cur_dt) if cv_dt > cur_dt => {
+                    // New max: current max becomes penultimate. All messages pushed so
+                    // far are strictly before this new max timestamp.
+                    penultimate_cursor = max_cursor.take();
                     max_cursor = Some(cv_owned.into_owned());
                     max_cursor_parsed = Some(cv_dt);
                     rows_at_max_cursor = 1;
+                    safe_message_count = messages.len();
                 }
                 Some(cur_dt) if cv_dt == cur_dt => {
                     rows_at_max_cursor += 1;
@@ -414,6 +443,8 @@ pub(crate) fn process_rows(
         messages,
         max_cursor,
         rows_at_max_cursor,
+        penultimate_cursor,
+        safe_message_count,
     })
 }
 
@@ -476,7 +507,65 @@ pub(crate) async fn poll(
         Schema::Json
     };
 
-    // Stuck-timestamp detection: when the batch fills up entirely with rows sharing
+    let full_batch = rows.len() as u32 == effective_batch;
+    let all_same_timestamp = result.rows_at_max_cursor >= effective_batch as u64;
+
+    // Mixed full-batch: the batch is completely full but rows span more than one
+    // timestamp. Advancing the cursor to max_cursor would silently discard any rows
+    // at that timestamp that did not fit in this batch. Instead, emit only the rows
+    // whose timestamps are strictly less than max_cursor (safe_message_count) and
+    // advance the cursor to penultimate_cursor so the next poll re-fetches all rows
+    // at max_cursor cleanly via WHERE time > penultimate_cursor.
+    //
+    // This path fires only when cap_factor > 0, because cap_factor == 0 disables
+    // both stuck detection and this guard (consistent with open() allowing queries
+    // without $offset when cap_factor == 0).
+    if cap_factor > 0
+        && full_batch
+        && !all_same_timestamp
+        && let Some(penultimate) = result.penultimate_cursor
+    {
+        let safe_count = result.safe_message_count;
+        if safe_count == 0 {
+            // ORDER BY invariant violated: unsorted result placed max_cursor row first.
+            // open() rejects such queries at startup when cap_factor > 0, so this
+            // path should be unreachable in practice. Fall through rather than
+            // advancing with zero messages (which would silently drop the first row).
+            warn!(
+                "InfluxDB V3 source — full mixed-timestamp batch has safe_message_count=0; \
+                     ORDER BY invariant may be violated. Falling through to normal advance."
+            );
+        } else {
+            let max_ts = result.max_cursor.as_deref().unwrap_or("unknown");
+            warn!(
+                "InfluxDB V3 source — full batch of {} rows has mixed timestamps; \
+                     emitting {} safe rows and advancing cursor to {} \
+                     (rows at {} deferred to next poll)",
+                rows.len(),
+                safe_count,
+                penultimate,
+                max_ts,
+            );
+            let mut messages = result.messages;
+            messages.truncate(safe_count);
+            let msg_count = messages.len() as u64;
+            return Ok(PollResult {
+                messages,
+                new_state: V3State {
+                    last_timestamp: Some(penultimate),
+                    processed_rows: state.processed_rows + msg_count,
+                    effective_batch_size: base_batch,
+                    last_timestamp_row_offset: 0,
+                    stuck_cursor: None,
+                },
+                schema,
+                trip_circuit_breaker: false,
+                is_stuck: false,
+            });
+        }
+    }
+
+    // Stuck-timestamp detection: when the batch fills up entirely with rows all sharing
     // the same max timestamp (rows_at_max_cursor >= effective_batch), there may be
     // more rows at that timestamp beyond the LIMIT. The cursor cannot safely advance
     // to that timestamp until all tied rows have been seen.
@@ -484,7 +573,7 @@ pub(crate) async fn poll(
     // available rows — the cursor can advance regardless of how many share the max timestamp.
     // cap_factor == 0 disables detection entirely: cursor advances even on a full same-timestamp
     // batch (consistent with open() skipping the $offset requirement when cap_factor == 0).
-    let stuck = cap_factor > 0 && result.rows_at_max_cursor >= effective_batch as u64;
+    let stuck = cap_factor > 0 && all_same_timestamp;
 
     if stuck {
         return match next_stuck_batch_size(effective_batch, base_batch, cap_factor) {
@@ -518,6 +607,7 @@ pub(crate) async fn poll(
                     },
                     schema,
                     trip_circuit_breaker: false,
+                    is_stuck: true,
                 })
             }
             None => {
@@ -544,6 +634,7 @@ pub(crate) async fn poll(
                     },
                     schema,
                     trip_circuit_breaker: true,
+                    is_stuck: false,
                 })
             }
         };
@@ -564,17 +655,31 @@ pub(crate) async fn poll(
     ) && !old_dt.is_some_and(|dt| is_timestamp_after(new, dt))
     {
         warn!("V3 source: max_cursor did not advance past saved cursor; keeping old value");
+        // Mid-stuck-sequence: preserve the inflated batch so OFFSET pagination can
+        // complete; treat as neutral (is_stuck=true skips both CB success and failure).
+        //
+        // Pure clock regression (no stuck_cursor): cursor cannot advance and the
+        // same rows would be re-delivered on every subsequent poll. Suppress message
+        // delivery and record as CB failure so repeated regressions eventually trip
+        // the circuit breaker and halt the re-delivery loop.
+        let (messages, effective_batch_size, trip_circuit_breaker, is_stuck) =
+            if state.stuck_cursor.is_some() {
+                (result.messages, state.effective_batch_size, false, true)
+            } else {
+                (vec![], base_batch, true, false)
+            };
         return Ok(PollResult {
-            messages: result.messages,
+            messages,
             new_state: V3State {
                 last_timestamp: state.last_timestamp.clone(),
                 processed_rows,
-                effective_batch_size: state.effective_batch_size,
+                effective_batch_size,
                 last_timestamp_row_offset: state.last_timestamp_row_offset,
                 stuck_cursor: state.stuck_cursor.clone(),
             },
             schema,
-            trip_circuit_breaker: false,
+            trip_circuit_breaker,
+            is_stuck,
         });
     }
 
@@ -583,8 +688,17 @@ pub(crate) async fn poll(
         state.last_timestamp.as_deref(),
     ) {
         (Some(_), _) => result.max_cursor,
-        // Empty batch after stuck sequence: zero-row response at accumulated offset
-        // confirms all rows at stuck_cursor seen; advance there instead of T0.
+        // Empty batch after stuck sequence: advance cursor to stuck_cursor.
+        //
+        // A zero-row response at the accumulated OFFSET is treated as confirmation
+        // that all rows at stuck_cursor have been delivered. This is safe under the
+        // assumption that InfluxDB receives writes in monotonically increasing time
+        // order (the typical time-series pattern). If out-of-order or backdated
+        // writes are possible in your workload, a concurrent writer could insert
+        // rows at stuck_cursor AFTER this empty-batch poll, and those rows would
+        // be silently skipped because the cursor advances past them here. In that
+        // case, use stuck_batch_cap_factor = 0 to disable stuck detection and
+        // accept potential re-delivery instead.
         _ if state.last_timestamp_row_offset > 0 && state.stuck_cursor.is_some() => {
             state.stuck_cursor.clone()
         }
@@ -606,6 +720,7 @@ pub(crate) async fn poll(
         new_state,
         schema,
         trip_circuit_breaker: false,
+        is_stuck: false,
     })
 }
 
@@ -770,6 +885,46 @@ mod tests {
     fn process_rows_rows_at_max_cursor_zero_for_empty_slice() {
         let result = process_rows(&[], &ctx(T1, 1000), 0).unwrap();
         assert_eq!(result.rows_at_max_cursor, 0);
+    }
+
+    #[test]
+    fn process_rows_penultimate_cursor_set_on_mixed_timestamps() {
+        // [T1, T2]: T1 becomes penultimate when T2 becomes the new max.
+        let rows = vec![row(&[("time", T1)]), row(&[("time", T2)])];
+        let result = process_rows(&rows, &ctx(T1, 1000), 0).unwrap();
+        assert_eq!(result.penultimate_cursor.as_deref(), Some(T1));
+        assert_eq!(result.safe_message_count, 1);
+        assert_eq!(result.max_cursor.as_deref(), Some(T2));
+    }
+
+    #[test]
+    fn process_rows_penultimate_cursor_none_for_single_timestamp() {
+        // All rows share one timestamp — penultimate does not exist.
+        let rows = vec![row(&[("time", T1)]), row(&[("time", T1)])];
+        let result = process_rows(&rows, &ctx(T1, 1000), 0).unwrap();
+        assert!(result.penultimate_cursor.is_none());
+        assert_eq!(result.safe_message_count, 0);
+    }
+
+    #[test]
+    fn process_rows_penultimate_tracks_second_highest_across_three_timestamps() {
+        // [T1, T2, T3]: penultimate should be T2 (the one just before T3).
+        let rows = vec![
+            row(&[("time", T1)]),
+            row(&[("time", T2)]),
+            row(&[("time", T3)]),
+        ];
+        let result = process_rows(&rows, &ctx(T1, 1000), 0).unwrap();
+        assert_eq!(result.penultimate_cursor.as_deref(), Some(T2));
+        assert_eq!(result.safe_message_count, 2); // T1 + T2 rows safe
+        assert_eq!(result.max_cursor.as_deref(), Some(T3));
+    }
+
+    #[test]
+    fn process_rows_penultimate_cursor_none_for_empty_slice() {
+        let result = process_rows(&[], &ctx(T1, 1000), 0).unwrap();
+        assert!(result.penultimate_cursor.is_none());
+        assert_eq!(result.safe_message_count, 0);
     }
 
     // ── next_stuck_batch_size ────────────────────────────────────────────────
@@ -1440,6 +1595,7 @@ mod http_tests {
         );
         assert_eq!(result.new_state.effective_batch_size, 20, "should double");
         assert!(!result.trip_circuit_breaker);
+        assert!(result.is_stuck, "inflating batch must signal is_stuck");
         // Cursor must not change
         assert_eq!(result.new_state.last_timestamp.as_deref(), Some(t));
     }

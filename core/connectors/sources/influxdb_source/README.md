@@ -34,11 +34,19 @@ V3 SQL uses strict `WHERE time > '$cursor'` — no rows are re-delivered across 
 
 #### Stuck-Timestamp Handling (V3)
 
-InfluxDB 3's DataFusion engine does not guarantee stable row ordering for rows that share the same timestamp. If a full batch is returned and all rows share the same timestamp, the cursor cannot advance. The connector handles this by:
+InfluxDB 3's DataFusion engine does not guarantee stable row ordering for rows that share the same timestamp. Two full-batch scenarios require special handling:
 
-1. Doubling `effective_batch_size` on each stuck poll, up to `stuck_batch_cap_factor × batch_size`.
-2. Using `OFFSET $offset` to page through the tied rows without re-delivering earlier ones.
-3. Tripping the circuit breaker when the cap is reached and resetting `effective_batch_size` to `batch_size` after the cool-down so the connector recovers cleanly.
+**All rows share the same timestamp** — the cursor cannot advance. The connector:
+
+1. Doubles `effective_batch_size` on each stuck poll, up to `stuck_batch_cap_factor × batch_size`.
+2. Uses `OFFSET $offset` to page through the tied rows without re-delivering earlier ones.
+3. Trips the circuit breaker when the cap is reached and resets `effective_batch_size` to `batch_size` after the cool-down so the connector recovers cleanly.
+
+**Mixed timestamps, full batch** — the batch is full and rows span more than one timestamp. Advancing the cursor to the highest timestamp seen would silently discard rows at that timestamp that did not fit in the batch. The connector:
+
+1. Emits only rows whose timestamp is strictly less than the batch maximum (`safe_message_count` rows).
+2. Advances the cursor to the second-highest distinct timestamp seen (`penultimate_cursor`) so the next poll re-fetches all rows at the maximum timestamp cleanly via `WHERE time > penultimate_cursor`.
+3. Resets `effective_batch_size` to `batch_size` (no inflation needed — cursor advanced).
 
 ## Configuration
 
@@ -174,6 +182,7 @@ Persisted state (via the connector runtime's state store) holds the last cursor 
 | Concern | InfluxDB V2 | InfluxDB V3 |
 | --- | --- | --- |
 | Write body format | Line Protocol | Line Protocol |
+| Query body format | JSON (Flux query payload) | JSON (SQL query payload) |
 | Health check | `GET /health` | `GET /health` |
 | Retry triggers | 429 / 5xx | 429 / 5xx |
 | Cursor field default | `_time` | `time` |

@@ -20,7 +20,7 @@
 
 [connectors]
 config_type = "local"
-config_dir = "../connectors/sinks/influxdb_sink"
+config_dir = "tests/connectors/influxdb/sink_v3_config"
 [plugin_config]
 version = "v3"
 precision = "ns"

@@ -22,8 +22,8 @@ mod v2;
 mod v3;
 
 use crate::common::{
-    is_timestamp_after, query_has_cursor_placeholder, query_has_offset_placeholder,
-    strip_block_comments,
+    is_timestamp_after, query_has_cursor_placeholder, query_has_cursor_placeholder_flux,
+    query_has_offset_placeholder, strip_block_comments,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -137,9 +137,10 @@ fn restore_v2_state(id: u32, state: Option<ConnectorState>) -> (V2State, Option<
     let Some(cs) = state else {
         return (V2State::default(), None);
     };
-    // Clone bytes before consuming cs — needed for the legacy fallback path below.
-    let raw_bytes = cs.0.clone();
-    match cs.deserialize::<PersistedState>(CONNECTOR_NAME, id) {
+    // Move bytes out so the None arm can consume them directly without a second clone.
+    // The first attempt uses a clone; on the happy path bytes is dropped unused.
+    let bytes = cs.0;
+    match ConnectorState(bytes.clone()).deserialize::<PersistedState>(CONNECTOR_NAME, id) {
         Some(PersistedState::V2(s)) => {
             if let Some(ref ts) = s.last_timestamp
                 && let Err(e) = validate_cursor(ts)
@@ -170,7 +171,7 @@ fn restore_v2_state(id: u32, state: Option<ConnectorState>) -> (V2State, Option<
         None => {
             // PersistedState deserialization failed. Try the legacy format: direct V2State
             // bytes without the PersistedState wrapper, written by an older connector version.
-            if let Some(s) = ConnectorState(raw_bytes).deserialize::<V2State>(CONNECTOR_NAME, id) {
+            if let Some(s) = ConnectorState(bytes).deserialize::<V2State>(CONNECTOR_NAME, id) {
                 if let Some(ref ts) = s.last_timestamp
                     && let Err(e) = validate_cursor(ts)
                 {
@@ -267,6 +268,9 @@ impl Source for InfluxDbSource {
         if let Some(offset) = self.config.initial_offset() {
             validate_cursor(offset)?;
         }
+        if let Some(fmt) = self.config.payload_format() {
+            PayloadFormat::validate(fmt)?;
+        }
 
         // #10 — non-empty required fields
         match &self.config {
@@ -285,11 +289,12 @@ impl Source for InfluxDbSource {
 
         // #11 — $cursor placeholder must be present; without it apply_query_params
         // never substitutes the cursor and the same rows are re-delivered every poll.
-        let query = match &self.config {
-            InfluxDbSourceConfig::V2(c) => c.query.as_str(),
-            InfluxDbSourceConfig::V3(c) => c.query.as_str(),
+        // V2 Flux uses // for line comments; V3 SQL uses --.
+        let has_cursor = match &self.config {
+            InfluxDbSourceConfig::V2(c) => query_has_cursor_placeholder_flux(&c.query),
+            InfluxDbSourceConfig::V3(c) => query_has_cursor_placeholder(&c.query),
         };
-        if !query_has_cursor_placeholder(query) {
+        if !has_cursor {
             return Err(Error::InvalidConfigValue(
                 "query must contain the '$cursor' placeholder — without it the connector \
                  cannot advance and will re-deliver the same rows on every poll."
@@ -364,7 +369,7 @@ impl Source for InfluxDbSource {
         // don't discover this only after data loss. Queries using strict `>` do not
         // need skip-N and are not affected.
         if let InfluxDbSourceConfig::V2(cfg) = &self.config
-            && cfg.query.contains(">=")
+            && query_has_inclusive_cursor_flux(&cfg.query)
             && !query_has_sort_call(&cfg.query)
         {
             return Err(Error::InvalidConfigValue(format!(
@@ -381,7 +386,7 @@ impl Source for InfluxDbSource {
         // `>= '$cursor'`, rows at the cursor timestamp are re-fetched and
         // re-delivered on the next poll (there is no skip-N dedup for V3).
         if let InfluxDbSourceConfig::V3(cfg) = &self.config
-            && (cfg.query.contains(">= '$cursor'") || cfg.query.contains(">='$cursor'"))
+            && query_has_inclusive_cursor(&cfg.query)
         {
             return Err(Error::InvalidConfigValue(
                 "V3 source query uses '>= $cursor' (inclusive). V3 uses strict \
@@ -463,7 +468,7 @@ impl Source for InfluxDbSource {
             .as_ref()
             .map(|s| s.expose_secret().as_str())
             .ok_or_else(|| {
-                Error::Connection("auth_header not initialised — was open() called?".to_string())
+                Error::Connection("auth_header not initialised -- was open() called?".to_string())
             })?;
         match &self.version_state {
             VersionState::V2(state_mu) => {
@@ -486,37 +491,41 @@ impl Source for InfluxDbSource {
                         self.circuit_breaker.record_success();
                         let messages = result.messages;
                         let schema = result.schema;
-                        let mut state = state_mu.lock().await;
-                        state.processed_rows += messages.len() as u64;
-                        apply_v2_cursor_advance(
-                            &mut state,
-                            result.max_cursor,
-                            result.rows_at_max_cursor,
-                            result.skipped,
-                        );
+                        let state_snap = {
+                            let mut state = state_mu.lock().await;
+                            state.processed_rows += messages.len() as u64;
+                            apply_v2_cursor_advance(
+                                &mut state,
+                                result.max_cursor,
+                                result.rows_at_max_cursor,
+                                result.skipped,
+                            );
 
-                        if self.config.verbose_logging() {
-                            info!(
-                                "{CONNECTOR_NAME} ID: {} produced {} messages (V2). \
-                                 Total: {}. Cursor: {:?}",
-                                self.id,
-                                messages.len(),
-                                state.processed_rows,
-                                state.last_timestamp
-                            );
-                        } else {
-                            debug!(
-                                "{CONNECTOR_NAME} ID: {} produced {} messages (V2). \
-                                 Total: {}. Cursor: {:?}",
-                                self.id,
-                                messages.len(),
-                                state.processed_rows,
-                                state.last_timestamp
-                            );
-                        }
+                            if self.config.verbose_logging() {
+                                info!(
+                                    "{CONNECTOR_NAME} ID: {} produced {} messages (V2). \
+                                     Total: {}. Cursor: {:?}",
+                                    self.id,
+                                    messages.len(),
+                                    state.processed_rows,
+                                    state.last_timestamp
+                                );
+                            } else {
+                                debug!(
+                                    "{CONNECTOR_NAME} ID: {} produced {} messages (V2). \
+                                     Total: {}. Cursor: {:?}",
+                                    self.id,
+                                    messages.len(),
+                                    state.processed_rows,
+                                    state.last_timestamp
+                                );
+                            }
+                            state.clone()
+                            // lock released here
+                        };
 
                         let persisted = ConnectorState::serialize(
-                            &PersistedState::V2(state.clone()),
+                            &PersistedState::V2(state_snap),
                             CONNECTOR_NAME,
                             self.id,
                         );
@@ -580,7 +589,10 @@ impl Source for InfluxDbSource {
                     Ok(result) => {
                         if result.trip_circuit_breaker {
                             self.circuit_breaker.record_failure().await;
-                        } else {
+                        } else if !result.is_stuck {
+                            // Stuck polls (batch inflating) are neutral: query succeeded
+                            // but cursor did not advance. Don't record success — it would
+                            // reset the failure counter and mask prior transient errors.
                             self.circuit_breaker.record_success();
                         }
 
@@ -588,25 +600,29 @@ impl Source for InfluxDbSource {
                         let messages = result.messages;
                         let schema = result.schema;
                         let msg_count = messages.len();
-                        let mut state = state_mu.lock().await;
-                        *state = new;
+                        let state_snap = {
+                            let mut state = state_mu.lock().await;
+                            *state = new;
 
-                        if self.config.verbose_logging() {
-                            info!(
-                                "{CONNECTOR_NAME} ID: {} produced {} messages (V3). \
-                                 Total: {}. Cursor: {:?}",
-                                self.id, msg_count, state.processed_rows, state.last_timestamp
-                            );
-                        } else {
-                            debug!(
-                                "{CONNECTOR_NAME} ID: {} produced {} messages (V3). \
-                                 Total: {}. Cursor: {:?}",
-                                self.id, msg_count, state.processed_rows, state.last_timestamp
-                            );
-                        }
+                            if self.config.verbose_logging() {
+                                info!(
+                                    "{CONNECTOR_NAME} ID: {} produced {} messages (V3). \
+                                     Total: {}. Cursor: {:?}",
+                                    self.id, msg_count, state.processed_rows, state.last_timestamp
+                                );
+                            } else {
+                                debug!(
+                                    "{CONNECTOR_NAME} ID: {} produced {} messages (V3). \
+                                     Total: {}. Cursor: {:?}",
+                                    self.id, msg_count, state.processed_rows, state.last_timestamp
+                                );
+                            }
+                            state.clone()
+                            // lock released here
+                        };
 
                         let persisted = ConnectorState::serialize(
-                            &PersistedState::V3(state.clone()),
+                            &PersistedState::V3(state_snap),
                             CONNECTOR_NAME,
                             self.id,
                         );
@@ -701,8 +717,8 @@ fn query_has_order_by(query: &str) -> bool {
 /// Best-effort check: warns if `sort(` does not appear outside
 /// line comments. Not a full parser; documents its limitations.
 fn query_has_sort_call(query: &str) -> bool {
-    query.lines().any(|line| {
-        // Strip line comments before checking for sort(
+    let q = strip_block_comments(query);
+    q.lines().any(|line| {
         let code = match line.find("//") {
             Some(pos) => &line[..pos],
             None => line,
@@ -720,6 +736,65 @@ fn query_has_sort_call(query: &str) -> bool {
                 return true;
             }
             search = &search[pos + 5..]; // skip past "sort("
+        }
+        false
+    })
+}
+
+/// Returns `true` if a V2 Flux `query` contains a `>= $cursor` comparison outside of
+/// comments. Flux uses `//` for line comments and `/* */` for block comments.
+///
+/// Checks for the bare and quoted forms (`$cursor`, `'$cursor'`, `"$cursor"`) to
+/// avoid false positives on unrelated `>=` comparisons (e.g. `r.val >= 0`).
+fn query_has_inclusive_cursor_flux(query: &str) -> bool {
+    let q = strip_block_comments(query);
+    q.lines().any(|line| {
+        let code = match line.find("//") {
+            Some(pos) => &line[..pos],
+            None => line,
+        };
+        let mut rest = code;
+        while let Some(pos) = rest.find(">=") {
+            let after = rest[pos + 2..].trim_start_matches([' ', '\t']);
+            let inner = after
+                .strip_prefix('\'')
+                .or_else(|| after.strip_prefix('"'))
+                .unwrap_or(after);
+            if inner.starts_with("$cursor")
+                && !inner["$cursor".len()..]
+                    .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return true;
+            }
+            rest = &rest[pos + 2..];
+        }
+        false
+    })
+}
+
+/// Returns `true` if a V3 SQL `query` contains a `>= $cursor` comparison in any
+/// quoting style (`'$cursor'`, `"$cursor"`, or bare `$cursor`) outside of comments.
+fn query_has_inclusive_cursor(query: &str) -> bool {
+    let q = strip_block_comments(query);
+    q.lines().any(|line| {
+        let code = match line.find("--") {
+            Some(pos) => &line[..pos],
+            None => line,
+        };
+        let mut rest = code;
+        while let Some(pos) = rest.find(">=") {
+            let after = rest[pos + 2..].trim_start_matches([' ', '\t']);
+            let inner = after
+                .strip_prefix('\'')
+                .or_else(|| after.strip_prefix('"'))
+                .unwrap_or(after);
+            if inner.starts_with("$cursor")
+                && !inner["$cursor".len()..]
+                    .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return true;
+            }
+            rest = &rest[pos + 2..];
         }
         false
     })
@@ -749,12 +824,14 @@ fn apply_v2_cursor_advance(
             Some(old) => match old.parse::<DateTime<Utc>>() {
                 Ok(dt) => is_timestamp_after(new_cursor, dt),
                 Err(e) => {
+                    // Persisted cursor is corrupt — the server-supplied new_cursor is
+                    // authoritative. Advance unconditionally so the connector un-stucks
+                    // itself rather than accumulating cursor_row_count indefinitely.
                     error!(
                         "V2 source: persisted cursor {old:?} failed RFC 3339 parse ({e}); \
-                         cannot advance cursor — connector state may be corrupt. \
-                         Clear or migrate the connector state to recover."
+                         advancing to server cursor {new_cursor:?} to recover."
                     );
-                    false
+                    true
                 }
             },
         };
@@ -1582,6 +1659,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn sort_call_in_block_comment_is_ignored() {
+        assert!(!query_has_sort_call(
+            "/* sort(columns: [\"_time\"]) */ from(bucket:\"b\")"
+        ));
+        assert!(!query_has_sort_call(
+            "/*\n sort(columns: [\"_time\"])\n*/ from(bucket:\"b\")"
+        ));
+        // sort( after the block comment must still be detected
+        assert!(query_has_sort_call(
+            "/* comment */ sort(columns: [\"_time\"])"
+        ));
+    }
+
     // ── query_has_order_by heuristic ──────────────────────────────────────────
 
     #[test]
@@ -1626,6 +1717,129 @@ mod tests {
         // Real ORDER BY with an unrelated block comment must still be detected.
         assert!(query_has_order_by(
             "/* header */\nSELECT * FROM t WHERE time > '$cursor' ORDER BY time LIMIT $limit"
+        ));
+    }
+
+    // ── query_has_inclusive_cursor_flux ──────────────────────────────────────
+
+    #[test]
+    fn inclusive_cursor_flux_not_detected_for_unrelated_gte() {
+        // >= on a non-cursor field must NOT trigger: would wrongly reject valid queries
+        assert!(!query_has_inclusive_cursor_flux(
+            r#"from(bucket:"b") |> range(start: $cursor) |> filter(fn: (r) => r.val >= 10)"#
+        ));
+        assert!(!query_has_inclusive_cursor_flux(
+            "from(bucket:\"b\") |> filter(fn: (r) => r.v >= 5) // inclusive"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_flux_detected_bare() {
+        assert!(query_has_inclusive_cursor_flux(
+            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= $cursor)"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_flux_detected_single_quote() {
+        assert!(query_has_inclusive_cursor_flux(
+            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= '$cursor')"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_flux_detected_double_quote() {
+        assert!(query_has_inclusive_cursor_flux(
+            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= \"$cursor\")"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_flux_not_detected_when_only_in_line_comment() {
+        // >= $cursor inside a // comment must not trigger
+        assert!(!query_has_inclusive_cursor_flux(
+            "from(bucket:\"b\") // r._time >= $cursor\n|> range(start: $cursor)"
+        ));
+        // unrelated >= in comment: also no trigger
+        assert!(!query_has_inclusive_cursor_flux(
+            "from(bucket:\"b\") // batch_size >= 100\n|> range(start: $cursor)"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_flux_not_detected_when_only_in_block_comment() {
+        assert!(!query_has_inclusive_cursor_flux(
+            "/* use >= '$cursor' for inclusive */ from(bucket:\"b\") |> range(start: $cursor)"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_flux_not_detected_for_extended_identifier() {
+        assert!(!query_has_inclusive_cursor_flux(
+            "from(bucket:\"b\") |> filter(fn: (r) => r._time >= $cursor_start)"
+        ));
+    }
+
+    // ── query_has_inclusive_cursor ────────────────────────────────────────────
+
+    #[test]
+    fn inclusive_cursor_detected_single_quote() {
+        assert!(query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >= '$cursor' LIMIT $limit"
+        ));
+        assert!(query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >='$cursor' LIMIT $limit"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_detected_double_quote() {
+        assert!(query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >= \"$cursor\" LIMIT $limit"
+        ));
+        assert!(query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >=\"$cursor\" LIMIT $limit"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_detected_bare() {
+        assert!(query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >= $cursor LIMIT $limit"
+        ));
+        assert!(query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >=$cursor LIMIT $limit"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_not_detected_for_strict_gt() {
+        assert!(!query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time > '$cursor' LIMIT $limit"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_not_detected_for_extended_identifier() {
+        assert!(!query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >= '$cursor_field' LIMIT $limit"
+        ));
+        assert!(!query_has_inclusive_cursor(
+            "SELECT * FROM t WHERE time >= $cursor_field LIMIT $limit"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_not_detected_when_only_in_sql_comment() {
+        assert!(!query_has_inclusive_cursor(
+            "-- use >= '$cursor' for inclusive\nSELECT * FROM t WHERE time > '$cursor'"
+        ));
+    }
+
+    #[test]
+    fn inclusive_cursor_not_detected_when_only_in_block_comment() {
+        assert!(!query_has_inclusive_cursor(
+            "/* example: time >= '$cursor' */ SELECT * FROM t WHERE time > '$cursor'"
         ));
     }
 
@@ -1809,29 +2023,24 @@ mod tests {
     // ── apply_v2_cursor_advance — corrupt cursor parse failure ───────────────
 
     #[test]
-    fn apply_v2_cursor_advance_corrupt_cursor_does_not_advance() {
-        // When the persisted cursor is not valid RFC 3339, the parse fails and
-        // last_timestamp must NOT advance to the new max_cursor.
-        // The else-branch still accumulates cursor_row_count (normal behaviour
-        // for "same-cursor" polls); only the timestamp guard is affected.
+    fn apply_v2_cursor_advance_corrupt_cursor_advances_to_server_cursor() {
+        // When the persisted cursor is not valid RFC 3339, the server-supplied
+        // new_cursor is authoritative. The connector advances to it so it can
+        // un-stuck itself rather than accumulating cursor_row_count indefinitely.
         let mut state = V2State {
             last_timestamp: Some("this-is-not-a-timestamp".to_string()),
             cursor_row_count: 3,
             processed_rows: 0,
         };
         apply_v2_cursor_advance(&mut state, Some("2024-06-01T00:00:00Z".to_string()), 1, 0);
-        // last_timestamp must remain the corrupt string — should_advance=false
-        // because the old cursor failed to parse, so we do NOT replace it.
         assert_eq!(
             state.last_timestamp.as_deref(),
-            Some("this-is-not-a-timestamp"),
-            "corrupt cursor must not be replaced by new max_cursor"
+            Some("2024-06-01T00:00:00Z"),
+            "corrupt old cursor: advance to server cursor to recover"
         );
-        // cursor_row_count is accumulated in the else branch (not reset), which
-        // is correct: the connector treats the parse failure as "same cursor".
         assert_eq!(
-            state.cursor_row_count, 4,
-            "cursor_row_count must accumulate (+rows_at_max_cursor) in else branch"
+            state.cursor_row_count, 1,
+            "cursor_row_count reset to rows_at_max_cursor for new cursor"
         );
     }
 

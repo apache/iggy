@@ -869,6 +869,20 @@ pub(crate) async fn poll(
 
     let result = process_rows(&rows, &ctx, already_seen)?;
 
+    // Guard: messages emitted but none contained the cursor field. max_cursor stays None;
+    // apply_v2_cursor_advance is a noop; cursor never advances; infinite re-delivery with
+    // no CB trip. Covers both all-emitted (skipped=0) and mixed (some skipped + some
+    // emitted without cursor field, where skipped > 0).
+    if !result.messages.is_empty() && result.max_cursor.is_none() {
+        tracing::error!(
+            "V2 source: {} row(s) processed but none contained the cursor field '{}'. \
+             Cursor cannot advance. Tripping circuit breaker.",
+            rows.len(),
+            ctx.cursor_field,
+        );
+        return Err(Error::InvalidState);
+    }
+
     // Detect all-skipped-at-cap livelock: every row was at the current cursor and
     // skipped; max_cursor stayed None; cursor cannot advance. Fire at cap-1 (not just
     // cap) to catch the off-by-one: when already_seen = cap-1 and the server returns
@@ -878,10 +892,12 @@ pub(crate) async fn poll(
     let cap = batch_u64.saturating_mul(MAX_SKIP_INFLATION_FACTOR);
     if result.max_cursor.is_none() && result.skipped > 0 && already_seen.saturating_add(1) >= cap {
         tracing::error!(
-            "V2 source stuck-cursor livelock: already_seen ({already_seen}) has reached \
-             the inflation cap ({MAX_SKIP_INFLATION_FACTOR}×{batch_u64}={cap}). \
-             All rows were at the current cursor and skipped; the cursor cannot advance. \
-             Tripping circuit breaker — will retry after cool-down."
+            "V2 source stuck-cursor livelock: already_seen ({already_seen}) reached \
+             inflation cap ({MAX_SKIP_INFLATION_FACTOR}x{batch_u64}={cap}), \
+             skipped={}. Cursor cannot advance. \
+             Manual state clear required to recover: remove the persisted state for \
+             this connector and restart.",
+            result.skipped,
         );
         return Err(Error::InvalidState);
     }

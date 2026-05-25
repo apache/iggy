@@ -347,16 +347,19 @@ impl PayloadFormat {
         match value.map(|v| v.to_ascii_lowercase()).as_deref() {
             Some("text") | Some("utf8") => PayloadFormat::Text,
             Some("raw") | Some("base64") => PayloadFormat::Raw,
-            Some("json") => PayloadFormat::Json,
-            other => {
-                if other.is_some() {
-                    warn!(
-                        "Unrecognized payload_format {:?}, falling back to JSON",
-                        other
-                    );
-                }
-                PayloadFormat::Json
-            }
+            _ => PayloadFormat::Json,
+        }
+    }
+
+    /// Returns an error if `value` is not a recognized payload format string.
+    /// Called from `open()` so misconfiguration is caught at startup.
+    pub fn validate(value: &str) -> Result<(), iggy_connector_sdk::Error> {
+        match value.to_ascii_lowercase().as_str() {
+            "json" | "text" | "utf8" | "raw" | "base64" => Ok(()),
+            other => Err(iggy_connector_sdk::Error::InvalidConfigValue(format!(
+                "unrecognized payload_format {other:?}; \
+                 expected one of: json, text, utf8, raw, base64"
+            ))),
         }
     }
 
@@ -517,11 +520,12 @@ fn matches_placeholder(s: &str, placeholder: &str) -> bool {
 
 /// Returns `true` if `query` contains a bare `placeholder` token outside of
 /// comments - not immediately followed by an alphanumeric character or `_`.
-/// `/* */` block comments and `--` line comments are stripped before checking.
-fn scan_placeholder(query: &str, placeholder: &str) -> bool {
+/// `/* */` block comments and the caller-supplied `line_comment` prefix are
+/// stripped before checking.
+fn scan_placeholder(query: &str, placeholder: &str, line_comment: &str) -> bool {
     let q = strip_block_comments(query);
     q.lines().any(|line| {
-        let code = match line.find("--") {
+        let code = match line.find(line_comment) {
             Some(pos) => &line[..pos],
             None => line,
         };
@@ -537,21 +541,28 @@ fn scan_placeholder(query: &str, placeholder: &str) -> bool {
 }
 
 /// Returns `true` if `query` contains a bare `$cursor` placeholder outside of
-/// comments. Uses the same boundary rule as `apply_query_params` so `open()`
-/// and `poll()` agree on whether substitution will occur.
+/// SQL-style comments (`--` and `/* */`). For V3 SQL queries.
 ///
-/// Both `/* */` block comments and `--` line comments are stripped before
-/// checking. `$cursor` appearing only inside a comment does NOT satisfy this
-/// check.
+/// Uses the same boundary rule as `apply_query_params` so `open()` and
+/// `poll()` agree on whether substitution will occur.
 pub(crate) fn query_has_cursor_placeholder(query: &str) -> bool {
-    scan_placeholder(query, "$cursor")
+    scan_placeholder(query, "$cursor", "--")
+}
+
+/// Returns `true` if `query` contains a bare `$cursor` placeholder outside of
+/// Flux-style comments (`//` and `/* */`). For V2 Flux queries.
+///
+/// Flux uses `//` for line comments, not `--`. Using the SQL variant for Flux
+/// queries would miss `$cursor` inside a `//` comment, allowing a query that
+/// never substitutes the cursor to pass validation.
+pub(crate) fn query_has_cursor_placeholder_flux(query: &str) -> bool {
+    scan_placeholder(query, "$cursor", "//")
 }
 
 /// Returns `true` if `query` contains a bare `$offset` placeholder outside of
-/// comments. Same boundary rule and comment-stripping as
-/// `query_has_cursor_placeholder`.
+/// SQL-style comments. Used for V3 SQL queries only.
 pub(crate) fn query_has_offset_placeholder(query: &str) -> bool {
-    scan_placeholder(query, "$offset")
+    scan_placeholder(query, "$offset", "--")
 }
 
 /// Substitute `$cursor`, `$limit`, and `$offset` placeholders in a query
@@ -747,6 +758,24 @@ mod tests {
         // Mixed: one extended, one bare — bare must still be found.
         assert!(query_has_cursor_placeholder(
             "SELECT $cursor_field FROM t WHERE time > '$cursor'"
+        ));
+    }
+
+    #[test]
+    fn cursor_placeholder_flux_strips_double_slash_comments() {
+        // V2 Flux queries use // for line comments, not --.
+        // $cursor inside a // comment must NOT satisfy the check.
+        assert!(!query_has_cursor_placeholder_flux(
+            "from(bucket:\"b\") |> range(start: v.start) // $cursor unused here"
+        ));
+        // $cursor before the // comment must still be found.
+        assert!(query_has_cursor_placeholder_flux(
+            "from(bucket:\"b\") |> range(start: $cursor) // start from cursor"
+        ));
+        // SQL -- comment style is NOT stripped for Flux; $cursor after -- is found
+        // (treated as code, not a comment). This is intentional: Flux does not use --.
+        assert!(query_has_cursor_placeholder_flux(
+            "from(bucket:\"b\") |> range(start: v.s) -- $cursor"
         ));
     }
 
