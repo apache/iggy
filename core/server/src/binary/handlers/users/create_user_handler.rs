@@ -17,6 +17,7 @@
  */
 
 use crate::binary::dispatch::HandlerResult;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardRequest, ShardRequestPayload};
@@ -25,11 +26,11 @@ use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::requests::users::CreateUserRequest;
 use iggy_binary_protocol::responses::users::{UserDetailsResponse, UserResponse};
+use iggy_common::IggyError;
 use iggy_common::defaults::{
     MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
 use iggy_common::wire_conversions::permissions_to_wire;
-use iggy_common::{IggyError, SenderKind};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 

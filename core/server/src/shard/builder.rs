@@ -35,7 +35,7 @@ use ahash::AHashSet;
 use dashmap::DashMap;
 use iggy_common::EncryptorKind;
 use iggy_common::SemanticVersion;
-use iggy_common::sharding::{IggyNamespace, PartitionLocation};
+use server_common::sharding::{IggyNamespace, PartitionLocation};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,

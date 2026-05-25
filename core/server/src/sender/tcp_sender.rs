@@ -16,12 +16,13 @@
  * under the License.
  */
 
-use super::{PooledBuffer, Sender};
-use crate::IggyError;
+use super::Sender;
 use compio::buf::IoBufMut;
 use compio::io::AsyncWrite;
 use compio::net::TcpStream;
 use err_trail::ErrContext;
+use iggy_common::IggyError;
+use server_common::PooledBuffer;
 
 const COMPONENT: &str = "TCP";
 

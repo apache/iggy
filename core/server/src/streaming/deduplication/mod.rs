@@ -16,4 +16,4 @@
  * under the License.
  */
 
-pub use iggy_common::MessageDeduplicator;
+pub use server_common::MessageDeduplicator;

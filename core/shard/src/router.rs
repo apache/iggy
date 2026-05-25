@@ -20,14 +20,13 @@ use crate::shards_table::{ShardsTable, calculate_shard_from_consensus_ns};
 use crate::{IggyShard, LifecycleFrame, Receiver, ShardFrame};
 use crossfire::TrySendError;
 use futures::FutureExt;
-use iggy_binary_protocol::{
-    ConsensusHeader, GenericHeader, Message, MessageBag, Operation, PrepareHeader,
-};
-use iggy_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
+use iggy_binary_protocol::{ConsensusHeader, GenericHeader, Operation, PrepareHeader};
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
+use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
+use server_common::{Message, MessageBag};
 
 /// Decompose a [`MessageBag`] into the routing-relevant tuple
 /// `(operation, namespace, generic_message)`.

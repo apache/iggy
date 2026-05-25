@@ -1,0 +1,51 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+[package]
+name = "server_common"
+version = "0.1.0"
+description = "Server-only primitives shared between iggy server crates. Not part of the public SDK surface."
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+aligned-vec = { workspace = true }
+bytemuck = { workspace = true }
+bytes = { workspace = true }
+compio = { workspace = true }
+compio-buf = { workspace = true }
+crossbeam = { workspace = true }
+err_trail = { workspace = true }
+human-repr = { workspace = true }
+iggy_binary_protocol = { workspace = true }
+iggy_common = { workspace = true }
+lending-iterator = { workspace = true }
+moka = { workspace = true }
+once_cell = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+twox-hash = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
+[dev-dependencies]
+serial_test = { workspace = true }
+tokio = { workspace = true }

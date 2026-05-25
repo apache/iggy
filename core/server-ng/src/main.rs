@@ -69,7 +69,7 @@ fn main() -> Result<(), ServerNgError> {
             logging.early_init();
 
             let config = load_config(&mut logging).await?;
-            iggy_common::MemoryPool::init_pool(&config.system.memory_pool.into_other());
+            server_common::MemoryPool::init_pool(&config.system.memory_pool.into_other());
 
             Ok((config, args.replica_id))
         });

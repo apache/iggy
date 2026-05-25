@@ -15,17 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::INDEX_SIZE;
-use crate::IggyError;
+use crate::PooledBuffer;
 use compio::fs::File;
 use compio::fs::OpenOptions;
 use compio::io::AsyncWriteAtExt;
 use err_trail::ErrContext;
+use iggy_common::INDEX_SIZE;
+use iggy_common::IggyError;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::trace;
-
-use crate::PooledBuffer;
 
 /// A dedicated struct for writing to the index file.
 #[derive(Debug)]

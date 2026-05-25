@@ -26,9 +26,8 @@ use crate::{
     },
 };
 use err_trail::ErrContext;
-use iggy_common::{
-    Consumer, ConsumerKind, ConsumerOffsetInfo, Identifier, IggyError, sharding::IggyNamespace,
-};
+use iggy_common::{Consumer, ConsumerKind, ConsumerOffsetInfo, Identifier, IggyError};
+use server_common::sharding::IggyNamespace;
 use std::sync::atomic::Ordering;
 
 impl IggyShard {

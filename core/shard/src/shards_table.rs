@@ -16,7 +16,7 @@
 // under the License.
 
 use hash32::{Hasher, Murmur3Hasher};
-use iggy_common::sharding::{IggyNamespace, PartitionLocation};
+use server_common::sharding::{IggyNamespace, PartitionLocation};
 use std::hash::Hasher as _;
 
 /// Lookup table that maps partition namespaces to their owning shard.

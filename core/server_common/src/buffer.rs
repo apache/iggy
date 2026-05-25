@@ -16,9 +16,7 @@
  * under the License.
  */
 
-use crate::alloc::memory_pool::{ALIGNMENT, AlignedBuffer};
-
-use super::memory_pool::{AlignedBufferExt, memory_pool};
+use crate::memory_pool::{ALIGNMENT, AlignedBuffer, AlignedBufferExt, memory_pool};
 use bytes::Bytes;
 use compio::buf::{IoBuf, IoBufMut, SetLen};
 use std::{
@@ -437,8 +435,8 @@ mod miri_tests {
     #[cfg(not(miri))]
     mod split_to {
         use super::*;
-        use crate::IggyByteSize;
-        use crate::alloc::memory_pool::{MemoryPool, MemoryPoolConfigOther};
+        use crate::memory_pool::{MemoryPool, MemoryPoolConfigOther};
+        use iggy_common::IggyByteSize;
         use serial_test::serial;
         use std::str::FromStr;
         use std::sync::Once;
