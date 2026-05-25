@@ -17,13 +17,14 @@
  */
 
 use crate::binary::dispatch::HandlerResult;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::responses::system::get_cluster_metadata::{
     ClusterMetadataResponse, ClusterNodeResponse,
 };
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::IggyError;
 use std::rc::Rc;
 use tracing::{debug, instrument};
 

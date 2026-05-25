@@ -16,4 +16,4 @@
 // under the License.
 
 #[allow(unused_imports)]
-pub use iggy_common::MessagesReader;
+pub use server_common::MessagesReader;

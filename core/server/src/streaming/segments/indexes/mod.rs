@@ -19,5 +19,5 @@
 mod index_reader;
 mod index_writer;
 
-pub use iggy_common::IggyIndexesMut;
 pub use index_writer::IndexWriter;
+pub use server_common::IggyIndexesMut;

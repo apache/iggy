@@ -34,14 +34,13 @@ use async_channel::bounded;
 use common::{header_only, install_ws_clients_locally, loopback};
 use compio::net::TcpStream;
 use iggy_binary_protocol::Command2;
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
-use iggy_binary_protocol::{GenericHeader, Message};
+use iggy_binary_protocol::GenericHeader;
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener::ws::{bind, run};
 use message_bus::transports::ws::WsTransportConn;
 use message_bus::transports::{ActorContext, TransportConn};
 use message_bus::{FusedShutdown, IggyMessageBus, MessageBus, Shutdown, framing};
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use std::rc::Rc;
 use std::time::Duration;
 

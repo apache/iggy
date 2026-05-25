@@ -135,7 +135,7 @@ pub fn load_pem(cert_path: &Path, key_path: &Path) -> io::Result<TlsServerCreden
 /// in any caller this helper is intended for (tests, dev loops).
 #[must_use]
 pub fn self_signed_for_loopback() -> TlsServerCredentials {
-    let (cert_chain, key_der) = iggy_common::generate_self_signed_certificate("localhost")
+    let (cert_chain, key_der) = server_common::generate_self_signed_certificate("localhost")
         .expect("rcgen self-signed certificate generation must not fail in test/dev paths");
     TlsServerCredentials {
         cert_chain,

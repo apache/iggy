@@ -60,7 +60,8 @@ impl PostgresSourceJsonFixture {
                 count INTEGER NOT NULL,
                 amount DOUBLE PRECISION NOT NULL,
                 active BOOLEAN NOT NULL,
-                timestamp BIGINT NOT NULL
+                timestamp BIGINT NOT NULL,
+                tag CHAR(10) NOT NULL
             )",
             Self::TABLE
         );
@@ -81,8 +82,9 @@ impl PostgresSourceJsonFixture {
         active: bool,
         timestamp: i64,
     ) {
+        let tag = format!("{:<10}", format!("tag_{id}"));
         let query = format!(
-            "INSERT INTO {} (id, name, count, amount, active, timestamp) VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO {} (id, name, count, amount, active, timestamp, tag) VALUES ($1, $2, $3, $4, $5, $6, $7)",
             Self::TABLE
         );
         sqlx::query(&query)
@@ -92,6 +94,7 @@ impl PostgresSourceJsonFixture {
             .bind(amount)
             .bind(active)
             .bind(timestamp)
+            .bind(&tag)
             .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));

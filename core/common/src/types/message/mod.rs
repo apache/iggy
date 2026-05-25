@@ -17,20 +17,16 @@
  */
 
 mod iggy_message;
-mod in_flight;
 mod index;
 mod index_view;
 mod indexes;
-mod indexes_mut;
-mod message_boundaries;
+pub mod message_boundaries;
 mod message_header;
 mod message_header_view;
 mod message_header_view_mut;
 mod message_view;
 mod message_view_mut;
 mod messages_batch;
-mod messages_batch_mut;
-mod messages_batch_set;
 pub mod partitioning;
 pub mod partitioning_kind;
 mod poll_metadata;
@@ -44,11 +40,10 @@ pub const INDEX_SIZE: usize = 16;
 pub use crate::http::messages::poll_messages::PollMessages;
 pub use crate::http::messages::send_messages::SendMessages;
 pub use iggy_message::{IggyMessage, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE};
-pub use in_flight::IggyMessagesBatchSetInFlight;
 pub use index::IggyIndex;
 pub use index_view::IggyIndexView;
 pub use indexes::IggyIndexes;
-pub use indexes_mut::IggyIndexesMut;
+pub use message_boundaries::IggyMessageBoundaries;
 pub use message_header::{
     IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADER_RANGE, IGGY_MESSAGE_HEADER_SIZE,
     IGGY_MESSAGE_HEADERS_LENGTH_OFFSET_RANGE, IGGY_MESSAGE_ID_OFFSET_RANGE,
@@ -61,8 +56,6 @@ pub use message_header_view_mut::IggyMessageHeaderViewMut;
 pub use message_view::{IggyMessageView, IggyMessageViewIterator};
 pub use message_view_mut::{IggyMessageViewMut, IggyMessageViewMutIterator};
 pub use messages_batch::IggyMessagesBatch;
-pub use messages_batch_mut::IggyMessagesBatchMut;
-pub use messages_batch_set::IggyMessagesBatchSet;
 pub use partitioning::Partitioning;
 pub use partitioning_kind::PartitioningKind;
 pub use poll_metadata::IggyPollMetadata;

@@ -17,10 +17,11 @@
 
 //! `DeleteConsumerOffset2` op. Namespace-routed with `AckLevel`.
 
-use iggy_binary_protocol::{AckLevel, Message, ReplyHeader, RequestHeader};
-use iggy_common::sharding::IggyNamespace;
+use iggy_binary_protocol::{AckLevel, ReplyHeader, RequestHeader};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
+use server_common::Message;
+use server_common::sharding::IggyNamespace;
 
 use crate::client::SimClient;
 use crate::workload::effect::Effect;

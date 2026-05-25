@@ -32,9 +32,7 @@ use common::{
 };
 use compio::net::TcpStream;
 use iggy_binary_protocol::Command2;
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
-use iggy_binary_protocol::{GenericHeader, Message};
+use iggy_binary_protocol::GenericHeader;
 use message_bus::client_listener::RequestHandler;
 use message_bus::connector::DEFAULT_RECONNECT_PERIOD;
 use message_bus::replica::io::start_on_shard_zero;
@@ -45,6 +43,7 @@ use message_bus::transports::{ActorContext, TransportConn};
 use message_bus::{FusedShutdown, IggyMessageBus, MessageBus, Shutdown, framing};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;

@@ -16,11 +16,12 @@
  * under the License.
  */
 
-use crate::{
-    IggyByteSize, IggyIndexesMut, IggyMessage, IggyMessageView, IggyMessagesBatch,
-    IggyMessagesBatchMut, IggyPollMetadata, PolledMessages, PooledBuffer, Sizeable,
-};
+use crate::{IggyIndexesMut, IggyMessagesBatchMut, PooledBuffer};
 use bytes::Bytes;
+use iggy_common::{
+    IggyByteSize, IggyMessage, IggyMessageView, IggyMessagesBatch, IggyPollMetadata,
+    PolledMessages, Sizeable,
+};
 use std::ops::Index;
 use tracing::trace;
 

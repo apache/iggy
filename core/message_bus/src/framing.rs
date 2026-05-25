@@ -24,10 +24,9 @@
 use compio::BufResult;
 use compio::buf::{IntoInner, IoBuf, IoBufMut};
 use compio::io::{AsyncReadExt, AsyncWriteExt};
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Owned;
-use iggy_binary_protocol::{GenericHeader, HEADER_SIZE, Message, read_size_field};
+use iggy_binary_protocol::{GenericHeader, HEADER_SIZE, read_size_field};
 use iggy_common::IggyError;
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Owned};
 use tracing::error;
 
 /// Default hard ceiling on a single wire frame. Frames above this are

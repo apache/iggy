@@ -36,10 +36,9 @@ mod tests {
     use crate::streaming::partitions::ops;
     use crate::streaming::polling_consumer::PollingConsumer;
     use crate::streaming::stats::{PartitionStats, StreamStats, TopicStats};
-    use iggy_common::sharding::IggyNamespace;
-    use iggy_common::{
-        IggyByteSize, IggyMessage, MemoryPool, MemoryPoolConfigOther, PollingStrategy, Sizeable,
-    };
+    use iggy_common::{IggyByteSize, IggyMessage, PollingStrategy, Sizeable};
+    use server_common::sharding::IggyNamespace;
+    use server_common::{MemoryPool, MemoryPoolConfigOther};
     use std::cell::RefCell;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
@@ -73,7 +72,7 @@ mod tests {
         )
     }
 
-    fn create_batch(count: u32) -> iggy_common::IggyMessagesBatchMut {
+    fn create_batch(count: u32) -> server_common::IggyMessagesBatchMut {
         let messages: Vec<IggyMessage> = (0..count)
             .map(|_| {
                 IggyMessage::builder()
@@ -87,7 +86,7 @@ mod tests {
             .iter()
             .map(|m| m.get_size_bytes().as_bytes_u32())
             .sum();
-        iggy_common::IggyMessagesBatchMut::from_messages(&messages, messages_size)
+        server_common::IggyMessagesBatchMut::from_messages(&messages, messages_size)
     }
 
     /// Sets up "State C": in-flight holds committed data, journal holds new
@@ -112,7 +111,7 @@ mod tests {
         let mut partition = create_test_partition(journal_end);
 
         let segment = iggy_common::Segment::new(0, IggyByteSize::from(1_073_741_824u64));
-        let storage = iggy_common::SegmentStorage::default();
+        let storage = server_common::SegmentStorage::default();
         partition.log.add_persisted_segment(segment, storage);
 
         let seg = &mut partition.log.segments_mut()[0];
@@ -216,7 +215,7 @@ mod tests {
         let segment = iggy_common::Segment::new(0, IggyByteSize::from(1_073_741_824u64));
         partition
             .log
-            .add_persisted_segment(segment, iggy_common::SegmentStorage::default());
+            .add_persisted_segment(segment, server_common::SegmentStorage::default());
         let seg = &mut partition.log.segments_mut()[0];
         seg.end_offset = 9;
         seg.start_timestamp = 1;
@@ -245,7 +244,7 @@ mod tests {
         let segment = iggy_common::Segment::new(0, IggyByteSize::from(1_073_741_824u64));
         partition
             .log
-            .add_persisted_segment(segment, iggy_common::SegmentStorage::default());
+            .add_persisted_segment(segment, server_common::SegmentStorage::default());
         let seg = &mut partition.log.segments_mut()[0];
         seg.end_offset = 9;
         seg.start_timestamp = 1;
