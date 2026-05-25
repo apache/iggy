@@ -103,7 +103,8 @@ class E2ETestFixture : public ::testing::Test {
     void TrackStream(const std::uint32_t stream_id) { tracked_stream_ids_.push_back(stream_id); }
     void ForgetTrackedStream(const std::string &stream_name) {
         tracked_stream_names_.erase(
-            std::remove(tracked_stream_names_.begin(), tracked_stream_names_.end(), stream_name), tracked_stream_names_.end());
+            std::remove(tracked_stream_names_.begin(), tracked_stream_names_.end(), stream_name),
+            tracked_stream_names_.end());
     }
     void ForgetTrackedStream(const std::uint32_t stream_id) {
         tracked_stream_ids_.erase(std::remove(tracked_stream_ids_.begin(), tracked_stream_ids_.end(), stream_id),

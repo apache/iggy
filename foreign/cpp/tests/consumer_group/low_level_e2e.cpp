@@ -46,7 +46,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupSucceeds) {
         ASSERT_EQ(group.members_count, 0);
         ASSERT_TRUE(group.members.empty());
     });
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithInvalidIdentifiersThrows) {
@@ -76,7 +75,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithInvalidIdentifiersThrow
     ASSERT_THROW(client->create_consumer_group(make_string_identifier(stream_name), std::move(invalid_topic_id),
                                                "client-create-group-invalid-topic-id"),
                  std::exception);
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupOnNonExistentResourcesThrows) {
@@ -100,7 +98,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupOnNonExistentResourcesThrow
         client->create_consumer_group(make_string_identifier(stream_name), make_string_identifier(missing_topic_name),
                                       "client-create-group-missing-topic-group"),
         std::exception);
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupTwiceOnSameInputThrows) {
@@ -120,7 +117,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupTwiceOnSameInputThrows) {
     ASSERT_THROW(client->create_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
                                                group_name),
                  std::exception);
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithNumericIdentifiersSucceeds) {
@@ -147,7 +143,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithNumericIdentifiersSucce
         ASSERT_EQ(group.members_count, 0);
         ASSERT_TRUE(group.members.empty());
     });
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithInvalidNamesThrows) {
@@ -168,7 +163,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithInvalidNamesThrows) {
                                                    make_string_identifier(topic_name), invalid_name),
                      std::exception);
     }
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupAfterStreamDeletionThrows) {
@@ -188,7 +182,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupAfterStreamDeletionThrows) 
     ASSERT_THROW(client->create_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
                                                group_name),
                  std::exception);
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupBeforeLoginThrows) {
@@ -238,7 +231,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupReturnsSameInfoAsCreateConsume
     ASSERT_EQ(fetched_group.partitions_count, created_group.partitions_count);
     ASSERT_EQ(fetched_group.members_count, created_group.members_count);
     ASSERT_EQ(fetched_group.members.size(), created_group.members.size());
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupBeforeLoginThrows) {
@@ -288,7 +280,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupWithInvalidIdentifiersThrows) 
     ASSERT_THROW(client->get_consumer_group(make_string_identifier(stream_name), make_string_identifier(""),
                                             make_string_identifier(group_name)),
                  std::exception);
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupOnNonExistentResourcesThrows) {
@@ -319,7 +310,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupOnNonExistentResourcesThrows) 
     ASSERT_THROW(client->get_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
                                             make_string_identifier(missing_group_name)),
                  std::exception);
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupAfterStreamDeletionThrows) {
@@ -341,7 +331,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupAfterStreamDeletionThrows) {
     ASSERT_THROW(client->get_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
                                             make_string_identifier(group_name)),
                  std::exception);
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupSucceeds) {
@@ -364,7 +353,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupSucceeds) {
     ASSERT_THROW(client->get_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
                                             make_string_identifier(group_name)),
                  std::exception);
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupBeforeLoginThrows) {
@@ -423,7 +411,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupWithInvalidIdentifiersThrow
     ASSERT_THROW(client->delete_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
                                                std::move(invalid_group_id)),
                  std::exception);
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupOnNonExistentResourcesThrows) {
@@ -454,7 +441,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupOnNonExistentResourcesThrow
     ASSERT_THROW(client->delete_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
                                                make_string_identifier(missing_group_name)),
                  std::exception);
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupTwiceThrows) {
@@ -476,7 +462,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupTwiceThrows) {
     ASSERT_THROW(client->delete_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
                                                make_string_identifier(group_name)),
                  std::exception);
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupWithNumericIdentifiersSucceeds) {
@@ -503,7 +488,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupWithNumericIdentifiersSucce
     ASSERT_THROW(client->get_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
                                             make_string_identifier(group_name)),
                  std::exception);
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupAfterStreamDeletionThrows) {
@@ -526,7 +510,6 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupAfterStreamDeletionThrows) 
     ASSERT_THROW(client->delete_consumer_group(make_string_identifier(stream_name), make_string_identifier(topic_name),
                                                make_string_identifier(group_name)),
                  std::exception);
-
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupAndRecreateWithSameNameSucceeds) {
