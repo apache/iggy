@@ -18,10 +18,11 @@
 
 use crate::binary::dispatch::HandlerResult;
 use crate::binary::handlers::users::COMPONENT;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use err_trail::ErrContext;
-use iggy_common::{IggyError, SenderKind};
+use iggy_common::IggyError;
 use std::rc::Rc;
 use tracing::{debug, info, instrument};
 

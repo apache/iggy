@@ -34,10 +34,33 @@ use iggy_binary_protocol::requests::consumer_offsets::{
 use iggy_binary_protocol::requests::messages::SendMessagesHeader;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::{WireIdentifier, WirePartitioning};
-use iggy_common::sharding::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
 use iggy_common::{IggyError, IggyTimestamp};
 
 const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
+const MAX_STREAMS: usize = 4096;
+const MAX_TOPICS: usize = 4096;
+const MAX_PARTITIONS: usize = 1_000_000;
+const STREAM_BITS: u32 = bits_required((MAX_STREAMS - 1) as u64);
+const TOPIC_BITS: u32 = bits_required((MAX_TOPICS - 1) as u64);
+const PARTITION_BITS: u32 = bits_required((MAX_PARTITIONS - 1) as u64);
+const PARTITION_SHIFT: u32 = 0;
+const TOPIC_SHIFT: u32 = PARTITION_SHIFT + PARTITION_BITS;
+const STREAM_SHIFT: u32 = TOPIC_SHIFT + TOPIC_BITS;
+const PARTITION_MASK: u64 = (1u64 << PARTITION_BITS) - 1;
+const TOPIC_MASK: u64 = (1u64 << TOPIC_BITS) - 1;
+const STREAM_MASK: u64 = (1u64 << STREAM_BITS) - 1;
+
+const fn bits_required(mut n: u64) -> u32 {
+    if n == 0 {
+        return 1;
+    }
+    let mut b = 0;
+    while n > 0 {
+        b += 1;
+        n >>= 1;
+    }
+    b
+}
 
 // TODO(vsr): transparent retry-after-disconnect can weaken at-most-once semantics
 // for replicated writes. The transports currently disconnect, reconnect, and encode
@@ -237,7 +260,11 @@ fn namespace_from_partition(
     validate_namespace_field(stream_id, MAX_STREAMS)?;
     validate_namespace_field(topic_id, MAX_TOPICS)?;
     validate_namespace_field(partition_id, MAX_PARTITIONS)?;
-    Ok(IggyNamespace::new(stream_id as usize, topic_id as usize, partition_id as usize).inner())
+    Ok(pack_namespace(
+        stream_id as usize,
+        topic_id as usize,
+        partition_id as usize,
+    ))
 }
 
 fn validate_namespace_field(value: u32, exclusive_max: usize) -> Result<(), IggyError> {
@@ -248,6 +275,12 @@ fn validate_namespace_field(value: u32, exclusive_max: usize) -> Result<(), Iggy
     Ok(())
 }
 
+fn pack_namespace(stream_id: usize, topic_id: usize, partition_id: usize) -> u64 {
+    ((stream_id as u64) & STREAM_MASK) << STREAM_SHIFT
+        | ((topic_id as u64) & TOPIC_MASK) << TOPIC_SHIFT
+        | ((partition_id as u64) & PARTITION_MASK) << PARTITION_SHIFT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,15 +288,14 @@ mod tests {
     use iggy_binary_protocol::codes::{
         CREATE_STREAM_CODE, GET_STREAM_CODE, LOGOUT_USER_CODE, PING_CODE,
     };
-    use iggy_binary_protocol::consensus::{Message, RequestHeader, iobuf::Owned};
     use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::LoginRegisterRequest;
     use iggy_binary_protocol::{WireEncode, WireName};
     use secrecy::SecretString;
 
-    fn decode_request(bytes: &Bytes) -> Message<RequestHeader> {
-        Message::try_from(Owned::<4096>::copy_from_slice(bytes.as_ref())).unwrap()
+    fn decode_request_header(bytes: &Bytes) -> RequestHeader {
+        *bytemuck::checked::try_from_bytes::<RequestHeader>(&bytes[..HEADER_SIZE]).unwrap()
     }
 
     #[test]
@@ -280,8 +312,7 @@ mod tests {
         let bytes =
             encode_contiguous_request(&mut session, LOGIN_REGISTER_CODE, &request.to_bytes())
                 .unwrap();
-        let request = decode_request(&bytes);
-        let header = request.header();
+        let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::Register);
         assert_eq!(header.request, 0);
@@ -303,10 +334,10 @@ mod tests {
         let first = encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
         let second = encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
 
-        assert_eq!(decode_request(&first).header().request, 1);
-        assert_eq!(decode_request(&second).header().request, 2);
-        assert_eq!(decode_request(&second).header().session, 99);
-        assert_eq!(decode_request(&second).header().namespace, 0);
+        assert_eq!(decode_request_header(&first).request, 1);
+        assert_eq!(decode_request_header(&second).request, 2);
+        assert_eq!(decode_request_header(&second).session, 99);
+        assert_eq!(decode_request_header(&second).namespace, 0);
     }
 
     #[test]
@@ -314,8 +345,7 @@ mod tests {
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99);
         let bytes = encode_contiguous_request(&mut session, PING_CODE, &Bytes::new()).unwrap();
-        let request = decode_request(&bytes);
-        let header = request.header();
+        let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::NonReplicated);
         assert_eq!(
@@ -336,8 +366,7 @@ mod tests {
         session.bind(99);
         let bytes =
             encode_contiguous_request(&mut session, LOGOUT_USER_CODE, &Bytes::new()).unwrap();
-        let request = decode_request(&bytes);
-        let header = request.header();
+        let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::Logout);
         assert_eq!(header.request, 1);
@@ -351,8 +380,7 @@ mod tests {
         session.bind(99);
         let bytes =
             encode_contiguous_request(&mut session, GET_STREAM_CODE, &Bytes::new()).unwrap();
-        let request = decode_request(&bytes);
-        let header = request.header();
+        let header = decode_request_header(&bytes);
 
         assert_eq!(header.operation, Operation::NonReplicated);
         assert_eq!(
@@ -405,10 +433,8 @@ mod tests {
             Operation::SendMessages,
         )
         .unwrap();
-        let namespace = IggyNamespace::from_raw(namespace);
-
-        assert_eq!(namespace.stream_id(), 2);
-        assert_eq!(namespace.topic_id(), 3);
-        assert_eq!(namespace.partition_id(), 4);
+        assert_eq!((namespace >> STREAM_SHIFT) & STREAM_MASK, 2);
+        assert_eq!((namespace >> TOPIC_SHIFT) & TOPIC_MASK, 3);
+        assert_eq!((namespace >> PARTITION_SHIFT) & PARTITION_MASK, 4);
     }
 }

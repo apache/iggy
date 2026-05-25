@@ -60,13 +60,12 @@ use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
 use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
 use iggy_binary_protocol::{
-    Command2, GenericHeader, Message, Operation, ReplyHeader, RequestHeader, WireDecode,
-    WireEncode, WireIdentifier, WireName, WirePartitioning,
+    Command2, GenericHeader, Operation, ReplyHeader, RequestHeader, WireDecode, WireEncode,
+    WireIdentifier, WireName, WirePartitioning,
 };
-use iggy_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use iggy_common::{
     ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, IggyTimestamp, PartitionStats,
-    PersonalAccessToken, TopicStats, UserStatus, sharding::LocalIdx, variadic,
+    PersonalAccessToken, TopicStats, UserStatus, variadic,
 };
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
@@ -99,6 +98,8 @@ use metadata::stm::user::{
 use partitions::{
     IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig, Segment,
 };
+use server_common::Message;
+use server_common::sharding::{IggyNamespace, LocalIdx, PartitionLocation, ShardId};
 // TODO: decouple bootstrap/storage helpers and logging from the `server` crate.
 use secrecy::ExposeSecret;
 use server::bootstrap::{create_directories, create_shard_executor};
@@ -1149,7 +1150,7 @@ fn restore_metadata_consensus(
         CLUSTER_ID,
         self_replica_id,
         replica_count,
-        iggy_common::sharding::METADATA_CONSENSUS_NAMESPACE,
+        server_common::sharding::METADATA_CONSENSUS_NAMESPACE,
         bus,
         LocalPipeline::new(),
     );
@@ -1409,7 +1410,7 @@ fn validate_recovered_segment(
     topic_id: usize,
     partition_id: usize,
     segment: &iggy_common::Segment,
-    storage: &iggy_common::SegmentStorage,
+    storage: &server_common::SegmentStorage,
     indexes: Option<&server::streaming::segments::IggyIndexesMut>,
 ) -> Result<(), ServerNgError> {
     let messages_size_bytes = storage
@@ -1458,7 +1459,7 @@ fn indexes_max_timestamp(indexes: &server::streaming::segments::IggyIndexesMut) 
 }
 
 async fn load_segment_max_timestamp(
-    storage: &iggy_common::SegmentStorage,
+    storage: &server_common::SegmentStorage,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
@@ -3377,9 +3378,8 @@ async fn start_client_listeners(
     }
 
     if let Some(ws_addr) = topology.ws_listen_addr {
-        let (listener, bound_addr) = client_listener::ws::bind(ws_addr)
-            .await
-            .map_err(|source| {
+        let (listener, bound_addr) =
+            client_listener::ws::bind(ws_addr).await.map_err(|source| {
                 error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
                 source
             })?;
@@ -3467,7 +3467,7 @@ fn load_quic_server_credentials(
 ) -> Result<replica_io::QuicServerCredentials, ServerNgError> {
     let certificate = &config.quic.certificate;
     if certificate.self_signed {
-        let (cert_chain, key_der) = iggy_common::generate_self_signed_certificate("localhost")
+        let (cert_chain, key_der) = server_common::generate_self_signed_certificate("localhost")
             .map_err(|error| ServerNgError::ListenerCredentials {
                 transport: "quic",
                 source: std::io::Error::other(error.to_string()),

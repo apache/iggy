@@ -31,7 +31,7 @@ use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use std::collections::HashMap;
 
-use iggy_common::sharding::IggyNamespace;
+use server_common::sharding::IggyNamespace;
 
 use crate::workload::effect::{ApplyResult, Effect};
 use crate::workload::ids::IdPermutation;

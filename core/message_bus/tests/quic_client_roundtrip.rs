@@ -25,9 +25,7 @@ use async_channel::bounded;
 use common::{header_only, install_quic_clients_locally, loopback};
 use compio_quic::{ClientBuilder, Endpoint};
 use iggy_binary_protocol::Command2;
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
-use iggy_binary_protocol::{GenericHeader, Message};
+use iggy_binary_protocol::GenericHeader;
 use message_bus::QuicTuning;
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener::quic::{bind, run};
@@ -36,6 +34,7 @@ use message_bus::transports::quic::{QuicTransportConn, server_config_with_cert};
 use message_bus::transports::{ActorContext, TransportConn};
 use message_bus::{FusedShutdown, IggyMessageBus, MessageBus, Shutdown};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use std::rc::Rc;
 use std::time::Duration;
 

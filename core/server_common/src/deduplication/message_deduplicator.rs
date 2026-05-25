@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::IggyDuration;
+use iggy_common::IggyDuration;
 use moka::future::{Cache, CacheBuilder};
 
 #[derive(Debug)]

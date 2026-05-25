@@ -32,9 +32,9 @@ use iggy_binary_protocol::requests::topics::{
 };
 use iggy_common::{
     CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, StreamStats, TopicStats,
-    sharding::IggyNamespace,
 };
 use serde::{Deserialize, Serialize};
+use server_common::sharding::IggyNamespace;
 use slab::Slab;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

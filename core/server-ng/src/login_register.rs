@@ -28,7 +28,7 @@
 use crate::session_manager::{SessionError, SessionManager};
 use consensus::VsrConsensus;
 use iggy_binary_protocol::{
-    EvictionReason, Message, PrepareHeader,
+    EvictionReason, PrepareHeader,
     requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest},
     responses::users::LoginRegisterResponse,
 };
@@ -38,6 +38,7 @@ use metadata::{
     IggyMetadata, RegisterSubmitError, impls::metadata::StreamsFrontend, stm::StateMachine,
 };
 use secrecy::ExposeSecret;
+use server_common::Message;
 
 /// Credential verifier. Real impl: metadata user store + Argon2.
 pub trait CredentialVerifier {

@@ -28,14 +28,12 @@ use consensus::{
     LocalPipeline, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind,
     Sequencer, VsrAction, VsrConsensus,
 };
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
 use iggy_binary_protocol::{
-    Command2, CommitHeader, DoViewChangeHeader, GenericHeader, Message, MessageBag, PrepareHeader,
-    PrepareOkHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
+    Command2, CommitHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
+    RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
+use iggy_common::PartitionStats;
 use iggy_common::variadic;
-use iggy_common::{PartitionStats, sharding::IggyNamespace};
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use message_bus::client_listener::RequestHandler;
@@ -46,6 +44,8 @@ use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 use partitions::{IggyPartition, IggyPartitions};
+use server_common::sharding::IggyNamespace;
+use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::rc::Rc;
 use std::sync::Arc;

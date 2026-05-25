@@ -38,6 +38,7 @@ iggy_common = { workspace = true }
 message_bus = { workspace = true }
 rand = { workspace = true }
 rand_xoshiro = { workspace = true }
+server_common = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

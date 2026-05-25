@@ -24,7 +24,8 @@
 use crate::packet::{
     ALLOW_ALL, BLOCK_ALL, LinkFilter, Packet, PacketSimulator, PacketSimulatorOptions, ProcessId,
 };
-use iggy_binary_protocol::{GenericHeader, Message};
+use iggy_binary_protocol::GenericHeader;
+use server_common::Message;
 
 /// Network layer for the cluster simulation.
 ///

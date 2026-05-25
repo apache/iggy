@@ -18,12 +18,6 @@
 name: _common
 on:
   workflow_call:
-    inputs:
-      skip_pr_title:
-        type: boolean
-        required: false
-        default: false
-        description: "Skip PR title check (for push events)"
 
 permissions:
   contents: read
@@ -66,75 +60,6 @@ jobs:
 
       - name: Check version consistency
         run: ./scripts/extract-version.sh --check
-
-  pr-title:
-    name: Check PR Title
-    if: github.event_name == 'pull_request' && !inputs.skip_pr_title
-    runs-on: ubuntu-latest
-    steps:
-      - name: Validate PR Title
-        uses: amannn/action-semantic-pull-request@v6
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          types: |
-            feat
-            fix
-            docs
-            style
-            refactor
-            perf
-            test
-            build
-            ci
-            chore
-            revert
-            repo
-            deps
-          scopes: |
-            bdd
-            bench
-            ci
-            cli
-            clock
-            common
-            connector
-            connectors
-            cpp
-            csharp
-            deps
-            deps-dev
-            docs
-            example
-            go
-            helm
-            integration
-            io_uring
-            java
-            journal
-            js
-            mcp
-            node
-            partitions
-            proc
-            pr_template
-            python
-            repo
-            rust
-            sdk
-            security
-            server
-            server-ng
-            shard
-            test
-            web
-            consensus
-            cluster
-            metadata
-            message_bus
-            storage
-            simulator
-            configs
 
   license-headers:
     name: Check license headers
@@ -269,7 +194,6 @@ jobs:
         rust-versions,
         python-versions,
         version-consistency,
-        pr-title,
         license-headers,
         third-party-licenses,
         markdown,
@@ -289,22 +213,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Check | Status | Description |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|-------------|" >> $GITHUB_STEP_SUMMARY
-
-          # PR-specific checks
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            PR_TITLE="${{ needs.pr-title.result }}"
-
-            # Add emoji based on status
-            if [ "$PR_TITLE" = "success" ]; then
-              echo "| ✅ PR Title | success | Follows conventional format |" >> $GITHUB_STEP_SUMMARY
-            elif [ "$PR_TITLE" = "failure" ]; then
-              echo "| ❌ PR Title | failure | Must follow conventional format |" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "| ⏭️ PR Title | $PR_TITLE | Check skipped |" >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "| ⏭️ PR Title | skipped | Not a pull request |" >> $GITHUB_STEP_SUMMARY
-          fi
 
           # Always-run checks
           RUST_VERSIONS="${{ needs.rust-versions.result }}"

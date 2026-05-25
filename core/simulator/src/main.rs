@@ -16,10 +16,11 @@
 // under the License.
 
 use bytes::Bytes;
-use iggy_binary_protocol::{Message, ReplyHeader};
-use iggy_common::sharding::IggyNamespace;
-use iggy_common::{IggyByteSize, MemoryPool, MemoryPoolConfigOther, PollingStrategy};
+use iggy_binary_protocol::ReplyHeader;
+use iggy_common::{IggyByteSize, PollingStrategy};
 use partitions::{PollingArgs, PollingConsumer};
+use server_common::sharding::IggyNamespace;
+use server_common::{MemoryPool, MemoryPoolConfigOther, Message};
 use simulator::Simulator;
 use simulator::client::SimClient;
 use simulator::packet::PacketSimulatorOptions;

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub use iggy_common::SegmentStorage as Storage;
+pub use server_common::SegmentStorage as Storage;
 
 use crate::configs::system::SystemConfig;
 use iggy_common::IggyError;

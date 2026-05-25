@@ -17,6 +17,7 @@
  */
 
 use crate::binary::dispatch::{HandlerResult, wire_id_to_identifier};
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use iggy_binary_protocol::WireName;
@@ -26,7 +27,6 @@ use iggy_binary_protocol::responses::consumer_groups::{
     ConsumerGroupDetailsResponse, ConsumerGroupMemberResponse, ConsumerGroupResponse,
 };
 use iggy_common::IggyError;
-use iggy_common::SenderKind;
 use std::rc::Rc;
 use tracing::debug;
 

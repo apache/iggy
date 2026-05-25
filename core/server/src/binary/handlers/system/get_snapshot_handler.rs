@@ -17,11 +17,12 @@
  */
 
 use crate::binary::dispatch::HandlerResult;
+use crate::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use bytes::Bytes;
 use iggy_binary_protocol::requests::system::GetSnapshotRequest;
-use iggy_common::{IggyError, SenderKind, SnapshotCompression, SystemSnapshotType};
+use iggy_common::{IggyError, SnapshotCompression, SystemSnapshotType};
 use std::rc::Rc;
 use tracing::debug;
 

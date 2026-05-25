@@ -146,6 +146,7 @@ secrecy = { workspace = true }
 send_wrapper = { workspace = true }
 serde = { workspace = true }
 server = { workspace = true }
+server_common = { workspace = true }
 shard = { workspace = true }
 slab = { workspace = true }
 socket2 = { workspace = true }

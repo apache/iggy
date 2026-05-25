@@ -81,7 +81,7 @@ pub struct MemoryPoolConfigOther {
     /// Whether the pool is enabled.
     pub enabled: bool,
     /// Maximum size of the pool.
-    pub size: crate::IggyByteSize,
+    pub size: iggy_common::IggyByteSize,
     /// Maximum number of buffers per bucket.
     pub bucket_capacity: u32,
 }
@@ -493,7 +493,8 @@ fn size_str(size: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::{IggyByteSize, alloc::buffer::PooledBuffer};
+    use crate::buffer::PooledBuffer;
+    use iggy_common::IggyByteSize;
 
     use super::*;
     use serial_test::serial;

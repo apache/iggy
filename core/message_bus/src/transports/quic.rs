@@ -63,7 +63,8 @@ use compio_quic::{
     crypto::rustls::QuicServerConfig,
 };
 use futures::FutureExt;
-use iggy_binary_protocol::{GenericHeader, Message};
+use iggy_binary_protocol::GenericHeader;
+use server_common::Message;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -518,10 +519,10 @@ mod tests {
     use async_channel::bounded;
     use compio::io::AsyncWrite;
     use compio_quic::ClientBuilder;
-    use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-    use iggy_binary_protocol::consensus::iobuf::Frozen;
     use iggy_binary_protocol::{Command2, HEADER_SIZE, SIZE_FIELD_OFFSET};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use server_common::MESSAGE_ALIGN;
+    use server_common::iobuf::Frozen;
     use std::time::Duration;
 
     fn install_crypto_provider() {

@@ -101,9 +101,8 @@ pub use transports::tls::TlsServerCredentials;
 
 use compio::runtime::JoinHandle;
 use configs::server_ng::ServerNgConfig;
-use iggy_binary_protocol::consensus::MESSAGE_ALIGN;
-use iggy_binary_protocol::consensus::iobuf::Frozen;
-use iggy_binary_protocol::{GenericHeader, Message};
+use iggy_binary_protocol::GenericHeader;
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use std::array;
 use std::cell::{OnceCell, RefCell};
 use std::net::SocketAddr;
