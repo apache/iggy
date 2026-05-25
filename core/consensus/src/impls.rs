@@ -28,6 +28,7 @@ use iggy_binary_protocol::{
     Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
     ReplyHeader, RequestHeader, StartViewChangeHeader, StartViewHeader,
 };
+use iggy_common::IggyTimestamp;
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
 use server_common::Message;
@@ -2007,6 +2008,10 @@ where
 
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareHeader> {
         let op = consensus.sequencer.current_sequence() + 1;
+        // Primary stamps wall-clock once at prepare-build; the value is
+        // replicated to every backup so apply() reads the same timestamp
+        // across the cluster (deterministic state-machine apply).
+        let timestamp = IggyTimestamp::now().as_micros();
 
         self.transmute_header(|old, new| {
             *new = PrepareHeader {
@@ -2022,7 +2027,7 @@ where
                 request: old.request,
                 commit: consensus.commit_max.get(),
                 op,
-                timestamp: 0, // 0 for now. Implement correct way to get timestamp later
+                timestamp,
                 operation: old.operation,
                 namespace: old.namespace,
                 ..Default::default()

@@ -146,26 +146,29 @@ impl Users {
         // split cannot race another user creation in that phase.
         let username = WireName::new(username).expect("root username must be valid");
         self.inner
-            .try_apply(UsersCommand::CreateUser(CreateUserRequest {
-                username,
-                password: password_hash.to_string(),
-                status: UserStatus::Active.as_code(),
-                permissions: Some(WirePermissions {
-                    global: WireGlobalPermissions {
-                        manage_servers: true,
-                        read_servers: true,
-                        manage_users: true,
-                        read_users: true,
-                        manage_streams: true,
-                        read_streams: true,
-                        manage_topics: true,
-                        read_topics: true,
-                        poll_messages: true,
-                        send_messages: true,
-                    },
-                    streams: Vec::new(),
-                }),
-            }))
+            .try_apply(UsersCommand::CreateUser(
+                CreateUserRequest {
+                    username,
+                    password: password_hash.to_string(),
+                    status: UserStatus::Active.as_code(),
+                    permissions: Some(WirePermissions {
+                        global: WireGlobalPermissions {
+                            manage_servers: true,
+                            read_servers: true,
+                            manage_users: true,
+                            read_users: true,
+                            manage_streams: true,
+                            read_streams: true,
+                            manage_topics: true,
+                            read_topics: true,
+                            poll_messages: true,
+                            send_messages: true,
+                        },
+                        streams: Vec::new(),
+                    }),
+                },
+                IggyTimestamp::now(),
+            ))
             .expect("root user bootstrap must run on the metadata writer");
     }
 }
@@ -238,7 +241,7 @@ impl WireDecode for DeletePersonalAccessTokenRequest {
 impl StateHandler for CreateUserRequest {
     type State = UsersInner;
     #[allow(clippy::cast_possible_truncation)]
-    fn apply(&self, state: &mut UsersInner) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> Bytes {
         let username_arc: Arc<str> = Arc::from(self.username.as_str());
         if state.index.contains_key(&username_arc) {
             return Bytes::new();
@@ -255,7 +258,7 @@ impl StateHandler for CreateUserRequest {
             username: username_arc.clone(),
             password_hash: Arc::from(self.password.as_str()),
             status,
-            created_at: IggyTimestamp::now(),
+            created_at: timestamp,
             permissions,
         };
 
@@ -275,7 +278,7 @@ impl StateHandler for CreateUserRequest {
 impl StateHandler for UpdateUserRequest {
     type State = UsersInner;
     #[allow(clippy::cast_possible_truncation)]
-    fn apply(&self, state: &mut UsersInner) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return Bytes::new();
         };
@@ -309,7 +312,7 @@ impl StateHandler for UpdateUserRequest {
 impl StateHandler for DeleteUserRequest {
     type State = UsersInner;
     #[allow(clippy::cast_possible_truncation)]
-    fn apply(&self, state: &mut UsersInner) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return Bytes::new();
         };
@@ -330,7 +333,7 @@ impl StateHandler for DeleteUserRequest {
 
 impl StateHandler for ChangePasswordRequest {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return Bytes::new();
         };
@@ -344,7 +347,7 @@ impl StateHandler for ChangePasswordRequest {
 
 impl StateHandler for UpdatePermissionsRequest {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
         let Some(user_id) = state.resolve_user_id(&self.user_id) else {
             return Bytes::new();
         };
@@ -362,7 +365,7 @@ impl StateHandler for UpdatePermissionsRequest {
 // TODO(hubcio): Serialize proper reply (e.g. generated token) instead of empty Bytes.
 impl StateHandler for CreatePersonalAccessTokenRequest {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> Bytes {
         let expiry = IggyExpiry::from(self.expiry);
         let user_tokens = state
             .personal_access_tokens
@@ -373,19 +376,15 @@ impl StateHandler for CreatePersonalAccessTokenRequest {
             return Bytes::new();
         }
 
-        let expiry_at = PersonalAccessToken::calculate_expiry_at(IggyTimestamp::now(), expiry);
+        let expiry_at = PersonalAccessToken::calculate_expiry_at(timestamp, expiry);
         if let Some(expiry_at) = expiry_at
-            && expiry_at.as_micros() <= IggyTimestamp::now().as_micros()
+            && expiry_at.as_micros() <= timestamp.as_micros()
         {
             return Bytes::new();
         }
 
-        let (pat, _) = PersonalAccessToken::new(
-            self.user_id,
-            self.name.as_ref(),
-            IggyTimestamp::now(),
-            expiry,
-        );
+        let (pat, _) =
+            PersonalAccessToken::new(self.user_id, self.name.as_ref(), timestamp, expiry);
         let token_hash = Arc::clone(&pat.token);
         user_tokens.insert(name_arc, pat);
         state
@@ -397,7 +396,7 @@ impl StateHandler for CreatePersonalAccessTokenRequest {
 
 impl StateHandler for DeletePersonalAccessTokenRequest {
     type State = UsersInner;
-    fn apply(&self, state: &mut UsersInner) -> Bytes {
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> Bytes {
         if let Some(user_tokens) = state.personal_access_tokens.get_mut(&self.user_id) {
             let name_arc: Arc<str> = Arc::from(self.name.as_str());
             if let Some(pat) = user_tokens.remove(&name_arc) {
@@ -673,7 +672,7 @@ mod tests {
             name: WireName::new("deploy").unwrap(),
             expiry: 0,
         };
-        create.apply(&mut users);
+        create.apply(&mut users, IggyTimestamp::now());
 
         assert!(users.personal_access_tokens.contains_key(&5));
         assert!(!users.personal_access_tokens.contains_key(&0));
@@ -686,7 +685,7 @@ mod tests {
             user_id: 5,
             name: WireName::new("deploy").unwrap(),
         };
-        delete.apply(&mut users);
+        delete.apply(&mut users, IggyTimestamp::now());
 
         assert!(users.personal_access_tokens[&5].is_empty());
         assert!(users.personal_access_token_index.is_empty());

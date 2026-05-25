@@ -185,12 +185,10 @@ impl<B: BinaryClient> UserClient for B {
         #[cfg(feature = "vsr")]
         {
             let wire_name = WireName::new(username).map_err(|_| IggyError::InvalidFormat)?;
-            let client_id = self.get_vsr_client_id().await?;
             let response = match self
                 .send_raw_with_response(
                     LOGIN_REGISTER_CODE,
                     LoginRegisterRequest {
-                        client_id,
                         username: wire_name,
                         password: SecretString::from(password.to_string()),
                         version: Some(env!("CARGO_PKG_VERSION").to_string()),

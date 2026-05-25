@@ -22,9 +22,6 @@ use iggy_binary_protocol::requests::consumer_groups::{
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
 };
-use iggy_binary_protocol::requests::personal_access_tokens::{
-    CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
-};
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
@@ -39,6 +36,7 @@ use iggy_binary_protocol::requests::users::{
 use iggy_binary_protocol::{
     AckLevel, Operation, RequestHeader, WireEncode, WireIdentifier, WireName,
 };
+use metadata::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest};
 use server_common::sharding::IggyNamespace;
 use server_common::{
     Message,
@@ -377,6 +375,7 @@ impl SimClient {
     /// Panics if `name` is not a valid `WireName`.
     pub fn create_personal_access_token(&self, name: &str, expiry: u64) -> Message<RequestHeader> {
         let wire = CreatePersonalAccessTokenRequest {
+            user_id: 0,
             name: WireName::new(name).expect("PAT name must be valid"),
             expiry,
         };
@@ -387,6 +386,7 @@ impl SimClient {
     /// Panics if `name` is not a valid `WireName`.
     pub fn delete_personal_access_token(&self, name: &str) -> Message<RequestHeader> {
         let wire = DeletePersonalAccessTokenRequest {
+            user_id: 0,
             name: WireName::new(name).expect("PAT name must be valid"),
         };
         self.build_request(Operation::DeletePersonalAccessToken, &wire.to_bytes())

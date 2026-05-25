@@ -90,7 +90,7 @@ where
             Error = iggy_common::IggyError,
         >,
 {
-    if request.client_id == 0 {
+    if connection_id == 0 {
         return Err(LoginRegisterError::InvalidClientId);
     }
 
@@ -98,14 +98,7 @@ where
     let user_id = verifier.verify(request.username.as_str(), request.password.expose_secret())?;
 
     // Phase 2: Register through consensus.
-    complete_register(
-        request.client_id,
-        user_id,
-        metadata,
-        session_manager,
-        connection_id,
-    )
-    .await
+    complete_register(connection_id, user_id, metadata, session_manager).await
 }
 
 /// PAT variant of [`handle_login_register`]; Phase 1 verifies token.
@@ -132,7 +125,7 @@ where
             Error = iggy_common::IggyError,
         >,
 {
-    if request.client_id == 0 {
+    if connection_id == 0 {
         return Err(LoginRegisterError::InvalidClientId);
     }
 
@@ -140,24 +133,20 @@ where
     let user_id = token_verifier.verify_token(request.token.expose_secret())?;
 
     // Phase 2: Register through consensus.
-    complete_register(
-        request.client_id,
-        user_id,
-        metadata,
-        session_manager,
-        connection_id,
-    )
-    .await
+    complete_register(connection_id, user_id, metadata, session_manager).await
 }
 
 /// Phase 2: transition session state, submit Register. Shared by password + PAT handlers.
+///
+/// The `connection_id` doubles as the VSR `client_id`; the transport assigns
+/// one per connection (so `transport_client_id == vsr_client_id` at this
+/// handler), and the request body no longer carries a separate field.
 #[allow(clippy::future_not_send)]
 async fn complete_register<B, J, S, M>(
-    client_id: u128,
+    connection_id: u128,
     user_id: u32,
     metadata: &LoginMetadata<'_, B, J, S, M>,
     session_manager: &mut SessionManager,
-    connection_id: u128,
 ) -> Result<LoginRegisterResponse, LoginRegisterError>
 where
     B: MessageBus,
@@ -180,7 +169,7 @@ where
     // TryFrom<&LoginRegisterError> for EvictionReason returns NotEvictable
     // and the network layer can't ship a wire-terminal Eviction for a
     // recoverable failure. SDK read-timeout replays.
-    let session = match metadata.submit_register_in_process(client_id).await {
+    let session = match metadata.submit_register_in_process(connection_id).await {
         Ok(session) => session,
         Err(e) => {
             triage_submit_error(&e);
@@ -192,7 +181,7 @@ where
 
     // Transition: Authenticated -> Bound.
     session_manager
-        .bind_session(connection_id, client_id, session)
+        .bind_session(connection_id, connection_id, session)
         .map_err(LoginRegisterError::Session)?;
 
     Ok(LoginRegisterResponse { user_id, session })

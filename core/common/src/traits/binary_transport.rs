@@ -31,17 +31,11 @@ pub trait BinaryTransport {
     fn get_heartbeat_interval(&self) -> IggyDuration;
 
     #[cfg(feature = "vsr")]
-    async fn get_vsr_client_id(&self) -> Result<u128, IggyError> {
-        Err(IggyError::FeatureUnavailable)
-    }
+    async fn get_vsr_client_id(&self) -> Result<u128, IggyError>;
 
     #[cfg(feature = "vsr")]
-    async fn bind_vsr_session(&self, _session: u64) -> Result<(), IggyError> {
-        Err(IggyError::FeatureUnavailable)
-    }
+    async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError>;
 
     #[cfg(feature = "vsr")]
-    async fn reset_vsr_session(&self) -> Result<(), IggyError> {
-        Err(IggyError::FeatureUnavailable)
-    }
+    async fn reset_vsr_session(&self) -> Result<(), IggyError>;
 }

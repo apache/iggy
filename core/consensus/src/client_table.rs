@@ -365,8 +365,15 @@ impl ClientTable {
 
     /// Remove a client session and cached reply.
     ///
-    /// Returns `true` when a slot existed. This is used by transport-level
-    /// disconnect/logout cleanup to release local table capacity.
+    /// **LOCAL ONLY -- does NOT replicate.** Only call from transport-level
+    /// disconnect/logout cleanup to release local table capacity. Using this
+    /// to roll back a cluster-committed [`Operation::Register`] would
+    /// produce local-vs-cluster divergence: peers keep the slot until they
+    /// evict the client themselves.
+    ///
+    /// Returns `true` when a slot existed.
+    ///
+    /// [`Operation::Register`]: iggy_binary_protocol::Operation
     pub fn remove_client(&mut self, client_id: u128) -> bool {
         let Some(slot_idx) = self.index.remove(&client_id) else {
             return false;

@@ -167,7 +167,11 @@ impl ConsumerGroups {
 // TODO(hubcio): Serialize proper reply (e.g. assigned group ID) instead of empty Bytes.
 impl StateHandler for CreateConsumerGroupRequest {
     type State = ConsumerGroupsInner;
-    fn apply(&self, state: &mut ConsumerGroupsInner) -> Bytes {
+    fn apply(
+        &self,
+        state: &mut ConsumerGroupsInner,
+        _timestamp: iggy_common::IggyTimestamp,
+    ) -> Bytes {
         let name: Arc<str> = Arc::from(self.name.as_str());
         if state.name_index.contains_key(&name) {
             return Bytes::new();
@@ -201,7 +205,11 @@ impl StateHandler for CreateConsumerGroupRequest {
 
 impl StateHandler for DeleteConsumerGroupRequest {
     type State = ConsumerGroupsInner;
-    fn apply(&self, state: &mut ConsumerGroupsInner) -> Bytes {
+    fn apply(
+        &self,
+        state: &mut ConsumerGroupsInner,
+        _timestamp: iggy_common::IggyTimestamp,
+    ) -> Bytes {
         let Some(id) = state.resolve_consumer_group_id_by_identifiers(
             &self.stream_id,
             &self.topic_id,

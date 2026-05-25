@@ -2249,6 +2249,39 @@ async fn handle_client_request(
     }
 
     let bound = sessions.borrow().get_session(transport_client_id);
+    if bound.is_none() {
+        // Replicated request on an unbound transport. Without this short-
+        // circuit, the rewrite below overwrites `header.client` with
+        // `transport_client_id` and dispatches; the request_preflight then
+        // rejects with `NoSession`/`SessionMismatch` and the failure either
+        // disappears silently or emits an Eviction the SDK previously
+        // could not decode. Either way the SDK blocked until socket
+        // timeout. Emit an empty Reply so the SDK fails fast: the typed
+        // decoder downstream rejects the empty body with `InvalidCommand`
+        // instead of hanging.
+        let commit = current_metadata_commit(shard);
+        let reply = build_empty_reply(&header, transport_client_id, 0, commit);
+        if let Err(error) = shard
+            .bus
+            .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+            .await
+        {
+            warn!(
+                transport_client_id,
+                error = %error,
+                operation = ?header.operation,
+                "failed to surface unbound-session reply"
+            );
+        } else {
+            warn!(
+                transport_client_id,
+                operation = ?header.operation,
+                "dropping replicated request from unbound transport; replied empty"
+            );
+        }
+        return;
+    }
+
     let resolved_namespace = if header.operation.is_partition() {
         match resolve_partition_request_namespace(shard, header.operation, request_body(&request)) {
             Ok(namespace) => Some(namespace),
@@ -2500,12 +2533,19 @@ async fn handle_login_register_request(
                 .await
                 {
                     warn!(transport_client_id, error = %error, "login/register failed");
+                    send_login_failure_reply(shard, transport_client_id, request.header()).await;
                 }
                 return;
             }
-            Err(LoginRegisterError::InvalidCredentials) => {}
+            Err(LoginRegisterError::InvalidCredentials) => {
+                // Fall through to PAT attempt so a credential payload that
+                // collides with a valid PAT payload shape still gets a
+                // chance; if PAT also rejects, the final fall-through emits
+                // the empty-reply failure path below.
+            }
             Err(error) => {
                 warn!(transport_client_id, error = %error, "login/register failed");
+                send_login_failure_reply(shard, transport_client_id, request.header()).await;
                 return;
             }
         }
@@ -2529,6 +2569,7 @@ async fn handle_login_register_request(
                         error = %error,
                         "login/register with PAT failed"
                     );
+                    send_login_failure_reply(shard, transport_client_id, request.header()).await;
                 }
                 return;
             }
@@ -2538,6 +2579,7 @@ async fn handle_login_register_request(
                     error = %error,
                     "login/register with PAT failed"
                 );
+                send_login_failure_reply(shard, transport_client_id, request.header()).await;
                 return;
             }
         }
@@ -2547,6 +2589,35 @@ async fn handle_login_register_request(
         transport_client_id,
         "dropping register request with unsupported payload shape"
     );
+    send_login_failure_reply(shard, transport_client_id, request.header()).await;
+}
+
+/// Empty Reply on a failed Register. Without it the SDK -- which only
+/// decodes `Command2::Reply` -- blocks until the socket read timeout fires
+/// for what is really a typed failure. An empty body fails downstream
+/// `LoginRegisterResponse` decoding with `InvalidCommand`, surfacing the
+/// failure to the caller immediately. A future change can switch this to
+/// an Eviction frame with a typed `EvictionReason` once the SDK eviction
+/// decoder lands at every transport.
+#[allow(clippy::future_not_send)]
+async fn send_login_failure_reply(
+    shard: &Rc<ServerNgShard>,
+    transport_client_id: u128,
+    request_header: &RequestHeader,
+) {
+    let commit = current_metadata_commit(shard);
+    let reply = build_empty_reply(request_header, transport_client_id, 0, commit);
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            error = %error,
+            "failed to send login-failure reply"
+        );
+    }
 }
 
 fn request_body(request: &Message<RequestHeader>) -> &[u8] {
@@ -3067,7 +3138,12 @@ async fn complete_login_register(
     {
         let mut sessions = sessions.borrow_mut();
         if let Err(error) = sessions.bind_session(transport_client_id, vsr_client_id, session) {
-            shard.plane.metadata().remove_client_session(vsr_client_id);
+            // No local rollback: `submit_register_in_process` above has
+            // already committed cluster-wide. A local-only
+            // `remove_client_session` here would diverge peers (they retain
+            // the slot until they evict the client themselves). The
+            // transport-disconnect callback owns local cleanup once the
+            // socket closes.
             return Err(LoginRegisterError::Session(error));
         }
     }

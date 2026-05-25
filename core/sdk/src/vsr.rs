@@ -25,7 +25,12 @@ use iggy_binary_protocol::codes::{
     STORE_CONSUMER_OFFSET_2_CODE, STORE_CONSUMER_OFFSET_CODE,
 };
 use iggy_binary_protocol::consensus::{
-    Command2, HEADER_SIZE, Operation, ReplyHeader, RequestHeader, read_size_field,
+    Command2, EvictionHeader, EvictionReason, HEADER_SIZE, Operation, ReplyHeader, RequestHeader,
+    read_size_field,
+};
+use iggy_binary_protocol::namespace::{
+    MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS, METADATA_CONSENSUS_NAMESPACE, PARTITION_MASK,
+    PARTITION_SHIFT, STREAM_MASK, STREAM_SHIFT, TOPIC_MASK, TOPIC_SHIFT,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
@@ -37,30 +42,6 @@ use iggy_binary_protocol::{WireIdentifier, WirePartitioning};
 use iggy_common::{IggyError, IggyTimestamp};
 
 const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
-const MAX_STREAMS: usize = 4096;
-const MAX_TOPICS: usize = 4096;
-const MAX_PARTITIONS: usize = 1_000_000;
-const STREAM_BITS: u32 = bits_required((MAX_STREAMS - 1) as u64);
-const TOPIC_BITS: u32 = bits_required((MAX_TOPICS - 1) as u64);
-const PARTITION_BITS: u32 = bits_required((MAX_PARTITIONS - 1) as u64);
-const PARTITION_SHIFT: u32 = 0;
-const TOPIC_SHIFT: u32 = PARTITION_SHIFT + PARTITION_BITS;
-const STREAM_SHIFT: u32 = TOPIC_SHIFT + TOPIC_BITS;
-const PARTITION_MASK: u64 = (1u64 << PARTITION_BITS) - 1;
-const TOPIC_MASK: u64 = (1u64 << TOPIC_BITS) - 1;
-const STREAM_MASK: u64 = (1u64 << STREAM_BITS) - 1;
-
-const fn bits_required(mut n: u64) -> u32 {
-    if n == 0 {
-        return 1;
-    }
-    let mut b = 0;
-    while n > 0 {
-        b += 1;
-        n >>= 1;
-    }
-    b
-}
 
 // TODO(vsr): transparent retry-after-disconnect can weaken at-most-once semantics
 // for replicated writes. The transports currently disconnect, reconnect, and encode
@@ -116,6 +97,9 @@ pub(crate) fn encode_request_header(
         request: request_id,
         session: session_id,
         namespace,
+        // Informational only: copied into `ReplyHeader.timestamp` for RTT
+        // observability. Ordering uses the per-session request counter
+        // (see `ConsensusSession::register_request_id`), not this field.
         timestamp: IggyTimestamp::now().as_micros(),
         reserved,
         ..Default::default()
@@ -167,18 +151,84 @@ pub(crate) fn decode_response(response: Bytes) -> Result<Bytes, IggyError> {
     Ok(response.slice(HEADER_SIZE..total_size))
 }
 
+/// Decode a reply when the header and body have been read into separate
+/// buffers. Saves the 64B header `put_slice` that `decode_response` would
+/// otherwise perform when callers concatenate header + body before decoding.
+///
+/// Also surfaces session-terminal `Command2::Eviction` frames as typed
+/// errors: callers waiting on a Reply for an unbound session would otherwise
+/// hit a read-timeout because the SDK previously only accepted
+/// `Command2::Reply`. Returns the body slice on a normal Reply, or maps the
+/// eviction reason to an `IggyError` so the request fails fast.
+pub(crate) fn decode_response_split(
+    header_bytes: &[u8; HEADER_SIZE],
+    body: Bytes,
+) -> Result<Bytes, IggyError> {
+    let command = peek_command(header_bytes);
+    if command == Command2::Eviction {
+        if let Ok(header) = bytemuck::checked::try_from_bytes::<EvictionHeader>(header_bytes) {
+            return Err(map_eviction_reason(header.reason));
+        }
+        return Err(IggyError::Unauthenticated);
+    }
+
+    let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(header_bytes)
+        .map_err(|_| IggyError::InvalidCommand)?;
+    if header.command != Command2::Reply {
+        return Err(IggyError::InvalidCommand);
+    }
+
+    let total_size = header.size as usize;
+    if total_size < HEADER_SIZE {
+        return Err(IggyError::InvalidCommand);
+    }
+    let expected_body = total_size - HEADER_SIZE;
+    if body.len() < expected_body {
+        return Err(IggyError::InvalidCommand);
+    }
+    Ok(body.slice(..expected_body))
+}
+
+/// `Command2` lives at a fixed offset shared by every consensus header
+/// (Reply, Eviction, Prepare, ...), so a byte read is enough to discriminate
+/// the frame before paying for full `bytemuck` validation.
+fn peek_command(header_bytes: &[u8; HEADER_SIZE]) -> Command2 {
+    const COMMAND_OFFSET: usize = 60;
+    match header_bytes[COMMAND_OFFSET] {
+        x if x == Command2::Reply as u8 => Command2::Reply,
+        x if x == Command2::Eviction as u8 => Command2::Eviction,
+        _ => Command2::Reserved,
+    }
+}
+
+fn map_eviction_reason(reason: EvictionReason) -> IggyError {
+    match reason {
+        EvictionReason::InvalidCredentials => IggyError::InvalidCredentials,
+        EvictionReason::InvalidToken => IggyError::InvalidPersonalAccessToken,
+        EvictionReason::UserInactive => IggyError::Unauthenticated,
+        EvictionReason::SessionError
+        | EvictionReason::NoSession
+        | EvictionReason::SessionTooLow
+        | EvictionReason::SessionReleaseMismatch => IggyError::Unauthenticated,
+        _ => IggyError::InvalidCommand,
+    }
+}
+
 fn namespace_for_request(
     code: u32,
     payload: &Bytes,
     operation: Operation,
 ) -> Result<u64, IggyError> {
-    // Control-plane requests do not target a concrete stream/topic/partition shard.
-    // They are encoded with namespace 0 and routed through metadata/shard 0.
-    if operation == Operation::Register
-        || operation == Operation::Logout
-        || operation == Operation::NonReplicated
-        || operation.is_metadata()
-    {
+    // Control-plane requests target the metadata replica (shard 0). The
+    // router's `route_typed` only short-circuits to shard 0 when the
+    // namespace value equals `METADATA_CONSENSUS_NAMESPACE`; sending plain
+    // `0` falls into `route_consensus_control` which hashes the namespace
+    // and lands a Register on a peer shard whose `submit_register_in_process`
+    // panics ("consensus only exists on shard 0").
+    if operation == Operation::Register || operation == Operation::Logout {
+        return Ok(METADATA_CONSENSUS_NAMESPACE);
+    }
+    if operation == Operation::NonReplicated || operation.is_metadata() {
         return Ok(0);
     }
 
@@ -302,7 +352,6 @@ mod tests {
     fn register_request_uses_zero_request_and_session() {
         let mut session = ConsensusSession::with_client_id(7);
         let request = LoginRegisterRequest {
-            client_id: 7,
             username: WireName::new("admin").unwrap(),
             password: SecretString::from("secret"),
             version: None,
@@ -318,7 +367,9 @@ mod tests {
         assert_eq!(header.request, 0);
         assert_eq!(header.session, 0);
         assert_eq!(header.client, 7);
-        assert_eq!(header.namespace, 0);
+        // Register is routed to the metadata replica (shard 0). The router's
+        // namespace==METADATA short-circuit needs the sentinel, not 0.
+        assert_eq!(header.namespace, METADATA_CONSENSUS_NAMESPACE);
     }
 
     #[test]
@@ -371,7 +422,9 @@ mod tests {
         assert_eq!(header.operation, Operation::Logout);
         assert_eq!(header.request, 1);
         assert_eq!(header.session, 99);
-        assert_eq!(header.namespace, 0);
+        // Logout, like Register, is routed to shard 0 via the metadata
+        // sentinel rather than namespace 0.
+        assert_eq!(header.namespace, METADATA_CONSENSUS_NAMESPACE);
     }
 
     #[test]

@@ -105,12 +105,10 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
     ) -> Result<IdentityInfo, IggyError> {
         #[cfg(feature = "vsr")]
         {
-            let client_id = self.get_vsr_client_id().await?;
             let response = match self
                 .send_raw_with_response(
                     LOGIN_REGISTER_WITH_PAT_CODE,
                     LoginRegisterWithPatRequest {
-                        client_id,
                         token: SecretString::from(token.to_string()),
                         version: Some(env!("CARGO_PKG_VERSION").to_string()),
                         client_context: Some(String::new()),

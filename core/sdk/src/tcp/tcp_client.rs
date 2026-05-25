@@ -26,7 +26,9 @@ use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
 use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
-use bytes::{BufMut, Bytes, BytesMut};
+#[cfg(not(feature = "vsr"))]
+use bytes::BufMut;
+use bytes::{Bytes, BytesMut};
 #[cfg(feature = "vsr")]
 use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
 #[cfg(not(feature = "vsr"))]
@@ -685,7 +687,10 @@ impl TcpClient {
                 #[cfg(feature = "vsr")]
                 {
                     let mut response_header = [0u8; iggy_binary_protocol::HEADER_SIZE];
-                    let read_bytes = stream.read(&mut response_header).await.map_err(|error| {
+                    // `stream.read` delegates to `read_exact`; on success it
+                    // always returns the requested length, so no short-read
+                    // guard is needed here.
+                    stream.read(&mut response_header).await.map_err(|error| {
                         error!(
                             "Failed to read VSR response header for TCP request with code: {code}: {error}",
                             code = code,
@@ -694,18 +699,12 @@ impl TcpClient {
                         IggyError::Disconnected
                     })?;
 
-                    if read_bytes != iggy_binary_protocol::HEADER_SIZE {
-                        error!("Received an invalid or empty VSR response header.");
-                        return Err(IggyError::EmptyResponse);
-                    }
-
                     let response_size = crate::vsr::response_size(&response_header)?;
-                    let mut response = BytesMut::with_capacity(response_size);
-                    response.put_slice(&response_header);
 
-                    if response_size > iggy_binary_protocol::HEADER_SIZE {
-                        let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
-                        stream.read_buf(&mut response, body_size).await.map_err(|error| {
+                    let body_size = response_size - iggy_binary_protocol::HEADER_SIZE;
+                    let body = if body_size > 0 {
+                        let mut body = BytesMut::with_capacity(body_size);
+                        stream.read_buf(&mut body, body_size).await.map_err(|error| {
                             error!(
                                 "Failed to read VSR response body for TCP request with code: {code}: {error}",
                                 code = code,
@@ -713,9 +712,12 @@ impl TcpClient {
                             );
                             IggyError::Disconnected
                         })?;
-                    }
+                        body.freeze()
+                    } else {
+                        Bytes::new()
+                    };
 
-                    return crate::vsr::decode_response(response.freeze());
+                    return crate::vsr::decode_response_split(&response_header, body);
                 }
 
                 #[cfg(not(feature = "vsr"))]

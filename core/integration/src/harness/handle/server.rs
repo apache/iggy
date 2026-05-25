@@ -817,6 +817,15 @@ impl TestBinary for ServerHandle {
         };
 
         command.env("IGGY_SYSTEM_PATH", data_path.display().to_string());
+        // VSR multi-node tests spawn N shards per node * M nodes per test;
+        // the 4096-entry per-ring default exhausts dev memlock budgets
+        // (`ulimit -l` is commonly 8 MiB). Shrink unless the caller already
+        // supplied an explicit value via `extra_envs` or the parent env.
+        if !self.envs.contains_key("IGGY_SHARD_RUNTIME_CAPACITY")
+            && std::env::var("IGGY_SHARD_RUNTIME_CAPACITY").is_err()
+        {
+            command.env("IGGY_SHARD_RUNTIME_CAPACITY", "256");
+        }
         command.envs(&self.envs);
 
         // Legacy clustering elects node 0 externally and requires explicit followers.
@@ -861,6 +870,15 @@ impl TestBinary for ServerHandle {
             self.stderr_path = Some(fs::canonicalize(&stderr_path)?);
         }
 
+        // server-ng production listeners intentionally do not use
+        // SO_REUSEPORT, so the harness must release pre-bound reservation
+        // sockets before spawning the child. The environment still carries
+        // the selected ports; this preserves deterministic client config
+        // without requiring production listener reuse.
+        if let Some(reserver) = self.port_reserver.take() {
+            reserver.release();
+        }
+
         let child = command.spawn().map_err(|e| TestBinaryError::ProcessSpawn {
             binary: launched_binary,
             source: e,
@@ -869,12 +887,6 @@ impl TestBinary for ServerHandle {
         self.watchdog_stop = Arc::new(AtomicBool::new(false));
 
         self.wait_for_server_ready()?;
-
-        // Release port reservation after server has written config file (bound to ports).
-        // This avoids SO_REUSEPORT load-balancing conflicts during startup.
-        if let Some(reserver) = self.port_reserver.take() {
-            reserver.release();
-        }
 
         self.start_watchdog();
 
